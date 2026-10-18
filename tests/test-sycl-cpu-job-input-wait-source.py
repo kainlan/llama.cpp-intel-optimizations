@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The CPU expert pool worker never enters the driver to wait for a job's inputs (llama.cpp-42zj).
+"""The CPU expert pool worker never enters the driver to wait for a job's inputs while the input marker is in play,
+that is, with GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on (llama.cpp-42zj, llama.cpp-nqbe).
 
 THE DEADLOCK (capture 2 on the fix build 4e39aadb3, B70, Qwen3.8 IQ3_XXS, the first 256-token prompt graph).  The
 retained-handle drain worker waited a record's event natively (mem-handle.cpp, record.event.wait_and_throw()).  libze
@@ -18,18 +19,25 @@ zeEventHostSignal (EventImp::hostSignal, 0x37ece0 and 0x36f8d0, slot 3 of the ev
 reaches neither G nor 0x37fd10 (a direct-call walk that does find G from hostSynchronize and from the status method),
 so a job that makes no other driver call cannot join the cycle.
 
+THE MARKER FOLLOWS THE KNOB (llama.cpp-nqbe).  The hang needs device work that waits on a CPU job's own signal, which
+only GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=1 submits (llama.cpp-m5v8); with the knob off the worker's native wait never
+hung.  And the marker costs Qwen3.8 IQ3_XXS decode on the B70 without -c 2.8 t/s against 9.7 with the knob off as with
+it on.  So the marker is in play only with the knob on; with it off the prologue arms, refuses, logs and waits nothing,
+and the worker waits a job's inputs natively, as it did before the marker (W10).
+
 THE CONTRACT.  With comments and string literals blanked:
   W1. The worker's input wait is driver-free.  moe_cpu_job_wait_inputs calls only cpu_job_input_marker_wait,
       ggml_sycl_watchdog_heartbeat, moe_hostpath_waits_enabled, cpu_expert_pool_trace_stamp_inputs_ready and
-      memset; the closure moe_cpu_job_prologue returns calls only moe_cpu_job_wait_inputs; neither names anything
-      in sycl::.
+      memset; the closure moe_cpu_job_prologue returns calls only moe_cpu_job_wait_inputs and, while the marker is
+      not in play, moe_cpu_job_wait_inputs_native (W10); neither names anything in sycl::.
   W2. The marker is waited once, unconditionally, at the top of moe_cpu_job_wait_inputs, before the watchdog tick,
       the inputs-ready stamp and the zeroing of the output span, which must follow the inputs.  The watchdog is
       ticked exactly once, unconditionally, after the wait (as a CPU expert batch ticks it when it finishes,
       llama.cpp-ff00) and never inside it, so a marker that never arrives fires the watchdog instead of spinning
       unseen.
-  W3. The worker cannot be handed an event.  moe_cpu_job_wait_inputs takes no sycl::event and no moe_cpu_job_inputs,
-      and the closure captures only marker, zero_out and zero_bytes.
+  W3. While the marker is in play the worker cannot be handed an event.  moe_cpu_job_wait_inputs takes no sycl::event
+      and no moe_cpu_job_inputs, and the closure captures only in_play, native, marker, zero_out and zero_bytes;
+      native, the one capture that can hold events, is filled only while the marker is not in play (W10).
   W4. The marker is armed on the submitting thread, and a refused arm is waited there.  moe_cpu_job_prologue takes
       the stream and, outside its closure, calls unified_cache_cpu_job_input_marker_arm once, as the condition of an
       `if` that first asks `!moe_cpu_job_input_marker_may(stream) ||`; that branch holds
@@ -85,6 +93,15 @@ THE CONTRACT.  With comments and string literals blanked:
       take record->ready, the barrier over the leases' producer events, before the prologue is built.  Its marker
       would follow that barrier on the in-order stream anyway, but a refused arm waits exactly the inputs on the
       submitting thread, and without it the job would read host weights still being written.
+  W10. The marker is in play only with the knob on.  moe_cpu_job_input_marker_in_play is exactly
+      `return moe_cpu_job_device_signal_enabled();`.  moe_cpu_job_prologue asks it once, by copy into `in_play`, in
+      its first statement and before any call of its own; its first branch, `if (!in_play)`, does nothing but move
+      the inputs' events into `native`, its only write, and the arm, its refusal WARN and its B2 wait all sit in that
+      branch's `else`, so with the knob off nothing is armed, refused, logged or waited on the submitting thread.  The
+      closure is exactly `if (in_play)` the marker wait, else moe_cpu_job_wait_inputs_native(native, zero_out,
+      zero_bytes), capturing in_play by copy.  moe_cpu_job_wait_inputs_native is the worker's wait from before the
+      marker: it waits the events when there are any, then stamps the inputs-ready trace, then zeroes the span, and
+      ticks no watchdog.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It does not show that zeEventHostSignal stays clear of the driver's
 device lock on another driver (that is the disassembly above, for 26.35 only), that the device writes the marker
@@ -110,6 +127,9 @@ submit_batch on a call expression (W6), the owner's other writers and the order 
 per reason (W4), and the arm's throw report outside the mutex and once per process, and its named refusals (W7):
 each of their mutants passes the pin as it stood on f60cc2636, with only its lock pattern widened to the
 unique_lock the arm now takes.
+RED for W10 on eaafb5b83, which arms the marker whatever the knob (Qwen3.8 decode without -c measured 2.79 t/s there
+with the knob unset, against 9.69 and 9.65 on master), while the pin as it stood passes that tree:
+  FAIL [pin W10]: moe_cpu_job_prologue arms the input marker whatever GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL says: ...
 """
 
 from __future__ import annotations
@@ -237,8 +257,19 @@ STREAM_RECORDING_SIG = r"static\s+bool\s+moe_cpu_job_stream_recording\s*\(\s*syc
 CHAINED_SIG = r"static\s+bool\s+ggml_sycl_moe_hybrid_decode_event_chained\s*\(([^)]*)\)\s*\{"
 WAIT_ALLOWED = {"cpu_job_input_marker_wait", "ggml_sycl_watchdog_heartbeat", "moe_hostpath_waits_enabled",
                 "cpu_expert_pool_trace_stamp_inputs_ready", "memset"}
-CLOSURE_ALLOWED = {"moe_cpu_job_wait_inputs"}
-CAPTURES_ALLOWED = {"marker", "zero_out", "zero_bytes"}
+CLOSURE_ALLOWED = {"moe_cpu_job_wait_inputs", "moe_cpu_job_wait_inputs_native"}
+CAPTURES_ALLOWED = {"in_play", "native", "marker", "zero_out", "zero_bytes"}
+# W10: the marker follows the knob (llama.cpp-nqbe). Compared with every space removed.
+IN_PLAY_SIG = r"static\s+bool\s+moe_cpu_job_input_marker_in_play\s*\(\s*\)\s*\{"
+NATIVE_SIG = r"static\s+void\s+moe_cpu_job_wait_inputs_native\s*\(([^)]*)\)\s*\{"
+NATIVE_PARAMS = "const std::vector<sycl::event> & events, float * zero_out, size_t zero_bytes"
+NATIVE_BODY = ("if (!events.empty()) { sycl::event::wait(events); } "
+               "if (moe_hostpath_waits_enabled()) { ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready(); } "
+               "if (zero_out && zero_bytes > 0) { std::memset(zero_out, 0, zero_bytes); }")
+IN_PLAY_FIRST = "const bool in_play = moe_cpu_job_input_marker_in_play();"
+NOT_IN_PLAY_BODY = "native = std::move(inputs.events);"
+CLOSURE_BODY = ("if (in_play) { moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes); } "
+                "else { moe_cpu_job_wait_inputs_native(native, zero_out, zero_bytes); }")
 DRIVER_CALL = re.compile(r"^(?:wait|wait_and_throw|wait_for|throw_asynchronous|get_info|get_profiling_info|submit|"
                          r"single_task|parallel_for|memcpy|memset_async|fill|copy|depends_on|ext_oneapi_\w+|"
                          r"ze[A-Z]\w*|ur[A-Z]\w*|mem_copy\w*|event_complete\w*)$")
@@ -298,7 +329,8 @@ def check_wait_inputs(s: dict[str, str]) -> None:
     bad = sorted({q for q, n in calls(lbody) if n not in CLOSURE_ALLOWED})
     if bad or re.search(r"\bsycl\s*::", lbody):
         fail("W1", "the closure moe_cpu_job_prologue returns runs on the pool worker and calls " +
-                   (", ".join(bad) if bad else "something in sycl::") + "; it may call only moe_cpu_job_wait_inputs")
+                   (", ".join(bad) if bad else "something in sycl::") + "; it may call only " +
+                   ", ".join(sorted(CLOSURE_ALLOWED)))
 
     # W2: once, at the top level, before the watchdog tick, the stamp and the zeroing; the tick once, right after it.
     hits = [m.start() for m in re.finditer(r"\bcpu_job_input_marker_wait\s*\(", wbody)]
@@ -833,6 +865,68 @@ def check_ring_locks(s: dict[str, str]) -> None:
                        "or a recycle still in a driver call would use a destroyed event")
 
 
+def nospace(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def check_in_play(s: dict[str, str]) -> None:
+    code = s["backend"]
+    _, pbody = definition(code, PROLOGUE_SIG, "W10")
+    lam = re.search(r"return\s*\[([^\]]*)\]\s*\(\s*\)\s*(?:mutable\s*)?\{", pbody)
+    if not lam:
+        fail("W10", "moe_cpu_job_prologue does not return a closure")
+    outside = pbody[: lam.start()]
+    branch = re.search(r"\bif\s*\(\s*!\s*in_play\s*\)\s*\{", outside)
+    arm = re.search(ARM, outside)
+    if not branch or not arm or arm.start() < branch.start():
+        fail("W10", "moe_cpu_job_prologue arms the input marker whatever GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL says: "
+                    "with the knob off the marker is not in play, and it costs Qwen3.8 decode without -c 2.8 t/s "
+                    "against 9.7 (llama.cpp-nqbe), for a hang only the knob's device wait has (llama.cpp-m5v8); the "
+                    "knob is asked first, as `if (!in_play)`, and the arm sits in that branch's else")
+    head = outside[: branch.start()]
+    stmts = [nospace(t) for t in head.split(";") if t.strip()]
+    if not stmts or stmts[0] != nospace(IN_PLAY_FIRST[:-1]) or \
+            sorted({n for _, n in calls(head)}) != ["moe_cpu_job_input_marker_in_play"] or \
+            len(re.findall(r"\bmoe_cpu_job_input_marker_in_play\s*\(", pbody)) != 1:
+        fail("W10", "moe_cpu_job_prologue does not ask moe_cpu_job_input_marker_in_play once, into `const bool "
+                    "in_play`, in its first statement and before any other call of its own")
+    nbody, nstart = block_at(outside, branch.end() - 1, "W10")
+    # The else: `else if (...) {...}` or `else {...}`, and nothing after it before the closure.
+    rest = outside[nstart + len(nbody) + 1 :]
+    els = re.match(r"\s*else\b\s*(?:if\s*\()?", rest)
+    tail = None
+    if els:
+        at = els.end()
+        if rest[els.end() - 1] == "(":
+            at = matching_paren(rest, els.end() - 1) + 1
+        brace = re.match(r"\s*\{", rest[at:])
+        if brace:
+            eb, es = block_at(rest, at + brace.end() - 1, "W10")
+            tail = rest[es + len(eb) + 1 :]
+    if nospace(nbody) != nospace(NOT_IN_PLAY_BODY) or tail is None or tail.strip():
+        fail("W10", "moe_cpu_job_prologue does more than hand the job's input events to the worker while the marker is "
+                    "not in play, or does its marker work outside that branch's else: with the knob off nothing is "
+                    "armed, refused, logged or waited on the submitting thread, and the worker waits natively")
+    writes = [m.start() for m in re.finditer(r"\bnative\s*(?:=(?!=)|\.\s*\w+\s*\(|\[)", outside)]
+    if len(writes) != 1 or not (nstart <= writes[0] < nstart + len(nbody)):
+        fail("W10", "moe_cpu_job_prologue fills `native` outside its `if (!in_play)` branch: while the marker is in "
+                    "play the worker would be handed events")
+    caps = [nospace(c) for c in lam.group(1).split(",")]
+    lbody, _ = block_at(pbody, pbody.index("{", lam.end() - 1), "W10")
+    if "in_play" not in caps or "native=std::move(native)" not in caps or nospace(lbody) != nospace(CLOSURE_BODY):
+        fail("W10", "the closure moe_cpu_job_prologue returns is not exactly `if (in_play)` the marker wait, else the "
+                    "native wait on `native`, with in_play captured by copy and native moved in")
+    nm, native_body = definition(code, NATIVE_SIG, "W10")
+    if nospace(nm.group(1)) != nospace(NATIVE_PARAMS) or nospace(native_body) != nospace(NATIVE_BODY):
+        fail("W10", "moe_cpu_job_wait_inputs_native is not the worker's input wait from before the marker (wait the "
+                    "events when there are any, then the inputs-ready stamp, then the zeroing, and no watchdog tick)")
+    _, ibody = definition(code, IN_PLAY_SIG, "W10")
+    if nospace(ibody) != nospace("return moe_cpu_job_device_signal_enabled();"):
+        fail("W10", "moe_cpu_job_input_marker_in_play is not exactly the GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL knob: the "
+                    "marker would be armed with the knob off, where it costs Qwen3.8 decode without -c 2.8 t/s "
+                    "against 9.7 (llama.cpp-nqbe)")
+
+
 def check_chained_inputs(s: dict[str, str]) -> None:
     _, cbody = definition(s["backend"], CHAINED_SIG, "W9")
     ready = re.search(r"\bif\s*\(\s*record\s*->\s*has_ready\s*\)\s*\{\s*job_inputs\s*\.\s*events\s*\.\s*push_back\s*\(\s*"
@@ -845,6 +939,7 @@ def check_chained_inputs(s: dict[str, str]) -> None:
 
 def check(s: dict[str, str]) -> None:
     check_wait_inputs(s)
+    check_in_play(s)
     check_pool_lambda(s)
     check_helpers(s)
     check_ring_locks(s)
@@ -896,6 +991,14 @@ def mutants() -> list:
     arm_call = r"!ggml_sycl::unified_cache_cpu_job_input_marker_arm\(stream, inputs\.events, &marker, &why\)"
     fallback = r"\n\s*sycl::event::wait\(inputs\.events\);"
     site1 = r"\n    std::function<void\(\)> job_prologue = moe_cpu_job_prologue\(\*stream, std::move\(job_inputs\), src0\);"
+    in_play_ret = (r"(static bool moe_cpu_job_input_marker_in_play\(\) \{\n\s*)"
+                   r"return moe_cpu_job_device_signal_enabled\(\);")
+    knob_off = r"\n    if (!in_play) {\n        native = std::move(inputs.events);\n    }"
+    any_inputs = r"\n    if (!inputs.events.empty()) {"
+    knob_branch = (r"\n    if \(!in_play\) \{\n        native = std::move\(inputs\.events\);\n    \} "
+                   r"else if \(!inputs\.events\.empty\(\)\) \{")
+    native_open = r"(moe_cpu_job_wait_inputs_native\([^)]*\)\s*\{\n    )"
+    native_wait = native_open[:-1] + r"if \(!events\.empty\(\)\) \{\n        sycl::event::wait\(events\);\n    \})"
     end_call = (r"\n(\s*)\{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n"
                 r"\s*cpu_job_input_marker_end\(cpu_job_input_marker_word_, cpu_job_input_marker_owner_\);\n\s*\}")
     return [
@@ -925,8 +1028,7 @@ def mutants() -> list:
              r"const ggml_sycl::cpu_job_input_marker & marker,")),
         ("W3", "backend", "the closure captures the inputs",
          sub(r"zero_bytes = inputs\.zero_bytes\]", r"zero_bytes = inputs.zero_bytes, inputs = std::move(inputs)]")),
-        ("W3", "backend", "the closure captures by default",
-         sub(r"return \[marker = std::move\(marker\),", r"return [=, marker = std::move(marker),")),
+        ("W3", "backend", "the closure captures by default", sub(r"return \[in_play,", r"return [=, in_play,")),
         ("W4", "backend", "the prologue never arms the marker", sub(arm_call, r"true")),
         ("W4", "backend", "the prologue does not take the stream",
          sub(r"moe_cpu_job_prologue\(sycl::queue\s*&\s*stream,\s*", r"moe_cpu_job_prologue(")),
@@ -947,7 +1049,11 @@ def mutants() -> list:
          sub(r"if \(!g_moe_cpu_job_input_marker_refusal_logged\[why\]\.exchange\(true, std::memory_order_acq_rel\)\)",
              r"if (true)")),
         ("W4", "backend", "the prologue also waits the inputs when the marker is armed",
-         sub(r"(\n(\s*)return \[marker = std::move\(marker\),)", r"\n\2sycl::event::wait(inputs.events);\1")),
+         sub(r"(\n(\s*)return \[in_play,)", r"\n\2sycl::event::wait(inputs.events);\1")),
+        # With the knob off the worker waits natively: the submitting thread waiting the inputs there, as the refused
+        # arm's B2 fallback does, is not the path from before the marker.
+        ("W4", "backend", "the prologue waits the inputs itself while the marker is not in play",
+         sub(r"(\n        native = std::move\(inputs\.events\);)", r"\n        sycl::event::wait(inputs.events);\1")),
         ("W4", "backend", "the recording test misses a recording stream",
          sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*stream\.ext_oneapi_get_state\(\) == "
              r"sycl::ext::oneapi::experimental::queue_state::recording;", r"return ggml_sycl_graph_recording_active();")),
@@ -956,6 +1062,41 @@ def mutants() -> list:
         ("W4", "backend", "the marker predicate skips the recording test",
          sub(r"(static bool moe_cpu_job_input_marker_may\(sycl::queue & stream\) \{\n\s*)"
              r"return !moe_cpu_job_stream_recording\(stream\);", r"\1return true;")),
+        # W10: the marker follows the knob (llama.cpp-nqbe): the predicate, the order of the knob and the arm, the
+        # knob-off branch, the closure's two waits and the native wait from before the marker.
+        ("W10", "backend", "the marker is in play whatever the knob",
+         sub(in_play_ret, r"\1return true;")),
+        ("W10", "backend", "the marker is in play only with the knob off",
+         sub(in_play_ret, r"\1return !moe_cpu_job_device_signal_enabled();")),
+        ("W10", "backend", "the knob is asked after an arm attempt",
+         chain(sub(knob_branch, any_inputs), sub(r"(\n    return \[in_play,)", knob_off + r"\1"))),
+        ("W10", "backend", "the prologue drops the knob's branch", sub(knob_branch, any_inputs)),
+        ("W10", "backend", "the prologue asks the stream's device-signal test instead of the knob",
+         sub(r"in_play = moe_cpu_job_input_marker_in_play\(\);", r"in_play = moe_cpu_job_device_signal_may(stream);")),
+        ("W10", "backend", "the knob-off branch logs a refusal",
+         sub(r"(\n        native = std::move\(inputs\.events\);)",
+             r'\1\n        GGML_LOG_WARN("[MOE-INPUT-MARKER] its input marker was not armed (%s)\\n", "off");')),
+        ("W10", "backend", "the worker is handed events while the marker is in play",
+         sub(r"(\} else if \(!inputs\.events\.empty\(\)\) \{)", r"\1\n        native = inputs.events;")),
+        ("W10", "backend", "the closure copies the input events instead of moving native in",
+         sub(r"return \[in_play, native = std::move\(native\),", r"return [in_play, native = inputs.events,")),
+        ("W10", "backend", "the closure's waits are swapped",
+         sub(r"\n        if \(in_play\) \{\n            moe_cpu_job_wait_inputs\(marker",
+             r"\n        if (!in_play) {\n            moe_cpu_job_wait_inputs(marker")),
+        ("W10", "backend", "the closure waits natively whatever the knob",
+         sub(r"\n        if \(in_play\) \{\n            moe_cpu_job_wait_inputs\(marker, zero_out, zero_bytes\);"
+             r"\n        \} else \{\n            (moe_cpu_job_wait_inputs_native\(native, zero_out, zero_bytes\);)"
+             r"\n        \}",
+             r"\n        \1")),
+        ("W10", "backend", "the closure captures in_play by reference",
+         sub(r"return \[in_play,", r"return [&in_play,")),
+        ("W10", "backend", "the native wait ticks the watchdog",
+         sub(native_wait, r"\1\n    ggml_sycl_watchdog_heartbeat();")),
+        ("W10", "backend", "the native wait skips one-event jobs",
+         sub(native_open + r"if \(!events\.empty\(\)\)", r"\1if (events.size() > 1)")),
+        ("W10", "backend", "the native wait zeroes before the inputs land",
+         sub(native_open, r"\1if (zero_out && zero_bytes > 0) {\n        std::memset(zero_out, 0, zero_bytes);"
+                          r"\n    }\n    ")),
         ("W5", "backend", "a site builds its prologue without the stream",
          sub(r"moe_cpu_job_prologue\(\*stream, std::move\(job_inputs\), src0\)",
              r"moe_cpu_job_prologue(std::move(job_inputs), src0)")),
@@ -1208,8 +1349,9 @@ def main(argv: list[str]) -> int:
     except ContractError as e:
         print(e)
         return 1
-    print("PASS: the CPU expert pool worker waits a job's inputs on a device-written marker with host loads, and makes "
-          f"no driver call but the job's device signal {TAG}")
+    print("PASS: with GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on, the CPU expert pool worker waits a job's inputs on a "
+          "device-written marker with host loads and makes no driver call but the job's device signal; with it off no "
+          f"marker is armed and the worker waits them natively, as before the marker {TAG}")
     return 0
 
 

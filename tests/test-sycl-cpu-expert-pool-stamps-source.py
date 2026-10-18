@@ -15,9 +15,11 @@ THE CONTRACT.  With comments blanked:
   S. (cpu-expert-pool.cpp CpuExpertPool::submit_batch) the job's record is made
      with std::make_shared<cpu_expert_job_stamps> and stamped with t_submit_ns,
      both inside `if (trace)`: no allocation and no clock read while tracing is off.
-  R. (ggml-sycl.cpp moe_cpu_job_wait_inputs) the prologue calls
-     cpu_expert_pool_trace_stamp_inputs_ready() after cpu_job_input_marker_wait(marker),
-     its wait for the job's inputs (llama.cpp-42zj), inside
+  R. (ggml-sycl.cpp moe_cpu_job_wait_inputs and moe_cpu_job_wait_inputs_native) each
+     of the prologue's input waits calls cpu_expert_pool_trace_stamp_inputs_ready()
+     after its wait for the job's inputs, cpu_job_input_marker_wait(marker) with
+     GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on (llama.cpp-42zj) and
+     sycl::event::wait(events) with it off (llama.cpp-nqbe), inside
      `if (moe_hostpath_waits_enabled())`; and (cpu-expert-pool.cpp) that
      function writes t_inputs_ready_ns only through the worker's current-job pointer,
      inside an `if` on that pointer.
@@ -181,6 +183,14 @@ def guarded(code: str, pos: int, guard: str) -> bool:
 SUBMIT_SIG = r"std::future<void>\s+CpuExpertPool::submit_batch\s*\([^{]*\)\s*\{"
 STAMP_INPUTS_SIG = r"void\s+cpu_expert_pool_trace_stamp_inputs_ready\s*\(\s*\)\s*\{"
 WAIT_INPUTS_SIG = r"static\s+void\s+moe_cpu_job_wait_inputs\s*\([^)]*\)\s*\{"
+WAIT_INPUTS_NATIVE_SIG = r"static\s+void\s+moe_cpu_job_wait_inputs_native\s*\([^)]*\)\s*\{"
+# The prologue's input waits, each with the wait its stamp must follow: the input marker with
+# GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on (llama.cpp-42zj), the events natively with it off (llama.cpp-nqbe).
+INPUT_WAITS = (
+    ("moe_cpu_job_wait_inputs", WAIT_INPUTS_SIG, r"\bcpu_job_input_marker_wait\s*\(\s*marker\s*\)", "its input marker"),
+    ("moe_cpu_job_wait_inputs_native", WAIT_INPUTS_NATIVE_SIG, r"\bsycl::event::wait\s*\(\s*events\s*\)",
+     "its input events"),
+)
 # Either public overload or the static row loop they forward to.
 BATCHED_SIG = r"void\s+(?:ggml_sycl_cpu_expert_mul_mat_batched|cpu_expert_mul_mat_batched_run)\s*\([^)]*\)\s*\{"
 JOIN_SIG = r"static\s+void\s+moe_cpu_job_join\s*\([^)]*\)\s*noexcept\s*\{"
@@ -206,18 +216,19 @@ def check_submit(pool: str) -> None:
 
 def check_inputs(pool: str, backend: str) -> None:
     bcode = blank_comments(backend)
-    body, off = body_of(bcode, WAIT_INPUTS_SIG, "R")
-    w = re.search(r"\bcpu_job_input_marker_wait\s*\(\s*marker\s*\)", body)
-    if not w:
-        fail("R", "moe_cpu_job_wait_inputs no longer waits for its input marker")
-    calls = list(re.finditer(r"\bcpu_expert_pool_trace_stamp_inputs_ready\s*\(\s*\)", body))
-    if not calls:
-        fail("R", "moe_cpu_job_wait_inputs does not stamp t_inputs_ready after its input wait")
-    for m in calls:
-        if m.start() < w.end():
-            fail("R", "moe_cpu_job_wait_inputs stamps t_inputs_ready before its input wait returns")
-        if not guarded(bcode, off + m.start(), WAITS_GUARD):
-            fail("R", "moe_cpu_job_wait_inputs stamps t_inputs_ready outside `if (moe_hostpath_waits_enabled())`")
+    for name, sig, wait, what in INPUT_WAITS:
+        body, off = body_of(bcode, sig, "R")
+        w = re.search(wait, body)
+        if not w:
+            fail("R", f"{name} no longer waits for {what}")
+        calls = list(re.finditer(r"\bcpu_expert_pool_trace_stamp_inputs_ready\s*\(\s*\)", body))
+        if not calls:
+            fail("R", f"{name} does not stamp t_inputs_ready after its input wait")
+        for m in calls:
+            if m.start() < w.end():
+                fail("R", f"{name} stamps t_inputs_ready before its input wait returns")
+            if not guarded(bcode, off + m.start(), WAITS_GUARD):
+                fail("R", f"{name} stamps t_inputs_ready outside `if (moe_hostpath_waits_enabled())`")
     pcode = blank_comments(pool)
     sbody, soff = body_of(pcode, STAMP_INPUTS_SIG, "R")
     writes = list(re.finditer(r"(\w+)\s*->\s*t_inputs_ready_ns\s*=", sbody))
@@ -381,6 +392,16 @@ def self_test(s: dict) -> int:
         ("R", "backend", "inputs-ready stamped before the wait",
          sub(r"(ggml_sycl::cpu_job_input_marker_wait\(marker\);)",
              r"ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();\n    \1")),
+        # With the knob off the worker waits the events natively (llama.cpp-nqbe), and stamps after them.
+        ("R", "backend", "native inputs-ready stamped before the wait",
+         sub(r"(moe_cpu_job_wait_inputs_native\([^)]*\)\s*\{\n)",
+             r"\1    ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();\n")),
+        ("R", "backend", "native inputs-ready stamp dropped",
+         sub(r"(moe_cpu_job_wait_inputs_native\([^)]*\)\s*\{(?:(?!\n\}).)*?)"
+             r"ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready\(\);", r"\1;", flags=re.S)),
+        ("R", "backend", "native input wait dropped",
+         sub(r"(moe_cpu_job_wait_inputs_native\([^)]*\)\s*\{\n\s*if \(!events\.empty\(\)\) \{\n\s*)"
+             r"sycl::event::wait\(events\);", r"\1;")),
         ("R", "pool", "current-job pointer not tested",
          sub(r"if \(g_pool_current_job\) \{\n(\s*)g_pool_current_job->t_inputs_ready_ns",
              r"{\n\1g_pool_current_job->t_inputs_ready_ns")),

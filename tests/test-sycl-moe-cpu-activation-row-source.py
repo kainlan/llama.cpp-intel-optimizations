@@ -64,7 +64,9 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      and a top-K pool restarts at entry 0, so different ops DO alias).  The premises pinned since
      llama.cpp-z4kd moved the waits off the submitting thread: the job's prologue
      (moe_cpu_job_wait_inputs) waits for the job's input marker, which the device writes once every
-     input event has completed (llama.cpp-42zj), and only then zeroes the out region, and
+     input event has completed (llama.cpp-42zj), or, with GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL off,
+     waits every input event itself (moe_cpu_job_wait_inputs_native, llama.cpp-nqbe), and only then
+     zeroes the out region, and
      dispatch_cpu_compute zeroes nothing itself (pin W1: with an extra conjunct on the wait, or the
      memset first, the zeroing and the CPU read run before the D2H lands); every job form -- the
      CpuExpertPool worker and both std::async forms -- runs that prologue before its kernel, and the
@@ -360,6 +362,7 @@ DISPATCH_MARKER = "auto do_cpu_dispatch = [&]("
 POOL_CPP = ROOT / "ggml/src/ggml-sycl/pinned-buffer-pool.cpp"
 EXPERT_POOL_CPP = ROOT / "ggml/src/ggml-sycl/cpu-expert-pool.cpp"
 WAIT_INPUTS_DEF = "static void moe_cpu_job_wait_inputs(const ggml_sycl::cpu_job_input_marker & marker,"
+WAIT_INPUTS_NATIVE_DEF = "static void moe_cpu_job_wait_inputs_native(const std::vector<sycl::event> & events,"
 PROLOGUE_DEF = "static std::function<void()> moe_cpu_job_prologue("
 SLOT_FLUSH_DEF = "static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) "
 
@@ -535,7 +538,8 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
 
     # 8. (I2, llama.cpp-z4kd) the job's input waits and the out-region memset that depends on them run
     #    on the pool worker, in the job's prologue, never on the submitting thread.  W1: the prologue
-    #    waits for the job's input marker (every input event, llama.cpp-42zj) and only then zeroes, and
+    #    waits for the job's input marker (every input event, llama.cpp-42zj), or with the knob off every
+    #    input event itself (llama.cpp-nqbe), and only then zeroes, and
     #    dispatch_cpu_compute never zeroes the region itself.  W2: every way the job can run (pool worker, recipe std::async, inactive-pool std::async)
     #    runs the prologue before the kernel.  W3: the zeroing is requested on every path that needs it.
     #    W4: every activation-copy branch hands its copy events to the prologue, unconditionally.
@@ -555,10 +559,22 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
             "span`; zeroing before the activation copy lands can clear a region an earlier scatter's H2D has not "
             "read yet (llama.cpp-4hg7, llama.cpp-z4kd, llama.cpp-42zj)"
         )
-    # The arm and the refused arm's wait on the submitting thread are test-sycl-cpu-job-input-wait-source.py's W4.
+    # With GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL off the worker waits the input events natively (llama.cpp-nqbe).
+    if one_body(WAIT_INPUTS_NATIVE_DEF, "W1") != (
+            "{ if (!events.empty()) { sycl::event::wait(events); } "
+            "if (moe_hostpath_waits_enabled()) { ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready(); } "
+            "if (zero_out && zero_bytes > 0) { std::memset(zero_out, 0, zero_bytes); } }"):
+        raise ContractError(
+            "FAIL [pin W1]: moe_cpu_job_wait_inputs_native is not exactly `wait every input event, then zero the "
+            "output span`; zeroing before the activation copy lands can clear a region an earlier scatter's H2D has "
+            "not read yet (llama.cpp-4hg7, llama.cpp-z4kd, llama.cpp-nqbe)"
+        )
+    # The arm, the refused arm's wait on the submitting thread and the knob's branch are
+    # test-sycl-cpu-job-input-wait-source.py's W4 and W10.
     if not one_body(PROLOGUE_DEF, "W1").endswith(
-            "return [marker = std::move(marker), zero_out = inputs.zero_out, zero_bytes = inputs.zero_bytes]() "
-            "{ moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes); }; }"):
+            "return [in_play, native = std::move(native), marker = std::move(marker), zero_out = inputs.zero_out, "
+            "zero_bytes = inputs.zero_bytes]() { if (in_play) { moe_cpu_job_wait_inputs(marker, zero_out, "
+            "zero_bytes); } else { moe_cpu_job_wait_inputs_native(native, zero_out, zero_bytes); } }; }"):
         raise ContractError(
             "FAIL [pin W1]: moe_cpu_job_prologue is not exactly a closure that runs moe_cpu_job_wait_inputs; the "
             "job's input waits would not run, or would run on the submitting thread (llama.cpp-z4kd)"
@@ -950,9 +966,18 @@ def self_test(backend_src: str) -> int:
     # W1: the prologue's wait gains a condition, so some jobs read their inputs before they land.
     expect_fail("prologue-wait-conditional", sub(marker_wait, "    if (zero_bytes > 4096) {\n    " + marker_wait + "    }\n",
                                                  in_lambda=False, after=WAIT_INPUTS_DEF), None, "W1")
+    native_wait = "    if (!events.empty()) {\n        sycl::event::wait(events);\n    }\n"
+    # W1: the native wait (the knob off) zeroes before it waits the activation copy.
+    expect_fail("native-zeroes-before-wait", sub(native_wait, zero_span + native_wait, in_lambda=False,
+                                                 after=WAIT_INPUTS_NATIVE_DEF), None, "W1")
+    # W1 (I2(c) analogue): the native wait gains a conjunct, so a one-event job skips it.
+    expect_fail("native-wait-needs-two-events", sub("if (!events.empty()) {", "if (events.size() > 1) {",
+                                                    in_lambda=False, after=WAIT_INPUTS_NATIVE_DEF), None, "W1")
     # W1: the closure no longer runs the waits.
-    expect_fail("prologue-closure-empty", sub("() {\n        moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);\n    };",
-                                              "() {};", in_lambda=False, after=PROLOGUE_DEF), None, "W1")
+    expect_fail("prologue-closure-empty", sub(
+        "() {\n        if (in_play) {\n            moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);\n"
+        "        } else {\n            moe_cpu_job_wait_inputs_native(native, zero_out, zero_bytes);\n        }\n    };",
+        "() {};", in_lambda=False, after=PROLOGUE_DEF), None, "W1")
     # W2: one job form stops running the prologue, or the pool submission drops it.
     expect_fail("fallback-skips-prologue", sub(
         "prologue();\n                        ggml_sycl_cpu_expert_mul_mat_batched", "ggml_sycl_cpu_expert_mul_mat_batched"),

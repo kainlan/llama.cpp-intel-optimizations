@@ -16,8 +16,11 @@ does not reach it (N7).  Everything after it is event-chained:
   * the waits a CPU job needs before it writes its pool span (its activation copy, the producer events
     of its host weight leases, an earlier scatter H2D it would alias) run on the pool worker, through
     moe_cpu_job_wait_inputs, which only moe_cpu_job_prologue's returned closure calls.  Since
-    llama.cpp-42zj that wait reads a device-written marker the prologue arms behind those events, and
-    when the marker cannot be armed the prologue waits the events itself (KNOWN_WAITS);
+    llama.cpp-42zj, with GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on, that wait reads a device-written marker
+    the prologue arms behind those events, and when the marker cannot be armed the prologue waits the
+    events itself (KNOWN_WAITS); with the knob off the closure waits them through
+    moe_cpu_job_wait_inputs_native, as before the marker, which only that closure calls too
+    (llama.cpp-nqbe);
   * a CPU job's completion is joined by a host_task on the op's in-order queue
     (moe_cpu_job_join_on_queue, whose host_task calls moe_cpu_job_join, the one function that takes
     the job's future.get()), and the scatter H2D copies are submitted with that host_task's event as a
@@ -332,8 +335,9 @@ KNOWN_WAITS = {
         "recipe workspace; it predates llama.cpp-z4kd, and llama.cpp-yzwy moves the zeroing to the job prologue"
     ),
     ("moe_cpu_job_prologue", "wait()"): (
-        "the refused input marker's fallback, `sycl::event::wait(inputs.events)`, taken only when a command graph "
-        "records, the stream is not in-order or the marker word cannot be allocated or submitted.  The lead's "
+        "the refused input marker's fallback, `sycl::event::wait(inputs.events)`, taken only while the marker is in "
+        "play (GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on) and a command graph records, the stream is not in-order or "
+        "the marker word cannot be allocated or submitted.  The lead's "
         "decision on llama.cpp-42zj puts it here: a native wait on the pool worker can block on the driver's "
         "device lock behind a wait_and_throw on another thread, which deadlocked the first Qwen3.8 prompt graph"
     ),
@@ -1186,8 +1190,11 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     pro_def = ("static std::function<void()> moe_cpu_job_prologue(sycl::queue &       stream,\n"
                "                                                  moe_cpu_job_inputs  inputs,\n"
                "                                                  const ggml_tensor * src0) {\n")
-    pro_closure = ("    return [marker = std::move(marker), zero_out = inputs.zero_out, zero_bytes = inputs.zero_bytes]() {\n"
-                   "        moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);\n    };\n")
+    pro_closure = ("    return [in_play, native = std::move(native), marker = std::move(marker), "
+                   "zero_out = inputs.zero_out,\n            zero_bytes = inputs.zero_bytes]() {\n"
+                   "        if (in_play) {\n            moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);\n"
+                   "        } else {\n            moe_cpu_job_wait_inputs_native(native, zero_out, zero_bytes);\n"
+                   "        }\n    };\n")
     pro_fallback = "            sycl::event::wait(inputs.events);\n"
     sub("N1", "join get() outside its host_task", join_def, join_def + "    job.get();\n")
     sub("N1", "job join called outside its host_task", join_def, join_def + "    moe_cpu_job_join(job, nullptr);\n")
@@ -1206,6 +1213,10 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N1", "prologue waits its inputs on the armed path too", pro_closure,
         "    sycl::event::wait(inputs.events);\n" + pro_closure)
     sub("N2", "refused arm's fallback wait dropped", pro_fallback, "")
+    # With the knob off the worker waits natively (llama.cpp-nqbe); the same wait reached from the factory body
+    # runs on the submitting thread, and the scan follows the call into it.
+    sub("N1", "the native worker wait called from the factory body", pro_def,
+        pro_def + "    moe_cpu_job_wait_inputs_native(inputs.events, inputs.zero_out, inputs.zero_bytes);\n")
     timer = "            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n"
     sub("N2", "refused arm's census timer dropped", timer, "")
     # The timer is excused by its text, so a real wait_* call in its place, or a second timer beside it,

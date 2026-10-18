@@ -24549,9 +24549,10 @@ struct cpu_dispatch_result {
 // flush.  Each drained the GPU queue and left it idle while the host woke up.
 // Now the ids readback is the one host block per layer:
 //  - a job's input waits (and the zeroing of its output span, which must follow
-//    them) run on the pool worker, in the closure moe_cpu_job_prologue builds,
-//    on an input marker the device writes once the inputs are complete, so the
-//    worker never waits inside the driver (llama.cpp-42zj);
+//    them) run on the pool worker, in the closure moe_cpu_job_prologue builds;
+//    with GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on they wait an input marker the
+//    device writes once the inputs are complete, so the worker never waits
+//    inside the driver (llama.cpp-42zj);
 //  - a job signals its entry of the stream's ring of host-signalled device
 //    events after its last write, and its scatter H2D copies depend on a fresh
 //    wrapper of that event, which the device waits itself (llama.cpp-qwn5);
@@ -24587,8 +24588,21 @@ static bool moe_cpu_job_stream_recording(sycl::queue & stream) {
            stream.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
 }
 
-// Whether a CPU job's input marker may be armed on `stream` (llama.cpp-42zj): no command graph records there, since a
-// recorded marker is written only when the graph replays, and the job would wait until then.
+// The knob GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, defined with the scatter's device wait below.
+static bool moe_cpu_job_device_signal_enabled();
+
+// Whether CPU jobs wait their inputs on an input marker at all (llama.cpp-42zj): only with the knob on. The marker
+// replaces the pool worker's driver wait for a job's inputs, and that wait hung (llama.cpp-m5v8) only on the
+// device-signal path, where the retained-handle drain worker holds the Level Zero mutex inside its event wait while
+// the device work behind that event waits for a CPU job's own signal. With the knob off the native wait never hung,
+// and the marker costs Qwen3.8 IQ3_XXS decode on the B70 without -c 2.8 t/s against 9.7 (llama.cpp-nqbe), so the
+// worker then waits a job's inputs natively, as it did before the marker, and no marker is armed or logged.
+static bool moe_cpu_job_input_marker_in_play() {
+    return moe_cpu_job_device_signal_enabled();
+}
+
+// Whether a CPU job's input marker may be armed on `stream` (llama.cpp-42zj), once it is in play: no command graph
+// records there, since a recorded marker is written only when the graph replays, and the job would wait until then.
 static bool moe_cpu_job_input_marker_may(sycl::queue & stream) {
     return !moe_cpu_job_stream_recording(stream);
 }
@@ -24615,15 +24629,37 @@ static void moe_cpu_job_wait_inputs(const ggml_sycl::cpu_job_input_marker & mark
     }
 }
 
-// Runs on the submitting thread, right after the job's last input on `stream`: arms the job's input marker there
-// (cpu_job_input_marker), so the worker waits its inputs with host loads. When the marker is not armed, this thread
-// waits the inputs itself before the job exists, counted as B2, and the worker waits nothing; the first job refused
-// for each reason is logged.
+// Runs on the pool worker while the input marker is not in play (moe_cpu_job_input_marker_in_play): waits the job's
+// input events in the driver, as every CPU job did before the marker (llama.cpp-42zj).
+static void moe_cpu_job_wait_inputs_native(const std::vector<sycl::event> & events,
+                                           float *                          zero_out,
+                                           size_t                           zero_bytes) {
+    if (!events.empty()) {
+        sycl::event::wait(events);
+    }
+    // The job's inputs-ready stamp (llama.cpp-j6jf); a no-op off a traced pool job.
+    if (moe_hostpath_waits_enabled()) {
+        ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();
+    }
+    if (zero_out && zero_bytes > 0) {
+        std::memset(zero_out, 0, zero_bytes);
+    }
+}
+
+// Runs on the submitting thread, right after the job's last input on `stream`. While the input marker is not in play
+// it only hands the job's input events to the worker, which waits them natively. Otherwise it arms the job's input
+// marker there (cpu_job_input_marker), so the worker waits its inputs with host loads. When the marker is not armed,
+// this thread waits the inputs itself before the job exists, counted as B2, and the worker waits nothing; the first
+// job refused for each reason is logged.
 static std::function<void()> moe_cpu_job_prologue(sycl::queue &       stream,
                                                   moe_cpu_job_inputs  inputs,
                                                   const ggml_tensor * src0) {
+    const bool                      in_play = moe_cpu_job_input_marker_in_play();
+    std::vector<sycl::event>        native;  // waited by the worker, only while the marker is not in play
     ggml_sycl::cpu_job_input_marker marker;
-    if (!inputs.events.empty()) {
+    if (!in_play) {
+        native = std::move(inputs.events);
+    } else if (!inputs.events.empty()) {
         ggml_sycl::cpu_job_input_marker_refusal why = ggml_sycl::CPU_JOB_INPUT_MARKER_REFUSAL_GRAPH_RECORDING;
         if (!moe_cpu_job_input_marker_may(stream) ||
             !ggml_sycl::unified_cache_cpu_job_input_marker_arm(stream, inputs.events, &marker, &why)) {
@@ -24641,8 +24677,13 @@ static std::function<void()> moe_cpu_job_prologue(sycl::queue &       stream,
             sycl::event::wait(inputs.events);
         }
     }
-    return [marker = std::move(marker), zero_out = inputs.zero_out, zero_bytes = inputs.zero_bytes]() {
-        moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);
+    return [in_play, native = std::move(native), marker = std::move(marker), zero_out = inputs.zero_out,
+            zero_bytes = inputs.zero_bytes]() {
+        if (in_play) {
+            moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);
+        } else {
+            moe_cpu_job_wait_inputs_native(native, zero_out, zero_bytes);
+        }
     };
 }
 
@@ -24740,9 +24781,10 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
 
 // GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or 0 joins every CPU expert pool job with a
 // host task; non-zero lets the job's scatter wait on a host-signalled Level Zero event the job signals after its last
-// write. Default off (llama.cpp-nqbe): with it on, Qwen3.8 IQ3_XXS decode on the B70 without -c (12 KV layers on the
-// host, direct path) fell to 2.7 t/s from 9.7, while at -c 4096 it rose to 13.3 from 9.0. The first prompt graph hang
-// that first turned it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
+// write, and puts the job's input marker in play (moe_cpu_job_input_marker_in_play). Default off (llama.cpp-nqbe): with
+// it on, Qwen3.8 IQ3_XXS decode on the B70 without -c (12 KV layers on the host, direct path) fell to 2.7 t/s from 9.7,
+// which is the marker's cost, while at -c 4096 it rose to 13.3 from 9.0. The first prompt graph hang that first turned
+// it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
 static bool moe_cpu_job_device_signal_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");
@@ -77879,11 +77921,12 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     if (record->has_ready) {
         job_inputs.events.push_back(record->ready);
     }
-    // Armed before the device half: on the in-order stream the job's input marker follows its last input and not the
-    // device-expert kernel, so the CPU job runs alongside that kernel (llama.cpp-42zj). A refused arm waits the
-    // inputs here instead, before the device half is submitted: the stream runs dry until this thread wakes and
-    // submits the table copy and the kernel, and this thread no longer runs ahead of the device. The CPU job,
-    // submitted after the kernel, still runs alongside it.
+    // Built before the device half. While the input marker is in play (GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on), the
+    // marker follows the job's last input on the in-order stream and not the device-expert kernel, so the CPU job runs
+    // alongside that kernel (llama.cpp-42zj). A refused arm waits the inputs here instead, before the device half is
+    // submitted: the stream runs dry until this thread wakes and submits the table copy and the kernel, and this
+    // thread no longer runs ahead of the device. The CPU job, submitted after the kernel, still runs alongside it.
+    // With the knob off the prologue submits and waits nothing, and the worker waits the inputs natively.
     std::function<void()> job_prologue = moe_cpu_job_prologue(*stream, std::move(job_inputs), src0);
 
     // A split record's device half: the table, into the planned scratch, and the device kernel over every slot.
@@ -88734,8 +88777,8 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
 // the join to the point a real consumer needs the result (or graph end),
 // and let the input-side D2H join happen INSIDE the worker thread instead
 // of on the submitting thread (the shape the MoE host path had, llama.cpp-z4kd;
-// that path's pool worker now waits a device-written input marker instead of
-// the events, llama.cpp-42zj).
+// with GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on, that path's pool worker now
+// waits a device-written input marker instead of the events, llama.cpp-42zj).
 //
 // A SEPARATE pending slot from g_pending_scatter
 // (owner ruling 2026-08-27, llama.cpp-sbky): two independent producers
@@ -88991,10 +89034,11 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
     // D2H: capture the events but do NOT wait here -- the wait is deferred
     // to immediately before the CPU task actually reads the data, INSIDE
     // the worker thread below, so GPU submission for other graph regions
-    // in between is never blocked by it. The MoE host path used to wait a CPU
-    // job's input events the same way on its pool worker (llama.cpp-z4kd); it
-    // now waits a device-written input marker there (llama.cpp-42zj). K/V need
-    // no copy or event -- already pinned host memory.
+    // in between is never blocked by it. The MoE host path waits a CPU job's
+    // input events the same way on its pool worker (llama.cpp-z4kd), unless
+    // GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is on: then it waits a device-written
+    // input marker there (llama.cpp-42zj). K/V need no copy or event --
+    // already pinned host memory.
     sycl::event q_evt = ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev);
     sycl::event mask_evt;
     bool        have_mask_evt = false;
