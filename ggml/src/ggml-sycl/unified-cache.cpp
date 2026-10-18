@@ -17086,12 +17086,22 @@ class cpu_job_signal_ring {
             case cpu_job_signal_grow_result::GREW:
                 return book_.acquire(id, generation);
             case cpu_job_signal_grow_result::FULL:
-            case cpu_job_signal_grow_result::FAILED:
                 if (!full_warned_) {
                     full_warned_ = true;
                     GGML_LOG_WARN(
                         "[MOE-DEVSIG] the CPU expert job signal ring cannot grow past %zu entries; jobs past that are "
                         "joined by host tasks (llama.cpp-qwn5)\n",
+                        book_.size());
+                }
+                return false;
+            case cpu_job_signal_grow_result::FAILED:
+                // A driver failure, not the cap: the next acquire with no free entry tries to grow again.
+                if (!grow_warned_) {
+                    grow_warned_ = true;
+                    GGML_LOG_WARN(
+                        "[MOE-DEVSIG] creating a block of host-visible events for the CPU expert job signal ring "
+                        "failed at %zu entries; a job that finds no free entry is joined by a host task "
+                        "(llama.cpp-q0xu)\n",
                         book_.size());
                 }
                 return false;
@@ -17299,6 +17309,11 @@ class cpu_job_signal_ring {
     // its events are created with mutex_ released and counted in outside_calls_, and published under it. `lock` holds
     // mutex_ on entry and on return. zctx_ and l0_ are fixed at construction, so the creation reads them unlocked.
     cpu_job_signal_grow_result grow(std::unique_lock<std::timed_mutex> & lock) {
+        // The room a publish needs, reserved under mutex_ before the growth, so the publish cannot throw. Only a
+        // publish adds to these vectors, and one growth is in flight at a time; shutdown()'s clear() keeps the
+        // capacity.
+        pools_.reserve(pools_.size() + 1);
+        events_.reserve(events_.size() + block_events);
         ze_event_pool_handle_t         pool = nullptr;
         std::vector<ze_event_handle_t> made;
         return cpu_job_signal_grow(
@@ -17336,9 +17351,6 @@ class cpu_job_signal_ring {
                     // Shut down or abandoned meanwhile: no driver call, the block is left to the process exit.
                     return false;
                 }
-                // Both reserves before either insert, so a throw leaves the ring as it was.
-                pools_.reserve(pools_.size() + 1);
-                events_.reserve(events_.size() + made.size());
                 pools_.push_back(pool);
                 events_.insert(events_.end(), made.begin(), made.end());
                 return true;
@@ -17355,6 +17367,7 @@ class cpu_job_signal_ring {
     bool                                live_          = true;
     bool                                full_warned_   = false;
     bool                                busy_warned_   = false;
+    bool                                grow_warned_   = false;
     bool                                wrap_warned_   = false;
     bool                                reset_warned_  = false;
     bool                                signal_warned_ = false;

@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -86,14 +87,17 @@ class cpu_job_signal_book {
         return first;
     }
 
-    // A growth (llama.cpp-q0xu). The ring makes a new block's native events with its lock released, so it reserves the
-    // growth under the lock first: at most one is in flight, so two acquirers never both grow and the book stays
-    // within the ring's max. True when the caller now owns the growth: none was in flight and n more entries stay
-    // within max. grow_end() lets it go, whether the block was added or not.
+    // Reserves a growth of n entries (llama.cpp-q0xu). cpu_job_signal_grow answers BUSY before calling this, so false
+    // here means the block would pass max. The ring makes a new block's native events with its lock released, so at
+    // most one growth is in flight: two acquirers never both grow, and the book stays within the ring's max. It also
+    // reserves the room for those n entries, so add(n), which comes after the block is published, does not allocate.
+    // grow_end() lets the growth go, whether the block was added or not.
     bool grow_begin(uint32_t n, uint32_t max) {
         if (growing_ || entries_.size() + n > max) {
             return false;
         }
+        entries_.reserve(entries_.size() + n);
+        free_.reserve(entries_.size() + n);  // free_ never holds more ids than there are entries
         growing_ = true;
         return true;
     }
@@ -250,8 +254,8 @@ enum class cpu_job_signal_grow_result {
     GONE,    // the ring stopped being live while the block was made: publish() refused it
 };
 
-// Grows `book` by one block of n entries for its ring (llama.cpp-q0xu). `lock` is the std::unique_lock that holds the
-// ring's lock; it holds it on entry and again on return, a throw included.
+// Grows `book` by one block of n entries for its ring (llama.cpp-q0xu). `lock` holds the ring's lock on entry and
+// again on return, a throw included.
 //
 // Why. The job's own signal takes the ring's lock, and making a block calls the driver (zeEventPoolCreate and
 // zeEventCreate), which may block behind a host wait on another thread that holds the driver's device lock behind
@@ -262,14 +266,20 @@ enum class cpu_job_signal_grow_result {
 // After it the lock is taken again and *outside lowered; publish() then adds the block's native objects to the ring
 // and returns whether it did (false when the ring is no longer live), and only then does the book gain the n entries,
 // so no entry exists without its native event.
-template <typename Lock, typename Make, typename Publish>
-cpu_job_signal_grow_result cpu_job_signal_grow(Lock &                lock,
-                                               cpu_job_signal_book & book,
-                                               uint32_t *            outside,
-                                               uint32_t              n,
-                                               uint32_t              max,
-                                               Make &&               make,
-                                               Publish &&            publish) {
+//
+// The callbacks' contract. make() runs with the lock released and owns what it creates until it returns true: on a
+// false return or a throw it has already destroyed its own partial objects, since nothing else knows them. publish()
+// runs under the lock, and only the lock it holds then makes the ring's state valid to read: it must not rely on
+// anything read before the unlock. It should not throw (the ring reserves its own room before the call). One that
+// does throw loses its block to the process exit, and the growth still gives its reservation back. Each runs at most
+// once per call, once per block of n entries, so std::function costs nothing that matters here.
+inline cpu_job_signal_grow_result cpu_job_signal_grow(std::unique_lock<std::timed_mutex> & lock,
+                                                      cpu_job_signal_book &                book,
+                                                      uint32_t *                           outside,
+                                                      uint32_t                             n,
+                                                      uint32_t                             max,
+                                                      const std::function<bool()> &        make,
+                                                      const std::function<bool()> &        publish) {
     if (book.growing()) {
         return cpu_job_signal_grow_result::BUSY;
     }

@@ -95,13 +95,14 @@ THE CONTRACT.  With comments and string literals blanked:
       and shutdown destroys native objects only inside `if (outside_calls_ == 0)`.  The ring grows the same way
       (llama.cpp-q0xu): every pool_create and event_create of the ring sits in the make lambda its one
       grow(std::unique_lock<std::timed_mutex> &) hands to cpu_job_signal_grow (cpu-job-signal.hpp), with
-      &outside_calls_, block_events and max_events; that lambda takes no mutex_ and touches no lock, and the publish
-      lambda first returns false when the ring is not live_.  cpu_job_signal_grow answers BUSY to a growth in flight
-      and reserves its own (book.grow_begin, which refuses while growing_) before anything else; raises *outside once,
-      before it releases the lock; releases it once, before its one make(), and takes it again only after; lowers
-      *outside right after each lock.lock(); publishes only after the last lock.lock() and adds the entries to the
-      book (book.add, once) only after the publish; and every way out after *outside is raised, a throw included, lets
-      the reservation go (book.grow_end) in its own block or in an enclosing one before it.
+      &outside_calls_, block_events and max_events; that lambda takes no mutex_, touches no lock, and destroys a
+      partial block itself; every pool_destroy and event_destroy of the ring sits in that lambda or in shutdown; and
+      the publish lambda first returns false when the ring is not live_.  cpu_job_signal_grow answers BUSY to a
+      growth in flight and reserves its own (book.grow_begin, which refuses while growing_) before anything else;
+      raises *outside once, before it releases the lock; releases it once, before its one make(), and takes it again
+      only after; lowers *outside right after each lock.lock(); publishes only after the last lock.lock() and adds
+      the entries to the book (book.add, once) only after the publish; and every way out after *outside is raised, a
+      throw included, lets the reservation go (book.grow_end) in its own block or in an enclosing one before it.
   W9. The event-chained hybrid route's job waits for its experts' leases: when record->has_ready, the job's inputs
       take record->ready, the barrier over the leases' producer events, before the prologue is built.  Its marker
       would follow that barrier on the in-order stream anyway, but a refused arm waits exactly the inputs on the
@@ -155,14 +156,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TAG = "(llama.cpp-42zj)"
+GROW_TAG = "(llama.cpp-q0xu)"  # W8's growth rules (check_ring_growth)
 
 
 class ContractError(Exception):
     pass
 
 
-def fail(pin: str, msg: str) -> None:
-    raise ContractError(f"FAIL [pin {pin}]: {msg} {TAG}")
+def fail(pin: str, msg: str, tag: str = TAG) -> None:
+    raise ContractError(f"FAIL [pin {pin}]: {msg} {tag}")
 
 
 _BLANK_TOKEN = re.compile(r'//[^\n]*|/\*.*?(?:\*/|\Z)|"(?:\\.|[^"\\])*(?:"|\Z)|(?<![^\W_])\'(?:\\.|[^\'\\])*(?:\'|\Z)', re.S)
@@ -886,6 +888,7 @@ GROW_BEGIN_SIG = r"bool\s+grow_begin\s*\(\s*uint32_t\s+n\s*,\s*uint32_t\s+max\s*
 RING_GROW_SIG = (r"cpu_job_signal_grow_result\s+grow\s*\(\s*std::unique_lock\s*<\s*std::timed_mutex\s*>\s*&\s*lock\s*\)"
                  r"\s*\{")
 _CREATE = re.compile(r"\b(?:pool_create|event_create)\s*\(")
+_DESTROY = re.compile(r"\b(?:pool_destroy|event_destroy)\s*\(")
 
 
 def top_level_arg_spans(code: str, open_paren: int) -> list[tuple[int, int]]:
@@ -955,32 +958,42 @@ def check_ring_growth(s: dict[str, str], ring: str) -> None:
     if len(found) != 1:
         fail("W8", f"cpu_job_signal_ring creates pools or events ({len(created)} pool_create/event_create call(s)) "
                    "outside a grow(std::unique_lock<std::timed_mutex> &) that hands them to cpu_job_signal_grow: they "
-                   "run under mutex_, which the job's own signal takes (llama.cpp-q0xu)")
+                   "run under mutex_, which the job's own signal takes", tag=GROW_TAG)
     body, base = block_at(ring, ring.index("{", found[0].end() - 1), "W8")
     grows = list(re.finditer(r"\bcpu_job_signal_grow\s*\(", body))
     if len(grows) != 1:
-        fail("W8", f"cpu_job_signal_ring::grow calls cpu_job_signal_grow {len(grows)} times, not once (llama.cpp-q0xu)")
+        fail("W8", f"cpu_job_signal_ring::grow calls cpu_job_signal_grow {len(grows)} times, not once", tag=GROW_TAG)
     spans = [(base + a, base + b) for a, b in top_level_arg_spans(body, grows[0].end() - 1)]
     args = [nospace(ring[a:b]) for a, b in spans]
     if len(args) != 7 or args[0] != "lock" or args[1] != "book_" or args[2] != "&outside_calls_" or \
             args[3] != "block_events" or args[4] != "max_events":
         fail("W8", "cpu_job_signal_ring::grow does not call cpu_job_signal_grow(lock, book_, &outside_calls_, "
                    "block_events, max_events, make, publish): the growth would not be counted where shutdown looks, "
-                   "or would not keep the ring's capacity (llama.cpp-q0xu)")
+                   "or would not keep the ring's capacity", tag=GROW_TAG)
     make_a, make_b = lambda_span(ring, spans[5][0], spans[5][1], "W8")
     if not created or any(not (make_a <= c < make_b) for c in created) or \
             not re.search(r"\bpool_create\s*\(", ring[make_a:make_b]) or \
             not re.search(r"\bevent_create\s*\(", ring[make_a:make_b]):
         fail("W8", "cpu_job_signal_ring creates a pool or an event outside the make lambda of its growth, the one "
-                   "place that runs with mutex_ released (llama.cpp-q0xu)")
+                   "place that runs with mutex_ released", tag=GROW_TAG)
     make = ring[make_a:make_b]
+    shut = re.search(RING_SHUTDOWN_SIG, ring)
+    shut_body, shut_a = block_at(ring, ring.index("{", shut.end() - 1), "W8")
+    for m in _DESTROY.finditer(ring):
+        if not (make_a <= m.start() < make_b or shut_a <= m.start() < shut_a + len(shut_body)):
+            fail("W8", "cpu_job_signal_ring destroys a pool or an event outside the make lambda of its growth and "
+                       "outside shutdown: anywhere else the driver call runs under mutex_, which the job's own "
+                       "signal takes", tag=GROW_TAG)
+    if not re.search(r"\bpool_destroy\s*\(", make) or not re.search(r"\bevent_destroy\s*\(", make):
+        fail("W8", "cpu_job_signal_ring::grow's make lambda does not destroy a partial block itself: nothing else "
+                   "knows those objects, and destroying them anywhere else would be under mutex_", tag=GROW_TAG)
     if _RING_LOCK.search(make) or re.search(r"\bmutex_\b|\block\b", make):
         fail("W8", "cpu_job_signal_ring::grow's make lambda takes mutex_ or touches the lock: the block's driver "
-                   "calls would run under the lock the job's own signal takes (llama.cpp-q0xu)")
+                   "calls would run under the lock the job's own signal takes", tag=GROW_TAG)
     pub_a, _ = lambda_span(ring, spans[6][0], spans[6][1], "W8")
     if not re.match(r"\s*if\s*\(\s*!\s*live_\s*\)\s*\{\s*return\s+false\s*;\s*\}", ring[pub_a:]):
         fail("W8", "cpu_job_signal_ring::grow's publish lambda does not first refuse a ring that is no longer live: a "
-                   "block made while the ring was shut down would be published into it (llama.cpp-q0xu)")
+                   "block made while the ring was shut down would be published into it", tag=GROW_TAG)
 
     hdr = s["header"]
     _, g = definition(hdr, GROW_SIG, "W8")
@@ -989,7 +1002,7 @@ def check_ring_growth(s: dict[str, str], ring: str) -> None:
     makes = [m.start() for m in re.finditer(r"\bmake\s*\(\s*\)", g)]
     if len(unlock) != 1 or len(makes) != 1 or not relock or not (unlock[0] < makes[0] < min(relock)):
         fail("W8", "cpu_job_signal_grow does not release the ring's lock once, before its one make(), and take it "
-                   "again only after: the driver calls that make a block would run under mutex_ (llama.cpp-q0xu)")
+                   "again only after: the driver calls that make a block would run under mutex_", tag=GROW_TAG)
     busy = re.search(r"\bif\s*\(\s*book\s*\.\s*growing\s*\(\s*\)\s*\)\s*\{\s*return\s+"
                      r"cpu_job_signal_grow_result\s*::\s*BUSY\s*;\s*\}", g)
     begin = [m.start() for m in re.finditer(r"\bbook\s*\.\s*grow_begin\s*\(", g)]
@@ -998,27 +1011,26 @@ def check_ring_growth(s: dict[str, str], ring: str) -> None:
         fail("W8", "cpu_job_signal_grow does not answer BUSY to a growth in flight, then reserve its own (grow_begin), "
                    "then raise *outside, all before it releases the lock: two acquirers could both grow, one could "
                    "wait on the other's driver calls, or a shutdown meanwhile could destroy objects under the "
-                   "creation (llama.cpp-q0xu)")
+                   "creation", tag=GROW_TAG)
     _, gb = definition(hdr, GROW_BEGIN_SIG, "W8")
     if not re.search(r"\bif\s*\(\s*growing_\s*\|\|", gb):
-        fail("W8", "cpu_job_signal_book::grow_begin reserves a growth while another is in flight (llama.cpp-q0xu)")
+        fail("W8", "cpu_job_signal_book::grow_begin reserves a growth while another is in flight", tag=GROW_TAG)
     down = [m.start() for m in re.finditer(r"\*\s*outside\s*-=\s*1\s*;", g)]
     lowered = [re.match(r"\s*\*\s*outside\s*-=\s*1\s*;", g[g.index(";", r) + 1 :]) is not None for r in relock]
     if len(down) != len(relock) or not all(lowered):
         fail("W8", "cpu_job_signal_grow does not lower *outside right after each lock.lock(): a path back under the "
-                   "lock would leave the ring's driver calls counted, and shutdown would leak for good "
-                   "(llama.cpp-q0xu)")
+                   "lock would leave the ring's driver calls counted, and shutdown would leak for good", tag=GROW_TAG)
     publish = [m.start() for m in re.finditer(r"\bpublish\s*\(\s*\)", g)]
     adds = [m.start() for m in re.finditer(r"\bbook\s*\.\s*add\s*\(", g)]
     if len(publish) != 1 or len(adds) != 1 or not (max(relock) < publish[0] < adds[0]):
         fail("W8", "cpu_job_signal_grow does not publish the block with the lock held again and only then add its "
-                   "entries to the book: an entry could exist without its native event (llama.cpp-q0xu)")
+                   "entries to the book: an entry could exist without its native event", tag=GROW_TAG)
     # The reservation holds from the statement after grow_begin's refusal, whose first step raises *outside.
     for m in re.finditer(r"\b(?:return\b[^;]*|throw\s*);", g):
         exit_text = re.sub(r"\s+", " ", m.group(0))
         if m.start() > up[0] and not released_on_the_way_out(g, m.start(), up[0]):
             fail("W8", f"cpu_job_signal_grow leaves through `{exit_text}` with its growth still reserved: "
-                       "every later acquirer would be told BUSY for good (llama.cpp-q0xu)")
+                       "every later acquirer would be told BUSY for good", tag=GROW_TAG)
 
 
 def nospace(text: str) -> str:
@@ -1472,8 +1484,7 @@ def mutants() -> list:
         ("W8", "header", "the book reserves over a growth in flight",
          sub(re.escape("if (growing_ || entries_.size() + n > max) {"), "if (entries_.size() + n > max) {")),
         ("W8", "header", "the entries are added before the block is published",
-         sub(re.escape("    *outside += 1;\n    lock.unlock();"),
-             "    (void) book.add(n);\n    *outside += 1;\n    lock.unlock();")),
+         move(r"    \(void\) book\.add\(n\);\n", r"    \*outside \+= 1;")),
         ("W8", "header", "a block that was not made keeps its reservation",
          sub(re.escape("    if (!made) {\n        book.grow_end();\n"), "    if (!made) {\n")),
         ("W8", "header", "a refused block keeps its reservation",
@@ -1491,6 +1502,14 @@ def mutants() -> list:
              "                made.reserve(block_events);")),
         ("W8", "cache", "the growth is counted somewhere shutdown does not look",
          sub(re.escape("&outside_calls_, block_events"), "&growth_calls_, block_events")),
+        ("W8", "cache", "the partial block is destroyed at the FAILED return, under mutex_",
+         chain(sub(r"for \(ze_event_handle_t m : made\) \{\n\s*\(void\) l0_->event_destroy\(m\);\n\s*\}\n"
+                   r"\s*\(void\) l0_->pool_destroy\(pool\);\n\s*", ""),
+               sub(r"(case cpu_job_signal_grow_result::FAILED:\n)",
+                   r"\1                (void) l0_->pool_destroy(nullptr);\n"))),
+        ("W8", "cache", "the make lambda leaves a partial block undestroyed",
+         sub(r"for \(ze_event_handle_t m : made\) \{\n\s*\(void\) l0_->event_destroy\(m\);\n\s*\}\n"
+             r"\s*\(void\) l0_->pool_destroy\(pool\);\n\s*", "")),
         ("W8", "cache", "the growth publishes into a ring no longer live",
          sub(r"\[this, &pool, &made\]\(\) \{\n\s*if \(!live_\) \{\n\s*return false;\n\s*\}",
              "[this, &pool, &made]() {")),
