@@ -34,22 +34,25 @@ body of the closure each hands to another thread (OFF_THREAD_SPANS: the lambda t
 on the pool worker, the lambda the join gives host_task runs on the queue's host-task thread).  A
 closure's capture list stays in the scan, since it is evaluated where the closure is built.  The gate
 fails when the closure can no longer be found, or when it is not the whole expression handed off (a
-lambda the submitting thread calls to build the closure runs there, not on the other thread).  Three
+lambda the submitting thread calls to build the closure runs there, not on the other thread).  Two
 matches inside the scanned code are excused by name in KNOWN_WAITS, each at exactly one match.  One
-predates this ticket and names the ticket that removes it.  The second is the input marker's refused-arm
+predates this ticket and names the ticket that removes it.  The other is the input marker's refused-arm
 fallback, which llama.cpp-42zj puts on the submitting thread on purpose: the pool worker must make no
-driver wait, and a job whose marker is not armed has no other thread to wait on.  The third is that
-fallback's census timer, whose `wait_timer(` reads as a wait_* helper and counts the wait as B2.  An
-entry that matches nothing fails the gate, so the list cannot outlive the code it excuses:
+driver wait, and a job whose marker is not armed has no other thread to wait on.  That fallback's census
+timer, whose `wait_timer(` reads as a wait_* helper and which counts the wait as B2, is excused by its own
+text in moe_cpu_job_prologue (SCOPED_ALLOWED), so a real wait_* call there takes no excuse from it.  An
+entry of either list that matches nothing fails the gate, so the lists cannot outlive the code they
+excuse:
 
   N1. no `.get()`, `.wait(`, `::wait(`, `wait_and_throw`, `wait_for`, `wait_until` or `*_sync(` call, no
       call of a `wait_*(` helper (a census timer's `wait_timer(` declaration reads as one), and no
       synchronous `mem_copy(`/`mem_fill(`, and no call of the input marker's spin wait
       (`cpu_job_input_marker_wait(`, a header helper the scan cannot follow into), apart from the
-      allowlisted multi-GPU statement below, at most once, and the KNOWN_WAITS entries;
-  N2. the exception lists are current: each KNOWN_WAITS entry matches, each OFF_THREAD_SPANS function is
-      defined once, hands off one closure that is the whole handed-off expression, and is reached, and
-      each BOUNDARY entry is defined and reached;
+      allowlisted multi-GPU statement below, at most once, the KNOWN_WAITS entries, and the
+      SCOPED_ALLOWED statements, each at most once in its function;
+  N2. the exception lists are current: each KNOWN_WAITS entry and SCOPED_ALLOWED statement matches, each
+      OFF_THREAD_SPANS function is defined once, hands off one closure that is the whole handed-off
+      expression, and is reached, and each BOUNDARY entry is defined and reached;
   N3. the closure that moe_cpu_job_prologue returns calls moe_cpu_job_wait_inputs, so a job's input
       waits still run, on the pool worker;
   N4. moe_cpu_job_join takes the job's `.get()`, the closure that moe_cpu_job_join_on_queue hands
@@ -334,10 +337,18 @@ KNOWN_WAITS = {
         "decision on llama.cpp-42zj puts it here: a native wait on the pool worker can block on the driver's "
         "device lock behind a wait_and_throw on another thread, which deadlocked the first Qwen3.8 prompt graph"
     ),
-    ("moe_cpu_job_prologue", "a wait_* helper"): (
-        "the census timer `moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2)` around that fallback, which is no wait "
-        "of its own: it counts the fallback as B2 on the [MOE-HOSTPATH-WAITS] line, so a run whose markers are "
-        "refused shows the submitting thread waiting a CPU job's inputs (llama.cpp-42zj)"
+}
+
+# Statements a FORBIDDEN pattern reads as a wait that wait for nothing, each keyed by (function, what it
+# is) and excused by its own text in that function only: the scan masks it there before FORBIDDEN runs,
+# so no other match in the function takes the excuse.  None fails N2, a second match fails N1.
+SCOPED_ALLOWED = {
+    ("moe_cpu_job_prologue", "the refused arm's census timer"): (
+        re.compile(r"\bmoe_hostpath_wait_timer\s+\w+\s*\(\s*MOE_WAIT_B2\s*\)\s*;"),
+        "the census timer `moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2)` around the refused marker's "
+        "fallback, whose `wait_timer(` reads as a wait_* helper and which is no wait of its own: it counts the "
+        "fallback as B2 on the [MOE-HOSTPATH-WAITS] line, so a run whose markers are refused shows the "
+        "submitting thread waiting a CPU job's inputs (llama.cpp-42zj)",
     ),
 }
 
@@ -631,8 +642,15 @@ class Scan:
         self.waits: list[str] = []
         self.allowed_seen = {a: 0 for a in ALLOWED}
         self.known_seen = {k: 0 for k in KNOWN_WAITS}
+        self.scoped_seen = {k: 0 for k in SCOPED_ALLOWED}
         for name, base, text in self.scanned:
             masked = text
+            for (fn, what), (pat, _) in SCOPED_ALLOWED.items():
+                if fn != name.split(" ")[0]:
+                    continue
+                for m in pat.finditer(masked):
+                    self.scoped_seen[(fn, what)] += 1
+                    masked = masked[: m.start()] + " " * (m.end() - m.start()) + masked[m.end() :]
             for a, pat in ALLOWED_PATTERNS:
                 for m in pat.finditer(masked):
                     self.allowed_seen[a] += 1
@@ -652,7 +670,8 @@ class Scan:
 
 
 def check_n1(scan: Scan) -> None:
-    """No host wait in the scanned code, apart from the allowlisted statement (at most once) and KNOWN_WAITS."""
+    """No host wait in the scanned code, apart from the allowlisted statement (at most once), KNOWN_WAITS and
+    the SCOPED_ALLOWED statements (each at most once in its function)."""
     if scan.waits:
         raise ContractError(
             f"FAIL [N1]: {len(scan.waits)} host wait(s) on the submitting thread after the ids readback "
@@ -661,16 +680,26 @@ def check_n1(scan: Scan) -> None:
     for a, n in scan.allowed_seen.items():
         if n > 1:
             raise ContractError(f"FAIL [N1]: the allowlisted `{a}` appears {n} times; it is allowed once ({TAG})")
+    for (fn, what), n in scan.scoped_seen.items():
+        if n > 1:
+            raise ContractError(
+                f"FAIL [N1]: SCOPED_ALLOWED `{fn}` / {what} matches {n} times there; it is allowed once ({TAG})"
+            )
 
 
 def check_n2(scan: Scan) -> None:
-    """The exception lists still describe the code: each KNOWN_WAITS entry matches, each OFF_THREAD_SPANS
-    function is defined once, hands off one whole closure and is reached, and each BOUNDARY entry is defined
-    and reached."""
+    """The exception lists still describe the code: each KNOWN_WAITS entry and SCOPED_ALLOWED statement
+    matches, each OFF_THREAD_SPANS function is defined once, hands off one whole closure and is reached, and
+    each BOUNDARY entry is defined and reached."""
     for (fn, what), n in scan.known_seen.items():
         if n == 0:
             raise ContractError(
                 f"FAIL [N2]: KNOWN_WAITS entry `{fn}` / {what} matches nothing in the scanned code; drop it ({TAG})"
+            )
+    for (fn, what), n in scan.scoped_seen.items():
+        if n == 0:
+            raise ContractError(
+                f"FAIL [N2]: SCOPED_ALLOWED `{fn}` / {what} matches nothing in its scanned function; drop it ({TAG})"
             )
     if scan.off_thread_problems:
         name, problem = scan.off_thread_problems[0]
@@ -1177,7 +1206,14 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N1", "prologue waits its inputs on the armed path too", pro_closure,
         "    sycl::event::wait(inputs.events);\n" + pro_closure)
     sub("N2", "refused arm's fallback wait dropped", pro_fallback, "")
-    sub("N2", "refused arm's census timer dropped", "            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n", "")
+    timer = "            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n"
+    sub("N2", "refused arm's census timer dropped", timer, "")
+    # The timer is excused by its text, so a real wait_* call in its place, or a second timer beside it,
+    # takes no excuse from it.
+    sub("N1", "refused arm's census timer swapped for a wait_* call", timer,
+        "            wait_inputs_natively(inputs.events);\n")
+    sub("N1", "a second census timer in the prologue", timer,
+        timer + "            moe_hostpath_wait_timer wait_timer_again(MOE_WAIT_B2);\n")
     sub("N1", "boundary wait called from a flush", "        ++g_cpu_scatter_serial;\n",
         "        ++g_cpu_scatter_serial;\n        pending_cpu_scatter_wait_prev_events(slot);\n")
     sub("N6", "boundary wait dropped from the graph-boundary flush",
