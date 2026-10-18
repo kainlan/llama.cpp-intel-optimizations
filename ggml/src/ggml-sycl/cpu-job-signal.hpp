@@ -255,10 +255,15 @@ enum class cpu_job_signal_grow_result {
 };
 
 // Puts back what cpu_job_signal_grow changed, on every way out after its reservation (llama.cpp-q0xu). *outside is
-// raised exactly while the growth has the lock released, so a way out with the lock released (make() threw) takes
-// it again and lowers *outside, and one with the lock held (a FAILED, GONE or GREW return, or a publish() that threw)
-// leaves both as they are: std::unique_lock::lock() on a lock this thread owns throws. Either way the book's
-// reservation goes back, so a later acquirer is not told BUSY for good.
+// raised exactly while the growth has the lock released: it is raised right before the unlock and lowered right
+// after the relock, and nothing between the raise and the unlock, or between the relock and the lowering, can throw,
+// so owns_lock() tells whether it is raised. A way out with the lock released (make() threw) takes it again and
+// lowers *outside, and one with the lock held (a FAILED, GONE or GREW return, or a publish() that threw) leaves both
+// as they are: std::unique_lock::lock() on a lock this thread owns throws. Either way the book's reservation goes
+// back, so a later acquirer is not told BUSY for good. The destructor is implicitly noexcept, so a lock.lock() that
+// threw while make()'s throw unwinds would terminate the process. That is a choice: std::timed_mutex::lock() throws
+// only for a deadlock or a missing mutex, and neither is a state the ring can recover from. The members are
+// references, and a pointer for *outside, so the guard releases the caller's reservation and count, not a copy's.
 struct cpu_job_signal_grow_scope {
     std::unique_lock<std::timed_mutex> & lock;
     cpu_job_signal_book &                book;

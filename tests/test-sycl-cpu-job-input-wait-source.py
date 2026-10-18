@@ -105,7 +105,8 @@ THE CONTRACT.  With comments and string literals blanked:
       only after; lowers *outside right after each lock.lock(); publishes only after the last lock.lock() and adds
       the entries to the book (book.add, once) only after the publish; has no try or catch and no book.grow_end of
       its own; and declares one cpu_job_signal_grow_scope{ lock, book, outside } at its own level, after grow_begin
-      and before *outside is raised, whose destructor is exactly `if (!lock.owns_lock()) { lock.lock(); *outside -=
+      and before *outside is raised, holding `std::unique_lock<std::timed_mutex> & lock`, `cpu_job_signal_book & book`
+      and `uint32_t * outside`, whose destructor is exactly `if (!lock.owns_lock()) { lock.lock(); *outside -=
       1; }` then `book.grow_end();`, so every way out after the reservation, a throw included, hands the caller the
       lock, lowers *outside and lets the reservation go.
   W9. The event-chained hybrid route's job waits for its experts' leases: when record->has_ready, the job's inputs
@@ -1025,6 +1026,12 @@ def check_ring_growth(s: dict[str, str], ring: str) -> None:
         fail("W8", f"{len(scope)} definitions of cpu_job_signal_grow_scope, not 1: nothing puts the growth back on "
                    "its way out", tag=GROW_TAG)
     scope_body, _ = block_at(hdr, hdr.index("{", scope[0].end() - 1), "W8")
+    for member in (r"std::unique_lock\s*<\s*std::timed_mutex\s*>\s*&\s*lock\s*;",
+                   r"cpu_job_signal_book\s*&\s*book\s*;", r"uint32_t\s*\*\s*outside\s*;"):
+        if not re.search(r"(?:^|[;{}])\s*" + member, scope_body):
+            fail("W8", "cpu_job_signal_grow_scope does not hold `std::unique_lock<std::timed_mutex> & lock`, "
+                       "`cpu_job_signal_book & book` and `uint32_t * outside`: a member held by value would retake, "
+                       "release or lower a copy, and leave the caller's reservation or count as it was", tag=GROW_TAG)
     _, dtor = definition(scope_body, r"~\s*cpu_job_signal_grow_scope\s*\(\s*\)\s*\{", "W8")
     if not re.fullmatch(r"\s*if\s*\(\s*!\s*lock\s*\.\s*owns_lock\s*\(\s*\)\s*\)\s*\{\s*lock\s*\.\s*lock\s*\(\s*\)\s*;"
                         r"\s*\*\s*outside\s*-=\s*1\s*;\s*\}\s*book\s*\.\s*grow_end\s*\(\s*\)\s*;\s*", dtor):
@@ -1514,6 +1521,8 @@ def mutants() -> list:
         ("W8", "header", "the guard is declared before the BUSY answer",
          move(re.escape("    cpu_job_signal_grow_scope scope{ lock, book, outside };\n"),
               r"    if \(book\.growing\(\)\)")),
+        ("W8", "header", "the guard holds the book by value",
+         sub(r"(\n    )cpu_job_signal_book &(\s+)book;", r"\1cpu_job_signal_book  \2book;")),
         ("W8", "header", "the guard is declared in a nested block",
          sub(re.escape("    cpu_job_signal_grow_scope scope{ lock, book, outside };\n"),
              "    {\n        cpu_job_signal_grow_scope scope{ lock, book, outside };\n    }\n")),
