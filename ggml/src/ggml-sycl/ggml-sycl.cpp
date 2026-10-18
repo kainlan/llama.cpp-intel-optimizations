@@ -24600,7 +24600,8 @@ static bool moe_cpu_job_device_signal_enabled();
 // sat in the host STAGING zone, which every graph boundary checks for emptiness, so every boundary refused and walked
 // the whole allocation registry on the submitting thread. The word is now a persistent owner in the WEIGHT host zone,
 // which no boundary checks, and a refused check walks the registry only for its first 8 refusals per zone or an active
-// zone audit. So that cost is expected to be gone, but that is not yet measured.
+// zone audit. Measured 2026-10-18 on the B70 without -c with the knob on: 10.10 t/s, against 2.68 before the move and
+// 9.28 with the knob off.
 static bool moe_cpu_job_input_marker_in_play() {
     return moe_cpu_job_device_signal_enabled();
 }
@@ -24787,10 +24788,11 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
 // host task; non-zero lets the job's scatter wait on a host-signalled Level Zero event the job signals after its last
 // write, and puts the job's input marker in play (moe_cpu_job_input_marker_in_play). Default off (llama.cpp-nqbe): with
 // it on, Qwen3.8 IQ3_XXS decode on the B70 without -c (12 KV layers on the host, direct path) fell to 2.7 t/s from 9.7,
-// while at -c 4096 it rose to 13.3 from 9.0. The loss was the marker's word, held in a host zone every graph boundary
-// checks (see moe_cpu_job_input_marker_in_play). The word has moved, which is expected to remove the loss but is not
-// yet measured, so the default stays off until the knob is measured again. The first prompt graph hang that first
-// turned it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
+// while at -c 4096 it rose to 13.3 from 9.0. The loss was the marker's word in the boundary-checked host STAGING zone,
+// which made every graph boundary walk the allocation registry (see moe_cpu_job_input_marker_in_play). With the word
+// in the WEIGHT host zone, the knob on measured 10.10 t/s without -c against 2.68 before and 9.28 off, and 13.15 at
+// -c 4096 against 8.94 off (2026-10-18). The first prompt graph hang that first turned it off (llama.cpp-m5v8) is
+// fixed by the input marker (llama.cpp-42zj).
 static bool moe_cpu_job_device_signal_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");

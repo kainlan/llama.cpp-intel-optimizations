@@ -52,7 +52,9 @@ THE CONTRACT.  With comments and string literals blanked:
       a refusal reads one counter and returns, unless a zone audit is active.
 
 NOT COVERED: this reads text.  The decision table itself runs in test-sycl-runtime-registry-containment (host-only, the
-hook allocation_registry_test_host_zone_refusals), and a device run is what shows the boundary no longer refuses.  Z5
+hook allocation_registry_test_host_zone_refusals), and a device run is what shows the boundary no longer refuses: on
+2026-10-18 the B70 run without -c and with the knob on logged no refusal and decoded at 10.10 t/s, against 8 refusals
+and 2.68 t/s on master 6f8cb1a5b.  Z5
 sees writes spelled through the member name; a write through a reference or pointer bound to the field, or through
 std::exchange or a whole-struct copy from a constraints object that has it set, is not seen, and a write inside a
 constructor with a member initialiser list is named by its last initialiser, which fails closed.  Nor is this a census of
