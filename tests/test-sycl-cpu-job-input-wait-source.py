@@ -57,22 +57,23 @@ THE CONTRACT.  With comments and string literals blanked:
       32-bit distance (the modulo-2^32 invariant is stated beside it).  The wait reports a slow wait at most once,
       through the word's slow, once it has yielded for slow_after; the arm installs the cache's reporter, which only
       logs.  The device task depends on the job's inputs, then fences (release, system scope) before it stores the
-      serial.  The arm takes the cache's marker mutex first and releases it once in the submit's catch and once on the
-      way out, after it records the serial; after either release it touches no marker member, and only after one does
-      it log: the word's creation, through cpu_job_input_marker_report_made (which only logs, at INFO, and is handed
-      the word this arm made), and in the catch the throw, once per process, so no arm waits on the log's lock behind
-      another; every refusal of the arm and of unified_cache_cpu_job_input_marker_arm names its reason right before it
-      returns, since the caller's log flag is chosen by it; the arm refuses a stream that is not in order before it
-      allocates; zeroes the word before it publishes it; takes the next serial as the last plus one; submits every
-      marker on queue_, before it records the new serial; and takes its word from the unified cache as a host-pinned
-      allocation.  unified_cache_cpu_job_input_marker_arm reaches the cache through moe_join_queue_cache_of(stream),
-      which returns only the cache whose queue_ is that stream.  The owner, the word's allocation, is assigned only by
-      the arm's one publish and released only through cpu_job_input_marker_end, in unified-cache.cpp and in
-      unified-cache.hpp's inline code alike: a release anywhere else would let the allocation go without the abandon,
-      under a waiter's load.  shutdown_resources, in each of its three branches (the SYCL runtime already shutting
-      down, an invalid context, and the normal one after the queues drained), ends the signal ring once and then the
-      word once, and ends neither anywhere else: the ring is no longer live once ended, so a job the abandon releases
-      signals it without a driver call, and on the two SYCL-gone branches no driver call could succeed.
+      serial.  The arm takes the cache's marker mutex first and releases it once in the submit's catch, which ends in
+      `return false;`, and once on the way out, after it records the serial; after either release it touches no marker
+      member, and only after one does it log: the word's creation, once after each release, through
+      cpu_job_input_marker_report_made (which only logs, at INFO, and is handed the word this arm made), and in the
+      catch the throw, once per process, so no arm waits on the log's lock behind another; every refusal of the arm
+      and of unified_cache_cpu_job_input_marker_arm names its reason right before it returns, since the caller's log
+      flag is chosen by it; the arm refuses a stream that is not in order before it allocates; zeroes the word before
+      it publishes it; takes the next serial as the last plus one; submits every marker on queue_, before it records
+      the new serial; and takes its word from the unified cache as a host-pinned allocation.
+      unified_cache_cpu_job_input_marker_arm reaches the cache through moe_join_queue_cache_of(stream), which returns
+      only the cache whose queue_ is that stream.  The owner, the word's allocation, is assigned only by the arm's one
+      publish and released only through cpu_job_input_marker_end, in unified-cache.cpp and in unified-cache.hpp's
+      inline code alike: a release anywhere else would let the allocation go without the abandon, under a waiter's
+      load.  shutdown_resources, in each of its three branches (the SYCL runtime already shutting down, an invalid
+      context, and the normal one after the queues drained), ends the signal ring once and then the word once, and
+      ends neither anywhere else: the ring is no longer live once ended, so a job the abandon releases signals it
+      without a driver call, and on the two SYCL-gone branches no driver call could succeed.
   W8. The signal ring (cpu_job_signal_ring, unified-cache.cpp) makes no driver call that may block under mutex_, the
       lock the job's own signal takes: a host wait on another thread may hold the driver's device lock behind that
       job.  wrap makes its event and recycle resets its events outside every mutex_ scope, each call counted in
@@ -622,9 +623,10 @@ def check_helpers(s: dict[str, str]) -> None:
 
 
 def check_arm_unlock(cache: str, arm: str, lock: re.Match) -> None:
-    """W7: the arm releases its mutex once in the submit's catch and once on the way out, after it records the serial;
-    after either release it touches no marker member, and it logs only after one: the word's creation, through
-    cpu_job_input_marker_report_made with the word it made, and in the catch the throw, once per process."""
+    """W7: the arm releases its mutex once in the submit's catch, which ends in `return false;`, and once on the way
+    out, after it records the serial; after either release it touches no marker member, and it logs only after one:
+    the word's creation, once after each release, through cpu_job_input_marker_report_made with the word it made,
+    and in the catch the throw, once per process."""
     unlocks = [m.start() for m in re.finditer(r"\b" + lock.group(1) + r"\s*\.\s*unlock\s*\(\s*\)\s*;", arm)]
     catch = list(re.finditer(r"\bcatch\s*\(\s*const\s+sycl::exception\s*&\s*\w+\s*\)\s*\{", arm))
     warns = [m.start() for m in re.finditer(r"\bGGML_LOG_WARN\s*\(", arm)]
@@ -633,6 +635,10 @@ def check_arm_unlock(cache: str, arm: str, lock: re.Match) -> None:
                    "it catches its submit's throw once")
     body, start = block_at(arm, catch[0].end() - 1, "W7")
     end = start + len(body)
+    if not re.search(r"\breturn\s+false\s*;\Z", body.rstrip()):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker's submit catch does not end in `return false;`: a throw "
+                   "would fall through to the way out, release the mutex a second time and record the serial and "
+                   "*out without it")
     took = re.search(r"\bcpu_job_input_marker_serial_\s*=\s*serial\s*;", arm)
     inside = [u for u in unlocks if start <= u < end]
     outside = [u for u in unlocks if not start <= u < end]
@@ -651,12 +657,12 @@ def check_arm_unlock(cache: str, arm: str, lock: re.Match) -> None:
     reports = [m.start() for m in re.finditer(r"\bcpu_job_input_marker_report_made\s*\(", arm)]
     made = re.search(r"\bmade\s*=\s*word\s*;", arm)
     pub = re.search(r"\bcpu_job_input_marker_word_\s*=\s*std::move\s*\(\s*word\s*\)\s*;", arm)
-    if not all(any(a <= r < b for r in reports) for a, b in released) or not made or not pub or \
+    if any(sum(a <= r < b for r in reports) != 1 for a, b in released) or not made or not pub or \
        made.start() > pub.start() or \
        any(not re.match(r"cpu_job_input_marker_report_made\s*\(\s*made\s*\.\s*get\s*\(\s*\)\s*\)", arm[r:])
            for r in reports):
         fail("W7", "unified_cache::arm_cpu_job_input_marker does not hand cpu_job_input_marker_report_made the word "
-                   "it made after each release: the word's creation would go unlogged")
+                   "it made once after each release: the word's creation would go unlogged, or be logged twice")
     early = re.search(r"\bcpu_job_input_marker_\w+_\b", arm[: lock.start()])
     if early:
         fail("W7", f"unified_cache::arm_cpu_job_input_marker uses {early.group(0)} before it takes "
@@ -1082,6 +1088,12 @@ def mutants() -> list:
         ("W7", "cache", "the way out does not report the word",
          sub(r"\n\s*cpu_job_input_marker_report_made\(made\.get\(\)\);(?=\n\s*return true;)", "")),
         ("W7", "cache", "the report is never handed the word", sub(r"\n\s*made\s*= word;", "")),
+        ("W7", "cache", "the way out reports the word twice",
+         sub(r"(\n\s*cpu_job_input_marker_report_made\(made\.get\(\)\);)(?=\n\s*return true;)", r"\1\1")),
+        # A catch that falls through reaches the way out: a second release of a released lock, and the serial and
+        # *out written without the mutex.
+        ("W7", "cache", "the catch falls through to the way out",
+         sub(r"(\n\s*\*why = CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW;)\n\s*return false;", r"\1")),
         ("W7", "cache", "the report logs more than its INFO",
          sub(r"(\n(\s*)w->device\);)", r"\1\n\2(void) sycl::queue{};")),
         ("W7", "cache", "a failed allocation does not name its reason",
