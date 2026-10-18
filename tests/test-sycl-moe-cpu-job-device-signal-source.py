@@ -74,11 +74,13 @@ THE CONTRACT.  With comments blanked:
      rose to 13.3 from 9.0 at -c 4096.  The loss was the marker's word, held in the
      host STAGING zone that every graph boundary checks for emptiness, so every
      boundary refused and walked the allocation registry; the word is now a
-     persistent owner in the WEIGHT host zone, so that cost is removed, and the
-     default stays off until the knob is measured again.  The llama.cpp-m5v8 hang on
+     persistent owner in the WEIGHT host zone, which is expected to remove the
+     cost but is not yet measured, so the default stays off until the knob is
+     measured again.  The llama.cpp-m5v8 hang on
      that path is fixed by the input marker, llama.cpp-42zj), and is the only getenv
      of that name; the catalog row documents =1, its default, its default's reason
-     (the boundary-checked zone and the persistent owner) and the atoi parse; the
+     (the boundary-checked zone, the persistent owner, and that the removal is
+     expected but not yet measured) and the atoi parse; the
      [MOE-HOSTPATH-WAITS] line prints devsig=, counted under the trace only.
   I. No host waits on the new events.  The flush body and the ring section of
      unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
@@ -547,8 +549,8 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
         fail("H", f"{KNOB} is not read once into a function-local static, default off: with it on, which also "
                   "puts the input marker in play, Qwen3.8 IQ3_XXS decode on the B70 fell to 2.7 from 9.7 t/s "
                   "without -c and rose to 13.3 from 9.0 at -c 4096 (llama.cpp-nqbe). The loss was the marker's word "
-                  "in a boundary-checked host zone, now removed; the default stays off until the knob is measured "
-                  "again. The llama.cpp-m5v8 hang on that path is fixed by the input marker (llama.cpp-42zj)")
+                  "in a boundary-checked host zone; the word has moved, which is expected to remove the loss but is "
+                  "not yet measured, so the default stays off until the knob is measured again. The llama.cpp-m5v8 hang on that path is fixed by the input marker (llama.cpp-42zj)")
     n = sum(len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", blank_comments(s)))
             for s in sources.values() if KNOB in s)
     n += len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", code))
@@ -558,11 +560,12 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
     if len(rows) != 1 or "| OFF |" not in rows[0] or "`devsig=" not in rows[0] or "`atoi`" not in rows[0]:
         fail("H", f"the catalog has no single {KNOB}=1 row with its default, devsig= and the atoi parse")
     elif not all(s in rows[0] for s in ("host `STAGING` zone", "`alloc_constraints::persistent_owner`",
-                                        "`WEIGHT` host zone",
+                                        "`WEIGHT` host zone", "is expected to be gone, but that is not yet measured",
                                         "the default stays off until the knob is measured again")):
         fail("H", f"the catalog's {KNOB}=1 row does not give its default's reason: the input marker's word sat in the "
-                  "boundary-checked host STAGING zone, it is now a persistent owner in the WEIGHT host zone, and the "
-                  "default stays off until the knob is measured again (llama.cpp-nqbe)")
+                  "boundary-checked host STAGING zone, it is now a persistent owner in the WEIGHT host zone, that "
+                  "this is expected to remove the cost but is not yet measured, and that the default stays off until "
+                  "the knob is measured again (llama.cpp-nqbe)")
     cbody, _ = body_of(code, COUNT_SIG, "H")
     if flat(cbody).strip() != ("if (!moe_hostpath_waits_enabled()) { return; } "
                                "g_moe_hostpath_waits.joins_device_signal += 1;"):
@@ -1017,6 +1020,8 @@ def self_test(s: dict) -> int:
         ("H", "doc", "catalog row lost", sub(r"\| `" + KNOB + r"=1`", "| `" + KNOB + "_OFF`")),
         ("H", "doc", "catalog row loses its default's reason",
          sub(r"`alloc_constraints::persistent_owner`", "the marker's word")),
+        ("H", "doc", "catalog row states the unmeasured removal as measured",
+         sub(r"is expected to be gone, but that is not yet measured", "is removed")),
         ("H", "backend", "devsig counted untraced",
          sub(r"(static void moe_hostpath_waits_device_signal\(\) \{\n)\s*if \(!moe_hostpath_waits_enabled\(\)\) "
              r"\{\n\s*return;\n\s*\}\n", r"\1")),

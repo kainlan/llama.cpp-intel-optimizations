@@ -25,8 +25,8 @@ hung.  So the marker is in play only with the knob on; with it off the prologue 
 and the worker waits a job's inputs natively, as it did before the marker (W10).  The marker once cost Qwen3.8 IQ3_XXS
 decode on the B70 without -c 2.8 t/s against 9.7, with the knob off as with it on: its word sat in the host STAGING
 zone, which every graph boundary checks for emptiness, so every boundary refused and walked the allocation registry.
-The word is now a persistent owner in the WEIGHT host zone, so that cost is removed
-(test-sycl-host-zone-boundary-owner-source.py).
+The word is now a persistent owner in the WEIGHT host zone (test-sycl-host-zone-boundary-owner-source.py), which is
+expected to remove that cost but is not yet measured.
 
 THE CONTRACT.  With comments and string literals blanked:
   W1. The worker's input wait is driver-free.  moe_cpu_job_wait_inputs calls only cpu_job_input_marker_wait,
