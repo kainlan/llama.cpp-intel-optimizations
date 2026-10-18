@@ -6541,6 +6541,12 @@ struct alloc_constraints {
     // slice.  Some Level Zero copy paths need the host pointer to be a
     // driver-visible USM allocation base, not an interior TLSF suballocation.
     bool         require_host_usm_base      = false;
+    // The allocation's owner outlives every graph: it is released at model or cache teardown, never by the graph that
+    // first asked for it. A host-zone request carrying it goes to the WEIGHT host zone, which host_zone_settle() never
+    // sweeps. The host STAGING and SCRATCH zones must be empty at every graph boundary, so one row that lives for the
+    // process there makes every boundary check refuse (llama.cpp-nqbe). Role alone cannot say this: CONTROL also names
+    // scoped host transients, which belong in STAGING so a leaked one is still caught at the boundary.
+    bool         persistent_owner           = false;
     // When arena is active and prefer_vram_zone != COUNT, unified_alloc routes
     // through that VRAM zone (zone_alloc) instead of raw device malloc.
     // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.

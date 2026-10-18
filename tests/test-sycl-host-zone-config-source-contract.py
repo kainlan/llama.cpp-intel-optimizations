@@ -210,9 +210,9 @@ def witness_a3(t):
 
 
 # --- B: ggml_backend_sycl_host_buffer_type_get_max_size must mirror the zone
-# select_zone() (unified_alloc, unified-cache.cpp) ACTUALLY uses for this
+# unified_alloc_host_zone() (unified-cache.cpp) ACTUALLY uses for this
 # buft's requests -- WEIGHT, unconditionally, because alloc_buffer always sets
-# category=HOST_COMPUTE and select_zone's WEIGHT branch is checked before any
+# category=HOST_COMPUTE and unified_alloc_host_zone's WEIGHT branch is checked before any
 # role-only STAGING fallback. The old code re-derived alloc_buffer's ROLE
 # computation (in_model_load || weights_evictable) instead, which disagreed
 # with the real zone once in_model_load went false post-load.
@@ -233,11 +233,11 @@ def witness_b_mirror(t):
     return t
 
 
-# select_zone's real precedence (unified-cache.cpp): WEIGHT branch fires on
+# unified_alloc_host_zone's real precedence (unified-cache.cpp): WEIGHT branch fires on
 # role==WEIGHT OR cat==HOST_COMPUTE OR cat==EXPERT_CACHE, checked before the
 # STAGING fallback. This is the reason B's unconditional WEIGHT is correct
 # for this call site (alloc_buffer always sets category=HOST_COMPUTE) --
-# pinned so a future rewrite of select_zone's precedence is forced to revisit
+# pinned so a future rewrite of unified_alloc_host_zone's precedence is forced to revisit
 # the mirror in get_max_size too.
 SELECT_ZONE_WEIGHT_BRANCH = "role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||"
 SELECT_ZONE_EXPERT_BRANCH = "cat == runtime_category::EXPERT_CACHE"
@@ -274,7 +274,7 @@ def witness_b_alloc_buffer_category(t):
 
 
 # --- C: the WEIGHT zone (where every runtime HOST_COMPUTE request lands,
-# per B/select_zone above) reserves headroom for the context's own host
+# per B/unified_alloc_host_zone above) reserves headroom for the context's own host
 # buffers (llama_context::output_reserve() et al.), not just weight bytes.
 def check_c_headroom(t):
     fn = t["populate_zone_sizing_fn"]
@@ -417,9 +417,9 @@ checks = [
      check_a1_lock_scoped_to_impl, witness_a1),
     ("A3: neither the exported setter nor its impl contains a configure_host_zones call",
      check_a3_no_configure_in_setter, witness_a3),
-    ("B: get_max_size mirrors select_zone's actual WEIGHT routing unconditionally",
+    ("B: get_max_size mirrors unified_alloc_host_zone's actual WEIGHT routing unconditionally",
      check_b_mirror, witness_b_mirror),
-    ("B: select_zone's WEIGHT-before-STAGING precedence unchanged (the reason B is correct)",
+    ("B: unified_alloc_host_zone's WEIGHT-before-STAGING precedence unchanged (the reason B is correct)",
      check_b_select_zone, witness_b_select_zone),
     ("B: alloc_buffer still sets category=HOST_COMPUTE unconditionally for this buft",
      check_b_alloc_buffer_category, witness_b_alloc_buffer_category),

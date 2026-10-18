@@ -17638,6 +17638,9 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
         req.intent.category                     = runtime_category::CONTROL;
         req.intent.cohort_id                    = "cpu_job_input_marker";
         req.intent.constraints.must_host_pinned = true;
+        // The word lives as long as the cache, so it must not sit in a host zone every graph boundary checks for
+        // emptiness (llama.cpp-nqbe).
+        req.intent.constraints.persistent_owner = true;
         allocation_result allocation            = unified_allocate_owner(req);
         if (!allocation) {
             *why = CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED;
@@ -18439,6 +18442,35 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
     return total;
 }
 
+// The host zone a zone-managed host-pinned request lands in, by its owner's lifetime. KV spills and KV go to KV.
+// Owners that outlive a graph go to WEIGHT, which host_zone_settle() never sweeps: permanent weight data, persistent
+// host-compute owners, expert-cache pools, and any request that declares a persistent owner
+// (alloc_constraints::persistent_owner, llama.cpp-nqbe). Transient EXPERT_STAGING goes to SCRATCH and must be released
+// by its scoped smart-handle owner before the graph boundary. Everything else goes to STAGING, which must be empty at
+// every graph boundary.
+//
+// Role decides before category: role == EXPERT_STAGING must route to SCRATCH even when category == HOST_COMPUTE
+// (e.g. a MoE CPU fallback's expert staging slab, which is both). The WEIGHT branch's category disjuncts were added to
+// route persistent host-compute/expert-cache owners to WEIGHT (9a0670712), but being checked first meant they shadowed
+// EXPERT_STAGING's role for any request that also carried HOST_COMPUTE/EXPERT_CACHE, silently overriding the "must be
+// released by scoped smart-handle owners before reset" contract above with a zone that is *not* swept by
+// host_zone_settle() -- llama.cpp-0igs / llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
+static host_zone_id unified_alloc_host_zone(const alloc_request & req,
+                                            runtime_category      cat,
+                                            bool                  kv_spill_to_host) noexcept {
+    if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
+        return host_zone_id::KV;
+    }
+    if (req.intent.role == alloc_role::EXPERT_STAGING) {
+        return host_zone_id::SCRATCH;
+    }
+    if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
+        cat == runtime_category::EXPERT_CACHE || req.intent.constraints.persistent_owner) {
+        return host_zone_id::WEIGHT;
+    }
+    return host_zone_id::STAGING;
+}
+
 bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // Non-null only for the narrow allocator-internal owner adapter. Broad
     // legacy callers continue to receive alloc_handle without gaining a way to
@@ -18828,37 +18860,6 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         auto * ucache =
             !req.intent.constraints.require_host_usm_base ? get_unified_cache_for_device(req.device) : nullptr;
         if (!ptr && ucache) {
-            // Route to the correct host zone based on lifetime. KV spills go to
-            // KV; permanent weight data, persistent host-compute owners, and
-            // expert-cache pools go to WEIGHT so graph-boundary STAGING/SCRATCH
-            // resets cannot reclaim live owners. Transient EXPERT_STAGING
-            // remains SCRATCH and must be released by scoped smart-handle
-            // owners before reset.
-            //
-            // role decides before category: role == EXPERT_STAGING must route
-            // to SCRATCH even when category == HOST_COMPUTE (e.g. a MoE CPU
-            // fallback's expert staging slab, which is both). The WEIGHT
-            // branch's category disjuncts were added to route persistent
-            // host-compute/expert-cache owners to WEIGHT (9a0670712), but
-            // being checked first meant they shadowed EXPERT_STAGING's role
-            // for any request that also carried HOST_COMPUTE/EXPERT_CACHE,
-            // silently overriding the "must be released by scoped smart-
-            // handle owners before reset" contract above with a zone that is
-            // *not* swept by host_zone_settle() -- llama.cpp-0igs /
-            // llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
-            auto select_zone = [&]() {
-                if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
-                    return host_zone_id::KV;
-                }
-                if (req.intent.role == alloc_role::EXPERT_STAGING) {
-                    return host_zone_id::SCRATCH;
-                }
-                if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
-                    cat == runtime_category::EXPERT_CACHE) {
-                    return host_zone_id::WEIGHT;
-                }
-                return host_zone_id::STAGING;
-            };
             // CRITICAL: unified_alloc() must return a pointer whose [ptr, ptr+size)
             // is fully mapped and contiguous in the process address space.
             // `sycl::malloc_host` chunks are NOT guaranteed to be adjacent in
@@ -18928,7 +18929,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     ptr = ucache->host_pool_alloc(
                         alloc_size, req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT);
                 } else {
-                    host_zone_id pool_zone = select_zone();
+                    host_zone_id pool_zone = unified_alloc_host_zone(req, cat, kv_spill_to_host);
                     ptr                    = try_zone_alloc_contiguous(pool_zone);
                     if (ptr) {
                         zone_managed                = true;
@@ -18950,7 +18951,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     uses_pinned_pool = true;
                 }
             } else if (ucache->host_zones_configured()) {
-                host_zone_id zone = select_zone();
+                host_zone_id zone = unified_alloc_host_zone(req, cat, kv_spill_to_host);
                 ptr               = try_zone_alloc_contiguous(zone);
                 zone_managed      = (ptr != nullptr);
                 if (zone_managed) {
@@ -31468,7 +31469,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     constexpr size_t k_scratch_headroom      = 32ull * 1024ull * 1024ull;
     constexpr double k_weight_headroom_ratio = 1.2;
     // llama.cpp-glkg: the WEIGHT zone is where every runtime HOST_COMPUTE
-    // request lands (select_zone() in unified_alloc routes role==WEIGHT OR
+    // request lands (unified_alloc_host_zone() routes role==WEIGHT OR
     // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
     // that includes llama_context::output_reserve()'s logits/embd host
     // buffer plus the server's prompt-checkpoint reads after model load.

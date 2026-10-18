@@ -44117,7 +44117,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         // Host allocation path: planner-says-host layers, or layout-says-host
         // (cold tier).  Use unified_alloc with must_host_pinned=true so the
         // allocator deterministically routes through the HOST arena's KV zone
-        // (alloc_role::KV → host_zone_id::KV in select_zone() at
+        // (alloc_role::KV → host_zone_id::KV in unified_alloc_host_zone() at
         // unified-cache.cpp:5719).  The bare unified_cache_allocate shorthand
         // tries DEVICE FIRST and only falls back to host on budget exhaustion,
         // which silently put planner-says-host layers on device whenever VRAM
@@ -47142,16 +47142,16 @@ static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffe
     auto * cache = ggml_sycl::get_unified_cache_for_device(get_current_device_id());
     if (cache && cache->host_zones_configured()) {
         // Mirror the zone-selection logic `alloc_buffer` actually reaches
-        // (unified-cache.cpp's `select_zone`, inside `unified_alloc`):
+        // (unified-cache.cpp's `unified_alloc_host_zone`, used by `unified_alloc`):
         //   role == WEIGHT || cat == HOST_COMPUTE || cat == EXPERT_CACHE -> WEIGHT
         //   otherwise                                                    -> STAGING
         // `alloc_buffer` unconditionally sets
         // `req.intent.category = ggml_sycl::runtime_category::HOST_COMPUTE` for
-        // every buffer this buft allocates, and select_zone's WEIGHT branch is
+        // every buffer this buft allocates, and unified_alloc_host_zone's WEIGHT branch is
         // checked BEFORE any role-only STAGING fallback, so a HOST_COMPUTE
         // category request routes to WEIGHT unconditionally here -- regardless
         // of role, in_model_load, or weights_evictable. This function used to
-        // re-derive alloc_buffer's ROLE computation instead of select_zone's
+        // re-derive alloc_buffer's ROLE computation instead of unified_alloc_host_zone's
         // actual ZONE decision -- a role-only ternary (WEIGHT when
         // in_model_load was set or weights_evictable, STAGING otherwise) --
         // so once in_model_load went false after model load, it picked
