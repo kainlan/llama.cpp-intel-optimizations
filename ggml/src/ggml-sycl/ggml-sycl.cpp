@@ -24600,8 +24600,8 @@ static bool moe_cpu_job_device_signal_enabled();
 // sat in the host STAGING zone, which every graph boundary checks for emptiness, so every boundary refused and walked
 // the whole allocation registry on the submitting thread. The word is now a persistent owner in the WEIGHT host zone,
 // which no boundary checks, and a refused check walks the registry only for its first 8 refusals per zone or an active
-// zone audit. Measured 2026-10-18 on the B70 without -c with the knob on: 10.10 t/s, against 2.68 before the move and
-// 9.28 with the knob off.
+// zone audit. Measured 2026-10-18 on the B70 without -c with the knob on, traced (GGML_SYCL_MOE_IDS_COPY_TRACE=1,
+// about 8% below untraced): 10.10 t/s, against 2.68 before the move and 9.28 with the knob off.
 static bool moe_cpu_job_input_marker_in_play() {
     return moe_cpu_job_device_signal_enabled();
 }
@@ -24786,12 +24786,13 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
 
 // GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or non-zero lets a CPU expert pool job's
 // scatter wait on a host-signalled Level Zero event the job signals after its last write, and puts the job's input
-// marker in play (moe_cpu_job_input_marker_in_play); 0 joins every job with a host task, as before. Default on
-// (llama.cpp-nqbe): Qwen3.8 IQ3_XXS decode on the B70 (12 KV layers on the host without -c, direct path) measured
-// 10.10 t/s with it on against 9.28 off without -c, and 13.15 against 8.94 at -c 4096 (2026-10-18). It was off while
-// the marker's word sat in the boundary-checked host STAGING zone, which made every graph boundary walk the allocation
-// registry (2.68 t/s with it on, see moe_cpu_job_input_marker_in_play). The first prompt graph hang that first turned
-// it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
+// marker in play (moe_cpu_job_input_marker_in_play); =0, an empty value or a non-numeric value (the parse is atoi)
+// joins every job with a host task, as before. Default on (llama.cpp-nqbe): Qwen3.8 IQ3_XXS decode on the B70 (12 KV
+// layers on the host without -c, direct path), traced with GGML_SYCL_MOE_IDS_COPY_TRACE=1 (about 8% below untraced),
+// measured 10.10 t/s with it on against 9.28 off without -c, and 13.15 against 8.94 at -c 4096 (2026-10-18). It was off
+// while the marker's word sat in the boundary-checked host STAGING zone, which made every graph boundary walk the
+// allocation registry (2.68 t/s with it on, see moe_cpu_job_input_marker_in_play). The first prompt graph hang that
+// first turned it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
 static bool moe_cpu_job_device_signal_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");

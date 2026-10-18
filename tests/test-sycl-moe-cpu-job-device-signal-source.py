@@ -70,16 +70,18 @@ THE CONTRACT.  With comments blanked:
      when it ends.
   H. GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is read once, into a function-local static,
      default on (llama.cpp-nqbe: with it on, which also puts the input marker in
-     play, Qwen3.8 IQ3_XXS decode on the B70 measured 10.10 t/s without -c against
-     9.28 off, and 13.15 against 8.94 at -c 4096, 2026-10-18.  It was off while the
+     play, Qwen3.8 IQ3_XXS decode on the B70, traced with
+     GGML_SYCL_MOE_IDS_COPY_TRACE=1 (about 8% below untraced), measured 10.10 t/s
+     without -c against 9.28 off, and 13.15 against 8.94 at -c 4096, 2026-10-18.
+     It was off while the
      marker's word sat in the host STAGING zone that every graph boundary checks
      for emptiness, so every boundary refused and walked the allocation registry,
      2.68 t/s with it on; the word is now a persistent owner in the WEIGHT host
      zone.  The llama.cpp-m5v8 hang on that path is fixed by the input marker,
      llama.cpp-42zj), and is the only getenv of that name; the catalog row
      documents =0, its default, its default's reason (the boundary-checked zone,
-     the persistent owner, and the measurement after the move) and the atoi
-     parse; the
+     the persistent owner, and the traced measurement after the move) and the
+     atoi parse; the
      [MOE-HOSTPATH-WAITS] line prints devsig=, counted under the trace only.
   I. No host waits on the new events.  The flush body and the ring section of
      unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
@@ -546,7 +548,8 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
     if not re.search(r"static const bool enabled = \[\] \{ const char \* env = std::getenv\(\"" + KNOB +
                      r"\"\); return env == nullptr \|\| std::atoi\(env\) != 0; \}\(\); return enabled;", flat(body)):
         fail("H", f"{KNOB} is not read once into a function-local static, default on: with it on, which also puts "
-                  "the input marker in play, Qwen3.8 IQ3_XXS decode on the B70 measured 10.10 t/s without -c against "
+                  "the input marker in play, Qwen3.8 IQ3_XXS decode on the B70, traced with "
+                  "GGML_SYCL_MOE_IDS_COPY_TRACE=1 (about 8% below untraced), measured 10.10 t/s without -c against "
                   "9.28 off, and 13.15 against 8.94 at -c 4096 (llama.cpp-nqbe, 2026-10-18). It was off while the "
                   "marker's word sat in a boundary-checked host zone (2.68 t/s with it on). The llama.cpp-m5v8 hang on "
                   "that path is fixed by the input marker (llama.cpp-42zj)")
@@ -560,11 +563,11 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
         fail("H", f"the catalog has no single {KNOB}=0 row with its default, devsig= and the atoi parse")
     elif not all(s in rows[0] for s in ("Default on again (llama.cpp-nqbe)", "host `STAGING` zone",
                                         "`alloc_constraints::persistent_owner`", "`WEIGHT` host zone",
-                                        "2.68 t/s on master", "10.10 t/s with the word moved",
+                                        "(traced, `-t 4`", "2.68 t/s on master", "10.10 t/s with the word moved",
                                         "9.28 t/s with the knob off")):
-        fail("H", f"the catalog's {KNOB}=0 row does not give its default's reason: that the default is on again, the input marker's word sat in the "
-                  " that the input marker's word sat in the boundary-checked host STAGING zone, it is now a "
-                  "persistent owner in the WEIGHT host zone, and what the knob measured after the move: 2.68 t/s on "
+        fail("H", f"the catalog's {KNOB}=0 row does not give its default's reason: that the default is on again, "
+                  "that the input marker's word sat in the boundary-checked host STAGING zone and is now a persistent "
+                  "owner in the WEIGHT host zone, and what the knob measured after the move, traced: 2.68 t/s on "
                   "master, 10.10 with the word moved, 9.28 with the knob off (llama.cpp-nqbe)")
     cbody, _ = body_of(code, COUNT_SIG, "H")
     if flat(cbody).strip() != ("if (!moe_hostpath_waits_enabled()) { return; } "
@@ -1022,6 +1025,8 @@ def self_test(s: dict) -> int:
                                                                        "Default off (llama.cpp-nqbe)")),
         ("H", "doc", "catalog row loses its default's reason",
          sub(r"`alloc_constraints::persistent_owner`", "the marker's word")),
+        ("H", "doc", "catalog row does not say the measurement was traced",
+         sub(r"\(traced, `-t 4`, ", "(`-t 4`, ")),
         ("H", "doc", "catalog row loses the measurement after the move",
          sub(r"10\.10 t/s with the word moved", "a higher rate with the word moved")),
         ("H", "backend", "devsig counted untraced",
