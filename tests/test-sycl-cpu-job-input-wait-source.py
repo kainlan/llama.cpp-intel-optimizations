@@ -21,9 +21,12 @@ so a job that makes no other driver call cannot join the cycle.
 
 THE MARKER FOLLOWS THE KNOB (llama.cpp-nqbe).  The hang needs device work that waits on a CPU job's own signal, which
 only GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=1 submits (llama.cpp-m5v8); with the knob off the worker's native wait never
-hung.  And the marker costs Qwen3.8 IQ3_XXS decode on the B70 without -c 2.8 t/s against 9.7 with the knob off as with
-it on.  So the marker is in play only with the knob on; with it off the prologue arms, refuses, logs and waits nothing,
-and the worker waits a job's inputs natively, as it did before the marker (W10).
+hung.  So the marker is in play only with the knob on; with it off the prologue arms, refuses, logs and waits nothing,
+and the worker waits a job's inputs natively, as it did before the marker (W10).  The marker once cost Qwen3.8 IQ3_XXS
+decode on the B70 without -c 2.8 t/s against 9.7, with the knob off as with it on: its word sat in the host STAGING
+zone, which every graph boundary checks for emptiness, so every boundary refused and walked the allocation registry.
+The word is now a persistent owner in the WEIGHT host zone, so that cost is removed
+(test-sycl-host-zone-boundary-owner-source.py).
 
 THE CONTRACT.  With comments and string literals blanked:
   W1. The worker's input wait is driver-free.  moe_cpu_job_wait_inputs calls only cpu_job_input_marker_wait,
@@ -880,9 +883,9 @@ def check_in_play(s: dict[str, str]) -> None:
     arm = re.search(ARM, outside)
     if not branch or not arm or arm.start() < branch.start():
         fail("W10", "moe_cpu_job_prologue arms the input marker whatever GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL says: "
-                    "with the knob off the marker is not in play, and it costs Qwen3.8 decode without -c 2.8 t/s "
-                    "against 9.7 (llama.cpp-nqbe), for a hang only the knob's device wait has (llama.cpp-m5v8); the "
-                    "knob is asked first, as `if (!in_play)`, and the arm sits in that branch's else")
+                    "with the knob off the marker is not in play, since only the knob's device wait has the hang it "
+                    "fixes (llama.cpp-m5v8, llama.cpp-nqbe); the knob is asked first, as `if (!in_play)`, and the arm "
+                    "sits in that branch's else")
     head = outside[: branch.start()]
     stmts = [nospace(t) for t in head.split(";") if t.strip()]
     if not stmts or stmts[0] != nospace(IN_PLAY_FIRST[:-1]) or \
@@ -923,8 +926,8 @@ def check_in_play(s: dict[str, str]) -> None:
     _, ibody = definition(code, IN_PLAY_SIG, "W10")
     if nospace(ibody) != nospace("return moe_cpu_job_device_signal_enabled();"):
         fail("W10", "moe_cpu_job_input_marker_in_play is not exactly the GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL knob: the "
-                    "marker would be armed with the knob off, where it costs Qwen3.8 decode without -c 2.8 t/s "
-                    "against 9.7 (llama.cpp-nqbe)")
+                    "marker would be armed with the knob off, where the hang it fixes cannot happen "
+                    "(llama.cpp-m5v8, llama.cpp-nqbe)")
 
 
 def check_chained_inputs(s: dict[str, str]) -> None:

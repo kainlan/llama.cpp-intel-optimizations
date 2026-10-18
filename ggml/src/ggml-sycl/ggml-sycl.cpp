@@ -24595,8 +24595,11 @@ static bool moe_cpu_job_device_signal_enabled();
 // replaces the pool worker's driver wait for a job's inputs, and that wait hung (llama.cpp-m5v8) only on the
 // device-signal path, where the retained-handle drain worker holds the Level Zero mutex inside its event wait while
 // the device work behind that event waits for a CPU job's own signal. With the knob off the native wait never hung,
-// and the marker costs Qwen3.8 IQ3_XXS decode on the B70 without -c 2.8 t/s against 9.7 (llama.cpp-nqbe), so the
-// worker then waits a job's inputs natively, as it did before the marker, and no marker is armed or logged.
+// so the worker then waits a job's inputs natively, as it did before the marker, and no marker is armed or logged.
+// The marker once cost Qwen3.8 IQ3_XXS decode on the B70 without -c 2.8 t/s against 9.7 (llama.cpp-nqbe): its word
+// sat in the host STAGING zone, which every graph boundary checks for emptiness, so every boundary refused and walked
+// the whole allocation registry on the submitting thread. The word is now a persistent owner in the WEIGHT host zone,
+// and a refusal past its diagnostics walks nothing, so that cost is gone.
 static bool moe_cpu_job_input_marker_in_play() {
     return moe_cpu_job_device_signal_enabled();
 }
@@ -24783,8 +24786,10 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
 // host task; non-zero lets the job's scatter wait on a host-signalled Level Zero event the job signals after its last
 // write, and puts the job's input marker in play (moe_cpu_job_input_marker_in_play). Default off (llama.cpp-nqbe): with
 // it on, Qwen3.8 IQ3_XXS decode on the B70 without -c (12 KV layers on the host, direct path) fell to 2.7 t/s from 9.7,
-// which is the marker's cost, while at -c 4096 it rose to 13.3 from 9.0. The first prompt graph hang that first turned
-// it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
+// while at -c 4096 it rose to 13.3 from 9.0. The loss was the marker's word, held in a host zone every graph boundary
+// sweeps (see moe_cpu_job_input_marker_in_play). That cost is removed; the default stays off until the knob is
+// measured again. The first prompt graph hang that first turned it off (llama.cpp-m5v8) is fixed by the input marker
+// (llama.cpp-42zj).
 static bool moe_cpu_job_device_signal_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");
