@@ -69,9 +69,11 @@ THE CONTRACT.  With comments blanked:
      job's outputs, which teardown frees once the queues drain, so the job signals itself
      when it ends.
   H. GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is read once, into a function-local static,
-     default off (llama.cpp-nqbe), and is the only getenv of that name; the catalog
-     row documents =1; the [MOE-HOSTPATH-WAITS] line prints devsig=, counted under
-     the trace only.
+     default off (llama.cpp-nqbe: with it on, Qwen3.8 IQ3_XXS decode on the B70 fell
+     to 2.7 from 9.7 t/s without -c and rose to 13.3 from 9.0 at -c 4096; the
+     llama.cpp-m5v8 hang is fixed by the input marker, llama.cpp-42zj), and is the
+     only getenv of that name; the catalog row documents =1; the [MOE-HOSTPATH-WAITS]
+     line prints devsig=, counted under the trace only.
   I. No host waits on the new events.  The flush body and the ring section of
      unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
      wait, wait_and_throw, wait_for or wait_until, no get_info<...> and name neither
@@ -536,7 +538,9 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
     body, _ = body_of(code, KNOB_SIG, "H")
     if not re.search(r"static const bool enabled = \[\] \{ const char \* env = std::getenv\(\"" + KNOB +
                      r"\"\); return env != nullptr && std::atoi\(env\) != 0; \}\(\); return enabled;", flat(body)):
-        fail("H", f"{KNOB} is not read once into a function-local static, default off (llama.cpp-nqbe)")
+        fail("H", f"{KNOB} is not read once into a function-local static, default off: with it on, Qwen3.8 "
+                  "IQ3_XXS decode on the B70 fell to 2.7 from 9.7 t/s without -c and rose to 13.3 from 9.0 at "
+                  "-c 4096 (llama.cpp-nqbe); the llama.cpp-m5v8 hang is fixed by the input marker (llama.cpp-42zj)")
     n = sum(len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", blank_comments(s)))
             for s in sources.values() if KNOB in s)
     n += len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", code))
