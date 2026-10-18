@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A process-lifetime host owner never sits in a boundary-swept host zone, and a refused boundary check stops walking
+"""A process-lifetime host owner never sits in a boundary-checked host zone, and a refused boundary check stops walking
 the allocation registry once its diagnostics are spent (llama.cpp-nqbe).
 
 THE COST.  The host STAGING and SCRATCH zones must be empty at every graph boundary: the graph code calls
@@ -17,18 +17,31 @@ get_rows host index stage are CONTROL too, and they must stay in STAGING so the 
 leaks.  So the persistence is a field of the request, alloc_constraints::persistent_owner, never a role or a cohort
 string.
 
+THE FLAG IS AN EXEMPTION, SO ITS SETTERS ARE A CENSUS.  A request carrying persistent_owner lands in WEIGHT, which no
+graph boundary checks.  Set on a transient request, it would silence exactly the STAGING leak the boundary check exists
+to catch: the leaked row would sit in WEIGHT until the cache dies and no boundary would ever refuse on it.  So the
+only function that may set it is the one whose owner provably lives as long as the cache, and a new setter must be
+added here by name, with that argument made for it (Z5).
+
 THE CONTRACT.  With comments and string literals blanked:
   Z1. alloc_constraints has `bool persistent_owner = false;`.  unified_cache::arm_cpu_job_input_marker builds the
       word's request with role CONTROL (its only role write), must_host_pinned = true and persistent_owner = true,
       each an unconditional statement between the request's declaration and its unified_allocate_owner call.
-  Z2. unified_alloc_host_zone, the allocator's host-zone choice, returns KV exactly for `kv_spill_to_host ||
+  Z2. unified_alloc_host_zone, the allocator's host-zone choice, first asserts that a persistent_owner request is
+      neither a KV spill nor role KV nor role EXPERT_STAGING (those choose KV and SCRATCH before WEIGHT is
+      considered, so the flag would not reach WEIGHT).  It then returns KV exactly for `kv_spill_to_host ||
       req.intent.role == alloc_role::KV`, SCRATCH exactly for `req.intent.role == alloc_role::EXPERT_STAGING`, WEIGHT
       for a condition with `req.intent.constraints.persistent_owner` among its top-level `||` operands, and STAGING
-      only as its last statement; it has no other return.  So a persistent CONTROL request lands in WEIGHT.
+      only as its last statement; it has no other return, and reads persistent_owner only in the assert and the
+      WEIGHT condition.  So a persistent CONTROL request lands in WEIGHT.
   Z3. unified_alloc chooses every host zone through unified_alloc_host_zone(req, cat, kv_spill_to_host), twice (the
       pinned-pool branch and the direct-zone branch, each the initialiser of its zone variable), and no lambda of its
       returns a host_zone_id of its own.
   Z4. host_zone_settle asserts that WEIGHT is never settled, which is what keeps a persistent owner out of the sweep.
+  Z5. Across every .cpp and .hpp under ggml/src/ggml-sycl/ (ggml-sycl.cpp included), the writes to persistent_owner
+      (an assignment, compound assignment or brace initialiser through `.` or `->`, a designated initialiser
+      included) are exactly one, in the allowlisted function unified_cache::arm_cpu_job_input_marker, named by its
+      enclosing function.
   S1. host_zone_settle takes its refusal report once, as `const host_zone_refusal_report report =
       host_zone_refusal_take(zone_refusals, audit.active());`, inside the block of
       `if (runtime_registry_host_zone_live_locked(zone)) {`, and calls runtime_registry_scan_host_zone_locked exactly
@@ -39,7 +52,11 @@ THE CONTRACT.  With comments and string literals blanked:
       a refusal reads one counter and returns, unless a zone audit is active.
 
 NOT COVERED: this reads text.  The decision table itself runs in test-sycl-runtime-registry-containment (host-only, the
-hook allocation_registry_test_host_zone_refusals), and a device run is what shows the boundary no longer refuses.
+hook allocation_registry_test_host_zone_refusals), and a device run is what shows the boundary no longer refuses.  Z5
+sees writes spelled through the member name; a write through a reference or pointer bound to the field, or through
+std::exchange or a whole-struct copy from a constraints object that has it set, is not seen, and a write inside a
+constructor with a member initialiser list is named by its last initialiser, which fails closed.  Nor is this a census of
+the process-lifetime CONTROL owners that do not set the flag: those still land in STAGING (llama.cpp-bvq7 is one).
 
 Run with --self-test: each mutant is written to a copy of the sources in a temporary directory and must fail on its
 own pin, and the unmodified tree must pass.  --root DIR checks another tree (the directory holding ggml/).
@@ -56,6 +73,15 @@ FILES = {
     "cache": "ggml/src/ggml-sycl/unified-cache.cpp",
     "header": "ggml/src/ggml-sycl/unified-cache.hpp",
 }
+SYCL_DIR = "ggml/src/ggml-sycl"
+FLAG = "persistent_owner"
+# Z5: the functions that may set the flag, with the reason each owner outlives every graph.
+SETTERS_ALLOWED = {
+    # The input marker's word lives as long as the cache: published once by the arm, ended at shutdown.
+    ("ggml/src/ggml-sycl/unified-cache.cpp", "arm_cpu_job_input_marker"),
+}
+FLAG_WRITE = re.compile(r"(?:\.|->)\s*" + FLAG + r"\s*(?:[|&^]?=(?!=)|\{)")
+HEAD_KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "sizeof", "decltype", "alignof", "noexcept"}
 
 _LEXEME_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', flags=re.DOTALL)
 
@@ -139,6 +165,8 @@ def if_blocks(body: str):
     return out
 
 
+ZONE_ASSERT = ("GGML_ASSERT(!req.intent.constraints.persistent_owner || (!kv_spill_to_host && "
+               "req.intent.role != alloc_role::KV && req.intent.role != alloc_role::EXPERT_STAGING));")
 ARM_SIG = r"bool\s+unified_cache::arm_cpu_job_input_marker\s*\([^)]*\)\s*\{"
 ZONE_SIG = (r"static\s+host_zone_id\s+unified_alloc_host_zone\s*\(\s*const\s+alloc_request\s*&\s*req\s*,\s*"
             r"runtime_category\s+cat\s*,\s*bool\s+kv_spill_to_host\s*\)\s*noexcept\s*\{")
@@ -218,8 +246,13 @@ def check_zone_choice(code: str, fails: list) -> None:
             [nospace(o) for o in top_level_or_operands(weight)]:
         fails.append(("Z2", "unified_alloc_host_zone's WEIGHT condition does not take a request with "
                             "persistent_owner: such an owner would fall through to STAGING"))
-    if body.count("persistent_owner") != 1:
-        fails.append(("Z2", "unified_alloc_host_zone reads persistent_owner outside its WEIGHT condition"))
+    if not nospace(body).startswith(nospace(ZONE_ASSERT)):
+        fails.append(("Z2", "unified_alloc_host_zone does not first assert that a persistent_owner request is neither a "
+                            "KV spill, role KV nor role EXPERT_STAGING: such a request would land in KV or SCRATCH, "
+                            "and SCRATCH must be empty at every graph boundary"))
+    if body.count("persistent_owner") != 2:
+        fails.append(("Z2", "unified_alloc_host_zone reads persistent_owner outside its assert and its WEIGHT "
+                            "condition"))
 
 
 def check_alloc_uses_choice(code: str, fails: list) -> None:
@@ -287,6 +320,65 @@ def check_take(code: str, fails: list) -> None:
                             "stops at the WARN budget, scan = log_detail || warn || audit_active)"))
 
 
+def head_name(head: str):
+    """The function name a block head declares (`... name(params) qualifiers`), or None for a control statement,
+    a lambda, a class or a namespace."""
+    h = re.sub(r"\s*->\s*[\w:<>,\s*&]+$", "", head.rstrip())
+    while True:
+        h2 = re.sub(r"\s*\b(?:const|override|final|mutable|noexcept(?:\s*\([^()]*\))?)\s*$", "", h)
+        if h2 == h:
+            break
+        h = h2
+    if not h.endswith(")"):
+        return None
+    depth, i = 0, len(h) - 1
+    while i >= 0:
+        if h[i] == ")":
+            depth += 1
+        elif h[i] == "(":
+            depth -= 1
+            if depth == 0:
+                break
+        i -= 1
+    if i < 0:
+        return None
+    m = re.search(r"(~?[A-Za-z_]\w*)\s*$", h[:i])
+    if not m or m.group(1) in HEAD_KEYWORDS:
+        return None
+    return m.group(1)
+
+
+def enclosing_function(code: str, pos: int):
+    stack = []
+    for m in re.finditer(r"[{}]", code[:pos]):
+        if m.group(0) == "{":
+            stack.append(m.start())
+        elif stack:
+            stack.pop()
+    for open_idx in reversed(stack):
+        start = max(code.rfind(";", 0, open_idx), code.rfind("{", 0, open_idx), code.rfind("}", 0, open_idx)) + 1
+        name = head_name(code[start:open_idx])
+        if name:
+            return name
+    return None
+
+
+def check_setters(census: dict, fails: list) -> None:
+    writes = []
+    for rel in sorted(census):
+        code = blank(census[rel])
+        for m in FLAG_WRITE.finditer(code):
+            line = code.count("\n", 0, m.start()) + 1
+            writes.append((rel, enclosing_function(code, m.start()), line))
+    allowed = sorted(SETTERS_ALLOWED)
+    if sorted((rel, fn) for rel, fn, _ in writes) != allowed:
+        got = ", ".join(f"{rel}:{line} in {fn or '<no function>'}" for rel, fn, line in writes) or "none"
+        fails.append(("Z5", f"the writes to {FLAG} are [{got}]; want exactly one, in "
+                            f"{', '.join(fn for _, fn in allowed)}: the flag sends a request to the WEIGHT host zone, "
+                            "which no graph boundary checks, so set on a transient request it hides exactly the "
+                            "STAGING leak the boundary check exists to catch"))
+
+
 def check_header(header: str, fails: list) -> None:
     m = re.search(r"struct\s+alloc_constraints\s*\{", header)
     body = block_at(header, m.end() - 1)[0] if m else None
@@ -304,11 +396,23 @@ def check(sources: dict) -> list:
     check_weight_never_settled(code, fails)
     check_settle(code, fails)
     check_take(code, fails)
+    check_setters(sources["census"], fails)
     return fails
 
 
+def sycl_sources(root: Path) -> dict:
+    """Every .cpp and .hpp under ggml/src/ggml-sycl/, by path relative to root."""
+    out = {}
+    for path in sorted((root / SYCL_DIR).rglob("*")):
+        if path.suffix in (".cpp", ".hpp") and path.is_file():
+            out[path.relative_to(root).as_posix()] = path.read_text(errors="replace")
+    return out
+
+
 def read_sources(root: Path) -> dict:
-    return {k: (root / v).read_text() for k, v in FILES.items()}
+    sources = {k: (root / v).read_text() for k, v in FILES.items()}
+    sources["census"] = {rel: text for rel, text in sycl_sources(root).items() if FLAG in text}
+    return sources
 
 
 def sub(pattern: str, repl: str, count: int = 1):
@@ -333,6 +437,10 @@ def mutants():
         ("Z2", "cache", "CONTROL is sent to SCRATCH",
          sub(r"if \(req\.intent\.role == alloc_role::EXPERT_STAGING\) \{",
              r"if (req.intent.role == alloc_role::EXPERT_STAGING || req.intent.role == alloc_role::CONTROL) {")),
+        ("Z2", "cache", "the persistent-owner assert is gone",
+         sub(r"\n\s*GGML_ASSERT\(!req\.intent\.constraints\.persistent_owner[^;]*;", "")),
+        ("Z2", "cache", "the persistent-owner assert lets EXPERT_STAGING through",
+         sub(r" &&\s*req\.intent\.role != alloc_role::EXPERT_STAGING\)\);", r"));")),
         ("Z2", "cache", "CONTROL is sent to STAGING ahead of WEIGHT",
          sub(r"(\n(\s*)if \(req\.intent\.role == alloc_role::WEIGHT)",
              r"\n\2if (req.intent.role == alloc_role::CONTROL) {\n\2    return host_zone_id::STAGING;\n\2}\1")),
@@ -341,6 +449,12 @@ def mutants():
              r"host_zone_id zone = host_zone_id::STAGING;")),
         ("Z4", "cache", "WEIGHT may be settled",
          sub(r"\n\s*GGML_ASSERT\(zone != host_zone_id::WEIGHT && \"WEIGHT host zone must not be reset\"\);", "")),
+        ("Z5", "ggml/src/ggml-sycl/common.hpp", "a scoped host transient declares a persistent owner",
+         sub(r"(\n(\s*)intent\.constraints\.require_host_usm_base = graph_lifetime;)",
+             r"\1\n\2intent.constraints.persistent_owner = true;")),
+        ("Z5", "ggml/src/ggml-sycl/ggml-sycl.cpp", "a managed host-pinned request declares a persistent owner",
+         sub(r"(\n    req\.intent\.constraints\.must_host_pinned = true;)",
+             r"\1\n    req.intent.constraints.persistent_owner = true;")),
         ("S1", "cache", "the refusal always scans", sub(r"if \(report\.scan\) \{", r"if (true) {")),
         ("S1", "cache", "the scan is hoisted out of the report's branch",
          sub(r"(\n(\s*)const host_zone_refusal_report report\s*= host_zone_refusal_take\(zone_refusals)",
@@ -360,19 +474,24 @@ def mutants():
 
 def self_test(root: Path) -> int:
     base = read_sources(root)
+    every = sycl_sources(root)
     failures, caught = [], 0
     with tempfile.TemporaryDirectory(prefix="nqbe-pin-") as tmp:
         for pin, key, name, mutate in mutants():
-            mutated = mutate(base[key])
-            if mutated == base[key]:
+            rel_mutated = FILES.get(key, key)
+            original = every[rel_mutated]
+            mutated = mutate(original)
+            if mutated == original:
                 failures.append(f"mutant '{name}' did not apply")
                 print(f"  self-test: mutant '{name}' did not apply")
                 continue
+            # The copy holds the checked files, every source that names the flag, and the mutated file; the census
+            # of the copy then sees what a census of the whole mutated tree would.
             copy = Path(tmp) / name.replace(" ", "_").replace("'", "")
-            for k, rel in FILES.items():
+            for rel in set(FILES.values()) | set(base["census"]) | {rel_mutated}:
                 dst = copy / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_text(mutated if k == key else base[k])
+                dst.write_text(mutated if rel == rel_mutated else every[rel])
             got = check(read_sources(copy))
             pins = {p for p, _ in got}
             if pin in pins:
@@ -411,7 +530,7 @@ def main(argv: list) -> int:
     if fails:
         return 1
     print("PASS: the CPU job input marker's word is a persistent owner in the WEIGHT host zone, which no graph "
-          "boundary sweeps, and a refused host-zone boundary check walks the registry only for its first 8 refusals "
+          "boundary checks, only arm_cpu_job_input_marker sets that flag, and a refused host-zone boundary check walks the registry only for its first 8 refusals "
           f"per zone or an active zone audit {TAG}")
     return 0
 
