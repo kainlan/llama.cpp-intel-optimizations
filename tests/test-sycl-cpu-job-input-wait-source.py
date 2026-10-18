@@ -103,8 +103,11 @@ THE CONTRACT.  With comments and string literals blanked:
       free_ before it sets growing_, so the book's add cannot allocate) before anything else;
       raises *outside once, before it releases the lock; releases it once, before its one make(), and takes it again
       only after; lowers *outside right after each lock.lock(); publishes only after the last lock.lock() and adds
-      the entries to the book (book.add, once) only after the publish; and every way out after *outside is raised, a
-      throw included, lets the reservation go (book.grow_end) in its own block or in an enclosing one before it.
+      the entries to the book (book.add, once) only after the publish; has no try or catch and no book.grow_end of
+      its own; and declares one cpu_job_signal_grow_scope{ lock, book, outside } at its own level, after grow_begin
+      and before *outside is raised, whose destructor is exactly `if (!lock.owns_lock()) { lock.lock(); *outside -=
+      1; }` then `book.grow_end();`, so every way out after the reservation, a throw included, hands the caller the
+      lock, lowers *outside and lets the reservation go.
   W9. The event-chained hybrid route's job waits for its experts' leases: when record->has_ready, the job's inputs
       take record->ready, the barrier over the leases' producer events, before the prologue is built.  Its marker
       would follow that barrier on the in-order stream anyway, but a refused arm waits exactly the inputs on the
@@ -925,34 +928,6 @@ def lambda_span(code: str, start: int, end: int, pin: str) -> tuple[int, int]:
     return body_start, body_start + len(body)
 
 
-def level_text(code: str, start: int, end: int) -> str:
-    """code[start:end] without the blocks nested in it."""
-    flat, out, depth = strip_strings(code), [], 0
-    for i in range(start, end):
-        c = flat[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-        elif depth == 0:
-            out.append(code[i])
-    return "".join(out)
-
-
-def released_on_the_way_out(g: str, exit_at: int, reserved_at: int) -> bool:
-    """Whether book.grow_end() runs before the exit at exit_at, in its block or an enclosing one, after the
-    reservation."""
-    pos = exit_at
-    while True:
-        open_at = enclosing_brace(g, pos)
-        start = max(open_at + 1 if open_at >= 0 else 0, reserved_at)
-        if re.search(r"\bbook\s*\.\s*grow_end\s*\(", level_text(g, start, pos)):
-            return True
-        if open_at < 0 or open_at < reserved_at:
-            return False
-        pos = open_at
-
-
 def check_ring_growth(s: dict[str, str], ring: str) -> None:
     """W8, the ring's growth (llama.cpp-q0xu): the driver calls that make a block run with mutex_ released."""
     created = [m.start() for m in _CREATE.finditer(ring)]
@@ -1039,12 +1014,29 @@ def check_ring_growth(s: dict[str, str], ring: str) -> None:
     if len(publish) != 1 or len(adds) != 1 or not (max(relock) < publish[0] < adds[0]):
         fail("W8", "cpu_job_signal_grow does not publish the block with the lock held again and only then add its "
                    "entries to the book: an entry could exist without its native event", tag=GROW_TAG)
-    # The reservation holds from the statement after grow_begin's refusal, whose first step raises *outside.
-    for m in re.finditer(r"\b(?:return\b[^;]*|throw\s*);", g):
-        exit_text = re.sub(r"\s+", " ", m.group(0))
-        if m.start() > up[0] and not released_on_the_way_out(g, m.start(), up[0]):
-            fail("W8", f"cpu_job_signal_grow leaves through `{exit_text}` with its growth still reserved: "
-                       "every later acquirer would be told BUSY for good", tag=GROW_TAG)
+    if re.search(r"\b(?:try|catch)\b", g):
+        fail("W8", "cpu_job_signal_grow has a try or a catch: its ways out are the guard's, and a catch (...) there "
+                   "can swallow a planned refusal", tag=GROW_TAG)
+    if re.search(r"\bbook\s*\.\s*grow_end\s*\(", g):
+        fail("W8", "cpu_job_signal_grow lets its reservation go itself instead of through its guard: a release with "
+                   "the lock released lets a second acquirer grow beside it", tag=GROW_TAG)
+    scope = list(re.finditer(r"\bstruct\s+cpu_job_signal_grow_scope\s*\{", hdr))
+    if len(scope) != 1:
+        fail("W8", f"{len(scope)} definitions of cpu_job_signal_grow_scope, not 1: nothing puts the growth back on "
+                   "its way out", tag=GROW_TAG)
+    scope_body, _ = block_at(hdr, hdr.index("{", scope[0].end() - 1), "W8")
+    _, dtor = definition(scope_body, r"~\s*cpu_job_signal_grow_scope\s*\(\s*\)\s*\{", "W8")
+    if not re.fullmatch(r"\s*if\s*\(\s*!\s*lock\s*\.\s*owns_lock\s*\(\s*\)\s*\)\s*\{\s*lock\s*\.\s*lock\s*\(\s*\)\s*;"
+                        r"\s*\*\s*outside\s*-=\s*1\s*;\s*\}\s*book\s*\.\s*grow_end\s*\(\s*\)\s*;\s*", dtor):
+        fail("W8", "cpu_job_signal_grow_scope's destructor is not `if (!lock.owns_lock()) { lock.lock(); *outside -= "
+                   "1; }` then `book.grow_end();`: a throwing make() would hand the caller no lock or a raised count, "
+                   "a lock this thread owns would be taken again and throw, or the reservation would stay and every "
+                   "later acquirer would be told BUSY for good", tag=GROW_TAG)
+    decl = list(re.finditer(r"\bcpu_job_signal_grow_scope\s+\w+\s*\{\s*lock\s*,\s*book\s*,\s*outside\s*\}\s*;", g))
+    if len(decl) != 1 or enclosing_brace(g, decl[0].start()) >= 0 or not (begin[0] < decl[0].start() < up[0]):
+        fail("W8", "cpu_job_signal_grow does not declare one cpu_job_signal_grow_scope{ lock, book, outside } at its "
+                   "own level, after grow_begin and before it raises *outside: a way out after the reservation would "
+                   "skip it, or it would give back a reservation that another growth holds", tag=GROW_TAG)
 
 
 def nospace(text: str) -> str:
@@ -1482,17 +1474,14 @@ def mutants() -> list:
          sub(re.escape("if (outside_calls_ == 0) {"), "if (true) {")),
         # W8: the ring's growth makes its block with mutex_ released (llama.cpp-q0xu).
         ("W8", "header", "the growth makes its block under the lock",
-         sub(re.escape("    lock.unlock();\n    bool made = false;"), "    bool made = false;")),
+         sub(re.escape("    lock.unlock();\n    const bool made = make();"), "    const bool made = make();")),
         ("W8", "header", "the growth releases the lock only after make",
-         sub(re.escape("    lock.unlock();\n    bool made = false;\n    try {\n        made = make();"),
-             "    bool made = false;\n    try {\n        made = make();\n        lock.unlock();")),
+         sub(re.escape("    lock.unlock();\n    const bool made = make();"),
+             "    const bool made = make();\n    lock.unlock();")),
         ("W8", "header", "the growth is not counted outside",
          sub(re.escape("    *outside += 1;\n"), "")),
         ("W8", "header", "the growth raises the count after it released the lock",
          sub(re.escape("    *outside += 1;\n    lock.unlock();"), "    lock.unlock();\n    *outside += 1;")),
-        ("W8", "header", "a throwing make leaves the count raised",
-         sub(re.escape("        lock.lock();\n        *outside -= 1;\n        book.grow_end();\n        throw;"),
-             "        lock.lock();\n        book.grow_end();\n        throw;")),
         ("W8", "header", "a second acquirer is not told BUSY",
          sub(r"\n    if \(book\.growing\(\)\) \{\n\s*return cpu_job_signal_grow_result::BUSY;\n    \}", "")),
         ("W8", "header", "the book reserves over a growth in flight",
@@ -1502,13 +1491,32 @@ def mutants() -> list:
         ("W8", "header", "the book does not reserve the growth's room",
          sub(r"        entries_\.reserve\(entries_\.size\(\) \+ n\);\n"
              r"        free_\.reserve\(entries_\.size\(\) \+ n\);[^\n]*\n", "")),
-        ("W8", "header", "a block that was not made keeps its reservation",
-         sub(re.escape("    if (!made) {\n        book.grow_end();\n"), "    if (!made) {\n")),
-        ("W8", "header", "a refused block keeps its reservation",
-         sub(re.escape("    book.grow_end();\n    if (!published) {"), "    if (!published) {")),
-        ("W8", "header", "a throwing publish keeps its reservation",
-         sub(re.escape("        published = publish();\n    } catch (...) {\n        book.grow_end();\n        throw;"),
-             "        published = publish();\n    } catch (...) {\n        throw;")),
+        ("W8", "header", "the growth goes back to a catch",
+         sub(re.escape("    const bool made = make();\n"),
+             "    bool made = false;\n    try {\n        made = make();\n"
+             "    } catch (...) {\n        throw;\n    }\n")),
+        ("W8", "header", "the growth lets its reservation go with the lock released",
+         sub(re.escape("    lock.unlock();\n"), "    lock.unlock();\n    book.grow_end();\n")),
+        ("W8", "header", "the guard leaves the count raised after a throwing make",
+         sub(re.escape("            lock.lock();\n            *outside -= 1;\n"), "            lock.lock();\n")),
+        ("W8", "header", "the guard hands back no lock after a throwing make",
+         sub(re.escape("            lock.lock();\n            *outside -= 1;\n"), "            *outside -= 1;\n")),
+        ("W8", "header", "the guard takes a lock this thread already owns",
+         sub(re.escape("        if (!lock.owns_lock()) {\n"), "        {\n")),
+        ("W8", "header", "the guard does not let the reservation go",
+         sub(re.escape("        book.grow_end();\n    }\n};"), "    }\n};")),
+        ("W8", "header", "the guard lets the reservation go only after a throwing make",
+         sub(r"(            \*outside -= 1;\n)(        \}\n)(        book\.grow_end\(\);\n)",
+             r"\1            book.grow_end();\n\2")),
+        ("W8", "header", "the guard is declared after make",
+         move(re.escape("    cpu_job_signal_grow_scope scope{ lock, book, outside };\n"),
+              r"(?<=\n)    lock\.lock\(\);\n    \*outside -= 1;")),
+        ("W8", "header", "the guard is declared before the BUSY answer",
+         move(re.escape("    cpu_job_signal_grow_scope scope{ lock, book, outside };\n"),
+              r"    if \(book\.growing\(\)\)")),
+        ("W8", "header", "the guard is declared in a nested block",
+         sub(re.escape("    cpu_job_signal_grow_scope scope{ lock, book, outside };\n"),
+             "    {\n        cpu_job_signal_grow_scope scope{ lock, book, outside };\n    }\n")),
         ("W8", "cache", "the ring creates a pool outside its growth",
          sub(re.escape("if (ring->grow(lock) != cpu_job_signal_grow_result::GREW) {"),
              "if (l0.pool_create(zctx, nullptr, 0, nullptr, nullptr) != ZE_RESULT_SUCCESS ||\n"

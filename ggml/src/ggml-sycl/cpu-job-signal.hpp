@@ -254,6 +254,25 @@ enum class cpu_job_signal_grow_result {
     GONE,    // the ring stopped being live while the block was made: publish() refused it
 };
 
+// Puts back what cpu_job_signal_grow changed, on every way out after its reservation (llama.cpp-q0xu). *outside is
+// raised exactly while the growth has the lock released, so a way out with the lock released (make() threw) takes
+// it again and lowers *outside, and one with the lock held (a FAILED, GONE or GREW return, or a publish() that threw)
+// leaves both as they are: std::unique_lock::lock() on a lock this thread owns throws. Either way the book's
+// reservation goes back, so a later acquirer is not told BUSY for good.
+struct cpu_job_signal_grow_scope {
+    std::unique_lock<std::timed_mutex> & lock;
+    cpu_job_signal_book &                book;
+    uint32_t *                           outside;
+
+    ~cpu_job_signal_grow_scope() {
+        if (!lock.owns_lock()) {
+            lock.lock();
+            *outside -= 1;
+        }
+        book.grow_end();
+    }
+};
+
 // Grows `book` by one block of n entries for its ring (llama.cpp-q0xu). `lock` holds the ring's lock on entry and
 // again on return, a throw included.
 //
@@ -273,6 +292,9 @@ enum class cpu_job_signal_grow_result {
 // anything read before the unlock. It should not throw (the ring reserves its own room before the call). One that
 // does throw loses its block to the process exit, and the growth still gives its reservation back. Each runs at most
 // once per call, once per block of n entries, so std::function costs nothing that matters here.
+//
+// Every way out after the reservation, a throw from either callback included, goes through a
+// cpu_job_signal_grow_scope, so the caller holds the lock again, *outside is back and the reservation is released.
 inline cpu_job_signal_grow_result cpu_job_signal_grow(std::unique_lock<std::timed_mutex> & lock,
                                                       cpu_job_signal_book &                book,
                                                       uint32_t *                           outside,
@@ -286,32 +308,16 @@ inline cpu_job_signal_grow_result cpu_job_signal_grow(std::unique_lock<std::time
     if (!book.grow_begin(n, max)) {
         return cpu_job_signal_grow_result::FULL;
     }
+    cpu_job_signal_grow_scope scope{ lock, book, outside };
     *outside += 1;
     lock.unlock();
-    bool made = false;
-    try {
-        made = make();
-    } catch (...) {
-        lock.lock();
-        *outside -= 1;
-        book.grow_end();
-        throw;
-    }
+    const bool made = make();
     lock.lock();
     *outside -= 1;
     if (!made) {
-        book.grow_end();
         return cpu_job_signal_grow_result::FAILED;
     }
-    bool published = false;
-    try {
-        published = publish();
-    } catch (...) {
-        book.grow_end();
-        throw;
-    }
-    book.grow_end();
-    if (!published) {
+    if (!publish()) {
         return cpu_job_signal_grow_result::GONE;
     }
     (void) book.add(n);
