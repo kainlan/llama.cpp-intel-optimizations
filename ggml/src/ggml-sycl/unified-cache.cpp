@@ -18447,7 +18447,8 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
 // host-compute owners, expert-cache pools, and any request that declares a persistent owner
 // (alloc_constraints::persistent_owner, llama.cpp-nqbe). Transient EXPERT_STAGING goes to SCRATCH and must be released
 // by its scoped smart-handle owner before the graph boundary. Everything else goes to STAGING, which must be empty at
-// every graph boundary.
+// every graph boundary. The KV and EXPERT_STAGING choices come first, so a persistent owner with either role would never
+// reach WEIGHT: that combination is asserted against rather than routed.
 //
 // Role decides before category: role == EXPERT_STAGING must route to SCRATCH even when category == HOST_COMPUTE
 // (e.g. a MoE CPU fallback's expert staging slab, which is both). The WEIGHT branch's category disjuncts were added to
@@ -18458,6 +18459,10 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
 static host_zone_id unified_alloc_host_zone(const alloc_request & req,
                                             runtime_category      cat,
                                             bool                  kv_spill_to_host) noexcept {
+    // persistent_owner is a lifetime claim, not a routing preference. WEIGHT is the one host zone that holds an owner
+    // outliving every graph, so a persistent request that would land in KV or SCRATCH is a defect.
+    GGML_ASSERT(!req.intent.constraints.persistent_owner || (!kv_spill_to_host && req.intent.role != alloc_role::KV &&
+                                                             req.intent.role != alloc_role::EXPERT_STAGING));
     if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
         return host_zone_id::KV;
     }
