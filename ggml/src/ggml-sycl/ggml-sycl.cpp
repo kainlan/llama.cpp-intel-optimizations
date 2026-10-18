@@ -24557,9 +24557,9 @@ struct cpu_dispatch_result {
 //    events after its last write, and its scatter H2D copies depend on a fresh
 //    wrapper of that event, which the device waits itself (llama.cpp-qwn5);
 //  - a job the device may not wait (a graph records, the knob
-//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL unset or 0, no entry) is joined by a
-//    host_task on the op's in-order queue, and its scatter H2D copies depend on
-//    that host_task's event.
+//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=0, no entry) is joined by a host_task
+//    on the op's in-order queue, and its scatter H2D copies depend on that
+//    host_task's event.
 // No cycle: a prologue waits only for queue work submitted before its job, a
 // join or a device wait only for a job submitted before it, and the pool runs
 // jobs in order, so every wait points back in submission order (one pool worker
@@ -24595,8 +24595,13 @@ static bool moe_cpu_job_device_signal_enabled();
 // replaces the pool worker's driver wait for a job's inputs, and that wait hung (llama.cpp-m5v8) only on the
 // device-signal path, where the retained-handle drain worker holds the Level Zero mutex inside its event wait while
 // the device work behind that event waits for a CPU job's own signal. With the knob off the native wait never hung,
-// and the marker costs Qwen3.8 IQ3_XXS decode on the B70 without -c 2.8 t/s against 9.7 (llama.cpp-nqbe), so the
-// worker then waits a job's inputs natively, as it did before the marker, and no marker is armed or logged.
+// so the worker then waits a job's inputs natively, as it did before the marker, and no marker is armed or logged.
+// The marker once cost Qwen3.8 IQ3_XXS decode on the B70 without -c 2.8 t/s against 9.7 (llama.cpp-nqbe): its word
+// sat in the host STAGING zone, which every graph boundary checks for emptiness, so every boundary refused and walked
+// the whole allocation registry on the submitting thread. The word is now a persistent owner in the WEIGHT host zone,
+// which no boundary checks, and a refused check walks the registry only for its first 8 refusals per zone or an active
+// zone audit. Measured 2026-10-18 on the B70 without -c with the knob on, traced (GGML_SYCL_MOE_IDS_COPY_TRACE=1,
+// about 8% below untraced): 10.10 t/s, against 2.68 before the move and 9.28 with the knob off.
 static bool moe_cpu_job_input_marker_in_play() {
     return moe_cpu_job_device_signal_enabled();
 }
@@ -24779,16 +24784,19 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
     return join;
 }
 
-// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or 0 joins every CPU expert pool job with a
-// host task; non-zero lets the job's scatter wait on a host-signalled Level Zero event the job signals after its last
-// write, and puts the job's input marker in play (moe_cpu_job_input_marker_in_play). Default off (llama.cpp-nqbe): with
-// it on, Qwen3.8 IQ3_XXS decode on the B70 without -c (12 KV layers on the host, direct path) fell to 2.7 t/s from 9.7,
-// which is the marker's cost, while at -c 4096 it rose to 13.3 from 9.0. The first prompt graph hang that first turned
-// it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
+// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or non-zero lets a CPU expert pool job's
+// scatter wait on a host-signalled Level Zero event the job signals after its last write, and puts the job's input
+// marker in play (moe_cpu_job_input_marker_in_play); =0, an empty value or a non-numeric value (the parse is atoi)
+// joins every job with a host task, as before. Default on (llama.cpp-nqbe): Qwen3.8 IQ3_XXS decode on the B70 (12 KV
+// layers on the host without -c, direct path), traced with GGML_SYCL_MOE_IDS_COPY_TRACE=1 (about 8% below untraced),
+// measured 10.10 t/s with it on against 9.28 off without -c, and 13.15 against 8.94 at -c 4096 (2026-10-18). It was off
+// while the marker's word sat in the boundary-checked host STAGING zone, which made every graph boundary walk the
+// allocation registry (2.68 t/s with it on, see moe_cpu_job_input_marker_in_play). The first prompt graph hang that
+// first turned it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
 static bool moe_cpu_job_device_signal_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");
-        return env != nullptr && std::atoi(env) != 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
     return enabled;
 }
@@ -44117,7 +44125,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         // Host allocation path: planner-says-host layers, or layout-says-host
         // (cold tier).  Use unified_alloc with must_host_pinned=true so the
         // allocator deterministically routes through the HOST arena's KV zone
-        // (alloc_role::KV → host_zone_id::KV in select_zone() at
+        // (alloc_role::KV → host_zone_id::KV in unified_alloc_host_zone() at
         // unified-cache.cpp:5719).  The bare unified_cache_allocate shorthand
         // tries DEVICE FIRST and only falls back to host on budget exhaustion,
         // which silently put planner-says-host layers on device whenever VRAM
@@ -47142,16 +47150,19 @@ static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffe
     auto * cache = ggml_sycl::get_unified_cache_for_device(get_current_device_id());
     if (cache && cache->host_zones_configured()) {
         // Mirror the zone-selection logic `alloc_buffer` actually reaches
-        // (unified-cache.cpp's `select_zone`, inside `unified_alloc`):
-        //   role == WEIGHT || cat == HOST_COMPUTE || cat == EXPERT_CACHE -> WEIGHT
+        // (unified-cache.cpp's `unified_alloc_host_zone`, used by `unified_alloc`):
+        //   role == WEIGHT || cat == HOST_COMPUTE || cat == EXPERT_CACHE
+        //     || constraints.persistent_owner                            -> WEIGHT
         //   otherwise                                                    -> STAGING
+        // (This buft never sets persistent_owner; its HOST_COMPUTE category
+        // already takes the WEIGHT branch.)
         // `alloc_buffer` unconditionally sets
         // `req.intent.category = ggml_sycl::runtime_category::HOST_COMPUTE` for
-        // every buffer this buft allocates, and select_zone's WEIGHT branch is
+        // every buffer this buft allocates, and unified_alloc_host_zone's WEIGHT branch is
         // checked BEFORE any role-only STAGING fallback, so a HOST_COMPUTE
         // category request routes to WEIGHT unconditionally here -- regardless
         // of role, in_model_load, or weights_evictable. This function used to
-        // re-derive alloc_buffer's ROLE computation instead of select_zone's
+        // re-derive alloc_buffer's ROLE computation instead of unified_alloc_host_zone's
         // actual ZONE decision -- a role-only ternary (WEIGHT when
         // in_model_load was set or weights_evictable, STAGING otherwise) --
         // so once in_model_load went false after model load, it picked

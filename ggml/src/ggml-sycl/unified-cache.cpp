@@ -17638,6 +17638,9 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
         req.intent.category                     = runtime_category::CONTROL;
         req.intent.cohort_id                    = "cpu_job_input_marker";
         req.intent.constraints.must_host_pinned = true;
+        // The word lives as long as the cache, so it must not sit in a host zone every graph boundary checks for
+        // emptiness (llama.cpp-nqbe).
+        req.intent.constraints.persistent_owner = true;
         allocation_result allocation            = unified_allocate_owner(req);
         if (!allocation) {
             *why = CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED;
@@ -18439,6 +18442,40 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
     return total;
 }
 
+// The host zone a zone-managed host-pinned request lands in, by its owner's lifetime. KV spills and KV go to KV.
+// Owners that outlive a graph go to WEIGHT, which host_zone_settle() never sweeps: permanent weight data, persistent
+// host-compute owners, expert-cache pools, and any request that declares a persistent owner
+// (alloc_constraints::persistent_owner, llama.cpp-nqbe). Transient EXPERT_STAGING goes to SCRATCH and must be released
+// by its scoped smart-handle owner before the graph boundary. Everything else goes to STAGING, which must be empty at
+// every graph boundary. The KV and EXPERT_STAGING choices come first, so a persistent owner with either role would never
+// reach WEIGHT: that combination is asserted against rather than routed.
+//
+// Role decides before category: role == EXPERT_STAGING must route to SCRATCH even when category == HOST_COMPUTE
+// (e.g. a MoE CPU fallback's expert staging slab, which is both). The WEIGHT branch's category disjuncts were added to
+// route persistent host-compute/expert-cache owners to WEIGHT (9a0670712), but being checked first meant they shadowed
+// EXPERT_STAGING's role for any request that also carried HOST_COMPUTE/EXPERT_CACHE, silently overriding the "must be
+// released by scoped smart-handle owners before reset" contract above with a zone that is *not* swept by
+// host_zone_settle() -- llama.cpp-0igs / llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
+static host_zone_id unified_alloc_host_zone(const alloc_request & req,
+                                            runtime_category      cat,
+                                            bool                  kv_spill_to_host) noexcept {
+    // persistent_owner is a lifetime claim, not a routing preference. WEIGHT is the one host zone that holds an owner
+    // outliving every graph, so a persistent request that would land in KV or SCRATCH is a defect.
+    GGML_ASSERT(!req.intent.constraints.persistent_owner || (!kv_spill_to_host && req.intent.role != alloc_role::KV &&
+                                                             req.intent.role != alloc_role::EXPERT_STAGING));
+    if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
+        return host_zone_id::KV;
+    }
+    if (req.intent.role == alloc_role::EXPERT_STAGING) {
+        return host_zone_id::SCRATCH;
+    }
+    if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
+        cat == runtime_category::EXPERT_CACHE || req.intent.constraints.persistent_owner) {
+        return host_zone_id::WEIGHT;
+    }
+    return host_zone_id::STAGING;
+}
+
 bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // Non-null only for the narrow allocator-internal owner adapter. Broad
     // legacy callers continue to receive alloc_handle without gaining a way to
@@ -18828,37 +18865,6 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         auto * ucache =
             !req.intent.constraints.require_host_usm_base ? get_unified_cache_for_device(req.device) : nullptr;
         if (!ptr && ucache) {
-            // Route to the correct host zone based on lifetime. KV spills go to
-            // KV; permanent weight data, persistent host-compute owners, and
-            // expert-cache pools go to WEIGHT so graph-boundary STAGING/SCRATCH
-            // resets cannot reclaim live owners. Transient EXPERT_STAGING
-            // remains SCRATCH and must be released by scoped smart-handle
-            // owners before reset.
-            //
-            // role decides before category: role == EXPERT_STAGING must route
-            // to SCRATCH even when category == HOST_COMPUTE (e.g. a MoE CPU
-            // fallback's expert staging slab, which is both). The WEIGHT
-            // branch's category disjuncts were added to route persistent
-            // host-compute/expert-cache owners to WEIGHT (9a0670712), but
-            // being checked first meant they shadowed EXPERT_STAGING's role
-            // for any request that also carried HOST_COMPUTE/EXPERT_CACHE,
-            // silently overriding the "must be released by scoped smart-
-            // handle owners before reset" contract above with a zone that is
-            // *not* swept by host_zone_settle() -- llama.cpp-0igs /
-            // llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
-            auto select_zone = [&]() {
-                if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
-                    return host_zone_id::KV;
-                }
-                if (req.intent.role == alloc_role::EXPERT_STAGING) {
-                    return host_zone_id::SCRATCH;
-                }
-                if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
-                    cat == runtime_category::EXPERT_CACHE) {
-                    return host_zone_id::WEIGHT;
-                }
-                return host_zone_id::STAGING;
-            };
             // CRITICAL: unified_alloc() must return a pointer whose [ptr, ptr+size)
             // is fully mapped and contiguous in the process address space.
             // `sycl::malloc_host` chunks are NOT guaranteed to be adjacent in
@@ -18928,7 +18934,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     ptr = ucache->host_pool_alloc(
                         alloc_size, req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT);
                 } else {
-                    host_zone_id pool_zone = select_zone();
+                    host_zone_id pool_zone = unified_alloc_host_zone(req, cat, kv_spill_to_host);
                     ptr                    = try_zone_alloc_contiguous(pool_zone);
                     if (ptr) {
                         zone_managed                = true;
@@ -18950,7 +18956,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     uses_pinned_pool = true;
                 }
             } else if (ucache->host_zones_configured()) {
-                host_zone_id zone = select_zone();
+                host_zone_id zone = unified_alloc_host_zone(req, cat, kv_spill_to_host);
                 ptr               = try_zone_alloc_contiguous(zone);
                 zone_managed      = (ptr != nullptr);
                 if (zone_managed) {
@@ -24032,6 +24038,47 @@ static size_t runtime_registry_scan_host_zone_locked(host_zone_id            zon
     return live_allocations;
 }
 
+// What one refused host-zone settle reports, from the count of the zone's earlier refusals.
+struct host_zone_refusal_report {
+    bool log_detail = false;  // name the zone's rows: the first 4 refusals of the zone
+    bool warn       = false;  // print the refusal WARN, with the oldest live epoch: the first 8
+    bool scan       = false;  // enumerate the registry, for either of those or for an active zone audit
+};
+
+// Takes the report of a zone's next refusal and counts it. The per-allocation dump names the owner, which is the
+// diagnostic that matters, but it is one stderr line each and a refusal returns rather than aborting, so it is kept to
+// the first few refusals, and the WARN to a few more. Past both, a refusal reports nothing, so it does not enumerate
+// the registry unless a zone audit wants the inventory (llama.cpp-nqbe). The count stops at the WARN budget: past it
+// the count decides nothing, and one bumped at every graph boundary for the life of the process would wrap.
+static host_zone_refusal_report host_zone_refusal_take(std::atomic<int> & refusals, bool audit_active) noexcept {
+    constexpr int detail_budget = 4;
+    constexpr int warn_budget   = 8;
+    int           index         = refusals.load(std::memory_order_relaxed);
+    if (index < warn_budget) {
+        index = refusals.fetch_add(1, std::memory_order_relaxed);
+    }
+    host_zone_refusal_report report{};
+    report.log_detail = index < detail_budget;
+    report.warn       = index < warn_budget;
+    report.scan       = report.log_detail || report.warn || audit_active;
+    return report;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+host_zone_refusal_census allocation_registry_test_host_zone_refusals(int refusals, bool audit_active) noexcept {
+    std::atomic<int>         count{ 0 };
+    host_zone_refusal_census census{};
+    for (int i = 0; i < refusals; i++) {
+        const host_zone_refusal_report report = host_zone_refusal_take(count, audit_active);
+        census.refusals_named += report.log_detail ? 1 : 0;
+        census.refusals_warning += report.warn ? 1 : 0;
+        census.refusals_scanning += report.scan ? 1 : 0;
+    }
+    census.count = count.load(std::memory_order_relaxed);
+    return census;
+}
+#endif
+
 void unified_cache::host_zone_settle(host_zone_id zone) {
     // Phase 0 escape audit. Declared FIRST, ahead of the reservation
     // early-return just below, so the RAII destructor still records a visit
@@ -24105,23 +24152,23 @@ void unified_cache::host_zone_settle(host_zone_id zone) {
         // zone's first-ever refusal -- and a first occurrence is exactly what has
         // to be visible.  Not hypothetical: STAGING alone reaches 7 refusals in one
         // multi-model run, so it would exhaust a shared budget by itself.
-        static std::atomic<int>     refusal_logs[static_cast<int>(host_zone_id::COUNT)]{};
-        std::atomic<int> &          zone_logs        = refusal_logs[static_cast<int>(zone)];
-        // The per-allocation dump names the owner, which is the diagnostic that
-        // matters -- but it is one stderr line each and this path now returns
-        // instead of aborting, so keep it only for the first few refusals, and
-        // bound it within a single refusal too.
-        const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      live_allocations = 0;
-        uint64_t                    oldest_epoch     = new_epoch;
-        // A clean settle (the normal case: once per graph) is one counter read. Only a zone that has a row pays for the
-        // enumeration, which exists to explain the refusal.
+        static std::atomic<int> refusal_logs[static_cast<int>(host_zone_id::COUNT)]{};
+        std::atomic<int> &      zone_refusals = refusal_logs[static_cast<int>(zone)];
+        uint64_t                oldest_epoch  = new_epoch;
+        // A clean settle (the normal case: once per graph) is one counter read, and so is a refusal once its
+        // diagnostics are spent. The registry is enumerated only for what a refusal reports (host_zone_refusal_take):
+        // a row that never leaves the zone would otherwise make every graph boundary walk the whole registry under
+        // its mutex, on the submitting thread (llama.cpp-nqbe). The counter is non-zero exactly when the zone has a
+        // row, so the refusal itself needs no enumeration.
         if (runtime_registry_host_zone_live_locked(zone)) {
-            live_allocations =
-                runtime_registry_scan_host_zone_locked(zone, log_detail, epoch_tracked, audit, oldest_epoch);
-        }
-        if (live_allocations > 0) {
-            if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            const host_zone_refusal_report report           = host_zone_refusal_take(zone_refusals, audit.active());
+            // The row count the WARN prints. The scan gives it, and the scan runs whenever the WARN is due.
+            size_t                         live_allocations = 0;
+            if (report.scan) {
+                live_allocations =
+                    runtime_registry_scan_host_zone_locked(zone, report.log_detail, epoch_tracked, audit, oldest_epoch);
+            }
+            if (report.warn) {
                 if (epoch_tracked) {
                     GGML_LOG_WARN(
                         "[UNIFIED-CACHE] refusing %s host_zone_boundary_check with %zu live registered allocations "
@@ -31468,7 +31515,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     constexpr size_t k_scratch_headroom      = 32ull * 1024ull * 1024ull;
     constexpr double k_weight_headroom_ratio = 1.2;
     // llama.cpp-glkg: the WEIGHT zone is where every runtime HOST_COMPUTE
-    // request lands (select_zone() in unified_alloc routes role==WEIGHT OR
+    // request lands (unified_alloc_host_zone() routes role==WEIGHT OR
     // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
     // that includes llama_context::output_reserve()'s logits/embd host
     // buffer plus the server's prompt-checkpoint reads after model load.

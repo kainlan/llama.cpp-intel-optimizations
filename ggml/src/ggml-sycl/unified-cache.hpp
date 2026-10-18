@@ -6541,6 +6541,16 @@ struct alloc_constraints {
     // slice.  Some Level Zero copy paths need the host pointer to be a
     // driver-visible USM allocation base, not an interior TLSF suballocation.
     bool         require_host_usm_base      = false;
+    // The allocation's owner outlives every graph: it is released at model or cache teardown, never by the graph that
+    // first asked for it. A host-zone request carrying it goes to the WEIGHT host zone, which no graph boundary checks
+    // and host_zone_settle() never settles. It must carry neither role KV nor role EXPERT_STAGING (nor be a KV spill):
+    // those choose the KV and SCRATCH zones before WEIGHT is considered, so unified_alloc_host_zone() asserts against
+    // the combination. The host STAGING and SCRATCH zones must be empty at every graph boundary, so one row that lives
+    // for the process there makes every boundary check refuse (llama.cpp-nqbe). Role alone cannot say this: CONTROL
+    // also names scoped host transients, which belong in STAGING so a leaked one is still caught at the boundary. Set
+    // on such a transient, the flag would hide exactly that leak, so its setters are pinned
+    // (tests/test-sycl-host-zone-boundary-owner-source.py).
+    bool         persistent_owner           = false;
     // When arena is active and prefer_vram_zone != COUNT, unified_alloc routes
     // through that VRAM zone (zone_alloc) instead of raw device malloc.
     // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.
@@ -7003,6 +7013,19 @@ bool   allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept;
 size_t allocation_registry_test_span_irregular_rows() noexcept;
 size_t allocation_registry_test_rows_scanned() noexcept;
 void   allocation_registry_test_reset_rows_scanned() noexcept;
+
+// llama.cpp-nqbe: what `refusals` successive refusals of one host zone report, from a fresh count, through the helper
+// host_zone_settle() takes each refusal's report from: how many name their rows, print the WARN and enumerate the
+// registry, and the zone's count after them.
+struct host_zone_refusal_census {
+    size_t refusals_named    = 0;
+    size_t refusals_warning  = 0;
+    size_t refusals_scanning = 0;
+    int    count             = 0;
+};
+
+host_zone_refusal_census allocation_registry_test_host_zone_refusals(int refusals, bool audit_active) noexcept;
+
 // llama.cpp-ii25: rewrite a registered row's size behind the index's back (the next lookup inside that range must abort).
 bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;

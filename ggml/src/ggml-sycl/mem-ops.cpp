@@ -347,7 +347,7 @@ static std::atomic<uint64_t> g_stage_graph_self_seen{ 0 };
 // mistake silently.
 // WHICH ZONE THE REQUEST ACTUALLY USED (llama.cpp-13u6).  zone_used/zone_cap
 // sample STAGING, but every request traced here carries role == EXPERT_STAGING,
-// and select_zone() routes that role to SCRATCH before the WEIGHT/STAGING
+// and unified_alloc_host_zone() routes that role to SCRATCH before the WEIGHT/STAGING
 // disjuncts are even consulted (unified-cache.cpp, "role decides before
 // category").  So zone_used has been reporting occupancy of a zone these
 // allocations never touch: a zone that is FULL and a zone that is untouched

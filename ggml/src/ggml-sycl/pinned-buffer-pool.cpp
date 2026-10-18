@@ -46,7 +46,7 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     // for the process lifetime (see shutdown() -- released only at module
     // shutdown), not a per-graph ephemeral staging buffer. alloc_role::
     // EXPERT_STAGING is force-routed to the host SCRATCH zone by
-    // select_zone() specifically so that genuinely short-lived EXPERT_STAGING
+    // unified_alloc_host_zone() specifically so that genuinely short-lived EXPERT_STAGING
     // leaks stay visible to host_zone_boundary_check()'s per-graph live scan
     // (that routing exists on purpose -- see 9a0670712 / llama.cpp-0igs /
     // llama.cpp-7f2e, which fixed the opposite bug of persistent allocations
@@ -58,7 +58,7 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     // via the WEIGHT zone's own per-allocation host_zone_free() TLSF reclaim).
     // role=COMPUTE + category=EXPERT_CACHE mirrors the existing
     // g_retained_scratch precedent in cpu-dispatch.cpp (role=COMPUTE,
-    // category=HOST_COMPUTE): both hit select_zone()'s category-based WEIGHT
+    // category=HOST_COMPUTE): both hit unified_alloc_host_zone()'s category-based WEIGHT
     // branch, which is never swept by host_zone_settle(), while leaving the
     // EXPERT_STAGING-role-first SCRATCH routing that 0igs/7f2e protect
     // untouched for every other (genuinely ephemeral) EXPERT_STAGING caller.

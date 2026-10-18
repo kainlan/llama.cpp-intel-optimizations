@@ -24,6 +24,9 @@
 //     (an "irregular" row; none occurs in practice, the fallback keeps the old key-in-span semantics for one);
 //   - both agree with a full scan of the registry (the consistency audit checks the counters too).
 //
+// llama.cpp-nqbe adds the refused settle's side: a refusal enumerates the registry only for what it reports (the first
+// 8 refusals of a zone, or an active zone audit), and the zone's refusal count stops at that budget.
+//
 // The pure index logic is tests/test-address-range-index.cpp; this proves the registry is wired to it.
 
 #include "ggml.h"
@@ -354,6 +357,23 @@ void test_clean_settle_scans_no_rows() {
     check(allocation_registry_test_size() == 0 && allocation_registry_test_index_consistent(), "registry empty again");
 }
 
+// What a REFUSED settle pays (llama.cpp-nqbe). A row that never leaves a boundary-checked zone makes every graph
+// boundary refuse, so the enumeration that explains a refusal must stop once nothing is left to explain: it serves the
+// first 4 refusals' detail lines and the first 8 refusals' WARN, and an active zone audit's inventory.
+void test_refused_settle_scans_only_for_its_report() {
+    printf("a refused settle enumerates the registry only for what it reports:\n");
+    const host_zone_refusal_census quiet = allocation_registry_test_host_zone_refusals(1000, false);
+    check(quiet.refusals_named == 4, "the first 4 refusals name their rows");
+    check(quiet.refusals_warning == 8, "the first 8 print the WARN");
+    check(quiet.refusals_scanning == 8, "and only those 8 of 1000 enumerate the registry");
+    check(quiet.count == 8, "the zone's count stops at the WARN budget, so a refusal at every boundary cannot wrap it");
+    const host_zone_refusal_census audited = allocation_registry_test_host_zone_refusals(1000, true);
+    check(audited.refusals_scanning == 1000 && audited.refusals_named == 4 && audited.refusals_warning == 8,
+          "an active zone audit enumerates on every refusal, and logs no more than without it");
+    const host_zone_refusal_census none = allocation_registry_test_host_zone_refusals(0, false);
+    check(none.refusals_scanning == 0 && none.count == 0, "no refusal, no enumeration");
+}
+
 void test_span_liveness() {
     printf("zone-span liveness (a row's KEY in [lo, hi)):\n");
     const uintptr_t chunk = 0x800000;
@@ -584,6 +604,7 @@ int main() {
     test_host_zone_counters();
     test_span_liveness();
     test_clean_settle_scans_no_rows();
+    test_refused_settle_scans_only_for_its_report();
     test_settle_queries_against_oracle();
     if (g_failures != 0) {
         printf("FAILED: %d check(s)\n", g_failures);

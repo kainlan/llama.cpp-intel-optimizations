@@ -69,12 +69,18 @@ THE CONTRACT.  With comments blanked:
      job's outputs, which teardown frees once the queues drain, so the job signals itself
      when it ends.
   H. GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is read once, into a function-local static,
-     default off (llama.cpp-nqbe: with it on, which also puts the input marker in
-     play, Qwen3.8 IQ3_XXS decode on the B70 fell to 2.7 from 9.7 t/s without -c, the
-     marker's cost, and rose to 13.3 from 9.0 at -c 4096; the llama.cpp-m5v8 hang on
-     that path is fixed by the input marker, llama.cpp-42zj), and is the only getenv
-     of that name; the catalog row documents =1; the [MOE-HOSTPATH-WAITS]
-     line prints devsig=, counted under the trace only.
+     default on (llama.cpp-nqbe: with it on, which also puts the input marker in play,
+     Qwen3.8 IQ3_XXS decode on the B70, traced with GGML_SYCL_MOE_IDS_COPY_TRACE=1
+     (about 8% below untraced), measured 10.10 t/s without -c against 9.28 off, and
+     13.15 against 8.94 at -c 4096, 2026-10-18.  It was off while the marker's word sat
+     in the host STAGING zone that every graph boundary checks for emptiness, so every
+     boundary refused and walked the allocation registry, 2.68 t/s with it on; the word
+     is now a persistent owner in the WEIGHT host zone.  The llama.cpp-m5v8 hang on
+     that path is fixed by the input marker, llama.cpp-42zj), and is the only getenv of
+     that name; the catalog row documents =0, its default, its default's reason (the
+     boundary-checked zone, the persistent owner, and the traced measurement after the
+     move) and the atoi parse; the [MOE-HOSTPATH-WAITS] line prints devsig=, counted
+     under the trace only.
   I. No host waits on the new events.  The flush body and the ring section of
      unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
      wait, wait_and_throw, wait_for or wait_until, no get_info<...> and name neither
@@ -538,19 +544,29 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
     code = blank_comments(backend)
     body, _ = body_of(code, KNOB_SIG, "H")
     if not re.search(r"static const bool enabled = \[\] \{ const char \* env = std::getenv\(\"" + KNOB +
-                     r"\"\); return env != nullptr && std::atoi\(env\) != 0; \}\(\); return enabled;", flat(body)):
-        fail("H", f"{KNOB} is not read once into a function-local static, default off: with it on, which also "
-                  "puts the input marker in play, Qwen3.8 IQ3_XXS decode on the B70 fell to 2.7 from 9.7 t/s "
-                  "without -c, the marker's cost, and rose to 13.3 from 9.0 at -c 4096 (llama.cpp-nqbe); the "
-                  "llama.cpp-m5v8 hang on that path is fixed by the input marker (llama.cpp-42zj)")
+                     r"\"\); return env == nullptr \|\| std::atoi\(env\) != 0; \}\(\); return enabled;", flat(body)):
+        fail("H", f"{KNOB} is not read once into a function-local static, default on: with it on, which also puts "
+                  "the input marker in play, Qwen3.8 IQ3_XXS decode on the B70, traced with "
+                  "GGML_SYCL_MOE_IDS_COPY_TRACE=1 (about 8% below untraced), measured 10.10 t/s without -c against "
+                  "9.28 off, and 13.15 against 8.94 at -c 4096 (llama.cpp-nqbe, 2026-10-18). It was off while the "
+                  "marker's word sat in a boundary-checked host zone (2.68 t/s with it on). The llama.cpp-m5v8 hang on "
+                  "that path is fixed by the input marker (llama.cpp-42zj)")
     n = sum(len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", blank_comments(s)))
             for s in sources.values() if KNOB in s)
     n += len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", code))
     if n != 1:
         fail("H", f"{n} getenv calls of {KNOB}; want one")
-    rows = [ln for ln in doc.splitlines() if ln.startswith(f"| `{KNOB}=1`")]
-    if len(rows) != 1 or "| OFF |" not in rows[0] or "`devsig=" not in rows[0] or "`atoi`" not in rows[0]:
-        fail("H", f"the catalog has no single {KNOB}=1 row with its default, devsig= and the atoi parse")
+    rows = [ln for ln in doc.splitlines() if ln.startswith(f"| `{KNOB}=0`")]
+    if len(rows) != 1 or "| ON |" not in rows[0] or "`devsig=" not in rows[0] or "`atoi`" not in rows[0]:
+        fail("H", f"the catalog has no single {KNOB}=0 row with its default, devsig= and the atoi parse")
+    elif not all(s in rows[0] for s in ("Default on again (llama.cpp-nqbe)", "host `STAGING` zone",
+                                        "`alloc_constraints::persistent_owner`", "`WEIGHT` host zone",
+                                        "(traced, `-t 4`", "2.68 t/s on master", "10.10 t/s with the word moved",
+                                        "9.28 t/s with the knob off")):
+        fail("H", f"the catalog's {KNOB}=0 row does not give its default's reason: that the default is on again, "
+                  "that the input marker's word sat in the boundary-checked host STAGING zone and is now a persistent "
+                  "owner in the WEIGHT host zone, and what the knob measured after the move, traced: 2.68 t/s on "
+                  "master, 10.10 with the word moved, 9.28 with the knob off (llama.cpp-nqbe)")
     cbody, _ = body_of(code, COUNT_SIG, "H")
     if flat(cbody).strip() != ("if (!moe_hostpath_waits_enabled()) { return; } "
                                "g_moe_hostpath_waits.joins_device_signal += 1;"):
@@ -755,11 +771,11 @@ def check_gates(s: dict) -> None:
         if not re.search(r"\bw\." + re.escape(field).replace("\\ ", r"\s*"), rbf):
             fail("B8", f"w.{field.split()[0]} is not reset with the token's counts")
     trace = [ln for ln in s["doc"].splitlines() if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1")]
-    knob = [ln for ln in s["doc"].splitlines() if ln.startswith(f"| `{KNOB}=1`")]
+    knob = [ln for ln in s["doc"].splitlines() if ln.startswith(f"| `{KNOB}=0`")]
     if len(trace) != 1 or not all(f in trace[0] for f in ("`B8`", "`gate_waits=`", "`gate_sleep_us=`", "`driver_us=`")):
         fail("B8", "the catalog's trace row does not name B8 and its gate_waits=, gate_sleep_us= and driver_us= split")
     if len(knob) != 1 or "gate" not in knob[0]:
-        fail("B8", f"the catalog's {KNOB}=1 row does not say that the host waits sleep on the jobs' gates")
+        fail("B8", f"the catalog's {KNOB}=0 row does not say that the host waits sleep on the jobs' gates")
     gsf = flat(gs).strip()
     if not gsf.startswith("ggml_sycl_cpu_job_gate_sleep sleep; sleep.t_begin = moe_hostpath_wait_begin(); "
                           "sleep.gates = ") or \
@@ -866,13 +882,13 @@ def check_queue_waits(s: dict) -> None:
         if not re.search(r"\bw\." + re.escape(field).replace("\\ ", r"\s*"), rbf):
             fail("B9", f"w.{field.split()[0]} is not reset with the token's counts")
     trace = [ln for ln in s["doc"].splitlines() if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1")]
-    knob = [ln for ln in s["doc"].splitlines() if ln.startswith(f"| `{KNOB}=1`")]
+    knob = [ln for ln in s["doc"].splitlines() if ln.startswith(f"| `{KNOB}=0`")]
     if len(trace) != 1 or not all(f in trace[0] for f in ("B1..B9", "`B9`", "`queue_gate_waits=`",
                                                           "`queue_gate_sleep_us=`", "`queue_driver_us=`")):
         fail("B9", "the catalog's trace row does not name B9 and its queue_gate_waits=, queue_gate_sleep_us= and "
                    "queue_driver_us= split")
     if len(knob) != 1 or "`ggml_sycl_trace_queue_wait`" not in knob[0]:
-        fail("B9", f"the catalog's {KNOB}=1 row does not say that the graph code's queue waits sleep on the gates")
+        fail("B9", f"the catalog's {KNOB}=0 row does not say that the graph code's queue waits sleep on the gates")
 
 
 def read_sources(root: Path) -> dict:
@@ -995,14 +1011,22 @@ def self_test(s: dict) -> int:
          sub(r"ggml_sycl::cpu_job_signal_signal_all\(\);", ";")),
         ("G", "pool", "detach signals every ring",
          sub(r"(\n(\s*))t\.detach\(\);", r"\1ggml_sycl::cpu_job_signal_signal_all();\1t.detach();")),
-        ("H", "backend", "knob default on",
-         sub(r'return env != nullptr && std::atoi\(env\) != 0;'
+        ("H", "backend", "knob default off",
+         sub(r'return env == nullptr \|\| std::atoi\(env\) != 0;'
              r'(\s*\}\(\);\s*return enabled;\s*\}\s*\n\s*// Whether the scatter)',
-             r'return env == nullptr || std::atoi(env) != 0;\1')),
+             r'return env != nullptr && std::atoi(env) != 0;\1')),
         ("H", "backend", "knob read per call",
          sub(r'static const bool enabled = \[\] \{\n(\s*)const char \* env = std::getenv\("' + KNOB + r'"\);',
              r'const bool enabled = [] {\n\1const char * env = std::getenv("' + KNOB + r'");')),
-        ("H", "doc", "catalog row lost", sub(r"\| `" + KNOB + r"=1`", "| `" + KNOB + "_OFF`")),
+        ("H", "doc", "catalog row lost", sub(r"\| `" + KNOB + r"=0`", "| `" + KNOB + "_OFF`")),
+        ("H", "doc", "catalog row keeps the default-off reading", sub(r"Default on again \(llama\.cpp-nqbe\)",
+                                                                       "Default off (llama.cpp-nqbe)")),
+        ("H", "doc", "catalog row loses its default's reason",
+         sub(r"`alloc_constraints::persistent_owner`", "the marker's word")),
+        ("H", "doc", "catalog row does not say the measurement was traced",
+         sub(r"\(traced, `-t 4`, ", "(`-t 4`, ")),
+        ("H", "doc", "catalog row loses the measurement after the move",
+         sub(r"10\.10 t/s with the word moved", "a higher rate with the word moved")),
         ("H", "backend", "devsig counted untraced",
          sub(r"(static void moe_hostpath_waits_device_signal\(\) \{\n)\s*if \(!moe_hostpath_waits_enabled\(\)\) "
              r"\{\n\s*return;\n\s*\}\n", r"\1")),
@@ -1237,7 +1261,7 @@ def self_test(s: dict) -> int:
                              else ln for ln in t.split("\n"))),
         ("B9", "doc", "the knob row does not name the queue waits",
          lambda t: "\n".join(ln.replace("`ggml_sycl_trace_queue_wait`", "the queue waits")
-                             if ln.startswith(f"| `{KNOB}=1`") else ln for ln in t.split("\n"))),
+                             if ln.startswith(f"| `{KNOB}=0`") else ln for ln in t.split("\n"))),
         ("R", "mem_cpp", "the reaper times its waits untraced",
          sub(r"bool(\s+)on(\s+)= g_retained_drain_census_on\.load\(std::memory_order_relaxed\);", "bool on = true;")),
         ("R", "mem_cpp", "the reaper never counts a wait", sub(r"\n\s*wait_timer\.waited\(\);", "")),
@@ -1258,7 +1282,7 @@ def self_test(s: dict) -> int:
          lambda t: "\n".join(ln.replace("`reaper=`", "`reaper`") if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1")
                              else ln for ln in t.split("\n"))),
         ("B8", "doc", "the knob row does not mention the gates",
-         lambda t: "\n".join(re.sub(r"gate", "wait", ln) if ln.startswith(f"| `{KNOB}=1`") else ln
+         lambda t: "\n".join(re.sub(r"gate", "wait", ln) if ln.startswith(f"| `{KNOB}=0`") else ln
                              for ln in t.split("\n"))),
     ]
     failures, caught = [], 0

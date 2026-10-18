@@ -104,7 +104,7 @@ has four named zones distinct from `vram_zone_id`:
 
 | Zone (`host_zone_id`) | Purpose |
 |---|---|
-| `WEIGHT` | Host-resident model weights (overflow from VRAM) |
+| `WEIGHT` | Host-resident model weights (overflow from VRAM). It also holds cache-lifetime owners that no graph boundary checks: `HOST_COMPUTE` host buffer type buffers such as the logits, the `EXPERT_CACHE` pinned-buffer pool, and the CPU job input marker's word, which asks for it through `alloc_constraints::persistent_owner`. Each is freed per allocation through `unified_free_record` (llama.cpp-nqbe). |
 | `KV` | KV cache host fallback |
 | `STAGING` | DMA staging / expert bias D2H |
 | `SCRATCH` | Host-side quantization / CPU compute scratch |
@@ -505,7 +505,7 @@ completes and shared by its contexts:
 | `g_placement_publication` | `ggml-sycl.cpp:2189` | Model-scoped: an immutable published snapshot, not a mutable plan (see below) |
 | `g_placement_kv_info` | `ggml-sycl.cpp:12351` | Model-scoped: per-layer KV sizing |
 | `g_model_n_layer` | `ggml-sycl.cpp:12350` | Model-scoped |
-| `unified_cache` WEIGHT zone | `unified-cache.cpp` | Model-scoped: weight entries survive across requests |
+| `unified_cache` WEIGHT zone | `unified-cache.cpp` | Model-scoped: weight entries survive across requests. The host `WEIGHT` zone also holds cache-lifetime owners that no graph boundary checks (`HOST_COMPUTE` logits, the `EXPERT_CACHE` pinned-buffer pool, the CPU job input marker's word through `persistent_owner`), each freed per allocation through `unified_free_record` (llama.cpp-nqbe) |
 | `placement_plan::entries` | `unified-cache.hpp` | Model-scoped |
 | `placement_plan::layer_device`, `expert_device`, `kv_device` | `unified-cache.hpp` | Model-scoped |
 
