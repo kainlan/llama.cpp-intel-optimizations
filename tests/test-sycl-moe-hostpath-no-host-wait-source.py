@@ -34,12 +34,13 @@ body of the closure each hands to another thread (OFF_THREAD_SPANS: the lambda t
 on the pool worker, the lambda the join gives host_task runs on the queue's host-task thread).  A
 closure's capture list stays in the scan, since it is evaluated where the closure is built.  The gate
 fails when the closure can no longer be found, or when it is not the whole expression handed off (a
-lambda the submitting thread calls to build the closure runs there, not on the other thread).  Two
-waits inside the scanned code are excused by name in KNOWN_WAITS, each at exactly one match.  One
-predates this ticket and names the ticket that removes it.  The other is the input marker's refused-arm
+lambda the submitting thread calls to build the closure runs there, not on the other thread).  Three
+matches inside the scanned code are excused by name in KNOWN_WAITS, each at exactly one match.  One
+predates this ticket and names the ticket that removes it.  The second is the input marker's refused-arm
 fallback, which llama.cpp-42zj puts on the submitting thread on purpose: the pool worker must make no
-driver wait, and a job whose marker is not armed has no other thread to wait on.  An entry that matches
-nothing fails the gate, so the list cannot outlive the code it excuses:
+driver wait, and a job whose marker is not armed has no other thread to wait on.  The third is that
+fallback's census timer, whose `wait_timer(` reads as a wait_* helper and counts the wait as B2.  An
+entry that matches nothing fails the gate, so the list cannot outlive the code it excuses:
 
   N1. no `.get()`, `.wait(`, `::wait(`, `wait_and_throw`, `wait_for`, `wait_until` or `*_sync(` call, no
       call of a `wait_*(` helper (a census timer's `wait_timer(` declaration reads as one), and no
@@ -332,6 +333,11 @@ KNOWN_WAITS = {
         "records, the stream is not in-order or the marker word cannot be allocated or submitted.  The lead's "
         "decision on llama.cpp-42zj puts it here: a native wait on the pool worker can block on the driver's "
         "device lock behind a wait_and_throw on another thread, which deadlocked the first Qwen3.8 prompt graph"
+    ),
+    ("moe_cpu_job_prologue", "a wait_* helper"): (
+        "the census timer `moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2)` around that fallback, which is no wait "
+        "of its own: it counts the fallback as B2 on the [MOE-HOSTPATH-WAITS] line, so a run whose markers are "
+        "refused shows the submitting thread waiting a CPU job's inputs (llama.cpp-42zj)"
     ),
 }
 
@@ -1171,6 +1177,7 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N1", "prologue waits its inputs on the armed path too", pro_closure,
         "    sycl::event::wait(inputs.events);\n" + pro_closure)
     sub("N2", "refused arm's fallback wait dropped", pro_fallback, "")
+    sub("N2", "refused arm's census timer dropped", "            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n", "")
     sub("N1", "boundary wait called from a flush", "        ++g_cpu_scatter_serial;\n",
         "        ++g_cpu_scatter_serial;\n        pending_cpu_scatter_wait_prev_events(slot);\n")
     sub("N6", "boundary wait dropped from the graph-boundary flush",

@@ -33,7 +33,10 @@ THE CONTRACT.  With comments and string literals blanked:
   W4. The marker is armed on the submitting thread, and a refused arm is waited there.  moe_cpu_job_prologue takes
       the stream and, outside its closure, calls unified_cache_cpu_job_input_marker_arm once, as the condition of an
       `if` that first asks `!moe_cpu_job_input_marker_may(stream) ||`; that branch holds
-      `sycl::event::wait(inputs.events)`, and every wait outside the closure sits in it.  moe_cpu_job_input_marker_may
+      `sycl::event::wait(inputs.events)` inside the scope of a `MOE_WAIT_B2` census timer, so the waits line counts
+      it, and logs its WARN under one flag per reason (an array of flags indexed by the cpu_job_input_marker_refusal
+      the arm names), so a refusal for one reason does not hide the first refusal for another; every wait outside
+      the closure sits in that branch.  moe_cpu_job_input_marker_may
       is `!moe_cpu_job_stream_recording(stream)`, the one recording test the CPU job's three decisions share: the
       backend's flag or the stream's own state (a recorded marker would be written only at replay).
   W5. Every prologue is built with its stream: each moe_cpu_job_prologue call passes the op's stream first, and the
@@ -54,7 +57,10 @@ THE CONTRACT.  With comments and string literals blanked:
       32-bit distance (the modulo-2^32 invariant is stated beside it).  The wait reports a slow wait at most once,
       through the word's slow, once it has yielded for slow_after; the arm installs the cache's reporter, which only
       logs.  The device task depends on the job's inputs, then fences (release, system scope) before it stores the
-      serial.  The arm takes the cache's marker mutex for the whole arm; refuses a stream that is not in order before
+      serial.  The arm takes the cache's marker mutex first and releases it only in the submit's catch, which then
+      touches no marker member and logs the throw, once per process, so no arm waits on the log's lock behind
+      another; every refusal of the arm and of unified_cache_cpu_job_input_marker_arm names its reason right before
+      it returns, since the caller's log flag is chosen by it; the arm refuses a stream that is not in order before
       it allocates; zeroes the word before it publishes it; takes the next serial as the last plus one; submits every
       marker on queue_, before it records the new serial; and takes its word from the unified cache as a host-pinned
       allocation.  unified_cache_cpu_job_input_marker_arm reaches the cache through moe_join_queue_cache_of(stream),
@@ -98,7 +104,10 @@ RED for the readers drain and the slow-wait report, on 2b5fb934a (the commit tha
 The resolve-step scan (W6), the arm's serial, zeroing, in-order refusal, queue and cache (W7) and W9 were gaps: on
 2b5fb934a each of their mutants passes the pin as it stood, and fails it here.  So were a resolve step handed to
 submit_batch on a call expression (W6), the owner's other writers and the order inside each shutdown branch (W7): on
-4b162ae16 each of their mutants passes the pin as it stood.
+4b162ae16 each of their mutants passes the pin as it stood.  So were the refused arm's B2 count and its WARN once
+per reason (W4), and the arm's throw report outside the mutex and once per process, and its named refusals (W7):
+each of their mutants passes the pin as it stood on f60cc2636, with only its lock pattern widened to the
+unique_lock the arm now takes.
 """
 
 from __future__ import annotations
@@ -175,6 +184,15 @@ def enclosing_brace(code: str, pos: int) -> int:
     return -1
 
 
+def scope_end(code: str, pos: int) -> int:
+    """Where the innermost block that holds `pos` closes; the end of `code` when `pos` is at its top level."""
+    open_at = enclosing_brace(code, pos)
+    if open_at < 0:
+        return len(code)
+    body, start = block_at(code, open_at, "scope")
+    return start + len(body)
+
+
 def matching_paren(code: str, open_pos: int) -> int:
     flat_code = strip_strings(code)
     depth = 0
@@ -223,6 +241,8 @@ DRIVER_CALL = re.compile(r"^(?:wait|wait_and_throw|wait_for|throw_asynchronous|g
                          r"single_task|parallel_for|memcpy|memset_async|fill|copy|depends_on|ext_oneapi_\w+|"
                          r"ze[A-Z]\w*|ur[A-Z]\w*|mem_copy\w*|event_complete\w*)$")
 ARM = r"\bunified_cache_cpu_job_input_marker_arm\s*\("
+# The prologue's WARN for a refused arm, as its format string reads.
+REFUSAL_WARN = "its input marker was not armed (%s)"
 
 # W7: what the header's marker helpers may call. None may sleep, lock, tick the watchdog or name sycl::.
 HELPERS = {
@@ -336,6 +356,24 @@ def check_wait_inputs(s: dict[str, str]) -> None:
         if not (fstart <= w < fstart + len(fallback)):
             fail("W4", "moe_cpu_job_prologue waits on the submitting thread outside the arm's refusal branch; a host "
                        "wait there is only the fallback for a marker that was not armed")
+    fwait = re.search(r"\bsycl\s*::\s*event\s*::\s*wait\s*\(\s*inputs\s*\.\s*events\s*\)", fallback)
+    timer = re.search(r"\bmoe_hostpath_wait_timer\s+\w+\s*\(\s*MOE_WAIT_B2\s*\)\s*;", fallback)
+    if not timer or not (timer.start() < fwait.start() < scope_end(fallback, timer.start())):
+        fail("W4", "moe_cpu_job_prologue's wait for a refused arm's inputs is not inside the scope of a MOE_WAIT_B2 "
+                   "census timer: the [MOE-HOSTPATH-WAITS] line would not show the submitting thread waiting a CPU "
+                   "job's inputs")
+    latch = None
+    for m in re.finditer(r"\bif\s*\(\s*!\s*(\w+)\s*\[\s*why\s*\]\s*\.\s*exchange\s*\(\s*true\b[^)]*\)\s*\)\s*\{",
+                         fallback):
+        if REFUSAL_WARN in block_at(fallback, m.end() - 1, "W4")[0]:
+            latch = m.group(1)
+    flags = latch and re.search(r"\bstatic\s+std::atomic<bool>\s+" + latch +
+                                r"\s*\[\s*ggml_sycl\s*::\s*CPU_JOB_INPUT_MARKER_REFUSAL_COUNT\s*\]", code)
+    named = re.search(r"\bggml_sycl\s*::\s*cpu_job_input_marker_refusal\s+why\s*=", outside)
+    if not latch or not flags or not named:
+        fail("W4", "moe_cpu_job_prologue does not log a refused arm once per reason, under a flag of an array indexed "
+                   "by the cpu_job_input_marker_refusal the arm names: the first refusal for one reason would hide "
+                   "every refusal for another")
     _, maybody = definition(code, MAY_SIG, "W4")
     _, recbody = definition(code, STREAM_RECORDING_SIG, "W4")
     if not re.fullmatch(r"\s*return\s*!\s*moe_cpu_job_stream_recording\s*\(\s*stream\s*\)\s*;\s*", maybody) or \
@@ -512,7 +550,8 @@ def check_helpers(s: dict[str, str]) -> None:
                    "fence (release, system scope) before it stores the serial: the host could see the word before the "
                    "inputs, or before they completed")
     _, arm = definition(cache, ARM_METHOD_SIG, "W7")
-    lock = re.search(r"std::lock_guard<std::mutex>\s+\w+\s*\(\s*cpu_job_input_marker_mutex_\s*\)", arm)
+    lock = re.search(r"std::(?:lock_guard|unique_lock)<std::mutex>\s+(\w+)\s*\(\s*cpu_job_input_marker_mutex_\s*\)",
+                     arm)
     subm = re.search(r"\bcpu_job_input_marker_submit\s*\(", arm)
     took = re.search(r"\bcpu_job_input_marker_serial_\s*=\s*serial\s*;", arm)
     if not lock or not subm or not took or not (lock.start() < subm.start() < took.start()) or \
@@ -523,6 +562,7 @@ def check_helpers(s: dict[str, str]) -> None:
     if not (re.search(r"\bmust_host_pinned\s*=\s*true\s*;", arm) and re.search(r"\bunified_allocate_owner\s*\(", arm)):
         fail("W7", "unified_cache::arm_cpu_job_input_marker does not take its word from the unified cache as a "
                    "host-pinned owner")
+    check_arm_unlock(cache, arm, lock)
     if not re.search(r"\bconst\s+uint32_t\s+serial\s*=\s*cpu_job_input_marker_serial_\s*\+\s*1\s*;", arm):
         fail("W7", "unified_cache::arm_cpu_job_input_marker does not take the last serial plus one: a serial that does "
                    "not advance lets a later job pass on an earlier job's marker")
@@ -550,6 +590,12 @@ def check_helpers(s: dict[str, str]) -> None:
        not re.search(r"\bcache\s*->\s*arm_cpu_job_input_marker\s*\(", armfn):
         fail("W7", "unified_cache_cpu_job_input_marker_arm does not reach the cache through "
                    "moe_join_queue_cache_of(stream): a marker on another cache's queue would not follow the job's inputs")
+    for fn, body in (("unified_cache::arm_cpu_job_input_marker", arm), ("unified_cache_cpu_job_input_marker_arm", armfn)):
+        refusals = len(re.findall(r"\breturn\s+false\s*;", body))
+        named = len(re.findall(r"\*\s*why\s*=\s*CPU_JOB_INPUT_MARKER_REFUSAL_(?!COUNT\b)\w+\s*;\s*return\s+false\s*;", body))
+        if refusals == 0 or named != refusals:
+            fail("W7", f"{fn} refuses {refusals - named} time(s) without naming its reason right before it returns: "
+                       "the caller would log that refusal under another reason's flag, or not at all")
     _, cof = definition(cache, CACHE_OF_SIG, "W7")
     if not re.search(r"\bcache\s*->\s*get_queue\s*\(\s*\)\s*==\s*q\b", cof):
         fail("W7", "moe_join_queue_cache_of returns a cache whose queue_ is not the stream it was given")
@@ -566,6 +612,44 @@ def check_helpers(s: dict[str, str]) -> None:
                    (", ".join(bad) if bad else "no WARN, or something in sycl::"))
     check_marker_owner(s)
     check_shutdown_branches(cache)
+
+
+def check_arm_unlock(cache: str, arm: str, lock: re.Match) -> None:
+    """W7: the arm releases its mutex only in the submit's catch, which then touches no marker member, and logs the
+    throw there, once per process."""
+    unlocks = list(re.finditer(r"\b" + lock.group(1) + r"\s*\.\s*unlock\s*\(\s*\)\s*;", arm))
+    catch = list(re.finditer(r"\bcatch\s*\(\s*const\s+sycl::exception\s*&\s*\w+\s*\)\s*\{", arm))
+    warns = [m.start() for m in re.finditer(r"\bGGML_LOG_WARN\s*\(", arm)]
+    if len(catch) != 1 or len(unlocks) > 1:
+        fail("W7", f"unified_cache::arm_cpu_job_input_marker has {len(catch)} catch(const sycl::exception &) blocks "
+                   f"and releases its mutex {len(unlocks)} times; it catches its submit's throw once and releases "
+                   "the mutex there at most once")
+    body, start = block_at(arm, catch[0].end() - 1, "W7")
+    end = start + len(body)
+    held_until = unlocks[0].start() if unlocks else len(arm)
+    if unlocks and not (start <= held_until < end):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker releases cpu_job_input_marker_mutex_ outside its submit's "
+                   "catch: the serial and the submit must stay under it")
+    if not warns or any(w < held_until or w >= end for w in warns):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker logs a WARN with cpu_job_input_marker_mutex_ held, or "
+                   "outside its submit's catch: an arm on another thread would wait on the log's lock behind it")
+    early = re.search(r"\bcpu_job_input_marker_\w+_\b", arm[: lock.start()])
+    if early:
+        fail("W7", f"unified_cache::arm_cpu_job_input_marker uses {early.group(0)} before it takes "
+                   "cpu_job_input_marker_mutex_")
+    late = re.search(r"\bcpu_job_input_marker_\w+_\b", arm[held_until:end])
+    if late:
+        fail("W7", f"unified_cache::arm_cpu_job_input_marker uses {late.group(0)} after it released "
+                   "cpu_job_input_marker_mutex_")
+    latched = False
+    for m in re.finditer(r"\bif\s*\(\s*!\s*(\w+)\s*\.\s*exchange\s*\(\s*true\b[^)]*\)\s*\)\s*\{", body):
+        b, s0 = block_at(body, m.end() - 1, "W7")
+        if all(start + s0 <= w < start + s0 + len(b) for w in warns) and \
+           re.search(r"\bstatic\s+std::atomic<bool>\s+" + m.group(1) + r"\s*\{", cache):
+            latched = True
+    if not latched:
+        fail("W7", "unified_cache::arm_cpu_job_input_marker logs every throwing submit: once per process is enough, "
+                   "since a stream that throws once throws for every job, and the prologue logs each reason once")
 
 
 OWNER_PUBLISH = r"\bcpu_job_input_marker_owner_\s*=\s*std::move\s*\(\s*owner\s*\)\s*;"
@@ -757,6 +841,19 @@ def move(pattern: str, before: str):
     return apply
 
 
+def chain(*steps):
+    """Applies each mutation in turn; the text is unchanged unless every step applied."""
+    def apply(text: str) -> str:
+        out = text
+        for step in steps:
+            nxt = step(out)
+            if nxt == out:
+                return text
+            out = nxt
+        return out
+    return apply
+
+
 def mutants() -> list:
     marker_wait = r"(\n(\s*)ggml_sycl::cpu_job_input_marker_wait\(marker\);)"
     tick = r"(ggml_sycl::cpu_job_input_marker_wait\(marker\);)\n(\s*)ggml_sycl_watchdog_heartbeat\(\);"
@@ -800,6 +897,19 @@ def mutants() -> list:
         ("W4", "backend", "the prologue skips the recording test",
          sub(r"!moe_cpu_job_input_marker_may\(stream\) \|\|\s*", "")),
         ("W4", "backend", "a refused arm is not waited", sub(fallback, "")),
+        # The waits line counts the refused arm's wait as B2, and a refusal is logged once per reason.
+        ("W4", "backend", "a refused arm's wait is not counted", sub(r"\n\s*moe_hostpath_wait_timer wait_timer\(MOE_WAIT_B2\);", "")),
+        ("W4", "backend", "a refused arm's wait is counted as B1",
+         sub(r"moe_hostpath_wait_timer wait_timer\(MOE_WAIT_B2\);", r"moe_hostpath_wait_timer wait_timer(MOE_WAIT_B1);")),
+        ("W4", "backend", "a refused arm's timer ends before its wait",
+         sub(r"\n(\s*)(moe_hostpath_wait_timer wait_timer\(MOE_WAIT_B2\);)", r"\n\1{\n\1    \2\n\1}")),
+        ("W4", "backend", "one latch for every refusal reason",
+         chain(sub(r"g_moe_cpu_job_input_marker_refusal_logged\[ggml_sycl::CPU_JOB_INPUT_MARKER_REFUSAL_COUNT\] = \{\};",
+                   r"g_moe_cpu_job_input_marker_refusal_logged{ false };"),
+               sub(r"g_moe_cpu_job_input_marker_refusal_logged\[why\]\.exchange", r"g_moe_cpu_job_input_marker_refusal_logged.exchange"))),
+        ("W4", "backend", "every refused job is logged",
+         sub(r"if \(!g_moe_cpu_job_input_marker_refusal_logged\[why\]\.exchange\(true, std::memory_order_acq_rel\)\)",
+             r"if (true)")),
         ("W4", "backend", "the prologue also waits the inputs when the marker is armed",
          sub(r"(\n(\s*)return \[marker = std::move\(marker\),)", r"\n\2sycl::event::wait(inputs.events);\1")),
         ("W4", "backend", "the recording test misses a recording stream",
@@ -889,8 +999,9 @@ def mutants() -> list:
          sub(r"sycl::atomic_fence\(sycl::memory_order::release, sycl::memory_scope::system\)",
              r"sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device)")),
         ("W7", "cache", "the serial is submitted outside the lock",
-         sub(r"\n(\s*)std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n(\s*)if \(!cpu_job_input_marker_word_\)",
-             r"\n\1{\n\1    std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);\n\1}\n\2if (!cpu_job_input_marker_word_)")),
+         sub(r"\n(\s*)std::unique_lock<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n(\s*)if \(!cpu_job_input_marker_word_\)",
+             r"\n\1{\n\1    std::unique_lock<std::mutex> lock(cpu_job_input_marker_mutex_);\n\1}\n\2"
+             r"if (!cpu_job_input_marker_word_)")),
         ("W7", "cache", "the serial is consumed before the submit",
          move(r"\n\s*cpu_job_input_marker_serial_ = serial;", r"\n\s*try \{\n\s*cpu_job_input_marker_submit\(")),
         ("W7", "cache", "the word is not host-pinned",
@@ -905,8 +1016,29 @@ def mutants() -> list:
         ("W7", "cache", "the word is zeroed after it is published",
          move(r"\n\s*\*word->ptr\s*= 0;", r"\n\s*GGML_LOG_INFO\(\n\s*\"\[MOE-INPUT-MARKER\] CPU expert jobs wait")),
         ("W7", "cache", "an out-of-order stream is not refused",
-         sub(r"\n\s*if \(!queue_\.has_property<sycl::property::queue::in_order>\(\)\) \{\n\s*\*why = \"the stream is not "
-             r"in order[^}]*\}", "")),
+         sub(r"\n\s*if \(!queue_\.has_property<sycl::property::queue::in_order>\(\)\) \{\n\s*"
+             r"\*why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_IN_ORDER;[^}]*\}", "")),
+        # A throwing submit is logged with the mutex released, once per process, and every refusal names its reason.
+        ("W7", "cache", "the throw is logged with the mutex held",
+         sub(r"\n\s*lock\.unlock\(\);(\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)", r"\1")),
+        ("W7", "cache", "the throw is logged before the mutex is released",
+         move(r"\n\s*lock\.unlock\(\);(?=\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)",
+              r"\n\s*\*why = CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW;")),
+        ("W7", "cache", "every throw is logged",
+         sub(r"if \(!g_cpu_job_input_marker_submit_threw_logged\.exchange\(true, std::memory_order_acq_rel\)\)", r"if (true)")),
+        ("W7", "cache", "the arm releases its mutex before the submit",
+         move(r"\n\s*lock\.unlock\(\);(?=\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)",
+              r"\n\s*try \{\n\s*cpu_job_input_marker_submit\(")),
+        ("W7", "cache", "the arm reads a member before it locks",
+         sub(r"(\n(\s*)std::unique_lock<std::mutex> lock\(cpu_job_input_marker_mutex_\);)",
+             r"\n\2(void) cpu_job_input_marker_serial_;\1")),
+        ("W7", "cache", "the catch reads a member after the release",
+         sub(r"(\n(\s*)lock\.unlock\(\);)(\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)",
+             r"\1\n\2cpu_job_input_marker_tried_ = false;\3")),
+        ("W7", "cache", "a failed allocation does not name its reason",
+         sub(r"\n\s*\*why = CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED;", "")),
+        ("W7", "cache", "a stream that is not a cache's does not name its reason",
+         sub(r"\n\s*\*why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_CACHE_STREAM;", "")),
         ("W7", "cache", "the marker goes on the DMA queue",
          sub(r"cpu_job_input_marker_submit\(queue_,", r"cpu_job_input_marker_submit(*dma_queue_,")),
         ("W7", "cache", "the arm reaches device 0's cache",

@@ -10,8 +10,8 @@ behaviour, lead-run, including a record published with no scope that carries a r
 THE DEADLOCK.  With the device waiting a CPU expert job's own host-signalled event, a host wait on an event behind
 that job can take libze's lock-and-wait path: it locks a device-level mutex and holds it while it polls the device's
 progress (libze_intel_gpu.so.1.17.39758: the lock at 0x9b6ace, the wait loop around 0x9b6ca4, no unlock between).
-The job's prologue checks its input events through the same driver path and needs that mutex before it can run and
-signal.  On the B70 the retained-handle drain worker held it while waiting an ungated record's event at the first
+The job's prologue then checked its input events through the same driver path and needed that mutex before it could
+run and signal (it now waits a device-written input marker; test-sycl-cpu-job-input-wait-source.py).  On the B70 the retained-handle drain worker held it while waiting an ungated record's event at the first
 host-tiered MUL_MAT_ID of Qwen3.8's first 256-token prompt graph, so the job never started and nothing returned (4 of
 5 plain runs on 97db9565e).  The drain worker did sleep on a record's gates first, but only the CPU-job scatter flush
 gave records gates, through a scope of its own; every other publication gave the worker none.  One fact, two

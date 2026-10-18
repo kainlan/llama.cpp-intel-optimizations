@@ -24095,6 +24095,7 @@ static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_ba
 // field unconditionally.
 // ---------------------------------------------------------------------------
 using ggml_sycl::MOE_WAIT_B1;
+using ggml_sycl::MOE_WAIT_B2;
 using ggml_sycl::MOE_WAIT_B4B;
 using ggml_sycl::MOE_WAIT_B7;
 using ggml_sycl::MOE_WAIT_B8;
@@ -24590,8 +24591,9 @@ static bool moe_cpu_job_input_marker_may(sycl::queue & stream) {
     return !moe_cpu_job_stream_recording(stream);
 }
 
-// Set by the first CPU expert job whose input marker was not armed; that job is logged, the later ones are not.
-static std::atomic<bool> g_moe_cpu_job_input_marker_refusal_logged{ false };
+// One flag per refusal reason, set by the first CPU expert job whose input marker was refused for it: that job is
+// logged, the later ones refused for the same reason are not, and a job refused for another reason still is.
+static std::atomic<bool> g_moe_cpu_job_input_marker_refusal_logged[ggml_sycl::CPU_JOB_INPUT_MARKER_REFUSAL_COUNT] = {};
 
 // Runs on the pool worker, never on the submitting thread, and makes no driver call (llama.cpp-42zj): a host wait on
 // another thread may hold the driver's device lock while it polls for device work that stands behind this very job.
@@ -24613,22 +24615,27 @@ static void moe_cpu_job_wait_inputs(const ggml_sycl::cpu_job_input_marker & mark
 
 // Runs on the submitting thread, right after the job's last input on `stream`: arms the job's input marker there
 // (cpu_job_input_marker), so the worker waits its inputs with host loads. When the marker is not armed, this thread
-// waits the inputs itself before the job exists, and the worker waits nothing; the first such job is logged.
+// waits the inputs itself before the job exists, counted as B2, and the worker waits nothing; the first job refused
+// for each reason is logged.
 static std::function<void()> moe_cpu_job_prologue(sycl::queue &       stream,
                                                   moe_cpu_job_inputs  inputs,
                                                   const ggml_tensor * src0) {
     ggml_sycl::cpu_job_input_marker marker;
     if (!inputs.events.empty()) {
-        const char * why = "a command graph is recording";
+        ggml_sycl::cpu_job_input_marker_refusal why = ggml_sycl::CPU_JOB_INPUT_MARKER_REFUSAL_GRAPH_RECORDING;
         if (!moe_cpu_job_input_marker_may(stream) ||
             !ggml_sycl::unified_cache_cpu_job_input_marker_arm(stream, inputs.events, &marker, &why)) {
-            if (!g_moe_cpu_job_input_marker_refusal_logged.exchange(true, std::memory_order_acq_rel)) {
+            if (!g_moe_cpu_job_input_marker_refusal_logged[why].exchange(true, std::memory_order_acq_rel)) {
                 GGML_LOG_WARN(
                     "[MOE-INPUT-MARKER] CPU expert job %s: its input marker was not armed (%s); the submitting thread "
-                    "waits its inputs instead, and waits those of every later job refused the same way, unlogged "
+                    "waits its inputs instead, and those of every later job refused for the same reason, unlogged "
                     "(llama.cpp-42zj)\n",
-                    src0 && src0->name ? src0->name : "?", why);
+                    src0 && src0->name ? src0->name : "?", ggml_sycl::cpu_job_input_marker_refusal_text(why));
             }
+            // Counted as B2 on the [MOE-HOSTPATH-WAITS] line: the one wait for a CPU job's inputs left on this
+            // thread, so a run whose markers are refused shows what it pays. On the event-chained route it also
+            // runs before the op's device half is submitted (see there).
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);
             sycl::event::wait(inputs.events);
         }
     }
@@ -77683,7 +77690,10 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         job_inputs.events.push_back(record->ready);
     }
     // Armed before the device half: on the in-order stream the job's input marker follows its last input and not the
-    // device-expert kernel, so the CPU job runs alongside that kernel (llama.cpp-42zj).
+    // device-expert kernel, so the CPU job runs alongside that kernel (llama.cpp-42zj). A refused arm waits the
+    // inputs here instead, before the device half is submitted: the stream runs dry until this thread wakes and
+    // submits the table copy and the kernel, and this thread no longer runs ahead of the device. The CPU job,
+    // submitted after the kernel, still runs alongside it.
     std::function<void()> job_prologue = moe_cpu_job_prologue(*stream, std::move(job_inputs), src0);
 
     // A split record's device half: the table, into the planned scratch, and the device kernel over every slot.

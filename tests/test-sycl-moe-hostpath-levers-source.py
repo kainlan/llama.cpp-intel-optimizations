@@ -21,8 +21,10 @@ calls them, and calls them the way the tests assume.
      (ggml_sycl_cpu_tg_flush_pending) opens with the B7 context and the hot-group flush runs under
      the B4b context, which are the B7 and B4b figures the lane's acceptance reads.  The B2..B6
      waits, the down activation gather's among them, and the flush's CPU job join no longer run on
-     the submitting thread (llama.cpp-z4kd), so they carry no timer;
-     test-sycl-moe-hostpath-no-host-wait-source pins their absence.  The B4b context stays so that a
+     the submitting thread (llama.cpp-z4kd), so they carry no timer, apart from B2's one: the wait
+     for a CPU job's inputs when its input marker was not armed (llama.cpp-42zj);
+     test-sycl-moe-hostpath-no-host-wait-source pins their absence and excuses that one wait and its
+     timer by name.  The B4b context stays so that a
      wait brought back into the hot-group flush is counted as the hot join it would be.
 
   P. pending_any.  ggml_sycl_cpu_tg_pending_any reads every slot that can hold scatter state between

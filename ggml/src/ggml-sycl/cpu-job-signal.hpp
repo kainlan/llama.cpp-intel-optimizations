@@ -484,8 +484,9 @@ class cpu_job_signal_ref {
 // order, so the word only advances: a word at or past a job's serial means its inputs are complete. The word is 32
 // bits, which the device stores in one write, and it is compared modulo 2^32, so the serial may wrap (see
 // cpu_job_input_marker_reached for why the compare holds). The worker reads the word with acquire loads, pausing and
-// then yielding between them: no sleep, no lock and no driver call. Its job's one driver call is its signal
-// (zeEventHostSignal), which on driver 26.35 reaches no lock a host wait holds.
+// then yielding between them: no sleep, no lock and no driver call while it waits, and a wait still unanswered
+// after its slow_after is reported once through the log callback, which takes the log's lock. Its job's one driver
+// call is its signal (zeEventHostSignal), which on driver 26.35 reaches no lock a host wait holds.
 //
 // Ownership. The word's allocation belongs to the unified cache, which lets it go at teardown, after its queues
 // drained, on the tearing-down thread. A job holds only the cpu_job_input_marker_word below, so a worker that drops
@@ -493,7 +494,9 @@ class cpu_job_signal_ref {
 // lets it go it abandons the word (cpu_job_input_marker_abandon): it sets abandoned, then waits until no waiter is
 // between its test of that flag and its load of the word. A waiter counts itself in readers for exactly that span, so
 // no load of the word can follow its release, and a job still waiting then stops waiting, as the ring's halves make no
-// driver call once their ring is shut down.
+// driver call once their ring is shut down. On the two shutdown branches that run once the SYCL runtime is gone, no
+// device write will come, so that job is released to compute on inputs that may never have landed: acceptable only
+// because those branches run as the process exits.
 //
 // An unarmed marker is passed at once: a job with no input events, or one whose arm was refused, after which the
 // submitting thread waited the inputs itself.
@@ -520,6 +523,41 @@ struct cpu_job_input_marker {
 
     bool armed() const { return word != nullptr; }
 };
+
+// Why a CPU expert job's input marker was not armed. The submitting thread then waits that job's inputs itself, and
+// the first job refused for each reason is logged with that reason's text, so one reason does not hide another.
+enum cpu_job_input_marker_refusal {
+    CPU_JOB_INPUT_MARKER_REFUSAL_GRAPH_RECORDING,   // a command graph records on the stream
+    CPU_JOB_INPUT_MARKER_REFUSAL_NOT_CACHE_STREAM,  // the stream is not a unified cache's queue_
+    CPU_JOB_INPUT_MARKER_REFUSAL_NO_WORD,           // the word could not be made, or was let go at teardown
+    CPU_JOB_INPUT_MARKER_REFUSAL_NOT_IN_ORDER,      // the stream is not in order
+    CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED,      // the unified cache could not allocate the word
+    CPU_JOB_INPUT_MARKER_REFUSAL_NOT_HOST,          // the word did not resolve to host memory
+    CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW,      // submitting the marker's device task threw
+    CPU_JOB_INPUT_MARKER_REFUSAL_COUNT,
+};
+
+inline const char * cpu_job_input_marker_refusal_text(cpu_job_input_marker_refusal why) {
+    switch (why) {
+        case CPU_JOB_INPUT_MARKER_REFUSAL_GRAPH_RECORDING:
+            return "a command graph is recording";
+        case CPU_JOB_INPUT_MARKER_REFUSAL_NOT_CACHE_STREAM:
+            return "the stream is not a cache's compute stream";
+        case CPU_JOB_INPUT_MARKER_REFUSAL_NO_WORD:
+            return "its host-pinned word could not be made, or was let go at teardown";
+        case CPU_JOB_INPUT_MARKER_REFUSAL_NOT_IN_ORDER:
+            return "the stream is not in order, so its markers could be written out of serial order";
+        case CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED:
+            return "allocating its host-pinned word failed";
+        case CPU_JOB_INPUT_MARKER_REFUSAL_NOT_HOST:
+            return "its word did not resolve to host memory";
+        case CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW:
+            return "submitting its device task threw";
+        case CPU_JOB_INPUT_MARKER_REFUSAL_COUNT:
+            break;
+    }
+    return "an unknown reason";
+}
 
 // How many pauses the waiter makes before it starts yielding the core instead.
 constexpr uint32_t cpu_job_input_marker_pause_spins = 2048;
@@ -571,9 +609,11 @@ inline void cpu_job_input_marker_abandon(cpu_job_input_marker_word & w) {
     }
 }
 
-// Returns once cpu_job_input_marker_seen(m). On the pool worker: it never sleeps, takes no lock and makes no driver
-// call. It does not tick the SYCL watchdog either, so a marker that never arrives shows as the watchdog firing, and as
-// one call of the word's slow once the wait has yielded for its slow_after.
+// Returns once cpu_job_input_marker_seen(m). On the pool worker: it never sleeps, and its wait takes no lock and makes
+// no driver call. The one exception is the slow report, at most once per wait: the word's slow logs through the log
+// callback, which takes the log's lock. The wait does not tick the SYCL watchdog either, so a marker that never
+// arrives shows as the watchdog firing, and as that one call of the word's slow once the wait has yielded for its
+// slow_after.
 inline void cpu_job_input_marker_wait(const cpu_job_input_marker & m) {
     uint32_t                              spins = 0;
     bool                                  told  = false;

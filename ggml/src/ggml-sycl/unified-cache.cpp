@@ -7051,8 +7051,9 @@ bool unified_cache::shutdown_resources() {
             std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
             cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
         }
-        // llama.cpp-42zj: no device write will come; a job still waiting stops, and the word's release is
-        // shutdown-safe (mem_handle).
+        // llama.cpp-42zj: no device write will come, so a job still waiting is released to compute on inputs that
+        // may never have landed, acceptable only because the process is exiting. The ring ended first, so that
+        // job's signal makes no driver call. The word's release is shutdown-safe (mem_handle).
         {
             std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
             cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
@@ -7112,8 +7113,9 @@ bool unified_cache::shutdown_resources() {
             std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
             cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
         }
-        // llama.cpp-42zj: no device write will come; a job still waiting stops, and the word's release is
-        // shutdown-safe (mem_handle).
+        // llama.cpp-42zj: no device write will come, so a job still waiting is released to compute on inputs that
+        // may never have landed, acceptable only because the process is exiting. The ring ended first, so that
+        // job's signal makes no driver call. The word's release is shutdown-safe (mem_handle).
         {
             std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
             cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
@@ -17503,18 +17505,21 @@ static void cpu_job_input_marker_report_slow(const cpu_job_input_marker_word & w
         serial, w.device, waited_s);
 }
 
+// Set by the first input marker whose submit threw, in any cache: that throw is logged, the later ones are not.
+static std::atomic<bool> g_cpu_job_input_marker_submit_threw_logged{ false };
+
 bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
                                              cpu_job_input_marker *           out,
-                                             const char **                    why) {
-    std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+                                             cpu_job_input_marker_refusal *   why) {
+    std::unique_lock<std::mutex> lock(cpu_job_input_marker_mutex_);
     if (!cpu_job_input_marker_word_) {
         if (cpu_job_input_marker_tried_) {
-            *why = "its host-pinned word could not be made, or was let go at teardown";
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NO_WORD;
             return false;
         }
         cpu_job_input_marker_tried_ = true;
         if (!queue_.has_property<sycl::property::queue::in_order>()) {
-            *why = "the stream is not in order, so its markers could be written out of serial order";
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_IN_ORDER;
             return false;
         }
         const int     device = get_device_id_from_queue(queue_);
@@ -17529,13 +17534,13 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
         req.intent.constraints.must_host_pinned = true;
         allocation_result allocation            = unified_allocate_owner(req);
         if (!allocation) {
-            *why = "allocating its host-pinned word failed";
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED;
             return false;
         }
         mem_handle owner    = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
         const auto resolved = owner.resolve(device);
         if (!resolved.ptr || resolved.on_device) {
-            *why = "its word did not resolve to host memory";
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_HOST;
             return false;
         }
         // The word is zeroed before any arm: a reused block may hold any value, and one at or past a serial would
@@ -17556,9 +17561,16 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
     try {
         cpu_job_input_marker_submit(queue_, cpu_job_input_marker_word_->ptr, serial, after);
     } catch (const sycl::exception & e) {
-        GGML_LOG_WARN("[MOE-INPUT-MARKER] submitting a CPU expert job's input marker threw: %s (llama.cpp-42zj)\n",
-                      e.what());
-        *why = "submitting its device task threw";
+        // Logged with the mutex released, so an arm on another thread does not wait on the log's lock, and once per
+        // process: a stream that throws once throws on every job.
+        lock.unlock();
+        if (!g_cpu_job_input_marker_submit_threw_logged.exchange(true, std::memory_order_acq_rel)) {
+            GGML_LOG_WARN(
+                "[MOE-INPUT-MARKER] submitting a CPU expert job's input marker threw: %s; later throws are not "
+                "logged (llama.cpp-42zj)\n",
+                e.what());
+        }
+        *why = CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW;
         return false;
     }
     cpu_job_input_marker_serial_ = serial;
@@ -17570,10 +17582,10 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
 bool unified_cache_cpu_job_input_marker_arm(sycl::queue &                    stream,
                                             const std::vector<sycl::event> & after,
                                             cpu_job_input_marker *           out,
-                                            const char **                    why) {
+                                            cpu_job_input_marker_refusal *   why) {
     unified_cache * cache = moe_join_queue_cache_of(stream);
     if (!cache) {
-        *why = "the stream is not a cache's compute stream";
+        *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_CACHE_STREAM;
         return false;
     }
     return cache->arm_cpu_job_input_marker(after, out, why);

@@ -3496,12 +3496,13 @@ class unified_cache {
     // --- CPU expert job input markers (llama.cpp-42zj) ---
     // Arms *out on queue_ after `after` (see cpu_job_input_marker in cpu-job-signal.hpp). The host-pinned word is
     // made on first use; the serial is the next one, and the marker's device task is submitted under the same lock,
-    // so on the in-order queue_ the word only advances. False, leaving *out unarmed and *why set, when queue_ is not
-    // in order, the word cannot be made (tried once) or was let go at teardown, or the submit throws. Never waits.
+    // so on the in-order queue_ the word only advances. False, leaving *out unarmed and *why naming the reason, when
+    // queue_ is not in order, the word cannot be made (tried once) or was let go at teardown, or the submit throws;
+    // the first throw in the process is logged once the lock is released. Never waits.
     // Reached through unified_cache_cpu_job_input_marker_arm().
     bool arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
                                   cpu_job_input_marker *           out,
-                                  const char **                    why);
+                                  cpu_job_input_marker_refusal *   why);
 
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
@@ -6258,12 +6259,13 @@ std::shared_ptr<cpu_job_gate_list> cpu_job_signal_gates(const cpu_job_signal_mar
 std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & stream);
 
 // Arms a CPU expert job's input marker on `stream` after `after` (llama.cpp-42zj), through the cache whose queue_ is
-// `stream`; see unified_cache::arm_cpu_job_input_marker(). False, with *out unarmed and *why set, when `stream` is not
-// a cache's queue_ or that cache refuses; the caller then waits `after` itself. Never waits. Creates no cache.
+// `stream`; see unified_cache::arm_cpu_job_input_marker(). False, with *out unarmed and *why naming the reason, when
+// `stream` is not a cache's queue_ or that cache refuses; the caller then waits `after` itself. Never waits. Creates
+// no cache.
 bool unified_cache_cpu_job_input_marker_arm(sycl::queue &                    stream,
                                             const std::vector<sycl::event> & after,
                                             cpu_job_input_marker *           out,
-                                            const char **                    why);
+                                            cpu_job_input_marker_refusal *   why);
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // A ring on `q`'s context outside any cache, for the device test; null when the ring cannot be made.
