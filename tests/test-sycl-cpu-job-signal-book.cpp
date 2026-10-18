@@ -8,6 +8,13 @@
 // wait on it. Each case below breaks one of those conditions. The ring resets the native events with its lock released
 // (llama.cpp-42zj), so a recycle runs in two phases, and between them its entries belong to no one else.
 //
+// The ring grows its book one block at a time (llama.cpp-q0xu), and making a block calls the driver, which may block
+// behind a host wait that holds the driver's device lock behind a job whose own signal needs the ring's lock. So
+// cpu_job_signal_grow makes the block with that lock released. Its cases check that a job's signal takes the lock
+// while the block is made, that the growth is reserved and counted outside meanwhile, that a second acquirer neither
+// grows nor waits, that the ring's max still holds, and that a failed, refused or throwing growth gives everything
+// back. A std::timed_mutex stands in for the ring's lock and make() for the driver calls.
+//
 // The gate list (llama.cpp-qwn5) is the jobs' futures, which a host wait on the device sleeps on first. Its cases
 // check that a waiter sleeps rather than spins, that it holds no lock a producer needs while it sleeps, that a job
 // that failed or was destroyed unrun still lets it go, and which gates a wait and a clear cover. The copy a
@@ -34,6 +41,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -43,6 +51,8 @@ using ggml_sycl::cpu_job_gate_list;
 using ggml_sycl::cpu_job_input_marker;
 using ggml_sycl::cpu_job_input_marker_word;
 using ggml_sycl::cpu_job_signal_book;
+using ggml_sycl::cpu_job_signal_grow;
+using grow_result = ggml_sycl::cpu_job_signal_grow_result;
 using entry_state = cpu_job_signal_book::entry_state;
 
 static int g_failures = 0;
@@ -210,7 +220,8 @@ static void test_stale_generation_after_recycle() {
     b.drop(id, gen);
     recycle_all_reset(b, 0);
     uint32_t id2 = 0, gen2 = 0;
-    expect_true("the freed entry is acquired again", b.acquire(&id2, &gen2) && id2 == id);
+    expect_true("stale generation: the freed entry is acquired again", b.acquire(&id2, &gen2));
+    expect_eq("stale generation: the acquire takes the freed entry", id2, id);
     expect_true("with a new generation", gen2 != gen);
     expect_true("the old job half cannot signal the new acquire", !b.signal(id, gen));
     expect_true("the old slot half cannot make a device wait on it", !b.consume(id, gen, b.begin_flush()));
@@ -264,7 +275,8 @@ static void test_recycle_two_phase() {
                 b.at(c).state == entry_state::SIGNALLED && b.at(c).serial == cpu_job_signal_book::retired);
     expect_true("finishing an entry that is not resetting does nothing",
                 !b.recycle_finish(a, true) && !b.recycle_finish(c, true) && b.count().free == 1);
-    expect_true("the freed entry is acquired again", b.acquire(&x, &gx) && x == a);
+    expect_true("two-phase recycle: the freed entry is acquired again", b.acquire(&x, &gx));
+    expect_eq("two-phase recycle: the acquire takes the freed entry", x, a);
     expect_true("the retired one never", !b.acquire(&x, &gx));
 }
 
@@ -283,6 +295,219 @@ static void test_signal_all() {
     expect_true("it is SIGNALLED now", b.at(a).state == entry_state::SIGNALLED);
     expect_true("its job half's own signal then sends nothing", !b.signal(a, ga));
     expect_eq("a second signal_all sends nothing", b.signal_all([](uint32_t) {}), 0);
+}
+
+// --- The ring's growth ---
+
+// How long a thread standing in for a job's signal, or for a second acquirer, tries for the ring's lock. Far longer
+// than making a fake block takes; a lock held across make() keeps it for the whole call, so the try fails.
+static constexpr std::chrono::milliseconds grow_lock_try{ 1000 };
+
+// Whether another thread could take `m` just now: the calling thread may own it, so it does not try itself. A one-sided
+// check: try_lock() may fail spuriously, so false proves nothing alone; test_grow_lock_probe is its positive control.
+static bool lock_is_free(std::timed_mutex & m) {
+    bool        free = false;
+    std::thread other([&m, &free]() {
+        if (m.try_lock()) {
+            free = true;
+            m.unlock();
+        }
+    });
+    other.join();
+    return free;
+}
+
+// The probe the growth cases rely on reads an unlocked mutex as free and a held one as not.
+static void test_grow_lock_probe() {
+    std::timed_mutex m;
+    expect_true("probe: an unlocked mutex reads free", lock_is_free(m));
+    std::unique_lock<std::timed_mutex> lock(m);
+    expect_true("probe: a held mutex does not read free", !lock_is_free(m));
+}
+
+static std::function<bool()> grow_returns(bool value) {
+    return [value]() {
+        return value;
+    };
+}
+
+// The property of llama.cpp-q0xu: while the block is made, a job's signal takes the ring's lock, and sees the growth
+// reserved and counted as a driver call outside the lock. publish() runs with the lock held again, before the book
+// has the new entries; afterwards the book has them and the caller still holds the lock.
+static void test_grow_outside_lock() {
+    std::timed_mutex                   m;
+    cpu_job_signal_book                b;
+    uint32_t                           outside = 0;
+    std::unique_lock<std::timed_mutex> lock(m);
+    bool                               signal_took_lock = false;
+    bool                               seen_growing     = false;
+    uint32_t                           seen_outside     = 0;
+    bool                               publish_owns     = false;
+    bool                               publish_free     = true;
+    size_t                             publish_size     = 99;
+    const grow_result                  r                = cpu_job_signal_grow(
+        lock, b, &outside, 4, 16,
+        [&]() {
+            std::thread job([&]() {
+                std::unique_lock<std::timed_mutex> held(m, std::defer_lock);
+                if (held.try_lock_for(grow_lock_try)) {
+                    signal_took_lock = true;
+                    seen_growing     = b.growing();
+                    seen_outside     = outside;
+                }
+            });
+            job.join();
+            return true;
+        },
+        [&]() {
+            publish_owns = lock.owns_lock();
+            publish_free = lock_is_free(m);
+            publish_size = b.size();
+            return true;
+        });
+    expect_true("grow: a job's signal takes the ring's lock while the block is made", signal_took_lock);
+    expect_true("grow: and sees the growth reserved", seen_growing);
+    expect_eq("grow: and counted as a driver call outside the lock", seen_outside, 1);
+    expect_true("grow: publish runs with the caller's lock owned", publish_owns);
+    expect_true("grow: publish runs with no other thread able to take the lock", !publish_free);
+    expect_eq("grow: publish runs before the book has the new entries", publish_size, 0);
+    expect_true("grow: the result is GREW", r == grow_result::GREW);
+    expect_eq("grow: the book has the block", b.size(), 4);
+    expect_eq("grow: the outside count is back to 0", outside, 0);
+    expect_true("grow: the reservation is let go", !b.growing());
+    expect_true("grow: the caller owns the lock on return", lock.owns_lock());
+    expect_true("grow: no other thread can take the lock on return", !lock_is_free(m));
+    uint32_t id = 0, gen = 0;
+    expect_true("grow: an entry of the block is acquired", b.acquire(&id, &gen));
+    expect_true("grow: the acquired entry is in the block", id < 4);
+}
+
+// An acquirer that finds a growth in flight gets BUSY: it does not make a second block and does not wait for the
+// first, and the ring keeps one block's worth of entries.
+static void test_grow_second_acquirer_busy() {
+    std::timed_mutex                   m;
+    cpu_job_signal_book                b;
+    uint32_t                           outside = 0;
+    std::unique_lock<std::timed_mutex> lock(m);
+    bool                               second_locked = false;
+    bool                               second_made   = false;
+    grow_result                        second        = grow_result::GREW;
+    int                                made          = 0;
+    const grow_result                  r             = cpu_job_signal_grow(
+        lock, b, &outside, 4, 16,
+        [&]() {
+            made += 1;
+            std::thread acquirer([&]() {
+                std::unique_lock<std::timed_mutex> held(m, std::defer_lock);
+                if (!held.try_lock_for(grow_lock_try)) {
+                    return;
+                }
+                second_locked = true;
+                second        = cpu_job_signal_grow(
+                    held, b, &outside, 4, 16,
+                    [&]() {
+                        second_made = true;
+                        return true;
+                    },
+                    grow_returns(true));
+            });
+            acquirer.join();
+            return true;
+        },
+        grow_returns(true));
+    expect_true("busy: a second acquirer takes the ring's lock while the block is made", second_locked);
+    expect_true("busy: the second acquirer is told the ring is growing", second == grow_result::BUSY);
+    expect_true("busy: the second acquirer makes no block of its own", !second_made);
+    expect_true("busy: the first growth's result is GREW", r == grow_result::GREW);
+    expect_eq("busy: the first growth made one block", made, 1);
+    expect_eq("busy: the book grew by one block", b.size(), 4);
+    expect_eq("busy: the outside count is back to 0", outside, 0);
+}
+
+// The ring's max still bounds the book: a growth that would pass it is FULL and makes nothing.
+static void test_grow_capacity() {
+    std::timed_mutex                   m;
+    cpu_job_signal_book                b;
+    uint32_t                           outside = 0;
+    std::unique_lock<std::timed_mutex> lock(m);
+    int                                made = 0;
+    const std::function<bool()>        make = [&made]() {
+        made += 1;
+        return true;
+    };
+    const grow_result first  = cpu_job_signal_grow(lock, b, &outside, 4, 8, make, grow_returns(true));
+    const grow_result second = cpu_job_signal_grow(lock, b, &outside, 4, 8, make, grow_returns(true));
+    const grow_result third  = cpu_job_signal_grow(lock, b, &outside, 4, 8, make, grow_returns(true));
+    expect_true("capacity: a first block fits", first == grow_result::GREW);
+    expect_true("capacity: a second reaches the max", second == grow_result::GREW);
+    expect_true("capacity: a third would pass it and is FULL", third == grow_result::FULL);
+    expect_eq("capacity: FULL makes no block", made, 2);
+    expect_eq("capacity: the book stays at the max", b.size(), 8);
+    expect_true("capacity: no growth is left reserved", !b.growing());
+    expect_eq("capacity: the outside count is back to 0", outside, 0);
+}
+
+// A block that could not be made adds no entry and gives the reservation and the outside count back, without asking
+// publish(); so does a block a ring no longer live refused. A later growth then runs.
+static void test_grow_failed_and_gone() {
+    std::timed_mutex                   m;
+    cpu_job_signal_book                b;
+    uint32_t                           outside = 0;
+    std::unique_lock<std::timed_mutex> lock(m);
+    bool                               published = false;
+    const std::function<bool()>        publish   = [&published]() {
+        published = true;
+        return true;
+    };
+    const grow_result failed = cpu_job_signal_grow(lock, b, &outside, 4, 16, grow_returns(false), publish);
+    expect_true("after FAILED: the result is FAILED", failed == grow_result::FAILED);
+    expect_true("after FAILED: publish was not asked", !published);
+    expect_eq("after FAILED: the book has no entry", b.size(), 0);
+    expect_true("after FAILED: the reservation is let go", !b.growing());
+    expect_eq("after FAILED: the outside count is back to 0", outside, 0);
+    expect_true("after FAILED: the caller owns the lock", lock.owns_lock());
+    const grow_result gone = cpu_job_signal_grow(lock, b, &outside, 4, 16, grow_returns(true), grow_returns(false));
+    expect_true("after GONE: the result is GONE", gone == grow_result::GONE);
+    expect_eq("after GONE: the book has no entry", b.size(), 0);
+    expect_true("after GONE: the reservation is let go", !b.growing());
+    expect_eq("after GONE: the outside count is back to 0", outside, 0);
+    expect_true("after GONE: the caller owns the lock", lock.owns_lock());
+    const grow_result later = cpu_job_signal_grow(lock, b, &outside, 4, 16, grow_returns(true), grow_returns(true));
+    expect_true("after FAILED and GONE: a later growth is GREW", later == grow_result::GREW);
+    expect_eq("after FAILED and GONE: the later growth adds its block", b.size(), 4);
+}
+
+// A make() or publish() that throws gives the reservation and the outside count back, and the caller owns the lock
+// while the exception leaves the growth.
+static void test_grow_throw() {
+    std::timed_mutex                   m;
+    cpu_job_signal_book                b;
+    uint32_t                           outside = 0;
+    std::unique_lock<std::timed_mutex> lock(m);
+    bool                               thrown = false;
+    try {
+        (void) cpu_job_signal_grow(
+            lock, b, &outside, 4, 16, []() -> bool { throw std::runtime_error("make"); }, grow_returns(true));
+    } catch (const std::runtime_error &) {
+        thrown = true;
+    }
+    expect_true("after a throwing make: the exception leaves the growth", thrown);
+    expect_true("after a throwing make: the caller owns the lock", lock.owns_lock());
+    expect_eq("after a throwing make: the book has no entry", b.size(), 0);
+    expect_true("after a throwing make: the reservation is let go", !b.growing());
+    expect_eq("after a throwing make: the outside count is back to 0", outside, 0);
+    thrown = false;
+    try {
+        (void) cpu_job_signal_grow(lock, b, &outside, 4, 16, grow_returns(true),
+                                   []() -> bool { throw std::runtime_error("publish"); });
+    } catch (const std::runtime_error &) {
+        thrown = true;
+    }
+    expect_true("after a throwing publish: the exception leaves the growth", thrown);
+    expect_true("after a throwing publish: the caller owns the lock", lock.owns_lock());
+    expect_eq("after a throwing publish: the book has no entry", b.size(), 0);
+    expect_true("after a throwing publish: the reservation is let go", !b.growing());
+    expect_eq("after a throwing publish: the outside count is back to 0", outside, 0);
 }
 
 // --- The gate list ---
@@ -738,6 +963,12 @@ int main() {
     test_failed_reset_retires();
     test_recycle_two_phase();
     test_signal_all();
+    test_grow_lock_probe();
+    test_grow_outside_lock();
+    test_grow_second_acquirer_busy();
+    test_grow_capacity();
+    test_grow_failed_and_gone();
+    test_grow_throw();
     test_gate_sleeps();
     test_gate_failed_job();
     test_gate_cover();

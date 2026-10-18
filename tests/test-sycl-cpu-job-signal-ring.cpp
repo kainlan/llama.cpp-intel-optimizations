@@ -15,6 +15,9 @@
 // not its own event stands behind the job, and the drain worker holds the record's handles until the gate opens
 // (llama.cpp-42zj).
 //
+// A ring with every entry in use grows by one block, made with the ring's lock released (llama.cpp-q0xu), and an
+// entry of that block parks a gated command until its job signals, as an entry of the first block does.
+//
 // A CpuExpertPool job whose prologue waits its input on the device-written input marker finishes while another thread
 // waits natively on device work that stands behind that very job (llama.cpp-42zj). `--native-counterpart` runs only
 // the same case with the base's prologue, a native sycl::event::wait in the worker, and prints REPRODUCED when that
@@ -192,6 +195,46 @@ static void case_signal_all(sycl::queue & q, int * flag) {
     ggml_sycl::cpu_job_signal_recycle(mark);
     const auto c = ggml_sycl::cpu_job_signal_ring_counts_for_testing(ring);
     expect("the entry signal-all released is recycled", c.free == c.total);
+    ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(ring);
+}
+
+// Taking one entry more than the first block holds grows the ring by one block, and that block's entries are real
+// events: a command gated on one parks until its job signals (llama.cpp-q0xu).
+static void case_grow(sycl::queue & q, int * flag) {
+    std::shared_ptr<cpu_job_signal_ring> ring = ggml_sycl::cpu_job_signal_ring_create_for_testing(q);
+    if (!ring) {
+        expect("a ring is made for the growth case", false);
+        return;
+    }
+    const size_t                    block = ggml_sycl::cpu_job_signal_ring_counts_for_testing(ring).total;
+    std::vector<cpu_job_signal>     jobs(block + 1);
+    std::vector<cpu_job_signal_ref> refs(block + 1);
+    bool                            all = block > 0;
+    for (size_t i = 0; i < jobs.size() && all; ++i) {
+        all = ggml_sycl::cpu_job_signal_acquire_for_testing(ring, &jobs[i], &refs[i]);
+    }
+    expect("one entry more than the first block is acquired", all);
+    const auto c = ggml_sycl::cpu_job_signal_ring_counts_for_testing(ring);
+    expect("the ring grew by one block", c.total == 2 * block && c.acquired == block + 1);
+    if (!all) {
+        ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(ring);
+        return;
+    }
+    cpu_job_signal_mark mark;
+    sycl::event         gate;
+    expect("an entry of the new block is wrapped",
+           refs[block].id() >= block && ggml_sycl::cpu_job_signal_wrap(refs[block], mark, &gate));
+    *flag                = 0;
+    const sycl::event kw = submit_gated_write(q, gate, flag, 11);
+    expect("a command gated on the new block's entry waits for its signal", parked(flag, 11));
+    jobs[block].signal();
+    expect("the signal releases it", wait_flag(flag, 11, 5000));
+    sycl::event(kw).wait();
+    jobs.clear();
+    refs.clear();
+    ggml_sycl::cpu_job_signal_recycle(mark);
+    const auto after = ggml_sycl::cpu_job_signal_ring_counts_for_testing(ring);
+    expect("every entry of both blocks is free again", after.free == after.total && after.total == 2 * block);
     ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(ring);
 }
 
@@ -570,6 +613,7 @@ int main(int argc, char ** argv) {
     case_signal_and_recycle(q1, flag1);
     case_abandoned_job_half(q1, flag1);
     case_signal_all(q1, flag1);
+    case_grow(q1, flag1);
     case_unwaited_stream_keeps_its_entries(q1, q2, flag1, flag2);
     case_record_carries_ring_gates(q1);
     case_input_marker_beside_a_native_wait(q1, q2, flag2, false);

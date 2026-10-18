@@ -17011,11 +17011,11 @@ static void cpu_job_signal_registry_prune();
 // shut down or abandoned: no driver call is made after that, and the halves still held only update the book.
 //
 // The job's own signal takes mutex_, so a driver call that may block must not run under it: a host wait on another
-// thread may hold the driver's device lock behind that very job (llama.cpp-42zj). wrap() makes its event and recycle()
-// resets its events with mutex_ released, counted in outside_calls_; grow_locked() still creates pools and events
-// under it (llama.cpp-q0xu). gates_ holds the futures of the jobs whose events the
-// device waits (cpu_job_gate_list) under its own lock, so a host thread sleeping on one never holds mutex_ and never
-// keeps a job's own signal from taking it.
+// thread may hold the driver's device lock behind that very job (llama.cpp-42zj). wrap() makes its event, recycle()
+// resets its events and grow() creates a block's pool and events (cpu_job_signal_grow, llama.cpp-q0xu) with mutex_
+// released, each counted in outside_calls_. gates_ holds the futures of the jobs whose events the device waits
+// (cpu_job_gate_list) under its own lock, so a host thread sleeping on one never holds mutex_ and never keeps a job's
+// own signal from taking it.
 class cpu_job_signal_ring {
   public:
     static constexpr uint32_t block_events = 64;
@@ -17047,8 +17047,8 @@ class cpu_job_signal_ring {
         }
         std::shared_ptr<cpu_job_signal_ring> ring(new cpu_job_signal_ring(std::move(ctx), zctx, l0));
         {
-            std::lock_guard<std::timed_mutex> lock(ring->mutex_);
-            if (!ring->grow_locked()) {
+            std::unique_lock<std::timed_mutex> lock(ring->mutex_);
+            if (ring->grow(lock) != cpu_job_signal_grow_result::GREW) {
                 ring->live_ = false;
                 *why        = "creating the first host-visible event pool failed";
                 return nullptr;
@@ -17072,25 +17072,52 @@ class cpu_job_signal_ring {
         cpu_job_signal_registry_prune();
     }
 
+    // The hot path takes a free entry under mutex_. With none free the ring grows by one block, made with mutex_
+    // released (see the class comment); grow() returns with mutex_ held again and nothing taken since its publish.
     bool acquire(uint32_t * id, uint32_t * generation) {
-        std::lock_guard<std::timed_mutex> lock(mutex_);
+        std::unique_lock<std::timed_mutex> lock(mutex_);
         if (!live_) {
             return false;
         }
         if (book_.acquire(id, generation)) {
             return true;
         }
-        if (!grow_locked()) {
-            if (!full_warned_) {
-                full_warned_ = true;
-                GGML_LOG_WARN(
-                    "[MOE-DEVSIG] the CPU expert job signal ring cannot grow past %zu entries; jobs past that are "
-                    "joined by host tasks (llama.cpp-qwn5)\n",
-                    book_.size());
-            }
-            return false;
+        switch (grow(lock)) {
+            case cpu_job_signal_grow_result::GREW:
+                return book_.acquire(id, generation);
+            case cpu_job_signal_grow_result::FULL:
+                if (!full_warned_) {
+                    full_warned_ = true;
+                    GGML_LOG_WARN(
+                        "[MOE-DEVSIG] the CPU expert job signal ring cannot grow past %zu entries; jobs past that are "
+                        "joined by host tasks (llama.cpp-qwn5)\n",
+                        book_.size());
+                }
+                return false;
+            case cpu_job_signal_grow_result::FAILED:
+                // A driver failure, not the cap: the next acquire with no free entry tries to grow again.
+                if (!grow_warned_) {
+                    grow_warned_ = true;
+                    GGML_LOG_WARN(
+                        "[MOE-DEVSIG] creating a block of host-visible events for the CPU expert job signal ring "
+                        "failed at %zu entries; a job that finds no free entry is joined by a host task "
+                        "(llama.cpp-q0xu)\n",
+                        book_.size());
+                }
+                return false;
+            case cpu_job_signal_grow_result::BUSY:
+                // Another thread is making the next block; waiting for it would be a host wait on that driver call.
+                if (!busy_warned_) {
+                    busy_warned_ = true;
+                    GGML_LOG_WARN(
+                        "[MOE-DEVSIG] a CPU expert job found its signal ring growing on another thread; such jobs are "
+                        "joined by host tasks (llama.cpp-q0xu)\n");
+                }
+                return false;
+            case cpu_job_signal_grow_result::GONE:
+                return false;
         }
-        return book_.acquire(id, generation);
+        return false;
     }
 
     void signal(uint32_t id, uint32_t generation) noexcept {
@@ -17215,7 +17242,8 @@ class cpu_job_signal_ring {
     // After the cache's queues drained, no device command waits on an entry. Signals what is still acquired (a job
     // that has not run releases nothing then), destroys the driver objects and keeps only the book. Idempotent. A wrap
     // or a recycle still in a driver call with mutex_ released holds some of those objects, so then they are left to
-    // the process exit, as abandon() leaves them.
+    // the process exit, as abandon() leaves them. So are they while a growth makes a block outside mutex_, and so is
+    // that block, which the growth's publish then refuses.
     void shutdown() noexcept {
         std::lock_guard<std::timed_mutex> lock(mutex_);
         if (!live_) {
@@ -17277,40 +17305,56 @@ class cpu_job_signal_ring {
         }
     }
 
-    bool grow_locked() {
-        if (book_.size() + block_events > max_events) {
-            return false;
-        }
-        ze_event_pool_desc_t pd{};
-        pd.stype                    = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
-        pd.flags                    = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
-        pd.count                    = block_events;
-        ze_event_pool_handle_t pool = nullptr;
-        if (l0_->pool_create(zctx_, &pd, 0, nullptr, &pool) != ZE_RESULT_SUCCESS || !pool) {
-            return false;
-        }
+    // Grows the ring by one block of block_events entries, up to max_events, through cpu_job_signal_grow: the pool and
+    // its events are created with mutex_ released and counted in outside_calls_, and published under it. `lock` holds
+    // mutex_ on entry and on return. zctx_ and l0_ are fixed at construction, so the creation reads them unlocked.
+    cpu_job_signal_grow_result grow(std::unique_lock<std::timed_mutex> & lock) {
+        // The room a publish needs, reserved under mutex_ before the growth, so the publish cannot throw. Only a
+        // publish adds to these vectors, and one growth is in flight at a time; shutdown()'s clear() keeps the
+        // capacity.
+        pools_.reserve(pools_.size() + 1);
+        events_.reserve(events_.size() + block_events);
+        ze_event_pool_handle_t         pool = nullptr;
         std::vector<ze_event_handle_t> made;
-        made.reserve(block_events);
-        for (uint32_t i = 0; i < block_events; ++i) {
-            ze_event_desc_t ed{};
-            ed.stype             = ZE_STRUCTURE_TYPE_EVENT_DESC;
-            ed.index             = i;
-            ed.signal            = ZE_EVENT_SCOPE_FLAG_HOST;
-            ed.wait              = ZE_EVENT_SCOPE_FLAG_HOST;
-            ze_event_handle_t ev = nullptr;
-            if (l0_->event_create(pool, &ed, &ev) != ZE_RESULT_SUCCESS || !ev) {
-                for (ze_event_handle_t m : made) {
-                    (void) l0_->event_destroy(m);
+        return cpu_job_signal_grow(
+            lock, book_, &outside_calls_, block_events, max_events,
+            [this, &pool, &made]() {
+                made.reserve(block_events);
+                ze_event_pool_desc_t pd{};
+                pd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+                pd.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+                pd.count = block_events;
+                if (l0_->pool_create(zctx_, &pd, 0, nullptr, &pool) != ZE_RESULT_SUCCESS || !pool) {
+                    return false;
                 }
-                (void) l0_->pool_destroy(pool);
-                return false;
-            }
-            made.push_back(ev);
-        }
-        pools_.push_back(pool);
-        events_.insert(events_.end(), made.begin(), made.end());
-        (void) book_.add(block_events);
-        return true;
+                for (uint32_t i = 0; i < block_events; ++i) {
+                    ze_event_desc_t ed{};
+                    ed.stype             = ZE_STRUCTURE_TYPE_EVENT_DESC;
+                    ed.index             = i;
+                    ed.signal            = ZE_EVENT_SCOPE_FLAG_HOST;
+                    ed.wait              = ZE_EVENT_SCOPE_FLAG_HOST;
+                    ze_event_handle_t ev = nullptr;
+                    if (l0_->event_create(pool, &ed, &ev) != ZE_RESULT_SUCCESS || !ev) {
+                        // No one else knows this block yet, so it is destroyed here, still with mutex_ released.
+                        for (ze_event_handle_t m : made) {
+                            (void) l0_->event_destroy(m);
+                        }
+                        (void) l0_->pool_destroy(pool);
+                        return false;
+                    }
+                    made.push_back(ev);
+                }
+                return true;
+            },
+            [this, &pool, &made]() {
+                if (!live_) {
+                    // Shut down or abandoned meanwhile: no driver call, the block is left to the process exit.
+                    return false;
+                }
+                pools_.push_back(pool);
+                events_.insert(events_.end(), made.begin(), made.end());
+                return true;
+            });
     }
 
     std::timed_mutex                    mutex_;
@@ -17322,10 +17366,12 @@ class cpu_job_signal_ring {
     const cpu_job_signal_l0 *           l0_            = nullptr;
     bool                                live_          = true;
     bool                                full_warned_   = false;
+    bool                                busy_warned_   = false;
+    bool                                grow_warned_   = false;
     bool                                wrap_warned_   = false;
     bool                                reset_warned_  = false;
     bool                                signal_warned_ = false;
-    uint32_t                            outside_calls_ = 0;  // wraps and recycles in a driver call, mutex_ released
+    uint32_t                            outside_calls_ = 0;  // wraps, recycles, growths in a driver call, unlocked
     cpu_job_gate_list                   gates_;
 };
 
