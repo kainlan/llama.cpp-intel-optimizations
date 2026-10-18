@@ -47149,8 +47149,11 @@ static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffe
     if (cache && cache->host_zones_configured()) {
         // Mirror the zone-selection logic `alloc_buffer` actually reaches
         // (unified-cache.cpp's `unified_alloc_host_zone`, used by `unified_alloc`):
-        //   role == WEIGHT || cat == HOST_COMPUTE || cat == EXPERT_CACHE -> WEIGHT
+        //   role == WEIGHT || cat == HOST_COMPUTE || cat == EXPERT_CACHE
+        //     || constraints.persistent_owner                            -> WEIGHT
         //   otherwise                                                    -> STAGING
+        // (This buft never sets persistent_owner; its HOST_COMPUTE category
+        // already takes the WEIGHT branch.)
         // `alloc_buffer` unconditionally sets
         // `req.intent.category = ggml_sycl::runtime_category::HOST_COMPUTE` for
         // every buffer this buft allocates, and unified_alloc_host_zone's WEIGHT branch is
