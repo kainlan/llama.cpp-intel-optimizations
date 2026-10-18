@@ -220,7 +220,8 @@ static void test_stale_generation_after_recycle() {
     b.drop(id, gen);
     recycle_all_reset(b, 0);
     uint32_t id2 = 0, gen2 = 0;
-    expect_true("the freed entry is acquired again", b.acquire(&id2, &gen2) && id2 == id);
+    expect_true("stale generation: the freed entry is acquired again", b.acquire(&id2, &gen2));
+    expect_eq("stale generation: the acquire takes the freed entry", id2, id);
     expect_true("with a new generation", gen2 != gen);
     expect_true("the old job half cannot signal the new acquire", !b.signal(id, gen));
     expect_true("the old slot half cannot make a device wait on it", !b.consume(id, gen, b.begin_flush()));
@@ -274,7 +275,8 @@ static void test_recycle_two_phase() {
                 b.at(c).state == entry_state::SIGNALLED && b.at(c).serial == cpu_job_signal_book::retired);
     expect_true("finishing an entry that is not resetting does nothing",
                 !b.recycle_finish(a, true) && !b.recycle_finish(c, true) && b.count().free == 1);
-    expect_true("the freed entry is acquired again", b.acquire(&x, &gx) && x == a);
+    expect_true("two-phase recycle: the freed entry is acquired again", b.acquire(&x, &gx));
+    expect_eq("two-phase recycle: the acquire takes the freed entry", x, a);
     expect_true("the retired one never", !b.acquire(&x, &gx));
 }
 

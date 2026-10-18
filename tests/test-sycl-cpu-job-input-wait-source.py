@@ -96,9 +96,11 @@ THE CONTRACT.  With comments and string literals blanked:
       (llama.cpp-q0xu): every pool_create and event_create of the ring sits in the make lambda its one
       grow(std::unique_lock<std::timed_mutex> &) hands to cpu_job_signal_grow (cpu-job-signal.hpp), with
       &outside_calls_, block_events and max_events; that lambda takes no mutex_, touches no lock, and destroys a
-      partial block itself; every pool_destroy and event_destroy of the ring sits in that lambda or in shutdown; and
-      the publish lambda first returns false when the ring is not live_.  cpu_job_signal_grow answers BUSY to a
-      growth in flight and reserves its own (book.grow_begin, which refuses while growing_) before anything else;
+      partial block itself; every pool_destroy and event_destroy of the ring sits in that lambda or in shutdown; grow
+      reserves pools_ and events_ before that call, so the publish cannot throw; and the publish lambda first returns
+      false when the ring is not live_.  cpu_job_signal_grow answers BUSY to a
+      growth in flight and reserves its own (book.grow_begin, which refuses while growing_ and reserves entries_ and
+      free_ before it sets growing_, so the book's add cannot allocate) before anything else;
       raises *outside once, before it releases the lock; releases it once, before its one make(), and takes it again
       only after; lowers *outside right after each lock.lock(); publishes only after the last lock.lock() and adds
       the entries to the book (book.add, once) only after the publish; and every way out after *outside is raised, a
@@ -963,6 +965,12 @@ def check_ring_growth(s: dict[str, str], ring: str) -> None:
     grows = list(re.finditer(r"\bcpu_job_signal_grow\s*\(", body))
     if len(grows) != 1:
         fail("W8", f"cpu_job_signal_ring::grow calls cpu_job_signal_grow {len(grows)} times, not once", tag=GROW_TAG)
+    for vec in ("pools_", "events_"):
+        reserve = re.search(rf"\b{vec}\s*\.\s*reserve\s*\(", body)
+        if not reserve or reserve.start() > grows[0].start():
+            fail("W8", f"cpu_job_signal_ring::grow does not reserve {vec} before it calls cpu_job_signal_grow: the "
+                       "publish, under mutex_ after the block is made, could then throw and lose the block",
+                 tag=GROW_TAG)
     spans = [(base + a, base + b) for a, b in top_level_arg_spans(body, grows[0].end() - 1)]
     args = [nospace(ring[a:b]) for a, b in spans]
     if len(args) != 7 or args[0] != "lock" or args[1] != "book_" or args[2] != "&outside_calls_" or \
@@ -1013,6 +1021,12 @@ def check_ring_growth(s: dict[str, str], ring: str) -> None:
                    "wait on the other's driver calls, or a shutdown meanwhile could destroy objects under the "
                    "creation", tag=GROW_TAG)
     _, gb = definition(hdr, GROW_BEGIN_SIG, "W8")
+    marked = re.search(r"\bgrowing_\s*=\s*true\s*;", gb)
+    for vec in ("entries_", "free_"):
+        reserve = re.search(rf"\b{vec}\s*\.\s*reserve\s*\(", gb)
+        if not marked or not reserve or reserve.start() > marked.start():
+            fail("W8", f"cpu_job_signal_book::grow_begin does not reserve {vec} before it sets growing_: book.add(n), "
+                       "after the block is published, could then allocate and throw", tag=GROW_TAG)
     if not re.search(r"\bif\s*\(\s*growing_\s*\|\|", gb):
         fail("W8", "cpu_job_signal_book::grow_begin reserves a growth while another is in flight", tag=GROW_TAG)
     down = [m.start() for m in re.finditer(r"\*\s*outside\s*-=\s*1\s*;", g)]
@@ -1485,6 +1499,9 @@ def mutants() -> list:
          sub(re.escape("if (growing_ || entries_.size() + n > max) {"), "if (entries_.size() + n > max) {")),
         ("W8", "header", "the entries are added before the block is published",
          move(r"    \(void\) book\.add\(n\);\n", r"    \*outside \+= 1;")),
+        ("W8", "header", "the book does not reserve the growth's room",
+         sub(r"        entries_\.reserve\(entries_\.size\(\) \+ n\);\n"
+             r"        free_\.reserve\(entries_\.size\(\) \+ n\);[^\n]*\n", "")),
         ("W8", "header", "a block that was not made keeps its reservation",
          sub(re.escape("    if (!made) {\n        book.grow_end();\n"), "    if (!made) {\n")),
         ("W8", "header", "a refused block keeps its reservation",
@@ -1510,6 +1527,11 @@ def mutants() -> list:
         ("W8", "cache", "the make lambda leaves a partial block undestroyed",
          sub(r"for \(ze_event_handle_t m : made\) \{\n\s*\(void\) l0_->event_destroy\(m\);\n\s*\}\n"
              r"\s*\(void\) l0_->pool_destroy\(pool\);\n\s*", "")),
+        ("W8", "cache", "the ring reserves its publish's room inside the publish",
+         chain(sub(r"        pools_\.reserve\(pools_\.size\(\) \+ 1\);\n"
+                   r"        events_\.reserve\(events_\.size\(\) \+ block_events\);\n", ""),
+               sub(r"(\n(\s*)pools_\.push_back\(pool\);)",
+                   r"\n\2pools_.reserve(pools_.size() + 1);\n\2events_.reserve(events_.size() + block_events);\1"))),
         ("W8", "cache", "the growth publishes into a ring no longer live",
          sub(r"\[this, &pool, &made\]\(\) \{\n\s*if \(!live_\) \{\n\s*return false;\n\s*\}",
              "[this, &pool, &made]() {")),
