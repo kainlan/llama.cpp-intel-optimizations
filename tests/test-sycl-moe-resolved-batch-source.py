@@ -246,9 +246,11 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "owning queue ready dependency": "target_queue->ext_oneapi_submit_barrier(route_ready_events)",
         "primary ready dependency": "dispatch_deps.push_back(entry->ready_event)",
         # llama.cpp-z4kd: the CPU job waits its leases' ready events on the pool worker, in its
-        # prologue, instead of copying each one and waiting it on the submitting thread.
+        # prologue, instead of copying each one and waiting it on the submitting thread.  Since
+        # llama.cpp-42zj the worker reads the device-written input marker armed behind them, while
+        # GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL puts it in play, and waits them natively otherwise.
         "CPU ready dependency": "job_inputs.events.push_back(entry.ready_event)",
-        "CPU ready wait": "sycl::event::wait(inputs.events)",
+        "CPU ready wait": "ggml_sycl::cpu_job_input_marker_wait(marker)",
         "admission failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode admission failed\")",
         "CPU-TG executor failure propagates":

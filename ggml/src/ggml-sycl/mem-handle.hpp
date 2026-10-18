@@ -13,7 +13,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -915,30 +914,6 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
 // caller can drain the exact submission queue before releasing its owners.
 void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
                                               retained_handle_publish_ticket & ticket);
-
-// While a scope is open, every record this thread publishes for event retention also carries `gates`: the futures of
-// the CPU expert jobs whose own device events the record's work waits behind (llama.cpp-qwn5). The drain worker sleeps
-// on each gate before it waits the record's event, so its wait in the driver covers only the device work after the
-// jobs, not the jobs' whole length; a record without gates is waited as before. A gate decides only how the worker
-// waits: the event wait after it is what releases the handles. wait() on a gate returns once the job's promise holds a
-// value or an exception, a broken promise included; the worker never calls get() on one. A job whose pool worker
-// was detached (CpuExpertPool::stop_workers) may never end, and its gate never opens; the device command parked on
-// that job's event does not end either. The scope is the current thread's because it names that thread's
-// publications only: the flush that opens it publishes on its own thread. Scopes nest; `gates` must outlive the scope
-// and stay unchanged while it is open.
-class retained_handle_gate_scope {
-  public:
-    explicit retained_handle_gate_scope(const std::vector<std::shared_future<void>> & gates) noexcept;
-    // The scope keeps a pointer to `gates`, which a temporary would leave dangling.
-    retained_handle_gate_scope(const std::vector<std::shared_future<void>> &&) = delete;
-    ~retained_handle_gate_scope() noexcept;
-
-    retained_handle_gate_scope(const retained_handle_gate_scope &)             = delete;
-    retained_handle_gate_scope & operator=(const retained_handle_gate_scope &) = delete;
-
-  private:
-    const std::vector<std::shared_future<void>> * saved_;
-};
 
 // The drain worker's waits since the last take (llama.cpp-qwn5), for the hybrid MoE decode trace's per-token waits
 // line: the records it waited, the gates those records carried, its time asleep on the gates and its time in the

@@ -6887,6 +6887,7 @@ bool unified_cache::ensure_planned_arena_zones() {
 // llama.cpp-qwn5: shuts the cache's CPU expert job signal ring down (after the queues drained) or abandons it (SYCL
 // already gone); defined with the ring below.
 static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept;
+static void cpu_job_input_marker_end(std::shared_ptr<cpu_job_input_marker_word> & word, mem_handle & owner) noexcept;
 
 unified_cache::~unified_cache() {
     if (!shutdown_resources()) {
@@ -7050,6 +7051,13 @@ bool unified_cache::shutdown_resources() {
             std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
             cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
         }
+        // llama.cpp-42zj: no device write will come, so a job still waiting is released to compute on inputs that
+        // may never have landed, acceptable only because the process is exiting. The ring ended first, so that
+        // job's signal makes no driver call. The word's release is shutdown-safe (mem_handle).
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+            cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
+        }
         // llama.cpp-0oxf: onednn_graph_scratch_reuse_pool_
         // is not touched here, unlike the owner members just above -- it does
         // not need to be. Its entries are destroyed the same way any other
@@ -7105,6 +7113,13 @@ bool unified_cache::shutdown_resources() {
             std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
             cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
         }
+        // llama.cpp-42zj: no device write will come, so a job still waiting is released to compute on inputs that
+        // may never have landed, acceptable only because the process is exiting. The ring ended first, so that
+        // job's signal makes no driver call. The word's release is shutdown-safe (mem_handle).
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+            cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
+        }
         // llama.cpp-0oxf: same reasoning as the
         // g_sycl_shutting_down branch above -- onednn_graph_scratch_reuse_pool_'s
         // entries are mem_handles, whose own destructor is already
@@ -7126,6 +7141,11 @@ bool unified_cache::shutdown_resources() {
     {
         std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
         cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/false);
+    }
+    // llama.cpp-42zj: after the drain every armed input marker has been written, so the word can go.
+    {
+        std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+        cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
     }
 
 #if GGML_SYCL_DNNL
@@ -16986,9 +17006,14 @@ static void cpu_job_signal_registry_add(const std::shared_ptr<cpu_job_signal_rin
 static void cpu_job_signal_registry_prune();
 
 // One device's events: pools of block_events host-visible events with host signal and wait scopes, on the context of
-// the stream whose device commands wait on them, with the book of what each entry is doing. Every member but gates_ is
-// read and written only under mutex_. live_ is false once the ring is shut down or abandoned: no driver call is made
-// after that, and the halves still held only update the book. gates_ holds the futures of the jobs whose events the
+// the stream whose device commands wait on them, with the book of what each entry is doing. Every member but gates_ and
+// those fixed at construction (ctx_, zctx_, l0_) is read and written only under mutex_. live_ is false once the ring is
+// shut down or abandoned: no driver call is made after that, and the halves still held only update the book.
+//
+// The job's own signal takes mutex_, so a driver call that may block must not run under it: a host wait on another
+// thread may hold the driver's device lock behind that very job (llama.cpp-42zj). wrap() makes its event and recycle()
+// resets its events with mutex_ released, counted in outside_calls_; grow_locked() still creates pools and events
+// under it (llama.cpp-q0xu). gates_ holds the futures of the jobs whose events the
 // device waits (cpu_job_gate_list) under its own lock, so a host thread sleeping on one never holds mutex_ and never
 // keeps a job's own signal from taking it.
 class cpu_job_signal_ring {
@@ -17080,28 +17105,45 @@ class cpu_job_signal_ring {
         book_.drop(id, generation);
     }
 
-    // *serial is the flush's serial, or 0 for the first wrap of a flush, which takes a new one.
+    // *serial is the flush's serial, or 0 for the first wrap of a flush, which takes a new one. The event is made with
+    // mutex_ released (see the class comment); the caller's live slot half keeps the entry from being recycled meanwhile.
     bool wrap(uint32_t id, uint32_t generation, uint64_t * serial, sycl::event * out) {
-        std::lock_guard<std::timed_mutex> lock(mutex_);
-        if (!live_ || id >= book_.size()) {
-            return false;
-        }
-        const cpu_job_signal_book::entry & e = book_.at(id);
-        if (e.generation != generation || !e.ref_live) {
-            return false;
+        ze_event_handle_t native = nullptr;
+        {
+            std::lock_guard<std::timed_mutex> lock(mutex_);
+            if (!live_ || id >= book_.size()) {
+                return false;
+            }
+            const cpu_job_signal_book::entry & e = book_.at(id);
+            if (e.generation != generation || !e.ref_live) {
+                return false;
+            }
+            native = events_[id];
+            outside_calls_ += 1;
         }
         sycl::event ev;
+        std::string failure;
+        bool        made = false;
         try {
             ev = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
-                { events_[id], sycl::ext::oneapi::level_zero::ownership::keep }, *ctx_);
+                { native, sycl::ext::oneapi::level_zero::ownership::keep }, *ctx_);
+            made = true;
         } catch (const sycl::exception & ex) {
+            failure = ex.what();
+        }
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        outside_calls_ -= 1;
+        if (!made) {
             if (!wrap_warned_) {
                 wrap_warned_ = true;
                 GGML_LOG_WARN(
                     "[MOE-DEVSIG] wrapping a CPU expert job's event failed; that job is joined by a host "
                     "task: %s (llama.cpp-qwn5)\n",
-                    ex.what());
+                    failure.c_str());
             }
+            return false;
+        }
+        if (!live_) {
             return false;
         }
         const uint64_t s = *serial != 0 ? *serial : book_.begin_flush();
@@ -17113,22 +17155,48 @@ class cpu_job_signal_ring {
         return true;
     }
 
+    // The native resets run with mutex_ released (see the class comment); the book holds the entries RESETTING
+    // meanwhile, so no other recycle or acquire takes them.
     size_t recycle(uint64_t upto) noexcept {
-        std::lock_guard<std::timed_mutex> lock(mutex_);
-        return book_.recycle(upto, [this](uint32_t id) {
-            if (!live_) {
-                return true;
+        std::vector<uint32_t>          ids;
+        std::vector<ze_event_handle_t> natives;
+        {
+            std::lock_guard<std::timed_mutex> lock(mutex_);
+            if (book_.recycle_begin(upto, &ids) == 0) {
+                return 0;
             }
-            const ze_result_t r = l0_->host_reset(events_[id]);
-            if (r != ZE_RESULT_SUCCESS && !reset_warned_) {
+            if (!live_) {
+                // Shut down: no driver call, the entries only go back to the book.
+                size_t n = 0;
+                for (uint32_t id : ids) {
+                    n += book_.recycle_finish(id, true) ? 1 : 0;
+                }
+                return n;
+            }
+            for (uint32_t id : ids) {
+                natives.push_back(events_[id]);
+            }
+            outside_calls_ += 1;
+        }
+        std::vector<ze_result_t> results(natives.size(), ZE_RESULT_SUCCESS);
+        for (size_t i = 0; i < natives.size(); ++i) {
+            results[i] = l0_->host_reset(natives[i]);
+        }
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        outside_calls_ -= 1;
+        size_t n = 0;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const bool reset = results[i] == ZE_RESULT_SUCCESS;
+            if (!reset && !reset_warned_) {
                 reset_warned_ = true;
                 GGML_LOG_ERROR(
                     "[MOE-DEVSIG] zeEventHostReset failed (%d); the entry is retired rather than reused signalled, "
                     "which would let the next job's scatter read its outputs early (llama.cpp-qwn5)\n",
-                    (int) r);
+                    (int) results[i]);
             }
-            return r == ZE_RESULT_SUCCESS;
-        });
+            n += book_.recycle_finish(ids[i], reset) ? 1 : 0;
+        }
+        return n;
     }
 
     // Bounded lock: this runs from the abort callback, possibly on a thread that already holds mutex_.
@@ -17145,18 +17213,27 @@ class cpu_job_signal_ring {
     }
 
     // After the cache's queues drained, no device command waits on an entry. Signals what is still acquired (a job
-    // that has not run releases nothing then), destroys the driver objects and keeps only the book. Idempotent.
+    // that has not run releases nothing then), destroys the driver objects and keeps only the book. Idempotent. A wrap
+    // or a recycle still in a driver call with mutex_ released holds some of those objects, so then they are left to
+    // the process exit, as abandon() leaves them.
     void shutdown() noexcept {
         std::lock_guard<std::timed_mutex> lock(mutex_);
         if (!live_) {
             return;
         }
         book_.signal_all([this](uint32_t id) { signal_native_locked(id); });
-        for (ze_event_handle_t ev : events_) {
-            (void) l0_->event_destroy(ev);
-        }
-        for (ze_event_pool_handle_t pool : pools_) {
-            (void) l0_->pool_destroy(pool);
+        if (outside_calls_ == 0) {
+            for (ze_event_handle_t ev : events_) {
+                (void) l0_->event_destroy(ev);
+            }
+            for (ze_event_pool_handle_t pool : pools_) {
+                (void) l0_->pool_destroy(pool);
+            }
+        } else {
+            GGML_LOG_WARN(
+                "[MOE-DEVSIG] the CPU expert job signal ring was shut down while %u of its driver calls ran outside "
+                "its lock; its %zu events are left to the process exit (llama.cpp-42zj)\n",
+                outside_calls_, events_.size());
         }
         events_.clear();
         pools_.clear();
@@ -17248,8 +17325,14 @@ class cpu_job_signal_ring {
     bool                                wrap_warned_   = false;
     bool                                reset_warned_  = false;
     bool                                signal_warned_ = false;
+    uint32_t                            outside_calls_ = 0;  // wraps and recycles in a driver call, mutex_ released
     cpu_job_gate_list                   gates_;
 };
+
+// One gate per wrapped entry, and a recycle clears its entries' gates: at most max_events gates, so the list never
+// drops one a host wait still needs (llama.cpp-42zj).
+static_assert(cpu_job_gate_list::max_gates >= cpu_job_signal_ring::max_events,
+              "a gate list must hold a gate for every entry its ring can have in use");
 
 // The live rings, for cpu_job_signal_signal_all(), and the ggml abort callback they install. Made once and never
 // destroyed: a ring can be released during static destruction (a CPU expert pool, a static of ggml-sycl.cpp, can still
@@ -17325,6 +17408,28 @@ void cpu_job_signal_signal_all() noexcept {
     for (const std::shared_ptr<cpu_job_signal_ring> & ring : live) {
         (void) ring->signal_all();
     }
+}
+
+std::vector<std::shared_future<void>> cpu_job_signal_gates_outstanding() {
+    cpu_job_signal_registry & r = cpu_job_signal_registry_get();
+
+    // Released after the registry lock: dropping the last owner of a ring prunes the registry under that lock. A cache
+    // shuts its ring down before it lets go of it, so a last owner dropped here makes no driver call.
+    std::vector<std::shared_ptr<cpu_job_signal_ring>> live;
+    {
+        std::lock_guard<std::timed_mutex> lock(r.mutex);
+        live.reserve(r.rings.size());
+        for (const std::weak_ptr<cpu_job_signal_ring> & w : r.rings) {
+            if (std::shared_ptr<cpu_job_signal_ring> ring = w.lock()) {
+                live.push_back(std::move(ring));
+            }
+        }
+    }
+    std::vector<std::shared_future<void>> gates;
+    for (const std::shared_ptr<cpu_job_signal_ring> & ring : live) {
+        ring->gates().append_outstanding(&gates);
+    }
+    return gates;
 }
 
 static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept {
@@ -17452,7 +17557,162 @@ std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & str
     return std::shared_ptr<cpu_job_gate_list>(ring, &ring->gates());
 }
 
+// --- CPU expert job input markers (llama.cpp-42zj); see cpu-job-signal.hpp ---
+
+// The marker's device task: once every event in `after` has completed (and, on the in-order `q`, every command
+// submitted before it), it makes the device's earlier writes visible to the host and stores `serial` into `word`.
+// Discrete BMG has no host-USM atomics, so the store is a plain one after a system-scope release fence, and the host
+// reads it with an acquire load. Throws what submit throws.
+static void cpu_job_input_marker_submit(sycl::queue &                    q,
+                                        uint32_t *                       word,
+                                        uint32_t                         serial,
+                                        const std::vector<sycl::event> & after) {
+    q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(after);
+        cgh.single_task([word, serial]() {
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            *word = serial;
+        });
+    });
+}
+
+// A job still waiting on the word stops, and the cache's allocation is released here, on the tearing-down thread. The
+// jobs keep only the view and the flag, and hold no handle, so the word is abandoned first: no waiter's load of it can
+// follow the release (cpu_job_input_marker_abandon).
+static void cpu_job_input_marker_end(std::shared_ptr<cpu_job_input_marker_word> & word, mem_handle & owner) noexcept {
+    if (word) {
+        cpu_job_input_marker_abandon(*word);
+        word.reset();
+    }
+    owner = {};
+}
+
+// The word's slow-wait report (cpu_job_input_marker_word::slow): one WARN, on the pool worker, and no driver call.
+// A job is named by its marker's serial, which is unique on its device.
+static void cpu_job_input_marker_report_slow(const cpu_job_input_marker_word & w, uint32_t serial, double waited_s) {
+    GGML_LOG_WARN(
+        "[MOE-INPUT-MARKER] CPU expert job %u on device %d has waited %.0f s for its inputs' marker; the SYCL watchdog "
+        "fires if it never arrives, and with GGML_SYCL_OP_TIMEOUT_MS=0 the job spins on one core until it does "
+        "(llama.cpp-42zj)\n",
+        serial, w.device, waited_s);
+}
+
+// The word's creation report, made by the arm that made it (w is that word) once the arm has released
+// cpu_job_input_marker_mutex_: a log callback may take a lock of its own, and an arm on another thread would wait on it
+// behind the mutex. Null when the arm made no word.
+static void cpu_job_input_marker_report_made(const cpu_job_input_marker_word * w) {
+    if (w) {
+        GGML_LOG_INFO(
+            "[MOE-INPUT-MARKER] CPU expert jobs wait their inputs on a device-written word on device %d "
+            "(llama.cpp-42zj)\n",
+            w->device);
+    }
+}
+
+// Set by the first input marker whose submit threw, in any cache: that throw is logged, the later ones are not.
+static std::atomic<bool> g_cpu_job_input_marker_submit_threw_logged{ false };
+
+bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
+                                             cpu_job_input_marker *           out,
+                                             cpu_job_input_marker_refusal *   why) {
+    std::unique_lock<std::mutex> lock(cpu_job_input_marker_mutex_);
+    // The word this arm makes, if it makes one, reported once the mutex is released.
+    std::shared_ptr<cpu_job_input_marker_word> made;
+    if (!cpu_job_input_marker_word_) {
+        if (cpu_job_input_marker_tried_) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NO_WORD;
+            return false;
+        }
+        cpu_job_input_marker_tried_ = true;
+        if (!queue_.has_property<sycl::property::queue::in_order>()) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_IN_ORDER;
+            return false;
+        }
+        const int     device = get_device_id_from_queue(queue_);
+        alloc_request req{};
+        req.queue                               = &queue_;
+        req.device                              = device;
+        // A cache line of its own: the device's write shares it with no host data.
+        req.size                                = 64;
+        req.intent.role                         = alloc_role::CONTROL;
+        req.intent.category                     = runtime_category::CONTROL;
+        req.intent.cohort_id                    = "cpu_job_input_marker";
+        req.intent.constraints.must_host_pinned = true;
+        allocation_result allocation            = unified_allocate_owner(req);
+        if (!allocation) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED;
+            return false;
+        }
+        mem_handle owner    = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = owner.resolve(device);
+        if (!resolved.ptr || resolved.on_device) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_HOST;
+            return false;
+        }
+        // The word is zeroed before any arm: a reused block may hold any value, and one at or past a serial would
+        // release that job before its inputs land.
+        auto word                   = std::make_shared<cpu_job_input_marker_word>();
+        word->ptr                   = static_cast<uint32_t *>(resolved.ptr);
+        word->device                = device;
+        word->slow                  = cpu_job_input_marker_report_slow;
+        *word->ptr                  = 0;
+        made                        = word;
+        cpu_job_input_marker_owner_ = std::move(owner);
+        cpu_job_input_marker_word_  = std::move(word);
+    }
+    const uint32_t serial = cpu_job_input_marker_serial_ + 1;
+    try {
+        cpu_job_input_marker_submit(queue_, cpu_job_input_marker_word_->ptr, serial, after);
+    } catch (const sycl::exception & e) {
+        // Logged with the mutex released, so an arm on another thread does not wait on the log's lock, and once per
+        // process: a stream that throws once throws on every job.
+        lock.unlock();
+        cpu_job_input_marker_report_made(made.get());
+        if (!g_cpu_job_input_marker_submit_threw_logged.exchange(true, std::memory_order_acq_rel)) {
+            GGML_LOG_WARN(
+                "[MOE-INPUT-MARKER] submitting a CPU expert job's input marker threw: %s; later throws are not "
+                "logged (llama.cpp-42zj)\n",
+                e.what());
+        }
+        *why = CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW;
+        return false;
+    }
+    cpu_job_input_marker_serial_ = serial;
+    out->word                    = cpu_job_input_marker_word_;
+    out->serial                  = serial;
+    lock.unlock();
+    cpu_job_input_marker_report_made(made.get());
+    return true;
+}
+
+bool unified_cache_cpu_job_input_marker_arm(sycl::queue &                    stream,
+                                            const std::vector<sycl::event> & after,
+                                            cpu_job_input_marker *           out,
+                                            cpu_job_input_marker_refusal *   why) {
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_CACHE_STREAM;
+        return false;
+    }
+    return cache->arm_cpu_job_input_marker(after, out, why);
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+bool cpu_job_input_marker_arm_for_testing(sycl::queue &                                      q,
+                                          const std::shared_ptr<cpu_job_input_marker_word> & word,
+                                          uint32_t                                           serial,
+                                          const std::vector<sycl::event> &                   after,
+                                          cpu_job_input_marker *                             out) {
+    try {
+        cpu_job_input_marker_submit(q, word->ptr, serial, after);
+    } catch (const sycl::exception &) {
+        return false;
+    }
+    out->word   = word;
+    out->serial = serial;
+    return true;
+}
+
 std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_create_for_testing(sycl::queue & q) {
     const char * why = "unknown";
     auto         r   = cpu_job_signal_ring::create(q, &why);

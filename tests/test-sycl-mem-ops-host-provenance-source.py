@@ -168,7 +168,8 @@ ROUTE_FLUSH = "} else { flush_pending_cpu_scatter(); reuse = reusable();"
 ROUTE_IDS_D2H = ("const sycl::event ids_d2h = ggml_sycl::mem_copy_async(pool.ids_handle(), first * sizeof(int32_t), "
                  "ids_storage.handle, ids_storage.view_offset, ids_bytes, *stream);")
 ROUTE_IDS_WAIT = "job_inputs.events.push_back(ids_d2h);"
-ROUTE_SUBMIT = "cpu_pool.submit_batch({}, moe_cpu_job_prologue(std::move(job_inputs)),"
+ROUTE_PROLOGUE = "std::function<void()> job_prologue = moe_cpu_job_prologue(*stream, std::move(job_inputs), src0);"
+ROUTE_SUBMIT = "cpu_pool.submit_batch({}, std::move(job_prologue),"
 ROUTE_IN_ORDER = "!ctx.stream()->has_property<sycl::property::queue::in_order>()"
 ROUTE_STREAM = "sycl::queue * stream = ctx.stream();"
 ROUTE_SLOT_STREAM = "slot.stream = stream;"
@@ -504,8 +505,9 @@ def check_ring(s: dict) -> None:
     if ids < reserve:
         fail("G", "the event-chained route does not copy the ids into its reserved entries on the in-order queue")
     wait = route.find(ROUTE_IDS_WAIT, ids)
+    prologue = route.find(ROUTE_PROLOGUE)
     submit = route.find(ROUTE_SUBMIT)
-    if wait < 0 or submit < 0 or wait > submit:
+    if wait < 0 or prologue < 0 or submit < 0 or not (wait < prologue < submit):
         fail("G", "the event-chained route's job does not wait its ids copy, so it could rewrite entries an earlier "
                   "scatter still reads")
     if ROUTE_STREAM not in route or route.count(ROUTE_SLOT_STREAM) != 1:
@@ -527,7 +529,7 @@ def check_ring(s: dict) -> None:
     if backend.count(ORDER_SWITCH) != 1:
         fail("G", "the retained route no longer waits the last flush's events or a queue barrier as "
                   "moe_cpu_job_order_decide says")
-    after = backend.find("moe_cpu_job_prologue(std::move(job_inputs))", backend.find(ORDER_SWITCH))
+    after = backend.find("moe_cpu_job_prologue(*stream, std::move(job_inputs), src0)", backend.find(ORDER_SWITCH))
     if after < 0:
         fail("G", "the retained route's order wait does not reach the job's prologue")
     if not flat_body(s["hostpath"], ORDER_SIG, "G").startswith(ORDER_HEAD):

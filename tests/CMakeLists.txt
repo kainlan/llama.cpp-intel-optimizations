@@ -908,6 +908,22 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-watchdog-progress-tick-source.py --self-test)
     set_tests_properties(test-sycl-watchdog-progress-tick-source PROPERTIES
         LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # Every retained-handle record takes the gates of every live ring's CPU expert jobs from one snapshot that waits on
+    # nothing, and a gate list cannot drop a running job's gate: the drain worker must not reach a driver wait in front
+    # of a job that has not started (llama.cpp-42zj). Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-retained-record-gates-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-retained-record-gates-source.py --self-test)
+    set_tests_properties(test-sycl-retained-record-gates-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The CPU expert pool worker waits a job's inputs on a device-written marker with host loads and makes no driver
+    # call but the job's device signal; a refused arm is waited on the submitting thread (llama.cpp-42zj). Run WITH
+    # --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-cpu-job-input-wait-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-job-input-wait-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-job-input-wait-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The per-op source chain skips the ready events its own in-order stream produced, behind
     # GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, and queries every other one as before (llama.cpp-wfsl). Run WITH
     # --self-test so each pin is proven to catch its mutant.

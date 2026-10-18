@@ -3342,10 +3342,14 @@ set_tests_properties(test-sycl-retained-reap PROPERTIES
 # Test: a device command waiting on a CPU expert job's ring entry runs only after the entry is signalled -- by the
 # job half, its destructor, or signal-all -- a recycled entry parks the next job's command again, an entry whose
 # stream was not waited stays in use, and a pool job whose prologue throws releases the device before the process
-# ends (llama.cpp-qwn5). It opens a Level Zero GPU, so it is labelled cache (lead-run) and pinned to the B70: no
-# iGPU, whose "VRAM" is host RAM (CLAUDE.md, llama.cpp-403s). ENVIRONMENT replaces an outer ONEAPI_DEVICE_SELECTOR,
-# so the card is this one. It exits 77 without a GPU. The child arms re-exec the binary through /proc/self/exe and
-# inherit the selector.
+# ends (llama.cpp-qwn5); a retained-handle record published while a ring holds a job's gate carries it, so the drain
+# worker holds the record's handles until the gate opens, and a pool job whose prologue waits on its input marker
+# finishes while another thread waits natively on device work behind that job (llama.cpp-42zj; `--native-counterpart`
+# runs only that case with the worker's old native wait, prints REPRODUCED or NOT_REPRODUCED, and is not registered
+# as a test). It opens a Level Zero GPU, so it is
+# labelled cache (lead-run) and pinned to the B70: no iGPU, whose "VRAM" is host RAM (CLAUDE.md, llama.cpp-403s).
+# ENVIRONMENT replaces an outer ONEAPI_DEVICE_SELECTOR, so the card is this one. It exits 77 without a GPU. The child
+# arms re-exec the binary through /proc/self/exe and inherit the selector.
 add_executable(test-sycl-cpu-job-signal-ring
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-job-signal-ring.cpp
 )

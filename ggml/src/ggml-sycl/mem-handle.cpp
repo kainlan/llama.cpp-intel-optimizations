@@ -53,8 +53,13 @@ struct retained_handle_record {
     // handles[i].owner_control_id(), read when the record is published, so a
     // reap matches under the store mutex without asking any handle.
     std::vector<uint64_t>   ids;
-    // The futures of the CPU expert jobs the event waits behind, from the
-    // publisher's retained_handle_gate_scope (llama.cpp-qwn5); usually none.
+    // The futures of every CPU expert job a device command may still wait on, from
+    // every live ring when the record is published (cpu_job_signal_gates_outstanding,
+    // llama.cpp-42zj). The drain worker sleeps on them before its driver wait on the
+    // event, because a host wait on an event behind a job that has not started can
+    // keep the job from starting. A record behind none of those jobs sleeps on them
+    // too, by design: its handles are released later, never earlier, so lifetime
+    // stays safe and only memory is held a little longer.
     std::vector<std::shared_future<void>> gates;
 };
 
@@ -144,8 +149,6 @@ struct graph_recording_sink_state {
 
 std::atomic<uint64_t>                   g_graph_retention_token_counter{ 0 };
 thread_local graph_recording_sink_state g_graph_recording_sink;
-// The innermost open retained_handle_gate_scope's gates on this thread, or null (llama.cpp-qwn5).
-thread_local const std::vector<std::shared_future<void>> * g_retained_handle_gates = nullptr;
 
 // The drain worker's waits for the trace (retained_handle_drain_census): counted once the trace turned the census on,
 // taken and zeroed by the thread that prints the trace's waits line (llama.cpp-qwn5).
@@ -2666,26 +2669,18 @@ static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::e
 
     std::call_once(g_retained_drain_worker_once, start_retained_handle_drain_worker);
 
-    std::vector<uint64_t>                 ids = owner_control_ids(handles);
-    std::vector<std::shared_future<void>> gates;
-    if (g_retained_handle_gates) {
-        gates = *g_retained_handle_gates;
-    }
+    std::vector<uint64_t> ids = owner_control_ids(handles);
+
+    // Every record takes the gates of every CPU expert job a device command may still wait on, whether or not its
+    // own event stands behind one: the drain worker must not reach a driver wait in front of a job that has not
+    // started (llama.cpp-42zj). Taken before the store lock, under which it never runs.
+    std::vector<std::shared_future<void>> gates = cpu_job_signal_gates_outstanding();
     {
         auto &              state = *g_retained_handles_state;
         retained_store_lock lock(state);
         state.queue.push_back({ std::move(handles), std::move(event), std::move(ids), std::move(gates) });
     }
     g_retained_handles_state->cv.notify_one();
-}
-
-retained_handle_gate_scope::retained_handle_gate_scope(const std::vector<std::shared_future<void>> & gates) noexcept :
-    saved_(g_retained_handle_gates) {
-    g_retained_handle_gates = gates.empty() ? nullptr : &gates;
-}
-
-retained_handle_gate_scope::~retained_handle_gate_scope() noexcept {
-    g_retained_handle_gates = saved_;
 }
 
 void retained_handle_drain_census_enable() noexcept {

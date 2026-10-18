@@ -359,8 +359,10 @@ inline bool moe_glu_input_host_produced(const ggml_tensor * op, moe_weight_on_ho
 //       the gates and the queue wait (llama.cpp-qwn5)
 // B1..B7 are the waits the path paid before its CPU jobs were event-chained
 // (llama.cpp-z4kd).  Only B1 and the graph-boundary B7 still wait on the
-// submitting thread; B2..B6 read 0, and a change that brings one of those waits
-// back shows in its class.
+// submitting thread, and B2 for a CPU job whose input marker was not armed:
+// that thread then waits the job's inputs itself (llama.cpp-42zj), so B2 reads 0
+// while every marker is armed.  B3..B6 read 0, and a change that brings one of
+// those waits back shows in its class.
 // MOE_WAIT_NONE and MOE_WAIT_JOIN are not classes.  MOE_WAIT_NONE is the flush
 // context outside any flush that forces a class.  MOE_WAIT_JOIN is an input the
 // classifier keeps for a CPU job join, whose class (B3 or B5) it reads from the

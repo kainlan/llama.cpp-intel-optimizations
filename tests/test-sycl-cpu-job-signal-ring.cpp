@@ -10,8 +10,18 @@
 // whole run: past it, every ring is signalled and the test fails, so a regression parks nothing past the deadline.
 // Nothing here queries the status of a parked command (on a profiling queue the driver busy-waits such a query);
 // whether a command ran is read from the host memory it writes.
+//
+// A retained-handle record published while a ring holds a job's gate carries that gate, with no scope and whether or
+// not its own event stands behind the job, and the drain worker holds the record's handles until the gate opens
+// (llama.cpp-42zj).
+//
+// A CpuExpertPool job whose prologue waits its input on the device-written input marker finishes while another thread
+// waits natively on device work that stands behind that very job (llama.cpp-42zj). `--native-counterpart` runs only
+// the same case with the base's prologue, a native sycl::event::wait in the worker, and prints REPRODUCED when that
+// deadlocks (then signals every ring to recover) or NOT_REPRODUCED when it does not.
 
 #include "cpu-expert-pool.hpp"
+#include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
 #include <sys/resource.h>
@@ -24,10 +34,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
+#include <vector>
 
 using ggml_sycl::cpu_job_signal;
 using ggml_sycl::cpu_job_signal_mark;
@@ -220,6 +233,198 @@ static void case_unwaited_stream_keeps_its_entries(sycl::queue & q1, sycl::queue
     ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(r2);
 }
 
+// --- retained-handle records take the rings' gates (llama.cpp-42zj) ----------------------------------------------
+
+static std::atomic<int> g_records_released{ 0 };
+
+static ggml_sycl::release_attempt count_record_release(const ggml_sycl::alloc_metadata &, void *) noexcept {
+    g_records_released.fetch_add(1);
+    return { ggml_sycl::release_attempt_status::RELEASED };
+}
+
+// An owner handle over a fresh owner control with an injected release in place of a physical free, so "released"
+// below is the owner's last reference going.
+static ggml_sycl::mem_handle make_record_owner(size_t size) {
+    static std::vector<std::vector<unsigned char>> backing;
+    static uint64_t                                next_id = 4200;
+    backing.emplace_back(size);
+    const uint64_t            id = next_id++;
+    ggml_sycl::alloc_metadata metadata{};
+    metadata.ptr      = backing.back().data();
+    metadata.size     = size;
+    metadata.device   = 0;
+    metadata.id       = id;
+    metadata.alloc_id = id;
+    metadata.epoch_id = 1;
+    metadata.tier     = ggml_sycl::alloc_tier::HOST_PINNED;
+    auto fixture      = ggml_sycl::allocation_owner_test_create(metadata, count_record_release, nullptr);
+    if (!fixture.result) {
+        return ggml_sycl::mem_handle{};
+    }
+    return ggml_sycl::mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+}
+
+// The record's event is complete, as a device command's is once it ran, and stands behind no job: a worker that waited
+// the event alone would release the handle at once. This one must hold it until the ring's gate opens.
+static void case_record_carries_ring_gates(sycl::queue & q) {
+    std::shared_ptr<cpu_job_signal_ring> ring = ggml_sycl::cpu_job_signal_ring_create_for_testing(q);
+    if (!ring) {
+        expect("a ring is made for the record-gates case", false);
+        return;
+    }
+    cpu_job_signal     job;
+    cpu_job_signal_ref ref;
+    expect("acquire for the record-gates case", ggml_sycl::cpu_job_signal_acquire_for_testing(ring, &job, &ref));
+    cpu_job_signal_mark mark;
+    sycl::event         gate_event;
+    expect("wrap for the record-gates case", ggml_sycl::cpu_job_signal_wrap(ref, mark, &gate_event));
+
+    // Control: with no gate outstanding, a published record is released as soon as the worker reaches it.
+    const int released = g_records_released.load();
+    {
+        ggml_sycl::mem_handle owner = make_record_owner(256);
+        expect("an owner is made for the control record", owner.valid());
+        ggml_sycl::retain_handles_until_event({ owner }, sycl::event{});
+    }
+    expect("with no gate outstanding the worker finishes the record",
+           ggml_sycl::drain_retained_handles(true, 10000) && g_records_released.load() - released == 1);
+
+    std::promise<void> job_done;
+    ggml_sycl::cpu_job_signal_gate_push(mark, job_done.get_future().share());
+    expect("the snapshot holds the ring's one gate", ggml_sycl::cpu_job_signal_gates_outstanding().size() == 1);
+    {
+        ggml_sycl::mem_handle owner = make_record_owner(256);
+        expect("an owner is made for the gated record", owner.valid());
+        ggml_sycl::retain_handles_until_event({ owner }, sycl::event{});
+    }
+    // A bound on a wait for an outcome, not an ordering: the record's event is complete.
+    expect("the worker does not finish a record while a ring's gate is shut",
+           !ggml_sycl::drain_retained_handles(true, 500));
+    expect("the record's handle is held while the gate is shut", g_records_released.load() - released == 1);
+    job_done.set_value();
+    expect("the worker finishes the record once the gate opens",
+           ggml_sycl::drain_retained_handles(true, 10000) && g_records_released.load() - released == 2);
+
+    job.signal();
+    ggml_sycl::cpu_job_signal_recycle(mark);
+    expect("the recycle clears the ring's gate", ggml_sycl::cpu_job_signal_gates_outstanding().empty());
+    ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(ring);
+}
+
+// --- the CPU job's input marker (llama.cpp-42zj) -------------------------------------------------------------------
+
+// The first-prompt-graph deadlock in miniature. A holder thread waits natively, as the retained-handle drain worker's
+// wait_and_throw did, on a command that stands behind job J's ring signal: on driver 26.35 that wait holds a
+// device-level lock while it polls. J runs on a real CpuExpertPool, and its prologue waits for its one input, another
+// ring entry, which this thread signals 200 ms later. With the input marker (`native` false) the worker waits with host
+// loads and J finishes. With a native wait in the worker (`native` true, the form before the fix) the worker blocks on
+// the holder's lock and nothing finishes until every ring is signalled. Returns 1 when that native wait deadlocked, 0
+// when it did not, and -1 when the case could not be set up; the marker arm returns 0.
+static int case_input_marker_beside_a_native_wait(sycl::queue & q, sycl::queue & hq, int * flag, bool native) {
+    std::shared_ptr<cpu_job_signal_ring> ring = ggml_sycl::cpu_job_signal_ring_create_for_testing(q);
+    if (!ring) {
+        expect("a ring is made for the input-marker case", false);
+        return -1;
+    }
+    cpu_job_signal      in_job, j_job;
+    cpu_job_signal_ref  in_ref, j_ref;
+    cpu_job_signal_mark in_mark, j_mark;
+    sycl::event         in_gate, j_gate;
+    if (!ggml_sycl::cpu_job_signal_acquire_for_testing(ring, &in_job, &in_ref) ||
+        !ggml_sycl::cpu_job_signal_wrap(in_ref, in_mark, &in_gate) ||
+        !ggml_sycl::cpu_job_signal_acquire_for_testing(ring, &j_job, &j_ref) ||
+        !ggml_sycl::cpu_job_signal_wrap(j_ref, j_mark, &j_gate)) {
+        expect("two ring entries for the input-marker case", false);
+        ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(ring);
+        return -1;
+    }
+
+    // The marker's word is the test's own host memory; production takes it from the unified cache.
+    uint32_t * word_mem = sycl::malloc_host<uint32_t>(1, q);
+    *word_mem           = 0;
+    auto word           = std::make_shared<ggml_sycl::cpu_job_input_marker_word>();
+    word->ptr           = word_mem;
+    ggml_sycl::cpu_job_input_marker marker;
+    if (!native) {
+        expect("the input marker is armed behind the job's input",
+               ggml_sycl::cpu_job_input_marker_arm_for_testing(q, word, 1, { in_gate }, &marker) && marker.armed());
+    }
+
+    *flag = 0;
+    std::atomic<bool> holder_done{ false };
+    std::thread       holder([&]() {
+        sycl::event kw = submit_gated_write(hq, j_gate, flag, 9);
+        try {
+            kw.wait_and_throw();
+        } catch (const sycl::exception &) {
+        }
+        holder_done.store(true);
+    });
+    // A bound, not an ordering: the holder is inside its wait before the job's prologue starts.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::function<void()> prologue;
+    if (native) {
+        prologue = [in_gate]() {
+            sycl::event::wait(std::vector<sycl::event>{ in_gate });
+        };
+    } else {
+        prologue = [marker]() {
+            ggml_sycl::cpu_job_input_marker_wait(marker);
+        };
+    }
+    ggml_sycl::CpuExpertPool pool;
+    pool.init(1);
+    std::future<void> done = pool.submit_batch({}, std::move(prologue), {}, nullptr, std::move(j_job));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    expect(native ? "native counterpart: the job waits for its input" : "the job waits for its input",
+           done.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready);
+    if (!native) {
+        expect("the marker is not written before its input completes",
+               __atomic_load_n(word_mem, __ATOMIC_ACQUIRE) == 0);
+    }
+    in_job.signal();
+
+    int deadlocked = 0;
+    if (native) {
+        const bool finished = done.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        std::printf("NATIVE_COUNTERPART %s\n",
+                    finished ? "NOT_REPRODUCED: the worker's native wait finished beside the holder's wait" :
+                               "REPRODUCED: the worker's native wait did not finish 2 s after its input was signalled");
+        std::fflush(stdout);
+        if (!finished) {
+            deadlocked = 1;
+            ggml_sycl::cpu_job_signal_signal_all();
+        }
+    }
+    const bool finished = done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    expect(native ? "native counterpart: the job finishes once every ring is signalled" :
+                    "with the input marker the job finishes while another thread waits natively behind it",
+           finished);
+    expect(
+        native ? "native counterpart: the holder's wait returns" : "the holder's wait returns once the job signalled",
+        wait_flag(flag, 9, 5000));
+    for (int i = 0; i < 5000 && !holder_done.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!holder_done.load()) {
+        // Nothing may stay parked behind the holder before it is joined.
+        ggml_sycl::cpu_job_signal_signal_all();
+    }
+    holder.join();
+    q.wait();
+    hq.wait();
+    ggml_sycl::cpu_job_signal_recycle(in_mark);
+    ggml_sycl::cpu_job_signal_recycle(j_mark);
+    const auto c = ggml_sycl::cpu_job_signal_ring_counts_for_testing(ring);
+    expect("both entries are free again after the case", c.free == c.total && c.total > 0);
+    ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(ring);
+    word->abandoned.store(true, std::memory_order_release);
+    sycl::free(word_mem, q);
+    return deadlocked;
+}
+
 // --- child arms: a throw on the thread that holds the job half ---------------------------------------------------
 
 static int * g_child_flag = nullptr;
@@ -348,10 +553,26 @@ int main(int argc, char ** argv) {
     int *       flag1 = sycl::malloc_host<int>(1, q1);
     int *       flag2 = sycl::malloc_host<int>(1, q2);
 
+    if (argc >= 2 && std::strcmp(argv[1], "--native-counterpart") == 0) {
+        // Informational: what the input marker replaced. Not part of the default run.
+        const int deadlocked = case_input_marker_beside_a_native_wait(q1, q2, flag2, true);
+        sycl::free(flag1, q1);
+        sycl::free(flag2, q2);
+        g_done.store(true);
+        std::printf("test-sycl-cpu-job-signal-ring --native-counterpart: %s, %d failure(s)\n",
+                    deadlocked == 1 ? "deadlocked" :
+                    deadlocked == 0 ? "did not deadlock" :
+                                      "not set up",
+                    g_failures);
+        return g_failures != 0 || deadlocked < 0 ? 1 : 0;
+    }
+
     case_signal_and_recycle(q1, flag1);
     case_abandoned_job_half(q1, flag1);
     case_signal_all(q1, flag1);
     case_unwaited_stream_keeps_its_entries(q1, q2, flag1, flag2);
+    case_record_carries_ring_gates(q1);
+    case_input_marker_beside_a_native_wait(q1, q2, flag2, false);
     case_throwing_job("/proc/self/exe");
 
     sycl::free(flag1, q1);

@@ -25,8 +25,10 @@ behind the job is a wait inside the driver, which polls for the job's whole leng
 whole-queue waits (ggml_sycl_trace_queue_wait: the periodic drain and the rest), and the
 retained-handle reaper.  Both took CPU from the job's own row threads.  So the flush keeps
 the job's future as a gate, and
-those waits sleep on it first; the device wait after it still orders the host, so a gate
-changes how the host waits, never whether.  A gate is only a shared_future: wait() on it
+those waits sleep on it first.  A gate also decides whether such a wait returns: a host
+wait in the driver in front of a job that has not started can keep the job from starting
+(llama.cpp-42zj; test-sycl-retained-record-gates-source.py pins that every retained
+record carries every live ring's gates).  A gate is only a shared_future: wait() on it
 returns for a value, an exception or a broken promise, never throws, and runs with no
 lock held.  Two paths leave a gate shut.  A job that throws: the pool's handlers rethrow
 into a worker with no handler, so the process aborts with the promise unset, and a waiter
@@ -39,7 +41,8 @@ THE CONTRACT.  With comments blanked:
      host-task join; moe_cpu_job_join_on_queue is called only after that branch.
   B. The device waits a job only when moe_cpu_job_device_signal_may() holds: the knob is
      on and neither the backend's recording flag nor the stream's own state records a
-     graph.  The flush asks it for the slot's stream; the one acquire helper asks it
+     graph (moe_cpu_job_stream_recording, the recording test the CPU job's three decisions
+     share).  The flush asks it for the slot's stream; the one acquire helper asks it
      before it asks the cache; the three CpuExpertPool producers acquire through that
      helper and hand the job half to submit_batch; nothing else takes an entry.
   C. (cpu-expert-pool.cpp submit_batch) the worker lambda's body is one try block whose
@@ -54,19 +57,24 @@ THE CONTRACT.  With comments blanked:
      pending_cpu_scatter_wait_prev_events(slot), after its sycl::event::wait(events);
      the slot-pair wait is called only from ggml_sycl_cpu_tg_flush_pending.
   F. (unified-cache.cpp cpu_job_signal_ring::wrap) each wrap makes a fresh
-     sycl::make_event with ownership::keep; nothing the ring class declares outside its
-     function bodies and parameter lists names sycl::event, so no member holds a wrapper,
-     bare or in a container; the flush clears its dependency list after the retention,
-     and the wrap's out-parameter is a local of the member loop.
+     sycl::make_event with ownership::keep, from the entry's native event that it copied
+     under the lock (it makes the event with the lock released, llama.cpp-42zj); nothing
+     the ring class declares outside its function bodies and parameter lists names
+     sycl::event, so no member holds a wrapper, bare or in a container; the flush clears
+     its dependency list after the retention, and the wrap's out-parameter is a local of
+     the member loop.
   G. The abort callback signals every ring before it calls the previous callback, and
      the SYCL watchdog signals every ring before it frees host allocations and exits.
      The pool's stop_workers signals nothing: a worker it detaches may still write the
      job's outputs, which teardown frees once the queues drain, so the job signals itself
      when it ends.
   H. GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is read once, into a function-local static,
-     default off (llama.cpp-m5v8), and is the only getenv of that name; the catalog
-     row documents =1; the [MOE-HOSTPATH-WAITS] line prints devsig=, counted under
-     the trace only.
+     default off (llama.cpp-nqbe: with it on, which also puts the input marker in
+     play, Qwen3.8 IQ3_XXS decode on the B70 fell to 2.7 from 9.7 t/s without -c, the
+     marker's cost, and rose to 13.3 from 9.0 at -c 4096; the llama.cpp-m5v8 hang on
+     that path is fixed by the input marker, llama.cpp-42zj), and is the only getenv
+     of that name; the catalog row documents =1; the [MOE-HOSTPATH-WAITS]
+     line prints devsig=, counted under the trace only.
   I. No host waits on the new events.  The flush body and the ring section of
      unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
      wait, wait_and_throw, wait_for or wait_until, no get_info<...> and name neither
@@ -77,10 +85,9 @@ THE CONTRACT.  With comments blanked:
      statement is the release fence that orders the job's writes before the device can
      see the signal.
 
-  J1. (flush) the natively waited member, after its wrap, shares its future into one gate,
-     pushes it to the ring's gates (cpu_job_signal_gate_push, the backend's only call) and
-     keeps it in ws.gates, before its wrapper becomes its dependency; ws.gates is cleared
-     before the member loop and after the try block, so no flush keeps another's.
+  J1. (flush) the natively waited member, after its wrap, pushes its shared future to the
+     ring's gates (cpu_job_signal_gate_push, the backend's only call) before its wrapper
+     becomes its dependency.
   J2. (ggml_backend_sycl_synchronize) the gate sleep is one unconditional statement after
      the CPU-expert flush and before both stream-wait branches, and no site but the
      synchronize and the graph code's queue wait (B9) calls ggml_sycl_cpu_job_gates_sleep;
@@ -102,11 +109,10 @@ THE CONTRACT.  With comments blanked:
      through . or ->, or std::lock()) is taken in the synchronize before its sleep, in the
      gate sleep the synchronize and the queue wait share, or anywhere in the graph code's
      queue wait.
-  J5. (reaper) a record publication copies the open retained_handle_gate_scope's gates
-     into the record; the scope saves and restores the thread's pointer; the reaper waits
-     each valid gate with wait() inside the watchdog guard, right before the record's event
-     wait; the flush opens one scope on ws.gates after its member loop and before its first
-     scatter submission, in the block that also runs the retention.
+  J5. (reaper) the reaper waits each valid gate of a record with wait() inside the
+     watchdog guard, right before the record's event wait.  Where a record's gates come
+     from (every live ring's, taken when it is published) is the contract of
+     test-sycl-retained-record-gates-source.py (llama.cpp-42zj).
   B8. The [MOE-HOSTPATH-WAITS] line names B8 after B7 and prints gate_waits=,
      gate_sleep_us= and driver_us= right after total=, reset with the token's counts; the
      catalog's trace row names B8 and the three fields, and its knob row the gates.  The
@@ -158,9 +164,8 @@ RED on the tree before the change:
   FAIL [pin A]: the flush does not wrap a member's device event under
   `may_signal && group[k]->device_signal` (llama.cpp-qwn5)
 RED on the tree before the gates:
-  FAIL [pin J1]: the natively waited member does not share its future into a gate, push it
-  to the ring's gates and keep it for the flush's records before its wrapper becomes its
-  dependency (llama.cpp-qwn5)
+  FAIL [pin J1]: the natively waited member does not push its shared future to the ring's
+  gates before its wrapper becomes its dependency (llama.cpp-qwn5)
 """
 
 from __future__ import annotations
@@ -275,6 +280,7 @@ def enclosing_headers(code: str, pos: int) -> list[str]:
 
 FLUSH_SIG = r"static\s+void\s+flush_pending_cpu_scatter_slot\s*\(\s*pending_cpu_scatter\s*&\s*slot\s*\)\s*\{"
 MAY_SIG = r"static\s+bool\s+moe_cpu_job_device_signal_may\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
+REC_SIG = r"static\s+bool\s+moe_cpu_job_stream_recording\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
 ACQ_SIG = r"static\s+void\s+moe_cpu_job_device_signal_acquire\s*\([^)]*\)\s*\{"
 KNOB_SIG = r"static\s+bool\s+moe_cpu_job_device_signal_enabled\s*\(\s*\)\s*\{"
 WAIT_SLOT_SIG = r"static\s+void\s+pending_cpu_scatter_wait_prev_events\s*\(\s*pending_cpu_scatter\s*&\s*slot\s*\)\s*\{"
@@ -351,10 +357,13 @@ def check_flush(backend: str) -> None:
 def check_predicate(backend: str) -> None:
     code = blank_comments(backend)
     body, _ = body_of(code, MAY_SIG, "B")
-    want = ("return moe_cpu_job_device_signal_enabled() && !ggml_sycl_graph_recording_active() && "
-            "stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;")
-    if flat(body).strip() != want:
-        fail("B", "moe_cpu_job_device_signal_may is not the knob and the two recording tests")
+    want = "return moe_cpu_job_device_signal_enabled() && !moe_cpu_job_stream_recording(stream);"
+    rec, _ = body_of(code, REC_SIG, "B")
+    rec_want = ("return ggml_sycl_graph_recording_active() || "
+                "stream.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;")
+    if flat(body).strip() != want or flat(rec).strip() != rec_want:
+        fail("B", "moe_cpu_job_device_signal_may is not the knob and the two recording tests "
+                  "(moe_cpu_job_stream_recording: the backend's flag or the stream's state)")
     body, _ = body_of(code, ACQ_SIG, "B")
     if flat(body).strip() != ("if (moe_cpu_job_device_signal_may(stream)) { "
                               "(void) ggml_sycl::unified_cache_cpu_job_signal_acquire(stream, job, ref); }"):
@@ -450,8 +459,11 @@ def check_ring(cache_cpp: str) -> None:
         fail("F", "cpu_job_signal_ring has no wrap(id, ...) member")
     wrap, _ = block_at(cls, cls.index("{", m.end() - 1), "F")
     wf = flat(wrap)
-    if not re.search(r"ev = sycl::make_event<sycl::backend::ext_oneapi_level_zero>\( \{ events_\[id\], "
-                     r"sycl::ext::oneapi::level_zero::ownership::keep \}, \*ctx_\);", wf):
+    # wrap copies the entry's native event under mutex_ and makes the wrapper from that copy with mutex_ released
+    # (llama.cpp-42zj); test-sycl-cpu-job-input-wait-source.py W8 pins where the lock is.
+    if "native = events_[id];" not in wf or not re.search(
+            r"ev = sycl::make_event<sycl::backend::ext_oneapi_level_zero>\( \{ native, "
+            r"sycl::ext::oneapi::level_zero::ownership::keep \}, \*ctx_\);", wf):
         fail("F", "wrap does not make a fresh wrapper with ownership::keep for each use")
     if "*out = std::move(ev);" not in wf:
         fail("F", "wrap does not hand the fresh wrapper to its caller")
@@ -527,7 +539,10 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
     body, _ = body_of(code, KNOB_SIG, "H")
     if not re.search(r"static const bool enabled = \[\] \{ const char \* env = std::getenv\(\"" + KNOB +
                      r"\"\); return env != nullptr && std::atoi\(env\) != 0; \}\(\); return enabled;", flat(body)):
-        fail("H", f"{KNOB} is not read once into a function-local static, default off (llama.cpp-m5v8)")
+        fail("H", f"{KNOB} is not read once into a function-local static, default off: with it on, which also "
+                  "puts the input marker in play, Qwen3.8 IQ3_XXS decode on the B70 fell to 2.7 from 9.7 t/s "
+                  "without -c, the marker's cost, and rose to 13.3 from 9.0 at -c 4096 (llama.cpp-nqbe); the "
+                  "llama.cpp-m5v8 hang on that path is fixed by the input marker (llama.cpp-42zj)")
     n = sum(len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", blank_comments(s)))
             for s in sources.values() if KNOB in s)
     n += len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", code))
@@ -554,10 +569,6 @@ RECYCLE_SIG = r"void\s+cpu_job_signal_recycle\s*\(\s*cpu_job_signal_mark\s*&\s*m
 CACHE_GATES_SIG = r"std::shared_ptr<cpu_job_gate_list>\s+unified_cache_cpu_job_gates\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
 GATE_LIST_SIG = r"class\s+cpu_job_gate_list\s*\{"
 DRAIN_SIG = r"void\s+retained_handle_drain_loop\s*\(\s*\)\s*\{"
-PUBLISH_SIG = r"static\s+void\s+publish_handles_until_event\s*\(\s*std::vector<mem_handle>\s+handles\s*,\s*sycl::event\s+event\s*\)\s*\{"
-SCOPE_CTOR_SIG = (r"retained_handle_gate_scope::retained_handle_gate_scope\s*\(\s*const\s+std::vector<std::shared_future<void>>"
-                  r"\s*&\s*gates\s*\)\s*noexcept\s*:\s*saved_\(g_retained_handle_gates\)\s*\{")
-SCOPE_DTOR_SIG = r"retained_handle_gate_scope::~retained_handle_gate_scope\s*\(\s*\)\s*noexcept\s*\{"
 GATE_POLLS = ((r"\.\s*get\s*\(\s*\)", "takes a value (`.get()`)"),
               (r"\bwait_for\s*\(", "polls (`wait_for`)"),
               (r"\bwait_until\s*\(", "polls (`wait_until`)"))
@@ -591,7 +602,6 @@ DRAIN_PRINT = ('at += snprintf(line + at, sizeof(line) - at, " %s=%llu/%.0fus", 
                'w.drain_gate_waits, w.drain_gate_sleep_us, w.drain_driver_us); }')
 REAPER_COUNTERS = ("records", "gates", "gate_sleep_ns", "driver_ns")
 GATE_SLEEP_STMT = "const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);"
-SCOPE_STMT = "const ggml_sycl::retained_handle_gate_scope gate_scope(ws.gates);"
 READBACK_SIG = r"static\s+void\s+moe_hostpath_waits_readback\s*\(\s*int\s+layer\s*,\s*bool\s+async[^)]*\)\s*\{"
 QUEUE_WAIT_SIG = r"static\s+void\s+ggml_sycl_trace_queue_wait\s*\(\s*queue_ptr\s+q\s*,[^)]*\)\s*\{"
 QUEUE_CLEAR_SIG = (r"static\s+void\s+ggml_sycl_cpu_job_gates_clear_queue_wait\s*\(\s*const\s+"
@@ -626,37 +636,13 @@ def check_gates(s: dict) -> None:
     f = flat(body)
     i = f.find(NATIVE_IF)
     native = block_at(f, i + len(NATIVE_IF) - 1, "J1")[0] if i >= 0 else ""
-    want = ("std::shared_future<void> gate = group[k]->future.share(); "
-            "ggml_sycl::cpu_job_signal_gate_push(signal_mark, gate); ws.gates.push_back(std::move(gate)); "
+    want = ("ggml_sycl::cpu_job_signal_gate_push(signal_mark, group[k]->future.share()); "
             "joins.push_back(std::move(device_wait)); continue;")
     if want not in native:
-        fail("J1", "the natively waited member does not share its future into a gate, push it to the ring's gates and "
-                   "keep it for the flush's records before its wrapper becomes its dependency")
+        fail("J1", "the natively waited member does not push its shared future to the ring's gates before its wrapper "
+                   "becomes its dependency")
     if len(word_matches(r"cpu_job_signal_gate_push\s*\(", code)) != 1:
         fail("J1", "cpu_job_signal_gate_push is called outside the flush's native branch")
-    loop = f.find("for (int k = 0; k < n_group; ++k) { sycl::event device_wait;")
-    if loop < 0 or f.rfind("ws.gates.clear();", 0, loop) < 0:
-        fail("J1", "ws.gates is not cleared before the member loop")
-    fb, _ = body_of(code, FLUSH_SIG, "J1")
-    cm = re.search(r"\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*ex\s*\)\s*\{", fb)
-    after = ""
-    if cm:
-        handler, hoff = block_at(fb, fb.index("{", cm.end() - 1), "J1")
-        after = flat(fb[hoff + len(handler) + 1 :]).strip()
-    if not after.startswith("ws.gates.clear();"):
-        fail("J1", "ws.gates is not cleared right after the flush's try block")
-    # J5 (flush half): one scope, after the member loop and before the first submission, beside the retention.
-    if f.count(SCOPE_STMT) != 1:
-        fail("J5", "the flush does not open exactly one gate scope on ws.gates")
-    sc = f.find(SCOPE_STMT)
-    t1 = f.find("auto t1 = hrc::now();")
-    sub1 = f.find("moe_host_scatter_submit_compact(")
-    if not (0 <= t1 < sc < sub1):
-        fail("J5", "the gate scope is not opened after the member loop and before the first scatter submission")
-    sp = fb.find("const ggml_sycl::retained_handle_gate_scope gate_scope(ws.gates);")
-    rp = fb.find("ws.release_handles();")
-    if sp < 0 or rp < 0 or enclosing_headers(fb, sp) != enclosing_headers(fb, rp):
-        fail("J5", "the gate scope does not cover the retention: it is not in the block that runs it")
     # J2: the synchronize.
     sync, _ = body_of(code, SYNC_SIG, "J2")
     sf = flat(sync)
@@ -754,17 +740,6 @@ def check_gates(s: dict) -> None:
     # J5 (reaper half).
     if not re.search(r"\} watchdog_guard; " + re.escape(gw), dlf):
         fail("J5", "the reaper does not sleep on a record's gates inside the watchdog guard, right before the event wait")
-    pb, _ = body_of(mem, PUBLISH_SIG, "J5")
-    pf = flat(pb)
-    if "std::vector<std::shared_future<void>> gates; if (g_retained_handle_gates) { gates = *g_retained_handle_gates; }" \
-            not in pf or "state.queue.push_back({ std::move(handles), std::move(event), std::move(ids), std::move(gates) });" \
-            not in pf:
-        fail("J5", "a publication does not copy the open scope's gates into its record")
-    ct, _ = body_of(mem, SCOPE_CTOR_SIG, "J5")
-    dt, _ = body_of(mem, SCOPE_DTOR_SIG, "J5")
-    if flat(ct).strip() != "g_retained_handle_gates = gates.empty() ? nullptr : &gates;" or \
-            flat(dt).strip() != "g_retained_handle_gates = saved_;":
-        fail("J5", "the gate scope does not set the thread's gates and restore the enclosing scope's")
     # B8: the census.
     rb_body, _ = body_of(code, r"static\s+void\s+moe_hostpath_waits_readback\s*\(\s*int\s+layer\s*,\s*bool\s+async[^)]*\)\s*\{",
                          "B8")
@@ -948,12 +923,16 @@ def self_test(s: dict) -> int:
         ("A", "backend", "no native branch", sub(r"may_signal && group\[k\]->device_signal &&", "false &&")),
         ("B", "backend", "the flush asks for another stream",
          sub(r"moe_cpu_job_device_signal_may\(\*slot\.stream\);", "moe_cpu_job_device_signal_enabled();")),
+        # The recording test is moe_cpu_job_stream_recording, which the join and input-marker predicates share.
         ("B", "backend", "native under the backend's recording",
-         sub(r"return moe_cpu_job_device_signal_enabled\(\) && !ggml_sycl_graph_recording_active\(\) &&",
-             "return moe_cpu_job_device_signal_enabled() &&")),
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*stream\.", "return stream.")),
         ("B", "backend", "native while the stream records",
-         sub(r"(return moe_cpu_job_device_signal_enabled\(\) && !ggml_sycl_graph_recording_active\(\)) &&\n\s*"
-             r"stream\.ext_oneapi_get_state\(\) != sycl::ext::oneapi::experimental::queue_state::recording;", r"\1;")),
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*"
+             r"stream\.ext_oneapi_get_state\(\) == sycl::ext::oneapi::experimental::queue_state::recording;",
+             "return ggml_sycl_graph_recording_active();")),
+        ("B", "backend", "the device-signal predicate skips the recording test",
+         sub(r"return moe_cpu_job_device_signal_enabled\(\) && !moe_cpu_job_stream_recording\(stream\);",
+             "return moe_cpu_job_device_signal_enabled();")),
         ("B", "backend", "acquire without the predicate",
          sub(r"if \(moe_cpu_job_device_signal_may\(stream\)\) \{", "if (moe_cpu_job_device_signal_enabled()) {")),
         ("B", "backend", "a producer keeps its job half",
@@ -1040,9 +1019,8 @@ def self_test(s: dict) -> int:
         ("I", "backend", "the flush gets a job's future",
          sub(r"\n(\s*)auto t1 = hrc::now\(\);", r"\n\1group[0]->future.share().get();\n\1auto t1 = hrc::now();")),
         ("I", "cache_cpp", "wrap host-synchronizes the event",
-         sub(r"\n(\s*)sycl::event ev;\n(\s*)try \{\n(\s*)ev = sycl::make_event",
-             r"\n\1(void) zeEventHostSynchronize(events_[id], UINT64_MAX);\n\1sycl::event ev;\n\2try {\n\3"
-             r"ev = sycl::make_event")),
+         sub(r"\n(\s*)sycl::event ev;\n((?:\s*[^\n]*;\n){0,2}\s*try \{\n\s*ev = sycl::make_event)",
+             r"\n\1(void) zeEventHostSynchronize(native, UINT64_MAX);\n\1sycl::event ev;\n\2")),
         ("I", "cache_cpp", "the ring resolves a status query",
          sub(r'(\n(\s*)f\.host_reset    = reinterpret_cast<decltype\(&zeEventHostReset\)>\(dlsym\(lib, '
              r'"zeEventHostReset"\)\);)',
@@ -1055,25 +1033,13 @@ def self_test(s: dict) -> int:
              r"\1(void) l0_->host_signal(events_[id]);")),
         # The gates (J1-J5, B8, B7D).
         ("J1", "backend", "the native member pushes no gate",
-         sub(r"\n\s*ggml_sycl::cpu_job_signal_gate_push\(signal_mark, gate\);", "")),
-        ("J1", "backend", "the native member's records get no gate",
-         sub(r"\n\s*ws\.gates\.push_back\(std::move\(gate\)\);", "")),
+         sub(r"\n\s*ggml_sycl::cpu_job_signal_gate_push\(signal_mark, group\[k\]->future\.share\(\)\);", "")),
+        ("J1", "backend", "the gate push moves after the wrapper is kept",
+         sub(r"(\n\s*ggml_sycl::cpu_job_signal_gate_push\(signal_mark, group\[k\]->future\.share\(\)\);)"
+             r"(\n\s*joins\.push_back\(std::move\(device_wait\)\);)", r"\2\1")),
         ("J1", "backend", "a host-task-joined member pushes a gate",
          sub(r"(\n(\s*)joins\.push_back\(moe_cpu_job_join_on_queue\()",
              r"\n\2ggml_sycl::cpu_job_signal_gate_push(signal_mark, group[k]->future.share());\1")),
-        ("J1", "backend", "the flush keeps its gates", sub(r"\n    ws\.gates\.clear\(\);\n", "\n")),
-        ("J1", "backend", "the member loop starts with the last flush's gates",
-         sub(r"\n\s*ws\.gates\.clear\(\);\n(\s*)const bool may_signal", r"\n\1const bool may_signal")),
-        ("J5", "backend", "the flush publishes outside a gate scope",
-         sub(r"\n\s*const ggml_sycl::retained_handle_gate_scope gate_scope\(ws\.gates\);", "")),
-        ("J5", "backend", "the gate scope opens after the scatter",
-         lambda t: re.sub(r"(\n(\s*)ws\.release_handles\(\);)",
-                          r"\n\2const ggml_sycl::retained_handle_gate_scope gate_scope(ws.gates);\1",
-                          re.sub(r"\n\s*const ggml_sycl::retained_handle_gate_scope gate_scope\(ws\.gates\);", "", t,
-                                 count=1), count=1)),
-        ("J5", "backend", "the gate scope ends before the retention",
-         sub(r"(\n(\s*))(const ggml_sycl::retained_handle_gate_scope gate_scope\(ws\.gates\);)",
-             r"\1{\1    \3\1}")),
         ("J2", "backend", "the synchronize does not sleep",
          sub(r"ggml_sycl_cpu_job_gates_sleep\(\*stream\);", "ggml_sycl_cpu_job_gate_sleep{};")),
         ("J2", "backend", "the synchronize sleeps after its stream wait",
@@ -1139,10 +1105,6 @@ def self_test(s: dict) -> int:
         ("J4", "backend", "the synchronize sleeps under a lock",
          sub(r"(\n(\s*))(const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*stream\);)",
              r"\1std::lock_guard<std::mutex> held(g_execution_backend_binding_mutex);\1\3")),
-        ("J5", "mem_cpp", "a publication drops the scope's gates",
-         sub(r"std::move\(ids\), std::move\(gates\) \}\);", "std::move(ids) });")),
-        ("J5", "mem_cpp", "the scope does not restore the enclosing one",
-         sub(r"g_retained_handle_gates = saved_;", "g_retained_handle_gates = nullptr;")),
         ("J5", "mem_cpp", "the reaper waits the event before the gates",
          sub(r"(\n\s*for \(const std::shared_future<void> & gate : record\.gates\) \{\n\s*if \(gate\.valid\(\)\) \{\n"
              r"\s*gate\.wait\(\);\n\s*\}\n\s*\})(\n\s*wait_timer\.slept\(record\.gates\.size\(\)\);)"

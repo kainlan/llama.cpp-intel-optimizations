@@ -15,7 +15,12 @@ does not reach it (N7).  Everything after it is event-chained:
 
   * the waits a CPU job needs before it writes its pool span (its activation copy, the producer events
     of its host weight leases, an earlier scatter H2D it would alias) run on the pool worker, through
-    moe_cpu_job_wait_inputs, which only moe_cpu_job_prologue's returned closure calls;
+    moe_cpu_job_wait_inputs, which only moe_cpu_job_prologue's returned closure calls.  Since
+    llama.cpp-42zj, with GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on, that wait reads a device-written marker
+    the prologue arms behind those events, and when the marker cannot be armed the prologue waits the
+    events itself (KNOWN_WAITS); with the knob off the closure waits them through
+    moe_cpu_job_wait_inputs_native, as before the marker, which only that closure calls too
+    (llama.cpp-nqbe);
   * a CPU job's completion is joined by a host_task on the op's in-order queue
     (moe_cpu_job_join_on_queue, whose host_task calls moe_cpu_job_join, the one function that takes
     the job's future.get()), and the scatter H2D copies are submitted with that host_task's event as a
@@ -32,18 +37,25 @@ body of the closure each hands to another thread (OFF_THREAD_SPANS: the lambda t
 on the pool worker, the lambda the join gives host_task runs on the queue's host-task thread).  A
 closure's capture list stays in the scan, since it is evaluated where the closure is built.  The gate
 fails when the closure can no longer be found, or when it is not the whole expression handed off (a
-lambda the submitting thread calls to build the closure runs there, not on the other thread).  One
-wait inside the scanned code predates this ticket and is excused by name in KNOWN_WAITS, at exactly one
-match, with the ticket that removes it; an entry that matches nothing fails the gate, so that list can
-only shrink:
+lambda the submitting thread calls to build the closure runs there, not on the other thread).  Two
+matches inside the scanned code are excused by name in KNOWN_WAITS, each at exactly one match.  One
+predates this ticket and names the ticket that removes it.  The other is the input marker's refused-arm
+fallback, which llama.cpp-42zj puts on the submitting thread on purpose: the pool worker must make no
+driver wait, and a job whose marker is not armed has no other thread to wait on.  That fallback's census
+timer, whose `wait_timer(` reads as a wait_* helper and which counts the wait as B2, is excused by its own
+text in moe_cpu_job_prologue (SCOPED_ALLOWED), so a real wait_* call there takes no excuse from it.  An
+entry of either list that matches nothing fails the gate, so the lists cannot outlive the code they
+excuse:
 
   N1. no `.get()`, `.wait(`, `::wait(`, `wait_and_throw`, `wait_for`, `wait_until` or `*_sync(` call, no
       call of a `wait_*(` helper (a census timer's `wait_timer(` declaration reads as one), and no
-      synchronous `mem_copy(`/`mem_fill(`, apart from the allowlisted multi-GPU statement below, at most
-      once, and the KNOWN_WAITS entry;
-  N2. the exception lists are current: each KNOWN_WAITS entry matches, each OFF_THREAD_SPANS function is
-      defined once, hands off one closure that is the whole handed-off expression, and is reached, and
-      each BOUNDARY entry is defined and reached;
+      synchronous `mem_copy(`/`mem_fill(`, and no call of the input marker's spin wait
+      (`cpu_job_input_marker_wait(`, a header helper the scan cannot follow into), apart from the
+      allowlisted multi-GPU statement below, at most once, the KNOWN_WAITS entries, and the
+      SCOPED_ALLOWED statements, each at most once in its function;
+  N2. the exception lists are current: each KNOWN_WAITS entry and SCOPED_ALLOWED statement matches, each
+      OFF_THREAD_SPANS function is defined once, hands off one closure that is the whole handed-off
+      expression, and is reached, and each BOUNDARY entry is defined and reached;
   N3. the closure that moe_cpu_job_prologue returns calls moe_cpu_job_wait_inputs, so a job's input
       waits still run, on the pool worker;
   N4. moe_cpu_job_join takes the job's `.get()`, the closure that moe_cpu_job_join_on_queue hands
@@ -314,13 +326,33 @@ ENCLOSING_DEF = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ct
 HYBRID_LABEL = "the hybrid MUL_MAT_ID block"
 LOCAL_LAMBDA = re.compile(r"\bauto\s+(\w+)\s*=\s*\[")
 
-# Waits the scan finds inside the contract that predate llama.cpp-z4kd and stay for now, each keyed by
-# (function, FORBIDDEN label) and excused at exactly one match.  An entry that matches nothing fails the
-# gate, and a second match in the same function is reported, so the list can only shrink.
+# Waits the scan finds inside the contract that stay, each keyed by (function, FORBIDDEN label) and
+# excused at exactly one match.  An entry that matches nothing fails the gate, and a second match in the
+# same function is reported.
 KNOWN_WAITS = {
     ("allocate_managed_host_pinned", "synchronous mem_fill("): (
         "the zero_init fill, taken by the CPU dispatch's over-capacity managed output and by every Q1_0/NVFP4 "
-        "recipe workspace; llama.cpp-yzwy moves the zeroing to the job prologue"
+        "recipe workspace; it predates llama.cpp-z4kd, and llama.cpp-yzwy moves the zeroing to the job prologue"
+    ),
+    ("moe_cpu_job_prologue", "wait()"): (
+        "the refused input marker's fallback, `sycl::event::wait(inputs.events)`, taken only while the marker is in "
+        "play (GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on) and a command graph records, the stream is not in-order or "
+        "the marker word cannot be allocated or submitted.  The lead's "
+        "decision on llama.cpp-42zj puts it here: a native wait on the pool worker can block on the driver's "
+        "device lock behind a wait_and_throw on another thread, which deadlocked the first Qwen3.8 prompt graph"
+    ),
+}
+
+# Statements a FORBIDDEN pattern reads as a wait that wait for nothing, each keyed by (function, what it
+# is) and excused by its own text in that function only: the scan masks it there before FORBIDDEN runs,
+# so no other match in the function takes the excuse.  None fails N2, a second match fails N1.
+SCOPED_ALLOWED = {
+    ("moe_cpu_job_prologue", "the refused arm's census timer"): (
+        re.compile(r"\bmoe_hostpath_wait_timer\s+\w+\s*\(\s*MOE_WAIT_B2\s*\)\s*;"),
+        "the census timer `moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2)` around the refused marker's "
+        "fallback, whose `wait_timer(` reads as a wait_* helper and which is no wait of its own: it counts the "
+        "fallback as B2 on the [MOE-HOSTPATH-WAITS] line, so a run whose markers are refused shows the "
+        "submitting thread waiting a CPU job's inputs (llama.cpp-42zj)",
     ),
 }
 
@@ -344,6 +376,9 @@ FORBIDDEN = (
     (re.compile(r"\bmem_copy\s*\("), "synchronous mem_copy("),
     (re.compile(r"\bmem_fill\s*\("), "synchronous mem_fill("),
     (re.compile(r"\bwait_\w+\s*\("), "a wait_* helper"),
+    # The input marker's spin (cpu-job-signal.hpp, llama.cpp-42zj) is a host wait on device progress.  It is
+    # defined in a header, so the scan sees it only at the call.
+    (re.compile(r"\bcpu_job_input_marker_wait\s*\("), "the input marker's spin wait"),
 )
 
 
@@ -611,8 +646,15 @@ class Scan:
         self.waits: list[str] = []
         self.allowed_seen = {a: 0 for a in ALLOWED}
         self.known_seen = {k: 0 for k in KNOWN_WAITS}
+        self.scoped_seen = {k: 0 for k in SCOPED_ALLOWED}
         for name, base, text in self.scanned:
             masked = text
+            for (fn, what), (pat, _) in SCOPED_ALLOWED.items():
+                if fn != name.split(" ")[0]:
+                    continue
+                for m in pat.finditer(masked):
+                    self.scoped_seen[(fn, what)] += 1
+                    masked = masked[: m.start()] + " " * (m.end() - m.start()) + masked[m.end() :]
             for a, pat in ALLOWED_PATTERNS:
                 for m in pat.finditer(masked):
                     self.allowed_seen[a] += 1
@@ -632,7 +674,8 @@ class Scan:
 
 
 def check_n1(scan: Scan) -> None:
-    """No host wait in the scanned code, apart from the allowlisted statement (at most once) and KNOWN_WAITS."""
+    """No host wait in the scanned code, apart from the allowlisted statement (at most once), KNOWN_WAITS and
+    the SCOPED_ALLOWED statements (each at most once in its function)."""
     if scan.waits:
         raise ContractError(
             f"FAIL [N1]: {len(scan.waits)} host wait(s) on the submitting thread after the ids readback "
@@ -641,16 +684,26 @@ def check_n1(scan: Scan) -> None:
     for a, n in scan.allowed_seen.items():
         if n > 1:
             raise ContractError(f"FAIL [N1]: the allowlisted `{a}` appears {n} times; it is allowed once ({TAG})")
+    for (fn, what), n in scan.scoped_seen.items():
+        if n > 1:
+            raise ContractError(
+                f"FAIL [N1]: SCOPED_ALLOWED `{fn}` / {what} matches {n} times there; it is allowed once ({TAG})"
+            )
 
 
 def check_n2(scan: Scan) -> None:
-    """The exception lists still describe the code: each KNOWN_WAITS entry matches, each OFF_THREAD_SPANS
-    function is defined once, hands off one whole closure and is reached, and each BOUNDARY entry is defined
-    and reached."""
+    """The exception lists still describe the code: each KNOWN_WAITS entry and SCOPED_ALLOWED statement
+    matches, each OFF_THREAD_SPANS function is defined once, hands off one whole closure and is reached, and
+    each BOUNDARY entry is defined and reached."""
     for (fn, what), n in scan.known_seen.items():
         if n == 0:
             raise ContractError(
                 f"FAIL [N2]: KNOWN_WAITS entry `{fn}` / {what} matches nothing in the scanned code; drop it ({TAG})"
+            )
+    for (fn, what), n in scan.scoped_seen.items():
+        if n == 0:
+            raise ContractError(
+                f"FAIL [N2]: SCOPED_ALLOWED `{fn}` / {what} matches nothing in its scanned function; drop it ({TAG})"
             )
     if scan.off_thread_problems:
         name, problem = scan.off_thread_problems[0]
@@ -1114,7 +1167,7 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N1", "synchronous copy in the hybrid block", graphs_off,
         graphs_off + "            ggml_sycl::mem_copy(shared_act_handle, shared_act_handle, 0, *stream);\n")
     sub("N1", "worker wait called directly", graphs_off,
-        graphs_off + "            moe_cpu_job_wait_inputs(moe_cpu_job_inputs{});\n")
+        graphs_off + "            moe_cpu_job_wait_inputs(ggml_sycl::cpu_job_input_marker{}, nullptr, 0);\n")
     sub("N1", "second allowlisted secondary flush", graphs_off,
         graphs_off + "            wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());\n")
     slot_open = "static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {\n"
@@ -1134,7 +1187,15 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "                                             std::shared_future<void>                          job,\n"
         "                                             std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> stamps) {\n"
     )
-    pro_def = "static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {\n"
+    pro_def = ("static std::function<void()> moe_cpu_job_prologue(sycl::queue &       stream,\n"
+               "                                                  moe_cpu_job_inputs  inputs,\n"
+               "                                                  const ggml_tensor * src0) {\n")
+    pro_closure = ("    return [in_play, native = std::move(native), marker = std::move(marker), "
+                   "zero_out = inputs.zero_out,\n            zero_bytes = inputs.zero_bytes]() {\n"
+                   "        if (in_play) {\n            moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);\n"
+                   "        } else {\n            moe_cpu_job_wait_inputs_native(native, zero_out, zero_bytes);\n"
+                   "        }\n    };\n")
+    pro_fallback = "            sycl::event::wait(inputs.events);\n"
     sub("N1", "join get() outside its host_task", join_def, join_def + "    job.get();\n")
     sub("N1", "job join called outside its host_task", join_def, join_def + "    moe_cpu_job_join(job, nullptr);\n")
     sub("N1", "job join called from the slot flush", slot_open,
@@ -1142,7 +1203,28 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N4", "join helper stops taking get()",
         "ggml_sycl::cpu_expert_pool_trace_note_join(was_ready);\n    }\n    job.get();\n",
         "ggml_sycl::cpu_expert_pool_trace_note_join(was_ready);\n    }\n")
-    sub("N1", "prologue waits in the factory body", pro_def, pro_def + "    moe_cpu_job_wait_inputs(inputs);\n")
+    sub("N1", "prologue waits in the factory body", pro_def,
+        pro_def + "    moe_cpu_job_wait_inputs(ggml_sycl::cpu_job_input_marker{}, inputs.zero_out, inputs.zero_bytes);\n")
+    # The input marker (llama.cpp-42zj): the submitting thread spinning on it, a second native wait on the
+    # armed path, and the excused fallback gone (a refused job would then wait nothing; the input-wait pin
+    # W4 catches that too).
+    sub("N1", "prologue spins on the input marker itself", pro_closure,
+        "    ggml_sycl::cpu_job_input_marker_wait(marker);\n" + pro_closure)
+    sub("N1", "prologue waits its inputs on the armed path too", pro_closure,
+        "    sycl::event::wait(inputs.events);\n" + pro_closure)
+    sub("N2", "refused arm's fallback wait dropped", pro_fallback, "")
+    # With the knob off the worker waits natively (llama.cpp-nqbe); the same wait reached from the factory body
+    # runs on the submitting thread, and the scan follows the call into it.
+    sub("N1", "the native worker wait called from the factory body", pro_def,
+        pro_def + "    moe_cpu_job_wait_inputs_native(inputs.events, inputs.zero_out, inputs.zero_bytes);\n")
+    timer = "            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n"
+    sub("N2", "refused arm's census timer dropped", timer, "")
+    # The timer is excused by its text, so a real wait_* call in its place, or a second timer beside it,
+    # takes no excuse from it.
+    sub("N1", "refused arm's census timer swapped for a wait_* call", timer,
+        "            wait_inputs_natively(inputs.events);\n")
+    sub("N1", "a second census timer in the prologue", timer,
+        timer + "            moe_hostpath_wait_timer wait_timer_again(MOE_WAIT_B2);\n")
     sub("N1", "boundary wait called from a flush", "        ++g_cpu_scatter_serial;\n",
         "        ++g_cpu_scatter_serial;\n        pending_cpu_scatter_wait_prev_events(slot);\n")
     sub("N6", "boundary wait dropped from the graph-boundary flush",
@@ -1199,7 +1281,8 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "static void moe_settle_inputs(const moe_cpu_job_inputs & in) {\n    sycl::event::wait(in.events);\n}\n\n"
         + pro_def + "    moe_settle_inputs(inputs);\n")
     sub("N1", "worker wait behind a wrapper the prologue factory calls", pro_def,
-        "static void moe_inputs_ready(const moe_cpu_job_inputs & in) {\n    moe_cpu_job_wait_inputs(in);\n}\n\n"
+        "static void moe_inputs_ready(const moe_cpu_job_inputs & in) {\n"
+        "    moe_cpu_job_wait_inputs(ggml_sycl::cpu_job_input_marker{}, in.zero_out, in.zero_bytes);\n}\n\n"
         + pro_def + "    moe_inputs_ready(inputs);\n")
     sub("N1", "wait in the host_task closure's capture list", join_task,
         "cgh.host_task([job = (job.wait(), job), stamps = std::move(stamps)]() "
@@ -1210,17 +1293,17 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N2", "prologue definition renamed away", "static std::function<void()> moe_cpu_job_prologue(",
         "static std::function<void()> moe_cpu_job_prologue_v2(")
     # Every caller: the hybrid block and the event-chained route (llama.cpp-7pvo) each build one.
-    sub("N2", "CPU dispatch stops building its jobs' prologue", "moe_cpu_job_prologue(std::move(job_inputs))",
-        "moe_cpu_job_prologue_unused(std::move(job_inputs))", count=-1)
+    sub("N2", "CPU dispatch stops building its jobs' prologue", "moe_cpu_job_prologue(*stream, std::move(job_inputs), src0)",
+        "moe_cpu_job_prologue_unused(*stream, std::move(job_inputs), src0)", count=-1)
     # A lambda called on the submitting thread to build the handed-off closure runs there: only its result
     # is handed off.
     sub("N1", "join builds its host_task closure by calling a lambda", join_task,
         "cgh.host_task([job, stamps]() { job.wait(); return [job, stamps]() "
         "{ moe_cpu_job_join(job, stamps.get()); }; }());")
-    sub("N1", "prologue builds its closure by calling a lambda",
-        "    return [inputs = std::move(inputs)]() {\n        moe_cpu_job_wait_inputs(inputs);\n    };\n",
-        "    return [&]() { sycl::event::wait(inputs.events); return std::function<void()>([inputs]() "
-        "{ moe_cpu_job_wait_inputs(inputs); }); }();\n")
+    sub("N1", "prologue builds its closure by calling a lambda", pro_closure,
+        "    return [&]() { sycl::event::wait(inputs.events); return std::function<void()>([marker, "
+        "zero_out = inputs.zero_out, zero_bytes = inputs.zero_bytes]() "
+        "{ moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes); }); }();\n")
     # A lambda of ggml_sycl_mul_mat_id that the hybrid block calls runs on the submitting thread too.
     expert_id_line = "        local_extra.moe_expert_id     = expert_id;\n"
     sub("N1", "wait in a lambda of ggml_sycl_mul_mat_id the hybrid block calls", expert_id_line,
@@ -1231,9 +1314,9 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N1", "future.get in the sibling move", sib, sib + "    g_pending_scatter.future.get();\n")
     # One mutant per rule that N1 cannot see: each removes a positive pin or adds a caller outside the
     # scanned code, where the scan never looks for waits.
-    sub("N3", "prologue closure stops waiting for its inputs",
-        "    return [inputs = std::move(inputs)]() {\n        moe_cpu_job_wait_inputs(inputs);\n    };\n",
-        "    return [inputs = std::move(inputs)]() {\n        (void) inputs;\n    };\n")
+    sub("N3", "prologue closure stops waiting for its inputs", pro_closure,
+        "    return [marker = std::move(marker), zero_out = inputs.zero_out, zero_bytes = inputs.zero_bytes]() {\n"
+        "        (void) marker;\n    };\n")
     sub("N4", "join host_task closure stops joining the job", join_task,
         "cgh.host_task([job, stamps = std::move(stamps)]() { (void) job; });")
     boundary_open = (
