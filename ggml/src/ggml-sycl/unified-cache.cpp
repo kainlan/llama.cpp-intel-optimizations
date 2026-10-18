@@ -24033,6 +24033,47 @@ static size_t runtime_registry_scan_host_zone_locked(host_zone_id            zon
     return live_allocations;
 }
 
+// What one refused host-zone settle reports, from the count of the zone's earlier refusals.
+struct host_zone_refusal_report {
+    bool log_detail = false;  // name the zone's rows: the first 4 refusals of the zone
+    bool warn       = false;  // print the refusal WARN, with the oldest live epoch: the first 8
+    bool scan       = false;  // enumerate the registry, for either of those or for an active zone audit
+};
+
+// Takes the report of a zone's next refusal and counts it. The per-allocation dump names the owner, which is the
+// diagnostic that matters, but it is one stderr line each and a refusal returns rather than aborting, so it is kept to
+// the first few refusals, and the WARN to a few more. Past both, a refusal reports nothing, so it does not enumerate
+// the registry unless a zone audit wants the inventory (llama.cpp-nqbe). The count stops at the WARN budget: past it
+// the count decides nothing, and one bumped at every graph boundary for the life of the process would wrap.
+static host_zone_refusal_report host_zone_refusal_take(std::atomic<int> & refusals, bool audit_active) noexcept {
+    constexpr int detail_budget = 4;
+    constexpr int warn_budget   = 8;
+    int           index         = refusals.load(std::memory_order_relaxed);
+    if (index < warn_budget) {
+        index = refusals.fetch_add(1, std::memory_order_relaxed);
+    }
+    host_zone_refusal_report report{};
+    report.log_detail = index < detail_budget;
+    report.warn       = index < warn_budget;
+    report.scan       = report.log_detail || report.warn || audit_active;
+    return report;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+host_zone_refusal_census allocation_registry_test_host_zone_refusals(int refusals, bool audit_active) noexcept {
+    std::atomic<int>         count{ 0 };
+    host_zone_refusal_census census{};
+    for (int i = 0; i < refusals; i++) {
+        const host_zone_refusal_report report = host_zone_refusal_take(count, audit_active);
+        census.refusals_named += report.log_detail ? 1 : 0;
+        census.refusals_warning += report.warn ? 1 : 0;
+        census.refusals_scanning += report.scan ? 1 : 0;
+    }
+    census.count = count.load(std::memory_order_relaxed);
+    return census;
+}
+#endif
+
 void unified_cache::host_zone_settle(host_zone_id zone) {
     // Phase 0 escape audit. Declared FIRST, ahead of the reservation
     // early-return just below, so the RAII destructor still records a visit
@@ -24106,23 +24147,23 @@ void unified_cache::host_zone_settle(host_zone_id zone) {
         // zone's first-ever refusal -- and a first occurrence is exactly what has
         // to be visible.  Not hypothetical: STAGING alone reaches 7 refusals in one
         // multi-model run, so it would exhaust a shared budget by itself.
-        static std::atomic<int>     refusal_logs[static_cast<int>(host_zone_id::COUNT)]{};
-        std::atomic<int> &          zone_logs        = refusal_logs[static_cast<int>(zone)];
-        // The per-allocation dump names the owner, which is the diagnostic that
-        // matters -- but it is one stderr line each and this path now returns
-        // instead of aborting, so keep it only for the first few refusals, and
-        // bound it within a single refusal too.
-        const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      live_allocations = 0;
-        uint64_t                    oldest_epoch     = new_epoch;
-        // A clean settle (the normal case: once per graph) is one counter read. Only a zone that has a row pays for the
-        // enumeration, which exists to explain the refusal.
+        static std::atomic<int> refusal_logs[static_cast<int>(host_zone_id::COUNT)]{};
+        std::atomic<int> &      zone_refusals = refusal_logs[static_cast<int>(zone)];
+        uint64_t                oldest_epoch  = new_epoch;
+        // A clean settle (the normal case: once per graph) is one counter read, and so is a refusal once its
+        // diagnostics are spent. The registry is enumerated only for what a refusal reports (host_zone_refusal_take):
+        // a row that never leaves the zone would otherwise make every graph boundary walk the whole registry under
+        // its mutex, on the submitting thread (llama.cpp-nqbe). The counter is non-zero exactly when the zone has a
+        // row, so the refusal itself needs no enumeration.
         if (runtime_registry_host_zone_live_locked(zone)) {
-            live_allocations =
-                runtime_registry_scan_host_zone_locked(zone, log_detail, epoch_tracked, audit, oldest_epoch);
-        }
-        if (live_allocations > 0) {
-            if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            const host_zone_refusal_report report           = host_zone_refusal_take(zone_refusals, audit.active());
+            // The row count the WARN prints. The scan gives it, and the scan runs whenever the WARN is due.
+            size_t                         live_allocations = 0;
+            if (report.scan) {
+                live_allocations =
+                    runtime_registry_scan_host_zone_locked(zone, report.log_detail, epoch_tracked, audit, oldest_epoch);
+            }
+            if (report.warn) {
                 if (epoch_tracked) {
                     GGML_LOG_WARN(
                         "[UNIFIED-CACHE] refusing %s host_zone_boundary_check with %zu live registered allocations "

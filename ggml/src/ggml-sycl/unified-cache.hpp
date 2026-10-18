@@ -7009,6 +7009,19 @@ bool   allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept;
 size_t allocation_registry_test_span_irregular_rows() noexcept;
 size_t allocation_registry_test_rows_scanned() noexcept;
 void   allocation_registry_test_reset_rows_scanned() noexcept;
+
+// llama.cpp-nqbe: what `refusals` successive refusals of one host zone report, from a fresh count, through the helper
+// host_zone_settle() takes each refusal's report from: how many name their rows, print the WARN and enumerate the
+// registry, and the zone's count after them.
+struct host_zone_refusal_census {
+    size_t refusals_named    = 0;
+    size_t refusals_warning  = 0;
+    size_t refusals_scanning = 0;
+    int    count             = 0;
+};
+
+host_zone_refusal_census allocation_registry_test_host_zone_refusals(int refusals, bool audit_active) noexcept;
+
 // llama.cpp-ii25: rewrite a registered row's size behind the index's back (the next lookup inside that range must abort).
 bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
