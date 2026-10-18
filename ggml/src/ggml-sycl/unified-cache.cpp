@@ -32513,7 +32513,9 @@ static std::string kv_context_room_class_summary(size_t n_held, size_t n_layers,
 // held and refused by cost, the deciding layer's A and B with the parameters that produced them, and the device bytes
 // of routed experts the pack placed against those the same pack places with the room added back. A WARN when it cost
 // experts, could not hold all it wanted or refused a layer, so a default run shows it; a fully refused room is one
-// WARN. With no requested context, one INFO line says no room is held.
+// WARN. With no requested context, one INFO line says no room is held. When the context is the model's default (the
+// caller named no n_ctx, so its context opens at the training context), both lines say so right after the contexts
+// they compare, so a room the size of the training context reads as the context llama creates (llama.cpp-7fmt).
 static void log_kv_context_room(const kv_context_room & room, const placement_kv_info & kv_info, int device_id) {
     if (kv_info.n_ctx_context == 0) {
         GGML_LOG_INFO(
@@ -32529,14 +32531,16 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
     const std::string full = kv_context_room_class_summary(room.n_held - room.n_swa_held,
                                                            room.n_layers - room.n_swa_layers, "full-attention");
     const std::string swa  = kv_context_room_class_summary(room.n_swa_held, room.n_swa_layers, "SWA");
+    const char *      ctx_source =
+        kv_info.n_ctx_context_is_default ? " (the model's default, training context: the caller named no n_ctx)" : "";
     if (room.n_held == 0) {
         GGML_LOG_WARN(
             "[PLACEMENT] KV context room on device %d: %s, %s: every layer's room was refused by cost, so none of "
-            "the %.1f MB for n_ctx_context=%u over planner n_ctx=%u is held, the routed experts keep it, and the "
+            "the %.1f MB for n_ctx_context=%u over planner n_ctx=%u%s is held, the routed experts keep it, and the "
             "runtime re-places the overflow at context creation; deciding layer %d: host attention %.1f us/token vs "
             "displaced experts %.1f us/token (fill %.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s). "
             "n_ctx_context is the requested n_ctx.\n",
-            device_id, full.c_str(), swa.c_str(), room.refused / mb, kv_info.n_ctx_context, kv_info.n_ctx,
+            device_id, full.c_str(), swa.c_str(), room.refused / mb, kv_info.n_ctx_context, kv_info.n_ctx, ctx_source,
             room.decision.layer_id, room.decision.host_attn_us, room.decision.expert_us, kv_info.ctx_fill_pct,
             kv_info.host_attn_gbps, kv_info.cpu_expert_gbps);
         return;
@@ -32551,13 +32555,13 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
     // once.
     ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
                       "[PLACEMENT] KV context room on device %d: %s, %s%s; "
-                      "held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u, before the "
+                      "held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u%s, before the "
                       "routed experts%s; deciding layer %d %s: host attention %.1f us/token vs displaced experts "
                       "%.1f us/token (fill %.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s); it cost %.1f MB of "
                       "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
                       "with the room added back. n_ctx_context is the requested n_ctx.\n",
                       device_id, full.c_str(), swa.c_str(), refused_note, room.held / mb, room.wanted / mb,
-                      kv_info.n_ctx_context, kv_info.n_ctx, short_note, room.decision.layer_id,
+                      kv_info.n_ctx_context, kv_info.n_ctx, ctx_source, short_note, room.decision.layer_id,
                       room.decision.held ? "held" : "refused", room.decision.host_attn_us, room.decision.expert_us,
                       kv_info.ctx_fill_pct, kv_info.host_attn_gbps, kv_info.cpu_expert_gbps,
                       room.displaced_bytes() / mb, room.expert_bytes / mb, room.expert_groups,

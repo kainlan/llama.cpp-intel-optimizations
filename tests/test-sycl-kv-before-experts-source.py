@@ -23,9 +23,11 @@ The fix this gate pins:
     packs in MB after the pack, as a WARN when the room cost experts; with no requested context it logs one INFO
     line saying no room is held;
   - the loader hands the backend that context (llama.cpp-ak0p): the one the caller is about to create
-    (llama_model_params::n_ctx_hint, which common sets from -c and llama-bench from its test's context), padded the
-    way llama_context pads n_ctx for a single sequence, or 0 when no request reached the load, so a run without -c
-    holds no room and places as master does. The placement envelope's n_ctx stays 0, so the load measures and the
+    (llama_model_params::n_ctx_hint, which common sets from -c, or without it to the model's default context, its
+    training context (llama.cpp-7fmt), and llama-bench from its test's context), padded the way llama_context pads
+    n_ctx for a single sequence, or 0 when no request reached the load (a caller that never sets the field), which
+    holds no room. The hint is resolved in one place, src/llama-n-ctx-hint.h, whose default-context rule
+    test-sycl-ctx-hint-default-source pins. The placement envelope's n_ctx stays 0, so the load measures and the
     planning shape keep their inputs.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
@@ -73,6 +75,7 @@ CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 SYCL_H = read("ggml/include/ggml-sycl.h")
 MODEL = read("src/llama-model.cpp")
+RESOLVER = read("src/llama-n-ctx-hint.h")
 MODEL_H = read("src/llama-model.h")
 CONTEXT = read("src/llama-context.cpp")
 LLAMA_H = read("include/llama.h")
@@ -268,30 +271,40 @@ def claim_runtime_rederivation_drops_the_room(hpp: str) -> bool:
 
 
 CONTEXT_PAD_RE = re.compile(r"cparams\.n_ctx = GGML_PAD\(cparams\.n_ctx, (\d+)\);")
-HINT_PICK_RE = re.compile(r"inventory\.n_ctx_context = n_ctx_hint != 0 \? GGML_PAD\(n_ctx_hint, (\d+)\) : 0;")
+RESOLVE_SIG = ("static inline llama_n_ctx_hint_resolution llama_n_ctx_hint_resolve(uint32_t n_ctx_hint, "
+               "uint32_t n_ctx_train)")
+# A hint the caller named (not the model's default): the context as given, padded, or no room for 0.
+HINT_PICK_RE = re.compile(r"return \{ n_ctx_hint != 0 \? GGML_PAD\(n_ctx_hint, (\d+)\) : 0, false \};")
+HINT_PICK = "inventory.n_ctx_context = ctx_room.n_ctx_context;"
+HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);"
 HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint());"
-INV_TAIL = "uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; }"
+INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
+            "bool n_ctx_context_is_default; }")
 COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
 TAIL_ASSERTS = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184,",
 )
 
 
-def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str, header: str) -> bool:
-    """The inventory carries the context the caller is about to create (llama_model_params::n_ctx_hint), or 0 when
-    no request reached the load, so no room is held; both plan builders pass the model's hint. The context sits right
-    after kv_layer_count and before the indexer widths (the KV tail ggml-sycl.cpp pins with static_asserts), and the
-    backend copies it into its KV inputs."""
+def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str, header: str, resolver: str) -> bool:
+    """The inventory carries the context the caller is about to create (llama_model_params::n_ctx_hint), resolved
+    once (src/llama-n-ctx-hint.h): a hint the caller named is that context, and 0, no request, holds no room (the
+    model's default context, llama.cpp-7fmt, is pinned by test-sycl-ctx-hint-default-source); both plan builders pass
+    the model's hint. The context sits right after kv_layer_count and before the indexer widths (the KV tail
+    ggml-sycl.cpp pins with static_asserts, with the context's provenance appended after it), and the backend copies
+    it into its KV inputs."""
     m   = norm(model)
     pop = body(m, POPULATE_SIG)
+    r   = body(norm(resolver), RESOLVE_SIG)
     h   = norm(header)
     at  = h.find(INVENTORY_STRUCT)
     inv = body(h[at:], "struct ggml_sycl_tensor_inventory") if at >= 0 else ""
     s   = norm(sycl)
-    return (bool(pop) and len(HINT_PICK_RE.findall(pop)) == 1 and pop.count("inventory.n_ctx_context =") == 1
-            and "n_ctx_train" not in pop.split("inventory.n_ctx_context =")[1].split(";")[0]
+    return (bool(pop) and ordered(pop, HINT_RESOLVE, HINT_PICK) and pop.count("inventory.n_ctx_context =") == 1
+            and len(HINT_PICK_RE.findall(r)) == 1
             and "llama_load_measure_n_ctx" not in pop
             and m.count(HINT_PASS) == 2
             and "uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }" in norm(model_h)
@@ -299,13 +312,13 @@ def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str
             and COPY_CTX in s and all(a in s for a in TAIL_ASSERTS))
 
 
-def claim_hint_is_padded_like_the_context(model: str, context: str) -> bool:
+def claim_hint_is_padded_like_the_context(resolver: str, context: str) -> bool:
     """The room's context is padded with the constant llama_context pads n_ctx with (src/llama-context.cpp,
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256)), so the room covers a single-sequence context of the requested size.
     A non-unified multi-slot context can exceed it (each sequence's share is padded, SWA cells grow with the streams);
     the runtime transaction re-places that overflow."""
     pad = CONTEXT_PAD_RE.findall(norm(context))
-    pick = HINT_PICK_RE.findall(body(norm(model), POPULATE_SIG))
+    pick = HINT_PICK_RE.findall(body(norm(resolver), RESOLVE_SIG))
     return len(pad) == 1 and len(pick) == 1 and pad[0] == pick[0]
 
 
@@ -323,17 +336,17 @@ def claim_api_carries_the_hint(llama_h: str, model: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;"
+COMMON_HINT = "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
-COMMON_FIT_REFRESH = "if (params.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
+COMMON_FIT_REFRESH = "if (cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
 
 
 def claim_common_hands_the_requested_context(common: str) -> bool:
-    """common passes -c as the hint (0, the training context, stays 0). After a fit, which may shrink a requested
-    context, the hint is the context the fit chose, before the model loads; without -c the fit resolves the training
-    context and the hint stays 0, so no room is held (owner ruling, llama.cpp-ak0p)."""
+    """common passes -c as the hint, and without -c the model's default context (llama.cpp-7fmt). After a fit, which
+    may shrink a requested context or resolve the default one itself, the hint is the context the fit left in
+    cparams, before the model loads; a fit that resolved none (the SYCL build's fit is a no-op) keeps the default."""
     n = norm(common)
     b = body(n, COMMON_SIG)
     return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
@@ -395,11 +408,11 @@ def test_runtime_rederivation_drops_the_room():
 
 
 def test_loader_hands_the_requested_context():
-    assert claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, SYCL_H)
+    assert claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, SYCL_H, RESOLVER)
 
 
 def test_hint_is_padded_like_the_context():
-    assert claim_hint_is_padded_like_the_context(MODEL, CONTEXT)
+    assert claim_hint_is_padded_like_the_context(RESOLVER, CONTEXT)
 
 
 def test_envelope_keeps_no_context():
@@ -543,45 +556,42 @@ def test_mutant_room_survives_the_runtime_shape_fails():
               "vram_bytes = weight_vram_bytes"))
 
 
-HINT_PICK = "inventory.n_ctx_context = n_ctx_hint != 0 ? GGML_PAD(n_ctx_hint, 256) : 0;"
-
-
 def test_mutant_loader_ignores_the_hint_fails():
-    """The room for n_ctx_train whatever the caller asked for: the defect this ticket fixes."""
+    """The room for n_ctx_train whatever the caller asked for: the defect llama.cpp-ak0p fixed."""
     assert not claim_loader_hands_the_requested_context(
-        _once(MODEL, HINT_PICK, "inventory.n_ctx_context = hparams.n_ctx_train;"), MODEL_H, SYCL, SYCL_H)
+        _once(MODEL, HINT_PICK, "inventory.n_ctx_context = hparams.n_ctx_train;"), MODEL_H, SYCL, SYCL_H, RESOLVER)
 
 
 def test_mutant_loader_falls_back_to_n_ctx_train_fails():
-    """A run without -c holds the room for n_ctx_train again instead of placing as master does."""
+    """A caller that asked for nothing (hint 0) holds the room for n_ctx_train again instead of none."""
     assert not claim_loader_hands_the_requested_context(
-        _once(MODEL, HINT_PICK, "inventory.n_ctx_context = n_ctx_hint != 0 ? GGML_PAD(n_ctx_hint, 256) : "
-              "hparams.n_ctx_train;"), MODEL_H, SYCL, SYCL_H)
+        MODEL, MODEL_H, SYCL, SYCL_H, _once(RESOLVER, ": 0, false };", ": GGML_PAD(n_ctx_train, 256), false };"))
 
 
 def test_mutant_loader_rides_the_measure_context_fails():
     """The room keyed to the probe measure's n_ctx again."""
     assert not claim_loader_hands_the_requested_context(
         _once(MODEL, HINT_PICK, "inventory.n_ctx_context = llama_load_measure_n_ctx("
-              "llama_model_sycl_make_placement_envelope().n_ctx, hparams.n_ctx_train);"), MODEL_H, SYCL, SYCL_H)
+              "llama_model_sycl_make_placement_envelope().n_ctx, hparams.n_ctx_train);"), MODEL_H, SYCL, SYCL_H,
+        RESOLVER)
 
 
 def test_mutant_hint_padded_differently_fails():
     """A padding of its own: the room falls short of the context llama_context creates."""
     assert not claim_hint_is_padded_like_the_context(
-        _once(MODEL, "GGML_PAD(n_ctx_hint, 256)", "GGML_PAD(n_ctx_hint, 255)"), CONTEXT)
+        _once(RESOLVER, "GGML_PAD(n_ctx_hint, 256)", "GGML_PAD(n_ctx_hint, 255)"), CONTEXT)
 
 
 def test_mutant_context_pads_differently_fails():
     """The comparison is real: llama_context changing its padding turns the claim red until the room follows."""
     assert not claim_hint_is_padded_like_the_context(
-        MODEL, _once(CONTEXT, "cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);",
-                     "cparams.n_ctx = GGML_PAD(cparams.n_ctx, 512);"))
+        RESOLVER, _once(CONTEXT, "cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);",
+                        "cparams.n_ctx = GGML_PAD(cparams.n_ctx, 512);"))
 
 
 def test_mutant_hint_unpadded_fails():
     assert not claim_hint_is_padded_like_the_context(
-        _once(MODEL, HINT_PICK, "inventory.n_ctx_context = n_ctx_hint;"), CONTEXT)
+        _once(RESOLVER, "n_ctx_hint != 0 ? GGML_PAD(n_ctx_hint, 256) : 0", "n_ctx_hint"), CONTEXT)
 
 
 def test_mutant_late_builder_drops_the_hint_fails():
@@ -591,25 +601,32 @@ def test_mutant_late_builder_drops_the_hint_fails():
     assert at >= 0 and n.find(HINT_PASS, at) >= 0
     k = n.find(HINT_PASS, at)
     mutant = n[:k] + "max_pp_pipeline_weight_bytes, hparams, 0);" + n[k + len(HINT_PASS):]
-    assert not claim_loader_hands_the_requested_context(mutant, MODEL_H, SYCL, SYCL_H)
+    assert not claim_loader_hands_the_requested_context(mutant, MODEL_H, SYCL, SYCL_H, RESOLVER)
 
 
 def test_mutant_field_inserted_before_the_indexer_widths_fails():
     """A field inserted into the KV tail moves the fields the consumer reads at pinned offsets."""
-    mutant = _once(SYCL_H, "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; };",
-                   "uint32_t n_ctx_context; size_t spare; const uint32_t * kv_idx_k_width_per_layer; };")
-    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant)
+    mutant = _once(SYCL_H, "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer;",
+                   "uint32_t n_ctx_context; size_t spare; const uint32_t * kv_idx_k_width_per_layer;")
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant, RESOLVER)
 
 
 def test_mutant_field_appended_fails():
-    """A field appended after the indexer widths: the struct no longer ends where the consumer's size pin says."""
-    mutant = _once(SYCL_H, "const uint32_t * kv_idx_k_width_per_layer; };",
-                   "const uint32_t * kv_idx_k_width_per_layer; uint8_t spare; };")
-    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant)
+    """A field appended after the context's provenance: the struct no longer ends where the consumer's size pin
+    says."""
+    mutant = _once(SYCL_H, "bool n_ctx_context_is_default; };", "bool n_ctx_context_is_default; uint8_t spare; };")
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant, RESOLVER)
+
+
+def test_mutant_size_pin_left_at_the_old_size_fails():
+    """The provenance appended but the size pin left at 184: the static_assert would stop the build, and the gate
+    says so first."""
+    mutant = _once(SYCL, TAIL_ASSERTS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,")
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, mutant, SYCL_H, RESOLVER)
 
 
 def test_mutant_backend_drops_the_context_fails():
-    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, COPY_CTX, ""), SYCL_H)
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, COPY_CTX, ""), SYCL_H, RESOLVER)
 
 
 def test_mutant_envelope_carries_the_hint_fails():
@@ -631,7 +648,8 @@ def test_mutant_common_fit_keeps_the_unfitted_hint_fails():
 
 
 def test_mutant_common_fit_refresh_unguarded_fails():
-    """Restores the defect: without -c the fit's training context becomes the hint and reinstalls its room."""
+    """Unguarded, a fit that resolved no context (the SYCL build's fit is a no-op, so cparams.n_ctx stays 0 without
+    -c) overwrites the default context's hint with 0, and the load holds no room again (llama.cpp-7fmt)."""
     assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_FIT_REFRESH, FIT_REFRESH))
 
 

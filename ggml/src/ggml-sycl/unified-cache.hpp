@@ -646,6 +646,10 @@ struct placement_kv_info {
     // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
     // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
     uint32_t              n_ctx_context    = 0;
+    // llama.cpp-7fmt: n_ctx_context is the model's default context (the training context, which a caller that names
+    // no n_ctx creates) rather than one the caller named; from ggml_sycl_tensor_inventory::n_ctx_context_is_default.
+    // Only the room's line reads it, to say where the room's context came from.
+    bool                  n_ctx_context_is_default = false;
     // llama.cpp-w013: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room is held for a
     // layer only when the attention it keeps on the device is worth more per decode token than the routed experts it
     // displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at host_attn_gbps, and

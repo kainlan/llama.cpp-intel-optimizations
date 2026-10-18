@@ -353,8 +353,9 @@ struct ggml_sycl_tensor_inventory {
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds on the device ahead of the
     // routed experts; n_ctx above stays the load's own planning shape. llama.cpp-ak0p: libllama fills it with the
     // context the caller is about to create (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx for
-    // a single sequence. 0 = no request reached the load: no room is held. libllama and libggml-sycl must be rebuilt
-    // together for the planner to see it (see kv_idx_k_width_per_layer for the layout).
+    // a single sequence; a caller that names no n_ctx asks for the model's default context, n_ctx_train
+    // (n_ctx_context_is_default, llama.cpp-7fmt). 0 = no request reached the load: no room is held. libllama and
+    // libggml-sycl must be rebuilt together for the planner to see it (see kv_idx_k_width_per_layer for the layout).
     uint32_t                       n_ctx_context;
     // llama.cpp-8ecj: the key width of each layer's indexer key cache (llama_memory_hybrid_idx, qwen4exp: one key head
     // of indexer_head_size, no V) [kv_layer_count]; 0 where a layer has none. NULL and an all-zero array both mean no
@@ -366,6 +367,13 @@ struct ggml_sycl_tensor_inventory {
     // caller's object, and with kv_layer_count > 0 dereferences whatever lies there as an array of kv_layer_count
     // widths. libllama and libggml-sycl must be rebuilt together.
     const uint32_t *               kv_idx_k_width_per_layer;
+    // llama.cpp-7fmt: n_ctx_context above is the model's default context (the training context, which a caller that
+    // names no n_ctx creates) rather than one the caller named. libllama resolves the hint; the backend only reads
+    // this to say, in the KV context room line, where the room's context came from. false is a named context, so a
+    // zero-initialised inventory keeps the line's wording. Appended: the struct grew from 184 to 192 bytes, which
+    // ggml-sycl.cpp pins with static_asserts; a libllama built before this field passes a 184-byte object, and
+    // libggml-sycl would read this byte past its end. libllama and libggml-sycl must be rebuilt together.
+    bool                           n_ctx_context_is_default;
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama

@@ -17057,11 +17057,13 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
 static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owner{};
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
-// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 184, "ggml_sycl_tensor_inventory layout changed");
+// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), and the context's provenance appended
+// after it (llama.cpp-7fmt).
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184, "n_ctx_context_is_default moved");
 
 // llama.cpp-w013: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct, host_attn_gbps and
 // cpu_expert_gbps) from its environment variable. Unset, unparsable, not finite, zero or negative keeps the default;
@@ -17296,6 +17298,8 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
     g_placement_kv_info.n_ctx_context    = inventory->n_ctx_context;
+    // llama.cpp-7fmt: whether that is the model's default context, for the room's line only.
+    g_placement_kv_info.n_ctx_context_is_default = inventory->n_ctx_context_is_default;
     // llama.cpp-w013: what the planner weighs that room by, layer by layer: the share of the requested context a
     // conversation is expected to fill (a percent, so at most 100), and the two host read rates.
     g_placement_kv_info.ctx_fill_pct =

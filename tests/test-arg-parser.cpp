@@ -381,8 +381,8 @@ static void test(void) {
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
     // llama.cpp-ak0p: -c reaches the model load as llama_model_params::n_ctx_hint, so the SYCL load holds that
-    // context's KV room; without -c the hint is 0, no room is held, and the load places as it did before the hint
-    // existed.
+    // context's KV room. llama.cpp-7fmt: without -c the hint asks for the model's default context, the training
+    // context llama_context creates for n_ctx 0, so the load holds that context's room instead of none.
     {
         common_params ctx_params;
         argv = { "binary_name", "-m", "model_file.gguf", "-c", "2048" };
@@ -394,7 +394,7 @@ static void test(void) {
         argv = { "binary_name", "-m", "model_file.gguf" };
         assert(true ==
                common_params_parse(argv.size(), list_str_to_char(argv).data(), no_ctx_params, LLAMA_EXAMPLE_COMMON));
-        assert(common_model_params_to_llama(no_ctx_params).n_ctx_hint == 0);
+        assert(common_model_params_to_llama(no_ctx_params).n_ctx_hint == LLAMA_N_CTX_HINT_DEFAULT);
     }
 
 #ifndef _WIN32

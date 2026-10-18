@@ -1282,10 +1282,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
-        // a fit may shrink a requested context: the load then plans for the context the fit chose. Without -c the fit
-        // resolves the training context, and the hint stays 0: no room is held for a context nobody asked for (owner
-        // ruling, llama.cpp-ak0p).
-        if (params.n_ctx > 0) {
+        // the load plans for the context the fit left in cparams, which is the one the context is created with: a fit
+        // may shrink a requested context, and without -c it resolves the default context itself (n_ctx_train per
+        // sequence, possibly shrunk). A fit that resolved none (cparams.n_ctx still 0; the SYCL build's fit is a
+        // no-op) keeps LLAMA_N_CTX_HINT_DEFAULT from common_model_params_to_llama rather than overwriting it with 0,
+        // so the load still holds the default context's room (llama.cpp-7fmt, llama.cpp-ak0p).
+        if (cparams.n_ctx > 0) {
             mparams.n_ctx_hint = cparams.n_ctx;
         }
     }
@@ -1678,10 +1680,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
-    // the context the caller will create (llama.cpp-ak0p): -c, or 0 for the training context. It is the context's
-    // whole cell count, which llama_context divides among the slots when the KV is not unified (llama-server
-    // --parallel), so it is never multiplied by n_parallel.
-    mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;
+    // the context the caller will create (llama.cpp-ak0p): -c, or without it the model's default context, which
+    // llama_context creates as n_ctx_train, so the SYCL load holds that context's KV room as it does for an explicit
+    // -c (llama.cpp-7fmt). It is the context's whole cell count, which llama_context divides among the slots when the
+    // KV is not unified (llama-server --parallel), so it is never multiplied by n_parallel.
+    mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;
 
     return mparams;
 }

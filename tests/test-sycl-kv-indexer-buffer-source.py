@@ -126,11 +126,13 @@ REFUSE = "if (ggml_sycl::kv_admission_mismatch(planned_device_bytes, kv_vram_cap
 HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == device) { total += layer_bytes[l]; }"
 
 
-FIELD = "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; };"
+# The indexer widths follow n_ctx_context; the context's provenance is appended after them (llama.cpp-7fmt, pinned by
+# test-sycl-ctx-hint-default-source), so the struct no longer ends here.
+FIELD = "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; bool n_ctx_context_is_default; };"
 READ = ("g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
@@ -152,7 +154,8 @@ HOT_ENV = "const char * hot_layers_env = std::getenv(\"GGML_SYCL_KV_HOT_LAYERS\"
 
 
 def claim_inventory_carries_the_indexer_width(header: str, sycl_cpp: str) -> bool:
-    """The field is appended after n_ctx_context, the backend copies it, and the consumer pins the layout."""
+    """The field follows n_ctx_context (with only the context's provenance after it), the backend copies it, and the
+    consumer pins the layout."""
     n = norm(sycl_cpp)
     return FIELD in norm(header) and READ in n and all(a in n for a in LAYOUT)
 
