@@ -393,10 +393,8 @@ bool ggml_backend_sycl_moe_exec_rates_lookup(int device, struct ggml_sycl_moe_ex
         ggml_sycl_moe_exec_rates_record rec = {};
         rec.h2d_gbps                        = e.h2d_gbps;
         rec.reorder_gbps                    = e.reorder_gbps;
-        for (const auto & tg : e.dev_gflops_by_type) {
-            if (tg.first < 0 || tg.first >= GGML_TYPE_COUNT || !(tg.second > 0.0)) {
-                continue;  // a type this build does not know, or a rate that cannot be one
-            }
+        // The file is not trusted to hold at most one pair per type: the record has GGML_TYPE_COUNT slots.
+        for (const auto & tg : moe_exec_rates_distinct_types(e, GGML_TYPE_COUNT)) {
             rec.types[rec.n_types]      = tg.first;
             rec.dev_gflops[rec.n_types] = tg.second;
             ++rec.n_types;

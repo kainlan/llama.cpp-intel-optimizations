@@ -1076,6 +1076,26 @@ inline MoeExecRatesEntry moe_exec_rates_entry_from_json(const std::string & json
     return e;
 }
 
+// The (type, GFLOP/s) pairs of `e` a record with one slot per ggml type can hold: a type in [0, type_count) with a
+// positive finite rate, each type once (the first occurrence wins), at most type_count pairs. A stored file is not
+// trusted to respect any of that.
+inline std::vector<std::pair<int, double>> moe_exec_rates_distinct_types(const MoeExecRatesEntry & e, int type_count) {
+    std::vector<std::pair<int, double>> kept;
+    std::vector<bool>                   seen(static_cast<size_t>(std::max(type_count, 0)), false);
+    for (const auto & tg : e.dev_gflops_by_type) {
+        if (static_cast<int>(kept.size()) >= type_count) {
+            break;
+        }
+        if (tg.first < 0 || tg.first >= type_count || !std::isfinite(tg.second) || !(tg.second > 0.0) ||
+            seen[static_cast<size_t>(tg.first)]) {
+            continue;
+        }
+        seen[static_cast<size_t>(tg.first)] = true;
+        kept.push_back(tg);
+    }
+    return kept;
+}
+
 inline std::string get_moe_exec_rates_cache_file(const std::string & cache_dir, const std::string & device_name) {
     return cache_dir + "/" + sanitize_device_name(device_name) + "-moe-exec-rates.json";
 }

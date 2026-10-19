@@ -1509,15 +1509,12 @@ TEST(ubatch_participating_devices_order) {
     return true;
 }
 
-// =============================================================================
-// Main test runner
-// =============================================================================
 // llama.cpp-36j0: the MoE executor's rates kind. One file per device, "<sanitized device>-moe-exec-rates.json",
 // under the same GGML_SYCL_TUNING_CACHE_DIR the ubatch kind uses, sharing CACHE_VERSION without bumping it.
 static std::string moe_exec_rates_test_dir(const char * leaf) {
     const char * env = std::getenv("GGML_SYCL_TUNING_CACHE_DIR");
-    std::string  dir = (env && env[0]) ? std::string(env) : std::string("/tmp/llama_test_moe_exec_rates");
-    dir += std::string("/") + leaf + "_" + std::to_string(getpid());
+    std::string  dir = (env && env[0]) ? std::string(env) + "/" : std::string("/tmp/llama_test_");
+    dir += std::string(leaf) + "_" + std::to_string(getpid());
     return dir;
 }
 
@@ -1569,6 +1566,7 @@ TEST(moe_exec_rates_cache_roundtrip) {
     ASSERT(loaded.size() == 1 && loaded[0].device_key == b50.device_key);
 
     std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
     return true;
 }
 
@@ -1593,6 +1591,7 @@ TEST(moe_exec_rates_cache_other_version_is_a_miss) {
     std::remove(path.c_str());
     ASSERT(!load_moe_exec_rates(cache_dir, device_name, loaded));
     ASSERT(loaded.empty());
+    rmdir(cache_dir.c_str());
     return true;
 }
 
@@ -1626,9 +1625,59 @@ TEST(moe_exec_rates_kind_leaves_the_ubatch_file_loadable) {
 
     std::remove(ubatch_path.c_str());
     std::remove(get_moe_exec_rates_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
     return true;
 }
 
+// A corrupt or hand-edited file can hold more (type, rate) pairs than there are ggml types, repeats included. The
+// lookup's record holds one slot per type, so the pairs it keeps are bounded and distinct, first occurrence wins.
+TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct) {
+    const int         type_count  = static_cast<int>(GGML_TYPE_COUNT);
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_dup");
+    const std::string device_name = "TestMoeExecRatesDupDevice";
+
+    MoeExecRatesEntry e;
+    e.device_key = "Dev@1.0";
+    e.h2d_gbps   = 20.0;
+    for (int i = 0; i < 5; ++i) {
+        e.dev_gflops_by_type.emplace_back(0, 1000.0 + i);  // type 0 five times
+    }
+    for (int t = 0; t < type_count; ++t) {
+        e.dev_gflops_by_type.emplace_back(t, 2000.0 + t);
+    }
+    e.dev_gflops_by_type.emplace_back(1, 9.0);
+    e.dev_gflops_by_type.emplace_back(type_count, 9.0);  // out of range
+    e.dev_gflops_by_type.emplace_back(2, -1.0);          // not a rate
+    ASSERT(static_cast<int>(e.dev_gflops_by_type.size()) == type_count + 8);
+
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, { e }));
+    std::vector<MoeExecRatesEntry> loaded;
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].dev_gflops_by_type.size() == e.dev_gflops_by_type.size());
+
+    const std::vector<std::pair<int, double>> kept = moe_exec_rates_distinct_types(loaded[0], type_count);
+    ASSERT(static_cast<int>(kept.size()) <= type_count);
+    ASSERT(static_cast<int>(kept.size()) == type_count);  // every type once
+    std::vector<bool> seen(static_cast<size_t>(type_count), false);
+    for (const auto & tg : kept) {
+        ASSERT(tg.first >= 0 && tg.first < type_count);
+        ASSERT(!seen[static_cast<size_t>(tg.first)]);
+        seen[static_cast<size_t>(tg.first)] = true;
+        ASSERT(tg.second > 0.0);
+    }
+    ASSERT(kept[0].first == 0 && kept[0].second == 1000.0);  // the first occurrence wins
+
+    // a smaller bound stops the list there
+    ASSERT(moe_exec_rates_distinct_types(loaded[0], 3).size() == 3);
+
+    std::remove(get_moe_exec_rates_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// =============================================================================
+// Main test runner
+// =============================================================================
 int main() {
     // llama.cpp-7n6n: several tests in this binary
     // (cache_file_roundtrip, version_check, atomic_write) resolve their
@@ -1706,6 +1755,7 @@ int main() {
     RUN_TEST(moe_exec_rates_cache_roundtrip);
     RUN_TEST(moe_exec_rates_cache_other_version_is_a_miss);
     RUN_TEST(moe_exec_rates_kind_leaves_the_ubatch_file_loadable);
+    RUN_TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";
