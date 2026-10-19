@@ -17057,16 +17057,22 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
 static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owner{};
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
-// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 184, "ggml_sycl_tensor_inventory layout changed");
+// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), and the context's provenance appended
+// after it (llama.cpp-7fmt).
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184, "n_ctx_context_is_default moved");
 
-// llama.cpp-w013: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct, host_attn_gbps and
-// cpu_expert_gbps) from its environment variable. Unset, unparsable, not finite, zero or negative keeps the default;
-// above `max` is `max` (docs/backend/sycl-env-vars.md). The room's line prints the value each run used.
-static double ggml_sycl_plan_cost_param(const char * name, double def, double max) {
+// llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
+// host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,
+// zero or negative keeps the default; above `max` is `max` (docs/backend/sycl-env-vars.md). `set`, when given, says
+// whether the variable supplied the value. The room's line prints the value each run used.
+static double ggml_sycl_plan_cost_param(const char * name, double def, double max, bool * set = nullptr) {
+    if (set != nullptr) {
+        *set = false;
+    }
     const char * env = std::getenv(name);
     if (env == nullptr) {
         return def;
@@ -17075,6 +17081,9 @@ static double ggml_sycl_plan_cost_param(const char * name, double def, double ma
     const double value = std::strtod(env, &end);
     if (end == env || !std::isfinite(value) || value <= 0.0) {
         return def;
+    }
+    if (set != nullptr) {
+        *set = true;
     }
     return std::min(value, max);
 }
@@ -17296,8 +17305,12 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
     g_placement_kv_info.n_ctx_context    = inventory->n_ctx_context;
-    // llama.cpp-w013: what the planner weighs that room by, layer by layer: the share of the requested context a
-    // conversation is expected to fill (a percent, so at most 100), and the two host read rates.
+    // llama.cpp-7fmt: whether that is the model's default context. The room's lines say so, and for the default
+    // context an expert type with no measured CPU rate refuses the room instead of being priced at the fallback.
+    g_placement_kv_info.n_ctx_context_is_default = inventory->n_ctx_context_is_default;
+    // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs that room by, layer by layer: the share of the requested
+    // context a conversation is expected to fill (a percent, so at most 100), the two host read rates (the CPU expert
+    // rate, when its variable is given, prices every expert type), and the cost of each CPU split a host layer adds.
     g_placement_kv_info.ctx_fill_pct =
         ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CTX_FILL_PCT", ggml_sycl::PLACEMENT_CTX_FILL_PCT_DEFAULT, 100.0);
     g_placement_kv_info.host_attn_gbps =
@@ -17305,7 +17318,9 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                                   std::numeric_limits<double>::max());
     g_placement_kv_info.cpu_expert_gbps =
         ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CPU_EXPERT_GBPS", ggml_sycl::PLACEMENT_CPU_EXPERT_GBPS_DEFAULT,
-                                  std::numeric_limits<double>::max());
+                                  std::numeric_limits<double>::max(), &g_placement_kv_info.cpu_expert_gbps_set);
+    g_placement_kv_info.host_split_us = ggml_sycl_plan_cost_param(
+        "GGML_SYCL_PLAN_HOST_SPLIT_US", ggml_sycl::PLACEMENT_HOST_SPLIT_US_DEFAULT, std::numeric_limits<double>::max());
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
             "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB "

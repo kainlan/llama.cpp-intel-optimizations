@@ -67,6 +67,10 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = common_model_params_to_llama(params);
 
+    // the context below depends on n_ctx_train, known only after the load, so no room is requested and the runtime
+    // places the KV overflow when the context is created (llama.cpp-7fmt)
+    model_params.n_ctx_hint = 0;
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
 
     if (model == NULL) {

@@ -34,6 +34,7 @@ INPUTS = (
     "ggml/src/ggml-sycl/fattn.cpp",
     "ggml/src/ggml-sycl/fattn-dpas.cpp",
     "ggml/src/ggml-sycl/layer-streaming.cpp",
+    "ggml/src/ggml-sycl/kv-room-cost.hpp",
 )
 INVENTORY = "docs/backend/sycl-static-storage-inventory.csv"
 STALE_MESSAGE = "is stale; regenerate without --check"

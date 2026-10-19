@@ -36,6 +36,10 @@
 
 #define LLAMA_DEFAULT_SEED 0xFFFFFFFF
 
+// llama_model_params::n_ctx_hint for the model's default context: the one a context created with n_ctx 0 opens with,
+// the training context (n_ctx_train). The load resolves it as llama_context resolves n_ctx 0 (llama.cpp-7fmt).
+#define LLAMA_N_CTX_HINT_DEFAULT 0xFFFFFFFFu
+
 #define LLAMA_TOKEN_NULL -1
 
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
@@ -356,7 +360,9 @@ extern "C" {
 
         // the context the caller is about to create (llama_context_params::n_ctx); 0 = unknown. A placement hint: a
         // backend that places weights at load (SYCL) holds this context's KV room on the device ahead of the routed
-        // experts, and holds none for 0. The context itself may still be created at any size.
+        // experts, and holds none for 0. LLAMA_N_CTX_HINT_DEFAULT names the model's default context, the one an n_ctx
+        // of 0 creates (n_ctx_train), without the caller reading the model first. The context itself may still be
+        // created at any size.
         uint32_t n_ctx_hint;
     };
 

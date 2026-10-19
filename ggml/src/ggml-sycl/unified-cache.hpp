@@ -11,6 +11,7 @@
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
+#include "kv-room-cost.hpp"
 #include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
 #include "model-lifecycle.hpp"
@@ -582,13 +583,6 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
         [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });
 }
 
-// llama.cpp-w013: the defaults of the KV context room's three cost parameters (placement_kv_info::ctx_fill_pct,
-// host_attn_gbps and cpu_expert_gbps). docs/backend/sycl-env-vars.md gives the measurement behind each one and the
-// variable that overrides it.
-constexpr double PLACEMENT_CTX_FILL_PCT_DEFAULT    = 50.0;  // percent of the requested context expected to be filled
-constexpr double PLACEMENT_HOST_ATTN_GBPS_DEFAULT  = 30.0;  // GB/s at which the CPU reads a host layer's KV
-constexpr double PLACEMENT_CPU_EXPERT_GBPS_DEFAULT = 40.0;  // GB/s at which the CPU expert kernels read weights
-
 // Explicit planner inputs used for KV sizing and placement.
 struct placement_kv_info {
     uint32_t              n_layer      = 0;
@@ -646,16 +640,28 @@ struct placement_kv_info {
     // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
     // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
     uint32_t              n_ctx_context    = 0;
-    // llama.cpp-w013: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room is held for a
-    // layer only when the attention it keeps on the device is worth more per decode token than the routed experts it
-    // displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at host_attn_gbps, and
-    // the displaced experts would be read at cpu_expert_gbps, each with probability n_expert_used / n_expert. The
-    // backend fills all three once, where it copies the inventory in, from GGML_SYCL_PLAN_CTX_FILL_PCT,
-    // GGML_SYCL_PLAN_HOST_ATTN_GBPS and GGML_SYCL_PLAN_CPU_EXPERT_GBPS; a test sets them directly. The two rates must
-    // be finite and > 0 (the planner asserts it, since each divides); the fill is clamped to [0, 100] where it is used.
-    double                ctx_fill_pct     = PLACEMENT_CTX_FILL_PCT_DEFAULT;
-    double                host_attn_gbps   = PLACEMENT_HOST_ATTN_GBPS_DEFAULT;
-    double                cpu_expert_gbps  = PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
+    // llama.cpp-7fmt: n_ctx_context is the model's default context (the training context, which a caller that names
+    // no n_ctx creates) rather than one the caller named; from ggml_sycl_tensor_inventory::n_ctx_context_is_default.
+    // The room's lines say so, and it enters the decision in one direction only: for the default context a routed-
+    // expert type with no measured CPU rate refuses the room for every layer instead of being priced at
+    // cpu_expert_gbps (kv_room_expert_rate_for, kv-room-cost.hpp). It never makes a room held.
+    bool                  n_ctx_context_is_default = false;
+    // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
+    // is held for a layer only when the attention it keeps on the device is worth more per decode token than the
+    // routed experts it displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at
+    // host_attn_gbps and pay host_split_us for each CPU split the layer adds, and the displaced experts would be read
+    // at their type's measured CPU rate (cpu_expert_gbps for a type with none), each with probability
+    // n_expert_used / n_expert (kv-room-cost.hpp). The backend fills these once, where it copies the inventory in, from
+    // GGML_SYCL_PLAN_CTX_FILL_PCT, GGML_SYCL_PLAN_HOST_ATTN_GBPS, GGML_SYCL_PLAN_CPU_EXPERT_GBPS and
+    // GGML_SYCL_PLAN_HOST_SPLIT_US; a test sets them directly. The two rates must be finite and > 0 and the split cost
+    // finite and >= 0 (the planner asserts it, since the rates divide and the split cost adds); the fill is clamped
+    // to [0, 100] where it is used.
+    double                ctx_fill_pct             = PLACEMENT_CTX_FILL_PCT_DEFAULT;
+    double                host_attn_gbps           = PLACEMENT_HOST_ATTN_GBPS_DEFAULT;
+    double                cpu_expert_gbps          = PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
+    double                host_split_us            = PLACEMENT_HOST_SPLIT_US_DEFAULT;
+    // GGML_SYCL_PLAN_CPU_EXPERT_GBPS was given, so cpu_expert_gbps prices every routed-expert type (llama.cpp-7fmt).
+    bool                  cpu_expert_gbps_set      = false;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention

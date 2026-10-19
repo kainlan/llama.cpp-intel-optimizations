@@ -773,8 +773,13 @@ static bool run_kv_context_room_follows_the_requested_context_test() {
 
 // llama.cpp-w013: the room is cost-based (owner ruling 2026-10-10). A layer's room is held only when the attention it
 // keeps on the device is worth more per decode token than the routed experts it displaces:
-//   A = host attention    = kv_bytes_for_layer_at(layer, F) / host_attn_gbps, F = n_ctx_context x ctx_fill_pct / 100
-//   B = displaced experts = the layer's room x n_expert_used / n_expert / cpu_expert_gbps
+//   A = host attention    = kv_bytes_for_layer_at(layer, F) / host_attn_gbps + n_splits x host_split_us,
+//                           F = n_ctx_context x ctx_fill_pct / 100
+//   B = displaced experts = the layer's room x n_expert_used / n_expert / the experts' CPU rate
+// llama.cpp-7fmt added the split term (n_splits 3 for a layer with an indexer key cache, else 1) and the per-type CPU
+// rate. Cases (a) to (f) pin w013's arithmetic, not 7fmt's constants: moe() sets host_split_us to 0, and their experts
+// are untyped in a context the caller named, so B reads at cpu_expert_gbps, which moe() sets to 40. Cases (g) to (i)
+// pin what 7fmt added through the real planner; test-kv-room-cost pins the measured shapes.
 // Every number below comes from the kv_order_case constants: one cell of one layer is 512 bytes (128 + 128 f16
 // elements), a FULL layer's room at n_ctx 4096 over the planner's 512 is 3584 cells (1.75 MiB), and GB/s is 1e3 bytes
 // per microsecond. The triplets are all one size, so the popularity ranks earlier cases left behind decide which
@@ -784,6 +789,10 @@ using namespace kv_order_case;
 constexpr size_t cell_bytes = (kv_width + kv_width) * 2;
 constexpr size_t full_room  = (4096 - 512) * cell_bytes;  // kv_extra_layer
 constexpr size_t swa_room   = (1536 - 512) * cell_bytes;  // window n_swa 1024 + n_ubatch 512 = 1536 cells
+// Case (h)'s layer 1 also keeps an indexer key cache of kv_width f16 K elements per cell (llama.cpp-7fmt).
+constexpr size_t idx_cell_bytes = cell_bytes + kv_width * 2;      // 768
+constexpr size_t idx_room       = (4096 - 512) * idx_cell_bytes;  // 2.625 MiB
+constexpr size_t idx_kv_at_512  = 512 * idx_cell_bytes;
 // Dense weights, their KV at 512, and a budget whose experts get two triplets with both FULL rooms held, six without.
 constexpr size_t budget     = 2 * dense_bytes + 2 * kv_at_512 + 2 * full_room + 2 * triplet_bytes;
 
@@ -791,9 +800,26 @@ static ggml_sycl::placement_kv_info moe(uint32_t n_ctx_context, double fill_pct,
     ggml_sycl::placement_kv_info kv = kv_info(n_ctx_context);
     kv.ctx_fill_pct                 = fill_pct;
     kv.host_attn_gbps               = 30.0;
+    // w013's arithmetic, not llama.cpp-7fmt's defaults: no split cost, and the rate an untyped expert reads at in a
+    // context the caller named.
+    kv.host_split_us                = 0.0;
     kv.cpu_expert_gbps              = 40.0;
     kv.n_expert_used                = n_expert_used;
     return kv;
+}
+
+// inventory() with every routed-expert tensor typed `type` and given no shape: has_shape() stays false, so every
+// layout keeps the expert's size and only the room's CPU rate reads the type (llama.cpp-7fmt).
+static std::vector<ggml_sycl::placement_tensor_info> typed_inventory(ggml_type type) {
+    std::vector<ggml_sycl::placement_tensor_info> inv;
+    for (const auto & item : inventory()) {
+        ggml_sycl::placement_tensor_info tensor{ item.first, item.second };
+        if (item.first.find("_exps") != std::string::npos) {
+            tensor.type = type;
+        }
+        inv.push_back(tensor);
+    }
+    return inv;
 }
 
 // Layer 0 slides a 1024-token window; layer 1 attends to the whole context.
@@ -820,12 +846,31 @@ static std::vector<std::pair<int, int>> device_triplet_set(const ggml_sycl::plac
     }
     return set;
 }
+
+// One sub-case's held room, device triplets and displaced expert bytes; a mismatch clears `ok`.
+static void expect_room(bool &                            ok,
+                        const char *                      what,
+                        const ggml_sycl::placement_plan & plan,
+                        size_t                            held,
+                        size_t                            triplets,
+                        size_t                            displaced) {
+    if (plan.kv_context_reserve_bytes != held || device_triplets(plan) != triplets ||
+        plan.kv_context_room_displaced_bytes != displaced) {
+        printf("FAIL: %s: held %zu (want %zu), %zu device triplets (want %zu), displaced %zu (want %zu)\n", what,
+               plan.kv_context_reserve_bytes, held, device_triplets(plan), triplets,
+               plan.kv_context_room_displaced_bytes, displaced);
+        ok = false;
+        return;
+    }
+    printf("PASS: %s\n", what);
+}
 }  // namespace kv_cost_case
 
 static bool run_kv_context_room_is_cost_based_test() {
     using namespace kv_cost_case;
     bool ok = true;
-    // The sub-cases run a, e, b, c, d, f: (b) compares against the triplet set (e) plans, so (e) runs before it.
+    // The sub-cases run a, e, b, c, d, f, g, h, i: (b) compares against the triplet set (e) plans, so (e) runs before
+    // it.
 
     // (a) Qwen-shaped: the context is expected full and a token uses few experts. F = 4096 cells, so
     //     A = 4096 x 512 B / 30 GB/s = 69.9 us and B = 1.75 MiB x 1/4 / 40 GB/s = 11.5 us on each layer: A > B, both
@@ -876,13 +921,14 @@ static bool run_kv_context_room_is_cost_based_test() {
         printf("PASS: (b) a 1%% fill refuses every layer's KV context room and packs the experts of no request\n");
     }
 
-    // (c) Mixed: under the uniform cost every full-attention layer decides alike, all held or all refused: a layer's
-    //     KV per cell is in both A and B and cancels (A/B = F / (4096 - 512) x 40 / (30 x p_hit) for every FULL
-    //     layer), so no constants make two FULL layers split. Only a SWA layer, whose room and host read are capped by
-    //     its window, can decide otherwise, so the case flips between a SWA and a FULL layer. Fill 25%: F = 1024; p_hit
-    //     2/4. Layer 1 (FULL, latest, demoted first): A = 1024 x 512 B / 30 GB/s = 17.5 us, B = 1.75 MiB x 1/2 /
-    //     40 GB/s = 22.9 us: refused. Layer 0 (SWA): its room is the window, 1536 - 512 = 1024 cells = 512 KiB, and the
-    //     host reads min(1024, 1536) = 1024 cells, so A = 17.5 us against B = 512 KiB x 1/2 / 40 GB/s = 6.6 us: held.
+    // (c) Mixed: with no split cost and one CPU rate, as moe() sets, every full-attention layer decides alike: a
+    //     layer's KV per cell is in both A and B and cancels (A/B = F / (4096 - 512) x 40 / (30 x p_hit) for every
+    //     FULL layer). A split cost does not scale with the layer's KV, so it can split two FULL layers, which (h)
+    //     shows. Here a SWA layer, whose room and host read are capped by its window, decides otherwise, so the case
+    //     flips between a SWA and a FULL layer. Fill 25%: F = 1024; p_hit 2/4. Layer 1 (FULL, latest, demoted
+    //     first): A = 1024 x 512 B / 30 GB/s = 17.5 us, B = 1.75 MiB x 1/2 / 40 GB/s = 22.9 us: refused. Layer 0
+    //     (SWA): its room is the window, 1536 - 512 = 1024 cells = 512 KiB, and the host reads min(1024, 1536) = 1024
+    //     cells, so A = 17.5 us against B = 512 KiB x 1/2 / 40 GB/s = 6.6 us: held.
     //     The budget leaves both rooms and two triplets: held 512 KiB, so the experts get 1.75 MiB + 1.5 MiB = 4.33
     //     triplets (4), and 5 with the SWA room added back: one displaced.
     const ggml_sycl::placement_kv_info mixed_kv = swa_then_full(4096, 25.0, 2);
@@ -950,6 +996,85 @@ static bool run_kv_context_room_is_cost_based_test() {
     } else {
         printf("PASS: (f) past its window a SWA layer's host read is capped, so its KV context room is refused\n");
     }
+
+    // (g) The experts' type sets B's rate (llama.cpp-7fmt). (a)'s shape: F = 4096 cells and p_hit 1/4, so A = 69.9 us
+    //     on each layer. MXFP4 reads at its measured 5.6 GB/s, so B = 1.75 MiB x 1/4 / 5.6 GB/s = 81.9 us: every room
+    //     is refused and the six triplets of no request fit. IQ3_XXS reads at 22 GB/s, so B = 20.9 us: held as in
+    //     (a). GGML_SYCL_PLAN_CPU_EXPERT_GBPS (cpu_expert_gbps_set) prices every type, so at 40 GB/s the MXFP4 rooms
+    //     are held as in (a).
+    const auto mxfp4 = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0,
+                                                         moe(4096, 100.0, 1), nullptr, n_experts);
+    expect_room(ok, "(g) MXFP4 experts read at 5.6 GB/s refuse every KV context room", mxfp4, 0, 6, 0);
+    const auto iq3 = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0,
+                                                       moe(4096, 100.0, 1), nullptr, n_experts);
+    expect_room(ok, "(g) IQ3_XXS experts read at 22 GB/s hold every KV context room", iq3, 2 * full_room, 2,
+                4 * triplet_bytes);
+    ggml_sycl::placement_kv_info overridden_kv = moe(4096, 100.0, 1);
+    overridden_kv.cpu_expert_gbps_set          = true;
+    const auto overridden = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0,
+                                                              overridden_kv, nullptr, n_experts);
+    expect_room(ok, "(g) the override prices MXFP4 experts at 40 GB/s and holds every KV context room", overridden,
+                2 * full_room, 2, 4 * triplet_bytes);
+
+    // (h) The split term follows the indexer key cache (llama.cpp-7fmt). Two FULL layers at a 1% fill, F = 40 cells,
+    //     p_hit 1/4, 8 us per split. Layer 1 also keeps an indexer key cache, so its cell is 768 bytes and its room
+    //     3584 cells = 2.625 MiB. Layer 1 (3 splits): A = 40 x 768 B / 30 GB/s + 3 x 8 us = 25.0 us against
+    //     B = 2.625 MiB x 1/4 / 40 GB/s = 17.2 us: held. Layer 0 (1 split): A = 0.68 + 8 = 8.7 us against
+    //     B = 11.5 us: refused. The budget leaves the KV at 512, layer 1's room and two triplets: two triplets on the
+    //     device and five with the room added back, so three are displaced. Layer 1 holds and layer 0 refuses for
+    //     any split cost between 5.4 and 10.8 us. With the mapping flipped, layer 0's room would be held instead
+    //     (A = 24.7 us against 11.5). With no split cost both are refused (A = 1.0 and 0.68 us) and five triplets fit.
+    ggml_sycl::placement_kv_info indexed_kv = moe(4096, 1.0, 1);
+    indexed_kv.layer_idx_k_width            = { 0, kv_width };
+    indexed_kv.host_split_us                = 8.0;
+    if (indexed_kv.kv_context_extra_bytes_for_layer(1) != idx_room ||
+        indexed_kv.kv_bytes_for_layer(1) != idx_kv_at_512 ||
+        indexed_kv.kv_context_extra_bytes_for_layer(0) != full_room) {
+        printf(
+            "FAIL: (h) the fixture's rooms are %zu (indexer) and %zu, want %zu and %zu; its indexer KV at 512 is "
+            "%zu, want %zu\n",
+            indexed_kv.kv_context_extra_bytes_for_layer(1), indexed_kv.kv_context_extra_bytes_for_layer(0), idx_room,
+            full_room, indexed_kv.kv_bytes_for_layer(1), idx_kv_at_512);
+        ok = false;
+    }
+    const size_t indexed_budget = 2 * dense_bytes + kv_at_512 + idx_kv_at_512 + idx_room + 2 * triplet_bytes;
+    const auto   indexed =
+        ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr, n_experts);
+    expect_room(ok, "(h) the indexer layer pays three splits and holds its KV context room, the other refuses", indexed,
+                idx_room, 2, 3 * triplet_bytes);
+    if (indexed.get_kv_device(0) != 0 || indexed.get_kv_device(1) != 0) {
+        printf("FAIL: (h) kv %d/%d, want 0/0\n", indexed.get_kv_device(0), indexed.get_kv_device(1));
+        ok = false;
+    }
+    indexed_kv.host_split_us = 0.0;
+    const auto unsplit =
+        ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr, n_experts);
+    expect_room(ok, "(h) with no split cost both layers refuse their KV context rooms", unsplit, 0, 5, 0);
+
+    // (i) The model's default context (llama.cpp-7fmt). n_ctx_context_is_default prices no expert type without a
+    //     measured rate, so the room is refused for every layer without being weighed, even at (a)'s shape, where
+    //     A = 69.9 us is six times B = 11.5 us; a context the caller names prices those experts at 40 GB/s and holds,
+    //     which is (a). Untyped experts and Q8_0 ones are refused, and the six triplets of no request fit. IQ3_XXS
+    //     ones are measured, so they are weighed and held. The override prices every type, so untyped experts are
+    //     weighed and held too.
+    ggml_sycl::placement_kv_info default_kv = moe(4096, 100.0, 1);
+    default_kv.n_ctx_context_is_default     = true;
+    const auto untyped_default =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, unpriced untyped experts refuse every KV context room", untyped_default, 0, 6, 0);
+    const auto q8_default =
+        ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_Q8_0), budget, 0, default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, Q8_0 experts (no measured rate) refuse every KV context room", q8_default, 0, 6,
+                0);
+    const auto iq3_default = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0,
+                                                               default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, measured IQ3_XXS experts are weighed and hold every KV context room", iq3_default,
+                2 * full_room, 2, 4 * triplet_bytes);
+    default_kv.cpu_expert_gbps_set = true;
+    const auto overridden_default =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, the override prices untyped experts and holds every KV context room",
+                overridden_default, 2 * full_room, 2, 4 * triplet_bytes);
     return ok;
 }
 

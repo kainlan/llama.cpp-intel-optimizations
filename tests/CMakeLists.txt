@@ -252,6 +252,11 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+# llama.cpp-7fmt: the context a load holds KV room for, resolved from llama_model_params::n_ctx_hint: 0 no room, a
+# named hint as given (padded), and LLAMA_N_CTX_HINT_DEFAULT the model's default context, n_ctx_train padded as
+# llama_context pads it. Header-only (src/llama-n-ctx-hint.h), so it needs no internal export. No model, no device.
+llama_build_and_test(test-n-ctx-hint-resolve.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
@@ -4555,10 +4560,11 @@ endif()
 
 # llama.cpp-8ecj: the single-device planner places dense weights, then KV (each device layer's KV, then the room the
 # context the model opens with needs on top of it), then routed experts, and logs what the room displaced. The room is
-# for the context the caller asked for (llama_model_params::n_ctx_hint, from -c in common and from the test's context
-# in llama-bench, padded as llama_context pads n_ctx for a single sequence; a non-unified multi-slot context can exceed
-# it, and the runtime transaction re-places the overflow); none is held when no request reached the load
-# (llama.cpp-ak0p). A mutant per claim, experts-first among them. Text only: no device, no model.
+# for the context the caller asked for (llama_model_params::n_ctx_hint, from -c in common, or without it the model's
+# default context (llama.cpp-7fmt), and from the test's context in llama-bench, padded as llama_context pads n_ctx for a
+# single sequence; a non-unified multi-slot context can exceed it, and the runtime transaction re-places the
+# overflow); none is held when no request reached the load (llama.cpp-ak0p). A mutant per claim, experts-first among
+# them. Text only: no device, no model.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-kv-before-experts-source
@@ -4575,6 +4581,18 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-kv-room-cost-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-room-cost-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-7fmt: without -c, common asks for the model's default context (LLAMA_N_CTX_HINT_DEFAULT), the load
+# resolves it once (src/llama-n-ctx-hint.h) to n_ctx_train padded as llama_context pads it and holds that context's KV
+# room, no backend names the sentinel, and the KV context room line says when its context is the default. A mutant per
+# claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-ctx-hint-default-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ctx-hint-default-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

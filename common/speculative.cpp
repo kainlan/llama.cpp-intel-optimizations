@@ -2546,6 +2546,9 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // and the draft model's load holds the KV room for that context, the one it is about to create, rather than for the
+    // draft model's own default context, which common_model_params_to_llama asks for without -c (llama.cpp-7fmt)
+    mparams.n_ctx_hint = cparams.n_ctx;
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
