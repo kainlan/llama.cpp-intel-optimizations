@@ -3036,11 +3036,14 @@ set_tests_properties(mem-copy-site-census PROPERTIES
 )
 
 # MoE prefill expert streaming ring (llama.cpp-36j0): one WEIGHT-zone
-# reservation sliced into mem_handle slots, two epoch regions, release through
-# the retained-handle drain. It uses only the public backend API, so it links the
-# ordinary libggml-sycl (no private fixtures) and has no device kernel of its
-# own (SYCL_LINK_ONLY_TEST_OPTIONS per rule 1). It allocates device memory, so
-# it carries "cache" and runs serially, outside the throttled sweep.
+# reservation sliced into mem_handle slots, two epoch regions gated on the
+# device, release through the retained-handle drain. Its positive control for
+# the release reads the allocation registry (allocation_registry_test_contains,
+# GGML_SYCL_PRIVATE_TESTING only), so it links the private fixture carrier, as
+# test-mem-handle-eviction does, and never the ordinary ggml-sycl beside it. It
+# has no device kernel of its own (SYCL_LINK_ONLY_TEST_OPTIONS per rule 1). It
+# allocates device memory, so it carries "cache" and runs serially, outside the
+# throttled sweep.
 add_executable(test-moe-stream-ring
     tests/test-moe-stream-ring.cpp
 )
@@ -3055,11 +3058,9 @@ target_link_options(test-moe-stream-ring PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
 target_compile_definitions(test-moe-stream-ring PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-moe-stream-ring PRIVATE ggml-base ggml ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-moe-stream-ring PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-moe-stream-ring PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME sycl-moe-stream-ring COMMAND test-moe-stream-ring)
 set_tests_properties(sycl-moe-stream-ring PROPERTIES
     LABELS "sycl;moe;ring;cache;tdd"
@@ -7408,6 +7409,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
 
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
+        test-moe-stream-ring
         test-sycl-intrusive-allocation-owner
         test-sycl-staging-replacement-failpoints
         test-sycl-cache-backing-provenance
