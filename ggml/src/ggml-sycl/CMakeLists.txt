@@ -2243,8 +2243,9 @@ set_tests_properties(sycl-kv-room-cost PROPERTIES
     TIMEOUT 60
 )
 
-# llama.cpp-36j0: the MoE executor's per-layer cost. The header includes only ggml.h, kv-room-cost.hpp and the STL: host-only, no
-# -fsycl, links only ggml-base. Pins the Qwen3.8/B70 and GPT-OSS/B50 shapes the brief measured.
+# llama.cpp-36j0: the MoE executor's per-layer cost. The header includes only
+# ggml.h, kv-room-cost.hpp and the STL: host-only, no -fsycl, links only
+# ggml-base. Pins the Qwen3.8/B70 and GPT-OSS/B50 shapes the brief measured.
 add_executable(test-moe-exec-cost
     tests/test-moe-exec-cost.cpp
 )
