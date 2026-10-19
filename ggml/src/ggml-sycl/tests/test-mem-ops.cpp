@@ -4,13 +4,16 @@
 #include "../mem-ops.hpp"
 #include "../unified-cache.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <functional>
-#include <sycl/sycl.hpp>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <string>
+#include <sycl/sycl.hpp>
 #include <vector>
 
 static bool expect_fatal(const char * label, const std::function<void()> & operation) {
@@ -41,7 +44,188 @@ static bool check_bytes(const uint8_t * data, size_t size, uint8_t expected, con
     return true;
 }
 
+// The th86 copy site census as mem_copy_site_census_flush prints it to stderr, read back through a temporary file.
+static std::string capture_site_census() {
+    std::string text;
+    FILE *      f = std::tmpfile();
+    if (!f) {
+        return text;
+    }
+    std::fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    if (saved < 0 || dup2(fileno(f), fileno(stderr)) < 0) {
+        std::fclose(f);
+        return text;
+    }
+    ggml_sycl::mem_copy_site_census_flush("test-mem-ops");
+    std::fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+    std::rewind(f);
+    char   buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        text.append(buf, n);
+    }
+    std::fclose(f);
+    return text;
+}
+
+// llama.cpp-36j0: a pinned-pool host buffer with role WEIGHT, the shape S1-PRELOAD gives a host-planned expert
+// (register_host_aos_expert in ggml-sycl.cpp: role WEIGHT, no category), is a trusted USM copy endpoint, so its
+// host->device copy is one direct DMA. Taking the staged branch instead would count staged_h2d and wait the copy's
+// dependency on this thread (H2D_DEPS). Category OTHER, not EXPERT_CACHE: the expert-path category was already in
+// scope, so a copy from it would pass without the change this case checks. Runs first in main: host zones configured
+// after the pinned pool has handed out runtime chunks (every staged copy's stage) can fail on the pool budget.
+static int check_pinned_weight_copy_is_direct(sycl::queue & q) {
+    constexpr size_t       mib       = 1024ull * 1024ull;
+    constexpr size_t       bytes     = 16 * mib;
+    constexpr const char * site_file = "test-mem-ops-pinned-weight";
+    constexpr int          site_line = 1;
+    const char * const     site_tag  = "site=test-mem-ops-pinned-weight:1 ";
+
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        std::fprintf(stderr,
+                     "FAIL: pinned WEIGHT copy: GGML_SYCL_MOE_IDS_COPY_TRACE is off, so the staged-copy census "
+                     "would read zero whatever branch ran\n");
+        return 1;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
+    if (!cache) {
+        std::fprintf(stderr, "FAIL: pinned WEIGHT copy: no unified cache for the device\n");
+        return 1;
+    }
+    if (!cache->host_zones_configured()) {
+        cache->configure_host_zones(2 * bytes, 2 * mib, 4 * mib, 2 * mib);
+    }
+    if (!cache->host_zones_configured()) {
+        std::fprintf(stderr, "FAIL: pinned WEIGHT copy: host zones could not be configured\n");
+        return 1;
+    }
+    sycl::queue & cq     = cache->get_queue();
+    const int     device = ggml_sycl_get_device_id_from_queue(cq);
+
+    ggml_sycl::alloc_request host_req{};
+    host_req.queue                               = &cq;
+    host_req.device                              = device;
+    host_req.size                                = bytes;
+    host_req.intent.role                         = ggml_sycl::alloc_role::WEIGHT;
+    host_req.intent.category                     = ggml_sycl::runtime_category::OTHER;
+    host_req.intent.constraints.must_host_pinned = true;
+    host_req.intent.constraints.use_pinned_pool  = true;
+    ggml_sycl::mem_handle     src                = ggml_sycl::unified_allocate(host_req);
+    ggml_sycl::alloc_metadata owner{};
+    if (!src.valid() || !src.owner_metadata(&owner) || owner.tier != ggml_sycl::alloc_tier::HOST_PINNED ||
+        owner.host_zone == ggml_sycl::host_zone_id::COUNT || owner.role != ggml_sycl::alloc_role::WEIGHT ||
+        owner.device < 0) {
+        std::fprintf(stderr,
+                     "FAIL: pinned WEIGHT copy: the source is not a zone-managed pinned-pool WEIGHT owner "
+                     "(valid=%d tier=%d host_zone=%d role=%d device=%d)\n",
+                     src.valid() ? 1 : 0, (int) owner.tier, (int) owner.host_zone, (int) owner.role, owner.device);
+        return 1;
+    }
+    const ggml_sycl::resolved_ptr src_ptr = src.resolve();
+    if (!src_ptr || src_ptr.on_device) {
+        std::fprintf(stderr, "FAIL: pinned WEIGHT copy: the source did not resolve to host memory\n");
+        return 1;
+    }
+    uint8_t * host = static_cast<uint8_t *>(src_ptr.ptr);
+    for (size_t i = 0; i < bytes; ++i) {
+        host[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xffu);
+    }
+
+    ggml_sycl::alloc_request dev_req{};
+    dev_req.queue                                     = &cq;
+    dev_req.device                                    = device;
+    dev_req.size                                      = bytes;
+    dev_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+    dev_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
+    dev_req.intent.constraints.must_device            = true;
+    dev_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+    dev_req.intent.constraints.forbid_vram_zone_spill = true;
+    ggml_sycl::mem_handle dst                         = ggml_sycl::unified_allocate(dev_req);
+    if (!dst.valid()) {
+        std::fprintf(stderr,
+                     "FAIL: pinned WEIGHT copy: the RUNTIME zone refused the %zu-byte device buffer "
+                     "(arena_active=%d zone_available=%zu)\n",
+                     bytes, cache->arena_active() ? 1 : 0, cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME));
+        return 1;
+    }
+
+    int                                          failed = 0;
+    sycl::event                                  fill   = ggml_sycl::mem_fill_async(dst, 0, bytes, cq);
+    const ggml_sycl::mem_copy_staged_wait_census before = ggml_sycl::mem_copy_staged_wait_census_this_thread();
+    // The copy carries a dependency so that the staged branch, had it run, would also have waited it on this thread.
+    sycl::event h2d = ggml_sycl::mem_copy_async(dst, src, bytes, cq, { fill }, site_file, site_line, __func__);
+    h2d.wait_and_throw();
+    const ggml_sycl::mem_copy_staged_wait_census after = ggml_sycl::mem_copy_staged_wait_census_this_thread();
+
+    if (after.staged_h2d != before.staged_h2d) {
+        std::fprintf(stderr, "FAIL: pinned WEIGHT copy took the staged host->device branch (%llu staged copies)\n",
+                     (unsigned long long) (after.staged_h2d - before.staged_h2d));
+        failed++;
+    }
+    const int staged_kinds[] = { ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS,
+                                 ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK,
+                                 ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL };
+    for (int kind : staged_kinds) {
+        if (after.count[kind] != before.count[kind]) {
+            std::fprintf(stderr, "FAIL: pinned WEIGHT copy recorded %llu staged wait(s) of kind %d\n",
+                         (unsigned long long) (after.count[kind] - before.count[kind]), kind);
+            failed++;
+        }
+    }
+
+    // Exactly one copy left this site, a host->device submission of all the bytes: one census row, one call.
+    const std::string table = capture_site_census();
+    if (table.find("[SYCL-MEMCPY-SITE-CENSUS]") == std::string::npos) {
+        std::fprintf(stderr,
+                     "FAIL: pinned WEIGHT copy: the copy site census printed nothing "
+                     "(GGML_SYCL_MEMCPY_SITE_CENSUS off?)\n");
+        failed++;
+    } else {
+        int         rows = 0;
+        std::string row;
+        for (size_t at = 0; at < table.size();) {
+            size_t end = table.find('\n', at);
+            if (end == std::string::npos) {
+                end = table.size();
+            }
+            const std::string line = table.substr(at, end - at);
+            if (line.find(site_tag) != std::string::npos) {
+                rows++;
+                row = line;
+            }
+            at = end + 1;
+        }
+        const std::string want = " calls=1 bytes=" + std::to_string(bytes) + " dir=H2D path=sycl.memcpy.mem_ops ";
+        if (rows != 1 || row.find(want) == std::string::npos) {
+            std::fprintf(stderr, "FAIL: pinned WEIGHT copy: expected one census row with%s, got %d (last: %s)\n",
+                         want.c_str(), rows, row.c_str());
+            failed++;
+        }
+    }
+
+    std::vector<uint8_t> out(bytes, 0);
+    ggml_sycl::mem_copy(ggml_sycl::mem_handle::from_direct(out.data(), GGML_LAYOUT_AOS, false,
+                                                           ggml_sycl::mem_handle::HOST_DEVICE, bytes),
+                        dst, bytes, cq);
+    for (size_t i = 0; i < bytes; ++i) {
+        if (out[i] != static_cast<uint8_t>((i * 31u + 7u) & 0xffu)) {
+            std::fprintf(stderr, "FAIL: pinned WEIGHT copy: byte %zu read back 0x%02x\n", i, out[i]);
+            failed++;
+            break;
+        }
+    }
+    return failed;
+}
+
 int main() {
+    // Before any copy: both diagnostics latch on their first read. The staged-copy census is the trace's
+    // (llama.cpp-qwn5) and the copy site census is th86's; check_pinned_weight_copy_is_direct reads both.
+    setenv("GGML_SYCL_MOE_IDS_COPY_TRACE", "1", 1);
+    setenv("GGML_SYCL_MEMCPY_SITE_CENSUS", "1", 1);
+
     std::vector<sycl::device> gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     if (gpus.empty()) {
         // Exit 77, not 0. A device test that cannot reach a device has verified NOTHING,
@@ -64,6 +248,8 @@ int main() {
     sycl::queue      q(gpus.front(), sycl::property::queue::in_order{});
     constexpr size_t size = 4096;
 
+    int failed = check_pinned_weight_copy_is_direct(q);
+
     uint8_t * host_a = sycl::malloc_host<uint8_t>(size, q);
     uint8_t * host_b = sycl::malloc_host<uint8_t>(size, q);
     uint8_t * dev_a  = sycl::malloc_device<uint8_t>(size, q);
@@ -77,7 +263,6 @@ int main() {
         return 1;
     }
 
-    int  failed   = 0;
     auto host_a_h = ggml_sycl::mem_handle::from_direct(
         host_a, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, size);
     auto host_b_h = ggml_sycl::mem_handle::from_direct(
