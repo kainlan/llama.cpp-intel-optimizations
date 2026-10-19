@@ -5,12 +5,16 @@
 // through the VRAM ring and run on the device. Plain values, no SYCL: test-moe-exec-cost pins it with no device.
 
 #include "ggml.h"
-#include "kv-room-cost.hpp"  // Task 2 adds moe_exec_rates_seed over its CPU rate table
+#include "kv-room-cost.hpp"  // the per-type CPU expert rate table moe_exec_rates_seed folds
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace ggml_sycl {
 
@@ -126,6 +130,50 @@ static inline moe_exec_decision moe_exec_weigh(const moe_exec_layer_inputs & in,
     d.choice = d.t_ring_us < d.t_cpu_us ? moe_exec_choice::RING : moe_exec_choice::CPU;
     d.reason = moe_exec_reason::CHEAPER;
     return d;
+}
+
+typedef const char * (*moe_exec_getenv_fn)(const char * name);
+
+// The w013 rule (ggml_sycl_plan_cost_param): unset, unparsable, non-finite or <= 0 keeps the default.
+static inline double moe_exec_env_param(moe_exec_getenv_fn getenv_fn, const char * name, double def) {
+    const char * env = getenv_fn ? getenv_fn(name) : nullptr;
+    if (env == nullptr) {
+        return def;
+    }
+    char *       end   = nullptr;
+    const double value = std::strtod(env, &end);
+    if (end == env || !std::isfinite(value) || value <= 0.0) {
+        return def;
+    }
+    return value;
+}
+
+// The seed record for a layer whose host-resident experts are `host_mix` (type, bytes). cpu_gbps is the byte-weighted
+// harmonic mean over the measured types, as kv_room_expert_types::add folds them; the room's default when none is.
+static inline moe_exec_rates moe_exec_rates_seed(const std::vector<std::pair<ggml_type, size_t>> & host_mix) {
+    moe_exec_rates       r;
+    kv_room_expert_types types;
+    for (const auto & tb : host_mix) {
+        types.add(tb.first, tb.second);
+    }
+    const size_t measured = types.bytes - types.unmeasured_bytes;
+    r.cpu_gbps = measured > 0 && types.measured_us > 0.0 ? static_cast<double>(measured) / (types.measured_us * 1e3) :
+                                                           PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
+    r.h2d_gbps = 20.0;         // seed; the Task 3 probe replaces it (measured 26.5 B70 / 27.1 B50, 8bgi c-nn1q)
+    r.reorder_gbps = 200.0;    // seed; the on-device AOS->SOA reorder (B70 D2D 870 GB/s, kernel-bound well below)
+    r.dev_gflops   = 20000.0;  // seed; Task 9 seeds per type from the batched prompt executor measurement
+    r.cpu_gflops   = 1000.0;   // seed; 22 threads of AVX2 vec_dot (cego)
+    r.cpu_fixed_us = 500.0;    // seed; per-layer submit/join/scatter (8bgi orchestration map)
+    r.dev_fixed_us = 800.0;    // seed; ptr-table upload + per-expert launches
+    return r;
+}
+
+// Env overrides for the four rates that have one. getenv_fn is injected so a test needs no real environment.
+static inline void moe_exec_rates_apply_env(moe_exec_rates & r, moe_exec_getenv_fn getenv_fn) {
+    r.h2d_gbps     = moe_exec_env_param(getenv_fn, "GGML_SYCL_MOE_EXEC_H2D_GBPS", r.h2d_gbps);
+    r.cpu_gbps     = moe_exec_env_param(getenv_fn, "GGML_SYCL_MOE_EXEC_CPU_GBPS", r.cpu_gbps);
+    r.dev_gflops   = moe_exec_env_param(getenv_fn, "GGML_SYCL_MOE_EXEC_DEV_GFLOPS", r.dev_gflops);
+    r.reorder_gbps = moe_exec_env_param(getenv_fn, "GGML_SYCL_MOE_EXEC_REORDER_GBPS", r.reorder_gbps);
 }
 
 }  // namespace ggml_sycl

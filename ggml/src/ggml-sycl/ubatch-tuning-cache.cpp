@@ -337,3 +337,107 @@ bool ggml_backend_sycl_ubatch_cache_store_layout1(const ggml_sycl_ubatch_cache_k
 
     return save_ubatch_cache(ubatch_tuning_cache_dir(), device_name, entries);
 }
+
+// llama.cpp-36j0: the MoE executor's probed rates, one entry per device and driver in the device's
+// "<sanitized name>-moe-exec-rates.json" (tuning-cache-io.hpp's MoeExecRatesEntry). Both calls honour
+// GGML_SYCL_TUNING_CACHE=0 and GGML_SYCL_TUNING_CACHE_DIR like the ubatch pair above.
+//
+// The record crosses the backend's dlopen boundary, and these entry points carry no _layoutN suffix, so the layout is
+// pinned: GGML_TYPE_COUNT is part of it, and a change that moves a field fires one of these.
+static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, h2d_gbps) == 0,
+              "ggml_sycl_moe_exec_rates_record layout changed");
+static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, reorder_gbps) == 8,
+              "ggml_sycl_moe_exec_rates_record layout changed");
+static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, n_types) == 16,
+              "ggml_sycl_moe_exec_rates_record layout changed");
+static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, types) == 20,
+              "ggml_sycl_moe_exec_rates_record layout changed");
+static_assert(sizeof(void *) != 8 ||
+                  offsetof(ggml_sycl_moe_exec_rates_record, dev_gflops) == ((20 + 4 * GGML_TYPE_COUNT + 7) / 8) * 8,
+              "ggml_sycl_moe_exec_rates_record layout changed");
+static_assert(sizeof(void *) != 8 || sizeof(ggml_sycl_moe_exec_rates_record) ==
+                                         ((20 + 4 * GGML_TYPE_COUNT + 7) / 8) * 8 + 8 * GGML_TYPE_COUNT,
+              "ggml_sycl_moe_exec_rates_record layout changed");
+
+namespace {
+
+// The entry key: the device's sanitized name and driver, as ubatch_device_set_key names one device. A driver
+// upgrade is a new key, so rates measured under another driver are never read back.
+bool resolve_moe_exec_rates_key(int device, std::string & out_device_name, std::string & out_device_key) {
+    if (!resolve_file_device_name(device, out_device_name)) {
+        return false;
+    }
+    const auto & dev = ggml_sycl_info().devices[device];
+    out_device_key   = sanitize_device_name(dev.device_name) + "@" + dev.driver_version;
+    return true;
+}
+
+}  // namespace
+
+bool ggml_backend_sycl_moe_exec_rates_lookup(int device, struct ggml_sycl_moe_exec_rates_record * out) {
+    if (out == nullptr || !ubatch_tuning_cache_env_enabled()) {
+        return false;
+    }
+    std::string device_name, device_key;
+    if (!resolve_moe_exec_rates_key(device, device_name, device_key)) {
+        return false;
+    }
+    std::vector<MoeExecRatesEntry> entries;
+    if (!load_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries)) {
+        return false;  // missing, unreadable, or wrong-version file -- a plain miss
+    }
+    for (const auto & e : entries) {
+        if (e.device_key != device_key) {
+            continue;
+        }
+        ggml_sycl_moe_exec_rates_record rec = {};
+        rec.h2d_gbps                        = e.h2d_gbps;
+        rec.reorder_gbps                    = e.reorder_gbps;
+        for (const auto & tg : e.dev_gflops_by_type) {
+            if (tg.first < 0 || tg.first >= GGML_TYPE_COUNT || !(tg.second > 0.0)) {
+                continue;  // a type this build does not know, or a rate that cannot be one
+            }
+            rec.types[rec.n_types]      = tg.first;
+            rec.dev_gflops[rec.n_types] = tg.second;
+            ++rec.n_types;
+        }
+        *out = rec;
+        return true;
+    }
+    return false;
+}
+
+bool ggml_backend_sycl_moe_exec_rates_store(int device, const struct ggml_sycl_moe_exec_rates_record * rec) {
+    if (rec == nullptr || rec->n_types > static_cast<uint32_t>(GGML_TYPE_COUNT) || !ubatch_tuning_cache_env_enabled()) {
+        return false;
+    }
+    std::string device_name, device_key;
+    if (!resolve_moe_exec_rates_key(device, device_name, device_key)) {
+        return false;
+    }
+    MoeExecRatesEntry stored;
+    stored.device_key   = device_key;
+    stored.h2d_gbps     = rec->h2d_gbps;
+    stored.reorder_gbps = rec->reorder_gbps;
+    stored.created      = iso8601_now_utc();
+    for (uint32_t i = 0; i < rec->n_types; ++i) {
+        stored.dev_gflops_by_type.emplace_back(rec->types[i], rec->dev_gflops[i]);
+    }
+
+    // Load-modify-save, not atomic across processes: the same advisory-cache tradeoff the ubatch store documents. A
+    // missing, corrupt, or wrong-version file is a start from empty, never a reason to refuse.
+    std::vector<MoeExecRatesEntry> entries;
+    load_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries);
+    bool replaced = false;
+    for (auto & e : entries) {
+        if (e.device_key == device_key) {
+            e        = stored;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        entries.push_back(stored);
+    }
+    return save_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries);
+}

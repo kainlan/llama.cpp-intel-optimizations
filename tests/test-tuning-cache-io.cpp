@@ -22,6 +22,7 @@
 // to save_ubatch_cache()/load_ubatch_cache(), never through get_cache_dir().
 
 #include "../ggml/src/ggml-sycl/tuning-cache-io.hpp"
+#include "ggml.h"
 #include "test-skip.h"
 
 #include <dirent.h>
@@ -1511,6 +1512,123 @@ TEST(ubatch_participating_devices_order) {
 // =============================================================================
 // Main test runner
 // =============================================================================
+// llama.cpp-36j0: the MoE executor's rates kind. One file per device, "<sanitized device>-moe-exec-rates.json",
+// under the same GGML_SYCL_TUNING_CACHE_DIR the ubatch kind uses, sharing CACHE_VERSION without bumping it.
+static std::string moe_exec_rates_test_dir(const char * leaf) {
+    const char * env = std::getenv("GGML_SYCL_TUNING_CACHE_DIR");
+    std::string  dir = (env && env[0]) ? std::string(env) : std::string("/tmp/llama_test_moe_exec_rates");
+    dir += std::string("/") + leaf + "_" + std::to_string(getpid());
+    return dir;
+}
+
+TEST(moe_exec_rates_cache_roundtrip) {
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates");
+    const std::string device_name = "Intel(R) Arc(TM) Pro B70 Graphics";
+
+    MoeExecRatesEntry b70;
+    b70.device_key         = "Intel(R) Arc(TM) Pro B70@26.31";
+    b70.h2d_gbps           = 26.5;
+    b70.reorder_gbps       = 187.25;
+    b70.dev_gflops_by_type = {
+        { static_cast<int>(GGML_TYPE_MXFP4), 18000.0            },
+        { static_cast<int>(GGML_TYPE_IQ3_S), 12345.678901234567 }
+    };
+    b70.created = "2026-10-19T12:34:56Z";
+    MoeExecRatesEntry b50;
+    b50.device_key   = "Intel(R) Arc(TM) Pro B50@26.31";
+    b50.h2d_gbps     = 27.1;
+    b50.reorder_gbps = 90.5;  // no per-type device rate measured yet
+    b50.created      = "2026-10-19T12:35:00Z";
+
+    const std::vector<MoeExecRatesEntry> entries{ b70, b50 };
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, entries));
+
+    const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
+    ASSERT(path == cache_dir + "/" + sanitize_device_name(device_name) + "-moe-exec-rates.json");
+    struct stat st;
+    ASSERT(stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
+
+    std::vector<MoeExecRatesEntry> loaded;
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 2);
+    for (size_t i = 0; i < 2; ++i) {
+        ASSERT(loaded[i].device_key == entries[i].device_key);
+        ASSERT(loaded[i].h2d_gbps == entries[i].h2d_gbps);
+        ASSERT(loaded[i].reorder_gbps == entries[i].reorder_gbps);
+        ASSERT(loaded[i].created == entries[i].created);
+        ASSERT(loaded[i].dev_gflops_by_type.size() == entries[i].dev_gflops_by_type.size());
+        for (size_t j = 0; j < entries[i].dev_gflops_by_type.size(); ++j) {
+            ASSERT(loaded[i].dev_gflops_by_type[j].first == entries[i].dev_gflops_by_type[j].first);
+            ASSERT(loaded[i].dev_gflops_by_type[j].second == entries[i].dev_gflops_by_type[j].second);
+        }
+    }
+
+    // a second save replaces the file wholesale
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, { b50 }));
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].device_key == b50.device_key);
+
+    std::remove(path.c_str());
+    return true;
+}
+
+TEST(moe_exec_rates_cache_other_version_is_a_miss) {
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_v5");
+    const std::string device_name = "TestMoeExecRatesV5Device";
+
+    create_dir_recursive(cache_dir);
+    const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
+    {
+        std::ofstream f(path);
+        f << "{\n  \"version\": 5,\n  \"device\": \"" << device_name << "\",\n  \"entries\": [\n"
+          << "    {\"device_key\":\"Dev@1\",\"h2d_gbps\":20,\"reorder_gbps\":200,"
+          << "\"dev_gflops_by_type\":[],\"created\":\"2026-10-19T00:00:00Z\"}\n  ]\n}\n";
+    }
+    std::vector<MoeExecRatesEntry> loaded;
+    loaded.resize(3);  // load must clear what the caller passed
+    ASSERT(!load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.empty());
+
+    // a missing file is a miss too
+    std::remove(path.c_str());
+    ASSERT(!load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.empty());
+    return true;
+}
+
+// The new kind is a new file, so CACHE_VERSION does not move and an ubatch file written before it still loads.
+TEST(moe_exec_rates_kind_leaves_the_ubatch_file_loadable) {
+    ASSERT(CACHE_VERSION == 6);
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_ubatch");
+    const std::string device_name = "TestMoeExecRatesUbatchDevice";
+
+    create_dir_recursive(cache_dir);
+    const std::string ubatch_path = get_ubatch_cache_file(cache_dir, device_name);
+    {
+        // byte-for-byte what save_ubatch_cache wrote at version 6, before the rates kind existed
+        std::ofstream f(ubatch_path);
+        f << "{\n  \"version\": 6,\n  \"device\": \"" << device_name << "\",\n  \"entries\": [\n"
+          << "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":4108931808,"
+          << "\"model_hash\":111,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,"
+          << "\"type_k\":1,\"type_v\":1,\"kv_unified\":false,\"swa_full\":false,\"n_ubatch\":1024,"
+          << "\"reason\":\"ladder\",\"created\":\"2026-09-11T12:34:56Z\"}\n  ]\n}\n";
+    }
+    // writing the rates kind for the same device must not touch it
+    MoeExecRatesEntry r;
+    r.device_key = "Dev@1.0";
+    r.h2d_gbps   = 20.0;
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, { r }));
+    ASSERT(get_moe_exec_rates_cache_file(cache_dir, device_name) != ubatch_path);
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].n_ubatch == 1024 && loaded[0].reason == "ladder");
+
+    std::remove(ubatch_path.c_str());
+    std::remove(get_moe_exec_rates_cache_file(cache_dir, device_name).c_str());
+    return true;
+}
+
 int main() {
     // llama.cpp-7n6n: several tests in this binary
     // (cache_file_roundtrip, version_check, atomic_write) resolve their
@@ -1585,6 +1703,9 @@ int main() {
     RUN_TEST(ubatch_device_set_key_visible_subset_keys_every_planner_gpu);
     RUN_TEST(ubatch_device_set_key_missing_identity_is_no_key);
     RUN_TEST(ubatch_participating_devices_order);
+    RUN_TEST(moe_exec_rates_cache_roundtrip);
+    RUN_TEST(moe_exec_rates_cache_other_version_is_a_miss);
+    RUN_TEST(moe_exec_rates_kind_leaves_the_ubatch_file_loadable);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";

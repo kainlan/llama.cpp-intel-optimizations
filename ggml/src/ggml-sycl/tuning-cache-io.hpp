@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #    include <direct.h>
@@ -273,6 +275,26 @@ inline int parse_int(const std::string& json, const std::string& key) {
         pos++;
     }
     return neg ? -val : val;
+}
+
+// Parse a floating-point value from JSON at key position (llama.cpp-36j0: the MoE executor's rates). Returns 0 when
+// the key is absent or no number follows it; a non-finite parse is also 0, so a stored "nan" never reaches a divide.
+inline double parse_double(const std::string & json, const std::string & key) {
+    std::string search = "\"" + key + "\":";
+    size_t      pos    = json.find(search);
+    if (pos == std::string::npos) {
+        return 0.0;
+    }
+    pos += search.size();
+    pos = skip_whitespace(json, pos);
+
+    const char * begin = json.c_str() + pos;
+    char *       end   = nullptr;
+    const double value = std::strtod(begin, &end);
+    if (end == begin || !std::isfinite(value)) {
+        return 0.0;
+    }
+    return value;
 }
 
 // Parse boolean value from JSON at key position
@@ -971,6 +993,188 @@ inline bool load_ubatch_cache(const std::string &             cache_dir,
         }
     }
 
+    return true;
+}
+
+// =============================================================================
+// MoE executor rates entry (llama.cpp-36j0): the per-device rates the MoE executor's cost divides by that a probe
+// measures (host-to-device GB/s, on-device AOS->SOA reorder GB/s, the device expert GFLOP/s per ggml type), so the
+// next start reuses them instead of re-probing. A third entry kind next to the matmul and ubatch kinds: its own
+// per-device file ("-moe-exec-rates.json", so the three never collide), the same CACHE_VERSION (not bumped: a new
+// kind is a new file, so every existing file stays valid), the same atomic write and version-miss behavior.
+// =============================================================================
+
+struct MoeExecRatesEntry {
+    std::string                         device_key;  // "<sanitized device name>@<driver version>"
+    double                              h2d_gbps     = 0.0;
+    double                              reorder_gbps = 0.0;
+    std::vector<std::pair<int, double>> dev_gflops_by_type;  // (ggml_type, GFLOP/s)
+    std::string                         created;             // ISO 8601, UTC
+};
+
+// A double that parse_double reads back to the same bits: 17 significant digits.
+inline std::string moe_exec_rates_double_to_json(double v) {
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%.17g", std::isfinite(v) ? v : 0.0);
+    return buf;
+}
+
+inline std::string moe_exec_rates_entry_to_json(const MoeExecRatesEntry & e) {
+    std::ostringstream ss;
+    ss << "{\"device_key\":\"" << json_escape(e.device_key) << "\","
+       << "\"h2d_gbps\":" << moe_exec_rates_double_to_json(e.h2d_gbps) << ","
+       << "\"reorder_gbps\":" << moe_exec_rates_double_to_json(e.reorder_gbps) << ","
+       << "\"dev_gflops_by_type\":[";
+    for (size_t i = 0; i < e.dev_gflops_by_type.size(); ++i) {
+        ss << (i ? "," : "") << "[" << e.dev_gflops_by_type[i].first << ","
+           << moe_exec_rates_double_to_json(e.dev_gflops_by_type[i].second) << "]";
+    }
+    ss << "],"
+       << "\"created\":\"" << e.created << "\""
+       << "}";
+    return ss.str();
+}
+
+inline MoeExecRatesEntry moe_exec_rates_entry_from_json(const std::string & json) {
+    MoeExecRatesEntry e;
+    e.device_key   = parse_string(json, "device_key");
+    e.h2d_gbps     = parse_double(json, "h2d_gbps");
+    e.reorder_gbps = parse_double(json, "reorder_gbps");
+    e.created      = parse_string(json, "created");
+
+    const size_t key_pos = json.find("\"dev_gflops_by_type\":");
+    size_t       pos     = key_pos == std::string::npos ? std::string::npos : json.find('[', key_pos);
+    if (pos == std::string::npos) {
+        return e;
+    }
+    ++pos;
+    while (pos < json.size()) {
+        pos = skip_whitespace(json, pos);
+        if (pos >= json.size() || json[pos] == ']') {
+            break;
+        }
+        if (json[pos] != '[') {  // a separator, or something unexpected
+            ++pos;
+            continue;
+        }
+        const size_t close = json.find(']', pos);
+        if (close == std::string::npos) {
+            break;
+        }
+        const char * begin = json.c_str() + pos + 1;
+        char *       end   = nullptr;
+        const long   type  = std::strtol(begin, &end, 10);
+        if (end != begin && end < json.c_str() + close && *end == ',') {
+            char *       gend   = nullptr;
+            const double gflops = std::strtod(end + 1, &gend);
+            if (gend != end + 1 && std::isfinite(gflops) && type >= INT_MIN && type <= INT_MAX) {
+                e.dev_gflops_by_type.emplace_back(static_cast<int>(type), gflops);
+            }
+        }
+        pos = close + 1;
+    }
+    return e;
+}
+
+inline std::string get_moe_exec_rates_cache_file(const std::string & cache_dir, const std::string & device_name) {
+    return cache_dir + "/" + sanitize_device_name(device_name) + "-moe-exec-rates.json";
+}
+
+// Save every entry for one device, atomically (per-pid temp file, then rename; the discipline of save_ubatch_cache).
+// Returns false on failure, never throws.
+inline bool save_moe_exec_rates(const std::string &                    cache_dir,
+                                const std::string &                    device_name,
+                                const std::vector<MoeExecRatesEntry> & entries) {
+    create_dir_recursive(cache_dir);
+
+    const std::string path      = get_moe_exec_rates_cache_file(cache_dir, device_name);
+    const std::string temp_path = path + "." + std::to_string(sycl_tuning_getpid()) + ".tmp";
+
+    std::ofstream f(temp_path);
+    if (!f) {
+        return false;
+    }
+
+    f << "{\n";
+    f << "  \"version\": " << CACHE_VERSION << ",\n";
+    f << "  \"device\": \"" << json_escape(device_name) << "\",\n";
+    f << "  \"entries\": [\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        f << "    " << moe_exec_rates_entry_to_json(entries[i]);
+        if (i + 1 < entries.size()) {
+            f << ",";
+        }
+        f << "\n";
+    }
+    f << "  ]\n";
+    f << "}\n";
+
+    f.close();
+    if (!f) {
+        std::remove(temp_path.c_str());
+        return false;
+    }
+    if (std::rename(temp_path.c_str(), path.c_str()) != 0) {
+        std::remove(temp_path.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Load every entry for one device. Returns false (entries left empty) on a missing or unreadable file or a version
+// mismatch, exactly like load_ubatch_cache. Never throws.
+inline bool load_moe_exec_rates(const std::string &              cache_dir,
+                                const std::string &              device_name,
+                                std::vector<MoeExecRatesEntry> & entries) {
+    entries.clear();
+
+    std::ifstream f(get_moe_exec_rates_cache_file(cache_dir, device_name));
+    if (!f) {
+        return false;
+    }
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+
+    if (parse_int(content, "version") != CACHE_VERSION) {
+        return false;
+    }
+
+    const size_t entries_pos = content.find("\"entries\":");
+    if (entries_pos == std::string::npos) {
+        return false;
+    }
+    const size_t array_start = content.find('[', entries_pos);
+    if (array_start == std::string::npos) {
+        return false;
+    }
+
+    size_t pos = array_start + 1;
+    while (pos < content.size()) {
+        while (pos < content.size() &&
+               (std::isspace(static_cast<unsigned char>(content[pos])) || content[pos] == ',')) {
+            pos++;
+        }
+        if (pos >= content.size() || content[pos] == ']') {
+            break;
+        }
+        if (content[pos] == '{') {
+            int    brace_count = 1;
+            size_t start       = pos;
+            pos++;
+            while (pos < content.size() && brace_count > 0) {
+                if (content[pos] == '{') {
+                    brace_count++;
+                }
+                if (content[pos] == '}') {
+                    brace_count--;
+                }
+                pos++;
+            }
+            entries.push_back(moe_exec_rates_entry_from_json(content.substr(start, pos - start)));
+        } else {
+            pos++;  // Skip unexpected character
+        }
+    }
     return true;
 }
 

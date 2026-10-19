@@ -686,6 +686,28 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store_layout1(const struct 
                                                                    uint32_t                                  n_ubatch,
                                                                    const char *                              reason);
 
+// llama.cpp-36j0: the MoE executor's probed per-device rates (host-to-device GB/s, on-device AOS->SOA reorder GB/s,
+// and the device expert GFLOP/s per ggml type: types[i] has dev_gflops[i], for i < n_types), persisted in the tuning
+// cache next to the ubatch choice (tuning-cache-io.hpp's MoeExecRatesEntry). This struct crosses the backend's
+// dlopen boundary, so its layout is pinned by static_asserts in ggml/src/ggml-sycl/ubatch-tuning-cache.cpp; GGML_TYPE_COUNT
+// is part of it.
+struct ggml_sycl_moe_exec_rates_record {
+    double   h2d_gbps;
+    double   reorder_gbps;
+    uint32_t n_types;
+    int32_t  types[GGML_TYPE_COUNT];
+    double   dev_gflops[GGML_TYPE_COUNT];
+};
+
+// Look up `device`'s persisted rates for its current driver. Returns false (leaving *out untouched) on a miss, a
+// disabled cache (GGML_SYCL_TUNING_CACHE=0), an out-of-range device, or an unreadable or wrong-version file.
+GGML_BACKEND_API bool ggml_backend_sycl_moe_exec_rates_lookup(int device, struct ggml_sycl_moe_exec_rates_record * out);
+
+// Persist `rec` for `device` and its current driver (atomic write), replacing that driver's earlier entry. Returns
+// false on a disabled cache, an out-of-range device, a null or malformed record, or a write failure; never throws.
+GGML_BACKEND_API bool ggml_backend_sycl_moe_exec_rates_store(int                                            device,
+                                                             const struct ggml_sycl_moe_exec_rates_record * rec);
+
 // Provide the actual layer membership for the next KV buffer allocation on a
 // SYCL device. llama_kv_cache may create multiple same-sized KV buffers for
 // heterogeneous attention (for example non-SWA and SWA layers); the SYCL

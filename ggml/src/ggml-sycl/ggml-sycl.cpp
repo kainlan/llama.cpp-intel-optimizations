@@ -119449,6 +119449,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store_layout1") == 0) {
         return (void *) ggml_backend_sycl_ubatch_cache_store_layout1;
     }
+    if (strcmp(name, "ggml_backend_sycl_moe_exec_rates_lookup") == 0) {
+        return (void *) ggml_backend_sycl_moe_exec_rates_lookup;
+    }
+    if (strcmp(name, "ggml_backend_sycl_moe_exec_rates_store") == 0) {
+        return (void *) ggml_backend_sycl_moe_exec_rates_store;
+    }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;
     }
