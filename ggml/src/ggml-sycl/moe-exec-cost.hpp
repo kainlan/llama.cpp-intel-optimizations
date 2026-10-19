@@ -5,7 +5,7 @@
 // through the VRAM ring and run on the device. Plain values, no SYCL: test-moe-exec-cost pins it with no device.
 
 #include "ggml.h"
-#include "kv-room-cost.hpp"
+#include "kv-room-cost.hpp"  // Task 2 adds moe_exec_rates_seed over its CPU rate table
 
 #include <algorithm>
 #include <cmath>
@@ -38,7 +38,7 @@ struct moe_exec_layer_inputs {
     size_t   host_expert_bytes = 0;    // this layer's host-resident triplet bytes
     int      n_host_experts    = 0;
     int64_t  K                 = 0;    // n_embd for gate/up, n_ff for down (use the larger: an upper bound)
-    int64_t  N                 = 0;
+    int64_t  N                 = 0;    // K and N are n_embd and n_ff in either order: only the product is used
     double   window_us         = 0.0;  // the previous layer's compute window the copies can hide under
     size_t   ring_bytes_free   = 0;    // ring bytes the layer may use (0 = no ring)
     size_t   triplet_bytes_max = 0;    // the largest host triplet of the layer
@@ -67,6 +67,17 @@ static inline double moe_exec_layer_gflop(const moe_exec_layer_inputs & in) {
     return 2.0 * 3.0 * static_cast<double>(in.K) * static_cast<double>(in.N) * in.n_expert_used * in.n_tokens / 1e9;
 }
 
+// The five rates the decision divides by must be measured (or seeded): a zero would turn a cost into inf or NaN.
+static inline bool moe_exec_rates_valid(const moe_exec_rates & r) {
+    const double v[] = { r.h2d_gbps, r.cpu_gbps, r.reorder_gbps, r.dev_gflops, r.cpu_gflops };
+    for (double x : v) {
+        if (!std::isfinite(x) || x <= 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static inline moe_exec_decision moe_exec_weigh(const moe_exec_layer_inputs & in,
                                                const moe_exec_rates &        r,
                                                moe_exec_policy               policy) {
@@ -75,11 +86,12 @@ static inline moe_exec_decision moe_exec_weigh(const moe_exec_layer_inputs & in,
         d.reason = moe_exec_reason::NO_HOST_EXPERTS;
         return d;
     }
-    if (in.n_tokens <= 1) {  // decode is untouched by this plan
+    if (in.n_tokens <= 1) {  // n_tokens <= 1: decode, or an empty batch
         d.choice = moe_exec_choice::CPU;
         d.reason = moe_exec_reason::DECODE;
         return d;
     }
+    GGML_ASSERT(moe_exec_rates_valid(r));
     d.p_touch           = moe_exec_p_touch(in.n_expert_used, in.n_expert, in.n_tokens);
     d.regime            = d.p_touch >= r.stream_all_p_min ? moe_exec_regime::STREAM_ALL : moe_exec_regime::ROUTED_ONLY;
     // Bytes moved: every host expert under STREAM_ALL, the touched share otherwise (GB/s is 1e3 bytes per us).
