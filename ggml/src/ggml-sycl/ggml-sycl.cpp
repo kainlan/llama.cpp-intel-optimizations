@@ -37211,6 +37211,67 @@ struct ggml_sycl_scoped_alloc_rollback {
     void release() noexcept { transferred = true; }
 };
 
+// GGML_SYCL_MOE_EXEC_TRACE (llama.cpp-36j0): level 2 runs the load-time host-expert copy probe below.
+static int ggml_sycl_moe_exec_trace_level() {
+    static const int level = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_EXEC_TRACE");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    return level;
+}
+
+// llama.cpp-36j0 Task 5 spike, opt-in: once per device at load, after S1-PRELOAD registered its host-planned
+// experts, copy one expert's registered handle into a device RUNTIME buffer until at least 64 MiB have moved, and
+// log the rate and whether the copies took mem_copy_submit's direct or staged branch. It is diagnostic only and
+// waits on the loading thread, which no production copy may do. The branch comes from this thread's staged-copy
+// census (llama.cpp-qwn5), which counts only under GGML_SYCL_MOE_IDS_COPY_TRACE=1, so without it the line says
+// unknown; the th86 site census prints to stderr and cannot be read in-process.
+static void ggml_sycl_moe_exec_copy_probe(int                           device,
+                                          const ggml_sycl::mem_handle & expert,
+                                          size_t                        bytes,
+                                          sycl::queue &                 queue) {
+    if (!expert.valid() || bytes == 0) {
+        return;
+    }
+    try {
+        ggml_sycl::alloc_request req{};
+        req.queue                                     = &queue;
+        req.device                                    = device;
+        req.size                                      = bytes;
+        req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+        req.intent.category                           = ggml_sycl::runtime_category::STAGING;
+        req.intent.cohort_id                          = "moe_exec_copy_probe";
+        req.intent.constraints.must_device            = true;
+        req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+        req.intent.constraints.forbid_vram_zone_spill = true;
+        ggml_sycl::mem_handle dst                     = ggml_sycl::unified_allocate(req);
+        if (!dst.valid()) {
+            GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d: no %zu-byte RUNTIME buffer\n", device, bytes);
+            return;
+        }
+        const size_t copies = (64ull * 1024ull * 1024ull + bytes - 1) / bytes;
+        ggml_sycl::mem_copy_async(dst, expert, bytes, queue).wait_and_throw();  // untimed warm-up
+        const uint64_t           staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
+        std::vector<sycl::event> events;
+        events.reserve(copies);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < copies; ++i) {
+            events.push_back(ggml_sycl::mem_copy_async(dst, expert, bytes, queue));
+        }
+        sycl::event::wait_and_throw(events);
+        const double   sec    = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const uint64_t staged = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before;
+        const char *   kind   = !ggml_sycl_cpu_expert_trace_enabled() ? "unknown" : (staged != 0 ? "staged" : "direct");
+        const size_t   total  = copies * bytes;
+        GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d: %.1f GB/s over %zu MiB, %s\n", device,
+                      sec > 0.0 ? (double) total / sec / 1e9 : 0.0, total / (1024 * 1024), kind);
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d failed: %s\n", device, e.what());
+    }
+}
+
 static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, layout_mode layout) {
     if (!src0 || device < 0 || device >= ggml_sycl_info().device_count) {
         return false;
@@ -37592,6 +37653,9 @@ static void ggml_sycl_preload_model_weights() {
                 continue;
             }
             sycl::queue & stream = *stream_ptr;
+            // The first host-planned expert this device registers, for the copy probe (llama.cpp-36j0).
+            ggml_sycl::mem_handle moe_exec_probe_expert;
+            size_t                moe_exec_probe_bytes = 0;
 
             // P4/P4.5: Apply placement plan to cache.
             // Multi-device plans are copied to each device's cache (all need it).
@@ -38094,6 +38158,10 @@ static void ggml_sycl_preload_model_weights() {
                                 throw std::runtime_error("SYCL host expert registration failed during preload");
                             }
                             if (!remembered_handle) {
+                                if (ggml_sycl_moe_exec_trace_level() >= 2 && !moe_exec_probe_expert.valid()) {
+                                    moe_exec_probe_expert = handle;
+                                    moe_exec_probe_bytes  = expert_size;
+                                }
                                 if (!extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS,
                                                                        std::move(handle), nullptr,
                                                                        /*logical_offset=*/0, expert_size)) {
@@ -39367,6 +39435,10 @@ static void ggml_sycl_preload_model_weights() {
 
             ggml_sycl_record_weight_load_summary(device, weight_device_bytes[device], weight_host_bytes[device],
                                                  weight_device_count[device], weight_host_count[device]);
+            if (moe_exec_probe_expert.valid()) {
+                ggml_sycl_moe_exec_copy_probe(device, moe_exec_probe_expert, moe_exec_probe_bytes, cache->get_queue());
+                moe_exec_probe_expert = {};
+            }
 
             // Seal the layout pool to prevent new 256 MB chunk allocations.
             // All dense weights are now loaded; any subsequent layout requests
