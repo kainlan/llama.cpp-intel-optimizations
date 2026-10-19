@@ -2243,6 +2243,21 @@ set_tests_properties(sycl-kv-room-cost PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-36j0: the MoE executor's per-layer cost. Header over ggml.h and kv-room-cost.hpp only: host-only, no
+# -fsycl, links nothing. Pins the Qwen3.8/B70 and GPT-OSS/B50 shapes the brief measured.
+add_executable(test-moe-exec-cost
+    tests/test-moe-exec-cost.cpp
+)
+target_include_directories(test-moe-exec-cost PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+add_test(NAME sycl-moe-exec-cost COMMAND test-moe-exec-cost)
+set_tests_properties(sycl-moe-exec-cost PROPERTIES
+    LABELS "sycl;moe;planner;hostonly"
+    TIMEOUT 60
+)
+
 # TKV-13 (B2) step 1: the DAG-consumption check that will let the SYCL
 # backend defer a pending host-computed demoted-layer attention result
 # instead of blocking on it (docs/plans/2026-08-27-tkv13-b2-addendum.md
