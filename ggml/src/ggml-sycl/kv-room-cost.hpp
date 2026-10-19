@@ -224,7 +224,7 @@ struct kv_room_cost_terms {
     double host_attn_us = 0.0;  // A: fill_us plus the splits, each host_split_us
     double expert_us    = 0.0;  // B. It counts every room byte as a displaced expert byte, even where the experts
                                 // fit beside the room and none is displaced; weighing min(room, displaced) is a
-                                // follow-up (llama.cpp-7fmt).
+                                // follow-up (llama.cpp-idar).
     bool   held         = false;
 };
 
