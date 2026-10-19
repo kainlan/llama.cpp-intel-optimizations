@@ -47,6 +47,11 @@ placement_plan make_plan() {
             }
         }
     }
+    // Entries that must never reach a list: a dense host tensor (expert_id -1) and a fused host GATE_UP for expert 1.
+    plan.entries.push_back({ "blk.1.attn_q.weight", kSrc, kDst, 0, placement_priority::ATTENTION, 1, -1,
+                             expert_tensor_role::UNKNOWN, false, -1 });
+    plan.entries.push_back({ "blk.1.ffn_gate_up_exps.weight", kSrc, kDst, 0, placement_priority::MOE_UP, 1, 1,
+                             expert_tensor_role::GATE_UP, false, -1 });
     plan.build_index();
     return plan;
 }
@@ -59,7 +64,7 @@ int main() {
 
     // STREAM_ALL: 3 triplets in entries order, gate/up/down within each; ids ignored.
     const int32_t ignored[2] = { 0, 2 };
-    const auto    all        = ggml_sycl::moe_stream_plan_build(plan, 0, 1, moe_exec_regime::STREAM_ALL, ignored, 2);
+    const auto    all        = ggml_sycl::moe_stream_plan_build(plan, 0, 1, moe_exec_regime::STREAM_ALL, nullptr, 0);
     CHECK(all.size() == 9);
     const int                exp_e[3] = { 1, 5, 6 };
     const expert_tensor_role exp_r[3] = { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN };
@@ -81,6 +86,14 @@ int main() {
         CHECK(part[i].role == exp_r[i % 3]);
     }
 
+    // Entries order, not ids order: {5, 1, 5, 7} still lists expert 1 before expert 5.
+    const int32_t reordered[4] = { 5, 1, 5, 7 };
+    const auto    ord = ggml_sycl::moe_stream_plan_build(plan, 0, 1, moe_exec_regime::ROUTED_ONLY, reordered, 4);
+    CHECK(ord.size() == 6);
+    for (size_t i = 0; i < ord.size() && i < 6; ++i) {
+        CHECK(ord[i].expert_id == (i < 3 ? 1 : 5));
+    }
+
     // A layer with no host experts lists nothing under either regime.
     CHECK(ggml_sycl::moe_stream_plan_build(plan, 0, 3, moe_exec_regime::STREAM_ALL, no_ids, 1).empty());
     CHECK(ggml_sycl::moe_stream_plan_build(plan, 0, 3, moe_exec_regime::ROUTED_ONLY, routed, 4).empty());
@@ -95,6 +108,11 @@ int main() {
     CHECK(ggml_sycl::moe_stream_layer_fully_staged(short_list, plan, 0, 1, ignored, 2));  // 5 is not asked for
     CHECK(!ggml_sycl::moe_stream_layer_fully_staged(std::vector<moe_stream_item>{}, plan, 0, 1, routed, 4));
     CHECK(ggml_sycl::moe_stream_layer_fully_staged(std::vector<moe_stream_item>{}, plan, 0, 3, routed, 4));
+
+    // A staged item of another layer does not count.
+    std::vector<moe_stream_item> wrong_layer = all;
+    wrong_layer[4].layer                     = 2;
+    CHECK(!ggml_sycl::moe_stream_layer_fully_staged(wrong_layer, plan, 0, 1, routed, 4));
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);

@@ -28,6 +28,8 @@ struct moe_stream_item {
 
 namespace detail {
 
+// Fused GATE_UP and CHUNK_* host entries are deliberately NOT listed: the stream list is gate/up/down triplets, the only
+// shape the ring stages. An empty list therefore does not mean "staged" for a fused-gate_up or chunked model.
 // A gate/up/down entry of `layer` that is planned for the host. Host entries carry target_device -1 (the planner sets
 // it at placement time), so they serve any device and the device argument of the callers is not a filter.
 static inline bool moe_stream_host_triplet_entry(const placement_entry & e, int layer) {
@@ -81,6 +83,9 @@ static inline std::vector<moe_stream_item> moe_stream_plan_build(const placement
     return out;
 }
 
+// Only gate/up/down triplets are considered (see moe_stream_host_triplet_entry): a layer whose host experts are fused
+// GATE_UP or CHUNK_* entries has an empty want list and so answers true without anything staged. Callers must not use
+// this predicate to skip the CPU path for a fused-gate_up or chunked model.
 // True iff every distinct id in ids that is host-planned in `layer` has gate, up and down in `staged`.
 static inline bool moe_stream_layer_fully_staged(const std::vector<moe_stream_item> & staged,
                                                  const placement_plan &               plan,
