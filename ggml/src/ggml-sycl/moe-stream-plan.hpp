@@ -155,33 +155,33 @@ static inline bool moe_loan_soa_inverse_exists(ggml_type type) {
     return false;
 }
 
-// True iff the tensor `name` is bulk-staged at load: every one of its experts is planned on one device, in one layout,
-// with no same-device alternate. This is the predicate of try_bulk_stage_moe_tensor (ggml-sycl.cpp:38073-38138, the
-// lambda starting at 38073), evaluated over the plan: it returns false when an expert is missing, is not on the device,
-// carries a same-device alternate layout, or disagrees on the layout. A bulk tensor is views into ONE WEIGHT allocation,
-// so no single expert can be handed back. The load path also requires n_experts > 1 and tensor->data; a one-expert
-// tensor is never bulk here.
-static inline bool moe_tensor_bulk_staged(const placement_plan & plan, const std::string & name) {
-    int              n_experts = 0;
-    int              device    = -2;
-    ggml_layout_mode layout    = GGML_LAYOUT_AOS;
+// True iff the tensor `name` is bulk-staged on `device` at load, mirroring the per-expert loop of
+// try_bulk_stage_moe_tensor (ggml-sycl.cpp) over the plan. Every expert must stage on `device` as one of:
+//   (a) primary there (on_device and target_device == device) with no alternate resolving to `device`, or
+//   (b) not primary there and carrying exactly one alternate that resolves to `device` (the "stage-alt-bulk" branch).
+// An expert that is neither, and n_experts <= 1, mean the load path does not bulk-stage. A bulk tensor is views into ONE
+// WEIGHT allocation, so no single expert can be handed back. Where the load path compares layouts (after
+// ggml_sycl_adjust_layout_for_tensor, which the plan cannot see) a layout disagreement is treated as bulk: the fail-safe
+// over-skip. Checks that need runtime state (tensor->data, GGML_SYCL_MOE_BULK_STAGE=0) are likewise not mirrored; each
+// can only make the load path not bulk where this says bulk, which skips more, never less.
+static inline bool moe_tensor_bulk_staged(const placement_plan & plan, const std::string & name, int device) {
+    int n_experts = 0;
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.name != name) {
             continue;
         }
-        if (!e.on_device || e.target_device < 0) {
-            return false;
-        }
+        int n_alt = 0;
         for (const placement_alternate_layout & alt : e.alternate_layouts) {
             const int alt_target = alt.target_device >= 0 ? alt.target_device : e.target_device;
-            if (alt_target == e.target_device) {
-                return false;
+            if (alt_target == device) {
+                ++n_alt;
             }
         }
-        if (n_experts == 0) {
-            device = e.target_device;
-            layout = e.layout;
-        } else if (e.target_device != device || e.layout != layout) {
+        if (e.on_device && e.target_device == device) {
+            if (n_alt != 0) {
+                return false;
+            }
+        } else if (n_alt != 1) {
             return false;
         }
         ++n_experts;
@@ -211,12 +211,13 @@ static inline bool moe_loan_triplet_lendable(const moe_loan_triplet &           
         if (!e.on_device) {
             return false;
         }
-        if (e.layout != GGML_LAYOUT_AOS && !moe_loan_soa_inverse_exists(e.type)) {
+        if (e.layout != GGML_LAYOUT_AOS && !(e.layout == GGML_LAYOUT_SOA && moe_loan_soa_inverse_exists(e.type))) {
             return false;
         }
-        auto it = bulk_memo.find(e.name);
+        const std::string memo_key = e.name + "@" + std::to_string(e.target_device);
+        auto              it       = bulk_memo.find(memo_key);
         if (it == bulk_memo.end()) {
-            it = bulk_memo.emplace(e.name, moe_tensor_bulk_staged(plan, e.name)).first;
+            it = bulk_memo.emplace(memo_key, moe_tensor_bulk_staged(plan, e.name, e.target_device)).first;
         }
         if (it->second) {
             return false;

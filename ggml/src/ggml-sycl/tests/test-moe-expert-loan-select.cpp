@@ -56,6 +56,37 @@ placement_plan make_plan() {
     return plan;
 }
 
+// Alternate-layout plan, queried for device 0. Layer 0: experts 0-3 primary on device 0, experts 4-5 primary on device 1
+// with one alternate targeted at device 0, so load stages the tensor as ONE bulk allocation on device 0 (the alt-only
+// branch). Layer 1: the same, plus expert 1 carries an alternate on its own device 0, which makes the tensor non-bulk.
+// Layer 2: a single expert, so n_experts > 1 fails and the tensor is non-bulk.
+placement_plan make_alt_plan() {
+    placement_plan           plan{};
+    const expert_tensor_role roles[3] = { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN };
+    const char *             names[3] = { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps" };
+    for (int l = 0; l < 3; ++l) {
+        const int n = l == 2 ? 1 : kExperts;
+        for (int e = 0; e < n; ++e) {
+            for (int r = 0; r < 3; ++r) {
+                const int       dev = e < 4 ? 0 : 1;
+                placement_entry pe("blk." + std::to_string(l) + "." + names[r] + ".weight", 4096, kDst[r], 0,
+                                   placement_priority::MOE_UP, l, e, roles[r], true, dev);
+                pe.type = GGML_TYPE_Q4_0;
+                if (dev == 1 || (l == 1 && e == 1)) {
+                    ggml_sycl::placement_alternate_layout alt;
+                    alt.layout           = GGML_LAYOUT_AOS;
+                    alt.target_device    = 0;
+                    alt.vram_charge_size = ggml_sycl::placement_vram_charge_bytes(kDst[r]);
+                    pe.alternate_layouts.push_back(alt);
+                }
+                plan.entries.push_back(pe);
+            }
+        }
+    }
+    plan.build_index();
+    return plan;
+}
+
 size_t triplet_charge() {
     size_t s = 0;
     for (int r = 0; r < 3; ++r) {
@@ -135,6 +166,27 @@ int main() {
     CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, 0, &sel).empty() && sel == 0);
     CHECK(ggml_sycl::moe_expert_loan_select(plan, 1, ~static_cast<size_t>(0), &sel).empty() && sel == 0);
     CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, 1, nullptr).size() == 3);  // bytes_selected is optional
+
+    // Alternate-only bulk branch: experts 4-5 stage on device 0 through an alternate, so the whole tensor is one bulk
+    // allocation there and the primary experts 0-3 are views into it.
+    const placement_plan alt = make_alt_plan();
+    for (int e = 0; e < 4; ++e) {
+        CHECK(!ggml_sycl::moe_expert_triplet_lendable(alt, 0, e));
+    }
+    // A same-device alternate on one expert makes the tensor non-bulk: its experts are lendable.
+    for (int e = 0; e < 4; ++e) {
+        CHECK(ggml_sycl::moe_expert_triplet_lendable(alt, 1, e));
+    }
+    // One expert only: n_experts > 1 fails, so not bulk.
+    CHECK(ggml_sycl::moe_expert_triplet_lendable(alt, 2, 0));
+    // Select on device 0: layer 2, then layer 1 experts 3..0; layer 0 is bulk and skipped.
+    const auto alt_sel = ggml_sycl::moe_expert_loan_select(alt, 0, ~static_cast<size_t>(0), &sel);
+    CHECK(alt_sel.size() == 15 && sel == 5 * tc);
+    if (alt_sel.size() == 15) {
+        CHECK(key_is(alt_sel[0], 2, 0, expert_tensor_role::GATE));
+        CHECK(key_is(alt_sel[3], 1, 3, expert_tensor_role::GATE));
+        CHECK(key_is(alt_sel[12], 1, 0, expert_tensor_role::GATE));
+    }
 
     if (failures) {
         std::fprintf(stderr, "test-moe-expert-loan-select: %d failure(s)\n", failures);
