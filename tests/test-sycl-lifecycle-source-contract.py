@@ -677,21 +677,31 @@ INTERNAL_WRAPPER_SITES = {
         # llama.cpp-mwmr took this from 3 to 4: the expert loan transaction's one acquire load, held for the whole
         # transaction as the runtime context transaction holds its own.
         "const auto current = ggml_sycl_global_plan_snapshot();": 4,
+        # llama.cpp-sif1: the refill device case reads the plan its first refill published, to tell which triplet
+        # came back and which is still lent.
+        "const auto first = ::ggml_sycl_global_plan_snapshot();": 1,
         "const auto lifecycle_owner = ggml_sycl_global_plan_snapshot();": 1,
         # llama.cpp-mwmr: the expert loan device cases (GGML_SYCL_PRIVATE_TESTING) read the publication they started
         # under, the plan they published, and what the loan published after it; the refusal cases compare pointer
-        # identity to show a refused loan published nothing.
+        # identity to show a refused loan published nothing. llama.cpp-sif1 took `published` from 4 to 8: the fixture's
+        # lent_triplets and readmitted helpers read the current plan, and the two refill cases read the publication a
+        # refused or cancelled refill must leave in place.
         "const auto now = ::ggml_sycl_global_plan_snapshot();": 1,
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 4,
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 8,
         "const auto published = ggml_sycl_global_plan_snapshot();": 1,
         "const auto snapshot = ggml_sycl_global_plan_snapshot();": 2,
         "found = ::ggml_sycl_global_plan_snapshot();": 1,
         "ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());": 1,
-        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 4,
+        # llama.cpp-sif1 took this from 4 to 6: the refill cases show a refill with nothing to do, and one cancelled
+        # by a loan, published nothing.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 6,
         # llama.cpp-mwmr: the expert loan transaction re-checks the publication's identity under
         # g_tensor_inventory_mutex before it lends, with the lifecycle row check after the ||.
         "if (ggml_sycl_global_plan_snapshot().get() != current.get() ||": 1,
         "if (ggml_sycl_global_plan_snapshot().get() != current.get()) {": 3,
+        # llama.cpp-sif1: the cancelled-refill case shows a prompt-phase boundary re-admits nothing and publishes
+        # nothing.
+        "if (remaining != 0 || ::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 1,
         "return candidate ? candidate : ggml_sycl_global_plan_snapshot();": 1,
         "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {": 1,
     }),

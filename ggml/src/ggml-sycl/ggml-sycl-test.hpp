@@ -562,6 +562,13 @@ std::string test_expert_loan_lends_two_triplets();
 std::string test_expert_loan_probe_changes_nothing();
 std::string test_expert_loan_refuses_replacing_a_host_entry();
 std::string test_expert_loan_refuses_shared_storage();
+// The refill's staging question (llama.cpp-sif1): outside a load, under a published plan and a planned materialization
+// scope, direct staging takes one expert from a pinned host copy. It reserves the WEIGHT arena itself.
+std::string test_expert_refill_stage_outside_a_load();
+// The refill (llama.cpp-sif1): after the loan, two calls re-admit one triplet each, the bytes and the device's zone
+// room come back and no host entry is left; a loan between two calls cancels the second.
+std::string test_expert_refill_readmits_one_triplet_per_call();
+std::string test_expert_refill_cancelled_by_a_loan();
 #endif
 
 }  // namespace ggml_sycl
