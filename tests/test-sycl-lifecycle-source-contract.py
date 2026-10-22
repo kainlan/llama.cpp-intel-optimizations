@@ -519,6 +519,11 @@ OWNING_READER_SITES = {
         "const auto woq_plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(cache);": 1,
         "placement_cache_read cache_placement_coherence(const unified_cache * cache) noexcept {": 1,
         "return cache_placement_coherence(cache).owner;": 1,
+        # llama.cpp-mwmr: the expert loan device test's stage-refusal diagnostic (GGML_SYCL_PRIVATE_TESTING) names in
+        # its failure message what direct staging checks, the plan coherence and the plan's entry count. Each is one
+        # coherent read that decides only the message.
+        "if (cache_placement_coherence(cache).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
+        "coherent_cache_placement_plan_owner(cache)->entries.size());": 1,
     }),
     "ggml/src/ggml-sycl/mmvq.cpp": Counter({
         "const auto plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(route_cache);": 1,
@@ -530,7 +535,10 @@ OWNING_READER_SITES = {
         "const bool skip_pool = !coherent_cache_placement_plan_owner(this)->entries.empty();": 1,
         "const auto owned_read = retained_read ? placement_cache_read{} : cache_placement_coherence(this);": 2,
         "const auto placement = cache_placement_coherence(this);": 5,
-        "if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
+        # llama.cpp-mwmr took this from 1 to 2: loan_expert_triplet makes the coherence decision its host
+        # registration makes, before anything is copied, so the registration cannot refuse once the device entries
+        # are withdrawn.
+        "if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 2,
         "if (!key_id.valid || cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
     }),
     "ggml/src/ggml-sycl/unified-cache.hpp": Counter({
@@ -660,11 +668,23 @@ INTERNAL_WRAPPER_SITES = {
     }),
     "ggml_sycl_global_plan_snapshot": Counter({
         "const auto active = ggml_sycl_global_plan_snapshot();": 1,
-        "const auto current = ggml_sycl_global_plan_snapshot();": 3,
+        # llama.cpp-mwmr took this from 3 to 4: the expert loan transaction's one acquire load, held for the whole
+        # transaction as the runtime context transaction holds its own.
+        "const auto current = ggml_sycl_global_plan_snapshot();": 4,
         "const auto lifecycle_owner = ggml_sycl_global_plan_snapshot();": 1,
+        # llama.cpp-mwmr: the expert loan device cases (GGML_SYCL_PRIVATE_TESTING) read the publication they started
+        # under, the plan they published, and what the loan published after it; the refusal cases compare pointer
+        # identity to show a refused loan published nothing.
+        "const auto now = ::ggml_sycl_global_plan_snapshot();": 1,
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 4,
         "const auto published = ggml_sycl_global_plan_snapshot();": 1,
         "const auto snapshot = ggml_sycl_global_plan_snapshot();": 2,
+        "found = ::ggml_sycl_global_plan_snapshot();": 1,
         "ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());": 1,
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 4,
+        # llama.cpp-mwmr: the expert loan transaction re-checks the publication's identity under
+        # g_tensor_inventory_mutex before it lends, with the lifecycle row check after the ||.
+        "if (ggml_sycl_global_plan_snapshot().get() != current.get() ||": 1,
         "if (ggml_sycl_global_plan_snapshot().get() != current.get()) {": 3,
         "return candidate ? candidate : ggml_sycl_global_plan_snapshot();": 1,
         "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {": 1,
@@ -916,7 +936,8 @@ checks = {
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"
     in cpp,
-    "retained cache coherence decisions": cache_cpp.count("cache_placement_coherence(this)") == 9
+    # llama.cpp-mwmr took the coherence count from 9 to 10: loan_expert_triplet's pre-copy coherence decision.
+    "retained cache coherence decisions": cache_cpp.count("cache_placement_coherence(this)") == 10
     and cache_cpp.count("planned_materialization_allowed(\"direct_stage_") == 3
     and cache_cpp.count("__func__, &placement") == 3
     and "unpin(key, layout, &placement)" in cache_cpp,
