@@ -282,6 +282,46 @@ int main() {
         moe_exec_rates_apply_env(r, nullptr);
         CHECK(r.h2d_gbps == 1.0, "a null getenv keeps what the record holds");
     }
+    // the H2D probe's aggregation (llama.cpp-xr4i): the max over iterations 2..n, so one slow window cannot drag the
+    // persisted rate down, and none when even that max is under half the seed
+    {
+        double       lo        = -1.0;
+        double       hi        = -1.0;
+        const double steady[8] = { 9.3, 25.1, 24.8, 26.0, 25.5, 24.9, 25.2, 25.0 };
+        double       r         = moe_exec_h2d_rate_from_iterations(steady, 8, 20.0, &lo, &hi);
+        CHECK(r == 26.0 && hi == 26.0, "the rate is the max over iterations 2..8");
+        CHECK(lo == 24.8, "the spread's low end is the min over iterations 2..8, not the slow first iteration");
+        const double one_slow[8] = { 25.0, 25.3, 9.4, 25.6, 25.1, 25.4, 25.2, 25.5 };
+        r                        = moe_exec_h2d_rate_from_iterations(one_slow, 8, 20.0, &lo, &hi);
+        CHECK(r == 25.6 && lo == 9.4 && hi == 25.6, "one slow window among 2..8 neither lowers the rate nor hides");
+        const double fast_first[8] = { 31.0, 24.0, 25.0, 24.5, 24.0, 24.2, 24.1, 24.4 };
+        r                          = moe_exec_h2d_rate_from_iterations(fast_first, 8, 20.0, &lo, &hi);
+        CHECK(r == 25.0 && hi == 25.0, "iteration 1 is a warm-up: a fast one is not the rate");
+        const double slow[8] = { 9.3, 9.8, 9.6, 9.5, 9.9, 9.7, 9.6, 9.4 };
+        r                    = moe_exec_h2d_rate_from_iterations(slow, 8, 20.0, &lo, &hi);
+        CHECK(r == 0.0, "a max under half the seed yields no rate, so the probe retries");
+        CHECK(lo == 9.4 && hi == 9.9, "the spread is still reported for a rejected window");
+        const double edge[3] = { 1.0, 10.0, 9.0 };
+        CHECK(moe_exec_h2d_rate_from_iterations(edge, 3, 20.0, &lo, &hi) == 10.0, "exactly half the seed is kept");
+        const double under[3] = { 1.0, 9.99, 9.0 };
+        CHECK(moe_exec_h2d_rate_from_iterations(under, 3, 20.0, &lo, &hi) == 0.0, "just under half the seed is not");
+        const double bad[8] = { 25.0, 0.0, -3.0, NAN, INFINITY, 12.0, 0.0, 14.0 };
+        r                   = moe_exec_h2d_rate_from_iterations(bad, 8, 20.0, &lo, &hi);
+        CHECK(r == 14.0 && lo == 12.0 && hi == 14.0, "zero, negative and non-finite iterations are skipped");
+        const double none[4] = { 25.0, 0.0, NAN, -1.0 };
+        r                    = moe_exec_h2d_rate_from_iterations(none, 4, 20.0, &lo, &hi);
+        CHECK(r == 0.0 && lo == 0.0 && hi == 0.0, "no valid iteration yields no rate and a zero spread");
+        const double two[2] = { 30.0, 22.0 };
+        CHECK(moe_exec_h2d_rate_from_iterations(two, 2, 20.0, nullptr, nullptr) == 22.0,
+              "two iterations use the second alone, and the spread outputs are optional");
+        CHECK(moe_exec_h2d_rate_from_iterations(two, 1, 20.0, &lo, &hi) == 0.0 && lo == 0.0 && hi == 0.0,
+              "a single iteration is only the warm-up");
+        CHECK(moe_exec_h2d_rate_from_iterations(nullptr, 0, 20.0, &lo, &hi) == 0.0, "no iterations yield no rate");
+        const moe_exec_rates seed = moe_exec_rates_seed({});
+        CHECK(moe_exec_h2d_rate_from_iterations(slow, 8, seed.h2d_gbps, nullptr, nullptr) == 0.0 &&
+                  moe_exec_h2d_rate_from_iterations(steady, 8, seed.h2d_gbps, nullptr, nullptr) == 26.0,
+              "the bimodal readings of llama.cpp-zujy c-vbf4: 9.x GB/s rejected, 24-26 GB/s kept, against the seed");
+    }
     std::printf("test-moe-exec-cost: %d cases, %d failures\n", g_cases, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

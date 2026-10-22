@@ -15,8 +15,12 @@ reused. The probe this gate pins:
   - one untimed warm-up copy (ggml_sycl::mem_copy, which is synchronous), then 8 timed iterations of a 64 MiB buffer
     moved in 4 MiB chunks with ggml_sycl::mem_copy_async at an offset, one q->wait() per iteration and never one per
     chunk, timed on the host with steady_clock;
-  - one WARN line per device, "[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)", whose source word is "probed",
-    "tuning cache" or "seed, GGML_SYCL_H2D_PROBE=0";
+  - one WARN line per device, "[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)", whose source word is "probed" (with the
+    iteration spread appended: "probed; iterations 24.1-26.2"), "tuning cache" or "seed, GGML_SYCL_H2D_PROBE=0";
+  - llama.cpp-xr4i (c-vbf4, the bimodal 9.x vs 24-26 GB/s readings): each of the 8 iterations is timed on its own, the
+    rate persisted is the max over iterations 2..8 (iteration 1 is a second warm-up) through
+    moe_exec_h2d_rate_from_iterations in moe-exec-cost.hpp, the spread rides in the probed line only, and a max under
+    half the seed is RETRY_NO_RATE (kept seed, retried at the next load) instead of a stored rate;
   - GGML_SYCL_H2D_PROBE is read once (1 forces a re-probe, 0 skips it and keeps the seed); a stored record skips the
     probe; a probe that cannot allocate keeps the seed and never aborts;
   - a handler that can swallow ggml_sycl_fallback_error is preceded by the sanctioned rethrow (clause (g));
@@ -85,10 +89,12 @@ def read(rel: str) -> str:
 
 SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 COMMON_REL = "ggml/src/ggml-sycl/common.hpp"
+COST_REL = "ggml/src/ggml-sycl/moe-exec-cost.hpp"
 SYCL_TREE_DIR = "ggml/src/ggml-sycl"
 
 SYCL = read(SYCL_REL)
 COMMON = read(COMMON_REL)
+COST = read(COST_REL)
 
 PROBE_SIG = "static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info)"
 LOG_FORMAT = '"[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\\n"'
@@ -343,7 +349,7 @@ def claim_a_refused_store_is_not_reported_as_persisted(src: str) -> bool:
     fn = probe_body(src)
     return bool(fn) and all([
         fn.count("const bool stored = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);") == 1,
-        fn.count('report(dev, gbps, H2D_PROBE_OUTCOME_MEASURED, stored ? "probed" : "probed, not stored");') == 1,
+        fn.count(MEASURED_REPORT) == 1,
     ])
 
 
@@ -377,6 +383,72 @@ def claim_copies_run_on_the_cache_queue(src: str) -> bool:
         "dpct::dev_mgr" not in fn,
         "dst_req.queue = q;" in fn,
         fn.count("*q)") + fn.count("*q,") >= 2,
+    ])
+
+
+HELPER_CALL = "ggml_sycl::moe_exec_h2d_rate_from_iterations(iter_gbps, k_iters, seed.h2d_gbps, &lo, &hi)"
+ITER_LOOP = "for (int it = 0; it < k_iters; ++it)"
+SPREAD_WORD = '"%s; iterations %.1f-%.1f"'
+MEASURED_REPORT = ('report(dev, gbps, H2D_PROBE_OUTCOME_MEASURED, stored ? "probed" : "probed, not stored", '
+                   "spread);")
+
+
+def claim_each_iteration_is_timed_on_its_own(src: str) -> bool:
+    """llama.cpp-xr4i: the clock starts and stops inside the iteration loop, once per iteration, and each iteration's
+    rate lands in its own slot, so one slow window is a reading rather than a third of a mean."""
+    fn = probe_body(src)
+    loop = body(fn, ITER_LOOP) if fn else ""
+    return bool(loop) and all([
+        fn.count("std::chrono::steady_clock::now()") == 2,
+        loop.count("std::chrono::steady_clock::now()") == 2,
+        "iter_gbps[it] = " in loop,
+        "double iter_gbps[k_iters];" in fn,
+        ordered(loop, "steady_clock::now()", "mem_copy_async(", "q->wait()", "steady_clock::now()", "iter_gbps[it] = "),
+    ])
+
+
+def claim_the_rate_is_the_max_over_iterations_two_to_eight(src: str, cost: str) -> bool:
+    """The probe persists what moe_exec_h2d_rate_from_iterations returns for all k_iters readings, and that helper
+    skips iteration 1 (the second warm-up) and keeps the max of the rest."""
+    fn = probe_body(src)
+    helper = body(norm(cost), "static inline double moe_exec_h2d_rate_from_iterations(")
+    return bool(fn) and bool(helper) and all([
+        fn.count("moe_exec_h2d_rate_from_iterations(") == 1,
+        fn.count("const double gbps = " + HELPER_CALL + ";") == 1,
+        fn.count("rec.h2d_gbps = gbps;") == 1,
+        ordered(fn, HELPER_CALL, "rec.h2d_gbps = gbps;"),
+        "for (int i = 1; i < n; ++i)" in helper,
+        "if (g > best) { best = g; }" in helper,
+        "if (g < low) { low = g; }" in helper,
+        "bool any = false;" in helper and "any = true;" in helper,
+        "return best;" in helper,
+    ])
+
+
+def claim_the_spread_rides_in_the_probed_line_only(src: str) -> bool:
+    """The one WARN call keeps its one format; the iteration spread is folded into the source word by the report
+    lambda, and only the MEASURED report passes it."""
+    fn = probe_body(src)
+    return bool(fn) and all([
+        fn.count(SPREAD_WORD) == 1,
+        fn.count(MEASURED_REPORT) == 1,
+        fn.count(", spread)") == 1,
+        fn.count("const double spread[2] = { lo, hi };") == 1,
+        ordered(fn, "const double * spread = nullptr", SPREAD_WORD, "GGML_LOG_WARN(" + LOG_FORMAT),
+    ])
+
+
+def claim_a_max_under_half_the_seed_is_retried_not_stored(src: str, cost: str) -> bool:
+    """A max under MOE_EXEC_H2D_MIN_SEED_FRACTION (0.5) of the seed is the helper's zero, and a zero is
+    RETRY_NO_RATE, reported before the store and never kept."""
+    fn = probe_body(src)
+    n = norm(cost)
+    return bool(fn) and all([
+        "static constexpr double MOE_EXEC_H2D_MIN_SEED_FRACTION = 0.5;" in n,
+        "if (!any || !(best >= seed * MOE_EXEC_H2D_MIN_SEED_FRACTION)) { return 0.0; }" in n,
+        "if (gbps <= 0.0) {" in fn,
+        ordered(fn, HELPER_CALL, "if (gbps <= 0.0) {", "H2D_PROBE_OUTCOME_RETRY_NO_RATE",
+                "continue;", "rec.h2d_gbps = gbps;", "moe_exec_rates_store("),
     ])
 
 
@@ -468,6 +540,22 @@ def test_copies_run_on_the_cache_queue():
 def test_device_info_carries_the_rate_and_one_consumer_reads_it():
     assert claim_device_info_fields(COMMON)
     assert claim_one_consumer_reads_the_rate()
+
+
+def test_each_iteration_is_timed_on_its_own():
+    assert claim_each_iteration_is_timed_on_its_own(SYCL)
+
+
+def test_the_rate_is_the_max_over_iterations_two_to_eight():
+    assert claim_the_rate_is_the_max_over_iterations_two_to_eight(SYCL, COST)
+
+
+def test_the_spread_rides_in_the_probed_line_only():
+    assert claim_the_spread_rides_in_the_probed_line_only(SYCL)
+
+
+def test_a_max_under_half_the_seed_is_retried_not_stored():
+    assert claim_a_max_under_half_the_seed_is_retried_not_stored(SYCL, COST)
 
 
 # ---- mutants: each claim must go red when its text is broken ----
@@ -707,6 +795,75 @@ def test_mutant_second_reader_fails():
     outside = SYCL + ("\nstatic double h2d_extra_reader(const ggml_sycl_device_info & i) "
                       "{ return i.devices[0].h2d_pinned_gbps; }\n")
     assert not claim_one_consumer_reads_the_rate({SYCL_REL: outside})
+
+
+def test_mutant_iterations_timed_as_one_block_fails():
+    """The old shape: one clock around all the iterations."""
+    mutant = _once(SYCL, ITER_LOOP + " { const auto t0 = std::chrono::steady_clock::now();", ITER_LOOP + " {")
+    mutant = _once(mutant, ITER_LOOP, "const auto t0 = std::chrono::steady_clock::now(); " + ITER_LOOP)
+    assert not claim_each_iteration_is_timed_on_its_own(mutant)
+
+
+def test_mutant_iteration_rate_not_kept_per_slot_fails():
+    assert not claim_each_iteration_is_timed_on_its_own(_once(SYCL, "iter_gbps[it] = ", "iter_gbps[0] = "))
+
+
+def test_mutant_probe_persists_a_mean_fails():
+    assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
+        _once(SYCL, "const double gbps = " + HELPER_CALL + ";",
+              "const double gbps = (iter_gbps[1] + iter_gbps[2]) / 2;"),
+        COST)
+
+
+def test_mutant_helper_counts_the_first_iteration_fails():
+    assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
+        SYCL, _once(COST, "for (int i = 1; i < n; ++i) {", "for (int i = 0; i < n; ++i) {"))
+
+
+def test_mutant_helper_keeps_the_min_fails():
+    assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
+        SYCL, _once(COST, "if (g > best) {", "if (g < best) {"))
+
+
+def test_mutant_helper_low_end_never_tracks_the_min_fails():
+    assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
+        SYCL, _once(COST, "if (g < low) {", "if (g > low) {"))
+
+
+def test_mutant_helper_never_sees_a_valid_iteration_fails():
+    assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
+        SYCL, _once(COST, "any = true;", "any = false;"))
+
+
+def test_mutant_spread_dropped_from_the_probed_line_fails():
+    no_spread = MEASURED_REPORT.replace(", spread)", ")")
+    assert not claim_the_spread_rides_in_the_probed_line_only(_once(SYCL, MEASURED_REPORT, no_spread))
+
+
+def test_mutant_spread_on_another_outcome_fails():
+    assert not claim_the_spread_rides_in_the_probed_line_only(
+        _once(SYCL, 'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged");',
+              'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged", spread);'))
+
+
+def test_mutant_spread_format_dropped_fails():
+    assert not claim_the_spread_rides_in_the_probed_line_only(
+        _once(SYCL, SPREAD_WORD, '"%s; %.1f-%.1f"'))
+
+
+def test_mutant_half_seed_floor_removed_fails():
+    assert not claim_a_max_under_half_the_seed_is_retried_not_stored(
+        SYCL, _once(COST, "MOE_EXEC_H2D_MIN_SEED_FRACTION = 0.5;", "MOE_EXEC_H2D_MIN_SEED_FRACTION = 0.0;"))
+
+
+def test_mutant_helper_ignores_the_floor_fails():
+    assert not claim_a_max_under_half_the_seed_is_retried_not_stored(
+        SYCL, _once(COST, "!(best >= seed * MOE_EXEC_H2D_MIN_SEED_FRACTION)", "false"))
+
+
+def test_mutant_below_floor_rate_reaches_the_store_fails():
+    assert not claim_a_max_under_half_the_seed_is_retried_not_stored(
+        _once(SYCL, "if (gbps <= 0.0) {", "if (false) {"), COST)
 
 
 if __name__ == "__main__":
