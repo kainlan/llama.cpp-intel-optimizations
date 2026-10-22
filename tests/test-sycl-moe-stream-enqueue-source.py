@@ -44,7 +44,9 @@ What this gate pins:
   - a matrix whose weight the oneDNN batched prompt executor claims stages NONE: the backend answers the index build's
     library-claims predicate with ggml_sycl_moe_pp_onednn_batched_claims_tensor, the check the staged route refuses a
     weight on (c-las5), so the ring copies nothing the route would refuse and sizes no slot for it (one fact, one
-    source; llama.cpp-o9uw);
+    source; llama.cpp-o9uw). The predicate asks that check's plan-taking form with call.plan, the plan the index
+    build holds, so it never reads the device's plan a second time (lead ruling c-gi44); only the check's
+    two-argument entry point, the batched executor's own route, reads the device's plan, by passing no plan;
   - a region closes on an event after its last copy and its last reorder: AOS-only items go first, so the region's
     last submission is a reorder when it holds a SOA item and the last copy otherwise;
   - when a region's last use or its new one holds an AOS-only item, the new copies also wait for the region's read
@@ -911,7 +913,20 @@ def test_staging_mirrors_serving_mutants():
 LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "
                       "ggml_sycl::expert_tensor_role role)")
 LIBRARY_CLAIMS_WEIGHT = "const ggml_tensor * w = ggml_sycl_moe_stream_layer_weight(layer, role);"
-LIBRARY_CLAIMS_QUERY = "ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, call->device);"
+LIBRARY_CLAIMS_QUERY = "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, call->device);"
+LIBRARY_CLAIMS_GUARD = "return call != nullptr && call->plan && w != nullptr &&"
+CLAIMS_PLAN_SIG = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan, "
+                   "const ggml_tensor * weight, int device)")
+CLAIMS_PLAN_LAYOUT = ("const bool planned = plan != nullptr ? "
+                      "ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) : "
+                      "ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);")
+CLAIMS_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) { "
+                "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device); }")
+PRIMARY_PLAN_SIG = ("static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_sycl::placement_plan & plan, "
+                    "const ggml_tensor * src0, int device, layout_mode * out_layout)")
+PRIMARY_ENTRY_TAIL = "return ggml_sycl_moe_tensor_plan_primary_layout(*plan_owner, src0, device, out_layout); }"
+PLAN_READERS = ("ggml_sycl_cache_plan_owner(", "coherent_placement_plan_owner(", "coherent_cache_placement_plan_owner(",
+                "global_placement_plan_owner(", "ggml_sycl_global_plan_owner(", "get_unified_cache_for_device(")
 LIBRARY_CLAIMS_FILL = "call.op.library_claims = ggml_sycl_moe_stream_library_claims;"
 ROUTE_LIBRARY_CLAIM = ("const bool stream_library_claimed = moe_stream != nullptr && "
                        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);")
@@ -956,7 +971,8 @@ def test_library_claim_mutants():
         mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_woq_enabled();"), PLAN_HPP, PHASE)
     # Asked for another device than the call's.
     assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, 0);"), PLAN_HPP, PHASE)
+        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, 0);"),
+        PLAN_HPP, PHASE)
     # A second table of its own beside the claim. The host lease takes its weight with the same line, so the mutant is
     # made inside the definition.
     n = norm(SYCL)
@@ -983,6 +999,55 @@ def test_library_claim_mutants():
     # The phase asks again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.library_claims(op.graph_ctx, item.layer, item.role);"
     assert not claim_staging_declines_library_claimed(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
+
+
+def claim_library_claims_read_the_index_plan(sycl: str) -> bool:
+    """Lead ruling c-gi44, one fact one source: the library-claim predicate answers from call.plan, the plan the index
+    build that asks it holds, through the plan-taking form of the batched executor's claim, and asks only when the
+    call holds a plan. That form takes the planned layout from the plan it is given, and the plan-taking walk behind
+    it reads no plan of its own. Only the claim's two-argument entry point, the batched executor's own route, reads
+    the device's plan: it passes no plan, and the walk's two-argument form reads the cache plan and delegates."""
+    n = norm(sycl)
+    at = n.find(LIBRARY_CLAIMS_SIG + " {")
+    lc = body(n[at:], LIBRARY_CLAIMS_SIG) if at >= 0 else ""
+    at = n.find(CLAIMS_PLAN_SIG + " {")
+    cl = body(n[at:], CLAIMS_PLAN_SIG) if at >= 0 else ""
+    at = n.find(PRIMARY_PLAN_SIG + " {")
+    pl = body(n[at:], PRIMARY_PLAN_SIG) if at >= 0 else ""
+    return (ordered(lc, LIBRARY_CLAIMS_GUARD, LIBRARY_CLAIMS_QUERY)
+            and lc.count("ggml_sycl_moe_pp_onednn_batched_claims_tensor(") == 1
+            and n.count(CLAIMS_PLAN_SIG + " {") == 1 and cl.count(CLAIMS_PLAN_LAYOUT) == 1
+            and cl.count("ggml_sycl_moe_tensor_plan_primary_layout(") == 2
+            and n.count(CLAIMS_ENTRY) == 1
+            and n.count(PRIMARY_PLAN_SIG + " {") == 1 and "plan.all_experts_on_device(" in pl
+            and not any(r in pl for r in PLAN_READERS) and n.count(PRIMARY_ENTRY_TAIL) == 1)
+
+
+def test_library_claims_read_the_index_plan():
+    assert claim_library_claims_read_the_index_plan(SYCL)
+
+
+def test_library_claims_index_plan_mutants():
+    c = claim_library_claims_read_the_index_plan
+    # The predicate reads the device's plan again through the two-argument entry point.
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, call->device);"))
+    # The predicate passes no plan, so the claim reads the device's plan instead of the index build's.
+    assert not c(mutate(SYCL, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w,",
+                        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, w,"))
+    # Asked without a plan in hand.
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_GUARD, "return call != nullptr && w != nullptr &&"))
+    # The claim ignores the plan it is given.
+    assert not c(mutate(SYCL, CLAIMS_PLAN_LAYOUT,
+                        "const bool planned = "
+                        "ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);"))
+    # The plan-taking walk reads the device's plan behind its caller's back.
+    assert not c(mutate(SYCL, "if (!plan.all_experts_on_device(src0->name, n_experts, device)) {",
+                        "(void) ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device)); "
+                        "if (!plan.all_experts_on_device(src0->name, n_experts, device)) {"))
+    # The executor's own route handed a plan read ahead of its type and role checks.
+    assert not c(mutate(SYCL, "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device); }",
+                        "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(ggml_sycl_cache_plan_owner("
+                        "ggml_sycl::get_unified_cache_for_device(device)).get(), weight, device); }"))
 
 
 # ---- the policy gate -------------------------------------------------------------------------------------------------

@@ -40,15 +40,17 @@ What this gate pins:
     and detail when it refused any;
   - the two executors that cannot read a staged slot refuse a staged batch by name: the non-hybrid retained prompt
     per-expert path, which multiplies each expert at the tensor's route_layout from route.ptr, throws a fallback error
-    before its first route, and try_xmx_sorted_moe rejects it at its head, before it uploads anything;
-  - a staged slot's raw pointer does not outlive the ring that holds it (lead item 6, c-ned2): the upload records the
-    payload slot it gives a staged pointer, keyed by the weight extra's cache identity and holding no device pointer,
-    the phase counts every ring release in teardown, and once the count moves (or the phase is gone) the backend nulls
-    each recorded payload slot that still holds a pointer and no live handle, marks the device table invalid and
-    resets the full-local probe, so moe_ptrs_ptr answers null until the next upload rewrites the table. It runs after
-    end_prompt at the first decode graph and in the test hook, after begin_layer (a new geometry re-reserves the
-    ring), and once the phase is gone in the context destructor. Each record is counted on its extra, the context's
-    member documents that a record's extra outlives it, and release_extra_gpu asserts no record is left.
+    directly after the batched executor's try, before its scratch setup claims, allocates or can abort, and before its
+    first route; try_xmx_sorted_moe rejects it at its head, before it uploads anything;
+  - a staged slot's raw pointer does not outlive the ring that holds it, since a raw pointer must not outlive its
+    owning handle (llama.cpp-o9uw, c-8jtz): the upload records the payload slot it gives a staged pointer, keyed by
+    the weight extra's cache identity and holding no device pointer, the phase counts every ring release in teardown,
+    and once the count moves (or the phase is gone) the backend nulls each recorded payload slot that still holds a
+    pointer and no live handle, marks the device table invalid and resets the full-local probe, so moe_ptrs_ptr
+    answers null until the next upload rewrites the table. It runs after end_prompt at the first decode graph and in
+    the test hook, after begin_layer (a new geometry re-reserves the ring), and once the phase is gone in the context
+    destructor. Each record is counted on its extra, the context's member documents that a record's extra outlives
+    it, and release_extra_gpu asserts no record is left.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -617,7 +619,7 @@ TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
 
 def claim_staged_pointer_released_with_ring(sycl: str, common: str, common_cpp: str, phase: str,
                                             plan_hpp: str) -> bool:
-    """A raw pointer must not outlive its owning handle (lead item 6, c-ned2). The upload records the payload slot it
+    """A raw pointer must not outlive its owning handle (llama.cpp-o9uw, c-8jtz). The upload records the payload slot it
     gives a staged slot's pointer, keyed by the weight extra's cache identity, never its address, and the record holds
     no device pointer; teardown counts the ring's release; when the count moves, or the phase is gone, the backend
     nulls only the recorded payload slots that still hold a pointer and no live handle (a later upload may have given
@@ -711,7 +713,10 @@ def test_staged_pointer_release_mutants():
 PER_EXPERT_REFUSE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) { "
                      "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt per-expert path refused a "
                      "staged ring slot\"); }")
+PER_EXPERT_ANCHOR = "if (try_pp_mxfp4_soa_onednn_f16_batched()) { return; }"
 PER_EXPERT_STEPS = (
+    "pp_moe_onednn_scratch_claim pp_moe_onednn_scratch_claim_state;",
+    'GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for',
     "std::vector<ggml_sycl::mem_handle> pp_gpu_leases;",
     "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
     "expert_ptr = route.ptr;",
@@ -729,13 +734,15 @@ XMX_STEPS = (
 def claim_staged_batch_refused_by_name(sycl: str) -> bool:
     """The non-hybrid retained prompt per-expert path multiplies each expert at the tensor's route_layout from
     route.ptr, which a staged slot (holding its entry's layout) does not match: a batch naming a staged slot throws a
-    fallback error before that path's first route. try_xmx_sorted_moe reads each expert through a payload with no
-    staged slot: it rejects such a batch at its head, before the policy check and before any upload, instead of
-    through the payload's missing entry."""
+    fallback error directly after the batched executor's try, before the path's scratch setup claims the oneDNN
+    scratch slot, allocates its staging or aborts on a failed allocation, and before its first route.
+    try_xmx_sorted_moe reads each expert through a payload with no staged slot: it rejects such a batch at its head,
+    before the policy check and before any upload, instead of through the payload's missing entry."""
     n = norm(sycl)
     mmid = body(n, MMID_SIG)
     xmx = body(n, XMX_SIG)
-    return (n.count(PER_EXPERT_REFUSE) == 1 and ordered(mmid, PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
+    return (n.count(PER_EXPERT_REFUSE) == 1 and mmid.count(PER_EXPERT_ANCHOR + " " + PER_EXPERT_REFUSE) == 1
+            and ordered(mmid, PER_EXPERT_ANCHOR, PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
             and n.count(XMX_REFUSE) == 1 and ordered(xmx, XMX_REJECT, XMX_REFUSE, *XMX_STEPS))
 
 
@@ -749,7 +756,11 @@ def test_staged_batch_refused_by_name_mutants():
     assert not c(mutate(SYCL, PER_EXPERT_REFUSE, ""))
     # Refused only after the routes were taken.
     m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
-    m = m.replace(PER_EXPERT_STEPS[3], PER_EXPERT_STEPS[3] + " " + PER_EXPERT_REFUSE, 1)
+    m = m.replace(PER_EXPERT_STEPS[-1], PER_EXPERT_STEPS[-1] + " " + PER_EXPERT_REFUSE, 1)
+    assert not c(m)
+    # Refused after the scratch setup, where a staged batch can hit the staging allocation's abort first.
+    m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
+    m = m.replace(PER_EXPERT_STEPS[2], PER_EXPERT_REFUSE + " " + PER_EXPERT_STEPS[2], 1)
     assert not c(m)
     # The XMX path refuses only through the payload's missing entry.
     assert not c(mutate(SYCL, XMX_REFUSE, ""))

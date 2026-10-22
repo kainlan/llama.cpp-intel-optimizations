@@ -578,9 +578,9 @@ struct moe_stream_op {
     moe_stream_library_claims_fn library_claims = nullptr;
 };
 
-// Why the resolver refused a staged ring slot (llama.cpp-o9uw), in the order ggml_sycl_build_moe_resolved_batch
-// asks.
-// NONE: served.
+// Why the resolver refused a staged ring slot (llama.cpp-o9uw). The enumerators name the causes; the staged branch's
+// lambda in ggml_sycl_build_moe_resolved_batch fixes the order they are asked in. RECIPE covers both the missing
+// recipe, asked before the route, and the recipe validator's refusal, asked after it. NONE means served.
 enum class moe_staged_route_refusal : uint8_t {
     NONE,
     CLAIMED,        // the oneDNN batched prompt executor claims the weight (c-las5)
