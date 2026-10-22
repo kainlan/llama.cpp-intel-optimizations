@@ -6,12 +6,15 @@
 //    the first region's first slot again, gated on the first boundary's event,
 //    resolving on the device with the bytes the first fill wrote. Release and
 //    check the allocation's registry row and the raw device bytes are gone.
+//    The first region's slots are acquired as AOS and SOA in turn, and each
+//    resolves with the layout it was acquired for (lead ruling c-o9uw-1).
 // 2. Geometries that are not two equal aligned regions (one slot, an odd slot
 //    count, short or surplus bytes, a region_slots other than n_slots / 2, an
 //    unaligned slot_bytes) are refused before allocating.
 // 3. The region gate is a device dependency: a copy chained on it does not run
 //    while the event that ended the region's previous use is incomplete, and
-//    acquire_slot() hands the slot out regardless (it never consults an event).
+//    acquire_slot(layout) hands the slot out regardless (it never consults an
+//    event).
 //
 // A test may wait on events; the ring itself never does, and nothing here
 // status-queries an event.
@@ -92,9 +95,13 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         std::vector<void *>     first_ptrs;
         sycl::event             first_fill;
         for (uint32_t i = 0; i < kRegion; ++i) {
-            mem_handle slot     = ring.acquire_slot();
-            const auto resolved = slot.resolve(device);
+            const ggml_layout_mode want     = i % 2 == 0 ? GGML_LAYOUT_AOS : GGML_LAYOUT_SOA;
+            mem_handle             slot     = ring.acquire_slot(want);
+            const auto             resolved = slot.resolve(device);
             CHECK(resolved.ptr != nullptr && resolved.on_device, "region 0 slot %u resolves on device", i);
+            CHECK(resolved.layout == want,
+                  "region 0 slot %u resolves with the layout it was acquired for (%d, want %d)", i,
+                  static_cast<int>(resolved.layout), static_cast<int>(want));
             CHECK(is_slot_aligned(resolved.ptr), "region 0 slot %u starts at a multiple of %zu (got %p)", i,
                   MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
             first_fill = mem_fill_async(slot, 0x10 + static_cast<int>(i), kSlot, q, { ring.current_region_gate() });
@@ -116,7 +123,7 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
             CHECK(held_during >= held_before + geo.bytes,
                   "the raw reservation is in the held-bytes ledger (before %zu, during %zu)", held_before, held_during);
         }
-        CHECK(!ring.acquire_slot().valid(), "an exhausted region hands out an invalid handle");
+        CHECK(!ring.acquire_slot(GGML_LAYOUT_AOS).valid(), "an exhausted region hands out an invalid handle");
         CHECK(ring.slots_free() == 0, "an exhausted region has no free slots (got %u)", ring.slots_free());
         ring.epoch_boundary(first_fill);
 
@@ -124,7 +131,7 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         std::vector<mem_handle> second_region;
         sycl::event             second_fill;
         for (uint32_t i = 0; i < kRegion; ++i) {
-            mem_handle           slot     = ring.acquire_slot();
+            mem_handle           slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
             const auto           resolved = slot.resolve(device);
             const std::ptrdiff_t offset   = resolved.ptr != nullptr ? static_cast<const char *>(resolved.ptr) -
                                                                         static_cast<const char *>(first_ptrs[0]) :
@@ -144,7 +151,7 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         // comes back without the ring asking whether that event completed.
         const sycl::event gate = ring.current_region_gate();
         CHECK(gate == first_fill, "after two boundaries the current region's gate is the first boundary's event");
-        mem_handle again    = ring.acquire_slot();
+        mem_handle again    = ring.acquire_slot(GGML_LAYOUT_AOS);
         const auto resolved = again.resolve(device);
         CHECK(resolved.ptr != nullptr && resolved.on_device && resolved.ptr == first_ptrs[0],
               "after two boundaries the next slot is region 0's first slot, on device (got %p, want %p)", resolved.ptr,
@@ -165,7 +172,7 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         first_region.clear();
         second_region.clear();
         ring.release();
-        CHECK(!ring.acquire_slot().valid(), "a released ring hands out an invalid handle");
+        CHECK(!ring.acquire_slot(GGML_LAYOUT_AOS).valid(), "a released ring hands out an invalid handle");
     }
 
     // release() handed the backing to the retained-handle drain; let it run.
@@ -187,14 +194,14 @@ static void test_refused_geometries(int device) {
     {
         moe_stream_ring ring;
         CHECK(!ring.reserve(device, make_geometry(kSlot, 1, kSlot)), "reserve refuses n_slots = 1");
-        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot(GGML_LAYOUT_AOS).valid(),
               "a refused n_slots = 1 leaves the ring unreserved");
     }
     {
         moe_stream_ring ring;
         CHECK(!ring.reserve(device, make_geometry(kSlot, 8, 8 * kSlot - 1)),
               "reserve refuses bytes < n_slots x slot_bytes");
-        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot(GGML_LAYOUT_AOS).valid(),
               "a refused short geometry leaves the ring unreserved");
     }
     {
@@ -202,27 +209,27 @@ static void test_refused_geometries(int device) {
         moe_stream_ring_geometry geo = make_geometry(kSlot, 8, 8 * kSlot);
         geo.region_slots             = 3;
         CHECK(!ring.reserve(device, geo), "reserve refuses region_slots != n_slots / 2");
-        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot(GGML_LAYOUT_AOS).valid(),
               "a refused region_slots mismatch leaves the ring unreserved");
     }
     {
         moe_stream_ring ring;
         CHECK(!ring.reserve(device, make_geometry(kSlot, 7, 7 * kSlot)), "reserve refuses an odd n_slots");
-        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot(GGML_LAYOUT_AOS).valid(),
               "a refused odd n_slots leaves the ring unreserved");
     }
     {
         moe_stream_ring ring;
         CHECK(!ring.reserve(device, make_geometry(kSlot, 8, 8 * kSlot + 1)),
               "reserve refuses bytes > n_slots x slot_bytes");
-        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot(GGML_LAYOUT_AOS).valid(),
               "a refused surplus-bytes geometry leaves the ring unreserved");
     }
     {
         moe_stream_ring ring;
         CHECK(!ring.reserve(device, make_geometry(kSlot + 1, 8, 8 * (kSlot + 1))),
               "reserve refuses a slot_bytes that is not a multiple of %zu", MOE_STREAM_RING_SLOT_ALIGN);
-        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot(GGML_LAYOUT_AOS).valid(),
               "a refused unaligned slot_bytes leaves the ring unreserved");
     }
 }
@@ -243,7 +250,7 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     std::atomic<bool> release_blocker{ false };
     std::atomic<bool> copy_done{ false };
 
-    mem_handle first_use = ring.acquire_slot();
+    mem_handle first_use = ring.acquire_slot(GGML_LAYOUT_AOS);
     void *     base_ptr  = first_use.resolve(device).ptr;
     CHECK(base_ptr != nullptr && allocation_registry_test_contains(base_ptr),
           "the gate case's reservation has a registry row while held");
@@ -262,8 +269,8 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     CHECK(ring.current_region_gate() == blocker,
           "a boundary taken while a region was never acquired from keeps its older gate");
 
-    mem_handle slot = ring.acquire_slot();
-    CHECK(slot.valid(), "acquire_slot() hands the slot out while the gate is still pending");
+    mem_handle slot = ring.acquire_slot(GGML_LAYOUT_AOS);
+    CHECK(slot.valid(), "acquire_slot(layout) hands the slot out while the gate is still pending");
     const sycl::event gate = ring.current_region_gate();
 
     // The release is NOT sequenced behind the main thread: this thread releases

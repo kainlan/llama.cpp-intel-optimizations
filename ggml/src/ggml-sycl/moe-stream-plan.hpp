@@ -37,6 +37,27 @@ sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue &                    queue,
 
 namespace ggml_sycl {
 
+// How the ring stages one matrix (c-hmey). SOA: two slots, the AOS slot the copy lands in and the SOA slot the reorder
+// writes, which the device route reads. AOS_ONLY: one slot the copy lands in, read in place by the device's AOS prompt
+// kernel; the type has no AOS->SOA reorder, or no prompt kernel reads its SOA layout. NONE: no slot; a stage counts the
+// matrix untyped.
+enum class moe_stream_staging : uint8_t {
+    NONE,
+    SOA,
+    AOS_ONLY,
+};
+
+// True iff the device runs a prompt MUL_MAT_ID over a device-resident expert of `type` in `layout`, ne0 x ne1
+// (c-hmey). The backend answers from ggml_sycl_moe_query_route_capability, the source the resolver's STAGED_RING
+// recipe is built from (llama.cpp-o9uw), so the ring stages no layout that no prompt kernel reads.
+using moe_stream_prompt_kernel_fn =
+    bool (*)(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1);
+
+// True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight. The staged ring route
+// refuses a claimed weight (c-las5), so the ring stages none of it: the backend answers with the claim the route
+// refuses on, so staging and serving give one answer (llama.cpp-o9uw).
+using moe_stream_library_claims_fn = bool (*)(void * graph_ctx, int layer, expert_tensor_role role);
+
 struct moe_stream_item {
     int                layer;
     int                expert_id;
@@ -46,6 +67,8 @@ struct moe_stream_item {
     size_t             src_bytes;  // the AOS size of the host copy
     ggml_type          type;       // from the plan entry (moe_stream_plan_index_build); moe_stream_plan_build leaves 0
     int64_t            ncols, nrows;
+    // From moe_stream_plan_index_build (moe_stream_item_staging); moe_stream_plan_build leaves NONE.
+    moe_stream_staging staging = moe_stream_staging::NONE;
 };
 
 namespace detail {
@@ -136,8 +159,11 @@ static inline bool moe_stream_layer_fully_staged(const std::vector<moe_stream_it
 }
 
 // One staged matrix: the SOA slot the device route reads, the AOS slot the copy landed in, and the reorder's event,
-// after which `soa` holds the matrix. `layout` is the layout the SOA slot really holds (ruling C, c-3bde): a ring slice
-// inherits the ring's AOS tag, so Task 8's resolver reads the layout from here, never from the slice.
+// after which `soa` holds the matrix. `layout` is the layout the slot the device route reads really holds (ruling C,
+// c-3bde), and the resolver's STAGED_RING route reads it from here. Each slot is acquired with the layout written
+// there (lead ruling c-o9uw-1), so the slice's own tag agrees, and the route refuses a slot where it does not. An
+// AOS-only matrix (c-hmey) has no SOA slot: `soa` is empty, `ready` is the copy's event and `layout` is AOS, so the
+// route reads `aos`.
 struct moe_stream_staged {
     mem_handle       soa;
     mem_handle       aos;
@@ -167,19 +193,65 @@ static inline std::vector<uint8_t> moe_stream_ids_bitmap(const int32_t * ids, si
     return bitmap;
 }
 
-// True iff the reorder takes `item` into one ring slot of `slot_bytes`: its type has an AOS->SOA reorder (the one
-// table, soa-reorder-types.hpp), its rows are whole blocks, and src_bytes is exactly its rows' bytes, which is also what
-// the reorder writes. Anything else (an IQ type, a zeroed inventory shape) is not streamable in v1: counted, never
-// copied as AOS.
-static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes) {
-    if (!ggml_sycl_soa_reorder_supported_type(item.type) || item.ncols <= 0 || item.nrows <= 0 ||
+namespace detail {
+
+// The bytes of `item`'s rows when its type is a known one with a block size, its rows are whole blocks and src_bytes is
+// exactly those bytes; 0 otherwise (a zeroed inventory shape, a retired type). Both ways of staging copy src_bytes and
+// a kernel then reads ncols x nrows of the type from the slot, so a mismatch is never staged.
+static inline size_t moe_stream_item_rows_bytes(const moe_stream_item & item) {
+    if (static_cast<int>(item.type) < 0 || static_cast<int>(item.type) >= GGML_TYPE_COUNT ||
+        ggml_blck_size(item.type) <= 0 || item.ncols <= 0 || item.nrows <= 0 ||
         item.ncols % ggml_blck_size(item.type) != 0) {
-        return false;
+        return 0;
     }
     const size_t row = ggml_row_size(item.type, item.ncols);
-    return row != 0 && static_cast<size_t>(item.nrows) <= SIZE_MAX / row &&
-           row * static_cast<size_t>(item.nrows) == item.src_bytes &&
+    if (row == 0 || static_cast<size_t>(item.nrows) > SIZE_MAX / row ||
+        row * static_cast<size_t>(item.nrows) != item.src_bytes) {
+        return 0;
+    }
+    return item.src_bytes;
+}
+
+}  // namespace detail
+
+// True iff the reorder takes `item` into one ring slot of `slot_bytes`: its type has an AOS->SOA reorder (the one
+// table, soa-reorder-types.hpp), its rows are whole blocks, and src_bytes is exactly its rows' bytes, which is also
+// what the reorder writes.
+static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes) {
+    return ggml_sycl_soa_reorder_supported_type(item.type) && detail::moe_stream_item_rows_bytes(item) != 0 &&
            std::max(item.src_bytes, item.dst_bytes) <= slot_bytes;
+}
+
+// True iff one ring slot of `slot_bytes` holds `item` as AOS, to be read in place (c-hmey): its rows are whole blocks,
+// src_bytes is exactly its rows' bytes, and src_bytes fits. No SOA side is written, so dst_bytes plays no part.
+static inline bool moe_stream_item_aos_fits(const moe_stream_item & item, size_t slot_bytes) {
+    return detail::moe_stream_item_rows_bytes(item) != 0 && item.src_bytes <= slot_bytes;
+}
+
+// How the ring stages `item` in a slot of `slot_bytes` (SIZE_MAX while the ring is being sized), asking the device's
+// prompt kernels (c-hmey): SOA when the type reorders and a prompt kernel reads SOA, else AOS_ONLY when a prompt kernel
+// reads AOS, else NONE. With no predicate the ring cannot tell what the device reads, so nothing is staged.
+static inline moe_stream_staging moe_stream_item_staging(const moe_stream_item &     item,
+                                                         size_t                      slot_bytes,
+                                                         moe_stream_prompt_kernel_fn prompt_kernel,
+                                                         void *                      graph_ctx) {
+    if (prompt_kernel == nullptr) {
+        return moe_stream_staging::NONE;
+    }
+    if (moe_stream_item_reorderable(item, slot_bytes) &&
+        prompt_kernel(graph_ctx, item.type, GGML_LAYOUT_SOA, item.ncols, item.nrows)) {
+        return moe_stream_staging::SOA;
+    }
+    if (moe_stream_item_aos_fits(item, slot_bytes) &&
+        prompt_kernel(graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, item.nrows)) {
+        return moe_stream_staging::AOS_ONLY;
+    }
+    return moe_stream_staging::NONE;
+}
+
+// The slots one item takes in a region: two staged as SOA, one staged AOS-only, none otherwise.
+static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging) {
+    return staging == moe_stream_staging::SOA ? 2u : staging == moe_stream_staging::AOS_ONLY ? 1u : 0u;
 }
 
 // One layer's host expert entries, read in the one scan of the plan a micro-batch makes (c-7soh).
@@ -189,7 +261,8 @@ struct moe_stream_layer_info {
     size_t  host_bytes       = 0;  // AOS bytes of every host expert entry of the layer, fused ones included
     int     n_host_experts   = 0;  // distinct expert ids with a host entry
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
-    int     n_streamable     = 0;  // items the ring gives slots: moe_stream_item_reorderable with any slot
+    int     n_streamable     = 0;  // items the ring gives slots: staging SOA or AOS_ONLY
+    int     region_slots     = 0;  // the slots its streamable items take: 2 per SOA item, 1 per AOS-only item
     size_t  expert_bytes_max = 0;  // the largest one expert's streamable AOS bytes, summed over its roles
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
     int64_t N                = 0;  // the largest ne[1] over the host expert entries
@@ -198,7 +271,10 @@ struct moe_stream_layer_info {
 // The plan as the phase reads it for one micro-batch, and the inputs of the ring's geometry (ruling B, c-3bde).
 struct moe_stream_plan_index {
     uint32_t host_matrices_per_layer_max = 0;  // the most streamable items one layer has
-    size_t   matrix_bytes_max            = 0;  // max(src, dst) over every streamable item: a slot holds either side
+    uint32_t region_slots_max            = 0;  // the most slots one layer's streamable items take: a region's size
+    // Over every streamable item, the bytes a slot holds: max(src, dst) staged as SOA (a slot holds either side), src
+    // staged AOS-only.
+    size_t   matrix_bytes_max            = 0;
     size_t   resident_expert_bytes       = 0;  // dst bytes of the expert entries resident on the device
 
     // Only layers with a host expert entry: the rest are skipped, never weighed.
@@ -229,11 +305,28 @@ static inline bool moe_stream_rate_measured(double rate) {
 
 // One scan of plan.entries. Host entries carry target_device -1 and serve any device (moe_stream_host_triplet_entry);
 // `device` selects only the resident bytes that bound the ring's size. The items take type and shape from the entry,
-// which the planner copied from the tensor inventory (a zeroed shape fails moe_stream_item_reorderable).
-static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan & plan, int device) {
+// which the planner copied from the tensor inventory (a zeroed shape stages NONE), and their staging from
+// moe_stream_item_staging over the device's prompt kernels. The predicate is asked once per distinct (type, shape,
+// bytes) a build meets, not once per entry (c-7soh): a model has few. A matrix whose weight the library executor
+// claims stages NONE; that is asked once per (layer, role).
+static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan &       plan,
+                                                                int                          device,
+                                                                moe_stream_prompt_kernel_fn  prompt_kernel,
+                                                                void *                       graph_ctx,
+                                                                moe_stream_library_claims_fn library_claims) {
     moe_stream_plan_index                idx;
     // Streamable AOS bytes per (layer, expert), keyed with role UNKNOWN; an expert's key exists once it has any host entry.
     std::unordered_map<uint64_t, size_t> expert_bytes;
+
+    struct staging_answer {
+        ggml_type          type;
+        int64_t            ncols, nrows;
+        size_t             src_bytes;
+        moe_stream_staging staging;
+    };
+
+    std::vector<staging_answer>        answers;
+    std::unordered_map<uint64_t, bool> claims;  // (layer, role) keyed with expert 0 -> the library executor claims it
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.layer_id < 0) {
             continue;
@@ -266,20 +359,50 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         item.type      = e.type;
         item.ncols     = e.ne[0];
         item.nrows     = e.ne[1];
+        // The staging depends only on (type, shape, src bytes) at the sizing slot, so it is asked once per distinct
+        // one.
+        bool answered  = false;
+        for (const staging_answer & a : answers) {
+            if (a.type == item.type && a.ncols == item.ncols && a.nrows == item.nrows &&
+                a.src_bytes == item.src_bytes) {
+                item.staging = a.staging;
+                answered     = true;
+                break;
+            }
+        }
+        if (!answered) {
+            item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);
+            answers.push_back({ item.type, item.ncols, item.nrows, item.src_bytes, item.staging });
+        }
+        // The staged route refuses a weight the library executor claims, so the ring would copy it for nothing.
+        if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {
+            const uint64_t ck = moe_stream_table_key(item.layer, 0, item.role);
+            auto           c  = claims.find(ck);
+            if (c == claims.end()) {
+                c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;
+            }
+            if (c->second) {
+                item.staging = moe_stream_staging::NONE;
+            }
+        }
         li.items.push_back(item);
         // The ring is sized over the matrices it can stage. Another one is still listed, so a stage counts it untyped,
-        // but it takes no slot: a type with no reorder is not streamable in v1.
-        if (!moe_stream_item_reorderable(item, SIZE_MAX)) {
+        // but it takes no slot.
+        if (item.staging == moe_stream_staging::NONE) {
             continue;
         }
         ++li.n_streamable;
+        li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));
         ins.first->second += e.src_size;
-        li.expert_bytes_max  = std::max(li.expert_bytes_max, ins.first->second);
-        idx.matrix_bytes_max = std::max(idx.matrix_bytes_max, std::max(e.src_size, e.dst_size));
+        li.expert_bytes_max = std::max(li.expert_bytes_max, ins.first->second);
+        idx.matrix_bytes_max =
+            std::max(idx.matrix_bytes_max,
+                     item.staging == moe_stream_staging::SOA ? std::max(e.src_size, e.dst_size) : e.src_size);
     }
     for (const auto & kv : idx.layers) {
         idx.host_matrices_per_layer_max =
             std::max(idx.host_matrices_per_layer_max, static_cast<uint32_t>(kv.second.n_streamable));
+        idx.region_slots_max = std::max(idx.region_slots_max, static_cast<uint32_t>(kv.second.region_slots));
     }
     return idx;
 }
@@ -287,8 +410,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
 // holds, in this order. geo is what moe_stream_ring_size gave for idx; its all-zero answer past the first two rules is
 // the 10% bound (its overflow guards refuse sizes far above any resident expert set too). The last name is unreachable
-// while expert_bytes_max counts only streamable matrices, since a region of 2 * host_matrices_per_layer_max slots holds
-// any streamable triplet twice over; it is there so that no ring-unavailable line goes unexplained.
+// while expert_bytes_max counts only streamable matrices, since a region of region_slots_max slots holds every
+// streamable matrix of the heaviest layer, each in a slot of at least its AOS bytes; it is there so that no
+// ring-unavailable line goes unexplained.
 static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_plan_index &    idx,
                                                             const moe_stream_ring_geometry & geo,
                                                             bool                             in_order,
@@ -419,8 +543,8 @@ static inline bool moe_stream_ubatch_starts(bool     live,
 }
 
 // True iff a layer's decision moves bytes now: the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it.
-// Nothing consumes a staged expert until Task 8 (llama.cpp-o9uw), so under AUTO the choice is only recorded (lead
-// ruling c-3skf).
+// Under AUTO the choice is only recorded (lead ruling c-3skf); what an explicit ring stages, the resolver's STAGED_RING
+// route consumes (llama.cpp-o9uw).
 static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy) {
     return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING;
 }
@@ -432,9 +556,10 @@ static inline bool moe_stream_resolve_ahead(const moe_exec_decision & d) {
 }
 
 // What begin_layer needs beyond its plan, cache and queue: the op's shape for the cost model, the backend's one policy
-// and decision log (ggml_sycl_moe_exec_config(), ggml_sycl_moe_exec_log()), and two answers only the graph has, from
-// the backend's MUL_MAT_ID scan: whether a layer's ops are in the graph being computed, and the host AOS lease of one
-// of its experts (keyed from that layer's weight tensor, as the hybrid path's host route keys it).
+// and decision log (ggml_sycl_moe_exec_config(), ggml_sycl_moe_exec_log()), two answers only the graph has, from the
+// backend's MUL_MAT_ID scan: whether a layer's ops are in the graph being computed, and the host AOS lease of one of
+// its experts (keyed from that layer's weight tensor, as the hybrid path's host route keys it), and which layouts the
+// device's prompt kernels read (c-hmey), which decides how each host matrix is staged.
 struct moe_stream_op {
     uint32_t                n_tokens                   = 0;  // ids->ne[1]
     int                     n_expert                   = 0;  // src0->ne[2]
@@ -447,15 +572,122 @@ struct moe_stream_op {
     // The host lease of (layer, expert, role) and its bytes, or an invalid handle.
     mem_handle (*host_lease)(void * graph_ctx, int layer, int expert_id, expert_tensor_role role, size_t * bytes) =
         nullptr;
+    // Unset, nothing is staged (moe_stream_item_staging).
+    moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
+    // Unset, the library executor claims no weight (moe_stream_plan_index_build).
+    moe_stream_library_claims_fn library_claims = nullptr;
+};
+
+// Why the resolver refused a staged ring slot (llama.cpp-o9uw). The enumerators name the causes; the staged branch's
+// lambda in ggml_sycl_build_moe_resolved_batch fixes the order they are asked in. RECIPE covers both the missing
+// recipe, asked before the route, and the recipe validator's refusal, asked after it. NONE means served.
+enum class moe_staged_route_refusal : uint8_t {
+    NONE,
+    CLAIMED,        // the oneDNN batched prompt executor claims the weight (c-las5)
+    UNSUPPORTED,    // the capability query answers no kernel for the type in the entry's layout
+    KERNEL,         // it answers a kernel other than the plain MMVQ_COMPAT
+    DIRECT_KERNEL,  // Q1_0/NVFP4: only their direct kernel runs them on a device (moe_type_needs_direct_kernel)
+    VIEW,           // the slot resolves to no device pointer
+    LAYOUT,         // the slot's resolved layout is not the entry's
+    ROUTE,          // validate_moe_batch_route refuses the route
+    RECIPE,         // the recipe is missing, or validate_moe_execution_recipe refuses it
+};
+
+inline const char * moe_staged_route_refusal_name(moe_staged_route_refusal refusal) {
+    switch (refusal) {
+        case moe_staged_route_refusal::NONE:
+            return "served";
+        case moe_staged_route_refusal::CLAIMED:
+            return "claimed";
+        case moe_staged_route_refusal::UNSUPPORTED:
+            return "unsupported";
+        case moe_staged_route_refusal::KERNEL:
+            return "kernel";
+        case moe_staged_route_refusal::DIRECT_KERNEL:
+            return "direct-kernel";
+        case moe_staged_route_refusal::VIEW:
+            return "view";
+        case moe_staged_route_refusal::LAYOUT:
+            return "layout";
+        case moe_staged_route_refusal::ROUTE:
+            return "route";
+        case moe_staged_route_refusal::RECIPE:
+            return "recipe";
+    }
+    return "unknown";
+}
+
+// The ring regions' last uses, as reusing a region needs them (lead ruling c-o9uw-1): per region, the layer its last
+// use held (-1: none), whether that use left an AOS-only slot, and that layer's read gate once its down op records one,
+// an event behind every kernel that read the region. stage() refills a region, layer_done() records a layer's read gate
+// and reset() starts both regions over, for a new ring or a torn-down one, so a gate recorded for one use is never
+// taken for another. Templated on the event so test-moe-stream-phase drives it without a SYCL object; moe_stream_phase
+// holds it over sycl::event.
+template <typename event_t> struct moe_stream_region_reads {
+    int                    layer[2]    = { -1, -1 };
+    bool                   aos_only[2] = { false, false };
+    std::optional<event_t> read_gate[2];
+
+    // A copy went into `region`: it now holds layer `l`, it left an AOS-only slot iff `left_aos_only`, and it has no
+    // read gate until l's down op records one.
+    void refill(int region, int l, bool left_aos_only) {
+        layer[region]    = l;
+        aos_only[region] = left_aos_only;
+        read_gate[region].reset();
+    }
+
+    // `down_done` follows every kernel that read layer `l`'s slots, so it is the read gate of the region holding l. A
+    // region refilled since holds another layer and takes nothing of l's.
+    void layer_done(int l, const event_t & down_done) {
+        for (int r = 0; r < 2; ++r) {
+            if (layer[r] == l) {
+                read_gate[r] = down_done;
+            }
+        }
+    }
+
+    void reset() {
+        for (int r = 0; r < 2; ++r) {
+            layer[r]    = -1;
+            aos_only[r] = false;
+            read_gate[r].reset();
+        }
+    }
+};
+
+// The resolver's STAGED_RING lookups over one prompt (llama.cpp-o9uw): how many it served and refused, and the refusals
+// by cause and detail, so the trace says why a staged slot went unserved (plan Task 8). A detail is a string with
+// static storage (a capability reason, or moe_batch_reject_reason_name's), or null.
+struct moe_staged_route_tally {
+    struct refusal_count {
+        moe_staged_route_refusal refusal = moe_staged_route_refusal::NONE;
+        const char *             detail  = nullptr;
+        size_t                   n       = 0;
+    };
+
+    size_t                     served  = 0;
+    size_t                     refused = 0;
+    std::vector<refusal_count> refusals;  // one per distinct (cause, detail), in the order first seen
+
+    void        count(moe_staged_route_refusal refusal, const char * detail);
+    // "cause(detail)=n", or "cause=n" with no detail, per distinct (cause, detail), space-separated; empty when none.
+    std::string refusals_text() const;
 };
 
 // The prompt phase of one device context (ggml_backend_sycl_context::moe_stream): the VRAM ring, the stage table and
 // the current micro-batch's per-layer decisions.
 //
 // Ordering (ruling A, c-3bde): the device orders everything, the host never waits or asks. A copy waits for its ring
-// region's gate, a reorder for its copy, and a region closes on an event after its last reorder. The SOA slots of a
-// reused region are overwritten by reorders submitted to the same in-order compute queue after that region's readers,
-// so the ring is offered only on an in-order queue and its readers (Task 8) must run on that queue.
+// region's gate, a reorder for its copy, and a region closes on an event after its last copy and its last reorder. The
+// SOA slots of a reused region are overwritten by reorders submitted to the same in-order compute queue after that
+// region's readers, so the ring is offered only on an in-order queue and its readers (the STAGED_RING route's
+// kernels, llama.cpp-o9uw) run on that queue.
+// An AOS-only slot (c-hmey) is read in place by those readers and rewritten by a copy on the copy queue, which no
+// queue order puts after them, and with AOS-only items a pair's slots no longer sit at fixed indices: so when a
+// region's last use or its new one holds an AOS-only item, the new copies also wait for the region's read gate, the
+// barrier ggml_sycl_moe_stream_layer_done submits behind the down op of the layer the region last held, which follows
+// every reader of that use. With no read gate recorded, a compute-queue barrier submitted at the stage stands in (see
+// stage()).
 //
 // Lifetime (ruling D, c-fjx1): the ring's bytes go back only after the device's last use of them, on every exit path
 // (end_prompt, a change of geometry, the destructor).
@@ -485,11 +717,36 @@ class moe_stream_phase {
     bool                      fully_staged(int layer, const int32_t * ids, size_t n_ids, int n_expert) const;
     // True iff slots were taken from the ring's current region since it last flipped.
     bool                      region_open() const;
-    // After `layer`'s down op: an open region closes on `down_done`, a device event behind that op. It gates the
-    // region's AOS reuse only (see ggml_sycl_moe_stream_layer_done).
+    // After `layer`'s down op: `down_done`, a device event behind that op, becomes the read gate of the region holding
+    // `layer`, and an open region closes on it (see ggml_sycl_moe_stream_layer_done).
     void                      layer_done(int layer, sycl::event down_done);
     // The first decode graph after a prompt: the table, the decisions and the ring go.
     void                      end_prompt();
+    // The resolver's STAGED_RING lookups this prompt (llama.cpp-o9uw): NONE for an entry it served, else why it
+    // refused the entry and left it to the route core, with the detail (moe_staged_route_tally). end_prompt reports and
+    // clears them, or the destructor for a prompt no end_prompt ended: on the trace, and at WARN under an explicit ring
+    // when any was refused.
+    void                      count_staged_route(moe_staged_route_refusal refusal, const char * detail);
+
+    size_t staged_routes_served() const { return staged_routes_.served; }
+
+    size_t staged_routes_refused() const { return staged_routes_.refused; }
+
+    // This prompt's refusals by cause and detail (moe_staged_route_tally::refusals_text).
+    std::string staged_route_refusals() const { return staged_routes_.refusals_text(); }
+
+    // The times the ring was given back (teardown). The backend nulls the slot pointers its pointer tables copied out
+    // of the stage table when this moves (llama.cpp-o9uw).
+    uint64_t ring_releases() const { return ring_releases_; }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Puts `entry` in the stage table under (layer, expert_id, role), as stage() does, for a device test of the route.
+    void       test_insert_staged(int layer, int expert_id, expert_tensor_role role, moe_stream_staged entry);
+    // Reserves the ring with `geo` on `device`, its reorders on `ccs`, as prepare() and the first staging layer's
+    // ring_ready() do; test_acquire_slot takes a slot of it with `layout`, as stage() does. For a device test of a
+    // staged slot's lifetime (llama.cpp-o9uw).
+    bool       test_reserve_ring(int device, const moe_stream_ring_geometry & geo, sycl::queue & ccs);
+    mem_handle test_acquire_slot(ggml_layout_mode layout);
+#endif
 
   private:
     struct layer_state {
@@ -503,13 +760,15 @@ class moe_stream_phase {
         int    staged    = 0;  // experts with every selected matrix staged
         int    wanted    = 0;  // experts selected
         int    unowned   = 0;  // matrices skipped: no lease, or a lease the ring cannot copy directly
-        int    untyped   = 0;  // matrices skipped: no AOS->SOA reorder for the type, or a shape that does not fit
+        int    untyped   = 0;  // matrices skipped: staged NONE (no reader, or claimed), or a shape that does not fit
         int    exhausted = 0;  // matrices skipped: no ring slot
         size_t bytes     = 0;  // AOS bytes copied
         bool   ring_unavailable = false;  // the ring could not be reserved
+        int    soa              = 0;      // matrices staged SOA: two slots, read after the reorder
+        int    aos_only         = 0;      // matrices staged AOS-only: one slot, read in place
     };
 
-    void              prepare(const placement_plan & plan, int device, sycl::queue & ccs);
+    void              prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op);
     size_t            ring_bytes_free() const;
     moe_exec_decision weigh(const moe_stream_layer_info & li, const moe_stream_op & op, double window_us) const;
     moe_exec_decision decision_of(int layer) const;
@@ -524,17 +783,19 @@ class moe_stream_phase {
                             const moe_stream_op &         op);
     bool              ring_ready();
     void              close_region(sycl::event region_done);
+    void              reset_regions();
     sycl::event       compute_barrier();
     void              teardown(sycl::event last_use);
     void              report(int layer, const layer_state & st, const stage_counts & n, const moe_stream_op & op) const;
+    void              report_staged_routes();
     void              warn_ring_unavailable(const moe_stream_op & op);
 
     std::unique_ptr<moe_stream_ring>                ring_;
     std::unordered_map<uint64_t, moe_stream_staged> table_;           // key = moe_stream_table_key(layer, expert, role)
     std::vector<uint64_t>                           region_keys_[2];  // the table keys whose slots each region holds
     int                                             cur_region_       = 0;      // flips with every epoch_boundary
-    bool                                            region_submitted_ = false;  // a reorder went into it since
-    sycl::event                                     region_last_reorder_;       // the last of them
+    bool                                            region_submitted_ = false;  // a copy went into it since
+    sycl::event                                     region_last_;    // its last submission's event (see stage())
     mem_handle                                      anchor_;         // one slot: any slice holds the whole reservation
     std::chrono::steady_clock::time_point           last_layer_tp_;  // the previous layer's first op, this micro-batch
     moe_stream_plan_index                           index_;
@@ -555,6 +816,13 @@ class moe_stream_phase {
     bool                                            record_valid_       = false;
     bool                                            record_looked_up_   = false;
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
+    // Each region's last use: its layer, whether it left an AOS-only slot, and that layer's read gate (stage()).
+    moe_stream_region_reads<sycl::event>            region_reads_;
+    // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor.
+    const moe_exec_decision_log *                   log_    = nullptr;
+    moe_exec_policy                                 policy_ = moe_exec_policy::AUTO;
+    moe_staged_route_tally                          staged_routes_;
+    uint64_t                                        ring_releases_ = 0;
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

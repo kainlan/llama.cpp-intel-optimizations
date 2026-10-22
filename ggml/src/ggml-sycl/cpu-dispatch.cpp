@@ -858,14 +858,14 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
                                         ggml_sycl::moe_batch_reject_reason * reject) {
     using namespace ggml_sycl;
     const resolved_ptr workspace_resolved = task.workspace_lease.resolve(mem_handle::HOST_DEVICE);
-    if (!task.activations || !task.output || !task.workspace || !workspace_resolved.ptr || workspace_resolved.on_device ||
-        workspace_resolved.ptr != task.workspace || task.recipe.request.K > INT_MAX ||
+    if (!task.activations || !task.output || !task.workspace || !workspace_resolved.ptr ||
+        workspace_resolved.on_device || workspace_resolved.ptr != task.workspace || task.recipe.request.K > INT_MAX ||
         task.recipe.request.N > INT_MAX || task.recipe.request.K <= 0 || task.recipe.request.N <= 0 ||
         task.recipe.workspace.alignment == 0 ||
         (reinterpret_cast<uintptr_t>(task.workspace) & (task.recipe.workspace.alignment - 1)) != 0 ||
         !validate_moe_execution_recipe(task.recipe, task.admitted_recipe_signature, task.weight_lease,
-                                       moe_batch_residency::HOST, task.recipe.request.submit, true,
-                                       task.workspace_bytes, reject)) {
+                                       moe_batch_residency::HOST, /*has_ready_event=*/false, task.recipe.request.submit,
+                                       true, task.workspace_bytes, reject)) {
         return false;
     }
     if ((task.recipe.request.type != GGML_TYPE_Q1_0 && task.recipe.request.type != GGML_TYPE_NVFP4) ||

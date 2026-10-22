@@ -4612,6 +4612,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-o9uw (plan Task 8 of llama.cpp-36j0): STAGED_RING is the one route by which a staged host expert answers
+# PRIMARY_DEVICE: one writer in the resolver, served only as a plain MMVQ_COMPAT kernel on the submit queue, layout from
+# the stage-table entry, no persistent handle, one device barrier and no host wait. A mutant per claim. Text only: no
+# device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-staged-ring-route-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-staged-ring-route-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device probes its pinned host-to-device rate once and keeps it in
 # the tuning cache. Both buffers go through unified_allocate with the literal tier flags, the copy is chunked
 # mem_copy_async with one wait per iteration, the WARN line and the GGML_SYCL_H2D_PROBE switch each appear once, and
