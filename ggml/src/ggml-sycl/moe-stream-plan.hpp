@@ -684,8 +684,10 @@ struct moe_staged_route_tally {
 // kernels, llama.cpp-o9uw) run on that queue.
 // An AOS-only slot (c-hmey) is read in place by those readers and rewritten by a copy on the copy queue, which no
 // queue order puts after them, and with AOS-only items a pair's slots no longer sit at fixed indices: so when a
-// region's last use or its new one holds an AOS-only item, the new copies also wait for a compute-queue barrier
-// submitted at the stage, after every reader of the region's last use (see stage()).
+// region's last use or its new one holds an AOS-only item, the new copies also wait for the region's read gate, the
+// barrier ggml_sycl_moe_stream_layer_done submits behind the down op of the layer the region last held, which follows
+// every reader of that use. With no read gate recorded, a compute-queue barrier submitted at the stage stands in (see
+// stage()).
 //
 // Lifetime (ruling D, c-fjx1): the ring's bytes go back only after the device's last use of them, on every exit path
 // (end_prompt, a change of geometry, the destructor).
@@ -721,8 +723,9 @@ class moe_stream_phase {
     // The first decode graph after a prompt: the table, the decisions and the ring go.
     void                      end_prompt();
     // The resolver's STAGED_RING lookups this prompt (llama.cpp-o9uw): NONE for an entry it served, else why it
-    // refused the entry and left it to the route core, with the detail (moe_staged_route_tally). end_prompt traces and
-    // clears them.
+    // refused the entry and left it to the route core, with the detail (moe_staged_route_tally). end_prompt reports and
+    // clears them, or the destructor for a prompt no end_prompt ended: on the trace, and at WARN under an explicit ring
+    // when any was refused.
     void                      count_staged_route(moe_staged_route_refusal refusal, const char * detail);
 
     size_t staged_routes_served() const { return staged_routes_.served; }
@@ -815,7 +818,8 @@ class moe_stream_phase {
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
     // Each region's last use: its layer, whether it left an AOS-only slot, and that layer's read gate (stage()).
     moe_stream_region_reads<sycl::event>            region_reads_;
-    const moe_exec_decision_log *                   log_ = nullptr;  // the last op's, for end_prompt
+    const moe_exec_decision_log *                   log_    = nullptr;                // the last op's, for end_prompt
+    moe_exec_policy                                 policy_ = moe_exec_policy::AUTO;  // the last op's, for end_prompt
     moe_staged_route_tally                          staged_routes_;
     uint64_t                                        ring_releases_ = 0;
 };

@@ -31,8 +31,10 @@ moe_stream_phase::moe_stream_phase() = default;
 
 // The context destructor resets this after draining its queues, so the barrier is already complete; it still orders the
 // ring's return after every use for any other owner. As in moe_stream_ring's destructor, a throw from the barrier or
-// from retain_handles_until_event() terminates: there is deliberately no catch.
+// from retain_handles_until_event() terminates: there is deliberately no catch. A prompt no end_prompt ended (the
+// context freed mid-prompt) is reported first; after an end_prompt the tally is empty and nothing prints again.
 moe_stream_phase::~moe_stream_phase() {
+    report_staged_routes();
     teardown(ring_ && ccs_ ? ccs_->ext_oneapi_submit_barrier() : sycl::event());
 }
 
@@ -74,6 +76,7 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     cur_layer_     = layer;
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
+    policy_        = op.policy;
     bitmap_        = moe_stream_ids_bitmap(ids, n_ids, op.n_expert);
 
     // The layer itself: weighed here only when the previous layer did not weigh it (the micro-batch's first host
@@ -278,8 +281,9 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
     // in the last use: an AOS-only slot is read in place, and a pair's SOA slot no longer sits at a fixed odd index.
     // Those readers ran on the compute queue (c-las5), and the gate does not follow them: under STREAM_ALL, layer_done
     // closes the region that holds the NEXT layer, so a region's gate precedes its own layer's readers. So the copies
-    // also wait for the region's read gate (lead ruling c-o9uw-1): the barrier layer_done submitted behind the down op
-    // of the layer the region last held, which follows every kernel that read the region.
+    // also wait for the region's read gate (lead ruling c-o9uw-1): the barrier the backend's
+    // ggml_sycl_moe_stream_layer_done submits behind the down op of the layer the region last held, and hands to
+    // layer_done(), which follows every kernel that read the region.
     // The backend skips layer_done while no region is open. With no read gate recorded, the copies wait for a
     // compute-queue barrier submitted at the first of them. It follows every reader of the last use as well, because
     // no reader is submitted after it:
@@ -420,9 +424,9 @@ bool moe_stream_phase::ring_ready() {
 void moe_stream_phase::reset_regions() {
     region_keys_[0].clear();
     region_keys_[1].clear();
-    cur_region_         = 0;
-    region_submitted_   = false;
-    region_last_        = sycl::event();
+    cur_region_       = 0;
+    region_submitted_ = false;
+    region_last_      = sycl::event();
     region_reads_.reset();
 }
 
@@ -540,7 +544,9 @@ void moe_stream_phase::count_staged_route(moe_staged_route_refusal refusal, cons
 
 // The resolver's STAGED_RING lookups for the prompt that ends, on the trace (llama.cpp-o9uw): without it a ring that
 // stages and a route that serves none of it read alike in the stage lines. A prompt that refused any also gets a line
-// naming each refusal's cause and detail (plan Task 8: the trace says why). Cleared for the next prompt.
+// naming each refusal's cause and detail (plan Task 8: the trace says why). Under an explicit ring the refusals also go
+// out at WARN: a refused expert runs on another route than the one asked for. Cleared last, so the destructor after an
+// end_prompt prints nothing.
 void moe_stream_phase::report_staged_routes() {
     if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && log_->trace >= 1 &&
         log_->trace_sink != nullptr) {
@@ -554,6 +560,14 @@ void moe_stream_phase::report_staged_routes() {
             const std::string causes = head + staged_routes_.refusals_text();
             log_->trace_sink(log_->sink_ctx, causes.c_str());
         }
+    }
+    if (staged_routes_.refused != 0 && policy_ == moe_exec_policy::RING && log_ != nullptr && log_->sink != nullptr) {
+        char warn_head[112];
+        std::snprintf(warn_head, sizeof(warn_head),
+                      "[MOE-EXEC] staged route refusals device %d: served=%zu refused=%zu ", device_,
+                      staged_routes_.served, staged_routes_.refused);
+        const std::string warn_line = warn_head + staged_routes_.refusals_text();
+        log_->sink(log_->sink_ctx, warn_line.c_str());
     }
     staged_routes_ = moe_staged_route_tally();
 }
@@ -585,8 +599,9 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
 #endif
 
 // One WARN per prompt saying why the ring is unavailable, at the first layer that answers RING_UNAVAILABLE, under an
-// explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log. The
-// slots and bytes are the ring the layer asked for, so when the 10% bound refused it they are the uncapped request.
+// explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log.
+// region_slots_max is the most slots one layer's region needs. The slots and bytes are the ring the layer asked for, so
+// when the 10% bound refused it they are the uncapped request.
 void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
     if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr ||
         (op.policy != moe_exec_policy::RING && op.log->trace < 1)) {
@@ -598,10 +613,10 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
     char line[320];
     std::snprintf(line, sizeof(line),
                   "[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
-                  "matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)",
+                  "region_slots_max=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)",
                   device_, moe_stream_ring_unavailable_rule(index_, geo_, in_order_, reserve_failed_),
-                  index_.host_matrices_per_layer_max, index_.matrix_bytes_max, index_.resident_expert_bytes,
-                  asked.n_slots, asked.bytes);
+                  index_.host_matrices_per_layer_max, index_.region_slots_max, index_.matrix_bytes_max,
+                  index_.resident_expert_bytes, asked.n_slots, asked.bytes);
     op.log->sink(op.log->sink_ctx, line);
 }
 

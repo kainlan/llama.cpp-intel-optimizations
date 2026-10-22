@@ -32794,7 +32794,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                                             invocation_queue == sctx->stream() && !g_ggml_sycl_graph_recording ?
                                         sctx->moe_stream.get() :
                                         nullptr;
-    const int                stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;
+    const int          stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;
     const expert_tensor_role stream_role =
         moe_stream && src0 ? expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;
     // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the slot's reuse;
@@ -78325,6 +78325,13 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * we
     return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device);
 }
 
+// Whether any role of the bundle names a staged ring slot (STAGED_RING, llama.cpp-o9uw).
+static bool ggml_sycl_moe_bundle_names_staged_ring(const ggml_sycl::moe_retained_role_bundle & roles) {
+    return ggml_sycl::moe_batch_names_staged_ring(roles.gate.batch) ||
+           ggml_sycl::moe_batch_names_staged_ring(roles.up.batch) ||
+           ggml_sycl::moe_batch_names_staged_ring(roles.down.batch);
+}
+
 // llama.cpp-iikr (B50 residual-pool cycle, design finding 1, team-lead GO):
 // extracted from routeeval's own prompt_pair_retained_roles_validated lambda
 // (ggml_sycl_mul_mat_id, further below) -- this is the exact same body,
@@ -78343,12 +78350,6 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * we
 // before calling -- align_moe_retained_role_batches() guarantees a non-
 // rejected result has non-empty, authority-aligned operands for every role,
 // which is what makes the unchecked .front() calls below safe.
-static bool ggml_sycl_moe_bundle_names_staged_ring(const ggml_sycl::moe_retained_role_bundle & roles) {
-    return ggml_sycl::moe_batch_names_staged_ring(roles.gate.batch) ||
-           ggml_sycl::moe_batch_names_staged_ring(roles.up.batch) ||
-           ggml_sycl::moe_batch_names_staged_ring(roles.down.batch);
-}
-
 static bool ggml_sycl_moe_validate_retained_role_bundle(const ggml_sycl::moe_retained_role_bundle & roles, int device) {
     const auto & gate = roles.gate.batch;
     const auto & up   = roles.up.batch;

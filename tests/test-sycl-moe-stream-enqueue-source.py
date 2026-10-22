@@ -1283,8 +1283,11 @@ def test_reserve_latch_mutants():
     assert not claim_reserve_failure_lasts_one_ubatch(mutate(PHASE, NEW_UBATCH, "if (new_ubatch) {"))
 
 
-DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u matrix_bytes_max=%zu "
-            "resident_expert_bytes=%zu n_slots=%u bytes=%zu)")
+DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u "
+            "matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)")
+# One argument per field, in the format's order: the region_slots_max a region would need is the ring's other input.
+DIAG_ARGS = ("index_.host_matrices_per_layer_max, index_.region_slots_max, index_.matrix_bytes_max, "
+             "index_.resident_expert_bytes, asked.n_slots, asked.bytes);")
 DIAG_EMIT = "op.log->sink(op.log->sink_ctx, line);"
 DIAG_RULE_CALL = "moe_stream_ring_unavailable_rule(index_, geo_, in_order_, reserve_failed_)"
 WARN_SIG = "void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op)"
@@ -1310,7 +1313,7 @@ def claim_ring_unavailable_diagnostic(phase: str, hpp: str, tree: dict) -> bool:
     the helper names each rule right after testing its condition, in a fixed order."""
     w = body(norm(phase), WARN_SIG)
     count = sum(norm(text).count(DIAG_FMT) for text in tree.values())
-    return (count == 1 and ordered(w, DIAG_FMT, DIAG_RULE_CALL, DIAG_EMIT)
+    return (count == 1 and ordered(w, DIAG_FMT, DIAG_RULE_CALL, DIAG_ARGS, DIAG_EMIT)
             and ordered(body(norm(hpp), RULE_SIG), *RULE_ORDER))
 
 
@@ -1321,6 +1324,13 @@ def test_ring_unavailable_diagnostic():
 def test_ring_unavailable_diagnostic_mutants():
     renamed = mutate(PHASE, "n_slots=%u ", "slots=%u ")
     assert not claim_ring_unavailable_diagnostic(renamed, PLAN_HPP, {PHASE_REL: renamed})
+    # The region's slot need left out, or printed under another field's name.
+    dropped = mutate(PHASE, " region_slots_max=%u", "")
+    assert not claim_ring_unavailable_diagnostic(dropped, PLAN_HPP, {PHASE_REL: dropped})
+    # (anchored on the whole argument list: prepare() passes the same two fields to moe_stream_ring_size)
+    swapped = mutate(PHASE, "index_.host_matrices_per_layer_max, index_.region_slots_max, index_.matrix_bytes_max,",
+                     "index_.host_matrices_per_layer_max, index_.matrix_bytes_max, index_.region_slots_max,")
+    assert not claim_ring_unavailable_diagnostic(swapped, PLAN_HPP, {PHASE_REL: swapped})
     tree = dict(SYCL_TREE)
     tree["extra.cpp"] = '"' + DIAG_FMT + '"'
     assert not claim_ring_unavailable_diagnostic(PHASE, PLAN_HPP, tree)

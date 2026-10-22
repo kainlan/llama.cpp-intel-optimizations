@@ -358,6 +358,22 @@ TRACE_REFUSALS = (
 COUNT_SIG = "void moe_stream_phase::count_staged_route(moe_staged_route_refusal refusal, const char * detail)"
 COUNT_BODY = "{ staged_routes_.count(refusal, detail); }"
 END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && table_.empty()) {"
+DTOR_SIG = "moe_stream_phase::~moe_stream_phase()"
+DTOR_HEAD = "{ report_staged_routes(); teardown("
+REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && log_->trace >= 1 && "
+               "log_->trace_sink != nullptr) {")
+REPORT_RESET = "staged_routes_ = moe_staged_route_tally();"
+REFUSALS_WARN_FMT = "[MOE-EXEC] staged route refusals device %d: served=%zu refused=%zu "
+REFUSALS_WARN = (
+    "if (staged_routes_.refused != 0 && policy_ == moe_exec_policy::RING && log_ != nullptr && log_->sink != nullptr) {",
+    REFUSALS_WARN_FMT,
+    "const std::string warn_line = warn_head + staged_routes_.refusals_text();",
+    "log_->sink(log_->sink_ctx, warn_line.c_str()); }",
+    REPORT_RESET + " }",
+)
+BEGIN_LAYER_SIG = "moe_exec_decision moe_stream_phase::begin_layer("
+POLICY_MEMBER = "moe_exec_policy policy_ = moe_exec_policy::AUTO;"
+POLICY_SET = "policy_ = op.policy;"
 
 WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(|\bget_info\s*<")
 
@@ -968,6 +984,77 @@ def test_trace_mutants():
     # A lookup counted without its cause.
     m = mutate(PHASE, COUNT_BODY, "{ staged_routes_.count(moe_staged_route_refusal::RECIPE, nullptr); }")
     assert not claim_trace(m, {PHASE_REL: m})
+
+
+def claim_reported_once_on_every_exit(phase: str) -> bool:
+    """A prompt's lookups are reported when it ends and, for a prompt the context outlives no end_prompt of, when the
+    phase is destroyed. report_staged_routes prints only a non-empty tally and clears it as its last statement, so the
+    destructor after an end_prompt prints nothing again; nothing else reports, so a prompt is never split."""
+    n = norm(phase)
+    r = body(n, REPORT_SIG)
+    return (body(n, DTOR_SIG).startswith(DTOR_HEAD) and body(n, END_PROMPT_SIG).startswith(END_PROMPT_HEAD)
+            and n.count("report_staged_routes();") == 2 and r.startswith(REPORT_HEAD)
+            and r.endswith(REPORT_RESET + " }") and r.count(REPORT_RESET) == 1)
+
+
+def test_reported_once_on_every_exit():
+    assert claim_reported_once_on_every_exit(PHASE)
+
+
+def test_reported_once_on_every_exit_mutants():
+    # The destructor drops a prompt no end_prompt reported.
+    assert not claim_reported_once_on_every_exit(mutate(PHASE, DTOR_HEAD, "{ teardown("))
+    # The tally survives a report, so the destructor prints the prompt end_prompt already printed.
+    assert not claim_reported_once_on_every_exit(mutate(PHASE, REPORT_RESET + " }", "}"))
+    # Cleared before anything reads it: nothing is ever printed.
+    assert not claim_reported_once_on_every_exit(
+        mutate(PHASE, REPORT_HEAD, "{ " + REPORT_RESET + " " + REPORT_HEAD[2:]))
+    # An empty tally printed: the destructor after an end_prompt prints served=0 refused=0.
+    assert not claim_reported_once_on_every_exit(
+        mutate(PHASE, "(staged_routes_.served != 0 || staged_routes_.refused != 0) && ", ""))
+    # A report per micro-batch splits a prompt's counts.
+    assert not claim_reported_once_on_every_exit(
+        mutate(PHASE, "reserve_failed_ = false; table_.clear();", "report_staged_routes(); reserve_failed_ = false; "
+               "table_.clear();"))
+
+
+def claim_refusals_warn_under_ring(phase: str, hpp: str, tree: dict) -> bool:
+    """Under an explicit ring a refused lookup leaves its experts to another route, so a prompt that refused any says
+    so at WARN, once: the line is part of the report, after the trace's own lines and before the tally is cleared. The
+    policy is the last op's, set where the decision log is. The format exists once in the backend."""
+    n = norm(phase)
+    r = body(n, REPORT_SIG)
+    bl = body(n, BEGIN_LAYER_SIG)
+    count = sum(norm(text).count(REFUSALS_WARN_FMT) for text in tree.values())
+    return (count == 1 and ordered(r, "log_->trace_sink(log_->sink_ctx, causes.c_str()); } }", *REFUSALS_WARN)
+            and r.count(REPORT_RESET) == 1
+            and norm(hpp).count(POLICY_MEMBER) == 1 and n.count(POLICY_SET) == 1 and ordered(bl, "log_ = op.log;", POLICY_SET))
+
+
+def test_refusals_warn_under_ring():
+    assert claim_refusals_warn_under_ring(PHASE, PLAN_HPP, SYCL_TREE)
+
+
+def test_refusals_warn_under_ring_mutants():
+    def c(phase=PHASE, hpp=PLAN_HPP, tree=None):
+        return claim_refusals_warn_under_ring(phase, hpp, tree if tree is not None else {PHASE_REL: phase})
+    # Under AUTO or CPU as well.
+    assert not c(mutate(PHASE, " && policy_ == moe_exec_policy::RING", ""))
+    # A prompt that refused nothing.
+    assert not c(mutate(PHASE, "if (staged_routes_.refused != 0 && policy_", "if (policy_"))
+    # At INFO, through the trace sink, so a run without -v never sees it.
+    assert not c(mutate(PHASE, "log_->sink(log_->sink_ctx, warn_line.c_str());",
+                        "log_->trace_sink(log_->sink_ctx, warn_line.c_str());"))
+    # The policy never recorded, so it stays AUTO and the line never prints.
+    assert not c(mutate(PHASE, POLICY_SET, ""))
+    assert not c(PHASE, mutate(PLAN_HPP, POLICY_MEMBER, "moe_exec_policy policy_ = moe_exec_policy::RING;"))
+    # The tally cleared before the WARN reads it.
+    m = mutate(PHASE, "if (staged_routes_.refused != 0 && policy_", REPORT_RESET + " if (staged_routes_.refused != 0 && policy_")
+    assert not c(m)
+    # A second copy of the format elsewhere in the backend.
+    tree = dict(SYCL_TREE)
+    tree["extra.cpp"] = '"' + REFUSALS_WARN_FMT + '"'
+    assert not c(tree=tree)
 
 
 # ---- lead ruling c-o9uw-1: the slice's tag is the layout -------------------------------------------------------------
