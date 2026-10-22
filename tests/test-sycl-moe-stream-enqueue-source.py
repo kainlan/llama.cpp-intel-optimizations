@@ -899,6 +899,13 @@ def test_staging_source_mutants():
         SYCL, PLAN_HPP,
         mutate(PHASE, INDEX_CALL,
                "moe_stream_plan_ring_geometry(plan, device, nullptr, nullptr, op.library_claims, &index_);"))
+    # The shared geometry helper builds the index blind or without the claims hook, whatever prepare() passes.
+    assert not claim_staging_from_the_capability_query(
+        SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, nullptr, nullptr, "
+                                                 "library_claims)"), PHASE)
+    assert not claim_staging_from_the_capability_query(
+        SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, prompt_kernel, "
+                                                 "graph_ctx, nullptr)"), PHASE)
     # The predicate asked again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, " \
                                   "item.nrows);"

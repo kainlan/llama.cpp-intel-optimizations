@@ -411,7 +411,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
 // ring with it (moe_stream_phase::prepare) and the auto-ubatch fit sizes the ring it charges with it
 // (ggml_sycl_hold_ring_uncovered), so the two cannot disagree: what sizes the ring (the staging hooks, the index's
 // region slot maximum) changes here once. `index_out`, when given, receives the index the geometry was sized over.
-// A plan with no host expert has no layer and no region slot, so the sizing answers the default geometry.
+// A plan with no host expert has no layer and no region slot, so the sizing answers the default geometry. A null
+// `library_claims` claims nothing: a caller with no live graph scan (the auto-ubatch fit) passes none, and the ring it
+// gets is then an upper bound of the phase's.
 static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const placement_plan &       plan,
                                                                      int                          device,
                                                                      moe_stream_prompt_kernel_fn  prompt_kernel,

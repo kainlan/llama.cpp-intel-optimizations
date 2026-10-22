@@ -2931,6 +2931,69 @@ def test_the_shared_ring_geometry_pin_has_a_mutation_witness(where):
         assert not _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, mutated), "the mutant must make the pin fail"
 
 
+# What the fit hands the shared function (llama.cpp-kjef). A prompt-kernel hook left null, or a stream call whose rows
+# are 0 (the capability refuses zero rows), sizes NO ring, so the fit would under-count and wave a rung through. The
+# library-claims hook is null on purpose: the backend's hook reads a thread-local graph scan that is stale outside
+# compute (a previous model's weight tensors), so the fit counts no claim and its ring is an upper bound.
+_RING_GEOMETRY_CALL = (
+    "ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr);"
+)
+_RING_ROWS_FILL = "call.op.n_tokens = n_ubatch;"
+
+
+def _fit_ring_geometry_call_pinned(raw_cpp: str) -> bool:
+    # Whitespace-free on both sides: a wrapped argument list leaves a space after "(" that a plain match would miss.
+    body = re.sub(r"\s+", "", _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END))
+    return (
+        body.count(re.sub(r"\s+", "", _RING_GEOMETRY_CALL)) == 1
+        and body.count(re.sub(r"\s+", "", _RING_ROWS_FILL)) == 1
+    )
+
+
+def _mutate_raw_ws_tolerant(raw: str, old: str, new: str) -> str:
+    pat = _ws_tolerant(old)
+    assert len(pat.findall(raw)) == 1, f"mutation target not unique: {old!r}"
+    return pat.sub(lambda _m: new, raw, count=1)
+
+
+def test_the_fit_hands_the_shared_ring_geometry_its_hooks_and_rows():
+    assert _fit_ring_geometry_call_pinned(GGML_SYCL_CPP)
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("ggml_sycl_moe_stream_prompt_kernel, &call, nullptr", "nullptr, &call, nullptr"),
+        ("ggml_sycl_moe_stream_prompt_kernel, &call, nullptr", "ggml_sycl_moe_stream_prompt_kernel, nullptr, nullptr"),
+        (
+            "ggml_sycl_moe_stream_prompt_kernel, &call, nullptr",
+            "ggml_sycl_moe_stream_prompt_kernel, &call, ggml_sycl_moe_stream_library_claims",
+        ),
+        ("call.op.n_tokens = n_ubatch;", ""),
+    ],
+    ids=["no-prompt-kernel", "no-graph-ctx", "backend-library-claims", "no-rows"],
+)
+def test_the_fit_ring_geometry_call_has_a_mutation_witness(old, new):
+    mutated = _mutate_raw_ws_tolerant(GGML_SYCL_CPP, old, new)
+    assert not _fit_ring_geometry_call_pinned(mutated), "the mutant must make the pin fail"
+
+
+@pytest.mark.parametrize("where", ["phase", "fit"])
+def test_the_shared_ring_geometry_pin_sees_a_duplicated_call(where):
+    """The single-call clause: a second call beside the shared one (a second sizing in the same function)."""
+    if where == "phase":
+        call = (
+            "moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, &index_);"
+        )
+        mutated = _mutate_raw_ws_tolerant(MOE_STREAM_PLAN_CPP, call, call + " (void) " + call)
+        assert not _ring_geometry_is_shared(mutated, GGML_SYCL_CPP), "the mutant must make the pin fail"
+    else:
+        mutated = _mutate_raw_ws_tolerant(
+            GGML_SYCL_CPP, _RING_GEOMETRY_CALL, _RING_GEOMETRY_CALL + " (void) " + _RING_GEOMETRY_CALL
+        )
+        assert not _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, mutated), "the mutant must make the pin fail"
+
+
 if __name__ == "__main__":
     import sys
 

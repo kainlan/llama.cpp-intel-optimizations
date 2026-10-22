@@ -33737,14 +33737,15 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
 // host. 0 with no published plan, no host expert, or no ring (the sizing refuses one past a tenth of the resident
 // expert bytes). A refused probe (a graph is active) lends nothing, so the whole ring counts.
 //
-// The geometry is the stream phase's own: moe_stream_plan_ring_geometry over the same hooks (this file's prompt-kernel
-// and library-claim predicates), so the fit and the ring cannot disagree about its size. The hooks read a stream call:
-// the device, the plan and the rows. At the PROMPT phase the capability they query reads the rows only to refuse zero
-// (ggml_sycl_moe_query_route_capability); the decode rows == 1 case of the Q1_0 / NVFP4 AOS candidate is not reached,
-// and the XMX-tiled row limit is for a layout the ring never asks about. So the geometry does not depend on the rung
-// and `n_ubatch` stands in for the micro-batch's rows. The library-claim hook answers from this thread's graph scan
-// (the weights of the graph being computed): outside a graph it claims nothing, so a ring the library executor would
-// shrink is counted at its full staged size here, an upper bound, never an under-count.
+// The geometry is the stream phase's own: moe_stream_plan_ring_geometry over the same prompt-kernel predicate, so the
+// fit and the ring cannot disagree about its size. The predicate reads a stream call: the device and the rows. At the
+// PROMPT phase the capability it queries reads the rows only to refuse zero (ggml_sycl_moe_query_route_capability);
+// the decode rows == 1 case of the Q1_0 / NVFP4 AOS candidate is not reached, and the XMX-tiled row limit is for a
+// layout the ring never asks about. So the geometry does not depend on the rung and `n_ubatch` stands in for the
+// micro-batch's rows. The fit passes NO library-claims hook: the backend's hook reads g_moe_gate_up_pairs, a
+// thread-local scan of a graph that is stale outside compute (a previous model's weight tensors can still be in it),
+// so asking it here could read freed tensors. The fit therefore counts no library claim, and its ring is an upper
+// bound of the phase's, never an under-count.
 // The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
 // context transaction, before it publishes, this can see the previous plan or none, and the realized check (run
 // after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
@@ -33755,14 +33756,14 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     if (!current || !current->plan) {
         return 0;
     }
-    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the hooks read it through graph_ctx
+    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the prompt-kernel hook reads it through graph_ctx
     call.plan        = current->plan;
     call.cache       = ggml_sycl::get_unified_cache_for_device(device);
     call.device      = device;
     call.op.n_tokens = n_ubatch;
 
     const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
-        *call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, ggml_sycl_moe_stream_library_claims);
+        *call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr);
     if (geo.bytes == 0) {
         return 0;
     }
