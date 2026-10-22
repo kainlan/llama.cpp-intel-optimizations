@@ -4,6 +4,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace ggml_sycl;
 
@@ -164,6 +167,120 @@ int main() {
         d = moe_exec_weigh(gptoss_layer(512, false), b50_rates(), moe_exec_policy::AUTO);
         CHECK(d.choice == moe_exec_choice::NOT_CONSULTED && d.reason == moe_exec_reason::NO_HOST_EXPERTS,
               "all-VRAM -c 4096 layer is not consulted");
+    }
+    // seed: the Qwen GSQ-RCO mix (seven measured types at 22 GB/s) gives 22; a mix with an unmeasured type keeps
+    // the measured bytes' mean (the room refuses unmeasured types; the executor just prices them at the default)
+    {
+        std::vector<std::pair<ggml_type, size_t>> mix = {
+            { GGML_TYPE_IQ3_S,  218 },
+            { GGML_TYPE_IQ4_NL, 198 },
+            { GGML_TYPE_Q2_0,   165 },
+            { GGML_TYPE_IQ2_S,  125 }
+        };
+        moe_exec_rates r = moe_exec_rates_seed(mix);
+        CHECK(std::fabs(r.cpu_gbps - 22.0) < 1e-9, "Qwen mix seeds the mix's 22 GB/s");
+        CHECK(r.h2d_gbps == 20.0 && r.reorder_gbps == 200.0, "H2D and reorder carry their seeds");
+        CHECK(moe_exec_rates_valid(r), "the seed passes the validity check weigh asserts");
+        mix.push_back({ GGML_TYPE_Q4_0, 1000 });
+        r = moe_exec_rates_seed(mix);
+        CHECK(std::fabs(r.cpu_gbps - 22.0) < 1e-9, "an unmeasured type does not move the measured mean");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_Q4_0, 1000 }
+        });
+        CHECK(r.cpu_gbps == PLACEMENT_CPU_EXPERT_GBPS_DEFAULT, "no measured type: the room's default");
+        CHECK(moe_exec_rates_valid(r), "the all-default seed is valid too");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 100 },
+            { GGML_TYPE_IQ3_S, 100 }
+        });
+        CHECK(std::fabs(r.cpu_gbps - 200.0 / (100.0 / 5.6 + 100.0 / 22.0)) < 1e-9, "two measured types: harmonic mean");
+    }
+    // dev_gflops seeds per type from the Task 9 measurement (llama.cpp-g4uy), byte-weighted harmonic mean over the mix:
+    // bytes / sum(bytes_i / rate_i). The fixtures above that call weigh set their own rates, so none of their
+    // expectations depended on the old 20000 seed; the only pin that did is the unset-variable check below (600).
+    {
+        moe_exec_rates r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 1000 }
+        });
+        CHECK(r.dev_gflops == 3990.0, "a pure MXFP4 mix seeds the batched XMX executor's 3990 GFLOP/s");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_Q4_0, 1000 }
+        });
+        CHECK(r.dev_gflops == 630.0, "a pure Q4_0 mix seeds the per-row MMVQ path's 630 GFLOP/s");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_IQ3_S, 1000 }
+        });
+        CHECK(r.dev_gflops == 600.0, "a type with no batched executor seeds the per-row 600 GFLOP/s");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 500 },
+            { GGML_TYPE_Q4_0,  500 }
+        });
+        CHECK(std::fabs(r.dev_gflops - 2.0 / (1.0 / 3990.0 + 1.0 / 630.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 1088.1) < 0.1,
+              "equal MXFP4 and Q4_0 bytes seed the harmonic mean, 1088.1 (not the 2310 arithmetic mean)");
+        // unequal bytes tell the byte weighting from an unweighted harmonic mean (which would give the 1088.1 above):
+        // 400 / (100 / 3990 + 300 / 630) = 400 / (0.025063 + 0.476190) = 798.0
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 100 },
+            { GGML_TYPE_Q4_0,  300 }
+        });
+        CHECK(std::fabs(r.dev_gflops - 400.0 / (100.0 / 3990.0 + 300.0 / 630.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 798.0) < 0.1,
+              "100 B MXFP4 + 300 B Q4_0 seed the byte-weighted harmonic mean, 798.0");
+        r = moe_exec_rates_seed({});
+        CHECK(r.dev_gflops == 600.0, "an empty mix seeds 600 GFLOP/s");
+        CHECK(moe_exec_rates_valid(r), "the empty-mix seed is valid");
+        // the env override still wins over a per-type seed
+        auto env_fn = [](const char * name) -> const char * {
+            return std::string(name) == "GGML_SYCL_MOE_EXEC_DEV_GFLOPS" ? "777" : nullptr;
+        };
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 1000 }
+        });
+        moe_exec_rates_apply_env(r, env_fn);
+        CHECK(r.dev_gflops == 777.0, "the env override wins over the per-type seed");
+    }
+    // env overrides follow the w013 rule
+    {
+        static const char * fake_env_h2d = "31.5";
+        auto                getenv_fn    = [](const char * name) -> const char * {
+            return std::string(name) == "GGML_SYCL_MOE_EXEC_H2D_GBPS" ? fake_env_h2d : nullptr;
+        };
+        moe_exec_rates r = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 31.5, "H2D override applied");
+        CHECK(r.cpu_gbps == PLACEMENT_CPU_EXPERT_GBPS_DEFAULT && r.reorder_gbps == 200.0 && r.dev_gflops == 600.0,
+              "an unset variable keeps its seed (the empty mix's 600 GFLOP/s)");
+        fake_env_h2d = "-3";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "a negative override keeps the seed");
+        fake_env_h2d = "nan";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "a non-finite override keeps the seed");
+        fake_env_h2d = "fast";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "an unparsable override keeps the seed");
+        fake_env_h2d = "0";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "a zero override keeps the seed");
+        auto all_fn = [](const char * name) -> const char * {
+            const std::string n(name);
+            return n == "GGML_SYCL_MOE_EXEC_H2D_GBPS"     ? "1" :
+                   n == "GGML_SYCL_MOE_EXEC_CPU_GBPS"     ? "2" :
+                   n == "GGML_SYCL_MOE_EXEC_DEV_GFLOPS"   ? "3" :
+                   n == "GGML_SYCL_MOE_EXEC_REORDER_GBPS" ? "4" :
+                                                            nullptr;
+        };
+        r = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, all_fn);
+        CHECK(r.h2d_gbps == 1.0 && r.cpu_gbps == 2.0 && r.dev_gflops == 3.0 && r.reorder_gbps == 4.0,
+              "each of the four variables overrides its own rate");
+        moe_exec_rates_apply_env(r, nullptr);
+        CHECK(r.h2d_gbps == 1.0, "a null getenv keeps what the record holds");
     }
     std::printf("test-moe-exec-cost: %d cases, %d failures\n", g_cases, g_failures);
     return g_failures == 0 ? 0 : 1;
