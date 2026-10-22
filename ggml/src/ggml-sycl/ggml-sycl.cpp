@@ -20723,9 +20723,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // A prompt phase borrows VRAM for the prefill ring from the device's least popular resident expert triplets.
 // moe_expert_loan_select() picks whole (gate, up, down) triplets from the published plan; the cache copies each to
 // pinned host storage and withdraws the device copy (unified_cache::loan_expert_triplet); the plan flips those entries
-// to the host and is published once, so each lent expert executes where it now lives. File-static: its callers, the
-// auto-ubatch fit term (probe mode, plan Task 12) and the boundary runner ggml_backend_sycl_synchronize() calls, are in
-// this file, after it. The ring's admission in mul_mat_id calls only ggml_sycl_request_expert_loan().
+// to the host and is published once, so each lent expert executes where it now lives. File-static. Today its one
+// caller is the boundary runner ggml_backend_sycl_synchronize() calls, which finds no request until a requester lands.
+// Once plan Task 12 lands, the auto-ubatch fit term will call it in probe mode (ggml_sycl_run_expert_loan_transaction),
+// and the ring's admission in mul_mat_id (the ring phase, Task 7b) will call only ggml_sycl_request_expert_loan().
 //
 // Where it runs (c-tdra): at a graph boundary, never inside a graph. The ring's admission runs inside one, holding
 // g_sycl_graph_compute_mutex (L2), and the inventory mutex (L1) ranks below it (canonical contract section 12.5), so it
@@ -21534,15 +21535,11 @@ std::string test_expert_loan_refuses_replacing_a_host_entry() {
     if (!fx.cache) {
         return "no unified cache for device 0";
     }
-    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
-        return why;
-    }
-    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
-    const auto   published = ::ggml_sycl_global_plan_snapshot();
-    const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
 
     // The fixture's host id is the device entry's own id; the down slot's, so the gate and up members pass first.
-    // resolve() asks for that id's host entry first, so it names the planted entry until something replaces it.
+    // Planted before the device experts are staged: a registration publishes the id's mirror holding a lease on its
+    // entry, and staging the device copy under the same id replaces that mirror and drops the lease, so the planted
+    // entry is idle when the loan looks at it. Nothing may resolve it before the loan, since a resolve takes a lease.
     const ggml_sycl_cache_id planted_key = fx.keys[fx.index(0, 2, 0)];
     mem_handle               planted     = ::ggml_sycl_host_expert_alloc(fx.device, test_loan_expert_bytes());
     void * const             planted_ptr = planted.valid() ? planted.resolve().ptr : nullptr;
@@ -21553,8 +21550,20 @@ std::string test_expert_loan_refuses_replacing_a_host_entry() {
             return "the planted host entry was not registered";
         }
     }
-    if (const expert_resolve_result found = fx.resolve(0, 2, 0); !found || found.ptr != planted_ptr) {
-        return "the planted host entry does not resolve";
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    const auto   published = ::ggml_sycl_global_plan_snapshot();
+    const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
+
+    // Live and idle: the state a check refusing only a retired or leased host entry lets through to be replaced.
+    uint32_t planted_in_use  = 0;
+    bool     planted_retired = false;
+    if (!fx.cache->test_expert_host_entry_state(planted_key, &planted_in_use, &planted_retired) || planted_retired ||
+        planted_in_use != 0) {
+        return test_loan_fail("the planted host entry is not live and idle (in_use_count %u, retired %d)",
+                              planted_in_use, (int) planted_retired);
     }
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();

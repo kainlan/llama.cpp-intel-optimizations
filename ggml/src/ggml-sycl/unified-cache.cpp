@@ -16014,6 +16014,21 @@ bool unified_cache::test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint
     return true;
 }
 
+bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_t * in_use, bool * retired) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    const auto                          it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });
+    if (it == entries_.end()) {
+        return false;
+    }
+    if (in_use) {
+        *in_use = it->second.in_use_count.load();
+    }
+    if (retired) {
+        *retired = it->second.retired;
+    }
+    return true;
+}
+
 uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     for (const auto & pair : entries_) {
