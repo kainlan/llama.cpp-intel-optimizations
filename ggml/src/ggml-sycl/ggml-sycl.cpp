@@ -29204,8 +29204,8 @@ void ggml_backend_sycl_print_sycl_devices() {
     print_device_opt_feature(device_count);
 }
 
-// The MoE executor's knobs (llama.cpp-36j0 Task 4), parsed once. This is the only reader of GGML_SYCL_MOE_EXEC and
-// GGML_SYCL_MOE_EXEC_TRACE: the trace level (2 runs the Task 5 load-time copy probe) comes from here too.
+// The MoE executor's knobs (llama.cpp-36j0), parsed once. This is the only reader of GGML_SYCL_MOE_EXEC and
+// GGML_SYCL_MOE_EXEC_TRACE: the trace level (2 runs the load-time host-expert copy probe) comes from here too.
 static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {
     static const ggml_sycl::moe_exec_config config = [] {
         ggml_sycl::moe_exec_config c =
@@ -37198,6 +37198,25 @@ static std::shared_ptr<void> ggml_sycl_transfer_alloc_owner(ggml_sycl::alloc_han
     return std::shared_ptr<void>(owner, owner->handle.ptr);
 }
 
+// Host-pinned storage for one host-planned MoE expert, minted owner-first and handed out as its owner handle,
+// which frees it on release. S1-PRELOAD registers the expert with this typed owner so every lease on the entry
+// reports the allocation's provenance (HOST_PINNED, WEIGHT) through owner_metadata(): the copy path trusts a host
+// source for a direct USM copy only on that evidence, and these experts are the prefill ring's copy source
+// (llama.cpp-36j0). Returns an invalid handle when the pinned pool cannot hold it.
+static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size) {
+    ggml_sycl::alloc_request req{};
+    req.device                              = device;
+    req.size                                = size;
+    req.intent.role                         = ggml_sycl::alloc_role::WEIGHT;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return {};
+    }
+    return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+}
+
 struct ggml_sycl_scoped_alloc_rollback {
     ggml_sycl::alloc_handle & handle;
     bool                      transferred = false;
@@ -37210,6 +37229,60 @@ struct ggml_sycl_scoped_alloc_rollback {
 
     void release() noexcept { transferred = true; }
 };
+
+// llama.cpp-36j0, opt-in: the prefill expert ring is only worth building if a copy from a host-planned expert's
+// handle is a direct DMA, so this measures it. Once per device at load, after S1-PRELOAD registered its host-planned
+// experts, copy one expert's registered handle into a device RUNTIME buffer until at least 64 MiB have moved, and
+// log the rate and whether the copies took mem_copy_submit's direct or staged branch. It is diagnostic only and
+// waits on the loading thread, which no production copy may do. The branch comes from this thread's staged-copy
+// census (llama.cpp-qwn5), which counts only under GGML_SYCL_MOE_IDS_COPY_TRACE=1, so without it the line says
+// unknown; the th86 site census prints to stderr and cannot be read in-process.
+static void ggml_sycl_moe_exec_copy_probe(int                           device,
+                                          const ggml_sycl::mem_handle & expert,
+                                          size_t                        bytes,
+                                          sycl::queue &                 queue) {
+    if (!expert.valid() || bytes == 0) {
+        return;
+    }
+    try {
+        ggml_sycl::alloc_request req{};
+        req.queue                                     = &queue;
+        req.device                                    = device;
+        req.size                                      = bytes;
+        req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+        req.intent.category                           = ggml_sycl::runtime_category::STAGING;
+        req.intent.cohort_id                          = "moe_exec_copy_probe";
+        req.intent.constraints.must_device            = true;
+        req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+        req.intent.constraints.forbid_vram_zone_spill = true;
+        ggml_sycl::mem_handle dst                     = ggml_sycl::unified_allocate(req);
+        if (!dst.valid()) {
+            GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d: no %zu-byte RUNTIME buffer\n", device, bytes);
+            return;
+        }
+        const size_t copies = (64ull * 1024ull * 1024ull + bytes - 1) / bytes;
+        ggml_sycl::mem_copy_async(dst, expert, bytes, queue).wait_and_throw();  // untimed warm-up
+        const uint64_t           staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
+        std::vector<sycl::event> events;
+        events.reserve(copies);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < copies; ++i) {
+            events.push_back(ggml_sycl::mem_copy_async(dst, expert, bytes, queue));
+        }
+        sycl::event::wait_and_throw(events);
+        const double   sec    = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const uint64_t staged = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before;
+        const char *   kind   = !ggml_sycl_cpu_expert_trace_enabled() ? "unknown" : (staged != 0 ? "staged" : "direct");
+        const size_t   total  = copies * bytes;
+        GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d: %.1f GB/s over %zu MiB, %s\n", device,
+                      sec > 0.0 ? (double) total / sec / 1e9 : 0.0, total / (1024 * 1024), kind);
+    } catch (const ggml_sycl_fallback_error &) {
+        // Not a probe failure: preload's own handler owns the fallback decision, so the error must reach it.
+        throw;
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d failed: %s\n", device, e.what());
+    }
+}
 
 static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, layout_mode layout) {
     if (!src0 || device < 0 || device >= ggml_sycl_info().device_count) {
@@ -37592,6 +37665,9 @@ static void ggml_sycl_preload_model_weights() {
                 continue;
             }
             sycl::queue & stream = *stream_ptr;
+            // The first host-planned expert this device registers, for the copy probe (llama.cpp-36j0).
+            ggml_sycl::mem_handle moe_exec_probe_expert;
+            size_t                moe_exec_probe_bytes = 0;
 
             // P4/P4.5: Apply placement plan to cache.
             // Multi-device plans are copied to each device's cache (all need it).
@@ -38036,64 +38112,46 @@ static void ggml_sycl_preload_model_weights() {
                             return false;
                         }
 
-                        ggml_sycl::alloc_request host_req{};
-                        host_req.device                              = device;
-                        host_req.size                                = expert_size;
-                        host_req.intent.role                         = ggml_sycl::alloc_role::WEIGHT;
-                        host_req.intent.constraints.must_host_pinned = true;
-                        host_req.intent.constraints.use_pinned_pool  = true;
-                        ggml_sycl::alloc_handle host_handle{};
-                        if (!ggml_sycl::unified_alloc(host_req, &host_handle)) {
-                            host_handle = {};
-                        }
-                        ggml_sycl_scoped_alloc_rollback host_alloc_guard{ host_handle };
-
-                        void *       host_ptr  = host_handle.ptr;
-                        const size_t seg0_size = (!host_handle.segments().empty()) ?
-                                                     host_handle.segments()[0].size :
-                                                     (host_ptr ? expert_size : 0);
-                        if (host_ptr && seg0_size < expert_size) {
-                            host_ptr = nullptr;
-                        }
+                        // The owner handle frees the storage on every early return.
+                        ggml_sycl::mem_handle host_owner = ggml_sycl_host_expert_alloc(device, expert_size);
+                        void *                host_ptr   = host_owner.valid() ? host_owner.resolve().ptr : nullptr;
 
                         if (host_ptr) {
-                            ggml_sycl::mem_handle host_copy_handle = host_handle.as_mem_handle();
-                            if (!host_copy_handle.valid()) {
-                                return false;
-                            }
                             if (tensor_source_is_device) {
                                 sycl::queue * source_queue =
                                     ggml_sycl_owner_queue_for_ptr(expert_aos, tensor_source_device, stream);
                                 ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_chunk_ptr(
                                     const_cast<uint8_t *>(expert_aos), tensor_source_device, GGML_LAYOUT_AOS, true);
-                                ggml_sycl::mem_copy(host_copy_handle, src_handle, expert_size, *source_queue);
+                                ggml_sycl::mem_copy(host_owner, src_handle, expert_size, *source_queue);
                             } else {
                                 ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
                                     const_cast<uint8_t *>(expert_aos), GGML_LAYOUT_AOS, false,
                                     ggml_sycl::mem_handle::HOST_DEVICE, expert_size);
-                                ggml_sycl::mem_copy(host_copy_handle, src_handle, expert_size, stream);
+                                ggml_sycl::mem_copy(host_owner, src_handle, expert_size, stream);
                             }
                             ggml_sycl::host_mem_ledger_get().host_expert_copy_cumulative_bytes.fetch_add(
                                 expert_size, std::memory_order_relaxed);
                         } else if (!tensor_source_is_device) {
-                            host_ptr = const_cast<uint8_t *>(expert_aos);
+                            // The mmap source itself, registered as unowned external storage.
+                            host_owner = {};
+                            host_ptr   = const_cast<uint8_t *>(expert_aos);
                         } else {
                             return false;
                         }
 
-                        std::shared_ptr<void> allocation_owner;
-                        if (host_handle.ptr && host_ptr == host_handle.ptr) {
-                            allocation_owner = ggml_sycl_transfer_alloc_owner(host_handle);
-                        }
                         bool remembered_handle = false;
                         for (const ggml_sycl_cache_id & key : keys) {
                             ggml_sycl::mem_handle handle;
-                            if (!cache->register_host_expert(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle,
-                                                             allocation_owner) ||
+                            if (!cache->register_host_expert_owned(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle,
+                                                                   host_owner) ||
                                 !handle.resolve().ptr) {
                                 throw std::runtime_error("SYCL host expert registration failed during preload");
                             }
                             if (!remembered_handle) {
+                                if (ggml_sycl_moe_exec_config().trace >= 2 && !moe_exec_probe_expert.valid()) {
+                                    moe_exec_probe_expert = handle;
+                                    moe_exec_probe_bytes  = expert_size;
+                                }
                                 if (!extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS,
                                                                        std::move(handle), nullptr,
                                                                        /*logical_offset=*/0, expert_size)) {
@@ -39367,6 +39425,10 @@ static void ggml_sycl_preload_model_weights() {
 
             ggml_sycl_record_weight_load_summary(device, weight_device_bytes[device], weight_host_bytes[device],
                                                  weight_device_count[device], weight_host_count[device]);
+            if (moe_exec_probe_expert.valid()) {
+                ggml_sycl_moe_exec_copy_probe(device, moe_exec_probe_expert, moe_exec_probe_bytes, cache->get_queue());
+                moe_exec_probe_expert = {};
+            }
 
             // Seal the layout pool to prevent new 256 MB chunk allocations.
             // All dense weights are now loaded; any subsequent layout requests

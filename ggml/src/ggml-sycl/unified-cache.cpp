@@ -10390,6 +10390,32 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                                          ggml_layout_mode      layout,
                                          mem_handle *          out_handle,
                                          std::shared_ptr<void> allocation_owner) {
+    return register_host_expert(key, ptr, size, layout, out_handle, std::move(allocation_owner), mem_handle{});
+}
+
+bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id key,
+                                               void *             ptr,
+                                               size_t             size,
+                                               ggml_layout_mode   layout,
+                                               mem_handle *       out_handle,
+                                               const mem_handle & allocation_owner) {
+    if (!allocation_owner.valid()) {
+        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{});
+    }
+    // The storage owner is a copy of the typed owner, aliased to ptr as the
+    // legacy owner wrapper was, so the entry releases exactly as before.
+    auto storage_owner = std::make_shared<mem_handle>(allocation_owner);
+    return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>(storage_owner, ptr),
+                                allocation_owner);
+}
+
+bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
+                                         void *                ptr,
+                                         size_t                size,
+                                         ggml_layout_mode      layout,
+                                         mem_handle *          out_handle,
+                                         std::shared_ptr<void> allocation_owner,
+                                         const mem_handle &    typed_owner) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -10439,6 +10465,9 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                 if (allocation_owner && !old->second.storage_owner) {
                     old->second.storage_owner = allocation_owner;
                     old->second.non_owning_external_host = !allocation_owner;
+                    if (typed_owner.valid() && !old->second.direct_alloc_owner.valid()) {
+                        old->second.direct_alloc_owner = typed_owner;
+                    }
                 }
                 old->second.access_count++;
                 old->second.last_access = time_++;
@@ -10481,6 +10510,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.has_write_event  = false;
         cache_entry.storage_owner            = allocation_owner;
         cache_entry.non_owning_external_host = !allocation_owner;
+        cache_entry.direct_alloc_owner       = typed_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {

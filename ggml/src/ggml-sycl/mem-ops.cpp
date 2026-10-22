@@ -138,8 +138,9 @@ static bool host_ptr_is_usm_accessible(const void * ptr) {
 
 // Whether a copy endpoint's owner, by its provenance alone, is host USM in the
 // context of its device's cache queue. Only one provenance qualifies: a runtime
-// stage (role STAGING or EXPERT_STAGING) or expert-path buffer (category
-// EXPERT_CACHE) that is a host-pinned slice of a device cache's host zone.
+// stage (role STAGING or EXPERT_STAGING), expert-path buffer (category
+// EXPERT_CACHE) or pinned-pool weight (role WEIGHT, tier HOST_PINNED) that is a
+// host-pinned slice of a device cache's host zone.
 //   - A host-zone slice comes from that cache's pinned arena, allocated on the
 //     cache's own queue, so its context is the one queue_for_device_or_fallback()
 //     names for its device. A standalone pinned base (require_host_usm_base) is
@@ -147,18 +148,29 @@ static bool host_ptr_is_usm_accessible(const void * ptr) {
 //     record, so it does not qualify. Nor does a pinned-pool allocation made
 //     before the host zones are configured: its metadata cannot be told from a
 //     standalone base's, so it keeps the registry answer.
-//   - SYCL device buffers' owners (roles WEIGHT, KV and COMPUTE) never
-//     qualify, even when the buffer fell back to host-pinned memory. The
-//     SYCL_Host buffer's owner (role STAGING outside model load, category
-//     HOST_COMPUTE) would, but the backend holds it only as the buffer's
-//     identity: its tensors' copies pass views without an owner, so they keep
-//     the registry answer.
+//   - SYCL device buffers' owners with roles KV and COMPUTE never qualify,
+//     even when the buffer fell back to host-pinned memory. The SYCL_Host
+//     buffer's owner (role STAGING outside model load, category HOST_COMPUTE)
+//     would, but the backend holds it only as the buffer's identity: its
+//     tensors' copies pass views without an owner, so they keep the registry
+//     answer.
+//   - A pinned-pool weight qualifies because host-planned experts are the
+//     prefill expert ring's copy source (llama.cpp-36j0): staged, every ring
+//     copy would hold the submitting thread on a host memcpy and a wait. A
+//     weight is written only while the model loads, so a direct copy reading
+//     it when the DMA runs sees what a staged copy would have snapshotted. A
+//     SYCL device buffer that fell back to host-pinned weight memory is in
+//     scope too: its set and get copies are host to host, and an async copy
+//     into it is complete only once the caller synchronises, as the backend
+//     API requires. HOST_MMAP and unregistered memory stay out: they are
+//     pageable, and the early return refuses them.
 static bool host_endpoint_owner_in_scope(const alloc_metadata & owner) {
     if (owner.tier != alloc_tier::HOST_PINNED || owner.host_zone == host_zone_id::COUNT || owner.device < 0) {
         return false;
     }
     return owner.role == alloc_role::STAGING || owner.role == alloc_role::EXPERT_STAGING ||
-           owner.category == runtime_category::EXPERT_CACHE;
+           owner.category == runtime_category::EXPERT_CACHE ||
+           (owner.tier == alloc_tier::HOST_PINNED && owner.role == alloc_role::WEIGHT);
 }
 
 // Whether the host endpoint `h` of a copy on `copy_queue` can be read or written

@@ -2537,6 +2537,15 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # llama.cpp-36j0: a pinned-pool WEIGHT-role host owner is a trusted USM copy endpoint, so a copy from a
+    # host-planned expert is a direct DMA; the qwn5 graph-recording exclusion stays verbatim. Text only.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mem-ops-host-scope-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
     # llama.cpp-z5fn: load_tensors must feed planner_owns_placement (SYCL) into the lazy AUTO decision.
     llama_test_pytest(
         ${LLAMA_PYTHON3}

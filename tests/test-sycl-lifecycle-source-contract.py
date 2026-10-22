@@ -1043,7 +1043,7 @@ checks = {
     and "SYCL host expert registration failed during preload" in backend
     and "SYCL host weight registration failed during preload" in backend
     and "dense_alloc_guard" in backend
-    and "host_alloc_guard" in backend,
+    and "ggml_sycl::mem_handle host_owner = ggml_sycl_host_expert_alloc(device, expert_size);" in backend,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp

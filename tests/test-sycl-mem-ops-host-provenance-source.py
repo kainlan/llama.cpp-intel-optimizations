@@ -11,9 +11,12 @@ took the synchronous staged path: the flagged scatter's two H2D copies waited th
 each D2H into the pool waited for its chunk before returning.
 
 THE FIX.  The handle's retained owner answers first, from its provenance, never from the pointer.
-mem_handle::owner_metadata() copies the owner's metadata under the handle's lock.  host_endpoint_owner_in_scope()
+mem_handle::owner_metadata() copies the owner's metadata under the handle's lock; a weight lease answers with the
+typed owner its cache entry was registered with (llama.cpp-36j0).  host_endpoint_owner_in_scope()
 admits one provenance: a host-pinned slice of a device cache's host zone (host_zone set, device >= 0) that is a
-runtime stage (role STAGING or EXPERT_STAGING) or an expert-path buffer (category EXPERT_CACHE).  Such a slice comes
+runtime stage (role STAGING or EXPERT_STAGING), an expert-path buffer (category EXPERT_CACHE) or, since llama.cpp-36j0,
+a pinned-pool weight (role WEIGHT with tier HOST_PINNED: host-planned experts are the prefill ring's copy source; a
+weight is written only while the model loads).  Such a slice comes
 from the cache's pinned arena, allocated on the cache's queue, so host_endpoint_is_usm_accessible() takes the owner's
 answer only when that queue (queue_for_device_or_fallback(owner.device, ...)) shares the copy queue's context.  A
 standalone pinned base (require_host_usm_base) is allocated on the requesting queue, which the owner does not record,
@@ -32,7 +35,10 @@ when the DMA runs.  Each mem_copy_async site whose host endpoint can be in scope
     flush's events or a queue barrier when its copy does not order the scatter, and every job buffer is retained
     until its join;
   - backend-buffer storage stays out of scope (pin T): the SYCL device buffers' owners carry roles COMPUTE, KV and
-    WEIGHT, and the SYCL_Host buffer's in-scope owner is held only as the buffer's identity, never as a copy endpoint;
+    WEIGHT, and the SYCL_Host buffer's in-scope owner is held only as the buffer's identity, never as a copy endpoint.
+    llama.cpp-36j0 admits WEIGHT: a device buffer that fell back to host-pinned weight memory is then in scope, which
+    is safe because its set and get copies are host to host and an async copy into it is complete only once the
+    caller synchronises;
   - segment graph recording relied on the staged H2D's host wait as an ordering assumption (pin D): the boundary
     flush ran just before begin_recording, and its staged copy left everything earlier on the in-order stream
     complete.  Direct, the copy and the MoE output's ready event are still pending when the segment records, the
@@ -42,10 +48,13 @@ when the DMA runs.  Each mem_copy_async site whose host endpoint can be in scope
 
 THE CONTRACT.  With comments blanked:
   O. (mem-handle.hpp, mem-handle.cpp) bool owner_metadata(alloc_metadata * out) const is declared; its definition
-     takes the handle's lock first, answers false without an owner or an out pointer, copies the owner's metadata and
-     answers true; it reads no pointer.
+     takes the handle's lock first, answers false without an out pointer, copies the retained owner's metadata and
+     answers true, else copies the lease's typed owner's metadata and answers true, else answers false; it reads no
+     pointer.  mem_handle::leased_entry_alloc_owner, which fills the lease's typed owner, returns an empty owner unless
+     the entry's owner is alloc_tier::HOST_PINNED, so a device entry's lease retains nothing.
   S. (mem-ops.cpp host_endpoint_owner_in_scope) refuses unless the tier is HOST_PINNED, the host zone is set and the
-     device is >= 0, and then admits exactly role STAGING, role EXPERT_STAGING and category EXPERT_CACHE.
+     device is >= 0, and then admits exactly role STAGING, role EXPERT_STAGING, category EXPERT_CACHE and
+     (tier HOST_PINNED and role WEIGHT); test-sycl-mem-ops-host-scope-source.py pins the last one's form.
   H. (mem-ops.cpp host_endpoint_is_usm_accessible) takes the owner's answer exactly when no graph records, the owner
      answers, the owner is in scope and the owner device's cache queue shares the copy queue's context; the registry
      is asked once, as the last statement, and never before the owner.
@@ -61,7 +70,8 @@ THE CONTRACT.  With comments blanked:
      per call with alloc_pinned_stage_handle_terminal, writes the ids into it and copies from it.
   T. (ggml-sycl.cpp) every use of a SYCL_Host buffer context's buffer_handle is a validity, identity or reset use; the
      host buffer allocator hands its owner only to the wrap, which stores it; every other buffer type's allocation
-     requests roles COMPUTE, KV or WEIGHT and never category EXPERT_CACHE.
+     requests roles COMPUTE, KV or WEIGHT and never category EXPERT_CACHE (WEIGHT storage is in scope only when it
+     lands host-pinned in a host zone; see the hazard note above).
   G. (ggml-sycl.cpp, moe-decode-hostpath.hpp) the event-chained route refuses an out-of-order queue, flushes or keeps
      every pending scatter between its entry flush and its pool reservation (a keep only through
      moe_sibling_pending_keep, which requires disjoint spans), copies the ids into its entries on that queue after the
@@ -103,6 +113,8 @@ FILES = (
 TAG = "(llama.cpp-qwn5)"
 
 OWNER_SIG = r"bool mem_handle::owner_metadata\(alloc_metadata \* out\) const\s*\{"
+LEASED_OWNER_SIG = r"shared_alloc_owner mem_handle::leased_entry_alloc_owner\(const unified_cache_entry \* entry\)\s*\{"
+LEASED_OWNER_TIER_GATE = "if (!owner || owner.metadata().tier != alloc_tier::HOST_PINNED) { return {}; }"
 SCOPE_SIG = r"static bool host_endpoint_owner_in_scope\(const alloc_metadata & owner\)\s*\{"
 HELPER_SIG = r"static bool host_endpoint_is_usm_accessible\(const mem_handle & h, const void \* ptr, sycl::queue & copy_queue\)\s*\{"
 REGISTRY_SIG = r"static bool host_ptr_is_usm_accessible\(const void \* ptr\)\s*\{"
@@ -146,6 +158,7 @@ SCOPE_ADMITS = (
     "owner.role == alloc_role::STAGING",
     "owner.role == alloc_role::EXPERT_STAGING",
     "owner.category == runtime_category::EXPERT_CACHE",
+    "(owner.tier == alloc_tier::HOST_PINNED && owner.role == alloc_role::WEIGHT)",
 )
 HELPER_TERMS = (
     ("!ggml_sycl_graph_recording_active()", "asks the owner while a command graph records"),
@@ -290,15 +303,21 @@ def check_owner(s: dict) -> None:
     if not body.startswith("mem_handle_lock_guard g(lock_);"):
         fail("O", "owner_metadata does not take the handle's lock before it reads the owner")
     in_order(body, (
-        ("if (!owned_alloc_ || !out) { return false; }", "answers other than false for a handle without an owner"),
-        ("*out = owned_alloc_.metadata();", "does not copy the owner's metadata"),
-        ("return true;", "does not answer true for a handle with an owner"),
+        ("if (!out) { return false; }", "answers other than false without an out pointer"),
+        ("if (owned_alloc_) { *out = owned_alloc_.metadata(); return true; }",
+         "does not copy the retained owner's metadata and answer true"),
+        ("if (leased_alloc_owner_) { *out = leased_alloc_owner_.metadata(); return true; }",
+         "does not copy the lease's typed owner's metadata and answer true"),
     ), "O", "owner_metadata")
-    if not body.endswith("return true;"):
-        fail("O", "owner_metadata does not end by answering true")
+    if not body.endswith("} return false;"):
+        fail("O", "owner_metadata does not end by answering false for a handle without an owner")
     for probe in ("ggml_sycl_get_alloc_type", "get_pointer_type", "resolve(", "ptr_"):
         if probe in body:
             fail("O", f"owner_metadata reads the pointer ({probe!r}); its answer must come from the owner")
+    leased = flat_body(s["handle_cpp"], LEASED_OWNER_SIG, "O")
+    if LEASED_OWNER_TIER_GATE not in leased or not leased.endswith("return owner;"):
+        fail("O", "leased_entry_alloc_owner retains an entry's owner without first refusing one that is not "
+                  "alloc_tier::HOST_PINNED")
 
 
 def check_scope(s: dict) -> None:
@@ -323,7 +342,8 @@ def check_scope(s: dict) -> None:
             fail("S", f"host_endpoint_owner_in_scope no longer admits {term!r}")
     extra = [a for a in admits if a not in SCOPE_ADMITS]
     if extra:
-        fail("S", f"host_endpoint_owner_in_scope admits more than runtime stages and expert-path buffers: {extra!r}")
+        fail("S", f"host_endpoint_owner_in_scope admits more than runtime stages, expert-path buffers and pinned-pool "
+                 f"weights: {extra!r}")
 
 
 def check_helper(s: dict) -> None:
@@ -605,12 +625,20 @@ def self_test(s: dict) -> int:
     mutants = [
         ("O", "handle_hpp", "accessor undeclared", sub(r"\n\s*bool owner_metadata\(alloc_metadata \* out\) const;", "")),
         ("O", "handle_cpp", "owner read without the lock", sub(OWN + r"\n\s*mem_handle_lock_guard g\(lock_\);", r"\1")),
-        ("O", "handle_cpp", "ownerless handle not refused", sub(OWN + r"if \(!owned_alloc_ \|\| !out\)", r"\1if (!out)")),
+        ("O", "handle_cpp", "null out not refused", sub(OWN + r"if \(!out\) \{\n\s*return false;\n\s*\}\n", r"\1")),
         ("O", "handle_cpp", "ownerless handle answers true",
-         sub(OWN + r"(if \(!owned_alloc_ \|\| !out\) \{\n\s*return )false;", r"\1\2true;")),
+         sub(OWN + r"(\n\s*return )false;\n\}", r"\1\2true;\n}")),
         ("O", "handle_cpp", "metadata not copied", sub(OWN + r"\*out = owned_alloc_\.metadata\(\);", r"\1(void) out;")),
+        ("O", "handle_cpp", "lease owner not asked",
+         sub(OWN + r"\n\s*if \(leased_alloc_owner_\) \{\n[^}]*\}", r"\1")),
+        ("O", "handle_cpp", "lease owner read off the retained owner",
+         sub(OWN + r"\*out = leased_alloc_owner_\.metadata\(\);", r"\1*out = owned_alloc_.metadata();")),
+        ("O", "handle_cpp", "lease snapshot not tier-gated",
+         sub(r" \|\| owner\.metadata\(\)\.tier != alloc_tier::HOST_PINNED", "")),
+        ("O", "handle_cpp", "lease snapshot gated on a device tier",
+         sub(r"owner\.metadata\(\)\.tier != alloc_tier::HOST_PINNED", "owner.metadata().tier != alloc_tier::DEVICE_VRAM")),
         ("O", "handle_cpp", "pointer probed",
-         sub(OWN + r"(\*out = owned_alloc_\.metadata\(\);)",
+         sub(OWN + r"(if \(owned_alloc_\) \{)",
              r"\1if (ggml_sycl_get_alloc_type(ptr_) == sycl::usm::alloc::unknown) {\n        return false;\n    }\n    \2")),
         ("S", "ops_cpp", "tier test dropped", sub(r"owner\.tier != alloc_tier::HOST_PINNED \|\| ", "")),
         ("S", "ops_cpp", "mmap tier accepted",
@@ -619,11 +647,12 @@ def self_test(s: dict) -> int:
         ("S", "ops_cpp", "owner on no device accepted", sub(r" \|\| owner\.device < 0", "")),
         ("S", "ops_cpp", "backend storage accepted",
          sub(r"return owner\.role == alloc_role::STAGING \|\| owner\.role == alloc_role::EXPERT_STAGING \|\|\n\s*"
-             r"owner\.category == runtime_category::EXPERT_CACHE;", "return true;")),
+             r"owner\.category == runtime_category::EXPERT_CACHE \|\|\n\s*"
+             r"\(owner\.tier == alloc_tier::HOST_PINNED && owner\.role == alloc_role::WEIGHT\);", "return true;")),
         ("S", "ops_cpp", "COMPUTE role accepted",
          sub(r"return owner\.role == alloc_role::STAGING", "return owner.role == alloc_role::COMPUTE || owner.role == alloc_role::STAGING")),
         ("S", "ops_cpp", "expert-path category dropped",
-         sub(r" \|\|\n\s*owner\.category == runtime_category::EXPERT_CACHE;", ";")),
+         sub(r" \|\|\n\s*owner\.category == runtime_category::EXPERT_CACHE", "")),
         ("H", "ops_cpp", "recording guard dropped", sub(HELP + r"!ggml_sycl_graph_recording_active\(\) && ", r"\1")),
         ("H", "ops_cpp", "scope not applied", sub(HELP + r"host_endpoint_owner_in_scope\(owner\) &&\s*", r"\1")),
         ("H", "ops_cpp", "provenance ignored",
