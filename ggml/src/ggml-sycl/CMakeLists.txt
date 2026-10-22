@@ -4939,6 +4939,34 @@ set_tests_properties(sycl-plan-cpu-work PROPERTIES
     TIMEOUT 120
 )
 
+# llama.cpp-36j0 Task 7a: the per-layer stream list over a hand-built placement_plan. Host-only; built like the
+# residency-summary test above (it links ggml-sycl for placement_plan) inside the same NOT GGML_BACKEND_DL guard.
+add_executable(test-moe-stream-plan
+    tests/test-moe-stream-plan.cpp
+)
+target_include_directories(test-moe-stream-plan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-stream-plan PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-stream-plan PRIVATE "-fsycl")
+target_compile_definitions(test-moe-stream-plan PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-stream-plan PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-stream-plan PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-moe-stream-plan COMMAND test-moe-stream-plan)
+set_tests_properties(sycl-moe-stream-plan PROPERTIES
+    LABELS "sycl;moe;ring;hostonly"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+)
+
 # The placement plan's per-(layer, role) residency summary agrees with the
 # per-expert sweep it replaced (llama.cpp-5tdy). Host-only: synthetic plans, no
 # queue, no device, no model.
