@@ -1684,6 +1684,14 @@ struct sycl_device_info {
     // + "@" + driver_version -- no PCI id, which moves across boots on this
     // host).
     char            driver_version[64] = { 0 };
+    // llama.cpp-zujy: the pinned host-to-device rate, GB/s, that ggml_sycl_measure_h2d_pinned fills once per device (a
+    // probe, the tuning cache, or the seed). 0 means "not resolved yet"; h2d_probed is true for a measured or stored
+    // rate and false for the seed.
+    double          h2d_pinned_gbps    = 0.0;
+    bool            h2d_probed         = false;
+    // The retry outcomes the H2D probe has already logged for this device, one bit per h2d_probe_outcome, so a device
+    // that stays unresolved (zones not configured yet) logs each reason once per process, not at every load.
+    uint32_t        h2d_retry_logged   = 0;
 };
 
 struct sycl_peer_link_info {

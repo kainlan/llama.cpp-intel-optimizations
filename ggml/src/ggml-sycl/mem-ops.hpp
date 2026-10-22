@@ -151,9 +151,10 @@ constexpr size_t k_mem_copy_staged_wait_site_slots = 16;
 
 // The calling thread's waits inside mem_copy_submit while ggml_sycl_cpu_expert_trace_enabled() (llama.cpp-qwn5): how
 // many of each kind and their summed wall time, the same per copy-caller site in a fixed table (a site that finds no
-// free slot counts into overflow), and how many copies took the staged branch in each direction. The submitting
-// thread prints its own on each [MOE-HOSTPATH-WAITS] line and then resets it. Off, a wait costs one cached flag test
-// and reads no clock.
+// free slot counts into overflow). Off, a wait costs one cached flag test and reads no clock. staged_d2h and
+// staged_h2d, how many copies took the staged branch in each direction, count with the trace off too (llama.cpp-36j0):
+// a caller reads its own thread's delta around its own copies to learn whether they were direct. The submitting
+// thread prints its own on each [MOE-HOSTPATH-WAITS] line and then resets it.
 struct mem_copy_staged_wait_census {
     uint64_t                  count[MEM_COPY_STAGED_WAIT_KIND_COUNT]   = {};
     double                    us[MEM_COPY_STAGED_WAIT_KIND_COUNT]      = {};

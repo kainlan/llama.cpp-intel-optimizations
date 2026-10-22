@@ -348,8 +348,9 @@ static int check_registered_host_expert_lease_copy_is_direct(sycl::queue & q) {
 }
 
 int main() {
-    // Before any copy: both diagnostics latch on their first read. The staged-copy census is the trace's
-    // (llama.cpp-qwn5) and the copy site census is th86's; check_pinned_weight_copy_is_direct reads both.
+    // Before any copy: both diagnostics latch on their first read. The trace times the staged waits of the
+    // staged-copy census (llama.cpp-qwn5; its staged counts need no trace) and the copy site census is th86's;
+    // check_pinned_weight_copy_is_direct reads both.
     setenv("GGML_SYCL_MOE_IDS_COPY_TRACE", "1", 1);
     setenv("GGML_SYCL_MEMCPY_SITE_CENSUS", "1", 1);
 
