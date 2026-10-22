@@ -5004,6 +5004,34 @@ set_tests_properties(sycl-moe-stream-plan PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-36j0 Task 11a: loan selection (the lendable tail of the resident expert set) over a hand-built plan. Host-only,
+# built exactly like test-moe-stream-plan above.
+add_executable(test-moe-expert-loan-select
+    tests/test-moe-expert-loan-select.cpp
+)
+target_include_directories(test-moe-expert-loan-select PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-expert-loan-select PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-expert-loan-select PRIVATE "-fsycl")
+target_compile_definitions(test-moe-expert-loan-select PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-expert-loan-select PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-expert-loan-select PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-moe-expert-loan-select COMMAND test-moe-expert-loan-select)
+set_tests_properties(sycl-moe-expert-loan-select PROPERTIES
+    LABELS "sycl;moe;ring;hostonly"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+)
+
 # The placement plan's per-(layer, role) residency summary agrees with the
 # per-expert sweep it replaced (llama.cpp-5tdy). Host-only: synthetic plans, no
 # queue, no device, no model.
