@@ -155,6 +155,8 @@ static inline double moe_exec_env_param(moe_exec_getenv_fn getenv_fn, const char
 //   Q4_0:  B70, mulmat.mmvq.id_aos_q4_0, the per-row MMVQ path (11.81 GFLOP per 2048-row call in 18.68 ms).
 //   other: no batched mul_mat_id executor exists for them on this fork, so the per-row rate is the honest seed (the
 //          Q4_0 down matrix measured 590).
+static constexpr double MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED = 600.0;
+
 static inline double moe_exec_dev_gflops_seed(ggml_type t) {
     switch (t) {
         case GGML_TYPE_MXFP4:
@@ -162,7 +164,7 @@ static inline double moe_exec_dev_gflops_seed(ggml_type t) {
         case GGML_TYPE_Q4_0:
             return 630.0;
         default:
-            return 600.0;
+            return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
     }
 }
 
@@ -185,7 +187,7 @@ static inline moe_exec_rates moe_exec_rates_seed(const std::vector<std::pair<ggm
         dev_bytes += static_cast<double>(tb.second);
         dev_us += static_cast<double>(tb.second) / moe_exec_dev_gflops_seed(tb.first);
     }
-    const double dev_gflops = dev_bytes > 0.0 ? dev_bytes / dev_us : moe_exec_dev_gflops_seed(GGML_TYPE_COUNT);
+    const double dev_gflops = dev_bytes > 0.0 ? dev_bytes / dev_us : MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
 
     moe_exec_rates r;
     r.cpu_gbps     = cpu_gbps;

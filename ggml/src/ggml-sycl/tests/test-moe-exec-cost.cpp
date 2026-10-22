@@ -218,6 +218,15 @@ int main() {
         CHECK(std::fabs(r.dev_gflops - 2.0 / (1.0 / 3990.0 + 1.0 / 630.0)) < 0.1 &&
                   std::fabs(r.dev_gflops - 1088.1) < 0.1,
               "equal MXFP4 and Q4_0 bytes seed the harmonic mean, 1088.1 (not the 2310 arithmetic mean)");
+        // unequal bytes tell the byte weighting from an unweighted harmonic mean (which would give the 1088.1 above):
+        // 400 / (100 / 3990 + 300 / 630) = 400 / (0.025063 + 0.476190) = 798.0
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 100 },
+            { GGML_TYPE_Q4_0,  300 }
+        });
+        CHECK(std::fabs(r.dev_gflops - 400.0 / (100.0 / 3990.0 + 300.0 / 630.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 798.0) < 0.1,
+              "100 B MXFP4 + 300 B Q4_0 seed the byte-weighted harmonic mean, 798.0");
         r = moe_exec_rates_seed({});
         CHECK(r.dev_gflops == 600.0, "an empty mix seeds 600 GFLOP/s");
         CHECK(moe_exec_rates_valid(r), "the empty-mix seed is valid");
