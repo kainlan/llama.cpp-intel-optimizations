@@ -267,16 +267,17 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     const sycl::event gate = ring.current_region_gate();
 
     // The release is NOT sequenced behind the main thread: this thread releases
-    // on a timer, so nothing the main thread does between the fill and
-    // done.wait() can wait on the release that follows it.
+    // on a timer. A host_task submission can block on an in-flight dependency
+    // (here the gated fill on the same in-order queue), so a release placed on
+    // the submitting thread after that submit waits on itself. Measured on the
+    // B50 on 2026-10-21: in 1 of 3 runs the submit returned 1.8 ms after the
+    // release fired, and that path is the 30 s stall (then the SYCL watchdog)
+    // seen before this thread existed. done.wait() returning after every
+    // release excludes a runtime deadlock.
     //
-    // A stall seen once in this case (30 s, then the SYCL watchdog) has an
-    // unestablished cause. Either (a) the main thread blocks inside the SYCL
-    // runtime while the retained-handle drain worker waits on a copy the
-    // scheduler holds behind the blocker, or (b) the runtime deadlocks between
-    // that wait and the enqueue that follows the blocker's completion. The INFO
-    // lines below are stamped by this process, in microseconds since the case
-    // began, and flushed as they print, so a run tells the two apart.
+    // The INFO lines below are stamped by this process, in microseconds since
+    // the case began, and flushed as they print. A submit stamp later than the
+    // releaser's is that blocking path, not a ring defect.
     const auto t0    = std::chrono::steady_clock::now();
     auto       stamp = [&](const char * what) {
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0);
