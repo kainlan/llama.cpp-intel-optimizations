@@ -20,18 +20,16 @@
 
 namespace ggml_sycl {
 
-moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_max,
+moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
                                               size_t   matrix_bytes_max,
                                               size_t   resident_expert_bytes) {
     // Every no-ring path returns the default geometry: every field is 0.
-    if (host_matrices_per_layer_max == 0 || matrix_bytes_max == 0) {
+    if (region_slots == 0 || matrix_bytes_max == 0) {
         return {};
     }
 
-    // Two slots per matrix (AOS copy destination, SOA reorder destination), a
-    // whole layer per region, two regions.
-    const uint64_t region_slots = 2ull * host_matrices_per_layer_max;
-    const uint64_t n_slots      = 2ull * region_slots;
+    // A whole layer's slots per region, two regions.
+    const uint64_t n_slots = 2ull * region_slots;
 
     // Round each slot up to the alignment so every slot starts aligned.
     const size_t align = MOE_STREAM_RING_SLOT_ALIGN;
@@ -49,7 +47,7 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_m
 
     moe_stream_ring_geometry geo;
     geo.slot_bytes   = slot_bytes;
-    geo.region_slots = static_cast<uint32_t>(region_slots);
+    geo.region_slots = region_slots;
     geo.n_slots      = static_cast<uint32_t>(n_slots);
     geo.bytes        = bytes;
     return geo;
@@ -128,7 +126,7 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) 
     return true;
 }
 
-mem_handle moe_stream_ring::acquire_slot() {
+mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout) {
     if (!base_.valid()) {
         return {};
     }
@@ -140,7 +138,7 @@ mem_handle moe_stream_ring::acquire_slot() {
     // current_region_gate().
     const size_t index = static_cast<size_t>(r.first) + r.next;
     ++r.next;
-    return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes);
+    return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);
 }
 
 sycl::event moe_stream_ring::current_region_gate() const {

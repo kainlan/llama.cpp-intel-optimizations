@@ -16,6 +16,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sycl/sycl.hpp>
 #include <utility>
 #include <vector>
@@ -466,6 +467,14 @@ class mem_handle {
     // every resolve, after the backing handle's generation/stale checks.
     mem_handle slice(size_t byte_offset, size_t byte_size) const;
 
+    // slice(), naming the layout the view's bytes hold (lead ruling c-o9uw-1):
+    // every resolve of the view, and of its copies and plain sub-slices, reports
+    // `layout`. Only an owned allocation (from_owned_alloc) may name one, since
+    // its owner decides what it writes there. Any other handle refuses with an
+    // invalid handle: a weight lease's layout is a cache-key fact, and a borrowed
+    // view's is its creator's.
+    mem_handle slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const;
+
     // Sets the ready event with no recorded producer: every consumer queries it as before.
     void set_ready_event(const sycl::event & event);
     // Sets the ready event of a command submitted on `producer` (llama.cpp-wfsl), recording the queue's identity
@@ -716,6 +725,10 @@ class mem_handle {
     size_t         backing_offset_ = 0;  // physical arena offset of the allocation backing pointer
     size_t         slice_offset_   = 0;  // immutable-after-construction offset from backing pointer
     bool           is_slice_       = false;
+    // The layout a tagged slice names (slice(offset, size, layout)); every view
+    // resolves with it instead of the backing resolver's. Immutable after
+    // construction, like the range above.
+    std::optional<ggml_layout_mode>  view_layout_;
     uint64_t arena_gen_ = 0;  // Mint-time arena generation (checked against owner every resolve)
     std::shared_ptr<arena_authority> arena_authority_; // retained incarnation authority
     std::shared_ptr<void>            arena_lease_;     // admitted lease; releases without cache access

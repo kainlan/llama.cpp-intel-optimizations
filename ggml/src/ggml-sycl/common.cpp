@@ -1226,6 +1226,10 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
     if (prev > 1) {
         return;
     }
+    // No backend context's staged-ring payload record names this extra any more (llama.cpp-o9uw): each holds the extra
+    // without a reference, and the contexts that run a model go before its weights.
+    GGML_ASSERT(extra->weight_ext == nullptr ||
+                extra->weight_ext->moe_stream_payload_records.load(std::memory_order_acquire) == 0);
 
     for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
         // llama.cpp-h9uv: events/xmx/moe live behind the lazily-allocated
