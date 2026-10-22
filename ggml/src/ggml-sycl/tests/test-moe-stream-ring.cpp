@@ -265,17 +265,34 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     mem_handle slot = ring.acquire_slot();
     CHECK(slot.valid(), "acquire_slot() hands the slot out while the gate is still pending");
     const sycl::event gate = ring.current_region_gate();
-    sycl::event       copy = mem_fill_async(slot, 0x5A, kSlot, q, { gate });
-    sycl::event       done = q.submit([&](sycl::handler & h) {
+
+    // The release is NOT sequenced behind the main thread. Everything between
+    // the fill and done.wait() below may touch `copy` (the retained-handle
+    // drain worker waits on it, mem-handle.cpp:298, and a host_task submit
+    // queries its device dependencies), and `copy` cannot finish before the
+    // blocker is released. A release placed after those calls on this thread
+    // would wait on itself; this thread releases on a timer instead.
+    std::atomic<bool> submitted{ false };
+    std::atomic<bool> ran_early{ false };
+    std::atomic<bool> submitted_before_release{ false };
+    std::thread       releaser([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ran_early.store(copy_done.load());
+        submitted_before_release.store(submitted.load());
+        release_blocker.store(true);
+    });
+
+    sycl::event copy = mem_fill_async(slot, 0x5A, kSlot, q, { gate });
+    sycl::event done = q.submit([&](sycl::handler & h) {
         h.depends_on(copy);
         h.host_task([&]() { copy_done.store(true); });
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    const bool ran_early = copy_done.load();
-    release_blocker.store(true);
+    submitted.store(true);
     done.wait();
-    CHECK(!ran_early, "a copy chained on the gate does not run while the gate is pending");
+    releaser.join();
+    CHECK(submitted_before_release.load(), "the chained copy was submitted before the blocker was released");
+    CHECK(!ran_early.load(), "a copy chained on the gate does not run while the gate is pending");
     CHECK(copy_done.load(), "the chained copy runs once the gate completes");
 
     blocker_queue.wait();
