@@ -23,10 +23,9 @@ namespace ggml_sycl {
 moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_max,
                                               size_t   matrix_bytes_max,
                                               size_t   resident_expert_bytes) {
-    moe_stream_ring_geometry geo;
-    geo.slot_bytes = matrix_bytes_max;
+    // Every no-ring path returns the default geometry: every field is 0.
     if (host_matrices_per_layer_max == 0 || matrix_bytes_max == 0) {
-        return geo;
+        return {};
     }
 
     // Two slots per matrix (AOS copy destination, SOA reorder destination), a
@@ -34,13 +33,15 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_m
     const uint64_t region_slots = 2ull * host_matrices_per_layer_max;
     const uint64_t n_slots      = 2ull * region_slots;
     if (n_slots > UINT32_MAX || n_slots > SIZE_MAX / matrix_bytes_max) {
-        return geo;
+        return {};
     }
     const size_t bytes = static_cast<size_t>(n_slots) * matrix_bytes_max;
     if (bytes > resident_expert_bytes / 10) {
-        return geo;
+        return {};
     }
 
+    moe_stream_ring_geometry geo;
+    geo.slot_bytes   = matrix_bytes_max;
     geo.region_slots = static_cast<uint32_t>(region_slots);
     geo.n_slots      = static_cast<uint32_t>(n_slots);
     geo.bytes        = bytes;
@@ -59,13 +60,15 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) 
                       device_, geo_.bytes / (1024.0 * 1024.0));
         return false;
     }
-    // Fewer than two slots cannot give each of the two regions one slot.
+    // Fewer than two slots cannot give each of the two regions one slot, and a
+    // region_slots other than n_slots / 2 is a geometry this ring cannot honour.
     const uint32_t region_slots = geo.n_slots / 2;
-    if (geo.n_slots < 2 || geo.slot_bytes == 0 || geo.bytes / geo.slot_bytes < geo.n_slots) {
+    if (geo.n_slots < 2 || geo.region_slots != region_slots || geo.slot_bytes == 0 ||
+        geo.bytes / geo.slot_bytes < geo.n_slots) {
         GGML_LOG_WARN(
-            "[MOE-STREAM-RING] reserve: geometry of %u slots x %zu bytes in %zu bytes cannot form two "
-            "regions on device %d\n",
-            geo.n_slots, geo.slot_bytes, geo.bytes, device);
+            "[MOE-STREAM-RING] reserve: geometry of %u slots (%u per region) x %zu bytes in %zu bytes cannot "
+            "form two regions on device %d\n",
+            geo.n_slots, geo.region_slots, geo.slot_bytes, geo.bytes, device);
         return false;
     }
     // Exactly the two regions' slots; an odd slot or spare bytes are not reserved.

@@ -36,8 +36,8 @@ namespace ggml_sycl {
 // max(src_size, dst_size) on the device). A region holds one layer:
 // region_slots = 2 * the heaviest layer's host matrices, so the one-layer floor
 // is per region. n_slots = 2 * region_slots and bytes = n_slots * slot_bytes.
-// n_slots, region_slots and bytes are 0 when the ring does not fit; the caller
-// then answers RING_UNAVAILABLE.
+// When the ring does not fit, every field is 0 (the default geometry); the
+// caller then answers RING_UNAVAILABLE.
 struct moe_stream_ring_geometry {
     size_t   slot_bytes   = 0;
     uint32_t n_slots      = 0;
@@ -83,7 +83,9 @@ class moe_stream_ring {
     // One WEIGHT-zone allocation on `device` of exactly 2 * (geo.n_slots / 2)
     // slots, split into two regions of geo.n_slots / 2 slots; geometry() is that
     // trimmed geometry. Returns false, with one WARN and no throw, when the
-    // geometry cannot form two regions or the zone cannot give the bytes.
+    // geometry cannot form two regions (fewer than two slots, region_slots other
+    // than n_slots / 2, or bytes short of n_slots * slot_bytes) or the zone
+    // cannot give the bytes.
     bool reserve(int device, const moe_stream_ring_geometry & geo);
 
     // The next slot of the current region as a slice of the ring's allocation,

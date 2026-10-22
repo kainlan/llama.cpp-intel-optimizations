@@ -6,7 +6,8 @@
 //    the first region's first slot again, gated on the first boundary's event,
 //    resolving on the device with the bytes the first fill wrote. Release and
 //    check the allocation's registry row and the raw device bytes are gone.
-// 2. Geometries that cannot form two regions are refused before allocating.
+// 2. Geometries that cannot form two regions (one slot, short bytes, a
+//    region_slots other than n_slots / 2) are refused before allocating.
 // 3. The region gate is a device dependency: a copy chained on it does not run
 //    while the event that ended the region's previous use is incomplete, and
 //    acquire_slot() hands the slot out regardless (it never consults an event).
@@ -173,6 +174,14 @@ static void test_refused_geometries(int device) {
               "reserve refuses bytes < n_slots x slot_bytes");
         CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
               "a refused short geometry leaves the ring unreserved");
+    }
+    {
+        moe_stream_ring          ring;
+        moe_stream_ring_geometry geo = make_geometry(kSlot, 8, 8 * kSlot);
+        geo.region_slots             = 3;
+        CHECK(!ring.reserve(device, geo), "reserve refuses region_slots != n_slots / 2");
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+              "a refused region_slots mismatch leaves the ring unreserved");
     }
 }
 

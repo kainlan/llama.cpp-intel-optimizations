@@ -53,18 +53,20 @@ int main() {
     // GPT-OSS 20B on the B50 at default context: 712 MB of host experts per
     // layer in triplets of 37.5 MB is 19 triplets, 57 matrices of 12.5 MB. A
     // region is 114 slots, the ring 228 slots = 2850 MB, over 10 % of ~12 GB
-    // (1.2 GB). No ring until the loan grows the budget: RING_UNAVAILABLE.
-    check_geometry("GPT-OSS/B50 does not fit", moe_stream_ring_size(57, 12500000, 12000000000ull), 12500000, 0, 0, 0);
+    // (1.2 GB). No ring until the loan grows the budget: RING_UNAVAILABLE, with
+    // every field 0.
+    check_geometry("GPT-OSS/B50 does not fit", moe_stream_ring_size(57, 12500000, 12000000000ull), 0, 0, 0, 0);
 
     // 10 matrices of 1000 bytes: regions of 20 slots, 40 slots, 40000 bytes.
     check_geometry("exactly at the 10 % cap", moe_stream_ring_size(10, 1000, 400000), 1000, 40, 40000, 20);
-    check_geometry("one slot over the cap", moe_stream_ring_size(10, 1000, 390000), 1000, 0, 0, 0);
-    check_geometry("one byte over the cap", moe_stream_ring_size(10, 1000, 399999), 1000, 0, 0, 0);
+    check_geometry("one slot over the cap", moe_stream_ring_size(10, 1000, 390000), 0, 0, 0, 0);
+    check_geometry("one byte over the cap", moe_stream_ring_size(10, 1000, 399999), 0, 0, 0, 0);
 
     // Degenerate inputs give no ring rather than a zero-sized or overflowed one.
-    check_geometry("no host matrices", moe_stream_ring_size(0, 1000, 400000), 1000, 0, 0, 0);
+    // Every no-ring answer is the default geometry: every field is 0.
+    check_geometry("no host matrices", moe_stream_ring_size(0, 1000, 400000), 0, 0, 0, 0);
     check_geometry("matrix_bytes_max 0", moe_stream_ring_size(10, 0, 400000), 0, 0, 0, 0);
-    check_geometry("slot count overflows uint32", moe_stream_ring_size(UINT32_MAX, 1, SIZE_MAX), 1, 0, 0, 0);
+    check_geometry("slot count overflows uint32", moe_stream_ring_size(UINT32_MAX, 1, SIZE_MAX), 0, 0, 0, 0);
 
     if (g_failures != 0) {
         std::printf("FAILED: %d case(s)\n", g_failures);
