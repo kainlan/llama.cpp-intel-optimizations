@@ -30,11 +30,13 @@ THE CONTRACT.  With comments blanked:
      16-slot site table, the overflow count and time, and the staged copies by
      direction; mem_copy_staged_wait_census_this_thread() returns one function-local
      thread_local census, and it and the formatter are declared in mem-ops.hpp.
-  G. (mem-ops.cpp) the event and deps wrappers and the copy note test
+  G. (mem-ops.cpp) the event and deps wrappers test
      ggml_sycl_cpu_expert_trace_enabled() before anything else (the deps wrapper
-     after its empty-list return) and, off, wait or return without reading a clock
-     or touching the census; mem-ops.cpp reads no GGML_SYCL_MOE_IDS_COPY_TRACE of its
-     own.
+     after its empty-list return) and, off, wait without reading a clock or touching
+     the census; the copy note does NOT test it (llama.cpp-36j0): the staged-copy
+     counts are what the H2D probe reads to refuse a staged rate, and every user runs
+     untraced, so they count unconditionally and no trace test encloses the
+     increment; mem-ops.cpp reads no GGML_SYCL_MOE_IDS_COPY_TRACE of its own.
   R. (mem-ops.cpp staged_wait_record) a wait adds to its kind's count and time and to
      its site's row, matched on line, kind and file text; a free slot is claimed for
      a new site; a full table counts into overflow.
@@ -229,8 +231,8 @@ def check_guard(s: dict) -> None:
                            "staged_wait_record(kind, file, line, staged_wait_us_since(t0));"):
         fail("G", "staged_wait_deps does not skip an empty list, then test the trace and wait without a clock off")
     body = flat_body(code, NOTE_SIG, "G")
-    if not body.startswith("if (!" + TRACE_GUARD + ") { return; }"):
-        fail("G", "staged_copy_note does not test the trace before it counts")
+    if TRACE_GUARD in body or "trace" in body.lower() or not body.startswith("mem_copy_staged_wait_census & c = "):
+        fail("G", "staged_copy_note is guarded by the trace: the staged counts must count untraced (llama.cpp-36j0)")
     if "GGML_SYCL_MOE_IDS_COPY_TRACE" in code:
         fail("G", "mem-ops.cpp reads GGML_SYCL_MOE_IDS_COPY_TRACE itself instead of the trace's one reader")
     # The census is written only by the guarded wrappers, by the record they call and by its own accessor.
@@ -420,9 +422,9 @@ def self_test(s: dict) -> int:
              r"\1\2const auto t_off = std::chrono::steady_clock::now();\n\2(void) t_off;\n\2\3")),
         ("G", "ops_cpp", "deps wrapper waits an empty list under the trace",
          sub(r"if \(deps\.empty\(\)\) \{\n\s*return;\n\s*\}\n", "")),
-        ("G", "ops_cpp", "copy note counts with the trace off",
-         sub(r"(static void staged_copy_note\(bool device_to_host\) \{\n)\s*if \(!ggml_sycl_cpu_expert_trace_enabled"
-             r"\(\)\) \{\n\s*return;\n\s*\}\n", r"\1")),
+        ("G", "ops_cpp", "copy note counts only under the trace",
+         sub(r"(static void staged_copy_note\(bool device_to_host\) \{\n)",
+             r"\1    if (!ggml_sycl_cpu_expert_trace_enabled()) {\n        return;\n    }\n")),
         ("G", "ops_cpp", "a second reader of the trace knob",
          sub(r"(static bool mem_copy_trace_enabled\(\) \{)",
              r'static bool staged_trace_local() { return std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE") != nullptr; }\n\n\1')),

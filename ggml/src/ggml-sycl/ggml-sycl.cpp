@@ -28696,8 +28696,9 @@ static void ggml_sycl_measure_peer_host_bounce(ggml_sycl_device_info & info) {
 // model load, when the host zones are configured. A device whose cache has no configured zones is left unresolved
 // and tried again at the next load. A staged copy reads a host wait, not the link (4.7 and 6.2 GB/s measured when
 // the source was an unzoned pool buffer), so that rate is never stored or kept: the seed stands, h2d_probed stays
-// false, and the device is retried at the next load. The staged-copy census counts only while
-// GGML_SYCL_MOE_IDS_COPY_TRACE=1, so that check sees a staged copy only then; the zone check above holds without it.
+// false, and the device is retried at the next load. The census's staged-copy counts do not depend on
+// GGML_SYCL_MOE_IDS_COPY_TRACE, and the census is per thread: this thread's before/after delta is exactly the copies
+// the probe submitted. The zone check above is a precondition, the census is the detection.
 //
 // Once per process and device for a final answer (probed, stored, or env-skipped): a device that holds a rate is left
 // alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever the tuning

@@ -895,11 +895,12 @@ static void staged_wait_deps(const std::vector<sycl::event> & deps,
     staged_wait_record(kind, file, line, staged_wait_us_since(t0));
 }
 
-// A copy that took a staged branch, by direction, under the trace.
+// A copy that took a staged branch, by direction. Unlike the waits above this counts with the trace off: a staged
+// copy is a fact callers act on (the H2D probe refuses to keep a rate measured through one, and every user runs
+// untraced), and the cost is one thread_local increment. The census is per thread, and a copy is noted on the thread
+// that submits it, so a caller that reads staged_h2d on its own thread before and after its own copies sees exactly
+// those copies in the difference. Only the wait timing and the site table, which read a clock, stay under the trace.
 static void staged_copy_note(bool device_to_host) {
-    if (!ggml_sycl_cpu_expert_trace_enabled()) {
-        return;
-    }
     mem_copy_staged_wait_census & c = mem_copy_staged_wait_census_this_thread();
     if (device_to_host) {
         c.staged_d2h += 1;
