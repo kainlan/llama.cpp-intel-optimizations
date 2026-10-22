@@ -420,6 +420,7 @@ def claim_the_rate_is_the_max_over_iterations_two_to_eight(src: str, cost: str) 
         "for (int i = 1; i < n; ++i)" in helper,
         "if (g > best) { best = g; }" in helper,
         "if (g < low) { low = g; }" in helper,
+        "bool any = false;" in helper and "any = true;" in helper,
         "return best;" in helper,
     ])
 
@@ -445,8 +446,8 @@ def claim_a_max_under_half_the_seed_is_retried_not_stored(src: str, cost: str) -
     return bool(fn) and all([
         "static constexpr double MOE_EXEC_H2D_MIN_SEED_FRACTION = 0.5;" in n,
         "if (!any || !(best >= seed * MOE_EXEC_H2D_MIN_SEED_FRACTION)) { return 0.0; }" in n,
-        "if (!(gbps > 0.0) || !std::isfinite(gbps)) {" in fn,
-        ordered(fn, HELPER_CALL, "if (!(gbps > 0.0) || !std::isfinite(gbps)) {", "H2D_PROBE_OUTCOME_RETRY_NO_RATE",
+        "if (gbps <= 0.0) {" in fn,
+        ordered(fn, HELPER_CALL, "if (gbps <= 0.0) {", "H2D_PROBE_OUTCOME_RETRY_NO_RATE",
                 "continue;", "rec.h2d_gbps = gbps;", "moe_exec_rates_store("),
     ])
 
@@ -824,6 +825,16 @@ def test_mutant_helper_keeps_the_min_fails():
         SYCL, _once(COST, "if (g > best) {", "if (g < best) {"))
 
 
+def test_mutant_helper_low_end_never_tracks_the_min_fails():
+    assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
+        SYCL, _once(COST, "if (g < low) {", "if (g > low) {"))
+
+
+def test_mutant_helper_never_sees_a_valid_iteration_fails():
+    assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
+        SYCL, _once(COST, "any = true;", "any = false;"))
+
+
 def test_mutant_spread_dropped_from_the_probed_line_fails():
     no_spread = MEASURED_REPORT.replace(", spread)", ")")
     assert not claim_the_spread_rides_in_the_probed_line_only(_once(SYCL, MEASURED_REPORT, no_spread))
@@ -852,7 +863,7 @@ def test_mutant_helper_ignores_the_floor_fails():
 
 def test_mutant_below_floor_rate_reaches_the_store_fails():
     assert not claim_a_max_under_half_the_seed_is_retried_not_stored(
-        _once(SYCL, "if (!(gbps > 0.0) || !std::isfinite(gbps)) {", "if (false) {"), COST)
+        _once(SYCL, "if (gbps <= 0.0) {", "if (false) {"), COST)
 
 
 if __name__ == "__main__":

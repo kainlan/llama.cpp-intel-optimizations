@@ -28693,7 +28693,7 @@ enum h2d_probe_outcome {
     H2D_PROBE_OUTCOME_RETRY_ZONES,    // the cache has no configured host zones yet
     H2D_PROBE_OUTCOME_RETRY_ALLOC,    // the host source or the device buffer was refused
     H2D_PROBE_OUTCOME_RETRY_STAGED,   // the copy took the staged branch, so it timed a host wait
-    H2D_PROBE_OUTCOME_RETRY_NO_RATE,  // the clock gave no positive finite rate
+    H2D_PROBE_OUTCOME_RETRY_NO_RATE,  // no usable rate: none timed, or the best of 2..8 is under half the seed
     H2D_PROBE_OUTCOME_RETRY_FAILED,   // an exception other than the fallback error
 };
 
@@ -28853,14 +28853,16 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             double       hi = 0.0;
             const double gbps =
                 ggml_sycl::moe_exec_h2d_rate_from_iterations(iter_gbps, k_iters, seed.h2d_gbps, &lo, &hi);
-            if (!(gbps > 0.0) || !std::isfinite(gbps)) {
-                // No iteration timed, or the best of 2..8 is under half the seed (moe-exec-cost.hpp: a link that is
-                // not delivering the slow end of what the 7fmt table measured). The seed stands and the next load
-                // probes again, rather than the cache freezing that reading as the device's rate.
+            if (gbps <= 0.0) {
+                // No iteration timed, or the best of 2..8 is under half the seed (moe-exec-cost.hpp: 10 GB/s against
+                // the 20 GB/s seed, above the 9.x GB/s readings it refuses). The seed stands and the next load probes
+                // again, rather than the cache freezing that reading as the device's rate.
                 char why[96];
-                std::snprintf(
-                    why, sizeof(why),
-                    hi > 0.0 ? "seed, probe max %.1f GB/s is under half the seed" : "seed, probe measured no rate", hi);
+                if (hi > 0.0) {
+                    std::snprintf(why, sizeof(why), "seed, probe max %.1f GB/s is under half the seed", hi);
+                } else {
+                    std::snprintf(why, sizeof(why), "seed, probe measured no rate");
+                }
                 report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_NO_RATE, why);
                 continue;
             }

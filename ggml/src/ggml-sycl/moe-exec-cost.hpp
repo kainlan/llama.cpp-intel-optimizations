@@ -207,9 +207,10 @@ static inline moe_exec_rates moe_exec_rates_seed(const std::vector<std::pair<ggm
 // the device's sustained copy capacity, which one slow window does not change, so the rate is the max of iterations
 // 2..n (iteration 1 is a second warm-up) and the spread is returned for the log.
 //
-// A max still under this fraction of the seed is not a rate: the seed is the 7fmt table's measured rate on this
-// hardware, so half of it is a link that is not delivering even the slow end of what it measured, and persisting that
-// would bias every ring-vs-cpu decision for the life of the cache entry. The probe retries at the next load instead.
+// A max still under this fraction of the seed is not a rate. The seed is 20 GB/s, set under the 26.5-27.1 GB/s that
+// llama.cpp-8bgi c-nn1q measured, so half of it (10 GB/s) sits well below a healthy link and just above the 9.x GB/s
+// bad readings this threshold exists to refuse. Persisting one would bias every ring-vs-cpu decision for the life of
+// the cache entry, so the probe retries at the next load instead.
 static constexpr double MOE_EXEC_H2D_MIN_SEED_FRACTION = 0.5;
 
 // gbps[0..n) are the per-iteration rates in GB/s, in order. Returns the rate, or 0 when there is none: fewer than two
