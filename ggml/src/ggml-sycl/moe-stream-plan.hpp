@@ -53,6 +53,11 @@ enum class moe_stream_staging : uint8_t {
 using moe_stream_prompt_kernel_fn =
     bool (*)(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1);
 
+// True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight. The staged ring route
+// refuses a claimed weight (c-las5), so the ring stages none of it: the backend answers with the claim the route
+// refuses on, so staging and serving give one answer (llama.cpp-o9uw).
+using moe_stream_library_claims_fn = bool (*)(void * graph_ctx, int layer, expert_tensor_role role);
+
 struct moe_stream_item {
     int                layer;
     int                expert_id;
@@ -302,11 +307,13 @@ static inline bool moe_stream_rate_measured(double rate) {
 // `device` selects only the resident bytes that bound the ring's size. The items take type and shape from the entry,
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE), and their staging from
 // moe_stream_item_staging over the device's prompt kernels. The predicate is asked once per distinct (type, shape,
-// bytes) a build meets, not once per entry (c-7soh): a model has few.
-static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan &      plan,
-                                                                int                         device,
-                                                                moe_stream_prompt_kernel_fn prompt_kernel,
-                                                                void *                      graph_ctx) {
+// bytes) a build meets, not once per entry (c-7soh): a model has few. A matrix whose weight the library executor
+// claims stages NONE; that is asked once per (layer, role).
+static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan &       plan,
+                                                                int                          device,
+                                                                moe_stream_prompt_kernel_fn  prompt_kernel,
+                                                                void *                       graph_ctx,
+                                                                moe_stream_library_claims_fn library_claims) {
     moe_stream_plan_index                idx;
     // Streamable AOS bytes per (layer, expert), keyed with role UNKNOWN; an expert's key exists once it has any host entry.
     std::unordered_map<uint64_t, size_t> expert_bytes;
@@ -318,7 +325,8 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         moe_stream_staging staging;
     };
 
-    std::vector<staging_answer> answers;
+    std::vector<staging_answer>        answers;
+    std::unordered_map<uint64_t, bool> claims;  // (layer, role) keyed with expert 0 -> the library executor claims it
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.layer_id < 0) {
             continue;
@@ -364,6 +372,17 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         if (!answered) {
             item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);
             answers.push_back({ item.type, item.ncols, item.nrows, item.src_bytes, item.staging });
+        }
+        // The staged route refuses a weight the library executor claims, so the ring would copy it for nothing.
+        if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {
+            const uint64_t ck = moe_stream_table_key(item.layer, 0, item.role);
+            auto           c  = claims.find(ck);
+            if (c == claims.end()) {
+                c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;
+            }
+            if (c->second) {
+                item.staging = moe_stream_staging::NONE;
+            }
         }
         li.items.push_back(item);
         // The ring is sized over the matrices it can stage. Another one is still listed, so a stage counts it untyped,
@@ -553,7 +572,9 @@ struct moe_stream_op {
     mem_handle (*host_lease)(void * graph_ctx, int layer, int expert_id, expert_tensor_role role, size_t * bytes) =
         nullptr;
     // Unset, nothing is staged (moe_stream_item_staging).
-    moe_stream_prompt_kernel_fn prompt_kernel = nullptr;
+    moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
+    // Unset, the library executor claims no weight (moe_stream_plan_index_build).
+    moe_stream_library_claims_fn library_claims = nullptr;
 };
 
 // The prompt phase of one device context (ggml_backend_sycl_context::moe_stream): the VRAM ring, the stage table and
@@ -609,6 +630,10 @@ class moe_stream_phase {
     size_t staged_routes_served() const { return staged_served_; }
 
     size_t staged_routes_refused() const { return staged_refused_; }
+
+    // The times the ring was given back (teardown). The backend nulls the slot pointers its pointer tables copied out
+    // of the stage table when this moves (llama.cpp-o9uw).
+    uint64_t ring_releases() const { return ring_releases_; }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     // Puts `entry` in the stage table under (layer, expert_id, role), as stage() does, for a device test of the route.
     void test_insert_staged(int layer, int expert_id, expert_tensor_role role, moe_stream_staged entry);
@@ -626,7 +651,7 @@ class moe_stream_phase {
         int    staged    = 0;  // experts with every selected matrix staged
         int    wanted    = 0;  // experts selected
         int    unowned   = 0;  // matrices skipped: no lease, or a lease the ring cannot copy directly
-        int    untyped   = 0;  // matrices skipped: staged NONE (no kernel reads it), or a shape that does not fit
+        int    untyped   = 0;  // matrices skipped: staged NONE (no reader, or claimed), or a shape that does not fit
         int    exhausted = 0;  // matrices skipped: no ring slot
         size_t bytes     = 0;  // AOS bytes copied
         bool   ring_unavailable = false;  // the ring could not be reserved
@@ -689,6 +714,7 @@ class moe_stream_phase {
     const moe_exec_decision_log *                   log_                = nullptr;  // the last op's, for end_prompt
     size_t                                          staged_served_      = 0;
     size_t                                          staged_refused_     = 0;
+    uint64_t                                        ring_releases_      = 0;
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

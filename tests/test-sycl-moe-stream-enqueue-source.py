@@ -36,6 +36,10 @@ What this gate pins:
     (no reorder), the AOS slot and the host lease are retained until the copy, and its stage-table entry holds the AOS
     slot with layout AOS; how a matrix stages comes from the device's prompt kernels, which the backend answers from
     ggml_sycl_moe_query_route_capability (one fact, one source), asked once per micro-batch in the index build;
+  - a matrix whose weight the oneDNN batched prompt executor claims stages NONE: the backend answers the index build's
+    library-claims predicate with ggml_sycl_moe_pp_onednn_batched_claims_tensor, the check the staged route refuses a
+    weight on (c-las5), so the ring copies nothing the route would refuse and sizes no slot for it (one fact, one
+    source; llama.cpp-o9uw);
   - a region closes on an event after its last copy and its last reorder: AOS-only items go first, so the region's
     last submission is a reorder when it holds a SOA item and the last copy otherwise;
   - when a region's last use or its new one holds an AOS-only item, the new copies also wait for the region's read
@@ -58,7 +62,9 @@ What this gate pins:
   - begin_layer and resolve decide through the header's pure predicates (a micro-batch's start, resolving the next
     layer ahead, staging now), which test-moe-stream-phase pins, and never restate them;
   - the stage trace line carries the plan's fixed fields under its own "[MOE-EXEC-TRACE] stage layer" prefix (plan
-    amendment for Task 15, lead ruling c-xod7-q1).
+    amendment for Task 15, lead ruling c-xod7-q1), byte-identical to master's; the staged matrices' split by layout,
+    soa= and aos_only=, is a separate "[MOE-EXEC-TRACE] stage layouts layer" line under the same trace guard (lead
+    ruling c-o9uw-1, c-9wgo).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -725,7 +731,7 @@ PROMPT_KERNEL_QUERY = ("ggml_sycl_moe_query_route_capability(type, layout, moe_r
                        "call->device);")
 PROMPT_KERNEL_FILL = "call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;"
 STAGING_SIG = "static inline moe_stream_staging moe_stream_item_staging("
-INDEX_CALL = "index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx);"
+INDEX_CALL = "index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims);"
 PREPARE_SIG = "void moe_stream_phase::prepare("
 
 
@@ -774,11 +780,88 @@ def test_staging_source_mutants():
                      "prompt_kernel(graph_ctx, item.type, GGML_LAYOUT_AOS,"), PHASE)
     # The index built blind.
     assert not claim_staging_from_the_capability_query(
-        SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, "index_ = moe_stream_plan_index_build(plan, device, nullptr, nullptr);"))
+        SYCL, PLAN_HPP,
+        mutate(PHASE, INDEX_CALL, "index_ = moe_stream_plan_index_build(plan, device, nullptr, nullptr, op.library_claims);"))
     # The predicate asked again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, " \
                                   "item.nrows);"
     assert not claim_staging_from_the_capability_query(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
+
+
+LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "
+                      "ggml_sycl::expert_tensor_role role)")
+LIBRARY_CLAIMS_WEIGHT = "const ggml_tensor * w = ggml_sycl_moe_stream_layer_weight(layer, role);"
+LIBRARY_CLAIMS_QUERY = "ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, call->device);"
+LIBRARY_CLAIMS_FILL = "call.op.library_claims = ggml_sycl_moe_stream_library_claims;"
+ROUTE_LIBRARY_CLAIM = ("const bool stream_library_claimed = moe_stream != nullptr && "
+                       "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);")
+LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
+                    "ggml_sycl::expert_tensor_role role)")
+INDEX_STAGING_ASK = "item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);"
+INDEX_CLAIM_GUARD = "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"
+INDEX_CLAIM_ASK = "c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;"
+INDEX_CLAIM_APPLY = "if (c->second) { item.staging = moe_stream_staging::NONE; }"
+INDEX_SLOT_SKIP = "if (item.staging == moe_stream_staging::NONE) { continue; }"
+
+
+def claim_staging_declines_library_claimed(sycl: str, hpp: str, phase: str) -> bool:
+    """One fact, one source (llama.cpp-o9uw): the staged route refuses a weight the oneDNN batched prompt executor
+    claims (c-las5), so the index build stages none of it. The backend answers the build's library-claims predicate
+    with that same claim, for the call's device and the graph's own weight tensor of (layer, role); the build asks it
+    after the kernels' answer and before the slot accounting, so a claimed matrix stays listed (a stage counts it
+    untyped) and takes no slot; and the phase asks it only through the index build."""
+    n = norm(sycl)
+    at = n.find(LIBRARY_CLAIMS_SIG + " {")
+    lc = body(n[at:], LIBRARY_CLAIMS_SIG) if at >= 0 else ""
+    build = body(norm(hpp), INDEX_BUILD_SIG)
+    p = norm(phase)
+    return (n.count(LIBRARY_CLAIMS_SIG + " {") == 1 and LIBRARY_CLAIMS_WEIGHT in lc and LIBRARY_CLAIMS_QUERY in lc
+            and "MXFP4" not in lc and "moe_classify_tensor" not in lc
+            and "g_moe_gate_up_pairs.find(layer)" in body(n, LAYER_WEIGHT_SIG)
+            and n.count(LIBRARY_CLAIMS_FILL) == 1 and n.count(ROUTE_LIBRARY_CLAIM) == 1
+            and "moe_stream_library_claims_fn library_claims)" in norm(hpp)
+            and ordered(build, INDEX_STAGING_ASK, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY,
+                        "li.items.push_back(item);", INDEX_SLOT_SKIP, "++li.n_streamable;", REGION_SIZE)
+            and norm(hpp).count("library_claims(graph_ctx") == 1
+            and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
+
+
+def test_staging_declines_library_claimed():
+    assert claim_staging_declines_library_claimed(SYCL, PLAN_HPP, PHASE)
+
+
+def test_library_claim_mutants():
+    # The backend answers from something other than the claim the route refuses on.
+    assert not claim_staging_declines_library_claimed(
+        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_woq_enabled();"), PLAN_HPP, PHASE)
+    # Asked for another device than the call's.
+    assert not claim_staging_declines_library_claimed(
+        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, 0);"), PLAN_HPP, PHASE)
+    # A second table of its own beside the claim. The host lease takes its weight with the same line, so the mutant is
+    # made inside the definition.
+    n = norm(SYCL)
+    at = n.find(LIBRARY_CLAIMS_SIG + " {")
+    assert at >= 0 and LIBRARY_CLAIMS_WEIGHT in n[at:], "mutant precondition: the claims definition takes its weight"
+    second = n[:at] + n[at:].replace(
+        LIBRARY_CLAIMS_WEIGHT, LIBRARY_CLAIMS_WEIGHT + " if (w && w->type != GGML_TYPE_MXFP4) { return false; }", 1)
+    assert not claim_staging_declines_library_claimed(second, PLAN_HPP, PHASE)
+    # The backend leaves the predicate unset: a claimed weight would be staged and then always refused.
+    assert not claim_staging_declines_library_claimed(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
+    # The route refuses on something else, so the two would answer differently.
+    assert not claim_staging_declines_library_claimed(
+        mutate(SYCL, ROUTE_LIBRARY_CLAIM, "const bool stream_library_claimed = false;"), PLAN_HPP, PHASE)
+    # The build asks and ignores the answer.
+    assert not claim_staging_declines_library_claimed(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
+    # A claimed matrix still takes a slot: the claim applied after the slot accounting.
+    late = mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "")
+    late = mutate(late, "++li.n_streamable;", "++li.n_streamable; " + INDEX_CLAIM_APPLY)
+    assert not claim_staging_declines_library_claimed(SYCL, late, PHASE)
+    # The phase builds its index without the claims.
+    assert not claim_staging_declines_library_claimed(
+        SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, INDEX_CALL.replace("op.library_claims", "nullptr")))
+    # The phase asks again at every stage.
+    asked_again = AOS_ONLY_FLAG + " (void) op.library_claims(op.graph_ctx, item.layer, item.role);"
+    assert not claim_staging_declines_library_claimed(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
 
 
 # ---- the policy gate --------------------------------------------------------------------------------------------------
@@ -1118,7 +1201,8 @@ def test_teardown_mutants():
 MEMBER = "std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;"
 DTOR_SIG = "ggml_backend_sycl_context::~ggml_backend_sycl_context()"
 END_PROMPT = ("sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed); "
-              "if (cached_is_decode && sycl_ctx->moe_stream) { sycl_ctx->moe_stream->end_prompt(); }")
+              "if (cached_is_decode && sycl_ctx->moe_stream) { sycl_ctx->moe_stream->end_prompt(); "
+              "ggml_sycl_moe_stream_release_payload(*sycl_ctx); }")
 DISPATCH = ("ggml_sycl_mul_mat_id(ctx, dst); ggml_sycl_moe_down_shadow_compare(ctx, dst); "
             "ggml_sycl_moe_stream_layer_done(ctx, dst); break;")
 LAYER_DONE_SIG = "static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst)"
@@ -1212,17 +1296,27 @@ def test_trace_mutants():
     assert not claim_trace_line(old, {PHASE_REL: old})
 
 
-TRACE_SPLIT_FMT = TRACE_FMT + " unowned=%d untyped=%d exhausted=%d soa=%d aos_only=%d"
-TRACE_SPLIT_ARGS = "n.unowned, n.untyped, n.exhausted, n.soa, n.aos_only);"
+STAGE_LINE_FMT = '"' + TRACE_FMT + ' unowned=%d untyped=%d exhausted=%d"'
+STAGE_LINE_ARGS = ("st.decision.t_ring_us, st.window_us, n.staged, n.wanted, n.bytes, n.unowned, n.untyped, "
+                   "n.exhausted);")
+TRACE_GUARD = "if (op.log->trace >= 1 && op.log->trace_sink != nullptr)"
+TRACE_SPLIT_FMT = '"[MOE-EXEC-TRACE] stage layouts layer %d ubatch %u: soa=%d aos_only=%d"'
+TRACE_SPLIT_ARGS = "layer, ubatch_seq_, n.soa, n.aos_only);"
+TRACE_SPLIT_EMIT = "op.log->trace_sink(op.log->sink_ctx, split);"
 STAGE_COUNTS_SPLIT = "int soa = 0; int aos_only = 0;"
 
 
 def claim_stage_trace_splits_layouts(phase: str, hpp: str) -> bool:
-    """The stage trace splits the staged matrices by the layout their slot holds, soa= and aos_only= (the lead's
-    addition to ruling c-o9uw-1), so a census can tell which path a layer took. Each staged matrix is counted once, in
-    the branch that writes its stage-table entry with that layout."""
+    """The staged matrices split by the layout their slot holds, soa= and aos_only=, so a census can tell which path a
+    layer took (the lead's addition to ruling c-o9uw-1). The split is a line of its own, after the stage line and
+    under the same trace guard, so the stage line stays byte-identical to master's: its literal ends at exhausted=%d
+    (lead ruling c-9wgo). Each staged matrix is counted once, in the branch that writes its stage-table entry with that
+    layout."""
     n = norm(phase)
-    return (n.count(TRACE_SPLIT_FMT) == 1 and ordered(n, TRACE_SPLIT_FMT, TRACE_SPLIT_ARGS, TRACE_EMIT)
+    guarded = body(n, TRACE_GUARD)
+    return (n.count(STAGE_LINE_FMT) == 1 and n.count(TRACE_SPLIT_FMT) == 1 and n.count("soa=%d") == 1
+            and ordered(guarded, STAGE_LINE_FMT, STAGE_LINE_ARGS, TRACE_EMIT, TRACE_SPLIT_FMT, TRACE_SPLIT_ARGS,
+                        TRACE_SPLIT_EMIT)
             and AOS_ONLY_RECORD in body(n, STAGE_SIG) and n.count("++n.soa;") == 1 and n.count("++n.aos_only;") == 1
             and STAGE_COUNTS_SPLIT in norm(hpp))
 
@@ -1232,11 +1326,20 @@ def test_stage_trace_splits_layouts():
 
 
 def test_stage_trace_split_mutants():
+    # The split appended to the stage line, which changes its bytes.
+    assert not claim_stage_trace_splits_layouts(
+        mutate(PHASE, STAGE_LINE_FMT, STAGE_LINE_FMT[:-1] + ' soa=%d aos_only=%d"'), PLAN_HPP)
     # The two counts printed under each other's names.
     assert not claim_stage_trace_splits_layouts(
-        mutate(PHASE, TRACE_SPLIT_ARGS, "n.unowned, n.untyped, n.exhausted, n.aos_only, n.soa);"), PLAN_HPP)
-    # No split in the line.
-    assert not claim_stage_trace_splits_layouts(mutate(PHASE, " soa=%d aos_only=%d", ""), PLAN_HPP)
+        mutate(PHASE, TRACE_SPLIT_ARGS, "layer, ubatch_seq_, n.aos_only, n.soa);"), PLAN_HPP)
+    # The split line formatted but never emitted.
+    assert not claim_stage_trace_splits_layouts(mutate(PHASE, TRACE_SPLIT_EMIT, "(void) split;"), PLAN_HPP)
+    # The split line under another prefix.
+    assert not claim_stage_trace_splits_layouts(
+        mutate(PHASE, "[MOE-EXEC-TRACE] stage layouts layer", "[MOE-EXEC] stage layouts layer"), PLAN_HPP)
+    # The split emitted outside the trace guard.
+    outside = mutate(PHASE, TRACE_SPLIT_EMIT + " }", "} " + TRACE_SPLIT_EMIT)
+    assert not claim_stage_trace_splits_layouts(outside, PLAN_HPP)
     # A staged matrix left uncounted, or counted under the other layout.
     assert not claim_stage_trace_splits_layouts(mutate(PHASE, "++n.soa;", ""), PLAN_HPP)
     assert not claim_stage_trace_splits_layouts(mutate(PHASE, "++n.aos_only;", "++n.soa;"), PLAN_HPP)

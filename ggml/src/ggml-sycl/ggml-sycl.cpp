@@ -29474,6 +29474,18 @@ static bool ggml_sycl_moe_stream_layer_present(void *, int layer) {
     return g_moe_gate_up_pairs.find(layer) != g_moe_gate_up_pairs.end();
 }
 
+// `layer`'s `role` weight tensor in the graph being computed, or null.
+static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, ggml_sycl::expert_tensor_role role) {
+    const auto it = g_moe_gate_up_pairs.find(layer);
+    if (it == g_moe_gate_up_pairs.end()) {
+        return nullptr;
+    }
+    return role == ggml_sycl::expert_tensor_role::GATE ? it->second.gate_weight :
+           role == ggml_sycl::expert_tensor_role::UP   ? it->second.up_weight :
+           role == ggml_sycl::expert_tensor_role::DOWN ? it->second.down_weight :
+                                                         nullptr;
+}
+
 // The host AOS lease of one expert matrix of `layer`, keyed from that layer's weight tensor as the hybrid path's host
 // route keys its experts (ggml_sycl_resolve_moe_meta_source). A device-resident answer is not a host lease.
 static ggml_sycl::mem_handle ggml_sycl_moe_stream_host_lease(void *                        graph_ctx,
@@ -29482,14 +29494,10 @@ static ggml_sycl::mem_handle ggml_sycl_moe_stream_host_lease(void *             
                                                              ggml_sycl::expert_tensor_role role,
                                                              size_t *                      bytes) {
     const auto * call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx);
-    const auto   it   = g_moe_gate_up_pairs.find(layer);
-    if (call == nullptr || call->cache == nullptr || it == g_moe_gate_up_pairs.end()) {
+    if (call == nullptr || call->cache == nullptr) {
         return {};
     }
-    const ggml_tensor * w = role == ggml_sycl::expert_tensor_role::GATE ? it->second.gate_weight :
-                            role == ggml_sycl::expert_tensor_role::UP   ? it->second.up_weight :
-                            role == ggml_sycl::expert_tensor_role::DOWN ? it->second.down_weight :
-                                                                          nullptr;
+    const ggml_tensor * w = ggml_sycl_moe_stream_layer_weight(layer, role);
     if (w == nullptr || w->extra == nullptr) {
         return {};
     }
@@ -29523,6 +29531,8 @@ static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
                                                ggml_layout_mode layout,
                                                int64_t          ne0,
                                                int64_t          ne1);
+// Defined after ggml_sycl_moe_pp_onednn_batched_claims_tensor's declaration, which answers it.
+static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role);
 
 // The layer the stream phase keys `src0` under: its name's layer id when the decision log can hold it, else -1. The
 // phase's begin_layer (through ggml_sycl_moe_stream_prepare) and the staged ring route's find() both take it from here.
@@ -29562,7 +29572,8 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.graph_ctx     = &call;
     call.op.layer_present = ggml_sycl_moe_stream_layer_present;
     call.op.host_lease    = ggml_sycl_moe_stream_host_lease;
-    call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;
+    call.op.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
+    call.op.library_claims = ggml_sycl_moe_stream_library_claims;
     return true;
 }
 
@@ -29592,6 +29603,41 @@ static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, con
         GGML_ABORT("[MOE-EXEC] stream layer barrier failed: %s", e.what());
     }
     ctx.moe_stream->layer_done(layer, down_done);
+}
+
+// A pointer-table upload copies a staged ring slot's raw pointer into its weight's persistent payload
+// (ggml_sycl_upload_moe_transient_ptr_table). Once the ring that held it is given back the pointer has no owner, so it
+// is nulled here, as an expert storage release nulls its own slot (ggml_tensor_extra_gpu): the payload slot goes to
+// null and the device table is marked invalid, so no kernel reads it (moe_ptrs_ptr answers null) until the next upload
+// revalidates the table and rewrites all of it. A slot a later upload gave a resident expert holds that expert's handle
+// and is left alone. Called where the ring can go: after end_prompt, after begin_layer (a new geometry re-reserves
+// it), and once the phase is gone. Nothing is submitted.
+static void ggml_sycl_moe_stream_release_payload(ggml_backend_sycl_context & ctx) {
+    const uint64_t releases = ctx.moe_stream ? ctx.moe_stream->ring_releases() : UINT64_MAX;
+    if (releases == ctx.moe_stream_payload_releases) {
+        return;  // the ring the recorded pointers point into is still held
+    }
+    ctx.moe_stream_payload_releases = releases;
+    const int device                = ctx.device;
+    for (auto & kv : ctx.moe_stream_payload) {
+        ggml_tensor_extra_gpu *                    extra     = kv.first;
+        const std::vector<void *> &                ring_ptrs = kv.second;
+        std::vector<void *> &                      payload   = extra->weight().moe_expert_ptr_payload[device];
+        const std::vector<ggml_sycl::mem_handle> & handles   = extra->weight().moe_expert_handles[device];
+        bool                                       nulled    = false;
+        for (size_t slot = 0; slot < ring_ptrs.size() && slot < payload.size(); ++slot) {
+            if (ring_ptrs[slot] != nullptr && payload[slot] == ring_ptrs[slot] &&
+                (slot >= handles.size() || !handles[slot].valid())) {
+                payload[slot] = nullptr;
+                nulled        = true;
+            }
+        }
+        if (nulled) {
+            extra->weight().moe_device_table_valid[device] = false;
+            ggml_sycl_invalidate_moe_full_local_probe(extra, device);
+        }
+    }
+    ctx.moe_stream_payload.clear();
 }
 
 static inline int get_sycl_env(const char * env_name, int default_val) {
@@ -32575,6 +32621,15 @@ static ggml_sycl::moe_expert_route ggml_sycl_resolve_moe_expert_route_for_dispat
 // Defined with the prompt executors below. The staged ring route refuses a weight it claims (c-las5).
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device);
 
+// The stream ring's library-claim predicate: whether the oneDNN batched prompt executor claims `layer`'s `role` weight
+// on the call's device. The staged ring route refuses such a weight with this same claim, so the ring does not stage
+// it: staging and serving give one answer (one fact, one source).
+static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role) {
+    const auto *        call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx);
+    const ggml_tensor * w    = ggml_sycl_moe_stream_layer_weight(layer, role);
+    return call != nullptr && w != nullptr && ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, call->device);
+}
+
 namespace ggml_sycl {
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
@@ -32874,6 +32929,7 @@ bool test_moe_stream_end_prompt(ggml_backend_t backend) {
         return false;
     }
     ctx->moe_stream->end_prompt();
+    ggml_sycl_moe_stream_release_payload(*ctx);
     return true;
 }
 
@@ -49545,6 +49601,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     }
     // The queues are drained, so the stream ring's last use is complete before its bytes are handed back.
     moe_stream.reset();
+    ggml_sycl_moe_stream_release_payload(*this);
     pp_moe_onednn_drain_scratch_slots(device);
     ggml_sycl_execution_abort_and_release_graph(this);
     // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
@@ -62118,13 +62175,19 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
         // the micro-batch, and a held slice keeps the ring's whole reservation. Its handle entry is cleared, so no
         // later upload takes it for the same entry and the full-local probe refuses the table. The ring's anchor keeps
         // the bytes until the prompt's last use (moe_stream_phase::teardown), and the region gates keep a later copy
-        // off the slot until its readers are done.
+        // off the slot until its readers are done. The pointer is recorded, and nulled once the ring is given back
+        // (ggml_sycl_moe_stream_release_payload), so it does not outlive the reservation.
         const bool staged = staged_experts != nullptr &&
                             std::find(staged_experts->begin(), staged_experts->end(), eid) != staged_experts->end();
         if (staged) {
             expert_handles[slot] = ggml_sycl::mem_handle{};
             ptr_payload[slot]    = resolved.ptr;
             any_updated          = true;
+            std::vector<void *> & ring_ptrs = ctx.moe_stream_payload[extra];
+            if (ring_ptrs.size() != static_cast<size_t>(n_experts)) {
+                ring_ptrs.assign(static_cast<size_t>(n_experts), nullptr);
+            }
+            ring_ptrs[slot] = resolved.ptr;
         } else if (!same_entry) {
             expert_handles[slot] = handle;
             // llama.cpp-fzem: tag the persistent extra->weight().moe_expert_handles[]
@@ -79221,6 +79284,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ctx.moe_stream->begin_layer(stream_call.layer, *stream_call.plan, ctx.device, *stream_call.cache,
                                             *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
                                             stream_call.op);
+                ggml_sycl_moe_stream_release_payload(ctx);
             }
         }
         // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1): sweep_a/
@@ -114567,6 +114631,7 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed);
     if (cached_is_decode && sycl_ctx->moe_stream) {
         sycl_ctx->moe_stream->end_prompt();  // the prompt's ring and stage table go at its first decode graph
+        ggml_sycl_moe_stream_release_payload(*sycl_ctx);
     }
     if (cached_is_decode) {
         // Once per device, at the entry of its first one-token graph: the WEIGHT room G0 prints beside

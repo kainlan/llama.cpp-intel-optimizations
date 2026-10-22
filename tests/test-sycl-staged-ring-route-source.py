@@ -33,7 +33,13 @@ What this gate pins:
   - the triad builds and the retained prompt build pass the invocation's context and queue, so the route can answer;
   - the validator requires a STAGED_RING recipe to be PRIMARY_DEVICE on the submit device and queue, with a ready event;
   - the phase reports its served/refused counts once per prompt through the decision log's trace sink, from
-    end_prompt, before end_prompt's early return.
+    end_prompt, before end_prompt's early return;
+  - a staged slot's raw pointer does not outlive the ring that holds it (lead item 6, c-ned2): the upload records the
+    pointer it writes into a weight's persistent payload, the phase counts every ring release in teardown, and once
+    the count moves the backend nulls each recorded payload slot that still holds that pointer and no live handle,
+    marks the device table invalid and resets the full-local probe, so moe_ptrs_ptr answers null until the next upload
+    rewrites the table. It runs after end_prompt at the first decode graph and in the test hook, after begin_layer
+    (a new geometry re-reserves the ring), and once the phase is gone in the context destructor.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -88,6 +94,8 @@ MEM_HPP_REL = "ggml/src/ggml-sycl/mem-handle.hpp"
 MEM_CPP_REL = "ggml/src/ggml-sycl/mem-handle.cpp"
 RING_HPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.hpp"
 RING_CPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.cpp"
+PLAN_HPP_REL = "ggml/src/ggml-sycl/moe-stream-plan.hpp"
+COMMON_REL = "ggml/src/ggml-sycl/common.hpp"
 
 SYCL = read(SYCL_REL)
 BATCH_HPP = read(BATCH_HPP_REL)
@@ -96,6 +104,8 @@ MEM_HPP = read(MEM_HPP_REL)
 MEM_CPP = read(MEM_CPP_REL)
 RING_HPP = read(RING_HPP_REL)
 RING_CPP = read(RING_CPP_REL)
+PLAN_HPP = read(PLAN_HPP_REL)
+COMMON = read(COMMON_REL)
 # Every C/C++ source of the SYCL backend outside its tests/, by path from the repository root.
 SYCL_TREE = {
     p.relative_to(ROOT).as_posix(): p.read_text(errors="replace")
@@ -250,8 +260,11 @@ PERSISTENT = ("moe_expert_handles[", "remember_moe_storage_handle(", "retain_han
 
 UPLOAD_STAGED = ("const bool staged = staged_experts != nullptr && std::find(staged_experts->begin(), "
                  "staged_experts->end(), eid) != staged_experts->end();")
+UPLOAD_RECORD = ("std::vector<void *> & ring_ptrs = ctx.moe_stream_payload[extra]; if (ring_ptrs.size() != "
+                 "static_cast<size_t>(n_experts)) { ring_ptrs.assign(static_cast<size_t>(n_experts), nullptr); } "
+                 "ring_ptrs[slot] = resolved.ptr;")
 UPLOAD_CLEAR = ("if (staged) { expert_handles[slot] = ggml_sycl::mem_handle{}; ptr_payload[slot] = resolved.ptr; "
-                "any_updated = true; } else if (!same_entry) {")
+                "any_updated = true; " + UPLOAD_RECORD + " } else if (!same_entry) {")
 UPLOAD_LEASE = "if (!staged) { leases.push_back(std::move(handle)); }"
 FROM_BATCH_STAGED = "const std::vector<int32_t> staged_experts = ggml_sycl::moe_batch_staged_ring_experts(batch);"
 FROM_BATCH_PASS = "table_event_out, table_event_set, staged_experts.empty() ? nullptr : &staged_experts);"
@@ -502,6 +515,90 @@ def test_no_persistent_handle_mutants():
     assert not claim_no_persistent_handle(
         mutate(SYCL, "&route_ptrs_event_set, route_staged_experts.empty() ? nullptr : &route_staged_experts);",
                "&route_ptrs_event_set);"))
+
+
+# ---- a staged slot's pointer goes with its ring -----------------------------------------------------------------------
+
+RELEASE_SIG = "static void ggml_sycl_moe_stream_release_payload(ggml_backend_sycl_context & ctx)"
+RELEASE_SKIP = ("const uint64_t releases = ctx.moe_stream ? ctx.moe_stream->ring_releases() : UINT64_MAX; "
+                "if (releases == ctx.moe_stream_payload_releases) { return; } "
+                "ctx.moe_stream_payload_releases = releases;")
+RELEASE_LOOP = "for (auto & kv : ctx.moe_stream_payload) {"
+RELEASE_PAYLOAD = "std::vector<void *> & payload = extra->weight().moe_expert_ptr_payload[device];"
+RELEASE_HANDLES = "const std::vector<ggml_sycl::mem_handle> & handles = extra->weight().moe_expert_handles[device];"
+RELEASE_NULL = ("if (ring_ptrs[slot] != nullptr && payload[slot] == ring_ptrs[slot] && (slot >= handles.size() || "
+                "!handles[slot].valid())) { payload[slot] = nullptr; nulled = true; }")
+RELEASE_INVALIDATE = ("if (nulled) { extra->weight().moe_device_table_valid[device] = false; "
+                      "ggml_sycl_invalidate_moe_full_local_probe(extra, device); }")
+RELEASE_CLEAR = "ctx.moe_stream_payload.clear();"
+RELEASE_SITES = (
+    "sycl_ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*sycl_ctx);",
+    "prompt_ids_snapshot.size(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx);",
+    "moe_stream.reset(); ggml_sycl_moe_stream_release_payload(*this);",
+    "ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*ctx);",
+)
+PAYLOAD_MEMBERS = ("std::unordered_map<ggml_tensor_extra_gpu *, std::vector<void *>> moe_stream_payload; "
+                   "uint64_t moe_stream_payload_releases = 0;")
+RELEASE_COUNT = "ring_->release(); ring_.reset(); ++ring_releases_;"
+RELEASES_ACCESSOR = "uint64_t ring_releases() const { return ring_releases_; }"
+TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
+
+
+def claim_staged_pointer_released_with_ring(sycl: str, common: str, phase: str, plan_hpp: str) -> bool:
+    """A raw pointer must not outlive its owning handle (lead item 6, c-ned2). The upload records the staged slot's
+    pointer it writes into the persistent payload; teardown counts the ring's release; when the count moves, the
+    backend nulls only the payload slots that still hold a recorded pointer and no live handle (a later upload may
+    have given the slot a resident expert), invalidates the device table and the full-local probe when it nulled any,
+    and forgets the records. It runs at every point the ring can go, and nowhere submits anything."""
+    n = norm(sycl)
+    at = n.find(RELEASE_SIG + " {")
+    rel = body(n[at:], RELEASE_SIG) if at >= 0 else ""
+    td = body(norm(phase), TEARDOWN_SIG)
+    return (n.count(RELEASE_SIG + " {") == 1
+            and ordered(rel, RELEASE_SKIP, RELEASE_LOOP, RELEASE_PAYLOAD, RELEASE_HANDLES, RELEASE_NULL,
+                        RELEASE_INVALIDATE, RELEASE_CLEAR)
+            and "submit" not in rel and "wait" not in rel
+            and UPLOAD_RECORD in body(n, UPLOAD_SIG)
+            and all(n.count(site) == 1 for site in RELEASE_SITES)
+            and n.count("ggml_sycl_moe_stream_release_payload(") == 1 + len(RELEASE_SITES)
+            and PAYLOAD_MEMBERS in norm(common)
+            and RELEASE_COUNT in td and norm(phase).count("++ring_releases_;") == 1
+            and RELEASES_ACCESSOR in norm(plan_hpp))
+
+
+def test_staged_pointer_released_with_ring():
+    assert claim_staged_pointer_released_with_ring(SYCL, COMMON, PHASE, PLAN_HPP)
+
+
+def test_staged_pointer_release_mutants():
+    def c(sycl=SYCL, common=COMMON, phase=PHASE, plan_hpp=PLAN_HPP):
+        return claim_staged_pointer_released_with_ring(sycl, common, phase, plan_hpp)
+
+    # The upload writes the pointer and records nothing, so nothing ever nulls it.
+    assert not c(sycl=mutate(SYCL, UPLOAD_RECORD, ""))
+    # The payload slot left holding the pointer: only the guard would stand between it and a kernel.
+    assert not c(sycl=mutate(SYCL, "{ payload[slot] = nullptr; nulled = true; }", "{ nulled = true; }"))
+    # A slot a later upload gave a resident expert is nulled under it.
+    assert not c(sycl=mutate(SYCL, " && (slot >= handles.size() || !handles[slot].valid())", ""))
+    # The device table kept valid, so moe_ptrs_ptr hands a kernel the stale device copy.
+    assert not c(sycl=mutate(SYCL, "extra->weight().moe_device_table_valid[device] = false; ", ""))
+    # The full-local probe kept.
+    assert not c(sycl=mutate(SYCL, " ggml_sycl_invalidate_moe_full_local_probe(extra, device); }", " }"))
+    # Nulled while the ring that holds the pointers is still held.
+    assert not c(sycl=mutate(SYCL, "if (releases == ctx.moe_stream_payload_releases) { return; }", ""))
+    # The records kept, so a later release nulls a slot that now holds another ring's pointer by coincidence.
+    assert not c(sycl=mutate(SYCL, RELEASE_CLEAR, ""))
+    # Any one of the release points missing.
+    for site in RELEASE_SITES:
+        head = site[:site.index(" ggml_sycl_moe_stream_release_payload(")]
+        assert not c(sycl=mutate(SYCL, site, head))
+    # Teardown releases the ring without counting it.
+    assert not c(phase=mutate(PHASE, RELEASE_COUNT, "ring_->release(); ring_.reset();"))
+    # One release counted twice.
+    assert not c(phase=mutate(PHASE, "ring_->release(); ring_.reset(); ++ring_releases_;",
+                              "ring_->release(); ring_.reset(); ++ring_releases_; ++ring_releases_;"))
+    # The context forgets the records.
+    assert not c(common=mutate(COMMON, "uint64_t moe_stream_payload_releases = 0;", ""))
 
 
 # ---- ordering: one barrier, no host waits ----------------------------------------------------------------------------

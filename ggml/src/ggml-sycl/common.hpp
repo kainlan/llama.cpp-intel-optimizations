@@ -6298,6 +6298,11 @@ struct ggml_backend_sycl_context {
     // MUL_MAT_ID of a published plan, emptied at the first decode graph, reset in the destructor once the queues have
     // drained.
     std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;
+    // The staged ring slot pointers pointer-table uploads wrote into weights' persistent payloads, per weight and
+    // expert slot (llama.cpp-o9uw), and moe_stream->ring_releases() when they were last nulled: they are nulled once
+    // the ring that held them is given back (ggml_sycl_moe_stream_release_payload).
+    std::unordered_map<ggml_tensor_extra_gpu *, std::vector<void *>>                  moe_stream_payload;
+    uint64_t                                                                          moe_stream_payload_releases = 0;
 
     // XMX-v2 flash-attention per-context cache (Phase 4 — fattn-xmx-f16-v2.hpp).
     // Opaque pointer (fattn_xmx_v2_device_cache*); stores the matrix_combinations

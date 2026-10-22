@@ -162,7 +162,7 @@ void moe_stream_phase::end_prompt() {
 // the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache record is read once
 // per prompt.
 void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
-    index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx);
+    index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims);
     const moe_stream_ring_geometry geo =
         moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, index_.resident_expert_bytes);
     const bool same_queue = ccs_.has_value() && *ccs_ == ccs;
@@ -459,6 +459,7 @@ void moe_stream_phase::teardown(sycl::event last_use) {
         }
         ring_->release();
         ring_.reset();
+        ++ring_releases_;
     }
     anchor_ = mem_handle();
     table_.clear();
@@ -480,19 +481,24 @@ void moe_stream_phase::report(int                   layer,
         return;
     }
     // The stage line: the plan's fields under a prefix of its own, apart from note()'s "[MOE-EXEC-TRACE] dev" line
-    // (plan amendment for Task 15, lead ruling c-xod7-q1). soa= and aos_only= split the staged matrices by the layout
-    // their slot holds, so a census can tell which path a layer took (the lead's addition to ruling c-o9uw-1).
+    // (plan amendment for Task 15, lead ruling c-xod7-q1).
     if (op.log->trace >= 1 && op.log->trace_sink != nullptr) {
-        char line[320];
+        char line[256];
         std::snprintf(line, sizeof(line),
                       "[MOE-EXEC-TRACE] stage layer %d ubatch %u: %s regime=%s p=%.2f t_cpu=%.0f t_ring=%.0f "
                       "window=%.0f staged=%d/%d bytes=%zu"
-                      " unowned=%d untyped=%d exhausted=%d soa=%d aos_only=%d",
+                      " unowned=%d untyped=%d exhausted=%d",
                       layer, ubatch_seq_, moe_exec_choice_name(st.decision.choice),
                       moe_stream_regime_name(st.decision.regime), st.decision.p_touch, st.decision.t_cpu_us,
                       st.decision.t_ring_us, st.window_us, n.staged, n.wanted, n.bytes, n.unowned, n.untyped,
-                      n.exhausted, n.soa, n.aos_only);
+                      n.exhausted);
         op.log->trace_sink(op.log->sink_ctx, line);
+        // The staged matrices split by the layout their slot holds, so a census can tell which path each layer took
+        // (lead ruling c-o9uw-1, c-9wgo). A line of its own: the stage line keeps its bytes.
+        char split[128];
+        std::snprintf(split, sizeof(split), "[MOE-EXEC-TRACE] stage layouts layer %d ubatch %u: soa=%d aos_only=%d",
+                      layer, ubatch_seq_, n.soa, n.aos_only);
+        op.log->trace_sink(op.log->sink_ctx, split);
     }
     op.log->note(device_, layer, st.decision, n.bytes);
 }

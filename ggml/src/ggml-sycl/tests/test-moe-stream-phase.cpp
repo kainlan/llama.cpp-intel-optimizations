@@ -10,13 +10,18 @@
 // A second plan mixes in host experts of a type with no AOS->SOA reorder (IQ3_XXS). Whether the ring stages a matrix
 // depends on the device's prompt kernels, which the tests pass as a predicate (the backend answers from
 // ggml_sycl_moe_query_route_capability):
-//   kernels_soa_q4: Q4_0 is read as SOA and as AOS, IQ3_XXS in no layout (as IQ4_XS is on the real tables), so IQ3_XXS
-//                   is listed (and counted untyped when staged) but given no slot;
+//   kernels_soa_q4: a stand-in no real table matches (no prompt kernel reads Q4_0 as SOA today; kernels_table has the
+//                   tables' shape): Q4_0 is read as SOA and as AOS, IQ3_XXS in no layout (as IQ4_XS is on the real
+//                   tables), so IQ3_XXS is listed (and counted untyped when staged) but given no slot;
 //   kernels_aos:    both types are read as AOS only, as the batched MMVQ tables answer for Q4_0, the K types and
 //                   IQ3_XXS, so each matrix takes one slot and is read in place (c-hmey);
 //   kernels_table:  the device's prompt kernels as the tables answer today (moe-mmvq-tables.hpp): SOA for MXFP4 only,
 //                   AOS for the rest, so a reorderable Q4_K stages AOS-only and MXFP4 stages SOA (lead ruling
 //                   c-o9uw-2), whatever the capability table says.
+//
+// A matrix whose weight the prompt's library executor claims stages NONE whatever the kernels answer: the staged route
+// refuses that weight (c-las5), so the ring sizes no slot for it (llama.cpp-o9uw). The tests pass the claims as a
+// second predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_tensor, the route's own check.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
@@ -195,7 +200,26 @@ bool kernels_table(void *, ggml_type type, ggml_layout_mode layout, int64_t, int
 }
 
 moe_stream_plan_index index_of(const placement_plan & plan, ggml_sycl::moe_stream_prompt_kernel_fn kernels) {
-    return ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels, nullptr);
+    return ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels, nullptr, nullptr);
+}
+
+// The library executor's claims, handed to the index build through graph_ctx as the backend's call is.
+struct claims_probe {
+    int calls = 0;
+};
+
+// Claims layer 0's GATE weight and every weight of layer 2, counting its calls.
+bool claims_l0_gate_l2(void * graph_ctx, int layer, expert_tensor_role role) {
+    ++static_cast<claims_probe *>(graph_ctx)->calls;
+    return (layer == 0 && role == expert_tensor_role::GATE) || layer == 2;
+}
+
+bool claims_all(void *, int, expert_tensor_role) {
+    return true;
+}
+
+bool claims_none(void *, int, expert_tensor_role) {
+    return false;
 }
 
 const moe_stream_layer_info * layer_info(const moe_stream_plan_index & idx, int layer) {
@@ -379,8 +403,52 @@ int main() {
         // The predicate is asked once per distinct (type, shape, bytes) per build, not once per entry (c-7soh): the plan
         // has one host matrix shape, which takes a SOA question and then an AOS one.
         int calls = 0;
-        (void) ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_aos_counted, &calls);
+        (void) ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_aos_counted, &calls, nullptr);
         CHECK(calls == 2);
+    }
+
+    // ---- a matrix whose weight the library executor claims stages NONE: the staged route refuses that weight (c-las5),
+    // so the ring copies none of it and sizes no slot for it; staging and serving give one answer (llama.cpp-o9uw) ----
+    {
+        claims_probe                probe;
+        const moe_stream_plan_index claimed =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2);
+        const moe_stream_layer_info * c0 = layer_info(claimed, 0);
+        const moe_stream_layer_info * c1 = layer_info(claimed, 1);
+        const moe_stream_layer_info * c2 = layer_info(claimed, 2);
+        CHECK(c0 != nullptr && c1 != nullptr && c2 != nullptr);
+        if (c0 && c1 && c2) {
+            // Still listed, so a stage counts the claimed ones untyped; only the unclaimed ones take slots.
+            CHECK(c0->items.size() == 9 && c2->items.size() == 9);
+            for (const moe_stream_item & it : c0->items) {
+                CHECK(it.staging ==
+                      (it.role == expert_tensor_role::GATE ? moe_stream_staging::NONE : moe_stream_staging::SOA));
+            }
+            for (const moe_stream_item & it : c2->items) {
+                CHECK(it.staging == moe_stream_staging::NONE);
+            }
+            CHECK(c0->n_streamable == 6 && c0->region_slots == 12 && c0->expert_bytes_max == 2 * src_bytes());
+            CHECK(c1->n_streamable == 9 && c1->region_slots == 18);  // layer 1's weights are not claimed
+            CHECK(c2->n_streamable == 0 && c2->region_slots == 0 && c2->expert_bytes_max == 0);
+        }
+        CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.region_slots_max == 18);
+        // Asked once per (layer, role) a kernel reads, not once per expert: layers 0-2, three roles each.
+        CHECK(probe.calls == 9);
+
+        // Every weight claimed: nothing is streamable, so the ring is never reserved for nothing.
+        const moe_stream_plan_index all =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
+        CHECK(all.host_matrices_per_layer_max == 0 && all.region_slots_max == 0 && all.matrix_bytes_max == 0);
+        CHECK(std::string(ggml_sycl::moe_stream_ring_unavailable_rule(
+                  all, ggml_sycl::moe_stream_ring_geometry{}, true, false)) == "no host matrices of a streamable type");
+
+        // No weight claimed: the index is the one an unset predicate builds.
+        const moe_stream_plan_index free_of =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_none);
+        const moe_stream_layer_info * f0 = layer_info(free_of, 0);
+        CHECK(free_of.host_matrices_per_layer_max == idx.host_matrices_per_layer_max &&
+              free_of.region_slots_max == idx.region_slots_max && free_of.matrix_bytes_max == idx.matrix_bytes_max);
+        CHECK(f0 != nullptr && f0->n_streamable == 9 && f0->region_slots == 18);
     }
 
     // ---- why a layer answered RING_UNAVAILABLE: the first rule that holds, in a fixed order ----
