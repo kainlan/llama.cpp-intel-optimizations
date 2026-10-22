@@ -686,16 +686,24 @@ INTERNAL_WRAPPER_SITES = {
         # identity to show a refused loan published nothing. llama.cpp-sif1 took `published` from 4 to 8: the fixture's
         # lent_triplets and readmitted helpers read the current plan, and the two refill cases read the publication a
         # refused or cancelled refill must leave in place. It then took it to 9: the case for a loan refused without
-        # host zones reads the publication that loan must leave in place.
+        # host zones reads the publication that loan must leave in place. It then took it to 12: the fixture's still_lent
+        # helper reads the current plan, and the once-per-decode-graph and unpreparable-triplet cases read the
+        # publication a skipped refill and a refill that moved nothing must leave in place.
         "const auto now = ::ggml_sycl_global_plan_snapshot();": 1,
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 9,
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 12,
+        # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
+        # leave in place, and shows it does.
+        "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
+        "if (::ggml_sycl_global_plan_snapshot().get() != before_full.get() ||": 1,
         "const auto published = ggml_sycl_global_plan_snapshot();": 1,
         "const auto snapshot = ggml_sycl_global_plan_snapshot();": 2,
         "found = ::ggml_sycl_global_plan_snapshot();": 1,
         "ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());": 1,
         # llama.cpp-sif1 took this from 4 to 6: the refill cases show a refill with nothing to do, and one cancelled
-        # by a loan, published nothing. It then took it to 7: a loan refused without host zones published nothing.
-        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 7,
+        # by a loan, published nothing. It then took it to 7: a loan refused without host zones published nothing. It
+        # then took it to 9: a boundary with no decode graph since the refill, and a refill whose only triplet was
+        # dropped, published nothing.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 9,
         # llama.cpp-mwmr: the expert loan transaction re-checks the publication's identity under
         # g_tensor_inventory_mutex before it lends, with the lifecycle row check after the ||.
         "if (ggml_sycl_global_plan_snapshot().get() != current.get() ||": 1,

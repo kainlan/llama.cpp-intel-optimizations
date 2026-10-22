@@ -20773,6 +20773,7 @@ struct ggml_sycl_expert_loan_result {
     size_t       bytes_readmitted = 0;  // a refill's: the re-admitted triplets' summed vram_charge_size
     uint32_t     n_triplets       = 0;  // the triplets lent, or re-admitted
     uint32_t     n_remaining      = 0;  // a refill's: the lent triplets its armed cursor still holds after it ran
+    uint32_t     n_dropped        = 0;  // a refill's: the lent triplets it dropped from the ledger, to stay on the host
     const char * reason           = "none";
 };
 
@@ -20948,8 +20949,8 @@ static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t si
 // The body, both directions (llama.cpp-sif1). `amount` is the bytes a loan should free, or the most triplets a refill
 // re-admits. `resolver` is null in production (the registry resolver above, bound to the published plan's owner); the
 // private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless the caller re-posts
-// BUSY ones (warn_busy false); a refill WARNs nothing itself, since it runs at every decode graph's boundary: its
-// boundary runner WARNs refusals, rate-limited.
+// BUSY ones (warn_busy false). A refill runs at every decode graph's boundary, so it WARNs only the lent triplets it
+// drops from the ledger, once each (a triplet is dropped once); its boundary runner WARNs refusals, rate-limited.
 static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction         direction,
                                                      int                                    device,
                                                      size_t                                 amount,
@@ -21053,6 +21054,12 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     prepared.reserve(n_selected);
     const char * stop      = nullptr;
     bool         transient = false;
+
+    // A lent triplet no later boundary could prepare either (a member no tensor resolves, or no WEIGHT arena on the
+    // device to mint its storage from) leaves the ledger under the lock below, if it is the back by then. Left there,
+    // every later refill would stop at it, and the triplets lent before it would never come back (llama.cpp-sif1).
+    std::array<ggml_sycl::expert_placement_key, 3> unpreparable{};
+    const char *                                   unpreparable_reason = nullptr;
     for (uint32_t t = 0; t < n_selected && !stop; ++t) {
         prepared_triplet triplet;
         for (int r = 0; r < 3 && !stop; ++r) {
@@ -21066,8 +21073,12 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
             if (refill) {
                 ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, e->dst_size);
                 if (!storage.valid()) {
-                    stop      = "WEIGHT zone full";
-                    transient = true;
+                    // A full zone is transient: the ring gives its room back, so the next boundary tries again. No
+                    // WEIGHT arena is not, since only a model load makes one, and a load replaces the ledger too.
+                    const bool arena =
+                        cache->arena_active() && cache->zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0;
+                    stop      = arena ? "WEIGHT zone full" : "no WEIGHT arena";
+                    transient = arena;
                     break;
                 }
                 triplet.refill_members[r].placement        = k;
@@ -21091,9 +21102,12 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         }
         if (!stop) {
             prepared.push_back(std::move(triplet));
+        } else if (refill && !transient) {
+            unpreparable        = { keys[3 * t], keys[3 * t + 1], keys[3 * t + 2] };
+            unpreparable_reason = stop;
         }
     }
-    if (prepared.empty()) {
+    if (prepared.empty() && !unpreparable_reason) {
         return refuse(transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED,
                       stop ? stop : "nothing lendable");
     }
@@ -21115,6 +21129,24 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     }
     uint32_t lent  = 0;
     size_t   freed = 0;
+
+    // The lent triplets this call drops from the ledger, each to stay on the host: at most the one the cache refuses
+    // for good (the loop stops there) and the one the preparation could not prepare. Each is WARNed once the lock is
+    // released, on every exit that follows a drop (llama.cpp-sif1).
+    std::array<std::pair<ggml_sycl::expert_placement_key, const char *>, 2> dropped{};
+    size_t                                                                  n_dropped = 0;
+
+    auto drop_back = [&](const char * reason) {
+        GGML_ASSERT(n_dropped < dropped.size());
+        dropped[n_dropped++] = { ledger.triplets.back()[0], reason };
+        ledger.triplets.pop_back();
+    };
+    auto warn_dropped = [&] {
+        for (size_t i = 0; i < n_dropped; ++i) {
+            GGML_LOG_WARN("[MOE-EXEC] refill device %d: layer %d expert %d stays on the host: %s\n", device,
+                          dropped[i].first.layer_id, dropped[i].first.expert_id, dropped[i].second);
+        }
+    };
 
     // An exception while moving a triplet stops the loop; the triplets already moved are still published below, and it
     // is rethrown once the inventory lock is released.
@@ -21139,7 +21171,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                     stop      = refilled.reason;
                     transient = !ggml_sycl_expert_refill_refusal_is_final(stop);
                     if (!transient) {
-                        ledger.triplets.pop_back();
+                        drop_back(stop);
                     }
                     break;
                 }
@@ -21218,6 +21250,13 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
             break;
         }
     }
+    // The triplet the preparation could not prepare leaves the ledger only from its back: every triplet selected before
+    // it has moved, and the publication is the one it was selected under (checked above). Behind a triplet that did not
+    // move, it stays, and a later boundary meets it again.
+    if (unpreparable_reason && !ledger.triplets.empty() && ledger.triplets.back() == unpreparable) {
+        drop_back(unpreparable_reason);
+    }
+    result.n_dropped = static_cast<uint32_t>(n_dropped);
     // An accepted loan starts a prompt phase: the refills still to run are cancelled, and what they would have
     // re-admitted stays lent with this loan's triplets.
     if (!refill && lent != 0) {
@@ -21233,6 +21272,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     const ggml_sycl_txn_result stop_code = transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED;
     if (lent == 0) {
         lock.unlock();
+        warn_dropped();
         if (escaped) {
             std::rethrow_exception(escaped);
         }
@@ -21259,6 +21299,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         ggml_sycl_optional_layouts_retired();
     }
     lock.unlock();
+    warn_dropped();
     if (!swapped) {
         GGML_LOG_ERROR("[MOE-EXEC] %s device %d: %u moved triplets left unpublished, the plan swap lost\n",
                        refill ? "refill" : "loan", device, lent);
@@ -21390,13 +21431,15 @@ static void ggml_sycl_run_pending_expert_loan(ggml_backend_t backend) {
     }
 }
 
-// ---- The refill (llama.cpp-sif1, plan Task 12 of llama.cpp-36j0) -------------------------------------------------------
+// ---- The refill (llama.cpp-sif1, plan Task 12 of llama.cpp-36j0) --------------------------------------------------
 // After a prompt phase, each decode graph's boundary re-admits lent triplets to the device, a few per graph, in the
 // background: the copies go on the BCS queue (the copy engine), so a decode token pays at most its share of the
 // re-admission and never waits for it. A new prompt phase cancels the rest, which stay lent for its ring.
 
-// GGML_SYCL_MOE_REFILL_PER_GRAPH: how many lent triplets one decode graph's boundary re-admits. Read once; 1 by default,
-// which keeps a decode token's extra copy to one triplet. Unparsable, or outside 1..1024, keeps 1.
+// GGML_SYCL_MOE_REFILL_PER_GRAPH: how many lent triplets one decode graph re-admits. A context synchronizes more than
+// once per graph, so the count is per decode graph_compute call on the context, however many boundaries follow it.
+// Read once; 1 by default, which keeps a decode graph's extra copy to one triplet. Unparsable, or outside 1..1024,
+// keeps 1.
 static uint32_t ggml_sycl_moe_refill_per_graph() {
     static const uint32_t per_graph = [] {
         const char * text = std::getenv("GGML_SYCL_MOE_REFILL_PER_GRAPH");
@@ -21465,12 +21508,17 @@ static void ggml_sycl_expert_refill_set_armed(int device, bool armed) {
 static std::atomic<uint32_t> g_sycl_expert_refill_refusal_streak[GGML_SYCL_MAX_DEVICES];
 
 // The graph boundary's refill. Nothing to do, and no lock taken, unless the device has lent triplets. Otherwise the
-// graph that just ran decides: a decode graph arms the cursor and re-admits up to max_triplets; a prompt graph disarms
-// it, so a new prompt phase stops the refills. A refusal is retried at the next decode boundary (a final one has
-// already dropped its triplet from the ledger), and its WARN names the first in a row and then one in every 64, with
-// the count. Returns what the cursor still holds. `resolver` is null in production.
+// graph that just ran decides: a decode graph arms the cursor, a prompt graph disarms it, so a new prompt phase stops
+// the refills. The refill itself runs only when a decode graph has run on the context since it last ran:
+// decode_graphs is the context's count of them and *refilled_at the count at its last refill, so one decode graph
+// re-admits at most max_triplets however often the context synchronizes. A refusal is retried at the next decode
+// graph's boundary (a final one, and a triplet no boundary could prepare, has left the ledger with its own WARN), and
+// its WARN names the first in a row and then one in every 64, with the count. Returns what the cursor still holds.
+// `resolver` is null in production.
 static uint32_t ggml_sycl_run_expert_refill_at_boundary_on_device(int                                    device,
                                                                   bool                                   decode,
+                                                                  uint64_t                               decode_graphs,
+                                                                  std::atomic<uint64_t> *                refilled_at,
                                                                   uint32_t                               max_triplets,
                                                                   const ggml_sycl_expert_loan_resolver * resolver,
                                                                   ggml_sycl_expert_loan_result *         out) {
@@ -21484,10 +21532,18 @@ static uint32_t ggml_sycl_run_expert_refill_at_boundary_on_device(int           
     }
     ggml_sycl_expert_loan_result   local;
     ggml_sycl_expert_loan_result * result = out ? out : &local;
-    ggml_sycl_txn_result           code   = ggml_sycl_txn_result::REFUSED;
-    const uint32_t remaining = ggml_sycl_expert_refill_transaction_run(device, max_triplets, resolver, result, &code);
+    if (refilled_at->exchange(decode_graphs, std::memory_order_relaxed) == decode_graphs) {
+        *result             = ggml_sycl_expert_loan_result{};
+        result->n_remaining = g_sycl_expert_lent_count[device].load(std::memory_order_acquire);
+        result->reason      = "no decode graph since the last refill";
+        return result->n_remaining;
+    }
+    ggml_sycl_txn_result code = ggml_sycl_txn_result::REFUSED;
+    const uint32_t remaining  = ggml_sycl_expert_refill_transaction_run(device, max_triplets, resolver, result, &code);
     std::atomic<uint32_t> & streak = g_sycl_expert_refill_refusal_streak[device];
-    if (code == ggml_sycl_txn_result::ACCEPTED || std::strcmp(result->reason, "nothing to refill") == 0) {
+    // A drop is progress, already WARNed by name, and the next boundary meets the next triplet.
+    if (code == ggml_sycl_txn_result::ACCEPTED || result->n_dropped != 0 ||
+        std::strcmp(result->reason, "nothing to refill") == 0) {
         streak.store(0, std::memory_order_relaxed);
         return remaining;
     }
@@ -21504,11 +21560,12 @@ static uint32_t ggml_sycl_run_expert_refill_at_boundary_on_device(int           
 // deferred-free pass has run: that pass reclaims a loan's withdrawn device entries and returns the zone room the ring
 // released, which the refill re-admits into.
 static void ggml_sycl_run_expert_refill_at_boundary(ggml_backend_t backend) {
-    const auto * ctx = backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr;
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
     if (ctx) {
         (void) ggml_sycl_run_expert_refill_at_boundary_on_device(
-            ctx->device, ctx->graph_phase_is_decode.load(std::memory_order_relaxed), ggml_sycl_moe_refill_per_graph(),
-            nullptr, nullptr);
+            ctx->device, ctx->graph_phase_is_decode.load(std::memory_order_relaxed),
+            ctx->decode_graph_count.load(std::memory_order_relaxed), &ctx->refill_decode_graph,
+            ggml_sycl_moe_refill_per_graph(), nullptr, nullptr);
     }
 }
 
@@ -21574,6 +21631,10 @@ struct test_loan_fixture {
     std::vector<ggml_sycl_cache_id>                     keys;    // [(layer * 3 + slot) * n_experts + expert]
     std::vector<std::vector<uint8_t>>                   bytes;   // the same index: each expert's original contents
     std::shared_ptr<const lifecycle_plan_snapshot>      found;   // the publication the case started under
+    // A backend context's side of the refill's once-per-decode-graph rule, driven by hand: the decode graphs the case
+    // has run, and that count when the boundary last ran the refill (llama.cpp-sif1).
+    uint64_t                                            decode_graphs = 0;
+    std::atomic<uint64_t>                               refilled_at{ 0 };
 
     test_loan_fixture(int layers, int experts, uint64_t model_id, bool configure_zones = true) :
         n_layers(layers),
@@ -21790,6 +21851,25 @@ struct test_loan_fixture {
         };
     }
 
+    // The graph boundary's refill right after a graph: a decode graph counts one, as graph_compute counts it, and a
+    // prompt graph does not.
+    uint32_t boundary_after_graph(bool                                     decode,
+                                  uint32_t                                 max_triplets,
+                                  const ::ggml_sycl_expert_loan_resolver * refill_resolver,
+                                  ::ggml_sycl_expert_loan_result *         result) {
+        decode_graphs += decode ? 1 : 0;
+        return boundary_without_graph(decode, max_triplets, refill_resolver, result);
+    }
+
+    // The graph boundary's refill with no graph run since the last boundary: another synchronize after the same graph.
+    uint32_t boundary_without_graph(bool                                     decode,
+                                    uint32_t                                 max_triplets,
+                                    const ::ggml_sycl_expert_loan_resolver * refill_resolver,
+                                    ::ggml_sycl_expert_loan_result *         result) {
+        return ::ggml_sycl_run_expert_refill_at_boundary_on_device(device, decode, decode_graphs, &refilled_at,
+                                                                   max_triplets, refill_resolver, result);
+    }
+
     // Device storage handed back since `before`: raw device rows released plus WEIGHT zone room regained, since a
     // direct-staged expert is a raw allocation without an arena and a zone sub-allocation with one.
     struct device_bytes {
@@ -21820,7 +21900,8 @@ struct test_loan_fixture {
         return cache->resolve_expert(req);
     }
 
-    // Run the deferred-free pass and drain retained handles until `done` holds or 2 s pass; returns `done`'s last answer.
+    // Run the deferred-free pass and drain retained handles until `done` holds or 2 s pass; returns `done`'s last
+    // answer.
     template <typename F> bool reclaim_until(F done) const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         for (;;) {
@@ -21862,6 +21943,22 @@ struct test_loan_fixture {
             on += entry->on_device ? 1 : 0;
         }
         return on == 3 ? 1 : on == 0 ? 0 : -1;
+    }
+
+    // A triplet still lent: on the host in the published plan, each member resolving to its host copy.
+    std::string still_lent(int layer, int expert) const {
+        const auto published = ::ggml_sycl_global_plan_snapshot();
+        if (!published || !published->plan || triplet_on_device(*published, layer, expert) != 0) {
+            return test_loan_fail("layer %d expert %d is not on the host in the published plan", layer, expert);
+        }
+        for (int s = 0; s < 3; ++s) {
+            const expert_resolve_result host = resolve(layer, s, expert);
+            if (!host || host.location != cache_location::HOST_PINNED || !host_entry_present(layer, s, expert)) {
+                return test_loan_fail("layer %d expert %d slot %d, still lent, does not resolve to its host copy",
+                                      layer, expert, s);
+            }
+        }
+        return {};
     }
 
     // The experts other than host_expert the published plan has on the host: the lent ones.
@@ -21907,7 +22004,7 @@ struct test_loan_fixture {
                 }
             }
         }
-        const bool                             gone     = reclaim_until([&] {
+        const bool gone = reclaim_until([&] {
             for (const auto & t : lent) {
                 for (int s = 0; s < 3; ++s) {
                     if (device_entry_present(t.first, s, t.second)) {
@@ -22466,8 +22563,7 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
     uint64_t                               staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
-    uint32_t remaining = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/true,
-                                                                             /*max_triplets=*/1, &resolver, &result);
+    uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
     // A refill's copies have typed owners at both ends, so the copy path takes the direct DMA, never the staged branch:
     // that is a synchronous bounce the boundary thread would wait on. Bracketed around the refill call alone.
     if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
@@ -22497,10 +22593,12 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     if (test_loan_fixture::triplet_on_device(*first, still.first, still.second) != 0) {
         return "the triplet the first refill left is not on the host in the plan";
     }
-    // Until the deferred-free pass finalizes them, the withdrawn host copies stay in the cache, retired, under the exact
-    // keys a resolve looks up first. The re-admitted ids resolve past them to their device entries, with no device
-    // named in the request. The device copy each extra now remembers is owned by the device: it resolves there and
-    // refuses a host caller (each refusal logs one wrong-device WARN, three in all, by design).
+    // Until the deferred-free pass finalizes them, the withdrawn host copies stay in the cache, retired, under the
+    // exact keys a resolve looks up first. The re-admitted ids resolve past them to their device entries, with no
+    // device named in the request, and each device entry is still IN_PROGRESS behind its copy: nothing between the
+    // refill and here asks the copy's status, so the resolve hands its consumer the copy as a ready event to order on.
+    // The device copy each extra now remembers is owned by the device: it resolves there and refuses a host caller
+    // (each refusal logs one wrong-device WARN, three in all, by design).
     for (int s = 0; s < 3; ++s) {
         if (!fx.host_entry_retired(again.first, s, again.second)) {
             return test_loan_fail(
@@ -22514,6 +22612,12 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
                 "layer %d expert %d slot %d, re-admitted, does not resolve past its retired host "
                 "entry to its device entry on device %d",
                 again.first, again.second, s, fx.device);
+        }
+        if (!resolved.has_ready_event) {
+            return test_loan_fail(
+                "layer %d expert %d slot %d, re-admitted, resolves without a ready event: its device "
+                "entry is not IN_PROGRESS behind the copy",
+                again.first, again.second, s);
         }
         const auto * record =
             fx.extras[again.first * 3 + s]->find_moe_storage_handle_on_device(again.second, GGML_LAYOUT_AOS, fx.device);
@@ -22615,8 +22719,7 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
     uint64_t                               staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
-    uint32_t remaining = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/true,
-                                                                             /*max_triplets=*/1, &resolver, &result);
+    uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
     // A refill's copies have typed owners at both ends, so the copy path takes the direct DMA, never the staged branch:
     // that is a synchronous bounce the boundary thread would wait on. Bracketed around the refill call alone.
     if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
@@ -22642,12 +22745,18 @@ std::string test_expert_refill_cancelled_by_a_loan() {
         return "the refill's retained owners did not drain";
     }
 
-    // A new prompt phase's loan.
+    // A new prompt phase's loan. Its triplet is the ledger's back now, ahead of the one the first loan still has lent.
     if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
         return why;
     }
-    const auto published = ::ggml_sycl_global_plan_snapshot();
-    remaining            = ::ggml_sycl_expert_refill_transaction_run(fx.device, /*max_triplets=*/1, &resolver, &result);
+    const std::vector<std::pair<int, int>> lent_now = fx.lent_triplets(/*host_expert=*/3);
+    if (lent_now.size() != 2 || std::find(lent_now.begin(), lent_now.end(), still) == lent_now.end()) {
+        return test_loan_fail("%zu triplets are lent after the second loan, not the first loan's one and the second's",
+                              lent_now.size());
+    }
+    const std::pair<int, int> newest    = lent_now[0] == still ? lent_now[1] : lent_now[0];
+    const auto                published = ::ggml_sycl_global_plan_snapshot();
+    remaining = ::ggml_sycl_expert_refill_transaction_run(fx.device, /*max_triplets=*/1, &resolver, &result);
     if (remaining != 0 || result.accepted || result.n_triplets != 0 ||
         std::strcmp(result.reason, "nothing to refill") != 0) {
         return test_loan_fail(
@@ -22675,15 +22784,13 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     }
 
     // A prompt graph's boundary keeps the cursor disarmed; the next decode graph's arms it and the refill resumes, from
-    // the new loan's triplet.
-    remaining = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/false, /*max_triplets=*/1,
-                                                                    &resolver, &result);
+    // the new loan's triplet, the ledger's back.
+    remaining = fx.boundary_after_graph(/*decode=*/false, /*max_triplets=*/1, &resolver, &result);
     if (remaining != 0 || ::ggml_sycl_global_plan_snapshot().get() != published.get()) {
         return "a prompt graph's boundary re-admitted a lent triplet";
     }
     staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
-    remaining     = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/true, /*max_triplets=*/1,
-                                                                        &resolver, &result);
+    remaining     = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
     if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
         return test_loan_fail("the resumed refill took %llu staged host-to-device copies, not the direct DMA",
                               (unsigned long long) staged);
@@ -22693,6 +22800,241 @@ std::string test_expert_refill_cancelled_by_a_loan() {
             "the decode boundary after the loan re-admitted %u triplets with %u remaining (%s), not "
             "1 and 1",
             result.n_triplets, remaining, result.reason);
+    }
+    if (std::string why = fx.readmitted(newest.first, newest.second); !why.empty()) {
+        return "the resumed refill did not re-admit the new loan's triplet: " + why;
+    }
+    if (std::string why = fx.still_lent(still.first, still.second); !why.empty()) {
+        return "the resumed refill took the first loan's triplet, not the back: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_refill_runs_once_per_decode_graph() {
+    // A context synchronizes more than once per graph, and each synchronize reaches the refill's boundary. Two
+    // boundaries with no graph between them re-admit one triplet, not two: the second sees no decode graph since the
+    // refill and changes nothing. The next decode graph's boundary re-admits the next one (llama.cpp-sif1).
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7369663104ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    if (std::string why = fx.lend(6 * charge, 2, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1 || remaining != 1) {
+        return test_loan_fail("the decode graph's boundary re-admitted %u triplets with %u remaining (%s), not 1 and 1",
+                              result.n_triplets, remaining, result.reason);
+    }
+    const auto published = ::ggml_sycl_global_plan_snapshot();
+
+    // The same graph's second synchronize.
+    remaining = fx.boundary_without_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (result.accepted || result.n_triplets != 0 || remaining != 1 || result.n_remaining != 1 ||
+        std::strcmp(result.reason, "no decode graph since the last refill") != 0) {
+        return test_loan_fail(
+            "a second boundary after the same decode graph answered accepted=%d triplets=%u remaining=%u (%s), not "
+            "no decode graph since the last refill with 1 remaining",
+            (int) result.accepted, result.n_triplets, remaining, result.reason);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "a second boundary after the same decode graph published a plan";
+    }
+    if (g_sycl_expert_readmitted_total[fx.device].load() != 1 || g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return test_loan_fail(
+            "two boundaries after one decode graph re-admitted %u triplets and left %u lent, not 1 and 1",
+            g_sycl_expert_readmitted_total[fx.device].load(), g_sycl_expert_lent_count[fx.device].load());
+    }
+
+    // The next decode graph's boundary re-admits the triplet still lent.
+    remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1 || remaining != 0) {
+        return test_loan_fail(
+            "the next decode graph's boundary re-admitted %u triplets with %u remaining (%s), not 1 and 0",
+            result.n_triplets, remaining, result.reason);
+    }
+    if (!fx.lent_triplets(/*host_expert=*/3).empty()) {
+        return "a triplet is still lent after two decode graphs re-admitted one each";
+    }
+    return {};
+}
+
+std::string test_expert_refill_drops_an_unpreparable_triplet() {
+    // A lent triplet with a member no tensor resolves leaves the ledger, so it no longer stops every later refill:
+    // first at the back with nothing before it (the refill moves nothing and publishes nothing), then behind a triplet
+    // that moves in the same call, at two per call. Each stays on the host, WARNed once. A full WEIGHT zone is
+    // transient and keeps its triplet, which the next decode graph's boundary re-admits once the room is back
+    // (llama.cpp-sif1).
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7369663105ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    if (std::string why = fx.lend(12 * charge, 4, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+
+    // The fixture's resolver, refusing slot 1 of the refused-th triplet a call asks about (0 is the ledger's back,
+    // where the refill's preparation starts), as a tensor the registry no longer has is refused. Slot 0 of that
+    // triplet has its storage minted first, so the refusal also shows that storage handed back.
+    std::vector<std::pair<int, int>>       asked;
+    int                                    refused  = 0;
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    const ::ggml_sycl_expert_loan_resolver refusing = [&](const placement_entry &          entry,
+                                                          ::ggml_sycl_expert_loan_target & target) {
+        const std::pair<int, int> triplet{ entry.layer_id, entry.expert_id };
+        if (asked.empty() || asked.back() != triplet) {
+            asked.push_back(triplet);
+        }
+        if (static_cast<int>(asked.size()) - 1 == refused && entry.expert_role == test_loan_fixture::role(1)) {
+            return false;
+        }
+        return resolver(entry, target);
+    };
+    ::ggml_sycl_expert_loan_result result;
+
+    // The back triplet refused: nothing moves, it leaves the ledger, and the three lent before it stay lent.
+    const auto before    = fx.sample();
+    const auto published = ::ggml_sycl_global_plan_snapshot();
+    uint32_t   remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &refusing, &result);
+    if (result.accepted || result.n_triplets != 0 || result.n_dropped != 1 || remaining != 3 ||
+        std::strcmp(result.reason, "no tensor for a lent expert") != 0 || asked.size() != 1) {
+        return test_loan_fail(
+            "the refill whose back triplet is refused answered accepted=%d triplets=%u dropped=%u remaining=%u (%s) "
+            "after asking about %zu triplets, not 0, 1 and 3 (no tensor for a lent expert) after 1",
+            (int) result.accepted, result.n_triplets, result.n_dropped, remaining, result.reason, asked.size());
+    }
+    const std::pair<int, int> dropped_back = asked[0];
+    if (g_sycl_expert_lent_count[fx.device].load() != 3) {
+        return test_loan_fail("the ledger counts %u lent triplets after the drop, not 3",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+    // A drop is progress, WARNed by name already, so the boundary runner does not count it as a refusal.
+    if (g_sycl_expert_refill_refusal_streak[fx.device].load() != 0) {
+        return test_loan_fail("the boundary runner counts %u refusals in a row after a drop, not 0",
+                              g_sycl_expert_refill_refusal_streak[fx.device].load());
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "a refill that moved nothing published a plan";
+    }
+    if (std::string why = fx.still_lent(dropped_back.first, dropped_back.second); !why.empty()) {
+        return "the dropped back triplet: " + why;
+    }
+    if (!fx.reclaim_until([&] { return fx.sample().zone == before.zone; })) {
+        return test_loan_fail("the WEIGHT zone has %zu bytes of room after the refused refill, not the %zu before it",
+                              fx.sample().zone, before.zone);
+    }
+
+    // Two per call, the second refused: the back moves, then the refused one, the back by then, leaves the ledger.
+    asked.clear();
+    refused   = 1;
+    remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &refusing, &result);
+    if (!result.accepted || result.n_triplets != 1 || result.n_dropped != 1 || remaining != 1 ||
+        result.bytes_readmitted != 3 * charge || std::strcmp(result.reason, "no tensor for a lent expert") != 0 ||
+        asked.size() != 2) {
+        return test_loan_fail(
+            "the two-triplet refill with its second refused answered accepted=%d triplets=%u dropped=%u remaining=%u "
+            "bytes=%zu (%s) after asking about %zu triplets, not 1, 1, 1 and %zu (no tensor for a lent expert) after 2",
+            (int) result.accepted, result.n_triplets, result.n_dropped, remaining, result.bytes_readmitted,
+            result.reason, asked.size(), 3 * charge);
+    }
+    const std::pair<int, int> moved          = asked[0];
+    const std::pair<int, int> dropped_behind = asked[1];
+    if (std::string why = fx.readmitted(moved.first, moved.second); !why.empty()) {
+        return "the back triplet of the two-triplet refill: " + why;
+    }
+    if (std::string why = fx.still_lent(dropped_behind.first, dropped_behind.second); !why.empty()) {
+        return "the refused second triplet: " + why;
+    }
+    const std::vector<std::pair<int, int>> on_host = fx.lent_triplets(/*host_expert=*/3);
+    std::pair<int, int>                    last{ -1, -1 };
+    for (const auto & t : on_host) {
+        if (t != dropped_back && t != dropped_behind) {
+            last = t;
+        }
+    }
+    if (on_host.size() != 3 || last.first < 0 || g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return test_loan_fail(
+            "the plan has %zu triplets on the host and the ledger counts %u, not 3 (the two dropped and one still "
+            "lent) and 1",
+            on_host.size(), g_sycl_expert_lent_count[fx.device].load());
+    }
+
+    // A full WEIGHT zone is transient: the refill answers BUSY, drops nothing, and the triplet stays in the ledger.
+    std::vector<mem_handle> fillers;
+    constexpr size_t        max_fillers = 16384;
+    while (fillers.size() < max_fillers) {
+        mem_handle filler = ::ggml_sycl_device_expert_alloc(fx.device, test_loan_expert_bytes());
+        if (!filler.valid()) {
+            break;
+        }
+        fillers.push_back(std::move(filler));
+    }
+    if (fillers.size() == max_fillers) {
+        return "the WEIGHT zone took 16 GiB of 1 MiB fillers and still had room";
+    }
+    const auto before_full = ::ggml_sycl_global_plan_snapshot();
+    remaining              = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (result.accepted || result.n_triplets != 0 || result.n_dropped != 0 || remaining != 1 ||
+        std::strcmp(result.reason, "WEIGHT zone full") != 0) {
+        return test_loan_fail(
+            "the refill into a full WEIGHT zone answered accepted=%d triplets=%u dropped=%u remaining=%u (%s), not "
+            "WEIGHT zone full with the triplet kept",
+            (int) result.accepted, result.n_triplets, result.n_dropped, remaining, result.reason);
+    }
+    // BUSY is a refusal to the boundary runner, which counts it (and WARNs the first in a row).
+    if (g_sycl_expert_refill_refusal_streak[fx.device].load() != 1) {
+        return test_loan_fail("the boundary runner counts %u refusals in a row after the full zone, not 1",
+                              g_sycl_expert_refill_refusal_streak[fx.device].load());
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != before_full.get() ||
+        g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return "the refill into a full WEIGHT zone published a plan or changed the ledger";
+    }
+    if (std::string why = fx.still_lent(last.first, last.second); !why.empty()) {
+        return "the triplet a full WEIGHT zone refused: " + why;
+    }
+
+    // The room back, the next decode graph's boundary re-admits the triplet the full zone kept.
+    fillers.clear();
+    if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= 3 * charge; })) {
+        return "the fillers' WEIGHT zone room did not come back within 2 s";
+    }
+    remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1 || result.n_dropped != 0 || remaining != 0) {
+        return test_loan_fail(
+            "the decode boundary after the room came back re-admitted %u triplets, dropped %u, with %u remaining (%s), "
+            "not 1, 0 and 0",
+            result.n_triplets, result.n_dropped, remaining, result.reason);
+    }
+    if (std::string why = fx.readmitted(last.first, last.second); !why.empty()) {
+        return "the triplet the full zone kept: " + why;
+    }
+    if (std::string why = fx.still_lent(dropped_back.first, dropped_back.second); !why.empty()) {
+        return "the first dropped triplet, later: " + why;
+    }
+    // The teardown line's counts: four lent, two re-admitted, two left on the host for the session.
+    if (g_sycl_expert_lent_total[fx.device].load() != 4 || g_sycl_expert_readmitted_total[fx.device].load() != 2) {
+        return test_loan_fail("the teardown counts read %u/%u, not 2/4",
+                              g_sycl_expert_readmitted_total[fx.device].load(),
+                              g_sycl_expert_lent_total[fx.device].load());
     }
     return {};
 }
@@ -93574,8 +93916,8 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
                 cache->process_deferred_frees_public();
             }
         }
-        // After a prompt phase, each decode graph's boundary re-admits lent triplets, behind the deferred-free pass that
-        // reclaims the loan's withdrawn device entries and the zone room the ring released (llama.cpp-sif1).
+        // After a prompt phase, each decode graph's boundary re-admits lent triplets, behind the deferred-free pass
+        // that reclaims the loan's withdrawn device entries and the zone room the ring released (llama.cpp-sif1).
         ggml_sycl_run_expert_refill_at_boundary(backend);
 
         if (ggml_sycl::unified_alloc_strict_mode()) {
@@ -116307,6 +116649,8 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
         sycl_ctx->moe_stream->end_prompt();  // the prompt's ring and stage table go at its first decode graph
     }
     if (cached_is_decode) {
+        // Counted for the graph boundary's refill, which re-admits once per decode graph (llama.cpp-sif1).
+        sycl_ctx->decode_graph_count.fetch_add(1, std::memory_order_relaxed);
         // Once per device, at the entry of its first one-token graph: the WEIGHT room G0 prints beside
         // the bytes each interim WEIGHT row requests.
         ggml_sycl::unified_cache_dump_capture_zone_figures(sycl_ctx->device, ggml_sycl::dump_point::FIRST_DECODE);

@@ -65,8 +65,9 @@ each triplet (unified_cache::refill_lent_triplet), then flips the plan copy back
 What this gate pins for it:
   - one body runs both directions, and its lock, its publication and its epoch bump are the one copy both share;
   - the refill code never waits, under the same forbidden list as the loan;
-  - the copy reads the host copy's own typed owner into the caller's device owner on the DMA queue, behind the host
-    copy's writes, and the device entry is published IN_PROGRESS with the copy as its ready event and last write;
+  - the copy reads the host copy's own typed owner into the caller's device owner on the BCS queue (the copy engine),
+    behind the host copy's writes, and the device entry is published IN_PROGRESS with the copy as its ready event and
+    last write;
   - the cache checks everything that would make the publication wrong before copying, inserts the device entries and
     mints their leases before anything published changes (a throw there withdraws only what it inserted), and from
     the mirror swap on allocates nothing; the host copy is retired entry by entry, only while it still names the lent
@@ -79,15 +80,23 @@ What this gate pins for it:
     loses the triplet;
   - an accepted loan disarms the refill cursor, a disarmed cursor selects nothing, and a loan between the selection
     and the lock cancels the refill; each device's ledger is reached only under g_tensor_inventory_mutex;
-  - ggml_backend_sycl_synchronize() runs the refill once per call, after the pending loan and the deferred-free pass;
-    the graph that just ran arms the cursor (decode) or disarms it (prompt), only a decode graph re-admits, up to
-    GGML_SYCL_MOE_REFILL_PER_GRAPH triplets, and mul_mat_id names no refill entry;
+  - ggml_backend_sycl_synchronize() reaches the refill at every call, after the pending loan and the deferred-free
+    pass; the graph that just ran arms the cursor (decode) or disarms it (prompt), only a decode graph re-admits, and
+    mul_mat_id names no refill entry;
+  - a context synchronizes more than once per graph, so the refill runs only when a decode graph_compute call has
+    been counted on the context since its last refill: one decode graph re-admits at most
+    GGML_SYCL_MOE_REFILL_PER_GRAPH triplets, and only graph_compute counts one;
   - GGML_SYCL_MOE_REFILL_PER_GRAPH is read once per process, defaults to 1, and no value turns the refill off;
   - the teardown line `[MOE-EXEC] refill device %d: %u/%u triplets re-admitted` prints once from counts taken as they
     print, ggml_backend_sycl_free() emits it right after the [MOE-EXEC] summary, a refusal is WARNed by the boundary
-    runner alone (first in a row, then one in every 64), the body WARNs no refill line, and the refill never touches
-    the loan's busy streak;
-  - each refusal the transaction treats as final names a refusal the cache really returns.
+    runner alone (first in a row, then one in every 64), the body WARNs no refill line but a dropped triplet's, and
+    the refill never touches the loan's busy streak;
+  - each refusal the transaction treats as final names a refusal the cache really returns, and drops its triplet;
+  - a lent triplet the preparation can never prepare (no tensor resolves a member, or the device has no WEIGHT arena,
+    which is told apart from a full zone) is dropped too, not returned BUSY: under the inventory lock, after the
+    publication is checked unchanged, and only while it is the ledger's back;
+  - each dropped triplet is WARNed once, after the lock is released, on both exits that follow a drop, naming the
+    device, the layer, the expert and the reason; a drop resets the runner's refusal count.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -140,6 +149,7 @@ def read(rel: str) -> str:
 CACHE = read("ggml/src/ggml-sycl/unified-cache.cpp")
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 SYCL_CMAKE = read("ggml/src/ggml-sycl/CMakeLists.txt")
+COMMON = read("ggml/src/ggml-sycl/common.hpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -350,7 +360,8 @@ FORWARD = "ready_event, replace_existing);"
 STOP_FROM_RECORD = "stop = record.reason;"
 REFUSE_STOP = "return refuse(stop_code, stop);"
 # A loan never sets `transient`, so its refusals stay REFUSED; only a refill's transient refusal is BUSY.
-STOP_CODE = "const ggml_sycl_txn_result stop_code = transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED;"
+STOP_CODE = ("const ggml_sycl_txn_result stop_code = transient ? ggml_sycl_txn_result::BUSY : "
+             "ggml_sycl_txn_result::REFUSED;")
 
 
 def claim_existing_host_entry_never_replaced(cache: str, sycl: str) -> bool:
@@ -554,7 +565,7 @@ REMEMBER = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_
 FLIP = "(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, refill, refill ? device : -1);"
 PUBLISH = "ggml_sycl_publish_prepared_plan_locked(prepared_publication);"
 EPOCH = "ggml_sycl_optional_layouts_retired();"
-UNLOCK = "} lock.unlock(); if (!swapped) {"
+UNLOCK = "} lock.unlock(); warn_dropped(); if (!swapped) {"
 
 
 def claim_probe_changes_nothing_and_a_loan_publishes_once(sycl: str) -> bool:
@@ -575,7 +586,7 @@ CATCH_LENDING = ('} catch (const ggml_sycl_fallback_error &) { throw; } catch (.
 FLIP_IF_LOANED = "if (loaned) { const ggml_sycl::expert_placement_key placed[3] = {"
 BREAK_ESCAPED = "if (escaped) { break; }"
 RETHROW = "if (escaped) { std::rethrow_exception(escaped); }"
-RETHROW_EXITS = ("if (lent == 0) { lock.unlock(); " + RETHROW + " return refuse(stop_code, stop); }",
+RETHROW_EXITS = ("if (lent == 0) { lock.unlock(); warn_dropped(); " + RETHROW + " return refuse(stop_code, stop); }",
                  RETHROW + ' return finish(ggml_sycl_txn_result::REFUSED, "concurrent transaction won the CAS");',
                  RETHROW + " return finish(ggml_sycl_txn_result::ACCEPTED, reason);")
 
@@ -647,9 +658,10 @@ def refill_bodies(cache: str, sycl: str) -> list[str]:
 
 
 DIRECTION_ENUM = "enum class ggml_sycl_expert_txn_direction { LOAN, REFILL, };"
-LOAN_ENTRY = "return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, probe_mode, resolver, out, warn_busy);"
-REFILL_ENTRY = ("const ggml_sycl_txn_result answer = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::REFILL, device, "
-                "max_triplets, false, resolver, result, false);")
+LOAN_ENTRY = ("return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, probe_mode, "
+              "resolver, out, warn_busy);")
+REFILL_ENTRY = ("const ggml_sycl_txn_result answer = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::REFILL, "
+                "device, max_triplets, false, resolver, result, false);")
 REFILL_FLAG = "const bool refill = direction == ggml_sycl_expert_txn_direction::REFILL;"
 REFILL_CALL = "loaned = cache->refill_lent_triplet(triplet.refill_members, refilled);"
 
@@ -691,7 +703,8 @@ def claim_refill_copy_is_owner_to_owner_on_the_copy_engine(cache: str) -> bool:
 
 
 EMPLACE = "entries_.emplace(device_key, device_entry[i]);"
-MINT_MIRROR = 'device_mirror[i].handle = make_direct_entry_handle(device_key, cache_device, stored, "expert_refill/mirror");'
+MINT_MIRROR = ("device_mirror[i].handle = make_direct_entry_handle(device_key, cache_device, stored, "
+               '"expert_refill/mirror");')
 MINT_OUT = ("out.device_handles[i] = mem_handle::from_weight_lease_locked(device_key, cache_device, stored.device_ptr, "
             "stored.layout, true, &stored);")
 SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);"
@@ -712,8 +725,9 @@ def claim_refill_allocates_before_it_changes_anything(cache: str) -> bool:
     b = body(norm(cache), REFILL_SIG)
     swap_at = b.find(SWAP_MIRROR)
     tail = b[swap_at:b.find("} } } ", swap_at) + 6] if swap_at >= 0 else ""
-    return (all(b.count(x) == 1 for x in (EMPLACE, MINT_MIRROR, MINT_OUT, SWAP_MIRROR, REMAP_ID, HOST_RETIRE,
-                                           PUBLICATION_FAILED, REFILL_CATCH, RELEASED_SIZED))
+    needles = (EMPLACE, MINT_MIRROR, MINT_OUT, SWAP_MIRROR, REMAP_ID, HOST_RETIRE, PUBLICATION_FAILED, REFILL_CATCH,
+               RELEASED_SIZED)
+    return (all(b.count(x) == 1 for x in needles)
             and bool(tail) and not any(x in tail for x in NODE_BUILDERS + ("make_direct_entry_handle(",))
             and ordered(b, REFILL_COPY, RELEASED_SIZED, CACHE_LOCKS, EMPLACE, MINT_MIRROR, MINT_OUT, REFILL_CATCH,
                         PUBLICATION_FAILED, SWAP_MIRROR, REMAP_ID, HOST_RETIRE))
@@ -729,9 +743,11 @@ def claim_refill_publishes_in_a_planned_materialization(cache: str) -> bool:
     return (b.count(REFILL_SESSION) == 1 and b.count("begin_planned_materialization(") == 0
             and ordered(b, REFILL_COPY, REFILL_SESSION, RELEASED_SIZED, CACHE_LOCKS, EMPLACE))
 
+
 RESOLVE_EXPERT_SIG = "expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request & req)"
 RESOLVE_PAST_RETIRED = "if (entry_it == entries_.end() || entry_it->second.retired) {"
-RESOLVE_MAPPED = "const auto mapped = entries_.find(id_it->second); if (mapped != entries_.end()) { entry_it = mapped; }"
+RESOLVE_MAPPED = ("const auto mapped = entries_.find(id_it->second); "
+                  "if (mapped != entries_.end()) { entry_it = mapped; }")
 
 
 def claim_a_retired_host_entry_does_not_shadow_the_refill(cache: str) -> bool:
@@ -742,6 +758,7 @@ def claim_a_retired_host_entry_does_not_shadow_the_refill(cache: str) -> bool:
     return (b.count(RESOLVE_PAST_RETIRED) == 1 and b.count(RESOLVE_MAPPED) == 1
             and ordered(b, "entry_it = entries_.find(explicit_key);", RESOLVE_PAST_RETIRED, "id_to_key_.find(req.key)",
                         RESOLVE_MAPPED, "if (entry.retired) {"))
+
 
 def claim_refill_retires_the_host_copy_exactly(cache: str) -> bool:
     """The host copy is withdrawn entry by entry under the loan's host ids, only while each still names the lent
@@ -790,7 +807,8 @@ FORGET_HOST = ("(void) extra->forget_moe_storage_handle_on_device(k.expert_id, G
                "ggml_sycl::mem_handle::HOST_DEVICE);")
 REMEMBER_DEVICE = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
                    "std::move(refilled.device_handles[r]), &refilled.copy_events[r], 0, logical);")
-POP_READMITTED = "if (refill) { ledger.triplets.pop_back(); } else { ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); }"
+POP_READMITTED = ("if (refill) { ledger.triplets.pop_back(); } "
+                  "else { ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); }")
 
 
 def claim_refill_flips_back_and_forgets_the_host_copy(sycl: str) -> bool:
@@ -846,23 +864,26 @@ def claim_ledger_is_guarded_by_the_inventory_mutex(sycl: str) -> bool:
             in s)
 
 
-SET_INACTIVE_TO_REFILL = (SET_INACTIVE, RUN_PENDING, DEFERRED_FREES, "ggml_sycl_run_expert_refill_at_boundary(backend);")
+SET_INACTIVE_TO_REFILL = (SET_INACTIVE, RUN_PENDING, DEFERRED_FREES,
+                          "ggml_sycl_run_expert_refill_at_boundary(backend);")
 RUN_REFILL = "ggml_sycl_run_expert_refill_at_boundary(backend);"
 BOUNDARY_SKIP = ("if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || "
                  "g_sycl_expert_lent_count[device].load(std::memory_order_acquire) == 0) { return 0; }")
 BOUNDARY_ARM = "ggml_sycl_expert_refill_set_armed(device, decode); if (!decode) { return 0; }"
 BOUNDARY_PHASE = ("ctx->device, ctx->graph_phase_is_decode.load(std::memory_order_relaxed), "
+                  "ctx->decode_graph_count.load(std::memory_order_relaxed), &ctx->refill_decode_graph, "
                   "ggml_sycl_moe_refill_per_graph(), nullptr, nullptr);")
-MMID_REFILL_FORBIDDEN = ("ggml_sycl_expert_txn_run(", "ggml_sycl_run_expert_refill", "ggml_sycl_expert_refill_transaction_run(",
-                         "refill_lent_triplet(")
+MMID_REFILL_FORBIDDEN = ("ggml_sycl_expert_txn_run(", "ggml_sycl_run_expert_refill",
+                         "ggml_sycl_expert_refill_transaction_run(", "refill_lent_triplet(")
 
 
 def claim_refill_runs_at_the_decode_boundary(sycl: str) -> bool:
-    """ggml_backend_sycl_synchronize() runs the refill once the compute flag is clear, after the pending loan and the
-    deferred-free pass (which reclaims the loan's withdrawn device entries and returns the zone room the ring
-    released). It asks, without a lock, whether the device has lent anything; the graph that just ran then arms the
-    cursor (decode) or disarms it (prompt), and only a decode graph re-admits, up to GGML_SYCL_MOE_REFILL_PER_GRAPH
-    triplets. mul_mat_id names no refill entry; the body refuses "graph active"."""
+    """ggml_backend_sycl_synchronize() reaches the refill at every call, once the compute flag is clear, after the
+    pending loan and the deferred-free pass (which reclaims the loan's withdrawn device entries and returns the zone
+    room the ring released). It asks, without a lock, whether the device has lent anything; the graph that just ran
+    then arms the cursor (decode) or disarms it (prompt), and only a decode graph re-admits; how many, and how often,
+    is claim_one_decode_graph_admits_one_refill's. mul_mat_id names no refill entry; the body refuses "graph
+    active"."""
     s = norm(sycl)
     sync = body(s, SYNC_SIG)
     boundary = body(s, BOUNDARY_DEVICE_SIG)
@@ -905,15 +926,19 @@ TAKE_READMITTED = ("const uint32_t readmitted = g_sycl_expert_readmitted_total[d
 FREE_REPORTS = "ggml_sycl_moe_exec_log_report(); ggml_sycl_expert_refill_log_report();"
 REFILL_BUSY_WARN = ('if ((n - 1) % warn_every == 0) { GGML_LOG_WARN("[MOE-EXEC] refill device %d refused: %s (%u in a '
                     'row; logged once per %u)\\n", device, result->reason, n, warn_every); }')
-REFILL_RESET = ('if (code == ggml_sycl_txn_result::ACCEPTED || std::strcmp(result->reason, "nothing to refill") == 0) '
-                '{ streak.store(0, std::memory_order_relaxed); return remaining; }')
+REFILL_RESET = ("if (code == ggml_sycl_txn_result::ACCEPTED || result->n_dropped != 0 || "
+                'std::strcmp(result->reason, "nothing to refill") == 0) { streak.store(0, std::memory_order_relaxed); '
+                "return remaining; }")
+DROP_WARN = ('GGML_LOG_WARN("[MOE-EXEC] refill device %d: layer %d expert %d stays on the host: %s\\n", device, '
+             "dropped[i].first.layer_id, dropped[i].first.expert_id, dropped[i].second);")
 
 
 def claim_refill_warn_formats(sycl: str) -> bool:
     """The teardown line prints next to the [MOE-EXEC] summary, once: the counts are taken as they print. A refill's
     refusal is WARNed by its boundary runner alone, the first in a row and then one in every 64, with the count; an
-    accepted refill or one with nothing to do resets the count. The body itself WARNs no refill line (one per decode
-    graph would flood the log), and the loan's busy streak is not the refill's."""
+    accepted refill, one that dropped a triplet (its drop is WARNed already) or one with nothing to do resets the
+    count. The body WARNs no refill line but the drop's (one per decode graph would flood the log; a triplet is
+    dropped once), and the loan's busy streak is not the refill's."""
     s = norm(sycl)
     report = body(s, REPORT_SIG)
     boundary = body(s, BOUNDARY_DEVICE_SIG)
@@ -923,14 +948,14 @@ def claim_refill_warn_formats(sycl: str) -> bool:
             and body(s, FREE_SIG).count(FREE_REPORTS) == 1
             and boundary.count("GGML_LOG_WARN(") == 1 and boundary.count(BUSY_EVERY) == 1
             and ordered(boundary, REFILL_RESET, BUSY_EVERY, REFILL_BUSY_WARN)
-            and 'GGML_LOG_WARN("[MOE-EXEC] refill' not in txn
+            and txn.count('GGML_LOG_WARN("[MOE-EXEC] refill') == 1 and txn.count(DROP_WARN) == 1
             and not any("g_sycl_expert_loan_busy_streak" in b for b in refill_bodies("", sycl)[1:]))
 
 
 FINAL_REASONS = ("invalid member", "not lent", "layout", "not a lent copy", "host copy not published",
                  "device storage size")
 FINAL_POP = ("stop = refilled.reason; transient = !ggml_sycl_expert_refill_refusal_is_final(stop); "
-             "if (!transient) { ledger.triplets.pop_back(); } break;")
+             "if (!transient) { drop_back(stop); } break;")
 
 
 def claim_final_refusals_name_the_cache_refusals(cache: str, sycl: str) -> bool:
@@ -942,6 +967,89 @@ def claim_final_refusals_name_the_cache_refusals(cache: str, sycl: str) -> bool:
     return (all(('"%s"' % r) in final for r in FINAL_REASONS)
             and all(('refusal = "%s";' % r) in refill for r in FINAL_REASONS)
             and body(norm(sycl), TXN_SIG).count(FINAL_POP) == 1)
+
+
+# --- a lent triplet the refill can never prepare leaves the ledger, WARNed (llama.cpp-sif1) -------------------------
+
+RESOLVE_FAILED = ("if (!e || !(*resolver)(*e, target) || !target.extra) { "
+                  'stop = refill ? "no tensor for a lent expert" : "no tensor for a selected expert"; break; }')
+ARENA_TOLD_APART = ("const bool arena = cache->arena_active() && "
+                    "cache->zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0; "
+                    'stop = arena ? "WEIGHT zone full" : "no WEIGHT arena"; transient = arena; break;')
+UNPREPARABLE = ("} else if (refill && !transient) { unpreparable = { keys[3 * t], keys[3 * t + 1], keys[3 * t + 2] }; "
+                "unpreparable_reason = stop; }")
+EARLY_REFUSAL = "if (prepared.empty() && !unpreparable_reason) {"
+PLAN_CHANGED = 'return refuse(ggml_sycl_txn_result::BUSY, "busy (plan changed while acquiring the transaction lock)");'
+DROP_AT_BACK = ("if (unpreparable_reason && !ledger.triplets.empty() && ledger.triplets.back() == unpreparable) "
+                "{ drop_back(unpreparable_reason); }")
+DROP_COUNTED = "result.n_dropped = static_cast<uint32_t>(n_dropped);"
+LENT_COUNT_STORE = ("g_sycl_expert_lent_count[device].store(static_cast<uint32_t>(ledger.triplets.size()), "
+                    "std::memory_order_release);")
+
+
+def claim_an_unpreparable_triplet_leaves_the_ledger(sycl: str) -> bool:
+    """A refill's preparation that fails for good on a triplet (no tensor resolves a member, or the device has no WEIGHT
+    arena, told apart from a full zone, which stays transient) does not return early: under the inventory lock, once
+    the publication is checked unchanged, the triplet leaves the ledger if it is the back by then (every triplet
+    selected before it moved), and the ledger count is stored after. Left there, it would stop every later refill at
+    the same triplet (llama.cpp-sif1)."""
+    b = body(norm(sycl), TXN_SIG)
+    needles = (RESOLVE_FAILED, ARENA_TOLD_APART, UNPREPARABLE, EARLY_REFUSAL, DROP_AT_BACK, DROP_COUNTED,
+               LENT_COUNT_STORE)
+    return (all(b.count(x) == 1 for x in needles)
+            and ordered(b, RESOLVE_FAILED, DEVICE_ALLOC, ARENA_TOLD_APART, UNPREPARABLE, EARLY_REFUSAL, INVENTORY_LOCK,
+                        PLAN_CHANGED, LEDGER_IN_TXN, REFILL_CALL, POP_READMITTED, DROP_AT_BACK, DROP_COUNTED,
+                        LENT_COUNT_STORE))
+
+
+DROP_BACK = ("auto drop_back = [&](const char * reason) { GGML_ASSERT(n_dropped < dropped.size()); "
+             "dropped[n_dropped++] = { ledger.triplets.back()[0], reason }; ledger.triplets.pop_back(); };")
+WARN_DROPPED_SIG = "auto warn_dropped = [&]"
+WARN_EACH = "for (size_t i = 0; i < n_dropped; ++i) {"
+WARN_AFTER_UNLOCK = "lock.unlock(); warn_dropped();"
+
+
+def claim_each_dropped_triplet_is_warned(sycl: str) -> bool:
+    """Both drops, the cache's final refusal and the unpreparable triplet, go through one recorder that pops the back
+    and keeps its key and reason; each recorded drop is WARNed once, naming the device, the layer, the expert and the
+    reason, after the inventory lock is released, on both exits that follow the drops: the one where nothing moved
+    and the one that publishes. Nothing filters the WARN (llama.cpp-sif1)."""
+    b = body(norm(sycl), TXN_SIG)
+    at = b.find(WARN_DROPPED_SIG)
+    warn = body(b[at:], WARN_DROPPED_SIG) if at >= 0 else ""
+    return (b.count(DROP_BACK) == 1 and b.count("drop_back(") == 2 and b.count(DROP_WARN) == 1
+            and warn.count(DROP_WARN) == 1 and warn.count(WARN_EACH) == 1 and warn.count("if (") == 0
+            and b.count("warn_dropped();") == 2 and b.count(WARN_AFTER_UNLOCK) == 2
+            and ordered(b, DROP_BACK, WARN_DROPPED_SIG, FINAL_POP, DROP_AT_BACK,
+                        "if (lent == 0) { " + WARN_AFTER_UNLOCK, PUBLISH, WARN_AFTER_UNLOCK + " if (!swapped) {"))
+
+
+GRAPH_COMPUTE_SIG = ("static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, "
+                     "ggml_cgraph * cgraph)")
+DECODE_COUNTER = "std::atomic<uint64_t> decode_graph_count{ 0 };"
+REFILL_MARK = "std::atomic<uint64_t> refill_decode_graph{ 0 };"
+DECODE_BUMP = "if (cached_is_decode) { sycl_ctx->decode_graph_count.fetch_add(1, std::memory_order_relaxed);"
+ONCE_PER_GRAPH = ("if (refilled_at->exchange(decode_graphs, std::memory_order_relaxed) == decode_graphs) { "
+                  "*result = ggml_sycl_expert_loan_result{};")
+SKIP_REASON = 'result->reason = "no decode graph since the last refill"; return result->n_remaining; }'
+
+
+def claim_one_decode_graph_admits_one_refill(sycl: str, common: str, sources: list[str]) -> bool:
+    """A context synchronizes more than once per graph, so the boundary alone does not bound the refill. Each context
+    counts its decode graph_compute calls (graph_compute alone bumps the count, and only for a decode graph) beside
+    the count its last refill ran at; the boundary passes both, and once it has armed the cursor it runs the refill
+    only when the count has moved, so one decode graph re-admits at most GGML_SYCL_MOE_REFILL_PER_GRAPH triplets
+    (llama.cpp-sif1)."""
+    s = norm(sycl)
+    c = norm(common)
+    boundary = body(s, BOUNDARY_DEVICE_SIG)
+    return (c.count(DECODE_COUNTER) == 1 and c.count(REFILL_MARK) == 1
+            and body(s, GRAPH_COMPUTE_SIG).count(DECODE_BUMP) == 1
+            and sum(norm(src).count("decode_graph_count.fetch_add(") for src in sources) == 1
+            and boundary.count(ONCE_PER_GRAPH) == 1 and boundary.count(SKIP_REASON) == 1
+            and ordered(boundary, BOUNDARY_SKIP, BOUNDARY_ARM, ONCE_PER_GRAPH, SKIP_REASON,
+                        "ggml_sycl_expert_refill_transaction_run(")
+            and body(s, BOUNDARY_SIG).count(BOUNDARY_PHASE) == 1)
 
 
 # --- positive tests -------------------------------------------------------------------------------------------------
@@ -1053,8 +1161,10 @@ def test_refill_allocates_before_it_changes_anything():
 def test_refill_publishes_in_a_planned_materialization():
     assert claim_refill_publishes_in_a_planned_materialization(CACHE)
 
+
 def test_a_retired_host_entry_does_not_shadow_the_refill():
     assert claim_a_retired_host_entry_does_not_shadow_the_refill(CACHE)
+
 
 def test_refill_retires_the_host_copy_exactly():
     assert claim_refill_retires_the_host_copy_exactly(CACHE)
@@ -1138,7 +1248,7 @@ def test_mutant_loan_finalizes_inline_fails():
     """The id-wide retire's immediate finalize asks the fill event's status: the loan leaves it to the deferred pass."""
     assert not claim_loan_never_waits(
         _once_in(CACHE, LOAN_SIG, "out.accepted = true; out.reason = \"OK\";",
-              "(void) finalize_retired_entries_locked(); out.accepted = true; out.reason = \"OK\";"), SYCL)
+                 "(void) finalize_retired_entries_locked(); out.accepted = true; out.reason = \"OK\";"), SYCL)
 
 
 def test_mutant_transaction_waits_fails():
@@ -1196,7 +1306,7 @@ def test_mutant_copy_source_not_the_owner_fails():
     """A raw-pointer copy handle retains nothing: the deferred free could release the storage mid-copy."""
     assert not claim_device_free_gated_on_the_copy(
         _once_in(CACHE, LOAN_SIG, SRC_IS_OWNER,
-              "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, GGML_LAYOUT_AOS, cache_device, e.size);"),
+                 "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, GGML_LAYOUT_AOS, cache_device, e.size);"),
         SYCL)
 
 
@@ -1440,8 +1550,9 @@ def test_mutant_runner_lets_the_transaction_warn_busy_fails():
 def test_mutant_transaction_ignores_warn_busy_fails():
     assert not claim_busy_warn_is_rate_limited(
         _once_in(SYCL, TXN_SIG, REFUSE_GATE,
-                 REFUSE_GATE.replace("if (!probe_mode && !refill && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {",
-                                     "if (!probe_mode && !refill) {")))
+                 REFUSE_GATE.replace(
+                     "if (!probe_mode && !refill && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {",
+                     "if (!probe_mode && !refill) {")))
 
 
 def test_mutant_busy_warn_drops_the_count_fails():
@@ -1589,14 +1700,6 @@ def test_mutant_registration_wrong_label_fails():
     assert not claim_device_test_registration(SYCL_CMAKE.replace('LABELS "sycl;cache;moe"', 'LABELS "sycl;moe"', 1))
 
 
-if __name__ == "__main__":
-    import sys
-
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-q"]))
-
-
 # --- refill mutants (llama.cpp-sif1) ----------------------------------------------------------------------------------
 
 
@@ -1617,7 +1720,8 @@ def test_mutant_refill_boundary_drains_the_queue_fails():
 
 
 def test_mutant_refill_copies_from_a_raw_pointer_fails():
-    mutant = _once_in(CACHE, REFILL_SIG, REFILL_SRC, "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, e.size);")
+    mutant = _once_in(CACHE, REFILL_SIG, REFILL_SRC,
+                      "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, e.size);")
     assert not claim_refill_copy_is_owner_to_owner_on_the_copy_engine(mutant)
 
 
@@ -1637,7 +1741,8 @@ def test_mutant_refill_copy_ignores_the_host_writes_fails():
 
 
 def test_mutant_refill_mints_after_the_swap_fails():
-    mutant = _once(CACHE, SWAP_MIRROR, SWAP_MIRROR + ' (void) make_direct_entry_handle(key, cache_device, stored, "x");')
+    mutant = _once(CACHE, SWAP_MIRROR,
+                   SWAP_MIRROR + ' (void) make_direct_entry_handle(key, cache_device, stored, "x");')
     assert not claim_refill_allocates_before_it_changes_anything(mutant)
 
 
@@ -1667,6 +1772,7 @@ def test_mutant_refill_opens_its_session_after_the_locks_fails():
     mutant = _once_in(moved, REFILL_SIG, EMPLACE, REFILL_SESSION + " " + EMPLACE)
     assert not claim_refill_publishes_in_a_planned_materialization(mutant)
 
+
 def test_mutant_retired_host_entry_shadows_the_refill_fails():
     mutant = _once(CACHE, RESOLVE_PAST_RETIRED, "if (entry_it == entries_.end()) {")
     assert not claim_a_retired_host_entry_does_not_shadow_the_refill(mutant)
@@ -1675,6 +1781,7 @@ def test_mutant_retired_host_entry_shadows_the_refill_fails():
 def test_mutant_resolve_takes_a_missing_mapping_fails():
     mutant = _once(CACHE, RESOLVE_MAPPED, "entry_it = entries_.find(id_it->second);")
     assert not claim_a_retired_host_entry_does_not_shadow_the_refill(mutant)
+
 
 def test_mutant_refill_uses_the_id_wide_retire_fails():
     mutant = _once(CACHE, HOST_RETIRE, "(void) retire_expert_entry_exact(id, GGML_LAYOUT_AOS, \"refill\");")
@@ -1798,7 +1905,8 @@ def test_mutant_refill_env_unset_turns_it_off_fails():
 
 
 def test_mutant_teardown_reprints_the_counts_fails():
-    mutant = _once(SYCL, TAKE_LENT, "const uint32_t lent = g_sycl_expert_lent_total[device].load(std::memory_order_acquire);")
+    mutant = _once(SYCL, TAKE_LENT,
+                   "const uint32_t lent = g_sycl_expert_lent_total[device].load(std::memory_order_acquire);")
     assert not claim_refill_warn_formats(mutant)
 
 
@@ -1834,7 +1942,7 @@ def test_mutant_renamed_refusal_turns_final_into_retried_fails():
 
 
 def test_mutant_final_refusal_kept_in_the_ledger_fails():
-    mutant = _once(SYCL, FINAL_POP, FINAL_POP.replace("if (!transient) { ledger.triplets.pop_back(); } ", ""))
+    mutant = _once(SYCL, FINAL_POP, FINAL_POP.replace("if (!transient) { drop_back(stop); } ", ""))
     assert not claim_final_refusals_name_the_cache_refusals(CACHE, mutant)
 
 
@@ -1874,3 +1982,125 @@ def test_mutant_pinned_pool_stops_branching_on_the_zones_fails():
     mutant = _once_in(CACHE, UNIFIED_ALLOC_SIG, PINNED_ZONE_BRANCH,
                       PINNED_ZONE_BRANCH.replace("!ucache->host_zones_configured()", "!ucache->arena_active()"))
     assert not claim_a_loan_without_host_zones_is_refused(mutant, SYCL)
+
+
+# --- a lent triplet the refill can never prepare leaves the ledger, each drop WARNed, and one decode graph admits one
+# --- refill (llama.cpp-sif1, quality review) --------------------------------------------------------------------------
+
+
+def test_an_unpreparable_triplet_leaves_the_ledger():
+    assert claim_an_unpreparable_triplet_leaves_the_ledger(SYCL)
+
+
+def test_each_dropped_triplet_is_warned():
+    assert claim_each_dropped_triplet_is_warned(SYCL)
+
+
+def test_one_decode_graph_admits_one_refill():
+    assert claim_one_decode_graph_admits_one_refill(SYCL, COMMON, sycl_sources_outside_tests())
+
+
+def test_mutant_unpreparable_triplet_stops_every_later_refill_fails():
+    """The early return the review found: an unpreparable back triplet returns before the lock, every boundary."""
+    mutant = _once(SYCL, EARLY_REFUSAL, "if (prepared.empty()) {")
+    assert not claim_an_unpreparable_triplet_leaves_the_ledger(mutant)
+
+
+def test_mutant_resolver_failure_is_not_recorded_fails():
+    mutant = _once(SYCL, UNPREPARABLE, UNPREPARABLE.replace("refill && !transient", "refill && transient"))
+    assert not claim_an_unpreparable_triplet_leaves_the_ledger(mutant)
+
+
+def test_mutant_unpreparable_triplet_dropped_from_behind_the_back_fails():
+    mutant = _once(SYCL, DROP_AT_BACK, DROP_AT_BACK.replace(" && ledger.triplets.back() == unpreparable", ""))
+    assert not claim_an_unpreparable_triplet_leaves_the_ledger(mutant)
+
+
+def test_mutant_unpreparable_triplet_dropped_before_the_plan_check_fails():
+    mutant = _once_in(_once(SYCL, DROP_AT_BACK, ""), TXN_SIG, INVENTORY_LOCK, INVENTORY_LOCK + " " + DROP_AT_BACK)
+    assert not claim_an_unpreparable_triplet_leaves_the_ledger(mutant)
+
+
+def test_mutant_no_weight_arena_returns_busy_fails():
+    mutant = _once(SYCL, ARENA_TOLD_APART, ARENA_TOLD_APART.replace("transient = arena;", "transient = true;"))
+    assert not claim_an_unpreparable_triplet_leaves_the_ledger(mutant)
+
+
+def test_mutant_no_weight_arena_reads_as_a_full_zone_fails():
+    mutant = _once(SYCL, ARENA_TOLD_APART, 'stop = "WEIGHT zone full"; transient = true; break;')
+    assert not claim_an_unpreparable_triplet_leaves_the_ledger(mutant)
+
+
+def test_mutant_ledger_count_stored_before_the_drop_fails():
+    mutant = _once(_once_in(SYCL, TXN_SIG, LENT_COUNT_STORE, ""), DROP_AT_BACK, LENT_COUNT_STORE + " " + DROP_AT_BACK)
+    assert not claim_an_unpreparable_triplet_leaves_the_ledger(mutant)
+
+
+def test_mutant_drop_unwarned_when_nothing_moved_fails():
+    mutant = _once(SYCL, "if (lent == 0) { " + WARN_AFTER_UNLOCK, "if (lent == 0) { lock.unlock();")
+    assert not claim_each_dropped_triplet_is_warned(mutant)
+
+
+def test_mutant_drop_unwarned_when_something_moved_fails():
+    mutant = _once(SYCL, WARN_AFTER_UNLOCK + " if (!swapped) {", "lock.unlock(); if (!swapped) {")
+    assert not claim_each_dropped_triplet_is_warned(mutant)
+
+
+def test_mutant_drop_warned_under_the_lock_fails():
+    mutant = _once(SYCL, DROP_BACK, DROP_BACK.replace("ledger.triplets.pop_back(); };",
+                                                      "ledger.triplets.pop_back(); " + DROP_WARN + " };"))
+    assert not claim_each_dropped_triplet_is_warned(mutant)
+
+
+def test_mutant_drop_warned_once_per_call_fails():
+    mutant = _once(SYCL, WARN_EACH, "for (size_t i = 0; i < n_dropped && i < 1; ++i) {")
+    assert not claim_each_dropped_triplet_is_warned(mutant)
+
+
+def test_mutant_drop_warn_filtered_fails():
+    mutant = _once(SYCL, DROP_WARN, "if (n_dropped > 1) { " + DROP_WARN + " }")
+    assert not claim_each_dropped_triplet_is_warned(mutant)
+
+
+def test_mutant_final_refusal_popped_unrecorded_fails():
+    mutant = _once(SYCL, FINAL_POP, FINAL_POP.replace("drop_back(stop);", "ledger.triplets.pop_back();"))
+    assert not claim_each_dropped_triplet_is_warned(mutant)
+
+
+def test_mutant_refill_at_every_synchronize_fails():
+    """The review's finding: without the count, every synchronize after a decode graph re-admits again."""
+    mutant = _once(SYCL, ONCE_PER_GRAPH, "if (false) { *result = ggml_sycl_expert_loan_result{};")
+    assert not claim_one_decode_graph_admits_one_refill(mutant, COMMON, [mutant, COMMON])
+
+
+def test_mutant_every_graph_counts_as_decode_fails():
+    mutant = _once(SYCL, DECODE_BUMP,
+                   "sycl_ctx->decode_graph_count.fetch_add(1, std::memory_order_relaxed); if (cached_is_decode) {")
+    assert not claim_one_decode_graph_admits_one_refill(mutant, COMMON, [mutant, COMMON])
+
+
+def test_mutant_boundary_counts_a_graph_itself_fails():
+    mutant = _once_in(SYCL, BOUNDARY_SIG, BOUNDARY_PHASE,
+                      BOUNDARY_PHASE + " ctx->decode_graph_count.fetch_add(1, std::memory_order_relaxed);")
+    assert not claim_one_decode_graph_admits_one_refill(mutant, COMMON, [mutant, COMMON])
+
+
+def test_mutant_refill_mark_is_not_the_contexts_fails():
+    mutant = _once(COMMON, REFILL_MARK, "")
+    assert not claim_one_decode_graph_admits_one_refill(SYCL, mutant, [SYCL, mutant])
+
+
+def test_mutant_refill_runs_before_the_count_is_checked_fails():
+    run = ("const uint32_t remaining = ggml_sycl_expert_refill_transaction_run(device, max_triplets, resolver, result, "
+           "&code);")
+    mutant = _once_in(SYCL, BOUNDARY_DEVICE_SIG, run, "")
+    mutant = _once_in(mutant, BOUNDARY_DEVICE_SIG, ONCE_PER_GRAPH, run + " " + ONCE_PER_GRAPH)
+    assert not claim_one_decode_graph_admits_one_refill(mutant, COMMON, [mutant, COMMON])
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

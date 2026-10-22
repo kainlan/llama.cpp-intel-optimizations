@@ -34,8 +34,9 @@
 //   refill_readmits_one_triplet_per_call
 //                           The two-triplet loan, then a decode boundary's refill and a direct one, one triplet each.
 //                           Right after the first, while its withdrawn host entries are still in the cache, retired,
-//                           the re-admitted ids resolve past them to the device entries, and each re-admitted handle
-//                           resolves on the device and refuses a host caller (three wrong-device WARNs, by design).
+//                           the re-admitted ids resolve past them to the device entries, still IN_PROGRESS with the
+//                           copy as their ready event, and each re-admitted handle resolves on the device and refuses
+//                           a host caller (three wrong-device WARNs, by design).
 //                           Each re-admitted triplet is on the device in the plan, resolves there with its original
 //                           bytes, its extras name the device copy, and its host entries are gone; each refill call
 //                           took no staged copy; a third call has nothing to refill; the raw device bytes and the
@@ -43,8 +44,21 @@
 //   refill_cancelled_by_a_loan
 //                           One refill, then a one-triplet loan: the next refill re-admits nothing (0 remaining) and
 //                           publishes nothing, the triplet still lent stays on the host, a prompt boundary keeps the
-//                           cursor disarmed and the next decode boundary re-admits again; neither accepted refill took
-//                           a staged copy.
+//                           cursor disarmed and the next decode boundary re-admits again, the new loan's triplet (the
+//                           ledger's back) while the first loan's stays lent; neither accepted refill took a staged
+//                           copy.
+//   refill_runs_once_per_decode_graph
+//                           The two-triplet loan, then two boundaries with no graph between them: the first re-admits
+//                           one triplet, the second answers "no decode graph since the last refill" and publishes
+//                           nothing; the next decode graph's boundary re-admits the other.
+//   refill_drops_an_unpreparable_triplet
+//                           A four-triplet loan and a resolver that refuses one member. Refused at the back, the
+//                           triplet leaves the ledger with nothing moved or published and its minted zone room handed
+//                           back; refused second at two per call, the back moves and the refused one leaves. Each
+//                           drop WARNs once ("stays on the host: no tensor for a lent expert", two in all) and resets
+//                           the runner's count. Then a full WEIGHT zone answers "WEIGHT zone full" and keeps the last
+//                           triplet (one "refill device 0 refused" WARN), which the next decode boundary re-admits
+//                           once the room is back. The teardown counts read 2/4.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -102,6 +116,8 @@ int main() {
                    ggml_sycl::test_expert_direct_stage_outside_a_load_copies_through_staging);
     ok &= run_case("refill_readmits_one_triplet_per_call", ggml_sycl::test_expert_refill_readmits_one_triplet_per_call);
     ok &= run_case("refill_cancelled_by_a_loan", ggml_sycl::test_expert_refill_cancelled_by_a_loan);
+    ok &= run_case("refill_runs_once_per_decode_graph", ggml_sycl::test_expert_refill_runs_once_per_decode_graph);
+    ok &= run_case("refill_drops_an_unpreparable_triplet", ggml_sycl::test_expert_refill_drops_an_unpreparable_triplet);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
