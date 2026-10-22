@@ -557,13 +557,17 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
 }
 
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
-    if (n_ubatch == 0 || !in.plan_of) {
+    if (n_ubatch == 0) {
         return 0;
     }
-    const size_t plan = in.plan_of(in.plan_ctx, n_ubatch);
+    // No plan function, no hold: the ring is still a demand.
+    const size_t plan  = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
     // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch.
-    return zone_hold_spill_raw_demand(
+    const size_t spill = zone_hold_spill_raw_demand(
         zone_hold_spill_bound(plan, zone_hold_fit_request(in, n_ubatch), n_ubatch, n_ubatch), in.kv_room);
+    // The ring is lent bytes, so only the part no loan covers is a demand on free memory (llama.cpp-kjef). The one
+    // place it is added, so every consumer of the fit reads it. Saturating, so a wrapped sum never reads as a fit.
+    return in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
 }
 
 bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {

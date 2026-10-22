@@ -521,6 +521,8 @@ struct zone_hold_rung_request {
 // The planned dense scratch (the most the hold can be) at a rung.
 typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 
+// ring_bytes is the prefill ring's bytes no loan can cover (llama.cpp-kjef): the ring is lent, so it is 0 when a loan
+// supplies all of it, and a demand on free memory otherwise.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
     size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
@@ -529,6 +531,7 @@ struct zone_hold_fit_inputs {
     size_t                         n_rungs     = 0;
     zone_hold_plan_fn              plan_of     = nullptr;
     void *                         plan_ctx    = nullptr;
+    size_t                         ring_bytes  = 0;
 };
 
 // The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
@@ -538,7 +541,8 @@ struct zone_hold_fit_inputs {
 size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
-// zone_hold_spill_bound(plan, the rung's request) and the KV room. 0 for an unknown n_ubatch.
+// zone_hold_spill_bound(plan, the rung's request) and the KV room, plus the ring bytes no loan covers (saturating).
+// 0 for an unknown n_ubatch.
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // Whether the rung fits: zone_hold_spill_bound_fits(free_before, headroom, demand).

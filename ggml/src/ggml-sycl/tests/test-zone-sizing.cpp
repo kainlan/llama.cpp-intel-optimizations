@@ -1640,6 +1640,54 @@ int main() {
         CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) != 1024, "a rung whose own request cannot fit is not named");
     }
 
+    // ---- Case 24b (llama.cpp-kjef, ring fit term): the prefill ring is lent bytes, so it costs the card nothing
+    // EXCEPT the part a loan cannot supply; that remainder is a demand on free memory and is part of the ONE demand
+    // every fit consumer reads. The Case 24 inputs (512: plan 76 MiB + request 495 MiB - 100 MiB of room = 471 MiB,
+    // 626 MiB left of 1097 MiB) with 400 MiB of the ring uncovered leave 226 MiB against a 256 MiB headroom. -------
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t {
+            return 76 * 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 512,  495 * MiB },
+            { 1024, 990 * MiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1097 * MiB;
+        in.kv_room                         = 100 * MiB;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 2;
+        in.plan_of                         = plan;
+        CHECK(in.ring_bytes == 0, "no uncovered ring unless a caller says so");
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "baseline: 512 fits with no ring bytes to charge");
+        const size_t base = ggml_sycl::zone_hold_fit_demand(in, 512);
+        in.ring_bytes     = 400 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == base + 400 * MiB,
+              "demand = today's value + the uncovered ring");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 512), "512 does not fit once 400 MiB of the ring is uncovered");
+        CHECK(ggml_sycl::zone_hold_fit(in, 256), "256 passes under the same inputs");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 512) == 256, "the -ub the refusal names is 256");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 256) == 256, "a rung that fits is returned unchanged");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "an unknown n_ubatch still names no demand");
+        // A ring a loan covers is no demand at all, so the verdict is today's.
+        in.ring_bytes = 0;
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "a fully covered ring changes nothing");
+        // Saturating: a huge figure never wraps to a small demand that reads as a fit.
+        in.ring_bytes = SIZE_MAX;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == SIZE_MAX, "a huge ring saturates the demand");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 512), "and the rung is refused, never fitted by a wrapped sum");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 512) == 0, "no rung fits an unbounded ring: nothing is named");
+        // No plan function, no hold: the ring is still a demand, and the only one.
+        in.plan_of    = nullptr;
+        in.ring_bytes = 400 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 400 * MiB, "with no plan the demand is the ring alone");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "an unknown n_ubatch names no demand, plan or not");
+        in.ring_bytes = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 0, "no plan and no ring is no demand");
+    }
+
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
     // THAT rung's measured request, not of which other rungs ran before it or in what order. A rung with its own
     // record uses it and only it; a rung without one is scaled from the SET of records (order never matters). -----
