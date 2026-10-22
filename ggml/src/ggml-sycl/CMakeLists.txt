@@ -3132,7 +3132,6 @@ set_tests_properties(sycl-moe-stream-ring PROPERTIES
 # device kernel of its own (SYCL_LINK_ONLY_TEST_OPTIONS). It allocates device
 # memory, so it carries "cache" and runs serially, outside the throttled sweep;
 # GGML_SYCL_STRICT_LEASES=1 makes an ownerless lease abort the run. Lead-run.
-if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-expert-loan
     tests/test-moe-expert-loan.cpp
 )
@@ -3160,7 +3159,6 @@ set_tests_properties(sycl-moe-expert-loan PROPERTIES
     # ctest renders that as FAILED rather than Skipped.
     SKIP_RETURN_CODE 77
 )
-endif() # static SYCL backend fixture
 
 # Unregistered-external-pointer byte-contract authority (llama.cpp-fxrg).
 # Regression for the P0 where several ggml-sycl.cpp call sites minted

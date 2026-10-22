@@ -4604,7 +4604,10 @@ endif()
 # llama.cpp-mwmr: the expert loan transaction (lend resident expert triplets to the prefill ring) never waits or asks an
 # event's status, retires each device entry exactly and only after its copy is submitted reading the entry's own owner,
 # takes the inventory mutex before the cache locks, refuses shared storage and SOA, registers the host copy typed, and
-# publishes once. Host-only: reads sources, no device, no model.
+# publishes once, also when lending throws. It runs only at a graph boundary from a lock-free request that a BUSY
+# refusal re-posts, never replaces an existing host entry ("host entry exists"), undoes a failed registration, and the
+# CPU expert consumer orders on the host copy's ready event. The full claim list is the gate's docstring. Host-only:
+# reads sources, no device, no model.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-expert-loan-source

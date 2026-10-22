@@ -10165,33 +10165,40 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         return false;
     }
 
-    // 3. All three or none, under the locks: each device entry is still the one checked. Its last write becomes its
-    // copy, which ran behind the fill, so its storage is freed behind the copy. The transaction takes a lease that
-    // holds the entry in place until its host copy is published, and withdraws it exactly, leaving any other entry
-    // under its id alone. DEFERRED is the expected status: that lease alone defers the free.
+    // 3. All three or none, under the locks: each device entry is still the one checked. The transaction takes a lease
+    // that holds the entry in place until its host copy is published. Its last write becomes its copy, which ran behind
+    // the fill, so its storage is freed behind the copy, and it is withdrawn exactly, leaving any other entry under its
+    // id alone. DEFERRED is the expected status: that lease alone defers the free. The leases are minted in the check
+    // loop, before any entry changes: minting allocates, so a throw leaves every entry as it was, and the leases
+    // already minted go with the unwinding. What changes the entries after it allocates nothing. The rollback after
+    // step 4 collects the host copies a failed registration left published into `released`, sized here, before any
+    // entry changes, so collecting them cannot throw.
     std::shared_ptr<mem_handle> held[3];
     weight_entry                released_mirrors[3];
+    std::vector<weight_entry>   released(members[0].host_keys.size() + members[1].host_keys.size() +
+                                         members[2].host_keys.size());
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
         unified_cache_entry * device_entry[3] = { nullptr, nullptr, nullptr };
         for (int i = 0; i < 3 && !refusal; ++i) {
-            const auto it =
-                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS));
+            const unified_cache_key device_key =
+                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+            const auto it = entries_.find(device_key);
             if (it == entries_.end() || it->second.retired ||
                 it->second.direct_alloc_owner.owner_control_id() != src_control[i]) {
                 refusal = "entry changed";
                 break;
             }
             device_entry[i] = &it->second;
+            held[i]         = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");
         }
         for (int i = 0; i < 3 && !refusal; ++i) {
             const unified_cache_key device_key =
                 make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
             device_entry[i]->last_write_event = out.copy_events[i];
             device_entry[i]->has_write_event  = true;
-            held[i] = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");
             out.retire_status[i] = retire_expert_entry_at_locked(device_key, &released_mirrors[i]);
         }
     }
@@ -10209,9 +10216,19 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         const expert_loan_member & m        = members[i];
         void *                     host_ptr = m.host_owner.resolve().ptr;
         for (size_t k = 0; k < m.host_keys.size(); ++k) {
-            if (!host_ptr || !register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
-                                                         k == 0 ? &out.host_handles[i] : nullptr, m.host_owner,
-                                                         &out.copy_events[i], /*replace_existing=*/false)) {
+            // The registration undoes and reports its own failures. The one allocation it does not catch, the typed
+            // wrapper's owner copy, comes before anything is registered, so it fails the registration like a refusal
+            // and the rollback below runs, with the device entries already withdrawn.
+            bool published = false;
+            try {
+                published = host_ptr && register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
+                                                                   k == 0 ? &out.host_handles[i] : nullptr,
+                                                                   m.host_owner, &out.copy_events[i],
+                                                                   /*replace_existing=*/false);
+            } catch (const std::bad_alloc &) {
+                published = false;
+            }
+            if (!published) {
                 failed = true;
                 break;
             }
@@ -10225,7 +10242,6 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         // withdrawn only while its entry is still the one this loan registered, so another registrant's entry under
         // the id is never touched. The held leases kept every withdrawn entry in place, and the copies stay retained
         // until they complete.
-        std::vector<weight_entry> released(static_cast<size_t>(registered[0] + registered[1] + registered[2]));
         {
             std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
             std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);

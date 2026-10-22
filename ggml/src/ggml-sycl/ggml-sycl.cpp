@@ -20737,12 +20737,19 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 //
 // Locking: g_tensor_inventory_mutex first, and under it the cache takes direct_stage_mutex_ and rw_mutex_, the order
 // the runtime context transaction keeps; g_sycl_graph_compute_mutex never. The host storage is minted and the tensors
-// are looked up before the inventory lock, so no allocation runs under it, and every WARN is emitted after it is
-// released.
+// are looked up before the inventory lock, so no unified-cache allocation runs under it, and every WARN is emitted
+// after it is released.
+//
+// An exception while a triplet is lent (an allocation failure) stops the loop without abandoning the triplets already
+// lent: they are withdrawn in the cache and forgotten by their extras, so the plan is still published for them, and
+// the exception is rethrown once the inventory lock is released. The publication's own allocations are made before
+// the first triplet is lent.
 // ---------------------------------------------------------------------------------------------------------------------
 
 static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size);
 
+// A partial loan (a later triplet refused after earlier ones were lent) is accepted: accepted=true and ACCEPTED, with
+// `reason` holding the refusal that stopped it, not "OK".
 struct ggml_sycl_expert_loan_result {
     bool         accepted    = false;
     size_t       bytes_freed = 0;  // the lent (or, probing, the selected) triplets' summed vram_charge_size
@@ -20924,41 +20931,73 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
         lock.unlock();
         return refuse(ggml_sycl_txn_result::BUSY, "busy (plan changed while acquiring the transaction lock)");
     }
-    ggml_sycl::placement_plan next_plan(*current->plan);
-    uint32_t                  lent  = 0;
-    size_t                    freed = 0;
+    // The publication's allocations come before the first triplet is lent, so none of them can strand a lent triplet.
+    auto     next      = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
+    auto     next_plan = std::make_shared<ggml_sycl::placement_plan>(*current->plan);
+    uint32_t lent      = 0;
+    size_t   freed     = 0;
+
+    // An exception while lending stops the loop; the triplets already lent are still published below, and it is
+    // rethrown once the inventory lock is released.
+    std::exception_ptr escaped;
     for (prepared_triplet & triplet : prepared) {
         ggml_sycl::expert_loan_record record;
-        if (!cache->loan_expert_triplet(triplet.members, record)) {
-            stop = record.reason;
+        bool                          loaned = false;
+        try {
+            loaned = cache->loan_expert_triplet(triplet.members, record);
+            if (!loaned) {
+                stop = record.reason;
+                break;
+            }
+            // Drop each extra's lease on its withdrawn device copy, so the retired entry can be reclaimed, before
+            // anything that allocates; then remember each host copy the way S1-PRELOAD remembers a host-planned
+            // expert, behind its copy event. A remember that fails leaves the expert to the cache's own host entries.
+            for (int r = 0; r < 3; ++r) {
+                const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
+                ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
+                (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
+            }
+            for (int r = 0; r < 3; ++r) {
+                const ggml_sycl::expert_placement_key & k       = triplet.members[r].placement;
+                ggml_tensor_extra_gpu *                 extra   = triplet.extras[r];
+                const size_t                            logical = record.host_handles[r].size();
+                (void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS,
+                                                          std::move(record.host_handles[r]), &record.copy_events[r],
+                                                          /*logical_offset=*/0, logical);
+            }
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (...) {
+            escaped = std::current_exception();
+            stop    = "exception while lending";
+        }
+        // A triplet the cache lent is withdrawn from the device whatever followed, so the plan says it is on the host.
+        if (loaned) {
+            for (int r = 0; r < 3; ++r) {
+                const ggml_sycl::expert_placement_key & k = triplet.members[r].placement;
+                (void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, /*on_device=*/false, -1);
+            }
+            ++lent;
+            freed += record.bytes_freed;
+        }
+        if (escaped) {
             break;
         }
-        for (int r = 0; r < 3; ++r) {
-            const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
-            ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
-            // Drop the extra's lease on the withdrawn device copy, so the retired entry can be reclaimed, and remember
-            // the host copy the way S1-PRELOAD remembers a host-planned expert, behind its copy event. A remember that
-            // fails leaves the expert to the cache's own host entries.
-            (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
-            const size_t logical = record.host_handles[r].size();
-            (void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, std::move(record.host_handles[r]),
-                                                      &record.copy_events[r], /*logical_offset=*/0, logical);
-            (void) next_plan.update_expert_placement(k.layer_id, k.expert_id, k.role, /*on_device=*/false, -1);
-        }
-        ++lent;
-        freed += record.bytes_freed;
     }
     if (lent == 0) {
         lock.unlock();
+        if (escaped) {
+            std::rethrow_exception(escaped);
+        }
         return refuse(ggml_sycl_txn_result::REFUSED, stop);
     }
 
     // update_expert_placement() touches no MMID workspace, so the publication keeps the current version, as the
     // runtime context transaction does when ggml_sycl_same_mmid_workspace_plan() holds.
-    GGML_ASSERT(ggml_sycl_same_mmid_workspace_plan(*current->plan, next_plan));
-    auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
-    next->plan    = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
+    GGML_ASSERT(ggml_sycl_same_mmid_workspace_plan(*current->plan, *next_plan));
+    next->plan    = std::move(next_plan);
     next->version = current->version;
+
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
 
     auto prepared_publication = ggml_sycl_prepare_plan_publication_locked(immutable);
@@ -20967,14 +21006,18 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
     const bool swapped = !lifecycle_owned || ggml_sycl::lifecycle_replace_placement_plan(current, immutable);
     if (swapped) {
         ggml_sycl_publish_prepared_plan_locked(prepared_publication);
-        // A recorded exec graph may bake a withdrawn copy's pointer: each context drops what it recorded before its
-        // next replay.
+        // The exec-graph epoch bump: a recorded exec graph may bake a withdrawn copy's pointer, so each context drops
+        // what it recorded before its next replay. The function is named for KV admission's optional-layout retire;
+        // the comment on g_ggml_sycl_optional_layout_epoch records that an expert loan bumps it too.
         ggml_sycl_optional_layouts_retired();
     }
     lock.unlock();
     if (!swapped) {
         GGML_LOG_ERROR("[MOE-EXEC] loan device %d: %u lent triplets left unpublished, the plan swap lost\n", device,
                        lent);
+        if (escaped) {
+            std::rethrow_exception(escaped);
+        }
         return finish(ggml_sycl_txn_result::REFUSED, "concurrent transaction won the CAS");
     }
 
@@ -20987,6 +21030,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
     const char * reason = stop ? stop : "OK";
     GGML_LOG_WARN("[MOE-EXEC] loan device %d: %u triplets, %zu MiB lent to the ring (%s)\n", device, lent,
                   freed / (1024 * 1024), reason);
+    if (escaped) {
+        std::rethrow_exception(escaped);
+    }
     return finish(ggml_sycl_txn_result::ACCEPTED, reason);
 }
 
@@ -21012,9 +21058,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 static std::atomic<size_t> g_sycl_expert_loan_requests[GGML_SYCL_MAX_DEVICES];
 
 // Ask for a loan from inside a graph: record the request for the device's next graph boundary. Lock-free, because the
-// caller may hold g_sycl_graph_compute_mutex; the largest request since the last boundary wins. Unused until its
-// caller lands (the ring's admission when a reserve falls short, plan Tasks 7b and 12).
-[[maybe_unused]] static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted) {
+// caller may hold g_sycl_graph_compute_mutex; the largest request since the last boundary wins. Its in-graph caller
+// lands with the ring's admission when a reserve falls short (plan Tasks 7b and 12); today the boundary runner below
+// calls it to re-post a request a transient refusal sent back.
+static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes_wanted == 0) {
         return;
     }
@@ -21026,8 +21073,11 @@ static std::atomic<size_t> g_sycl_expert_loan_requests[GGML_SYCL_MAX_DEVICES];
 }
 
 // Run the loan requested on the device since the last boundary, and clear the request. False when nothing ran: no
-// request, or a graph is still computing (the flag is process-wide), in which case the request waits for a later
-// boundary. The transaction emits the loan's WARN, or its refusal's. `resolver` is null in production.
+// request, or a graph is still computing (the flag is process-wide), in which case the request stays for a later
+// boundary. A loan refused BUSY, a transient refusal (a graph started after that check, the live-update lease was
+// held, or the plan moved while the transaction lock was taken), re-posts its request, so it too runs at a later
+// boundary; a REFUSED loan does not, since retrying it would refuse again. The transaction emits the loan's WARN, or
+// its refusal's. `resolver` is null in production.
 static bool ggml_sycl_run_pending_expert_loan_on_device(int                                    device,
                                                         const ggml_sycl_expert_loan_resolver * resolver,
                                                         ggml_sycl_expert_loan_result *         out) {
@@ -21042,7 +21092,11 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     if (bytes_wanted == 0) {
         return false;
     }
-    (void) ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/false, resolver, out);
+    const ggml_sycl_txn_result code =
+        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/false, resolver, out);
+    if (code == ggml_sycl_txn_result::BUSY) {
+        ggml_sycl_request_expert_loan(device, bytes_wanted);
+    }
     return true;
 }
 
@@ -21394,9 +21448,12 @@ std::string test_expert_loan_lends_two_triplets() {
                 return test_loan_fail("expert %d slot %d does not resolve to a %zu-byte host-pinned copy", e, s,
                                       test_loan_expert_bytes());
             }
-            if (host.has_ready_event) {
-                host.ready_event.wait_and_throw();
+            // The host copy is published IN_PROGRESS behind its copy event, and a default resolve neither requires
+            // readiness nor moves the entry to READY, so this first resolve must carry the event.
+            if (!host.has_ready_event) {
+                return test_loan_fail("expert %d slot %d's host copy resolves with no ready event", e, s);
             }
+            host.ready_event.wait_and_throw();
             if (std::memcmp(host.ptr, fx.bytes[fx.index(1, s, e)].data(), test_loan_expert_bytes()) != 0) {
                 return test_loan_fail("expert %d slot %d's host copy differs from the original", e, s);
             }
@@ -83514,7 +83571,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // its producer event is complete. The lease then moves into
                 // the future-owned task vector through completion.
                 for (const expert_dispatch_entry & entry : entries) {
-                    if (entry.has_ready_event) {
+                    if (entry.has_ready_event &&
+                        (job_inputs.events.empty() || job_inputs.events.back() != entry.ready_event)) {
                         job_inputs.events.push_back(entry.ready_event);
                     }
                 }
@@ -84920,11 +84978,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, 0, src1_storage.handle, src_off,
                                                                     static_cast<size_t>(K) * sizeof(float), *stream));
                 }
+                const sycl::event * last_ready = nullptr;
                 for (size_t ci = 0; ci < n_cpu; ++ci) {
                     const auto & entry = entries[ci];
                     // A host copy still landing (a lent expert's, llama.cpp-mwmr) joins the copies waited on below.
-                    if (entry.has_ready_event) {
+                    // Every row of an expert carries its copy's event, so an event equal to the last one pushed is
+                    // skipped. That collapses a run of one expert's rows; the rows are token-major, so an expert
+                    // that recurs after another lent expert's rows is pushed again.
+                    if (entry.has_ready_event && (!last_ready || *last_ready != entry.ready_event)) {
                         copy_events.push_back(entry.ready_event);
+                        last_ready = &entry.ready_event;
                     }
                     if (!shared_activation) {
                         const int64_t i11     = entry.id % ne11;
