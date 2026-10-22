@@ -18586,39 +18586,10 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
     return plan;
 }
 
-// Defined with the expert loan transaction below: the bytes a loan of `bytes_wanted` would lend on `device`, 0 when
-// the probe is refused. Declared here because the fit sits about 2,500 lines before the loan body it needs.
-static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted);
-
-// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
-// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
-// ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
-// host. The geometry is the one the stream phase sizes its ring with: the same index build and sizing over the
-// published plan (moe_stream_phase::prepare), so the fit and the ring cannot disagree about its size. 0 with no
-// published plan, no host expert, or no ring (the sizing refuses one past a tenth of the resident expert bytes). A
-// refused probe (a graph is active) lends nothing, so the whole ring counts.
-// The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the
-// runtime context transaction, before it publishes, this can see the previous plan or none, and the realized check
-// (run after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index
-// build and the loan selection); the callers are the transaction and the auto-ubatch trial's checks, never a
-// per-graph path, so a per-query cache is not warranted today.
-static size_t ggml_sycl_hold_ring_uncovered(int device) {
-    const auto current = ggml_sycl_global_plan_snapshot();
-    if (!current || !current->plan) {
-        return 0;
-    }
-    const ggml_sycl::moe_stream_plan_index index = ggml_sycl::moe_stream_plan_index_build(*current->plan, device);
-    if (index.layers.empty()) {
-        return 0;  // no host expert entry: nothing streams, so no ring
-    }
-    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_ring_size(
-        index.host_matrices_per_layer_max, index.matrix_bytes_max, index.resident_expert_bytes);
-    if (geo.bytes == 0) {
-        return 0;
-    }
-    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);
-    return geo.bytes > lent ? geo.bytes - lent : 0;
-}
+// Defined after the stream phase's prompt-kernel and library-claim hooks, which decide each matrix's staging and so
+// size the ring it asks about, about 15,000 lines below the fit. It is the prefill ring's bytes no loan can cover on
+// `device` for a rung of `n_ubatch` rows (llama.cpp-kjef); see its definition.
+static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch);
 
 static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
     ggml_sycl_hold_fit_answer  a;
@@ -18658,7 +18629,7 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.plan_of      = ggml_sycl_hold_plan_at;
     in.plan_ctx     = &device;
     // Lent bytes cost the card nothing; the part of the ring no loan covers is a demand (zone_hold_fit_demand).
-    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
+    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);
     a.demand        = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);
     a.free_before   = in.free_before;
     const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);
@@ -33758,6 +33729,45 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
     const ggml_tensor * w    = ggml_sycl_moe_stream_layer_weight(layer, role);
     return call != nullptr && call->plan && w != nullptr &&
            ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, call->device);
+}
+
+// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
+// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
+// ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
+// host. 0 with no published plan, no host expert, or no ring (the sizing refuses one past a tenth of the resident
+// expert bytes). A refused probe (a graph is active) lends nothing, so the whole ring counts.
+//
+// The geometry is the stream phase's own: moe_stream_plan_ring_geometry over the same hooks (this file's prompt-kernel
+// and library-claim predicates), so the fit and the ring cannot disagree about its size. The hooks read a stream call:
+// the device, the plan and the rows. At the PROMPT phase the capability they query reads the rows only to refuse zero
+// (ggml_sycl_moe_query_route_capability); the decode rows == 1 case of the Q1_0 / NVFP4 AOS candidate is not reached,
+// and the XMX-tiled row limit is for a layout the ring never asks about. So the geometry does not depend on the rung
+// and `n_ubatch` stands in for the micro-batch's rows. The library-claim hook answers from this thread's graph scan
+// (the weights of the graph being computed): outside a graph it claims nothing, so a ring the library executor would
+// shrink is counted at its full staged size here, an upper bound, never an under-count.
+// The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
+// context transaction, before it publishes, this can see the previous plan or none, and the realized check (run
+// after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
+// and the loan selection); the callers are the transaction and the auto-ubatch trial's checks, never a per-graph
+// path, so a per-query cache is not warranted today.
+static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
+    const auto current = ggml_sycl_global_plan_snapshot();
+    if (!current || !current->plan) {
+        return 0;
+    }
+    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the hooks read it through graph_ctx
+    call.plan        = current->plan;
+    call.cache       = ggml_sycl::get_unified_cache_for_device(device);
+    call.device      = device;
+    call.op.n_tokens = n_ubatch;
+
+    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
+        *call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, ggml_sycl_moe_stream_library_claims);
+    if (geo.bytes == 0) {
+        return 0;
+    }
+    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);
+    return geo.bytes > lent ? geo.bytes - lent : 0;
 }
 
 namespace ggml_sycl {

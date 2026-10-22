@@ -2795,7 +2795,7 @@ def test_the_settle_refusal_record_has_a_mutation_witness(mutation):
 
 _HOLD_FIT_START = "static bool ggml_sycl_hold_spill_fit("
 _HOLD_FIT_END = "static size_t ggml_sycl_planned_scratch_hold_spill_bound("
-_RING_BYTES_LINE = "in.ring_bytes = ggml_sycl_hold_ring_uncovered(q.device);"
+_RING_BYTES_LINE = "in.ring_bytes = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);"
 
 
 def _hold_fit_ring_bytes_pinned(raw_cpp: str) -> bool:
@@ -2816,7 +2816,7 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
     end = GGML_SYCL_CPP.find(_HOLD_FIT_END, start)
     assert start != -1 and end != -1
     # Whitespace-tolerant, so the assignment's column alignment never turns the witness into a vacuous miss.
-    assignment = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
+    assignment = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
     m = re.search(assignment, GGML_SYCL_CPP[start:end], re.M)
     assert m, "the assignment must sit in the fit body"
     at, line = start + m.start(), m.group(0)
@@ -2827,11 +2827,11 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
     assert not _hold_fit_ring_bytes_pinned(mutated), "the mutant must make the pin fail"
 
 
-_RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device) {"
-_RING_HELPER_END = "static bool ggml_sycl_hold_spill_fit("
+_RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {"
+_RING_HELPER_END = "const char * moe_batch_reject_reason_name("
 _RING_REMAINDER_LINE = "return geo.bytes > lent ? geo.bytes - lent : 0;"
 _RING_PROBE_LINE = "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);"
-_RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
+_RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
 
 
 def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:
@@ -2888,6 +2888,47 @@ def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
         )
     assert mutated != GGML_SYCL_CPP
     assert not _ring_helper_remainder_pinned(mutated), "the mutant must make the pin fail"
+
+
+# llama.cpp-kjef: the fit's ring and the stream phase's ring are ONE geometry function. Task 8 (llama.cpp-o9uw)
+# changed what sizes the ring (the hooks that decide each matrix's staging, and the index's region slot maximum); a
+# helper that copied the old two calls kept compiling against the old arguments until the merge. Both sizing sites
+# call moe_stream_plan_ring_geometry and neither calls moe_stream_ring_size or the index build itself.
+MOE_STREAM_PLAN_CPP = (ROOT / "ggml/src/ggml-sycl/moe-stream-plan.cpp").read_text()
+_PHASE_PREPARE_START = "void moe_stream_phase::prepare("
+_PHASE_PREPARE_END = "size_t moe_stream_phase::ring_bytes_free() const {"
+
+
+def _ring_geometry_is_shared(phase_cpp: str, backend_cpp: str) -> bool:
+    phase = _body_of(phase_cpp, _PHASE_PREPARE_START, _PHASE_PREPARE_END)
+    fit = _body_of(backend_cpp, _RING_HELPER_START, _RING_HELPER_END)
+    for body in (phase, fit):
+        if body.count("moe_stream_plan_ring_geometry(") != 1:
+            return False
+        if "moe_stream_ring_size(" in body or "moe_stream_plan_index_build(" in body:
+            return False
+    return True
+
+
+def test_the_fit_and_the_stream_phase_size_the_ring_with_one_function():
+    assert _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, GGML_SYCL_CPP)
+
+
+@pytest.mark.parametrize("where", ["phase", "fit"])
+def test_the_shared_ring_geometry_pin_has_a_mutation_witness(where):
+    direct = "moe_stream_ring_size(index.region_slots_max, index.matrix_bytes_max, index.resident_expert_bytes)"
+    if where == "phase":
+        old = "moe_stream_plan_ring_geometry("
+        at = MOE_STREAM_PLAN_CPP.find(old, MOE_STREAM_PLAN_CPP.find(_PHASE_PREPARE_START))
+        assert at != -1
+        mutated = MOE_STREAM_PLAN_CPP[:at] + direct + "; (void) " + MOE_STREAM_PLAN_CPP[at:]
+        assert not _ring_geometry_is_shared(mutated, GGML_SYCL_CPP), "the mutant must make the pin fail"
+    else:
+        old = "moe_stream_plan_ring_geometry("
+        at = GGML_SYCL_CPP.find(old, GGML_SYCL_CPP.find(_RING_HELPER_START))
+        assert at != -1
+        mutated = GGML_SYCL_CPP[:at] + direct + "; (void) " + GGML_SYCL_CPP[at:]
+        assert not _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, mutated), "the mutant must make the pin fail"
 
 
 if __name__ == "__main__":

@@ -407,6 +407,26 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
     return idx;
 }
 
+// The ring geometry for `plan` on `device`: the one scan of the plan and the sizing over it. The stream phase sizes its
+// ring with it (moe_stream_phase::prepare) and the auto-ubatch fit sizes the ring it charges with it
+// (ggml_sycl_hold_ring_uncovered), so the two cannot disagree: what sizes the ring (the staging hooks, the index's
+// region slot maximum) changes here once. `index_out`, when given, receives the index the geometry was sized over.
+// A plan with no host expert has no layer and no region slot, so the sizing answers the default geometry.
+static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const placement_plan &       plan,
+                                                                     int                          device,
+                                                                     moe_stream_prompt_kernel_fn  prompt_kernel,
+                                                                     void *                       graph_ctx,
+                                                                     moe_stream_library_claims_fn library_claims,
+                                                                     moe_stream_plan_index *      index_out = nullptr) {
+    moe_stream_plan_index index = moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims);
+    const moe_stream_ring_geometry geo =
+        moe_stream_ring_size(index.region_slots_max, index.matrix_bytes_max, index.resident_expert_bytes);
+    if (index_out != nullptr) {
+        *index_out = std::move(index);
+    }
+    return geo;
+}
+
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
 // holds, in this order. geo is what moe_stream_ring_size gave for idx; its all-zero answer past the first two rules is
 // the 10% bound (its overflow guards refuse sizes far above any resident expert set too). The last name is unreachable

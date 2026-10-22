@@ -575,7 +575,9 @@ STAGING_SLOTS_BODY = ("{ return staging == moe_stream_staging::SOA ? 2u : "
                       "staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }")
 REGION_SIZE = "li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));"
 INDEX_BUILD_SIG = "static inline moe_stream_plan_index moe_stream_plan_index_build("
-RING_SIZE_CALL = "moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, index_.resident_expert_bytes)"
+RING_GEOMETRY_SIG = "static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry("
+# The one place the ring is sized (llama.cpp-kjef): the phase's prepare() and the auto-ubatch fit both call the helper.
+RING_SIZE_CALL = "moe_stream_ring_size(index.region_slots_max, index.matrix_bytes_max, index.resident_expert_bytes)"
 
 
 def claim_aos_only_item_takes_one_slot(phase: str, hpp: str) -> bool:
@@ -587,7 +589,9 @@ def claim_aos_only_item_takes_one_slot(phase: str, hpp: str) -> bool:
     n = norm(phase)
     s = body(n, STAGE_SIG)
     return (body(h, STAGING_SLOTS_SIG) == STAGING_SLOTS_BODY and REGION_SIZE in body(h, INDEX_BUILD_SIG)
-            and RING_SIZE_CALL in n and n.count("ring_->acquire_slot(") == 2
+            and RING_SIZE_CALL in body(h, RING_GEOMETRY_SIG)
+            and "moe_stream_plan_ring_geometry(" in body(n, PREPARE_SIG)
+            and n.count("ring_->acquire_slot(") == 2
             and ordered(s, AOS_ONLY_FLAG, SLOTS_CHECK, AOS_ACQUIRE, SOA_ACQUIRE, COPY_DECL))
 
 
@@ -618,8 +622,8 @@ def test_aos_only_slot_mutants():
         PLAN_HPP)
     # The ring sized from the matrix count, as before c-hmey.
     assert not claim_aos_only_item_takes_one_slot(
-        mutate(PHASE, RING_SIZE_CALL, "moe_stream_ring_size(2 * index_.host_matrices_per_layer_max, "
-                                      "index_.matrix_bytes_max, index_.resident_expert_bytes)"), PLAN_HPP)
+        PHASE, mutate(PLAN_HPP, RING_SIZE_CALL, "moe_stream_ring_size(2 * index.host_matrices_per_layer_max, "
+                                                "index.matrix_bytes_max, index.resident_expert_bytes)"))
     # The branch keyed on the SOA staging.
     assert not claim_aos_only_item_takes_one_slot(
         mutate(PHASE, AOS_ONLY_FLAG, "const bool aos_only = item.staging == moe_stream_staging::SOA;"), PLAN_HPP)
@@ -838,7 +842,9 @@ PROMPT_KERNEL_FILL = "call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel
 PROMPT_KERNEL_RETURN = ("return ggml_sycl_moe_staged_capability_refusal(cap, type) == "
                         "ggml_sycl::moe_staged_route_refusal::NONE;")
 STAGING_SIG = "static inline moe_stream_staging moe_stream_item_staging("
-INDEX_CALL = "index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims);"
+INDEX_CALL = ("moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, "
+              "&index_);")
+INDEX_BUILD_CALL = "moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims)"
 PREPARE_SIG = "void moe_stream_phase::prepare("
 
 
@@ -863,7 +869,8 @@ def claim_staging_from_the_capability_query(sycl: str, hpp: str, phase: str) -> 
                         "moe_stream_item_aos_fits(item, slot_bytes) && prompt_kernel(graph_ctx, item.type, "
                         "GGML_LAYOUT_AOS,", "return moe_stream_staging::AOS_ONLY;")
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("prompt_kernel(") == 0
-            and p.count("moe_stream_plan_index_build(") == 1)
+            and p.count("moe_stream_plan_ring_geometry(") == 1 and p.count("moe_stream_plan_index_build(") == 0
+            and INDEX_BUILD_CALL in body(norm(hpp), RING_GEOMETRY_SIG))
 
 
 def test_staging_from_the_capability_query():
@@ -891,7 +898,7 @@ def test_staging_source_mutants():
     assert not claim_staging_from_the_capability_query(
         SYCL, PLAN_HPP,
         mutate(PHASE, INDEX_CALL,
-               "index_ = moe_stream_plan_index_build(plan, device, nullptr, nullptr, op.library_claims);"))
+               "moe_stream_plan_ring_geometry(plan, device, nullptr, nullptr, op.library_claims, &index_);"))
     # The predicate asked again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, " \
                                   "item.nrows);"
@@ -1327,7 +1334,7 @@ def test_ring_unavailable_diagnostic_mutants():
     # The region's slot need left out, or printed under another field's name.
     dropped = mutate(PHASE, " region_slots_max=%u", "")
     assert not claim_ring_unavailable_diagnostic(dropped, PLAN_HPP, {PHASE_REL: dropped})
-    # (anchored on the whole argument list: prepare() passes the same two fields to moe_stream_ring_size)
+    # (anchored on the whole argument list: the ring sizing passes the same two fields to moe_stream_ring_size)
     swapped = mutate(PHASE, "index_.host_matrices_per_layer_max, index_.region_slots_max, index_.matrix_bytes_max,",
                      "index_.host_matrices_per_layer_max, index_.matrix_bytes_max, index_.region_slots_max,")
     assert not claim_ring_unavailable_diagnostic(swapped, PLAN_HPP, {PHASE_REL: swapped})
