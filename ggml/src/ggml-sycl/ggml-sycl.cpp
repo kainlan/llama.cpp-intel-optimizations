@@ -28682,48 +28682,79 @@ static void ggml_sycl_measure_peer_host_bounce(ggml_sycl_device_info & info) {
     }
 }
 
+// How the H2D probe settled one device. A resolved outcome (MEASURED, FROM_CACHE, SEED_KEPT) sets h2d_pinned_gbps and
+// the once-guard keeps it for the process. A RETRY outcome leaves h2d_pinned_gbps at 0: the device is probed again, in
+// silence, at the next load, and each reason is logged once per device (h2d_retry_logged).
+enum h2d_probe_outcome {
+    H2D_PROBE_OUTCOME_MEASURED,       // a direct copy was timed and the rate kept
+    H2D_PROBE_OUTCOME_FROM_CACHE,     // the tuning cache's stored rate was read back
+    H2D_PROBE_OUTCOME_SEED_KEPT,      // GGML_SYCL_H2D_PROBE=0: the seed stands for the process
+    H2D_PROBE_OUTCOME_RETRY_ZONES,    // the cache has no configured host zones yet
+    H2D_PROBE_OUTCOME_RETRY_ALLOC,    // the host source or the device buffer was refused
+    H2D_PROBE_OUTCOME_RETRY_STAGED,   // the copy took the staged branch, so it timed a host wait
+    H2D_PROBE_OUTCOME_RETRY_NO_RATE,  // the clock gave no positive finite rate
+    H2D_PROBE_OUTCOME_RETRY_FAILED,   // an exception other than the fallback error
+};
+
 // llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device's host-to-device rate from PINNED host memory, which the
 // MoE executor's cost model divides by (26.5-27.1 GB/s pinned against 10.5-19 GB/s pageable, llama.cpp-8bgi). The peer
-// probe above stages through a pageable std::vector, so it cannot stand in. 64 MiB moves in 4 MiB chunks, 8 timed
-// iterations after one untimed copy, on the cache's queue (cache->get_queue(): mem_copy_submit's direct branch needs
-// the copy queue to share a context with it, and the dpct default queue does not) and timed on the host. The chunks
-// go out with mem_copy_async and one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy per 4 MiB
-// chunk would time the submit-and-wait latency of each chunk and read low.
+// probe above stages through a pageable std::vector, so it cannot stand in.
 //
-// The rate is only the link's if the copy is a direct DMA. mem_copy_submit takes its direct branch from a host
-// source only when the source's owner is a zone-managed host-pinned allocation of role WEIGHT, STAGING or
-// EXPERT_STAGING (host_endpoint_owner_in_scope), so the source is allocated the way the prefill ring's own copy
-// sources are (ggml_sycl_host_expert_alloc: owner-first, role WEIGHT), and the probe runs at the end of the outermost
-// model load, when the host zones are configured. A device whose cache has no configured zones is left unresolved
-// and tried again at the next load. A staged copy reads a host wait, not the link (4.7 and 6.2 GB/s measured when
-// the source was an unzoned pool buffer), so that rate is never stored or kept: the seed stands, h2d_probed stays
-// false, and the device is retried at the next load. The census's staged-copy counts do not depend on
-// GGML_SYCL_MOE_IDS_COPY_TRACE, and the census is per thread: this thread's before/after delta is exactly the copies
-// the probe submitted. The zone check above is a precondition, the census is the detection.
+// Consumers: h2d_pinned_gbps is 0 until a device resolves, and stays 0 for a device left in a RETRY outcome, so a
+// consumer (Task 7b's rates assembly) must fall back to the seed rate on 0. h2d_probed is true for a measured or stored
+// rate and false for the seed.
 //
-// Once per process and device for a final answer (probed, stored, or env-skipped): a device that holds a rate is left
-// alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever the tuning
-// cache holds, 0 skips the probe and keeps the seed. A stored record is read back instead of probing. A probe that
-// cannot allocate keeps the seed and says so: never an abort. The store accepts only a record with a positive reorder
-// rate, so the record carries Task 2's seed value for it (by reference to the seed, not a literal). That only satisfies
-// the store's validity rule: the executor's rates assembly takes the reorder rate from its own measurement. The tuning
-// cache is keyed by the visible devices, so a device hidden from the scheduler probes again on every start.
+// What it times: 64 MiB in 4 MiB chunks, 8 iterations after one untimed copy, on the cache's queue (cache->get_queue():
+// mem_copy_submit's direct branch needs the copy queue to share a context with it, and the dpct default queue does
+// not), timed on the host. The 4 MiB chunk is the order of one matrix's copy in the prefill ring, which is the transfer
+// the rate prices; 8 iterations repeat the 64 MiB enough to amortise the one queue wait each iteration ends with. The
+// chunks go out with mem_copy_async and that one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy
+// per chunk would time the submit-and-wait latency of each chunk and read low.
+//
+// The rate is only the link's if the copy is a direct DMA. mem_copy_submit takes its direct branch from a host source
+// only when the source's owner is a zone-managed host-pinned allocation of role WEIGHT, STAGING or EXPERT_STAGING
+// (host_endpoint_owner_in_scope), so the source is allocated the way the prefill ring's own copy sources are
+// (ggml_sycl_host_expert_alloc: owner-first, role WEIGHT), and the probe runs at the end of the outermost model load,
+// when the host zones are configured; a device whose cache has none yet is a RETRY outcome. The zone check below is
+// only that precondition. The detection is the staged-copy census: its staged counts do not depend on
+// GGML_SYCL_MOE_IDS_COPY_TRACE and are per thread, so this thread's before/after delta, read after the untimed copy,
+// is exactly the probe's timed copies. A staged copy times a host wait, not the link, so its rate is never stored or
+// kept: the seed stands and the device is probed again at the next load. (A probe that copied from an unzoned pool
+// buffer, and so staged, read 4.7 and 6.2 GB/s and persisted it; that is why the detection exists.)
+//
+// Once per process and device for a final answer (measured, from the cache, or env-skipped): a device that holds a
+// rate is left alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever
+// the tuning cache holds, 0 skips the probe and keeps the seed. A stored record is read back instead of probing. A
+// probe that cannot allocate keeps the seed and says so: never an abort. A refused store (a device the tuning cache is
+// not keyed by, or a disabled cache) still leaves the measured rate resolved for the process and is logged "probed, not
+// stored". The store accepts only a record with a positive reorder rate, so the record carries Task 2's seed value for
+// it (by reference to the seed, not a literal). That only satisfies the store's validity rule: the executor's rates
+// assembly takes the reorder rate from its own measurement. The tuning cache is keyed by the visible devices, so a
+// device hidden from the scheduler probes again on every start.
 static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
     const char * sw    = std::getenv("GGML_SYCL_H2D_PROBE");
     const bool   skip  = sw != nullptr && std::strcmp(sw, "0") == 0;
     const bool   force = sw != nullptr && std::strcmp(sw, "1") == 0;
 
-    constexpr size_t kBytes = 64ull << 20;
-    constexpr size_t kChunk = 4ull << 20;
-    constexpr int    kIters = 8;
+    constexpr size_t k_bytes = 64ull << 20;
+    constexpr size_t k_chunk = 4ull << 20;
+    constexpr int    k_iters = 8;
 
     const ggml_sycl::moe_exec_rates seed = ggml_sycl::moe_exec_rates_seed({});
 
-    // resolved: the device keeps this rate for the process (the once-guard). A retryable outcome logs and leaves 0.
-    auto report = [&info](int dev, double gbps, bool probed, bool resolved, const char * source) {
-        if (resolved) {
-            info.devices[dev].h2d_pinned_gbps = gbps;
-            info.devices[dev].h2d_probed      = probed;
+    // A resolved outcome is kept for the process (the once-guard). A RETRY outcome leaves the rate at 0 and logs its
+    // reason once per device, so the silent retry at every later load does not repeat the line.
+    auto report = [&info](int dev, double gbps, h2d_probe_outcome outcome, const char * source) {
+        auto & d = info.devices[dev];
+        if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {
+            const uint32_t bit = 1u << outcome;
+            if ((d.h2d_retry_logged & bit) != 0) {
+                return;
+            }
+            d.h2d_retry_logged |= bit;
+        } else {
+            d.h2d_pinned_gbps = gbps;
+            d.h2d_probed      = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;
         }
         GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\n", dev, gbps, source);
     };
@@ -28735,16 +28766,16 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
         ggml_sycl_moe_exec_rates_record rec  = {};
         const bool                      have = ggml_backend_sycl_moe_exec_rates_lookup(dev, &rec) && rec.h2d_gbps > 0.0;
         if (have && !force) {
-            report(dev, rec.h2d_gbps, true, true, "tuning cache");
+            report(dev, rec.h2d_gbps, H2D_PROBE_OUTCOME_FROM_CACHE, "tuning cache");
             continue;
         }
         if (skip) {
-            report(dev, seed.h2d_gbps, false, true, "seed, GGML_SYCL_H2D_PROBE=0");
+            report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_SEED_KEPT, "seed, GGML_SYCL_H2D_PROBE=0");
             continue;
         }
         ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(dev);
         if (cache == nullptr || !cache->host_zones_configured()) {
-            report(dev, seed.h2d_gbps, false, false, "seed, host zones not configured");
+            report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_ZONES, "seed, host zones not configured");
             continue;
         }
         try {
@@ -28752,7 +28783,7 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             ggml_sycl::alloc_request dst_req{};
             dst_req.queue                                     = q;
             dst_req.device                                    = dev;
-            dst_req.size                                      = kBytes;
+            dst_req.size                                      = k_bytes;
             dst_req.suppress_failure_log                      = true;
             dst_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
             dst_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
@@ -28760,31 +28791,31 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             dst_req.intent.constraints.must_device            = true;
             dst_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
             dst_req.intent.constraints.forbid_vram_zone_spill = true;
-            ggml_sycl::mem_handle src                         = ggml_sycl_host_expert_alloc(dev, kBytes);
+            ggml_sycl::mem_handle src                         = ggml_sycl_host_expert_alloc(dev, k_bytes);
             ggml_sycl::mem_handle dst                         = ggml_sycl::unified_allocate(dst_req);
             if (!src.valid() || !dst.valid()) {
-                report(dev, seed.h2d_gbps, false, false, "seed, probe allocation refused");
+                report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_ALLOC, "seed, probe allocation refused");
                 continue;
             }
 
-            ggml_sycl::mem_copy(dst, src, kBytes, *q);  // untimed: first-use costs stay out of the rate
+            ggml_sycl::mem_copy(dst, src, k_bytes, *q);  // untimed: first-use costs stay out of the rate
             const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
 
             const auto t0 = std::chrono::steady_clock::now();
-            for (int it = 0; it < kIters; ++it) {
-                for (size_t off = 0; off < kBytes; off += kChunk) {
-                    ggml_sycl::mem_copy_async(dst, off, src, off, kChunk, *q);
+            for (int it = 0; it < k_iters; ++it) {
+                for (size_t off = 0; off < k_bytes; off += k_chunk) {
+                    ggml_sycl::mem_copy_async(dst, off, src, off, k_chunk, *q);
                 }
                 q->wait();
             }
             const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-            const double gbps = us > 0.0 ? static_cast<double>(kBytes) * kIters / us / 1e3 : 0.0;
+            const double gbps = us > 0.0 ? static_cast<double>(k_bytes) * k_iters / us / 1e3 : 0.0;
             if (ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d != staged_before) {
-                report(dev, seed.h2d_gbps, false, false, "seed, probe copy was staged");
+                report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged");
                 continue;
             }
             if (!(gbps > 0.0) || !std::isfinite(gbps)) {
-                report(dev, seed.h2d_gbps, false, false, "seed, probe measured no rate");
+                report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_NO_RATE, "seed, probe measured no rate");
                 continue;
             }
             rec.h2d_gbps = gbps;
@@ -28794,14 +28825,16 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             // A refused store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the rate
             // resolved for this process, but the line must not claim it persisted.
             const bool stored = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);
-            report(dev, gbps, true, true, stored ? "probed" : "probed, not stored");
+            report(dev, gbps, H2D_PROBE_OUTCOME_MEASURED, stored ? "probed" : "probed, not stored");
         } catch (const ggml_sycl_fallback_error &) {
             // The alloc-zone contract's sanctioned form (clause g): ggml_sycl_fallback_error derives from
             // std::exception, so it is caught first and rethrown; nothing the probe calls throws it.
             throw;
         } catch (const std::exception & e) {
-            GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed: %s\n", dev, e.what());
-            report(dev, seed.h2d_gbps, false, false, "seed, probe failed");
+            if ((info.devices[dev].h2d_retry_logged & (1u << H2D_PROBE_OUTCOME_RETRY_FAILED)) == 0) {
+                GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed: %s\n", dev, e.what());
+            }
+            report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_FAILED, "seed, probe failed");
         }
     }
 }
@@ -29224,8 +29257,10 @@ sycl::queue * ggml_sycl_get_cpu_queue() {
     return info.has_cpu_device ? info.cpu_queue : nullptr;
 }
 
-// The one mutable view of the device info, for the post-init probes that fill fields the init pass cannot (the H2D
-// rate). Nothing else may write through it.
+// The one mutable view of the device info, for the load-time H2D probe that fills fields the init pass cannot (the
+// pinned H2D rate: ggml_sycl_init must not create caches, so it cannot measure). It exists because ggml_sycl_info()
+// must stay const for every other caller and a const_cast of it was ruled out (owner ruling E, c-ec9r on
+// llama.cpp-36j0): one mutable door, named, rather than a cast at the call site. Nothing else may write through it.
 static ggml_sycl_device_info & ggml_sycl_info_mutable() {
     static ggml_sycl_device_info info = ggml_sycl_init();
     return info;

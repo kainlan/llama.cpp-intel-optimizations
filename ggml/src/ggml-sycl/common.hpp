@@ -1682,6 +1682,9 @@ struct sycl_device_info {
     // rate and false for the seed.
     double          h2d_pinned_gbps    = 0.0;
     bool            h2d_probed         = false;
+    // The retry outcomes the H2D probe has already logged for this device, one bit per h2d_probe_outcome, so a device
+    // that stays unresolved (zones not configured yet) logs each reason once per process, not at every load.
+    uint32_t        h2d_retry_logged   = 0;
 };
 
 struct sycl_peer_link_info {

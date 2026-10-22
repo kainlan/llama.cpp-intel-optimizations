@@ -145,7 +145,7 @@ def claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(src: str)
     fn = probe_body(src)
     return bool(fn) and all([
         fn.count("ggml_sycl::unified_allocate(") == 1,
-        fn.count("ggml_sycl_host_expert_alloc(dev, kBytes)") == 1,
+        fn.count("ggml_sycl_host_expert_alloc(dev, k_bytes)") == 1,
         "role = ggml_sycl::alloc_role::STAGING" in fn,
         "category = ggml_sycl::runtime_category::STAGING" in fn,
         '"h2d_probe_dst"' in fn,
@@ -167,9 +167,9 @@ def claim_copy_shape_is_chunked_async_with_one_wait_per_iteration(src: str) -> b
         return False
     warm = fn.count("ggml_sycl::mem_copy(") == 1
     chunked = fn.count("ggml_sycl::mem_copy_async(") == 1
-    sizes = all(s in fn for s in ("kBytes = 64ull << 20", "kChunk = 4ull << 20", "kIters = 8"))
+    sizes = all(s in fn for s in ("k_bytes = 64ull << 20;", "k_chunk = 4ull << 20;", "k_iters = 8;"))
     # the one wait sits in the iteration loop, after the chunk loop closes and before the next iteration
-    one_wait = fn.count("q->wait()") == 1 and ordered(fn, "for (int it = 0; it < kIters; ++it)", "mem_copy_async(",
+    one_wait = fn.count("q->wait()") == 1 and ordered(fn, "for (int it = 0; it < k_iters; ++it)", "mem_copy_async(",
                                                        "q->wait()")
     clocked = "std::chrono::steady_clock::now()" in fn and "high_resolution_clock" not in fn
     return all([warm, chunked, sizes, one_wait, clocked])
@@ -189,7 +189,7 @@ def ordered(text: str, *needles: str) -> bool:
 def claim_wait_closes_the_chunk_loop_before_the_clock_stops(src: str) -> bool:
     """The wait is a sibling of the chunk loop, not inside it: the chunk loop's closing brace precedes it."""
     fn = probe_body(src)
-    m = re.search(r"for \(size_t off = 0; off < kBytes; off \+= kChunk\) \{.*?\} q->wait\(\);", fn)
+    m = re.search(r"for \(size_t off = 0; off < k_bytes; off \+= k_chunk\) \{.*?\} q->wait\(\);", fn)
     return bool(m) and "q->wait()" not in m.group(0)[:-len("q->wait();")]
 
 
@@ -207,8 +207,8 @@ def claim_reads_its_switch_once(src: str) -> bool:
 
 GUARD = "if (info.devices[dev].h2d_pinned_gbps > 0.0) { continue; }"
 LOOKUP = "ggml_backend_sycl_moe_exec_rates_lookup("
-CACHE_HIT = 'if (have && !force) { report(dev, rec.h2d_gbps, true, true, "tuning cache"); continue; }'
-SKIP = 'if (skip) { report(dev, seed.h2d_gbps, false, true, "seed, GGML_SYCL_H2D_PROBE=0"); continue; }'
+CACHE_HIT = 'if (have && !force) { report(dev, rec.h2d_gbps, H2D_PROBE_OUTCOME_FROM_CACHE, "tuning cache"); continue; }'
+SKIP = 'if (skip) { report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_SEED_KEPT, "seed, GGML_SYCL_H2D_PROBE=0"); continue; }'
 
 
 def claim_a_device_holding_a_rate_is_not_probed_again(src: str) -> bool:
@@ -299,26 +299,41 @@ def claim_probe_runs_after_preload_through_the_mutable_accessor(src: str) -> boo
     ])
 
 
+RETRY_ONCE = ("if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) { const uint32_t bit = 1u << outcome; "
+              "if ((d.h2d_retry_logged & bit) != 0) { return; } d.h2d_retry_logged |= bit; }")
+FAILED_ONCE = ("if ((info.devices[dev].h2d_retry_logged & (1u << H2D_PROBE_OUTCOME_RETRY_FAILED)) == 0) { "
+               'GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed: %s\\n", dev, e.what()); }')
+
+
+def claim_each_unresolved_reason_logs_once_per_device(src: str) -> bool:
+    """A device left unresolved (host zones not configured yet) is probed again, silently, at every later load: each
+    RETRY outcome logs once per device and process, through the per-device bit set in h2d_retry_logged, before the one
+    WARN line; the exception line is gated by the same bit."""
+    fn = probe_body(src)
+    return bool(fn) and fn.count(RETRY_ONCE) == 1 and fn.count(FAILED_ONCE) == 1 and ordered(
+        fn, RETRY_ONCE, "GGML_LOG_WARN(" + LOG_FORMAT)
+
+
 def claim_a_refused_store_is_not_reported_as_persisted(src: str) -> bool:
     fn = probe_body(src)
     return bool(fn) and all([
         fn.count("const bool stored = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);") == 1,
-        fn.count('report(dev, gbps, true, true, stored ? "probed" : "probed, not stored");') == 1,
+        fn.count('report(dev, gbps, H2D_PROBE_OUTCOME_MEASURED, stored ? "probed" : "probed, not stored");') == 1,
     ])
 
 
 def claim_zones_and_staged_copies_never_reach_the_store(src: str) -> bool:
     fn = probe_body(src)
-    staged_report = 'report(dev, seed.h2d_gbps, false, false, "seed, probe copy was staged"); continue;'
-    zones_report = 'report(dev, seed.h2d_gbps, false, false, "seed, host zones not configured"); continue;'
+    staged_report = 'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged"); continue;'
+    zones_report = 'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_ZONES, "seed, host zones not configured"); continue;'
     census = "ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d"
     return bool(fn) and all([
         fn.count(census) == 2,
         staged_report in fn,
         zones_report in fn,
-        ordered(fn, "cache->host_zones_configured()", zones_report, "ggml_sycl_host_expert_alloc(dev, kBytes)"),
+        ordered(fn, "cache->host_zones_configured()", zones_report, "ggml_sycl_host_expert_alloc(dev, k_bytes)"),
         # the baseline is read after the untimed warm-up, so the detection scores the timed copies only
-        ordered(fn, "ggml_sycl::mem_copy(dst, src, kBytes, *q);", "staged_before = " + census,
+        ordered(fn, "ggml_sycl::mem_copy(dst, src, k_bytes, *q);", "staged_before = " + census,
                 "mem_copy_async(", census + " != staged_before", staged_report, "moe_exec_rates_store("),
         fn.count("moe_exec_rates_store(") == 1,
     ])
@@ -340,7 +355,8 @@ def claim_copies_run_on_the_cache_queue(src: str) -> bool:
 
 def claim_device_info_fields(common: str) -> bool:
     n = norm(common)
-    return "double h2d_pinned_gbps = 0.0;" in n and "bool h2d_probed = false;" in n
+    return all(f in n for f in ("double h2d_pinned_gbps = 0.0;", "bool h2d_probed = false;",
+                                "uint32_t h2d_retry_logged = 0;"))
 
 
 def read_offsets(text: str) -> list:
@@ -353,16 +369,18 @@ def count_reads_in(text: str) -> int:
     return len(read_offsets(text))
 
 
-def claim_one_consumer_reads_the_rate() -> bool:
+def claim_one_consumer_reads_the_rate(overrides: dict = None) -> bool:
     """h2d_pinned_gbps is read in exactly one place across the backend's sources, and that place is the probe's own
-    once-guard. A write is an occurrence followed by `=` (the field's default, the report lambda's store)."""
+    once-guard. A write is an occurrence followed by `=` (the field's default, the report lambda's store). `overrides`
+    maps a relative path to replacement text, which is how a mutant tree is checked."""
     reads = []
     for p in sorted((ROOT / SYCL_TREE_DIR).rglob("*")):
         if not p.is_file() or p.suffix not in (".c", ".cpp", ".h", ".hpp"):
             continue
-        text = norm(p.read_text(errors="replace"))
+        rel = p.relative_to(ROOT).as_posix()
+        text = norm(overrides[rel] if overrides and rel in overrides else p.read_text(errors="replace"))
         for at in read_offsets(text):
-            reads.append((p.relative_to(ROOT).as_posix(), at, text))
+            reads.append((rel, at, text))
     if len(reads) != 1 or reads[0][0] != SYCL_REL:
         return False
     _, at, text = reads[0]
@@ -408,6 +426,10 @@ def test_a_device_holding_a_rate_is_not_probed_again():
     assert claim_a_device_holding_a_rate_is_not_probed_again(SYCL)
 
 
+def test_each_unresolved_reason_logs_once_per_device():
+    assert claim_each_unresolved_reason_logs_once_per_device(SYCL)
+
+
 def test_a_refused_store_is_not_reported_as_persisted():
     assert claim_a_refused_store_is_not_reported_as_persisted(SYCL)
 
@@ -424,8 +446,8 @@ def test_device_info_carries_the_rate_and_one_consumer_reads_it():
 # ---- mutants: each claim must go red when its text is broken ----
 
 LOG_CALL = 'GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\\n", dev, gbps, source);'
-GUARDED_CATCH = ('catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) { '
-                 'GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed')
+GUARDED_CATCH = ("catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) { "
+                 "if ((info.devices[dev].h2d_retry_logged")
 
 
 def test_mutant_raw_malloc_fails():
@@ -438,7 +460,7 @@ def test_mutant_unzoned_host_source_fails():
     """The host source built by a bare request in the probe instead of the helper: the provenance the direct branch
     trusts is then a second, unpinned spelling."""
     assert not claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(
-        _once(SYCL, "ggml_sycl::mem_handle src = ggml_sycl_host_expert_alloc(dev, kBytes);",
+        _once(SYCL, "ggml_sycl::mem_handle src = ggml_sycl_host_expert_alloc(dev, k_bytes);",
               "ggml_sycl::mem_handle src = ggml_sycl::unified_allocate(dst_req);"))
 
 
@@ -449,16 +471,16 @@ def test_mutant_device_spill_allowed_fails():
 
 
 def test_mutant_wait_per_chunk_fails():
-    mutant = _once(SYCL, "ggml_sycl::mem_copy_async(dst, off, src, off, kChunk, *q);",
-                   "ggml_sycl::mem_copy_async(dst, off, src, off, kChunk, *q); q->wait();")
+    mutant = _once(SYCL, "ggml_sycl::mem_copy_async(dst, off, src, off, k_chunk, *q);",
+                   "ggml_sycl::mem_copy_async(dst, off, src, off, k_chunk, *q); q->wait();")
     assert not claim_wait_closes_the_chunk_loop_before_the_clock_stops(mutant)
     assert not claim_copy_shape_is_chunked_async_with_one_wait_per_iteration(mutant)
 
 
 def test_mutant_sync_copy_per_chunk_fails():
     assert not claim_copy_shape_is_chunked_async_with_one_wait_per_iteration(
-        _once(SYCL, "ggml_sycl::mem_copy_async(dst, off, src, off, kChunk, *q);",
-              "ggml_sycl::mem_copy(dst, off, src, off, kChunk, *q);"))
+        _once(SYCL, "ggml_sycl::mem_copy_async(dst, off, src, off, k_chunk, *q);",
+              "ggml_sycl::mem_copy(dst, off, src, off, k_chunk, *q);"))
 
 
 def test_mutant_second_log_line_fails():
@@ -478,7 +500,8 @@ def test_mutant_abort_on_alloc_failure_fails():
 
 def test_mutant_unguarded_catch_fails():
     assert not claim_rethrows_fallback_error_first(
-        _once(SYCL, GUARDED_CATCH, 'catch (const std::exception & e) { GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed'))
+        _once(SYCL, GUARDED_CATCH,
+              "catch (const std::exception & e) { if ((info.devices[dev].h2d_retry_logged"))
 
 
 def test_mutant_reorder_rate_missing_fails():
@@ -552,6 +575,42 @@ def test_mutant_store_result_ignored_fails():
               "ggml_backend_sycl_moe_exec_rates_store(dev, &rec); const bool stored = true;"))
 
 
+def test_mutant_retry_reason_logs_every_load_fails():
+    assert not claim_each_unresolved_reason_logs_once_per_device(
+        _once(SYCL, "if ((d.h2d_retry_logged & bit) != 0) {", "if (false) {"))
+
+
+def test_mutant_failed_line_logs_every_load_fails():
+    assert not claim_each_unresolved_reason_logs_once_per_device(
+        _once(SYCL, "if ((info.devices[dev].h2d_retry_logged & (1u << H2D_PROBE_OUTCOME_RETRY_FAILED)) == 0) {",
+              "if (true) {"))
+
+
+def test_mutant_retry_bit_never_set_fails():
+    assert not claim_each_unresolved_reason_logs_once_per_device(
+        _once(SYCL, "d.h2d_retry_logged |= bit;", ""))
+
+
+def test_mutant_iteration_count_overmatch_fails():
+    assert not claim_copy_shape_is_chunked_async_with_one_wait_per_iteration(
+        _once(SYCL, "constexpr int k_iters = 8;", "constexpr int k_iters = 80;"))
+
+
+def test_mutant_warn_downgraded_to_info_fails():
+    assert not claim_logs_once_at_warn(_once(SYCL, "GGML_LOG_WARN(" + LOG_FORMAT.replace("\\n", "\\n"),
+                                             "GGML_LOG_INFO(" + LOG_FORMAT))
+
+
+def test_mutant_log_source_word_dropped_fails():
+    assert not claim_logs_once_at_warn(_once(SYCL, '"seed, host zones not configured"', '"seed"'))
+
+
+def test_mutant_device_info_field_dropped_fails():
+    for field in ("double h2d_pinned_gbps = 0.0;", "bool h2d_probed = false;", "uint32_t h2d_retry_logged = 0;"):
+        assert claim_device_info_fields(COMMON)
+        assert not claim_device_info_fields(_once(COMMON, field, ""))
+
+
 def test_mutant_default_queue_fails():
     assert not claim_copies_run_on_the_cache_queue(
         _once(SYCL, "sycl::queue * q = &cache->get_queue();",
@@ -564,17 +623,17 @@ def test_mutant_dst_on_another_queue_fails():
 
 
 def test_mutant_baseline_before_warmup_fails():
-    mutant = _once(SYCL, "ggml_sycl::mem_copy(dst, src, kBytes, *q);\n"
+    mutant = _once(SYCL, "ggml_sycl::mem_copy(dst, src, k_bytes, *q);\n"
                    "            const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;",
                    "const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;\n"
-                   "            ggml_sycl::mem_copy(dst, src, kBytes, *q);")
+                   "            ggml_sycl::mem_copy(dst, src, k_bytes, *q);")
     assert not claim_zones_and_staged_copies_never_reach_the_store(mutant)
 
 
 def test_mutant_staged_rate_is_kept_fails():
     assert not claim_zones_and_staged_copies_never_reach_the_store(
-        _once(SYCL, 'report(dev, seed.h2d_gbps, false, false, "seed, probe copy was staged");',
-              'report(dev, seed.h2d_gbps, false, true, "seed, probe copy was staged");'))
+        _once(SYCL, 'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged");',
+              'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_SEED_KEPT, "seed, probe copy was staged");'))
 
 
 def test_mutant_store_before_staged_check_fails():
@@ -592,11 +651,14 @@ def test_mutant_reorder_literal_fails():
         _once(SYCL, "rec.reorder_gbps = seed.reorder_gbps;", "rec.reorder_gbps = 200.0;"))
 
 
-def test_mutant_second_reader_fails(monkeypatch=None):
-    """A second read of the rate outside the probe's own guard changes the count: the claim reads the tree, so the
-    mutant is the claim run over a tree with one more reader."""
+def test_mutant_second_reader_fails():
+    """A second read of the rate inside the probe, and one outside it, each break the one-consumer claim."""
     assert claim_one_consumer_reads_the_rate()
-    assert count_reads_in(norm(SYCL) + " double x = info.devices[0].h2d_pinned_gbps;") == 2
+    inside = _once(SYCL, "if (info.devices[dev].h2d_pinned_gbps > 0.0) {",
+                   "double extra = info.devices[dev].h2d_pinned_gbps; if (info.devices[dev].h2d_pinned_gbps > 0.0) {")
+    assert not claim_one_consumer_reads_the_rate({SYCL_REL: inside})
+    outside = SYCL + "\nstatic double h2d_extra_reader(const ggml_sycl_device_info & i) { return i.devices[0].h2d_pinned_gbps; }\n"
+    assert not claim_one_consumer_reads_the_rate({SYCL_REL: outside})
 
 
 if __name__ == "__main__":
