@@ -148,7 +148,7 @@ FILL_SWITCH_SIGS = {
     "reorder_aos_to_soa_device": (r"static\s+bool\s+reorder_aos_to_soa_device\s*\(", "backend"),
     "reorder_rows_to_soa": (r"\bbool\s+reorder_rows_to_soa\s*\(", "backend"),
     "reorder_data_internal_": (r"static\s+bool\s+reorder_data_internal_\s*\(", "backend"),
-    "ggml_sycl_reorder_weight_gpu": (r"static\s+sycl::event\s+ggml_sycl_reorder_weight_gpu\s*\(", "backend"),
+    "ggml_sycl_reorder_weight_gpu": (r"(?:static\s+)?sycl::event\s+ggml_sycl_reorder_weight_gpu\s*\(", "backend"),
     "ggml_sycl_reorder_weight_cpu": (r"static\s+bool\s+ggml_sycl_reorder_weight_cpu\s*\(", "backend"),
     "ggml_sycl_reorder_expected_size": (r"static\s+bool\s+ggml_sycl_reorder_expected_size\s*\(", "backend"),
 }

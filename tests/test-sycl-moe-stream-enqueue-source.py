@@ -1,0 +1,548 @@
+"""Source contract for llama.cpp-xod7 (plan Task 7b of llama.cpp-36j0): a prompt layer's host experts are weighed at its
+first MUL_MAT_ID, and the next layer's are copied on the BCS queue and reordered on the compute queue a layer ahead.
+
+Host-only: reads sources, builds nothing, loads no model and touches no device.
+
+What this gate pins:
+  - ggml_sycl_mul_mat_id consults the prompt phase at exactly one site: inside the prompt ids-admission branch
+    (`ne12 != 1`, guarded by the same `ids->ne[1] > 1` that defines a prompt batch), after the graph-sink refusal (so a
+    ring copy is never recorded into a command graph) and the ids snapshot the layer routes on, and before
+    `moe_hybrid_with_plan` is computed. The site is the admission branch rather than the later `prompt_batch` local
+    because the executor fast paths return before that local is computed, which would skip the layer-ahead staging after
+    every all-device layer;
+  - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
+    c-3bde: slot reuse is ordered on the device, never by a host status query), and the reorder is
+    ggml_sycl_reorder_weight_gpu on the compute queue with the copy as its one dependency;
+  - the AOS slot and the host lease are retained until the reorder's event, and the stage-table entry holds the SOA slot
+    with the layout it really carries, SOA (ruling C: the slice's AOS tag is not the answer);
+  - a throw from either submission aborts with "[MOE-EXEC] stream enqueue failed: %s" (design 9.3);
+  - moe-stream-plan.cpp waits on nothing (.wait(), wait_and_throw()), queries no event status (get_info<), has no
+    const_cast (ruling E) and calls no allocator: its slots come from the ring's one reservation;
+  - the number of waits in ggml_sycl_mul_mat_id is the one master had at 84fb449da;
+  - only a host lease whose retained owner is a host-pinned WEIGHT allocation of this device's host zones is copied
+    (9y0p M4: any other lease would take the staged path), and only an item whose type has an AOS->SOA reorder in the
+    one table (soa-reorder-types.hpp) is staged;
+  - teardown gates the open region and holds one slot handle until the last use before the ring is released
+    (ruling D, c-fjx1), and the ring is offered only on an in-order compute queue (the SOA overwrite of a reused region
+    is ordered after its readers by that queue);
+  - the backend context owns the phase, resets it after draining its queues and before the retained handles drain,
+    ends the prompt at the first decode graph, and closes a layer's region after its down MUL_MAT_ID;
+  - the trace line carries the plan's fixed format.
+
+Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
+mutant that must make it fail.
+
+Pytest-style (module-level test_* functions): registered with llama_test_pytest.
+"""
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+_LEXEME_RE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
+    re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            return tok
+        return "\n" * tok.count("\n")
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+def norm(text: str) -> str:
+    """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
+    re-wrap nor a re-split format string can turn a claim red. Idempotent, so a mutant built on normalized text is
+    read the same way as the source."""
+    t = re.sub(r"\s+", " ", strip_comments(text))
+    t = re.sub(r"\( ", "(", t)
+    t = re.sub(r" \)", ")", t)
+    t = re.sub(r" ,", ",", t)
+    t = re.sub(r",(?! )", ", ", t)
+    t = re.sub(r'(?<!\\)" "', "", t)
+    return t
+
+
+def read(rel: str) -> str:
+    """The file's text, or empty when it does not exist yet, so a missing file fails the claims instead of erroring."""
+    p = ROOT / rel
+    return p.read_text(errors="replace") if p.exists() else ""
+
+
+SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
+PHASE_REL = "ggml/src/ggml-sycl/moe-stream-plan.cpp"
+PLAN_HPP_REL = "ggml/src/ggml-sycl/moe-stream-plan.hpp"
+COMMON_REL = "ggml/src/ggml-sycl/common.hpp"
+
+SYCL = read(SYCL_REL)
+PHASE = read(PHASE_REL)
+PLAN_HPP = read(PLAN_HPP_REL)
+COMMON = read(COMMON_REL)
+# Every C/C++ source of the SYCL backend outside its tests/, by path from the repository root.
+SYCL_TREE = {
+    p.relative_to(ROOT).as_posix(): p.read_text(errors="replace")
+    for p in sorted((ROOT / "ggml/src/ggml-sycl").rglob("*"))
+    if p.is_file() and p.suffix in (".c", ".cpp", ".h", ".hpp") and "tests" not in p.relative_to(ROOT).parts[3:]
+}
+
+def body(text: str, signature: str) -> str:
+    """The brace-balanced body of the first definition whose text starts with `signature` (string literals are
+    skipped while balancing). Empty when there is none."""
+    at = text.find(signature)
+    if at < 0:
+        return ""
+    open_at = text.find("{", at + len(signature))
+    if open_at < 0:
+        return ""
+    depth = 0
+    i = open_at
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at:i + 1]
+        i += 1
+    return ""
+
+
+def ordered(text: str, *needles: str) -> bool:
+    """Every needle is present, each after the one before it."""
+    at = 0
+    for needle in needles:
+        at = text.find(needle, at)
+        if at < 0:
+            return False
+        at += len(needle)
+    return True
+
+
+def call_args(text: str, name: str) -> list:
+    """The argument text of every call `name(...)` (name ends with "("), parentheses balanced, string literals
+    skipped. A definition or declaration matches too; callers pick the shape they expect."""
+    out = []
+    at = text.find(name)
+    while at >= 0:
+        i = at + len(name)
+        depth = 1
+        n = len(text)
+        start = i
+        while i < n and depth:
+            ch = text[i]
+            if ch in "\"'":
+                j = i + 1
+                while j < n and text[j] != ch:
+                    j += 2 if text[j] == "\\" else 1
+                i = j + 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        out.append(text[start:i - 1])
+        at = text.find(name, at + len(name))
+    return out
+
+
+def mutate(text: str, old: str, new: str) -> str:
+    """`text` (normalized) with `old` replaced once; the mutant must exist, or it would prove nothing."""
+    n = norm(text)
+    assert old in n, f"mutant precondition: {old!r} is not in the text"
+    return n.replace(old, new, 1)
+
+
+MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try"
+ADMIT_BRANCH = "if (ne12 != 1)"
+BEGIN_CALL = "moe_stream->begin_layer("
+BEGIN_GUARD = "if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) {"
+GRAPH_SINK = 'throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt batch cannot enter graph sink");'
+SNAPSHOT = "prompt_ids_snapshot = prompt_ids_entry.host_ids;"
+HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan ="
+
+COPY_DECL = "const sycl::event copy = mem_copy_async("
+REORDER_CALL = "ggml_sycl_reorder_weight_gpu("
+RETAIN = "retain_handles_until_event({ aos, host }, reorder);"
+TABLE_WRITE = "table_[key] = { soa, aos, reorder, GGML_LAYOUT_SOA };"
+ABORT = 'GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());'
+RETHROW = "catch (const ggml_sycl_fallback_error &) { throw; }"
+TRACE_FMT = ("[MOE-EXEC] trace layer %d ubatch %u: %s regime=%s p=%.2f t_cpu=%.0f t_ring=%.0f window=%.0f "
+             "staged=%d/%d bytes=%zu")
+TRACE_EMIT = "op.log->trace_sink(op.log->sink_ctx, line);"
+
+# Waits in ggml_sycl_mul_mat_id at master 84fb449da, counted on the normalized body: 5 `.wait()`, 3 `->wait()`,
+# 8 `wait_and_throw()`. The prompt phase adds none.
+MASTER_MMID_WAITS = 16
+MMID_WAIT_RE = re.compile(r"\.wait\(\)|->wait\(\)|\bwait_and_throw\(\)")
+ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
+
+
+# ---- the consultation site --------------------------------------------------------------------------------------------
+
+
+def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
+    """One consultation site, in ggml_sycl_mul_mat_id's prompt ids-admission branch: after the graph-sink refusal and
+    the ids snapshot, guarded by the prompt-batch predicate, routed on the snapshot, and before moe_hybrid_with_plan."""
+    n = norm(sycl)
+    if n.count(BEGIN_CALL) != 1:
+        return False
+    b = body(n, MMID_SIG)
+    if b.count(BEGIN_CALL) != 1:
+        return False
+    at = b.find(ADMIT_BRANCH + " {")
+    branch = body(b[at:], ADMIT_BRANCH) if at >= 0 else ""
+    call_at = branch.find(BEGIN_CALL)
+    if call_at < 0:
+        return False
+    args = call_args(branch[call_at:], BEGIN_CALL)
+    return (ordered(branch[:call_at], "ctx.moe_graphs_disabled_once = true;", GRAPH_SINK, SNAPSHOT, BEGIN_GUARD)
+            and bool(args) and "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()" in args[0]
+            and "*ctx.stream()" in args[0] and ordered(b, BEGIN_CALL, HYBRID_WITH_PLAN))
+
+
+def test_begin_layer_once_in_prompt_branch():
+    assert claim_begin_layer_once_in_prompt_branch(SYCL)
+
+
+def test_begin_layer_mutants():
+    n = norm(SYCL)
+    start = n.find("ctx." + BEGIN_CALL)
+    assert start >= 0, "mutant precondition: the consultation is a ctx.moe_stream->begin_layer( statement"
+    stmt = n[start:n.find(";", start) + 1]
+    # a second consultation
+    assert not claim_begin_layer_once_in_prompt_branch(mutate(SYCL, stmt, stmt + " " + stmt))
+    # the guard dropped
+    assert not claim_begin_layer_once_in_prompt_branch(mutate(SYCL, BEGIN_GUARD, "{"))
+    # consulted before the graph-sink refusal: a recorded graph could capture the ring copies
+    moved = mutate(SYCL, GRAPH_SINK, stmt + " " + GRAPH_SINK).replace(BEGIN_GUARD + " " + stmt, BEGIN_GUARD, 1)
+    assert not claim_begin_layer_once_in_prompt_branch(moved)
+    # consulted after moe_hybrid_with_plan is computed
+    late = mutate(SYCL, BEGIN_GUARD + " " + stmt, BEGIN_GUARD).replace(HYBRID_WITH_PLAN, stmt + " " + HYBRID_WITH_PLAN, 1)
+    assert not claim_begin_layer_once_in_prompt_branch(late)
+    # routed on something other than the snapshot
+    assert not claim_begin_layer_once_in_prompt_branch(
+        mutate(SYCL, "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()", "nullptr, 0"))
+
+
+# ---- the enqueue ------------------------------------------------------------------------------------------------------
+
+
+def claim_copy_on_bcs_behind_region_gate(phase: str) -> bool:
+    """One copy: the host lease's AOS bytes into the AOS slot, on the BCS queue, behind the region's gate."""
+    n = norm(phase)
+    args = call_args(n, "mem_copy_async(")
+    return (len(args) == 1 and COPY_DECL in n and args[0].startswith("aos, host, item.src_bytes, ")
+            and "cache.get_bcs_queue()" in args[0] and args[0].endswith("{ ring_->current_region_gate() }"))
+
+
+def test_copy_on_bcs_behind_region_gate():
+    assert claim_copy_on_bcs_behind_region_gate(PHASE)
+
+
+def test_copy_mutants():
+    assert not claim_copy_on_bcs_behind_region_gate(mutate(PHASE, "cache.get_bcs_queue()", "*ccs_"))
+    assert not claim_copy_on_bcs_behind_region_gate(mutate(PHASE, "{ ring_->current_region_gate() }", "{}"))
+    assert not claim_copy_on_bcs_behind_region_gate(
+        mutate(PHASE, "aos, host, item.src_bytes, ", "aos, host, item.dst_bytes, "))
+
+
+def claim_reorder_on_ccs_after_copy(phase: str) -> bool:
+    """One reorder: the AOS slot to the SOA slot on the compute queue, its one dependency the copy."""
+    n = norm(phase)
+    args = call_args(n, REORDER_CALL)
+    return (len(args) == 1 and args[0].startswith("*ccs_, ") and args[0].endswith(", { copy }")
+            and ordered(n, COPY_DECL, REORDER_CALL))
+
+
+def test_reorder_on_ccs_after_copy():
+    assert claim_reorder_on_ccs_after_copy(PHASE)
+
+
+def test_reorder_mutants():
+    assert not claim_reorder_on_ccs_after_copy(mutate(PHASE, ", { copy })", ", {})"))
+    assert not claim_reorder_on_ccs_after_copy(mutate(PHASE, ", { copy })", ", { ring_->current_region_gate() })"))
+    assert not claim_reorder_on_ccs_after_copy(mutate(PHASE, REORDER_CALL + "*ccs_, ", REORDER_CALL + "cache.get_bcs_queue(), "))
+
+
+def claim_handles_retained_and_entry_is_soa(phase: str, hpp: str) -> bool:
+    """The AOS slot and the host lease live until the reorder's event; the table holds the SOA slot as the entry's
+    handle with layout SOA, the field the stage table carries for Task 8's resolver (ruling C)."""
+    n = norm(phase)
+    staged = body(norm(hpp), "struct moe_stream_staged")
+    return (n.count(RETAIN) == 1 and ordered(n, REORDER_CALL, RETAIN, TABLE_WRITE)
+            and "ggml_layout_mode layout = GGML_LAYOUT_SOA;" in staged)
+
+
+def test_handles_retained_and_entry_is_soa():
+    assert claim_handles_retained_and_entry_is_soa(PHASE, PLAN_HPP)
+
+
+def test_retain_mutants():
+    assert not claim_handles_retained_and_entry_is_soa(mutate(PHASE, RETAIN, "retain_handles_until_event({ aos }, reorder);"), PLAN_HPP)
+    assert not claim_handles_retained_and_entry_is_soa(mutate(PHASE, RETAIN, "retain_handles_until_event({ aos, host }, copy);"), PLAN_HPP)
+    assert not claim_handles_retained_and_entry_is_soa(mutate(PHASE, TABLE_WRITE, "table_[key] = { soa, aos, reorder, GGML_LAYOUT_AOS };"), PLAN_HPP)
+    assert not claim_handles_retained_and_entry_is_soa(
+        PHASE, mutate(PLAN_HPP, "ggml_layout_mode layout = GGML_LAYOUT_SOA;", "ggml_layout_mode layout = GGML_LAYOUT_AOS;"))
+
+
+def claim_submission_failure_aborts(phase: str) -> bool:
+    """The copy, the reorder and the retention sit in one try block: a planned refusal is rethrown first (the alloc-zone
+    contract's G-CATCH rule), and every other exception aborts with the design's message."""
+    n = norm(phase)
+    at = n.find("try {")
+    while at >= 0:
+        blk = body(n[at:], "try")
+        end = n.find("{", at) + len(blk)
+        if all(s in blk for s in (COPY_DECL, REORDER_CALL, RETAIN)):
+            rest = n[end:].lstrip()
+            if not rest.startswith(RETHROW):
+                return False
+            rest = rest[len(RETHROW):].lstrip()
+            handler = body(rest, "catch (const std::exception & e)")
+            return rest.startswith("catch (const std::exception & e) {") and ABORT in handler
+        at = n.find("try {", at + 1)
+    return False
+
+
+def test_submission_failure_aborts():
+    assert claim_submission_failure_aborts(PHASE)
+
+
+def test_abort_mutants():
+    assert not claim_submission_failure_aborts(mutate(PHASE, ABORT, 'GGML_ABORT("stream failed: %s", e.what());'))
+    # the enqueue's handler narrowed (the phase has other std::exception handlers, so the mutant names this one)
+    assert not claim_submission_failure_aborts(
+        mutate(PHASE, "catch (const std::exception & e) { " + ABORT, "catch (const sycl::exception & e) { " + ABORT))
+    # the planned refusal swallowed by the abort
+    assert not claim_submission_failure_aborts(mutate(PHASE, RETHROW + " ", ""))
+    # the copy moved out of the guarded block
+    n = norm(PHASE)
+    copy_stmt = n[n.find(COPY_DECL):n.find(";", n.find(COPY_DECL)) + 1]
+    assert not claim_submission_failure_aborts(n.replace(copy_stmt, "", 1).replace("try {", copy_stmt + " try {", 1))
+
+
+# ---- what the phase never does ----------------------------------------------------------------------------------------
+
+
+def claim_phase_never_waits(phase: str) -> bool:
+    n = norm(phase)
+    return bool(n) and not ANY_WAIT_RE.search(n)
+
+
+def test_phase_never_waits():
+    assert claim_phase_never_waits(PHASE)
+
+
+def test_phase_wait_mutants():
+    assert not claim_phase_never_waits(mutate(PHASE, RETAIN, RETAIN + " reorder.wait();"))
+    assert not claim_phase_never_waits(mutate(PHASE, RETAIN, RETAIN + " ccs_->wait_and_throw();"))
+
+
+def claim_mul_mat_id_waits_unchanged(sycl: str) -> bool:
+    b = body(norm(sycl), MMID_SIG)
+    return bool(b) and len(MMID_WAIT_RE.findall(b)) == MASTER_MMID_WAITS
+
+
+def test_mul_mat_id_waits_unchanged():
+    assert claim_mul_mat_id_waits_unchanged(SYCL)
+
+
+def test_mul_mat_id_wait_mutants():
+    assert not claim_mul_mat_id_waits_unchanged(mutate(SYCL, SNAPSHOT, SNAPSHOT + " ctx.stream()->wait();"))
+    assert not claim_mul_mat_id_waits_unchanged(mutate(SYCL, SNAPSHOT, SNAPSHOT + " ctx.stream()->wait_and_throw();"))
+
+
+def claim_phase_queries_no_status_and_casts_no_const(phase: str) -> bool:
+    n = norm(phase)
+    return bool(n) and "get_info<" not in n and "const_cast" not in n
+
+
+def test_phase_queries_no_status_and_casts_no_const():
+    assert claim_phase_queries_no_status_and_casts_no_const(PHASE)
+
+
+def test_status_and_const_cast_mutants():
+    assert not claim_phase_queries_no_status_and_casts_no_const(
+        mutate(PHASE, RETAIN, RETAIN + " (void) reorder.get_info<sycl::info::event::command_execution_status>();"))
+    assert not claim_phase_queries_no_status_and_casts_no_const(
+        mutate(PHASE, RETAIN, RETAIN + " (void) const_cast<moe_stream_ring *>(ring_.get());"))
+
+
+ALLOCATOR_NAMES = ("malloc", "unified_alloc", "unified_allocate", "zone_allocate", "from_owned_alloc", "pinned_pool")
+
+
+def claim_phase_allocates_only_ring_slots(phase: str) -> bool:
+    """No allocator: every slot is ring_->acquire_slot() from the ring's one reservation."""
+    n = norm(phase)
+    return bool(n) and not any(a in n for a in ALLOCATOR_NAMES) and n.count("ring_->acquire_slot()") == 2
+
+
+def test_phase_allocates_only_ring_slots():
+    assert claim_phase_allocates_only_ring_slots(PHASE)
+
+
+def test_allocator_mutants():
+    assert not claim_phase_allocates_only_ring_slots(mutate(PHASE, RETAIN, RETAIN + " (void) sycl::malloc_device(16, *ccs_);"))
+    assert not claim_phase_allocates_only_ring_slots(mutate(PHASE, "ring_->acquire_slot()", "mem_handle()"))
+
+
+# ---- what is streamed -------------------------------------------------------------------------------------------------
+
+OWNER_SIG = "static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int device)"
+REORDERABLE_SIG = "static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes)"
+OWNER_CALL = "host.owner_metadata(&owner) && moe_stream_owner_streamable(owner, device)"
+REORDERABLE_CALL = "moe_stream_item_reorderable(item, geo_.slot_bytes)"
+
+
+def claim_only_direct_owned_typed_items_stream(phase: str, hpp: str) -> bool:
+    """9y0p M4: the lease's retained owner is a host-pinned WEIGHT allocation of this device's host zones (the shape
+    mem-ops.cpp copies directly); the type has an AOS->SOA reorder in the one table. Both before the copy."""
+    h = norm(hpp)
+    owner = body(h, OWNER_SIG)
+    reorderable = body(h, REORDERABLE_SIG)
+    n = norm(phase)
+    return ("owner.tier == alloc_tier::HOST_PINNED" in owner and "owner.role == alloc_role::WEIGHT" in owner
+            and "owner.host_zone != host_zone_id::COUNT" in owner and "owner.device == device" in owner
+            and "ggml_sycl_soa_reorder_supported_type(item.type)" in reorderable
+            and ordered(n, REORDERABLE_CALL, OWNER_CALL, "ring_->acquire_slot()", COPY_DECL))
+
+
+def test_only_direct_owned_typed_items_stream():
+    assert claim_only_direct_owned_typed_items_stream(PHASE, PLAN_HPP)
+
+
+def test_streamed_item_mutants():
+    assert not claim_only_direct_owned_typed_items_stream(mutate(PHASE, OWNER_CALL, "host.valid()"), PLAN_HPP)
+    assert not claim_only_direct_owned_typed_items_stream(mutate(PHASE, REORDERABLE_CALL, "true"), PLAN_HPP)
+    assert not claim_only_direct_owned_typed_items_stream(
+        PHASE, mutate(PLAN_HPP, "owner.role == alloc_role::WEIGHT", "owner.role != alloc_role::OTHER"))
+    assert not claim_only_direct_owned_typed_items_stream(
+        PHASE, mutate(PLAN_HPP, "ggml_sycl_soa_reorder_supported_type(item.type)", "item.type != GGML_TYPE_COUNT"))
+
+
+# ---- the ring's lifetime ----------------------------------------------------------------------------------------------
+
+TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
+
+
+def claim_teardown_gates_before_release(phase: str) -> bool:
+    """Ruling D: the open region is gated on the last use, one slot handle is held until it, then the ring releases;
+    the destructor and end_prompt both tear down through it, and the ring is offered only on an in-order queue."""
+    n = norm(phase)
+    td = body(n, TEARDOWN_SIG)
+    return (ordered(td, "close_region(last_use);", "retain_handles_until_event({ anchor_ }, last_use);",
+                    "ring_->release();")
+            and "teardown(" in body(n, "moe_stream_phase::~moe_stream_phase()")
+            and "teardown(" in body(n, "void moe_stream_phase::end_prompt()")
+            and "in_order_ = ccs.is_in_order();" in n)
+
+
+def test_teardown_gates_before_release():
+    assert claim_teardown_gates_before_release(PHASE)
+
+
+def test_teardown_mutants():
+    assert not claim_teardown_gates_before_release(mutate(PHASE, "close_region(last_use);", ""))
+    assert not claim_teardown_gates_before_release(mutate(PHASE, "retain_handles_until_event({ anchor_ }, last_use);", ""))
+    assert not claim_teardown_gates_before_release(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = true;"))
+
+
+# ---- the context's wiring ---------------------------------------------------------------------------------------------
+
+MEMBER = "std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;"
+DTOR_SIG = "ggml_backend_sycl_context::~ggml_backend_sycl_context()"
+END_PROMPT = ("sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed); "
+              "if (cached_is_decode && sycl_ctx->moe_stream) { sycl_ctx->moe_stream->end_prompt(); }")
+DISPATCH = ("ggml_sycl_mul_mat_id(ctx, dst); ggml_sycl_moe_down_shadow_compare(ctx, dst); "
+            "ggml_sycl_moe_stream_layer_done(ctx, dst); break;")
+LAYER_DONE_SIG = "static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst)"
+
+
+def claim_context_owns_and_ends_the_phase(common: str, sycl: str) -> bool:
+    n = norm(sycl)
+    dtor = body(n, DTOR_SIG)
+    done = body(n, LAYER_DONE_SIG)
+    return (MEMBER in norm(common)
+            and ordered(dtor, "qptrs[dev][s]->wait();", "moe_stream.reset();", "ggml_sycl::drain_retained_handles(true);")
+            and END_PROMPT in n and DISPATCH in n and n.count("moe_stream->layer_done(") == 1
+            and ordered(done, "!ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording",
+                        "it->second.down_weight != dst->src[0]", "moe_stream->layer_done("))
+
+
+def test_context_owns_and_ends_the_phase():
+    assert claim_context_owns_and_ends_the_phase(COMMON, SYCL)
+
+
+def test_context_mutants():
+    assert not claim_context_owns_and_ends_the_phase(mutate(COMMON, MEMBER, ""), SYCL)
+    assert not claim_context_owns_and_ends_the_phase(COMMON, mutate(SYCL, "moe_stream.reset();", ""))
+    assert not claim_context_owns_and_ends_the_phase(
+        COMMON, mutate(SYCL, "if (cached_is_decode && sycl_ctx->moe_stream) {", "if (sycl_ctx->moe_stream) {"))
+    assert not claim_context_owns_and_ends_the_phase(COMMON, mutate(SYCL, " ggml_sycl_moe_stream_layer_done(ctx, dst); break;", " break;"))
+    assert not claim_context_owns_and_ends_the_phase(
+        COMMON, mutate(SYCL, "it->second.down_weight != dst->src[0]", "false"))
+
+
+REORDER_DEF = "sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
+
+
+def claim_reorder_is_shared_not_copied(sycl: str, hpp: str) -> bool:
+    """The ring submits the load path's own reorder dispatch: defined once in ggml-sycl.cpp without `static`, declared
+    in moe-stream-plan.hpp, and the load-time fill still calls it."""
+    n = norm(sycl)
+    return (n.count(REORDER_DEF) == 1 and "static " + REORDER_DEF not in n
+            and "sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue," in norm(hpp)
+            and "ggml_sycl_reorder_weight_gpu(queue, static_cast<const uint8_t *>(temp_vram)," in n)
+
+
+def test_reorder_is_shared_not_copied():
+    assert claim_reorder_is_shared_not_copied(SYCL, PLAN_HPP)
+
+
+def test_reorder_shared_mutants():
+    assert not claim_reorder_is_shared_not_copied(mutate(SYCL, REORDER_DEF, "static " + REORDER_DEF), PLAN_HPP)
+    assert not claim_reorder_is_shared_not_copied(SYCL, mutate(PLAN_HPP, REORDER_DEF, "sycl::event other_reorder(sycl::queue & queue,"))
+
+
+# ---- the trace --------------------------------------------------------------------------------------------------------
+
+
+def claim_trace_line(phase: str, tree: dict) -> bool:
+    """The plan's fixed format, once in the backend, emitted through the decision log's trace sink."""
+    count = sum(norm(text).count(TRACE_FMT) for text in tree.values())
+    return count == 1 and ordered(norm(phase), TRACE_FMT, TRACE_EMIT)
+
+
+def test_trace_line():
+    assert claim_trace_line(PHASE, SYCL_TREE)
+
+
+def test_trace_mutants():
+    assert not claim_trace_line(mutate(PHASE, "window=%.0f", "win=%.0f"), {PHASE_REL: mutate(PHASE, "window=%.0f", "win=%.0f")})
+    tree = dict(SYCL_TREE)
+    tree["extra.cpp"] = '"' + TRACE_FMT + '"'
+    assert not claim_trace_line(PHASE, tree)
+    assert not claim_trace_line(mutate(PHASE, TRACE_EMIT, "(void) line;"), {PHASE_REL: PHASE})
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

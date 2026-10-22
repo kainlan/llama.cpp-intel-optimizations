@@ -5020,6 +5020,35 @@ set_tests_properties(sycl-moe-stream-plan PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-xod7 (plan Task 7b of llama.cpp-36j0): the prompt phase's pure parts (the stage-table key, the ids bitmap,
+# the per-micro-batch plan index and its skip rule, fully-staged from the table, the reorderable and direct-copy
+# predicates, the rates assembly). Host-only, built exactly like test-moe-stream-plan above; it constructs no SYCL object.
+add_executable(test-moe-stream-phase
+    tests/test-moe-stream-phase.cpp
+)
+target_include_directories(test-moe-stream-phase PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-stream-phase PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-stream-phase PRIVATE "-fsycl")
+target_compile_definitions(test-moe-stream-phase PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-stream-phase PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-stream-phase PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-moe-stream-phase COMMAND test-moe-stream-phase)
+set_tests_properties(sycl-moe-stream-phase PROPERTIES
+    LABELS "sycl;moe;ring;hostonly"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+)
+
 # llama.cpp-36j0 Task 11a: loan selection (the lendable tail of the resident expert set) over a hand-built plan. Host-only,
 # built exactly like test-moe-stream-plan above.
 add_executable(test-moe-expert-loan-select
