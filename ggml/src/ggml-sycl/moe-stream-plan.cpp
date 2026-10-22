@@ -131,11 +131,7 @@ void moe_stream_phase::layer_done(int layer, sycl::event down_done) {
     if (layer != cur_layer_) {
         return;  // the down op of a layer this micro-batch has not begun: nothing of it is in the ring
     }
-    for (int r = 0; r < 2; ++r) {
-        if (region_layer_[r] == layer) {
-            region_read_gate_[r] = down_done;
-        }
-    }
+    region_reads_.layer_done(layer, down_done);
     close_region(down_done);
 }
 
@@ -293,7 +289,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
     // The read gate is preferred: that barrier also waits for the work queued after the last use's down op, the next
     // layer's attention among it, so the copies would start later.
     const bool reuse_after_readers =
-        region_aos_only_[cur_region_] || std::any_of(items.begin(), items.end(), aos_only_item);
+        region_reads_.aos_only[cur_region_] || std::any_of(items.begin(), items.end(), aos_only_item);
     std::optional<sycl::event> reuse_gate;
     bool                       aos_only_staged = false;
     bool                       copied_in       = false;
@@ -341,8 +337,8 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
                 deps.push_back(hr.ready_event);
             }
             if (reuse_after_readers && !reuse_gate) {
-                reuse_gate = region_read_gate_[cur_region_] ? *region_read_gate_[cur_region_] :
-                                                              ccs_->ext_oneapi_submit_barrier();
+                reuse_gate = region_reads_.read_gate[cur_region_] ? *region_reads_.read_gate[cur_region_] :
+                                                                    ccs_->ext_oneapi_submit_barrier();
             }
             if (reuse_gate) {
                 deps.push_back(*reuse_gate);
@@ -390,9 +386,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
     // A copy went in, so the region's last use is now this one: its layer, whether it left an AOS-only slot, and no
     // read gate until layer_done records one behind this layer's readers.
     if (copied_in) {
-        region_aos_only_[cur_region_] = aos_only_staged;
-        region_layer_[cur_region_]    = items.front().layer;
-        region_read_gate_[cur_region_].reset();
+        region_reads_.refill(cur_region_, items.front().layer, aos_only_staged);
     }
     for (const auto & kv : per_expert) {
         ++n.wanted;
@@ -429,12 +423,7 @@ void moe_stream_phase::reset_regions() {
     cur_region_         = 0;
     region_submitted_   = false;
     region_last_        = sycl::event();
-    region_aos_only_[0] = false;
-    region_aos_only_[1] = false;
-    region_layer_[0]    = -1;
-    region_layer_[1]    = -1;
-    region_read_gate_[0].reset();
-    region_read_gate_[1].reset();
+    region_reads_.reset();
 }
 
 // Ends the current region's use when slots were taken from it. With nothing submitted into it the region keeps its
@@ -572,6 +561,26 @@ void moe_stream_phase::report_staged_routes() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void moe_stream_phase::test_insert_staged(int layer, int expert_id, expert_tensor_role role, moe_stream_staged entry) {
     table_[moe_stream_table_key(layer, expert_id, role)] = std::move(entry);
+}
+
+bool moe_stream_phase::test_reserve_ring(int device, const moe_stream_ring_geometry & geo, sycl::queue & ccs) {
+    device_         = device;
+    geo_            = geo;
+    reserve_failed_ = false;
+    ccs_.emplace(ccs);
+    in_order_ = ccs.is_in_order();
+    return ring_ready();
+}
+
+mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
+    if (!ring_) {
+        return mem_handle();
+    }
+    mem_handle slot = ring_->acquire_slot(layout);
+    if (slot.valid()) {
+        anchor_ = slot;  // as stage() keeps one: any slice holds the whole reservation
+    }
+    return slot;
 }
 #endif
 

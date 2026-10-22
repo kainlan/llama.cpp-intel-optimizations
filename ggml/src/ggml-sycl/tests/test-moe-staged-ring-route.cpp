@@ -30,6 +30,15 @@
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.
 // 6. end_prompt clears the counts and the refusals.
+// 7. A staged slot's pointer goes with its ring (c-8jtz). The backend's phase
+//    reserves a ring of its own and a staged batch over one of its slots
+//    uploads its pointer table, as a prompt MUL_MAT_ID does, for a weight with
+//    an extra: the payload slot holds the slot's pointer and no handle, the
+//    device table holds it too, no active lease is the slot, and the backend
+//    holds one record for the weight, counted on its extra. end_prompt gives the
+//    ring back: the payload slot is null, the device table is invalid (the
+//    table pointer answers null), and no record is left, so releasing the extra
+//    passes release_extra_gpu's assert.
 //
 // A test may wait on events; nothing here status-queries one.
 
@@ -325,6 +334,74 @@ int main() {
         slot_s = mem_handle();
         slot_b = mem_handle();
         ring.release();
+    }
+
+    {
+        // Case 7: the phase's own ring, one slot per region, and an extra for the weight, which the upload needs.
+        CHECK(test_moe_stream_reserve_ring(backend, kSlot, 2), "the backend's phase reserves a ring of 2 x %zu bytes",
+              kSlot);
+        mem_handle        slot     = test_moe_stream_acquire_slot(backend, GGML_LAYOUT_AOS);
+        const void *      slot_ptr = slot.resolve(device).ptr;
+        const sycl::event fill     = slot.valid() ? mem_fill_async(slot, 0x44, kSlot, q) : sycl::event();
+        CHECK(slot.valid() && slot_ptr != nullptr && slot.resolve(device).layout == GGML_LAYOUT_AOS,
+              "a slot of the phase's ring, acquired as AOS");
+        auto * extra    = new ggml_tensor_extra_gpu();
+        src0->extra     = extra;
+        const int32_t n = static_cast<int32_t>(src0->ne[2]);
+        {
+            const int32_t prompt_ids[] = { kExpert, kExpert };
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, kExpert, role, mem_handle(), slot, fill,
+                                                GGML_LAYOUT_AOS),
+                  "an AOS entry over the phase's slot goes into the stage table");
+            const moe_resolved_batch_result r =
+                test_moe_staged_ring_build(backend, src0, prompt_ids, 2, 1, GGML_LAYOUT_AOS);
+            CHECK(r, "the staged build is admitted (reject %s)", moe_batch_reject_reason_name(r.reject));
+            const void * const * table =
+                r ? test_moe_staged_ring_upload(backend, src0, r.batch, GGML_LAYOUT_AOS) : nullptr;
+            CHECK(table != nullptr, "the staged batch's pointer table uploads");
+            const std::vector<void *> &     payload = extra->weight().moe_expert_ptr_payload[device];
+            const std::vector<mem_handle> & handles = extra->weight().moe_expert_handles[device];
+            CHECK(payload.size() == static_cast<size_t>(n) && payload[kExpert] == slot_ptr,
+                  "the payload slot holds the staged slot's pointer (got %p, want %p)",
+                  payload.size() > static_cast<size_t>(kExpert) ? payload[kExpert] : nullptr, slot_ptr);
+            CHECK(handles.size() == static_cast<size_t>(n) && !handles[kExpert].valid(),
+                  "the payload slot's handle entry is empty: the slot is not the expert's storage");
+            bool lease_is_slot = false;
+            for (const mem_handle & lease : extra->weight().moe_expert_ptrs_leases[device]) {
+                lease_is_slot = lease_is_slot || lease.resolve(device).ptr == slot_ptr;
+            }
+            CHECK(!lease_is_slot, "no active lease of the table is the staged slot");
+            const uint32_t records_extra   = extra->weight().moe_stream_payload_records.load();
+            const size_t   records_backend = test_moe_stream_payload_records(backend);
+            CHECK(records_extra == 1 && records_backend == 1,
+                  "one record for the weight, counted on its extra (extra %u, backend %zu)", records_extra,
+                  records_backend);
+            CHECK(extra->weight().moe_device_table_valid[device] && extra->moe_ptrs_ptr(device) == table,
+                  "the device table is valid and is the one the upload returned");
+            ggml_backend_synchronize(backend);
+            std::vector<void *> device_table(static_cast<size_t>(n), nullptr);
+            if (table != nullptr) {
+                mem_copy_ptr_async(device_table.data(), table, device_table.size() * sizeof(void *), q).wait();
+            }
+            CHECK(device_table[kExpert] == slot_ptr, "the device table holds the staged slot's pointer (got %p)",
+                  device_table[kExpert]);
+        }
+
+        // end_prompt gives the phase's ring back, so the recorded pointer goes.
+        q.wait();
+        ggml_backend_synchronize(backend);
+        CHECK(test_moe_stream_end_prompt(backend), "end_prompt gives the phase's ring back");
+        const std::vector<void *> & payload = extra->weight().moe_expert_ptr_payload[device];
+        CHECK(payload.size() == static_cast<size_t>(n) && payload[kExpert] == nullptr,
+              "the recorded payload slot is null once the ring is given back");
+        CHECK(!extra->weight().moe_device_table_valid[device] && extra->moe_ptrs_ptr(device) == nullptr,
+              "the device table is invalid, so the table pointer answers null until the next upload");
+        CHECK(extra->weight().moe_stream_payload_records.load() == 0 && test_moe_stream_payload_records(backend) == 0,
+              "no record is left (extra %u, backend %zu)", extra->weight().moe_stream_payload_records.load(),
+              test_moe_stream_payload_records(backend));
+        slot        = mem_handle();
+        src0->extra = nullptr;
+        release_extra_gpu(extra);  // asserts that no record names the extra
     }
 
     ggml_free(tctx);

@@ -19,6 +19,9 @@
 //                   AOS for the rest, so a reorderable Q4_K stages AOS-only and MXFP4 stages SOA (lead ruling
 //                   c-o9uw-2), whatever the capability table says.
 //
+// The ring regions' read gates (lead ruling c-o9uw-1) are kept by moe_stream_region_reads, which the phase holds over
+// sycl::event; the test drives it over int, in the order stage(), layer_done() and reset_regions() call it.
+//
 // A matrix whose weight the prompt's library executor claims stages NONE whatever the kernels answer: the staged route
 // refuses that weight (c-las5), so the ring sizes no slot for it (llama.cpp-o9uw). The tests pass the claims as a
 // second predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_tensor, the route's own check.
@@ -711,6 +714,43 @@ int main() {
         CHECK(names.size() == sizeof(all) / sizeof(all[0]) && names.count("unknown") == 0);
         CHECK(std::strcmp(ggml_sycl::moe_staged_route_refusal_name(moe_staged_route_refusal::DIRECT_KERNEL),
                           "direct-kernel") == 0);
+    }
+
+    // ---- the regions' last uses: what stage() refills, layer_done() gates and reset_regions() forgets ----
+    {
+        ggml_sycl::moe_stream_region_reads<int> rr;
+        CHECK(rr.layer[0] == -1 && rr.layer[1] == -1 && !rr.aos_only[0] && !rr.aos_only[1]);
+        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
+        // stage(): region 0 now holds layer 3 and left an AOS-only slot; no read gate until layer 3's readers are done.
+        rr.refill(0, 3, true);
+        CHECK(rr.layer[0] == 3 && rr.aos_only[0] && !rr.read_gate[0]);
+        CHECK(rr.layer[1] == -1 && !rr.aos_only[1] && !rr.read_gate[1]);
+        // The down op of layer 4 gates no region: the region holding layer 3 waits for layer 3's own readers (the gate
+        // that layer_done closes the open region on belongs to the region holding the next layer).
+        rr.layer_done(4, 40);
+        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
+        rr.layer_done(3, 30);
+        CHECK(rr.read_gate[0] && *rr.read_gate[0] == 30 && !rr.read_gate[1]);
+        // Region 1 holds layer 4, with SOA slots only, and takes layer 4's gate; region 0 keeps its own.
+        rr.refill(1, 4, false);
+        CHECK(rr.layer[1] == 4 && !rr.aos_only[1] && !rr.read_gate[1]);
+        rr.layer_done(4, 41);
+        CHECK(rr.read_gate[1] && *rr.read_gate[1] == 41 && rr.read_gate[0] && *rr.read_gate[0] == 30);
+        // Refilled, region 0 holds layer 5 and forgets layer 3's gate and its AOS-only slot.
+        rr.refill(0, 5, false);
+        CHECK(rr.layer[0] == 5 && !rr.aos_only[0] && !rr.read_gate[0]);
+        CHECK(rr.read_gate[1] && *rr.read_gate[1] == 41);
+        // A late down op of a layer no region holds any more records nothing.
+        rr.layer_done(3, 31);
+        CHECK(!rr.read_gate[0] && rr.read_gate[1] && *rr.read_gate[1] == 41);
+        // reset_regions(), for a new ring or a torn-down one: no layer, no AOS-only slot, no read gate in either region,
+        // so a later layer_done of a layer the old ring held gates nothing.
+        rr.refill(0, 6, true);
+        rr.reset();
+        CHECK(rr.layer[0] == -1 && rr.layer[1] == -1 && !rr.aos_only[0] && !rr.aos_only[1]);
+        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
+        rr.layer_done(4, 42);
+        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
     }
 
     if (failures) {

@@ -617,6 +617,44 @@ inline const char * moe_staged_route_refusal_name(moe_staged_route_refusal refus
     return "unknown";
 }
 
+// The ring regions' last uses, as reusing a region needs them (lead ruling c-o9uw-1): per region, the layer its last
+// use held (-1: none), whether that use left an AOS-only slot, and that layer's read gate once its down op records one,
+// an event behind every kernel that read the region. stage() refills a region, layer_done() records a layer's read gate
+// and reset() starts both regions over, for a new ring or a torn-down one, so a gate recorded for one use is never
+// taken for another. Templated on the event so test-moe-stream-phase drives it without a SYCL object; moe_stream_phase
+// holds it over sycl::event.
+template <typename event_t> struct moe_stream_region_reads {
+    int                    layer[2]    = { -1, -1 };
+    bool                   aos_only[2] = { false, false };
+    std::optional<event_t> read_gate[2];
+
+    // A copy went into `region`: it now holds layer `l`, it left an AOS-only slot iff `left_aos_only`, and it has no
+    // read gate until l's down op records one.
+    void refill(int region, int l, bool left_aos_only) {
+        layer[region]    = l;
+        aos_only[region] = left_aos_only;
+        read_gate[region].reset();
+    }
+
+    // `down_done` follows every kernel that read layer `l`'s slots, so it is the read gate of the region holding l. A
+    // region refilled since holds another layer and takes nothing of l's.
+    void layer_done(int l, const event_t & down_done) {
+        for (int r = 0; r < 2; ++r) {
+            if (layer[r] == l) {
+                read_gate[r] = down_done;
+            }
+        }
+    }
+
+    void reset() {
+        for (int r = 0; r < 2; ++r) {
+            layer[r]    = -1;
+            aos_only[r] = false;
+            read_gate[r].reset();
+        }
+    }
+};
+
 // The resolver's STAGED_RING lookups over one prompt (llama.cpp-o9uw): how many it served and refused, and the refusals
 // by cause and detail, so the trace says why a staged slot went unserved (plan Task 8). A detail is a string with
 // static storage (a capability reason, or moe_batch_reject_reason_name's), or null.
@@ -699,7 +737,12 @@ class moe_stream_phase {
     uint64_t ring_releases() const { return ring_releases_; }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     // Puts `entry` in the stage table under (layer, expert_id, role), as stage() does, for a device test of the route.
-    void test_insert_staged(int layer, int expert_id, expert_tensor_role role, moe_stream_staged entry);
+    void       test_insert_staged(int layer, int expert_id, expert_tensor_role role, moe_stream_staged entry);
+    // Reserves the ring with `geo` on `device`, its reorders on `ccs`, as prepare() and the first staging layer's
+    // ring_ready() do; test_acquire_slot takes a slot of it with `layout`, as stage() does. For a device test of a
+    // staged slot's lifetime (llama.cpp-o9uw).
+    bool       test_reserve_ring(int device, const moe_stream_ring_geometry & geo, sycl::queue & ccs);
+    mem_handle test_acquire_slot(ggml_layout_mode layout);
 #endif
 
   private:
@@ -770,11 +813,8 @@ class moe_stream_phase {
     bool                                            record_valid_       = false;
     bool                                            record_looked_up_   = false;
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
-    // Per region: its last use left an AOS-only slot behind, so its next copies wait for its readers (stage()).
-    bool                                            region_aos_only_[2] = { false, false };
-    // Per region: the layer its last use held (-1: none), and that layer's read gate once layer_done records it.
-    int                                             region_layer_[2]    = { -1, -1 };
-    std::optional<sycl::event>                      region_read_gate_[2];
+    // Each region's last use: its layer, whether it left an AOS-only slot, and that layer's read gate (stage()).
+    moe_stream_region_reads<sycl::event>            region_reads_;
     const moe_exec_decision_log *                   log_ = nullptr;  // the last op's, for end_prompt
     moe_staged_route_tally                          staged_routes_;
     uint64_t                                        ring_releases_ = 0;

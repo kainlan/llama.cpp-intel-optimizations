@@ -53,9 +53,11 @@ What this gate pins:
     gate: the gate layer_done sets belongs to the region holding the next layer, so it precedes the readers of an
     AOS-only slot (and of a SOA slot that AOS-only items moved off a fixed odd index). The read gate is the barrier
     layer_done submitted behind the down op of the layer the region last held (lead ruling c-o9uw-1), and a
-    compute-queue barrier submitted at the first copy stands in when no layer_done recorded one. One helper,
-    reset_regions, forgets every region's keys, AOS-only flag, layer and read gate, and both a new ring and teardown
-    run it, so neither a new ring nor a reused phase inherits a gate or a layer;
+    compute-queue barrier submitted at the first copy stands in when no layer_done recorded one. Each region's last
+    use (its layer, AOS-only flag and read gate) is kept in one place, moe_stream_region_reads, which stage() refills,
+    layer_done() gates and reset() forgets (test-moe-stream-phase drives it). One helper, reset_regions, forgets every
+    region's keys and resets it, and both a new ring and teardown run it, so neither a new ring nor a reused phase
+    inherits a gate or a layer;
   - a throw from either submission aborts with "[MOE-EXEC] stream enqueue failed: %s" (design 9.3);
   - moe-stream-plan.cpp waits on nothing (.wait(), wait_and_throw()), queries no event status (get_info<), has no
     const_cast (ruling E) and calls no allocator: its slots come from the ring's one reservation;
@@ -121,13 +123,50 @@ def read(rel: str) -> str:
     return p.read_text(errors="replace") if p.exists() else ""
 
 
+_PRIVATE_IF_RE = re.compile(
+    r"\s*#\s*if(?:\s+defined\s*\(\s*GGML_SYCL_PRIVATE_TESTING\s*\)|def\s+GGML_SYCL_PRIVATE_TESTING)\s*$")
+_PP_OPEN_RE = re.compile(r"\s*#\s*if")
+_PP_ARM_RE = re.compile(r"\s*#\s*(?:else|elif)\b")
+_PP_END_RE = re.compile(r"\s*#\s*endif\b")
+
+
+def production(text: str) -> str:
+    """`text` without its GGML_SYCL_PRIVATE_TESTING arms. The test seams there are compiled into the private-testing
+    fixtures only, so they neither add to nor stand in for the production sites the claims count. An #else or #elif arm
+    is production and stays, and a seam moved outside its block is counted again. Line count is kept."""
+    out, depth, dropping = [], 0, False
+    for line in text.split("\n"):
+        if depth == 0:
+            if _PRIVATE_IF_RE.match(line):
+                depth, dropping = 1, True
+                out.append("")
+            else:
+                out.append(line)
+            continue
+        if _PP_OPEN_RE.match(line):
+            depth += 1
+        elif _PP_END_RE.match(line):
+            depth -= 1
+            if depth == 0:
+                out.append("")
+                continue
+        elif depth == 1 and _PP_ARM_RE.match(line):
+            dropping = False
+            out.append("")
+            continue
+        out.append("" if dropping else line)
+    return "\n".join(out)
+
+
 SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 PHASE_REL = "ggml/src/ggml-sycl/moe-stream-plan.cpp"
 PLAN_HPP_REL = "ggml/src/ggml-sycl/moe-stream-plan.hpp"
 COMMON_REL = "ggml/src/ggml-sycl/common.hpp"
 
 SYCL = read(SYCL_REL)
-PHASE = read(PHASE_REL)
+# The production phase: its PRIVATE_TESTING seams reserve a ring and acquire a slot for a device case, and are not
+# production sites (test_claims_count_production_sites_only).
+PHASE = production(read(PHASE_REL))
 PLAN_HPP = read(PLAN_HPP_REL)
 COMMON = read(COMMON_REL)
 # Every C/C++ source of the SYCL backend outside its tests/, by path from the repository root.
@@ -661,27 +700,34 @@ def test_region_close_mutants():
     assert not claim_region_closes_after_last_copy(mutate(PHASE, "region_last_ = copied; ", ""))
 
 
-REUSE_COND = ("const bool reuse_after_readers = region_aos_only_[cur_region_] || "
+REUSE_COND = ("const bool reuse_after_readers = region_reads_.aos_only[cur_region_] || "
               "std::any_of(items.begin(), items.end(), aos_only_item);")
-REUSE_TAKE = ("if (reuse_after_readers && !reuse_gate) { reuse_gate = region_read_gate_[cur_region_] ? "
-              "*region_read_gate_[cur_region_] : ccs_->ext_oneapi_submit_barrier(); }")
+REUSE_TAKE = ("if (reuse_after_readers && !reuse_gate) { reuse_gate = region_reads_.read_gate[cur_region_] ? "
+              "*region_reads_.read_gate[cur_region_] : ccs_->ext_oneapi_submit_barrier(); }")
 REUSE_DEP = "if (reuse_gate) { deps.push_back(*reuse_gate); }"
 COPIED_IN = "copied_in = true;"
-REUSE_RECORD = ("if (copied_in) { region_aos_only_[cur_region_] = aos_only_staged; region_layer_[cur_region_] = "
-                "items.front().layer; region_read_gate_[cur_region_].reset(); }")
-REGION_FLAGS_RESET = ("region_aos_only_[0] = false; region_aos_only_[1] = false; region_layer_[0] = -1; "
-                      "region_layer_[1] = -1; region_read_gate_[0].reset(); region_read_gate_[1].reset();")
+REUSE_RECORD = "if (copied_in) { region_reads_.refill(cur_region_, items.front().layer, aos_only_staged); }"
+REGION_FLAGS_RESET = "region_reads_.reset();"
+# The regions' last uses, kept in one place (moe-stream-plan.hpp) and held by the phase over sycl::event.
+READS_SIG = "template <typename event_t> struct moe_stream_region_reads"
+READS_FIELDS = "int layer[2] = { -1, -1 }; bool aos_only[2] = { false, false }; std::optional<event_t> read_gate[2];"
+READS_MEMBER = "moe_stream_region_reads<sycl::event> region_reads_;"
+REFILL_SIG = "void refill(int region, int l, bool left_aos_only)"
+REFILL_BODY = "{ layer[region] = l; aos_only[region] = left_aos_only; read_gate[region].reset(); }"
+READS_DONE_SIG = "void layer_done(int l, const event_t & down_done)"
+READS_DONE_BODY = "{ for (int r = 0; r < 2; ++r) { if (layer[r] == l) { read_gate[r] = down_done; } } }"
+READS_RESET_SIG = "void reset()"
+READS_RESET_BODY = "{ for (int r = 0; r < 2; ++r) { layer[r] = -1; aos_only[r] = false; read_gate[r].reset(); } }"
 RESET_REGIONS_SIG = "void moe_stream_phase::reset_regions()"
 REGION_STATE_RESET = ("region_keys_[0].clear(); region_keys_[1].clear(); cur_region_ = 0; region_submitted_ = false; "
                       "region_last_ = sycl::event();")
 RING_READY_RESET = "ring_ = std::move(ring); reset_regions(); return true;"
 TEARDOWN_RESET = "table_.clear(); reset_regions();"
 PHASE_LAYER_DONE_SIG = "void moe_stream_phase::layer_done(int layer, sycl::event down_done)"
-READ_GATE_RECORD = ("for (int r = 0; r < 2; ++r) { if (region_layer_[r] == layer) { region_read_gate_[r] = down_done; "
-                    "} }")
+READ_GATE_RECORD = "region_reads_.layer_done(layer, down_done);"
 
 
-def claim_aos_only_reuse_waits_for_readers(phase: str) -> bool:
+def claim_aos_only_reuse_waits_for_readers(phase: str, hpp: str = PLAN_HPP) -> bool:
     """When a region's last use or the stage reusing it holds an AOS-only item, a copy may rewrite a slot a kernel
     read in that last use, and the region's gate does not follow those readers (layer_done gates the region holding the
     next layer). So every copy of the stage also waits for the region's read gate (lead ruling c-o9uw-1): the barrier
@@ -689,18 +735,28 @@ def claim_aos_only_reuse_waits_for_readers(phase: str) -> bool:
     for the region holding that layer. Without one, the copies wait for a compute-queue barrier submitted at the first
     copy. A copy going in makes the stage the region's last use: its layer, whether it left an AOS-only slot, and no
     read gate yet. A new ring starts with no layer, no AOS-only slot and no read gate, and teardown leaves none behind:
-    both run the one helper that forgets them, so the two cannot drift apart."""
+    both run the one helper that forgets them, so the two cannot drift apart. The three facts per region live in one
+    struct (moe_stream_region_reads), whose refill, layer_done and reset are the only writers, and the phase holds no
+    copy of its own."""
     n = norm(phase)
     s = body(n, STAGE_SIG)
     done = body(n, PHASE_LAYER_DONE_SIG)
     reset = body(n, RESET_REGIONS_SIG)
+    h = norm(hpp)
+    at = h.find(READS_SIG + " {")
+    reads = body(h[at:], READS_SIG) if at >= 0 else ""
     return (s.count(REUSE_TAKE) == 1 and s.count(REUSE_DEP) == 1 and s.count(REUSE_RECORD) == 1
             and s.count(COPIED_IN) == 1 and "bool copied_in = false;" in s
             and ordered(s, PARTITION, REUSE_COND, ITEM_LOOP, COPY_DEPS, READY_DEP, REUSE_TAKE, REUSE_DEP, COPY_DECL,
                         COPIED_IN, AOS_ONLY_RECORD, REUSE_RECORD)
             and n.count(READ_GATE_RECORD) == 1 and done.count(READ_GATE_RECORD) == 1
             and ordered(done, "if (layer != cur_layer_) { return; }", READ_GATE_RECORD)
-            and n.count("region_read_gate_[r] =") == 1
+            and h.count(READS_SIG + " {") == 1 and READS_FIELDS in reads
+            and body(reads, REFILL_SIG) == REFILL_BODY and body(reads, READS_DONE_SIG) == READS_DONE_BODY
+            and body(reads, READS_RESET_SIG) == READS_RESET_BODY
+            and reads.count("read_gate[") == 4 and h.count(READS_MEMBER) == 1
+            and n.count("region_reads_.refill(") == 1 and n.count("region_reads_.reset();") == 1
+            and n.count("region_reads_.read_gate[") == 2 and n.count("region_reads_.aos_only[") == 1
             and n.count(RESET_REGIONS_SIG + " {") == 1 and ordered(reset, REGION_STATE_RESET, REGION_FLAGS_RESET)
             and RING_READY_RESET in body(n, RING_READY_SIG) and TEARDOWN_RESET in body(n, TEARDOWN_SIG)
             and n.count("reset_regions();") == 2)
@@ -719,14 +775,14 @@ def test_aos_only_reuse_mutants():
     # The read gate never used: every reuse waits for a stage-time barrier, which also waits for the work queued after
     # the last use's down op.
     assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, "region_read_gate_[cur_region_] ? *region_read_gate_[cur_region_] : ccs_", "ccs_"))
+        mutate(PHASE, "region_reads_.read_gate[cur_region_] ? *region_reads_.read_gate[cur_region_] : ccs_", "ccs_"))
     # The other region's read gate.
     assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, "region_read_gate_[cur_region_] ? *region_read_gate_[cur_region_] :",
-               "region_read_gate_[1 - cur_region_] ? *region_read_gate_[1 - cur_region_] :"))
+        mutate(PHASE, "region_reads_.read_gate[cur_region_] ? *region_reads_.read_gate[cur_region_] :",
+               "region_reads_.read_gate[1 - cur_region_] ? *region_reads_.read_gate[1 - cur_region_] :"))
     # A SOA-only stage after an AOS-only use, unordered after that use's readers.
     assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, "region_aos_only_[cur_region_] || std::any_of(", "std::any_of("))
+        mutate(PHASE, "region_reads_.aos_only[cur_region_] || std::any_of(", "std::any_of("))
     # An AOS-only stage after a SOA-only use: its single slots land on the use's SOA slots.
     assert not claim_aos_only_reuse_waits_for_readers(
         mutate(PHASE, " || std::any_of(items.begin(), items.end(), aos_only_item);", ";"))
@@ -736,14 +792,22 @@ def test_aos_only_reuse_mutants():
     # Never recorded.
     assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, REUSE_RECORD, ""))
     # A refilled region keeps the read gate of its previous layer, which precedes the new layer's readers.
-    assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, " region_read_gate_[cur_region_].reset(); }", " }"))
+    assert not claim_aos_only_reuse_waits_for_readers(PHASE, mutate(PLAN_HPP, " read_gate[region].reset(); }", " }"))
     # The region's layer never recorded, so layer_done finds no region to gate.
+    assert not claim_aos_only_reuse_waits_for_readers(PHASE, mutate(PLAN_HPP, "{ layer[region] = l; ", "{ "))
+    # The refill drops the AOS-only flag, so a SOA-only stage after an AOS-only use skips the read gate.
     assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, " region_layer_[cur_region_] = items.front().layer;", ""))
+        PHASE, mutate(PLAN_HPP, " aos_only[region] = left_aos_only;", ""))
+    # The stage refills with the wrong layer.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "region_reads_.refill(cur_region_, items.front().layer,",
+               "region_reads_.refill(cur_region_, items.front().layer + 1,"))
     # layer_done gates the region holding the next layer, the gate's old defect.
     assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, "if (region_layer_[r] == layer) {", "if (region_layer_[r] == layer + 1) {"))
+        PHASE, mutate(PLAN_HPP, "if (layer[r] == l) {", "if (layer[r] == l + 1) {"))
+    # A second copy of the read gates in the phase beside the struct's.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, READ_GATE_RECORD, READ_GATE_RECORD + " region_reads_.read_gate[0] = down_done;"))
     # layer_done records no read gate.
     assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, READ_GATE_RECORD, ""))
     # A down op of a layer this micro-batch has not begun records a gate.
@@ -751,12 +815,14 @@ def test_aos_only_reuse_mutants():
         mutate(PHASE, "if (layer != cur_layer_) { return; } " + READ_GATE_RECORD,
                READ_GATE_RECORD + " if (layer != cur_layer_) { return; }"))
     # A new ring inherits the old ring's read gates.
-    assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, "region_read_gate_[0].reset(); region_read_gate_[1].reset();", ""))
+    assert not claim_aos_only_reuse_waits_for_readers(PHASE, mutate(PLAN_HPP, " read_gate[r].reset(); } }", " } }"))
     # A new ring, or a torn-down phase, keeps the layers its regions last held, so layer_done gates a region by a
     # layer it no longer holds.
-    assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, "region_layer_[0] = -1; region_layer_[1] = -1;", ""))
+    assert not claim_aos_only_reuse_waits_for_readers(PHASE, mutate(PLAN_HPP, "{ layer[r] = -1; ", "{ "))
+    # ... or the AOS-only flags of the old ring's last uses.
+    assert not claim_aos_only_reuse_waits_for_readers(PHASE, mutate(PLAN_HPP, " aos_only[r] = false;", ""))
+    # reset_regions no longer resets the regions' last uses.
+    assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, REGION_FLAGS_RESET, ""))
     # A new ring never forgets the old ring's regions.
     assert not claim_aos_only_reuse_waits_for_readers(in_body(PHASE, RING_READY_SIG, "reset_regions(); ", ""))
     # Teardown leaves the regions' layers and read gates behind for the next ring of a reused phase.
@@ -1177,6 +1243,26 @@ def drop_in(text: str, signature: str, old: str) -> str:
     b = body(n, signature)
     assert old in b, f"mutant precondition: {old!r} is not in {signature!r}"
     return n.replace(b, b.replace(old, "", 1), 1)
+
+
+def test_claims_count_production_sites_only():
+    """The phase's PRIVATE_TESTING seams reserve a ring and acquire a slot so a device case can drive the staged-ring
+    route (llama.cpp-o9uw). The claims count the production sites, so production() leaves the seams out; were a seam
+    compiled into the shipped library, the claims would count it and fail."""
+    raw = read(PHASE_REL)
+    guard = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+    assert raw.count(guard) == 1
+    assert "moe_stream_phase::test_reserve_ring(" in raw and "moe_stream_phase::test_reserve_ring(" not in PHASE
+    assert "moe_stream_phase::test_acquire_slot(" in raw and "moe_stream_phase::test_acquire_slot(" not in PHASE
+    assert claim_phase_allocates_only_ring_slots(PHASE)
+    assert claim_staging_only_under_explicit_ring(PHASE, SYCL, PLAN_HPP)
+    # The seams outside their block: a second slot acquisition and a second ring_ready() call, both counted.
+    unguarded = production(raw.replace(guard, "#if 1"))
+    assert not claim_phase_allocates_only_ring_slots(unguarded)
+    assert not claim_staging_only_under_explicit_ring(unguarded, SYCL, PLAN_HPP)
+    # An #else arm is production and stays; a nested conditional inside the block goes with it.
+    assert production("a\n#if defined(GGML_SYCL_PRIVATE_TESTING)\nb\n#else\nc\n#endif\nd") == "a\n\n\n\nc\n\nd"
+    assert production("#ifdef GGML_SYCL_PRIVATE_TESTING\n#ifdef X\nb\n#else\nc\n#endif\n#endif\nd") == "\n" * 7 + "d"
 
 
 def test_reserve_failure_lasts_one_ubatch():

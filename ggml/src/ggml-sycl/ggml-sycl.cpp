@@ -33041,6 +33041,32 @@ bool test_moe_stream_staged_route_refusals(ggml_backend_t backend, std::string *
     return true;
 }
 
+bool test_moe_stream_reserve_ring(ggml_backend_t backend, size_t slot_bytes, uint32_t n_slots) {
+    ggml_backend_sycl_context * ctx = test_get_backend_ctx(backend);
+    if (ctx == nullptr) {
+        return false;
+    }
+    if (!ctx->moe_stream) {
+        ctx->moe_stream.reset(new moe_stream_phase());
+    }
+    moe_stream_ring_geometry geo;
+    geo.slot_bytes   = slot_bytes;
+    geo.n_slots      = n_slots;
+    geo.bytes        = slot_bytes * n_slots;
+    geo.region_slots = n_slots / 2;
+    return ctx->moe_stream->test_reserve_ring(ctx->device, geo, *ctx->stream());
+}
+
+mem_handle test_moe_stream_acquire_slot(ggml_backend_t backend, ggml_layout_mode layout) {
+    ggml_backend_sycl_context * ctx = test_get_backend_ctx(backend);
+    return ctx != nullptr && ctx->moe_stream ? ctx->moe_stream->test_acquire_slot(layout) : mem_handle();
+}
+
+size_t test_moe_stream_payload_records(ggml_backend_t backend) {
+    ggml_backend_sycl_context * ctx = test_get_backend_ctx(backend);
+    return ctx != nullptr ? ctx->moe_stream_payload.size() : 0;
+}
+
 moe_resolved_batch_result test_moe_staged_ring_build(ggml_backend_t      backend,
                                                      const ggml_tensor * src0,
                                                      const int32_t *     ids,
@@ -62385,6 +62411,21 @@ static const void * const * ggml_sycl_upload_moe_ptr_table_from_batch(ggml_backe
                                                     table_event_out, table_event_set,
                                                     staged_experts.empty() ? nullptr : &staged_experts);
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The staged ring route's device test (llama.cpp-o9uw) uploads a staged batch's pointer table as a prompt MUL_MAT_ID
+// does. No layer sequence holds the layer hash -1, so the table is the weight's own allocation.
+const void * const * ggml_sycl::test_moe_staged_ring_upload(ggml_backend_t                        backend,
+                                                            const ggml_tensor *                   src0,
+                                                            const ggml_sycl::moe_resolved_batch & batch,
+                                                            ggml_layout_mode                      layout) {
+    ggml_backend_sycl_context * ctx = ggml_sycl::test_get_backend_ctx(backend);
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    return ggml_sycl_upload_moe_ptr_table_from_batch(*ctx, src0, batch, /*layer_hash=*/-1, layout);
+}
+#endif
 
 static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_table_from_batch(
     ggml_backend_sycl_context &           ctx,
