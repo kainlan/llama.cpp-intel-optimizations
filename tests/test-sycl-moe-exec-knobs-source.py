@@ -77,3 +77,11 @@ def test_config_accessor_and_teardown_summary():
 @pytest.mark.parametrize("name", NAMES)
 def test_catalog_has_row(name):
     assert re.search(r"`%s`" % name, (ROOT / "docs" / "backend" / "sycl-env-vars.md").read_text())
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
