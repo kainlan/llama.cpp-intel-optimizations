@@ -32783,26 +32783,29 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                                                              const moe_mmid_queue_capability * queue_capability) {
     const size_t rows = slots_per_token == 0 ? 0 : count / slots_per_token;
 
-    // The staged ring route (llama.cpp-o9uw): a prompt build on the context that owns the stream phase, on that
-    // context's in-order queue and outside a graph recording, looks each expert up in the phase's stage table before
-    // the route core. The layer and role are the ones the phase keys its table with: the layer begin_layer was given,
-    // and the plan's role classifier.
+    // The staged ring route (llama.cpp-o9uw): a prompt build (rows > 1) on the context that owns the stream phase, on
+    // that context's in-order queue and outside a graph recording, looks each expert up in the phase's stage table
+    // before the route core. The layer and role are the ones the phase keys its table with: the layer begin_layer was
+    // given, and the plan's role classifier. A decode build (rows 1) never takes the phase and pays nothing for it:
+    // the context keeps its phase through decode, and the hybrid and retained decode builds run outside a recording.
     auto * const sctx = static_cast<ggml_backend_sycl_context *>(const_cast<void *>(invocation_backend));
 
-    moe_stream_phase *       moe_stream   = sctx != nullptr && sctx->device == submit_device && sctx->moe_stream &&
+    moe_stream_phase * moe_stream = rows > 1 && sctx != nullptr && sctx->device == submit_device && sctx->moe_stream &&
                                             invocation_queue == sctx->stream() && !g_ggml_sycl_graph_recording ?
-                                                sctx->moe_stream.get() :
-                                                nullptr;
+                                        sctx->moe_stream.get() :
+                                        nullptr;
     const int                stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;
     const expert_tensor_role stream_role =
         moe_stream && src0 ? expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;
     // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the slot's reuse;
     // it does not order a library's internals. The oneDNN batched prompt executor claims the weights it runs, so a
-    // weight it claims never takes a slot.
-    const bool stream_library_claimed =
-        moe_stream != nullptr && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);
+    // weight it claims never takes a slot. The claim reads the device's plan, so it is asked at the first stage-table
+    // hit and once per build: a build that finds no entry (every prompt build under AUTO, whose stage table stays
+    // empty) never asks it.
+    bool stream_claim_asked     = false;
+    bool stream_library_claimed = false;
     auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
-        if (rows > 1 && moe_stream != nullptr && stream_layer >= 0) {
+        if (moe_stream != nullptr && stream_layer >= 0) {
             if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {
                 // Ruling C (c-3bde): the slot and the layout it holds come from the entry, never from the slice's
                 // tag. The lease is the slot itself; its pointer is only checked here.
@@ -32844,6 +32847,10 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 // event.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
+                    if (!stream_claim_asked) {
+                        stream_library_claimed = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);
+                        stream_claim_asked     = true;
+                    }
                     if (stream_library_claimed) {
                         return moe_staged_route_refusal::CLAIMED;
                     }

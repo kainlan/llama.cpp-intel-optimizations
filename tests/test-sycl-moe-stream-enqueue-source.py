@@ -928,8 +928,7 @@ PRIMARY_ENTRY_TAIL = "return ggml_sycl_moe_tensor_plan_primary_layout(*plan_owne
 PLAN_READERS = ("ggml_sycl_cache_plan_owner(", "coherent_placement_plan_owner(", "coherent_cache_placement_plan_owner(",
                 "global_placement_plan_owner(", "ggml_sycl_global_plan_owner(", "get_unified_cache_for_device(")
 LIBRARY_CLAIMS_FILL = "call.op.library_claims = ggml_sycl_moe_stream_library_claims;"
-ROUTE_LIBRARY_CLAIM = ("const bool stream_library_claimed = moe_stream != nullptr && "
-                       "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);")
+ROUTE_LIBRARY_CLAIM = "stream_library_claimed = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);"
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 INDEX_STAGING_ASK = "item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);"
@@ -985,7 +984,7 @@ def test_library_claim_mutants():
     assert not claim_staging_declines_library_claimed(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
     # The route refuses on something else, so the two would answer differently.
     assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, ROUTE_LIBRARY_CLAIM, "const bool stream_library_claimed = false;"), PLAN_HPP, PHASE)
+        mutate(SYCL, ROUTE_LIBRARY_CLAIM, "stream_library_claimed = false;"), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
     assert not claim_staging_declines_library_claimed(
         SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)

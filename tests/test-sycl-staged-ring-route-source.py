@@ -5,9 +5,13 @@ Host-only: reads sources, builds nothing, loads no model and touches no device.
 
 What this gate pins:
   - one writer: `recipe.transfer = moe_recipe_transfer::STAGED_RING` is assigned at exactly one site in the backend,
-    inside ggml_sycl_build_moe_resolved_batch's resolver lambda, after the `rows > 1` prompt guard and the phase's
-    `moe_stream->find(` lookup, and before the route core; moe_batch_route carries no `staged_ring` flag (brief
-    amendment: the recipe's transfer is the fact);
+    inside ggml_sycl_build_moe_resolved_batch's resolver lambda, after the phase's `moe_stream->find(` lookup, and
+    before the route core; moe_batch_route carries no `staged_ring` flag (brief amendment: the recipe's transfer is
+    the fact);
+  - a decode build costs nothing: the phase is taken only for a prompt build (`rows > 1` is the first term of the
+    phase pointer's condition), so a decode build computes no layer, no role and no claim. The library claim reads
+    the device's plan, so it is asked inside the refusal lambda at the first stage-table hit and at most once per
+    build: a build that finds no entry, such as every prompt build under AUTO, never asks it (llama.cpp-o9uw);
   - the phase is consulted only from the context that owns it, on that context's own queue, outside a graph recording,
     and keyed by the layer and role the phase itself uses (ggml_sycl_moe_stream_layer_of, the plan's role classifier);
   - ruling C (c-3bde): the slot and its layout come from the stage-table entry (`s->layout`), never from the slice's
@@ -222,7 +226,7 @@ ROUTE_STRUCT_SIG = "struct moe_batch_route {"
 
 ASSIGN = "staged.recipe.transfer = moe_recipe_transfer::STAGED_RING;"
 ASSIGN_RE = r"(?<![=!<>])=\s*(?:ggml_sycl::)?moe_recipe_transfer::STAGED_RING\b"
-GUARD = "if (rows > 1 && moe_stream != nullptr && stream_layer >= 0) {"
+GUARD = "if (moe_stream != nullptr && stream_layer >= 0) {"
 FIND = "if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {"
 SERVE_RETURN = ("moe_stream->count_staged_route(refusal, refusal_detail); "
                 "if (refusal == moe_staged_route_refusal::NONE) { return staged; }")
@@ -230,15 +234,17 @@ ROUTE_CORE = "::ggml_sycl_resolve_moe_expert_route_for_dispatch("
 LAMBDA_OPEN = ("auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, "
                "[&](int32_t expert_id) {")
 
-STREAM_DECL = ("moe_stream_phase * moe_stream = sctx != nullptr && sctx->device == submit_device && "
+STREAM_DECL = ("moe_stream_phase * moe_stream = rows > 1 && sctx != nullptr && sctx->device == submit_device && "
                "sctx->moe_stream && invocation_queue == sctx->stream() && !g_ggml_sycl_graph_recording ? "
                "sctx->moe_stream.get() : nullptr;")
 LAYER_DECL = "const int stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;"
 ROLE_DECL = ("const expert_tensor_role stream_role = moe_stream && src0 ? "
              "expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;")
 PREPARE_LAYER = "call.layer = ggml_sycl_moe_stream_layer_of(src0);"
-CLAIMED_DECL = ("const bool stream_library_claimed = moe_stream != nullptr && "
-                "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);")
+CLAIM_DECLS = "bool stream_claim_asked = false; bool stream_library_claimed = false;"
+CLAIM_CALL = "ggml_sycl_moe_pp_onednn_batched_claims_tensor("
+CLAIM_SET = "stream_library_claimed = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);"
+CLAIM_ASK = "if (!stream_claim_asked) { " + CLAIM_SET + " stream_claim_asked = true; }"
 
 SLOT = "const mem_handle & slot = s->layout == GGML_LAYOUT_SOA ? s->soa : s->aos;"
 VIEW = "const resolved_ptr view = slot.resolve(submit_device);"
@@ -391,8 +397,8 @@ def test_single_writer_mutants():
     tree = dict(SYCL_TREE)
     tree["extra.cpp"] = "void f(moe_execution_recipe & r) { r.transfer = moe_recipe_transfer::STAGED_RING; }"
     assert not claim_single_writer(SYCL, tree, BATCH_HPP)
-    # Decode consults it: the rows guard is gone.
-    m = mutate(SYCL, GUARD, "if (moe_stream != nullptr && stream_layer >= 0) {")
+    # The staged branch outside the lambda's phase guard.
+    m = mutate(SYCL, GUARD, "if (stream_layer >= 0) {")
     assert not claim_single_writer(m, {SYCL_REL: m}, BATCH_HPP)
     # The route core runs first and the staged branch only after it.
     m = mutate(SYCL, LAMBDA_OPEN, LAMBDA_OPEN + " (void) ::ggml_sycl_resolve_moe_expert_route_for_dispatch(src0);")
@@ -412,7 +418,7 @@ def claim_owner_and_keys(sycl: str) -> bool:
     n = norm(sycl)
     b = build_body(sycl)
     prep = body(n, PREPARE_SIG)
-    return (ordered(b, STREAM_DECL, LAYER_DECL, ROLE_DECL, CLAIMED_DECL, LAMBDA_OPEN) and PREPARE_LAYER in prep
+    return (ordered(b, STREAM_DECL, LAYER_DECL, ROLE_DECL, CLAIM_DECLS, LAMBDA_OPEN) and PREPARE_LAYER in prep
             and "parse_layer_id_from_name(" not in prep)
 
 
@@ -500,7 +506,7 @@ def claim_library_claim_predicate(sycl: str) -> bool:
     resolver, defined with the executors), not a restatement of it."""
     n = norm(sycl)
     fwd = "static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device);"
-    return fwd in n and n.find(fwd) < n.find(BUILD_SIG) and CLAIMED_DECL in build_body(sycl)
+    return fwd in n and n.find(fwd) < n.find(BUILD_SIG) and CLAIM_ASK in staged_branch(sycl)
 
 
 def test_library_claim_predicate():
@@ -509,7 +515,43 @@ def test_library_claim_predicate():
 
 def test_library_claim_predicate_mutants():
     assert not claim_library_claim_predicate(
-        mutate(SYCL, CLAIMED_DECL, "const bool stream_library_claimed = src0->type == GGML_TYPE_MXFP4;"))
+        mutate(SYCL, CLAIM_SET, "stream_library_claimed = src0->type == GGML_TYPE_MXFP4;"))
+
+
+def claim_decode_and_unstaged_builds_skip_the_claim(sycl: str) -> bool:
+    """A decode build never takes the phase: `rows > 1` is the first term of the phase pointer's condition, ahead of
+    the layer, the role and the claim, which all read it. The library claim reads the device's plan, so it is not
+    asked up front: the one call in the build sits inside the refusal lambda, after the stage-table lookup and ahead
+    of the CLAIMED refusal, behind a flag that makes it once per build (llama.cpp-o9uw). So a build that finds no entry
+    never asks it."""
+    b = build_body(sycl)
+    br = staged_branch(sycl)
+    return (b.count(STREAM_DECL) == 1 and b.count(CLAIM_CALL) == 1 and br.count(CLAIM_ASK) == 1
+            and ordered(b, STREAM_DECL, LAYER_DECL, ROLE_DECL, CLAIM_DECLS, LAMBDA_OPEN, GUARD, FIND, REFUSAL_OPEN,
+                        CLAIM_ASK, REFUSAL_STEPS[0]))
+
+
+def test_decode_and_unstaged_builds_skip_the_claim():
+    assert claim_decode_and_unstaged_builds_skip_the_claim(SYCL)
+
+
+def test_decode_and_unstaged_builds_skip_the_claim_mutants():
+    c = claim_decode_and_unstaged_builds_skip_the_claim
+    # The claim asked up front, before the rows > 1 test can keep a decode build out (the shape before this fix).
+    eager = mutate(SYCL, CLAIM_DECLS, "bool stream_claim_asked = true; bool stream_library_claimed = "
+                                      "moe_stream != nullptr && " + CLAIM_CALL + "src0, submit_device);")
+    assert not c(eager)
+    # The rows test left to the lambda, so a decode build takes the phase, its layer and its role.
+    late_rows = mutate(SYCL, "= rows > 1 && sctx != nullptr", "= sctx != nullptr")
+    late_rows = late_rows.replace(GUARD, "if (rows > 1 && moe_stream != nullptr && stream_layer >= 0) {", 1)
+    assert not c(late_rows)
+    # Asked at every stage-table hit.
+    assert not c(mutate(SYCL, CLAIM_ASK, CLAIM_SET))
+    # Asked before the lookup, so every build with a phase asks it.
+    before_find = mutate(SYCL, FIND, CLAIM_ASK + " " + FIND)
+    at = before_find.rfind(CLAIM_ASK)
+    before_find = before_find[:at] + before_find[at + len(CLAIM_ASK):]
+    assert not c(before_find)
 
 
 # ---- one device recipe -----------------------------------------------------------------------------------------------
