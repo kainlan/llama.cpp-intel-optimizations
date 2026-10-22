@@ -1709,6 +1709,7 @@ TEST(moe_exec_rates_distinct_types_rejects_each_hostile_pair) {
 TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
     const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_invalid");
     const std::string device_name = "TestMoeExecRatesInvalidDevice";
+    const int         type_count  = static_cast<int>(GGML_TYPE_COUNT);  // the bound the backend passes
     create_dir_recursive(cache_dir);
     const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
     {
@@ -1740,13 +1741,13 @@ TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
     ASSERT(loaded[1].h2d_gbps == 0.0 && loaded[2].h2d_gbps == 0.0);
 
     MoeExecRatesEntry got;
-    ASSERT(moe_exec_rates_find(loaded, "GOOD", 43, got));
+    ASSERT(moe_exec_rates_find(loaded, "GOOD", type_count, got));
     ASSERT(got.h2d_gbps == 20.0 && got.reorder_gbps == 200.0 && got.dev_gflops_by_type == good_pairs);
-    ASSERT(!moe_exec_rates_find(loaded, "NOH2D", 43, got));
-    ASSERT(!moe_exec_rates_find(loaded, "NAN", 43, got));
-    ASSERT(!moe_exec_rates_find(loaded, "ZERO", 43, got));
-    ASSERT(!moe_exec_rates_find(loaded, "CUT", 43, got));
-    ASSERT(!moe_exec_rates_find(loaded, "ABSENT", 43, got));
+    ASSERT(!moe_exec_rates_find(loaded, "NOH2D", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "NAN", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "ZERO", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "CUT", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "ABSENT", type_count, got));
 
     // the store half
     std::vector<MoeExecRatesEntry> entries;
@@ -1759,12 +1760,12 @@ TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
         { 1,  6.0 },
         { 99, 1.0 }
     };
-    ASSERT(moe_exec_rates_upsert(entries, rec, 43));
+    ASSERT(moe_exec_rates_upsert(entries, rec, type_count));
     ASSERT(entries.size() == 1 && entries[0].dev_gflops_by_type == (std::vector<std::pair<int, double>>{
                                                                        { 1, 5.0 }
     }));
     rec.h2d_gbps = 27.0;
-    ASSERT(moe_exec_rates_upsert(entries, rec, 43));  // the same key replaces
+    ASSERT(moe_exec_rates_upsert(entries, rec, type_count));  // the same key replaces
     ASSERT(entries.size() == 1 && entries[0].h2d_gbps == 27.0);
 
     const double bad[] = { 0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
@@ -1772,15 +1773,15 @@ TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
     for (double b : bad) {
         MoeExecRatesEntry r = rec;
         r.h2d_gbps          = b;
-        ASSERT(!moe_exec_rates_upsert(entries, r, 43));
+        ASSERT(!moe_exec_rates_upsert(entries, r, type_count));
         r              = rec;
         r.reorder_gbps = b;
-        ASSERT(!moe_exec_rates_upsert(entries, r, 43));
+        ASSERT(!moe_exec_rates_upsert(entries, r, type_count));
     }
     ASSERT(entries.size() == 1 && entries[0].h2d_gbps == 27.0 && entries[0].reorder_gbps == 180.0);
     MoeExecRatesEntry unset;  // a default entry has measured nothing
     unset.device_key = "U";
-    ASSERT(!moe_exec_rates_upsert(entries, unset, 43) && entries.size() == 1);
+    ASSERT(!moe_exec_rates_upsert(entries, unset, type_count) && entries.size() == 1);
 
     std::remove(path.c_str());
     rmdir(cache_dir.c_str());

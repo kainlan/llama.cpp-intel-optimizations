@@ -1141,7 +1141,7 @@ inline std::string moe_exec_rates_entry_to_json(const MoeExecRatesEntry & e) {
            << moe_exec_rates_double_to_json(e.dev_gflops_by_type[i].second) << "]";
     }
     ss << "],"
-       << "\"created\":\"" << e.created << "\""
+       << "\"created\":\"" << json_escape(e.created) << "\""
        << "}";
     return ss.str();
 }
