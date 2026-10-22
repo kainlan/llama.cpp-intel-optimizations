@@ -195,6 +195,42 @@ int main() {
         });
         CHECK(std::fabs(r.cpu_gbps - 200.0 / (100.0 / 5.6 + 100.0 / 22.0)) < 1e-9, "two measured types: harmonic mean");
     }
+    // dev_gflops seeds per type from the Task 9 measurement (llama.cpp-g4uy), byte-weighted harmonic mean over the mix:
+    // bytes / sum(bytes_i / rate_i). The fixtures above that call weigh set their own rates, so none of their
+    // expectations depended on the old 20000 seed; the only pin that did is the unset-variable check below (600).
+    {
+        moe_exec_rates r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 1000 }
+        });
+        CHECK(r.dev_gflops == 3990.0, "a pure MXFP4 mix seeds the batched XMX executor's 3990 GFLOP/s");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_Q4_0, 1000 }
+        });
+        CHECK(r.dev_gflops == 630.0, "a pure Q4_0 mix seeds the per-row MMVQ path's 630 GFLOP/s");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_IQ3_S, 1000 }
+        });
+        CHECK(r.dev_gflops == 600.0, "a type with no batched executor seeds the per-row 600 GFLOP/s");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 500 },
+            { GGML_TYPE_Q4_0,  500 }
+        });
+        CHECK(std::fabs(r.dev_gflops - 2.0 / (1.0 / 3990.0 + 1.0 / 630.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 1088.1) < 0.1,
+              "equal MXFP4 and Q4_0 bytes seed the harmonic mean, 1088.1 (not the 2310 arithmetic mean)");
+        r = moe_exec_rates_seed({});
+        CHECK(r.dev_gflops == 600.0, "an empty mix seeds 600 GFLOP/s");
+        CHECK(moe_exec_rates_valid(r), "the empty-mix seed is valid");
+        // the env override still wins over a per-type seed
+        auto env_fn = [](const char * name) -> const char * {
+            return std::string(name) == "GGML_SYCL_MOE_EXEC_DEV_GFLOPS" ? "777" : nullptr;
+        };
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 1000 }
+        });
+        moe_exec_rates_apply_env(r, env_fn);
+        CHECK(r.dev_gflops == 777.0, "the env override wins over the per-type seed");
+    }
     // env overrides follow the w013 rule
     {
         static const char * fake_env_h2d = "31.5";
@@ -204,8 +240,8 @@ int main() {
         moe_exec_rates r = moe_exec_rates_seed({});
         moe_exec_rates_apply_env(r, getenv_fn);
         CHECK(r.h2d_gbps == 31.5, "H2D override applied");
-        CHECK(r.cpu_gbps == PLACEMENT_CPU_EXPERT_GBPS_DEFAULT && r.reorder_gbps == 200.0 && r.dev_gflops == 20000.0,
-              "an unset variable keeps its seed");
+        CHECK(r.cpu_gbps == PLACEMENT_CPU_EXPERT_GBPS_DEFAULT && r.reorder_gbps == 200.0 && r.dev_gflops == 600.0,
+              "an unset variable keeps its seed (the empty mix's 600 GFLOP/s)");
         fake_env_h2d = "-3";
         r            = moe_exec_rates_seed({});
         moe_exec_rates_apply_env(r, getenv_fn);

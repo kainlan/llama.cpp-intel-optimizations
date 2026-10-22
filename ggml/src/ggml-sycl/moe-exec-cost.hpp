@@ -147,25 +147,54 @@ static inline double moe_exec_env_param(moe_exec_getenv_fn getenv_fn, const char
     return value;
 }
 
+// The device expert executor's seed rate, GFLOP/s, for one ggml type. Task 9 (llama.cpp-g4uy, 2026-10-21): llama-bench
+// -p 512,2048 through bench-guard on Qwen1.5-MoE Q4_0 (B70) and GPT-OSS 20B MXFP4 (B50) with
+// GGML_SYCL_KERNEL_PROFILE=1; the persisted per-device record replaces the seed once measured.
+//   MXFP4: B50, the batched XMX executor as a whole (gemm.execute + repack.tiled + repack.soa + stage: 12.25 s over
+//          48.9 TFLOP); the GEMM kernel alone is 10070, but the executor's cost is the whole.
+//   Q4_0:  B70, mulmat.mmvq.id_aos_q4_0, the per-row MMVQ path (11.81 GFLOP per 2048-row call in 18.68 ms).
+//   other: no batched mul_mat_id executor exists for them on this fork, so the per-row rate is the honest seed (the
+//          Q4_0 down matrix measured 590).
+static inline double moe_exec_dev_gflops_seed(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_MXFP4:
+            return 3990.0;
+        case GGML_TYPE_Q4_0:
+            return 630.0;
+        default:
+            return 600.0;
+    }
+}
+
 // The seed record for a layer whose host-resident experts are `host_mix` (type, bytes). cpu_gbps is the byte-weighted
 // harmonic mean over the measured types, as kv_room_expert_types::add folds them; the room's default when none is.
+// dev_gflops is the byte-weighted harmonic mean of moe_exec_dev_gflops_seed (bytes / sum(bytes_i / rate_i): the cost
+// is bytes-proportional time), 600 for an empty mix.
 static inline moe_exec_rates moe_exec_rates_seed(const std::vector<std::pair<ggml_type, size_t>> & host_mix) {
     kv_room_expert_types types;
     for (const auto & tb : host_mix) {
         types.add(tb.first, tb.second);
     }
-    const size_t   measured = types.bytes - types.unmeasured_bytes;
-    const double   cpu_gbps = measured > 0 && types.measured_us > 0.0 ?
-                                  static_cast<double>(measured) / (types.measured_us * 1e3) :
-                                  PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
+    const size_t measured  = types.bytes - types.unmeasured_bytes;
+    const double cpu_gbps  = measured > 0 && types.measured_us > 0.0 ?
+                                 static_cast<double>(measured) / (types.measured_us * 1e3) :
+                                 PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
+    double       dev_bytes = 0.0;
+    double       dev_us    = 0.0;  // bytes_i / rate_i summed, in units of 1 / (GFLOP/s)
+    for (const auto & tb : host_mix) {
+        dev_bytes += static_cast<double>(tb.second);
+        dev_us += static_cast<double>(tb.second) / moe_exec_dev_gflops_seed(tb.first);
+    }
+    const double dev_gflops = dev_bytes > 0.0 ? dev_bytes / dev_us : moe_exec_dev_gflops_seed(GGML_TYPE_COUNT);
+
     moe_exec_rates r;
     r.cpu_gbps     = cpu_gbps;
-    r.h2d_gbps     = 20.0;     // seed; the Task 3 probe replaces it (measured 26.5 B70 / 27.1 B50, 8bgi c-nn1q)
-    r.reorder_gbps = 200.0;    // seed; the on-device AOS->SOA reorder (B70 D2D 870 GB/s, kernel-bound well below)
-    r.dev_gflops   = 20000.0;  // seed; Task 9 seeds per type from the batched prompt executor measurement
-    r.cpu_gflops   = 1000.0;   // seed; 22 threads of AVX2 vec_dot (cego)
-    r.cpu_fixed_us = 500.0;    // seed; per-layer submit/join/scatter (8bgi orchestration map)
-    r.dev_fixed_us = 800.0;    // seed; ptr-table upload + per-expert launches
+    r.h2d_gbps     = 20.0;        // seed; the Task 3 probe replaces it (measured 26.5 B70 / 27.1 B50, 8bgi c-nn1q)
+    r.reorder_gbps = 200.0;       // seed; the on-device AOS->SOA reorder (B70 D2D 870 GB/s, kernel-bound well below)
+    r.dev_gflops   = dev_gflops;  // seed; per type, moe_exec_dev_gflops_seed
+    r.cpu_gflops   = 1000.0;      // seed; 22 threads of AVX2 vec_dot (cego)
+    r.cpu_fixed_us = 500.0;       // seed; per-layer submit/join/scatter (8bgi orchestration map)
+    r.dev_fixed_us = 800.0;       // seed; ptr-table upload + per-expert launches
     return r;
 }
 
