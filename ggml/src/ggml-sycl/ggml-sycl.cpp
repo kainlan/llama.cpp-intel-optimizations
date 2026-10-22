@@ -29223,11 +29223,12 @@ static void ggml_sycl_moe_exec_log_sink(void *, const char * line) {
     GGML_LOG_WARN("%s\n", line);
 }
 
-// The [MOE-EXEC] once-per-change log of every layer decision in this process (Task 6 calls note()).
+// The level-1 trace lines go out at INFO: opt-in, visible with -lv 4 or -v.
 static void ggml_sycl_moe_exec_trace_sink(void *, const char * line) {
     GGML_LOG_INFO("%s\n", line);
 }
 
+// The [MOE-EXEC] once-per-change log of every layer decision in this process (Task 6 calls note()).
 static ggml_sycl::moe_exec_decision_log & ggml_sycl_moe_exec_log() {
     static ggml_sycl::moe_exec_decision_log log(ggml_sycl_moe_exec_log_sink, nullptr, ggml_sycl_moe_exec_config().trace,
                                                 ggml_sycl_moe_exec_trace_sink);
