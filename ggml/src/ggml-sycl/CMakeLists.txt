@@ -3124,6 +3124,43 @@ set_tests_properties(sycl-moe-stream-ring PROPERTIES
     SKIP_RETURN_CODE 77
 )
 
+# STAGED_RING (llama.cpp-o9uw, plan Task 8 of llama.cpp-36j0): a host expert the
+# prompt's stream phase staged into a ring slot answers the resolver as a
+# PRIMARY_DEVICE operand whose lease is the slot, only for a prompt build, and a
+# later micro-batch reads its own slot, not the earlier one's. It fills the
+# phase's stage table through a GGML_SYCL_PRIVATE_TESTING seam and runs the
+# resolver on the backend's own queue, so it links the private fixture carrier
+# like test-moe-stream-ring. No device kernel of its own
+# (SYCL_LINK_ONLY_TEST_OPTIONS). It allocates device memory, so it carries
+# "cache" and runs serially.
+add_executable(test-moe-staged-ring-route
+    tests/test-moe-staged-ring-route.cpp
+)
+target_include_directories(test-moe-staged-ring-route PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-staged-ring-route PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-moe-staged-ring-route PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-moe-staged-ring-route PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-moe-staged-ring-route PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME sycl-moe-staged-ring-route COMMAND test-moe-staged-ring-route)
+set_tests_properties(sycl-moe-staged-ring-route PROPERTIES
+    LABELS "sycl;moe;ring;cache;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    TIMEOUT 120
+    # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped.
+    SKIP_RETURN_CODE 77
+)
+
 # Unregistered-external-pointer byte-contract authority (llama.cpp-fxrg).
 # Regression for the P0 where several ggml-sycl.cpp call sites minted
 # mem_handles for unregistered external pointers with a 3-arg call against the
@@ -7547,6 +7584,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
         test-moe-stream-ring
+        test-moe-staged-ring-route
         test-sycl-intrusive-allocation-owner
         test-sycl-staging-replacement-failpoints
         test-sycl-cache-backing-provenance

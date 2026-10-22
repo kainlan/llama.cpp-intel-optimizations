@@ -864,8 +864,8 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
         task.recipe.workspace.alignment == 0 ||
         (reinterpret_cast<uintptr_t>(task.workspace) & (task.recipe.workspace.alignment - 1)) != 0 ||
         !validate_moe_execution_recipe(task.recipe, task.admitted_recipe_signature, task.weight_lease,
-                                       moe_batch_residency::HOST, task.recipe.request.submit, true,
-                                       task.workspace_bytes, reject)) {
+                                       moe_batch_residency::HOST, /*has_ready_event=*/false, task.recipe.request.submit,
+                                       true, task.workspace_bytes, reject)) {
         return false;
     }
     if ((task.recipe.request.type != GGML_TYPE_Q1_0 && task.recipe.request.type != GGML_TYPE_NVFP4) ||

@@ -72,6 +72,7 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     last_layer_tp_ = now;
     cur_layer_     = layer;
     cur_graph_seq_ = op.graph_seq;
+    log_           = op.log;
     bitmap_        = moe_stream_ids_bitmap(ids, n_ids, op.n_expert);
 
     // The layer itself: weighed here only when the previous layer did not weigh it (the micro-batch's first host
@@ -130,6 +131,7 @@ void moe_stream_phase::layer_done(int layer, sycl::event down_done) {
 }
 
 void moe_stream_phase::end_prompt() {
+    report_staged_routes();
     if (!ubatch_live_ && !ring_ && table_.empty()) {
         return;  // every decode graph after the first: nothing to drop
     }
@@ -219,8 +221,8 @@ void moe_stream_phase::resolve(int                           layer,
                                unified_cache &               cache,
                                const moe_stream_op &         op) {
     stage_counts n;
-    // Only an explicit GGML_SYCL_MOE_EXEC=ring moves bytes or reserves the ring: nothing consumes a staged expert
-    // until Task 8 (llama.cpp-o9uw) lands, so AUTO only records what the cost model would choose (lead ruling c-3skf).
+    // Only an explicit GGML_SYCL_MOE_EXEC=ring moves bytes or reserves the ring: AUTO only records what the cost model
+    // would choose (lead ruling c-3skf).
     if (moe_stream_stage_now(st.decision, op.policy)) {
         n = stage(li, st.decision.regime, cache, op);
         if (n.ring_unavailable) {
@@ -465,6 +467,34 @@ void moe_stream_phase::report(int                   layer,
     }
     op.log->note(device_, layer, st.decision, n.bytes);
 }
+
+void moe_stream_phase::count_staged_route(bool served) {
+    if (served) {
+        ++staged_served_;
+    } else {
+        ++staged_refused_;
+    }
+}
+
+// The resolver's STAGED_RING lookups for the prompt that ends, on the trace (llama.cpp-o9uw): without it a ring that
+// stages and a route that serves none of it read alike in the stage lines. Cleared for the next prompt.
+void moe_stream_phase::report_staged_routes() {
+    if ((staged_served_ != 0 || staged_refused_ != 0) && log_ != nullptr && log_->trace >= 1 &&
+        log_->trace_sink != nullptr) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "[MOE-EXEC-TRACE] staged route device %d: served=%zu refused=%zu", device_,
+                      staged_served_, staged_refused_);
+        log_->trace_sink(log_->sink_ctx, line);
+    }
+    staged_served_  = 0;
+    staged_refused_ = 0;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void moe_stream_phase::test_insert_staged(int layer, int expert_id, expert_tensor_role role, moe_stream_staged entry) {
+    table_[moe_stream_table_key(layer, expert_id, role)] = std::move(entry);
+}
+#endif
 
 // One WARN per prompt saying why the ring is unavailable, at the first layer that answers RING_UNAVAILABLE, under an
 // explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log. The

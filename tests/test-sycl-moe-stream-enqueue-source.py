@@ -12,8 +12,8 @@ What this gate pins:
     every all-device layer;
   - only an explicit GGML_SYCL_MOE_EXEC=ring stages: the phase's one stage() call sits under a guard that needs both
     the RING choice and the RING policy, the ring's reserve is reachable only through it, and the op's policy is the
-    parsed config's. Nothing consumes a staged expert until Task 8 (llama.cpp-o9uw), so under AUTO the decision log
-    records what the cost model would choose and no bytes move (lead ruling c-3skf);
+    parsed config's. What an explicit ring stages, the resolver's STAGED_RING route consumes (llama.cpp-o9uw); under
+    AUTO the decision log records what the cost model would choose and no bytes move (lead ruling c-3skf);
   - a refused ring reserve is not retried within a micro-batch and is tried once more in the next: the latch is cleared
     by begin_ubatch, which every new micro-batch runs, and by end_prompt. An expert loan (ruling c-tdra, llama.cpp-mwmr)
     can make room before the next micro-batch, so a per-prompt latch would waste the loan its own prompt asked for (lead
@@ -324,7 +324,7 @@ def test_reorder_mutants():
 def claim_handles_retained_and_entry_is_soa(phase: str, hpp: str) -> bool:
     """The AOS slot, the host lease and the SOA slot live until the reorder's event, so the submission's ownership does
     not lean on the table (CLAUDE.md: retain the handles behind a kernel's raw pointers for the queued work); the table
-    holds the SOA slot as the entry's handle with layout SOA, the field the stage table carries for Task 8's resolver
+    holds the SOA slot as the entry's handle with layout SOA, the field the resolver's STAGED_RING route reads
     (ruling C)."""
     n = norm(phase)
     staged = body(norm(hpp), "struct moe_stream_staged")
@@ -744,11 +744,11 @@ RING_READY_CALL_RE = re.compile(r"(?<![:\w])ring_ready\(\)")
 
 
 def claim_staging_only_under_explicit_ring(phase: str, sycl: str, hpp: str) -> bool:
-    """Lead ruling c-3skf: until Task 8 (llama.cpp-o9uw) consumes a staged expert, only an explicit
-    GGML_SYCL_MOE_EXEC=ring copies, reorders or reserves the ring, and AUTO only records the cost model's choice. The
-    phase's one stage() call is the first statement under a guard, moe_stream_stage_now, that needs both the RING choice
-    and the RING policy, the reserve is reachable only through stage() and ring_ready(), and the op's policy is the
-    parsed config's."""
+    """Lead ruling c-3skf: only an explicit GGML_SYCL_MOE_EXEC=ring copies, reorders or reserves the ring, and its
+    staged experts are what the resolver's STAGED_RING route consumes (llama.cpp-o9uw); AUTO only records the cost
+    model's choice. The phase's one stage() call is the first statement under a guard, moe_stream_stage_now, that needs
+    both the RING choice and the RING policy, the reserve is reachable only through stage() and ring_ready(), and the
+    op's policy is the parsed config's."""
     n = norm(phase)
     return (POLICY_GUARD + " " + STAGE_CALL in body(n, RESOLVE_SIG)
             and body(norm(hpp), STAGE_PRED_SIG) == STAGE_PRED_BODY

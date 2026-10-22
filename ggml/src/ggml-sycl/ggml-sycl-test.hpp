@@ -51,6 +51,35 @@ bool               test_moe_ptr_table_does_not_persist_pointer_cache();
 bool               test_moe_ptr_table_lease_covers_populated_slots();
 bool               test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+struct moe_resolved_batch_result;
+
+// The staged ring route (llama.cpp-o9uw). insert_staged puts one entry in the backend's stream-phase stage table
+// (making the phase when it has none); staged_ring_build runs the resolver on the backend's device and queue as a
+// prompt MUL_MAT_ID does; admission_entry_reusable is the prompt admission cache's reuse predicate.
+bool test_moe_stream_insert_staged(ggml_backend_t     backend,
+                                   int                layer,
+                                   int                expert_id,
+                                   expert_tensor_role role,
+                                   mem_handle         soa,
+                                   mem_handle         aos,
+                                   sycl::event        ready,
+                                   ggml_layout_mode   layout);
+bool test_moe_stream_begin_ubatch(ggml_backend_t backend, uint32_t n_tokens);
+bool test_moe_stream_end_prompt(ggml_backend_t backend);
+bool test_moe_stream_staged_route_counts(ggml_backend_t backend, size_t * served, size_t * refused);
+moe_resolved_batch_result test_moe_staged_ring_build(ggml_backend_t      backend,
+                                                     const ggml_tensor * src0,
+                                                     const int32_t *     ids,
+                                                     size_t              count,
+                                                     size_t              slots_per_token,
+                                                     ggml_layout_mode    requested_layout);
+bool                      test_moe_admission_entry_reusable(bool     valid,
+                                                            bool     names_staged_ring,
+                                                            uint64_t entry_graph_seq,
+                                                            uint64_t graph_seq);
+#endif
+
 // Exact test seam for the staged IDs ABI. The pointer, allocation lease, ready
 // event, and normalized strides are one receipt and must be consumed together.
 struct test_moe_ids_device_receipt {

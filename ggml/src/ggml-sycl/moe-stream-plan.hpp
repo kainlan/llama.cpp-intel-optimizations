@@ -48,8 +48,8 @@ enum class moe_stream_staging : uint8_t {
 };
 
 // True iff the device runs a prompt MUL_MAT_ID over a device-resident expert of `type` in `layout`, ne0 x ne1
-// (c-hmey). The backend answers from ggml_sycl_moe_query_route_capability, the source Task 8's staged-route recipe is
-// built from, so the ring stages no layout that no prompt kernel reads.
+// (c-hmey). The backend answers from ggml_sycl_moe_query_route_capability, the source the resolver's STAGED_RING
+// recipe is built from (llama.cpp-o9uw), so the ring stages no layout that no prompt kernel reads.
 using moe_stream_prompt_kernel_fn =
     bool (*)(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1);
 
@@ -155,9 +155,9 @@ static inline bool moe_stream_layer_fully_staged(const std::vector<moe_stream_it
 
 // One staged matrix: the SOA slot the device route reads, the AOS slot the copy landed in, and the reorder's event,
 // after which `soa` holds the matrix. `layout` is the layout the slot the device route reads really holds (ruling C,
-// c-3bde): a ring slice inherits the ring's AOS tag, so Task 8's resolver reads the layout from here, never from the
-// slice. An AOS-only matrix (c-hmey) has no SOA slot: `soa` is empty, `ready` is the copy's event and `layout` is AOS,
-// so the route reads `aos`.
+// c-3bde): a ring slice inherits the ring's AOS tag, so the resolver's STAGED_RING route reads the layout from here,
+// never from the slice. An AOS-only matrix (c-hmey) has no SOA slot: `soa` is empty, `ready` is the copy's event and
+// `layout` is AOS, so the route reads `aos`.
 struct moe_stream_staged {
     mem_handle       soa;
     mem_handle       aos;
@@ -522,8 +522,8 @@ static inline bool moe_stream_ubatch_starts(bool     live,
 }
 
 // True iff a layer's decision moves bytes now: the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it.
-// Nothing consumes a staged expert until Task 8 (llama.cpp-o9uw), so under AUTO the choice is only recorded (lead
-// ruling c-3skf).
+// Under AUTO the choice is only recorded (lead ruling c-3skf); what an explicit ring stages, the resolver's STAGED_RING
+// route consumes (llama.cpp-o9uw).
 static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy) {
     return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING;
 }
@@ -561,7 +561,8 @@ struct moe_stream_op {
 // Ordering (ruling A, c-3bde): the device orders everything, the host never waits or asks. A copy waits for its ring
 // region's gate, a reorder for its copy, and a region closes on an event after its last copy and its last reorder. The
 // SOA slots of a reused region are overwritten by reorders submitted to the same in-order compute queue after that
-// region's readers, so the ring is offered only on an in-order queue and its readers (Task 8) must run on that queue.
+// region's readers, so the ring is offered only on an in-order queue and its readers (the STAGED_RING route's
+// kernels, llama.cpp-o9uw) run on that queue.
 // An AOS-only slot (c-hmey) is read in place by those readers and rewritten by a copy on the copy queue, which no
 // queue order puts after them, and with AOS-only items a pair's slots no longer sit at fixed indices: so when a
 // region's last use or its new one holds an AOS-only item, the new copies also wait for a compute-queue barrier
@@ -600,6 +601,17 @@ class moe_stream_phase {
     void                      layer_done(int layer, sycl::event down_done);
     // The first decode graph after a prompt: the table, the decisions and the ring go.
     void                      end_prompt();
+    // The resolver's STAGED_RING lookups this prompt (llama.cpp-o9uw): an entry it served, or refused and left to the
+    // route core. end_prompt traces and clears them.
+    void                      count_staged_route(bool served);
+
+    size_t staged_routes_served() const { return staged_served_; }
+
+    size_t staged_routes_refused() const { return staged_refused_; }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Puts `entry` in the stage table under (layer, expert_id, role), as stage() does, for a device test of the route.
+    void test_insert_staged(int layer, int expert_id, expert_tensor_role role, moe_stream_staged entry);
+#endif
 
   private:
     struct layer_state {
@@ -637,6 +649,7 @@ class moe_stream_phase {
     sycl::event       compute_barrier();
     void              teardown(sycl::event last_use);
     void              report(int layer, const layer_state & st, const stage_counts & n, const moe_stream_op & op) const;
+    void              report_staged_routes();
     void              warn_ring_unavailable(const moe_stream_op & op);
 
     std::unique_ptr<moe_stream_ring>                ring_;
@@ -667,6 +680,9 @@ class moe_stream_phase {
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
     // Per region: its last use left an AOS-only slot behind, so its next copies wait for its readers (stage()).
     bool                                            region_aos_only_[2] = { false, false };
+    const moe_exec_decision_log *                   log_                = nullptr;  // the last op's, for end_prompt
+    size_t                                          staged_served_      = 0;
+    size_t                                          staged_refused_     = 0;
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

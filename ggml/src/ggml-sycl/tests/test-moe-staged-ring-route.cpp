@@ -1,0 +1,271 @@
+// Device test of the STAGED_RING route (llama.cpp-o9uw, Task 8 of
+// docs/plans/2026-10-19-moe-executor-cost-model-prefill-ring.md).
+//
+// The backend's stream phase is given stage-table entries whose slots are ring
+// slots this test filled, and the resolver runs on the backend's own device and
+// queue, as a prompt MUL_MAT_ID runs it, over a Q4_0 expert tensor with no
+// cache entry (so the route core can only answer "unavailable"):
+// 1. A prompt build (rows > 1) of an expert with an AOS entry is served: one
+//    PRIMARY_DEVICE operand per occurrence, transfer STAGED_RING, layout AOS,
+//    kernel MMVQ_COMPAT, carrying the entry's ready event; its lease resolves on
+//    the device at the slot, and the bytes read back through it are the fill's.
+//    The executor choice is PRIMARY_DEVICE, and the phase counts one served
+//    lookup (the resolver memoizes per expert).
+// 2. A decode build (rows == 1) never consults the entry: the route core
+//    answers and the counts do not move.
+// 3. An expert with no entry falls through to the route core, uncounted.
+// 4. An entry the slot cannot carry (layout SOA, while a ring slice is tagged
+//    AOS) is refused, counted, and falls through.
+// 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
+//    entry for the same expert in another slot is served from that slot, whose
+//    bytes differ from the first one's by construction.
+// 6. end_prompt clears the counts.
+//
+// A test may wait on events; nothing here status-queries one.
+
+#include "../common.hpp"
+#include "../ggml-sycl-test.hpp"
+#include "../mem-handle.hpp"
+#include "../mem-ops.hpp"
+#include "../moe-resolved-batch.hpp"
+#include "../moe-stream-ring.hpp"
+#include "../unified-cache.hpp"
+#include "ggml-backend.h"
+#include "ggml-sycl.h"
+#include "ggml.h"
+#include "sycl-test-skip.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <optional>
+#include <sycl/sycl.hpp>
+#include <vector>
+
+using namespace ggml_sycl;
+
+static int g_failures = 0;
+
+#define CHECK(cond, ...)                       \
+    do {                                       \
+        if (cond) {                            \
+            std::printf("PASS: " __VA_ARGS__); \
+        } else {                               \
+            std::printf("FAIL: " __VA_ARGS__); \
+            ++g_failures;                      \
+        }                                      \
+        std::printf("\n");                     \
+    } while (0)
+
+static constexpr int     kLayer  = 3;
+static constexpr int32_t kExpert = 5;
+static constexpr size_t  kSlot   = 1024 * 1024;
+
+// Every byte of `n` at `ptr` equals `want`, read back behind `dep`.
+static bool slot_holds(sycl::queue & q, const void * ptr, size_t n, uint8_t want, const sycl::event & dep) {
+    if (ptr == nullptr) {
+        return false;
+    }
+    std::vector<uint8_t> host(n, 0);
+    mem_copy_ptr_async(host.data(), ptr, n, q, { dep }).wait();
+    for (uint8_t b : host) {
+        if (b != want) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void counts(ggml_backend_t backend, size_t * served, size_t * refused) {
+    *served  = SIZE_MAX;
+    *refused = SIZE_MAX;
+    (void) test_moe_stream_staged_route_counts(backend, served, refused);
+}
+
+// A served build of kExpert from `slot`: every check of case 1, against the fill byte `want`.
+static void check_served(sycl::queue &                     q,
+                         int                               device,
+                         const moe_resolved_batch_result & r,
+                         const mem_handle &                slot,
+                         const sycl::event &               ready,
+                         uint8_t                           want,
+                         const char *                      what) {
+    CHECK(r, "%s: the prompt build is admitted (reject %s)", what, moe_batch_reject_reason_name(r.reject));
+    if (!r) {
+        return;
+    }
+    CHECK(r.batch.operands.size() == 2, "%s: one operand per occurrence (got %zu)", what, r.batch.operands.size());
+    const void * slot_ptr = slot.resolve(device).ptr;
+    for (const moe_resolved_operand & op : r.batch.operands) {
+        CHECK(op.expert_id == kExpert && op.residency() == moe_batch_residency::PRIMARY_DEVICE,
+              "%s: the staged expert is a PRIMARY_DEVICE operand", what);
+        CHECK(op.recipe().transfer == moe_recipe_transfer::STAGED_RING, "%s: the recipe's transfer is STAGED_RING",
+              what);
+        CHECK(op.recipe().layout == GGML_LAYOUT_AOS && op.actual_layout() == GGML_LAYOUT_AOS,
+              "%s: the recipe's layout is the entry's, AOS", what);
+        CHECK(op.recipe().kernel == moe_route_kernel::MMVQ_COMPAT, "%s: the kernel is the plain MMVQ_COMPAT", what);
+        CHECK(op.has_ready_event() && op.ready_event() == ready, "%s: the operand carries the entry's ready event",
+              what);
+        const resolved_ptr view = op.lease().resolve(device);
+        CHECK(view.ptr != nullptr && view.on_device && view.ptr == slot_ptr,
+              "%s: the lease resolves on the device at the slot (got %p, want %p)", what, view.ptr, slot_ptr);
+        const moe_batch_executor_choice choice = choose_moe_batch_executor(op, device, false, 0);
+        CHECK(choice && choice.executor == moe_batch_executor::PRIMARY_DEVICE,
+              "%s: the executor choice is PRIMARY_DEVICE (reject %s)", what,
+              moe_batch_reject_reason_name(choice.reject));
+    }
+    CHECK(slot_holds(q, r.batch.operands[0].lease().resolve(device).ptr, kSlot, want, ready),
+          "%s: the bytes read through the lease are the fill's 0x%02x", what, want);
+}
+
+int main() {
+    std::optional<sycl::device> dev_opt = sycl_test_require_gpu("the STAGED_RING route");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
+    }
+    const auto & sycl_info = ggml_sycl_info();
+    if (sycl_info.total_gpu_count <= 0) {
+        sycl_test_print_skip("the STAGED_RING route backend owner selection");
+        return SYCL_TEST_SKIP;
+    }
+    ggml_backend_t backend = ggml_backend_sycl_init(0);
+    if (backend == nullptr) {
+        std::printf("FAIL: ggml_backend_sycl_init(0) returned null\n");
+        return 1;
+    }
+    // The backend owner's device and context, as test-moe-stream-ring does; the slots' copies run on this queue and
+    // the resolver's barrier on the backend's queue waits for them.
+    auto &        owner       = ggml_sycl_get_gpu_device(0);
+    sycl::queue & owner_queue = owner.default_queue();
+    sycl::queue   q(owner_queue.get_context(), owner_queue.get_device(), sycl::property::queue::in_order{});
+    const int     device = ggml_sycl_get_device_id_from_queue(q);
+    std::printf("Device: %s (logical %d)\n", q.get_device().get_info<sycl::info::device::name>().c_str(), device);
+    if (device != 0) {
+        std::printf("FAIL: backend owner queue did not round-trip to logical GPU 0\n");
+        ggml_backend_free(backend);
+        return 1;
+    }
+    (void) get_unified_cache_for_device(device);
+
+    // A Q4_0 expert tensor of the stream phase's layer and role, with no data and no cache entry.
+    ggml_init_params params = { 4 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context *   tctx   = ggml_init(params);
+    ggml_tensor *    src0   = ggml_new_tensor_3d(tctx, GGML_TYPE_Q4_0, 256, 64, 8);
+    ggml_set_name(src0, "blk.3.ffn_gate_exps.weight");
+    const expert_tensor_role role = expert_tensor_role::GATE;
+
+    {
+        // Two regions of two 1 MiB slots: A and S in the first, B in the second.
+        moe_stream_ring          ring;
+        moe_stream_ring_geometry geo;
+        geo.slot_bytes      = kSlot;
+        geo.n_slots         = 4;
+        geo.bytes           = 4 * kSlot;
+        geo.region_slots    = 2;
+        const bool reserved = ring.reserve(device, geo);
+        CHECK(reserved, "reserve(4 slots x %zu bytes) on device %d", kSlot, device);
+        if (!reserved) {
+            ggml_free(tctx);
+            ggml_backend_free(backend);
+            std::printf("FAILED: %d case(s)\n", g_failures);
+            return 1;
+        }
+        mem_handle        slot_a = ring.acquire_slot();
+        mem_handle        slot_s = ring.acquire_slot();
+        const sycl::event fill_a = mem_fill_async(slot_a, 0x11, kSlot, q, { ring.current_region_gate() });
+        const sycl::event fill_s = mem_fill_async(slot_s, 0x33, kSlot, q, { ring.current_region_gate() });
+        ring.epoch_boundary(fill_s);
+        mem_handle        slot_b = ring.acquire_slot();
+        const sycl::event fill_b = mem_fill_async(slot_b, 0x22, kSlot, q, { ring.current_region_gate() });
+
+        const int32_t prompt_ids[] = { kExpert, kExpert };  // two tokens, one slot each: rows == 2
+        const int32_t decode_ids[] = { kExpert };           // one token: rows == 1
+        const int32_t miss_ids[]   = { 6, 6 };
+        size_t        served = 0, refused = 0;
+
+        // The build results hold slot leases; they all go before the ring is released below.
+        {
+            // Case 1: served. The insert makes the backend's phase.
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, kExpert, role, mem_handle(), slot_a, fill_a,
+                                                GGML_LAYOUT_AOS),
+                  "an AOS entry goes into the backend's stage table");
+            const moe_resolved_batch_result first =
+                test_moe_staged_ring_build(backend, src0, prompt_ids, 2, 1, GGML_LAYOUT_AOS);
+            check_served(q, device, first, slot_a, fill_a, 0x11, "micro-batch 1");
+            counts(backend, &served, &refused);
+            CHECK(served == 1 && refused == 0, "one served lookup for one unique expert (served %zu, refused %zu)",
+                  served, refused);
+
+            // Case 2: decode never consults the entry.
+            const moe_resolved_batch_result decode =
+                test_moe_staged_ring_build(backend, src0, decode_ids, 1, 1, GGML_LAYOUT_AOS);
+            CHECK(!decode && decode.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
+                  "rows == 1: the route core answers, not the entry (reject %s)",
+                  moe_batch_reject_reason_name(decode.reject));
+            counts(backend, &served, &refused);
+            CHECK(served == 1 && refused == 0, "rows == 1: the counts do not move (served %zu, refused %zu)", served,
+                  refused);
+
+            // Case 3: a miss falls through, uncounted.
+            const moe_resolved_batch_result miss =
+                test_moe_staged_ring_build(backend, src0, miss_ids, 2, 1, GGML_LAYOUT_AOS);
+            CHECK(!miss && miss.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
+                  "an expert with no entry falls through to the route core (reject %s)",
+                  moe_batch_reject_reason_name(miss.reject));
+            counts(backend, &served, &refused);
+            CHECK(served == 1 && refused == 0, "a miss is not counted (served %zu, refused %zu)", served, refused);
+
+            // Case 4: a SOA entry, which a ring slice (tagged AOS) cannot carry, is refused and counted.
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, 6, role, slot_s, slot_a, fill_s, GGML_LAYOUT_SOA),
+                  "a SOA entry goes into the stage table");
+            const moe_resolved_batch_result soa =
+                test_moe_staged_ring_build(backend, src0, miss_ids, 2, 1, GGML_LAYOUT_SOA);
+            CHECK(!soa && soa.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
+                  "the SOA entry is refused and falls through (reject %s)", moe_batch_reject_reason_name(soa.reject));
+            counts(backend, &served, &refused);
+            CHECK(served == 1 && refused == 1, "the refusal is counted (served %zu, refused %zu)", served, refused);
+
+            // Case 5: the next micro-batch starts with an empty table and reads its own slot.
+            CHECK(test_moe_stream_begin_ubatch(backend, 2), "the next micro-batch begins");
+            const moe_resolved_batch_result stale =
+                test_moe_staged_ring_build(backend, src0, prompt_ids, 2, 1, GGML_LAYOUT_AOS);
+            CHECK(!stale && stale.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
+                  "after begin_ubatch the first micro-batch's entry is gone (reject %s)",
+                  moe_batch_reject_reason_name(stale.reject));
+            (void) test_moe_stream_insert_staged(backend, kLayer, kExpert, role, mem_handle(), slot_b, fill_b,
+                                                 GGML_LAYOUT_AOS);
+            const moe_resolved_batch_result second =
+                test_moe_staged_ring_build(backend, src0, prompt_ids, 2, 1, GGML_LAYOUT_AOS);
+            check_served(q, device, second, slot_b, fill_b, 0x22, "micro-batch 2");
+            if (second && first) {
+                CHECK(second.batch.operands[0].lease().resolve(device).ptr !=
+                          first.batch.operands[0].lease().resolve(device).ptr,
+                      "the second micro-batch's lease is not the first one's slot");
+            }
+
+            // Case 6: end_prompt clears the counts.
+            CHECK(test_moe_stream_end_prompt(backend), "end_prompt runs");
+            counts(backend, &served, &refused);
+            CHECK(served == 0 && refused == 0, "end_prompt clears the counts (served %zu, refused %zu)", served,
+                  refused);
+        }
+
+        q.wait();
+        ggml_backend_synchronize(backend);
+        slot_a = mem_handle();
+        slot_s = mem_handle();
+        slot_b = mem_handle();
+        ring.release();
+    }
+
+    ggml_free(tctx);
+    ggml_backend_free(backend);
+    CHECK(drain_retained_handles(true), "the final retained-handle drain completes");
+
+    if (g_failures != 0) {
+        std::printf("FAILED: %d case(s)\n", g_failures);
+        return 1;
+    }
+    std::printf("ALL PASSED\n");
+    return 0;
+}
