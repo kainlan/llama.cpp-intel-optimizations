@@ -32,16 +32,23 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_m
     // whole layer per region, two regions.
     const uint64_t region_slots = 2ull * host_matrices_per_layer_max;
     const uint64_t n_slots      = 2ull * region_slots;
-    if (n_slots > UINT32_MAX || n_slots > SIZE_MAX / matrix_bytes_max) {
+
+    // Round each slot up to the alignment so every slot starts aligned.
+    const size_t align = MOE_STREAM_RING_SLOT_ALIGN;
+    if (matrix_bytes_max > SIZE_MAX - (align - 1)) {
         return {};
     }
-    const size_t bytes = static_cast<size_t>(n_slots) * matrix_bytes_max;
+    const size_t slot_bytes = (matrix_bytes_max + align - 1) / align * align;
+    if (n_slots > UINT32_MAX || n_slots > SIZE_MAX / slot_bytes) {
+        return {};
+    }
+    const size_t bytes = static_cast<size_t>(n_slots) * slot_bytes;
     if (bytes > resident_expert_bytes / 10) {
         return {};
     }
 
     moe_stream_ring_geometry geo;
-    geo.slot_bytes   = matrix_bytes_max;
+    geo.slot_bytes   = slot_bytes;
     geo.region_slots = static_cast<uint32_t>(region_slots);
     geo.n_slots      = static_cast<uint32_t>(n_slots);
     geo.bytes        = bytes;
@@ -50,47 +57,40 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_m
 
 #if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)
 
-// Device-copy alignment of the reservation; each slot then starts at a multiple
-// of slot_bytes from it.
-static constexpr size_t kMoeStreamRingAlign = 256;
-
 bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) {
     if (base_.valid()) {
         GGML_LOG_WARN("[MOE-STREAM-RING] reserve: device %d already holds a ring of %.1f MB; release it first\n",
                       device_, geo_.bytes / (1024.0 * 1024.0));
         return false;
     }
-    // Fewer than two slots cannot give each of the two regions one slot, and a
-    // region_slots other than n_slots / 2 is a geometry this ring cannot honour.
-    const uint32_t region_slots = geo.n_slots / 2;
-    if (geo.n_slots < 2 || geo.region_slots != region_slots || geo.slot_bytes == 0 ||
-        geo.bytes / geo.slot_bytes < geo.n_slots) {
+    // Only what moe_stream_ring_size() produces: two equal regions, exactly
+    // n_slots * slot_bytes bytes, and slots that start aligned. Fewer than two
+    // slots cannot give each region one.
+    const bool shape_ok = geo.n_slots >= 2 && geo.n_slots % 2 == 0 && geo.region_slots == geo.n_slots / 2 &&
+                          geo.slot_bytes != 0 && geo.slot_bytes % MOE_STREAM_RING_SLOT_ALIGN == 0 &&
+                          geo.bytes / geo.slot_bytes == geo.n_slots && geo.bytes % geo.slot_bytes == 0;
+    if (!shape_ok) {
         GGML_LOG_WARN(
-            "[MOE-STREAM-RING] reserve: geometry of %u slots (%u per region) x %zu bytes in %zu bytes cannot "
-            "form two regions on device %d\n",
+            "[MOE-STREAM-RING] reserve: geometry of %u slots (%u per region) x %zu bytes in %zu bytes is not two "
+            "equal aligned regions on device %d\n",
             geo.n_slots, geo.region_slots, geo.slot_bytes, geo.bytes, device);
         return false;
     }
-    // Exactly the two regions' slots; an odd slot or spare bytes are not reserved.
-    moe_stream_ring_geometry trimmed;
-    trimmed.slot_bytes   = geo.slot_bytes;
-    trimmed.region_slots = region_slots;
-    trimmed.n_slots      = 2 * region_slots;
-    trimmed.bytes        = static_cast<size_t>(trimmed.n_slots) * geo.slot_bytes;
+    const uint32_t region_slots = geo.region_slots;
 
     // The WEIGHT zone first. In single-chunk mode its allocator delegates to the
     // KV zone, which unified_cache_zone_allocate_owner() handles; the zone
     // allocator is never touched directly here.
     allocation_result allocation =
-        unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, trimmed.bytes, kMoeStreamRingAlign);
+        unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, geo.bytes, MOE_STREAM_RING_SLOT_ALIGN);
     if (!allocation) {
         // The scratch pool's arrangement: the same zone through the general
         // entry point, refusing rather than spilling into raw device memory
         // outside the arena when the arena is active.
         alloc_request req{};
         req.device                                    = device;
-        req.size                                      = trimmed.bytes;
-        req.alignment                                 = kMoeStreamRingAlign;
+        req.size                                      = geo.bytes;
+        req.alignment                                 = MOE_STREAM_RING_SLOT_ALIGN;
         req.intent.role                               = alloc_role::EXPERT_STAGING;
         req.intent.category                           = runtime_category::EXPERT_CACHE;
         req.intent.cohort_id                          = "moe_stream_ring";
@@ -103,7 +103,7 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) 
         GGML_LOG_WARN(
             "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give %.1f MB (%u slots x %.2f MB) on device "
             "%d\n",
-            trimmed.bytes / (1024.0 * 1024.0), trimmed.n_slots, trimmed.slot_bytes / (1024.0 * 1024.0), device);
+            geo.bytes / (1024.0 * 1024.0), geo.n_slots, geo.slot_bytes / (1024.0 * 1024.0), device);
         return false;
     }
 
@@ -111,11 +111,11 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) 
     const auto resolved = base.resolve(device);
     if (!resolved.ptr || !resolved.on_device) {
         GGML_LOG_WARN("[MOE-STREAM-RING] reserve: the %.1f MB reservation did not resolve on device %d\n",
-                      trimmed.bytes / (1024.0 * 1024.0), device);
+                      geo.bytes / (1024.0 * 1024.0), device);
         return false;
     }
 
-    geo_              = trimmed;
+    geo_              = geo;
     device_           = device;
     base_             = std::move(base);
     regions_[0]       = region{};

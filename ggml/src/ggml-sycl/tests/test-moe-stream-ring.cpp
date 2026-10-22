@@ -6,8 +6,9 @@
 //    the first region's first slot again, gated on the first boundary's event,
 //    resolving on the device with the bytes the first fill wrote. Release and
 //    check the allocation's registry row and the raw device bytes are gone.
-// 2. Geometries that cannot form two regions (one slot, short bytes, a
-//    region_slots other than n_slots / 2) are refused before allocating.
+// 2. Geometries that are not two equal aligned regions (one slot, an odd slot
+//    count, short or surplus bytes, a region_slots other than n_slots / 2, an
+//    unaligned slot_bytes) are refused before allocating.
 // 3. The region gate is a device dependency: a copy chained on it does not run
 //    while the event that ended the region's previous use is incomplete, and
 //    acquire_slot() hands the slot out regardless (it never consults an event).
@@ -47,6 +48,15 @@ static int g_failures = 0;
         std::printf("\n");                     \
     } while (0)
 
+// Whether the reservation came from the WEIGHT zone (sub-allocation). The
+// held-bytes ledger does not see zone sub-allocations, so its checks hold only
+// on the raw path; on the zone path the registry checks carry the release proof.
+static bool g_zone_managed = false;
+
+static bool is_slot_aligned(const void * ptr) {
+    return ptr != nullptr && reinterpret_cast<uintptr_t>(ptr) % MOE_STREAM_RING_SLOT_ALIGN == 0;
+}
+
 static moe_stream_ring_geometry make_geometry(size_t slot_bytes, uint32_t n_slots, size_t bytes) {
     moe_stream_ring_geometry geo;
     geo.slot_bytes   = slot_bytes;
@@ -85,6 +95,8 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
             mem_handle slot     = ring.acquire_slot();
             const auto resolved = slot.resolve(device);
             CHECK(resolved.ptr != nullptr && resolved.on_device, "region 0 slot %u resolves on device", i);
+            CHECK(is_slot_aligned(resolved.ptr), "region 0 slot %u starts at a multiple of %zu (got %p)", i,
+                  MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
             first_fill = mem_fill_async(slot, 0x10 + static_cast<int>(i), kSlot, q, { ring.current_region_gate() });
             first_ptrs.push_back(resolved.ptr);
             first_region.push_back(slot);
@@ -96,6 +108,7 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         CHECK(allocation_registry_test_contains(base_ptr), "the reservation's registry row exists while held");
         alloc_metadata md{};
         const bool     zone_managed = first_region.front().owner_metadata(&md) && md.zone_managed;
+        g_zone_managed              = zone_managed;
         std::printf("INFO: reservation is %s\n", zone_managed ? "a WEIGHT-zone sub-allocation" : "a raw device row");
         if (!zone_managed) {
             // A raw row must show up in the held-bytes ledger while held.
@@ -111,9 +124,13 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         std::vector<mem_handle> second_region;
         sycl::event             second_fill;
         for (uint32_t i = 0; i < kRegion; ++i) {
-            mem_handle slot     = ring.acquire_slot();
-            const auto resolved = slot.resolve(device);
-            const auto offset   = static_cast<const char *>(resolved.ptr) - static_cast<const char *>(first_ptrs[0]);
+            mem_handle           slot     = ring.acquire_slot();
+            const auto           resolved = slot.resolve(device);
+            const std::ptrdiff_t offset   = resolved.ptr != nullptr ? static_cast<const char *>(resolved.ptr) -
+                                                                        static_cast<const char *>(first_ptrs[0]) :
+                                                                      -1;
+            CHECK(is_slot_aligned(resolved.ptr), "region 1 slot %u starts at a multiple of %zu (got %p)", i,
+                  MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
             CHECK(resolved.ptr != nullptr && resolved.on_device &&
                       offset == static_cast<std::ptrdiff_t>((kRegion + i) * kSlot),
                   "region 1 slot %u resolves on device at slot offset %u (got byte offset %td)", i, kRegion + i,
@@ -154,9 +171,14 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
     // release() handed the backing to the retained-handle drain; let it run.
     CHECK(drain_retained_handles(true), "the retained-handle drain completes");
     CHECK(!allocation_registry_test_contains(base_ptr), "the reservation's registry row is gone after release");
-    const size_t held_after = unified_cache_raw_device_held_bytes(device, nullptr);
-    CHECK(held_after == held_before, "raw device held bytes return to their pre-reserve value (before %zu, after %zu)",
-          held_before, held_after);
+    if (g_zone_managed) {
+        std::printf("INFO: held-bytes check skipped: a zone sub-allocation is outside that ledger\n");
+    } else {
+        const size_t held_after = unified_cache_raw_device_held_bytes(device, nullptr);
+        CHECK(held_after == held_before,
+              "raw device held bytes return to their pre-reserve value (before %zu, after %zu)", held_before,
+              held_after);
+    }
 }
 
 // Case 2: geometries that cannot form two regions are refused before allocating.
@@ -183,6 +205,26 @@ static void test_refused_geometries(int device) {
         CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
               "a refused region_slots mismatch leaves the ring unreserved");
     }
+    {
+        moe_stream_ring ring;
+        CHECK(!ring.reserve(device, make_geometry(kSlot, 7, 7 * kSlot)), "reserve refuses an odd n_slots");
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+              "a refused odd n_slots leaves the ring unreserved");
+    }
+    {
+        moe_stream_ring ring;
+        CHECK(!ring.reserve(device, make_geometry(kSlot, 8, 8 * kSlot + 1)),
+              "reserve refuses bytes > n_slots x slot_bytes");
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+              "a refused surplus-bytes geometry leaves the ring unreserved");
+    }
+    {
+        moe_stream_ring ring;
+        CHECK(!ring.reserve(device, make_geometry(kSlot + 1, 8, 8 * (kSlot + 1))),
+              "reserve refuses a slot_bytes that is not a multiple of %zu", MOE_STREAM_RING_SLOT_ALIGN);
+        CHECK(ring.geometry().n_slots == 0 && !ring.acquire_slot().valid(),
+              "a refused unaligned slot_bytes leaves the ring unreserved");
+    }
 }
 
 // Case 3: the gate orders reuse on the device.
@@ -201,8 +243,11 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     std::atomic<bool> release_blocker{ false };
     std::atomic<bool> copy_done{ false };
 
-    mem_handle  first_use = ring.acquire_slot();
-    sycl::event blocker   = blocker_queue.submit([&](sycl::handler & h) {
+    mem_handle first_use = ring.acquire_slot();
+    void *     base_ptr  = first_use.resolve(device).ptr;
+    CHECK(base_ptr != nullptr && allocation_registry_test_contains(base_ptr),
+          "the gate case's reservation has a registry row while held");
+    sycl::event blocker = blocker_queue.submit([&](sycl::handler & h) {
         h.host_task([&]() {
             while (!release_blocker.load()) {
                 std::this_thread::yield();
@@ -238,6 +283,9 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     first_use = mem_handle();
     slot      = mem_handle();
     ring.release();
+    // Region 1 was never gated: its release is the has_gate == false branch.
+    CHECK(drain_retained_handles(true), "the gate case's retained-handle drain completes");
+    CHECK(!allocation_registry_test_contains(base_ptr), "the gate case's registry row is gone after release");
 }
 
 int main() {
@@ -272,9 +320,13 @@ int main() {
     test_gate_orders_reuse_on_device(q, device);
 
     CHECK(drain_retained_handles(true), "the final retained-handle drain completes");
-    const size_t held_end = unified_cache_raw_device_held_bytes(device, nullptr);
-    CHECK(held_end == held_before, "raw device held bytes end at their starting value (before %zu, end %zu)",
-          held_before, held_end);
+    if (g_zone_managed) {
+        std::printf("INFO: final held-bytes check skipped: a zone sub-allocation is outside that ledger\n");
+    } else {
+        const size_t held_end = unified_cache_raw_device_held_bytes(device, nullptr);
+        CHECK(held_end == held_before, "raw device held bytes end at their starting value (before %zu, end %zu)",
+              held_before, held_end);
+    }
 
     if (g_failures != 0) {
         std::printf("FAILED: %d case(s)\n", g_failures);

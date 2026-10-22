@@ -32,8 +32,14 @@
 
 namespace ggml_sycl {
 
-// slot_bytes is one matrix's slot (the largest host-planned matrix's
-// max(src_size, dst_size) on the device). A region holds one layer:
+// Every slot starts, and every slot is sized, at a multiple of this alignment
+// (the zone allocator's default), so wide device loads on a slot are aligned
+// whatever the quant's block size.
+static constexpr size_t MOE_STREAM_RING_SLOT_ALIGN = 256;
+
+// slot_bytes is one matrix's slot: the largest host-planned matrix's
+// max(src_size, dst_size) on the device, rounded up to
+// MOE_STREAM_RING_SLOT_ALIGN. A region holds one layer:
 // region_slots = 2 * the heaviest layer's host matrices, so the one-layer floor
 // is per region. n_slots = 2 * region_slots and bytes = n_slots * slot_bytes.
 // When the ring does not fit, every field is 0 (the default geometry); the
@@ -46,7 +52,8 @@ struct moe_stream_ring_geometry {
 };
 
 // Two regions of 2 * host_matrices_per_layer_max slots of matrix_bytes_max
-// each, or no ring when those bytes exceed resident_expert_bytes / 10. A
+// (rounded up to MOE_STREAM_RING_SLOT_ALIGN) each, or no ring when those bytes,
+// padding included, exceed resident_expert_bytes / 10. A
 // partial ring would need chunked streaming, which this revision does not do.
 moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_max,
                                               size_t   matrix_bytes_max,
@@ -80,12 +87,13 @@ class moe_stream_ring {
     moe_stream_ring(const moe_stream_ring &)             = delete;
     moe_stream_ring & operator=(const moe_stream_ring &) = delete;
 
-    // One WEIGHT-zone allocation on `device` of exactly 2 * (geo.n_slots / 2)
-    // slots, split into two regions of geo.n_slots / 2 slots; geometry() is that
-    // trimmed geometry. Returns false, with one WARN and no throw, when the
-    // geometry cannot form two regions (fewer than two slots, region_slots other
-    // than n_slots / 2, or bytes short of n_slots * slot_bytes) or the zone
-    // cannot give the bytes.
+    // One WEIGHT-zone allocation on `device` of geo.bytes, split into two
+    // regions of geo.region_slots slots; geometry() is geo as given. Returns
+    // false, with one WARN and no throw, for every geometry that is not exactly
+    // what moe_stream_ring_size() produces (n_slots == 2 * region_slots, at
+    // least two slots, bytes == n_slots * slot_bytes, slot_bytes a nonzero
+    // multiple of MOE_STREAM_RING_SLOT_ALIGN) or when the zone cannot give the
+    // bytes.
     bool reserve(int device, const moe_stream_ring_geometry & geo);
 
     // The next slot of the current region as a slice of the ring's allocation,
@@ -107,7 +115,11 @@ class moe_stream_ring {
 
     // Drops the ring's allocation. The bytes go back to the unified cache once
     // both regions' gates complete and every slot handed out is dropped;
-    // nothing waits here.
+    // nothing waits here. Gates exist only for regions closed by
+    // epoch_boundary(): the caller must call epoch_boundary(<event of the last
+    // use>) before release() and before destruction, or hold its slot handles
+    // until that device work completes. Otherwise the current region's bytes
+    // return to the cache under live device work.
     void release();
 
     const moe_stream_ring_geometry & geometry() const { return geo_; }
