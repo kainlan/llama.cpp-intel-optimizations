@@ -685,7 +685,7 @@ def test_mutant_loan_asks_an_event_status_fails():
 def test_mutant_loan_finalizes_inline_fails():
     """The id-wide retire's immediate finalize asks the fill event's status: the loan leaves it to the deferred pass."""
     assert not claim_loan_never_waits(
-        _once(CACHE, "out.accepted = true; out.reason = \"OK\";",
+        _once_in(CACHE, LOAN_SIG, "out.accepted = true; out.reason = \"OK\";",
               "(void) finalize_retired_entries_locked(); out.accepted = true; out.reason = \"OK\";"), SYCL)
 
 
@@ -743,13 +743,13 @@ def test_mutant_lease_minted_after_the_stamp_fails():
 def test_mutant_copy_source_not_the_owner_fails():
     """A raw-pointer copy handle retains nothing: the deferred free could release the storage mid-copy."""
     assert not claim_device_free_gated_on_the_copy(
-        _once(CACHE, SRC_IS_OWNER,
+        _once_in(CACHE, LOAN_SIG, SRC_IS_OWNER,
               "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, GGML_LAYOUT_AOS, cache_device, e.size);"),
         SYCL)
 
 
 def test_mutant_copy_not_behind_the_fill_fails():
-    assert not claim_device_free_gated_on_the_copy(_once(CACHE, DEPS[0], ""), SYCL)
+    assert not claim_device_free_gated_on_the_copy(_once_in(CACHE, LOAN_SIG, DEPS[0], ""), SYCL)
 
 
 def test_mutant_host_copy_published_ready_fails():
@@ -792,7 +792,7 @@ def test_mutant_load_effect_unchecked_fails():
 
 
 def test_mutant_coherence_unchecked_fails():
-    assert not claim_registration_checked_before_the_copies(_once(CACHE, COHERENCE, ""))
+    assert not claim_registration_checked_before_the_copies(_once_in(CACHE, LOAN_SIG, COHERENCE, ""))
 
 
 def test_mutant_existing_host_entry_unchecked_fails():
@@ -831,7 +831,7 @@ def test_mutant_refusal_reason_never_reaches_the_warn_fails():
 
 def test_mutant_rollback_vector_sized_in_the_rollback_fails():
     """The rollback allocating its vector after host copies are published: a throw there strands them."""
-    n = _once(CACHE, RELEASED_SIZED, "")
+    n = _once_in(CACHE, LOAN_SIG, RELEASED_SIZED, "")
     n = n.replace(REGISTRATION_REFUSED, RELEASED_SIZED + " " + REGISTRATION_REFUSED, 1)
     assert not claim_failed_registration_restores(n)
 
@@ -1078,11 +1078,11 @@ def test_mutant_shared_owner_lent_fails():
 
 def test_mutant_soa_lent_as_aos_fails():
     """c-n4gw: an SOA entry copied as AOS hands the host garbage."""
-    assert not claim_owner_checks_refuse_before_copying(_once(CACHE, LAYOUT_CHECK, ""))
+    assert not claim_owner_checks_refuse_before_copying(_once_in(CACHE, LOAN_SIG, LAYOUT_CHECK, ""))
 
 
 def test_mutant_refusal_falls_through_to_the_copy_fails():
-    assert not claim_owner_checks_refuse_before_copying(_once(CACHE, REFUSE_EARLY, ""))
+    assert not claim_owner_checks_refuse_before_copying(_once_in(CACHE, LOAN_SIG, REFUSE_EARLY, ""))
 
 
 def test_mutant_untyped_registration_fails():

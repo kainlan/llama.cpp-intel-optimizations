@@ -540,8 +540,9 @@ OWNING_READER_SITES = {
         "const auto placement = cache_placement_coherence(this);": 5,
         # llama.cpp-mwmr took this from 1 to 2: loan_expert_triplet makes the coherence decision its host
         # registration makes, before anything is copied, so the registration cannot refuse once the device entries
-        # are withdrawn.
-        "if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 2,
+        # are withdrawn. llama.cpp-sif1 took it to 3: refill_lent_triplet refuses an incoherent plan before it copies
+        # a lent triplet back, as a direct stage would.
+        "if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 3,
         "if (!key_id.valid || cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
     }),
     "ggml/src/ggml-sycl/unified-cache.hpp": Counter({
@@ -942,7 +943,8 @@ checks = {
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"
     in cpp,
     # llama.cpp-mwmr took the coherence count from 9 to 10: loan_expert_triplet's pre-copy coherence decision.
-    "retained cache coherence decisions": cache_cpp.count("cache_placement_coherence(this)") == 10
+    # llama.cpp-sif1 took it to 11: refill_lent_triplet's pre-copy coherence decision.
+    "retained cache coherence decisions": cache_cpp.count("cache_placement_coherence(this)") == 11
     and cache_cpp.count("planned_materialization_allowed(\"direct_stage_") == 3
     and cache_cpp.count("__func__, &placement") == 3
     and "unpin(key, layout, &placement)" in cache_cpp,
