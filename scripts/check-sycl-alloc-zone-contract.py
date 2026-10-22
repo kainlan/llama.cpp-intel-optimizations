@@ -6068,9 +6068,13 @@ def matrix_cases_s31():
            active="l", planted=False))
     A(Case("s31-l", "a new caller of owner_use_count outside the allowlist is a finding on the real tree", plant(
         "bool zzplant_l(mem_handle & h) {\n    return h.owner_use_count() > 1;\n}\n"), "FAIL", "L-CALLER", "zzplant_l"))
-    A(Case("s31-l", "the accessor renamed in mem-handle.hpp and mem-handle.cpp makes the clause dormant again", lambda f: dict(
-        f, **{rel: f[rel].replace(b"owner_use_count", b"owner_use_count_zz") for rel in ("mem-handle.hpp", "mem-handle.cpp")}),
-        "PASS", dormant="l", planted=False))
+    # The accessor gone means gone from every file that names it, its allowlisted callers too (the expert loan's sole-owner
+    # check, llama.cpp-mwmr, is the first), and an absent accessor has no callers to exempt.
+    A(Case("s31-l", "the accessor renamed everywhere it is named makes the clause dormant again", lambda f: dict(
+        f, **{rel: data.replace(b"owner_use_count", b"owner_use_count_zz") for rel, data in f.items()
+              if b"owner_use_count" in data}),
+        "PASS", dormant="l", planted=False,
+        edit_allowlist=lambda al: dict(al, entries=[e for e in al["entries"] if e["code"] != "L-CALLER"])))
     return c
 
 

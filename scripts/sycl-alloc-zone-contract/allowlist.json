@@ -363,6 +363,14 @@
       "function": "ggml_backend_sycl_claim_scope_open",
       "count": 1,
       "reason": "ggml_backend_sycl_claim_scope_open is a C-ABI constructor for the claim scope: its try body reads the context's slot table from the registry and stores it in a thread_local, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and reports failure as the FAILED status, which is distinct from the NO_RESERVATION answer a caller may read as allocate-as-before. Permanent; llama.cpp-moua L4 step 3c."
+    },
+    {
+      "id": "E-L-EXPERT-LOAN-SOLE-OWNER",
+      "code": "L-CALLER",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::loan_expert_triplet",
+      "count": 1,
+      "reason": "The expert loan's exact-owner check (llama.cpp-mwmr, tracker ruling c-sepd): a resident expert's AOS device entry is lent only when its direct_alloc_owner is held by the entry alone, under direct_stage_mutex_ and rw_mutex_. A count other than 1 means a copy, a recording or a view still retains the storage, so the loan refuses the whole triplet with \"storage still referenced\" before anything is copied or published. The count decides a refusal, never a free: the lent entry is retired, and its storage is released by the deferred-free pass only when its last handle drops, as for any retired entry. This is the residual refusal of the design's replace_within classification (a non-zero residual is SHARED, old unconsumed), applied to a loan."
     }
   ]
 }

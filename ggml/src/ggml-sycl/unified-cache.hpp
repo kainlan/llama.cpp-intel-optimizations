@@ -2873,6 +2873,34 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
            status == expert_retire_status::NOT_FOUND;
 }
 
+// One member of a resident expert triplet lent to the host for a prompt phase (llama.cpp-mwmr). key is the cache id the
+// member's AOS device entry was direct-staged under. host_keys are the ids the host copy is registered under, the set
+// S1-PRELOAD registers a host-planned expert under; the first must equal key, and its lease is the one returned.
+// host_owner is pinned host storage minted owner-first (unified_allocate_owner) by the caller before it took any listed
+// lock, so no allocation runs under one. vram_charge_size is the plan's charge for the member, reported as bytes freed.
+struct expert_loan_member {
+    expert_placement_key            placement;
+    ggml_sycl_cache_id              key;
+    std::vector<ggml_sycl_cache_id> host_keys;
+    size_t                          vram_charge_size = 0;
+    mem_handle                      host_owner;
+};
+
+// What one loan did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
+// loan carries the bytes the plan stops charging the device, a lease on each member's host entry (whose bytes are valid
+// once copy_events[i] completes; the entry carries that event as its ready event) and each device entry's retire
+// status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after the entry's
+// leases are gone and behind the copy, which is the entry's last write.
+struct expert_loan_record {
+    bool                 accepted    = false;
+    const char *         reason      = "none";
+    size_t               bytes_freed = 0;
+    mem_handle           host_handles[3];
+    sycl::event          copy_events[3];
+    expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
+                                              expert_retire_status::INVALID };
+};
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Deterministic publication/lifecycle controls exist only in private fixtures.
 using expert_publication_test_hook = void (*)(void * context);
@@ -3596,6 +3624,20 @@ class unified_cache {
                                                    ggml_layout_mode   layout,
                                                    const char *       reason = nullptr);
 
+    // Lend one resident expert triplet to the host (llama.cpp-mwmr). Each member's device entry must own its storage
+    // exactly: an AOS entry (c-n4gw) on the device, not retired, whose direct_alloc_owner is its whole allocation and
+    // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. What
+    // the host registration would refuse for is checked too, and a host id that already has an entry, idle or not,
+    // refuses the triplet as "host entry exists": the registration never replaces one, since a failed loan could not
+    // put a replaced entry back (c-mwmr-3). One member that fails refuses the triplet with a reason and leaves no state
+    // behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
+    // owners until it completes; each device entry's last write becomes its copy, so its storage is freed behind the
+    // copy; each device entry is retired exactly; then each host copy is registered with register_host_expert_owned
+    // carrying its copy as the ready event. A registration that fails anyway puts the device entries back. Nothing
+    // here waits and nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of
+    // the device lease, and flips the plan.
+    bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
+
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
     // A yield can release the device-resident, non-retired copies
@@ -3657,13 +3699,20 @@ class unified_cache {
     // copy path trusts a host source for a direct USM copy only on that
     // evidence (llama.cpp-36j0).  It also retains allocation_owner as the
     // entry's storage owner, so release is unchanged.  An invalid
-    // allocation_owner registers ptr as unowned external storage.
-    bool register_host_expert_owned(ggml_sycl_cache_id key,
-                                    void *             ptr,
-                                    size_t             size,
-                                    ggml_layout_mode   layout,
-                                    mem_handle *       out_handle,
-                                    const mem_handle & allocation_owner);
+    // allocation_owner registers ptr as unowned external storage.  A non-null
+    // ready_event publishes the entry IN_PROGRESS behind it: a loan registers
+    // its host copy while the D2H copy that fills it is still in flight.
+    // replace_existing = false refuses when the key already has an entry, of
+    // any state, instead of replacing an idle one with its storage: a loan
+    // must be able to undo every registration it made (c-mwmr-3).
+    bool register_host_expert_owned(ggml_sycl_cache_id  key,
+                                    void *              ptr,
+                                    size_t              size,
+                                    ggml_layout_mode    layout,
+                                    mem_handle *        out_handle,
+                                    const mem_handle &  allocation_owner,
+                                    const sycl::event * ready_event      = nullptr,
+                                    bool                replace_existing = true);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -4226,6 +4275,12 @@ class unified_cache {
     void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
     bool     test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
     uint64_t test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const;
+    // The lease count of the AOS device entry direct staging published for key, in *in_use; false when there is none
+    // (erased, or never staged). A retired entry still answers until the deferred-free pass erases it.
+    bool     test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint32_t * in_use) const;
+    // The lease count and retired flag of the host entry register_host_expert published for key; false when there is
+    // none.
+    bool     test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_t * in_use, bool * retired) const;
     // Retain a reference to a staged weight's allocation owner until `event`,
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
@@ -6224,14 +6279,45 @@ class unified_cache {
 
     // The body of register_host_expert() and register_host_expert_owned():
     // storage_owner keeps the storage alive, typed_owner (when valid) becomes
-    // the entry's direct_alloc_owner.
+    // the entry's direct_alloc_owner. A non-null ready_event publishes the
+    // entry IN_PROGRESS behind that event (the copy still filling it).
+    // replace_existing = false refuses any key that already has an entry.
     bool register_host_expert(ggml_sycl_cache_id    key,
                               void *                ptr,
                               size_t                size,
                               ggml_layout_mode      layout,
                               mem_handle *          out_handle,
                               std::shared_ptr<void> storage_owner,
-                              const mem_handle &    typed_owner);
+                              const mem_handle &    typed_owner,
+                              const sycl::event *   ready_event      = nullptr,
+                              bool                  replace_existing = true);
+
+    // What retire_expert_entry_at_locked() takes out of the lookup maps, kept as the maps' own nodes, so that
+    // restore_expert_entry_at_locked() puts them back without building new ones and a loan's rollback allocates no
+    // node (llama.cpp-mwmr). Either may be empty: the mirror when it named other storage, the mapping when the id was
+    // mapped to another entry or handed to one.
+    struct expert_retire_nodes {
+        direct_entry_map::node_type mirror;
+        id_map::node_type           mapping;
+    };
+
+    // remap_or_erase_id_mapping_locked(), except that a mapping it would erase moves to *erased instead.
+    void remap_or_extract_id_mapping_locked(const ggml_sycl_cache_id & id,
+                                            const unified_cache_key &  removed_key,
+                                            id_map::node_type *        erased);
+
+    // Retire exactly the entry at `exact`, never another entry under the same id. The direct mirror goes only when it
+    // names that entry's storage, and the id mapping only when it names that entry and no other entry takes the id
+    // over. Each moves to *released as its node, for the caller to drop with no lock held or to hand back to
+    // restore_expert_entry_at_locked(). Allocates nothing. Callers hold direct_stage_mutex_ and rw_mutex_.
+    expert_retire_status retire_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes * released);
+
+    // Undo retire_expert_entry_at_locked() for an entry the caller still holds a lease on: live again, counted out of
+    // the retired entries, and each node retire took re-inserted unless another entry has published its own under the
+    // id since. Re-inserting a node allocates no node; it can grow a map's bucket array only when the map holds more
+    // entries than it did when the node came out. Callers hold direct_stage_mutex_ and rw_mutex_; a node not taken
+    // stays with the caller.
+    void restore_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes & released);
 
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };
