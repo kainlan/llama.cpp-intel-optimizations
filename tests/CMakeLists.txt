@@ -4601,6 +4601,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-xod7 (plan Task 7b of llama.cpp-36j0): a prompt layer's host experts are weighed at its first MUL_MAT_ID and
+# the next layer's are copied on the BCS queue and reordered on the compute queue a layer ahead, event-chained, with no
+# wait added and no status query. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-stream-enqueue-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-stream-enqueue-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-7fmt: without -c, common asks for the model's default context (LLAMA_N_CTX_HINT_DEFAULT), the load
 # resolves it once (src/llama-n-ctx-hint.h) to n_ctx_train padded as llama_context pads it and holds that context's KV
 # room, no backend names the sentinel, and the KV context room line says when its context is the default. A mutant per

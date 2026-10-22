@@ -85,6 +85,13 @@ struct UnifiedKernelDeleter {
 struct SdpaCacheDeleter {
     void operator()(void * ptr) const;
 };
+
+class moe_stream_phase;  // moe-stream-plan.hpp: the prompt's layer-ahead expert stream (llama.cpp-xod7)
+
+// Defined in moe-stream-plan.cpp, where the type is complete.
+struct moe_stream_phase_deleter {
+    void operator()(moe_stream_phase * ptr) const;
+};
 }  // namespace ggml_sycl
 
 struct ggml_sycl_fa_graph_snapshot {
@@ -6278,6 +6285,11 @@ struct ggml_backend_sycl_context {
     // oneDNN graph SDPA compiled_partition cache (Phase 3 — fattn-onednn.cpp).
     // Opaque pointer (sdpa_partition_cache*) to avoid pulling graph headers here.
     std::unique_ptr<void, ggml_sycl::SdpaCacheDeleter> sdpa_cache;
+
+    // The prompt's layer-ahead expert stream through a VRAM ring (llama.cpp-xod7): made at the first prompt
+    // MUL_MAT_ID of a published plan, emptied at the first decode graph, reset in the destructor once the queues have
+    // drained.
+    std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;
 
     // XMX-v2 flash-attention per-context cache (Phase 4 — fattn-xmx-f16-v2.hpp).
     // Opaque pointer (fattn_xmx_v2_device_cache*); stores the matrix_combinations

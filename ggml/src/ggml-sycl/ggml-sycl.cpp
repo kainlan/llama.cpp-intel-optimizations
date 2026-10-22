@@ -2679,6 +2679,7 @@ static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_m
 // flush_pending_attn_if_consumed reuses rather than duplicating.
 #include "ggml-sycl/attn-host-dispatch.hpp"
 #include "ggml-sycl/moe-exec-policy.hpp"
+#include "ggml-sycl/moe-stream-plan.hpp"
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -29242,6 +29243,133 @@ static void ggml_sycl_moe_exec_log_report() {
     }
 }
 
+// ---- The prompt's layer-ahead expert stream (llama.cpp-xod7, plan Task 7b of llama.cpp-36j0) ----------------------
+// ggml_sycl_mul_mat_id hands each prompt layer to ctx.moe_stream at its admission; the two answers only the graph has
+// come from the graph's MoE scan (g_moe_gate_up_pairs).
+
+struct ggml_sycl_moe_stream_call {
+    std::shared_ptr<const ggml_sycl::placement_plan> plan;
+    ggml_sycl::unified_cache *                       cache  = nullptr;
+    int                                              device = -1;
+    int                                              layer  = -1;
+    ggml_sycl::moe_stream_op                         op;
+
+    // op.graph_ctx points back at the call, so a copy or a move would carry a pointer to its source.
+    ggml_sycl_moe_stream_call()                                              = default;
+    ggml_sycl_moe_stream_call(const ggml_sycl_moe_stream_call &)             = delete;
+    ggml_sycl_moe_stream_call(ggml_sycl_moe_stream_call &&)                  = delete;
+    ggml_sycl_moe_stream_call & operator=(const ggml_sycl_moe_stream_call &) = delete;
+    ggml_sycl_moe_stream_call & operator=(ggml_sycl_moe_stream_call &&)      = delete;
+};
+
+// True iff `layer`'s MUL_MAT_ID ops are in the graph being computed.
+static bool ggml_sycl_moe_stream_layer_present(void *, int layer) {
+    return g_moe_gate_up_pairs.find(layer) != g_moe_gate_up_pairs.end();
+}
+
+// The host AOS lease of one expert matrix of `layer`, keyed from that layer's weight tensor as the hybrid path's host
+// route keys its experts (ggml_sycl_resolve_moe_meta_source). A device-resident answer is not a host lease.
+static ggml_sycl::mem_handle ggml_sycl_moe_stream_host_lease(void *                        graph_ctx,
+                                                             int                           layer,
+                                                             int                           expert_id,
+                                                             ggml_sycl::expert_tensor_role role,
+                                                             size_t *                      bytes) {
+    const auto * call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx);
+    const auto   it   = g_moe_gate_up_pairs.find(layer);
+    if (call == nullptr || call->cache == nullptr || it == g_moe_gate_up_pairs.end()) {
+        return {};
+    }
+    const ggml_tensor * w = role == ggml_sycl::expert_tensor_role::GATE ? it->second.gate_weight :
+                            role == ggml_sycl::expert_tensor_role::UP   ? it->second.up_weight :
+                            role == ggml_sycl::expert_tensor_role::DOWN ? it->second.down_weight :
+                                                                          nullptr;
+    if (w == nullptr || w->extra == nullptr) {
+        return {};
+    }
+    const ggml_sycl_cache_id key =
+        ggml_sycl_get_moe_expert_cache_key(w, static_cast<ggml_tensor_extra_gpu *>(w->extra), expert_id);
+    if (!key.valid) {
+        return {};
+    }
+    ggml_sycl::expert_resolve_request req{};
+    req.key              = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_AOS);
+    req.requested_layout = GGML_LAYOUT_AOS;
+    req.layer_id         = layer;
+    req.expert_id        = expert_id;
+    req.current_device   = call->device;
+    req.preferred_device = call->device;
+    req.device_policy    = ggml_sycl::expert_resolve_device_policy::ANY;
+    req.allow_host       = true;
+    req.allow_mmap_host  = true;
+    req.require_ready    = false;
+    auto resolved        = call->cache->resolve_expert(req);
+    if (!resolved || !resolved.lifetime || resolved.location == ggml_sycl::cache_location::DEVICE) {
+        return {};
+    }
+    *bytes = resolved.size;
+    return std::move(*resolved.lifetime);
+}
+
+// Fills `call` for a prompt MUL_MAT_ID of `src0` and makes ctx.moe_stream on first use. False when the op names no
+// layer the decision log can hold, the device has no cache, or no plan is published.
+static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
+                                         const ggml_tensor *         src0,
+                                         const ggml_tensor *         ids,
+                                         ggml_sycl_moe_stream_call & call) {
+    call.layer = parse_layer_id_from_name(src0->name);
+    if (call.layer < 0 || call.layer >= ggml_sycl::moe_exec_decision_log::MAX_LAYERS) {
+        return false;
+    }
+    call.device = ctx.device;
+    call.cache  = ggml_sycl::get_unified_cache_for_device(ctx.device);
+    if (call.cache == nullptr) {
+        return false;
+    }
+    call.plan = ggml_sycl::coherent_cache_placement_plan_owner(call.cache);
+    if (!call.plan || call.plan->entries.empty()) {
+        return false;
+    }
+    if (!ctx.moe_stream) {
+        ctx.moe_stream.reset(new ggml_sycl::moe_stream_phase());
+    }
+    call.op.n_tokens      = static_cast<uint32_t>(ids->ne[1]);
+    call.op.n_expert      = static_cast<int>(src0->ne[2]);
+    call.op.n_expert_used = static_cast<int>(ids->ne[0]);
+    call.op.graph_seq     = ctx.graph_compute_seq;
+    call.op.policy        = ggml_sycl_moe_exec_config().policy;
+    call.op.log           = &ggml_sycl_moe_exec_log();
+    call.op.graph_ctx     = &call;
+    call.op.layer_present = ggml_sycl_moe_stream_layer_present;
+    call.op.host_lease    = ggml_sycl_moe_stream_host_lease;
+    return true;
+}
+
+// After a prompt layer's down op, an open stream region closes on a barrier behind it. The barrier becomes the gate the
+// region's next copies wait for, so it orders the reuse of the region's AOS slots only: every reorder that read them
+// ran before it on this queue. The region's SOA slots are next rewritten by reorders on this same in-order queue, so
+// the queue, not the barrier, orders that reuse after their readers. Under STREAM_ALL the open region holds layer + 1's
+// slots, staged a layer ahead, whose readers have not run yet; the barrier still follows their reorders. Never while a
+// command graph records: ring work is never recorded.
+static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+    if (!ctx.moe_stream || !ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording) {
+        return;
+    }
+    const int  layer = dst->src[0] ? parse_layer_id_from_name(dst->src[0]->name) : -1;
+    const auto it    = g_moe_gate_up_pairs.find(layer);
+    if (it == g_moe_gate_up_pairs.end() || it->second.down_weight != dst->src[0]) {
+        return;
+    }
+    sycl::event down_done;
+    try {
+        down_done = ctx.stream()->ext_oneapi_submit_barrier();
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
+        GGML_ABORT("[MOE-EXEC] stream layer barrier failed: %s", e.what());
+    }
+    ctx.moe_stream->layer_done(layer, down_done);
+}
+
 static inline int get_sycl_env(const char * env_name, int default_val) {
     char *   user_device_string = getenv(env_name);
     int      user_number        = default_val;
@@ -30911,14 +31039,16 @@ static sycl::event reorder_mxfp4_gpu(sycl::queue &                    queue,
 
 // Dispatch GPU reorder kernel based on quant type.
 // Returns event for the kernel completion, or empty event on failure.
-static sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue &                    queue,
-                                                const uint8_t *                  aos_device,
-                                                uint8_t *                        soa_device,
-                                                ggml_type                        type,
-                                                int64_t                          ncols,
-                                                int64_t                          nrows,
-                                                size_t                           src_bytes,
-                                                const std::vector<sycl::event> & deps) {
+// Shared with the prompt's stream ring (moe-stream-plan.hpp declares it), so a ring slot is reordered by the same
+// kernels as a weight at load.
+sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue &                    queue,
+                                         const uint8_t *                  aos_device,
+                                         uint8_t *                        soa_device,
+                                         ggml_type                        type,
+                                         int64_t                          ncols,
+                                         int64_t                          nrows,
+                                         size_t                           src_bytes,
+                                         const std::vector<sycl::event> & deps) {
     switch (type) {
         case GGML_TYPE_Q4_0:
             {
@@ -48978,6 +49108,8 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
             }
         }
     }
+    // The queues are drained, so the stream ring's last use is complete before its bytes are handed back.
+    moe_stream.reset();
     pp_moe_onednn_drain_scratch_slots(device);
     ggml_sycl_execution_abort_and_release_graph(this);
     // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
@@ -78616,6 +78748,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
         }
 #endif
+        // The layer-ahead stream (llama.cpp-xod7): weighs this layer and the next on the ids the layer routes on, and
+        // stages a ring decision's host experts through the VRAM ring. Nothing reads the stage table yet (Task 8).
+        {
+            ggml_sycl_moe_stream_call stream_call;
+            if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) {
+                ctx.moe_stream->begin_layer(stream_call.layer, *stream_call.plan, ctx.device, *stream_call.cache,
+                                            *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                                            stream_call.op);
+            }
+        }
         // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1): sweep_a/
         // sweep_b below are two independent 32-expert layout-validation
         // sweeps FOR SRC0 SPECIFICALLY. When src0 is one of the layer's 3
@@ -90307,6 +90449,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
             }
             ggml_sycl_mul_mat_id(ctx, dst);
             ggml_sycl_moe_down_shadow_compare(ctx, dst);
+            ggml_sycl_moe_stream_layer_done(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_sycl_op_out_prod(ctx, dst);
@@ -113939,6 +114082,9 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     const bool cached_is_decode =
         ggml_sycl_graph_is_decode(cgraph, sycl_ctx->graph_phase_is_decode.load(std::memory_order_relaxed));
     sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed);
+    if (cached_is_decode && sycl_ctx->moe_stream) {
+        sycl_ctx->moe_stream->end_prompt();  // the prompt's ring and stage table go at its first decode graph
+    }
     if (cached_is_decode) {
         // Once per device, at the entry of its first one-token graph: the WEIGHT room G0 prints beside
         // the bytes each interim WEIGHT row requests.
