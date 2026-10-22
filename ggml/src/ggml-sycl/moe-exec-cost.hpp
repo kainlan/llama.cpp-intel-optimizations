@@ -12,7 +12,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -151,15 +150,17 @@ static inline double moe_exec_env_param(moe_exec_getenv_fn getenv_fn, const char
 // The seed record for a layer whose host-resident experts are `host_mix` (type, bytes). cpu_gbps is the byte-weighted
 // harmonic mean over the measured types, as kv_room_expert_types::add folds them; the room's default when none is.
 static inline moe_exec_rates moe_exec_rates_seed(const std::vector<std::pair<ggml_type, size_t>> & host_mix) {
-    moe_exec_rates       r;
     kv_room_expert_types types;
     for (const auto & tb : host_mix) {
         types.add(tb.first, tb.second);
     }
-    const size_t measured = types.bytes - types.unmeasured_bytes;
-    r.cpu_gbps = measured > 0 && types.measured_us > 0.0 ? static_cast<double>(measured) / (types.measured_us * 1e3) :
-                                                           PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
-    r.h2d_gbps = 20.0;         // seed; the Task 3 probe replaces it (measured 26.5 B70 / 27.1 B50, 8bgi c-nn1q)
+    const size_t   measured = types.bytes - types.unmeasured_bytes;
+    const double   cpu_gbps = measured > 0 && types.measured_us > 0.0 ?
+                                  static_cast<double>(measured) / (types.measured_us * 1e3) :
+                                  PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
+    moe_exec_rates r;
+    r.cpu_gbps     = cpu_gbps;
+    r.h2d_gbps     = 20.0;     // seed; the Task 3 probe replaces it (measured 26.5 B70 / 27.1 B50, 8bgi c-nn1q)
     r.reorder_gbps = 200.0;    // seed; the on-device AOS->SOA reorder (B70 D2D 870 GB/s, kernel-bound well below)
     r.dev_gflops   = 20000.0;  // seed; Task 9 seeds per type from the batched prompt executor measurement
     r.cpu_gflops   = 1000.0;   // seed; 22 threads of AVX2 vec_dot (cego)

@@ -1803,6 +1803,23 @@ def test_ubatch_cache_disabled_by_env_var_zero():
     ), "ggml_backend_sycl_ubatch_cache_store_layout1 must consult the enabled accessor before doing anything else"
 
 
+def test_moe_exec_rates_entry_points_consult_the_enabled_accessor_first():
+    """llama.cpp-36j0: the MoE executor's rates lookup/store share the ubatch cache's GGML_SYCL_TUNING_CACHE
+    switch, so each must consult ubatch_tuning_cache_env_enabled() before it resolves a device, reads a file or
+    writes one -- otherwise GGML_SYCL_TUNING_CACHE=0 would still touch the filesystem."""
+    for name in ("ggml_backend_sycl_moe_exec_rates_lookup", "ggml_backend_sycl_moe_exec_rates_store"):
+        m = re.search(r"\bbool\s+" + name + r"\s*\([^)]*\)\s*\{(.*?)\n\}\n", UBATCH_TUNING_CACHE_CPP_CODE, re.S)
+        assert m, name + " must be defined in ubatch-tuning-cache.cpp"
+        body = m.group(1)
+        enabled = body.find("ubatch_tuning_cache_env_enabled()")
+        assert enabled != -1, name + " must consult the enabled accessor"
+        for later in ("resolve_", "load_moe_exec_rates", "save_moe_exec_rates", "ggml_sycl_info", "iso8601_now_utc"):
+            at = body.find(later)
+            assert at == -1 or enabled < at, (
+                name + " must consult the enabled accessor before " + later + " (GGML_SYCL_TUNING_CACHE=0 honoured)"
+            )
+
+
 def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
     """Mutation witnesses for the two position checks above: prove they
     would actually catch the lookup/store being moved to the wrong side

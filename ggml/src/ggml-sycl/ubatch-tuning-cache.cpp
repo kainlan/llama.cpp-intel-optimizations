@@ -10,7 +10,9 @@
 // ggml-sycl.h). Thin over tuning-cache-io.hpp's UbatchCacheKey/
 // UbatchCacheEntry/save_ubatch_cache/load_ubatch_cache -- see that header's
 // "Ubatch Cache Entry (v2)" section for the on-disk format this file reads
-// and writes. This TU owns:
+// and writes. The same TU also serves a second file kind, the MoE executor's
+// probed rates ("-moe-exec-rates.json", ggml_backend_sycl_moe_exec_rates_lookup/
+// _store, llama.cpp-36j0), at the end of the file. This TU owns:
 //   - the two env-var accessors (GGML_SYCL_TUNING_CACHE,
 //     GGML_SYCL_TUNING_CACHE_DIR), memoized the same way
 //     unified_cache_auto_ubatch_enabled() is (unified-cache.cpp);
@@ -251,6 +253,24 @@ UBATCH_CACHE_KEY_FIELD_AT(kv_unified, 64);
 UBATCH_CACHE_KEY_FIELD_AT(swa_full, 65);
 #undef UBATCH_CACHE_KEY_FIELD_AT
 
+// llama.cpp-36j0: ggml_sycl_moe_exec_rates_record crosses the same boundary, and its entry points carry no _layoutN
+// suffix, so its layout is pinned the same way. GGML_TYPE_COUNT is part of it: a change that moves a field, or a new
+// ggml type, fires one of these.
+#define MOE_EXEC_RATES_RECORD_FIELD_AT(field, offset)                                                  \
+    static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, field) == (offset), \
+                  "ggml_sycl_moe_exec_rates_record layout changed")
+#define MOE_EXEC_RATES_DEV_GFLOPS_OFFSET (((20 + 4 * GGML_TYPE_COUNT + 7) / 8) * 8)
+MOE_EXEC_RATES_RECORD_FIELD_AT(h2d_gbps, 0);
+MOE_EXEC_RATES_RECORD_FIELD_AT(reorder_gbps, 8);
+MOE_EXEC_RATES_RECORD_FIELD_AT(n_types, 16);
+MOE_EXEC_RATES_RECORD_FIELD_AT(types, 20);
+MOE_EXEC_RATES_RECORD_FIELD_AT(dev_gflops, MOE_EXEC_RATES_DEV_GFLOPS_OFFSET);
+static_assert(sizeof(void *) != 8 ||
+                  sizeof(ggml_sycl_moe_exec_rates_record) == MOE_EXEC_RATES_DEV_GFLOPS_OFFSET + 8 * GGML_TYPE_COUNT,
+              "ggml_sycl_moe_exec_rates_record layout changed");
+#undef MOE_EXEC_RATES_DEV_GFLOPS_OFFSET
+#undef MOE_EXEC_RATES_RECORD_FIELD_AT
+
 bool ggml_backend_sycl_ubatch_cache_lookup_layout1(const ggml_sycl_ubatch_cache_key * key,
                                                    uint32_t *                         n_ubatch,
                                                    char *                             reason_buf,
@@ -340,35 +360,20 @@ bool ggml_backend_sycl_ubatch_cache_store_layout1(const ggml_sycl_ubatch_cache_k
 
 // llama.cpp-36j0: the MoE executor's probed rates, one entry per device and driver in the device's
 // "<sanitized name>-moe-exec-rates.json" (tuning-cache-io.hpp's MoeExecRatesEntry). Both calls honour
-// GGML_SYCL_TUNING_CACHE=0 and GGML_SYCL_TUNING_CACHE_DIR like the ubatch pair above.
-//
-// The record crosses the backend's dlopen boundary, and these entry points carry no _layoutN suffix, so the layout is
-// pinned: GGML_TYPE_COUNT is part of it, and a change that moves a field fires one of these.
-static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, h2d_gbps) == 0,
-              "ggml_sycl_moe_exec_rates_record layout changed");
-static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, reorder_gbps) == 8,
-              "ggml_sycl_moe_exec_rates_record layout changed");
-static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, n_types) == 16,
-              "ggml_sycl_moe_exec_rates_record layout changed");
-static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_moe_exec_rates_record, types) == 20,
-              "ggml_sycl_moe_exec_rates_record layout changed");
-static_assert(sizeof(void *) != 8 ||
-                  offsetof(ggml_sycl_moe_exec_rates_record, dev_gflops) == ((20 + 4 * GGML_TYPE_COUNT + 7) / 8) * 8,
-              "ggml_sycl_moe_exec_rates_record layout changed");
-static_assert(sizeof(void *) != 8 || sizeof(ggml_sycl_moe_exec_rates_record) ==
-                                         ((20 + 4 * GGML_TYPE_COUNT + 7) / 8) * 8 + 8 * GGML_TYPE_COUNT,
-              "ggml_sycl_moe_exec_rates_record layout changed");
+// GGML_SYCL_TUNING_CACHE=0 and GGML_SYCL_TUNING_CACHE_DIR like the ubatch pair above. The validity and bounds rules
+// live in the header (moe_exec_rates_find / moe_exec_rates_upsert), where test-tuning-cache-io reaches them with no
+// device: a record with a rate that is not finite and positive is refused, and a stored entry like that is a miss.
 
 namespace {
 
-// The entry key: the device's sanitized name and driver, as ubatch_device_set_key names one device. A driver
-// upgrade is a new key, so rates measured under another driver are never read back.
+// The entry key: the device's identity, so a driver upgrade misses and rates measured under another driver are never
+// read back.
 bool resolve_moe_exec_rates_key(int device, std::string & out_device_name, std::string & out_device_key) {
     if (!resolve_file_device_name(device, out_device_name)) {
         return false;
     }
     const auto & dev = ggml_sycl_info().devices[device];
-    out_device_key   = sanitize_device_name(dev.device_name) + "@" + dev.driver_version;
+    out_device_key   = device_identity_key(dev.device_name, dev.driver_version);
     return true;
 }
 
@@ -386,23 +391,20 @@ bool ggml_backend_sycl_moe_exec_rates_lookup(int device, struct ggml_sycl_moe_ex
     if (!load_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries)) {
         return false;  // missing, unreadable, or wrong-version file -- a plain miss
     }
-    for (const auto & e : entries) {
-        if (e.device_key != device_key) {
-            continue;
-        }
-        ggml_sycl_moe_exec_rates_record rec = {};
-        rec.h2d_gbps                        = e.h2d_gbps;
-        rec.reorder_gbps                    = e.reorder_gbps;
-        // The file is not trusted to hold at most one pair per type: the record has GGML_TYPE_COUNT slots.
-        for (const auto & tg : moe_exec_rates_distinct_types(e, GGML_TYPE_COUNT)) {
-            rec.types[rec.n_types]      = tg.first;
-            rec.dev_gflops[rec.n_types] = tg.second;
-            ++rec.n_types;
-        }
-        *out = rec;
-        return true;
+    MoeExecRatesEntry e;
+    if (!moe_exec_rates_find(entries, device_key, GGML_TYPE_COUNT, e)) {
+        return false;
     }
-    return false;
+    ggml_sycl_moe_exec_rates_record rec = {};
+    rec.h2d_gbps                        = e.h2d_gbps;
+    rec.reorder_gbps                    = e.reorder_gbps;
+    for (const auto & tg : e.dev_gflops_by_type) {  // at most GGML_TYPE_COUNT, each type once
+        rec.types[rec.n_types]      = tg.first;
+        rec.dev_gflops[rec.n_types] = tg.second;
+        ++rec.n_types;
+    }
+    *out = rec;
+    return true;
 }
 
 bool ggml_backend_sycl_moe_exec_rates_store(int device, const struct ggml_sycl_moe_exec_rates_record * rec) {
@@ -426,16 +428,8 @@ bool ggml_backend_sycl_moe_exec_rates_store(int device, const struct ggml_sycl_m
     // missing, corrupt, or wrong-version file is a start from empty, never a reason to refuse.
     std::vector<MoeExecRatesEntry> entries;
     load_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries);
-    bool replaced = false;
-    for (auto & e : entries) {
-        if (e.device_key == device_key) {
-            e        = stored;
-            replaced = true;
-            break;
-        }
-    }
-    if (!replaced) {
-        entries.push_back(stored);
+    if (!moe_exec_rates_upsert(entries, stored, GGML_TYPE_COUNT)) {
+        return false;  // a rate that is not finite and positive
     }
     return save_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries);
 }

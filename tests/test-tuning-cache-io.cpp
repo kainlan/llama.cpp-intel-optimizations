@@ -34,6 +34,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <locale>
+#include <sstream>
 #include <string>
 
 using namespace ggml_sycl_tuning;
@@ -1637,8 +1640,9 @@ TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct) {
     const std::string device_name = "TestMoeExecRatesDupDevice";
 
     MoeExecRatesEntry e;
-    e.device_key = "Dev@1.0";
-    e.h2d_gbps   = 20.0;
+    e.device_key   = "Dev@1.0";
+    e.h2d_gbps     = 20.0;
+    e.reorder_gbps = 200.0;
     for (int i = 0; i < 5; ++i) {
         e.dev_gflops_by_type.emplace_back(0, 1000.0 + i);  // type 0 five times
     }
@@ -1656,7 +1660,6 @@ TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct) {
     ASSERT(loaded.size() == 1 && loaded[0].dev_gflops_by_type.size() == e.dev_gflops_by_type.size());
 
     const std::vector<std::pair<int, double>> kept = moe_exec_rates_distinct_types(loaded[0], type_count);
-    ASSERT(static_cast<int>(kept.size()) <= type_count);
     ASSERT(static_cast<int>(kept.size()) == type_count);  // every type once
     std::vector<bool> seen(static_cast<size_t>(type_count), false);
     for (const auto & tg : kept) {
@@ -1672,6 +1675,153 @@ TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct) {
 
     std::remove(get_moe_exec_rates_cache_file(cache_dir, device_name).c_str());
     rmdir(cache_dir.c_str());
+    return true;
+}
+
+// The same filter with a small bound and a list that BEGINS with the hostile pairs, so each rule has to reject its
+// own: out of range above and below, a negative and a zero rate, a non-finite rate, and a repeat of a kept type.
+TEST(moe_exec_rates_distinct_types_rejects_each_hostile_pair) {
+    MoeExecRatesEntry e;
+    e.dev_gflops_by_type = {
+        { 4,  5.0                                      },
+        { -1, 5.0                                      },
+        { 1,  -2.0                                     },
+        { 1,  0.0                                      },
+        { 3,  std::numeric_limits<double>::infinity()  },
+        { 0,  std::numeric_limits<double>::quiet_NaN() },
+        { 2,  3.0                                      },
+        { 1,  3.0                                      },
+        { 2,  7.0                                      }
+    };
+    const std::vector<std::pair<int, double>> kept = moe_exec_rates_distinct_types(e, 4);
+    const std::vector<std::pair<int, double>> want = {
+        { 2, 3.0 },
+        { 1, 3.0 }
+    };
+    ASSERT(kept == want);
+    ASSERT(moe_exec_rates_distinct_types(e, 0).empty());
+    return true;
+}
+
+// A persisted entry whose rates are not finite and positive must never reach a caller: the executor asserts on it.
+// A key the writer dropped, a "nan" the parser refuses, and a zero are all the same 0, and each is a miss; a store of
+// such a record is refused and leaves the file's entries alone.
+TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_invalid");
+    const std::string device_name = "TestMoeExecRatesInvalidDevice";
+    create_dir_recursive(cache_dir);
+    const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
+    {
+        std::ofstream f(path);
+        f << "{\n  \"version\": 6,\n  \"device\": \"" << device_name
+          << "\",\n  \"entries\": [\n"
+          // good, with junk between and inside its pairs: only the well-formed pairs survive
+          << "    {\"device_key\":\"GOOD\",\"h2d_gbps\":20,\"reorder_gbps\":200,\"dev_gflops_by_type\":"
+          << "[[1,5.0], junk ,[2,6.0],[3,nan],[4,1.0,9],[5],[6,7.5]],\"created\":\"c\"},\n"
+          // no h2d key at all
+          << "    {\"device_key\":\"NOH2D\",\"reorder_gbps\":200,\"dev_gflops_by_type\":[],\"created\":\"c\"},\n"
+          // non-finite and zero rates
+          << "    {\"device_key\":\"NAN\",\"h2d_gbps\":nan,\"reorder_gbps\":200,\"dev_gflops_by_type\":[]},\n"
+          << "    {\"device_key\":\"ZERO\",\"h2d_gbps\":20,\"reorder_gbps\":0,\"dev_gflops_by_type\":[]},\n"
+          // cut off mid-pair: its braces never close, so it is not an entry
+          << "    {\"device_key\":\"CUT\",\"h2d_gbps\":20,\"reorder_gbps\":200,\"dev_gflops_by_type\":[[1,5.0],[2,";
+    }
+    std::vector<MoeExecRatesEntry> loaded;
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 4);
+    ASSERT(loaded[0].device_key == "GOOD" && loaded[1].device_key == "NOH2D" && loaded[2].device_key == "NAN" &&
+           loaded[3].device_key == "ZERO");
+    const std::vector<std::pair<int, double>> good_pairs = {
+        { 1, 5.0 },
+        { 2, 6.0 },
+        { 6, 7.5 }
+    };
+    ASSERT(loaded[0].dev_gflops_by_type == good_pairs);
+    ASSERT(loaded[1].h2d_gbps == 0.0 && loaded[2].h2d_gbps == 0.0);
+
+    MoeExecRatesEntry got;
+    ASSERT(moe_exec_rates_find(loaded, "GOOD", 43, got));
+    ASSERT(got.h2d_gbps == 20.0 && got.reorder_gbps == 200.0 && got.dev_gflops_by_type == good_pairs);
+    ASSERT(!moe_exec_rates_find(loaded, "NOH2D", 43, got));
+    ASSERT(!moe_exec_rates_find(loaded, "NAN", 43, got));
+    ASSERT(!moe_exec_rates_find(loaded, "ZERO", 43, got));
+    ASSERT(!moe_exec_rates_find(loaded, "CUT", 43, got));
+    ASSERT(!moe_exec_rates_find(loaded, "ABSENT", 43, got));
+
+    // the store half
+    std::vector<MoeExecRatesEntry> entries;
+    MoeExecRatesEntry              rec;
+    rec.device_key         = "D";
+    rec.h2d_gbps           = 26.5;
+    rec.reorder_gbps       = 180.0;
+    rec.dev_gflops_by_type = {
+        { 1,  5.0 },
+        { 1,  6.0 },
+        { 99, 1.0 }
+    };
+    ASSERT(moe_exec_rates_upsert(entries, rec, 43));
+    ASSERT(entries.size() == 1 && entries[0].dev_gflops_by_type == (std::vector<std::pair<int, double>>{
+                                                                       { 1, 5.0 }
+    }));
+    rec.h2d_gbps = 27.0;
+    ASSERT(moe_exec_rates_upsert(entries, rec, 43));  // the same key replaces
+    ASSERT(entries.size() == 1 && entries[0].h2d_gbps == 27.0);
+
+    const double bad[] = { 0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity() };
+    for (double b : bad) {
+        MoeExecRatesEntry r = rec;
+        r.h2d_gbps          = b;
+        ASSERT(!moe_exec_rates_upsert(entries, r, 43));
+        r              = rec;
+        r.reorder_gbps = b;
+        ASSERT(!moe_exec_rates_upsert(entries, r, 43));
+    }
+    ASSERT(entries.size() == 1 && entries[0].h2d_gbps == 27.0 && entries[0].reorder_gbps == 180.0);
+    MoeExecRatesEntry unset;  // a default entry has measured nothing
+    unset.device_key = "U";
+    ASSERT(!moe_exec_rates_upsert(entries, unset, 43) && entries.size() == 1);
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// The writer and the reader follow the classic locale whatever the global one is: a decimal-comma locale (the console
+// code calls setlocale(LC_ALL, "")) must not write "26,5" or read "26.5" as 26.
+TEST(moe_exec_rates_json_ignores_the_global_locale) {
+    struct comma_punct : std::numpunct<char> {
+      protected:
+        char do_decimal_point() const override { return ','; }
+    };
+
+    struct restore_locale {
+        std::locale saved;
+
+        ~restore_locale() { std::locale::global(saved); }
+    } restore{ std::locale() };
+
+    std::locale::global(std::locale(std::locale::classic(), new comma_punct));
+
+    // the premise: a default stream now writes a comma
+    std::ostringstream probe;
+    probe << 26.5;
+    ASSERT(probe.str() == "26,5");
+
+    MoeExecRatesEntry e;
+    e.device_key         = "Dev@1";
+    e.h2d_gbps           = 26.5;
+    e.reorder_gbps       = 187.25;
+    e.dev_gflops_by_type = {
+        { 3, 18000.5 }
+    };
+    const std::string json = moe_exec_rates_entry_to_json(e);
+    ASSERT(json.find("\"h2d_gbps\":26.5,") != std::string::npos);
+    ASSERT(json.find("[3,18000.5]") != std::string::npos);
+    const MoeExecRatesEntry back = moe_exec_rates_entry_from_json(json);
+    ASSERT(back.h2d_gbps == 26.5 && back.reorder_gbps == 187.25);
+    ASSERT(back.dev_gflops_by_type == e.dev_gflops_by_type);
+    ASSERT(parse_double("{\"x\":0.25}", "x") == 0.25);
     return true;
 }
 
@@ -1756,6 +1906,9 @@ int main() {
     RUN_TEST(moe_exec_rates_cache_other_version_is_a_miss);
     RUN_TEST(moe_exec_rates_kind_leaves_the_ubatch_file_loadable);
     RUN_TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct);
+    RUN_TEST(moe_exec_rates_distinct_types_rejects_each_hostile_pair);
+    RUN_TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store);
+    RUN_TEST(moe_exec_rates_json_ignores_the_global_locale);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";

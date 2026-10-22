@@ -689,8 +689,9 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store_layout1(const struct 
 // llama.cpp-36j0: the MoE executor's probed per-device rates (host-to-device GB/s, on-device AOS->SOA reorder GB/s,
 // and the device expert GFLOP/s per ggml type: types[i] has dev_gflops[i], for i < n_types), persisted in the tuning
 // cache next to the ubatch choice (tuning-cache-io.hpp's MoeExecRatesEntry). This struct crosses the backend's
-// dlopen boundary, so its layout is pinned by static_asserts in ggml/src/ggml-sycl/ubatch-tuning-cache.cpp; GGML_TYPE_COUNT
-// is part of it.
+// dlopen boundary, so its layout is pinned by static_asserts in ggml/src/ggml-sycl/ubatch-tuning-cache.cpp.
+// GGML_TYPE_COUNT is part of the layout and there is no capacity field: lookup writes sizeof(record) bytes, so a
+// frontend built against a different GGML_TYPE_COUNT than the backend would be overrun.
 struct ggml_sycl_moe_exec_rates_record {
     double   h2d_gbps;
     double   reorder_gbps;
