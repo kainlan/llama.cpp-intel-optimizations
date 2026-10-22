@@ -775,9 +775,9 @@ class moe_stream_phase {
     // Per region: the layer its last use held (-1: none), and that layer's read gate once layer_done records it.
     int                                             region_layer_[2]    = { -1, -1 };
     std::optional<sycl::event>                      region_read_gate_[2];
-    const moe_exec_decision_log *                   log_                = nullptr;  // the last op's, for end_prompt
+    const moe_exec_decision_log *                   log_ = nullptr;  // the last op's, for end_prompt
     moe_staged_route_tally                          staged_routes_;
-    uint64_t                                        ring_releases_      = 0;
+    uint64_t                                        ring_releases_ = 0;
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

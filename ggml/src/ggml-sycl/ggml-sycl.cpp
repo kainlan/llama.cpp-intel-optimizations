@@ -32828,8 +32828,8 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 staged.recipe.owner_device     = submit_device;
                 const moe_route_capability cap = ggml_sycl_moe_build_device_recipe(
                     src0, submit_device, rows, invocation_backend, invocation_queue, queue_capability, staged);
-                staged.recipe.transfer      = moe_recipe_transfer::STAGED_RING;
-                staged.recipe_reason        = "staged-ring";
+                staged.recipe.transfer                        = moe_recipe_transfer::STAGED_RING;
+                staged.recipe_reason                          = "staged-ring";
                 // Served only as a plain MMVQ_COMPAT kernel on the submit queue (c-las5): a library claim, any other
                 // kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), or a type that
                 // needs its direct kernel refuses it (ggml_sycl_moe_staged_capability_refusal, which the ring's
