@@ -6,6 +6,9 @@
 //   layer 1:    also a fused host GATE_UP entry for expert 1 (a shape the ring cannot stage);
 //   layer 3:    no host expert (the phase skips it);
 //   layer 4:    only a fused host GATE_UP for expert 2 (host experts present, no item).
+//
+// A second plan mixes in host experts of a type with no AOS->SOA reorder (IQ3_XXS): the ring is sized over the
+// streamable matrices only, so those are listed (and counted untyped when staged) but given no slot.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
@@ -105,6 +108,29 @@ placement_plan make_plan() {
     return plan;
 }
 
+// Layer 0: experts 0 and 1 on the host as Q4_0 (streamable). Layer 1: experts 0-3 on the host as IQ3_XXS, which has no
+// reorder, with a larger device size than any Q4_0 matrix. Experts 4-7 of both layers are resident Q4_0 on device 0.
+// with_q4 = false drops layer 0's host experts, leaving only the IQ3_XXS ones.
+placement_plan make_mixed_plan(bool with_q4) {
+    const size_t   iq_src = ggml_row_size(GGML_TYPE_IQ3_XXS, kCols) * static_cast<size_t>(kRows);
+    placement_plan plan{};
+    for (int e = 0; e < kExperts; ++e) {
+        for (int r = 0; r < 3; ++r) {
+            const bool q4_host = with_q4 && e < 2;
+            plan.entries.push_back(entry(0, e, kRoles[r], kNames[r], q4_host, 0, src_bytes(), dst_bytes()));
+            if (e < 4) {
+                placement_entry iq = entry(1, e, kRoles[r], kNames[r], true, 0, iq_src, 4 * dst_bytes());
+                iq.type            = GGML_TYPE_IQ3_XXS;
+                plan.entries.push_back(iq);
+            } else {
+                plan.entries.push_back(entry(1, e, kRoles[r], kNames[r], false, 0, src_bytes(), dst_bytes()));
+            }
+        }
+    }
+    plan.build_index();
+    return plan;
+}
+
 const moe_stream_layer_info * layer_info(const moe_stream_plan_index & idx, int layer) {
     const auto it = idx.layers.find(layer);
     return it == idx.layers.end() ? nullptr : &it->second;
@@ -166,7 +192,7 @@ int main() {
             CHECK(it.type == GGML_TYPE_Q4_0 && it.ncols == kCols && it.nrows == kRows);
             CHECK(it.src_bytes == src_bytes() && it.dst_bytes == dst_bytes());
         }
-        CHECK(l0->n_host_experts == 3 && l0->n_untriplet == 0);
+        CHECK(l0->n_host_experts == 3 && l0->n_untriplet == 0 && l0->n_streamable == 9);
         CHECK(l0->host_bytes == 9 * src_bytes());
         CHECK(l0->expert_bytes_max == 3 * src_bytes());
         CHECK(l0->K == kCols && l0->N == kRows);
@@ -179,7 +205,8 @@ int main() {
         CHECK(l1->items.size() == 9 && l1->n_untriplet == 1);
         CHECK(l1->n_host_experts == 3);  // expert 1's fused entry is the same expert
         CHECK(l1->host_bytes == 9 * src_bytes() + kFused);
-        CHECK(l1->expert_bytes_max == 3 * src_bytes() + kFused);
+        // The fused entry takes no slot.
+        CHECK(l1->expert_bytes_max == 3 * src_bytes());
     }
     const moe_stream_layer_info * l4 = layer_info(idx, 4);
     CHECK(l4 != nullptr);
@@ -191,6 +218,30 @@ int main() {
     // Resident on device 0: 24 triplet entries per layer for layers 3 and 4 minus the host ones, 15 for layers 0-2.
     const size_t resident_entries = 3 * (3 * 5) + 3 * 8 + 3 * 7;
     CHECK(idx.resident_expert_bytes == resident_entries * dst_bytes());
+
+    // ---- the ring is sized over streamable matrices: an IQ3_XXS host expert is listed but given no slot ----
+    {
+        const moe_stream_plan_index   mixed = ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(true), 0);
+        const moe_stream_layer_info * m0    = layer_info(mixed, 0);
+        const moe_stream_layer_info * m1    = layer_info(mixed, 1);
+        CHECK(m0 != nullptr && m1 != nullptr);
+        if (m0 && m1) {
+            // Both listed, so a stage counts the untyped ones; only layer 0's take slots.
+            CHECK(m0->items.size() == 6 && m1->items.size() == 12);
+            CHECK(m0->n_streamable == 6 && m1->n_streamable == 0);
+            CHECK(m0->expert_bytes_max == 3 * src_bytes());
+            CHECK(m1->expert_bytes_max == 0);
+            // The cost model still sees every host byte.
+            CHECK(m1->n_host_experts == 4 && m1->host_bytes > 0);
+        }
+        // Layer 0's six, not layer 1's twelve, and a Q4_0 slot, not the IQ3_XXS device size.
+        CHECK(mixed.host_matrices_per_layer_max == 6);
+        CHECK(mixed.matrix_bytes_max == dst_bytes());
+        const moe_stream_plan_index iq_only = ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(false), 0);
+        CHECK(iq_only.host_matrices_per_layer_max == 0 && iq_only.matrix_bytes_max == 0);
+        const moe_stream_layer_info * q1 = layer_info(iq_only, 1);
+        CHECK(q1 != nullptr && q1->items.size() == 12);
+    }
 
     // ---- what a decision stages ----
     if (l0) {

@@ -167,6 +167,21 @@ static inline std::vector<uint8_t> moe_stream_ids_bitmap(const int32_t * ids, si
     return bitmap;
 }
 
+// True iff the reorder takes `item` into one ring slot of `slot_bytes`: its type has an AOS->SOA reorder (the one
+// table, soa-reorder-types.hpp), its rows are whole blocks, and src_bytes is exactly its rows' bytes, which is also what
+// the reorder writes. Anything else (an IQ type, a zeroed inventory shape) is not streamable in v1: counted, never
+// copied as AOS.
+static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes) {
+    if (!ggml_sycl_soa_reorder_supported_type(item.type) || item.ncols <= 0 || item.nrows <= 0 ||
+        item.ncols % ggml_blck_size(item.type) != 0) {
+        return false;
+    }
+    const size_t row = ggml_row_size(item.type, item.ncols);
+    return row != 0 && static_cast<size_t>(item.nrows) <= SIZE_MAX / row &&
+           row * static_cast<size_t>(item.nrows) == item.src_bytes &&
+           std::max(item.src_bytes, item.dst_bytes) <= slot_bytes;
+}
+
 // One layer's host expert entries, read in the one scan of the plan a micro-batch makes (c-7soh).
 struct moe_stream_layer_info {
     std::vector<moe_stream_item>              items;     // host gate/up/down entries in plan.entries order, typed
@@ -174,15 +189,16 @@ struct moe_stream_layer_info {
     size_t  host_bytes       = 0;  // AOS bytes of every host expert entry of the layer, fused ones included
     int     n_host_experts   = 0;  // distinct expert ids with a host entry
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
-    size_t  expert_bytes_max = 0;  // the largest one expert's host AOS bytes, summed over its roles
+    int     n_streamable     = 0;  // items the ring gives slots: moe_stream_item_reorderable with any slot
+    size_t  expert_bytes_max = 0;  // the largest one expert's streamable AOS bytes, summed over its roles
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
     int64_t N                = 0;  // the largest ne[1] over the host expert entries
 };
 
 // The plan as the phase reads it for one micro-batch, and the inputs of the ring's geometry (ruling B, c-3bde).
 struct moe_stream_plan_index {
-    uint32_t host_matrices_per_layer_max = 0;  // the most items one layer has
-    size_t   matrix_bytes_max            = 0;  // max(src, dst) over every item: one slot holds either side
+    uint32_t host_matrices_per_layer_max = 0;  // the most streamable items one layer has
+    size_t   matrix_bytes_max            = 0;  // max(src, dst) over every streamable item: a slot holds either side
     size_t   resident_expert_bytes       = 0;  // dst bytes of the expert entries resident on the device
 
     // Only layers with a host expert entry: the rest are skipped, never weighed.
@@ -216,7 +232,8 @@ static inline bool moe_stream_rate_measured(double rate) {
 // which the planner copied from the tensor inventory (a zeroed shape fails moe_stream_item_reorderable).
 static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan & plan, int device) {
     moe_stream_plan_index                idx;
-    std::unordered_map<uint64_t, size_t> expert_bytes;  // host AOS bytes per (layer, expert), keyed with role UNKNOWN
+    // Streamable AOS bytes per (layer, expert), keyed with role UNKNOWN; an expert's key exists once it has any host entry.
+    std::unordered_map<uint64_t, size_t> expert_bytes;
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.layer_id < 0) {
             continue;
@@ -236,8 +253,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         if (ins.second) {
             ++li.n_host_experts;
         }
-        ins.first->second += e.src_size;
-        li.expert_bytes_max = std::max(li.expert_bytes_max, ins.first->second);
         if (!detail::moe_expert_role_is_triplet(e.expert_role)) {
             ++li.n_untriplet;
             continue;
@@ -252,11 +267,19 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         item.ncols     = e.ne[0];
         item.nrows     = e.ne[1];
         li.items.push_back(item);
+        // The ring is sized over the matrices it can stage. Another one is still listed, so a stage counts it untyped,
+        // but it takes no slot: a type with no reorder is not streamable in v1 (xod7 brief).
+        if (!moe_stream_item_reorderable(item, SIZE_MAX)) {
+            continue;
+        }
+        ++li.n_streamable;
+        ins.first->second += e.src_size;
+        li.expert_bytes_max  = std::max(li.expert_bytes_max, ins.first->second);
         idx.matrix_bytes_max = std::max(idx.matrix_bytes_max, std::max(e.src_size, e.dst_size));
     }
     for (const auto & kv : idx.layers) {
         idx.host_matrices_per_layer_max =
-            std::max(idx.host_matrices_per_layer_max, static_cast<uint32_t>(kv.second.items.size()));
+            std::max(idx.host_matrices_per_layer_max, static_cast<uint32_t>(kv.second.n_streamable));
     }
     return idx;
 }
@@ -299,21 +322,6 @@ static inline bool moe_stream_fully_staged(const moe_stream_layer_info * li,
         }
     }
     return true;
-}
-
-// True iff the reorder takes `item` into one ring slot of `slot_bytes`: its type has an AOS->SOA reorder (the one
-// table, soa-reorder-types.hpp), its rows are whole blocks, and src_bytes is exactly its rows' bytes, which is also what
-// the reorder writes. Anything else (an IQ type, a zeroed inventory shape) is not streamable in v1: counted, never
-// copied as AOS.
-static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes) {
-    if (!ggml_sycl_soa_reorder_supported_type(item.type) || item.ncols <= 0 || item.nrows <= 0 ||
-        item.ncols % ggml_blck_size(item.type) != 0) {
-        return false;
-    }
-    const size_t row = ggml_row_size(item.type, item.ncols);
-    return row != 0 && static_cast<size_t>(item.nrows) <= SIZE_MAX / row &&
-           row * static_cast<size_t>(item.nrows) == item.src_bytes &&
-           std::max(item.src_bytes, item.dst_bytes) <= slot_bytes;
 }
 
 // True iff a lease's retained owner lets the ring copy from it directly (9y0p M4): a host-pinned WEIGHT allocation in

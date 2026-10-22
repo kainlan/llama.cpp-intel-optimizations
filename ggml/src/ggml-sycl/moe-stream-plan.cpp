@@ -199,7 +199,7 @@ moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
     in.N                 = li.N;
     in.window_us         = window_us;
     in.ring_bytes_free   = ring_bytes_free();
-    in.triplet_bytes_max = li.expert_bytes_max;
+    in.triplet_bytes_max = li.expert_bytes_max;  // the largest streamable triplet: a region holds no other kind
     const moe_exec_rates r =
         moe_stream_rates_assemble(li.host_mix, record_valid_ ? &record_ : nullptr, moe_stream_getenv);
     return moe_exec_weigh(in, r, op.policy);
