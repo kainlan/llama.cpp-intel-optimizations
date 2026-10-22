@@ -29571,8 +29571,9 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
 // The region's SOA slots are next rewritten by reorders on this same in-order queue, so the queue, not the barrier,
 // orders that reuse after their readers. Under STREAM_ALL the open region holds layer + 1's slots, staged a layer
 // ahead, whose readers have not run yet: the barrier follows their reorders, not their kernels. An AOS-only slot
-// (c-hmey) is read in place by those kernels, so moe_stream_phase::stage() also orders a reuse that may overwrite one
-// behind a later barrier on this queue. Never while a command graph records: ring work is never recorded.
+// (c-hmey) is read in place by those kernels, so the barrier is also the read gate of the region holding `layer`, whose
+// kernels it follows, and moe_stream_phase::stage() orders a reuse that may overwrite such a slot behind it (lead ruling
+// c-o9uw-1). Never while a command graph records: ring work is never recorded.
 static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
     if (!ctx.moe_stream || !ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording) {
         return;

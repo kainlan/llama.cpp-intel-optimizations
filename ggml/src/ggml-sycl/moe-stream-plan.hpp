@@ -597,8 +597,8 @@ class moe_stream_phase {
     bool                      fully_staged(int layer, const int32_t * ids, size_t n_ids, int n_expert) const;
     // True iff slots were taken from the ring's current region since it last flipped.
     bool                      region_open() const;
-    // After `layer`'s down op: an open region closes on `down_done`, a device event behind that op. It gates the
-    // region's AOS reuse only (see ggml_sycl_moe_stream_layer_done).
+    // After `layer`'s down op: `down_done`, a device event behind that op, becomes the read gate of the region holding
+    // `layer`, and an open region closes on it (see ggml_sycl_moe_stream_layer_done).
     void                      layer_done(int layer, sycl::event down_done);
     // The first decode graph after a prompt: the table, the decisions and the ring go.
     void                      end_prompt();
@@ -683,6 +683,9 @@ class moe_stream_phase {
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
     // Per region: its last use left an AOS-only slot behind, so its next copies wait for its readers (stage()).
     bool                                            region_aos_only_[2] = { false, false };
+    // Per region: the layer its last use held (-1: none), and that layer's read gate once layer_done records it.
+    int                                             region_layer_[2]    = { -1, -1 };
+    std::optional<sycl::event>                      region_read_gate_[2];
     const moe_exec_decision_log *                   log_                = nullptr;  // the last op's, for end_prompt
     size_t                                          staged_served_      = 0;
     size_t                                          staged_refused_     = 0;

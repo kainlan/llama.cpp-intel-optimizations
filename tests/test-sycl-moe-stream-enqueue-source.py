@@ -38,9 +38,11 @@ What this gate pins:
     ggml_sycl_moe_query_route_capability (one fact, one source), asked once per micro-batch in the index build;
   - a region closes on an event after its last copy and its last reorder: AOS-only items go first, so the region's
     last submission is a reorder when it holds a SOA item and the last copy otherwise;
-  - when a region's last use or its new one holds an AOS-only item, the new copies also wait for a compute-queue
-    barrier submitted at the first of them: the gate layer_done sets belongs to the region holding the next layer, so
-    it precedes the readers of an AOS-only slot (and of a SOA slot that AOS-only items moved off a fixed odd index);
+  - when a region's last use or its new one holds an AOS-only item, the new copies also wait for the region's read
+    gate: the gate layer_done sets belongs to the region holding the next layer, so it precedes the readers of an
+    AOS-only slot (and of a SOA slot that AOS-only items moved off a fixed odd index). The read gate is the barrier
+    layer_done submitted behind the down op of the layer the region last held (lead ruling c-o9uw-1), and a
+    compute-queue barrier submitted at the first copy stands in when no layer_done recorded one;
   - a throw from either submission aborts with "[MOE-EXEC] stream enqueue failed: %s" (design 9.3);
   - moe-stream-plan.cpp waits on nothing (.wait(), wait_and_throw()), queries no event status (get_info<), has no
     const_cast (ruling E) and calls no allocator: its slots come from the ring's one reservation;
@@ -633,23 +635,37 @@ def test_region_close_mutants():
 
 REUSE_COND = ("const bool reuse_after_readers = region_aos_only_[cur_region_] || std::any_of(items.begin(), items.end(), "
               "aos_only_item);")
-REUSE_TAKE = "if (reuse_after_readers && !reuse_gate) { reuse_gate = ccs_->ext_oneapi_submit_barrier(); }"
+REUSE_TAKE = ("if (reuse_after_readers && !reuse_gate) { reuse_gate = region_read_gate_[cur_region_] ? "
+              "*region_read_gate_[cur_region_] : ccs_->ext_oneapi_submit_barrier(); }")
 REUSE_DEP = "if (reuse_gate) { deps.push_back(*reuse_gate); }"
-REUSE_RECORD = "if (reuse_gate) { region_aos_only_[cur_region_] = aos_only_staged; }"
-REGION_FLAGS_RESET = "region_aos_only_[0] = false; region_aos_only_[1] = false;"
+COPIED_IN = "copied_in = true;"
+REUSE_RECORD = ("if (copied_in) { region_aos_only_[cur_region_] = aos_only_staged; region_layer_[cur_region_] = "
+                "items.front().layer; region_read_gate_[cur_region_].reset(); }")
+REGION_FLAGS_RESET = ("region_aos_only_[0] = false; region_aos_only_[1] = false; region_layer_[0] = -1; "
+                      "region_layer_[1] = -1; region_read_gate_[0].reset(); region_read_gate_[1].reset();")
+PHASE_LAYER_DONE_SIG = "void moe_stream_phase::layer_done(int layer, sycl::event down_done)"
+READ_GATE_RECORD = ("for (int r = 0; r < 2; ++r) { if (region_layer_[r] == layer) { region_read_gate_[r] = down_done; "
+                    "} }")
 
 
 def claim_aos_only_reuse_waits_for_readers(phase: str) -> bool:
     """When a region's last use or the stage reusing it holds an AOS-only item, a copy may rewrite a slot a kernel
     read in that last use, and the region's gate does not follow those readers (layer_done gates the region holding the
-    next layer). So every copy of the stage also waits for one compute-queue barrier, the readers' queue (c-las5),
-    submitted at its first copy. Whether the region's last use left an AOS-only slot is recorded only when a copy went
-    in, and a new ring starts with none."""
+    next layer). So every copy of the stage also waits for the region's read gate (lead ruling c-o9uw-1): the barrier
+    layer_done submitted on the readers' queue (c-las5) behind the down op of the layer the region last held, recorded
+    for the region holding that layer. Without one, the copies wait for a compute-queue barrier submitted at the first
+    copy. A copy going in makes the stage the region's last use: its layer, whether it left an AOS-only slot, and no
+    read gate yet. A new ring starts with no layer, no AOS-only slot and no read gate."""
     n = norm(phase)
     s = body(n, STAGE_SIG)
+    done = body(n, PHASE_LAYER_DONE_SIG)
     return (s.count(REUSE_TAKE) == 1 and s.count(REUSE_DEP) == 1 and s.count(REUSE_RECORD) == 1
+            and s.count(COPIED_IN) == 1 and "bool copied_in = false;" in s
             and ordered(s, PARTITION, REUSE_COND, ITEM_LOOP, COPY_DEPS, READY_DEP, REUSE_TAKE, REUSE_DEP, COPY_DECL,
-                        AOS_ONLY_RECORD, REUSE_RECORD)
+                        COPIED_IN, AOS_ONLY_RECORD, REUSE_RECORD)
+            and n.count(READ_GATE_RECORD) == 1 and done.count(READ_GATE_RECORD) == 1
+            and ordered(done, "if (layer != cur_layer_) { return; }", READ_GATE_RECORD)
+            and n.count("region_read_gate_[r] =") == 1
             and REGION_FLAGS_RESET in body(n, RING_READY_SIG))
 
 
@@ -658,23 +674,48 @@ def test_aos_only_reuse_waits_for_readers():
 
 
 def test_aos_only_reuse_mutants():
-    # The barrier taken but not waited on.
+    # The gate taken but not waited on.
     assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, REUSE_DEP, ""))
-    # The barrier on the copy queue, which the readers do not run on.
+    # The fallback barrier on the copy queue, which the readers do not run on.
     assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, "reuse_gate = ccs_->ext_oneapi_submit_barrier();",
-               "reuse_gate = cache.get_bcs_queue().ext_oneapi_submit_barrier();"))
+        mutate(PHASE, ": ccs_->ext_oneapi_submit_barrier();", ": cache.get_bcs_queue().ext_oneapi_submit_barrier();"))
+    # The read gate never used: every reuse waits for a stage-time barrier, which also waits for the work queued after
+    # the last use's down op.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "region_read_gate_[cur_region_] ? *region_read_gate_[cur_region_] : ccs_", "ccs_"))
+    # The other region's read gate.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "region_read_gate_[cur_region_] ? *region_read_gate_[cur_region_] :",
+               "region_read_gate_[1 - cur_region_] ? *region_read_gate_[1 - cur_region_] :"))
     # A SOA-only stage after an AOS-only use, unordered after that use's readers.
     assert not claim_aos_only_reuse_waits_for_readers(
         mutate(PHASE, "region_aos_only_[cur_region_] || std::any_of(", "std::any_of("))
     # An AOS-only stage after a SOA-only use: its single slots land on the use's SOA slots.
     assert not claim_aos_only_reuse_waits_for_readers(
         mutate(PHASE, " || std::any_of(items.begin(), items.end(), aos_only_item);", ";"))
-    # The last use forgotten when nothing was copied in.
+    # The last use recorded when nothing was copied in.
     assert not claim_aos_only_reuse_waits_for_readers(
-        mutate(PHASE, REUSE_RECORD, "region_aos_only_[cur_region_] = aos_only_staged;"))
+        mutate(PHASE, REUSE_RECORD, REUSE_RECORD.replace("if (copied_in) { ", "{ ")))
     # Never recorded.
     assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, REUSE_RECORD, ""))
+    # A refilled region keeps the read gate of its previous layer, which precedes the new layer's readers.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, " region_read_gate_[cur_region_].reset(); }", " }"))
+    # The region's layer never recorded, so layer_done finds no region to gate.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, " region_layer_[cur_region_] = items.front().layer;", ""))
+    # layer_done gates the region holding the next layer, the gate's old defect.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "if (region_layer_[r] == layer) {", "if (region_layer_[r] == layer + 1) {"))
+    # layer_done records no read gate.
+    assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, READ_GATE_RECORD, ""))
+    # A down op of a layer this micro-batch has not begun records a gate.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "if (layer != cur_layer_) { return; } " + READ_GATE_RECORD,
+               READ_GATE_RECORD + " if (layer != cur_layer_) { return; }"))
+    # A new ring inherits the old ring's read gates.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "region_read_gate_[0].reset(); region_read_gate_[1].reset();", ""))
 
 
 PROMPT_KERNEL_SIG = ("static bool ggml_sycl_moe_stream_prompt_kernel(void * graph_ctx, ggml_type type, ggml_layout_mode "
