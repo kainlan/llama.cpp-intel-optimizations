@@ -1679,6 +1679,13 @@ int main() {
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == SIZE_MAX, "a huge ring saturates the demand");
         CHECK(!ggml_sycl::zone_hold_fit(in, 512), "and the rung is refused, never fitted by a wrapped sum");
         CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 512) == 0, "no rung fits an unbounded ring: nothing is named");
+        // No plan function, no hold: the ring is still a demand, and the only one.
+        in.plan_of    = nullptr;
+        in.ring_bytes = 400 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 400 * MiB, "with no plan the demand is the ring alone");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "an unknown n_ubatch names no demand, plan or not");
+        in.ring_bytes = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 0, "no plan and no ring is no demand");
     }
 
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and

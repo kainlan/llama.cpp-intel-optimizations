@@ -2827,6 +2827,69 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
     assert not _hold_fit_ring_bytes_pinned(mutated), "the mutant must make the pin fail"
 
 
+_RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device) {"
+_RING_HELPER_END = "static bool ggml_sycl_hold_spill_fit("
+_RING_REMAINDER_LINE = "return geo.bytes > lent ? geo.bytes - lent : 0;"
+_RING_PROBE_LINE = "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);"
+_RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
+
+
+def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:
+    """The ring term is set BEFORE the fit reads the demand: the demand the refusal prints (a.demand) and the verdict
+    (zone_hold_fit) are both over `in`, so an assignment after the a.demand read would print a demand that omits the
+    ring while the verdict charges it."""
+    body = _body_of(raw_cpp, _HOLD_FIT_START, _HOLD_FIT_END)
+    assign = body.find(_RING_BYTES_LINE)
+    demand = body.find("a.demand = ggml_sycl::zone_hold_fit_demand(")
+    return assign != -1 and demand != -1 and assign < demand
+
+
+def _ring_helper_remainder_pinned(raw_cpp: str) -> bool:
+    """The helper returns what the loan did NOT cover: the clamped difference of the ring and the probe's lent bytes,
+    each exactly once."""
+    body = _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END)
+    return body.count(_RING_REMAINDER_LINE) == 1 and body.count(_RING_PROBE_LINE) == 1
+
+
+def test_the_ring_term_is_set_before_the_fit_reads_the_demand():
+    assert _ring_term_precedes_the_printed_demand(GGML_SYCL_CPP)
+
+
+def test_the_ring_term_order_has_a_mutation_witness():
+    start = GGML_SYCL_CPP.find(_HOLD_FIT_START)
+    end = GGML_SYCL_CPP.find(_HOLD_FIT_END, start)
+    m = re.search(_RING_ASSIGN_RE, GGML_SYCL_CPP[start:end], re.M)
+    assert m, "the assignment must sit in the fit body"
+    at, line = start + m.start(), m.group(0)
+    demand_re = r"^[ \t]*a\.demand\s*=\s*ggml_sycl::zone_hold_fit_demand\(in, q\.n_ubatch\);\n"
+    demand = re.search(demand_re, GGML_SYCL_CPP[start:end], re.M)
+    assert demand and start + demand.start() > at
+    d_end = start + demand.end()
+    mutated = GGML_SYCL_CPP[:at] + GGML_SYCL_CPP[at + len(line) : d_end] + line + GGML_SYCL_CPP[d_end:]
+    assert not _ring_term_precedes_the_printed_demand(mutated), "the mutant must make the order claim fail"
+
+
+def test_the_ring_helper_returns_the_clamped_uncovered_remainder():
+    assert _ring_helper_remainder_pinned(GGML_SYCL_CPP)
+
+
+@pytest.mark.parametrize("mutation", ["no-clamp", "returns-lent", "drops-probe"])
+def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
+    assert GGML_SYCL_CPP.count("return geo.bytes > lent ? geo.bytes - lent : 0;") == 1
+    if mutation == "no-clamp":
+        mutated = GGML_SYCL_CPP.replace(
+            "return geo.bytes > lent ? geo.bytes - lent : 0;", "return geo.bytes - lent;"
+        )
+    elif mutation == "returns-lent":
+        mutated = GGML_SYCL_CPP.replace("return geo.bytes > lent ? geo.bytes - lent : 0;", "return lent;")
+    else:
+        mutated = GGML_SYCL_CPP.replace(
+            "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);", "const size_t lent = 0;"
+        )
+    assert mutated != GGML_SYCL_CPP
+    assert not _ring_helper_remainder_pinned(mutated), "the mutant must make the pin fail"
+
+
 if __name__ == "__main__":
     import sys
 

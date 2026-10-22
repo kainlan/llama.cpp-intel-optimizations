@@ -18587,7 +18587,7 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
 }
 
 // Defined with the expert loan transaction below: the bytes a loan of `bytes_wanted` would lend on `device`, 0 when
-// the probe is refused.
+// the probe is refused. Declared here because the fit sits about 2,500 lines before the loan body it needs.
 static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted);
 
 // The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
@@ -18597,6 +18597,11 @@ static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted)
 // published plan (moe_stream_phase::prepare), so the fit and the ring cannot disagree about its size. 0 with no
 // published plan, no host expert, or no ring (the sizing refuses one past a tenth of the resident expert bytes). A
 // refused probe (a graph is active) lends nothing, so the whole ring counts.
+// The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the
+// runtime context transaction, before it publishes, this can see the previous plan or none, and the realized check
+// (run after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index
+// build and the loan selection); the callers are the transaction and the auto-ubatch trial's checks, never a
+// per-graph path, so a per-query cache is not warranted today.
 static size_t ggml_sycl_hold_ring_uncovered(int device) {
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
@@ -21109,7 +21114,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted) {
     ggml_sycl_expert_loan_result probe;
     const ggml_sycl_txn_result   code =
-        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/true, nullptr, &probe, false);
+        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/true, nullptr, &probe,
+                                              /*warn_busy=*/false);
     return code == ggml_sycl_txn_result::ACCEPTED ? probe.bytes_freed : 0;
 }
 
