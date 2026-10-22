@@ -309,8 +309,9 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
             ++n.exhausted;
             continue;
         }
-        mem_handle aos = ring_->acquire_slot();
-        mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot();
+        // Each slot is acquired with the layout written there, so its tag is the entry's layout (lead ruling c-o9uw-1).
+        mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);
+        mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_SOA);
         GGML_ASSERT(aos.valid() && soa.valid() != aos_only);
         sycl::event reorder;
         sycl::event copied;
@@ -357,9 +358,11 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
             region_last_    = copied;
             aos_only_staged = true;
             table_[key]     = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };
+            ++n.aos_only;
         } else {
             region_last_ = reorder;
             table_[key]  = { soa, aos, reorder, GGML_LAYOUT_SOA };
+            ++n.soa;
         }
         region_keys_[cur_region_].push_back(key);
         n.bytes += item.src_bytes;
@@ -452,17 +455,18 @@ void moe_stream_phase::report(int                   layer,
         return;
     }
     // The stage line: the plan's fields under a prefix of its own, apart from note()'s "[MOE-EXEC-TRACE] dev" line
-    // (plan amendment for Task 15, lead ruling c-xod7-q1).
+    // (plan amendment for Task 15, lead ruling c-xod7-q1). soa= and aos_only= split the staged matrices by the layout
+    // their slot holds, so a census can tell which path a layer took (the lead's addition to ruling c-o9uw-1).
     if (op.log->trace >= 1 && op.log->trace_sink != nullptr) {
-        char line[256];
+        char line[320];
         std::snprintf(line, sizeof(line),
                       "[MOE-EXEC-TRACE] stage layer %d ubatch %u: %s regime=%s p=%.2f t_cpu=%.0f t_ring=%.0f "
                       "window=%.0f staged=%d/%d bytes=%zu"
-                      " unowned=%d untyped=%d exhausted=%d",
+                      " unowned=%d untyped=%d exhausted=%d soa=%d aos_only=%d",
                       layer, ubatch_seq_, moe_exec_choice_name(st.decision.choice),
                       moe_stream_regime_name(st.decision.regime), st.decision.p_touch, st.decision.t_cpu_us,
                       st.decision.t_ring_us, st.window_us, n.staged, n.wanted, n.bytes, n.unowned, n.untyped,
-                      n.exhausted);
+                      n.exhausted, n.soa, n.aos_only);
         op.log->trace_sink(op.log->sink_ctx, line);
     }
     op.log->note(device_, layer, st.decision, n.bytes);

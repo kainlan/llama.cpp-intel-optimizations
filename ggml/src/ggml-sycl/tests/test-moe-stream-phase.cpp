@@ -13,7 +13,10 @@
 //   kernels_soa_q4: Q4_0 is read as SOA and as AOS, IQ3_XXS in no layout (as IQ4_XS is on the real tables), so IQ3_XXS
 //                   is listed (and counted untyped when staged) but given no slot;
 //   kernels_aos:    both types are read as AOS only, as the batched MMVQ tables answer for Q4_0, the K types and
-//                   IQ3_XXS, so each matrix takes one slot and is read in place (c-hmey).
+//                   IQ3_XXS, so each matrix takes one slot and is read in place (c-hmey);
+//   kernels_table:  the device's prompt kernels as the tables answer today (moe-mmvq-tables.hpp): SOA for MXFP4 only,
+//                   AOS for the rest, so a reorderable Q4_K stages AOS-only and MXFP4 stages SOA (lead ruling
+//                   c-o9uw-2), whatever the capability table says.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
@@ -180,6 +183,15 @@ bool kernels_mixed(void *, ggml_type type, ggml_layout_mode layout, int64_t, int
 bool kernels_aos_counted(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1) {
     ++*static_cast<int *>(graph_ctx);
     return kernels_aos(nullptr, type, layout, ne0, ne1);
+}
+
+// The tables' answers today: MXFP4 is the one type read as SOA, and every type here is read as AOS.
+bool kernels_table(void *, ggml_type type, ggml_layout_mode layout, int64_t, int64_t) {
+    if (layout == GGML_LAYOUT_SOA) {
+        return type == GGML_TYPE_MXFP4;
+    }
+    return layout == GGML_LAYOUT_AOS &&
+           (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ3_XXS);
 }
 
 moe_stream_plan_index index_of(const placement_plan & plan, ggml_sycl::moe_stream_prompt_kernel_fn kernels) {
@@ -486,6 +498,26 @@ int main() {
     CHECK(ggml_sycl::moe_stream_item_staging(iq, 4096, kernels_aos, nullptr) == moe_stream_staging::AOS_ONLY);
     CHECK(ggml_sycl::moe_stream_item_staging(iq, 4096, kernels_soa_q4, nullptr) == moe_stream_staging::NONE);
     CHECK(ggml_sycl::moe_stream_item_staging(q, 4096, nullptr, nullptr) == moe_stream_staging::NONE);
+
+    // Lead ruling c-o9uw-2: SOA iff the type reorders and a prompt kernel reads it as SOA, else AOS-only iff one reads
+    // it as AOS. Both types below reorder; under the tables' answers only MXFP4 is staged SOA.
+    moe_stream_item q4k{};
+    q4k.type           = GGML_TYPE_Q4_K;
+    q4k.ncols          = kCols;
+    q4k.nrows          = kRows;
+    q4k.src_bytes      = ggml_row_size(GGML_TYPE_Q4_K, kCols) * static_cast<size_t>(kRows);
+    q4k.dst_bytes      = q4k.src_bytes;
+    moe_stream_item mx = q4k;
+    mx.type            = GGML_TYPE_MXFP4;
+    mx.src_bytes       = ggml_row_size(GGML_TYPE_MXFP4, kCols) * static_cast<size_t>(kRows);
+    mx.dst_bytes       = mx.src_bytes;
+    CHECK(ggml_sycl::moe_stream_item_reorderable(q4k, 4096) && ggml_sycl::moe_stream_item_reorderable(mx, 4096));
+    CHECK(ggml_sycl::moe_stream_item_staging(q4k, 4096, kernels_table, nullptr) == moe_stream_staging::AOS_ONLY);
+    CHECK(ggml_sycl::moe_stream_item_staging(mx, 4096, kernels_table, nullptr) == moe_stream_staging::SOA);
+    CHECK(ggml_sycl::moe_stream_staging_slots(ggml_sycl::moe_stream_item_staging(q4k, 4096, kernels_table, nullptr)) ==
+          1u);
+    CHECK(ggml_sycl::moe_stream_staging_slots(ggml_sycl::moe_stream_item_staging(mx, 4096, kernels_table, nullptr)) ==
+          2u);
 
     // ---- a host lease the ring may copy from directly (llama.cpp-9y0p) ----
     alloc_metadata owner{};

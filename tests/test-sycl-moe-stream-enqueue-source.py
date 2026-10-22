@@ -29,7 +29,9 @@ What this gate pins:
     with the copy as its one dependency;
   - the AOS slot, the host lease and the SOA slot are retained until the reorder's event, so each submission owns what
     it touches, and the stage-table entry holds the SOA slot with the layout it really carries, SOA (ruling C: the
-    slice's AOS tag is not the answer);
+    entry is the answer);
+  - each slot is acquired with the layout it will hold, the AOS slot as AOS and the SOA slot as SOA (lead ruling
+    c-o9uw-1), so the slice's tag agrees with the entry's layout by construction;
   - AOS-only staging (c-hmey): a matrix the device reads only as AOS takes ONE slot, its copy is its last submission
     (no reorder), the AOS slot and the host lease are retained until the copy, and its stage-table entry holds the AOS
     slot with layout AOS; how a matrix stages comes from the device's prompt kernels, which the backend answers from
@@ -435,9 +437,9 @@ ALLOCATOR_NAMES = ("malloc", "unified_alloc", "unified_allocate", "zone_allocate
 
 
 def claim_phase_allocates_only_ring_slots(phase: str) -> bool:
-    """No allocator: every slot is ring_->acquire_slot() from the ring's one reservation."""
+    """No allocator: every slot is ring_->acquire_slot(layout) from the ring's one reservation."""
     n = norm(phase)
-    return bool(n) and not any(a in n for a in ALLOCATOR_NAMES) and n.count("ring_->acquire_slot()") == 2
+    return bool(n) and not any(a in n for a in ALLOCATOR_NAMES) and n.count("ring_->acquire_slot(") == 2
 
 
 def test_phase_allocates_only_ring_slots():
@@ -446,7 +448,7 @@ def test_phase_allocates_only_ring_slots():
 
 def test_allocator_mutants():
     assert not claim_phase_allocates_only_ring_slots(mutate(PHASE, RETAIN, RETAIN + " (void) sycl::malloc_device(16, *ccs_);"))
-    assert not claim_phase_allocates_only_ring_slots(mutate(PHASE, "ring_->acquire_slot()", "mem_handle()"))
+    assert not claim_phase_allocates_only_ring_slots(mutate(PHASE, "ring_->acquire_slot(GGML_LAYOUT_SOA)", "mem_handle()"))
 
 
 # ---- what is streamed -------------------------------------------------------------------------------------------------
@@ -474,7 +476,7 @@ def claim_only_direct_owned_typed_items_stream(phase: str, hpp: str) -> bool:
             and "ggml_sycl_soa_reorder_supported_type(item.type)" in reorderable
             and "detail::moe_stream_item_rows_bytes(item) != 0" in aos_fits
             and "item.src_bytes <= slot_bytes" in aos_fits
-            and ordered(n, TYPED_GUARD, OWNER_CALL, "ring_->acquire_slot()", COPY_DECL))
+            and ordered(n, TYPED_GUARD, OWNER_CALL, "ring_->acquire_slot(", COPY_DECL))
 
 
 def test_only_direct_owned_typed_items_stream():
@@ -502,8 +504,8 @@ def test_streamed_item_mutants():
 
 AOS_ONLY_FLAG = "const bool aos_only = item.staging == moe_stream_staging::AOS_ONLY;"
 SLOTS_CHECK = "if (ring_->slots_free() < moe_stream_staging_slots(item.staging)) { ++n.exhausted; continue; }"
-AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot();"
-SOA_ACQUIRE = "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot();"
+AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
+SOA_ACQUIRE = "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_SOA);"
 STAGING_SLOTS_SIG = "static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging)"
 STAGING_SLOTS_BODY = "{ return staging == moe_stream_staging::SOA ? 2u : staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }"
 REGION_SIZE = "li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));"
@@ -514,12 +516,13 @@ RING_SIZE_CALL = "moe_stream_ring_size(index_.region_slots_max, index_.matrix_by
 def claim_aos_only_item_takes_one_slot(phase: str, hpp: str) -> bool:
     """An AOS-only matrix takes ONE slot and a SOA matrix two, both when the ring is sized (each layer's slots summed
     from the one slot-count helper, the ring sized from the heaviest layer's) and when a stage acquires them: the region
-    is checked for that many free slots, then the AOS slot is acquired, and the SOA slot only for a SOA item."""
+    is checked for that many free slots, then the AOS slot is acquired, and the SOA slot only for a SOA item. Each is
+    acquired with the layout it will hold (lead ruling c-o9uw-1)."""
     h = norm(hpp)
     n = norm(phase)
     s = body(n, STAGE_SIG)
     return (body(h, STAGING_SLOTS_SIG) == STAGING_SLOTS_BODY and REGION_SIZE in body(h, INDEX_BUILD_SIG)
-            and RING_SIZE_CALL in n and n.count("ring_->acquire_slot()") == 2
+            and RING_SIZE_CALL in n and n.count("ring_->acquire_slot(") == 2
             and ordered(s, AOS_ONLY_FLAG, SLOTS_CHECK, AOS_ACQUIRE, SOA_ACQUIRE, COPY_DECL))
 
 
@@ -530,9 +533,17 @@ def test_aos_only_item_takes_one_slot():
 def test_aos_only_slot_mutants():
     # An AOS-only item takes a SOA slot too.
     assert not claim_aos_only_item_takes_one_slot(
-        mutate(PHASE, SOA_ACQUIRE, "mem_handle soa = ring_->acquire_slot();"), PLAN_HPP)
+        mutate(PHASE, SOA_ACQUIRE, "mem_handle soa = ring_->acquire_slot(GGML_LAYOUT_SOA);"), PLAN_HPP)
     assert not claim_aos_only_item_takes_one_slot(
-        mutate(PHASE, SOA_ACQUIRE, "mem_handle soa = aos_only ? ring_->acquire_slot() : ring_->acquire_slot();"), PLAN_HPP)
+        mutate(PHASE, SOA_ACQUIRE,
+               "mem_handle soa = aos_only ? ring_->acquire_slot(GGML_LAYOUT_AOS) : ring_->acquire_slot(GGML_LAYOUT_SOA);"),
+        PLAN_HPP)
+    # A slot tagged with the layout it will not hold: the slice's tag would disagree with the entry's layout.
+    assert not claim_aos_only_item_takes_one_slot(
+        mutate(PHASE, AOS_ACQUIRE, "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_SOA);"), PLAN_HPP)
+    assert not claim_aos_only_item_takes_one_slot(
+        mutate(PHASE, SOA_ACQUIRE, "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_AOS);"),
+        PLAN_HPP)
     # The ring sized, or the region checked, as if every item took two.
     assert not claim_aos_only_item_takes_one_slot(
         PHASE, mutate(PLAN_HPP, "moe_stream_staging::AOS_ONLY ? 1u", "moe_stream_staging::AOS_ONLY ? 2u"))
@@ -549,8 +560,8 @@ def test_aos_only_slot_mutants():
 
 AOS_ONLY_SUBMIT = "if (aos_only) { retain_handles_until_event({ aos, host }, copy); copied = copy; } else {"
 AOS_ONLY_TABLE = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"
-AOS_ONLY_RECORD = ("if (aos_only) { region_last_ = copied; aos_only_staged = true; " + AOS_ONLY_TABLE + " } else { "
-                   "region_last_ = reorder; " + TABLE_WRITE + " }")
+AOS_ONLY_RECORD = ("if (aos_only) { region_last_ = copied; aos_only_staged = true; " + AOS_ONLY_TABLE
+                   + " ++n.aos_only; } else { region_last_ = reorder; " + TABLE_WRITE + " ++n.soa; }")
 
 
 def claim_aos_only_entry_reads_in_place(phase: str) -> bool:
@@ -724,9 +735,9 @@ def test_staging_source_mutants():
     assert not claim_staging_from_the_capability_query(
         SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, "index_ = moe_stream_plan_index_build(plan, device, nullptr, nullptr);"))
     # The predicate asked again at every stage.
-    assert not claim_staging_from_the_capability_query(
-        SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, "
-                                                                  "GGML_LAYOUT_AOS, item.ncols, item.nrows);"))
+    asked_again = AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, " \
+                                  "item.nrows);"
+    assert not claim_staging_from_the_capability_query(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
 
 
 # ---- the policy gate --------------------------------------------------------------------------------------------------
@@ -1158,6 +1169,38 @@ def test_trace_mutants():
     # The old prefix, which read as the decision log's WARN lines.
     old = mutate(PHASE, "[MOE-EXEC-TRACE] stage layer", "[MOE-EXEC] trace layer")
     assert not claim_trace_line(old, {PHASE_REL: old})
+
+
+TRACE_SPLIT_FMT = TRACE_FMT + " unowned=%d untyped=%d exhausted=%d soa=%d aos_only=%d"
+TRACE_SPLIT_ARGS = "n.unowned, n.untyped, n.exhausted, n.soa, n.aos_only);"
+STAGE_COUNTS_SPLIT = "int soa = 0; int aos_only = 0;"
+
+
+def claim_stage_trace_splits_layouts(phase: str, hpp: str) -> bool:
+    """The stage trace splits the staged matrices by the layout their slot holds, soa= and aos_only= (the lead's
+    addition to ruling c-o9uw-1), so a census can tell which path a layer took. Each staged matrix is counted once, in
+    the branch that writes its stage-table entry with that layout."""
+    n = norm(phase)
+    return (n.count(TRACE_SPLIT_FMT) == 1 and ordered(n, TRACE_SPLIT_FMT, TRACE_SPLIT_ARGS, TRACE_EMIT)
+            and AOS_ONLY_RECORD in body(n, STAGE_SIG) and n.count("++n.soa;") == 1 and n.count("++n.aos_only;") == 1
+            and STAGE_COUNTS_SPLIT in norm(hpp))
+
+
+def test_stage_trace_splits_layouts():
+    assert claim_stage_trace_splits_layouts(PHASE, PLAN_HPP)
+
+
+def test_stage_trace_split_mutants():
+    # The two counts printed under each other's names.
+    assert not claim_stage_trace_splits_layouts(
+        mutate(PHASE, TRACE_SPLIT_ARGS, "n.unowned, n.untyped, n.exhausted, n.aos_only, n.soa);"), PLAN_HPP)
+    # No split in the line.
+    assert not claim_stage_trace_splits_layouts(mutate(PHASE, " soa=%d aos_only=%d", ""), PLAN_HPP)
+    # A staged matrix left uncounted, or counted under the other layout.
+    assert not claim_stage_trace_splits_layouts(mutate(PHASE, "++n.soa;", ""), PLAN_HPP)
+    assert not claim_stage_trace_splits_layouts(mutate(PHASE, "++n.aos_only;", "++n.soa;"), PLAN_HPP)
+    # The counters missing from stage_counts.
+    assert not claim_stage_trace_splits_layouts(PHASE, mutate(PLAN_HPP, "int aos_only = 0;", "int aos = 0;"))
 
 
 if __name__ == "__main__":

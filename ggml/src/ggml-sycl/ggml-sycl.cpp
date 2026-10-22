@@ -32723,9 +32723,13 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 staged.recipe_reason        = "staged-ring";
                 // Served only as a plain MMVQ_COMPAT kernel on the submit queue (c-las5): a library claim, or any
                 // other kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), refuses
-                // it. So does a slice whose resolved layout is not the entry's: a ring slice carries the ring's AOS
-                // tag, so a SOA entry cannot pass the lease checks until a slice can carry its own layout. A refused
-                // entry falls through to the route core, whose HOST answer stands.
+                // it. So does a slot whose resolved layout is not the entry's: the phase acquires each slot with the
+                // layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a wrong entry. A refused
+                // entry falls through to the route core, whose HOST answer stands. 348c can lift the MMVQ_COMPAT-only
+                // refusal for a library (oneDNN) reader by chaining a region's rewrite on that reader's completion:
+                // stage() already makes the rewrite wait for a compute-queue barrier behind every kernel read
+                // submitted before it (moe-stream-plan.cpp), and a library reader needs the same read gate, fed with
+                // its own completion event.
                 moe_batch_reject_reason why = moe_batch_reject_reason::NONE;
                 const bool              served =
                     !stream_library_claimed && cap.supported && cap.kernel == moe_route_kernel::MMVQ_COMPAT &&

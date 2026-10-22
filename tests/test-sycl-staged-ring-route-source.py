@@ -12,6 +12,11 @@ What this gate pins:
     and keyed by the layer and role the phase itself uses (ggml_sycl_moe_stream_layer_of, the plan's role classifier);
   - ruling C (c-3bde): the slot and its layout come from the stage-table entry (`s->layout`), never from the slice's
     tag; the lease is the slot and the ready event is the entry's;
+  - lead ruling c-o9uw-1: the slice's tag agrees with the entry by construction. mem_handle::slice(offset, size,
+    layout) names the layout only on an owned allocation (it refuses before anything else otherwise), the view applies
+    it on every resolve and all four special members carry it; the ring slices each slot with the layout it is
+    acquired for, the phase acquires the AOS slot as AOS and the SOA slot as SOA, and the resolver still refuses a slot
+    whose resolved layout is not the entry's;
   - c-las5 (1): a staged expert is served only as a plain MMVQ_COMPAT kernel on the submit queue. A weight the oneDNN
     batched prompt executor claims, any other kernel, a slice whose resolved layout is not the entry's, or a route
     either validator refuses falls through to the route core; every lookup is counted served or refused;
@@ -79,10 +84,18 @@ def read(rel: str) -> str:
 SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 BATCH_HPP_REL = "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
 PHASE_REL = "ggml/src/ggml-sycl/moe-stream-plan.cpp"
+MEM_HPP_REL = "ggml/src/ggml-sycl/mem-handle.hpp"
+MEM_CPP_REL = "ggml/src/ggml-sycl/mem-handle.cpp"
+RING_HPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.hpp"
+RING_CPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.cpp"
 
 SYCL = read(SYCL_REL)
 BATCH_HPP = read(BATCH_HPP_REL)
 PHASE = read(PHASE_REL)
+MEM_HPP = read(MEM_HPP_REL)
+MEM_CPP = read(MEM_CPP_REL)
+RING_HPP = read(RING_HPP_REL)
+RING_CPP = read(RING_CPP_REL)
 # Every C/C++ source of the SYCL backend outside its tests/, by path from the repository root.
 SYCL_TREE = {
     p.relative_to(ROOT).as_posix(): p.read_text(errors="replace")
@@ -623,6 +636,79 @@ def test_trace_mutants():
     tree = dict(SYCL_TREE)
     tree["extra.cpp"] = '"' + TRACE_FMT + '"'
     assert not claim_trace(PHASE, tree)
+
+
+# ---- lead ruling c-o9uw-1: the slice's tag is the layout ---------------------------------------------------------------
+
+TAGGED_SLICE_DECL = "mem_handle slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const;"
+TAGGED_SLICE_SIG = "mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const"
+OWNER_FIRST = "{ if (!owned_alloc_) { return {}; }"
+TAG_SET = "view_layout_ = layout;"
+VIEW_SIG = "resolved_ptr mem_handle::resolved_view_locked() const"
+VIEW_APPLY = "if (view_layout_) { view.layout = *view_layout_; }"
+SPECIAL_MEMBERS = (
+    ("mem_handle::mem_handle(const mem_handle & other)", ("view_layout_ = other.view_layout_;",)),
+    ("mem_handle::mem_handle(mem_handle && other) noexcept", ("view_layout_ = other.view_layout_;",)),
+    ("mem_handle & mem_handle::operator=(const mem_handle & other)",
+     ("new_view_layout = other.view_layout_;", "view_layout_ = new_view_layout;")),
+    ("mem_handle & mem_handle::operator=(mem_handle && other) noexcept",
+     ("new_view_layout = other.view_layout_;", "view_layout_ = new_view_layout;")),
+)
+RING_ACQUIRE_DECL = "mem_handle acquire_slot(ggml_layout_mode layout);"
+RING_ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout)"
+RING_SLICE = "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);"
+PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
+PHASE_SOA_ACQUIRE = "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_SOA);"
+PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"
+PHASE_SOA_ENTRY = "table_[key] = { soa, aos, reorder, GGML_LAYOUT_SOA };"
+TAG_AGREES = "view.layout == s->layout"
+
+
+def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp: str, phase: str, sycl: str) -> bool:
+    """A ring slot's resolved layout is the layout the phase acquired it for, which is the layout its stage-table entry
+    records: an owned allocation's slice may name its layout (any other handle refuses before deriving anything), the
+    view applies the name on every resolve, every copy and move carries it, the ring slices with it, the phase asks
+    AOS for the AOS slot and SOA for the SOA slot and records those layouts, and the resolver still checks that the
+    two agree before it serves."""
+    mh, mc, rh, rc, ph = norm(mem_hpp), norm(mem_cpp), norm(ring_hpp), norm(ring_cpp), norm(phase)
+    tagged = body(mc, TAGGED_SLICE_SIG)
+    view = body(mc, VIEW_SIG)
+    members_carry = all(all(line in body(mc, sig) for line in lines) for sig, lines in SPECIAL_MEMBERS)
+    return (TAGGED_SLICE_DECL in mh and tagged.startswith(OWNER_FIRST) and TAG_SET in tagged
+            and ordered(view, "if (!view.ptr) { return view; }", VIEW_APPLY, "if (!is_slice_) {")
+            and members_carry
+            and RING_ACQUIRE_DECL in rh and RING_SLICE in body(rc, RING_ACQUIRE_SIG)
+            and ordered(ph, PHASE_AOS_ACQUIRE, PHASE_SOA_ACQUIRE) and PHASE_AOS_ENTRY in ph and PHASE_SOA_ENTRY in ph
+            and TAG_AGREES in build_body(sycl))
+
+
+def test_tag_is_the_layout():
+    assert claim_tag_is_the_layout(MEM_HPP, MEM_CPP, RING_HPP, RING_CPP, PHASE, SYCL)
+
+
+def test_tag_is_the_layout_mutants():
+    args = [MEM_HPP, MEM_CPP, RING_HPP, RING_CPP, PHASE, SYCL]
+
+    def with_(i, old, new):
+        a = list(args)
+        a[i] = mutate(a[i], old, new)
+        return a
+
+    # Any handle may name a layout, a weight lease included.
+    assert not claim_tag_is_the_layout(*with_(1, "if (!owned_alloc_) { return {}; } mem_handle h = slice(", "mem_handle h = slice("))
+    # The name kept but never applied, so a slice resolves with its root's layout.
+    assert not claim_tag_is_the_layout(*with_(1, VIEW_APPLY, ""))
+    # A copy, or a copy assignment, that drops the name.
+    assert not claim_tag_is_the_layout(*with_(1, "view_layout_ = other.view_layout_;", ""))
+    assert not claim_tag_is_the_layout(*with_(1, "view_layout_ = new_view_layout;", ""))
+    # The ring slicing every slot with its root's AOS tag again.
+    assert not claim_tag_is_the_layout(
+        *with_(3, RING_SLICE, "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes);"))
+    # The SOA slot acquired as AOS.
+    assert not claim_tag_is_the_layout(
+        *with_(4, PHASE_SOA_ACQUIRE, "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_AOS);"))
+    # The resolver trusting the entry without checking the slot agrees.
+    assert not claim_tag_is_the_layout(*with_(5, TAG_AGREES + " && ", ""))
 
 
 if __name__ == "__main__":

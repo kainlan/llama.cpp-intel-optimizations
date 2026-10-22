@@ -126,7 +126,7 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) 
     return true;
 }
 
-mem_handle moe_stream_ring::acquire_slot() {
+mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout) {
     if (!base_.valid()) {
         return {};
     }
@@ -138,7 +138,7 @@ mem_handle moe_stream_ring::acquire_slot() {
     // current_region_gate().
     const size_t index = static_cast<size_t>(r.first) + r.next;
     ++r.next;
-    return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes);
+    return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);
 }
 
 sycl::event moe_stream_ring::current_region_gate() const {

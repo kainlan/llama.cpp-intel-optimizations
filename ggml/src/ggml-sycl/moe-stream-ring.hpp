@@ -99,11 +99,13 @@ class moe_stream_ring {
     // bytes.
     bool reserve(int device, const moe_stream_ring_geometry & geo);
 
-    // The next slot of the current region as a slice of the ring's allocation,
-    // or an invalid handle when the ring is not reserved or the region is
-    // exhausted. It never consults an event: the caller orders its copy into the
-    // slot on current_region_gate().
-    mem_handle acquire_slot();
+    // The next slot of the current region as a slice of the ring's allocation
+    // that resolves with `layout`, the layout the caller will write there (lead
+    // ruling c-o9uw-1: the slice's tag is the slot's layout), or an invalid
+    // handle when the ring is not reserved or the region is exhausted. It never
+    // consults an event: the caller orders its copy into the slot on
+    // current_region_gate().
+    mem_handle acquire_slot(ggml_layout_mode layout);
 
     // The event stored by the last epoch_boundary() that left the current
     // region, or a default-constructed (complete) event when it has none. Every

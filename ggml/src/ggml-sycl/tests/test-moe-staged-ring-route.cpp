@@ -14,8 +14,11 @@
 // 2. A decode build (rows == 1) never consults the entry: the route core
 //    answers and the counts do not move.
 // 3. An expert with no entry falls through to the route core, uncounted.
-// 4. An entry the slot cannot carry (layout SOA, while a ring slice is tagged
-//    AOS) is refused, counted, and falls through.
+// 4. Each slot resolves with the layout it was acquired for (lead ruling
+//    c-o9uw-1). A SOA entry over a SOA slot passes the tag check but is refused,
+//    counted, and falls through, because no prompt kernel reads Q4_0 as SOA. An
+//    AOS entry over a SOA-tagged slot, which the capability query alone would
+//    serve, is refused by the tag check and counted.
 // 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.
@@ -170,17 +173,18 @@ int main() {
             std::printf("FAILED: %d case(s)\n", g_failures);
             return 1;
         }
-        mem_handle        slot_a = ring.acquire_slot();
-        mem_handle        slot_s = ring.acquire_slot();
+        mem_handle        slot_a = ring.acquire_slot(GGML_LAYOUT_AOS);
+        mem_handle        slot_s = ring.acquire_slot(GGML_LAYOUT_SOA);
         const sycl::event fill_a = mem_fill_async(slot_a, 0x11, kSlot, q, { ring.current_region_gate() });
         const sycl::event fill_s = mem_fill_async(slot_s, 0x33, kSlot, q, { ring.current_region_gate() });
         ring.epoch_boundary(fill_s);
-        mem_handle        slot_b = ring.acquire_slot();
+        mem_handle        slot_b = ring.acquire_slot(GGML_LAYOUT_AOS);
         const sycl::event fill_b = mem_fill_async(slot_b, 0x22, kSlot, q, { ring.current_region_gate() });
 
         const int32_t prompt_ids[] = { kExpert, kExpert };  // two tokens, one slot each: rows == 2
         const int32_t decode_ids[] = { kExpert };           // one token: rows == 1
         const int32_t miss_ids[]   = { 6, 6 };
+        const int32_t tag_ids[]    = { 7, 7 };
         size_t        served = 0, refused = 0;
 
         // The build results hold slot leases; they all go before the ring is released below.
@@ -215,15 +219,30 @@ int main() {
             counts(backend, &served, &refused);
             CHECK(served == 1 && refused == 0, "a miss is not counted (served %zu, refused %zu)", served, refused);
 
-            // Case 4: a SOA entry, which a ring slice (tagged AOS) cannot carry, is refused and counted.
+            // Case 4: the slots carry the layouts they were acquired for.
+            CHECK(slot_a.resolve(device).layout == GGML_LAYOUT_AOS && slot_s.resolve(device).layout == GGML_LAYOUT_SOA,
+                  "slot A resolves as AOS and slot S as SOA, the layouts they were acquired for");
+            // A SOA entry over the SOA slot: the tags agree, but no prompt kernel reads Q4_0 as SOA.
             CHECK(test_moe_stream_insert_staged(backend, kLayer, 6, role, slot_s, slot_a, fill_s, GGML_LAYOUT_SOA),
                   "a SOA entry goes into the stage table");
             const moe_resolved_batch_result soa =
                 test_moe_staged_ring_build(backend, src0, miss_ids, 2, 1, GGML_LAYOUT_SOA);
             CHECK(!soa && soa.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
-                  "the SOA entry is refused and falls through (reject %s)", moe_batch_reject_reason_name(soa.reject));
+                  "the SOA entry is refused (no Q4_0 SOA prompt kernel) and falls through (reject %s)",
+                  moe_batch_reject_reason_name(soa.reject));
             counts(backend, &served, &refused);
             CHECK(served == 1 && refused == 1, "the refusal is counted (served %zu, refused %zu)", served, refused);
+            // An AOS entry over the SOA-tagged slot: the query would serve Q4_0 as AOS, the tag check refuses it.
+            CHECK(
+                test_moe_stream_insert_staged(backend, kLayer, 7, role, mem_handle(), slot_s, fill_s, GGML_LAYOUT_AOS),
+                "an AOS entry over a SOA-tagged slot goes into the stage table");
+            const moe_resolved_batch_result mistagged =
+                test_moe_staged_ring_build(backend, src0, tag_ids, 2, 1, GGML_LAYOUT_AOS);
+            CHECK(!mistagged && mistagged.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
+                  "an entry whose slot carries another layout is refused and falls through (reject %s)",
+                  moe_batch_reject_reason_name(mistagged.reject));
+            counts(backend, &served, &refused);
+            CHECK(served == 1 && refused == 2, "the tag refusal is counted (served %zu, refused %zu)", served, refused);
 
             // Case 5: the next micro-batch starts with an empty table and reads its own slot.
             CHECK(test_moe_stream_begin_ubatch(backend, 2), "the next micro-batch begins");

@@ -155,9 +155,10 @@ static inline bool moe_stream_layer_fully_staged(const std::vector<moe_stream_it
 
 // One staged matrix: the SOA slot the device route reads, the AOS slot the copy landed in, and the reorder's event,
 // after which `soa` holds the matrix. `layout` is the layout the slot the device route reads really holds (ruling C,
-// c-3bde): a ring slice inherits the ring's AOS tag, so the resolver's STAGED_RING route reads the layout from here,
-// never from the slice. An AOS-only matrix (c-hmey) has no SOA slot: `soa` is empty, `ready` is the copy's event and
-// `layout` is AOS, so the route reads `aos`.
+// c-3bde), and the resolver's STAGED_RING route reads it from here. Each slot is acquired with the layout written
+// there (lead ruling c-o9uw-1), so the slice's own tag agrees, and the route refuses a slot where it does not. An
+// AOS-only matrix (c-hmey) has no SOA slot: `soa` is empty, `ready` is the copy's event and `layout` is AOS, so the
+// route reads `aos`.
 struct moe_stream_staged {
     mem_handle       soa;
     mem_handle       aos;
@@ -629,6 +630,8 @@ class moe_stream_phase {
         int    exhausted = 0;  // matrices skipped: no ring slot
         size_t bytes     = 0;  // AOS bytes copied
         bool   ring_unavailable = false;  // the ring could not be reserved
+        int    soa              = 0;      // matrices staged SOA: two slots, read after the reorder
+        int    aos_only         = 0;      // matrices staged AOS-only: one slot, read in place
     };
 
     void              prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op);
