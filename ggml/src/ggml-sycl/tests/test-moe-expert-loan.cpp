@@ -59,6 +59,11 @@
 //                           the runner's count. Then a full WEIGHT zone answers "WEIGHT zone full" and keeps the last
 //                           triplet (one "refill device 0 refused" WARN), which the next decode boundary re-admits
 //                           once the room is back. The teardown counts read 2/4.
+//   refill_moves_two_triplets_per_call
+//                           A three-triplet loan, then one decode boundary at two per call: both move (2 triplets,
+//                           6 charges of bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
+//                           to a device entry IN_PROGRESS behind its copy, and the third stays lent until the next
+//                           decode boundary re-admits it. The teardown counts read 3/3.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -118,6 +123,7 @@ int main() {
     ok &= run_case("refill_cancelled_by_a_loan", ggml_sycl::test_expert_refill_cancelled_by_a_loan);
     ok &= run_case("refill_runs_once_per_decode_graph", ggml_sycl::test_expert_refill_runs_once_per_decode_graph);
     ok &= run_case("refill_drops_an_unpreparable_triplet", ggml_sycl::test_expert_refill_drops_an_unpreparable_triplet);
+    ok &= run_case("refill_moves_two_triplets_per_call", ggml_sycl::test_expert_refill_moves_two_triplets_per_call);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

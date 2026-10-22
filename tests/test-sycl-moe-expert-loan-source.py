@@ -96,7 +96,10 @@ What this gate pins for it:
     which is told apart from a full zone) is dropped too, not returned BUSY: under the inventory lock, after the
     publication is checked unchanged, and only while it is the ledger's back;
   - each dropped triplet is WARNed once, after the lock is released, on both exits that follow a drop, naming the
-    device, the layer, the expert and the reason; a drop resets the runner's refusal count.
+    device, the layer, the expert and the reason; a drop resets the runner's refusal count;
+  - one call moves every prepared triplet the cursor still holds: the move loop stops only where a triplet did not
+    move, so at more than one per call each moved triplet is counted, its bytes summed, and the next is checked
+    against the ledger's new back.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -1032,6 +1035,23 @@ DECODE_BUMP = "if (cached_is_decode) { sycl_ctx->decode_graph_count.fetch_add(1,
 ONCE_PER_GRAPH = ("if (refilled_at->exchange(decode_graphs, std::memory_order_relaxed) == decode_graphs) { "
                   "*result = ggml_sycl_expert_loan_result{};")
 SKIP_REASON = 'result->reason = "no decode graph since the last refill"; return result->n_remaining; }'
+
+
+MOVE_LOOP_SIG = "for (prepared_triplet & triplet : prepared)"
+LOOP_TAIL = "++lent; freed += refill ? refilled.bytes_readmitted : record.bytes_freed; } if (escaped) { break; } }"
+LOOP_STOPS = ("transient = ledger.refill_armed; break; }", FINAL_POP, "stop = record.reason; break; }",
+              "if (escaped) { break; }")
+
+
+def claim_the_move_loop_moves_every_prepared_triplet(sycl: str) -> bool:
+    """The move loop stops only where a triplet did not move: the cursor no longer holds it at its back (cancelled by a
+    loan, or changed), the cache refuses it (refill or loan), or an exception escaped. After a triplet moves, the
+    loop counts it, sums its bytes and goes on, so a refill of more than one per call checks the next triplet against
+    the back the first one's pop left (llama.cpp-sif1)."""
+    loop = body(body(norm(sycl), TXN_SIG), MOVE_LOOP_SIG)
+    return (loop.count("break;") == len(LOOP_STOPS) and all(loop.count(x) == 1 for x in LOOP_STOPS)
+            and loop.endswith(LOOP_TAIL)
+            and ordered(loop, CANCELLED, REFILL_CALL, FINAL_POP, POP_READMITTED, LOOP_TAIL))
 
 
 def claim_one_decode_graph_admits_one_refill(sycl: str, common: str, sources: list[str]) -> bool:
@@ -2065,6 +2085,21 @@ def test_mutant_drop_warn_filtered_fails():
 def test_mutant_final_refusal_popped_unrecorded_fails():
     mutant = _once(SYCL, FINAL_POP, FINAL_POP.replace("drop_back(stop);", "ledger.triplets.pop_back();"))
     assert not claim_each_dropped_triplet_is_warned(mutant)
+
+
+def test_the_move_loop_moves_every_prepared_triplet():
+    assert claim_the_move_loop_moves_every_prepared_triplet(SYCL)
+
+
+def test_mutant_move_loop_stops_after_one_triplet_fails():
+    """The build the two-triplet device case must catch: the loop stops after the first triplet that moved."""
+    mutant = _once_in(SYCL, TXN_SIG, "++lent;", "++lent; break;")
+    assert not claim_the_move_loop_moves_every_prepared_triplet(mutant)
+
+
+def test_mutant_refill_stops_after_one_readmitted_triplet_fails():
+    mutant = _once_in(SYCL, TXN_SIG, POP_READMITTED, POP_READMITTED + " if (refill) { ++lent; break; }")
+    assert not claim_the_move_loop_moves_every_prepared_triplet(mutant)
 
 
 def test_mutant_refill_at_every_synchronize_fails():

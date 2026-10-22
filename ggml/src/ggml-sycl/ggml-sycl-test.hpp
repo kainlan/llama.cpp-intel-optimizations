@@ -571,11 +571,13 @@ std::string test_expert_loan_refuses_shared_storage();
 std::string test_expert_direct_stage_outside_a_load_copies_through_staging();
 // The refill (llama.cpp-sif1): after the loan, two calls re-admit one triplet each, the bytes and the device's zone
 // room come back and no host entry is left; a loan between two calls cancels the second; two boundaries after one
-// decode graph re-admit once; a lent triplet no boundary could prepare leaves the ledger, and a full zone keeps its.
+// decode graph re-admit once; a lent triplet no boundary could prepare leaves the ledger, and a full zone keeps its;
+// two triplets per call both move, and the third stays lent.
 std::string test_expert_refill_readmits_one_triplet_per_call();
 std::string test_expert_refill_cancelled_by_a_loan();
 std::string test_expert_refill_runs_once_per_decode_graph();
 std::string test_expert_refill_drops_an_unpreparable_triplet();
+std::string test_expert_refill_moves_two_triplets_per_call();
 #endif
 
 }  // namespace ggml_sycl

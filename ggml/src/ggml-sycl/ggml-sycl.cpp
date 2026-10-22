@@ -23039,6 +23039,100 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     return {};
 }
 
+std::string test_expert_refill_moves_two_triplets_per_call() {
+    // Two per call, both moving: after the first pops off the ledger's back, the second is checked against the new back
+    // and moves in the same call, and the call counts both and sums their bytes. The third lent triplet stays in the
+    // ledger, which the next decode graph's boundary shows by re-admitting it (llama.cpp-sif1).
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7369663106ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    if (std::string why = fx.lend(9 * charge, 3, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (lent.size() != 3) {
+        return test_loan_fail("the published plan has %zu lent triplets, not 3", lent.size());
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    const uint64_t                         staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
+    uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &resolver, &result);
+    if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
+        return test_loan_fail("the two-triplet refill took %llu staged host-to-device copies, not the direct DMA",
+                              (unsigned long long) staged);
+    }
+    if (!result.accepted || result.n_triplets != 2 || result.n_dropped != 0 || remaining != 1 ||
+        result.n_remaining != 1 || result.bytes_readmitted != 6 * charge) {
+        return test_loan_fail(
+            "the two-triplet refill re-admitted %u triplets and %zu bytes, dropped %u, with %u remaining (%s), not 2, "
+            "%zu, 0 and 1",
+            result.n_triplets, result.bytes_readmitted, result.n_dropped, remaining, result.reason, 6 * charge);
+    }
+    const std::vector<std::pair<int, int>> on_host = fx.lent_triplets(/*host_expert=*/3);
+    if (on_host.size() != 1 || g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return test_loan_fail(
+            "%zu triplets are on the host and the ledger counts %u after the two-triplet call, not 1, 1",
+            on_host.size(), g_sycl_expert_lent_count[fx.device].load());
+    }
+    const std::pair<int, int>        still = on_host[0];
+    std::vector<std::pair<int, int>> moved;
+    for (const auto & t : lent) {
+        if (t != still) {
+            moved.push_back(t);
+        }
+    }
+    // Right after the call, both re-admitted triplets resolve on the device, each entry still IN_PROGRESS behind its
+    // copy, before anything below waits for a copy or reclaims a host entry.
+    for (const auto & t : moved) {
+        for (int s = 0; s < 3; ++s) {
+            const expert_resolve_result resolved = fx.resolve(t.first, s, t.second);
+            if (!resolved || resolved.location != cache_location::DEVICE || resolved.owning_device != fx.device ||
+                !resolved.has_ready_event) {
+                return test_loan_fail(
+                    "layer %d expert %d slot %d, re-admitted in the two-triplet call, does not resolve to an "
+                    "IN_PROGRESS device entry on device %d behind its copy",
+                    t.first, t.second, s, fx.device);
+            }
+        }
+    }
+    for (const auto & t : moved) {
+        if (std::string why = fx.readmitted(t.first, t.second); !why.empty()) {
+            return "a triplet of the two-triplet call: " + why;
+        }
+    }
+    if (std::string why = fx.still_lent(still.first, still.second); !why.empty()) {
+        return "the triplet the two-triplet call left: " + why;
+    }
+
+    // It is still in the ledger: the next decode graph's boundary re-admits it, and nothing else.
+    remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1 || remaining != 0 || result.bytes_readmitted != 3 * charge) {
+        return test_loan_fail(
+            "the next decode graph's boundary re-admitted %u triplets and %zu bytes with %u remaining (%s), not 1, "
+            "%zu and 0",
+            result.n_triplets, result.bytes_readmitted, remaining, result.reason, 3 * charge);
+    }
+    if (std::string why = fx.readmitted(still.first, still.second); !why.empty()) {
+        return "the triplet the two-triplet call left, re-admitted next: " + why;
+    }
+    if (g_sycl_expert_lent_total[fx.device].load() != 3 || g_sycl_expert_readmitted_total[fx.device].load() != 3) {
+        return test_loan_fail("the teardown counts read %u/%u, not 3/3",
+                              g_sycl_expert_readmitted_total[fx.device].load(),
+                              g_sycl_expert_lent_total[fx.device].load());
+    }
+    return {};
+}
+
 }  // namespace ggml_sycl
 #endif  // GGML_SYCL_PRIVATE_TESTING
 
