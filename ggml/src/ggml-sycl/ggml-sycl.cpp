@@ -37230,15 +37230,6 @@ struct ggml_sycl_scoped_alloc_rollback {
     void release() noexcept { transferred = true; }
 };
 
-// GGML_SYCL_MOE_EXEC_TRACE (llama.cpp-36j0): level 2 runs the load-time host-expert copy probe below.
-static int ggml_sycl_moe_exec_trace_level() {
-    static const int level = [] {
-        const char * env = std::getenv("GGML_SYCL_MOE_EXEC_TRACE");
-        return env != nullptr ? std::atoi(env) : 0;
-    }();
-    return level;
-}
-
 // llama.cpp-36j0 Task 5 spike, opt-in: once per device at load, after S1-PRELOAD registered its host-planned
 // experts, copy one expert's registered handle into a device RUNTIME buffer until at least 64 MiB have moved, and
 // log the rate and whether the copies took mem_copy_submit's direct or staged branch. It is diagnostic only and
@@ -38155,7 +38146,7 @@ static void ggml_sycl_preload_model_weights() {
                                 throw std::runtime_error("SYCL host expert registration failed during preload");
                             }
                             if (!remembered_handle) {
-                                if (ggml_sycl_moe_exec_trace_level() >= 2 && !moe_exec_probe_expert.valid()) {
+                                if (ggml_sycl_moe_exec_config().trace >= 2 && !moe_exec_probe_expert.valid()) {
                                     moe_exec_probe_expert = handle;
                                     moe_exec_probe_bytes  = expert_size;
                                 }
