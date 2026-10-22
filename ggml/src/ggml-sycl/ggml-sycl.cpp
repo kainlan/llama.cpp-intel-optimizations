@@ -29224,12 +29224,17 @@ static void ggml_sycl_moe_exec_log_sink(void *, const char * line) {
 }
 
 // The [MOE-EXEC] once-per-change log of every layer decision in this process (Task 6 calls note()).
+static void ggml_sycl_moe_exec_trace_sink(void *, const char * line) {
+    GGML_LOG_INFO("%s\n", line);
+}
+
 static ggml_sycl::moe_exec_decision_log & ggml_sycl_moe_exec_log() {
-    static ggml_sycl::moe_exec_decision_log log(ggml_sycl_moe_exec_log_sink);
+    static ggml_sycl::moe_exec_decision_log log(ggml_sycl_moe_exec_log_sink, nullptr, ggml_sycl_moe_exec_config().trace,
+                                                ggml_sycl_moe_exec_trace_sink);
     return log;
 }
 
-// The teardown line, once per process: the counters are printed and cleared, so a second backend free adds nothing.
+// The teardown line: the counters are printed and cleared, so the first backend free after the consultation prints it.
 static void ggml_sycl_moe_exec_log_report() {
     ggml_sycl::moe_exec_decision_log & log = ggml_sycl_moe_exec_log();
     if (log.layer_ubatches() == 0) {
@@ -29340,7 +29345,8 @@ static void ggml_check_sycl() try {
 #endif
             // The MoE executor's knobs (llama.cpp-36j0). The names come from moe-exec-policy.hpp so the table and the
             // parser share one spelling. GGML_SYCL_MOE_EXEC is a word, which this integer parse cannot read, so both
-            // destinations are overwritten from ggml_sycl_moe_exec_config() right after the loop.
+            // destinations are overwritten from ggml_sycl_moe_exec_config() right after the loop. The non-default report
+            // therefore prints the policy as its integer (cpu=1, ring=2), because this table parses integers.
             // clang-format off
             { ggml_sycl::MOE_EXEC_ENV_POLICY, &g_ggml_sycl_moe_exec_policy, 0 },
             { ggml_sycl::MOE_EXEC_ENV_TRACE,  &g_ggml_sycl_moe_exec_trace,  0 },

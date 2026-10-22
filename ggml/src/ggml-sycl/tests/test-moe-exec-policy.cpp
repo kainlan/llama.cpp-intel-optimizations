@@ -86,6 +86,12 @@ int main() {
         CHECK(moe_exec_config_parse(fake_getenv).trace == 2, "trace 2");
         g_env["GGML_SYCL_MOE_EXEC_TRACE"] = "junk";
         CHECK(moe_exec_config_parse(fake_getenv).trace == 0, "junk trace is 0");
+        g_env["GGML_SYCL_MOE_EXEC_TRACE"] = "7";
+        CHECK(moe_exec_config_parse(fake_getenv).trace == 2, "trace above 2 clamps to 2");
+        g_env["GGML_SYCL_MOE_EXEC_TRACE"] = "0";
+        CHECK(moe_exec_config_parse(fake_getenv).trace == 0, "trace 0");
+        g_env["GGML_SYCL_MOE_EXEC_TRACE"] = "";
+        CHECK(moe_exec_config_parse(fake_getenv).trace == 0, "empty trace is 0");
         g_env["GGML_SYCL_MOE_EXEC_TRACE"] = "-3";
         CHECK(moe_exec_config_parse(fake_getenv).trace == 0, "negative trace is 0");
     }
@@ -128,6 +134,25 @@ int main() {
         CHECK(count_layer_lines(lines) == 49, "one flip: 49 lines");
         CHECK(lines.back().find("layer 7: cpu") != std::string::npos, "the flip line names the new choice");
         CHECK(log.n_cpu == 1 && log.n_ring == 143, "counters follow the choices");
+    }
+    // log: the trace level adds one INFO-side line per consulted layer-ubatch and leaves the change lines alone
+    for (int level = 0; level <= 1; ++level) {
+        std::vector<std::string> lines;
+        moe_exec_decision_log    log(capture, &lines, level, capture);
+        for (int ub = 0; ub < 3; ++ub) {
+            for (int layer = 0; layer < 48; ++layer) {
+                log.note(0, layer, decision(moe_exec_choice::RING), 0);
+            }
+        }
+        log.note(0, 0, moe_exec_decision(), 0);  // NOT_CONSULTED: no line of either kind
+        size_t n_trace = 0;
+        for (const std::string & l : lines) {
+            n_trace += l.rfind("[MOE-EXEC-TRACE] dev 0 layer ", 0) == 0 ? 1 : 0;
+        }
+        CHECK(count_layer_lines(lines) == 48, "trace level does not change the 48 change lines");
+        CHECK(n_trace == (level == 0 ? 0u : 144u), "trace lines: none at level 0, one per layer-ubatch at level 1");
+        CHECK(level == 0 || lines[0].find("[MOE-EXEC-TRACE] dev 0 layer 0: ring (p=0.75") == 0,
+              "the trace line leads the change line and carries the terms");
     }
     // log: devices keep separate state; forced and streamed bytes are counted; NOT_CONSULTED is ignored
     {

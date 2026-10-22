@@ -8,7 +8,7 @@ satisfy one by accident, and each count is read against a positive control in th
      ggml/src/ggml-sycl/ outside tests/ (the catalog's literal-search command is the oracle); the table and the
      parser both name them through constants, never a second literal, so one fact has one source;
   2. the removed ring_layers knob has no literal and no config field;
-  3. the per-change WARN format and the teardown summary format each appear exactly once;
+  3. the per-change WARN format, the level-1 trace format and the teardown summary format each appear exactly once;
   4. sycl_env_settings[] carries a row for both names, so the non-default report names them;
   5. ggml_sycl_moe_exec_config() is defined once in ggml-sycl.cpp and the backend free path prints the summary;
   6. docs/backend/sycl-env-vars.md has a row for each name.  XFAIL until Task 14 (llama.cpp-36j0) writes the
@@ -47,6 +47,7 @@ def test_ring_layers_knob_is_removed():
 
 def test_log_formats_appear_once():
     assert count_literal("[MOE-EXEC] layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
+    assert count_literal("[MOE-EXEC-TRACE] dev %d layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
     assert count_literal("[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed") == 1
 
 

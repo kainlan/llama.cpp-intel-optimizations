@@ -81,17 +81,24 @@ static inline const char * moe_exec_reason_name(moe_exec_reason r) {
 struct moe_exec_decision_log {
     static constexpr int MAX_LAYERS = 512;  // Qwen3.8 has 48 layers, DeepSeek V4.1 61
 
-    explicit moe_exec_decision_log(void (*s)(void * ctx, const char * line) = nullptr, void * c = nullptr) :
+    explicit moe_exec_decision_log(void (*s)(void * ctx, const char * line)  = nullptr,
+                                   void * c                                  = nullptr,
+                                   int    trace_level                        = 0,
+                                   void (*ts)(void * ctx, const char * line) = nullptr) :
         sink(s),
-        sink_ctx(c) {}
+        sink_ctx(c),
+        trace(trace_level),
+        trace_sink(ts) {}
 
     void (*sink)(void * ctx, const char * line) = nullptr;  // tests capture through ctx; production is GGML_LOG_WARN
-    void *   sink_ctx                           = nullptr;
-    int8_t   last[GGML_SYCL_MAX_DEVICES][MAX_LAYERS] = {};  // 0 = none yet, else moe_exec_choice
-    uint32_t n_ring                                  = 0;
-    uint32_t n_cpu                                   = 0;
-    uint32_t n_forced                                = 0;
-    size_t   bytes_streamed                          = 0;
+    int trace = 0;  // GGML_SYCL_MOE_EXEC_TRACE level: >= 1 prints one line per consulted layer-ubatch
+    void (*trace_sink)(void * ctx, const char * line) = nullptr;  // production is GGML_LOG_INFO: opt-in, -lv 4 or -v
+    void *   sink_ctx                                 = nullptr;
+    int8_t   last[GGML_SYCL_MAX_DEVICES][MAX_LAYERS]  = {};       // 0 = none yet, else moe_exec_choice
+    uint32_t n_ring                                   = 0;
+    uint32_t n_cpu                                    = 0;
+    uint32_t n_forced                                 = 0;
+    size_t   bytes_streamed                           = 0;
 
     // bytes is what this layer-ubatch streams through the ring (0 for a CPU choice).
     void note(int device, int layer, const moe_exec_decision & d, size_t bytes) {
@@ -109,6 +116,14 @@ struct moe_exec_decision_log {
             ++n_cpu;
         }
         n_forced += d.reason == moe_exec_reason::FORCED ? 1 : 0;
+        if (trace >= 1 && trace_sink != nullptr) {
+            char tline[224];
+            std::snprintf(tline, sizeof(tline),
+                          "[MOE-EXEC-TRACE] dev %d layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)", device,
+                          layer, moe_exec_choice_name(d.choice), d.p_touch, d.t_cpu_us, d.t_ring_us,
+                          moe_exec_reason_name(d.reason));
+            trace_sink(sink_ctx, tline);
+        }
         const int8_t now = static_cast<int8_t>(d.choice);
         if (last[device][layer] == now) {
             return;
@@ -123,9 +138,13 @@ struct moe_exec_decision_log {
         }
     }
 
-    uint32_t layer_ubatches() const { return n_ring + n_cpu; }
+    uint32_t layer_ubatches() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return n_ring + n_cpu;
+    }
 
     void summary(char * buf, size_t cap) const {
+        std::lock_guard<std::mutex> lock(mu);
         std::snprintf(buf, cap, "[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed",
                       n_ring, n_cpu, n_forced, bytes_streamed >> 20);
     }
@@ -137,7 +156,7 @@ struct moe_exec_decision_log {
     }
 
   private:
-    std::mutex mu;
+    mutable std::mutex mu;
 };
 
 }  // namespace ggml_sycl
