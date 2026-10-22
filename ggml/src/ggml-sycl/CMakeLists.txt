@@ -2269,7 +2269,7 @@ target_include_directories(test-moe-exec-policy PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
-target_link_libraries(test-moe-exec-policy PRIVATE ggml-base)  # GGML_ASSERT and GGML_LOG_WARN resolve in ggml-base
+target_link_libraries(test-moe-exec-policy PRIVATE ggml-base)  # GGML_ASSERT in the header resolves ggml_abort
 add_test(NAME sycl-moe-exec-policy COMMAND test-moe-exec-policy)
 set_tests_properties(sycl-moe-exec-policy PROPERTIES
     LABELS "sycl;moe;planner;hostonly"

@@ -6,7 +6,9 @@ satisfy one by accident, and each count is read against a positive control in th
 
   1. each getenv literal, "GGML_SYCL_MOE_EXEC" and "GGML_SYCL_MOE_EXEC_TRACE", appears exactly once in
      ggml/src/ggml-sycl/ outside tests/ (the catalog's literal-search command is the oracle); the table and the
-     parser both name them through constants, never a second literal, so one fact has one source;
+     parser both name them through constants, never a second literal, so one fact has one source.  tests/ is
+     excluded because the host test spells the names as literals to drive its fake getenv, which deliberately pins
+     the real names;
   2. the removed ring_layers knob has no literal and no config field;
   3. the per-change WARN format, the level-1 trace format and the teardown summary format each appear exactly once;
   4. sycl_env_settings[] carries a row for both names, so the non-default report names them;
@@ -56,8 +58,11 @@ def test_env_settings_rows():
     m = re.search(r"sycl_env_settings\[\]\s*=\s*\{(.*?)\n        \};", text, re.S)
     assert m, "sycl_env_settings[] not found"
     body = m.group(1)
-    assert "MOE_EXEC_ENV_POLICY" in body
-    assert "MOE_EXEC_ENV_TRACE" in body
+    assert re.search(r"\{\s*ggml_sycl::MOE_EXEC_ENV_POLICY\s*,\s*&g_ggml_sycl_moe_exec_policy", body)
+    assert re.search(r"\{\s*ggml_sycl::MOE_EXEC_ENV_TRACE\s*,\s*&g_ggml_sycl_moe_exec_trace", body)
+    # The table's integer parse cannot read a policy word, so both destinations are overwritten from the config.
+    assert "g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);" in text
+    assert "g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;" in text
 
 
 def test_config_accessor_and_teardown_summary():
@@ -65,7 +70,7 @@ def test_config_accessor_and_teardown_summary():
     assert len(re.findall(r"ggml_sycl_moe_exec_config\(\)\s*\{", text)) == 1
     free = re.search(r"static void ggml_backend_sycl_free\(ggml_backend_t backend\) \{(.*?)\n\}\n", text, re.S)
     assert free, "ggml_backend_sycl_free not found"
-    assert "ggml_sycl_moe_exec_log_report" in free.group(1)
+    assert re.search(r"(?m)^\s*ggml_sycl_moe_exec_log_report\(\);", free.group(1))
 
 
 @pytest.mark.xfail(reason="Task 14 (llama.cpp-36j0) writes the sycl-env-vars.md rows", strict=False)

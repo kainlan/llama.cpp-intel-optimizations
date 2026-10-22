@@ -25,8 +25,7 @@ static constexpr const char * MOE_EXEC_ENV_TRACE  = "GGML_SYCL_MOE_EXEC_TRACE";
 struct moe_exec_config {
     moe_exec_policy policy = moe_exec_policy::AUTO;
     int             trace  = 0;  // 0 off, 1 one INFO line per layer per micro-batch, 2 also the load-time copy probe
-    const char *    bad_policy =
-        nullptr;                 // the rejected GGML_SYCL_MOE_EXEC value (points into the environment), for one WARN
+    char            bad_policy[48] = {};  // the rejected GGML_SYCL_MOE_EXEC value, copied, for one WARN; empty if none
 };
 
 // getenv_fn is injected so a test needs no real environment. The ring has a fixed two regions, so there is no
@@ -40,7 +39,7 @@ static inline moe_exec_config moe_exec_config_parse(moe_exec_getenv_fn getenv_fn
         } else if (std::strcmp(p, "ring") == 0) {
             c.policy = moe_exec_policy::RING;
         } else {
-            c.bad_policy = p;
+            std::snprintf(c.bad_policy, sizeof(c.bad_policy), "%s", p);
         }
     }
     const char * t = getenv_fn ? getenv_fn(MOE_EXEC_ENV_TRACE) : nullptr;
@@ -76,7 +75,7 @@ static inline const char * moe_exec_reason_name(moe_exec_reason r) {
 }
 
 // Remembers each (device, layer)'s last choice and prints a WARN line only when it differs from the previous
-// micro-batch's (the first decision counts as a change), never per op. The counters cover every consulted
+// micro-batch's (the first decision counts as a change, a reason change alone does not print), never per op. The counters cover every consulted
 // layer-ubatch, so the teardown summary is complete whether or not a line printed.
 struct moe_exec_decision_log {
     static constexpr int MAX_LAYERS = 512;  // Qwen3.8 has 48 layers, DeepSeek V4.1 61
@@ -90,15 +89,17 @@ struct moe_exec_decision_log {
         trace(trace_level),
         trace_sink(ts) {}
 
-    void (*sink)(void * ctx, const char * line) = nullptr;  // tests capture through ctx; production is GGML_LOG_WARN
-    int trace = 0;  // GGML_SYCL_MOE_EXEC_TRACE level: >= 1 prints one line per consulted layer-ubatch
-    void (*trace_sink)(void * ctx, const char * line) = nullptr;  // production is GGML_LOG_INFO: opt-in, -lv 4 or -v
-    void *   sink_ctx                                 = nullptr;
-    int8_t   last[GGML_SYCL_MAX_DEVICES][MAX_LAYERS]  = {};       // 0 = none yet, else moe_exec_choice
-    uint32_t n_ring                                   = 0;
-    uint32_t n_cpu                                    = 0;
-    uint32_t n_forced                                 = 0;
-    size_t   bytes_streamed                           = 0;
+    // Set only by the constructor, in this order. sink_ctx is handed to both sinks.
+    void (*sink)(void *       ctx,
+                 const char * line);  // the change line; tests capture through ctx; production is GGML_LOG_WARN
+    void * sink_ctx;
+    int    trace;                     // GGML_SYCL_MOE_EXEC_TRACE level: >= 1 prints one line per consulted layer-ubatch
+    void (*trace_sink)(void * ctx, const char * line);      // production is GGML_LOG_INFO: opt-in, -lv 4 or -v
+    int8_t   last[GGML_SYCL_MAX_DEVICES][MAX_LAYERS] = {};  // 0 = none yet, else moe_exec_choice
+    uint32_t n_ring                                  = 0;
+    uint32_t n_cpu                                   = 0;
+    uint32_t n_forced                                = 0;
+    size_t   bytes_streamed                          = 0;
 
     // bytes is what this layer-ubatch streams through the ring (0 for a CPU choice).
     void note(int device, int layer, const moe_exec_decision & d, size_t bytes) {
@@ -138,21 +139,18 @@ struct moe_exec_decision_log {
         }
     }
 
-    uint32_t layer_ubatches() const {
+    // Formats the teardown line and zeroes the counters under one lock, so a note() cannot be cleared unprinted and
+    // two concurrent frees cannot both print. False (buf untouched) when nothing was consulted.
+    bool take_summary(char * buf, size_t cap) {
         std::lock_guard<std::mutex> lock(mu);
-        return n_ring + n_cpu;
-    }
-
-    void summary(char * buf, size_t cap) const {
-        std::lock_guard<std::mutex> lock(mu);
+        if (n_ring + n_cpu == 0) {
+            return false;
+        }
         std::snprintf(buf, cap, "[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed",
                       n_ring, n_cpu, n_forced, bytes_streamed >> 20);
-    }
-
-    void reset_counters() {
-        std::lock_guard<std::mutex> lock(mu);
         n_ring = n_cpu = n_forced = 0;
         bytes_streamed            = 0;
+        return true;
     }
 
   private:

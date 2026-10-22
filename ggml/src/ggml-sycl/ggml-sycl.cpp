@@ -29210,9 +29210,8 @@ static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {
     static const ggml_sycl::moe_exec_config config = [] {
         ggml_sycl::moe_exec_config c =
             ggml_sycl::moe_exec_config_parse([](const char * name) -> const char * { return std::getenv(name); });
-        if (c.bad_policy != nullptr) {
+        if (c.bad_policy[0] != '\0') {
             GGML_LOG_WARN("[MOE-EXEC] GGML_SYCL_MOE_EXEC=%s is not auto, cpu or ring; using auto\n", c.bad_policy);
-            c.bad_policy = nullptr;  // the environment string is not kept past this line
         }
         return c;
     }();
@@ -29237,14 +29236,10 @@ static ggml_sycl::moe_exec_decision_log & ggml_sycl_moe_exec_log() {
 
 // The teardown line: the counters are printed and cleared, so the first backend free after the consultation prints it.
 static void ggml_sycl_moe_exec_log_report() {
-    ggml_sycl::moe_exec_decision_log & log = ggml_sycl_moe_exec_log();
-    if (log.layer_ubatches() == 0) {
-        return;
-    }
     char line[160];
-    log.summary(line, sizeof(line));
-    GGML_LOG_WARN("%s\n", line);
-    log.reset_counters();
+    if (ggml_sycl_moe_exec_log().take_summary(line, sizeof(line))) {
+        GGML_LOG_WARN("%s\n", line);
+    }
 }
 
 static inline int get_sycl_env(const char * env_name, int default_val) {

@@ -56,7 +56,7 @@ int main() {
         const moe_exec_config c = moe_exec_config_parse(fake_getenv);
         CHECK(c.policy == moe_exec_policy::AUTO, "unset policy is auto");
         CHECK(c.trace == 0, "unset trace is 0");
-        CHECK(c.bad_policy == nullptr, "unset has no bad policy");
+        CHECK(c.bad_policy[0] == '\0', "unset has no bad policy");
     }
     // config: each policy word
     {
@@ -67,7 +67,7 @@ int main() {
         CHECK(moe_exec_config_parse(fake_getenv).policy == moe_exec_policy::RING, "ring parses");
         g_env["GGML_SYCL_MOE_EXEC"] = "auto";
         const moe_exec_config c     = moe_exec_config_parse(fake_getenv);
-        CHECK(c.policy == moe_exec_policy::AUTO && c.bad_policy == nullptr, "auto parses, nothing rejected");
+        CHECK(c.policy == moe_exec_policy::AUTO && c.bad_policy[0] == '\0', "auto parses, nothing rejected");
     }
     // config: a bad word is AUTO and is named once
     {
@@ -75,7 +75,7 @@ int main() {
         g_env["GGML_SYCL_MOE_EXEC"] = "gpu";
         const moe_exec_config c     = moe_exec_config_parse(fake_getenv);
         CHECK(c.policy == moe_exec_policy::AUTO, "bad policy falls back to auto");
-        CHECK(c.bad_policy != nullptr && std::strcmp(c.bad_policy, "gpu") == 0, "bad policy names the value");
+        CHECK(std::strcmp(c.bad_policy, "gpu") == 0, "bad policy names the value");
     }
     // config: trace is an integer level (0 off, 1 trace, 2 probe); junk and negatives are 0
     {
@@ -95,20 +95,10 @@ int main() {
         g_env["GGML_SYCL_MOE_EXEC_TRACE"] = "-3";
         CHECK(moe_exec_config_parse(fake_getenv).trace == 0, "negative trace is 0");
     }
-    // the ring_layers knob is removed: setting it changes nothing
-    {
-        g_env.clear();
-        g_env["GGML_SYCL_MOE_RING_LAYERS"] = "5";
-        const moe_exec_config c            = moe_exec_config_parse(fake_getenv);
-        CHECK(c.policy == moe_exec_policy::AUTO && c.trace == 0, "RING_LAYERS is not read");
-    }
-
     // log: 48 layers x 3 micro-batches, nothing changes after the first -> exactly 48 lines
     {
         std::vector<std::string> lines;
-        moe_exec_decision_log    log;
-        log.sink     = capture;
-        log.sink_ctx = &lines;
+        moe_exec_decision_log    log(capture, &lines);
         for (int ub = 0; ub < 3; ++ub) {
             for (int layer = 0; layer < 48; ++layer) {
                 log.note(0, layer, decision(moe_exec_choice::RING), 1u << 20);
@@ -122,9 +112,7 @@ int main() {
     // log: one layer flips once -> 49 lines (positive control)
     {
         std::vector<std::string> lines;
-        moe_exec_decision_log    log;
-        log.sink     = capture;
-        log.sink_ctx = &lines;
+        moe_exec_decision_log    log(capture, &lines);
         for (int ub = 0; ub < 3; ++ub) {
             for (int layer = 0; layer < 48; ++layer) {
                 const bool flip = layer == 7 && ub == 2;
@@ -136,7 +124,7 @@ int main() {
         CHECK(log.n_cpu == 1 && log.n_ring == 143, "counters follow the choices");
     }
     // log: the trace level adds one INFO-side line per consulted layer-ubatch and leaves the change lines alone
-    for (int level = 0; level <= 1; ++level) {
+    for (int level = 0; level <= 2; ++level) {
         std::vector<std::string> lines;
         moe_exec_decision_log    log(capture, &lines, level, capture);
         for (int ub = 0; ub < 3; ++ub) {
@@ -150,16 +138,22 @@ int main() {
             n_trace += l.rfind("[MOE-EXEC-TRACE] dev 0 layer ", 0) == 0 ? 1 : 0;
         }
         CHECK(count_layer_lines(lines) == 48, "trace level does not change the 48 change lines");
-        CHECK(n_trace == (level == 0 ? 0u : 144u), "trace lines: none at level 0, one per layer-ubatch at level 1");
+        CHECK(n_trace == (level == 0 ? 0u : 144u),
+              "trace lines: none at level 0, one per layer-ubatch at level 1 and 2");
         CHECK(level == 0 || lines[0].find("[MOE-EXEC-TRACE] dev 0 layer 0: ring (p=0.75") == 0,
               "the trace line leads the change line and carries the terms");
+    }
+    // log: a trace level with no trace sink is silent
+    {
+        std::vector<std::string> lines;
+        moe_exec_decision_log    log(capture, &lines, 1, nullptr);
+        log.note(0, 0, decision(moe_exec_choice::RING), 0);
+        CHECK(lines.size() == 1, "trace level without a trace sink prints only the change line");
     }
     // log: devices keep separate state; forced and streamed bytes are counted; NOT_CONSULTED is ignored
     {
         std::vector<std::string> lines;
-        moe_exec_decision_log    log;
-        log.sink     = capture;
-        log.sink_ctx = &lines;
+        moe_exec_decision_log    log(capture, &lines);
         log.note(0, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED), 3ull << 20);
         log.note(1, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED), 5ull << 20);
         log.note(1, 3, moe_exec_decision(), 99);
@@ -167,9 +161,14 @@ int main() {
         CHECK(log.n_forced == 2, "forced counted");
         CHECK(log.bytes_streamed == (8ull << 20), "streamed bytes accumulate for RING only, NOT_CONSULTED ignored");
         char buf[160];
-        log.summary(buf, sizeof(buf));
+        CHECK(log.take_summary(buf, sizeof(buf)), "a consulted log gives a summary");
         CHECK(std::strcmp(buf, "[MOE-EXEC] summary: 2 layer-ubatches ring, 0 cpu, 2 forced, 8 MiB streamed") == 0,
               "summary format");
+        CHECK(!log.take_summary(buf, sizeof(buf)), "a second take gives nothing");
+        log.note(0, 4, decision(moe_exec_choice::CPU), 0);
+        CHECK(log.take_summary(buf, sizeof(buf)) &&
+                  std::strcmp(buf, "[MOE-EXEC] summary: 0 layer-ubatches ring, 1 cpu, 0 forced, 0 MiB streamed") == 0,
+              "a note after a take counts from zero");
     }
 
     std::printf("%d cases, %d failures\n", g_cases, g_failures);
