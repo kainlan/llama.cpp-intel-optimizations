@@ -75,8 +75,8 @@ static inline const char * moe_exec_reason_name(moe_exec_reason r) {
 }
 
 // Remembers each (device, layer)'s last choice and prints a WARN line only when it differs from the previous
-// micro-batch's (the first decision counts as a change, a reason change alone does not print), never per op. The counters cover every consulted
-// layer-ubatch, so the teardown summary is complete whether or not a line printed.
+// micro-batch's (the first decision counts as a change, a reason change alone does not print), never per op. The
+// counters cover every consulted layer-ubatch, so the teardown summary is complete whether or not a line printed.
 struct moe_exec_decision_log {
     static constexpr int MAX_LAYERS = 512;  // Qwen3.8 has 48 layers, DeepSeek V4.1 61
 

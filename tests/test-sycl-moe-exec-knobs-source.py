@@ -32,8 +32,43 @@ def sources():
             yield p
 
 
+def strip_comments(src):
+    """Drop // and /* */ comments, leaving string and char literals intact (a quoted "//" is not a comment)."""
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and src[j] != c:
+                j += 2 if src[j] == "\\" else 1
+            out.append(src[i : j + 1])
+            i = j + 1
+        elif src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def count_in(src, needle):
+    return strip_comments(src).count(needle)
+
+
 def count_literal(text):
-    return sum(p.read_text(errors="replace").count(text) for p in sources())
+    return sum(count_in(p.read_text(errors="replace"), text) for p in sources())
+
+
+def test_count_ignores_comments():
+    lit = '"GGML_SYCL_X"'
+    assert count_in('f(%s); // %s\n/* %s */' % (lit, lit, lit), lit) == 1
+    assert count_in('// %s\n/* %s\n%s */' % (lit, lit, lit), lit) == 0
+    assert count_in('s = "a // b"; g(%s);' % lit, lit) == 1
 
 
 @pytest.mark.parametrize("name", NAMES)
