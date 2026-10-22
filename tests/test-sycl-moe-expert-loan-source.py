@@ -7,18 +7,27 @@ that it cannot see at all.
 A prompt phase lends the device's least popular resident expert triplets to the prefill ring. The transaction
 (ggml_sycl_expert_loan_transaction_run in ggml-sycl.cpp) selects whole triplets from the published plan, mints pinned
 host storage owner-first, and under the inventory mutex has the cache lend each triplet
-(unified_cache::loan_expert_triplet), then flips the plan copy and publishes it once. What this gate pins:
+(unified_cache::loan_expert_triplet), then flips the plan copy and publishes it once. It runs at a graph boundary. What this gate pins (the retire, the boundary and the ready event are lead ruling c-tdra):
   - the loan code never waits and never asks an event's status (rulings A/D, c-3bde and c-fjx1): no .wait(, no
     wait_and_throw(, no get_info<, no event_complete(, and not finalize_retired_entries_locked(, which asks;
-  - the retire is chained after the copies: each D2H copy is submitted on the DMA queue reading the entry's own
-    allocation owner, which mem_copy_async retains until the copy completes, then the host copy is registered behind its
-    copy event, and only then is the device entry retired; its storage goes back through the deferred-free pass, so a
-    retire never frees bytes a copy is still reading;
-  - the retire is exact: it withdraws the device entry and leaves the host entry registered under the same cache id,
-    so the loan never calls the id-wide retire_expert_entry_exact;
-  - g_sycl_graph_compute_mutex is never named in the transaction (its caller holds it);
+  - the device free is gated on the copy event, with no host_task: each D2H copy is submitted on the DMA queue reading
+    the entry's own allocation owner, then each device entry's last write becomes its copy (has_write_event stamped from
+    the copy, and the copy ran behind the fill), so release_entry_allocation_locked queues the free behind the copy;
+    then the transaction takes a lease holding the entry in place, retires it exactly, registers the host copy behind
+    its copy event, and only then drops that lease;
+  - the retire is exact: it withdraws only the device entry's key, and its mirror only while it names that entry, so
+    the loan never calls the id-wide retire_expert_entry_exact;
+  - a host registration the checks could not foresee failing puts every device entry back (un-retired, recounted,
+    its mirror restored) after withdrawing the host copies already published, and what the registration checks
+    itself (the load effect, the plan coherence, a busy host entry) is checked before anything is copied;
+  - g_sycl_graph_compute_mutex is never named in the loan code;
   - lock order: the host storage is minted before g_tensor_inventory_mutex is taken, and the cache is asked to lend
     under it; the cache takes direct_stage_mutex_ and rw_mutex_ together, with std::lock;
+  - the loan runs at the graph boundary, never inside a graph: an in-graph caller records a request with a lock-free
+    compare-and-swap; ggml_backend_sycl_synchronize() runs the pending loan after it clears the graph's compute flag
+    and before the deferred-free pass; the transaction refuses "graph active"; and mul_mat_id names no loan entry;
+  - the CPU expert consumer orders on the host copy's ready event: the planned prompt route carries it into the dispatch
+    entry, and the planner CPU dispatch adds it to the copy events it waits on before building the tasks;
   - the exact-owner check (c-sepd) and the layout check (c-n4gw) refuse before anything is copied;
   - the registration is the typed register_host_expert_owned, carrying the minted owner, never the untyped overload;
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
@@ -122,9 +131,16 @@ def ordered(text: str, *needles: str) -> bool:
 
 LOAN_SIG = "bool unified_cache::loan_expert_triplet("
 EXACT_SIG = "expert_retire_status unified_cache::retire_expert_entry_at_locked("
+RESTORE_SIG = "void unified_cache::restore_expert_entry_at_locked("
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run("
 RESOLVE_SIG = "static bool ggml_sycl_expert_loan_resolve_registered("
 WRAPPER_SIG = "static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction("
+REQUEST_SIG = "static void ggml_sycl_request_expert_loan("
+PENDING_DEVICE_SIG = "static bool ggml_sycl_run_pending_expert_loan_on_device("
+PENDING_SIG = "static void ggml_sycl_run_pending_expert_loan("
+SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend)"
+MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst)"
+DISPATCH_SIG = "auto dispatch_cpu_entries_now = [&](const std::vector<expert_dispatch_entry> & entries)"
 
 
 def loan_bodies(cache: str, sycl: str) -> list[str]:
@@ -132,7 +148,8 @@ def loan_bodies(cache: str, sycl: str) -> list[str]:
     treats as a failure."""
     c = norm(cache)
     s = norm(sycl)
-    return [body(c, LOAN_SIG), body(c, EXACT_SIG), body(s, TXN_SIG), body(s, RESOLVE_SIG), body(s, WRAPPER_SIG)]
+    return [body(c, LOAN_SIG), body(c, EXACT_SIG), body(c, RESTORE_SIG), body(s, TXN_SIG), body(s, RESOLVE_SIG),
+            body(s, WRAPPER_SIG), body(s, REQUEST_SIG), body(s, PENDING_DEVICE_SIG), body(s, PENDING_SIG)]
 
 
 # --- waits and status queries ---------------------------------------------------------------------------------------
@@ -145,29 +162,37 @@ def claim_loan_never_waits(cache: str, sycl: str) -> bool:
     return all(bodies) and not any(token in b for b in bodies for token in FORBIDDEN_WAITS)
 
 
-# --- the retire is chained after the copies -------------------------------------------------------------------------
+# --- the device free is gated on the copy event ---------------------------------------------------------------------
 
 SRC_IS_OWNER = "src_owner[i] = e.direct_alloc_owner;"
 COPY = "out.copy_events[i] = mem_copy_async(members[i].host_owner, src_owner[i], bytes[i], dq, deps[i]);"
 DMA_QUEUE = "sycl::queue & dq = get_dma_queue();"
 DEPS = ("if (e.has_write_event) { deps[i].push_back(e.last_write_event); }",
         "if (e.has_ready_event) { deps[i].push_back(e.ready_event); }")
+STAMP_EVENT = "device_entry[i]->last_write_event = out.copy_events[i];"
+STAMP_FLAG = "device_entry[i]->has_write_event = true;"
+HOLD = 'held[i] = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");'
+DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &released_mirrors[i]);"
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
             "k == 0 ? &out.host_handles[i] : nullptr, m.host_owner, &out.copy_events[i])")
-DEVICE_RETIRE = ("out.retire_status[i] = retire_expert_entry_at_locked(make_direct_stage_key(cache_entry_type::MOE_EXPERT, "
-                 "members[i].key, GGML_LAYOUT_AOS), &released_mirrors[i]);")
+DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
 
 
-def claim_retire_follows_the_copies(cache: str) -> bool:
+def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
     b = body(norm(cache), LOAN_SIG)
-    return (b.count(COPY) == 1 and b.count(DEVICE_RETIRE) == 1 and SRC_IS_OWNER in b and all(d in b for d in DEPS)
-            and ordered(b, SRC_IS_OWNER, DMA_QUEUE, COPY, REGISTER, DEVICE_RETIRE))
+    bodies = loan_bodies(cache, sycl)
+    once = (SRC_IS_OWNER, COPY, STAMP_EVENT, STAMP_FLAG, HOLD, DEVICE_RETIRE, REGISTER)
+    return (all(bodies) and not any("host_task" in x for x in bodies) and all(b.count(x) == 1 for x in once)
+            and all(d in b for d in DEPS) and b.count(DROP_HELD) == 2
+            and ordered(b, SRC_IS_OWNER, DMA_QUEUE, COPY, STAMP_EVENT, STAMP_FLAG, HOLD, DEVICE_RETIRE, REGISTER)
+            and b.find(DROP_HELD) > b.find(REGISTER))
 
 
 # --- the retire is exact --------------------------------------------------------------------------------------------
 
 MIRROR_MATCH = ("if (direct != direct_expert_entries_.end() && direct->second.ptr == it->second.device_ptr && "
                 "direct->second.location == it->second.location && direct->second.layout == it->second.layout) {")
+MIRROR_MOVE = "*released_mirror = std::move(direct->second);"
 EXACT_FIND = "auto it = entries_.find(exact);"
 EXACT_REMAP = "remap_or_erase_id_mapping_locked(exact.id, exact);"
 
@@ -176,8 +201,46 @@ def claim_retire_is_exact(cache: str) -> bool:
     c = norm(cache)
     exact = body(c, EXACT_SIG)
     loan = body(c, LOAN_SIG)
-    return (bool(exact) and bool(loan) and EXACT_FIND in exact and MIRROR_MATCH in exact and EXACT_REMAP in exact
+    return (bool(exact) and bool(loan) and all(x in exact for x in (EXACT_FIND, MIRROR_MATCH, MIRROR_MOVE, EXACT_REMAP))
             and "for (auto & pair : entries_)" not in exact and "retire_expert_entry_exact(" not in loan)
+
+
+# --- a failed host registration puts the device entries back --------------------------------------------------------
+
+UNRETIRE = "it->second.retired = false;"
+COUNT_BACK = "retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);"
+MAPPING_BACK = "id_to_key_.emplace(exact.id, exact);"
+MIRROR_BACK = "direct_expert_entries_.emplace(exact.id, std::move(mirror));"
+HOST_WITHDRAW = ("(void) retire_expert_entry_at_locked({ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 }, "
+                 "&released[r++]);")
+RESTORE_CALL = ("restore_expert_entry_at_locked(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, "
+                "GGML_LAYOUT_AOS), released_mirrors[i]);")
+REGISTRATION_REFUSED = 'out.reason = "host registration failed";'
+
+
+def claim_failed_registration_restores(cache: str) -> bool:
+    c = norm(cache)
+    restore = body(c, RESTORE_SIG)
+    b = body(c, LOAN_SIG)
+    return (bool(restore) and all(x in restore for x in (UNRETIRE, COUNT_BACK, MAPPING_BACK, MIRROR_BACK))
+            and b.count(RESTORE_CALL) == 1 and b.count(HOST_WITHDRAW) == 1
+            and ordered(b, REGISTER, HOST_WITHDRAW, RESTORE_CALL, DROP_HELD, REGISTRATION_REFUSED))
+
+
+# --- what the registration checks is checked before anything is copied ----------------------------------------------
+
+LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
+COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
+             '{ out.reason = "plan not coherent"; return false; }')
+HOST_BUSY = ("if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) "
+             '{ refusal = "host entry busy"; break; }')
+REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
+
+
+def claim_registration_checked_before_the_copies(cache: str) -> bool:
+    b = body(norm(cache), LOAN_SIG)
+    return (all(b.count(x) == 1 for x in (LOAD_EFFECT, COHERENCE, HOST_BUSY, REFUSE_EARLY))
+            and ordered(b, LOAD_EFFECT, COHERENCE, HOST_BUSY, REFUSE_EARLY, COPY))
 
 
 # --- the graph compute mutex ----------------------------------------------------------------------------------------
@@ -201,8 +264,63 @@ def claim_lock_order(cache: str, sycl: str) -> bool:
     txn = body(norm(sycl), TXN_SIG)
     loan = body(norm(cache), LOAN_SIG)
     return (txn.count(INVENTORY_LOCK) == 1 and txn.count(HOST_ALLOC) == 1 and ordered(txn, HOST_ALLOC, INVENTORY_LOCK, LEND)
-            and "g_tensor_inventory_mutex" not in loan and loan.count(CACHE_LOCKS) >= 2
+            and "g_tensor_inventory_mutex" not in loan and loan.count(CACHE_LOCKS) >= 3
             and "std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);" not in loan)
+
+
+# --- the loan runs at the graph boundary ----------------------------------------------------------------------------
+
+REQUEST_SLOTS = "static std::atomic<size_t> g_sycl_expert_loan_requests[GGML_SYCL_MAX_DEVICES];"
+REQUEST_CAS = ("request.compare_exchange_weak(seen, bytes_wanted, std::memory_order_release, "
+               "std::memory_order_relaxed)")
+SET_INACTIVE = "ggml_sycl::unified_cache_set_graph_compute_active(false);"
+RUN_PENDING = "ggml_sycl_run_pending_expert_loan(backend);"
+DEFERRED_FREES = "cache->process_deferred_frees_public();"
+GRAPH_ACTIVE = ('if (ggml_sycl::unified_cache_is_graph_compute_active()) { '
+                'return refuse(ggml_sycl_txn_result::BUSY, "graph active"); }')
+PENDING_SKIP = ("if (request.load(std::memory_order_acquire) == 0 || ggml_sycl::unified_cache_is_graph_compute_active()) "
+                "{ return false; }")
+PENDING_TAKE = "const size_t bytes_wanted = request.exchange(0, std::memory_order_acq_rel);"
+PENDING_RUN = "(void) ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, false, resolver, out);"
+MMID_FORBIDDEN = ("ggml_sycl_expert_loan_transaction_run(", "ggml_sycl_run_expert_loan_transaction(",
+                  "ggml_sycl_run_pending_expert_loan", "loan_expert_triplet(")
+
+
+def claim_request_is_lock_free(sycl: str) -> bool:
+    s = norm(sycl)
+    b = body(s, REQUEST_SIG)
+    return (s.count(REQUEST_SLOTS) == 1 and b.count(REQUEST_CAS) == 1 and "mutex" not in b and "lock(" not in b
+            and "ggml_sycl_expert_loan_transaction_run(" not in b)
+
+
+def claim_loan_runs_at_the_graph_boundary(sycl: str) -> bool:
+    s = norm(sycl)
+    sync = body(s, SYNC_SIG)
+    txn = body(s, TXN_SIG)
+    pending = body(s, PENDING_DEVICE_SIG)
+    mmid = body(s, MMID_SIG)
+    return (bool(mmid) and s.count(RUN_PENDING) == 1 and ordered(sync, SET_INACTIVE, RUN_PENDING, DEFERRED_FREES)
+            and txn.count(GRAPH_ACTIVE) == 1 and ordered(txn, GRAPH_ACTIVE, "registry.acquire_live_update(", INVENTORY_LOCK)
+            and ordered(pending, PENDING_SKIP, PENDING_TAKE, PENDING_RUN)
+            and not any(x in mmid for x in MMID_FORBIDDEN))
+
+
+# --- the CPU expert consumer orders on the host copy's ready event --------------------------------------------------
+
+ROUTE_READY = ("expert_dispatch_entry host_entry = ggml_sycl_make_expert_dispatch_entry(i12, id, i02, "
+               "ggml_sycl::mem_handle::HOST_DEVICE, route.actual_layout, std::move(route.lease), false); "
+               "host_entry.has_ready_event = route.has_ready_event; host_entry.ready_event = route.ready_event; "
+               "cpu_entries.push_back(std::move(host_entry));")
+DISPATCH_READY = "if (entry.has_ready_event) { copy_events.push_back(entry.ready_event); }"
+DISPATCH_WAIT = "sycl::event::wait(copy_events);"
+
+
+def claim_host_consumer_orders_on_the_copy(sycl: str) -> bool:
+    s = norm(sycl)
+    mmid = body(s, MMID_SIG)
+    dispatch = body(mmid, DISPATCH_SIG)
+    return (mmid.count(ROUTE_READY) == 1 and dispatch.count(DISPATCH_READY) == 1
+            and ordered(dispatch, DISPATCH_READY, DISPATCH_WAIT, "cpu_expert_task task;"))
 
 
 # --- the exact-owner and layout checks ------------------------------------------------------------------------------
@@ -212,7 +330,6 @@ OWNER_CHECK = ("if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner
                "md.ptr != e.device_ptr || md.size < e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) "
                '{ refusal = "shared storage"; break; }')
 USE_CHECK = 'if (e.direct_alloc_owner.owner_use_count() != 1) { refusal = "storage still referenced"; break; }'
-REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
 
 
 def claim_owner_checks_refuse_before_copying(cache: str) -> bool:
@@ -286,12 +403,20 @@ def test_loan_never_waits():
     assert claim_loan_never_waits(CACHE, SYCL)
 
 
-def test_retire_follows_the_copies():
-    assert claim_retire_follows_the_copies(CACHE)
+def test_device_free_gated_on_the_copy():
+    assert claim_device_free_gated_on_the_copy(CACHE, SYCL)
 
 
 def test_retire_is_exact():
     assert claim_retire_is_exact(CACHE)
+
+
+def test_failed_registration_restores():
+    assert claim_failed_registration_restores(CACHE)
+
+
+def test_registration_checked_before_the_copies():
+    assert claim_registration_checked_before_the_copies(CACHE)
 
 
 def test_graph_mutex_untouched():
@@ -300,6 +425,18 @@ def test_graph_mutex_untouched():
 
 def test_lock_order():
     assert claim_lock_order(CACHE, SYCL)
+
+
+def test_request_is_lock_free():
+    assert claim_request_is_lock_free(SYCL)
+
+
+def test_loan_runs_at_the_graph_boundary():
+    assert claim_loan_runs_at_the_graph_boundary(SYCL)
+
+
+def test_host_consumer_orders_on_the_copy():
+    assert claim_host_consumer_orders_on_the_copy(SYCL)
 
 
 def test_owner_checks_refuse_before_copying():
@@ -368,47 +505,111 @@ def test_mutant_transaction_waits_fails():
     assert not claim_loan_never_waits(CACHE, _once(SYCL, LEND, "cache->get_queue().wait_and_throw(); " + LEND))
 
 
+def test_mutant_pending_runner_waits_fails():
+    assert not claim_loan_never_waits(CACHE, _once(SYCL, PENDING_TAKE, "cache_queue_wait.wait(); " + PENDING_TAKE))
+
+
+def test_mutant_retire_chained_through_a_host_task_fails():
+    """c-tdra dropped the host_task: a submit can block on its in-flight same-queue dependency (memory fact 8)."""
+    assert not claim_device_free_gated_on_the_copy(
+        _once(CACHE, COPY, COPY + " dq.submit([&](sycl::handler & h) { h.depends_on(out.copy_events[i]); "
+                                  "h.host_task([] {}); });"), SYCL)
+
+
+def test_mutant_device_entry_not_stamped_fails():
+    """Without the stamp the deferred free waits only for the fill: the storage could go back mid-copy."""
+    assert not claim_device_free_gated_on_the_copy(_once(CACHE, STAMP_EVENT, ""), SYCL)
+
+
+def test_mutant_write_flag_not_set_fails():
+    assert not claim_device_free_gated_on_the_copy(_once(CACHE, STAMP_FLAG, ""), SYCL)
+
+
 def test_mutant_retire_before_copy_fails():
     """The device entry retired before its bytes are read out: the copy source could be reclaimed under it."""
     n = _once(CACHE, DEVICE_RETIRE, "")
     n = n.replace(DMA_QUEUE, DEVICE_RETIRE + " " + DMA_QUEUE, 1)
-    assert not claim_retire_follows_the_copies(n)
+    assert not claim_device_free_gated_on_the_copy(n, SYCL)
+
+
+def test_mutant_host_registered_before_the_retire_fails():
+    """c-tdra: the host copy is registered once the device entry is withdrawn, never alongside it."""
+    n = _once(CACHE, DEVICE_RETIRE, "")
+    n = n.replace(REGISTRATION_REFUSED, REGISTRATION_REFUSED + " " + DEVICE_RETIRE, 1)
+    assert not claim_device_free_gated_on_the_copy(n, SYCL)
+
+
+def test_mutant_lease_dropped_before_the_registration_fails():
+    """The held lease dropped early: a registration failure could no longer put the withdrawn entry back."""
+    assert not claim_device_free_gated_on_the_copy(_once(CACHE, HOLD, HOLD + " " + DROP_HELD), SYCL)
 
 
 def test_mutant_copy_source_not_the_owner_fails():
     """A raw-pointer copy handle retains nothing: the deferred free could release the storage mid-copy."""
-    assert not claim_retire_follows_the_copies(
+    assert not claim_device_free_gated_on_the_copy(
         _once(CACHE, SRC_IS_OWNER,
-              "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, GGML_LAYOUT_AOS, cache_device, e.size);"))
+              "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, GGML_LAYOUT_AOS, cache_device, e.size);"),
+        SYCL)
 
 
 def test_mutant_copy_not_behind_the_fill_fails():
-    assert not claim_retire_follows_the_copies(_once(CACHE, DEPS[0], ""))
+    assert not claim_device_free_gated_on_the_copy(_once(CACHE, DEPS[0], ""), SYCL)
 
 
 def test_mutant_host_copy_published_ready_fails():
     """The host entry published READY while its copy is still in flight: a reader could see stale bytes."""
-    assert not claim_retire_follows_the_copies(
-        _once(CACHE, REGISTER, REGISTER.replace(", m.host_owner, &out.copy_events[i])", ", m.host_owner)")))
+    assert not claim_device_free_gated_on_the_copy(
+        _once(CACHE, REGISTER, REGISTER.replace(", m.host_owner, &out.copy_events[i])", ", m.host_owner)")), SYCL)
 
 
 def test_mutant_loan_uses_the_id_wide_retire_fails():
-    """retire_expert_entry_exact sweeps every AOS entry under the id, the host copy the loan just registered too."""
+    """retire_expert_entry_exact sweeps every AOS entry under the id, the host copy under the same id too."""
     assert not claim_retire_is_exact(
         _once(CACHE, DEVICE_RETIRE,
               "out.retire_status[i] = retire_expert_entry_exact(members[i].key, GGML_LAYOUT_AOS, \"loan\");"))
 
 
 def test_mutant_exact_retire_drops_any_mirror_fails():
-    """The mirror erased whatever it names: the host copy's mirror, published under the same id, would go."""
+    """The mirror erased whatever it names: a host copy's mirror published under the same id would go."""
     assert not claim_retire_is_exact(
         _once(CACHE, MIRROR_MATCH, "if (direct != direct_expert_entries_.end()) {"))
+
+
+def test_mutant_registration_failure_leaves_the_entry_retired_fails():
+    """No rollback: the plan still names a device copy nobody can resolve."""
+    assert not claim_failed_registration_restores(_once(CACHE, RESTORE_CALL, ""))
+
+
+def test_mutant_restore_keeps_the_retirement_count_fails():
+    """The count of retired entries left one too high: the deferred-free pass keeps looking for an entry that is live."""
+    assert not claim_failed_registration_restores(_once_in(CACHE, RESTORE_SIG, COUNT_BACK, ""))
+
+
+def test_mutant_registration_failure_keeps_the_host_copies_fails():
+    assert not claim_failed_registration_restores(_once(CACHE, HOST_WITHDRAW, ""))
+
+
+def test_mutant_load_effect_unchecked_fails():
+    assert not claim_registration_checked_before_the_copies(_once(CACHE, LOAD_EFFECT, ""))
+
+
+def test_mutant_coherence_unchecked_fails():
+    assert not claim_registration_checked_before_the_copies(_once(CACHE, COHERENCE, ""))
+
+
+def test_mutant_busy_host_entry_unchecked_fails():
+    assert not claim_registration_checked_before_the_copies(_once(CACHE, HOST_BUSY, ""))
 
 
 def test_mutant_transaction_takes_the_graph_mutex_fails():
     assert not claim_graph_mutex_untouched(
         CACHE, _once_in(SYCL, TXN_SIG, INVENTORY_LOCK,
                         "std::lock_guard<std::mutex> graph(g_sycl_graph_compute_mutex); " + INVENTORY_LOCK))
+
+
+def test_mutant_pending_runner_takes_the_graph_mutex_fails():
+    assert not claim_graph_mutex_untouched(
+        CACHE, _once(SYCL, PENDING_TAKE, "std::lock_guard<std::mutex> graph(g_sycl_graph_compute_mutex); " + PENDING_TAKE))
 
 
 def test_mutant_allocates_under_the_inventory_lock_fails():
@@ -423,13 +624,56 @@ def test_mutant_lends_without_the_inventory_lock_fails():
 
 def test_mutant_cache_takes_rw_mutex_alone_fails():
     """rw_mutex_ alone, not with direct_stage_mutex_ through std::lock: the order direct staging established breaks."""
-    n = norm(CACHE)
-    assert n.count(CACHE_LOCKS) >= 3
-    retire_block = "{ " + CACHE_LOCKS + " for (int i = 0; i < 3; ++i) { out.retire_status[i]"
-    assert n.count(retire_block) == 1
-    n = n.replace(retire_block, "{ std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_); "
-                                "for (int i = 0; i < 3; ++i) { out.retire_status[i]", 1)
+    stamp_block = "{ " + CACHE_LOCKS + " unified_cache_entry * device_entry[3] = { nullptr, nullptr, nullptr };"
+    n = _once(CACHE, stamp_block, "{ std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_); "
+                                  "unified_cache_entry * device_entry[3] = { nullptr, nullptr, nullptr };")
     assert not claim_lock_order(n, SYCL)
+
+
+def test_mutant_request_takes_a_mutex_fails():
+    """An in-graph caller may hold g_sycl_graph_compute_mutex (L2): a request that locks could invert L1 under it."""
+    assert not claim_request_is_lock_free(
+        _once(SYCL, REQUEST_CAS, "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex), " + REQUEST_CAS))
+
+
+def test_mutant_loan_runs_before_the_graph_flag_clears_fails():
+    n = _once_in(SYCL, SYNC_SIG, RUN_PENDING, "")
+    n = _once_in(n, SYNC_SIG, SET_INACTIVE, RUN_PENDING + " " + SET_INACTIVE)
+    assert not claim_loan_runs_at_the_graph_boundary(n)
+
+
+def test_mutant_loan_runs_after_the_deferred_frees_fails():
+    n = _once_in(SYCL, SYNC_SIG, RUN_PENDING, "")
+    n = _once_in(n, SYNC_SIG, DEFERRED_FREES, DEFERRED_FREES + " " + RUN_PENDING)
+    assert not claim_loan_runs_at_the_graph_boundary(n)
+
+
+def test_mutant_transaction_runs_inside_a_graph_fails():
+    assert not claim_loan_runs_at_the_graph_boundary(_once(SYCL, GRAPH_ACTIVE, ""))
+
+
+def test_mutant_pending_runner_ignores_an_active_graph_fails():
+    assert not claim_loan_runs_at_the_graph_boundary(
+        _once(SYCL, PENDING_SKIP, "if (request.load(std::memory_order_acquire) == 0) { return false; }"))
+
+
+def test_mutant_mul_mat_id_runs_the_loan_fails():
+    """Plan Task 11b's call from mul_mat_id's first prompt op is superseded: it would take L1 under L2."""
+    anchor = "auto dispatch_cpu_entries_now = [&]"
+    assert not claim_loan_runs_at_the_graph_boundary(
+        _once_in(SYCL, MMID_SIG, anchor,
+                 "(void) ggml_sycl_run_expert_loan_transaction(nullptr, 1, false, nullptr); " + anchor))
+
+
+def test_mutant_route_drops_the_ready_event_fails():
+    """The planned prompt host route without its ready event: the CPU job could read the host copy before it lands."""
+    assert not claim_host_consumer_orders_on_the_copy(
+        _once(SYCL, ROUTE_READY, ROUTE_READY.replace(
+            "host_entry.has_ready_event = route.has_ready_event; host_entry.ready_event = route.ready_event; ", "")))
+
+
+def test_mutant_dispatch_ignores_the_ready_event_fails():
+    assert not claim_host_consumer_orders_on_the_copy(_once(SYCL, DISPATCH_READY, ""))
 
 
 def test_mutant_bulk_view_lent_fails():

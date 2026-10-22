@@ -2889,8 +2889,8 @@ struct expert_loan_member {
 // What one loan did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
 // loan carries the bytes the plan stops charging the device, a lease on each member's host entry (whose bytes are valid
 // once copy_events[i] completes; the entry carries that event as its ready event) and each device entry's retire
-// status, DEFERRED because the storage goes back to its zone through the next deferred-free pass, after the entry's
-// leases, its fill and the copy are done.
+// status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after the entry's
+// leases are gone and behind the copy, which is the entry's last write.
 struct expert_loan_record {
     bool                 accepted    = false;
     const char *         reason      = "none";
@@ -3626,12 +3626,14 @@ class unified_cache {
 
     // Lend one resident expert triplet to the host (llama.cpp-mwmr). Each member's device entry must own its storage
     // exactly: an AOS entry (c-n4gw) on the device, not retired, whose direct_alloc_owner is its whole allocation and
-    // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. One
-    // member that fails refuses the triplet with a reason and leaves no state behind. Otherwise the three D2H copies
-    // go on the DMA queue, each copy's two owners are retained until it completes, each host copy is registered with
-    // register_host_expert_owned carrying its copy as the ready event, and each device entry is retired exactly: the
-    // host entries under the same ids stay published. Nothing here waits and nothing asks an event's status. The
-    // caller holds the placement transaction's locks, forgets its own record of the device lease, and flips the plan.
+    // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. What
+    // the host registration would refuse for is checked too. One member that fails refuses the triplet with a reason
+    // and leaves no state behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
+    // owners until it completes; each device entry's last write becomes its copy, so its storage is freed behind the
+    // copy; each device entry is retired exactly; then each host copy is registered with register_host_expert_owned
+    // carrying its copy as the ready event. A registration that fails anyway puts the device entries back. Nothing
+    // here waits and nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of
+    // the device lease, and flips the plan.
     bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
 
     // Optional layout copies (unified_cache_entry::optional_layout).
@@ -6280,10 +6282,14 @@ class unified_cache {
                               const sycl::event *   ready_event = nullptr);
 
     // Retire exactly the entry at `exact`, never another entry under the same id. The direct mirror goes only when it
-    // names that entry's storage; its lease moves to *released_mirror, for the caller to drop with no lock held.
-    // Callers hold direct_stage_mutex_ and rw_mutex_.
-    expert_retire_status retire_expert_entry_at_locked(const unified_cache_key &     exact,
-                                                       std::shared_ptr<mem_handle> * released_mirror);
+    // names that entry's storage; it moves to *released_mirror, for the caller to drop with no lock held or to hand
+    // back to restore_expert_entry_at_locked(). Callers hold direct_stage_mutex_ and rw_mutex_.
+    expert_retire_status retire_expert_entry_at_locked(const unified_cache_key & exact, weight_entry * released_mirror);
+
+    // Undo retire_expert_entry_at_locked() for an entry the caller still holds a lease on: live again, counted out of
+    // the retired entries, mapped by its id unless another entry is, and its mirror back unless another one is
+    // published. Callers hold direct_stage_mutex_ and rw_mutex_; a mirror not taken stays with the caller.
+    void restore_expert_entry_at_locked(const unified_cache_key & exact, weight_entry & mirror);
 
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };

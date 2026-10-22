@@ -7,15 +7,19 @@
 // begin_planned_materialization + direct_stage_expert (the bulk case through the tensor-bulk stager) inside the
 // backend, where the file-static transaction lives, and report here:
 //
-//   lends_two_triplets      2 layers x 4 experts, expert 3 on the host: two triplets are lent, the plan shows them on
-//                           the host, resolve_expert finds host-pinned copies equal to the originals, the device
-//                           entries are gone within 2 s and the device gets their storage back.
-//   probe_changes_nothing   the same plan probed: the selection is reported and nothing is copied or published.
+//   lends_two_triplets      2 layers x 4 experts, expert 3 on the host: three requests leave the largest pending,
+//                           the graph-boundary runner lends two triplets and clears it, the plan shows them on the
+//                           host, resolve_expert finds host-pinned copies equal to the originals, the device entries
+//                           are gone within 2 s and the device gets their storage back.
+//   probe_changes_nothing   c-tdra first: inside a graph the transaction refuses "graph active" and a request waits.
+//                           Then the same plan probed: the selection is reported and nothing is copied or published.
 //   refuses_shared_storage  c-sepd: a bulk-staged pair with expert 1 flipped to the host is refused with "shared
 //                           storage"; nothing is copied or published.
 //
 // The ctest registration sets GGML_SYCL_STRICT_LEASES=1, so an ownerless lease anywhere in the loan aborts the run.
-// The shared-storage case reserves a WEIGHT arena; it runs last so the others stage raw device allocations.
+// Each case puts back the plan publication it found, so the next one stages under the same coherence. A setup
+// failure names the cache's reason. The shared-storage case reserves a WEIGHT arena; it runs last so the others
+// stage raw device allocations.
 //
 // MIT license
 // SPDX-License-Identifier: MIT

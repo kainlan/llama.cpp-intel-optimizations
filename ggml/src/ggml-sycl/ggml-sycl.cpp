@@ -20726,10 +20726,16 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // to the host and is published once, so each lent expert executes where it now lives. File-static: its callers, the
 // auto-ubatch fit term (probe mode) and the ring's admission in mul_mat_id, are in this file, after it.
 //
-// Locking: the caller may hold g_sycl_graph_compute_mutex (mul_mat_id's first prompt op does), which this never takes.
-// It takes g_tensor_inventory_mutex, and under it the cache takes rw_mutex_, the order the runtime context transaction
-// keeps. The host storage is minted and the tensors are looked up before the inventory lock, so no allocation runs
-// under it, and every WARN is emitted after it is released.
+// Where it runs (c-tdra): at a graph boundary, never inside a graph. The ring's admission runs inside one, holding
+// g_sycl_graph_compute_mutex (L2), and the inventory mutex (L1) ranks below it (canonical contract section 12.5), so it
+// only records a request (ggml_sycl_request_expert_loan, lock-free); ggml_backend_sycl_synchronize() runs the pending
+// loan after it clears the graph's compute flag. The first prompt graph after a request runs without the lent bytes,
+// and the next one has them. A direct call while a graph computes is refused "graph active".
+//
+// Locking: g_tensor_inventory_mutex first, and under it the cache takes direct_stage_mutex_ and rw_mutex_, the order
+// the runtime context transaction keeps; g_sycl_graph_compute_mutex never. The host storage is minted and the tensors
+// are looked up before the inventory lock, so no allocation runs under it, and every WARN is emitted after it is
+// released.
 // ---------------------------------------------------------------------------------------------------------------------
 
 static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size);
@@ -20818,6 +20824,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (!cache || bytes_wanted == 0) {
         return refuse(ggml_sycl_txn_result::REFUSED, "invalid arguments");
+    }
+    // Inside a graph the plan and the cache's entries belong to it: an in-graph caller records a request instead.
+    if (ggml_sycl::unified_cache_is_graph_compute_active()) {
+        return refuse(ggml_sycl_txn_result::BUSY, "graph active");
     }
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
@@ -20978,8 +20988,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 }
 
 // Lend resident expert triplets worth at least bytes_wanted of VRAM on the backend's device to the prefill ring, or,
-// in probe mode, say what a loan would lend while copying and publishing nothing. Unused until its callers land
-// (the fit term and the ring's admission, plan Tasks 12 and 13).
+// in probe mode, say what a loan would lend while copying and publishing nothing. The direct entry, for a caller
+// outside any graph; refused "graph active" inside one. Unused until its caller lands (the fit term, plan Task 12).
 [[maybe_unused]] static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction(ggml_backend_t backend,
                                                                                    size_t         bytes_wanted,
                                                                                    bool           probe_mode,
@@ -20993,6 +21003,53 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
         return ggml_sycl_txn_result::REFUSED;
     }
     return ggml_sycl_expert_loan_transaction_run(ctx->device, bytes_wanted, probe_mode, nullptr, out);
+}
+
+// Per device, the most bytes any in-graph caller asked to borrow since the last graph boundary; 0 when none did.
+static std::atomic<size_t> g_sycl_expert_loan_requests[GGML_SYCL_MAX_DEVICES];
+
+// Ask for a loan from inside a graph: record the request for the device's next graph boundary. Lock-free, because the
+// caller may hold g_sycl_graph_compute_mutex; the largest request since the last boundary wins. Unused until its
+// caller lands (the ring's admission when a reserve falls short, plan Tasks 7b and 12).
+[[maybe_unused]] static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes_wanted == 0) {
+        return;
+    }
+    std::atomic<size_t> & request = g_sycl_expert_loan_requests[device];
+    size_t                seen    = request.load(std::memory_order_relaxed);
+    while (seen < bytes_wanted &&
+           !request.compare_exchange_weak(seen, bytes_wanted, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+}
+
+// Run the loan requested on the device since the last boundary, and clear the request. False when nothing ran: no
+// request, or a graph is still computing (the flag is process-wide), in which case the request waits for a later
+// boundary. The transaction emits the loan's WARN, or its refusal's. `resolver` is null in production.
+static bool ggml_sycl_run_pending_expert_loan_on_device(int                                    device,
+                                                        const ggml_sycl_expert_loan_resolver * resolver,
+                                                        ggml_sycl_expert_loan_result *         out) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    std::atomic<size_t> & request = g_sycl_expert_loan_requests[device];
+    if (request.load(std::memory_order_acquire) == 0 || ggml_sycl::unified_cache_is_graph_compute_active()) {
+        return false;
+    }
+    const size_t bytes_wanted = request.exchange(0, std::memory_order_acq_rel);
+    if (bytes_wanted == 0) {
+        return false;
+    }
+    (void) ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/false, resolver, out);
+    return true;
+}
+
+// The graph boundary's half of a request: ggml_backend_sycl_synchronize() calls this once the graph's work is done
+// and its compute flag is cleared, before the deferred-free pass.
+static void ggml_sycl_run_pending_expert_loan(ggml_backend_t backend) {
+    const auto * ctx = backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr;
+    if (ctx) {
+        (void) ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, nullptr);
+    }
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -21014,6 +21071,24 @@ std::string test_loan_fail(const char * fmt, ...) {
     return message;
 }
 
+// Why the cache refused a direct stage. Its result carries no reason, so this reads what direct staging checks, in its
+// order: a load bound to this thread, the plan coherence, a fill that threw, and otherwise the WEIGHT zone's room.
+std::string test_loan_stage_refusal(const unified_cache * cache, const direct_stage_result & stage) {
+    if (lifecycle::global_registry().bound_candidate().value != 0) {
+        return "a model load is bound to this thread";
+    }
+    if (cache_placement_coherence(cache).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return "the published plan is not the cache's (placement coherence TRANSIENT_MISMATCH)";
+    }
+    if (stage.fill_failed) {
+        return "the submitted fill threw";
+    }
+    return test_loan_fail("no storage (WEIGHT zone %zu MiB available, %zu MiB largest free, %zu plan entries)",
+                          cache->zone_available(vram_zone_id::WEIGHT) >> 20,
+                          cache->zone_largest_free(vram_zone_id::WEIGHT) >> 20,
+                          coherent_cache_placement_plan_owner(cache)->entries.size());
+}
+
 // n_layers x (gate, up, down) tensors of n_experts 1 MiB experts each, under cache ids no model registered.
 struct test_loan_fixture {
     int                                                 device    = 0;
@@ -21025,10 +21100,12 @@ struct test_loan_fixture {
     std::vector<std::unique_ptr<ggml_tensor_extra_gpu>> extras;  // [layer * 3 + slot]
     std::vector<ggml_sycl_cache_id>                     keys;    // [(layer * 3 + slot) * n_experts + expert]
     std::vector<std::vector<uint8_t>>                   bytes;   // the same index: each expert's original contents
+    std::shared_ptr<const lifecycle_plan_snapshot>      found;   // the publication the case started under
 
     test_loan_fixture(int layers, int experts, uint64_t model_id) : n_layers(layers), n_experts(experts) {
         cache = get_unified_cache_for_device(device);
         queue = &ggml_sycl_get_device(device).default_queue();
+        found = ::ggml_sycl_global_plan_snapshot();
 
         for (int l = 0; l < layers; ++l) {
             for (int s = 0; s < 3; ++s) {
@@ -21059,7 +21136,8 @@ struct test_loan_fixture {
         }
     }
 
-    // Retire every entry the case left (device and host), drop the extras' records, reclaim, and leave an empty plan.
+    // Retire every entry the case left (device and host), drop the extras' records, reclaim, and put back the
+    // publication the case found.
     ~test_loan_fixture() {
         if (!cache) {
             return;
@@ -21076,7 +21154,13 @@ struct test_loan_fixture {
         queue->wait();
         (void) drain_retained_handles(true, 5000);
         cache->process_deferred_frees_public();
-        ::ggml_sycl_publish_test_plan(placement_plan{});
+        // Not an empty plan: one uses no device, so it leaves every cache's snapshot null under a non-null authority,
+        // which reads as TRANSIENT_MISMATCH and refuses every later direct stage.
+        {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            ::ggml_sycl_publish_plan_locked(found);
+        }
+        g_sycl_expert_loan_requests[device].store(0, std::memory_order_release);
     }
 
     size_t index(int layer, int slot, int expert) const {
@@ -21110,7 +21194,8 @@ struct test_loan_fixture {
                                                                 test_loan_expert_bytes(), GGML_LAYOUT_AOS, nullptr,
                                                                 nullptr, queue, &lease);
                         if (!stage.ok || !stage.ptr) {
-                            return test_loan_fail("direct_stage_expert refused layer %d slot %d expert %d", l, s, e);
+                            return test_loan_fail("direct_stage_expert refused layer %d slot %d expert %d: %s", l, s, e,
+                                                  test_loan_stage_refusal(cache, stage).c_str());
                         }
                         if (!extras[l * 3 + s]->remember_moe_storage_handle(
                                 e, GGML_LAYOUT_AOS, std::move(lease), &stage.event, 0, test_loan_expert_bytes())) {
@@ -21149,8 +21234,13 @@ struct test_loan_fixture {
                     auto stage = unified_cache_direct_stage_expert_tensor(
                         device, tensor_keys, source.data(), source.size(), test_loan_expert_bytes(), GGML_LAYOUT_AOS,
                         nullptr, nullptr, queue, &leases);
-                    if (!stage.ok || leases.size() != static_cast<size_t>(n_experts)) {
-                        return test_loan_fail("bulk staging refused layer %d slot %d", l, s);
+                    if (!stage.ok) {
+                        return test_loan_fail("bulk staging refused layer %d slot %d: %s", l, s,
+                                              test_loan_stage_refusal(cache, stage).c_str());
+                    }
+                    if (leases.size() != static_cast<size_t>(n_experts)) {
+                        return test_loan_fail("bulk staging returned %zu leases for layer %d slot %d, not %d",
+                                              leases.size(), l, s, n_experts);
                     }
                     for (int e = 0; e < n_experts; ++e) {
                         if (!extras[l * 3 + s]->remember_moe_storage_handle(
@@ -21248,12 +21338,25 @@ std::string test_expert_loan_lends_two_triplets() {
     const auto   before    = fx.sample();
     const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
 
+    // c-tdra: an in-graph caller records a request and the graph boundary runs it. The largest request wins.
+    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
+    ::ggml_sycl_request_expert_loan(fx.device, 6 * charge);
+    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
+    const size_t pending = g_sycl_expert_loan_requests[fx.device].load();
+    if (pending != 6 * charge) {
+        return test_loan_fail("the pending request is %zu bytes, not the largest asked, %zu", pending, 6 * charge);
+    }
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
-    const ::ggml_sycl_txn_result           code =
-        ::ggml_sycl_expert_loan_transaction_run(fx.device, 6 * charge, /*probe_mode=*/false, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted) {
+    if (!::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, &result)) {
+        return "the graph boundary ran no loan for the pending request";
+    }
+    if (!result.accepted) {
         return test_loan_fail("the loan was refused: %s", result.reason);
+    }
+    if (g_sycl_expert_loan_requests[fx.device].load() != 0 ||
+        ::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, nullptr)) {
+        return "the loan that ran the request did not clear it";
     }
     if (result.n_triplets != 2 || result.bytes_freed != 6 * charge) {
         return test_loan_fail("the loan lent %u triplets and %zu bytes, not 2 and %zu", result.n_triplets,
@@ -21353,8 +21456,37 @@ std::string test_expert_loan_probe_changes_nothing() {
     const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
-    ::ggml_sycl_expert_loan_result         result;
-    const ::ggml_sycl_txn_result           code =
+
+    // c-tdra: inside a graph the transaction refuses, probing or lending, and a request waits for the boundary.
+    {
+        struct graph_compute_scope {
+            graph_compute_scope() { unified_cache_set_graph_compute_active(true); }
+
+            ~graph_compute_scope() { unified_cache_set_graph_compute_active(false); }
+        } graph;
+
+        for (const bool probe : { true, false }) {
+            ::ggml_sycl_expert_loan_result inside;
+            const ::ggml_sycl_txn_result   code =
+                ::ggml_sycl_expert_loan_transaction_run(fx.device, 6 * charge, probe, &resolver, &inside);
+            if (code != ::ggml_sycl_txn_result::BUSY || inside.accepted || std::strcmp(inside.reason, "graph active")) {
+                return test_loan_fail("inside a graph the %s answered code=%d accepted=%d (%s), not \"graph active\"",
+                                      probe ? "probe" : "loan", (int) code, (int) inside.accepted, inside.reason);
+            }
+        }
+        ::ggml_sycl_request_expert_loan(fx.device, 6 * charge);
+        if (::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, nullptr) ||
+            g_sycl_expert_loan_requests[fx.device].load() != 6 * charge) {
+            return "inside a graph the boundary runner ran the request or dropped it";
+        }
+        g_sycl_expert_loan_requests[fx.device].store(0);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "a refused loan inside a graph published a plan";
+    }
+
+    ::ggml_sycl_expert_loan_result result;
+    const ::ggml_sycl_txn_result   code =
         ::ggml_sycl_expert_loan_transaction_run(fx.device, 6 * charge, /*probe_mode=*/true, &resolver, &result);
     if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_triplets != 2 ||
         result.bytes_freed != 6 * charge) {
@@ -84715,6 +84847,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
                 for (size_t ci = 0; ci < n_cpu; ++ci) {
                     const auto & entry = entries[ci];
+                    // A host copy still landing (a lent expert's, llama.cpp-mwmr) joins the copies waited on below.
+                    if (entry.has_ready_event) {
+                        copy_events.push_back(entry.ready_event);
+                    }
                     if (!shared_activation) {
                         const int64_t i11     = entry.id % ne11;
                         const int64_t i12     = entry.iid1;
@@ -85127,9 +85263,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                             src0 && src0->name ? src0->name : "?", i02,
                                             ggml_sycl_layout_mode_name(route.actual_layout));
                                     }
-                                    cpu_entries.push_back(ggml_sycl_make_expert_dispatch_entry(
+                                    // A lent expert's host copy is published behind its D2H copy: the CPU job
+                                    // reads it only once that lands (llama.cpp-mwmr, c-tdra).
+                                    expert_dispatch_entry host_entry = ggml_sycl_make_expert_dispatch_entry(
                                         i12, id, i02, ggml_sycl::mem_handle::HOST_DEVICE, route.actual_layout,
-                                        std::move(route.lease), /*allow_cpu_fallback=*/false));
+                                        std::move(route.lease), /*allow_cpu_fallback=*/false);
+                                    host_entry.has_ready_event = route.has_ready_event;
+                                    host_entry.ready_event     = route.ready_event;
+                                    cpu_entries.push_back(std::move(host_entry));
                                     continue;
                                 } else {
                                     if (ggml_sycl_moe_route_is_layout_miss(route)) {
@@ -91919,6 +92060,8 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         sycl_ctx->has_pending_barrier              = false;
         sycl_ctx->barrier_event.reset();
         ggml_sycl::unified_cache_set_graph_compute_active(false);
+        // A loan an in-graph caller requested runs here, at the graph boundary (llama.cpp-mwmr, c-tdra).
+        ggml_sycl_run_pending_expert_loan(backend);
         {
             auto * cache = ggml_sycl::get_unified_cache_for_device(sycl_ctx->device);
             if (cache && cache->has_pending_deferred_frees()) {
