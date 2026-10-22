@@ -268,12 +268,13 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
 
     // The release is NOT sequenced behind the main thread: this thread releases
     // on a timer. A host_task submission can block on an in-flight dependency
-    // (here the gated fill on the same in-order queue), so a release placed on
-    // the submitting thread after that submit waits on itself. Measured on the
-    // B50 on 2026-10-21: in 1 of 3 runs the submit returned 1.8 ms after the
-    // release fired, and that path is the 30 s stall (then the SYCL watchdog)
-    // seen before this thread existed. done.wait() returning after every
-    // release excludes a runtime deadlock.
+    // (presumably the gated fill on the same in-order queue), so a release
+    // placed on the submitting thread after that submit would wait on itself.
+    // Measured on the B50 on 2026-10-21: in 1 of 3 runs the submit returned
+    // 1.8 ms after the release fired. That is consistent with the 30 s stall
+    // (then the SYCL watchdog) seen before this thread existed, which was not
+    // reproduced with stamps. done.wait() returned after every release in all
+    // 3 runs, which argues against a runtime deadlock.
     //
     // The INFO lines below are stamped by this process, in microseconds since
     // the case began, and flushed as they print. A submit stamp later than the
