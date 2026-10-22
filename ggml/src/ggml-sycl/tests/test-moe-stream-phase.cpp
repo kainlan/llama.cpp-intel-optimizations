@@ -718,39 +718,47 @@ int main() {
 
     // ---- the regions' last uses: what stage() refills, layer_done() gates and reset_regions() forgets ----
     {
-        ggml_sycl::moe_stream_region_reads<int> rr;
-        CHECK(rr.layer[0] == -1 && rr.layer[1] == -1 && !rr.aos_only[0] && !rr.aos_only[1]);
-        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
+        // The struct is inline and every input below is a constant, so at -O3 the compiler would prove each check true
+        // and drop it: a check that cannot fail proves nothing. Every use goes through a fresh read of a volatile
+        // pointer instead, so no store before one read is known at the next, and each check runs (its text is in the
+        // binary).
+        ggml_sycl::moe_stream_region_reads<int> reads;
+        ggml_sycl::moe_stream_region_reads<int> * volatile reads_at = &reads;
+        const auto rr = [&]() -> ggml_sycl::moe_stream_region_reads<int> & {
+            return *reads_at;
+        };
+        CHECK(rr().layer[0] == -1 && rr().layer[1] == -1 && !rr().aos_only[0] && !rr().aos_only[1]);
+        CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
         // stage(): region 0 now holds layer 3 and left an AOS-only slot; no read gate until layer 3's readers are done.
-        rr.refill(0, 3, true);
-        CHECK(rr.layer[0] == 3 && rr.aos_only[0] && !rr.read_gate[0]);
-        CHECK(rr.layer[1] == -1 && !rr.aos_only[1] && !rr.read_gate[1]);
+        rr().refill(0, 3, true);
+        CHECK(rr().layer[0] == 3 && rr().aos_only[0] && !rr().read_gate[0]);
+        CHECK(rr().layer[1] == -1 && !rr().aos_only[1] && !rr().read_gate[1]);
         // The down op of layer 4 gates no region: the region holding layer 3 waits for layer 3's own readers (the gate
         // that layer_done closes the open region on belongs to the region holding the next layer).
-        rr.layer_done(4, 40);
-        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
-        rr.layer_done(3, 30);
-        CHECK(rr.read_gate[0] && *rr.read_gate[0] == 30 && !rr.read_gate[1]);
+        rr().layer_done(4, 40);
+        CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
+        rr().layer_done(3, 30);
+        CHECK(rr().read_gate[0] && *rr().read_gate[0] == 30 && !rr().read_gate[1]);
         // Region 1 holds layer 4, with SOA slots only, and takes layer 4's gate; region 0 keeps its own.
-        rr.refill(1, 4, false);
-        CHECK(rr.layer[1] == 4 && !rr.aos_only[1] && !rr.read_gate[1]);
-        rr.layer_done(4, 41);
-        CHECK(rr.read_gate[1] && *rr.read_gate[1] == 41 && rr.read_gate[0] && *rr.read_gate[0] == 30);
+        rr().refill(1, 4, false);
+        CHECK(rr().layer[1] == 4 && !rr().aos_only[1] && !rr().read_gate[1]);
+        rr().layer_done(4, 41);
+        CHECK(rr().read_gate[1] && *rr().read_gate[1] == 41 && rr().read_gate[0] && *rr().read_gate[0] == 30);
         // Refilled, region 0 holds layer 5 and forgets layer 3's gate and its AOS-only slot.
-        rr.refill(0, 5, false);
-        CHECK(rr.layer[0] == 5 && !rr.aos_only[0] && !rr.read_gate[0]);
-        CHECK(rr.read_gate[1] && *rr.read_gate[1] == 41);
+        rr().refill(0, 5, false);
+        CHECK(rr().layer[0] == 5 && !rr().aos_only[0] && !rr().read_gate[0]);
+        CHECK(rr().read_gate[1] && *rr().read_gate[1] == 41);
         // A late down op of a layer no region holds any more records nothing.
-        rr.layer_done(3, 31);
-        CHECK(!rr.read_gate[0] && rr.read_gate[1] && *rr.read_gate[1] == 41);
+        rr().layer_done(3, 31);
+        CHECK(!rr().read_gate[0] && rr().read_gate[1] && *rr().read_gate[1] == 41);
         // reset_regions(), for a new ring or a torn-down one: no layer, no AOS-only slot, no read gate in either
         // region, so a later layer_done of a layer the old ring held gates nothing.
-        rr.refill(0, 6, true);
-        rr.reset();
-        CHECK(rr.layer[0] == -1 && rr.layer[1] == -1 && !rr.aos_only[0] && !rr.aos_only[1]);
-        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
-        rr.layer_done(4, 42);
-        CHECK(!rr.read_gate[0] && !rr.read_gate[1]);
+        rr().refill(0, 6, true);
+        rr().reset();
+        CHECK(rr().layer[0] == -1 && rr().layer[1] == -1 && !rr().aos_only[0] && !rr().aos_only[1]);
+        CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
+        rr().layer_done(4, 42);
+        CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
     }
 
     if (failures) {
