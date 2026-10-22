@@ -809,7 +809,8 @@ def test_mutant_iteration_rate_not_kept_per_slot_fails():
 
 def test_mutant_probe_persists_a_mean_fails():
     assert not claim_the_rate_is_the_max_over_iterations_two_to_eight(
-        _once(SYCL, "const double gbps = " + HELPER_CALL + ";", "const double gbps = (iter_gbps[1] + iter_gbps[2]) / 2;"),
+        _once(SYCL, "const double gbps = " + HELPER_CALL + ";",
+              "const double gbps = (iter_gbps[1] + iter_gbps[2]) / 2;"),
         COST)
 
 
@@ -824,7 +825,8 @@ def test_mutant_helper_keeps_the_min_fails():
 
 
 def test_mutant_spread_dropped_from_the_probed_line_fails():
-    assert not claim_the_spread_rides_in_the_probed_line_only(_once(SYCL, MEASURED_REPORT, MEASURED_REPORT.replace(", spread)", ")")))
+    no_spread = MEASURED_REPORT.replace(", spread)", ")")
+    assert not claim_the_spread_rides_in_the_probed_line_only(_once(SYCL, MEASURED_REPORT, no_spread))
 
 
 def test_mutant_spread_on_another_outcome_fails():
