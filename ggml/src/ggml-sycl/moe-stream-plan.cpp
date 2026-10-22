@@ -35,6 +35,9 @@ moe_stream_phase::~moe_stream_phase() {
 }
 
 void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {
+    // A reserve refused in the last graph is tried once more in this one: an expert loan runs at the graph boundary
+    // (ruling c-tdra, llama.cpp-mwmr), so the WEIGHT zone may have room now (lead ruling c-i8rz).
+    reserve_failed_ = false;
     table_.clear();
     region_keys_[0].clear();
     region_keys_[1].clear();
@@ -312,7 +315,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
 }
 
 // The ring is reserved at the first layer that stages, so a prompt whose every layer runs on the CPU reserves
-// nothing. A failed reserve stays failed for the rest of the prompt.
+// nothing. A failed reserve stays failed for the rest of the micro-batch's graph: one attempt per graph.
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;

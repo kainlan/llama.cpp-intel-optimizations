@@ -14,6 +14,10 @@ What this gate pins:
     the RING choice and the RING policy, the ring's reserve is reachable only through it, and the op's policy is the
     parsed config's. Nothing consumes a staged expert until Task 8 (llama.cpp-o9uw), so under AUTO the decision log
     records what the cost model would choose and no bytes move (lead ruling c-3skf);
+  - a refused ring reserve is not retried within a graph and is tried once more in the next: the latch is cleared by
+    begin_ubatch, which every new micro-batch runs, and by end_prompt. An expert loan runs at the graph boundary
+    (ruling c-tdra, llama.cpp-mwmr), so a per-prompt latch would waste the loan its own prompt asked for (lead ruling
+    c-i8rz);
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
     c-3bde: slot reuse is ordered on the device, never by a host status query), and the reorder is
     ggml_sycl_reorder_weight_gpu on the compute queue with the copy as its one dependency;
@@ -484,6 +488,52 @@ def test_policy_gate_mutants():
     # The op's policy pinned to RING instead of read from GGML_SYCL_MOE_EXEC.
     assert not claim_staging_only_under_explicit_ring(
         PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"))
+
+
+BEGIN_UBATCH_SIG = "void moe_stream_phase::begin_ubatch(uint32_t n_tokens)"
+BEGIN_LAYER_SIG = "moe_exec_decision moe_stream_phase::begin_layer("
+END_PROMPT_SIG = "void moe_stream_phase::end_prompt()"
+LATCH_CLEAR = "reserve_failed_ = false;"
+LATCH_SET = "reserve_failed_ = true;"
+LATCH_GUARD = "if (reserve_failed_ || geo_.n_slots == 0 || !in_order_) { return false; }"
+NEW_UBATCH = "if (new_ubatch) { begin_ubatch(op.n_tokens);"
+
+
+def claim_reserve_failure_lasts_one_graph(phase: str) -> bool:
+    """Lead ruling c-i8rz: a refused reserve is not retried within a graph and is tried once more in the next graph of
+    the same prompt. The latch is set only where the reserve fails, stops ring_ready() before any reserve, and is
+    cleared by begin_ubatch, which every new micro-batch runs, and by end_prompt."""
+    n = norm(phase)
+    ready = body(n, RING_READY_SIG)
+    return (n.count(LATCH_SET) == 1 and ordered(ready, LATCH_GUARD, "->reserve(", LATCH_SET)
+            and LATCH_CLEAR in body(n, BEGIN_UBATCH_SIG)
+            and LATCH_CLEAR in body(n, END_PROMPT_SIG)
+            and NEW_UBATCH in body(n, BEGIN_LAYER_SIG))
+
+
+def drop_in(text: str, signature: str, old: str) -> str:
+    """`text` (normalized) with `old` removed once from the body of `signature`; the mutant must exist."""
+    n = norm(text)
+    b = body(n, signature)
+    assert old in b, f"mutant precondition: {old!r} is not in {signature!r}"
+    return n.replace(b, b.replace(old, "", 1), 1)
+
+
+def test_reserve_failure_lasts_one_graph():
+    assert claim_reserve_failure_lasts_one_graph(PHASE)
+
+
+def test_reserve_latch_mutants():
+    # The per-graph clear removed: a refused reserve would last the whole prompt.
+    assert not claim_reserve_failure_lasts_one_graph(drop_in(PHASE, BEGIN_UBATCH_SIG, LATCH_CLEAR))
+    # The prompt-end clear removed.
+    assert not claim_reserve_failure_lasts_one_graph(drop_in(PHASE, END_PROMPT_SIG, LATCH_CLEAR))
+    # No latch check: every staging layer would retry the reserve.
+    assert not claim_reserve_failure_lasts_one_graph(mutate(PHASE, "if (reserve_failed_ || geo_.n_slots", "if (geo_.n_slots"))
+    # The latch never set.
+    assert not claim_reserve_failure_lasts_one_graph(mutate(PHASE, LATCH_SET, ""))
+    # A new micro-batch that skips begin_ubatch.
+    assert not claim_reserve_failure_lasts_one_graph(mutate(PHASE, NEW_UBATCH, "if (new_ubatch) {"))
 
 
 # ---- the ring's lifetime ----------------------------------------------------------------------------------------------

@@ -405,7 +405,8 @@ class moe_stream_phase {
     moe_stream_phase();
     ~moe_stream_phase();
 
-    // A new micro-batch: the table and the decisions start over; the ring and its regions carry on.
+    // A new micro-batch: the table and the decisions start over, and a refused ring reserve may be tried again; the
+    // ring and its regions carry on.
     void                      begin_ubatch(uint32_t n_tokens);
     // Called at every prompt MUL_MAT_ID of `layer`; the first one per micro-batch decides. It stages the layer itself
     // when the layer was not weighed a layer ahead (layer 0 of the micro-batch: the one exposed copy) or its decision
