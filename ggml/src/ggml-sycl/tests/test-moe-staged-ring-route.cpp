@@ -21,11 +21,15 @@
 //    claims nothing. A MXFP4 SOA entry over the SOA slot is served from it, with
 //    layout SOA. The same entry naming the AOS-tagged slot as its SOA slot is
 //    refused and counted. So is a Q4_0 AOS entry over the SOA-tagged slot, which
-//    the capability query alone would serve.
+//    the capability query alone would serve. A Q4_0 SOA entry over the
+//    SOA-tagged slot agrees with its tag but is refused all the same: no prompt
+//    kernel reads Q4_0 as SOA, so the capability query answers no kernel. The
+//    phase's refusals name each cause, as the trace prints them: two layout
+//    refusals and one unsupported, with the query's reason (plan Task 8).
 // 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.
-// 6. end_prompt clears the counts.
+// 6. end_prompt clears the counts and the refusals.
 //
 // A test may wait on events; nothing here status-queries one.
 
@@ -45,6 +49,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <string>
 #include <sycl/sycl.hpp>
 #include <vector>
 
@@ -86,6 +91,13 @@ static void counts(ggml_backend_t backend, size_t * served, size_t * refused) {
     *served  = SIZE_MAX;
     *refused = SIZE_MAX;
     (void) test_moe_stream_staged_route_counts(backend, served, refused);
+}
+
+// The phase's refusals as the trace prints them, or "(no phase)".
+static std::string refusals(ggml_backend_t backend) {
+    std::string text = "(no phase)";
+    (void) test_moe_stream_staged_route_refusals(backend, &text);
+    return text;
 }
 
 // A served build of `expert` from `slot`, whose entry holds `layout`: every check of case 1, against the fill byte
@@ -195,6 +207,7 @@ int main() {
         const int32_t miss_ids[]   = { 6, 6 };
         const int32_t tag_ids[]    = { 7, 7 };
         const int32_t soa_tag_ids[] = { 2, 2 };
+        const int32_t soa_q4_ids[]  = { 4, 4 };
         size_t        served = 0, refused = 0;
 
         // The build results hold slot leases; they all go before the ring is released below.
@@ -263,6 +276,21 @@ int main() {
                   moe_batch_reject_reason_name(mistagged.reject));
             counts(backend, &served, &refused);
             CHECK(served == 2 && refused == 2, "the tag refusal is counted (served %zu, refused %zu)", served, refused);
+            // A Q4_0 SOA entry over the SOA-tagged slot: the tags agree, but no prompt kernel reads Q4_0 as SOA (it is
+            // not MMVQ_COMPAT), so the capability refuses it before the tag is looked at.
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, 4, role, slot_s, slot_a, fill_s, GGML_LAYOUT_SOA),
+                  "a Q4_0 SOA entry over the SOA-tagged slot goes into the stage table");
+            const moe_resolved_batch_result soa_q4 =
+                test_moe_staged_ring_build(backend, src0, soa_q4_ids, 2, 1, GGML_LAYOUT_SOA);
+            CHECK(!soa_q4, "a Q4_0 SOA entry is refused and falls through (reject %s)",
+                  moe_batch_reject_reason_name(soa_q4.reject));
+            counts(backend, &served, &refused);
+            CHECK(served == 2 && refused == 3, "the Q4_0 SOA refusal is counted (served %zu, refused %zu)", served,
+                  refused);
+            const std::string causes = refusals(backend);
+            CHECK(causes == "layout=2 unsupported(local-layout-unsupported)=1",
+                  "the refusals name their causes: two layout, one unsupported with the query's reason (got \"%s\")",
+                  causes.c_str());
 
             // Case 5: the next micro-batch starts with an empty table and reads its own slot.
             CHECK(test_moe_stream_begin_ubatch(backend, 2), "the next micro-batch begins");
@@ -282,11 +310,13 @@ int main() {
                       "the second micro-batch's lease is not the first one's slot");
             }
 
-            // Case 6: end_prompt clears the counts.
+            // Case 6: end_prompt clears the counts and the refusals.
             CHECK(test_moe_stream_end_prompt(backend), "end_prompt runs");
             counts(backend, &served, &refused);
             CHECK(served == 0 && refused == 0, "end_prompt clears the counts (served %zu, refused %zu)", served,
                   refused);
+            const std::string cleared = refusals(backend);
+            CHECK(cleared.empty(), "end_prompt clears the refusals (got \"%s\")", cleared.c_str());
         }
 
         q.wait();

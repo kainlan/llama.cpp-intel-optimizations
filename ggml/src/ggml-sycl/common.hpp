@@ -4141,6 +4141,9 @@ struct ggml_tensor_extra_gpu_weight_ext {
     // Validity flag: set false when host-only pointer table mode is active (skip_device_copy=true).
     // Prevents stale device table from a prior token being used when VRAM was sufficient.
     bool                  moe_device_table_valid[GGML_SYCL_MAX_DEVICES]        = { false };
+    // Backend contexts' moe_stream_payload records naming this weight (llama.cpp-o9uw). Each record holds a non-owning
+    // pointer to the extra, so release_extra_gpu asserts none is left when the extra goes.
+    std::atomic<uint32_t> moe_stream_payload_records{ 0 };
     std::unordered_map<uint64_t, std::vector<moe_expert_storage_record>> moe_expert_storage_handles;
     uint64_t                                                             moe_expert_storage_generation = 1;
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
@@ -6298,11 +6301,24 @@ struct ggml_backend_sycl_context {
     // MUL_MAT_ID of a published plan, emptied at the first decode graph, reset in the destructor once the queues have
     // drained.
     std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;
-    // The staged ring slot pointers pointer-table uploads wrote into weights' persistent payloads, per weight and
-    // expert slot (llama.cpp-o9uw), and moe_stream->ring_releases() when they were last nulled: they are nulled once
-    // the ring that held them is given back (ggml_sycl_moe_stream_release_payload).
-    std::unordered_map<ggml_tensor_extra_gpu *, std::vector<void *>>                  moe_stream_payload;
-    uint64_t                                                                          moe_stream_payload_releases = 0;
+
+    // One weight whose persistent payload a pointer-table upload gave staged ring slot pointers (llama.cpp-o9uw): the
+    // extra, only to reach that payload, and per expert slot whether it took one. No device pointer is kept.
+    struct moe_stream_payload_record {
+        ggml_tensor_extra_gpu * extra = nullptr;
+        std::vector<uint8_t>    staged;
+    };
+
+    // The weights whose payload slots took a staged ring slot's pointer since the ring was last given back, keyed by
+    // the extra's cache identity (cache_uuid), and moe_stream->ring_releases() when they were last nulled: the slots
+    // are nulled and the records dropped once the ring that held them is given back
+    // (ggml_sycl_moe_stream_release_payload), which is at end_prompt, at a new ring geometry and in this destructor.
+    // Lifetime precondition: a record's extra outlives the record. A model's weights are freed only after every
+    // context that runs it, and the map is empty by then; each record is counted on its extra
+    // (moe_stream_payload_records), and release_extra_gpu asserts that count is zero, so a weight freed under a live
+    // record aborts instead of leaving a dangling extra here.
+    std::unordered_map<uint64_t, moe_stream_payload_record> moe_stream_payload;
+    uint64_t                                                moe_stream_payload_releases = 0;
 
     // XMX-v2 flash-attention per-context cache (Phase 4 — fattn-xmx-f16-v2.hpp).
     // Opaque pointer (fattn_xmx_v2_device_cache*); stores the matrix_combinations

@@ -17,9 +17,12 @@ What this gate pins:
     it on every resolve and all four special members carry it; the ring slices each slot with the layout it is
     acquired for, the phase acquires the AOS slot as AOS and the SOA slot as SOA, and the resolver still refuses a slot
     whose resolved layout is not the entry's;
-  - c-las5 (1): a staged expert is served only as a plain MMVQ_COMPAT kernel on the submit queue. A weight the oneDNN
-    batched prompt executor claims, any other kernel, a slice whose resolved layout is not the entry's, or a route
-    either validator refuses falls through to the route core; every lookup is counted served or refused;
+  - c-las5 (1): a staged expert is served only as a plain MMVQ_COMPAT kernel on the submit queue, for a type that
+    does not need its direct kernel. A weight the oneDNN batched prompt executor claims, any other kernel, a Q1_0 or
+    NVFP4 matrix, a slice whose resolved layout is not the entry's, or a route either validator refuses falls through
+    to the route core. Every lookup is counted served or refused, and every refusal with its cause, in the order
+    asked, and with the capability's reason or the validator's reject reason (plan Task 8: the trace says why); the
+    capability part is one helper the ring's staging asks too;
   - the device recipe is one function shared by a resident expert and a staged slot (one fact, one source);
   - the staged branch keeps no persistent handle: no moe_expert_handles[] write, no remember_moe_storage_handle, no
     handle retention; the transient pointer-table upload clears a staged slot's handle entry and keeps it out of the
@@ -33,13 +36,19 @@ What this gate pins:
   - the triad builds and the retained prompt build pass the invocation's context and queue, so the route can answer;
   - the validator requires a STAGED_RING recipe to be PRIMARY_DEVICE on the submit device and queue, with a ready event;
   - the phase reports its served/refused counts once per prompt through the decision log's trace sink, from
-    end_prompt, before end_prompt's early return;
+    end_prompt, before end_prompt's early return, and under the same guard a second line naming each refusal's cause
+    and detail when it refused any;
+  - the two executors that cannot read a staged slot refuse a staged batch by name: the non-hybrid retained prompt
+    per-expert path, which multiplies each expert at the tensor's route_layout from route.ptr, throws a fallback error
+    before its first route, and try_xmx_sorted_moe rejects it at its head, before it uploads anything;
   - a staged slot's raw pointer does not outlive the ring that holds it (lead item 6, c-ned2): the upload records the
-    pointer it writes into a weight's persistent payload, the phase counts every ring release in teardown, and once
-    the count moves the backend nulls each recorded payload slot that still holds that pointer and no live handle,
-    marks the device table invalid and resets the full-local probe, so moe_ptrs_ptr answers null until the next upload
-    rewrites the table. It runs after end_prompt at the first decode graph and in the test hook, after begin_layer
-    (a new geometry re-reserves the ring), and once the phase is gone in the context destructor.
+    payload slot it gives a staged pointer, keyed by the weight extra's cache identity and holding no device pointer,
+    the phase counts every ring release in teardown, and once the count moves (or the phase is gone) the backend nulls
+    each recorded payload slot that still holds a pointer and no live handle, marks the device table invalid and
+    resets the full-local probe, so moe_ptrs_ptr answers null until the next upload rewrites the table. It runs after
+    end_prompt at the first decode graph and in the test hook, after begin_layer (a new geometry re-reserves the
+    ring), and once the phase is gone in the context destructor. Each record is counted on its extra, the context's
+    member documents that a record's extra outlives it, and release_extra_gpu asserts no record is left.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -96,6 +105,7 @@ RING_HPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.hpp"
 RING_CPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.cpp"
 PLAN_HPP_REL = "ggml/src/ggml-sycl/moe-stream-plan.hpp"
 COMMON_REL = "ggml/src/ggml-sycl/common.hpp"
+COMMON_CPP_REL = "ggml/src/ggml-sycl/common.cpp"
 
 SYCL = read(SYCL_REL)
 BATCH_HPP = read(BATCH_HPP_REL)
@@ -106,6 +116,7 @@ RING_HPP = read(RING_HPP_REL)
 RING_CPP = read(RING_CPP_REL)
 PLAN_HPP = read(PLAN_HPP_REL)
 COMMON = read(COMMON_REL)
+COMMON_CPP = read(COMMON_CPP_REL)
 # Every C/C++ source of the SYCL backend outside its tests/, by path from the repository root.
 SYCL_TREE = {
     p.relative_to(ROOT).as_posix(): p.read_text(errors="replace")
@@ -191,6 +202,9 @@ def mutate(text: str, old: str, new: str) -> str:
 
 
 BUILD_SIG = "moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,"
+STAGED_CAP_SIG = ("static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const "
+                  "moe_route_capability & cap, ggml_type type)")
+XMX_SIG = "static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,"
 RECIPE_SIG = "static moe_route_capability ggml_sycl_moe_build_device_recipe("
 UPLOAD_SIG = "static const void * const * ggml_sycl_upload_moe_transient_ptr_table("
 FROM_BATCH_SIG = "static const void * const * ggml_sycl_upload_moe_ptr_table_from_batch("
@@ -208,15 +222,18 @@ ASSIGN = "staged.recipe.transfer = moe_recipe_transfer::STAGED_RING;"
 ASSIGN_RE = r"(?<![=!<>])=\s*(?:ggml_sycl::)?moe_recipe_transfer::STAGED_RING\b"
 GUARD = "if (rows > 1 && moe_stream != nullptr && stream_layer >= 0) {"
 FIND = "if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {"
-SERVE_RETURN = "moe_stream->count_staged_route(served); if (served) { return staged; }"
+SERVE_RETURN = ("moe_stream->count_staged_route(refusal, refusal_detail); "
+                "if (refusal == moe_staged_route_refusal::NONE) { return staged; }")
 ROUTE_CORE = "::ggml_sycl_resolve_moe_expert_route_for_dispatch("
-LAMBDA_OPEN = "auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {"
+LAMBDA_OPEN = ("auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, "
+               "[&](int32_t expert_id) {")
 
-STREAM_DECL = ("moe_stream_phase * moe_stream = sctx != nullptr && sctx->device == submit_device && sctx->moe_stream && "
-               "invocation_queue == sctx->stream() && !g_ggml_sycl_graph_recording ? sctx->moe_stream.get() : nullptr;")
+STREAM_DECL = ("moe_stream_phase * moe_stream = sctx != nullptr && sctx->device == submit_device && "
+               "sctx->moe_stream && invocation_queue == sctx->stream() && !g_ggml_sycl_graph_recording ? "
+               "sctx->moe_stream.get() : nullptr;")
 LAYER_DECL = "const int stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;"
-ROLE_DECL = ("const expert_tensor_role stream_role = moe_stream && src0 ? expert_tensor_role_from_tensor_name(src0->name) : "
-             "expert_tensor_role::UNKNOWN;")
+ROLE_DECL = ("const expert_tensor_role stream_role = moe_stream && src0 ? "
+             "expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;")
 PREPARE_LAYER = "call.layer = ggml_sycl_moe_stream_layer_of(src0);"
 CLAIMED_DECL = ("const bool stream_library_claimed = moe_stream != nullptr && "
                 "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);")
@@ -237,17 +254,31 @@ ENTRY_FIELDS = (
     "staged.recipe.layout = s->layout;",
     "staged.recipe.owner_device = submit_device;",
 )
-SERVED_TERMS = (
-    "!stream_library_claimed",
-    "cap.supported",
-    "cap.kernel == moe_route_kernel::MMVQ_COMPAT",
-    "view.ptr != nullptr",
-    "view.on_device",
-    "view.layout == s->layout",
-    "staged.recipe.valid",
-    "detail::validate_moe_batch_route(staged, submit_device) == moe_batch_reject_reason::NONE",
-    "validate_moe_execution_recipe(staged.recipe, moe_admitted_recipe_signature(staged.recipe, staged.lease), "
-    "staged.lease, staged.residency, staged.has_ready_event, submit_device, false, 0, &why)",
+REFUSAL_OPEN = ("const char * refusal_detail = nullptr; const moe_staged_route_refusal refusal = [&]() {")
+# The resolver's refusals, in the order it asks them; each names its cause and, where there is one, its detail.
+REFUSAL_STEPS = (
+    "if (stream_library_claimed) { return moe_staged_route_refusal::CLAIMED; }",
+    "const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);",
+    "if (by_cap != moe_staged_route_refusal::NONE) { refusal_detail = cap.reason; return by_cap; }",
+    "if (view.ptr == nullptr || !view.on_device) { return moe_staged_route_refusal::VIEW; }",
+    "if (view.layout != s->layout) { return moe_staged_route_refusal::LAYOUT; }",
+    "if (!staged.recipe.valid) { "
+    "refusal_detail = moe_batch_reject_reason_name(moe_batch_reject_reason::RECIPE_MISSING); "
+    "return moe_staged_route_refusal::RECIPE; }",
+    "const moe_batch_reject_reason route_why = detail::validate_moe_batch_route(staged, submit_device);",
+    "if (route_why != moe_batch_reject_reason::NONE) { refusal_detail = moe_batch_reject_reason_name(route_why); "
+    "return moe_staged_route_refusal::ROUTE; }",
+    "if (!validate_moe_execution_recipe(staged.recipe, moe_admitted_recipe_signature(staged.recipe, staged.lease), "
+    "staged.lease, staged.residency, staged.has_ready_event, submit_device, false, 0, &why)) { "
+    "refusal_detail = moe_batch_reject_reason_name(why); return moe_staged_route_refusal::RECIPE; }",
+    "return moe_staged_route_refusal::NONE; }();",
+)
+# What a staged slot is served with: the plain MMVQ_COMPAT kernel, for a type with no direct-kernel requirement.
+STAGED_CAP_STEPS = (
+    "if (!cap.supported) { return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED; }",
+    "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) { return ggml_sycl::moe_staged_route_refusal::KERNEL; }",
+    "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL; }",
+    "return ggml_sycl::moe_staged_route_refusal::NONE;",
 )
 STAGED_RECIPE_CALL = ("const moe_route_capability cap = ggml_sycl_moe_build_device_recipe(src0, submit_device, rows, "
                       "invocation_backend, invocation_queue, queue_capability, staged);")
@@ -260,9 +291,7 @@ PERSISTENT = ("moe_expert_handles[", "remember_moe_storage_handle(", "retain_han
 
 UPLOAD_STAGED = ("const bool staged = staged_experts != nullptr && std::find(staged_experts->begin(), "
                  "staged_experts->end(), eid) != staged_experts->end();")
-UPLOAD_RECORD = ("std::vector<void *> & ring_ptrs = ctx.moe_stream_payload[extra]; if (ring_ptrs.size() != "
-                 "static_cast<size_t>(n_experts)) { ring_ptrs.assign(static_cast<size_t>(n_experts), nullptr); } "
-                 "ring_ptrs[slot] = resolved.ptr;")
+UPLOAD_RECORD = "ggml_sycl_moe_stream_record_payload(ctx, extra, slot, static_cast<size_t>(n_experts));"
 UPLOAD_CLEAR = ("if (staged) { expert_handles[slot] = ggml_sycl::mem_handle{}; ptr_payload[slot] = resolved.ptr; "
                 "any_updated = true; " + UPLOAD_RECORD + " } else if (!same_entry) {")
 UPLOAD_LEASE = "if (!staged) { leases.push_back(std::move(handle)); }"
@@ -310,6 +339,16 @@ WORKSPACE_REFUSE = "return refuse(moe_batch_reject_reason::WORKSPACE_UNDERSIZED)
 
 TRACE_FMT = "[MOE-EXEC-TRACE] staged route device %d: served=%zu refused=%zu"
 TRACE_EMIT = "log_->trace_sink(log_->sink_ctx, line);"
+TRACE_REFUSALS_FMT = "[MOE-EXEC-TRACE] staged route refusals device %d: "
+TRACE_REFUSALS = (
+    "if (staged_routes_.refused != 0) {",
+    TRACE_REFUSALS_FMT,
+    "const std::string causes = head + staged_routes_.refusals_text();",
+    "log_->trace_sink(log_->sink_ctx, causes.c_str()); } }",
+    "staged_routes_ = moe_staged_route_tally(); }",
+)
+COUNT_SIG = "void moe_stream_phase::count_staged_route(moe_staged_route_refusal refusal, const char * detail)"
+COUNT_BODY = "{ staged_routes_.count(refusal, detail); }"
 END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && table_.empty()) {"
 
 WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(|\bget_info\s*<")
@@ -326,7 +365,7 @@ def staged_branch(sycl: str) -> str:
     return body(b[at:], GUARD) if at >= 0 else ""
 
 
-# ---- one writer, one place --------------------------------------------------------------------------------------------
+# ---- one writer, one place -------------------------------------------------------------------------------------------
 
 
 def claim_single_writer(sycl: str, tree: dict, batch_hpp: str) -> bool:
@@ -412,19 +451,19 @@ def test_entry_is_the_fact_mutants():
 
 
 def claim_served_only_as_plain_kernel(sycl: str) -> bool:
-    """c-las5 (1): served only as MMVQ_COMPAT on the submit queue, never for a library-claimed weight, never for a slice
-    whose layout is not the entry's, and only when both validators pass; every lookup is counted."""
+    """c-las5 (1): served only as MMVQ_COMPAT on the submit queue, for a type with no direct-kernel requirement, never
+    for a library-claimed weight, never for a slice whose layout is not the entry's, and only when both validators
+    pass. Every lookup is counted, a refusal with its cause and detail, in the order asked (plan Task 8: the trace
+    says why), and the slot is served only when nothing refused it. The capability part is one helper, which names
+    MMVQ_COMPAT and no other kernel."""
     br = staged_branch(sycl)
-    at = br.find("const bool served =")
-    if at < 0:
-        return False
-    expr = br[at:br.find(";", at)]
-    for term in SERVED_TERMS:
-        if term not in expr:
-            return False
-    # MMVQ_COMPAT is the only kernel named in the served test; no other kernel can be served.
-    kernels = re.findall(r"moe_route_kernel::(\w+)", expr)
-    return kernels == ["MMVQ_COMPAT"] and ordered(br, ASSIGN, "const bool served =", SERVE_RETURN)
+    at = br.find(REFUSAL_OPEN)
+    lam = body(br[at:], "const moe_staged_route_refusal refusal = [&]()") if at >= 0 else ""
+    cap = body(norm(sycl), STAGED_CAP_SIG)
+    return (ordered(br, ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN)
+            and lam.count("return moe_staged_route_refusal::NONE;") == 1 and br.count("return staged;") == 1
+            and ordered(cap, *STAGED_CAP_STEPS) and re.findall(r"moe_route_kernel::(\w+)", cap) == ["MMVQ_COMPAT"]
+            and norm(sycl).count(STAGED_CAP_SIG + " {") == 1)
 
 
 def test_served_only_as_plain_kernel():
@@ -432,14 +471,26 @@ def test_served_only_as_plain_kernel():
 
 
 def test_served_only_as_plain_kernel_mutants():
-    assert not claim_served_only_as_plain_kernel(mutate(SYCL, "!stream_library_claimed && cap.supported", "cap.supported"))
-    assert not claim_served_only_as_plain_kernel(
-        mutate(SYCL, "cap.kernel == moe_route_kernel::MMVQ_COMPAT",
-               "(cap.kernel == moe_route_kernel::MMVQ_COMPAT || cap.kernel == moe_route_kernel::XMX_TILED)"))
-    assert not claim_served_only_as_plain_kernel(mutate(SYCL, " && view.layout == s->layout", ""))
-    assert not claim_served_only_as_plain_kernel(
-        mutate(SYCL, " && detail::validate_moe_batch_route(staged, submit_device) == moe_batch_reject_reason::NONE", ""))
-    assert not claim_served_only_as_plain_kernel(mutate(SYCL, SERVE_RETURN, "if (served) { return staged; }"))
+    c = claim_served_only_as_plain_kernel
+    # A library-claimed weight served.
+    assert not c(mutate(SYCL, REFUSAL_STEPS[0], ""))
+    # Another kernel served.
+    assert not c(mutate(SYCL, "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {",
+                        "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT && "
+                        "cap.kernel != moe_route_kernel::XMX_TILED) {"))
+    # A Q1_0/NVFP4 slot staged and served past the capability helper.
+    assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""))
+    # A slot whose resolved layout is not the entry's.
+    assert not c(mutate(SYCL, REFUSAL_STEPS[4], ""))
+    # The route validator skipped.
+    assert not c(mutate(SYCL, REFUSAL_STEPS[7], ""))
+    # A refusal counted without its detail, so the trace cannot say why.
+    assert not c(mutate(SYCL, "refusal_detail = cap.reason; return by_cap;", "return by_cap;"))
+    assert not c(mutate(SYCL, "moe_stream->count_staged_route(refusal, refusal_detail);",
+                        "moe_stream->count_staged_route(refusal, nullptr);"))
+    # Served whatever the cause.
+    assert not c(mutate(SYCL, "if (refusal == moe_staged_route_refusal::NONE) { return staged; }",
+                        "return staged;"))
 
 
 def claim_library_claim_predicate(sycl: str) -> bool:
@@ -477,7 +528,8 @@ def test_one_device_recipe():
 
 def test_one_device_recipe_mutants():
     assert not claim_one_device_recipe(mutate(SYCL, STAGED_RECIPE_CALL,
-                                              "const moe_route_capability cap = ggml_sycl_moe_query_route_capability(src0->type);"))
+                                              "const moe_route_capability cap = "
+                                              "ggml_sycl_moe_query_route_capability(src0->type);"))
     # The transfer written before the recipe, which then overwrites it.
     m = mutate(SYCL, ASSIGN + " ", "")
     m = m.replace(STAGED_RECIPE_CALL, ASSIGN + " " + STAGED_RECIPE_CALL, 1)
@@ -510,69 +562,100 @@ def test_no_persistent_handle_mutants():
                                                  "remember_moe_storage_handle(src0, slot); " + SERVE_RETURN))
     assert not claim_no_persistent_handle(mutate(SYCL, UPLOAD_LEASE, "leases.push_back(std::move(handle));"))
     assert not claim_no_persistent_handle(
-        mutate(SYCL, "if (staged) { expert_handles[slot] = ggml_sycl::mem_handle{};", "if (staged) { expert_handles[slot] = handle;"))
+        mutate(SYCL, "if (staged) { expert_handles[slot] = ggml_sycl::mem_handle{};",
+               "if (staged) { expert_handles[slot] = handle;"))
     assert not claim_no_persistent_handle(mutate(SYCL, FROM_BATCH_PASS, "table_event_out, table_event_set);"))
     assert not claim_no_persistent_handle(
         mutate(SYCL, "&route_ptrs_event_set, route_staged_experts.empty() ? nullptr : &route_staged_experts);",
                "&route_ptrs_event_set);"))
 
 
-# ---- a staged slot's pointer goes with its ring -----------------------------------------------------------------------
+# ---- a staged slot's pointer goes with its ring ----------------------------------------------------------------------
 
 RELEASE_SIG = "static void ggml_sycl_moe_stream_release_payload(ggml_backend_sycl_context & ctx)"
-RELEASE_SKIP = ("const uint64_t releases = ctx.moe_stream ? ctx.moe_stream->ring_releases() : UINT64_MAX; "
-                "if (releases == ctx.moe_stream_payload_releases) { return; } "
-                "ctx.moe_stream_payload_releases = releases;")
+RELEASE_SKIP = ("if (ctx.moe_stream && ctx.moe_stream->ring_releases() == ctx.moe_stream_payload_releases) { return; } "
+                "ctx.moe_stream_payload_releases = ctx.moe_stream ? ctx.moe_stream->ring_releases() : 0;")
 RELEASE_LOOP = "for (auto & kv : ctx.moe_stream_payload) {"
+RELEASE_IDENTITY = ("ggml_tensor_extra_gpu * extra = kv.second.extra; "
+                    "GGML_ASSERT(extra != nullptr && extra->cache_uuid == kv.first);")
 RELEASE_PAYLOAD = "std::vector<void *> & payload = extra->weight().moe_expert_ptr_payload[device];"
 RELEASE_HANDLES = "const std::vector<ggml_sycl::mem_handle> & handles = extra->weight().moe_expert_handles[device];"
-RELEASE_NULL = ("if (ring_ptrs[slot] != nullptr && payload[slot] == ring_ptrs[slot] && (slot >= handles.size() || "
+RELEASE_NULL = ("if (staged[slot] != 0 && payload[slot] != nullptr && (slot >= handles.size() || "
                 "!handles[slot].valid())) { payload[slot] = nullptr; nulled = true; }")
 RELEASE_INVALIDATE = ("if (nulled) { extra->weight().moe_device_table_valid[device] = false; "
                       "ggml_sycl_invalidate_moe_full_local_probe(extra, device); }")
+RELEASE_UNCOUNT = "extra->weight().moe_stream_payload_records.fetch_sub(1, std::memory_order_release);"
 RELEASE_CLEAR = "ctx.moe_stream_payload.clear();"
+RECORD_SIG = ("static void ggml_sycl_moe_stream_record_payload(ggml_backend_sycl_context & ctx, "
+              "ggml_tensor_extra_gpu * extra, size_t slot, size_t n_slots)")
+RECORD_STEPS = (
+    "ctx.moe_stream_payload[ggml_sycl_assign_cache_uuid(extra)];",
+    "if (rec.extra == nullptr) { rec.extra = extra; "
+    "extra->weight().moe_stream_payload_records.fetch_add(1, std::memory_order_relaxed); }",
+    "GGML_ASSERT(rec.extra == extra);",
+    "rec.staged[slot] = 1;",
+)
+RECORD_STRUCT = ("struct moe_stream_payload_record { ggml_tensor_extra_gpu * extra = nullptr; "
+                 "std::vector<uint8_t> staged; };")
+RECORD_COUNTER = "std::atomic<uint32_t> moe_stream_payload_records{ 0 };"
+LIFETIME_DOC = "Lifetime precondition: a record's extra outlives the record."
+EXTRA_RELEASE_SIG = "void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams)"
+EXTRA_RELEASE_ASSERT = ("GGML_ASSERT(extra->weight_ext == nullptr || "
+                        "extra->weight_ext->moe_stream_payload_records.load(std::memory_order_acquire) == 0);")
 RELEASE_SITES = (
     "sycl_ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*sycl_ctx);",
     "prompt_ids_snapshot.size(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx);",
     "moe_stream.reset(); ggml_sycl_moe_stream_release_payload(*this);",
     "ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*ctx);",
 )
-PAYLOAD_MEMBERS = ("std::unordered_map<ggml_tensor_extra_gpu *, std::vector<void *>> moe_stream_payload; "
+PAYLOAD_MEMBERS = ("std::unordered_map<uint64_t, moe_stream_payload_record> moe_stream_payload; "
                    "uint64_t moe_stream_payload_releases = 0;")
 RELEASE_COUNT = "ring_->release(); ring_.reset(); ++ring_releases_;"
 RELEASES_ACCESSOR = "uint64_t ring_releases() const { return ring_releases_; }"
 TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
 
 
-def claim_staged_pointer_released_with_ring(sycl: str, common: str, phase: str, plan_hpp: str) -> bool:
-    """A raw pointer must not outlive its owning handle (lead item 6, c-ned2). The upload records the staged slot's
-    pointer it writes into the persistent payload; teardown counts the ring's release; when the count moves, the
-    backend nulls only the payload slots that still hold a recorded pointer and no live handle (a later upload may
-    have given the slot a resident expert), invalidates the device table and the full-local probe when it nulled any,
-    and forgets the records. It runs at every point the ring can go, and nowhere submits anything."""
+def claim_staged_pointer_released_with_ring(sycl: str, common: str, common_cpp: str, phase: str,
+                                            plan_hpp: str) -> bool:
+    """A raw pointer must not outlive its owning handle (lead item 6, c-ned2). The upload records the payload slot it
+    gives a staged slot's pointer, keyed by the weight extra's cache identity, never its address, and the record holds
+    no device pointer; teardown counts the ring's release; when the count moves, or the phase is gone, the backend
+    nulls only the recorded payload slots that still hold a pointer and no live handle (a later upload may have given
+    the slot a resident expert), invalidates the device table and the full-local probe when it nulled any, and forgets
+    the records. It runs at every point the ring can go, and nowhere submits anything. The record's extra is held
+    under a documented lifetime precondition, counted on the extra, and release_extra_gpu asserts the count is zero
+    before the extra goes."""
     n = norm(sycl)
     at = n.find(RELEASE_SIG + " {")
     rel = body(n[at:], RELEASE_SIG) if at >= 0 else ""
+    rec = body(n, RECORD_SIG)
     td = body(norm(phase), TEARDOWN_SIG)
+    cm = norm(common)
+    struct_at = cm.find("struct moe_stream_payload_record {")
+    record_struct = body(cm[struct_at:], "struct moe_stream_payload_record") if struct_at >= 0 else ""
+    extra_release = body(norm(common_cpp), EXTRA_RELEASE_SIG)
     return (n.count(RELEASE_SIG + " {") == 1
-            and ordered(rel, RELEASE_SKIP, RELEASE_LOOP, RELEASE_PAYLOAD, RELEASE_HANDLES, RELEASE_NULL,
-                        RELEASE_INVALIDATE, RELEASE_CLEAR)
+            and ordered(rel, RELEASE_SKIP, RELEASE_LOOP, RELEASE_IDENTITY, RELEASE_PAYLOAD, RELEASE_HANDLES,
+                        RELEASE_NULL, RELEASE_INVALIDATE, RELEASE_UNCOUNT, RELEASE_CLEAR)
             and "submit" not in rel and "wait" not in rel
-            and UPLOAD_RECORD in body(n, UPLOAD_SIG)
+            and n.count(RECORD_SIG + " {") == 1 and ordered(rec, *RECORD_STEPS)
+            and UPLOAD_RECORD in body(n, UPLOAD_SIG) and n.count("moe_stream_payload[") == 1
             and all(n.count(site) == 1 for site in RELEASE_SITES)
             and n.count("ggml_sycl_moe_stream_release_payload(") == 1 + len(RELEASE_SITES)
-            and PAYLOAD_MEMBERS in norm(common)
+            and PAYLOAD_MEMBERS in cm and RECORD_STRUCT in cm and "void *" not in record_struct
+            and LIFETIME_DOC in common and RECORD_COUNTER in cm
+            and ordered(extra_release, "if (prev > 1) { return; }", EXTRA_RELEASE_ASSERT, "delete extra;")
             and RELEASE_COUNT in td and norm(phase).count("++ring_releases_;") == 1
             and RELEASES_ACCESSOR in norm(plan_hpp))
 
 
 def test_staged_pointer_released_with_ring():
-    assert claim_staged_pointer_released_with_ring(SYCL, COMMON, PHASE, PLAN_HPP)
+    assert claim_staged_pointer_released_with_ring(SYCL, COMMON, COMMON_CPP, PHASE, PLAN_HPP)
 
 
 def test_staged_pointer_release_mutants():
-    def c(sycl=SYCL, common=COMMON, phase=PHASE, plan_hpp=PLAN_HPP):
-        return claim_staged_pointer_released_with_ring(sycl, common, phase, plan_hpp)
+    def c(sycl=SYCL, common=COMMON, common_cpp=COMMON_CPP, phase=PHASE, plan_hpp=PLAN_HPP):
+        return claim_staged_pointer_released_with_ring(sycl, common, common_cpp, phase, plan_hpp)
 
     # The upload writes the pointer and records nothing, so nothing ever nulls it.
     assert not c(sycl=mutate(SYCL, UPLOAD_RECORD, ""))
@@ -581,13 +664,35 @@ def test_staged_pointer_release_mutants():
     # A slot a later upload gave a resident expert is nulled under it.
     assert not c(sycl=mutate(SYCL, " && (slot >= handles.size() || !handles[slot].valid())", ""))
     # The device table kept valid, so moe_ptrs_ptr hands a kernel the stale device copy.
-    assert not c(sycl=mutate(SYCL, "extra->weight().moe_device_table_valid[device] = false; ", ""))
+    assert not c(sycl=mutate(SYCL, RELEASE_INVALIDATE,
+                             "if (nulled) { ggml_sycl_invalidate_moe_full_local_probe(extra, device); }"))
     # The full-local probe kept.
     assert not c(sycl=mutate(SYCL, " ggml_sycl_invalidate_moe_full_local_probe(extra, device); }", " }"))
     # Nulled while the ring that holds the pointers is still held.
-    assert not c(sycl=mutate(SYCL, "if (releases == ctx.moe_stream_payload_releases) { return; }", ""))
+    assert not c(sycl=mutate(SYCL, "if (ctx.moe_stream && ctx.moe_stream->ring_releases() == "
+                                   "ctx.moe_stream_payload_releases) { return; }", ""))
+    # The phase gone and the records kept, as when an earlier release ran with no phase.
+    assert not c(sycl=mutate(SYCL, RELEASE_SKIP,
+                             "const uint64_t releases = ctx.moe_stream ? ctx.moe_stream->ring_releases() : UINT64_MAX; "
+                             "if (releases == ctx.moe_stream_payload_releases) { return; } "
+                             "ctx.moe_stream_payload_releases = releases;"))
     # The records kept, so a later release nulls a slot that now holds another ring's pointer by coincidence.
     assert not c(sycl=mutate(SYCL, RELEASE_CLEAR, ""))
+    # Keyed by the extra's address again.
+    assert not c(sycl=mutate(SYCL, "ctx.moe_stream_payload[ggml_sycl_assign_cache_uuid(extra)];",
+                             "ctx.moe_stream_payload[reinterpret_cast<uintptr_t>(extra)];"))
+    # The record's extra trusted without its identity.
+    assert not c(sycl=mutate(SYCL, "GGML_ASSERT(extra != nullptr && extra->cache_uuid == kv.first);", ""))
+    # A record counted on its extra and never uncounted, or never counted.
+    assert not c(sycl=mutate(SYCL, RELEASE_UNCOUNT, ""))
+    assert not c(sycl=mutate(SYCL, "extra->weight().moe_stream_payload_records.fetch_add(1, "
+                                   "std::memory_order_relaxed);", ""))
+    # The record holds the device pointer again.
+    assert not c(common=mutate(COMMON, "std::vector<uint8_t> staged; };", "std::vector<void *> staged; };"))
+    # The lifetime precondition undocumented.
+    assert not c(common=COMMON.replace(LIFETIME_DOC, ""))
+    # The extra freed under a live record.
+    assert not c(common_cpp=mutate(COMMON_CPP, EXTRA_RELEASE_ASSERT, ""))
     # Any one of the release points missing.
     for site in RELEASE_SITES:
         head = site[:site.index(" ggml_sycl_moe_stream_release_payload(")]
@@ -599,6 +704,63 @@ def test_staged_pointer_release_mutants():
                               "ring_->release(); ring_.reset(); ++ring_releases_; ++ring_releases_;"))
     # The context forgets the records.
     assert not c(common=mutate(COMMON, "uint64_t moe_stream_payload_releases = 0;", ""))
+
+
+# ---- the executors that cannot read a staged slot refuse a staged batch by name --------------------------------------
+
+PER_EXPERT_REFUSE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) { "
+                     "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt per-expert path refused a "
+                     "staged ring slot\"); }")
+PER_EXPERT_STEPS = (
+    "std::vector<ggml_sycl::mem_handle> pp_gpu_leases;",
+    "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
+    "expert_ptr = route.ptr;",
+    "ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);",
+)
+XMX_REJECT = "auto reject_xmx = [&](const char * reason) -> bool {"
+XMX_REFUSE = "if (ggml_sycl::moe_batch_names_staged_ring(batch)) { return reject_xmx(\"staged-ring\"); }"
+XMX_STEPS = (
+    "const ggml_sycl_xmx_moe_policy xmx_policy = ggml_sycl_get_xmx_moe_policy();",
+    "ggml_sycl_upload_moe_ptr_table_from_batch(",
+    "expert_weights = expert_ptrs_host[e];",
+)
+
+
+def claim_staged_batch_refused_by_name(sycl: str) -> bool:
+    """The non-hybrid retained prompt per-expert path multiplies each expert at the tensor's route_layout from
+    route.ptr, which a staged slot (holding its entry's layout) does not match: a batch naming a staged slot throws a
+    fallback error before that path's first route. try_xmx_sorted_moe reads each expert through a payload with no
+    staged slot: it rejects such a batch at its head, before the policy check and before any upload, instead of
+    through the payload's missing entry."""
+    n = norm(sycl)
+    mmid = body(n, MMID_SIG)
+    xmx = body(n, XMX_SIG)
+    return (n.count(PER_EXPERT_REFUSE) == 1 and ordered(mmid, PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
+            and n.count(XMX_REFUSE) == 1 and ordered(xmx, XMX_REJECT, XMX_REFUSE, *XMX_STEPS))
+
+
+def test_staged_batch_refused_by_name():
+    assert claim_staged_batch_refused_by_name(SYCL)
+
+
+def test_staged_batch_refused_by_name_mutants():
+    c = claim_staged_batch_refused_by_name
+    # The per-expert path reads a staged slot at the tensor's layout.
+    assert not c(mutate(SYCL, PER_EXPERT_REFUSE, ""))
+    # Refused only after the routes were taken.
+    m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
+    m = m.replace(PER_EXPERT_STEPS[3], PER_EXPERT_STEPS[3] + " " + PER_EXPERT_REFUSE, 1)
+    assert not c(m)
+    # The XMX path refuses only through the payload's missing entry.
+    assert not c(mutate(SYCL, XMX_REFUSE, ""))
+    # Refused only after the upload wrote the staged slot into the table (moved inside try_xmx_sorted_moe's body: the
+    # upload helper's name also appears at six other sites).
+    n = norm(SYCL)
+    x = body(n, XMX_SIG)
+    after_upload = "has_table_event = table_event_set; }"
+    assert x.count(XMX_REFUSE + " ") == 1 and x.count(after_upload) == 1
+    moved = x.replace(XMX_REFUSE + " ", "", 1).replace(after_upload, after_upload + " " + XMX_REFUSE, 1)
+    assert not c(n.replace(x, moved, 1))
 
 
 # ---- ordering: one barrier, no host waits ----------------------------------------------------------------------------
@@ -617,8 +779,10 @@ def test_barrier_after_build():
 
 
 def test_barrier_after_build_mutants():
-    assert not claim_barrier_after_build(mutate(SYCL, "sctx->stream()->ext_oneapi_submit_barrier(staged_ready);", "(void) staged_ready;"))
-    assert not claim_barrier_after_build(mutate(SYCL, 'GGML_ABORT("[MOE-EXEC] staged ring barrier failed: %s", e.what());', "throw;"))
+    assert not claim_barrier_after_build(
+        mutate(SYCL, "sctx->stream()->ext_oneapi_submit_barrier(staged_ready);", "(void) staged_ready;"))
+    assert not claim_barrier_after_build(
+        mutate(SYCL, 'GGML_ABORT("[MOE-EXEC] staged ring barrier failed: %s", e.what());', "throw;"))
 
 
 def claim_no_host_waits(sycl: str) -> bool:
@@ -636,7 +800,9 @@ def test_no_host_waits():
 def test_no_host_waits_mutants():
     assert not claim_no_host_waits(mutate(SYCL, "sctx->stream()->ext_oneapi_submit_barrier(staged_ready);",
                                           "sctx->stream()->ext_oneapi_submit_barrier(staged_ready).wait();"))
-    assert not claim_no_host_waits(mutate(SYCL, SERVE_RETURN, "s->ready.get_info<sycl::info::event::command_execution_status>(); " + SERVE_RETURN))
+    assert not claim_no_host_waits(
+        mutate(SYCL, SERVE_RETURN,
+               "s->ready.get_info<sycl::info::event::command_execution_status>(); " + SERVE_RETURN))
 
 
 # ---- the admission cache and the fused path --------------------------------------------------------------------------
@@ -663,10 +829,12 @@ def test_admission_cache_graph_keyed_mutants():
     assert not claim_admission_cache_graph_keyed(
         mutate(SYCL, PREDICATE_BODY, "{ return entry.valid; }"))
     assert not claim_admission_cache_graph_keyed(
-        mutate(SYCL, "ggml_sycl_moe_admission_entry_reusable(admit_it->second, ctx.graph_compute_seq)", "admit_it->second.valid"))
+        mutate(SYCL, "ggml_sycl_moe_admission_entry_reusable(admit_it->second, ctx.graph_compute_seq)",
+               "admit_it->second.valid"))
     assert not claim_admission_cache_graph_keyed(mutate(SYCL, " new_entry.graph_seq = ctx.graph_compute_seq;", ""))
     assert not claim_admission_cache_graph_keyed(mutate(SYCL, ROLE_REFUSE, ""))
-    assert not claim_admission_cache_graph_keyed(mutate(SYCL, " || ggml_sycl::moe_batch_names_staged_ring(roles.down.batch)", ""))
+    assert not claim_admission_cache_graph_keyed(
+        mutate(SYCL, " || ggml_sycl::moe_batch_names_staged_ring(roles.down.batch)", ""))
 
 
 # ---- the builds that can receive a staged operand --------------------------------------------------------------------
@@ -684,7 +852,8 @@ def test_prompt_builds_pass_invocation():
 
 
 def test_prompt_builds_pass_invocation_mutants():
-    assert not claim_prompt_builds_pass_invocation(mutate(SYCL, "up_layout, false, &ctx, ctx.stream());", "up_layout, false);"))
+    assert not claim_prompt_builds_pass_invocation(
+        mutate(SYCL, "up_layout, false, &ctx, ctx.stream());", "up_layout, false);"))
     assert not claim_prompt_builds_pass_invocation(
         mutate(SYCL, "retained_prompt_layout, false, &ctx, ctx.stream());", "retained_prompt_layout, false);"))
 
@@ -715,10 +884,14 @@ def test_validator_mutants():
 
 def claim_trace(phase: str, tree: dict) -> bool:
     """The served/refused line exists once in the backend, goes through the decision log's trace sink, and end_prompt
-    reports it before its early return, so a prompt's counts are never carried into the next."""
+    reports it before its early return, so a prompt's counts are never carried into the next. Under the same guard, a
+    prompt that refused any also gets one line naming each refusal's cause and detail (plan Task 8), and the phase
+    counts each lookup with the cause the resolver gave."""
     count = sum(norm(text).count(TRACE_FMT) for text in tree.values())
+    refusals = sum(norm(text).count(TRACE_REFUSALS_FMT) for text in tree.values())
     n = norm(phase)
-    return count == 1 and ordered(body(n, REPORT_SIG), TRACE_FMT, TRACE_EMIT) and body(n, END_PROMPT_SIG).startswith(END_PROMPT_HEAD)
+    return (count == 1 and refusals == 1 and ordered(body(n, REPORT_SIG), TRACE_FMT, TRACE_EMIT, *TRACE_REFUSALS)
+            and body(n, END_PROMPT_SIG).startswith(END_PROMPT_HEAD) and body(n, COUNT_SIG) == COUNT_BODY)
 
 
 def test_trace():
@@ -733,9 +906,18 @@ def test_trace_mutants():
     tree = dict(SYCL_TREE)
     tree["extra.cpp"] = '"' + TRACE_FMT + '"'
     assert not claim_trace(PHASE, tree)
+    # No refusals line: the trace counts refusals but cannot say why.
+    m = mutate(PHASE, "log_->trace_sink(log_->sink_ctx, causes.c_str());", "(void) causes;")
+    assert not claim_trace(m, {PHASE_REL: m})
+    # The refusals line outside the guard, printed with tracing off.
+    m = mutate(PHASE, "log_->trace_sink(log_->sink_ctx, causes.c_str()); } }", "} } (void) 0;")
+    assert not claim_trace(m, {PHASE_REL: m})
+    # A lookup counted without its cause.
+    m = mutate(PHASE, COUNT_BODY, "{ staged_routes_.count(moe_staged_route_refusal::RECIPE, nullptr); }")
+    assert not claim_trace(m, {PHASE_REL: m})
 
 
-# ---- lead ruling c-o9uw-1: the slice's tag is the layout ---------------------------------------------------------------
+# ---- lead ruling c-o9uw-1: the slice's tag is the layout -------------------------------------------------------------
 
 TAGGED_SLICE_DECL = "mem_handle slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const;"
 TAGGED_SLICE_SIG = "mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const"
@@ -758,15 +940,15 @@ PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
 PHASE_SOA_ACQUIRE = "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_SOA);"
 PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"
 PHASE_SOA_ENTRY = "table_[key] = { soa, aos, reorder, GGML_LAYOUT_SOA };"
-TAG_AGREES = "view.layout == s->layout"
+TAG_AGREES = "if (view.layout != s->layout) { return moe_staged_route_refusal::LAYOUT; }"
 
 
 def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp: str, phase: str, sycl: str) -> bool:
     """A ring slot's resolved layout is the layout the phase acquired it for, which is the layout its stage-table entry
     records: an owned allocation's slice may name its layout (any other handle refuses before deriving anything), the
     view applies the name on every resolve, every copy and move carries it, the ring slices with it, the phase asks
-    AOS for the AOS slot and SOA for the SOA slot and records those layouts, and the resolver still checks that the
-    two agree before it serves."""
+    AOS for the AOS slot and SOA for the SOA slot and records those layouts, and the resolver still refuses, as a
+    layout refusal, a slot whose resolved layout is not its entry's."""
     mh, mc, rh, rc, ph = norm(mem_hpp), norm(mem_cpp), norm(ring_hpp), norm(ring_cpp), norm(phase)
     tagged = body(mc, TAGGED_SLICE_SIG)
     view = body(mc, VIEW_SIG)
@@ -792,7 +974,8 @@ def test_tag_is_the_layout_mutants():
         return a
 
     # Any handle may name a layout, a weight lease included.
-    assert not claim_tag_is_the_layout(*with_(1, "if (!owned_alloc_) { return {}; } mem_handle h = slice(", "mem_handle h = slice("))
+    assert not claim_tag_is_the_layout(
+        *with_(1, "if (!owned_alloc_) { return {}; } mem_handle h = slice(", "mem_handle h = slice("))
     # The name kept but never applied, so a slice resolves with its root's layout.
     assert not claim_tag_is_the_layout(*with_(1, VIEW_APPLY, ""))
     # A copy, or a copy assignment, that drops the name.
@@ -803,9 +986,10 @@ def test_tag_is_the_layout_mutants():
         *with_(3, RING_SLICE, "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes);"))
     # The SOA slot acquired as AOS.
     assert not claim_tag_is_the_layout(
-        *with_(4, PHASE_SOA_ACQUIRE, "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_AOS);"))
+        *with_(4, PHASE_SOA_ACQUIRE,
+               "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_AOS);"))
     # The resolver trusting the entry without checking the slot agrees.
-    assert not claim_tag_is_the_layout(*with_(5, TAG_AGREES + " && ", ""))
+    assert not claim_tag_is_the_layout(*with_(5, TAG_AGREES, ""))
 
 
 if __name__ == "__main__":

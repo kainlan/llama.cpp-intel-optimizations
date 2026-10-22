@@ -400,15 +400,16 @@ int main() {
         const moe_stream_layer_info * b0 = layer_info(blind, 0);
         CHECK(b0 != nullptr && b0->items.size() == 9 && b0->n_streamable == 0);
 
-        // The predicate is asked once per distinct (type, shape, bytes) per build, not once per entry (c-7soh): the plan
-        // has one host matrix shape, which takes a SOA question and then an AOS one.
+        // The predicate is asked once per distinct (type, shape, bytes) per build, not once per entry (c-7soh): the
+        // plan has one host matrix shape, which takes a SOA question and then an AOS one.
         int calls = 0;
         (void) ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_aos_counted, &calls, nullptr);
         CHECK(calls == 2);
     }
 
-    // ---- a matrix whose weight the library executor claims stages NONE: the staged route refuses that weight (c-las5),
-    // so the ring copies none of it and sizes no slot for it; staging and serving give one answer (llama.cpp-o9uw) ----
+    // ---- a matrix whose weight the library executor claims stages NONE: the staged route refuses that weight
+    // (c-las5), so the ring copies none of it and sizes no slot for it; staging and serving give one answer
+    // (llama.cpp-o9uw) ----
     {
         claims_probe                probe;
         const moe_stream_plan_index claimed =
@@ -676,6 +677,41 @@ int main() {
     CHECK(std::strcmp(ggml_sycl::moe_stream_regime_name(moe_exec_regime::STREAM_ALL), "stream-all") == 0);
     CHECK(std::strcmp(ggml_sycl::moe_stream_regime_name(moe_exec_regime::ROUTED_ONLY), "routed-only") == 0);
     CHECK(std::strcmp(ggml_sycl::moe_stream_regime_name(moe_exec_regime::NONE), "none") == 0);
+
+    // ---- the staged route's tally (llama.cpp-o9uw): served and refused lookups, and each refusal's cause and detail,
+    // which end_prompt traces (plan Task 8: the trace says why) ----
+    {
+        using ggml_sycl::moe_staged_route_refusal;
+        ggml_sycl::moe_staged_route_tally t;
+        CHECK(t.served == 0 && t.refused == 0 && t.refusals_text().empty());
+        t.count(moe_staged_route_refusal::NONE, nullptr);
+        t.count(moe_staged_route_refusal::LAYOUT, nullptr);
+        t.count(moe_staged_route_refusal::UNSUPPORTED, "local-layout-unsupported");
+        t.count(moe_staged_route_refusal::LAYOUT, nullptr);
+        // The same detail at another address is the same refusal: details compare by text.
+        const char same_reason[] = "local-layout-unsupported";
+        t.count(moe_staged_route_refusal::UNSUPPORTED, same_reason);
+        t.count(moe_staged_route_refusal::RECIPE, "RECIPE_MISMATCH");
+        t.count(moe_staged_route_refusal::RECIPE, "RECIPE_MISSING");
+        CHECK(t.served == 1 && t.refused == 6 && t.refusals.size() == 4);
+        CHECK(t.refusals_text() ==
+              "layout=2 unsupported(local-layout-unsupported)=2 recipe(RECIPE_MISMATCH)=1 recipe(RECIPE_MISSING)=1");
+        // Every cause has a name of its own.
+        const moe_staged_route_refusal all[] = {
+            moe_staged_route_refusal::NONE,          moe_staged_route_refusal::CLAIMED,
+            moe_staged_route_refusal::UNSUPPORTED,   moe_staged_route_refusal::KERNEL,
+            moe_staged_route_refusal::DIRECT_KERNEL, moe_staged_route_refusal::VIEW,
+            moe_staged_route_refusal::LAYOUT,        moe_staged_route_refusal::ROUTE,
+            moe_staged_route_refusal::RECIPE,
+        };
+        std::unordered_set<std::string> names;
+        for (moe_staged_route_refusal r : all) {
+            names.insert(ggml_sycl::moe_staged_route_refusal_name(r));
+        }
+        CHECK(names.size() == sizeof(all) / sizeof(all[0]) && names.count("unknown") == 0);
+        CHECK(std::strcmp(ggml_sycl::moe_staged_route_refusal_name(moe_staged_route_refusal::DIRECT_KERNEL),
+                          "direct-kernel") == 0);
+    }
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-phase: %d failure(s)\n", failures);

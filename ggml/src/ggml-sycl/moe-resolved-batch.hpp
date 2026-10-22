@@ -246,6 +246,14 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
     return h;
 }
 
+// Q1_0 and NVFP4 run on a device only through their direct kernel (DEVICE_MMVQ_Q1_NVFP4_AOS) and its admitted
+// workspace bundle, which validate_moe_execution_recipe checks and choose_moe_batch_executor keeps closed; any other
+// device recipe for them is refused. One answer for the validator, the executor choice and the stream ring's staging
+// predicate, so the ring stages no matrix of a type the staged route cannot serve (llama.cpp-o9uw).
+inline bool moe_type_needs_direct_kernel(ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
+}
+
 inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
                                           size_t                       admitted_signature,
                                           const mem_handle &           lease,
@@ -268,8 +276,7 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
     if (alignment == 0 || (alignment & (alignment - 1)) != 0 || recipe.request.rows == 0) {
         return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
     }
-    if (recipe.kind == moe_batch_executor::HOST_CPU &&
-        (recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4)) {
+    if (recipe.kind == moe_batch_executor::HOST_CPU && moe_type_needs_direct_kernel(recipe.request.type)) {
         moe_workspace_recipe expected;
         if (recipe.workspace.activation_q8_bytes % recipe.request.rows != 0 ||
             recipe.workspace.descriptor_bytes % recipe.request.rows != 0 ||
@@ -311,7 +318,7 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
             return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     } else {
-        const bool direct_q1_nvfp4 = recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4;
+        const bool direct_q1_nvfp4 = moe_type_needs_direct_kernel(recipe.request.type);
         if (direct_q1_nvfp4) {
             moe_workspace_recipe expected;
             if (recipe.kernel != moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS || recipe.layout != GGML_LAYOUT_AOS ||
@@ -817,9 +824,8 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     size_t                       reserved_workspace_bytes,
     const moe_admitted_workspace_bundle * workspace_bundle = nullptr) {
     moe_batch_executor_choice out;
-    const bool                direct_q1_nvfp4 =
-        operand.recipe().kind != moe_batch_executor::HOST_CPU &&
-        (operand.recipe().request.type == GGML_TYPE_Q1_0 || operand.recipe().request.type == GGML_TYPE_NVFP4);
+    const bool                direct_q1_nvfp4 = operand.recipe().kind != moe_batch_executor::HOST_CPU &&
+                                 moe_type_needs_direct_kernel(operand.recipe().request.type);
     if (direct_q1_nvfp4) {
         // Production capability remains closed until all four B70 oracle cases
         // pass. A matching bundle is necessary but not sufficient to advertise.

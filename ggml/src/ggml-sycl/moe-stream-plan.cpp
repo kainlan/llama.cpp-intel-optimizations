@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 
 namespace ggml_sycl {
@@ -386,8 +387,8 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
         n.bytes += item.src_bytes;
         ++pe.second;
     }
-    // A copy went in, so the region's last use is now this one: its layer, whether it left an AOS-only slot, and no read
-    // gate until layer_done records one behind this layer's readers.
+    // A copy went in, so the region's last use is now this one: its layer, whether it left an AOS-only slot, and no
+    // read gate until layer_done records one behind this layer's readers.
     if (copied_in) {
         region_aos_only_[cur_region_] = aos_only_staged;
         region_layer_[cur_region_]    = items.front().layer;
@@ -414,7 +415,17 @@ bool moe_stream_phase::ring_ready() {
         reserve_failed_ = true;
         return false;
     }
-    ring_               = std::move(ring);
+    ring_ = std::move(ring);
+    reset_regions();
+    return true;
+}
+
+// Both regions start over: the first one current, nothing submitted into either and no slot held, and no last use, so
+// no AOS-only slot, no layer and no read gate. A new ring and a torn-down one both start here, so a read gate recorded
+// for one ring is never taken by the next one's copies (stage()).
+void moe_stream_phase::reset_regions() {
+    region_keys_[0].clear();
+    region_keys_[1].clear();
     cur_region_         = 0;
     region_submitted_   = false;
     region_last_        = sycl::event();
@@ -424,7 +435,6 @@ bool moe_stream_phase::ring_ready() {
     region_layer_[1]    = -1;
     region_read_gate_[0].reset();
     region_read_gate_[1].reset();
-    return true;
 }
 
 // Ends the current region's use when slots were taken from it. With nothing submitted into it the region keeps its
@@ -463,14 +473,8 @@ void moe_stream_phase::teardown(sycl::event last_use) {
     }
     anchor_ = mem_handle();
     table_.clear();
-    region_keys_[0].clear();
-    region_keys_[1].clear();
-    cur_region_         = 0;
-    region_submitted_   = false;
-    region_last_        = sycl::event();
-    region_aos_only_[0] = false;
-    region_aos_only_[1] = false;
-    geo_                = moe_stream_ring_geometry();
+    reset_regions();
+    geo_ = moe_stream_ring_geometry();
 }
 
 void moe_stream_phase::report(int                   layer,
@@ -503,26 +507,66 @@ void moe_stream_phase::report(int                   layer,
     op.log->note(device_, layer, st.decision, n.bytes);
 }
 
-void moe_stream_phase::count_staged_route(bool served) {
-    if (served) {
-        ++staged_served_;
-    } else {
-        ++staged_refused_;
+void moe_staged_route_tally::count(moe_staged_route_refusal refusal, const char * detail) {
+    if (refusal == moe_staged_route_refusal::NONE) {
+        ++served;
+        return;
     }
+    ++refused;
+    for (refusal_count & c : refusals) {
+        const bool same_detail =
+            c.detail == detail || (c.detail != nullptr && detail != nullptr && std::strcmp(c.detail, detail) == 0);
+        if (c.refusal == refusal && same_detail) {
+            ++c.n;
+            return;
+        }
+    }
+    refusal_count c;
+    c.refusal = refusal;
+    c.detail  = detail;
+    c.n       = 1;
+    refusals.push_back(c);
+}
+
+std::string moe_staged_route_tally::refusals_text() const {
+    std::string out;
+    for (const refusal_count & c : refusals) {
+        char item[128];
+        if (c.detail != nullptr && c.detail[0] != '\0') {
+            std::snprintf(item, sizeof(item), "%s(%s)=%zu", moe_staged_route_refusal_name(c.refusal), c.detail, c.n);
+        } else {
+            std::snprintf(item, sizeof(item), "%s=%zu", moe_staged_route_refusal_name(c.refusal), c.n);
+        }
+        if (!out.empty()) {
+            out += ' ';
+        }
+        out += item;
+    }
+    return out;
+}
+
+void moe_stream_phase::count_staged_route(moe_staged_route_refusal refusal, const char * detail) {
+    staged_routes_.count(refusal, detail);
 }
 
 // The resolver's STAGED_RING lookups for the prompt that ends, on the trace (llama.cpp-o9uw): without it a ring that
-// stages and a route that serves none of it read alike in the stage lines. Cleared for the next prompt.
+// stages and a route that serves none of it read alike in the stage lines. A prompt that refused any also gets a line
+// naming each refusal's cause and detail (plan Task 8: the trace says why). Cleared for the next prompt.
 void moe_stream_phase::report_staged_routes() {
-    if ((staged_served_ != 0 || staged_refused_ != 0) && log_ != nullptr && log_->trace >= 1 &&
+    if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && log_->trace >= 1 &&
         log_->trace_sink != nullptr) {
         char line[160];
         std::snprintf(line, sizeof(line), "[MOE-EXEC-TRACE] staged route device %d: served=%zu refused=%zu", device_,
-                      staged_served_, staged_refused_);
+                      staged_routes_.served, staged_routes_.refused);
         log_->trace_sink(log_->sink_ctx, line);
+        if (staged_routes_.refused != 0) {
+            char head[64];
+            std::snprintf(head, sizeof(head), "[MOE-EXEC-TRACE] staged route refusals device %d: ", device_);
+            const std::string causes = head + staged_routes_.refusals_text();
+            log_->trace_sink(log_->sink_ctx, causes.c_str());
+        }
     }
-    staged_served_  = 0;
-    staged_refused_ = 0;
+    staged_routes_ = moe_staged_route_tally();
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)

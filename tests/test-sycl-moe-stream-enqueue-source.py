@@ -36,6 +36,11 @@ What this gate pins:
     (no reorder), the AOS slot and the host lease are retained until the copy, and its stage-table entry holds the AOS
     slot with layout AOS; how a matrix stages comes from the device's prompt kernels, which the backend answers from
     ggml_sycl_moe_query_route_capability (one fact, one source), asked once per micro-batch in the index build;
+  - staging mirrors serving (llama.cpp-o9uw): the prompt-kernel predicate answers through the one helper the staged
+    route refuses on, ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel for a
+    type with no direct-kernel requirement. Q1_0 and NVFP4 answer MMVQ_COMPAT in a prompt but run only through their
+    direct kernel, which the recipe validator and the executor choice ask through moe_type_needs_direct_kernel, so
+    the ring stages none of them and sizes no slot for them;
   - a matrix whose weight the oneDNN batched prompt executor claims stages NONE: the backend answers the index build's
     library-claims predicate with ggml_sycl_moe_pp_onednn_batched_claims_tensor, the check the staged route refuses a
     weight on (c-las5), so the ring copies nothing the route would refuse and sizes no slot for it (one fact, one
@@ -46,7 +51,9 @@ What this gate pins:
     gate: the gate layer_done sets belongs to the region holding the next layer, so it precedes the readers of an
     AOS-only slot (and of a SOA slot that AOS-only items moved off a fixed odd index). The read gate is the barrier
     layer_done submitted behind the down op of the layer the region last held (lead ruling c-o9uw-1), and a
-    compute-queue barrier submitted at the first copy stands in when no layer_done recorded one;
+    compute-queue barrier submitted at the first copy stands in when no layer_done recorded one. One helper,
+    reset_regions, forgets every region's keys, AOS-only flag, layer and read gate, and both a new ring and teardown
+    run it, so neither a new ring nor a reused phase inherits a gate or a layer;
   - a throw from either submission aborts with "[MOE-EXEC] stream enqueue failed: %s" (design 9.3);
   - moe-stream-plan.cpp waits on nothing (.wait(), wait_and_throw()), queries no event status (get_info<), has no
     const_cast (ruling E) and calls no allocator: its slots come from the ring's one reservation;
@@ -229,7 +236,7 @@ MMID_WAIT_RE = re.compile(r"\.wait\(\)|->wait\(\)|\bwait_and_throw\(\)")
 ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
 
 
-# ---- the consultation site --------------------------------------------------------------------------------------------
+# ---- the consultation site -------------------------------------------------------------------------------------------
 
 
 def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
@@ -269,14 +276,15 @@ def test_begin_layer_mutants():
     moved = mutate(SYCL, GRAPH_SINK, stmt + " " + GRAPH_SINK).replace(BEGIN_GUARD + " " + stmt, BEGIN_GUARD, 1)
     assert not claim_begin_layer_once_in_prompt_branch(moved)
     # consulted after moe_hybrid_with_plan is computed
-    late = mutate(SYCL, BEGIN_GUARD + " " + stmt, BEGIN_GUARD).replace(HYBRID_WITH_PLAN, stmt + " " + HYBRID_WITH_PLAN, 1)
+    late = mutate(SYCL, BEGIN_GUARD + " " + stmt, BEGIN_GUARD)
+    late = late.replace(HYBRID_WITH_PLAN, stmt + " " + HYBRID_WITH_PLAN, 1)
     assert not claim_begin_layer_once_in_prompt_branch(late)
     # routed on something other than the snapshot
     assert not claim_begin_layer_once_in_prompt_branch(
         mutate(SYCL, "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()", "nullptr, 0"))
 
 
-# ---- the enqueue ------------------------------------------------------------------------------------------------------
+# ---- the enqueue -----------------------------------------------------------------------------------------------------
 
 
 HOST_RESOLVE = "const resolved_ptr hr = host.resolve(device);"
@@ -328,7 +336,8 @@ def test_reorder_on_ccs_after_copy():
 def test_reorder_mutants():
     assert not claim_reorder_on_ccs_after_copy(mutate(PHASE, ", { copy })", ", {})"))
     assert not claim_reorder_on_ccs_after_copy(mutate(PHASE, ", { copy })", ", { ring_->current_region_gate() })"))
-    assert not claim_reorder_on_ccs_after_copy(mutate(PHASE, REORDER_CALL + "*ccs_, ", REORDER_CALL + "cache.get_bcs_queue(), "))
+    assert not claim_reorder_on_ccs_after_copy(
+        mutate(PHASE, REORDER_CALL + "*ccs_, ", REORDER_CALL + "cache.get_bcs_queue(), "))
 
 
 def claim_handles_retained_and_entry_is_soa(phase: str, hpp: str) -> bool:
@@ -347,15 +356,18 @@ def test_handles_retained_and_entry_is_soa():
 
 
 def test_retain_mutants():
-    assert not claim_handles_retained_and_entry_is_soa(mutate(PHASE, RETAIN, "retain_handles_until_event({ aos }, reorder);"), PLAN_HPP)
+    assert not claim_handles_retained_and_entry_is_soa(
+        mutate(PHASE, RETAIN, "retain_handles_until_event({ aos }, reorder);"), PLAN_HPP)
     # The SOA slot left to the table's hold.
     assert not claim_handles_retained_and_entry_is_soa(
         mutate(PHASE, RETAIN, "retain_handles_until_event({ aos, host }, reorder);"), PLAN_HPP)
     assert not claim_handles_retained_and_entry_is_soa(
         mutate(PHASE, RETAIN, "retain_handles_until_event({ aos, host, soa }, copy);"), PLAN_HPP)
-    assert not claim_handles_retained_and_entry_is_soa(mutate(PHASE, TABLE_WRITE, "table_[key] = { soa, aos, reorder, GGML_LAYOUT_AOS };"), PLAN_HPP)
     assert not claim_handles_retained_and_entry_is_soa(
-        PHASE, mutate(PLAN_HPP, "ggml_layout_mode layout = GGML_LAYOUT_SOA;", "ggml_layout_mode layout = GGML_LAYOUT_AOS;"))
+        mutate(PHASE, TABLE_WRITE, "table_[key] = { soa, aos, reorder, GGML_LAYOUT_AOS };"), PLAN_HPP)
+    assert not claim_handles_retained_and_entry_is_soa(
+        PHASE,
+        mutate(PLAN_HPP, "ggml_layout_mode layout = GGML_LAYOUT_SOA;", "ggml_layout_mode layout = GGML_LAYOUT_AOS;"))
 
 
 def claim_submission_failure_aborts(phase: str) -> bool:
@@ -394,7 +406,7 @@ def test_abort_mutants():
     assert not claim_submission_failure_aborts(n.replace(copy_stmt, "", 1).replace("try {", copy_stmt + " try {", 1))
 
 
-# ---- what the phase never does ----------------------------------------------------------------------------------------
+# ---- what the phase never does ---------------------------------------------------------------------------------------
 
 
 def claim_phase_never_waits(phase: str) -> bool:
@@ -455,18 +467,21 @@ def test_phase_allocates_only_ring_slots():
 
 
 def test_allocator_mutants():
-    assert not claim_phase_allocates_only_ring_slots(mutate(PHASE, RETAIN, RETAIN + " (void) sycl::malloc_device(16, *ccs_);"))
-    assert not claim_phase_allocates_only_ring_slots(mutate(PHASE, "ring_->acquire_slot(GGML_LAYOUT_SOA)", "mem_handle()"))
+    assert not claim_phase_allocates_only_ring_slots(
+        mutate(PHASE, RETAIN, RETAIN + " (void) sycl::malloc_device(16, *ccs_);"))
+    assert not claim_phase_allocates_only_ring_slots(
+        mutate(PHASE, "ring_->acquire_slot(GGML_LAYOUT_SOA)", "mem_handle()"))
 
 
-# ---- what is streamed -------------------------------------------------------------------------------------------------
+# ---- what is streamed ------------------------------------------------------------------------------------------------
 
 OWNER_SIG = "static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int device)"
 REORDERABLE_SIG = "static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes)"
 AOS_FITS_SIG = "static inline bool moe_stream_item_aos_fits(const moe_stream_item & item, size_t slot_bytes)"
 OWNER_CALL = "host.owner_metadata(&owner) && moe_stream_owner_streamable(owner, device)"
 REORDERABLE_CALL = "moe_stream_item_reorderable(item, geo_.slot_bytes)"
-TYPED_GUARD = ("if (item.staging == moe_stream_staging::NONE || !(aos_only ? moe_stream_item_aos_fits(item, geo_.slot_bytes) "
+TYPED_GUARD = ("if (item.staging == moe_stream_staging::NONE || "
+               "!(aos_only ? moe_stream_item_aos_fits(item, geo_.slot_bytes) "
                ": " + REORDERABLE_CALL + ")) { ++n.untyped; continue; }")
 
 
@@ -508,14 +523,15 @@ def test_streamed_item_mutants():
         mutate(PHASE, "item.staging == moe_stream_staging::NONE || ", ""), PLAN_HPP)
 
 
-# ---- AOS-only staging (c-hmey) ----------------------------------------------------------------------------------------
+# ---- AOS-only staging (c-hmey) ---------------------------------------------------------------------------------------
 
 AOS_ONLY_FLAG = "const bool aos_only = item.staging == moe_stream_staging::AOS_ONLY;"
 SLOTS_CHECK = "if (ring_->slots_free() < moe_stream_staging_slots(item.staging)) { ++n.exhausted; continue; }"
 AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
 SOA_ACQUIRE = "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_SOA);"
 STAGING_SLOTS_SIG = "static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging)"
-STAGING_SLOTS_BODY = "{ return staging == moe_stream_staging::SOA ? 2u : staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }"
+STAGING_SLOTS_BODY = ("{ return staging == moe_stream_staging::SOA ? 2u : "
+                      "staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }")
 REGION_SIZE = "li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));"
 INDEX_BUILD_SIG = "static inline moe_stream_plan_index moe_stream_plan_index_build("
 RING_SIZE_CALL = "moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, index_.resident_expert_bytes)"
@@ -544,7 +560,8 @@ def test_aos_only_slot_mutants():
         mutate(PHASE, SOA_ACQUIRE, "mem_handle soa = ring_->acquire_slot(GGML_LAYOUT_SOA);"), PLAN_HPP)
     assert not claim_aos_only_item_takes_one_slot(
         mutate(PHASE, SOA_ACQUIRE,
-               "mem_handle soa = aos_only ? ring_->acquire_slot(GGML_LAYOUT_AOS) : ring_->acquire_slot(GGML_LAYOUT_SOA);"),
+               "mem_handle soa = aos_only ? ring_->acquire_slot(GGML_LAYOUT_AOS) : "
+               "ring_->acquire_slot(GGML_LAYOUT_SOA);"),
         PLAN_HPP)
     # A slot tagged with the layout it will not hold: the slice's tag would disagree with the entry's layout.
     assert not claim_aos_only_item_takes_one_slot(
@@ -556,7 +573,8 @@ def test_aos_only_slot_mutants():
     assert not claim_aos_only_item_takes_one_slot(
         PHASE, mutate(PLAN_HPP, "moe_stream_staging::AOS_ONLY ? 1u", "moe_stream_staging::AOS_ONLY ? 2u"))
     assert not claim_aos_only_item_takes_one_slot(
-        mutate(PHASE, "ring_->slots_free() < moe_stream_staging_slots(item.staging)", "ring_->slots_free() < 2u"), PLAN_HPP)
+        mutate(PHASE, "ring_->slots_free() < moe_stream_staging_slots(item.staging)", "ring_->slots_free() < 2u"),
+        PLAN_HPP)
     # The ring sized from the matrix count, as before c-hmey.
     assert not claim_aos_only_item_takes_one_slot(
         mutate(PHASE, RING_SIZE_CALL, "moe_stream_ring_size(2 * index_.host_matrices_per_layer_max, "
@@ -596,7 +614,8 @@ def test_aos_only_entry_mutants():
         mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { soa, aos, copied, GGML_LAYOUT_AOS };"))
     # The slot left to the table's hold.
     assert not claim_aos_only_entry_reads_in_place(
-        mutate(PHASE, "retain_handles_until_event({ aos, host }, copy);", "retain_handles_until_event({ host }, copy);"))
+        mutate(PHASE, "retain_handles_until_event({ aos, host }, copy);",
+               "retain_handles_until_event({ host }, copy);"))
     # A reorder submitted for an AOS-only item as well.
     assert not claim_aos_only_entry_reads_in_place(mutate(PHASE, "copied = copy; } else {", "copied = copy; } {"))
     # The entry's event a stale reorder instead of the copy.
@@ -631,7 +650,8 @@ def test_region_close_mutants():
     assert not claim_region_closes_after_last_copy(mutate(PHASE, PARTITION, ""))
     # SOA items first.
     assert not claim_region_closes_after_last_copy(
-        mutate(PHASE, AOS_ONLY_LAMBDA, AOS_ONLY_LAMBDA.replace("moe_stream_staging::AOS_ONLY", "moe_stream_staging::SOA")))
+        mutate(PHASE, AOS_ONLY_LAMBDA,
+               AOS_ONLY_LAMBDA.replace("moe_stream_staging::AOS_ONLY", "moe_stream_staging::SOA")))
     # An AOS-only region closed on a reorder of another region.
     assert not claim_region_closes_after_last_copy(
         mutate(PHASE, "region_last_ = copied;", "region_last_ = reorder;"))
@@ -639,8 +659,8 @@ def test_region_close_mutants():
     assert not claim_region_closes_after_last_copy(mutate(PHASE, "region_last_ = copied; ", ""))
 
 
-REUSE_COND = ("const bool reuse_after_readers = region_aos_only_[cur_region_] || std::any_of(items.begin(), items.end(), "
-              "aos_only_item);")
+REUSE_COND = ("const bool reuse_after_readers = region_aos_only_[cur_region_] || "
+              "std::any_of(items.begin(), items.end(), aos_only_item);")
 REUSE_TAKE = ("if (reuse_after_readers && !reuse_gate) { reuse_gate = region_read_gate_[cur_region_] ? "
               "*region_read_gate_[cur_region_] : ccs_->ext_oneapi_submit_barrier(); }")
 REUSE_DEP = "if (reuse_gate) { deps.push_back(*reuse_gate); }"
@@ -649,6 +669,11 @@ REUSE_RECORD = ("if (copied_in) { region_aos_only_[cur_region_] = aos_only_stage
                 "items.front().layer; region_read_gate_[cur_region_].reset(); }")
 REGION_FLAGS_RESET = ("region_aos_only_[0] = false; region_aos_only_[1] = false; region_layer_[0] = -1; "
                       "region_layer_[1] = -1; region_read_gate_[0].reset(); region_read_gate_[1].reset();")
+RESET_REGIONS_SIG = "void moe_stream_phase::reset_regions()"
+REGION_STATE_RESET = ("region_keys_[0].clear(); region_keys_[1].clear(); cur_region_ = 0; region_submitted_ = false; "
+                      "region_last_ = sycl::event();")
+RING_READY_RESET = "ring_ = std::move(ring); reset_regions(); return true;"
+TEARDOWN_RESET = "table_.clear(); reset_regions();"
 PHASE_LAYER_DONE_SIG = "void moe_stream_phase::layer_done(int layer, sycl::event down_done)"
 READ_GATE_RECORD = ("for (int r = 0; r < 2; ++r) { if (region_layer_[r] == layer) { region_read_gate_[r] = down_done; "
                     "} }")
@@ -661,10 +686,12 @@ def claim_aos_only_reuse_waits_for_readers(phase: str) -> bool:
     layer_done submitted on the readers' queue (c-las5) behind the down op of the layer the region last held, recorded
     for the region holding that layer. Without one, the copies wait for a compute-queue barrier submitted at the first
     copy. A copy going in makes the stage the region's last use: its layer, whether it left an AOS-only slot, and no
-    read gate yet. A new ring starts with no layer, no AOS-only slot and no read gate."""
+    read gate yet. A new ring starts with no layer, no AOS-only slot and no read gate, and teardown leaves none behind:
+    both run the one helper that forgets them, so the two cannot drift apart."""
     n = norm(phase)
     s = body(n, STAGE_SIG)
     done = body(n, PHASE_LAYER_DONE_SIG)
+    reset = body(n, RESET_REGIONS_SIG)
     return (s.count(REUSE_TAKE) == 1 and s.count(REUSE_DEP) == 1 and s.count(REUSE_RECORD) == 1
             and s.count(COPIED_IN) == 1 and "bool copied_in = false;" in s
             and ordered(s, PARTITION, REUSE_COND, ITEM_LOOP, COPY_DEPS, READY_DEP, REUSE_TAKE, REUSE_DEP, COPY_DECL,
@@ -672,7 +699,9 @@ def claim_aos_only_reuse_waits_for_readers(phase: str) -> bool:
             and n.count(READ_GATE_RECORD) == 1 and done.count(READ_GATE_RECORD) == 1
             and ordered(done, "if (layer != cur_layer_) { return; }", READ_GATE_RECORD)
             and n.count("region_read_gate_[r] =") == 1
-            and REGION_FLAGS_RESET in body(n, RING_READY_SIG))
+            and n.count(RESET_REGIONS_SIG + " {") == 1 and ordered(reset, REGION_STATE_RESET, REGION_FLAGS_RESET)
+            and RING_READY_RESET in body(n, RING_READY_SIG) and TEARDOWN_RESET in body(n, TEARDOWN_SIG)
+            and n.count("reset_regions();") == 2)
 
 
 def test_aos_only_reuse_waits_for_readers():
@@ -722,14 +751,24 @@ def test_aos_only_reuse_mutants():
     # A new ring inherits the old ring's read gates.
     assert not claim_aos_only_reuse_waits_for_readers(
         mutate(PHASE, "region_read_gate_[0].reset(); region_read_gate_[1].reset();", ""))
+    # A new ring, or a torn-down phase, keeps the layers its regions last held, so layer_done gates a region by a
+    # layer it no longer holds.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "region_layer_[0] = -1; region_layer_[1] = -1;", ""))
+    # A new ring never forgets the old ring's regions.
+    assert not claim_aos_only_reuse_waits_for_readers(in_body(PHASE, RING_READY_SIG, "reset_regions(); ", ""))
+    # Teardown leaves the regions' layers and read gates behind for the next ring of a reused phase.
+    assert not claim_aos_only_reuse_waits_for_readers(in_body(PHASE, TEARDOWN_SIG, " reset_regions();", ""))
 
 
-PROMPT_KERNEL_SIG = ("static bool ggml_sycl_moe_stream_prompt_kernel(void * graph_ctx, ggml_type type, ggml_layout_mode "
-                     "layout, int64_t ne0, int64_t ne1)")
+PROMPT_KERNEL_SIG = ("static bool ggml_sycl_moe_stream_prompt_kernel(void * graph_ctx, ggml_type type, "
+                     "ggml_layout_mode layout, int64_t ne0, int64_t ne1)")
 PROMPT_KERNEL_QUERY = ("ggml_sycl_moe_query_route_capability(type, layout, moe_route_phase::PROMPT, ne0, ne1, "
                        "static_cast<size_t>(call->op.n_tokens), call->device, moe_layer_route_residency::DEVICE, "
                        "call->device);")
 PROMPT_KERNEL_FILL = "call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;"
+PROMPT_KERNEL_RETURN = ("return ggml_sycl_moe_staged_capability_refusal(cap, type) == "
+                        "ggml_sycl::moe_staged_route_refusal::NONE;")
 STAGING_SIG = "static inline moe_stream_staging moe_stream_item_staging("
 INDEX_CALL = "index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims);"
 PREPARE_SIG = "void moe_stream_phase::prepare("
@@ -747,7 +786,7 @@ def claim_staging_from_the_capability_query(sycl: str, hpp: str, phase: str) -> 
     pk = body(n[at:], PROMPT_KERNEL_SIG) if at >= 0 else ""
     st = body(norm(hpp), STAGING_SIG)
     p = norm(phase)
-    return (n.count(PROMPT_KERNEL_SIG + " {") == 1 and PROMPT_KERNEL_QUERY in pk and "return cap.supported;" in pk
+    return (n.count(PROMPT_KERNEL_SIG + " {") == 1 and PROMPT_KERNEL_QUERY in pk and PROMPT_KERNEL_RETURN in pk
             and "moe_mmvq_" not in pk and "soa_reorder" not in pk
             and n.count(PROMPT_KERNEL_FILL) == 1
             and ordered(st, "if (prompt_kernel == nullptr) { return moe_stream_staging::NONE; }",
@@ -766,11 +805,13 @@ def test_staging_from_the_capability_query():
 def test_staging_source_mutants():
     # A second table answering what the device reads.
     assert not claim_staging_from_the_capability_query(
-        mutate(SYCL, PROMPT_KERNEL_QUERY, PROMPT_KERNEL_QUERY + " (void) moe_mmvq_capability_supports_layout(type, layout);"),
+        mutate(SYCL, PROMPT_KERNEL_QUERY,
+               PROMPT_KERNEL_QUERY + " (void) moe_mmvq_capability_supports_layout(type, layout);"),
         PLAN_HPP, PHASE)
     # Asked for the decode phase.
     assert not claim_staging_from_the_capability_query(
-        mutate(SYCL, "type, layout, moe_route_phase::PROMPT, ne0, ne1,", "type, layout, moe_route_phase::DECODE, ne0, ne1,"),
+        mutate(SYCL, "type, layout, moe_route_phase::PROMPT, ne0, ne1,",
+               "type, layout, moe_route_phase::DECODE, ne0, ne1,"),
         PLAN_HPP, PHASE)
     # The backend leaves the predicate unset: nothing would ever stage.
     assert not claim_staging_from_the_capability_query(mutate(SYCL, PROMPT_KERNEL_FILL, ""), PLAN_HPP, PHASE)
@@ -781,11 +822,90 @@ def test_staging_source_mutants():
     # The index built blind.
     assert not claim_staging_from_the_capability_query(
         SYCL, PLAN_HPP,
-        mutate(PHASE, INDEX_CALL, "index_ = moe_stream_plan_index_build(plan, device, nullptr, nullptr, op.library_claims);"))
+        mutate(PHASE, INDEX_CALL,
+               "index_ = moe_stream_plan_index_build(plan, device, nullptr, nullptr, op.library_claims);"))
     # The predicate asked again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, " \
                                   "item.nrows);"
     assert not claim_staging_from_the_capability_query(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
+
+
+BATCH_HPP_REL = "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
+BATCH_HPP = read(BATCH_HPP_REL)
+BUILD_SIG = "moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,"
+STAGED_CAP_SIG = ("static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const "
+                  "moe_route_capability & cap, ggml_type type)")
+STAGED_CAP_STEPS = (
+    "if (!cap.supported) { return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED; }",
+    "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) { return ggml_sycl::moe_staged_route_refusal::KERNEL; }",
+    "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL; }",
+    "return ggml_sycl::moe_staged_route_refusal::NONE;",
+)
+ROUTE_CAP_ASK = "ggml_sycl_moe_staged_capability_refusal(cap, src0->type);"
+DIRECT_SIG = "inline bool moe_type_needs_direct_kernel(ggml_type type)"
+DIRECT_BODY = "{ return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4; }"
+VALIDATE_SIG = "inline bool validate_moe_execution_recipe("
+CHOOSE_SIG = "inline moe_batch_executor_choice choose_moe_batch_executor("
+DIRECT_USES = (
+    "if (recipe.kind == moe_batch_executor::HOST_CPU && moe_type_needs_direct_kernel(recipe.request.type)) {",
+    "const bool direct_q1_nvfp4 = moe_type_needs_direct_kernel(recipe.request.type);",
+    "operand.recipe().kind != moe_batch_executor::HOST_CPU && "
+    "moe_type_needs_direct_kernel(operand.recipe().request.type);",
+)
+
+
+def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
+    """llama.cpp-o9uw: the ring stages only what the staged route can serve. The prompt-kernel predicate and the
+    resolver ask one helper, which admits a supported MMVQ_COMPAT kernel and nothing else, and refuses a type that
+    runs only through its direct kernel. Which types those are is one predicate, the one the recipe validator and the
+    executor choice ask, and neither of those spells the types out, so the staging predicate cannot drift from the
+    served test: Q1_0 and NVFP4, which the capability query answers MMVQ_COMPAT for in a prompt, stage NONE. The
+    predicate's only answer other than the helper's is false for a missing call."""
+    n = norm(sycl)
+    b = norm(batch_hpp)
+    at = n.find(PROMPT_KERNEL_SIG + " {")
+    pk = body(n[at:], PROMPT_KERNEL_SIG) if at >= 0 else ""
+    cap = body(n, STAGED_CAP_SIG)
+    return (n.count(STAGED_CAP_SIG + " {") == 1 and ordered(cap, *STAGED_CAP_STEPS)
+            and re.findall(r"moe_route_kernel::(\w+)", cap) == ["MMVQ_COMPAT"]
+            and pk.endswith(PROMPT_KERNEL_RETURN + " }") and "return true" not in pk
+            and ROUTE_CAP_ASK in body(n, BUILD_SIG)
+            and n.count("ggml_sycl_moe_staged_capability_refusal(") == 3
+            and b.count(DIRECT_SIG + " " + DIRECT_BODY) == 1 and all(b.count(use) == 1 for use in DIRECT_USES)
+            and not any(t in body(b, sig) for t in ("GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4")
+                        for sig in (VALIDATE_SIG, CHOOSE_SIG)))
+
+
+def test_staging_mirrors_serving():
+    assert claim_staging_mirrors_serving(SYCL, BATCH_HPP)
+
+
+def test_staging_mirrors_serving_mutants():
+    c = claim_staging_mirrors_serving
+    # The predicate answering from the capability alone again, so a Q1_0/NVFP4 matrix stages and is never served.
+    assert not c(mutate(SYCL, PROMPT_KERNEL_RETURN, "return cap.supported;"), BATCH_HPP)
+    # The helper admitting a direct-kernel type.
+    assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""), BATCH_HPP)
+    # The helper admitting another kernel.
+    assert not c(mutate(SYCL, "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {",
+                        "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT && "
+                        "cap.kernel != moe_route_kernel::XMX_TILED) {"), BATCH_HPP)
+    # The resolver asking a test of its own.
+    assert not c(mutate(SYCL, ROUTE_CAP_ASK, "moe_staged_route_refusal::NONE;"), BATCH_HPP)
+    # The validator spelling the types out again, so the two answers can drift.
+    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_USES[1],
+                              "const bool direct_q1_nvfp4 = recipe.request.type == GGML_TYPE_Q1_0 || "
+                              "recipe.request.type == GGML_TYPE_NVFP4;"))
+    # The executor choice spelling the types out again.
+    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_USES[2],
+                              "operand.recipe().kind != moe_batch_executor::HOST_CPU && "
+                              "operand.recipe().request.type == GGML_TYPE_NVFP4;"))
+    # The predicate answering yes before it asks the helper.
+    head = PROMPT_KERNEL_SIG + " { const auto * call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx); "
+    assert not c(mutate(SYCL, head + "if (call == nullptr) { return false; }",
+                        head + "if (call != nullptr) { return true; }"), BATCH_HPP)
+    # The predicate losing one of its types.
+    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
 
 
 LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "
@@ -851,7 +971,8 @@ def test_library_claim_mutants():
     assert not claim_staging_declines_library_claimed(
         mutate(SYCL, ROUTE_LIBRARY_CLAIM, "const bool stream_library_claimed = false;"), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
-    assert not claim_staging_declines_library_claimed(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
+    assert not claim_staging_declines_library_claimed(
+        SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
     # A claimed matrix still takes a slot: the claim applied after the slot accounting.
     late = mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "")
     late = mutate(late, "++li.n_streamable;", "++li.n_streamable; " + INDEX_CLAIM_APPLY)
@@ -864,7 +985,7 @@ def test_library_claim_mutants():
     assert not claim_staging_declines_library_claimed(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
 
 
-# ---- the policy gate --------------------------------------------------------------------------------------------------
+# ---- the policy gate -------------------------------------------------------------------------------------------------
 
 RESOLVE_SIG = "void moe_stream_phase::resolve("
 STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage("
@@ -1054,16 +1175,18 @@ def test_ring_unavailable_diagnostic_mutants():
     tree["extra.cpp"] = '"' + DIAG_FMT + '"'
     assert not claim_ring_unavailable_diagnostic(PHASE, PLAN_HPP, tree)
     assert not claim_ring_unavailable_diagnostic(mutate(PHASE, DIAG_EMIT, "(void) line;"), PLAN_HPP, SYCL_TREE)
-    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, '"reserve refused"', '"reserve failed"'), SYCL_TREE)
-    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, "geo.n_slots == 0", "geo.bytes == 0"), SYCL_TREE)
+    assert not claim_ring_unavailable_diagnostic(
+        PHASE, mutate(PLAN_HPP, '"reserve refused"', '"reserve failed"'), SYCL_TREE)
+    assert not claim_ring_unavailable_diagnostic(
+        PHASE, mutate(PLAN_HPP, "geo.n_slots == 0", "geo.bytes == 0"), SYCL_TREE)
 
 
 def claim_ring_unavailable_once_per_prompt(phase: str) -> bool:
-    """Lead ruling c-kcyf: at most one diagnostic per prompt, and only under an explicit ring or a trace. The guard comes
-    first, the flag is set before the line goes out, end_prompt clears it and begin_ubatch does not, and resolve calls
-    it for the decision the layer ends with (after a refused reserve rewrote it), before the layer's report. The phase
-    has no log call of its own: a queue that is not in order is one of the diagnostic's rules, under the same gating
-    (lead ruling c-xod7-q1)."""
+    """Lead ruling c-kcyf: at most one diagnostic per prompt, and only under an explicit ring or a trace. The guard
+    comes first, the flag is set before the line goes out, end_prompt clears it and begin_ubatch does not, and resolve
+    calls it for the decision the layer ends with (after a refused reserve rewrote it), before the layer's report. The
+    phase has no log call of its own: a queue that is not in order is one of the diagnostic's rules, under the same
+    gating (lead ruling c-xod7-q1)."""
     n = norm(phase)
     w = body(n, WARN_SIG)
     return (w.startswith("{ " + WARN_GUARD) and "GGML_LOG_" not in n
@@ -1084,7 +1207,8 @@ def test_ring_unavailable_once_mutants():
     assert not claim_ring_unavailable_once_per_prompt(mutate(PHASE, "if (warned_unavailable_ || ", "if ("))
     # Cleared per micro-batch instead of per prompt.
     assert not claim_ring_unavailable_once_per_prompt(
-        mutate(PHASE, "reserve_failed_ = false; table_.clear();", "reserve_failed_ = false; " + WARN_CLEAR + " table_.clear();"))
+        mutate(PHASE, "reserve_failed_ = false; table_.clear();",
+               "reserve_failed_ = false; " + WARN_CLEAR + " table_.clear();"))
     # Never cleared: only the first prompt of the context would warn.
     assert not claim_ring_unavailable_once_per_prompt(drop_in(PHASE, END_PROMPT_SIG, WARN_CLEAR))
     # AUTO without a trace would warn too.
@@ -1099,7 +1223,8 @@ def test_ring_unavailable_once_mutants():
 
 
 REPORT_CALL = "report(layer, st, n, op);"
-NEXT_LOOKUP = "const auto nxt = next < moe_exec_decision_log::MAX_LAYERS ? index_.layers.find(next) : index_.layers.end();"
+NEXT_LOOKUP = ("const auto nxt = next < moe_exec_decision_log::MAX_LAYERS ? index_.layers.find(next) : "
+               "index_.layers.end();")
 
 
 def brace_depth(text: str, at: int) -> int:
@@ -1149,7 +1274,7 @@ def test_next_layer_bound_mutants():
         mutate(PHASE, "next < moe_exec_decision_log::MAX_LAYERS", "next <= moe_exec_decision_log::MAX_LAYERS"))
 
 
-# ---- the ring's lifetime ----------------------------------------------------------------------------------------------
+# ---- the ring's lifetime ---------------------------------------------------------------------------------------------
 
 TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
 
@@ -1183,7 +1308,8 @@ TEARDOWN_RETAIN = "if (anchor_.valid()) { retain_handles_until_event({ anchor_ }
 
 def test_teardown_mutants():
     assert not claim_teardown_gates_before_release(mutate(PHASE, "close_region(last_use);", ""))
-    assert not claim_teardown_gates_before_release(mutate(PHASE, "retain_handles_until_event({ anchor_ }, last_use);", ""))
+    assert not claim_teardown_gates_before_release(
+        mutate(PHASE, "retain_handles_until_event({ anchor_ }, last_use);", ""))
     assert not claim_teardown_gates_before_release(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = true;"))
     # The ring released before the slot handle is retained on the last use.
     assert not claim_teardown_gates_before_release(
@@ -1196,7 +1322,7 @@ def test_teardown_mutants():
         in_body(PHASE, END_PROMPT_SIG, "teardown(ring_ ? compute_barrier() : sycl::event());", ""))
 
 
-# ---- the context's wiring ---------------------------------------------------------------------------------------------
+# ---- the context's wiring --------------------------------------------------------------------------------------------
 
 MEMBER = "std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;"
 DTOR_SIG = "ggml_backend_sycl_context::~ggml_backend_sycl_context()"
@@ -1213,7 +1339,8 @@ def claim_context_owns_and_ends_the_phase(common: str, sycl: str) -> bool:
     dtor = body(n, DTOR_SIG)
     done = body(n, LAYER_DONE_SIG)
     return (MEMBER in norm(common)
-            and ordered(dtor, "qptrs[dev][s]->wait();", "moe_stream.reset();", "ggml_sycl::drain_retained_handles(true);")
+            and ordered(dtor, "qptrs[dev][s]->wait();", "moe_stream.reset();",
+                        "ggml_sycl::drain_retained_handles(true);")
             and END_PROMPT in n and DISPATCH in n and n.count("moe_stream->layer_done(") == 1
             and ordered(done, "!ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording",
                         "it->second.down_weight != dst->src[0]", "moe_stream->layer_done("))
@@ -1228,7 +1355,8 @@ def test_context_mutants():
     assert not claim_context_owns_and_ends_the_phase(COMMON, mutate(SYCL, "moe_stream.reset();", ""))
     assert not claim_context_owns_and_ends_the_phase(
         COMMON, mutate(SYCL, "if (cached_is_decode && sycl_ctx->moe_stream) {", "if (sycl_ctx->moe_stream) {"))
-    assert not claim_context_owns_and_ends_the_phase(COMMON, mutate(SYCL, " ggml_sycl_moe_stream_layer_done(ctx, dst); break;", " break;"))
+    assert not claim_context_owns_and_ends_the_phase(
+        COMMON, mutate(SYCL, " ggml_sycl_moe_stream_layer_done(ctx, dst); break;", " break;"))
     assert not claim_context_owns_and_ends_the_phase(
         COMMON, mutate(SYCL, "it->second.down_weight != dst->src[0]", "false"))
     # The phase reset before the queues drain: its teardown barrier would not follow the last ring use.
@@ -1263,13 +1391,14 @@ def test_reorder_is_shared_not_copied():
 
 def test_reorder_shared_mutants():
     assert not claim_reorder_is_shared_not_copied(mutate(SYCL, REORDER_DEF, "static " + REORDER_DEF), PLAN_HPP)
-    assert not claim_reorder_is_shared_not_copied(SYCL, mutate(PLAN_HPP, REORDER_DEF, "sycl::event other_reorder(sycl::queue & queue,"))
+    assert not claim_reorder_is_shared_not_copied(
+        SYCL, mutate(PLAN_HPP, REORDER_DEF, "sycl::event other_reorder(sycl::queue & queue,"))
     # The load-time fill moved off the shared dispatch.
     assert not claim_reorder_is_shared_not_copied(
         mutate(SYCL, LOAD_FILL, "other_reorder(queue, static_cast<const uint8_t *>(temp_vram),"), PLAN_HPP)
 
 
-# ---- the trace --------------------------------------------------------------------------------------------------------
+# ---- the trace -------------------------------------------------------------------------------------------------------
 
 
 def claim_trace_line(phase: str, tree: dict) -> bool:
@@ -1286,7 +1415,8 @@ def test_trace_line():
 
 
 def test_trace_mutants():
-    assert not claim_trace_line(mutate(PHASE, "window=%.0f", "win=%.0f"), {PHASE_REL: mutate(PHASE, "window=%.0f", "win=%.0f")})
+    m = mutate(PHASE, "window=%.0f", "win=%.0f")
+    assert not claim_trace_line(m, {PHASE_REL: m})
     tree = dict(SYCL_TREE)
     tree["extra.cpp"] = '"' + TRACE_FMT + '"'
     assert not claim_trace_line(PHASE, tree)

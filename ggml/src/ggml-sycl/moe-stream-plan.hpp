@@ -215,8 +215,8 @@ static inline size_t moe_stream_item_rows_bytes(const moe_stream_item & item) {
 }  // namespace detail
 
 // True iff the reorder takes `item` into one ring slot of `slot_bytes`: its type has an AOS->SOA reorder (the one
-// table, soa-reorder-types.hpp), its rows are whole blocks, and src_bytes is exactly its rows' bytes, which is also what
-// the reorder writes.
+// table, soa-reorder-types.hpp), its rows are whole blocks, and src_bytes is exactly its rows' bytes, which is also
+// what the reorder writes.
 static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes) {
     return ggml_sycl_soa_reorder_supported_type(item.type) && detail::moe_stream_item_rows_bytes(item) != 0 &&
            std::max(item.src_bytes, item.dst_bytes) <= slot_bytes;
@@ -359,7 +359,8 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         item.type      = e.type;
         item.ncols     = e.ne[0];
         item.nrows     = e.ne[1];
-        // The staging depends only on (type, shape, src bytes) at the sizing slot, so it is asked once per distinct one.
+        // The staging depends only on (type, shape, src bytes) at the sizing slot, so it is asked once per distinct
+        // one.
         bool answered  = false;
         for (const staging_answer & a : answers) {
             if (a.type == item.type && a.ncols == item.ncols && a.nrows == item.nrows &&
@@ -577,6 +578,64 @@ struct moe_stream_op {
     moe_stream_library_claims_fn library_claims = nullptr;
 };
 
+// Why the resolver refused a staged ring slot (llama.cpp-o9uw), in the order ggml_sycl_build_moe_resolved_batch
+// asks.
+// NONE: served.
+enum class moe_staged_route_refusal : uint8_t {
+    NONE,
+    CLAIMED,        // the oneDNN batched prompt executor claims the weight (c-las5)
+    UNSUPPORTED,    // the capability query answers no kernel for the type in the entry's layout
+    KERNEL,         // it answers a kernel other than the plain MMVQ_COMPAT
+    DIRECT_KERNEL,  // Q1_0/NVFP4: only their direct kernel runs them on a device (moe_type_needs_direct_kernel)
+    VIEW,           // the slot resolves to no device pointer
+    LAYOUT,         // the slot's resolved layout is not the entry's
+    ROUTE,          // validate_moe_batch_route refuses the route
+    RECIPE,         // the recipe is missing, or validate_moe_execution_recipe refuses it
+};
+
+inline const char * moe_staged_route_refusal_name(moe_staged_route_refusal refusal) {
+    switch (refusal) {
+        case moe_staged_route_refusal::NONE:
+            return "served";
+        case moe_staged_route_refusal::CLAIMED:
+            return "claimed";
+        case moe_staged_route_refusal::UNSUPPORTED:
+            return "unsupported";
+        case moe_staged_route_refusal::KERNEL:
+            return "kernel";
+        case moe_staged_route_refusal::DIRECT_KERNEL:
+            return "direct-kernel";
+        case moe_staged_route_refusal::VIEW:
+            return "view";
+        case moe_staged_route_refusal::LAYOUT:
+            return "layout";
+        case moe_staged_route_refusal::ROUTE:
+            return "route";
+        case moe_staged_route_refusal::RECIPE:
+            return "recipe";
+    }
+    return "unknown";
+}
+
+// The resolver's STAGED_RING lookups over one prompt (llama.cpp-o9uw): how many it served and refused, and the refusals
+// by cause and detail, so the trace says why a staged slot went unserved (plan Task 8). A detail is a string with
+// static storage (a capability reason, or moe_batch_reject_reason_name's), or null.
+struct moe_staged_route_tally {
+    struct refusal_count {
+        moe_staged_route_refusal refusal = moe_staged_route_refusal::NONE;
+        const char *             detail  = nullptr;
+        size_t                   n       = 0;
+    };
+
+    size_t                     served  = 0;
+    size_t                     refused = 0;
+    std::vector<refusal_count> refusals;  // one per distinct (cause, detail), in the order first seen
+
+    void        count(moe_staged_route_refusal refusal, const char * detail);
+    // "cause(detail)=n", or "cause=n" with no detail, per distinct (cause, detail), space-separated; empty when none.
+    std::string refusals_text() const;
+};
+
 // The prompt phase of one device context (ggml_backend_sycl_context::moe_stream): the VRAM ring, the stage table and
 // the current micro-batch's per-layer decisions.
 //
@@ -623,13 +682,17 @@ class moe_stream_phase {
     void                      layer_done(int layer, sycl::event down_done);
     // The first decode graph after a prompt: the table, the decisions and the ring go.
     void                      end_prompt();
-    // The resolver's STAGED_RING lookups this prompt (llama.cpp-o9uw): an entry it served, or refused and left to the
-    // route core. end_prompt traces and clears them.
-    void                      count_staged_route(bool served);
+    // The resolver's STAGED_RING lookups this prompt (llama.cpp-o9uw): NONE for an entry it served, else why it
+    // refused the entry and left it to the route core, with the detail (moe_staged_route_tally). end_prompt traces and
+    // clears them.
+    void                      count_staged_route(moe_staged_route_refusal refusal, const char * detail);
 
-    size_t staged_routes_served() const { return staged_served_; }
+    size_t staged_routes_served() const { return staged_routes_.served; }
 
-    size_t staged_routes_refused() const { return staged_refused_; }
+    size_t staged_routes_refused() const { return staged_routes_.refused; }
+
+    // This prompt's refusals by cause and detail (moe_staged_route_tally::refusals_text).
+    std::string staged_route_refusals() const { return staged_routes_.refusals_text(); }
 
     // The times the ring was given back (teardown). The backend nulls the slot pointers its pointer tables copied out
     // of the stage table when this moves (llama.cpp-o9uw).
@@ -674,6 +737,7 @@ class moe_stream_phase {
                             const moe_stream_op &         op);
     bool              ring_ready();
     void              close_region(sycl::event region_done);
+    void              reset_regions();
     sycl::event       compute_barrier();
     void              teardown(sycl::event last_use);
     void              report(int layer, const layer_state & st, const stage_counts & n, const moe_stream_op & op) const;
@@ -712,8 +776,7 @@ class moe_stream_phase {
     int                                             region_layer_[2]    = { -1, -1 };
     std::optional<sycl::event>                      region_read_gate_[2];
     const moe_exec_decision_log *                   log_                = nullptr;  // the last op's, for end_prompt
-    size_t                                          staged_served_      = 0;
-    size_t                                          staged_refused_     = 0;
+    moe_staged_route_tally                          staged_routes_;
     uint64_t                                        ring_releases_      = 0;
 };
 

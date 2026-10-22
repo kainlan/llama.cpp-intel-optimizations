@@ -29582,9 +29582,9 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
 // The region's SOA slots are next rewritten by reorders on this same in-order queue, so the queue, not the barrier,
 // orders that reuse after their readers. Under STREAM_ALL the open region holds layer + 1's slots, staged a layer
 // ahead, whose readers have not run yet: the barrier follows their reorders, not their kernels. An AOS-only slot
-// (c-hmey) is read in place by those kernels, so the barrier is also the read gate of the region holding `layer`, whose
-// kernels it follows, and moe_stream_phase::stage() orders a reuse that may overwrite such a slot behind it (lead ruling
-// c-o9uw-1). Never while a command graph records: ring work is never recorded.
+// (c-hmey) is read in place by those kernels, so the barrier is also the read gate of the region holding `layer`,
+// whose kernels it follows, and moe_stream_phase::stage() orders a reuse that may overwrite such a slot behind it
+// (lead ruling c-o9uw-1). Never while a command graph records: ring work is never recorded.
 static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
     if (!ctx.moe_stream || !ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording) {
         return;
@@ -29606,28 +29606,50 @@ static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, con
 }
 
 // A pointer-table upload copies a staged ring slot's raw pointer into its weight's persistent payload
-// (ggml_sycl_upload_moe_transient_ptr_table). Once the ring that held it is given back the pointer has no owner, so it
-// is nulled here, as an expert storage release nulls its own slot (ggml_tensor_extra_gpu): the payload slot goes to
-// null and the device table is marked invalid, so no kernel reads it (moe_ptrs_ptr answers null) until the next upload
-// revalidates the table and rewrites all of it. A slot a later upload gave a resident expert holds that expert's handle
-// and is left alone. Called where the ring can go: after end_prompt, after begin_layer (a new geometry re-reserves
-// it), and once the phase is gone. Nothing is submitted.
-static void ggml_sycl_moe_stream_release_payload(ggml_backend_sycl_context & ctx) {
-    const uint64_t releases = ctx.moe_stream ? ctx.moe_stream->ring_releases() : UINT64_MAX;
-    if (releases == ctx.moe_stream_payload_releases) {
-        return;  // the ring the recorded pointers point into is still held
+// (ggml_sycl_upload_moe_transient_ptr_table) and records which payload slot took one, here: per weight, keyed by the
+// extra's cache identity (cache_uuid), never by its address, with no device pointer in the record. The record holds
+// the extra itself only to reach its payload, which the lifetime precondition beside ctx.moe_stream_payload covers;
+// each record is counted on the extra, and release_extra_gpu asserts the count is zero.
+static void ggml_sycl_moe_stream_record_payload(ggml_backend_sycl_context & ctx,
+                                                ggml_tensor_extra_gpu *     extra,
+                                                size_t                      slot,
+                                                size_t                      n_slots) {
+    ggml_backend_sycl_context::moe_stream_payload_record & rec =
+        ctx.moe_stream_payload[ggml_sycl_assign_cache_uuid(extra)];
+    if (rec.extra == nullptr) {
+        rec.extra = extra;
+        extra->weight().moe_stream_payload_records.fetch_add(1, std::memory_order_relaxed);
     }
-    ctx.moe_stream_payload_releases = releases;
+    GGML_ASSERT(rec.extra == extra);  // one cache identity names one extra
+    if (rec.staged.size() < n_slots) {
+        rec.staged.resize(n_slots, 0);
+    }
+    rec.staged[slot] = 1;
+}
+
+// Once the ring that held a recorded slot's pointer is given back the pointer has no owner, so it is nulled here, as
+// an expert storage release nulls its own slot (ggml_tensor_extra_gpu): the payload slot goes to null and the device
+// table is marked invalid, so no kernel reads it (moe_ptrs_ptr answers null) until the next upload revalidates the
+// table and rewrites all of it. A recorded slot that a later upload gave a resident expert holds that expert's handle
+// and is left alone; every other writer of a payload slot writes its handle with it, so a recorded slot with no live
+// handle holds the ring's pointer or null. Called where the ring can go: after end_prompt, after begin_layer (a new
+// geometry re-reserves it), and once the phase is gone, when no ring is held and every record goes. Nothing is
+// submitted.
+static void ggml_sycl_moe_stream_release_payload(ggml_backend_sycl_context & ctx) {
+    if (ctx.moe_stream && ctx.moe_stream->ring_releases() == ctx.moe_stream_payload_releases) {
+        return;  // the ring the recorded slots point into is still held
+    }
+    ctx.moe_stream_payload_releases = ctx.moe_stream ? ctx.moe_stream->ring_releases() : 0;
     const int device                = ctx.device;
     for (auto & kv : ctx.moe_stream_payload) {
-        ggml_tensor_extra_gpu *                    extra     = kv.first;
-        const std::vector<void *> &                ring_ptrs = kv.second;
-        std::vector<void *> &                      payload   = extra->weight().moe_expert_ptr_payload[device];
-        const std::vector<ggml_sycl::mem_handle> & handles   = extra->weight().moe_expert_handles[device];
-        bool                                       nulled    = false;
-        for (size_t slot = 0; slot < ring_ptrs.size() && slot < payload.size(); ++slot) {
-            if (ring_ptrs[slot] != nullptr && payload[slot] == ring_ptrs[slot] &&
-                (slot >= handles.size() || !handles[slot].valid())) {
+        ggml_tensor_extra_gpu * extra = kv.second.extra;
+        GGML_ASSERT(extra != nullptr && extra->cache_uuid == kv.first);
+        const std::vector<uint8_t> &               staged  = kv.second.staged;
+        std::vector<void *> &                      payload = extra->weight().moe_expert_ptr_payload[device];
+        const std::vector<ggml_sycl::mem_handle> & handles = extra->weight().moe_expert_handles[device];
+        bool                                       nulled  = false;
+        for (size_t slot = 0; slot < staged.size() && slot < payload.size(); ++slot) {
+            if (staged[slot] != 0 && payload[slot] != nullptr && (slot >= handles.size() || !handles[slot].valid())) {
                 payload[slot] = nullptr;
                 nulled        = true;
             }
@@ -29636,6 +29658,7 @@ static void ggml_sycl_moe_stream_release_payload(ggml_backend_sycl_context & ctx
             extra->weight().moe_device_table_valid[device] = false;
             ggml_sycl_invalidate_moe_full_local_probe(extra, device);
         }
+        extra->weight().moe_stream_payload_records.fetch_sub(1, std::memory_order_release);
     }
     ctx.moe_stream_payload.clear();
 }
@@ -32284,11 +32307,31 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
     return cap;
 }
 
-// The stream ring's prompt-kernel predicate (c-hmey): whether a prompt MUL_MAT_ID runs a device-resident expert of
-// (type, layout) on the call's device. The staged ring route builds its device recipe from this same query
-// (ggml_sycl_moe_build_device_recipe), so the ring stages only what a route reads: one fact, one source. A ring slot
-// lives on the call's device, so that device both holds the expert and submits the op. The rows are the micro-batch's,
-// the most one expert can take; for the AOS and SOA layouts the ring asks about, the query refuses only zero rows.
+// What a staged ring slot is served with (c-las5): a plain MMVQ_COMPAT kernel on the submit queue, for a type that
+// does not need its own direct kernel (moe_type_needs_direct_kernel: Q1_0 and NVFP4 run on a device only through
+// DEVICE_MMVQ_Q1_NVFP4_AOS, so validate_moe_execution_recipe refuses an MMVQ_COMPAT recipe for them). NONE when the
+// capability `cap` of `type` can be served, else the cause. The ring's prompt-kernel predicate and the resolver's
+// staged route both ask it, so the ring stages nothing the route cannot serve (llama.cpp-o9uw).
+static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap,
+                                                                                   ggml_type                    type) {
+    if (!cap.supported) {
+        return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED;
+    }
+    if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {
+        return ggml_sycl::moe_staged_route_refusal::KERNEL;
+    }
+    if (ggml_sycl::moe_type_needs_direct_kernel(type)) {
+        return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL;
+    }
+    return ggml_sycl::moe_staged_route_refusal::NONE;
+}
+
+// The stream ring's prompt-kernel predicate (c-hmey): whether the staged ring route can serve a slot of (type, layout)
+// on the call's device. The route builds its device recipe from this same query (ggml_sycl_moe_build_device_recipe)
+// and serves only what ggml_sycl_moe_staged_capability_refusal accepts, so the ring stages only what the route reads:
+// one fact, one source. A ring slot lives on the call's device, so that device both holds the expert and submits the
+// op. The rows are the micro-batch's, the most one expert can take; for the AOS and SOA layouts the ring asks about,
+// the query refuses only zero rows.
 static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
                                                ggml_type        type,
                                                ggml_layout_mode layout,
@@ -32301,7 +32344,7 @@ static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
     const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
         type, layout, moe_route_phase::PROMPT, ne0, ne1, static_cast<size_t>(call->op.n_tokens), call->device,
         moe_layer_route_residency::DEVICE, call->device);
-    return cap.supported;
+    return ggml_sycl_moe_staged_capability_refusal(cap, type) == ggml_sycl::moe_staged_route_refusal::NONE;
 }
 
 static void ggml_sycl_moe_secondary_dispatch_layout_candidates(ggml_type                  type,
@@ -32777,26 +32820,55 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     src0, submit_device, rows, invocation_backend, invocation_queue, queue_capability, staged);
                 staged.recipe.transfer      = moe_recipe_transfer::STAGED_RING;
                 staged.recipe_reason        = "staged-ring";
-                // Served only as a plain MMVQ_COMPAT kernel on the submit queue (c-las5): a library claim, or any
-                // other kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), refuses
-                // it. So does a slot whose resolved layout is not the entry's: the phase acquires each slot with the
-                // layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a wrong entry. A refused
-                // entry falls through to the route core, whose HOST answer stands. 348c can lift the MMVQ_COMPAT-only
-                // refusal for a library (oneDNN) reader by chaining a region's rewrite on that reader's completion:
-                // stage() already makes the rewrite wait for a compute-queue barrier behind every kernel read
-                // submitted before it (moe-stream-plan.cpp), and a library reader needs the same read gate, fed with
-                // its own completion event.
-                moe_batch_reject_reason why = moe_batch_reject_reason::NONE;
-                const bool              served =
-                    !stream_library_claimed && cap.supported && cap.kernel == moe_route_kernel::MMVQ_COMPAT &&
-                    view.ptr != nullptr && view.on_device && view.layout == s->layout && staged.recipe.valid &&
-                    detail::validate_moe_batch_route(staged, submit_device) == moe_batch_reject_reason::NONE &&
-                    validate_moe_execution_recipe(
-                        staged.recipe, moe_admitted_recipe_signature(staged.recipe, staged.lease), staged.lease,
-                        staged.residency, staged.has_ready_event, submit_device,
-                        /*owning_queue_available=*/false, /*reserved_workspace_bytes=*/0, &why);
-                moe_stream->count_staged_route(served);
-                if (served) {
+                // Served only as a plain MMVQ_COMPAT kernel on the submit queue (c-las5): a library claim, any other
+                // kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), or a type that
+                // needs its direct kernel refuses it (ggml_sycl_moe_staged_capability_refusal, which the ring's
+                // staging asks too). So does a slot whose resolved layout is not the entry's: the phase acquires each
+                // slot with the layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a wrong
+                // entry. A refused entry falls through to the route core, whose HOST answer stands, and is counted
+                // with its cause and the capability's reason or the validator's reject reason, in the order asked
+                // here, so the trace says why (plan Task 8). 348c can lift the MMVQ_COMPAT-only refusal for a library
+                // (oneDNN) reader by chaining a region's rewrite on that reader's completion: stage() already makes
+                // the rewrite wait for a compute-queue barrier behind every kernel read submitted before it
+                // (moe-stream-plan.cpp), and a library reader needs the same read gate, fed with its own completion
+                // event.
+                const char *                   refusal_detail = nullptr;
+                const moe_staged_route_refusal refusal        = [&]() {
+                    if (stream_library_claimed) {
+                        return moe_staged_route_refusal::CLAIMED;
+                    }
+                    const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);
+                    if (by_cap != moe_staged_route_refusal::NONE) {
+                        refusal_detail = cap.reason;
+                        return by_cap;
+                    }
+                    if (view.ptr == nullptr || !view.on_device) {
+                        return moe_staged_route_refusal::VIEW;
+                    }
+                    if (view.layout != s->layout) {
+                        return moe_staged_route_refusal::LAYOUT;
+                    }
+                    if (!staged.recipe.valid) {
+                        refusal_detail = moe_batch_reject_reason_name(moe_batch_reject_reason::RECIPE_MISSING);
+                        return moe_staged_route_refusal::RECIPE;
+                    }
+                    const moe_batch_reject_reason route_why = detail::validate_moe_batch_route(staged, submit_device);
+                    if (route_why != moe_batch_reject_reason::NONE) {
+                        refusal_detail = moe_batch_reject_reason_name(route_why);
+                        return moe_staged_route_refusal::ROUTE;
+                    }
+                    moe_batch_reject_reason why = moe_batch_reject_reason::NONE;
+                    if (!validate_moe_execution_recipe(
+                            staged.recipe, moe_admitted_recipe_signature(staged.recipe, staged.lease), staged.lease,
+                            staged.residency, staged.has_ready_event, submit_device,
+                            /*owning_queue_available=*/false, /*reserved_workspace_bytes=*/0, &why)) {
+                        refusal_detail = moe_batch_reject_reason_name(why);
+                        return moe_staged_route_refusal::RECIPE;
+                    }
+                    return moe_staged_route_refusal::NONE;
+                }();
+                moe_stream->count_staged_route(refusal, refusal_detail);
+                if (refusal == moe_staged_route_refusal::NONE) {
                     return staged;
                 }
             }
@@ -32940,6 +33012,15 @@ bool test_moe_stream_staged_route_counts(ggml_backend_t backend, size_t * served
     }
     *served  = ctx->moe_stream->staged_routes_served();
     *refused = ctx->moe_stream->staged_routes_refused();
+    return true;
+}
+
+bool test_moe_stream_staged_route_refusals(ggml_backend_t backend, std::string * refusals) {
+    ggml_backend_sycl_context * ctx = test_get_backend_ctx(backend);
+    if (ctx == nullptr || !ctx->moe_stream || refusals == nullptr) {
+        return false;
+    }
+    *refusals = ctx->moe_stream->staged_route_refusals();
     return true;
 }
 
@@ -62175,19 +62256,15 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
         // the micro-batch, and a held slice keeps the ring's whole reservation. Its handle entry is cleared, so no
         // later upload takes it for the same entry and the full-local probe refuses the table. The ring's anchor keeps
         // the bytes until the prompt's last use (moe_stream_phase::teardown), and the region gates keep a later copy
-        // off the slot until its readers are done. The pointer is recorded, and nulled once the ring is given back
-        // (ggml_sycl_moe_stream_release_payload), so it does not outlive the reservation.
+        // off the slot until its readers are done. The payload slot is recorded, and nulled once the ring is given
+        // back (ggml_sycl_moe_stream_release_payload), so the pointer does not outlive the reservation.
         const bool staged = staged_experts != nullptr &&
                             std::find(staged_experts->begin(), staged_experts->end(), eid) != staged_experts->end();
         if (staged) {
             expert_handles[slot] = ggml_sycl::mem_handle{};
             ptr_payload[slot]    = resolved.ptr;
             any_updated          = true;
-            std::vector<void *> & ring_ptrs = ctx.moe_stream_payload[extra];
-            if (ring_ptrs.size() != static_cast<size_t>(n_experts)) {
-                ring_ptrs.assign(static_cast<size_t>(n_experts), nullptr);
-            }
-            ring_ptrs[slot] = resolved.ptr;
+            ggml_sycl_moe_stream_record_payload(ctx, extra, slot, static_cast<size_t>(n_experts));
         } else if (!same_entry) {
             expert_handles[slot] = handle;
             // llama.cpp-fzem: tag the persistent extra->weight().moe_expert_handles[]
@@ -73279,6 +73356,13 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
         }
         return false;
     };
+
+    // A staged ring slot (STAGED_RING, llama.cpp-o9uw) is read only by the plain MMVQ_COMPAT kernel (c-las5), and this
+    // path reads each expert at the tensor's layout through a payload that holds no staged slot: a batch naming one is
+    // refused here, by name, rather than by the payload's missing entry further down.
+    if (ggml_sycl::moe_batch_names_staged_ring(batch)) {
+        return reject_xmx("staged-ring");
+    }
 
     const ggml_sycl_xmx_moe_policy xmx_policy = ggml_sycl_get_xmx_moe_policy();
     if (xmx_policy == ggml_sycl_xmx_moe_policy::disabled) {
@@ -87278,6 +87362,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             return false;
 #endif
         };
+
+        // A staged ring slot (STAGED_RING, llama.cpp-o9uw) holds the layout its stage-table entry records, and this
+        // per-expert path multiplies every expert at the tensor's route_layout from route.ptr. The batched paths above
+        // read a staged slot through the pointer table; a staged batch that reaches here is refused, not misread.
+        if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) {
+            throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt per-expert path refused a staged ring slot");
+        }
 
         std::vector<ggml_sycl::mem_handle> pp_gpu_leases;
         size_t                             pp_route_dev0                           = 0;
