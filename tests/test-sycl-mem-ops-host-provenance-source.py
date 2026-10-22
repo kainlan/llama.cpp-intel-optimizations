@@ -11,7 +11,8 @@ took the synchronous staged path: the flagged scatter's two H2D copies waited th
 each D2H into the pool waited for its chunk before returning.
 
 THE FIX.  The handle's retained owner answers first, from its provenance, never from the pointer.
-mem_handle::owner_metadata() copies the owner's metadata under the handle's lock.  host_endpoint_owner_in_scope()
+mem_handle::owner_metadata() copies the owner's metadata under the handle's lock; a weight lease answers with the
+typed owner its cache entry was registered with (llama.cpp-36j0).  host_endpoint_owner_in_scope()
 admits one provenance: a host-pinned slice of a device cache's host zone (host_zone set, device >= 0) that is a
 runtime stage (role STAGING or EXPERT_STAGING), an expert-path buffer (category EXPERT_CACHE) or, since llama.cpp-36j0,
 a pinned-pool weight (role WEIGHT with tier HOST_PINNED: host-planned experts are the prefill ring's copy source; a
@@ -47,8 +48,9 @@ when the DMA runs.  Each mem_copy_async site whose host endpoint can be in scope
 
 THE CONTRACT.  With comments blanked:
   O. (mem-handle.hpp, mem-handle.cpp) bool owner_metadata(alloc_metadata * out) const is declared; its definition
-     takes the handle's lock first, answers false without an owner or an out pointer, copies the owner's metadata and
-     answers true; it reads no pointer.
+     takes the handle's lock first, answers false without an out pointer, copies the retained owner's metadata and
+     answers true, else copies the lease's typed owner's metadata and answers true, else answers false; it reads no
+     pointer.
   S. (mem-ops.cpp host_endpoint_owner_in_scope) refuses unless the tier is HOST_PINNED, the host zone is set and the
      device is >= 0, and then admits exactly role STAGING, role EXPERT_STAGING, category EXPERT_CACHE and
      (tier HOST_PINNED and role WEIGHT); test-sycl-mem-ops-host-scope-source.py pins the last one's form.
@@ -298,12 +300,14 @@ def check_owner(s: dict) -> None:
     if not body.startswith("mem_handle_lock_guard g(lock_);"):
         fail("O", "owner_metadata does not take the handle's lock before it reads the owner")
     in_order(body, (
-        ("if (!owned_alloc_ || !out) { return false; }", "answers other than false for a handle without an owner"),
-        ("*out = owned_alloc_.metadata();", "does not copy the owner's metadata"),
-        ("return true;", "does not answer true for a handle with an owner"),
+        ("if (!out) { return false; }", "answers other than false without an out pointer"),
+        ("if (owned_alloc_) { *out = owned_alloc_.metadata(); return true; }",
+         "does not copy the retained owner's metadata and answer true"),
+        ("if (leased_alloc_owner_) { *out = leased_alloc_owner_.metadata(); return true; }",
+         "does not copy the lease's typed owner's metadata and answer true"),
     ), "O", "owner_metadata")
-    if not body.endswith("return true;"):
-        fail("O", "owner_metadata does not end by answering true")
+    if not body.endswith("} return false;"):
+        fail("O", "owner_metadata does not end by answering false for a handle without an owner")
     for probe in ("ggml_sycl_get_alloc_type", "get_pointer_type", "resolve(", "ptr_"):
         if probe in body:
             fail("O", f"owner_metadata reads the pointer ({probe!r}); its answer must come from the owner")
@@ -614,12 +618,16 @@ def self_test(s: dict) -> int:
     mutants = [
         ("O", "handle_hpp", "accessor undeclared", sub(r"\n\s*bool owner_metadata\(alloc_metadata \* out\) const;", "")),
         ("O", "handle_cpp", "owner read without the lock", sub(OWN + r"\n\s*mem_handle_lock_guard g\(lock_\);", r"\1")),
-        ("O", "handle_cpp", "ownerless handle not refused", sub(OWN + r"if \(!owned_alloc_ \|\| !out\)", r"\1if (!out)")),
+        ("O", "handle_cpp", "null out not refused", sub(OWN + r"if \(!out\) \{\n\s*return false;\n\s*\}\n", r"\1")),
         ("O", "handle_cpp", "ownerless handle answers true",
-         sub(OWN + r"(if \(!owned_alloc_ \|\| !out\) \{\n\s*return )false;", r"\1\2true;")),
+         sub(OWN + r"(\n\s*return )false;\n\}", r"\1\2true;\n}")),
         ("O", "handle_cpp", "metadata not copied", sub(OWN + r"\*out = owned_alloc_\.metadata\(\);", r"\1(void) out;")),
+        ("O", "handle_cpp", "lease owner not asked",
+         sub(OWN + r"\n\s*if \(leased_alloc_owner_\) \{\n[^}]*\}", r"\1")),
+        ("O", "handle_cpp", "lease owner read off the retained owner",
+         sub(OWN + r"\*out = leased_alloc_owner_\.metadata\(\);", r"\1*out = owned_alloc_.metadata();")),
         ("O", "handle_cpp", "pointer probed",
-         sub(OWN + r"(\*out = owned_alloc_\.metadata\(\);)",
+         sub(OWN + r"(if \(owned_alloc_\) \{)",
              r"\1if (ggml_sycl_get_alloc_type(ptr_) == sycl::usm::alloc::unknown) {\n        return false;\n    }\n    \2")),
         ("S", "ops_cpp", "tier test dropped", sub(r"owner\.tier != alloc_tier::HOST_PINNED \|\| ", "")),
         ("S", "ops_cpp", "mmap tier accepted",

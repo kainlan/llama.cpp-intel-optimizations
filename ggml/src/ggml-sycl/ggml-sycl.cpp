@@ -37198,6 +37198,25 @@ static std::shared_ptr<void> ggml_sycl_transfer_alloc_owner(ggml_sycl::alloc_han
     return std::shared_ptr<void>(owner, owner->handle.ptr);
 }
 
+// Host-pinned storage for one host-planned MoE expert, minted owner-first and handed out as its owner handle,
+// which frees it on release. S1-PRELOAD registers the expert with this typed owner so every lease on the entry
+// reports the allocation's provenance (HOST_PINNED, WEIGHT) through owner_metadata(): the copy path trusts a host
+// source for a direct USM copy only on that evidence, and these experts are the prefill ring's copy source
+// (llama.cpp-36j0). Returns an invalid handle when the pinned pool cannot hold it.
+static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size) {
+    ggml_sycl::alloc_request req{};
+    req.device                              = device;
+    req.size                                = size;
+    req.intent.role                         = ggml_sycl::alloc_role::WEIGHT;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return {};
+    }
+    return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+}
+
 struct ggml_sycl_scoped_alloc_rollback {
     ggml_sycl::alloc_handle & handle;
     bool                      transferred = false;
@@ -38100,60 +38119,38 @@ static void ggml_sycl_preload_model_weights() {
                             return false;
                         }
 
-                        ggml_sycl::alloc_request host_req{};
-                        host_req.device                              = device;
-                        host_req.size                                = expert_size;
-                        host_req.intent.role                         = ggml_sycl::alloc_role::WEIGHT;
-                        host_req.intent.constraints.must_host_pinned = true;
-                        host_req.intent.constraints.use_pinned_pool  = true;
-                        ggml_sycl::alloc_handle host_handle{};
-                        if (!ggml_sycl::unified_alloc(host_req, &host_handle)) {
-                            host_handle = {};
-                        }
-                        ggml_sycl_scoped_alloc_rollback host_alloc_guard{ host_handle };
-
-                        void *       host_ptr  = host_handle.ptr;
-                        const size_t seg0_size = (!host_handle.segments().empty()) ?
-                                                     host_handle.segments()[0].size :
-                                                     (host_ptr ? expert_size : 0);
-                        if (host_ptr && seg0_size < expert_size) {
-                            host_ptr = nullptr;
-                        }
+                        // The owner handle frees the storage on every early return.
+                        ggml_sycl::mem_handle host_owner = ggml_sycl_host_expert_alloc(device, expert_size);
+                        void *                host_ptr   = host_owner.valid() ? host_owner.resolve().ptr : nullptr;
 
                         if (host_ptr) {
-                            ggml_sycl::mem_handle host_copy_handle = host_handle.as_mem_handle();
-                            if (!host_copy_handle.valid()) {
-                                return false;
-                            }
                             if (tensor_source_is_device) {
                                 sycl::queue * source_queue =
                                     ggml_sycl_owner_queue_for_ptr(expert_aos, tensor_source_device, stream);
                                 ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_chunk_ptr(
                                     const_cast<uint8_t *>(expert_aos), tensor_source_device, GGML_LAYOUT_AOS, true);
-                                ggml_sycl::mem_copy(host_copy_handle, src_handle, expert_size, *source_queue);
+                                ggml_sycl::mem_copy(host_owner, src_handle, expert_size, *source_queue);
                             } else {
                                 ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
                                     const_cast<uint8_t *>(expert_aos), GGML_LAYOUT_AOS, false,
                                     ggml_sycl::mem_handle::HOST_DEVICE, expert_size);
-                                ggml_sycl::mem_copy(host_copy_handle, src_handle, expert_size, stream);
+                                ggml_sycl::mem_copy(host_owner, src_handle, expert_size, stream);
                             }
                             ggml_sycl::host_mem_ledger_get().host_expert_copy_cumulative_bytes.fetch_add(
                                 expert_size, std::memory_order_relaxed);
                         } else if (!tensor_source_is_device) {
-                            host_ptr = const_cast<uint8_t *>(expert_aos);
+                            // The mmap source itself, registered as unowned external storage.
+                            host_owner = {};
+                            host_ptr   = const_cast<uint8_t *>(expert_aos);
                         } else {
                             return false;
                         }
 
-                        std::shared_ptr<void> allocation_owner;
-                        if (host_handle.ptr && host_ptr == host_handle.ptr) {
-                            allocation_owner = ggml_sycl_transfer_alloc_owner(host_handle);
-                        }
                         bool remembered_handle = false;
                         for (const ggml_sycl_cache_id & key : keys) {
                             ggml_sycl::mem_handle handle;
                             if (!cache->register_host_expert(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle,
-                                                             allocation_owner) ||
+                                                             host_owner) ||
                                 !handle.resolve().ptr) {
                                 throw std::runtime_error("SYCL host expert registration failed during preload");
                             }

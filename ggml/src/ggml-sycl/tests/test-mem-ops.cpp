@@ -220,6 +220,138 @@ static int check_pinned_weight_copy_is_direct(sycl::queue & q) {
     return failed;
 }
 
+// llama.cpp-36j0: the positive control for the real copy source. S1-PRELOAD mints a host-planned expert's storage
+// owner-first (ggml_sycl_host_expert_alloc: role WEIGHT, pinned pool, no category) and registers it with
+// register_host_expert's typed overload. The lease that registration hands out must answer owner_metadata() with
+// that allocation's HOST_PINNED/WEIGHT provenance on its own, after the caller's owner handle is gone, and a copy
+// from the lease must be one direct DMA: no staged_h2d and no staged wait, with a dependency passed.
+static int check_registered_host_expert_lease_copy_is_direct(sycl::queue & q) {
+    constexpr size_t bytes = 4ull * 1024ull * 1024ull;
+
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: GGML_SYCL_MOE_IDS_COPY_TRACE is off\n");
+        return 1;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
+    if (!cache || !cache->host_zones_configured()) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: no unified cache with host zones for the device\n");
+        return 1;
+    }
+    sycl::queue & cq     = cache->get_queue();
+    const int     device = ggml_sycl_get_device_id_from_queue(cq);
+
+    // The request S1-PRELOAD's ggml_sycl_host_expert_alloc makes.
+    ggml_sycl::alloc_request host_req{};
+    host_req.device                              = device;
+    host_req.size                                = bytes;
+    host_req.intent.role                         = ggml_sycl::alloc_role::WEIGHT;
+    host_req.intent.constraints.must_host_pinned = true;
+    host_req.intent.constraints.use_pinned_pool  = true;
+    ggml_sycl::allocation_result allocation      = ggml_sycl::unified_allocate_owner(host_req);
+    if (!allocation) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: the pinned pool refused the %zu-byte expert\n", bytes);
+        return 1;
+    }
+    ggml_sycl::mem_handle owner_handle =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const ggml_sycl::resolved_ptr host_ptr = owner_handle.resolve();
+    if (!host_ptr || host_ptr.on_device) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: the expert did not resolve to host memory\n");
+        return 1;
+    }
+    uint8_t * host = static_cast<uint8_t *>(host_ptr.ptr);
+    for (size_t i = 0; i < bytes; ++i) {
+        host[i] = static_cast<uint8_t>((i * 13u + 5u) & 0xffu);
+    }
+
+    static const char  key_tag = 0;
+    ggml_sycl_cache_id key{};
+    key.valid    = true;
+    key.model_id = 1;
+    key.aux_id   = reinterpret_cast<uintptr_t>(&key_tag);
+    ggml_sycl::mem_handle lease;
+    bool                  registered = false;
+    {
+        ggml_sycl::scoped_planned_materialization planned(cache, "test-mem-ops/host expert registration");
+        registered = cache->register_host_expert(key, host, bytes, GGML_LAYOUT_AOS, &lease, owner_handle);
+    }
+    owner_handle = {};  // From here only the entry and the lease hold the expert.
+    if (!registered || !lease.valid() || lease.resolve().ptr != host) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: registration failed or the lease does not resolve to it\n");
+        return 1;
+    }
+
+    int                       failed = 0;
+    ggml_sycl::alloc_metadata owner{};
+    if (!lease.owner_metadata(&owner) || owner.tier != ggml_sycl::alloc_tier::HOST_PINNED ||
+        owner.host_zone == ggml_sycl::host_zone_id::COUNT || owner.role != ggml_sycl::alloc_role::WEIGHT ||
+        owner.device < 0) {
+        std::fprintf(stderr,
+                     "FAIL: host expert lease copy: the lease does not report a zone-managed pinned-pool WEIGHT owner "
+                     "(tier=%d host_zone=%d role=%d device=%d)\n",
+                     (int) owner.tier, (int) owner.host_zone, (int) owner.role, owner.device);
+        failed++;
+    }
+
+    ggml_sycl::alloc_request dev_req{};
+    dev_req.queue                                     = &cq;
+    dev_req.device                                    = device;
+    dev_req.size                                      = bytes;
+    dev_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+    dev_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
+    dev_req.intent.constraints.must_device            = true;
+    dev_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+    dev_req.intent.constraints.forbid_vram_zone_spill = true;
+    ggml_sycl::mem_handle dst                         = ggml_sycl::unified_allocate(dev_req);
+    if (!dst.valid()) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: the RUNTIME zone refused the %zu-byte device buffer\n",
+                     bytes);
+        failed++;
+    } else {
+        sycl::event                                  fill   = ggml_sycl::mem_fill_async(dst, 0, bytes, cq);
+        const ggml_sycl::mem_copy_staged_wait_census before = ggml_sycl::mem_copy_staged_wait_census_this_thread();
+        sycl::event                                  h2d =
+            ggml_sycl::mem_copy_async(dst, lease, bytes, cq, { fill }, "test-mem-ops-host-expert-lease", 1, __func__);
+        h2d.wait_and_throw();
+        const ggml_sycl::mem_copy_staged_wait_census after = ggml_sycl::mem_copy_staged_wait_census_this_thread();
+        if (after.staged_h2d != before.staged_h2d) {
+            std::fprintf(stderr, "FAIL: host expert lease copy took the staged host->device branch (%llu)\n",
+                         (unsigned long long) (after.staged_h2d - before.staged_h2d));
+            failed++;
+        }
+        const int staged_kinds[] = { ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS,
+                                     ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK,
+                                     ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL };
+        for (int kind : staged_kinds) {
+            if (after.count[kind] != before.count[kind]) {
+                std::fprintf(stderr, "FAIL: host expert lease copy recorded %llu staged wait(s) of kind %d\n",
+                             (unsigned long long) (after.count[kind] - before.count[kind]), kind);
+                failed++;
+            }
+        }
+        std::vector<uint8_t> out(bytes, 0);
+        ggml_sycl::mem_copy(ggml_sycl::mem_handle::from_direct(out.data(), GGML_LAYOUT_AOS, false,
+                                                               ggml_sycl::mem_handle::HOST_DEVICE, bytes),
+                            dst, bytes, cq);
+        for (size_t i = 0; i < bytes; ++i) {
+            if (out[i] != static_cast<uint8_t>((i * 13u + 5u) & 0xffu)) {
+                std::fprintf(stderr, "FAIL: host expert lease copy: byte %zu read back 0x%02x\n", i, out[i]);
+                failed++;
+                break;
+            }
+        }
+    }
+
+    lease = {};
+    if (cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-mem-ops") !=
+        ggml_sycl::expert_retire_status::WITHDRAWN) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: the registered expert was not withdrawn\n");
+        failed++;
+    }
+    cache->process_deferred_frees_public();
+    return failed;
+}
+
 int main() {
     // Before any copy: both diagnostics latch on their first read. The staged-copy census is the trace's
     // (llama.cpp-qwn5) and the copy site census is th86's; check_pinned_weight_copy_is_direct reads both.
@@ -249,6 +381,7 @@ int main() {
     constexpr size_t size = 4096;
 
     int failed = check_pinned_weight_copy_is_direct(q);
+    failed += check_registered_host_expert_lease_copy_is_direct(q);
 
     uint8_t * host_a = sycl::malloc_host<uint8_t>(size, q);
     uint8_t * host_b = sycl::malloc_host<uint8_t>(size, q);

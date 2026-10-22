@@ -3648,8 +3648,22 @@ class unified_cache {
                               size_t             size,
                               ggml_layout_mode   layout,
                               mem_handle *       out_handle = nullptr) {
-        return register_host_expert(key, ptr, size, layout, out_handle, {});
+        return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>{});
     }
+
+    // Same, for host storage minted owner-first (unified_allocate_owner).  The
+    // entry keeps allocation_owner as its direct_alloc_owner, so every lease on
+    // it reports that allocation's provenance through owner_metadata(): the
+    // copy path trusts a host source for a direct USM copy only on that
+    // evidence (llama.cpp-36j0).  It also retains allocation_owner as the
+    // entry's storage owner, so release is unchanged.  An invalid
+    // allocation_owner registers ptr as unowned external storage.
+    bool register_host_expert(ggml_sycl_cache_id key,
+                              void *             ptr,
+                              size_t             size,
+                              ggml_layout_mode   layout,
+                              mem_handle *       out_handle,
+                              const mem_handle & allocation_owner);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -6207,6 +6221,17 @@ class unified_cache {
                                          ggml_layout_mode             layout,
                                          const char *                 caller,
                                          const placement_cache_read * retained_read = nullptr) const;
+
+    // The body of both public register_host_expert() overloads: storage_owner
+    // keeps the storage alive, typed_owner (when valid) becomes the entry's
+    // direct_alloc_owner.
+    bool register_host_expert(ggml_sycl_cache_id    key,
+                              void *                ptr,
+                              size_t                size,
+                              ggml_layout_mode      layout,
+                              mem_handle *          out_handle,
+                              std::shared_ptr<void> storage_owner,
+                              const mem_handle &    typed_owner);
 
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };

@@ -151,6 +151,9 @@ with gate('fattn-failure-atomicity'):
 # mem_copy_async now copies pinned-pool memory in place and a stage shared across
 # calls would be rewritten under a pending H2D -- 54->53 unified_alloc( and
 # 42->41 from_legacy_owned_alloc( code sites.
+# llama.cpp-36j0 retired one more legacy unified_alloc(: S1-PRELOAD's host-planned expert storage is minted
+# owner-first by the named ggml_sycl_host_expert_alloc, so the expert's cache entry carries a typed owner that its
+# leases report through owner_metadata() -- 53->52 unified_alloc( code sites.
 RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
@@ -180,6 +183,11 @@ NAMED_OWNER_FIRST_SITES = (
      "llama.cpp-7pvo: the event-chained hybrid decode record's host-pinned pointer table (n_as device weight "
      "pointers by expert id, copied to the planned scratch per op), owned by the record alone; refuses on failure, "
      "handed over via from_owned_alloc"),
+    ("ggml_sycl_host_expert_alloc",
+     "llama.cpp-36j0: S1-PRELOAD's pinned-pool storage for one host-planned expert (role WEIGHT), replacing a legacy "
+     "unified_alloc; the expert registers with this typed owner so its leases report HOST_PINNED/WEIGHT through "
+     "owner_metadata() and the prefill ring copies from it directly; refuses on failure, handed over via "
+     "from_owned_alloc"),
 )
 
 
@@ -275,7 +283,7 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
 
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (53, 41, OWNER_FIRST_BASELINE_SITES)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (52, 41, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):

@@ -527,8 +527,11 @@ class mem_handle {
     // Copies the retained allocation owner's metadata into *out and answers
     // true: tier, device, host zone, role and category as the allocator fixed
     // them, which is the allocation's provenance, never something read off the
-    // pointer. Answers false and leaves *out alone when the handle retains no
-    // owner (from_direct, from_chunk_ptr).
+    // pointer. A weight lease answers with the typed owner its cache entry was
+    // registered with (unified_cache_entry::direct_alloc_owner), snapshotted
+    // when the lease was taken. Answers false and leaves *out alone when the
+    // handle retains no owner (from_direct, from_chunk_ptr, or a lease on an
+    // entry registered without a typed owner).
     bool owner_metadata(alloc_metadata * out) const;
 
     // Identity of the allocation owner control this handle retains: the one
@@ -666,7 +669,13 @@ class mem_handle {
         int32_t               vram_chunk_idx    = -1;
         int                   chunk_device      = -1;
         std::shared_ptr<void> storage_owner;
+        shared_alloc_owner    alloc_owner;
     };
+
+    // The typed owner a cache entry was registered with (its
+    // direct_alloc_owner), for a caller that holds a lease on entry; empty for
+    // a null entry or one registered without a typed owner.
+    static shared_alloc_owner leased_entry_alloc_owner(const unified_cache_entry * entry);
 
     // Detach this handle's lease state (caller holds lock_).  The handle no
     // longer owns the returned leases; the caller must release them.
@@ -746,6 +755,11 @@ class mem_handle {
     // enforced in unified_cache::evict_one / remove / evict_and_flush.
     mutable unified_cache_entry * leased_entry_ = nullptr;  // GUARDED by lock_
     mutable std::shared_ptr<void> leased_storage_owner_;    // GUARDED by lock_
+    // The leased entry's typed allocation owner, copied from its
+    // direct_alloc_owner when the lease was taken, so owner_metadata() reports
+    // the provenance of the storage this lease reads. It answers provenance
+    // only: owns_allocation() and slice() still key off owned_alloc_.
+    mutable shared_alloc_owner    leased_alloc_owner_;  // GUARDED by lock_
 
     // llama.cpp-dyhdl: chunk-level lease backref.  Defense-in-depth beneath
     // the cache_entry refcount: this stops the underlying arena chunk from
