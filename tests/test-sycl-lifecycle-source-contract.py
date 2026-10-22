@@ -509,6 +509,9 @@ OWNING_READER_SITES = {
         "if (!coherent_placement_plan_owner(cache)->entries.empty()) {": 1,
     }),
     "ggml/src/ggml-sycl/ggml-sycl.cpp": Counter({
+        # call.plan in ggml_sycl_moe_stream_prepare: one coherent read of the device cache plan, held as the
+        # shared_ptr for the op (828b9f6ab, llama.cpp-xod7; census pin llama.cpp-0730).
+        "call.plan = ggml_sycl::coherent_cache_placement_plan_owner(call.cache);": 1,
         "return ggml_sycl::global_placement_plan_owner();": 1,
         "std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept {": 1,
         "return global_placement_plan_owner();": 1,
@@ -575,6 +578,9 @@ def _owning_reader_sites():
 # nsl3 reconciliation, y2zx (+1, dense overflow filter), 56805284f yx28 (+1, canonical `!cache ||` empty-plan
 # guard in the all-device decode MUL_MAT_ID table builder); 119/14/12/26 at a882b9c2a, the last green tree
 # before 64ec60199's pins drifted.
+# llama.cpp-0730 re-pin: the xod7 owning-reader site above (828b9f6ab); 8e9e8e100 (5tdy) and 2cd86c5cd (7pvo) moved
+# the wrapper statements: copying lookup_expert_placement forms and has_host_experts forms are gone, four
+# single-load plan_owner readers (phase_plan_owner, sec_plan, count_planned_experts, all_experts_on_device) came in.
 # merge/combined (rev-int-zhcn-r2 F4c): the MoE residency queries now resolve their plan through
 # ggml_sycl_moe_plan_owner_for_device (one cache-then-global read in place of four open-coded ones), and
 # ggml_sycl_ensure_moe_secondary_queues_for_plan republishes through ggml_sycl_cache_snapshot_empty and
@@ -583,25 +589,24 @@ def _owning_reader_sites():
 # an unowned one.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
-        "(*ggml_sycl_cache_plan_owner(cache))": 4,
-        "(*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(layer_id, static_cast<int>(e), role);": 1,
+        "(*ggml_sycl_cache_plan_owner(cache))": 1,
         "(*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, static_cast<int>(e));": 1,
         "(*ggml_sycl_cache_plan_owner(cache)).moe_pp_soa_promoted;": 1,
-        "(*ggml_sycl_cache_plan_owner(plan_cache)).lookup_expert_placement(std::string(src0->name), expert_id);": 2,
         "(*ggml_sycl_cache_plan_owner(plan_cache)).multi_device;": 1,
-        "(*ggml_sycl_cache_plan_owner(sec_cache)).lookup_expert_placement(tname, meta->expert_idx);": 1,
         "(plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
         "auto cache_plan = ggml_sycl_cache_plan_owner(cache);": 1,
         "cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
+        "const auto phase_plan_owner = ggml_sycl_cache_plan_owner(cache);": 1,
         "const auto placement = (*ggml_sycl_cache_plan_owner(cache))": 5,
         "const auto plan = ggml_sycl_cache_plan_owner(cache);": 1,
         "const auto plan_hybrid_owner = ggml_sycl_cache_plan_owner(plan_cache_hybrid);": 1,
         "const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
-        "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 13,
-        "const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);": 2,
+        "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 12,
+        "const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);": 4,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(route_cache);": 1,
         "const auto plan_ref_owner = ggml_sycl_cache_plan_owner(plan_cache);": 1,
         "const auto pp_owner = ggml_sycl_cache_plan_owner(cache);": 1,
+        "const auto sec_plan = ggml_sycl_cache_plan_owner(sec_cache);": 1,
         "const bool active_plan = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty();": 1,
         "const bool has_placement_plan = route_cache && !ggml_sycl_cache_plan_owner(route_cache)->entries.empty();": 1,
         "const bool have_plan = !ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty();": 2,
@@ -610,6 +615,7 @@ INTERNAL_WRAPPER_SITES = {
         "const bool use_planner = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() &&": 1,
         "const int layer_dev = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);": 1,
         "const int planned_device = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);": 1,
+        "ggml_sycl_cache_plan_owner(cache)->count_planned_experts(src0->name, n_experts, device);": 1,
         "ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);": 1,
         "ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));": 1,
         "if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {": 1,
@@ -622,21 +628,20 @@ INTERNAL_WRAPPER_SITES = {
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {": 1,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty()) {": 1,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 3,
-        "if (!plan_cache || ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() || !src0 || !src0->name ||": 2,
         "if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {": 1,
         "if (!sec_cache || ggml_sycl_cache_plan_owner(sec_cache)->entries.empty()) {": 1,
         "if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
-        "if (ggml_sycl_cache_plan_owner(plan_cache)->has_host_experts(tname, n_exp, ctx.device)) {": 2,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\\0') {": 1,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {": 3,
         "if (sec_budgets[i].cache && ggml_sycl_cache_plan_owner(sec_budgets[i].cache)->entries.empty()) {": 1,
         "in.has_placement_plan = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
         "plan_cache_hybrid && !ggml_sycl_cache_plan_owner(plan_cache_hybrid)->entries.empty();": 1,
-        "plan_has_cpu_experts = ggml_sycl_cache_plan_owner(route_cache)->has_host_experts(tname, n_exp, ctx.device);": 1,
         "return !ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);": 1,
         "return cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 1,
         "return cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
         "return ggml_sycl_has_global_plan() || (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
+        # llama.cpp-5tdy: the all-experts-resident query reads the plan once through its owning shared_ptr.
+        "return ggml_sycl_cache_plan_owner(cache)->all_experts_on_device(src0->name, n_experts, device);": 1,
         # ggml_sycl_moe_plan_owner_for_device: the one place the cache-then-global plan resolution is written.
         "return ggml_sycl_cache_plan_owner(cache);": 1,
         "return ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_cache_plan_owner(plan_cache)),": 1,
