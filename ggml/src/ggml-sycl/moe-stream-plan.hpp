@@ -258,6 +258,8 @@ static inline bool moe_loan_triplet_is_lendable(const moe_loan_triplet &        
 
 // True iff the gate/up/down triplet of (layer, expert) can be lent: all three entries exist and are on a device, none is
 // bulk-staged, and each is AOS or has a SOA-to-AOS inverse (v1: AOS only, see moe_loan_soa_inverse_exists).
+// Precondition: plan.build_index() has run; find_expert_entry returns nullptr on an un-indexed plan, so selection then
+// returns nothing (fail-safe, no signal).
 static inline bool moe_expert_triplet_lendable(const placement_plan & plan, int layer, int expert) {
     std::unordered_map<uint64_t, bool> memo;
     return detail::moe_loan_triplet_is_lendable(detail::moe_loan_triplet_of(plan, layer, expert), plan, memo);
@@ -267,6 +269,8 @@ static inline bool moe_expert_triplet_lendable(const placement_plan & plan, int 
 // (pack-group order, popularity rank when ranks exist, so the tail is the least popular), until the summed
 // vram_charge_size reaches bytes_wanted or nothing lendable is left. A triplet is never split. Keys come out in the
 // order the triplets are met, gate/up/down within each. *bytes_selected (when non-null) receives the sum.
+// Precondition: plan.build_index() has run; find_expert_entry returns nullptr on an un-indexed plan, so selection then
+// returns nothing (fail-safe, no signal).
 static inline std::vector<expert_placement_key> moe_expert_loan_select(const placement_plan & plan,
                                                                        int                    device,
                                                                        size_t                 bytes_wanted,
