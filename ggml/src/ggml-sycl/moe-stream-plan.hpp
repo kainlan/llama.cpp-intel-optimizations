@@ -284,6 +284,33 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
     return idx;
 }
 
+// Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
+// holds, in this order. geo is what moe_stream_ring_size gave for idx; its all-zero answer past the first two rules is
+// the 10% bound (its overflow guards refuse sizes far above any resident expert set too). The last name is unreachable
+// while expert_bytes_max counts only streamable matrices, since a region of 2 * host_matrices_per_layer_max slots holds
+// any streamable triplet twice over; it is there so that no ring-unavailable line goes unexplained.
+static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_plan_index &    idx,
+                                                            const moe_stream_ring_geometry & geo,
+                                                            bool                             in_order,
+                                                            bool                             reserve_failed) {
+    if (idx.host_matrices_per_layer_max == 0) {
+        return "no host matrices of a streamable type";
+    }
+    if (idx.matrix_bytes_max == 0) {
+        return "no matrix bytes";
+    }
+    if (geo.n_slots == 0) {
+        return "ring exceeds 10% of resident expert bytes";
+    }
+    if (!in_order) {
+        return "queue not in order";
+    }
+    if (reserve_failed) {
+        return "reserve refused";
+    }
+    return "region smaller than the largest streamable triplet";
+}
+
 // The items a decision stages: every item for STREAM_ALL, the experts the micro-batch routes to for ROUTED_ONLY, none
 // for any other regime. plan.entries order either way.
 static inline std::vector<moe_stream_item> moe_stream_select(const moe_stream_layer_info & li,
@@ -475,6 +502,7 @@ class moe_stream_phase {
     sycl::event       compute_barrier();
     void              teardown(sycl::event last_use);
     void              report(int layer, const layer_state & st, const stage_counts & n, const moe_stream_op & op) const;
+    void              warn_ring_unavailable(const moe_stream_op & op);
 
     std::unique_ptr<moe_stream_ring>                ring_;
     std::unordered_map<uint64_t, moe_stream_staged> table_;           // key = moe_stream_table_key(layer, expert, role)
@@ -502,6 +530,7 @@ class moe_stream_phase {
     bool                                            record_valid_        = false;
     bool                                            record_looked_up_    = false;
     bool                                            warned_not_in_order_ = false;
+    bool                                            warned_unavailable_  = false;  // this prompt's diagnostic is out
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

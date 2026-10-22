@@ -243,6 +243,33 @@ int main() {
         CHECK(q1 != nullptr && q1->items.size() == 12);
     }
 
+    // ---- why a layer answered RING_UNAVAILABLE: the first rule that holds, in a fixed order ----
+    {
+        const moe_stream_plan_index iq_only = ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(false), 0);
+        const moe_stream_plan_index mixed   = ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(true), 0);
+
+        ggml_sycl::moe_stream_ring_geometry none;
+        ggml_sycl::moe_stream_ring_geometry geo;
+        geo.slot_bytes   = 4096;
+        geo.region_slots = 12;
+        geo.n_slots      = 24;
+        geo.bytes        = 24 * 4096;
+        const auto rule  = [](const moe_stream_plan_index & idx, const ggml_sycl::moe_stream_ring_geometry & g,
+                             bool in_order, bool refused) {
+            return std::string(ggml_sycl::moe_stream_ring_unavailable_rule(idx, g, in_order, refused));
+        };
+        // No streamable host matrix wins over every later rule, the queue included.
+        CHECK(rule(iq_only, none, false, true) == "no host matrices of a streamable type");
+        moe_stream_plan_index no_bytes = mixed;
+        no_bytes.matrix_bytes_max      = 0;
+        CHECK(rule(no_bytes, none, true, false) == "no matrix bytes");
+        CHECK(rule(mixed, none, true, false) == "ring exceeds 10% of resident expert bytes");
+        CHECK(rule(mixed, geo, false, false) == "queue not in order");
+        CHECK(rule(mixed, geo, true, true) == "reserve refused");
+        // None of the five: named anyway, so no ring-unavailable line goes unexplained.
+        CHECK(rule(mixed, geo, true, false) == "region smaller than the largest streamable triplet");
+    }
+
     // ---- what a decision stages ----
     if (l0) {
         CHECK(ggml_sycl::moe_stream_select(*l0, moe_exec_regime::STREAM_ALL, bits).size() == 9);

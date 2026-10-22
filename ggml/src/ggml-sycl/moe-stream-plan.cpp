@@ -134,6 +134,8 @@ void moe_stream_phase::end_prompt() {
     if (!ubatch_live_ && !ring_ && table_.empty()) {
         return;  // every decode graph after the first: nothing to drop
     }
+    // The next prompt explains its own unavailable ring.
+    warned_unavailable_ = false;
     teardown(ring_ ? compute_barrier() : sycl::event());
     layers_.clear();
     index_            = moe_stream_plan_index();
@@ -229,6 +231,9 @@ void moe_stream_phase::resolve(int                           layer,
             st.decision.choice = moe_exec_choice::CPU;
             st.decision.reason = moe_exec_reason::RING_UNAVAILABLE;
         }
+    }
+    if (st.decision.reason == moe_exec_reason::RING_UNAVAILABLE) {
+        warn_ring_unavailable(op);
     }
     st.resolved = true;
     report(layer, st, n, op);
@@ -398,6 +403,28 @@ void moe_stream_phase::report(int                   layer,
         op.log->trace_sink(op.log->sink_ctx, line);
     }
     op.log->note(device_, layer, st.decision, n.bytes);
+}
+
+// One WARN per prompt saying why the ring is unavailable, at the first layer that answers RING_UNAVAILABLE, under an
+// explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log. The
+// slots and bytes are the ring the layer asked for, so when the 10% bound refused it they are the uncapped request.
+void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
+    if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr ||
+        (op.policy != moe_exec_policy::RING && op.log->trace < 1)) {
+        return;
+    }
+    warned_unavailable_ = true;
+    const moe_stream_ring_geometry asked =
+        geo_.n_slots != 0 ? geo_ :
+                            moe_stream_ring_size(index_.host_matrices_per_layer_max, index_.matrix_bytes_max, SIZE_MAX);
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
+                  "matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)",
+                  device_, moe_stream_ring_unavailable_rule(index_, geo_, in_order_, reserve_failed_),
+                  index_.host_matrices_per_layer_max, index_.matrix_bytes_max, index_.resident_expert_bytes,
+                  asked.n_slots, asked.bytes);
+    op.log->sink(op.log->sink_ctx, line);
 }
 
 }  // namespace ggml_sycl

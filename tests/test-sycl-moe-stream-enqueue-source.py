@@ -18,6 +18,9 @@ What this gate pins:
     begin_ubatch, which every new micro-batch runs, and by end_prompt. An expert loan runs at the graph boundary
     (ruling c-tdra, llama.cpp-mwmr), so a per-prompt latch would waste the loan its own prompt asked for (lead ruling
     c-i8rz);
+  - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
+    and the ring's inputs, in a fixed format, through the decision log's WARN sink; the flag is cleared by end_prompt
+    and never per graph (lead ruling c-kcyf);
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
     c-3bde: slot reuse is ordered on the device, never by a host status query), and the reorder is
     ggml_sycl_reorder_weight_gpu on the compute queue with the copy as its one dependency;
@@ -534,6 +537,86 @@ def test_reserve_latch_mutants():
     assert not claim_reserve_failure_lasts_one_graph(mutate(PHASE, LATCH_SET, ""))
     # A new micro-batch that skips begin_ubatch.
     assert not claim_reserve_failure_lasts_one_graph(mutate(PHASE, NEW_UBATCH, "if (new_ubatch) {"))
+
+
+DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u matrix_bytes_max=%zu "
+            "resident_expert_bytes=%zu n_slots=%u bytes=%zu)")
+DIAG_EMIT = "op.log->sink(op.log->sink_ctx, line);"
+DIAG_RULE_CALL = "moe_stream_ring_unavailable_rule(index_, geo_, in_order_, reserve_failed_)"
+WARN_SIG = "void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op)"
+RULE_SIG = "static inline const char * moe_stream_ring_unavailable_rule("
+# Each rule's condition, then its name, in the order the helper tests them.
+RULE_ORDER = (
+    "idx.host_matrices_per_layer_max == 0", '"no host matrices of a streamable type"',
+    "idx.matrix_bytes_max == 0", '"no matrix bytes"',
+    "geo.n_slots == 0", '"ring exceeds 10% of resident expert bytes"',
+    "!in_order", '"queue not in order"',
+    "reserve_failed", '"reserve refused"',
+)
+WARN_GUARD = ("if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr || "
+              "(op.policy != moe_exec_policy::RING && op.log->trace < 1)) { return; }")
+WARN_SET = "warned_unavailable_ = true;"
+WARN_CLEAR = "warned_unavailable_ = false;"
+WARN_CALL = "if (st.decision.reason == moe_exec_reason::RING_UNAVAILABLE) { warn_ring_unavailable(op); }"
+
+
+def claim_ring_unavailable_diagnostic(phase: str, hpp: str, tree: dict) -> bool:
+    """Lead ruling c-kcyf: a ring-unavailable answer is explained in the log. The fixed format exists once in the
+    backend, carries the rule the helper names and the ring's inputs, and goes out through the decision log's WARN sink;
+    the helper names each rule right after testing its condition, in a fixed order."""
+    w = body(norm(phase), WARN_SIG)
+    count = sum(norm(text).count(DIAG_FMT) for text in tree.values())
+    return (count == 1 and ordered(w, DIAG_FMT, DIAG_RULE_CALL, DIAG_EMIT)
+            and ordered(body(norm(hpp), RULE_SIG), *RULE_ORDER))
+
+
+def test_ring_unavailable_diagnostic():
+    assert claim_ring_unavailable_diagnostic(PHASE, PLAN_HPP, SYCL_TREE)
+
+
+def test_ring_unavailable_diagnostic_mutants():
+    renamed = mutate(PHASE, "n_slots=%u ", "slots=%u ")
+    assert not claim_ring_unavailable_diagnostic(renamed, PLAN_HPP, {PHASE_REL: renamed})
+    tree = dict(SYCL_TREE)
+    tree["extra.cpp"] = '"' + DIAG_FMT + '"'
+    assert not claim_ring_unavailable_diagnostic(PHASE, PLAN_HPP, tree)
+    assert not claim_ring_unavailable_diagnostic(mutate(PHASE, DIAG_EMIT, "(void) line;"), PLAN_HPP, SYCL_TREE)
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, '"reserve refused"', '"reserve failed"'), SYCL_TREE)
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, "geo.n_slots == 0", "geo.bytes == 0"), SYCL_TREE)
+
+
+def claim_ring_unavailable_once_per_prompt(phase: str) -> bool:
+    """Lead ruling c-kcyf: at most one diagnostic per prompt, and only under an explicit ring or a trace. The guard comes
+    first, the flag is set before the line goes out, end_prompt clears it and begin_ubatch does not, and resolve calls
+    it for the decision the layer ends with (after a refused reserve rewrote it), before the layer's report."""
+    n = norm(phase)
+    w = body(n, WARN_SIG)
+    return (w.startswith("{ " + WARN_GUARD)
+            and n.count(WARN_SET) == 1 and ordered(w, WARN_GUARD, WARN_SET, DIAG_EMIT)
+            and n.count(WARN_CLEAR) == 1 and WARN_CLEAR in body(n, END_PROMPT_SIG)
+            and WARN_CLEAR not in body(n, BEGIN_UBATCH_SIG)
+            and ordered(body(n, RESOLVE_SIG), STAGE_CALL, WARN_CALL, "report(layer, st, n, op);"))
+
+
+def test_ring_unavailable_once_per_prompt():
+    assert claim_ring_unavailable_once_per_prompt(PHASE)
+
+
+def test_ring_unavailable_once_mutants():
+    # The flag never set: every unavailable layer would warn.
+    assert not claim_ring_unavailable_once_per_prompt(mutate(PHASE, WARN_SET, ""))
+    # The flag not consulted.
+    assert not claim_ring_unavailable_once_per_prompt(mutate(PHASE, "if (warned_unavailable_ || ", "if ("))
+    # Cleared per graph instead of per prompt.
+    assert not claim_ring_unavailable_once_per_prompt(
+        mutate(PHASE, "reserve_failed_ = false; table_.clear();", "reserve_failed_ = false; " + WARN_CLEAR + " table_.clear();"))
+    # Never cleared: only the first prompt of the context would warn.
+    assert not claim_ring_unavailable_once_per_prompt(drop_in(PHASE, END_PROMPT_SIG, WARN_CLEAR))
+    # AUTO without a trace would warn too.
+    assert not claim_ring_unavailable_once_per_prompt(
+        mutate(PHASE, " || (op.policy != moe_exec_policy::RING && op.log->trace < 1)", ""))
+    # Not called for the layer's decision.
+    assert not claim_ring_unavailable_once_per_prompt(mutate(PHASE, WARN_CALL, ""))
 
 
 # ---- the ring's lifetime ----------------------------------------------------------------------------------------------
