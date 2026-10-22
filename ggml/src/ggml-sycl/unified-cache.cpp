@@ -10102,10 +10102,13 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
             // c-sepd: the entry must be the exact owner of its storage. A bulk-staged tensor's experts are views
             // into one allocation (storage_owner), so retiring one frees nothing and copying it from the owner's
             // base would copy another expert. The owner must be this entry's whole allocation and EXTERNAL_EXACT or
-            // CACHE_SUBALLOCATION: cache_backing is set exactly for the CACHE_BACKING class.
+            // CACHE_SUBALLOCATION: cache_backing is set exactly for the CACHE_BACKING class. Whole means the same
+            // base and the same size: an owner's size is the size it was requested at, which is the entry's for a
+            // direct-staged expert, so an owner wider than the entry (expert 0 of a bulk allocation starts at the
+            // owner's base) is refused here as shared rather than left to the use count below.
             alloc_metadata md{};
             if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) ||
-                md.ptr != e.device_ptr || md.size < e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) {
+                md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) {
                 refusal = "shared storage";
                 break;
             }

@@ -327,7 +327,7 @@ def claim_host_consumer_orders_on_the_copy(sycl: str) -> bool:
 
 LAYOUT_CHECK = 'if (e.layout != GGML_LAYOUT_AOS) { refusal = "layout"; break; }'
 OWNER_CHECK = ("if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) || "
-               "md.ptr != e.device_ptr || md.size < e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) "
+               "md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) "
                '{ refusal = "shared storage"; break; }')
 USE_CHECK = 'if (e.direct_alloc_owner.owner_use_count() != 1) { refusal = "storage still referenced"; break; }'
 
@@ -677,9 +677,21 @@ def test_mutant_dispatch_ignores_the_ready_event_fails():
 
 
 def test_mutant_bulk_view_lent_fails():
-    """c-sepd: without the storage_owner term a bulk tensor's view passes as an exact owner."""
+    """c-sepd: the storage_owner term names a bulk view's refusal by the field a bulk entry carries.
+
+    Not a behavioural RED: a bulk entry carries no direct_alloc_owner (unified-cache.cpp, the bulk staging loop that
+    sets entry.storage_owner), so without this term owner_metadata() still fails and the device case still reads
+    "shared storage". Only this mutant pins the term.
+    """
     assert not claim_owner_checks_refuse_before_copying(
         _once(CACHE, OWNER_CHECK, OWNER_CHECK.replace("e.storage_owner || ", "")))
+
+
+def test_mutant_wider_owner_lent_fails():
+    """c-sepd: a one-sided size term passes an owner wider than the entry that starts at its pointer (expert 0 of a
+    bulk allocation); the use count would then refuse it as "storage still referenced", the wrong reason."""
+    assert not claim_owner_checks_refuse_before_copying(
+        _once(CACHE, OWNER_CHECK, OWNER_CHECK.replace("md.size != e.size", "md.size < e.size")))
 
 
 def test_mutant_shared_owner_lent_fails():

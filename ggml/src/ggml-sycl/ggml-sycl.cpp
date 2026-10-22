@@ -21407,6 +21407,14 @@ std::string test_expert_loan_lends_two_triplets() {
     }
 
     // The retired device entries go once their last lease is gone; the storage once the copies reading it complete.
+    // The device gets back what it allocated, the entries' own sizes: a zone owner's extent is its requested size
+    // (unified_cache_zone_allocate_owner) and a raw allocation is held at its size. bytes_freed reports the
+    // planner's charge, those sizes rounded up to 256 bytes, so the two agree only for a 256-aligned expert. The
+    // fixture's is; this says so, so the physical check below cannot pass on the rounding.
+    if (charge != test_loan_expert_bytes()) {
+        return test_loan_fail("a %zu-byte expert charges %zu: the physical return cannot equal bytes_freed",
+                              test_loan_expert_bytes(), charge);
+    }
     const auto   deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     bool         gone     = false;
     uint32_t     in_use   = 0;

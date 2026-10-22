@@ -10,7 +10,8 @@
 //   lends_two_triplets      2 layers x 4 experts, expert 3 on the host: three requests leave the largest pending,
 //                           the graph-boundary runner lends two triplets and clears it, the plan shows them on the
 //                           host, resolve_expert finds host-pinned copies equal to the originals, the device entries
-//                           are gone within 2 s and the device gets their storage back.
+//                           are gone within 2 s and the device gets their storage back: the entries' sizes, which
+//                           equal the reported charge only because a 1 MiB expert is 256-byte aligned.
 //   probe_changes_nothing   c-tdra first: inside a graph the transaction refuses "graph active" and a request waits.
 //                           Then the same plan probed: the selection is reported and nothing is copied or published.
 //   refuses_shared_storage  c-sepd: a bulk-staged pair with expert 1 flipped to the host is refused with "shared
