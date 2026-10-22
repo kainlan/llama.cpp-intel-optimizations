@@ -10,6 +10,10 @@ What this gate pins:
     `moe_hybrid_with_plan` is computed. The site is the admission branch rather than the later `prompt_batch` local
     because the executor fast paths return before that local is computed, which would skip the layer-ahead staging after
     every all-device layer;
+  - only an explicit GGML_SYCL_MOE_EXEC=ring stages: the phase's one stage() call sits under a guard that needs both
+    the RING choice and the RING policy, the ring's reserve is reachable only through it, and the op's policy is the
+    parsed config's. Nothing consumes a staged expert until Task 8 (llama.cpp-o9uw), so under AUTO the decision log
+    records what the cost model would choose and no bytes move (lead ruling c-3skf);
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
     c-3bde: slot reuse is ordered on the device, never by a host status query), and the reorder is
     ggml_sycl_reorder_weight_gpu on the compute queue with the copy as its one dependency;
@@ -433,6 +437,53 @@ def test_streamed_item_mutants():
         PHASE, mutate(PLAN_HPP, "owner.role == alloc_role::WEIGHT", "owner.role != alloc_role::OTHER"))
     assert not claim_only_direct_owned_typed_items_stream(
         PHASE, mutate(PLAN_HPP, "ggml_sycl_soa_reorder_supported_type(item.type)", "item.type != GGML_TYPE_COUNT"))
+
+
+# ---- the policy gate --------------------------------------------------------------------------------------------------
+
+RESOLVE_SIG = "void moe_stream_phase::resolve("
+STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage("
+RING_READY_SIG = "bool moe_stream_phase::ring_ready()"
+POLICY_GUARD = "if (st.decision.choice == moe_exec_choice::RING && op.policy == moe_exec_policy::RING) {"
+STAGE_CALL = "n = stage(li, st.decision.regime, cache, op);"
+POLICY_FROM_CONFIG = "call.op.policy = ggml_sycl_moe_exec_config().policy;"
+STAGE_CALL_RE = re.compile(r"(?<![:\w])stage\(")
+RING_READY_CALL_RE = re.compile(r"(?<![:\w])ring_ready\(\)")
+
+
+def claim_staging_only_under_explicit_ring(phase: str, sycl: str) -> bool:
+    """Lead ruling c-3skf: until Task 8 (llama.cpp-o9uw) consumes a staged expert, only an explicit
+    GGML_SYCL_MOE_EXEC=ring copies, reorders or reserves the ring, and AUTO only records the cost model's choice. The
+    phase's one stage() call is the first statement under a guard that needs both the RING choice and the RING policy,
+    the reserve is reachable only through stage() and ring_ready(), and the op's policy is the parsed config's."""
+    n = norm(phase)
+    return (POLICY_GUARD + " " + STAGE_CALL in body(n, RESOLVE_SIG)
+            and len(STAGE_CALL_RE.findall(n)) == 1
+            and len(RING_READY_CALL_RE.findall(n)) == 1
+            and len(RING_READY_CALL_RE.findall(body(n, STAGE_SIG))) == 1
+            and n.count("->reserve(") == 1 and "->reserve(" in body(n, RING_READY_SIG)
+            and norm(sycl).count(POLICY_FROM_CONFIG) == 1)
+
+
+def test_staging_only_under_explicit_ring():
+    assert claim_staging_only_under_explicit_ring(PHASE, SYCL)
+
+
+def test_policy_gate_mutants():
+    # AUTO reaching the stage call: the guard tests the choice alone.
+    assert not claim_staging_only_under_explicit_ring(mutate(PHASE, " && op.policy == moe_exec_policy::RING", ""), SYCL)
+    # A guard that still admits AUTO.
+    assert not claim_staging_only_under_explicit_ring(
+        mutate(PHASE, "op.policy == moe_exec_policy::RING", "op.policy != moe_exec_policy::CPU"), SYCL)
+    # A second stage call outside the guard.
+    assert not claim_staging_only_under_explicit_ring(
+        mutate(PHASE, "st.resolved = true;", STAGE_CALL + " st.resolved = true;"), SYCL)
+    # The ring reserved outside stage().
+    assert not claim_staging_only_under_explicit_ring(
+        mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = ccs.is_in_order(); ring_ready();"), SYCL)
+    # The op's policy pinned to RING instead of read from GGML_SYCL_MOE_EXEC.
+    assert not claim_staging_only_under_explicit_ring(
+        PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"))
 
 
 # ---- the ring's lifetime ----------------------------------------------------------------------------------------------

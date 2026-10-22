@@ -218,7 +218,9 @@ void moe_stream_phase::resolve(int                           layer,
                                unified_cache &               cache,
                                const moe_stream_op &         op) {
     stage_counts n;
-    if (st.decision.choice == moe_exec_choice::RING) {
+    // Only an explicit GGML_SYCL_MOE_EXEC=ring moves bytes or reserves the ring: nothing consumes a staged expert
+    // until Task 8 (llama.cpp-o9uw) lands, so AUTO only records what the cost model would choose (lead ruling c-3skf).
+    if (st.decision.choice == moe_exec_choice::RING && op.policy == moe_exec_policy::RING) {
         n = stage(li, st.decision.regime, cache, op);
         if (n.ring_unavailable) {
             st.decision.choice = moe_exec_choice::CPU;
