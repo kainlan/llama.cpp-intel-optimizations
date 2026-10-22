@@ -22,8 +22,11 @@ reused. The probe this gate pins:
   - sycl_device_info carries h2d_pinned_gbps and h2d_probed, and exactly one place reads h2d_pinned_gbps: the probe's
     own once-guard (a device that holds a rate is not probed again). Task 7b's rates assembly makes it two and updates
     this count;
-  - the probe is called once per outermost model load, after the unified caches exist (ggml_sycl_info() is complete
-    there, which ggml_sycl_init is not, and ggml_sycl_init must not create caches).
+  - the probe is called from ggml_backend_sycl_model_load_begin, right after ggml_sycl_model_loading_effects(true, true)
+    (the unified caches exist and ggml_sycl_info() is complete there), never from ggml_sycl_init, which must not create
+    caches, and through ggml_sycl_info_mutable() rather than a const_cast of the const accessor;
+  - the stored record's reorder rate is the Task 2 seed's value (seed = moe_exec_rates_seed({}), seed.reorder_gbps),
+    never a numeric literal: it only satisfies the store's validity rule, and the rates assembly measures its own.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -219,9 +222,32 @@ def claim_rethrows_fallback_error_first(src: str) -> bool:
 
 def claim_store_carries_a_valid_reorder_rate(src: str) -> bool:
     """The store refuses a record whose reorder rate is not finite and positive, so a record holding only the H2D rate
-    would never persist and the second start would probe again."""
+    would never persist and the second start would probe again. The value is the seed's, by reference."""
     fn = probe_body(src)
-    return bool(fn) and "rec.reorder_gbps" in fn
+    return bool(fn) and all([
+        "rec.reorder_gbps = seed.reorder_gbps;" in fn,
+        "seed = ggml_sycl::moe_exec_rates_seed({})" in fn,
+        not re.search(r"reorder_gbps\s*=\s*[0-9]", fn),
+    ])
+
+
+LOAD_BEGIN_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn)"
+INIT_SIG = "static ggml_sycl_device_info ggml_sycl_init()"
+CALL = "ggml_sycl_measure_h2d_pinned(ggml_sycl_info_mutable())"
+
+
+def claim_probe_runs_at_load_begin_through_the_mutable_accessor(src: str) -> bool:
+    n = norm(src)
+    begin = body(n, LOAD_BEGIN_SIG)
+    init = body(n, INIT_SIG)
+    return bool(begin) and bool(init) and all([
+        n.count("ggml_sycl_measure_h2d_pinned(") == 3,  # forward declaration, definition, and the one call
+        begin.count(CALL) == 1,
+        ordered(begin, "ggml_sycl_model_loading_effects(true, true);", CALL, "registry->bind_candidate("),
+        "ggml_sycl_measure_h2d_pinned" not in init,
+        "const_cast<ggml_sycl_device_info" not in n,
+        "static ggml_sycl_device_info & ggml_sycl_info_mutable()" in n,
+    ])
 
 
 def claim_device_info_fields(common: str) -> bool:
@@ -280,6 +306,10 @@ def test_probe_failure_keeps_the_seed_and_never_aborts():
 
 def test_probe_stores_a_record_the_cache_will_accept():
     assert claim_store_carries_a_valid_reorder_rate(SYCL)
+
+
+def test_probe_runs_at_load_begin_through_the_mutable_accessor():
+    assert claim_probe_runs_at_load_begin_through_the_mutable_accessor(SYCL)
 
 
 def test_device_info_carries_the_rate_and_one_consumer_reads_it():
@@ -347,6 +377,29 @@ def test_mutant_unguarded_catch_fails():
 
 def test_mutant_reorder_rate_missing_fails():
     assert not claim_store_carries_a_valid_reorder_rate(SYCL.replace("rec.reorder_gbps", "rec.unused_gbps"))
+
+
+def test_mutant_probe_called_from_init_fails():
+    assert not claim_probe_runs_at_load_begin_through_the_mutable_accessor(
+        _once(SYCL, "ggml_sycl_init_peer_link_defaults(info);",
+              "ggml_sycl_init_peer_link_defaults(info); ggml_sycl_measure_h2d_pinned(info);"))
+
+
+def test_mutant_const_cast_fails():
+    assert not claim_probe_runs_at_load_begin_through_the_mutable_accessor(
+        _once(SYCL, CALL + ";", "ggml_sycl_measure_h2d_pinned(const_cast<ggml_sycl_device_info &>(ggml_sycl_info()));"))
+
+
+def test_mutant_probe_before_effects_fails():
+    mutant = _once(SYCL, CALL + ";", "")
+    mutant = _once(mutant, "ggml_sycl_model_loading_effects(true, true);",
+                   CALL + "; ggml_sycl_model_loading_effects(true, true);")
+    assert not claim_probe_runs_at_load_begin_through_the_mutable_accessor(mutant)
+
+
+def test_mutant_reorder_literal_fails():
+    assert not claim_store_carries_a_valid_reorder_rate(
+        _once(SYCL, "rec.reorder_gbps = seed.reorder_gbps;", "rec.reorder_gbps = 200.0;"))
 
 
 def test_mutant_second_reader_fails(monkeypatch=None):

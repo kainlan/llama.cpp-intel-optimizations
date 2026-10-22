@@ -12855,9 +12855,11 @@ static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_aut
 static void ggml_sycl_reset_layer_map_state();
 static void ggml_sycl_reset_moe_phase_demotion_state();
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
-// Defined with the peer-link probes below; called at the outermost model-load boundary, once the unified caches exist
-// (llama.cpp-zujy).
-static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info &);
+// Defined with the peer-link probes and next to ggml_sycl_info() below. The probe runs from
+// ggml_backend_sycl_model_load_begin, once the unified caches exist (llama.cpp-zujy). Only load-time probes write
+// through the mutable accessor.
+static void                    ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info &);
+static ggml_sycl_device_info & ggml_sycl_info_mutable();
 
 static thread_local bool g_sycl_abort_load_exit = false;
 
@@ -12893,11 +12895,6 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
                     cache->reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
                 }
             }
-
-            // Each device's pinned host-to-device rate, once per process: here the unified caches exist and
-            // ggml_sycl_info() is complete, which ggml_sycl_init is not (llama.cpp-zujy). The info is a non-const
-            // function-local static; this is the one writer of the two probe fields after init.
-            ggml_sycl_measure_h2d_pinned(const_cast<ggml_sycl_device_info &>(ggml_sycl_info()));
         }
         return;
     }
@@ -13626,6 +13623,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         // explicit UNKNOWN/no-plan candidate before any load effects.
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
         ggml_sycl_model_loading_effects(true, true);
+        // The caches exist now, so the probe may allocate (ggml_sycl_init must not create them), and ggml_sycl_info() is
+        // complete, so the tuning cache is readable. Once per device: a device holding a rate is skipped.
+        ggml_sycl_measure_h2d_pinned(ggml_sycl_info_mutable());
         registry->bind_candidate(result.txn);
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
@@ -28691,9 +28691,10 @@ static void ggml_sycl_measure_peer_host_bounce(ggml_sycl_device_info & info) {
 // is what lets the model-load boundary call this on every outermost load. GGML_SYCL_H2D_PROBE=1 probes again whatever
 // the tuning cache holds, 0 skips the probe and keeps the seed. A stored record is read back instead of probing.
 // A probe that cannot allocate (a zone with no room, no pinned pool yet) keeps the seed and says so: never an abort.
-// The store accepts only a record with a positive reorder rate, so the record carries Task 2's seed for it until a
-// measurement replaces it; the tuning cache is keyed by the registry's visible devices, so a device hidden from the
-// scheduler probes again on every start.
+// The store accepts only a record with a positive reorder rate, so the record carries Task 2's seed value for it
+// (by reference to the seed, not a literal). That only satisfies the store's validity rule: the executor's rates
+// assembly takes the reorder rate from its own measurement. The tuning cache is keyed by the visible devices, so a
+// device hidden from the scheduler probes again on every start.
 static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
     const char * sw    = std::getenv("GGML_SYCL_H2D_PROBE");
     const bool   skip  = sw != nullptr && std::strcmp(sw, "0") == 0;
@@ -29201,13 +29202,18 @@ sycl::queue * ggml_sycl_get_cpu_queue() {
     return info.has_cpu_device ? info.cpu_queue : nullptr;
 }
 
+static ggml_sycl_device_info & ggml_sycl_info_mutable() {
+    static ggml_sycl_device_info info = ggml_sycl_init();
+    return info;
+}
+
 const ggml_sycl_device_info & ggml_sycl_info() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (const ggml_sycl_device_info * test_info = ggml_sycl::test_get_sycl_info_override()) {
         return *test_info;
     }
 #endif
-    static ggml_sycl_device_info info = ggml_sycl_init();
+    ggml_sycl_device_info & info = ggml_sycl_info_mutable();
     ggml_sycl::g_runtime_sycl_info.store(&info, std::memory_order_release);
     return info;
 }
