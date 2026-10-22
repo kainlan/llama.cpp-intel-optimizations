@@ -970,6 +970,13 @@ if (Python3_Interpreter_FOUND)
     # TIMEOUT: the 79-mutant self-test took 37 s wall at host load 9.5.
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-exec-knobs-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-knobs-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
     # staging allocation fails, and the registry must not fail an allocation on a
     # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.

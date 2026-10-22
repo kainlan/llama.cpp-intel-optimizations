@@ -2260,6 +2260,22 @@ set_tests_properties(sycl-moe-exec-cost PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-36j0 Task 4: the MoE executor's knobs and its once-per-change [MOE-EXEC] log. Host-only like
+# test-moe-exec-cost: the header includes moe-exec-cost.hpp and the STL, links only ggml-base.
+add_executable(test-moe-exec-policy
+    tests/test-moe-exec-policy.cpp
+)
+target_include_directories(test-moe-exec-policy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-moe-exec-policy PRIVATE ggml-base)  # GGML_ASSERT and GGML_LOG_WARN resolve in ggml-base
+add_test(NAME sycl-moe-exec-policy COMMAND test-moe-exec-policy)
+set_tests_properties(sycl-moe-exec-policy PROPERTIES
+    LABELS "sycl;moe;planner;hostonly"
+    TIMEOUT 60
+)
+
 # TKV-13 (B2) step 1: the DAG-consumption check that will let the SYCL
 # backend defer a pending host-computed demoted-layer attention result
 # instead of blocking on it (docs/plans/2026-08-27-tkv13-b2-addendum.md

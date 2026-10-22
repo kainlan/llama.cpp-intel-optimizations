@@ -404,6 +404,11 @@ int g_ggml_sycl_safe_mode        = 0;
 // normal runs (the mismatch warnings are otherwise gated on g_ggml_sycl_debug,
 // which defaults to 0, so divergence is invisible in production). =1 warns.
 int g_ggml_sycl_handle_strict    = 0;
+// The MoE executor's knobs as the report's integers (llama.cpp-36j0): the policy as moe_exec_policy's value (0 auto,
+// 1 cpu, 2 ring) and the trace level. Both are SET from ggml_sycl_moe_exec_config() after the table parse; the
+// config is the one reader of the variables.
+int g_ggml_sycl_moe_exec_policy  = 0;
+int g_ggml_sycl_moe_exec_trace   = 0;
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
@@ -2673,6 +2678,7 @@ static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_m
 // the host-testable DAG-scan the final overlap increment's
 // flush_pending_attn_if_consumed reuses rather than duplicating.
 #include "ggml-sycl/attn-host-dispatch.hpp"
+#include "ggml-sycl/moe-exec-policy.hpp"
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -29198,6 +29204,43 @@ void ggml_backend_sycl_print_sycl_devices() {
     print_device_opt_feature(device_count);
 }
 
+// The MoE executor's knobs (llama.cpp-36j0 Task 4), parsed once. This is the only reader of GGML_SYCL_MOE_EXEC and
+// GGML_SYCL_MOE_EXEC_TRACE: the trace level (2 runs the Task 5 load-time copy probe) comes from here too.
+static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {
+    static const ggml_sycl::moe_exec_config config = [] {
+        ggml_sycl::moe_exec_config c =
+            ggml_sycl::moe_exec_config_parse([](const char * name) -> const char * { return std::getenv(name); });
+        if (c.bad_policy != nullptr) {
+            GGML_LOG_WARN("[MOE-EXEC] GGML_SYCL_MOE_EXEC=%s is not auto, cpu or ring; using auto\n", c.bad_policy);
+            c.bad_policy = nullptr;  // the environment string is not kept past this line
+        }
+        return c;
+    }();
+    return config;
+}
+
+static void ggml_sycl_moe_exec_log_sink(void *, const char * line) {
+    GGML_LOG_WARN("%s\n", line);
+}
+
+// The [MOE-EXEC] once-per-change log of every layer decision in this process (Task 6 calls note()).
+static ggml_sycl::moe_exec_decision_log & ggml_sycl_moe_exec_log() {
+    static ggml_sycl::moe_exec_decision_log log(ggml_sycl_moe_exec_log_sink);
+    return log;
+}
+
+// The teardown line, once per process: the counters are printed and cleared, so a second backend free adds nothing.
+static void ggml_sycl_moe_exec_log_report() {
+    ggml_sycl::moe_exec_decision_log & log = ggml_sycl_moe_exec_log();
+    if (log.layer_ubatches() == 0) {
+        return;
+    }
+    char line[160];
+    log.summary(line, sizeof(line));
+    GGML_LOG_WARN("%s\n", line);
+    log.reset_counters();
+}
+
 static inline int get_sycl_env(const char * env_name, int default_val) {
     char *   user_device_string = getenv(env_name);
     int      user_number        = default_val;
@@ -29295,11 +29338,20 @@ static void ggml_check_sycl() try {
             // before the report rather than after it.
             { "GGML_SYCL_ASYNC_MEM",        &g_ggml_sycl_use_async_mem_op, 0  },
 #endif
+            // The MoE executor's knobs (llama.cpp-36j0). The names come from moe-exec-policy.hpp so the table and the
+            // parser share one spelling. GGML_SYCL_MOE_EXEC is a word, which this integer parse cannot read, so both
+            // destinations are overwritten from ggml_sycl_moe_exec_config() right after the loop.
+            // clang-format off
+            { ggml_sycl::MOE_EXEC_ENV_POLICY, &g_ggml_sycl_moe_exec_policy, 0 },
+            { ggml_sycl::MOE_EXEC_ENV_TRACE,  &g_ggml_sycl_moe_exec_trace,  0 },
+            // clang-format on
         };
 
         for (const sycl_env_setting & setting : sycl_env_settings) {
             *setting.dest = get_sycl_env(setting.name, setting.default_value);
         }
+        g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);
+        g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a
@@ -90682,6 +90734,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // `[SYCL-MOE-SEQUENCE-GRAPHLET] summary phase=final` line may print here too.
     ggml_sycl_graph_diag_report("final", sycl_ctx && sycl_ctx->exec_graph, sycl_ctx);
 #endif
+    ggml_sycl_moe_exec_log_report();  // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
     // Stop adaptive prestage background thread before tearing down SYCL resources.
     g_adaptive_prestage.stop();
     // Flush any deferred CPU scatter before tearing down SYCL resources.
