@@ -18667,7 +18667,7 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
 }
 
 // What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the
-// rung, from the one fit function.
+// rung, plus the prefill-ring bytes no loan covers, from the one fit function.
 static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
     ggml_sycl_hold_fit_answer a;
     (void) ggml_sycl_hold_spill_fit(q, &a);
@@ -18704,9 +18704,9 @@ static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query &
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
         "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
-        "net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free (of %.1f MB free "
-        "before it), under the %.1f MB driver headroom the arena expects; %s; or free VRAM on this card (another "
-        "process) before loading\n",
+        "net of the KV-zone room a compute buffer can use, plus the prefill-ring bytes no loan covers) would leave "
+        "device %d %.1f MB free (of %.1f MB free before it), under the %.1f MB driver headroom the arena expects; "
+        "%s; or free VRAM on this card (another process) before loading\n",
         a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
         ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
     return false;
@@ -18743,9 +18743,10 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: at n_ubatch=%u the compute buffers the planned dense scratch "
-        "keeps out of the RUNTIME zone (worst case %.1f MB; %llu request(s) totalling %.1f MB were held out and now "
-        "live outside the arena) leave device %d %.1f MB free (of %.1f MB free before them), under the %.1f MB "
-        "driver headroom the arena expects; a smaller -ub keeps those buffers in the zone\n",
+        "keeps out of the RUNTIME zone (worst case %.1f MB, with any prefill-ring bytes no loan covers; %llu "
+        "request(s) totalling %.1f MB were held out and now live outside the arena) leave device %d %.1f MB free "
+        "(of %.1f MB free before them), under the %.1f MB driver headroom the arena expects; a smaller -ub keeps "
+        "those buffers in the zone\n",
         n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
         free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
@@ -18990,10 +18991,11 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     // headroom, using the free-memory reading taken above.
 
     // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan
-    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max) is counted here,
-    // in the check that already asks what the device can take outside the arena; those bytes and the non-FA scratch
-    // compete for the same headroom. (A flash-attention context asks the same live free-memory question without the
-    // non-FA terms, at the top of this function.) Saturating: a wrapped sum must not read as a small demand.
+    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max, and the prefill-ring
+    // bytes no loan covers) is counted here, in the check that already asks what the device can take outside the
+    // arena; those bytes and the non-FA scratch compete for the same headroom. (A flash-attention context asks the
+    // same live free-memory question without the non-FA terms, at the top of this function.) Saturating: a wrapped
+    // sum must not read as a small demand.
     const size_t hold_spill_bytes = hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;
     const size_t nonfa_scratch_demand =
         ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);

@@ -2826,6 +2826,7 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
         mutated = GGML_SYCL_CPP[:at] + line + line + GGML_SYCL_CPP[at + len(line) :]
     assert not _hold_fit_ring_bytes_pinned(mutated), "the mutant must make the pin fail"
 
+
 if __name__ == "__main__":
     import sys
 

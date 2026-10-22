@@ -531,7 +531,7 @@ struct zone_hold_fit_inputs {
     size_t                         n_rungs     = 0;
     zone_hold_plan_fn              plan_of     = nullptr;
     void *                         plan_ctx    = nullptr;
-    size_t                         ring_bytes      = 0;
+    size_t                         ring_bytes  = 0;
 };
 
 // The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
