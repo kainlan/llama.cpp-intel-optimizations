@@ -8,6 +8,11 @@
 // begin_planned_materialization + direct_stage_expert (the bulk case through the tensor-bulk stager) inside the
 // backend, where the file-static transaction lives, and report here:
 //
+//   refuses_without_host_zones
+//                           Lead ruling: before any case configures host zones, a loan of one staged triplet is
+//                           refused "host zones not configured", the probe agrees, the boundary runner does not
+//                           re-post it, and nothing is published, lent or moved off the device. Then, with the
+//                           zones configured, the same request lends the triplet, from zone slices. Runs first.
 //   lends_two_triplets      2 layers x 4 experts, expert 3 on the host: three requests leave the largest pending,
 //                           the graph-boundary runner lends two triplets and clears it, the plan shows them on the
 //                           host, resolve_expert finds host-pinned copies equal to the originals, the device entries
@@ -43,7 +48,8 @@
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
-// without staging. Every lend in the refill cases checks it.
+// without staging. Every lend in the refill cases checks it. The zones cannot be unconfigured, so the one case that
+// needs them absent runs first and fails, rather than passing vacuously, if they are already there.
 //
 // The ctest registration sets GGML_SYCL_STRICT_LEASES=1, so an ownerless lease anywhere in the loan or the refill
 // aborts the run. Each case puts back the plan publication it found and empties the lent ledger, so the next one stages
@@ -87,6 +93,7 @@ int main() {
     fprintf(stderr, "Device: %s\n", device->get_info<sycl::info::device::name>().c_str());
 
     bool ok = true;
+    ok &= run_case("refuses_without_host_zones", ggml_sycl::test_expert_loan_refuses_without_host_zones);
     ok &= run_case("lends_two_triplets", ggml_sycl::test_expert_loan_lends_two_triplets);
     ok &= run_case("probe_changes_nothing", ggml_sycl::test_expert_loan_probe_changes_nothing);
     ok &= run_case("refuses_replacing_a_host_entry", ggml_sycl::test_expert_loan_refuses_replacing_a_host_entry);

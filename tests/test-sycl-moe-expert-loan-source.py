@@ -41,6 +41,11 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
   - the loan runs at the graph boundary, never inside a graph: an in-graph caller records a request with a lock-free
     compare-and-swap; ggml_backend_sycl_synchronize() runs the pending loan after it clears the graph's compute flag
     and before the deferred-free pass; the transaction refuses "graph active"; and mul_mat_id names no loan entry;
+  - a loan is refused "host zones not configured", REFUSED and so never re-posted, before anything is selected,
+    leased, allocated or lent, when its device's cache has no host zones (lead ruling, llama.cpp-sif1): an unzoned
+    pinned copy sends every later copy from it down the staged branch. The transaction asks the same query the pinned
+    pool's allocation branches on, so a loan that passes the check mints only host-zone slices; a probe gets the same
+    answer, and the refill direction does not ask;
   - a loan refused BUSY (a transient refusal) re-posts its request for a later boundary, and a REFUSED one does not;
     the runner, not the transaction, WARNs a re-posted BUSY refusal: the first in a row and then one in every 64,
     with the count, and any other outcome resets the count;
@@ -458,6 +463,31 @@ def claim_loan_runs_at_the_graph_boundary(sycl: str) -> bool:
             and ordered(txn, GRAPH_ACTIVE, "registry.acquire_live_update(", INVENTORY_LOCK)
             and ordered(pending, PENDING_SKIP, PENDING_TAKE, PENDING_RUN)
             and not any(x in mmid for x in MMID_FORBIDDEN))
+
+
+# --- a loan without host zones is refused (lead ruling, llama.cpp-sif1) ----------------------------------------------
+
+INVALID_ARGS = 'return refuse(ggml_sycl_txn_result::REFUSED, "invalid arguments"); }'
+ZONES_REFUSAL = ('if (!refill && !cache->host_zones_configured()) { '
+                 'return refuse(ggml_sycl_txn_result::REFUSED, "host zones not configured"); }')
+LOAN_SELECT = "ggml_sycl::moe_expert_loan_select("
+UNIFIED_ALLOC_SIG = "bool unified_alloc(const alloc_request & req_in, alloc_handle * out)"
+PINNED_ZONE_BRANCH = ("if (req.intent.constraints.use_pinned_pool) { if (!ucache->host_zones_configured()) { "
+                      "ptr = ucache->host_pool_alloc(")
+
+
+def claim_a_loan_without_host_zones_is_refused(cache: str, sycl: str) -> bool:
+    """An unzoned pinned copy makes every later copy from it, the ring's and the refill's, a synchronous staged
+    bounce, so a loan whose device has no host zones is refused by name, as REFUSED (the runner re-posts only BUSY),
+    right after the argument check: before the selection, the probe's answer, the live-update lease, the host storage
+    and the lend. It asks the one query the pinned pool's allocation branches on to pick a zone over the zoneless
+    pool, so a loan that passes mints only zone slices."""
+    txn = body(norm(sycl), TXN_SIG)
+    alloc = body(norm(cache), UNIFIED_ALLOC_SIG)
+    return (txn.count(ZONES_REFUSAL) == 1 and txn.count("host_zones_configured(") == 1
+            and ordered(txn, INVALID_ARGS, ZONES_REFUSAL, GRAPH_ACTIVE, LOAN_SELECT, PROBE, LEASE, HOST_ALLOC,
+                        INVENTORY_LOCK, LEND)
+            and alloc.count(PINNED_ZONE_BRANCH) == 1)
 
 
 # --- the CPU expert consumer orders on the host copy's ready event --------------------------------------------------
@@ -1806,3 +1836,41 @@ def test_mutant_renamed_refusal_turns_final_into_retried_fails():
 def test_mutant_final_refusal_kept_in_the_ledger_fails():
     mutant = _once(SYCL, FINAL_POP, FINAL_POP.replace("if (!transient) { ledger.triplets.pop_back(); } ", ""))
     assert not claim_final_refusals_name_the_cache_refusals(CACHE, mutant)
+
+
+# --- a loan without host zones is refused (lead ruling, llama.cpp-sif1) ----------------------------------------------
+
+
+def test_a_loan_without_host_zones_is_refused():
+    assert claim_a_loan_without_host_zones_is_refused(CACHE, SYCL)
+
+
+def test_mutant_loan_without_host_zones_lends_fails():
+    assert not claim_a_loan_without_host_zones_is_refused(CACHE, _once(SYCL, ZONES_REFUSAL, ""))
+
+
+def test_mutant_loan_without_host_zones_is_reposted_fails():
+    mutant = _once(SYCL, ZONES_REFUSAL, ZONES_REFUSAL.replace("::REFUSED,", "::BUSY,"))
+    assert not claim_a_loan_without_host_zones_is_refused(CACHE, mutant)
+
+
+def test_mutant_host_zones_checked_after_the_host_storage_fails():
+    mutant = _once(_once(SYCL, ZONES_REFUSAL, ""), HOST_ALLOC, ZONES_REFUSAL + " " + HOST_ALLOC)
+    assert not claim_a_loan_without_host_zones_is_refused(CACHE, mutant)
+
+
+def test_mutant_probe_answers_before_the_host_zones_fails():
+    mutant = _once(_once(SYCL, ZONES_REFUSAL, ""), PROBE, PROBE + " " + ZONES_REFUSAL)
+    assert not claim_a_loan_without_host_zones_is_refused(CACHE, mutant)
+
+
+def test_mutant_loan_asks_a_second_zone_query_fails():
+    mutant = _once(SYCL, ZONES_REFUSAL, ZONES_REFUSAL.replace("!cache->host_zones_configured()",
+                                                              "!cache->host_zone_capacity(host_zone_id::WEIGHT)"))
+    assert not claim_a_loan_without_host_zones_is_refused(CACHE, mutant)
+
+
+def test_mutant_pinned_pool_stops_branching_on_the_zones_fails():
+    mutant = _once_in(CACHE, UNIFIED_ALLOC_SIG, PINNED_ZONE_BRANCH,
+                      PINNED_ZONE_BRANCH.replace("!ucache->host_zones_configured()", "!ucache->arena_active()"))
+    assert not claim_a_loan_without_host_zones_is_refused(mutant, SYCL)

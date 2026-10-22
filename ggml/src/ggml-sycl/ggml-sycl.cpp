@@ -20979,6 +20979,15 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     if (!cache || amount == 0 || (refill && probe_mode)) {
         return refuse(ggml_sycl_txn_result::REFUSED, "invalid arguments");
     }
+    // A loan's host copies must be slices of a host zone. The copy path proves a pinned endpoint is host USM only from
+    // such an owner, so every later copy from an unzoned one, the prefill ring's and the refill's, would take the
+    // synchronous staged branch: a host bounce the boundary thread waits on. Once the zones are configured, the pinned
+    // pool serves a lent copy only from the WEIGHT zone, so this one query covers every copy the loan mints. REFUSED,
+    // not BUSY: the zones change only at a model load, so a re-posted request would refuse again at every boundary
+    // (lead ruling, llama.cpp-sif1).
+    if (!refill && !cache->host_zones_configured()) {
+        return refuse(ggml_sycl_txn_result::REFUSED, "host zones not configured");
+    }
     // Inside a graph the plan and the cache's entries belong to it: an in-graph caller records a request instead.
     if (ggml_sycl::unified_cache_is_graph_compute_active()) {
         return refuse(ggml_sycl_txn_result::BUSY, "graph active");
@@ -21566,18 +21575,19 @@ struct test_loan_fixture {
     std::vector<std::vector<uint8_t>>                   bytes;   // the same index: each expert's original contents
     std::shared_ptr<const lifecycle_plan_snapshot>      found;   // the publication the case started under
 
-    test_loan_fixture(int layers, int experts, uint64_t model_id) : n_layers(layers), n_experts(experts) {
+    test_loan_fixture(int layers, int experts, uint64_t model_id, bool configure_zones = true) :
+        n_layers(layers),
+        n_experts(experts) {
         cache = get_unified_cache_for_device(device);
         queue = &ggml_sycl_get_device(device).default_queue();
         found = ::ggml_sycl_global_plan_snapshot();
         // A model load configures its device's host zones before anything runs, so a loan's host copies are slices of
-        // the WEIGHT host zone. Configured here as a load does: a pinned-pool copy made before the zones exist cannot
-        // be told from a standalone pinned base, so the copy path stages every copy from it, and a refill reading such
-        // a copy takes the staged branch its cases assert it never takes. Process-wide and never undone, so done for
-        // every case whatever order they run in; lend() checks the provenance it produces (llama.cpp-sif1).
-        if (cache && !cache->host_zones_configured()) {
-            constexpr size_t mib = 1024ull * 1024ull;
-            cache->configure_host_zones(16 * mib, 2 * mib, 4 * mib, 2 * mib);
+        // the WEIGHT host zone, and the loan refuses without them. Configured here as a load does: a pinned-pool copy
+        // made before the zones exist cannot be told from a standalone pinned base, so the copy path stages every
+        // copy from it. Process-wide and never undone, so done for every case whatever order they run in, except the
+        // one case that checks the refusal and so runs first; lend() checks the provenance (llama.cpp-sif1).
+        if (configure_zones && cache) {
+            (void) configure_host_zones();
         }
 
         for (int l = 0; l < layers; ++l) {
@@ -21640,6 +21650,15 @@ struct test_loan_fixture {
         g_sycl_expert_lent_total[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_readmitted_total[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_refill_refusal_streak[device].store(0, std::memory_order_relaxed);
+    }
+
+    // The device's host zones, sized for these cases, configured unless something already did; whether they are.
+    bool configure_host_zones() const {
+        if (!cache->host_zones_configured()) {
+            constexpr size_t mib = 1024ull * 1024ull;
+            cache->configure_host_zones(16 * mib, 2 * mib, 4 * mib, 2 * mib);
+        }
+        return cache->host_zones_configured();
     }
 
     size_t index(int layer, int slot, int expert) const {
@@ -21974,6 +21993,76 @@ struct test_loan_fixture {
 };
 
 }  // namespace
+
+std::string test_expert_loan_refuses_without_host_zones() {
+    // A loan whose host copies would not be host-zone slices is refused by name, as REFUSED, so the boundary runner
+    // does not re-post it, and nothing is lent; the probe gives the same answer (lead ruling, llama.cpp-sif1). Host
+    // zones cannot be unconfigured, so this case runs before any fixture configures them.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x7369663104ull, /*configure_zones=*/false);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (fx.cache->host_zones_configured()) {
+        return "host zones are already configured in this process: this case must run before any case that "
+               "configures them";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    const auto   published = ::ggml_sycl_global_plan_snapshot();
+    const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    const ::ggml_sycl_txn_result           probe =
+        ::ggml_sycl_expert_loan_transaction_run(fx.device, 3 * charge, /*probe_mode=*/true, &resolver, &result);
+    if (probe != ::ggml_sycl_txn_result::REFUSED || result.accepted ||
+        std::strcmp(result.reason, "host zones not configured") != 0) {
+        return test_loan_fail("the probe answered code=%d accepted=%d (%s), not a host-zones refusal", (int) probe,
+                              (int) result.accepted, result.reason);
+    }
+
+    // Through the graph boundary's runner, as the ring's request reaches the transaction.
+    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
+    result = {};
+    if (!::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, &result)) {
+        return "the boundary runner did not run the pending loan";
+    }
+    if (result.accepted || result.n_triplets != 0 || result.bytes_freed != 0 ||
+        std::strcmp(result.reason, "host zones not configured") != 0) {
+        return test_loan_fail("the loan answered accepted=%d triplets=%u bytes=%zu (%s), not a host-zones refusal",
+                              (int) result.accepted, result.n_triplets, result.bytes_freed, result.reason);
+    }
+    if (g_sycl_expert_loan_requests[fx.device].load(std::memory_order_acquire) != 0 ||
+        g_sycl_expert_loan_busy_streak[fx.device].load(std::memory_order_relaxed) != 0) {
+        return "the refused loan was re-posted as a transient refusal";
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "the refused loan published a plan";
+    }
+    if (g_sycl_expert_lent_count[fx.device].load(std::memory_order_acquire) != 0) {
+        return "the refused loan entered the lent ledger";
+    }
+    for (int s = 0; s < 3; ++s) {
+        const expert_resolve_result resolved = fx.resolve(0, s, 0);
+        if (!fx.device_entry_present(0, s, 0) ||
+            !fx.extras[s]->find_moe_storage_handle_on_device(0, GGML_LAYOUT_AOS, fx.device) || !resolved ||
+            resolved.location != cache_location::DEVICE) {
+            return test_loan_fail("the refused loan moved slot %d expert 0 off the device", s);
+        }
+        if (fx.host_entry_present(0, s, 0)) {
+            return test_loan_fail("the refused loan left a host entry for slot %d expert 0", s);
+        }
+    }
+
+    // The control: once the zones are configured, as a load configures them, the same request lends the triplet and
+    // lend() finds its host copies are zone slices, so the zones were the refusal's only cause.
+    if (!fx.configure_host_zones()) {
+        return "host zones could not be configured for the control";
+    }
+    return fx.lend(3 * charge, 1, /*host_expert=*/1);
+}
 
 std::string test_expert_loan_lends_two_triplets() {
     test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x6d776d7201ull);

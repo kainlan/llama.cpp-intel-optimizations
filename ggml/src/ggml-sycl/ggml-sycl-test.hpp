@@ -558,6 +558,9 @@ struct test_moe_mmid_route_reachable_override_guard {
 // The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an
 // empty string on a pass and otherwise names the first failed assertion. The shared-storage case reserves a WEIGHT
 // arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
+// Without host zones the loan refuses by name and lends nothing (llama.cpp-sif1). Host zones cannot be unconfigured
+// and every other case configures them, so run it first.
+std::string test_expert_loan_refuses_without_host_zones();
 std::string test_expert_loan_lends_two_triplets();
 std::string test_expert_loan_probe_changes_nothing();
 std::string test_expert_loan_refuses_replacing_a_host_entry();
