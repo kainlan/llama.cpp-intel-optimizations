@@ -28747,7 +28747,7 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             continue;
         }
         try {
-            sycl::queue *            q = &dpct::dev_mgr::instance().get_device(info.gpu_dpct_ids[dev]).default_queue();
+            sycl::queue *            q = &cache->get_queue();
             ggml_sycl::alloc_request dst_req{};
             dst_req.queue                                     = q;
             dst_req.device                                    = dev;
@@ -28766,8 +28766,8 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
                 continue;
             }
 
-            const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
             ggml_sycl::mem_copy(dst, src, kBytes, *q);  // untimed: first-use costs stay out of the rate
+            const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
 
             const auto t0 = std::chrono::steady_clock::now();
             for (int it = 0; it < kIters; ++it) {

@@ -27,6 +27,9 @@ reused. The probe this gate pins:
     ggml_sycl_preload_model_weights() (the host zones are configured and the experts placed), never from
     ggml_sycl_init (it must not create caches) nor from model_load_begin (the zones are not configured yet), and
     through ggml_sycl_info_mutable(), defined once, rather than a const_cast of the const accessor;
+  - the copies and the device buffer use cache->get_queue(), never the dpct device's default_queue(): the direct branch
+    needs the copy queue to share a context with the cache's own queue (measured: the default queue read 4-10 GB/s,
+    staged, against 20-21 GB/s direct), and the staged baseline is read after the untimed warm-up;
   - a device whose cache has no configured host zones is not probed (the host source would not be a trusted direct-copy
     source), and a copy the staged-copy census records as staged is never stored or kept: the seed stands, h2d_probed
     stays false, and both outcomes leave the device unresolved so the next load retries;
@@ -272,9 +275,24 @@ def claim_zones_and_staged_copies_never_reach_the_store(src: str) -> bool:
         staged_report in fn,
         zones_report in fn,
         ordered(fn, "cache->host_zones_configured()", zones_report, "ggml_sycl_host_expert_alloc(dev, kBytes)"),
-        ordered(fn, "staged_before = " + census, "ggml_sycl::mem_copy(dst, src, kBytes, *q);",
+        # the baseline is read after the untimed warm-up, so the detection scores the timed copies only
+        ordered(fn, "ggml_sycl::mem_copy(dst, src, kBytes, *q);", "staged_before = " + census,
                 "mem_copy_async(", census + " != staged_before", staged_report, "moe_exec_rates_store("),
         fn.count("moe_exec_rates_store(") == 1,
+    ])
+
+
+def claim_copies_run_on_the_cache_queue(src: str) -> bool:
+    """mem_copy_submit takes its direct branch only when the copy queue shares a context with the cache's own queue
+    (queue_for_device_or_fallback returns cache->get_queue()), so the probe copies, and allocates its device buffer,
+    on that queue: never the dpct device's default queue, which is a different context and is always refused."""
+    fn = probe_body(src)
+    return bool(fn) and all([
+        fn.count("sycl::queue * q = &cache->get_queue();") == 1,
+        "default_queue" not in fn,
+        "dpct::dev_mgr" not in fn,
+        "dst_req.queue = q;" in fn,
+        fn.count("*q)") + fn.count("*q,") >= 2,
     ])
 
 
@@ -342,6 +360,10 @@ def test_probe_runs_after_preload_through_the_mutable_accessor():
 
 def test_zones_and_staged_copies_never_reach_the_store():
     assert claim_zones_and_staged_copies_never_reach_the_store(SYCL)
+
+
+def test_copies_run_on_the_cache_queue():
+    assert claim_copies_run_on_the_cache_queue(SYCL)
 
 
 def test_device_info_carries_the_rate_and_one_consumer_reads_it():
@@ -447,6 +469,25 @@ def test_mutant_staged_check_removed_fails():
     assert not claim_zones_and_staged_copies_never_reach_the_store(
         _once(SYCL, "mem_copy_staged_wait_census_this_thread().staged_h2d != staged_before",
               "false"))
+
+
+def test_mutant_default_queue_fails():
+    assert not claim_copies_run_on_the_cache_queue(
+        _once(SYCL, "sycl::queue * q = &cache->get_queue();",
+              "sycl::queue * q = &dpct::dev_mgr::instance().get_device(info.gpu_dpct_ids[dev]).default_queue();"))
+
+
+def test_mutant_dst_on_another_queue_fails():
+    assert not claim_copies_run_on_the_cache_queue(
+        _once(SYCL, "dst_req.queue = q;", "dst_req.queue = nullptr;"))
+
+
+def test_mutant_baseline_before_warmup_fails():
+    mutant = _once(SYCL, "ggml_sycl::mem_copy(dst, src, kBytes, *q);\n"
+                   "            const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;",
+                   "const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;\n"
+                   "            ggml_sycl::mem_copy(dst, src, kBytes, *q);")
+    assert not claim_zones_and_staged_copies_never_reach_the_store(mutant)
 
 
 def test_mutant_staged_rate_is_kept_fails():
