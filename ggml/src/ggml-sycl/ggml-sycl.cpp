@@ -18586,6 +18586,35 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
     return plan;
 }
 
+// Defined with the expert loan transaction below: the bytes a loan of `bytes_wanted` would lend on `device`, 0 when
+// the probe is refused.
+static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted);
+
+// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
+// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
+// ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
+// host. The geometry is the one the stream phase sizes its ring with: the same index build and sizing over the
+// published plan (moe_stream_phase::prepare), so the fit and the ring cannot disagree about its size. 0 with no
+// published plan, no host expert, or no ring (the sizing refuses one past a tenth of the resident expert bytes). A
+// refused probe (a graph is active) lends nothing, so the whole ring counts.
+static size_t ggml_sycl_hold_ring_uncovered(int device) {
+    const auto current = ggml_sycl_global_plan_snapshot();
+    if (!current || !current->plan) {
+        return 0;
+    }
+    const ggml_sycl::moe_stream_plan_index index = ggml_sycl::moe_stream_plan_index_build(*current->plan, device);
+    if (index.layers.empty()) {
+        return 0;  // no host expert entry: nothing streams, so no ring
+    }
+    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_ring_size(
+        index.host_matrices_per_layer_max, index.matrix_bytes_max, index.resident_expert_bytes);
+    if (geo.bytes == 0) {
+        return 0;
+    }
+    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);
+    return geo.bytes > lent ? geo.bytes - lent : 0;
+}
+
 static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
     ggml_sycl_hold_fit_answer  a;
     ggml_sycl::unified_cache * cache    = ggml_sycl::get_unified_cache_for_device(q.device);
@@ -18623,6 +18652,8 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.rungs        = rungs;
     in.plan_of      = ggml_sycl_hold_plan_at;
     in.plan_ctx     = &device;
+    // Lent bytes cost the card nothing; the part of the ring no loan covers is a demand (zone_hold_fit_demand).
+    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
     a.demand        = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);
     a.free_before   = in.free_before;
     const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);
@@ -20737,8 +20768,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // to the host and is published once, so each lent expert executes where it now lives. File-static. Today its one
 // production caller is the boundary runner ggml_backend_sycl_synchronize() calls, which finds no request until a
 // requester lands.
-// Once plan Task 12 lands, the auto-ubatch fit term will call it in probe mode (ggml_sycl_run_expert_loan_transaction),
-// and the ring's admission in mul_mat_id (the ring phase, Task 7b) will call only ggml_sycl_request_expert_loan().
+// The auto-ubatch fit's ring term calls it in probe mode (ggml_sycl_expert_loan_probe_bytes), and once plan Task 12
+// lands the ring's admission in mul_mat_id (the ring phase, Task 7b) will call only ggml_sycl_request_expert_loan().
 //
 // Where it runs (c-tdra): at a graph boundary, never inside a graph. The ring's admission runs inside one, holding
 // g_sycl_graph_compute_mutex (L2), and the inventory mutex (L1) ranks below it (canonical contract section 12.5), so it
@@ -21053,7 +21084,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 
 // Lend resident expert triplets worth at least bytes_wanted of VRAM on the backend's device to the prefill ring, or,
 // in probe mode, say what a loan would lend while copying and publishing nothing. The direct entry, for a caller
-// outside any graph; refused "graph active" inside one. Unused until its caller lands (the fit term, plan Task 12).
+// outside any graph; refused "graph active" inside one. Unused until its caller lands (plan Task 12); the fit term asks
+// ggml_sycl_expert_loan_probe_bytes, which takes a device because the fit has no backend.
 [[maybe_unused]] static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction(ggml_backend_t backend,
                                                                                    size_t         bytes_wanted,
                                                                                    bool           probe_mode,
@@ -21067,6 +21099,16 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
         return ggml_sycl_txn_result::REFUSED;
     }
     return ggml_sycl_expert_loan_transaction_run(ctx->device, bytes_wanted, probe_mode, nullptr, out);
+}
+
+// What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused
+// (a graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks it
+// (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
+static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted) {
+    ggml_sycl_expert_loan_result probe;
+    const ggml_sycl_txn_result   code =
+        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/true, nullptr, &probe, false);
+    return code == ggml_sycl_txn_result::ACCEPTED ? probe.bytes_freed : 0;
 }
 
 // Per device, the most bytes any in-graph caller asked to borrow since the last graph boundary; 0 when none did.

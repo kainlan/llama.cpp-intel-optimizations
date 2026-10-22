@@ -2789,6 +2789,43 @@ def test_the_settle_refusal_record_has_a_mutation_witness(mutation):
     assert not _settle_catch_only_records(_trial_mutant(old, new))
 
 
+# ---------------------------------------------------------------------------
+# llama.cpp-kjef (plan Task 13 of llama.cpp-36j0): the hold-spill fit charges the prefill ring bytes no loan covers
+# ---------------------------------------------------------------------------
+
+_HOLD_FIT_START = "static bool ggml_sycl_hold_spill_fit("
+_HOLD_FIT_END = "static size_t ggml_sycl_planned_scratch_hold_spill_bound("
+_RING_BYTES_LINE = "in.ring_bytes = ggml_sycl_hold_ring_uncovered(q.device);"
+
+
+def _hold_fit_ring_bytes_pinned(raw_cpp: str) -> bool:
+    """The fit query hands zone_hold_fit_demand the ring bytes a loan cannot cover, once, from the one helper. The
+    term is added in the demand function only (see test-zone-sizing Case 24b), so a second mention here would be a
+    second place a caller could add it, and none would leave the fit blind to the ring."""
+    body = _body_of(raw_cpp, _HOLD_FIT_START, _HOLD_FIT_END)
+    return len(re.findall(r"\bring_bytes\b", body)) == 1 and _RING_BYTES_LINE in body
+
+
+def test_the_hold_spill_fit_query_mentions_ring_bytes_exactly_once():
+    assert _hold_fit_ring_bytes_pinned(GGML_SYCL_CPP)
+
+
+@pytest.mark.parametrize("mutation", ["none", "twice"])
+def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
+    start = GGML_SYCL_CPP.find(_HOLD_FIT_START)
+    end = GGML_SYCL_CPP.find(_HOLD_FIT_END, start)
+    assert start != -1 and end != -1
+    # Whitespace-tolerant, so the assignment's column alignment never turns the witness into a vacuous miss.
+    assignment = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
+    m = re.search(assignment, GGML_SYCL_CPP[start:end], re.M)
+    assert m, "the assignment must sit in the fit body"
+    at, line = start + m.start(), m.group(0)
+    if mutation == "none":
+        mutated = GGML_SYCL_CPP[:at] + GGML_SYCL_CPP[at + len(line) :]
+    else:
+        mutated = GGML_SYCL_CPP[:at] + line + line + GGML_SYCL_CPP[at + len(line) :]
+    assert not _hold_fit_ring_bytes_pinned(mutated), "the mutant must make the pin fail"
+
 if __name__ == "__main__":
     import sys
 
