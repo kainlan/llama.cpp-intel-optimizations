@@ -202,10 +202,10 @@ int main() {
         mem_handle        slot_b = ring.acquire_slot(GGML_LAYOUT_AOS);
         const sycl::event fill_b = mem_fill_async(slot_b, 0x22, kSlot, q, { ring.current_region_gate() });
 
-        const int32_t prompt_ids[] = { kExpert, kExpert };  // two tokens, one slot each: rows == 2
-        const int32_t decode_ids[] = { kExpert };           // one token: rows == 1
-        const int32_t miss_ids[]   = { 6, 6 };
-        const int32_t tag_ids[]    = { 7, 7 };
+        const int32_t prompt_ids[]  = { kExpert, kExpert };  // two tokens, one slot each: rows == 2
+        const int32_t decode_ids[]  = { kExpert };           // one token: rows == 1
+        const int32_t miss_ids[]    = { 6, 6 };
+        const int32_t tag_ids[]     = { 7, 7 };
         const int32_t soa_tag_ids[] = { 2, 2 };
         const int32_t soa_q4_ids[]  = { 4, 4 };
         size_t        served = 0, refused = 0;

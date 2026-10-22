@@ -71,7 +71,7 @@ bool test_moe_stream_insert_staged(ggml_backend_t     backend,
 bool test_moe_stream_begin_ubatch(ggml_backend_t backend, uint32_t n_tokens);
 bool test_moe_stream_end_prompt(ggml_backend_t backend);
 bool test_moe_stream_staged_route_counts(ggml_backend_t backend, size_t * served, size_t * refused);
-bool                      test_moe_stream_staged_route_refusals(ggml_backend_t backend, std::string * refusals);
+bool test_moe_stream_staged_route_refusals(ggml_backend_t backend, std::string * refusals);
 moe_resolved_batch_result test_moe_staged_ring_build(ggml_backend_t      backend,
                                                      const ggml_tensor * src0,
                                                      const int32_t *     ids,

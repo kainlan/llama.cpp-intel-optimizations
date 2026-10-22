@@ -1016,8 +1016,10 @@ int main() {
         !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
         !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||
-        !test_numerical_q1_nvfp4_host_executor() || !test_decode_admission_is_route_mode_independent() ||
-        !test_staged_ring_route_contract() || !test_admission_entry_reuse_is_graph_keyed_for_staged_bundles()) {
+        !test_numerical_q1_nvfp4_host_executor() || !test_decode_admission_is_route_mode_independent()) {
+        return 1;
+    }
+    if (!test_staged_ring_route_contract() || !test_admission_entry_reuse_is_graph_keyed_for_staged_bundles()) {
         return 1;
     }
     std::puts("PASS: retained MoE route-batch host contract");
