@@ -562,9 +562,10 @@ std::string test_expert_loan_lends_two_triplets();
 std::string test_expert_loan_probe_changes_nothing();
 std::string test_expert_loan_refuses_replacing_a_host_entry();
 std::string test_expert_loan_refuses_shared_storage();
-// The refill's staging question (llama.cpp-sif1): outside a load, under a published plan and a planned materialization
-// scope, direct staging takes one expert from a pinned host copy. It reserves the WEIGHT arena itself.
-std::string test_expert_refill_stage_outside_a_load();
+// The refill's design evidence (llama.cpp-sif1): outside a load, under a published plan and a planned materialization
+// scope, direct staging takes one expert from a pinned host copy, and its copy takes the staged branch. It reserves the
+// WEIGHT arena itself.
+std::string test_expert_direct_stage_outside_a_load_copies_through_staging();
 // The refill (llama.cpp-sif1): after the loan, two calls re-admit one triplet each, the bytes and the device's zone
 // room come back and no host entry is left; a loan between two calls cancels the second.
 std::string test_expert_refill_readmits_one_triplet_per_call();

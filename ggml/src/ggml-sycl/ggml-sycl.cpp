@@ -22239,13 +22239,15 @@ std::string test_expert_loan_refuses_shared_storage() {
     return {};
 }
 
-std::string test_expert_refill_stage_outside_a_load() {
-    // The refill re-admits lent experts at a decode graph's boundary, outside any model load (llama.cpp-sif1). The
-    // cache's direct staging gates (the load effect bound to this thread, the plan's coherence, the planned
-    // materialization authority) were only known to pass inside a load. This stages one expert the way a refill
-    // would, from a loan-shaped pinned host copy under a published plan, inside a planned materialization scope, and
-    // names the gate that refused if one did. It also reports whether direct staging's own copy, which reads its
-    // source through a raw pointer, took the copy path's staged branch.
+std::string test_expert_direct_stage_outside_a_load_copies_through_staging() {
+    // The evidence the refill's design rests on (llama.cpp-sif1). The refill re-admits lent experts at a decode
+    // graph's boundary, outside any model load, where the cache's direct staging gates (the load effect bound to this
+    // thread, the plan's coherence, the planned materialization authority) were only known to pass inside a load.
+    // This stages one expert the way a refill would, from a loan-shaped pinned host copy under a published plan,
+    // inside a planned materialization scope, and pins two facts: the gates pass outside a load, and direct staging's
+    // own copy, which reads its source through a raw pointer, takes the copy path's staged branch, a synchronous
+    // bounce the boundary thread would wait on. The second is why the refill copies owner to owner itself instead of
+    // staging directly.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x7369663101ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -22274,7 +22276,7 @@ std::string test_expert_refill_stage_outside_a_load() {
     mem_handle          lease;
     direct_stage_result stage{};
     {
-        scoped_planned_materialization materialization(fx.cache, "test/refill stage outside a load");
+        scoped_planned_materialization materialization(fx.cache, "test/direct stage outside a load");
         stage = fx.cache->direct_stage_expert(fx.keys[i], host, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr,
                                               &fx.cache->get_bcs_queue(), &lease);
     }
@@ -22286,6 +22288,10 @@ std::string test_expert_refill_stage_outside_a_load() {
                               test_loan_stage_refusal(fx.cache, stage).c_str());
     }
     stage.event.wait_and_throw();
+    if (staged == 0) {
+        return "direct staging's copy no longer takes the staged branch, so the reason the refill copies owner to "
+               "owner itself is gone: revisit unified_cache::refill_lent_triplet";
+    }
 
     // The staged bytes, read back through a pinned buffer, are the source's.
     mem_handle readback = ::ggml_sycl_host_expert_alloc(fx.device, bytes);
@@ -22330,9 +22336,15 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
-    const uint64_t                         staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
+    uint64_t                               staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
     uint32_t remaining = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/true,
                                                                              /*max_triplets=*/1, &resolver, &result);
+    // A refill's copies have typed owners at both ends, so the copy path takes the direct DMA, never the staged branch:
+    // that is a synchronous bounce the boundary thread would wait on. Bracketed around the refill call alone.
+    if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
+        return test_loan_fail("the first refill took %llu staged host-to-device copies, not the direct DMA",
+                              (unsigned long long) staged);
+    }
     if (!result.accepted || result.n_triplets != 1 || remaining != 1 || result.n_remaining != 1 ||
         result.bytes_readmitted != 3 * charge) {
         return test_loan_fail(
@@ -22369,7 +22381,12 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     }
 
     // The second call, through the direct entry: the cursor is still armed.
-    remaining = ::ggml_sycl_expert_refill_transaction_run(fx.device, /*max_triplets=*/1, &resolver, &result);
+    staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
+    remaining     = ::ggml_sycl_expert_refill_transaction_run(fx.device, /*max_triplets=*/1, &resolver, &result);
+    if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
+        return test_loan_fail("the second refill took %llu staged host-to-device copies, not the direct DMA",
+                              (unsigned long long) staged);
+    }
     if (!result.accepted || result.n_triplets != 1 || remaining != 0 || result.bytes_readmitted != 3 * charge) {
         return test_loan_fail(
             "the second refill re-admitted %u triplets and %zu bytes with %u remaining (%s), not 1, "
@@ -22380,12 +22397,6 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
         if (std::string why = fx.readmitted(t.first, t.second); !why.empty()) {
             return why;
         }
-    }
-    // Both endpoints of each copy are typed owners, so the copy path took the direct DMA, never the staged copy.
-    const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before;
-    if (staged != 0) {
-        return test_loan_fail("the refills took %llu staged host-to-device copies, not the direct DMA",
-                              (unsigned long long) staged);
     }
     if (g_sycl_expert_lent_count[fx.device].load() != 0) {
         return test_loan_fail("the ledger still counts %u lent triplets", g_sycl_expert_lent_count[fx.device].load());
@@ -22448,8 +22459,15 @@ std::string test_expert_refill_cancelled_by_a_loan() {
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
+    uint64_t                               staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
     uint32_t remaining = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/true,
                                                                              /*max_triplets=*/1, &resolver, &result);
+    // A refill's copies have typed owners at both ends, so the copy path takes the direct DMA, never the staged branch:
+    // that is a synchronous bounce the boundary thread would wait on. Bracketed around the refill call alone.
+    if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
+        return test_loan_fail("the first refill took %llu staged host-to-device copies, not the direct DMA",
+                              (unsigned long long) staged);
+    }
     if (!result.accepted || result.n_triplets != 1 || remaining != 1) {
         return test_loan_fail("the first refill re-admitted %u triplets with %u remaining (%s), not 1 and 1",
                               result.n_triplets, remaining, result.reason);
@@ -22508,8 +22526,13 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     if (remaining != 0 || ::ggml_sycl_global_plan_snapshot().get() != published.get()) {
         return "a prompt graph's boundary re-admitted a lent triplet";
     }
-    remaining = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/true, /*max_triplets=*/1,
-                                                                    &resolver, &result);
+    staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
+    remaining     = ::ggml_sycl_run_expert_refill_at_boundary_on_device(fx.device, /*decode=*/true, /*max_triplets=*/1,
+                                                                        &resolver, &result);
+    if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
+        return test_loan_fail("the resumed refill took %llu staged host-to-device copies, not the direct DMA",
+                              (unsigned long long) staged);
+    }
     if (!result.accepted || result.n_triplets != 1 || remaining != 1) {
         return test_loan_fail(
             "the decode boundary after the loan re-admitted %u triplets with %u remaining (%s), not "

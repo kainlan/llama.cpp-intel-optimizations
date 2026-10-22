@@ -65,7 +65,8 @@ What this gate pins for it:
   - the cache checks everything that would make the publication wrong before copying, inserts the device entries and
     mints their leases before anything published changes (a throw there withdraws only what it inserted), and from
     the mirror swap on allocates nothing; the host copy is retired entry by entry, only while it still names the lent
-    storage, never by the id-wide retire;
+    storage, never by the id-wide retire; the publication runs inside a planned materialization session, as the loan's
+    registration does;
   - lock order: the device storage is minted before g_tensor_inventory_mutex, the cache never names that mutex, and no
     refill code names g_sycl_graph_compute_mutex;
   - each extra forgets its host-copy record before remembering the device copy, the plan flips back, and the ledger
@@ -687,6 +688,16 @@ def claim_refill_allocates_before_it_changes_anything(cache: str) -> bool:
                         PUBLICATION_FAILED, SWAP_MIRROR, REMAP_ID, HOST_RETIRE))
 
 
+REFILL_SESSION = 'scoped_planned_materialization materialization(this, "expert refill");'
+
+
+def claim_refill_publishes_in_a_planned_materialization(cache: str) -> bool:
+    """The device entries are published inside a planned materialization session, as the loan registers its host copies
+    in one: the session opens after the copy is submitted and before the locks the publication takes."""
+    b = body(norm(cache), REFILL_SIG)
+    return (b.count(REFILL_SESSION) == 1 and b.count("begin_planned_materialization(") == 0
+            and ordered(b, REFILL_COPY, REFILL_SESSION, RELEASED_SIZED, CACHE_LOCKS, EMPLACE))
+
 def claim_refill_retires_the_host_copy_exactly(cache: str) -> bool:
     """The host copy is withdrawn entry by entry under the loan's host ids, only while each still names the lent
     storage, after the device entry has taken the mirror and the id mapping over; never by the id-wide retire."""
@@ -993,6 +1004,9 @@ def test_refill_copy_is_owner_to_owner_on_the_copy_engine():
 def test_refill_allocates_before_it_changes_anything():
     assert claim_refill_allocates_before_it_changes_anything(CACHE)
 
+
+def test_refill_publishes_in_a_planned_materialization():
+    assert claim_refill_publishes_in_a_planned_materialization(CACHE)
 
 def test_refill_retires_the_host_copy_exactly():
     assert claim_refill_retires_the_host_copy_exactly(CACHE)
@@ -1595,6 +1609,15 @@ def test_mutant_refill_catch_keeps_the_inserted_entries_fails():
     mutant = _once(CACHE, WITHDRAW_INSERTED, "for (int i = 0; i < 0; ++i) { (void) transition_to_retired_locked(")
     assert not claim_refill_allocates_before_it_changes_anything(mutant)
 
+
+def test_mutant_refill_publishes_outside_a_planned_materialization_fails():
+    assert not claim_refill_publishes_in_a_planned_materialization(_once(CACHE, REFILL_SESSION, ";"))
+
+
+def test_mutant_refill_opens_its_session_after_the_locks_fails():
+    moved = _once(CACHE, REFILL_SESSION, ";")
+    mutant = _once_in(moved, REFILL_SIG, EMPLACE, REFILL_SESSION + " " + EMPLACE)
+    assert not claim_refill_publishes_in_a_planned_materialization(mutant)
 
 def test_mutant_refill_uses_the_id_wide_retire_fails():
     mutant = _once(CACHE, HOST_RETIRE, "(void) retire_expert_entry_exact(id, GGML_LAYOUT_AOS, \"refill\");")

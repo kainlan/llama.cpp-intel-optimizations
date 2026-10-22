@@ -21,25 +21,28 @@
 //                           is copied or published and the planted entry keeps its storage.
 //   refuses_shared_storage  c-sepd: a bulk-staged pair with expert 1 flipped to the host is refused with "shared
 //                           storage"; nothing is copied or published.
-//   refill_stage_outside_a_load
-//                           The refill's staging question: outside a model load, under a published plan, direct
-//                           staging takes one expert from a pinned host copy; it prints whether its copy was staged.
+//   direct_stage_outside_a_load_copies_through_staging
+//                           The evidence the refill's design rests on: outside a model load, under a published
+//                           plan, direct staging takes one expert from a pinned host copy (its gates pass), and its
+//                           copy takes the staged branch, a synchronous bounce; so the refill copies owner to owner
+//                           itself.
 //   refill_readmits_one_triplet_per_call
 //                           The two-triplet loan, then a decode boundary's refill and a direct one, one triplet each:
 //                           each re-admitted triplet is on the device in the plan, resolves there with its original
-//                           bytes, its extras name the device copy, and its host entries are gone; the copies took the
-//                           direct DMA; a third call has nothing to refill; the raw device bytes and the WEIGHT zone
-//                           room are what they were before the loan; the teardown counts read 2/2.
+//                           bytes, its extras name the device copy, and its host entries are gone; each refill call
+//                           took no staged copy; a third call has nothing to refill; the raw device bytes and the
+//                           WEIGHT zone room are what they were before the loan; the teardown counts read 2/2.
 //   refill_cancelled_by_a_loan
 //                           One refill, then a one-triplet loan: the next refill re-admits nothing (0 remaining) and
 //                           publishes nothing, the triplet still lent stays on the host, a prompt boundary keeps the
-//                           cursor disarmed and the next decode boundary re-admits again.
+//                           cursor disarmed and the next decode boundary re-admits again; neither accepted refill took
+//                           a staged copy.
 //
-// The ctest registration sets GGML_SYCL_STRICT_LEASES=1, so an ownerless lease anywhere in the loan or the refill aborts
-// the run. Each case puts back the plan publication it found and empties the lent ledger, so the next one stages under
-// the same coherence. A setup failure names the cache's reason. The shared-storage case reserves a WEIGHT arena, so the
-// loan cases before it stage raw device allocations and the refill cases after it, which mint their storage from the
-// zone, stage into it.
+// The ctest registration sets GGML_SYCL_STRICT_LEASES=1, so an ownerless lease anywhere in the loan or the refill
+// aborts the run. Each case puts back the plan publication it found and empties the lent ledger, so the next one stages
+// under the same coherence. A setup failure names the cache's reason. The shared-storage case reserves a WEIGHT arena,
+// so the loan cases before it stage raw device allocations and the refill cases after it, which mint their storage from
+// the zone, stage into it.
 //
 // MIT license
 // SPDX-License-Identifier: MIT
@@ -81,7 +84,8 @@ int main() {
     ok &= run_case("probe_changes_nothing", ggml_sycl::test_expert_loan_probe_changes_nothing);
     ok &= run_case("refuses_replacing_a_host_entry", ggml_sycl::test_expert_loan_refuses_replacing_a_host_entry);
     ok &= run_case("refuses_shared_storage", ggml_sycl::test_expert_loan_refuses_shared_storage);
-    ok &= run_case("refill_stage_outside_a_load", ggml_sycl::test_expert_refill_stage_outside_a_load);
+    ok &= run_case("direct_stage_outside_a_load_copies_through_staging",
+                   ggml_sycl::test_expert_direct_stage_outside_a_load_copies_through_staging);
     ok &= run_case("refill_readmits_one_triplet_per_call", ggml_sycl::test_expert_refill_readmits_one_triplet_per_call);
     ok &= run_case("refill_cancelled_by_a_loan", ggml_sycl::test_expert_refill_cancelled_by_a_loan);
 

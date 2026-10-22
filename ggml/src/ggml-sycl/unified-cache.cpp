@@ -10477,6 +10477,9 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
         mirror.ready_event         = out.copy_events[i];
         mirror.pending_load_txn_id = load_effect.load_txn_id();
     }
+    // The publication runs inside a planned materialization session, as the loan's host registration does: the plan,
+    // not a runtime miss, asked for these device copies (llama.cpp-sif1).
+    scoped_planned_materialization   materialization(this, "expert refill");
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
                                                 members[2].host_keys.size());
     int                              inserted = 0;
