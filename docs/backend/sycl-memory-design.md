@@ -75,6 +75,8 @@ re-litigates it at op time. Two symmetric failure modes are therefore forbidden:
   (~9.7 µs cross-device latency). If a VRAM-starved configuration is too slow on
   CPU, the fix is placement (budget, eviction priority), never a streaming path.
 
+**Amendment, 2026-10-19.** The owner amended the "no weight streaming" bullet above for prompt processing: *"Our unified cache is meant to intelligently handle everything automatically, if it's faster to stream host pinned weights to vram it should do that. No idea is too complicated for us to consider."* A host-pinned expert is therefore streamed to VRAM for a prompt when the cost model says that is faster, and the unified cache decides automatically. The 2026-08-16 ruling still stands for where weights live, and decode still computes a host-resident expert on the CPU. The mechanism is in the subsection below.
+
 Scope boundary, so the rule is not over-applied: staging that converts the
 *format* of **device-resident** data (e.g. on-device dequant of MXFP4 into an
 f16 scratch for oneDNN) is not a placement violation — the bytes never cross the
@@ -87,6 +89,26 @@ audit that no dispatch route can receive a host-resident operand and stage it to
 device (the routes themselves carry no residency branch — the diversion must be
 proven structural, upstream, where `requires_host_staging` and the HOST tier are
 modelled).
+
+### The executor cost model and the prefill ring (owner ruling 2026-10-19)
+
+The 2026-08-16 ruling still decides where weights live. Placement assigns each expert to a device or to host-pinned memory, and a prompt does not move that assignment. The 2026-10-19 amendment governs how a host-resident expert is computed, and the executor cost model decides that per layer.
+
+**Decision unit.** The decision is made per layer per micro-batch. `moe_exec_weigh` (`moe-exec-cost.hpp`) prices two options for the layer's host-resident experts: `t_cpu`, computing them on the CPU where they live, and `t_ring`, staging them through the prefill ring and computing them on the device. Under `GGML_SYCL_MOE_EXEC=auto` the cheaper option wins. `moe_exec_decision_log` prints one `[MOE-EXEC]` line when a layer's choice changes.
+
+**Two regimes.** In decode, host-resident experts compute on the CPU. In prompt processing, a layer's host-resident experts are staged through the ring, and the batched device executor runs them, whenever the cost model prices `t_ring` lower.
+
+**The ring.** `moe_stream_ring::reserve` takes its slots from the WEIGHT zone. It makes one `unified_cache_zone_allocate_owner` call, and the resulting `alloc_owner` is wrapped with `mem_handle::from_owned_alloc`. `moe_stream_ring::acquire_slot` hands out each slot as its own `mem_handle`, so no raw pointer is kept. `moe_stream_ring_size` gives the geometry: two regions, each holding the heaviest layer's slots (`region_slots_max`), or no ring at all. The two regions are epochs. Layer l+1 streams into one while layer l runs from the other. Reuse of a region is ordered after the event that ended its previous use, chained on the device through `current_region_gate`, so the host never waits. `STAGED_RING` is the only route from a host-resident entry to the device, and `moe_staged_route_tally` counts each entry the route refuses, by cause.
+
+**The loan and the refill.** The loan and the refill are plan transactions. `ggml_sycl_expert_txn_run` runs them in the LOAN and REFILL directions, and each one republishes the expert plan. The refill runs at the decode boundary through `ggml_sycl_expert_refill_transaction_run`. It re-admits lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying each lent host copy back owner to owner on the copy queue, behind its writes. A triplet that can never be prepared stays on the host, with one WARN. The auto-ubatch fit includes the ring as well: `ggml_sycl_hold_ring_uncovered` charges the ring bytes that no loan would cover to the rung's demand, so a rung that needs them is refused with a figure.
+
+**Gates.** Three gates keep the rule enforceable.
+
+- `STAGED_RING` is the only route from a host-resident entry to the device. The source gate `tests/test-sycl-moe-stream-enqueue-source.py` guards the ring's copy path.
+- Nothing allocates outside the unified cache. The ring's slots come only from the WEIGHT zone allocation, and the alloc-zone contract in § 3 of the canonical contract gates it.
+- The `[MOE-EXEC]` summary and the teardown lines print once per change. `tests/test-sycl-moe-exec-knobs-source.py` pins each format to one occurrence, and `ggml_sycl_moe_exec_log_report` prints the summary at backend free.
+
+The end-to-end numbers are recorded by Task 15 (llama.cpp-x6zo) and are not restated here.
 
 ### Layout follows residency (owner ruling, 2026-08-16 — do not drift)
 
