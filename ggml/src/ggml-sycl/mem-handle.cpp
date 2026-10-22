@@ -1336,7 +1336,6 @@ mem_handle::lease_state mem_handle::take_lease_state_locked() const {
     vram_chunk_idx_    = -1;
     chunk_device_      = -1;
     leased_storage_owner_.reset();
-    (void) leased_alloc_owner_.reset();
 
     return state;
 }

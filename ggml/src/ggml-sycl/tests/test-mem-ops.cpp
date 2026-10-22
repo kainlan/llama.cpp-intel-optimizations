@@ -233,8 +233,17 @@ static int check_registered_host_expert_lease_copy_is_direct(sycl::queue & q) {
         return 1;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
-    if (!cache || !cache->host_zones_configured()) {
-        std::fprintf(stderr, "FAIL: host expert lease copy: no unified cache with host zones for the device\n");
+    if (!cache) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: no unified cache for the device\n");
+        return 1;
+    }
+    // Configured here as check_pinned_weight_copy_is_direct does, so this case does not rely on running after it.
+    if (!cache->host_zones_configured()) {
+        cache->configure_host_zones(2 * bytes, 2ull * 1024ull * 1024ull, 4ull * 1024ull * 1024ull,
+                                    2ull * 1024ull * 1024ull);
+    }
+    if (!cache->host_zones_configured()) {
+        std::fprintf(stderr, "FAIL: host expert lease copy: host zones could not be configured\n");
         return 1;
     }
     sycl::queue & cq     = cache->get_queue();
