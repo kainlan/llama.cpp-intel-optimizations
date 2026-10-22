@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct ggml_sycl_device_info;
 
@@ -551,6 +552,15 @@ struct test_moe_mmid_route_reachable_override_guard {
 
     const int previous;
 };
+#endif
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an
+// empty string on a pass and otherwise names the first failed assertion. The shared-storage case reserves a WEIGHT
+// arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
+std::string test_expert_loan_lends_two_triplets();
+std::string test_expert_loan_probe_changes_nothing();
+std::string test_expert_loan_refuses_shared_storage();
 #endif
 
 }  // namespace ggml_sycl

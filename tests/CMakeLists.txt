@@ -4601,6 +4601,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-mwmr: the expert loan transaction (lend resident expert triplets to the prefill ring) never waits or asks an
+# event's status, retires each device entry exactly and only after its copy is submitted reading the entry's own owner,
+# takes the inventory mutex before the cache locks, refuses shared storage and SOA, registers the host copy typed, and
+# publishes once. Host-only: reads sources, no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-expert-loan-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-loan-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-7fmt: without -c, common asks for the model's default context (LLAMA_N_CTX_HINT_DEFAULT), the load
 # resolves it once (src/llama-n-ctx-hint.h) to n_ctx_train padded as llama_context pads it and holds that context's KV
 # room, no backend names the sentinel, and the KV context room line says when its context is the default. A mutant per

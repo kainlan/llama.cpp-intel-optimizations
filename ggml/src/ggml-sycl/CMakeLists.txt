@@ -3124,6 +3124,44 @@ set_tests_properties(sycl-moe-stream-ring PROPERTIES
     SKIP_RETURN_CODE 77
 )
 
+# MoE expert loan transaction (llama.cpp-mwmr): resident expert triplets lent to
+# the prefill ring, copied to pinned host storage, flipped in the published plan
+# and retired on the device. The transaction is file-static in ggml-sycl.cpp, so
+# its cases are private seams there and this links the private fixture carrier,
+# as test-mem-handle-eviction does, never the ordinary ggml-sycl beside it. No
+# device kernel of its own (SYCL_LINK_ONLY_TEST_OPTIONS). It allocates device
+# memory, so it carries "cache" and runs serially, outside the throttled sweep;
+# GGML_SYCL_STRICT_LEASES=1 makes an ownerless lease abort the run. Lead-run.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-expert-loan
+    tests/test-moe-expert-loan.cpp
+)
+target_include_directories(test-moe-expert-loan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-expert-loan PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-moe-expert-loan PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-moe-expert-loan PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-moe-expert-loan PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME sycl-moe-expert-loan COMMAND test-moe-expert-loan)
+set_tests_properties(sycl-moe-expert-loan PROPERTIES
+    LABELS "sycl;cache;moe"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_STRICT_LEASES=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    TIMEOUT 120
+    # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped.
+    SKIP_RETURN_CODE 77
+)
+endif() # static SYCL backend fixture
+
 # Unregistered-external-pointer byte-contract authority (llama.cpp-fxrg).
 # Regression for the P0 where several ggml-sycl.cpp call sites minted
 # mem_handles for unregistered external pointers with a 3-arg call against the

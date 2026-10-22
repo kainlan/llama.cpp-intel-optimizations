@@ -9998,6 +9998,209 @@ expert_retire_status unified_cache::retire_expert_entry_exact(ggml_sycl_cache_id
                                                   expert_retire_status::NOT_FOUND;
 }
 
+expert_retire_status unified_cache::retire_expert_entry_at_locked(const unified_cache_key &     exact,
+                                                                  std::shared_ptr<mem_handle> * released_mirror) {
+    GGML_ASSERT(released_mirror != nullptr);
+    auto it = entries_.find(exact);
+    if (exact.type != cache_entry_type::MOE_EXPERT || it == entries_.end()) {
+        return expert_retire_status::NOT_FOUND;
+    }
+    // The mirror belongs to this entry only while it names the same storage. Once a loan has registered the host
+    // copy under the same id, the mirror is the host copy's and stays published.
+    auto direct = direct_expert_entries_.find(exact.id);
+    if (direct != direct_expert_entries_.end() && direct->second.ptr == it->second.device_ptr &&
+        direct->second.location == it->second.location && direct->second.layout == it->second.layout) {
+        *released_mirror = std::move(direct->second.handle);
+        direct_expert_entries_.erase(direct);
+    }
+    (void) transition_to_retired_locked(it->second);
+    remap_or_erase_id_mapping_locked(exact.id, exact);
+    return expert_retire_status::DEFERRED;
+}
+
+// llama.cpp-mwmr: lend one resident expert triplet to the host for a prompt phase. The order is what keeps every
+// reader correct: the copies are submitted before anything is published, the host copies are published (behind
+// their copy events) before the device entries are withdrawn, and the device storage is reclaimed only by the
+// deferred-free pass, after its leases, its fill and the copy that reads it.
+bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out) {
+    out = expert_loan_record{};
+    if (!members) {
+        out.reason = "invalid arguments";
+        return false;
+    }
+    const int cache_device = get_device_id_from_queue(queue_);
+
+    mem_handle               src_owner[3];
+    size_t                   bytes[3] = { 0, 0, 0 };
+    std::vector<sycl::event> deps[3];
+    alloc_metadata           host_md[3];
+    const char *             refusal = nullptr;
+    for (int i = 0; i < 3 && !refusal; ++i) {
+        const expert_loan_member & m = members[i];
+        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key)) {
+            refusal = "invalid member";
+        } else if (!m.host_owner.valid() || !m.host_owner.owner_metadata(&host_md[i]) ||
+                   host_md[i].tier != alloc_tier::HOST_PINNED) {
+            refusal = "host storage not pinned";
+        }
+        deps[i].reserve(2);
+    }
+
+    // 1. The exact-owner check, all three members before anything changes.
+    if (!refusal) {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const auto it =
+                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS));
+            if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
+                it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
+                refusal = "not resident";
+                break;
+            }
+            const unified_cache_entry & e = it->second;
+            // c-n4gw: v1 copies AOS bytes only. An SOA entry copied as AOS would hand the host garbage.
+            if (e.layout != GGML_LAYOUT_AOS) {
+                refusal = "layout";
+                break;
+            }
+            if (e.location != cache_location::DEVICE || e.host_resident || e.owner_device != cache_device) {
+                refusal = "not on device";
+                break;
+            }
+            // c-sepd: the entry must be the exact owner of its storage. A bulk-staged tensor's experts are views
+            // into one allocation (storage_owner), so retiring one frees nothing and copying it from the owner's
+            // base would copy another expert. The owner must be this entry's whole allocation and EXTERNAL_EXACT or
+            // CACHE_SUBALLOCATION: cache_backing is set exactly for the CACHE_BACKING class.
+            alloc_metadata md{};
+            if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) ||
+                md.ptr != e.device_ptr || md.size < e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) {
+                refusal = "shared storage";
+                break;
+            }
+            // Held by the entry alone: anything else retaining the owner shares the storage with the loan.
+            if (e.direct_alloc_owner.owner_use_count() != 1) {
+                refusal = "storage still referenced";
+                break;
+            }
+            if (host_md[i].size < e.size) {
+                refusal = "host storage too small";
+                break;
+            }
+            src_owner[i] = e.direct_alloc_owner;
+            bytes[i]     = e.size;
+            if (e.has_write_event) {
+                deps[i].push_back(e.last_write_event);
+            }
+            if (e.has_ready_event) {
+                deps[i].push_back(e.ready_event);
+            }
+        }
+    }
+    if (refusal) {
+        out.reason = refusal;
+        return false;
+    }
+
+    // 2. The copies, on the DMA queue behind what wrote each entry. mem_copy_async retains each copy's two owners
+    // until it completes, so the device storage outlives the read and the host storage the write, whatever happens
+    // to either entry afterwards.
+    try {
+        sycl::queue & dq = get_dma_queue();
+        for (int i = 0; i < 3; ++i) {
+            out.copy_events[i] = mem_copy_async(members[i].host_owner, src_owner[i], bytes[i], dq, deps[i]);
+        }
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (...) {
+        out        = expert_loan_record{};
+        out.reason = "copy submit failed";
+        return false;
+    }
+
+    // 3. Publish each host copy under every id it is resolved by, behind its copy event.
+    scoped_planned_materialization materialization(this, "expert loan");
+    int                            registered[3] = { 0, 0, 0 };
+    bool                           failed        = false;
+    for (int i = 0; i < 3 && !failed; ++i) {
+        const expert_loan_member & m        = members[i];
+        void *                     host_ptr = m.host_owner.resolve().ptr;
+        for (size_t k = 0; k < m.host_keys.size(); ++k) {
+            if (!host_ptr || !register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
+                                                         k == 0 ? &out.host_handles[i] : nullptr, m.host_owner,
+                                                         &out.copy_events[i])) {
+                failed = true;
+                break;
+            }
+            registered[i]++;
+        }
+    }
+    if (failed) {
+        // Withdraw the host copies already published and give each device entry back its mirror, so a refused
+        // loan leaves the cache as it found it. The copies stay retained until they complete.
+        std::vector<std::shared_ptr<mem_handle>> released;
+        released.reserve(12);
+        {
+            std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+            std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+            std::lock(direct_lock, cache_lock);
+            for (int i = 0; i < 3; ++i) {
+                for (int k = 0; k < registered[i]; ++k) {
+                    std::shared_ptr<mem_handle> mirror;
+                    (void) retire_expert_entry_at_locked(
+                        { cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 }, &mirror);
+                    released.push_back(std::move(mirror));
+                }
+                const unified_cache_key device_key =
+                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                auto it = entries_.find(device_key);
+                if (registered[i] == 0 || it == entries_.end() || it->second.retired ||
+                    direct_expert_entries_.find(members[i].key) != direct_expert_entries_.end()) {
+                    continue;
+                }
+                weight_entry mirror{};
+                mirror.ptr             = it->second.device_ptr;
+                mirror.size            = it->second.size;
+                mirror.layout          = it->second.layout;
+                mirror.location        = cache_location::DEVICE;
+                mirror.has_ready_event = it->second.has_ready_event;
+                mirror.ready_event     = it->second.ready_event;
+                mirror.handle = make_direct_entry_handle(device_key, cache_device, it->second, "expert_loan/rollback");
+                direct_expert_entries_[members[i].key] = std::move(mirror);
+            }
+        }
+        released.clear();
+        out        = expert_loan_record{};
+        out.reason = "host registration failed";
+        return false;
+    }
+
+    // 4. Withdraw each device entry exactly. The host copies under the same ids stay; the storage returns to its
+    // zone through the deferred-free pass once nothing holds it (a live lease defers, it never forces).
+    std::shared_ptr<mem_handle> released_mirrors[3];
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        for (int i = 0; i < 3; ++i) {
+            out.retire_status[i] = retire_expert_entry_at_locked(
+                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS),
+                &released_mirrors[i]);
+        }
+    }
+    for (std::shared_ptr<mem_handle> & mirror : released_mirrors) {
+        mirror.reset();
+    }
+
+    out.accepted = true;
+    out.reason   = "OK";
+    for (int i = 0; i < 3; ++i) {
+        out.bytes_freed += members[i].vram_charge_size;
+    }
+    return true;
+}
+
 bool unified_cache::mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout) {
     if (!key.valid) {
         return false;
@@ -10393,20 +10596,21 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
     return register_host_expert(key, ptr, size, layout, out_handle, std::move(allocation_owner), mem_handle{});
 }
 
-bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id key,
-                                               void *             ptr,
-                                               size_t             size,
-                                               ggml_layout_mode   layout,
-                                               mem_handle *       out_handle,
-                                               const mem_handle & allocation_owner) {
+bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id  key,
+                                               void *              ptr,
+                                               size_t              size,
+                                               ggml_layout_mode    layout,
+                                               mem_handle *        out_handle,
+                                               const mem_handle &  allocation_owner,
+                                               const sycl::event * ready_event) {
     if (!allocation_owner.valid()) {
-        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{});
+        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event);
     }
     // The storage owner is a copy of the typed owner, aliased to ptr as the
     // legacy owner wrapper was, so the entry releases exactly as before.
     auto storage_owner = std::make_shared<mem_handle>(allocation_owner);
     return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>(storage_owner, ptr),
-                                allocation_owner);
+                                allocation_owner, ready_event);
 }
 
 bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
@@ -10415,7 +10619,8 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                                          ggml_layout_mode      layout,
                                          mem_handle *          out_handle,
                                          std::shared_ptr<void> allocation_owner,
-                                         const mem_handle &    typed_owner) {
+                                         const mem_handle &    typed_owner,
+                                         const sycl::event *   ready_event) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -10500,14 +10705,15 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.last_access      = time_++;
         cache_entry.pinned           = true;
         cache_entry.hot              = true;
-        cache_entry.state            = cache_entry_state::READY;
-        cache_entry.has_ready_event  = false;
+        cache_entry.state                    = ready_event ? cache_entry_state::IN_PROGRESS : cache_entry_state::READY;
+        cache_entry.has_ready_event          = ready_event != nullptr;
+        cache_entry.ready_event              = ready_event ? *ready_event : sycl::event{};
         cache_entry.host_resident    = cache_loc != cache_location::DEVICE;
         cache_entry.location         = cache_loc;
         cache_entry.owner_device     = dev;
         cache_entry.pool_allocated   = false;
-        cache_entry.last_write_event = {};
-        cache_entry.has_write_event  = false;
+        cache_entry.last_write_event         = ready_event ? *ready_event : sycl::event{};
+        cache_entry.has_write_event          = ready_event != nullptr;
         cache_entry.storage_owner            = allocation_owner;
         cache_entry.non_owning_external_host = !allocation_owner;
         cache_entry.direct_alloc_owner       = typed_owner;
@@ -10549,6 +10755,8 @@ publish_host_expert_direct:
         entry.size                  = size;
         entry.layout                = layout;
         entry.location              = cache_loc;
+        entry.has_ready_event       = ready_event != nullptr;
+        entry.ready_event           = ready_event ? *ready_event : sycl::event{};
         entry.handle                = std::move(direct_handle);
         entry.pending_load_txn_id = load_effect_guard.load_txn_id();
         auto old_direct = direct_expert_entries_.find(key);
@@ -15714,6 +15922,18 @@ bool unified_cache::test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_l
         owner = it->second.direct_alloc_owner;
     }
     retain_handles_until_event({ std::move(owner) }, std::move(event));
+    return true;
+}
+
+bool unified_cache::test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint32_t * in_use) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    const auto it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
+    if (it == entries_.end()) {
+        return false;
+    }
+    if (in_use) {
+        *in_use = it->second.in_use_count.load();
+    }
     return true;
 }
 
