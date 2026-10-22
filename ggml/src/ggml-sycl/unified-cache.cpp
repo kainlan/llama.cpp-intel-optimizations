@@ -16342,7 +16342,10 @@ bool unified_cache::test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint
     return true;
 }
 
-bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_t * in_use, bool * retired) const {
+bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key,
+                                                 uint32_t *         in_use,
+                                                 bool *             retired,
+                                                 alloc_metadata *   owner) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     const auto                          it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });
     if (it == entries_.end()) {
@@ -16353,6 +16356,10 @@ bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_
     }
     if (retired) {
         *retired = it->second.retired;
+    }
+    if (owner) {
+        *owner = alloc_metadata{};
+        (void) it->second.direct_alloc_owner.owner_metadata(owner);
     }
     return true;
 }

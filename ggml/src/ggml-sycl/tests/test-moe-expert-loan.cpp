@@ -41,6 +41,10 @@
 //                           cursor disarmed and the next decode boundary re-admits again; neither accepted refill took
 //                           a staged copy.
 //
+// The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
+// slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
+// without staging. Every lend in the refill cases checks it.
+//
 // The ctest registration sets GGML_SYCL_STRICT_LEASES=1, so an ownerless lease anywhere in the loan or the refill
 // aborts the run. Each case puts back the plan publication it found and empties the lent ledger, so the next one stages
 // under the same coherence. A setup failure names the cache's reason. The shared-storage case reserves a WEIGHT arena,

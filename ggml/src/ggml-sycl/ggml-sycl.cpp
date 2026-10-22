@@ -21570,6 +21570,15 @@ struct test_loan_fixture {
         cache = get_unified_cache_for_device(device);
         queue = &ggml_sycl_get_device(device).default_queue();
         found = ::ggml_sycl_global_plan_snapshot();
+        // A model load configures its device's host zones before anything runs, so a loan's host copies are slices of
+        // the WEIGHT host zone. Configured here as a load does: a pinned-pool copy made before the zones exist cannot
+        // be told from a standalone pinned base, so the copy path stages every copy from it, and a refill reading such
+        // a copy takes the staged branch its cases assert it never takes. Process-wide and never undone, so done for
+        // every case whatever order they run in; lend() checks the provenance it produces (llama.cpp-sif1).
+        if (cache && !cache->host_zones_configured()) {
+            constexpr size_t mib = 1024ull * 1024ull;
+            cache->configure_host_zones(16 * mib, 2 * mib, 4 * mib, 2 * mib);
+        }
 
         for (int l = 0; l < layers; ++l) {
             for (int s = 0; s < 3; ++s) {
@@ -21864,6 +21873,21 @@ struct test_loan_fixture {
         }
         const std::vector<std::pair<int, int>> lent     = lent_triplets(host_expert);
         const size_t                           expected = 3 * n_expected * test_loan_expert_bytes();
+        // Each lent copy is a host-pinned slice of a host zone, the one provenance the copy path reads as host USM,
+        // so a refill's copy from it can be the direct DMA (llama.cpp-sif1).
+        for (const auto & t : lent) {
+            for (int s = 0; s < 3; ++s) {
+                alloc_metadata owner{};
+                if (!cache->test_expert_host_entry_state(keys[index(t.first, s, t.second)], nullptr, nullptr, &owner) ||
+                    owner.tier != alloc_tier::HOST_PINNED || owner.host_zone == host_zone_id::COUNT) {
+                    return test_loan_fail(
+                        "layer %d slot %d expert %d's lent copy is not a host-zone slice (tier=%d host_zone=%d, host "
+                        "zones configured=%d)",
+                        t.first, s, t.second, (int) owner.tier, (int) owner.host_zone,
+                        (int) cache->host_zones_configured());
+                }
+            }
+        }
         const bool                             gone     = reclaim_until([&] {
             for (const auto & t : lent) {
                 for (int s = 0; s < 3; ++s) {

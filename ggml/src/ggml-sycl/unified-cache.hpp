@@ -4317,9 +4317,13 @@ class unified_cache {
     // The lease count of the AOS device entry direct staging published for key, in *in_use; false when there is none
     // (erased, or never staged). A retired entry still answers until the deferred-free pass erases it.
     bool     test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint32_t * in_use) const;
-    // The lease count and retired flag of the host entry register_host_expert published for key; false when there is
-    // none.
-    bool     test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_t * in_use, bool * retired) const;
+    // The lease count and retired flag of the host entry register_host_expert published for key, and, in *owner, the
+    // allocation metadata of the owner it holds (empty without one); false when there is none. The owner's provenance
+    // is what the copy path reads to decide whether a copy from the entry is direct (llama.cpp-sif1).
+    bool     test_expert_host_entry_state(ggml_sycl_cache_id key,
+                                          uint32_t *         in_use,
+                                          bool *             retired,
+                                          alloc_metadata *   owner = nullptr) const;
     // Retain a reference to a staged weight's allocation owner until `event`,
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
