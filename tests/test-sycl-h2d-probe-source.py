@@ -332,6 +332,10 @@ def claim_outcome_enum_keeps_the_resolved_values_first(src: str) -> bool:
         "H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES",
         "H2D_PROBE_OUTCOME_FROM_CACHE < H2D_PROBE_OUTCOME_RETRY_ZONES",
         "H2D_PROBE_OUTCOME_SEED_KEPT < H2D_PROBE_OUTCOME_RETRY_ZONES",
+        "H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_ALLOC",
+        "H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_STAGED",
+        "H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_NO_RATE",
+        "H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_FAILED",
         "H2D_PROBE_OUTCOME_RETRY_FAILED < 32"))
 
 
@@ -345,8 +349,10 @@ def claim_a_refused_store_is_not_reported_as_persisted(src: str) -> bool:
 
 def claim_zones_and_staged_copies_never_reach_the_store(src: str) -> bool:
     fn = probe_body(src)
-    staged_report = 'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged"); continue;'
-    zones_report = 'report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_ZONES, "seed, host zones not configured"); continue;'
+    staged_report = ('report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged"); '
+                     "continue;")
+    zones_report = ('report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_ZONES, "seed, host zones not configured"); '
+                    "continue;")
     census = "ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d"
     return bool(fn) and all([
         fn.count(census) == 2,
@@ -511,7 +517,8 @@ def test_mutant_second_log_line_fails():
 def test_mutant_second_switch_read_fails():
     assert not claim_reads_its_switch_once(
         _once(SYCL, 'const char * sw = std::getenv("GGML_SYCL_H2D_PROBE");',
-              'const char * sw = std::getenv("GGML_SYCL_H2D_PROBE"); const char * s2 = std::getenv("GGML_SYCL_H2D_PROBE");'))
+              'const char * sw = std::getenv("GGML_SYCL_H2D_PROBE"); '
+              'const char * s2 = std::getenv("GGML_SYCL_H2D_PROBE");'))
 
 
 def test_mutant_abort_on_alloc_failure_fails():
@@ -662,7 +669,8 @@ def test_mutant_dst_on_another_queue_fails():
 
 def test_mutant_baseline_before_warmup_fails():
     mutant = _once(SYCL, "ggml_sycl::mem_copy(dst, src, k_bytes, *q);\n"
-                   "            const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;",
+                   "            const uint64_t staged_before = "
+                   "ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;",
                    "const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;\n"
                    "            ggml_sycl::mem_copy(dst, src, k_bytes, *q);")
     assert not claim_zones_and_staged_copies_never_reach_the_store(mutant)
@@ -675,7 +683,8 @@ def test_mutant_staged_rate_is_kept_fails():
 
 
 def test_mutant_store_before_staged_check_fails():
-    mutant = _once(SYCL, "rec.h2d_gbps = gbps;", "rec.h2d_gbps = gbps; ggml_backend_sycl_moe_exec_rates_store(dev, &rec);")
+    mutant = _once(SYCL, "rec.h2d_gbps = gbps;",
+                   "rec.h2d_gbps = gbps; ggml_backend_sycl_moe_exec_rates_store(dev, &rec);")
     assert not claim_zones_and_staged_copies_never_reach_the_store(mutant)
 
 
@@ -695,7 +704,8 @@ def test_mutant_second_reader_fails():
     inside = _once(SYCL, "if (info.devices[dev].h2d_pinned_gbps > 0.0) {",
                    "double extra = info.devices[dev].h2d_pinned_gbps; if (info.devices[dev].h2d_pinned_gbps > 0.0) {")
     assert not claim_one_consumer_reads_the_rate({SYCL_REL: inside})
-    outside = SYCL + "\nstatic double h2d_extra_reader(const ggml_sycl_device_info & i) { return i.devices[0].h2d_pinned_gbps; }\n"
+    outside = SYCL + ("\nstatic double h2d_extra_reader(const ggml_sycl_device_info & i) "
+                      "{ return i.devices[0].h2d_pinned_gbps; }\n")
     assert not claim_one_consumer_reads_the_rate({SYCL_REL: outside})
 
 

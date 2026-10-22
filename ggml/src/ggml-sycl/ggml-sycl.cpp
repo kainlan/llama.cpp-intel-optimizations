@@ -28701,7 +28701,10 @@ enum h2d_probe_outcome {
 static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
                   H2D_PROBE_OUTCOME_FROM_CACHE < H2D_PROBE_OUTCOME_RETRY_ZONES &&
                   H2D_PROBE_OUTCOME_SEED_KEPT < H2D_PROBE_OUTCOME_RETRY_ZONES &&
-                  H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_ALLOC && H2D_PROBE_OUTCOME_RETRY_FAILED < 32,
+                  H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_ALLOC &&
+                  H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_STAGED &&
+                  H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_NO_RATE &&
+                  H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_FAILED && H2D_PROBE_OUTCOME_RETRY_FAILED < 32,
               "h2d_probe_outcome: resolved outcomes first, then RETRY_ZONES and the other RETRY values");
 
 // llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device's host-to-device rate from PINNED host memory, which the
@@ -28738,13 +28741,13 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
 // store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the measured rate resolved for
 // the process and is logged "probed, not stored". The store accepts only a record with a positive reorder rate, so the
 // record carries Task 2's seed value for it (by reference to the seed, not a literal). That only satisfies the store's
-// validity rule: the executor's rates assembly takes the reorder rate from its own measurement. The tuning cache is keyed by the visible devices, so a
-// device hidden from the scheduler probes again on every start.
+// validity rule: the executor's rates assembly takes the reorder rate from its own measurement. The tuning cache is
+// keyed by the visible devices, so a device hidden from the scheduler probes again on every start.
 //
-// Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE or RETRY_ALLOC allocates 64 MiB and times 8 x 64 MiB again
-// at every outermost load, silently after its reason's first line. That is bounded and load-time only, and it is not
-// capped on purpose: a staged copy is exactly what the probe exists to refuse, and a cap would stop retrying a device
-// that a later load (host zones configured, a buffer freed) could measure correctly.
+// Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE, RETRY_ALLOC or RETRY_FAILED allocates 64 MiB and times
+// 8 x 64 MiB again at every outermost load, silently after its reason's first line. That is bounded and load-time
+// only, and it is not capped on purpose: a staged copy is exactly what the probe exists to refuse, and a cap would
+// stop retrying a device that a later load (host zones configured, a buffer freed) could measure correctly.
 static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
     const char * sw    = std::getenv("GGML_SYCL_H2D_PROBE");
     const bool   skip  = sw != nullptr && std::strcmp(sw, "0") == 0;
