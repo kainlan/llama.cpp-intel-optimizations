@@ -116,6 +116,7 @@
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
+#include "ggml-sycl/moe-exec-cost.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
@@ -12854,6 +12855,9 @@ static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_aut
 static void ggml_sycl_reset_layer_map_state();
 static void ggml_sycl_reset_moe_phase_demotion_state();
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
+// Defined with the peer-link probes below; called at the outermost model-load boundary, once the unified caches exist
+// (llama.cpp-zujy).
+static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info &);
 
 static thread_local bool g_sycl_abort_load_exit = false;
 
@@ -12889,6 +12893,11 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
                     cache->reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
                 }
             }
+
+            // Each device's pinned host-to-device rate, once per process: here the unified caches exist and
+            // ggml_sycl_info() is complete, which ggml_sycl_init is not (llama.cpp-zujy). The info is a non-const
+            // function-local static; this is the one writer of the two probe fields after init.
+            ggml_sycl_measure_h2d_pinned(const_cast<ggml_sycl_device_info &>(ggml_sycl_info()));
         }
         return;
     }
@@ -28667,6 +28676,109 @@ static void ggml_sycl_measure_peer_host_bounce(ggml_sycl_device_info & info) {
             } catch (const std::exception & e) {
                 ggml_sycl_peer_link_set_string(link.unsupported_reason, sizeof(link.unsupported_reason), e.what());
             }
+        }
+    }
+}
+
+// llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device's host-to-device rate from PINNED host memory, which the
+// MoE executor's cost model divides by (26.5-27.1 GB/s pinned against 10.5-19 GB/s pageable, llama.cpp-8bgi). The peer
+// probe above stages through a pageable std::vector, so it cannot stand in. 64 MiB moves in 4 MiB chunks, 8 timed
+// iterations after one untimed copy, on the device's default queue and timed on the host. The chunks go out with
+// mem_copy_async and one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy per 4 MiB chunk would
+// time the submit-and-wait latency of each chunk and read low.
+//
+// Once per process and device: a device that already holds a rate (probed, stored, or the seed) is left alone, which
+// is what lets the model-load boundary call this on every outermost load. GGML_SYCL_H2D_PROBE=1 probes again whatever
+// the tuning cache holds, 0 skips the probe and keeps the seed. A stored record is read back instead of probing.
+// A probe that cannot allocate (a zone with no room, no pinned pool yet) keeps the seed and says so: never an abort.
+// The store accepts only a record with a positive reorder rate, so the record carries Task 2's seed for it until a
+// measurement replaces it; the tuning cache is keyed by the registry's visible devices, so a device hidden from the
+// scheduler probes again on every start.
+static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
+    const char * sw    = std::getenv("GGML_SYCL_H2D_PROBE");
+    const bool   skip  = sw != nullptr && std::strcmp(sw, "0") == 0;
+    const bool   force = sw != nullptr && std::strcmp(sw, "1") == 0;
+
+    constexpr size_t kBytes = 64ull << 20;
+    constexpr size_t kChunk = 4ull << 20;
+    constexpr int    kIters = 8;
+
+    const ggml_sycl::moe_exec_rates seed = ggml_sycl::moe_exec_rates_seed({});
+
+    auto report = [&info](int dev, double gbps, bool probed, const char * source) {
+        info.devices[dev].h2d_pinned_gbps = gbps;
+        info.devices[dev].h2d_probed      = probed;
+        GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\n", dev, gbps, source);
+    };
+
+    for (int dev = 0; dev < info.total_gpu_count && dev < GGML_SYCL_MAX_DEVICES; ++dev) {
+        if (info.devices[dev].h2d_pinned_gbps > 0.0) {
+            continue;
+        }
+        ggml_sycl_moe_exec_rates_record rec  = {};
+        const bool                      have = ggml_backend_sycl_moe_exec_rates_lookup(dev, &rec) && rec.h2d_gbps > 0.0;
+        if (have && !force) {
+            report(dev, rec.h2d_gbps, true, "tuning cache");
+            continue;
+        }
+        if (skip) {
+            report(dev, seed.h2d_gbps, false, "seed, GGML_SYCL_H2D_PROBE=0");
+            continue;
+        }
+        try {
+            sycl::queue *            q = &dpct::dev_mgr::instance().get_device(info.gpu_dpct_ids[dev]).default_queue();
+            ggml_sycl::alloc_request src_req{};
+            src_req.queue                                     = q;
+            src_req.device                                    = dev;
+            src_req.size                                      = kBytes;
+            src_req.suppress_failure_log                      = true;
+            src_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+            src_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
+            src_req.intent.cohort_id                          = "h2d_probe_src";
+            src_req.intent.constraints.must_host_pinned       = true;
+            src_req.intent.constraints.use_pinned_pool        = true;
+            ggml_sycl::alloc_request dst_req                  = src_req;
+            dst_req.intent.cohort_id                          = "h2d_probe_dst";
+            dst_req.intent.constraints.must_host_pinned       = false;
+            dst_req.intent.constraints.use_pinned_pool        = false;
+            dst_req.intent.constraints.must_device            = true;
+            dst_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+            dst_req.intent.constraints.forbid_vram_zone_spill = true;
+            ggml_sycl::mem_handle src                         = ggml_sycl::unified_allocate(src_req);
+            ggml_sycl::mem_handle dst                         = ggml_sycl::unified_allocate(dst_req);
+            if (!src.valid() || !dst.valid()) {
+                report(dev, seed.h2d_gbps, false, "seed, probe allocation refused");
+                continue;
+            }
+
+            ggml_sycl::mem_copy(dst, src, kBytes, *q);  // untimed: first-use costs stay out of the rate
+
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int it = 0; it < kIters; ++it) {
+                for (size_t off = 0; off < kBytes; off += kChunk) {
+                    ggml_sycl::mem_copy_async(dst, off, src, off, kChunk, *q);
+                }
+                q->wait();
+            }
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            const double gbps = us > 0.0 ? static_cast<double>(kBytes) * kIters / us / 1e3 : 0.0;
+            if (!(gbps > 0.0) || !std::isfinite(gbps)) {
+                report(dev, seed.h2d_gbps, false, "seed, probe measured no rate");
+                continue;
+            }
+            rec.h2d_gbps = gbps;
+            if (!(rec.reorder_gbps > 0.0)) {
+                rec.reorder_gbps = seed.reorder_gbps;
+            }
+            ggml_backend_sycl_moe_exec_rates_store(dev, &rec);
+            report(dev, gbps, true, "probed");
+        } catch (const ggml_sycl_fallback_error &) {
+            // The alloc-zone contract's sanctioned form (clause g): ggml_sycl_fallback_error derives from
+            // std::exception, so it is caught first and rethrown; nothing the probe calls throws it.
+            throw;
+        } catch (const std::exception & e) {
+            GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed: %s\n", dev, e.what());
+            report(dev, seed.h2d_gbps, false, "seed, probe failed");
         }
     }
 }

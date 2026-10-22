@@ -4601,6 +4601,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device probes its pinned host-to-device rate once and keeps it in
+# the tuning cache. Both buffers go through unified_allocate with the literal tier flags, the copy is chunked
+# mem_copy_async with one wait per iteration, the WARN line and the GGML_SYCL_H2D_PROBE switch each appear once, and
+# one consumer reads the rate. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-h2d-probe-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-h2d-probe-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-7fmt: without -c, common asks for the model's default context (LLAMA_N_CTX_HINT_DEFAULT), the load
 # resolves it once (src/llama-n-ctx-hint.h) to n_ctx_train padded as llama_context pads it and holds that context's KV
 # room, no backend names the sentinel, and the KV context room line says when its context is the default. A mutant per
