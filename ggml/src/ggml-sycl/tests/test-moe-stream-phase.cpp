@@ -27,6 +27,9 @@ using ggml_sycl::alloc_role;
 using ggml_sycl::alloc_tier;
 using ggml_sycl::expert_tensor_role;
 using ggml_sycl::host_zone_id;
+using ggml_sycl::moe_exec_choice;
+using ggml_sycl::moe_exec_decision;
+using ggml_sycl::moe_exec_policy;
 using ggml_sycl::moe_exec_rates;
 using ggml_sycl::moe_exec_regime;
 using ggml_sycl::moe_stream_item;
@@ -332,7 +335,7 @@ int main() {
     bad.nrows = 0;
     CHECK(!ggml_sycl::moe_stream_item_reorderable(bad, 4096));
 
-    // ---- a host lease the ring may copy from directly (9y0p M4) ----
+    // ---- a host lease the ring may copy from directly (llama.cpp-9y0p) ----
     alloc_metadata owner{};
     owner.tier      = alloc_tier::HOST_PINNED;
     owner.role      = alloc_role::WEIGHT;
@@ -380,6 +383,42 @@ int main() {
     CHECK(near(fallback.h2d_gbps, seed.h2d_gbps) && near(fallback.reorder_gbps, seed.reorder_gbps));
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, fake_env_h2d).h2d_gbps, 31.0));
     CHECK(ggml_sycl::moe_exec_rates_valid(measured) && ggml_sycl::moe_exec_rates_valid(fallback));
+
+    // ---- the predicates begin_layer and resolve decide by ----
+    // A micro-batch starts at the first op of a prompt, at a layer below the current one, or at the current layer in a
+    // new graph. A new graph at a higher layer carries it on: a split micro-batch spans several graph_compute calls.
+    CHECK(ggml_sycl::moe_stream_ubatch_starts(false, 3, 3, 7, 7));
+    CHECK(ggml_sycl::moe_stream_ubatch_starts(true, 2, 3, 7, 7));
+    CHECK(ggml_sycl::moe_stream_ubatch_starts(true, 0, 47, 8, 7));
+    CHECK(ggml_sycl::moe_stream_ubatch_starts(true, 3, 3, 8, 7));
+    // the layer's later ops
+    CHECK(!ggml_sycl::moe_stream_ubatch_starts(true, 3, 3, 7, 7));
+    // the next layer in the same graph
+    CHECK(!ggml_sycl::moe_stream_ubatch_starts(true, 4, 3, 7, 7));
+    // the next layer in the next graph of a split micro-batch
+    CHECK(!ggml_sycl::moe_stream_ubatch_starts(true, 16, 15, 8, 7));
+
+    // Bytes move only when the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it (lead ruling c-3skf).
+    moe_exec_decision ring_all;
+    ring_all.choice               = moe_exec_choice::RING;
+    ring_all.regime               = moe_exec_regime::STREAM_ALL;
+    moe_exec_decision ring_routed = ring_all;
+    ring_routed.regime            = moe_exec_regime::ROUTED_ONLY;
+    moe_exec_decision cpu_routed  = ring_routed;
+    cpu_routed.choice             = moe_exec_choice::CPU;
+    moe_exec_decision unconsulted;
+    CHECK(ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::RING));
+    CHECK(ggml_sycl::moe_stream_stage_now(ring_routed, moe_exec_policy::RING));
+    CHECK(!ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::AUTO));
+    CHECK(!ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::CPU));
+    CHECK(!ggml_sycl::moe_stream_stage_now(cpu_routed, moe_exec_policy::RING));
+    CHECK(!ggml_sycl::moe_stream_stage_now(unconsulted, moe_exec_policy::RING));
+
+    // The next layer is resolved a layer ahead unless it is a ROUTED_ONLY ring, which needs that layer's own ids.
+    CHECK(ggml_sycl::moe_stream_resolve_ahead(ring_all));
+    CHECK(!ggml_sycl::moe_stream_resolve_ahead(ring_routed));
+    CHECK(ggml_sycl::moe_stream_resolve_ahead(cpu_routed));
+    CHECK(ggml_sycl::moe_stream_resolve_ahead(unconsulted));
 
     // ---- the trace's regime names ----
     CHECK(std::strcmp(ggml_sycl::moe_stream_regime_name(moe_exec_regime::STREAM_ALL), "stream-all") == 0);

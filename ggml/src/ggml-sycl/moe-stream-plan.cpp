@@ -35,8 +35,8 @@ moe_stream_phase::~moe_stream_phase() {
 }
 
 void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {
-    // A reserve refused in the last graph is tried once more in this one: an expert loan runs at the graph boundary
-    // (ruling c-tdra, llama.cpp-mwmr), so the WEIGHT zone may have room now (lead ruling c-i8rz).
+    // A reserve refused in the last micro-batch is tried once more in this one: an expert loan (ruling c-tdra,
+    // llama.cpp-mwmr) may have made room in the WEIGHT zone since (lead ruling c-i8rz).
     reserve_failed_ = false;
     table_.clear();
     region_keys_[0].clear();
@@ -56,8 +56,7 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
                                                 const int32_t *        ids,
                                                 size_t                 n_ids,
                                                 const moe_stream_op &  op) {
-    const bool new_ubatch =
-        !ubatch_live_ || layer < cur_layer_ || (layer == cur_layer_ && op.graph_seq != cur_graph_seq_);
+    const bool new_ubatch = moe_stream_ubatch_starts(ubatch_live_, layer, cur_layer_, op.graph_seq, cur_graph_seq_);
     if (!new_ubatch && layer == cur_layer_) {
         return decision_of(layer);  // the layer's later ops: the first one decided
     }
@@ -99,9 +98,7 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
             ns.decision  = weigh(nxt->second, op, window_us);
             ns.window_us = window_us;
             ns.decided   = true;
-            const bool routed_ring =
-                ns.decision.choice == moe_exec_choice::RING && ns.decision.regime == moe_exec_regime::ROUTED_ONLY;
-            if (!routed_ring) {
+            if (moe_stream_resolve_ahead(ns.decision)) {
                 resolve(next, nxt->second, ns, cache, op);
             }
         }
@@ -163,14 +160,9 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     }
     if (!same_queue) {
         ccs_.emplace(ccs);
+        // The SOA slots of a reused region are overwritten after its readers only because both run in order on this
+        // queue; on any other queue the ring is not offered, and the ring-unavailable diagnostic says so.
         in_order_ = ccs.is_in_order();
-    }
-    // The SOA slots of a reused region are overwritten after its readers only because both run in order on this
-    // queue; on any other queue the ring is not offered.
-    if (!in_order_ && !warned_not_in_order_) {
-        GGML_LOG_WARN("[MOE-EXEC] device %d: the compute queue is not in order, so the stream ring is unavailable\n",
-                      device);
-        warned_not_in_order_ = true;
     }
     device_   = device;
     geo_      = geo;
@@ -226,7 +218,7 @@ void moe_stream_phase::resolve(int                           layer,
     stage_counts n;
     // Only an explicit GGML_SYCL_MOE_EXEC=ring moves bytes or reserves the ring: nothing consumes a staged expert
     // until Task 8 (llama.cpp-o9uw) lands, so AUTO only records what the cost model would choose (lead ruling c-3skf).
-    if (st.decision.choice == moe_exec_choice::RING && op.policy == moe_exec_policy::RING) {
+    if (moe_stream_stage_now(st.decision, op.policy)) {
         n = stage(li, st.decision.regime, cache, op);
         if (n.ring_unavailable) {
             st.decision.choice = moe_exec_choice::CPU;
@@ -284,21 +276,34 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
             ++n.unowned;
             continue;
         }
+        // Slots go in pairs, AOS then SOA. A region holds an even number of slots (asserted in ring_ready) and every
+        // item takes none or two, so within a region each AOS slot is even and its SOA slot the odd one after it, and
+        // an exhausted region never leaves an AOS slot without its partner.
         mem_handle aos = ring_->acquire_slot();
         mem_handle soa = aos.valid() ? ring_->acquire_slot() : mem_handle();
+        GGML_ASSERT(aos.valid() == soa.valid());
         if (!soa.valid()) {
             ++n.exhausted;
             continue;
         }
         sycl::event reorder;
         try {
-            const sycl::event copy =
-                mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), { ring_->current_region_gate() });
-            const uint8_t * aos_ptr = static_cast<const uint8_t *>(aos.resolve(device).ptr);
-            uint8_t *       soa_ptr = static_cast<uint8_t *>(soa.resolve(device).ptr);
+            // The lease admits a host entry still being filled (require_ready=false), so the copy waits on the device
+            // for that entry's ready event as well as for the region's gate.
+            const resolved_ptr       hr   = host.resolve(device);
+            std::vector<sycl::event> deps = { ring_->current_region_gate() };
+            if (hr.has_ready_event) {
+                deps.push_back(hr.ready_event);
+            }
+
+            const sycl::event copy    = mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), deps);
+            const uint8_t *   aos_ptr = static_cast<const uint8_t *>(aos.resolve(device).ptr);
+            uint8_t *         soa_ptr = static_cast<uint8_t *>(soa.resolve(device).ptr);
             reorder = ggml_sycl_reorder_weight_gpu(*ccs_, aos_ptr, soa_ptr, item.type, item.ncols, item.nrows,
                                                    item.src_bytes, { copy });
-            retain_handles_until_event({ aos, host }, reorder);
+            // Every handle the two submissions touch lives until the reorder: the table's hold on the SOA slot is not
+            // this submission's ownership.
+            retain_handles_until_event({ aos, host, soa }, reorder);
         } catch (const ggml_sycl_fallback_error &) {
             throw;
         } catch (const std::exception & e) {
@@ -321,7 +326,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
 }
 
 // The ring is reserved at the first layer that stages, so a prompt whose every layer runs on the CPU reserves
-// nothing. A failed reserve stays failed for the rest of the micro-batch's graph: one attempt per graph.
+// nothing. A failed reserve stays failed for the rest of the micro-batch: one attempt per micro-batch.
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;
@@ -329,6 +334,8 @@ bool moe_stream_phase::ring_ready() {
     if (reserve_failed_ || geo_.n_slots == 0 || !in_order_) {
         return false;
     }
+    // stage() takes slots in pairs.
+    GGML_ASSERT(geo_.region_slots % 2 == 0);
     std::unique_ptr<moe_stream_ring> ring = std::make_unique<moe_stream_ring>();
     if (!ring->reserve(device_, geo_)) {
         reserve_failed_ = true;
@@ -391,11 +398,13 @@ void moe_stream_phase::report(int                   layer,
     if (st.decision.choice == moe_exec_choice::NOT_CONSULTED || op.log == nullptr) {
         return;
     }
+    // The stage line: the plan's fields under a prefix of its own, apart from note()'s "[MOE-EXEC-TRACE] dev" line
+    // (plan amendment for Task 15, lead ruling c-xod7-q1).
     if (op.log->trace >= 1 && op.log->trace_sink != nullptr) {
         char line[256];
         std::snprintf(line, sizeof(line),
-                      "[MOE-EXEC] trace layer %d ubatch %u: %s regime=%s p=%.2f t_cpu=%.0f t_ring=%.0f window=%.0f "
-                      "staged=%d/%d bytes=%zu"
+                      "[MOE-EXEC-TRACE] stage layer %d ubatch %u: %s regime=%s p=%.2f t_cpu=%.0f t_ring=%.0f "
+                      "window=%.0f staged=%d/%d bytes=%zu"
                       " unowned=%d untyped=%d exhausted=%d",
                       layer, ubatch_seq_, moe_exec_choice_name(st.decision.choice),
                       moe_stream_regime_name(st.decision.regime), st.decision.p_touch, st.decision.t_cpu_us,

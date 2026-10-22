@@ -268,7 +268,7 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         item.nrows     = e.ne[1];
         li.items.push_back(item);
         // The ring is sized over the matrices it can stage. Another one is still listed, so a stage counts it untyped,
-        // but it takes no slot: a type with no reorder is not streamable in v1 (xod7 brief).
+        // but it takes no slot: a type with no reorder is not streamable in v1.
         if (!moe_stream_item_reorderable(item, SIZE_MAX)) {
             continue;
         }
@@ -351,9 +351,9 @@ static inline bool moe_stream_fully_staged(const moe_stream_layer_info * li,
     return true;
 }
 
-// True iff a lease's retained owner lets the ring copy from it directly (9y0p M4): a host-pinned WEIGHT allocation in
-// one of this device's host zones, the shape mem-ops.cpp copies without a host bounce (a host zone of another device
-// lives in another context). Any other lease would take the staged path, which the ring never does.
+// True iff a lease's retained owner lets the ring copy from it directly (llama.cpp-9y0p): a host-pinned WEIGHT
+// allocation in one of this device's host zones, the shape mem-ops.cpp copies without a host bounce (a host zone of
+// another device lives in another context). Any other lease would take the staged path, which the ring never does.
 static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int device) {
     return owner.tier == alloc_tier::HOST_PINNED && owner.role == alloc_role::WEIGHT &&
            owner.host_zone != host_zone_id::COUNT && owner.device == device;
@@ -407,6 +407,30 @@ static inline const char * moe_stream_regime_name(moe_exec_regime r) {
     }
 }
 
+// True iff a prompt MUL_MAT_ID of `layer` in graph `graph_seq` starts a micro-batch: none is live, the layer is below
+// the current one, or it is the current layer again in a new graph. A new graph at a higher layer carries the
+// micro-batch on, since a split micro-batch spans several graph_compute calls.
+static inline bool moe_stream_ubatch_starts(bool     live,
+                                            int      layer,
+                                            int      cur_layer,
+                                            uint64_t graph_seq,
+                                            uint64_t cur_graph_seq) {
+    return !live || layer < cur_layer || (layer == cur_layer && graph_seq != cur_graph_seq);
+}
+
+// True iff a layer's decision moves bytes now: the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it.
+// Nothing consumes a staged expert until Task 8 (llama.cpp-o9uw), so under AUTO the choice is only recorded (lead
+// ruling c-3skf).
+static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy) {
+    return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING;
+}
+
+// True iff the next layer's decision is resolved a layer ahead, under the current layer's window: any decision but a
+// ROUTED_ONLY ring, which needs that layer's own ids and resolves at its first op.
+static inline bool moe_stream_resolve_ahead(const moe_exec_decision & d) {
+    return !(d.choice == moe_exec_choice::RING && d.regime == moe_exec_regime::ROUTED_ONLY);
+}
+
 // What begin_layer needs beyond its plan, cache and queue: the op's shape for the cost model, the backend's one policy
 // and decision log (ggml_sycl_moe_exec_config(), ggml_sycl_moe_exec_log()), and two answers only the graph has, from
 // the backend's MUL_MAT_ID scan: whether a layer's ops are in the graph being computed, and the host AOS lease of one
@@ -446,8 +470,8 @@ class moe_stream_phase {
     // Called at every prompt MUL_MAT_ID of `layer`; the first one per micro-batch decides. It stages the layer itself
     // when the layer was not weighed a layer ahead (layer 0 of the micro-batch: the one exposed copy) or its decision
     // is ROUTED_ONLY (which needs its own ids), then weighs layer + 1 and stages it now when that decision is a
-    // STREAM_ALL ring. A layer below the last one, or the same layer in a new graph, starts a micro-batch. Returns the
-    // layer's decision.
+    // STREAM_ALL ring. A layer below the last one, or the same layer in a new graph, starts a micro-batch
+    // (moe_stream_ubatch_starts). Returns the layer's decision.
     moe_exec_decision         begin_layer(int                    layer,
                                           const placement_plan & plan,
                                           int                    device,
@@ -461,7 +485,8 @@ class moe_stream_phase {
     bool                      fully_staged(int layer, const int32_t * ids, size_t n_ids, int n_expert) const;
     // True iff slots were taken from the ring's current region since it last flipped.
     bool                      region_open() const;
-    // After `layer`'s down op: an open region closes on `down_done`, a device event that ends the layer.
+    // After `layer`'s down op: an open region closes on `down_done`, a device event behind that op. It gates the
+    // region's AOS reuse only (see ggml_sycl_moe_stream_layer_done).
     void                      layer_done(int layer, sycl::event down_done);
     // The first decode graph after a prompt: the table, the decisions and the ring go.
     void                      end_prompt();
@@ -517,20 +542,19 @@ class moe_stream_phase {
     std::vector<uint8_t>                            bitmap_;  // the current op's ids, marked
     std::optional<sycl::queue>                      ccs_;     // the compute queue the reorders run on
     moe_stream_ring_geometry                        geo_;
-    ggml_sycl_moe_exec_rates_record                 record_              = {};
-    int                                             device_              = -1;
-    int                                             cur_layer_           = -1;
-    uint64_t                                        cur_graph_seq_       = 0;
-    uint32_t                                        n_tokens_            = 0;
-    uint32_t                                        ubatch_seq_          = 0;
-    bool                                            ubatch_live_         = false;
-    bool                                            prepared_            = false;
-    bool                                            in_order_            = false;
-    bool                                            reserve_failed_      = false;
-    bool                                            record_valid_        = false;
-    bool                                            record_looked_up_    = false;
-    bool                                            warned_not_in_order_ = false;
-    bool                                            warned_unavailable_  = false;  // this prompt's diagnostic is out
+    ggml_sycl_moe_exec_rates_record                 record_             = {};
+    int                                             device_             = -1;
+    int                                             cur_layer_          = -1;
+    uint64_t                                        cur_graph_seq_      = 0;
+    uint32_t                                        n_tokens_           = 0;
+    uint32_t                                        ubatch_seq_         = 0;
+    bool                                            ubatch_live_        = false;
+    bool                                            prepared_           = false;
+    bool                                            in_order_           = false;
+    bool                                            reserve_failed_     = false;
+    bool                                            record_valid_       = false;
+    bool                                            record_looked_up_   = false;
+    bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

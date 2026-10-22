@@ -29253,6 +29253,13 @@ struct ggml_sycl_moe_stream_call {
     int                                              device = -1;
     int                                              layer  = -1;
     ggml_sycl::moe_stream_op                         op;
+
+    // op.graph_ctx points back at the call, so a copy or a move would carry a pointer to its source.
+    ggml_sycl_moe_stream_call()                                              = default;
+    ggml_sycl_moe_stream_call(const ggml_sycl_moe_stream_call &)             = delete;
+    ggml_sycl_moe_stream_call(ggml_sycl_moe_stream_call &&)                  = delete;
+    ggml_sycl_moe_stream_call & operator=(const ggml_sycl_moe_stream_call &) = delete;
+    ggml_sycl_moe_stream_call & operator=(ggml_sycl_moe_stream_call &&)      = delete;
 };
 
 // True iff `layer`'s MUL_MAT_ID ops are in the graph being computed.
@@ -29337,8 +29344,12 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     return true;
 }
 
-// After a prompt layer's down op: an open stream region closes on a barrier behind it, which ends the layer's use of
-// its slots on the device. Never while a command graph records: ring work is never recorded.
+// After a prompt layer's down op, an open stream region closes on a barrier behind it. The barrier becomes the gate the
+// region's next copies wait for, so it orders the reuse of the region's AOS slots only: every reorder that read them
+// ran before it on this queue. The region's SOA slots are next rewritten by reorders on this same in-order queue, so
+// the queue, not the barrier, orders that reuse after their readers. Under STREAM_ALL the open region holds layer + 1's
+// slots, staged a layer ahead, whose readers have not run yet; the barrier still follows their reorders. Never while a
+// command graph records: ring work is never recorded.
 static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
     if (!ctx.moe_stream || !ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording) {
         return;
