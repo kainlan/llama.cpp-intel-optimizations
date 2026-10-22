@@ -603,10 +603,26 @@ struct test_moe_mmid_route_reachable_override_guard {
 // The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an
 // empty string on a pass and otherwise names the first failed assertion. The shared-storage case reserves a WEIGHT
 // arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
+// Without host zones the loan refuses by name and lends nothing (llama.cpp-sif1). Host zones cannot be unconfigured
+// and every other case configures them, so run it first.
+std::string test_expert_loan_refuses_without_host_zones();
 std::string test_expert_loan_lends_two_triplets();
 std::string test_expert_loan_probe_changes_nothing();
 std::string test_expert_loan_refuses_replacing_a_host_entry();
 std::string test_expert_loan_refuses_shared_storage();
+// The refill's design evidence (llama.cpp-sif1): outside a load, under a published plan and a planned materialization
+// scope, direct staging takes one expert from a pinned host copy, and its copy takes the staged branch. It reserves the
+// WEIGHT arena itself.
+std::string test_expert_direct_stage_outside_a_load_copies_through_staging();
+// The refill (llama.cpp-sif1): after the loan, two calls re-admit one triplet each, the bytes and the device's zone
+// room come back and no host entry is left; a loan between two calls cancels the second; two boundaries after one
+// decode graph re-admit once; a lent triplet no boundary could prepare leaves the ledger, and a full zone keeps its;
+// two triplets per call both move, and the third stays lent.
+std::string test_expert_refill_readmits_one_triplet_per_call();
+std::string test_expert_refill_cancelled_by_a_loan();
+std::string test_expert_refill_runs_once_per_decode_graph();
+std::string test_expert_refill_drops_an_unpreparable_triplet();
+std::string test_expert_refill_moves_two_triplets_per_call();
 #endif
 
 }  // namespace ggml_sycl

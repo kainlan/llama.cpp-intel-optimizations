@@ -9541,10 +9541,16 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
         auto                                entry_it = entries_.end();
         const unified_cache_key explicit_key{ cache_entry_type::MOE_EXPERT, req.key, req.layer_id, req.expert_id };
         entry_it = entries_.find(explicit_key);
-        if (entry_it == entries_.end()) {
+        // A retired entry under the explicit key does not shadow what the id maps to now. A refill leaves one there,
+        // the lent host copy it withdrew, until the deferred-free pass finalizes it, while the id already maps to the
+        // device entry that replaced it (llama.cpp-sif1).
+        if (entry_it == entries_.end() || entry_it->second.retired) {
             auto id_it = id_to_key_.find(req.key);
             if (id_it != id_to_key_.end() && id_it->second.type == cache_entry_type::MOE_EXPERT) {
-                entry_it = entries_.find(id_it->second);
+                const auto mapped = entries_.find(id_it->second);
+                if (mapped != entries_.end()) {
+                    entry_it = mapped;
+                }
             }
         }
 
@@ -10303,6 +10309,292 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
         out.bytes_freed += members[i].vram_charge_size;
+    }
+    return true;
+}
+
+// llama.cpp-sif1: re-admit one lent triplet to the device after a prompt phase, loan_expert_triplet() inverted. The
+// copies go first, from each host copy's typed pinned owner into the caller's device owner, so the copy path takes the
+// direct DMA and both owners stay retained until it completes. Each device entry is then published behind its copy and
+// takes over the direct mirror and the id mapping from the host copy, which is withdrawn exactly; a host copy still
+// leased (an extra's record, a ring copy reading it) stays retired until its last lease goes, and its pinned storage
+// until the copies reading it complete. Nothing here waits or asks an event's status.
+bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out) {
+    out = expert_refill_record{};
+    if (!members) {
+        out.reason = "invalid arguments";
+        return false;
+    }
+    const int cache_device = get_device_id_from_queue(queue_);
+
+    // The device entries are published as direct staging publishes one, so they are refused for what refuses direct
+    // staging: a load effect this thread cannot take and a plan the cache does not hold. Outside a model load (the
+    // decode boundary that runs a refill) the load effect is NONE and passes.
+    const cache_load_effect load_effect = acquire_bound_load_effect();
+    if (load_effect.failed()) {
+        out.reason = "load effect unavailable";
+        return false;
+    }
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        out.reason = "plan not coherent";
+        return false;
+    }
+
+    void *                   device_ptr[3]  = { nullptr, nullptr, nullptr };
+    size_t                   device_size[3] = { 0, 0, 0 };
+    mem_handle               src_owner[3];
+    uint64_t                 src_control[3] = { 0, 0, 0 };
+    size_t                   bytes[3]       = { 0, 0, 0 };
+    std::vector<sycl::event> deps[3];
+    const char *             refusal = nullptr;
+    for (int i = 0; i < 3 && !refusal; ++i) {
+        const expert_refill_member & m = members[i];
+        alloc_metadata               md{};
+        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key)) {
+            refusal = "invalid member";
+        } else if (!m.device_owner.valid() || !m.device_owner.owner_metadata(&md) || !md.ptr ||
+                   md.tier != alloc_tier::DEVICE_VRAM || md.cache_backing || md.device != cache_device) {
+            refusal = "device storage not owned";
+        } else {
+            device_ptr[i]  = md.ptr;
+            device_size[i] = md.size;
+        }
+        deps[i].reserve(2);
+    }
+
+    // 1. Each member's host copy is the one a loan published, all three members before anything changes.
+    if (!refusal) {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const ggml_sycl_cache_id & key = members[i].key;
+            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const auto                 it = entries_.find(host_key);
+            if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
+                it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
+                refusal = "not lent";
+                break;
+            }
+            const unified_cache_entry & e = it->second;
+            // c-n4gw: a loan copies AOS bytes only, so a lent copy is AOS.
+            if (e.layout != GGML_LAYOUT_AOS) {
+                refusal = "layout";
+                break;
+            }
+            // A loan's host copy owns its whole pinned storage (register_host_expert_owned's typed owner). A host
+            // copy S1-PRELOAD registered over planner-placed storage is not lent and stays where the planner put it.
+            alloc_metadata md{};
+            if (e.location != cache_location::HOST_PINNED || !e.host_resident ||
+                !e.direct_alloc_owner.owner_metadata(&md) || md.ptr != e.device_ptr ||
+                md.tier != alloc_tier::HOST_PINNED || md.size < e.size) {
+                refusal = "not a lent copy";
+                break;
+            }
+            // What resolves the id today: the mirror and the id mapping both name this host copy.
+            const auto mirror = direct_expert_entries_.find(key);
+            const auto mapped = id_to_key_.find(key);
+            if (mirror == direct_expert_entries_.end() || mirror->second.ptr != e.device_ptr ||
+                mirror->second.location != e.location || mirror->second.layout != e.layout ||
+                mapped == id_to_key_.end() || !(mapped->second == host_key)) {
+                refusal = "host copy not published";
+                break;
+            }
+            if (entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
+                entries_.end()) {
+                refusal = "device entry exists";
+                break;
+            }
+            // Exact: a loan that later lends this entry again requires its owner to be its whole allocation.
+            if (device_size[i] != e.size) {
+                refusal = "device storage size";
+                break;
+            }
+            src_owner[i]   = e.direct_alloc_owner;
+            src_control[i] = e.direct_alloc_owner.owner_control_id();
+            bytes[i]       = e.size;
+            if (e.has_write_event) {
+                deps[i].push_back(e.last_write_event);
+            }
+            if (e.has_ready_event) {
+                deps[i].push_back(e.ready_event);
+            }
+        }
+    }
+    if (refusal) {
+        out.reason = refusal;
+        return false;
+    }
+
+    // 2. The copies, on the BCS queue (the copy engine, off the compute engine the decode graph runs on) behind what
+    // wrote each host copy: the loan's D2H copy. Both endpoints are typed owners, so the copy is a direct DMA, and
+    // mem_copy_async retains both until it completes.
+    try {
+        sycl::queue & bq = get_bcs_queue();
+        for (int i = 0; i < 3; ++i) {
+            out.copy_events[i] = mem_copy_async(members[i].device_owner, src_owner[i], bytes[i], bq, deps[i]);
+        }
+    } catch (const ggml_sycl_fallback_error &) {
+        // G-CATCH requires this clause before catch (...). A copy submission never throws the op fallback (dispatch
+        // control flow), so no refill is stranded by it (llama.cpp-sif1).
+        throw;
+    } catch (...) {
+        out        = expert_refill_record{};
+        out.reason = "copy submit failed";
+        return false;
+    }
+
+    // 3. Everything the publication allocates, built before the locks: each device entry and its mirror record, and
+    // the nodes the host retires hand back. Under the locks, the device entries' insertion and their lease minting
+    // are the only allocations, and they come before anything already published changes.
+    unified_cache_entry device_entry[3];
+    weight_entry        device_mirror[3];
+    for (int i = 0; i < 3; ++i) {
+        unified_cache_entry & entry = device_entry[i];
+        entry.device_ptr            = device_ptr[i];
+        entry.src_ptr               = nullptr;
+        entry.content_hash          = 0;
+        entry.size                  = bytes[i];
+        entry.type                  = cache_entry_type::MOE_EXPERT;
+        entry.layer_id              = -1;
+        entry.expert_id             = -1;
+        entry.layout                = GGML_LAYOUT_AOS;
+        entry.access_count          = 0;
+        entry.pinned                = false;
+        entry.hot                   = true;
+        entry.state                 = cache_entry_state::IN_PROGRESS;
+        entry.has_ready_event       = true;
+        entry.ready_event           = out.copy_events[i];
+        entry.host_resident         = false;
+        entry.location              = cache_location::DEVICE;
+        entry.owner_device          = cache_device;
+        entry.pool_allocated        = false;
+        entry.direct_alloc_owner    = members[i].device_owner;
+        entry.last_write_event      = out.copy_events[i];
+        entry.has_write_event       = true;
+        stamp_pending_owner(entry, load_effect);
+
+        weight_entry & mirror      = device_mirror[i];
+        mirror.ptr                 = device_ptr[i];
+        mirror.size                = bytes[i];
+        mirror.layout              = GGML_LAYOUT_AOS;
+        mirror.location            = cache_location::DEVICE;
+        mirror.has_ready_event     = true;
+        mirror.ready_event         = out.copy_events[i];
+        mirror.pending_load_txn_id = load_effect.load_txn_id();
+    }
+    // The publication runs inside a planned materialization session, as the loan's host registration does: the plan,
+    // not a runtime miss, asked for these device copies (llama.cpp-sif1).
+    scoped_planned_materialization   materialization(this, "expert refill");
+    std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
+                                                members[2].host_keys.size());
+    int                              inserted = 0;
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        // Each host copy is still the one checked and still what resolves its id, and no device entry has appeared.
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const ggml_sycl_cache_id & key = members[i].key;
+            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const auto                 it     = entries_.find(host_key);
+            const auto                 mirror = direct_expert_entries_.find(key);
+            const auto                 mapped = id_to_key_.find(key);
+            if (it == entries_.end() || it->second.retired ||
+                it->second.direct_alloc_owner.owner_control_id() != src_control[i] ||
+                mirror == direct_expert_entries_.end() || mirror->second.ptr != it->second.device_ptr ||
+                mapped == id_to_key_.end() || !(mapped->second == host_key) ||
+                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
+                    entries_.end()) {
+                refusal = "entry changed";
+            }
+        }
+        // The allocations: insert each device entry, then mint its mirror's lease and the caller's. A throw withdraws
+        // the entries already inserted (nothing resolves them yet), and their storage goes back to its zone behind
+        // the copy, through the deferred-free pass, once the leases minted so far are gone.
+        if (!refusal) {
+            try {
+                for (int i = 0; i < 3; ++i) {
+                    const unified_cache_key device_key =
+                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    device_entry[i].last_access = time_++;
+                    entries_.emplace(device_key, device_entry[i]);
+                    ++inserted;
+                }
+                for (int i = 0; i < 3; ++i) {
+                    const unified_cache_key device_key =
+                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    unified_cache_entry & stored = entries_.find(device_key)->second;
+                    device_mirror[i].handle =
+                        make_direct_entry_handle(device_key, cache_device, stored, "expert_refill/mirror");
+                    stored.in_use_count.fetch_add(1);
+                    stored.debug_last_lease_site = "expert_refill/out_handle";
+                    stored.record_lease_event(true, "expert_refill/out_handle");
+                    out.device_handles[i] = mem_handle::from_weight_lease_locked(
+                        device_key, cache_device, stored.device_ptr, stored.layout, true, &stored);
+                }
+            } catch (const ggml_sycl_fallback_error &) {
+                // G-CATCH requires this clause before catch (...). Nothing here throws the op fallback (dispatch
+                // control flow) (llama.cpp-sif1).
+                throw;
+            } catch (...) {
+                for (int i = 0; i < inserted; ++i) {
+                    (void) transition_to_retired_locked(
+                        entries_
+                            .find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS))
+                            ->second);
+                }
+                refusal = "publication failed";
+            }
+        }
+        // Allocation-free from here: each device entry takes over its id's mirror (a swap, which hands the host
+        // copy's record, and its lease, back to device_mirror for release with no lock held) and its id mapping, then
+        // each host copy is retired exactly under every id still naming its storage. The mirror and the mapping under
+        // key name the device entry by then, so the retire there takes neither; under the loan's other host ids it
+        // takes both, into host_nodes.
+        if (!refusal) {
+            size_t r = 0;
+            for (int i = 0; i < 3; ++i) {
+                const ggml_sycl_cache_id & key = members[i].key;
+                std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);
+                id_to_key_.find(key)->second =
+                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);
+                for (const ggml_sycl_cache_id & id : members[i].host_keys) {
+                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+                    const auto              host = entries_.find(host_key);
+                    if (host != entries_.end() && !host->second.retired &&
+                        host->second.direct_alloc_owner.owner_control_id() == src_control[i]) {
+                        (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. With no lock held: the host copies' mirror leases go (swapped into device_mirror, or taken by a retire), and
+    // on a refusal the leases minted on the withdrawn device entries.
+    for (weight_entry & mirror : device_mirror) {
+        mirror.handle.reset();
+    }
+    for (expert_retire_nodes & nodes : host_nodes) {
+        if (!nodes.mirror.empty()) {
+            nodes.mirror.mapped().handle.reset();
+        }
+    }
+    host_nodes.clear();
+    if (refusal) {
+        for (mem_handle & lease : out.device_handles) {
+            lease = {};
+        }
+        out        = expert_refill_record{};
+        out.reason = refusal;
+        return false;
+    }
+
+    out.accepted = true;
+    out.reason   = "OK";
+    for (int i = 0; i < 3; ++i) {
+        out.bytes_readmitted += members[i].vram_charge_size;
     }
     return true;
 }
@@ -16050,7 +16342,10 @@ bool unified_cache::test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint
     return true;
 }
 
-bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_t * in_use, bool * retired) const {
+bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key,
+                                                 uint32_t *         in_use,
+                                                 bool *             retired,
+                                                 alloc_metadata *   owner) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     const auto                          it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });
     if (it == entries_.end()) {
@@ -16061,6 +16356,10 @@ bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_
     }
     if (retired) {
         *retired = it->second.retired;
+    }
+    if (owner) {
+        *owner = alloc_metadata{};
+        (void) it->second.direct_alloc_owner.owner_metadata(owner);
     }
     return true;
 }

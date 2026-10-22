@@ -6668,6 +6668,12 @@ struct ggml_backend_sycl_context {
     // (graph-phase.hpp). Atomic because the classification runs before graph_mutex is taken.
     std::atomic<bool> graph_phase_is_decode{ false };
 
+    // The decode graph_compute calls this context has run, and that count when its graph boundary last ran the expert
+    // refill: the refill runs only once the first has moved past the second, so one decode graph re-admits at most
+    // GGML_SYCL_MOE_REFILL_PER_GRAPH triplets however often the context synchronizes (llama.cpp-sif1).
+    std::atomic<uint64_t> decode_graph_count{ 0 };
+    std::atomic<uint64_t> refill_decode_graph{ 0 };
+
     uint64_t test_graph_replay_count  = 0;
 
     // One published retention epoch owns every MMID graphlet currently cached

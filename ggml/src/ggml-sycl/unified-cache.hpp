@@ -2901,6 +2901,31 @@ struct expert_loan_record {
                                               expert_retire_status::INVALID };
 };
 
+// One member of a lent triplet re-admitted to the device after a prompt phase (llama.cpp-sif1), the loan's member
+// inverted. key is the cache id the member's AOS device entry was staged under and its host copy is published under;
+// host_keys are every id the loan published the host copy under, key first. device_owner is the member's device
+// storage, minted owner-first by the caller from the WEIGHT zone before it took any listed lock, so no allocation for
+// the bytes runs under one; its size must be the host copy's. vram_charge_size is the plan's charge for the member,
+// reported as bytes re-admitted.
+struct expert_refill_member {
+    expert_placement_key            placement;
+    ggml_sycl_cache_id              key;
+    std::vector<ggml_sycl_cache_id> host_keys;
+    size_t                          vram_charge_size = 0;
+    mem_handle                      device_owner;
+};
+
+// What one refill did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
+// refill carries the bytes the plan charges the device again and a lease on each member's new device entry, whose
+// bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its last write).
+struct expert_refill_record {
+    bool         accepted         = false;
+    const char * reason           = "none";
+    size_t       bytes_readmitted = 0;
+    mem_handle   device_handles[3];
+    sycl::event  copy_events[3];
+};
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Deterministic publication/lifecycle controls exist only in private fixtures.
 using expert_publication_test_hook = void (*)(void * context);
@@ -3638,6 +3663,20 @@ class unified_cache {
     // the device lease, and flips the plan.
     bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
 
+    // Re-admit one lent triplet to the device (llama.cpp-sif1), the inverse of loan_expert_triplet(). Each member's
+    // host copy must be the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is
+    // its whole pinned storage, which the direct mirror and the id mapping both name, with no device entry under the
+    // member's direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry
+    // exists", so a later boundary retries). One member that fails refuses the triplet with a reason and leaves no
+    // state behind. Otherwise the three H2D copies go on the BCS queue behind the host copy's writes, each retaining
+    // its two owners until it completes, so the pinned storage outlives the read whatever happens to its entry. Under
+    // direct_stage_mutex_ and rw_mutex_, all three or none, each device entry is published IN_PROGRESS behind its copy
+    // and takes over the direct mirror and the id mapping, then each host copy is retired exactly under every host id
+    // still naming its storage; what follows the device entries' insertion allocates nothing. Nothing here waits and
+    // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the host lease,
+    // remembers the device lease, and flips the plan.
+    bool refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out);
+
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
     // A yield can release the device-resident, non-retired copies
@@ -4278,9 +4317,13 @@ class unified_cache {
     // The lease count of the AOS device entry direct staging published for key, in *in_use; false when there is none
     // (erased, or never staged). A retired entry still answers until the deferred-free pass erases it.
     bool     test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint32_t * in_use) const;
-    // The lease count and retired flag of the host entry register_host_expert published for key; false when there is
-    // none.
-    bool     test_expert_host_entry_state(ggml_sycl_cache_id key, uint32_t * in_use, bool * retired) const;
+    // The lease count and retired flag of the host entry register_host_expert published for key, and, in *owner, the
+    // allocation metadata of the owner it holds (empty without one); false when there is none. The owner's provenance
+    // is what the copy path reads to decide whether a copy from the entry is direct (llama.cpp-sif1).
+    bool     test_expert_host_entry_state(ggml_sycl_cache_id key,
+                                          uint32_t *         in_use,
+                                          bool *             retired,
+                                          alloc_metadata *   owner = nullptr) const;
     // Retain a reference to a staged weight's allocation owner until `event`,
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
