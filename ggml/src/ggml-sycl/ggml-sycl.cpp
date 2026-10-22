@@ -28685,9 +28685,10 @@ static void ggml_sycl_measure_peer_host_bounce(ggml_sycl_device_info & info) {
 // llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device's host-to-device rate from PINNED host memory, which the
 // MoE executor's cost model divides by (26.5-27.1 GB/s pinned against 10.5-19 GB/s pageable, llama.cpp-8bgi). The peer
 // probe above stages through a pageable std::vector, so it cannot stand in. 64 MiB moves in 4 MiB chunks, 8 timed
-// iterations after one untimed copy, on the device's default queue and timed on the host. The chunks go out with
-// mem_copy_async and one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy per 4 MiB chunk would
-// time the submit-and-wait latency of each chunk and read low.
+// iterations after one untimed copy, on the cache's queue (cache->get_queue(): mem_copy_submit's direct branch needs
+// the copy queue to share a context with it, and the dpct default queue does not) and timed on the host. The chunks
+// go out with mem_copy_async and one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy per 4 MiB
+// chunk would time the submit-and-wait latency of each chunk and read low.
 //
 // The rate is only the link's if the copy is a direct DMA. mem_copy_submit takes its direct branch from a host
 // source only when the source's owner is a zone-managed host-pinned allocation of role WEIGHT, STAGING or
@@ -28790,8 +28791,10 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             if (!(rec.reorder_gbps > 0.0)) {
                 rec.reorder_gbps = seed.reorder_gbps;
             }
-            ggml_backend_sycl_moe_exec_rates_store(dev, &rec);
-            report(dev, gbps, true, true, "probed");
+            // A refused store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the rate
+            // resolved for this process, but the line must not claim it persisted.
+            const bool stored = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);
+            report(dev, gbps, true, true, stored ? "probed" : "probed, not stored");
         } catch (const ggml_sycl_fallback_error &) {
             // The alloc-zone contract's sanctioned form (clause g): ggml_sycl_fallback_error derives from
             // std::exception, so it is caught first and rethrown; nothing the probe calls throws it.
@@ -37375,8 +37378,8 @@ struct ggml_sycl_scoped_alloc_rollback {
 // experts, copy one expert's registered handle into a device RUNTIME buffer until at least 64 MiB have moved, and
 // log the rate and whether the copies took mem_copy_submit's direct or staged branch. It is diagnostic only and
 // waits on the loading thread, which no production copy may do. The branch comes from this thread's staged-copy
-// census (llama.cpp-qwn5), which counts only under GGML_SYCL_MOE_IDS_COPY_TRACE=1, so without it the line says
-// unknown; the th86 site census prints to stderr and cannot be read in-process.
+// census (llama.cpp-qwn5), whose staged counts do not depend on GGML_SYCL_MOE_IDS_COPY_TRACE, so the line says staged
+// or direct in every run; the th86 site census prints to stderr and cannot be read in-process.
 static void ggml_sycl_moe_exec_copy_probe(int                           device,
                                           const ggml_sycl::mem_handle & expert,
                                           size_t                        bytes,
@@ -37412,7 +37415,7 @@ static void ggml_sycl_moe_exec_copy_probe(int                           device,
         sycl::event::wait_and_throw(events);
         const double   sec    = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const uint64_t staged = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before;
-        const char *   kind   = !ggml_sycl_cpu_expert_trace_enabled() ? "unknown" : (staged != 0 ? "staged" : "direct");
+        const char *   kind   = staged != 0 ? "staged" : "direct";
         const size_t   total  = copies * bytes;
         GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d: %.1f GB/s over %zu MiB, %s\n", device,
                       sec > 0.0 ? (double) total / sec / 1e9 : 0.0, total / (1024 * 1024), kind);

@@ -30,6 +30,9 @@ reused. The probe this gate pins:
   - the copies and the device buffer use cache->get_queue(), never the dpct device's default_queue(): the direct branch
     needs the copy queue to share a context with the cache's own queue (measured: the default queue read 4-10 GB/s,
     staged, against 20-21 GB/s direct), and the staged baseline is read after the untimed warm-up;
+  - the call sits inside the outermost-exit `if (outer)` block after the preload; a device that holds a rate is skipped
+    by the loop's first statement; a stored record (unless forced) and then the env skip come before the cache and
+    zone check; and a refused tuning-cache store is logged "probed, not stored", never "probed";
   - a device whose cache has no configured host zones is not probed (the host source would not be a trusted direct-copy
     source), and a copy the staged-copy census records as staged is never stored or kept: the seed stands, h2d_probed
     stays false, and both outcomes leave the device unresolved so the next load retries;
@@ -202,9 +205,26 @@ def claim_reads_its_switch_once(src: str) -> bool:
     return norm(src).count('getenv("GGML_SYCL_H2D_PROBE")') == 1
 
 
+GUARD = "if (info.devices[dev].h2d_pinned_gbps > 0.0) { continue; }"
+LOOKUP = "ggml_backend_sycl_moe_exec_rates_lookup("
+CACHE_HIT = 'if (have && !force) { report(dev, rec.h2d_gbps, true, true, "tuning cache"); continue; }'
+SKIP = 'if (skip) { report(dev, seed.h2d_gbps, false, true, "seed, GGML_SYCL_H2D_PROBE=0"); continue; }'
+
+
+def claim_a_device_holding_a_rate_is_not_probed_again(src: str) -> bool:
+    """The once-guard is the loop's first statement, ahead of the tuning-cache lookup: a device that holds a rate is
+    skipped whole, which is what lets every outermost load call the probe."""
+    fn = probe_body(src)
+    return bool(fn) and fn.count(GUARD) == 1 and ordered(fn, "for (int dev = 0;", GUARD, LOOKUP)
+
+
 def claim_switch_semantics(src: str) -> bool:
     fn = probe_body(src)
-    return all([
+    return bool(fn) and all([
+        # stored record first (unless forced), then the env skip, then the cache and zone check
+        ordered(fn, LOOKUP, CACHE_HIT, SKIP, "get_unified_cache_for_device(dev)", "host_zones_configured()"),
+        fn.count(CACHE_HIT) == 1,
+        fn.count(SKIP) == 1,
         "strcmp(sw, \"0\") == 0" in fn,
         "strcmp(sw, \"1\") == 0" in fn,
         "ggml_backend_sycl_moe_exec_rates_lookup(" in fn,
@@ -248,6 +268,19 @@ INIT_SIG = "static ggml_sycl_device_info ggml_sycl_init()"
 CALL = "ggml_sycl_measure_h2d_pinned(ggml_sycl_info_mutable())"
 
 
+OUTER_EXIT = "if (outer) { g_sycl_in_model_load.store(false, std::memory_order_release);"
+
+
+def in_outer_exit_block(effects: str) -> bool:
+    """The preload and the probe call both sit inside the outermost-exit `if (outer) { ... }` block, in that order, so a
+    nested or non-loading exit never probes."""
+    at = effects.find(OUTER_EXIT)
+    if at < 0:
+        return False
+    block = body(effects[at:], "if (outer)")
+    return bool(block) and block.count(CALL) == 1 and ordered(block, "ggml_sycl_preload_model_weights();", CALL)
+
+
 def claim_probe_runs_after_preload_through_the_mutable_accessor(src: str) -> bool:
     n = norm(src)
     effects = body(n, EFFECTS_SIG)
@@ -257,11 +290,20 @@ def claim_probe_runs_after_preload_through_the_mutable_accessor(src: str) -> boo
         n.count("ggml_sycl_measure_h2d_pinned(") == 3,  # forward declaration, definition, and the one call
         effects.count(CALL) == 1,
         ordered(effects, "ggml_sycl_preload_model_weights();", CALL),
+        in_outer_exit_block(effects),
         "ggml_sycl_measure_h2d_pinned" not in begin,
         "ggml_sycl_measure_h2d_pinned" not in init,
         "const_cast<ggml_sycl_device_info" not in n,
         n.count("static ggml_sycl_device_info & ggml_sycl_info_mutable() {") == 1,
         n.count("ggml_sycl_info_mutable()") == 4,  # declaration, definition, ggml_sycl_info()'s call, the probe's call
+    ])
+
+
+def claim_a_refused_store_is_not_reported_as_persisted(src: str) -> bool:
+    fn = probe_body(src)
+    return bool(fn) and all([
+        fn.count("const bool stored = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);") == 1,
+        fn.count('report(dev, gbps, true, true, stored ? "probed" : "probed, not stored");') == 1,
     ])
 
 
@@ -360,6 +402,14 @@ def test_probe_runs_after_preload_through_the_mutable_accessor():
 
 def test_zones_and_staged_copies_never_reach_the_store():
     assert claim_zones_and_staged_copies_never_reach_the_store(SYCL)
+
+
+def test_a_device_holding_a_rate_is_not_probed_again():
+    assert claim_a_device_holding_a_rate_is_not_probed_again(SYCL)
+
+
+def test_a_refused_store_is_not_reported_as_persisted():
+    assert claim_a_refused_store_is_not_reported_as_persisted(SYCL)
 
 
 def test_copies_run_on_the_cache_queue():
@@ -469,6 +519,37 @@ def test_mutant_staged_check_removed_fails():
     assert not claim_zones_and_staged_copies_never_reach_the_store(
         _once(SYCL, "mem_copy_staged_wait_census_this_thread().staged_h2d != staged_before",
               "false"))
+
+
+def test_mutant_call_outside_the_outer_exit_block_fails():
+    # close the outer-exit block right after its first statement and run the rest, probe included, unconditionally
+    mutant = _once(SYCL, OUTER_EXIT, OUTER_EXIT + " } {")
+    assert not claim_probe_runs_after_preload_through_the_mutable_accessor(mutant)
+
+
+def test_mutant_once_guard_inverted_fails():
+    assert not claim_a_device_holding_a_rate_is_not_probed_again(
+        _once(SYCL, "h2d_pinned_gbps > 0.0) {", "h2d_pinned_gbps < 0.0) {"))
+
+
+def test_mutant_once_guard_without_continue_fails():
+    assert not claim_a_device_holding_a_rate_is_not_probed_again(
+        _once(SYCL, "if (info.devices[dev].h2d_pinned_gbps > 0.0) { continue; }",
+              "if (info.devices[dev].h2d_pinned_gbps > 0.0) { }"))
+
+
+def test_mutant_env_skip_disabled_fails():
+    assert not claim_switch_semantics(_once(SYCL, "if (skip) {", "if (false) {"))
+
+
+def test_mutant_stored_record_ignored_fails():
+    assert not claim_switch_semantics(_once(SYCL, "if (have && !force) {", "if (false) {"))
+
+
+def test_mutant_store_result_ignored_fails():
+    assert not claim_a_refused_store_is_not_reported_as_persisted(
+        _once(SYCL, "const bool stored = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);",
+              "ggml_backend_sycl_moe_exec_rates_store(dev, &rec); const bool stored = true;"))
 
 
 def test_mutant_default_queue_fails():
