@@ -14,6 +14,9 @@
 //                           equal the reported charge only because a 1 MiB expert is 256-byte aligned.
 //   probe_changes_nothing   c-tdra first: inside a graph the transaction refuses "graph active" and a request waits.
 //                           Then the same plan probed: the selection is reported and nothing is copied or published.
+//   refuses_replacing_a_host_entry
+//                           c-mwmr-3: an idle host entry planted under the selected expert's host id is refused with
+//                           "host entry busy"; nothing is copied or published and the planted entry keeps its storage.
 //   refuses_shared_storage  c-sepd: a bulk-staged pair with expert 1 flipped to the host is refused with "shared
 //                           storage"; nothing is copied or published.
 //
@@ -60,6 +63,7 @@ int main() {
     bool ok = true;
     ok &= run_case("lends_two_triplets", ggml_sycl::test_expert_loan_lends_two_triplets);
     ok &= run_case("probe_changes_nothing", ggml_sycl::test_expert_loan_probe_changes_nothing);
+    ok &= run_case("refuses_replacing_a_host_entry", ggml_sycl::test_expert_loan_refuses_replacing_a_host_entry);
     ok &= run_case("refuses_shared_storage", ggml_sycl::test_expert_loan_refuses_shared_storage);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");

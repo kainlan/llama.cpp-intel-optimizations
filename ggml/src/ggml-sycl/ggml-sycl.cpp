@@ -20724,7 +20724,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // moe_expert_loan_select() picks whole (gate, up, down) triplets from the published plan; the cache copies each to
 // pinned host storage and withdraws the device copy (unified_cache::loan_expert_triplet); the plan flips those entries
 // to the host and is published once, so each lent expert executes where it now lives. File-static: its callers, the
-// auto-ubatch fit term (probe mode) and the ring's admission in mul_mat_id, are in this file, after it.
+// auto-ubatch fit term (probe mode, plan Task 12) and the boundary runner ggml_backend_sycl_synchronize() calls, are in
+// this file, after it. The ring's admission in mul_mat_id calls only ggml_sycl_request_expert_loan().
 //
 // Where it runs (c-tdra): at a graph boundary, never inside a graph. The ring's admission runs inside one, holding
 // g_sycl_graph_compute_mutex (L2), and the inventory mutex (L1) ranks below it (canonical contract section 12.5), so it
@@ -21521,6 +21522,62 @@ std::string test_expert_loan_probe_changes_nothing() {
                 return test_loan_fail("after the probe expert %d slot %d no longer resolves to the device", e, s);
             }
         }
+    }
+    return {};
+}
+
+std::string test_expert_loan_refuses_replacing_a_host_entry() {
+    // c-mwmr-3: an idle host entry already sits under the selected expert's host id. Registering the loan's host copy
+    // would replace it and free its storage with it, and a loan that failed later could not put it back, so the loan
+    // is refused before anything is copied and the planted entry keeps its storage.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x6d776d7204ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    const auto   published = ::ggml_sycl_global_plan_snapshot();
+    const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
+
+    // The fixture's host id is the device entry's own id; the down slot's, so the gate and up members pass first.
+    // resolve() asks for that id's host entry first, so it names the planted entry until something replaces it.
+    const ggml_sycl_cache_id planted_key = fx.keys[fx.index(0, 2, 0)];
+    mem_handle               planted     = ::ggml_sycl_host_expert_alloc(fx.device, test_loan_expert_bytes());
+    void * const             planted_ptr = planted.valid() ? planted.resolve().ptr : nullptr;
+    {
+        scoped_planned_materialization materialization(fx.cache, "test/expert loan planted host entry");
+        if (!planted_ptr || !fx.cache->register_host_expert_owned(planted_key, planted_ptr, test_loan_expert_bytes(),
+                                                                  GGML_LAYOUT_AOS, nullptr, planted)) {
+            return "the planted host entry was not registered";
+        }
+    }
+    if (const expert_resolve_result found = fx.resolve(0, 2, 0); !found || found.ptr != planted_ptr) {
+        return "the planted host entry does not resolve";
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    const ::ggml_sycl_txn_result           code =
+        ::ggml_sycl_expert_loan_transaction_run(fx.device, 3 * charge, /*probe_mode=*/false, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::REFUSED || result.accepted || result.n_triplets != 0 ||
+        result.bytes_freed != 0 || std::strcmp(result.reason, "host entry busy") != 0) {
+        return test_loan_fail("the loan answered code=%d accepted=%d triplets=%u (%s), not a host-entry-busy refusal",
+                              (int) code, (int) result.accepted, result.n_triplets, result.reason);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "the refused loan published a plan";
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (!fx.device_entry_present(0, s, 0) ||
+            !fx.extras[s]->find_moe_storage_handle_on_device(0, GGML_LAYOUT_AOS, fx.device)) {
+            return test_loan_fail("the refused loan moved slot %d expert 0 off the device", s);
+        }
+    }
+    if (const expert_resolve_result still = fx.resolve(0, 2, 0);
+        !still || still.location != cache_location::HOST_PINNED || still.ptr != planted_ptr) {
+        return "the refused loan replaced the planted host entry";
     }
     return {};
 }

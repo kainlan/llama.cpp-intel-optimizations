@@ -3627,8 +3627,10 @@ class unified_cache {
     // Lend one resident expert triplet to the host (llama.cpp-mwmr). Each member's device entry must own its storage
     // exactly: an AOS entry (c-n4gw) on the device, not retired, whose direct_alloc_owner is its whole allocation and
     // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. What
-    // the host registration would refuse for is checked too. One member that fails refuses the triplet with a reason
-    // and leaves no state behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
+    // the host registration would refuse for is checked too, and a host id that already has an entry, idle or not,
+    // refuses the triplet as "host entry busy": the registration never replaces one, since a failed loan could not put
+    // a replaced entry back (c-mwmr-3). One member that fails refuses the triplet with a reason and leaves no state
+    // behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
     // owners until it completes; each device entry's last write becomes its copy, so its storage is freed behind the
     // copy; each device entry is retired exactly; then each host copy is registered with register_host_expert_owned
     // carrying its copy as the ready event. A registration that fails anyway puts the device entries back. Nothing
@@ -3700,13 +3702,17 @@ class unified_cache {
     // allocation_owner registers ptr as unowned external storage.  A non-null
     // ready_event publishes the entry IN_PROGRESS behind it: a loan registers
     // its host copy while the D2H copy that fills it is still in flight.
+    // replace_existing = false refuses when the key already has an entry, of
+    // any state, instead of replacing an idle one with its storage: a loan
+    // must be able to undo every registration it made (c-mwmr-3).
     bool register_host_expert_owned(ggml_sycl_cache_id  key,
                                     void *              ptr,
                                     size_t              size,
                                     ggml_layout_mode    layout,
                                     mem_handle *        out_handle,
                                     const mem_handle &  allocation_owner,
-                                    const sycl::event * ready_event = nullptr);
+                                    const sycl::event * ready_event      = nullptr,
+                                    bool                replace_existing = true);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -6272,6 +6278,7 @@ class unified_cache {
     // storage_owner keeps the storage alive, typed_owner (when valid) becomes
     // the entry's direct_alloc_owner. A non-null ready_event publishes the
     // entry IN_PROGRESS behind that event (the copy still filling it).
+    // replace_existing = false refuses any key that already has an entry.
     bool register_host_expert(ggml_sycl_cache_id    key,
                               void *                ptr,
                               size_t                size,
@@ -6279,7 +6286,8 @@ class unified_cache {
                               mem_handle *          out_handle,
                               std::shared_ptr<void> storage_owner,
                               const mem_handle &    typed_owner,
-                              const sycl::event *   ready_event = nullptr);
+                              const sycl::event *   ready_event      = nullptr,
+                              bool                  replace_existing = true);
 
     // Retire exactly the entry at `exact`, never another entry under the same id. The direct mirror goes only when it
     // names that entry's storage; it moves to *released_mirror, for the caller to drop with no lock held or to hand

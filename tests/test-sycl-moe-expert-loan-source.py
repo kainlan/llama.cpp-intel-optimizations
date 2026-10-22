@@ -18,8 +18,12 @@ host storage owner-first, and under the inventory mutex has the cache lend each 
   - the retire is exact: it withdraws only the device entry's key, and its mirror only while it names that entry, so
     the loan never calls the id-wide retire_expert_entry_exact;
   - a host registration the checks could not foresee failing puts every device entry back (un-retired, recounted,
-    its mirror restored) after withdrawing the host copies already published, and what the registration checks
-    itself (the load effect, the plan coherence, a busy host entry) is checked before anything is copied;
+    its mirror restored) after withdrawing the host copies already published, only while each is still the entry the
+    loan registered, and what the registration checks itself (the load effect, the plan coherence, an existing host
+    entry) is checked before anything is copied;
+  - an existing host entry is never replaced (c-mwmr-3): any entry under a host id refuses the triplet as "host entry
+    busy", the registration is asked not to replace one and refuses when it would, and the refusal reason reaches
+    the transaction's refusal WARN;
   - g_sycl_graph_compute_mutex is never named in the loan code;
   - lock order: the host storage is minted before g_tensor_inventory_mutex is taken, and the cache is asked to lend
     under it; the cache takes direct_stage_mutex_ and rw_mutex_ together, with std::lock;
@@ -174,7 +178,7 @@ STAMP_FLAG = "device_entry[i]->has_write_event = true;"
 HOLD = 'held[i] = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");'
 DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &released_mirrors[i]);"
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
-            "k == 0 ? &out.host_handles[i] : nullptr, m.host_owner, &out.copy_events[i])")
+            "k == 0 ? &out.host_handles[i] : nullptr, m.host_owner, &out.copy_events[i], false)")
 DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
 
 
@@ -211,8 +215,8 @@ UNRETIRE = "it->second.retired = false;"
 COUNT_BACK = "retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);"
 MAPPING_BACK = "id_to_key_.emplace(exact.id, exact);"
 MIRROR_BACK = "direct_expert_entries_.emplace(exact.id, std::move(mirror));"
-HOST_WITHDRAW = ("(void) retire_expert_entry_at_locked({ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 }, "
-                 "&released[r++]);")
+HOST_WITHDRAW = ("if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) "
+                 "{ (void) retire_expert_entry_at_locked(host_key, &released[r++]); }")
 RESTORE_CALL = ("restore_expert_entry_at_locked(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, "
                 "GGML_LAYOUT_AOS), released_mirrors[i]);")
 REGISTRATION_REFUSED = 'out.reason = "host registration failed";'
@@ -232,7 +236,7 @@ def claim_failed_registration_restores(cache: str) -> bool:
 LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
 COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
              '{ out.reason = "plan not coherent"; return false; }')
-HOST_BUSY = ("if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) "
+HOST_BUSY = ("if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) "
              '{ refusal = "host entry busy"; break; }')
 REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
 
@@ -241,6 +245,30 @@ def claim_registration_checked_before_the_copies(cache: str) -> bool:
     b = body(norm(cache), LOAN_SIG)
     return (all(b.count(x) == 1 for x in (LOAD_EFFECT, COHERENCE, HOST_BUSY, REFUSE_EARLY))
             and ordered(b, LOAD_EFFECT, COHERENCE, HOST_BUSY, REFUSE_EARLY, COPY))
+
+
+# --- an existing host entry is never replaced (c-mwmr-3) ------------------------------------------------------------
+
+OWNED_SIG = "bool unified_cache::register_host_expert_owned("
+REG_BODY_SIG = "const mem_handle & typed_owner, const sycl::event * ready_event, bool replace_existing)"
+NO_REPLACE = "if (old != entries_.end()) { if (!replace_existing) { return false; }"
+REPLACE = "erase_entry_locked(old);"
+FORWARD = "ready_event, replace_existing);"
+STOP_FROM_RECORD = "stop = record.reason;"
+REFUSE_STOP = "return refuse(ggml_sycl_txn_result::REFUSED, stop);"
+
+
+def claim_existing_host_entry_never_replaced(cache: str, sycl: str) -> bool:
+    c = norm(cache)
+    loan = body(c, LOAN_SIG)
+    reg = body(c, REG_BODY_SIG)
+    owned = body(c, OWNED_SIG)
+    txn = body(norm(sycl), TXN_SIG)
+    return (loan.count(HOST_BUSY) == 1 and loan.count(REGISTER) == 1 and ordered(loan, HOST_BUSY, COPY, REGISTER)
+            and reg.count(NO_REPLACE) == 1 and ordered(reg, NO_REPLACE, REPLACE)
+            and owned.count(FORWARD) == 2
+            and txn.count(STOP_FROM_RECORD) == 1 and txn.count(REFUSE_STOP) == 1
+            and ordered(txn, LEND, STOP_FROM_RECORD, REFUSE_STOP))
 
 
 # --- the graph compute mutex ----------------------------------------------------------------------------------------
@@ -419,6 +447,10 @@ def test_registration_checked_before_the_copies():
     assert claim_registration_checked_before_the_copies(CACHE)
 
 
+def test_existing_host_entry_never_replaced():
+    assert claim_existing_host_entry_never_replaced(CACHE, SYCL)
+
+
 def test_graph_mutex_untouched():
     assert claim_graph_mutex_untouched(CACHE, SYCL)
 
@@ -469,6 +501,7 @@ def test_comment_cannot_satisfy_a_claim():
 
 def _once(text: str, old: str, new: str) -> str:
     """`text` with the one occurrence of `old` (matched on normalized text) replaced by `new`."""
+    assert new != old, f"a mutant must change its anchor: {old!r}"
     n = norm(text)
     assert n.count(old) == 1, f"mutant anchor must match exactly once: {old!r} x{n.count(old)}"
     return n.replace(old, new, 1)
@@ -477,6 +510,7 @@ def _once(text: str, old: str, new: str) -> str:
 def _once_in(text: str, signature: str, old: str, new: str) -> str:
     """`text`, normalized, with the one occurrence of `old` inside the body of `signature` replaced by `new`: for an
     anchor that also occurs elsewhere in the file."""
+    assert new != old, f"a mutant must change its anchor: {old!r}"
     n = norm(text)
     b = body(n, signature)
     assert b and n.count(b) == 1, f"body of {signature!r} must be present and unique"
@@ -559,7 +593,8 @@ def test_mutant_copy_not_behind_the_fill_fails():
 def test_mutant_host_copy_published_ready_fails():
     """The host entry published READY while its copy is still in flight: a reader could see stale bytes."""
     assert not claim_device_free_gated_on_the_copy(
-        _once(CACHE, REGISTER, REGISTER.replace(", m.host_owner, &out.copy_events[i])", ", m.host_owner)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace(", m.host_owner, &out.copy_events[i], false)",
+                                                ", m.host_owner, nullptr, false)")), SYCL)
 
 
 def test_mutant_loan_uses_the_id_wide_retire_fails():
@@ -599,6 +634,42 @@ def test_mutant_coherence_unchecked_fails():
 
 def test_mutant_busy_host_entry_unchecked_fails():
     assert not claim_registration_checked_before_the_copies(_once(CACHE, HOST_BUSY, ""))
+
+
+def test_mutant_idle_host_entry_let_through_fails():
+    """c-mwmr-3: refusing only a retired or leased host entry lets an idle one through to be replaced, storage and
+    all, by a registration the loan could not undo."""
+    busy_only = ("if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) "
+                 '{ refusal = "host entry busy"; break; }')
+    assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_BUSY, busy_only), SYCL)
+
+
+def test_mutant_loan_registration_may_replace_fails():
+    assert not claim_existing_host_entry_never_replaced(
+        _once(CACHE, REGISTER, REGISTER.replace("&out.copy_events[i], false)", "&out.copy_events[i], true)")), SYCL)
+
+
+def test_mutant_registration_ignores_replace_existing_fails():
+    assert not claim_existing_host_entry_never_replaced(
+        _once(CACHE, NO_REPLACE, "if (old != entries_.end()) {"), SYCL)
+
+
+def test_mutant_typed_registration_drops_replace_existing_fails():
+    owned = body(norm(CACHE), OWNED_SIG)
+    dropped = owned.replace(FORWARD, "ready_event);")
+    assert not claim_existing_host_entry_never_replaced(norm(CACHE).replace(owned, dropped, 1), SYCL)
+
+
+def test_mutant_refusal_reason_never_reaches_the_warn_fails():
+    """A loan refusal whose reason is not the record's: the WARN would not name "host entry busy"."""
+    assert not claim_existing_host_entry_never_replaced(
+        CACHE, _once(SYCL, STOP_FROM_RECORD, 'stop = "loan refused";'))
+
+
+def test_mutant_rollback_withdraws_another_entry_fails():
+    """The rollback withdrawing whatever entry sits under the host id, not only the one this loan registered."""
+    assert not claim_failed_registration_restores(
+        _once(CACHE, HOST_WITHDRAW, "{ (void) retire_expert_entry_at_locked(host_key, &released[r++]); }"))
 
 
 def test_mutant_transaction_takes_the_graph_mutex_fails():

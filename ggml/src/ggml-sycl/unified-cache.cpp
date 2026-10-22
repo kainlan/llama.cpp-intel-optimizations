@@ -10121,10 +10121,11 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
                 refusal = "host storage too small";
                 break;
             }
-            // The registration replaces a host id's existing entry only while nothing holds it.
+            // c-mwmr-3: a host id that already has an entry, idle or not, refuses the triplet. Replacing it would free
+            // its storage with it, and a loan that then failed could not put it back. The registration below refuses
+            // the same, so an entry that appears after this check fails the loan whole instead of being replaced.
             for (const ggml_sycl_cache_id & host_key : members[i].host_keys) {
-                const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 });
-                if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) {
+                if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) {
                     refusal = "host entry busy";
                     break;
                 }
@@ -10210,7 +10211,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         for (size_t k = 0; k < m.host_keys.size(); ++k) {
             if (!host_ptr || !register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
                                                          k == 0 ? &out.host_handles[i] : nullptr, m.host_owner,
-                                                         &out.copy_events[i])) {
+                                                         &out.copy_events[i], /*replace_existing=*/false)) {
                 failed = true;
                 break;
             }
@@ -10218,9 +10219,12 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         }
     }
     if (failed) {
-        // What the checks above could not foresee (an allocation failed): withdraw the host copies already published
-        // and put each device entry back as it was, so a refused loan leaves the cache as it found it. The held
-        // leases kept every withdrawn entry in place, and the copies stay retained until they complete.
+        // What the checks above could not foresee (an allocation failed, or an entry appeared under a host id since
+        // they ran, which the registration refuses rather than replaces): withdraw the host copies already published
+        // and put each device entry back as it was, so a refused loan leaves the cache as it found it. A host copy is
+        // withdrawn only while its entry is still the one this loan registered, so another registrant's entry under
+        // the id is never touched. The held leases kept every withdrawn entry in place, and the copies stay retained
+        // until they complete.
         std::vector<weight_entry> released(static_cast<size_t>(registered[0] + registered[1] + registered[2]));
         {
             std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
@@ -10228,9 +10232,13 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
             std::lock(direct_lock, cache_lock);
             size_t r = 0;
             for (int i = 0; i < 3; ++i) {
+                const uint64_t host_control = members[i].host_owner.owner_control_id();
                 for (int k = 0; k < registered[i]; ++k) {
-                    (void) retire_expert_entry_at_locked(
-                        { cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 }, &released[r++]);
+                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 };
+                    const auto              host = entries_.find(host_key);
+                    if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) {
+                        (void) retire_expert_entry_at_locked(host_key, &released[r++]);
+                    }
                 }
                 restore_expert_entry_at_locked(
                     make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS),
@@ -10664,15 +10672,17 @@ bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id  key,
                                                ggml_layout_mode    layout,
                                                mem_handle *        out_handle,
                                                const mem_handle &  allocation_owner,
-                                               const sycl::event * ready_event) {
+                                               const sycl::event * ready_event,
+                                               bool                replace_existing) {
     if (!allocation_owner.valid()) {
-        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event);
+        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event,
+                                    replace_existing);
     }
     // The storage owner is a copy of the typed owner, aliased to ptr as the
     // legacy owner wrapper was, so the entry releases exactly as before.
     auto storage_owner = std::make_shared<mem_handle>(allocation_owner);
     return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>(storage_owner, ptr),
-                                allocation_owner, ready_event);
+                                allocation_owner, ready_event, replace_existing);
 }
 
 bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
@@ -10682,7 +10692,8 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                                          mem_handle *          out_handle,
                                          std::shared_ptr<void> allocation_owner,
                                          const mem_handle &    typed_owner,
-                                         const sycl::event *   ready_event) {
+                                         const sycl::event *   ready_event,
+                                         bool                  replace_existing) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -10721,6 +10732,10 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         unified_cache_entry cache_entry{};
         auto                old = entries_.find(cache_key);
         if (old != entries_.end()) {
+            // A caller that must be able to undo this registration leaves an existing entry alone (c-mwmr-3).
+            if (!replace_existing) {
+                return false;
+            }
             if (old->second.device_ptr == ptr && old->second.size == size && old->second.layout == layout &&
                 !old->second.retired) {
                 if (old->second.owner_device != dev) {

@@ -560,6 +560,7 @@ struct test_moe_mmid_route_reachable_override_guard {
 // arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
 std::string test_expert_loan_lends_two_triplets();
 std::string test_expert_loan_probe_changes_nothing();
+std::string test_expert_loan_refuses_replacing_a_host_entry();
 std::string test_expert_loan_refuses_shared_storage();
 #endif
 
