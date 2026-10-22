@@ -3628,8 +3628,8 @@ class unified_cache {
     // exactly: an AOS entry (c-n4gw) on the device, not retired, whose direct_alloc_owner is its whole allocation and
     // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. What
     // the host registration would refuse for is checked too, and a host id that already has an entry, idle or not,
-    // refuses the triplet as "host entry busy": the registration never replaces one, since a failed loan could not put
-    // a replaced entry back (c-mwmr-3). One member that fails refuses the triplet with a reason and leaves no state
+    // refuses the triplet as "host entry exists": the registration never replaces one, since a failed loan could not
+    // put a replaced entry back (c-mwmr-3). One member that fails refuses the triplet with a reason and leaves no state
     // behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
     // owners until it completes; each device entry's last write becomes its copy, so its storage is freed behind the
     // copy; each device entry is retired exactly; then each host copy is registered with register_host_expert_owned

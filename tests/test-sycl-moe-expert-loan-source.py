@@ -21,9 +21,9 @@ host storage owner-first, and under the inventory mutex has the cache lend each 
     its mirror restored) after withdrawing the host copies already published, only while each is still the entry the
     loan registered, and what the registration checks itself (the load effect, the plan coherence, an existing host
     entry) is checked before anything is copied;
-  - an existing host entry is never replaced (c-mwmr-3): any entry under a host id refuses the triplet as "host entry
-    busy", the registration is asked not to replace one and refuses when it would, and the refusal reason reaches
-    the transaction's refusal WARN;
+  - an existing host entry is never replaced (c-mwmr-3): any entry under a host id, idle or not, refuses the triplet
+    as "host entry exists", the registration is asked not to replace one and refuses when it would, and the refusal
+    reason reaches the transaction's refusal WARN;
   - g_sycl_graph_compute_mutex is never named in the loan code;
   - lock order: the host storage is minted before g_tensor_inventory_mutex is taken, and the cache is asked to lend
     under it; the cache takes direct_stage_mutex_ and rw_mutex_ together, with std::lock;
@@ -236,15 +236,15 @@ def claim_failed_registration_restores(cache: str) -> bool:
 LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
 COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
              '{ out.reason = "plan not coherent"; return false; }')
-HOST_BUSY = ("if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) "
-             '{ refusal = "host entry busy"; break; }')
+HOST_EXISTS = ("if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) "
+               '{ refusal = "host entry exists"; break; }')
 REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
 
 
 def claim_registration_checked_before_the_copies(cache: str) -> bool:
     b = body(norm(cache), LOAN_SIG)
-    return (all(b.count(x) == 1 for x in (LOAD_EFFECT, COHERENCE, HOST_BUSY, REFUSE_EARLY))
-            and ordered(b, LOAD_EFFECT, COHERENCE, HOST_BUSY, REFUSE_EARLY, COPY))
+    return (all(b.count(x) == 1 for x in (LOAD_EFFECT, COHERENCE, HOST_EXISTS, REFUSE_EARLY))
+            and ordered(b, LOAD_EFFECT, COHERENCE, HOST_EXISTS, REFUSE_EARLY, COPY))
 
 
 # --- an existing host entry is never replaced (c-mwmr-3) ------------------------------------------------------------
@@ -264,7 +264,7 @@ def claim_existing_host_entry_never_replaced(cache: str, sycl: str) -> bool:
     reg = body(c, REG_BODY_SIG)
     owned = body(c, OWNED_SIG)
     txn = body(norm(sycl), TXN_SIG)
-    return (loan.count(HOST_BUSY) == 1 and loan.count(REGISTER) == 1 and ordered(loan, HOST_BUSY, COPY, REGISTER)
+    return (loan.count(HOST_EXISTS) == 1 and loan.count(REGISTER) == 1 and ordered(loan, HOST_EXISTS, COPY, REGISTER)
             and reg.count(NO_REPLACE) == 1 and ordered(reg, NO_REPLACE, REPLACE)
             and owned.count(FORWARD) == 2
             and txn.count(STOP_FROM_RECORD) == 1 and txn.count(REFUSE_STOP) == 1
@@ -632,16 +632,16 @@ def test_mutant_coherence_unchecked_fails():
     assert not claim_registration_checked_before_the_copies(_once(CACHE, COHERENCE, ""))
 
 
-def test_mutant_busy_host_entry_unchecked_fails():
-    assert not claim_registration_checked_before_the_copies(_once(CACHE, HOST_BUSY, ""))
+def test_mutant_existing_host_entry_unchecked_fails():
+    assert not claim_registration_checked_before_the_copies(_once(CACHE, HOST_EXISTS, ""))
 
 
 def test_mutant_idle_host_entry_let_through_fails():
     """c-mwmr-3: refusing only a retired or leased host entry lets an idle one through to be replaced, storage and
     all, by a registration the loan could not undo."""
     busy_only = ("if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) "
-                 '{ refusal = "host entry busy"; break; }')
-    assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_BUSY, busy_only), SYCL)
+                 '{ refusal = "host entry exists"; break; }')
+    assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, busy_only), SYCL)
 
 
 def test_mutant_loan_registration_may_replace_fails():
@@ -661,7 +661,7 @@ def test_mutant_typed_registration_drops_replace_existing_fails():
 
 
 def test_mutant_refusal_reason_never_reaches_the_warn_fails():
-    """A loan refusal whose reason is not the record's: the WARN would not name "host entry busy"."""
+    """A loan refusal whose reason is not the record's: the WARN would not name "host entry exists"."""
     assert not claim_existing_host_entry_never_replaced(
         CACHE, _once(SYCL, STOP_FROM_RECORD, 'stop = "loan refused";'))
 

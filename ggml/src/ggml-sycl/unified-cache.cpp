@@ -10126,7 +10126,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
             // the same, so an entry that appears after this check fails the loan whole instead of being replaced.
             for (const ggml_sycl_cache_id & host_key : members[i].host_keys) {
                 if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) {
-                    refusal = "host entry busy";
+                    refusal = "host entry exists";
                     break;
                 }
             }

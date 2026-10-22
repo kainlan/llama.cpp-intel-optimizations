@@ -20724,7 +20724,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // moe_expert_loan_select() picks whole (gate, up, down) triplets from the published plan; the cache copies each to
 // pinned host storage and withdraws the device copy (unified_cache::loan_expert_triplet); the plan flips those entries
 // to the host and is published once, so each lent expert executes where it now lives. File-static. Today its one
-// caller is the boundary runner ggml_backend_sycl_synchronize() calls, which finds no request until a requester lands.
+// production caller is the boundary runner ggml_backend_sycl_synchronize() calls, which finds no request until a
+// requester lands.
 // Once plan Task 12 lands, the auto-ubatch fit term will call it in probe mode (ggml_sycl_run_expert_loan_transaction),
 // and the ring's admission in mul_mat_id (the ring phase, Task 7b) will call only ggml_sycl_request_expert_loan().
 //
@@ -21571,8 +21572,8 @@ std::string test_expert_loan_refuses_replacing_a_host_entry() {
     const ::ggml_sycl_txn_result           code =
         ::ggml_sycl_expert_loan_transaction_run(fx.device, 3 * charge, /*probe_mode=*/false, &resolver, &result);
     if (code != ::ggml_sycl_txn_result::REFUSED || result.accepted || result.n_triplets != 0 ||
-        result.bytes_freed != 0 || std::strcmp(result.reason, "host entry busy") != 0) {
-        return test_loan_fail("the loan answered code=%d accepted=%d triplets=%u (%s), not a host-entry-busy refusal",
+        result.bytes_freed != 0 || std::strcmp(result.reason, "host entry exists") != 0) {
+        return test_loan_fail("the loan answered code=%d accepted=%d triplets=%u (%s), not a host-entry-exists refusal",
                               (int) code, (int) result.accepted, result.n_triplets, result.reason);
     }
     if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {

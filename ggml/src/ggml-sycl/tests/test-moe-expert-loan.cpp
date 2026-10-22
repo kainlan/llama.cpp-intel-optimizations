@@ -16,8 +16,8 @@
 //                           Then the same plan probed: the selection is reported and nothing is copied or published.
 //   refuses_replacing_a_host_entry
 //                           c-mwmr-3: a host entry planted under the selected expert's host id, checked live and idle
-//                           (no lease, not retired) before the loan, is refused with "host entry busy"; nothing is
-//                           copied or published and the planted entry keeps its storage.
+//                           (no lease, not retired) before the loan, is refused with "host entry exists"; nothing
+//                           is copied or published and the planted entry keeps its storage.
 //   refuses_shared_storage  c-sepd: a bulk-staged pair with expert 1 flipped to the host is refused with "shared
 //                           storage"; nothing is copied or published.
 //
