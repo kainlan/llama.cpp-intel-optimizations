@@ -28723,6 +28723,13 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
 // chunks go out with mem_copy_async and that one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy
 // per chunk would time the submit-and-wait latency of each chunk and read low.
 //
+// The rate persisted is the max over iterations 2..8, each timed on its own (llama.cpp-xr4i, c-vbf4): one block timed
+// as a mean let a link that had not ramped inside the first window freeze 9.x GB/s into the tuning cache on three of
+// ten probes, on both cards, against 24-26 on the rest. Iteration 1 is a second warm-up; the device's sustained copy
+// capacity is what the ring's cost needs, and one slow window does not change it. The probed WARN line carries the
+// min-max of those iterations so bimodality shows in any log. A max under half the seed is RETRY_NO_RATE, not a rate
+// (moe_exec_h2d_rate_from_iterations, moe-exec-cost.hpp).
+//
 // The rate is only the link's if the copy is a direct DMA. mem_copy_submit takes its direct branch from a host source
 // only when the source's owner is a zone-managed host-pinned allocation of role WEIGHT, STAGING or EXPERT_STAGING
 // (host_endpoint_owner_in_scope), so the source is allocated the way the prefill ring's own copy sources are
@@ -28762,7 +28769,8 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
 
     // A resolved outcome is kept for the process (the once-guard). A RETRY outcome leaves the rate at 0 and logs its
     // reason once per device, so the silent retry at every later load does not repeat the line.
-    auto report = [&info](int dev, double gbps, h2d_probe_outcome outcome, const char * source) {
+    auto report = [&info](int dev, double gbps, h2d_probe_outcome outcome, const char * source,
+                          const double * spread = nullptr) {
         auto & d = info.devices[dev];
         if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {
             const uint32_t bit = 1u << outcome;
@@ -28773,6 +28781,13 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
         } else {
             d.h2d_pinned_gbps = gbps;
             d.h2d_probed      = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;
+        }
+        // The probed outcome alone passes the min and max of the iterations behind its rate, so a bimodal link shows in
+        // any log ("probed; iterations 24.1-26.2"); every other outcome keeps its exact source word.
+        char word[96];
+        if (spread != nullptr) {
+            std::snprintf(word, sizeof(word), "%s; iterations %.1f-%.1f", source, spread[0], spread[1]);
+            source = word;
         }
         GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\n", dev, gbps, source);
     };
@@ -28819,21 +28834,34 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             ggml_sycl::mem_copy(dst, src, k_bytes, *q);  // untimed: first-use costs stay out of the rate
             const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
 
-            const auto t0 = std::chrono::steady_clock::now();
+            double iter_gbps[k_iters];
             for (int it = 0; it < k_iters; ++it) {
+                const auto t0 = std::chrono::steady_clock::now();
                 for (size_t off = 0; off < k_bytes; off += k_chunk) {
                     ggml_sycl::mem_copy_async(dst, off, src, off, k_chunk, *q);
                 }
                 q->wait();
+                const double us =
+                    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                iter_gbps[it] = us > 0.0 ? static_cast<double>(k_bytes) / us / 1e3 : 0.0;
             }
-            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-            const double gbps = us > 0.0 ? static_cast<double>(k_bytes) * k_iters / us / 1e3 : 0.0;
             if (ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d != staged_before) {
                 report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_STAGED, "seed, probe copy was staged");
                 continue;
             }
+            double       lo = 0.0;
+            double       hi = 0.0;
+            const double gbps =
+                ggml_sycl::moe_exec_h2d_rate_from_iterations(iter_gbps, k_iters, seed.h2d_gbps, &lo, &hi);
             if (!(gbps > 0.0) || !std::isfinite(gbps)) {
-                report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_NO_RATE, "seed, probe measured no rate");
+                // No iteration timed, or the best of 2..8 is under half the seed (moe-exec-cost.hpp: a link that is
+                // not delivering the slow end of what the 7fmt table measured). The seed stands and the next load
+                // probes again, rather than the cache freezing that reading as the device's rate.
+                char why[96];
+                std::snprintf(
+                    why, sizeof(why),
+                    hi > 0.0 ? "seed, probe max %.1f GB/s is under half the seed" : "seed, probe measured no rate", hi);
+                report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_NO_RATE, why);
                 continue;
             }
             rec.h2d_gbps = gbps;
@@ -28842,8 +28870,9 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             }
             // A refused store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the rate
             // resolved for this process, but the line must not claim it persisted.
-            const bool stored = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);
-            report(dev, gbps, H2D_PROBE_OUTCOME_MEASURED, stored ? "probed" : "probed, not stored");
+            const bool   stored    = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);
+            const double spread[2] = { lo, hi };
+            report(dev, gbps, H2D_PROBE_OUTCOME_MEASURED, stored ? "probed" : "probed, not stored", spread);
         } catch (const ggml_sycl_fallback_error &) {
             // The alloc-zone contract's sanctioned form (clause g): ggml_sycl_fallback_error derives from
             // std::exception, so it is caught first and rethrown; nothing the probe calls throws it.

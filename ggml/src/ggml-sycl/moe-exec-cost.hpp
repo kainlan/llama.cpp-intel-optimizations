@@ -200,6 +200,60 @@ static inline moe_exec_rates moe_exec_rates_seed(const std::vector<std::pair<ggm
     return r;
 }
 
+// llama.cpp-xr4i (c-vbf4, the bimodal readings): the H2D probe times each of its iterations and persists the best
+// iteration after the first, not the mean. Ten probed readings of one driver key came out 25.8, 23.4, 9.3, 9.8, 9.6,
+// 25.3, 24.0, 26.0, 26.2, 25.2 GB/s on two cards that idle at PCIe 2.5 GT/s x1; a mean over one block let a link that
+// had not ramped inside the first window freeze 9.x into the tuning cache as the device's rate. The cost model needs
+// the device's sustained copy capacity, which one slow window does not change, so the rate is the max of iterations
+// 2..n (iteration 1 is a second warm-up) and the spread is returned for the log.
+//
+// A max still under this fraction of the seed is not a rate: the seed is the 7fmt table's measured rate on this
+// hardware, so half of it is a link that is not delivering even the slow end of what it measured, and persisting that
+// would bias every ring-vs-cpu decision for the life of the cache entry. The probe retries at the next load instead.
+static constexpr double MOE_EXEC_H2D_MIN_SEED_FRACTION = 0.5;
+
+// gbps[0..n) are the per-iteration rates in GB/s, in order. Returns the rate, or 0 when there is none: fewer than two
+// iterations, no positive finite one among 2..n, or a max under MOE_EXEC_H2D_MIN_SEED_FRACTION of the seed. lo and hi
+// (each optional) receive the min and max over the positive finite iterations of 2..n, 0 when there are none, whether
+// or not the rate is returned, so a rejected window still shows its spread.
+static inline double moe_exec_h2d_rate_from_iterations(const double * gbps,
+                                                       int            n,
+                                                       double         seed,
+                                                       double *       lo,
+                                                       double *       hi) {
+    double best = 0.0;
+    double low  = 0.0;
+    bool   any  = false;
+    for (int i = 1; i < n; ++i) {
+        const double g = gbps[i];
+        if (!(g > 0.0) || !std::isfinite(g)) {
+            continue;
+        }
+        if (!any) {
+            best = g;
+            low  = g;
+            any  = true;
+        } else {
+            if (g > best) {
+                best = g;
+            }
+            if (g < low) {
+                low = g;
+            }
+        }
+    }
+    if (lo != nullptr) {
+        *lo = low;
+    }
+    if (hi != nullptr) {
+        *hi = best;
+    }
+    if (!any || !(best >= seed * MOE_EXEC_H2D_MIN_SEED_FRACTION)) {
+        return 0.0;
+    }
+    return best;
+}
+
 // Env overrides for the four rates that have one. getenv_fn is injected so a test needs no real environment.
 static inline void moe_exec_rates_apply_env(moe_exec_rates & r, moe_exec_getenv_fn getenv_fn) {
     r.h2d_gbps     = moe_exec_env_param(getenv_fn, "GGML_SYCL_MOE_EXEC_H2D_GBPS", r.h2d_gbps);
