@@ -10393,12 +10393,12 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
     return register_host_expert(key, ptr, size, layout, out_handle, std::move(allocation_owner), mem_handle{});
 }
 
-bool unified_cache::register_host_expert(ggml_sycl_cache_id key,
-                                         void *             ptr,
-                                         size_t             size,
-                                         ggml_layout_mode   layout,
-                                         mem_handle *       out_handle,
-                                         const mem_handle & allocation_owner) {
+bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id key,
+                                               void *             ptr,
+                                               size_t             size,
+                                               ggml_layout_mode   layout,
+                                               mem_handle *       out_handle,
+                                               const mem_handle & allocation_owner) {
     if (!allocation_owner.valid()) {
         return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{});
     }

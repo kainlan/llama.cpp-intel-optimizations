@@ -44,7 +44,7 @@ HELPER_SIG = "static bool host_endpoint_is_usm_accessible(const mem_handle & h, 
 WEIGHT_CLAUSE = "owner.tier == alloc_tier::HOST_PINNED && owner.role == alloc_role::WEIGHT"
 SCOPE_REFUSAL = ("if (owner.tier != alloc_tier::HOST_PINNED || owner.host_zone == host_zone_id::COUNT || "
                  "owner.device < 0) { return false; }")
-# Verbatim from master b39bc4e55, including its line break and indentation.
+# Verbatim from master, including its line break and indentation.
 RECORDING_EXCLUSION = (
     "    if (!ggml_sycl_graph_recording_active() && h.owner_metadata(&owner) && host_endpoint_owner_in_scope(owner) &&\n"
     "        queues_share_context(copy_queue, queue_for_device_or_fallback(owner.device, copy_queue))) {\n"
@@ -52,6 +52,14 @@ RECORDING_EXCLUSION = (
     "    }\n"
 )
 REASON_TAG = "llama.cpp-36j0"
+# Every admission in host_endpoint_owner_in_scope, in order: the runtime stages, the expert path and the one WEIGHT
+# conjunction. Nothing else may be admitted after the early refusal.
+SCOPE_ADMITS = [
+    "owner.role == alloc_role::STAGING",
+    "owner.role == alloc_role::EXPERT_STAGING",
+    "owner.category == runtime_category::EXPERT_CACHE",
+    f"({WEIGHT_CLAUSE})",
+]
 
 
 def strip_comments(src: str) -> str:
@@ -129,15 +137,21 @@ def claim_weight_never_admitted_alone(src: str) -> bool:
     return "HOST_MMAP" not in b and "MMAP_TRACKED" not in b
 
 
+def claim_no_extra_admission(src: str) -> bool:
+    """The admitted set is exactly SCOPE_ADMITS: no `|| true`, no further term."""
+    return admissions(src) == SCOPE_ADMITS
+
+
 def claim_refusal_unchanged(src: str) -> bool:
     b = body(src, SCOPE_SIG)
     return b is not None and b.startswith(SCOPE_REFUSAL)
 
 
 def claim_recording_exclusion_unchanged(src: str) -> bool:
-    """The helper's owner branch is byte-identical to master's, recording guard first."""
-    at = src.find(HELPER_SIG)
-    return at >= 0 and src.count(RECORDING_EXCLUSION) == 1 and src.find(RECORDING_EXCLUSION) > at
+    """The helper's owner branch, comments blanked, is byte-identical to master's, recording guard first."""
+    code = strip_comments(src)
+    at = code.find(HELPER_SIG)
+    return at >= 0 and code.count(RECORDING_EXCLUSION) == 1 and code.find(RECORDING_EXCLUSION) > at
 
 
 def claim_comment_states_the_reason(src: str) -> bool:
@@ -156,6 +170,10 @@ def test_weight_owner_admitted():
 
 def test_weight_never_admitted_alone():
     assert claim_weight_never_admitted_alone(MEMOPS)
+
+
+def test_no_extra_admission():
+    assert claim_no_extra_admission(MEMOPS)
 
 
 def test_refusal_unchanged():
@@ -188,6 +206,16 @@ def test_mutant_mmap_tier_fails():
     assert not claim_weight_never_admitted_alone(mutated)
 
 
+def test_mutant_admit_everything_fails():
+    mutated = _once(f"({WEIGHT_CLAUSE});", f"({WEIGHT_CLAUSE}) || true;")
+    assert not claim_no_extra_admission(mutated)
+
+
+def test_mutant_extra_term_fails():
+    mutated = _once(f"({WEIGHT_CLAUSE});", f"({WEIGHT_CLAUSE}) ||\n           owner.role == alloc_role::KV;")
+    assert not claim_no_extra_admission(mutated)
+
+
 def test_mutant_refusal_loosened_fails():
     mutated = _once(" || owner.host_zone == host_zone_id::COUNT", "")
     assert not claim_refusal_unchanged(mutated)
@@ -195,6 +223,12 @@ def test_mutant_refusal_loosened_fails():
 
 def test_mutant_recording_guard_dropped_fails():
     mutated = _once("if (!ggml_sycl_graph_recording_active() && h.owner_metadata(&owner)", "if (h.owner_metadata(&owner)")
+    assert not claim_recording_exclusion_unchanged(mutated)
+
+
+def test_mutant_recording_branch_commented_out_fails():
+    mutated = _once(RECORDING_EXCLUSION, "/*\n" + RECORDING_EXCLUSION + "*/\n")
+    assert claim_recording_exclusion_unchanged(MEMOPS)
     assert not claim_recording_exclusion_unchanged(mutated)
 
 

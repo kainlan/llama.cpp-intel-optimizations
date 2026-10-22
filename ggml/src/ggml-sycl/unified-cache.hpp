@@ -3648,7 +3648,7 @@ class unified_cache {
                               size_t             size,
                               ggml_layout_mode   layout,
                               mem_handle *       out_handle = nullptr) {
-        return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>{});
+        return register_host_expert(key, ptr, size, layout, out_handle, {});
     }
 
     // Same, for host storage minted owner-first (unified_allocate_owner).  The
@@ -3658,12 +3658,12 @@ class unified_cache {
     // evidence (llama.cpp-36j0).  It also retains allocation_owner as the
     // entry's storage owner, so release is unchanged.  An invalid
     // allocation_owner registers ptr as unowned external storage.
-    bool register_host_expert(ggml_sycl_cache_id key,
-                              void *             ptr,
-                              size_t             size,
-                              ggml_layout_mode   layout,
-                              mem_handle *       out_handle,
-                              const mem_handle & allocation_owner);
+    bool register_host_expert_owned(ggml_sycl_cache_id key,
+                                    void *             ptr,
+                                    size_t             size,
+                                    ggml_layout_mode   layout,
+                                    mem_handle *       out_handle,
+                                    const mem_handle & allocation_owner);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -6222,9 +6222,9 @@ class unified_cache {
                                          const char *                 caller,
                                          const placement_cache_read * retained_read = nullptr) const;
 
-    // The body of both public register_host_expert() overloads: storage_owner
-    // keeps the storage alive, typed_owner (when valid) becomes the entry's
-    // direct_alloc_owner.
+    // The body of register_host_expert() and register_host_expert_owned():
+    // storage_owner keeps the storage alive, typed_owner (when valid) becomes
+    // the entry's direct_alloc_owner.
     bool register_host_expert(ggml_sycl_cache_id    key,
                               void *                ptr,
                               size_t                size,

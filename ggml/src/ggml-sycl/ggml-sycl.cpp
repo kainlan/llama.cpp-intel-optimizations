@@ -29204,8 +29204,8 @@ void ggml_backend_sycl_print_sycl_devices() {
     print_device_opt_feature(device_count);
 }
 
-// The MoE executor's knobs (llama.cpp-36j0 Task 4), parsed once. This is the only reader of GGML_SYCL_MOE_EXEC and
-// GGML_SYCL_MOE_EXEC_TRACE: the trace level (2 runs the Task 5 load-time copy probe) comes from here too.
+// The MoE executor's knobs (llama.cpp-36j0), parsed once. This is the only reader of GGML_SYCL_MOE_EXEC and
+// GGML_SYCL_MOE_EXEC_TRACE: the trace level (2 runs the load-time host-expert copy probe) comes from here too.
 static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {
     static const ggml_sycl::moe_exec_config config = [] {
         ggml_sycl::moe_exec_config c =
@@ -37230,7 +37230,8 @@ struct ggml_sycl_scoped_alloc_rollback {
     void release() noexcept { transferred = true; }
 };
 
-// llama.cpp-36j0 Task 5 spike, opt-in: once per device at load, after S1-PRELOAD registered its host-planned
+// llama.cpp-36j0, opt-in: the prefill expert ring is only worth building if a copy from a host-planned expert's
+// handle is a direct DMA, so this measures it. Once per device at load, after S1-PRELOAD registered its host-planned
 // experts, copy one expert's registered handle into a device RUNTIME buffer until at least 64 MiB have moved, and
 // log the rate and whether the copies took mem_copy_submit's direct or staged branch. It is diagnostic only and
 // waits on the loading thread, which no production copy may do. The branch comes from this thread's staged-copy
@@ -37276,6 +37277,7 @@ static void ggml_sycl_moe_exec_copy_probe(int                           device,
         GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d: %.1f GB/s over %zu MiB, %s\n", device,
                       sec > 0.0 ? (double) total / sec / 1e9 : 0.0, total / (1024 * 1024), kind);
     } catch (const ggml_sycl_fallback_error &) {
+        // Not a probe failure: preload's own handler owns the fallback decision, so the error must reach it.
         throw;
     } catch (const std::exception & e) {
         GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d failed: %s\n", device, e.what());
@@ -38140,8 +38142,8 @@ static void ggml_sycl_preload_model_weights() {
                         bool remembered_handle = false;
                         for (const ggml_sycl_cache_id & key : keys) {
                             ggml_sycl::mem_handle handle;
-                            if (!cache->register_host_expert(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle,
-                                                             host_owner) ||
+                            if (!cache->register_host_expert_owned(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle,
+                                                                   host_owner) ||
                                 !handle.resolve().ptr) {
                                 throw std::runtime_error("SYCL host expert registration failed during preload");
                             }

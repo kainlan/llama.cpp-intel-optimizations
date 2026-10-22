@@ -50,7 +50,8 @@ THE CONTRACT.  With comments blanked:
   O. (mem-handle.hpp, mem-handle.cpp) bool owner_metadata(alloc_metadata * out) const is declared; its definition
      takes the handle's lock first, answers false without an out pointer, copies the retained owner's metadata and
      answers true, else copies the lease's typed owner's metadata and answers true, else answers false; it reads no
-     pointer.
+     pointer.  mem_handle::leased_entry_alloc_owner, which fills the lease's typed owner, returns an empty owner unless
+     the entry's owner is alloc_tier::HOST_PINNED, so a device entry's lease retains nothing.
   S. (mem-ops.cpp host_endpoint_owner_in_scope) refuses unless the tier is HOST_PINNED, the host zone is set and the
      device is >= 0, and then admits exactly role STAGING, role EXPERT_STAGING, category EXPERT_CACHE and
      (tier HOST_PINNED and role WEIGHT); test-sycl-mem-ops-host-scope-source.py pins the last one's form.
@@ -112,6 +113,8 @@ FILES = (
 TAG = "(llama.cpp-qwn5)"
 
 OWNER_SIG = r"bool mem_handle::owner_metadata\(alloc_metadata \* out\) const\s*\{"
+LEASED_OWNER_SIG = r"shared_alloc_owner mem_handle::leased_entry_alloc_owner\(const unified_cache_entry \* entry\)\s*\{"
+LEASED_OWNER_TIER_GATE = "if (!owner || owner.metadata().tier != alloc_tier::HOST_PINNED) { return {}; }"
 SCOPE_SIG = r"static bool host_endpoint_owner_in_scope\(const alloc_metadata & owner\)\s*\{"
 HELPER_SIG = r"static bool host_endpoint_is_usm_accessible\(const mem_handle & h, const void \* ptr, sycl::queue & copy_queue\)\s*\{"
 REGISTRY_SIG = r"static bool host_ptr_is_usm_accessible\(const void \* ptr\)\s*\{"
@@ -311,6 +314,10 @@ def check_owner(s: dict) -> None:
     for probe in ("ggml_sycl_get_alloc_type", "get_pointer_type", "resolve(", "ptr_"):
         if probe in body:
             fail("O", f"owner_metadata reads the pointer ({probe!r}); its answer must come from the owner")
+    leased = flat_body(s["handle_cpp"], LEASED_OWNER_SIG, "O")
+    if LEASED_OWNER_TIER_GATE not in leased or not leased.endswith("return owner;"):
+        fail("O", "leased_entry_alloc_owner retains an entry's owner without first refusing one that is not "
+                  "alloc_tier::HOST_PINNED")
 
 
 def check_scope(s: dict) -> None:
@@ -626,6 +633,10 @@ def self_test(s: dict) -> int:
          sub(OWN + r"\n\s*if \(leased_alloc_owner_\) \{\n[^}]*\}", r"\1")),
         ("O", "handle_cpp", "lease owner read off the retained owner",
          sub(OWN + r"\*out = leased_alloc_owner_\.metadata\(\);", r"\1*out = owned_alloc_.metadata();")),
+        ("O", "handle_cpp", "lease snapshot not tier-gated",
+         sub(r" \|\| owner\.metadata\(\)\.tier != alloc_tier::HOST_PINNED", "")),
+        ("O", "handle_cpp", "lease snapshot gated on a device tier",
+         sub(r"owner\.metadata\(\)\.tier != alloc_tier::HOST_PINNED", "owner.metadata().tier != alloc_tier::DEVICE_VRAM")),
         ("O", "handle_cpp", "pointer probed",
          sub(OWN + r"(if \(owned_alloc_\) \{)",
              r"\1if (ggml_sycl_get_alloc_type(ptr_) == sycl::usm::alloc::unknown) {\n        return false;\n    }\n    \2")),

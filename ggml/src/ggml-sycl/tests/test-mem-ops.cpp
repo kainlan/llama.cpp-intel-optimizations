@@ -71,6 +71,61 @@ static std::string capture_site_census() {
     return text;
 }
 
+// A bytes-long device buffer in the RUNTIME zone of cq's device: the destination of both direct-copy cases.
+static ggml_sycl::mem_handle make_runtime_dst(sycl::queue & cq, int device, size_t bytes) {
+    ggml_sycl::alloc_request dev_req{};
+    dev_req.queue                                     = &cq;
+    dev_req.device                                    = device;
+    dev_req.size                                      = bytes;
+    dev_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+    dev_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
+    dev_req.intent.constraints.must_device            = true;
+    dev_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+    dev_req.intent.constraints.forbid_vram_zone_spill = true;
+    return ggml_sycl::unified_allocate(dev_req);
+}
+
+// The failures of a host->device copy that should have been direct, named `what`: the staged-copy census moved
+// between `before` and `after` (a staged copy, or any staged H2D wait), or dst does not read back the pattern
+// (i * mul + add) & 0xff the case wrote into the source.
+static int expect_direct_copy(const char *                                   what,
+                              const ggml_sycl::mem_copy_staged_wait_census & before,
+                              const ggml_sycl::mem_copy_staged_wait_census & after,
+                              const ggml_sycl::mem_handle &                  dst,
+                              size_t                                         bytes,
+                              sycl::queue &                                  cq,
+                              unsigned                                       mul,
+                              unsigned                                       add) {
+    int failed = 0;
+    if (after.staged_h2d != before.staged_h2d) {
+        std::fprintf(stderr, "FAIL: %s took the staged host->device branch (%llu staged copies)\n", what,
+                     (unsigned long long) (after.staged_h2d - before.staged_h2d));
+        failed++;
+    }
+    const int staged_kinds[] = { ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS,
+                                 ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK,
+                                 ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL };
+    for (int kind : staged_kinds) {
+        if (after.count[kind] != before.count[kind]) {
+            std::fprintf(stderr, "FAIL: %s recorded %llu staged wait(s) of kind %d\n", what,
+                         (unsigned long long) (after.count[kind] - before.count[kind]), kind);
+            failed++;
+        }
+    }
+    std::vector<uint8_t> out(bytes, 0);
+    ggml_sycl::mem_copy(ggml_sycl::mem_handle::from_direct(out.data(), GGML_LAYOUT_AOS, false,
+                                                           ggml_sycl::mem_handle::HOST_DEVICE, bytes),
+                        dst, bytes, cq);
+    for (size_t i = 0; i < bytes; ++i) {
+        if (out[i] != static_cast<uint8_t>((i * mul + add) & 0xffu)) {
+            std::fprintf(stderr, "FAIL: %s: byte %zu read back 0x%02x\n", what, i, out[i]);
+            failed++;
+            break;
+        }
+    }
+    return failed;
+}
+
 // llama.cpp-36j0: a pinned-pool host buffer with role WEIGHT, the shape S1-PRELOAD gives a host-planned expert
 // (register_host_aos_expert in ggml-sycl.cpp: role WEIGHT, no category), is a trusted USM copy endpoint, so its
 // host->device copy is one direct DMA. Taking the staged branch instead would count staged_h2d and wait the copy's
@@ -134,16 +189,7 @@ static int check_pinned_weight_copy_is_direct(sycl::queue & q) {
         host[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xffu);
     }
 
-    ggml_sycl::alloc_request dev_req{};
-    dev_req.queue                                     = &cq;
-    dev_req.device                                    = device;
-    dev_req.size                                      = bytes;
-    dev_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
-    dev_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
-    dev_req.intent.constraints.must_device            = true;
-    dev_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
-    dev_req.intent.constraints.forbid_vram_zone_spill = true;
-    ggml_sycl::mem_handle dst                         = ggml_sycl::unified_allocate(dev_req);
+    ggml_sycl::mem_handle dst = make_runtime_dst(cq, device, bytes);
     if (!dst.valid()) {
         std::fprintf(stderr,
                      "FAIL: pinned WEIGHT copy: the RUNTIME zone refused the %zu-byte device buffer "
@@ -159,22 +205,6 @@ static int check_pinned_weight_copy_is_direct(sycl::queue & q) {
     sycl::event h2d = ggml_sycl::mem_copy_async(dst, src, bytes, cq, { fill }, site_file, site_line, __func__);
     h2d.wait_and_throw();
     const ggml_sycl::mem_copy_staged_wait_census after = ggml_sycl::mem_copy_staged_wait_census_this_thread();
-
-    if (after.staged_h2d != before.staged_h2d) {
-        std::fprintf(stderr, "FAIL: pinned WEIGHT copy took the staged host->device branch (%llu staged copies)\n",
-                     (unsigned long long) (after.staged_h2d - before.staged_h2d));
-        failed++;
-    }
-    const int staged_kinds[] = { ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS,
-                                 ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK,
-                                 ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL };
-    for (int kind : staged_kinds) {
-        if (after.count[kind] != before.count[kind]) {
-            std::fprintf(stderr, "FAIL: pinned WEIGHT copy recorded %llu staged wait(s) of kind %d\n",
-                         (unsigned long long) (after.count[kind] - before.count[kind]), kind);
-            failed++;
-        }
-    }
 
     // Exactly one copy left this site, a host->device submission of all the bytes: one census row, one call.
     const std::string table = capture_site_census();
@@ -206,25 +236,15 @@ static int check_pinned_weight_copy_is_direct(sycl::queue & q) {
         }
     }
 
-    std::vector<uint8_t> out(bytes, 0);
-    ggml_sycl::mem_copy(ggml_sycl::mem_handle::from_direct(out.data(), GGML_LAYOUT_AOS, false,
-                                                           ggml_sycl::mem_handle::HOST_DEVICE, bytes),
-                        dst, bytes, cq);
-    for (size_t i = 0; i < bytes; ++i) {
-        if (out[i] != static_cast<uint8_t>((i * 31u + 7u) & 0xffu)) {
-            std::fprintf(stderr, "FAIL: pinned WEIGHT copy: byte %zu read back 0x%02x\n", i, out[i]);
-            failed++;
-            break;
-        }
-    }
+    failed += expect_direct_copy("pinned WEIGHT copy", before, after, dst, bytes, cq, 31u, 7u);
     return failed;
 }
 
 // llama.cpp-36j0: the positive control for the real copy source. S1-PRELOAD mints a host-planned expert's storage
 // owner-first (ggml_sycl_host_expert_alloc: role WEIGHT, pinned pool, no category) and registers it with
-// register_host_expert's typed overload. The lease that registration hands out must answer owner_metadata() with
-// that allocation's HOST_PINNED/WEIGHT provenance on its own, after the caller's owner handle is gone, and a copy
-// from the lease must be one direct DMA: no staged_h2d and no staged wait, with a dependency passed.
+// register_host_expert_owned. The lease that registration hands out must answer owner_metadata() with that
+// allocation's HOST_PINNED/WEIGHT provenance on its own, after the caller's owner handle is gone, and a copy from the
+// lease must be one direct DMA: no staged_h2d and no staged wait, with a dependency passed.
 static int check_registered_host_expert_lease_copy_is_direct(sycl::queue & q) {
     constexpr size_t bytes = 4ull * 1024ull * 1024ull;
 
@@ -282,7 +302,7 @@ static int check_registered_host_expert_lease_copy_is_direct(sycl::queue & q) {
     bool                  registered = false;
     {
         ggml_sycl::scoped_planned_materialization planned(cache, "test-mem-ops/host expert registration");
-        registered = cache->register_host_expert(key, host, bytes, GGML_LAYOUT_AOS, &lease, owner_handle);
+        registered = cache->register_host_expert_owned(key, host, bytes, GGML_LAYOUT_AOS, &lease, owner_handle);
     }
     owner_handle = {};  // From here only the entry and the lease hold the expert.
     if (!registered || !lease.valid() || lease.resolve().ptr != host) {
@@ -302,16 +322,7 @@ static int check_registered_host_expert_lease_copy_is_direct(sycl::queue & q) {
         failed++;
     }
 
-    ggml_sycl::alloc_request dev_req{};
-    dev_req.queue                                     = &cq;
-    dev_req.device                                    = device;
-    dev_req.size                                      = bytes;
-    dev_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
-    dev_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
-    dev_req.intent.constraints.must_device            = true;
-    dev_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
-    dev_req.intent.constraints.forbid_vram_zone_spill = true;
-    ggml_sycl::mem_handle dst                         = ggml_sycl::unified_allocate(dev_req);
+    ggml_sycl::mem_handle dst = make_runtime_dst(cq, device, bytes);
     if (!dst.valid()) {
         std::fprintf(stderr, "FAIL: host expert lease copy: the RUNTIME zone refused the %zu-byte device buffer\n",
                      bytes);
@@ -323,32 +334,7 @@ static int check_registered_host_expert_lease_copy_is_direct(sycl::queue & q) {
             ggml_sycl::mem_copy_async(dst, lease, bytes, cq, { fill }, "test-mem-ops-host-expert-lease", 1, __func__);
         h2d.wait_and_throw();
         const ggml_sycl::mem_copy_staged_wait_census after = ggml_sycl::mem_copy_staged_wait_census_this_thread();
-        if (after.staged_h2d != before.staged_h2d) {
-            std::fprintf(stderr, "FAIL: host expert lease copy took the staged host->device branch (%llu)\n",
-                         (unsigned long long) (after.staged_h2d - before.staged_h2d));
-            failed++;
-        }
-        const int staged_kinds[] = { ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS,
-                                     ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK,
-                                     ggml_sycl::MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL };
-        for (int kind : staged_kinds) {
-            if (after.count[kind] != before.count[kind]) {
-                std::fprintf(stderr, "FAIL: host expert lease copy recorded %llu staged wait(s) of kind %d\n",
-                             (unsigned long long) (after.count[kind] - before.count[kind]), kind);
-                failed++;
-            }
-        }
-        std::vector<uint8_t> out(bytes, 0);
-        ggml_sycl::mem_copy(ggml_sycl::mem_handle::from_direct(out.data(), GGML_LAYOUT_AOS, false,
-                                                               ggml_sycl::mem_handle::HOST_DEVICE, bytes),
-                            dst, bytes, cq);
-        for (size_t i = 0; i < bytes; ++i) {
-            if (out[i] != static_cast<uint8_t>((i * 13u + 5u) & 0xffu)) {
-                std::fprintf(stderr, "FAIL: host expert lease copy: byte %zu read back 0x%02x\n", i, out[i]);
-                failed++;
-                break;
-            }
-        }
+        failed += expect_direct_copy("host expert lease copy", before, after, dst, bytes, cq, 13u, 5u);
     }
 
     lease = {};
