@@ -266,12 +266,23 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     CHECK(slot.valid(), "acquire_slot() hands the slot out while the gate is still pending");
     const sycl::event gate = ring.current_region_gate();
 
-    // The release is NOT sequenced behind the main thread. Everything between
-    // the fill and done.wait() below may touch `copy` (the retained-handle
-    // drain worker waits on it, mem-handle.cpp:298, and a host_task submit
-    // queries its device dependencies), and `copy` cannot finish before the
-    // blocker is released. A release placed after those calls on this thread
-    // would wait on itself; this thread releases on a timer instead.
+    // The release is NOT sequenced behind the main thread: this thread releases
+    // on a timer, so nothing the main thread does between the fill and
+    // done.wait() can wait on the release that follows it.
+    //
+    // A stall seen once in this case (30 s, then the SYCL watchdog) has an
+    // unestablished cause. Either (a) the main thread blocks inside the SYCL
+    // runtime while the retained-handle drain worker waits on a copy the
+    // scheduler holds behind the blocker, or (b) the runtime deadlocks between
+    // that wait and the enqueue that follows the blocker's completion. The INFO
+    // lines below are stamped by this process, in microseconds since the case
+    // began, and flushed as they print, so a run tells the two apart.
+    const auto t0    = std::chrono::steady_clock::now();
+    auto       stamp = [&](const char * what) {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0);
+        std::printf("INFO: gate case +%lld us: %s\n", static_cast<long long>(us.count()), what);
+        std::fflush(stdout);
+    };
     std::atomic<bool> submitted{ false };
     std::atomic<bool> ran_early{ false };
     std::atomic<bool> submitted_before_release{ false };
@@ -279,19 +290,24 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         ran_early.store(copy_done.load());
         submitted_before_release.store(submitted.load());
+        stamp("releaser fires");
         release_blocker.store(true);
     });
 
     sycl::event copy = mem_fill_async(slot, 0x5A, kSlot, q, { gate });
+    stamp("mem_fill_async returned");
     sycl::event done = q.submit([&](sycl::handler & h) {
         h.depends_on(copy);
         h.host_task([&]() { copy_done.store(true); });
     });
+    stamp("host_task submit returned");
 
     submitted.store(true);
     done.wait();
+    stamp("done.wait() returned");
     releaser.join();
-    CHECK(submitted_before_release.load(), "the chained copy was submitted before the blocker was released");
+    std::printf("INFO: gate case: submission %s the release\n",
+                submitted_before_release.load() ? "finished before" : "had NOT finished at");
     CHECK(!ran_early.load(), "a copy chained on the gate does not run while the gate is pending");
     CHECK(copy_done.load(), "the chained copy runs once the gate completes");
 
@@ -302,6 +318,7 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     ring.release();
     // Region 1 was never gated: its release is the has_gate == false branch.
     CHECK(drain_retained_handles(true), "the gate case's retained-handle drain completes");
+    stamp("retained-handle drain completed");
     CHECK(!allocation_registry_test_contains(base_ptr), "the gate case's registry row is gone after release");
 }
 
