@@ -21814,6 +21814,14 @@ struct test_loan_fixture {
         return cache->test_expert_host_entry_state(keys[index(layer, slot, expert)], &in_use, &retired);
     }
 
+    // A host entry still in the cache under (layer, slot, expert)'s exact key, retired: a withdrawn host copy the
+    // deferred-free pass has not finalized yet.
+    bool host_entry_retired(int layer, int slot, int expert) const {
+        uint32_t in_use  = 0;
+        bool     retired = false;
+        return cache->test_expert_host_entry_state(keys[index(layer, slot, expert)], &in_use, &retired) && retired;
+    }
+
     // Whether the published plan has every member of (layer, expert) on the device (1), every one on the host (0), or
     // a mix or a missing entry (-1).
     static int triplet_on_device(const lifecycle_plan_snapshot & published, int layer, int expert) {
@@ -21911,6 +21919,14 @@ struct test_loan_fixture {
             if (!resolved || resolved.location != cache_location::DEVICE || resolved.size != test_loan_expert_bytes()) {
                 return test_loan_fail("layer %d expert %d slot %d does not resolve to a %zu-byte device copy", layer,
                                       expert, s, test_loan_expert_bytes());
+            }
+            const auto * record =
+                extras[layer * 3 + s]->find_moe_storage_handle_on_device(expert, GGML_LAYOUT_AOS, device);
+            if (!record || record->handle.device() != device || !record->handle.resolve(device).ptr) {
+                return test_loan_fail(
+                    "layer %d expert %d slot %d's device copy is not owned by and resolvable on "
+                    "device %d",
+                    layer, expert, s, device);
             }
             if (std::string why = device_copy_matches(layer, s, expert); !why.empty()) {
                 return why;
@@ -22367,6 +22383,32 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     const std::pair<int, int> still = lent[1 - back];
     if (test_loan_fixture::triplet_on_device(*first, still.first, still.second) != 0) {
         return "the triplet the first refill left is not on the host in the plan";
+    }
+    // Until the deferred-free pass finalizes them, the withdrawn host copies stay in the cache, retired, under the exact
+    // keys a resolve looks up first. The re-admitted ids resolve past them to their device entries, with no device
+    // named in the request. The device copy each extra now remembers is owned by the device: it resolves there and
+    // refuses a host caller (each refusal logs one wrong-device WARN, three in all, by design).
+    for (int s = 0; s < 3; ++s) {
+        if (!fx.host_entry_retired(again.first, s, again.second)) {
+            return test_loan_fail(
+                "layer %d expert %d slot %d has no retired host entry right after its refill, so the "
+                "resolve past one is not exercised",
+                again.first, again.second, s);
+        }
+        const expert_resolve_result resolved = fx.resolve(again.first, s, again.second);
+        if (!resolved || resolved.location != cache_location::DEVICE || resolved.owning_device != fx.device) {
+            return test_loan_fail(
+                "layer %d expert %d slot %d, re-admitted, does not resolve past its retired host "
+                "entry to its device entry on device %d",
+                again.first, again.second, s, fx.device);
+        }
+        const auto * record =
+            fx.extras[again.first * 3 + s]->find_moe_storage_handle_on_device(again.second, GGML_LAYOUT_AOS, fx.device);
+        if (!record || record->handle.device() != fx.device || !record->handle.resolve(fx.device).ptr ||
+            record->handle.resolve(mem_handle::HOST_DEVICE).ptr) {
+            return test_loan_fail("layer %d expert %d slot %d's re-admitted handle does not resolve on device %d only",
+                                  again.first, again.second, s, fx.device);
+        }
     }
     if (std::string why = fx.readmitted(again.first, again.second); !why.empty()) {
         return why;

@@ -27,8 +27,11 @@
 //                           copy takes the staged branch, a synchronous bounce; so the refill copies owner to owner
 //                           itself.
 //   refill_readmits_one_triplet_per_call
-//                           The two-triplet loan, then a decode boundary's refill and a direct one, one triplet each:
-//                           each re-admitted triplet is on the device in the plan, resolves there with its original
+//                           The two-triplet loan, then a decode boundary's refill and a direct one, one triplet each.
+//                           Right after the first, while its withdrawn host entries are still in the cache, retired,
+//                           the re-admitted ids resolve past them to the device entries, and each re-admitted handle
+//                           resolves on the device and refuses a host caller (three wrong-device WARNs, by design).
+//                           Each re-admitted triplet is on the device in the plan, resolves there with its original
 //                           bytes, its extras name the device copy, and its host entries are gone; each refill call
 //                           took no staged copy; a third call has nothing to refill; the raw device bytes and the
 //                           WEIGHT zone room are what they were before the loan; the teardown counts read 2/2.

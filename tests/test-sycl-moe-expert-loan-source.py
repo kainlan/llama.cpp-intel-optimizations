@@ -66,7 +66,8 @@ What this gate pins for it:
     mints their leases before anything published changes (a throw there withdraws only what it inserted), and from
     the mirror swap on allocates nothing; the host copy is retired entry by entry, only while it still names the lent
     storage, never by the id-wide retire; the publication runs inside a planned materialization session, as the loan's
-    registration does;
+    registration does; and resolve_expert lets no retired entry under the exact key (the withdrawn host copy, until
+    the deferred-free pass finalizes it) shadow the id mapping that already names the device entry;
   - lock order: the device storage is minted before g_tensor_inventory_mutex, the cache never names that mutex, and no
     refill code names g_sycl_graph_compute_mutex;
   - each extra forgets its host-copy record before remembering the device copy, the plan flips back, and the ledger
@@ -698,6 +699,20 @@ def claim_refill_publishes_in_a_planned_materialization(cache: str) -> bool:
     return (b.count(REFILL_SESSION) == 1 and b.count("begin_planned_materialization(") == 0
             and ordered(b, REFILL_COPY, REFILL_SESSION, RELEASED_SIZED, CACHE_LOCKS, EMPLACE))
 
+RESOLVE_EXPERT_SIG = "expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request & req)"
+RESOLVE_PAST_RETIRED = "if (entry_it == entries_.end() || entry_it->second.retired) {"
+RESOLVE_MAPPED = "const auto mapped = entries_.find(id_it->second); if (mapped != entries_.end()) { entry_it = mapped; }"
+
+
+def claim_a_retired_host_entry_does_not_shadow_the_refill(cache: str) -> bool:
+    """resolve_expert looks the exact key up first. A refill leaves the withdrawn host copy there, retired, until the
+    deferred-free pass finalizes it, while the id already maps to the device entry; so a retired entry under the
+    exact key falls through to the id mapping, and the mapping replaces it only when it names an entry."""
+    b = body(norm(cache), RESOLVE_EXPERT_SIG)
+    return (b.count(RESOLVE_PAST_RETIRED) == 1 and b.count(RESOLVE_MAPPED) == 1
+            and ordered(b, "entry_it = entries_.find(explicit_key);", RESOLVE_PAST_RETIRED, "id_to_key_.find(req.key)",
+                        RESOLVE_MAPPED, "if (entry.retired) {"))
+
 def claim_refill_retires_the_host_copy_exactly(cache: str) -> bool:
     """The host copy is withdrawn entry by entry under the loan's host ids, only while each still names the lent
     storage, after the device entry has taken the mirror and the id mapping over; never by the id-wide retire."""
@@ -1007,6 +1022,9 @@ def test_refill_allocates_before_it_changes_anything():
 
 def test_refill_publishes_in_a_planned_materialization():
     assert claim_refill_publishes_in_a_planned_materialization(CACHE)
+
+def test_a_retired_host_entry_does_not_shadow_the_refill():
+    assert claim_a_retired_host_entry_does_not_shadow_the_refill(CACHE)
 
 def test_refill_retires_the_host_copy_exactly():
     assert claim_refill_retires_the_host_copy_exactly(CACHE)
@@ -1618,6 +1636,15 @@ def test_mutant_refill_opens_its_session_after_the_locks_fails():
     moved = _once(CACHE, REFILL_SESSION, ";")
     mutant = _once_in(moved, REFILL_SIG, EMPLACE, REFILL_SESSION + " " + EMPLACE)
     assert not claim_refill_publishes_in_a_planned_materialization(mutant)
+
+def test_mutant_retired_host_entry_shadows_the_refill_fails():
+    mutant = _once(CACHE, RESOLVE_PAST_RETIRED, "if (entry_it == entries_.end()) {")
+    assert not claim_a_retired_host_entry_does_not_shadow_the_refill(mutant)
+
+
+def test_mutant_resolve_takes_a_missing_mapping_fails():
+    mutant = _once(CACHE, RESOLVE_MAPPED, "entry_it = entries_.find(id_it->second);")
+    assert not claim_a_retired_host_entry_does_not_shadow_the_refill(mutant)
 
 def test_mutant_refill_uses_the_id_wide_retire_fails():
     mutant = _once(CACHE, HOST_RETIRE, "(void) retire_expert_entry_exact(id, GGML_LAYOUT_AOS, \"refill\");")

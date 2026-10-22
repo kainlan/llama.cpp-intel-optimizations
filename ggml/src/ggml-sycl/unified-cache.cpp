@@ -9541,10 +9541,16 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
         auto                                entry_it = entries_.end();
         const unified_cache_key explicit_key{ cache_entry_type::MOE_EXPERT, req.key, req.layer_id, req.expert_id };
         entry_it = entries_.find(explicit_key);
-        if (entry_it == entries_.end()) {
+        // A retired entry under the explicit key does not shadow what the id maps to now. A refill leaves one there,
+        // the lent host copy it withdrew, until the deferred-free pass finalizes it, while the id already maps to the
+        // device entry that replaced it (llama.cpp-sif1).
+        if (entry_it == entries_.end() || entry_it->second.retired) {
             auto id_it = id_to_key_.find(req.key);
             if (id_it != id_to_key_.end() && id_it->second.type == cache_entry_type::MOE_EXPERT) {
-                entry_it = entries_.find(id_it->second);
+                const auto mapped = entries_.find(id_it->second);
+                if (mapped != entries_.end()) {
+                    entry_it = mapped;
+                }
             }
         }
 
