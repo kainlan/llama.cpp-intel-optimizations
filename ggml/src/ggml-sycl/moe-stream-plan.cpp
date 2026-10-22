@@ -2,7 +2,8 @@
 // llama.cpp-36j0). The pure parts it consults are in moe-stream-plan.hpp; test-moe-stream-phase pins them.
 //
 // Nothing here waits on the host or asks an event for its status (ruling A, c-3bde): a copy waits for its region's
-// gate on the device, a reorder for its copy, and a region closes on an event after its last use.
+// gate on the device (and, around an AOS-only slot, for a compute-queue barrier), a reorder for its copy, and a region
+// closes on an event after its last use.
 
 #include "moe-stream-plan.hpp"
 
@@ -64,7 +65,7 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     double                                      window_us = 0.0;
     if (new_ubatch) {
         begin_ubatch(op.n_tokens);
-        prepare(plan, device, ccs);
+        prepare(plan, device, ccs, op);
     } else {
         window_us = std::chrono::duration<double, std::micro>(now - last_layer_tp_).count();
     }
@@ -146,12 +147,14 @@ void moe_stream_phase::end_prompt() {
     prepared_         = false;
 }
 
-// One scan of the plan per micro-batch (c-7soh). A new geometry, device or compute queue gives the old ring back
-// first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache record is read once per prompt.
-void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs) {
-    index_ = moe_stream_plan_index_build(plan, device);
+// One scan of the plan per micro-batch (c-7soh), at its first op, which carries the device's prompt-kernel predicate
+// (c-hmey) that decides each matrix's staging and so the ring's geometry. A new geometry, device or compute queue gives
+// the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache record is read once
+// per prompt.
+void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
+    index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx);
     const moe_stream_ring_geometry geo =
-        moe_stream_ring_size(index_.host_matrices_per_layer_max, index_.matrix_bytes_max, index_.resident_expert_bytes);
+        moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, index_.resident_expert_bytes);
     const bool same_queue = ccs_.has_value() && *ccs_ == ccs;
     const bool same_geo = geo.slot_bytes == geo_.slot_bytes && geo.n_slots == geo_.n_slots && geo.bytes == geo_.bytes &&
                           geo.region_slots == geo_.region_slots;
@@ -232,15 +235,15 @@ void moe_stream_phase::resolve(int                           layer,
     report(layer, st, n, op);
 }
 
-// Copies each selected matrix's AOS host bytes into one slot of the current region on the copy queue, after the
-// region's gate, then reorders it into a second slot on the compute queue, after the copy. Each item the ring cannot
-// take directly is counted, never copied another way.
+// Copies each selected matrix's AOS host bytes into a slot of the current region on the copy queue, after the
+// region's gate. A matrix staged as SOA is then reordered into a second slot on the compute queue, after the copy; an
+// AOS-only one (c-hmey) is read in place. Each item the ring cannot take directly is counted, never copied another way.
 moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_info & li,
                                                        moe_exec_regime               regime,
                                                        unified_cache &               cache,
                                                        const moe_stream_op &         op) {
-    stage_counts                       n;
-    const std::vector<moe_stream_item> items = moe_stream_select(li, regime, bitmap_);
+    stage_counts                 n;
+    std::vector<moe_stream_item> items = moe_stream_select(li, regime, bitmap_);
     if (items.empty()) {
         return n;
     }
@@ -250,19 +253,41 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
     }
     // A region holds one layer: close the one in use, then drop the table entries of the layer this region last
     // held. Their slots are rewritten below, after that layer's reorders (the gate) and its readers (the in-order
-    // compute queue).
-    close_region(region_last_reorder_);
+    // compute queue, and the barrier below).
+    close_region(region_last_);
     for (uint64_t key : region_keys_[cur_region_]) {
         table_.erase(key);
     }
     region_keys_[cur_region_].clear();
+
+    // AOS-only items first. The region's last submission is then a reorder when it holds a SOA item, and that reorder
+    // follows its own copy, which the in-order copy queue runs after every copy before it: the event the region closes
+    // on follows every copy and every reorder into it. With no SOA item it is the last copy, which follows the rest.
+    const auto aos_only_item = [](const moe_stream_item & it) {
+        return it.staging == moe_stream_staging::AOS_ONLY;
+    };
+    std::stable_partition(items.begin(), items.end(), aos_only_item);
+    // With an AOS-only item in the region's last use or in this one, a copy below may rewrite a slot that a kernel read
+    // in the last use: an AOS-only slot is read in place, and a pair's SOA slot no longer sits at a fixed odd index.
+    // Those readers ran on the compute queue (c-las5), and the gate does not follow them: under STREAM_ALL, layer_done
+    // closes the region that holds the NEXT layer, so a region's gate precedes its own layer's readers. So the copies
+    // also wait for a compute-queue barrier submitted at the first of them, after every reader of the last use. Each
+    // such reader is on the queue already: the last use held a layer staged two stages ago, below the layer whose
+    // first op runs this stage, or a layer of an earlier micro-batch.
+    const bool reuse_after_readers =
+        region_aos_only_[cur_region_] || std::any_of(items.begin(), items.end(), aos_only_item);
+    std::optional<sycl::event> reuse_gate;
+    bool                       aos_only_staged = false;
 
     const int                                    device = device_;
     std::unordered_map<int, std::pair<int, int>> per_expert;  // expert -> (matrices selected, matrices staged)
     for (const moe_stream_item & item : items) {
         std::pair<int, int> & pe = per_expert[item.expert_id];
         ++pe.first;
-        if (!moe_stream_item_reorderable(item, geo_.slot_bytes)) {
+        const bool aos_only = item.staging == moe_stream_staging::AOS_ONLY;
+        if (item.staging == moe_stream_staging::NONE ||
+            !(aos_only ? moe_stream_item_aos_fits(item, geo_.slot_bytes) :
+                         moe_stream_item_reorderable(item, geo_.slot_bytes))) {
             ++n.untyped;
             continue;
         }
@@ -276,17 +301,17 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
             ++n.unowned;
             continue;
         }
-        // Slots go in pairs, AOS then SOA. A region holds an even number of slots (asserted in ring_ready) and every
-        // item takes none or two, so within a region each AOS slot is even and its SOA slot the odd one after it, and
-        // an exhausted region never leaves an AOS slot without its partner.
-        mem_handle aos = ring_->acquire_slot();
-        mem_handle soa = aos.valid() ? ring_->acquire_slot() : mem_handle();
-        GGML_ASSERT(aos.valid() == soa.valid());
-        if (!soa.valid()) {
+        // A SOA item takes two slots, AOS then SOA, an AOS-only item one. An item is taken whole or not at all, so an
+        // exhausted region never leaves an AOS slot without its SOA partner.
+        if (ring_->slots_free() < moe_stream_staging_slots(item.staging)) {
             ++n.exhausted;
             continue;
         }
+        mem_handle aos = ring_->acquire_slot();
+        mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot();
+        GGML_ASSERT(aos.valid() && soa.valid() != aos_only);
         sycl::event reorder;
+        sycl::event copied;
         try {
             // The lease admits a host entry still being filled (require_ready=false), so the copy waits on the device
             // for that entry's ready event as well as for the region's gate.
@@ -295,28 +320,52 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
             if (hr.has_ready_event) {
                 deps.push_back(hr.ready_event);
             }
+            if (reuse_after_readers && !reuse_gate) {
+                reuse_gate = ccs_->ext_oneapi_submit_barrier();
+            }
+            if (reuse_gate) {
+                deps.push_back(*reuse_gate);
+            }
 
-            const sycl::event copy    = mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), deps);
-            const uint8_t *   aos_ptr = static_cast<const uint8_t *>(aos.resolve(device).ptr);
-            uint8_t *         soa_ptr = static_cast<uint8_t *>(soa.resolve(device).ptr);
-            reorder = ggml_sycl_reorder_weight_gpu(*ccs_, aos_ptr, soa_ptr, item.type, item.ncols, item.nrows,
-                                                   item.src_bytes, { copy });
-            // Every handle the two submissions touch lives until the reorder: the table's hold on the SOA slot is not
-            // this submission's ownership.
-            retain_handles_until_event({ aos, host, soa }, reorder);
+            const sycl::event copy = mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), deps);
+            if (aos_only) {
+                // Read in place: the copy is this submission's last use of the lease and of the slot, and the table's
+                // hold on the slot is not this submission's ownership.
+                retain_handles_until_event({ aos, host }, copy);
+                copied = copy;
+            } else {
+                const uint8_t * aos_ptr = static_cast<const uint8_t *>(aos.resolve(device).ptr);
+                uint8_t *       soa_ptr = static_cast<uint8_t *>(soa.resolve(device).ptr);
+                reorder = ggml_sycl_reorder_weight_gpu(*ccs_, aos_ptr, soa_ptr, item.type, item.ncols, item.nrows,
+                                                       item.src_bytes, { copy });
+                // Every handle the two submissions touch lives until the reorder: the table's hold on the SOA slot is
+                // not this submission's ownership.
+                retain_handles_until_event({ aos, host, soa }, reorder);
+            }
         } catch (const ggml_sycl_fallback_error &) {
             throw;
         } catch (const std::exception & e) {
             GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());
         }
-        const uint64_t key   = moe_stream_table_key(item.layer, item.expert_id, item.role);
-        region_submitted_    = true;
-        region_last_reorder_ = reorder;
-        anchor_              = soa;
-        table_[key]          = { soa, aos, reorder, GGML_LAYOUT_SOA };
+        const uint64_t key = moe_stream_table_key(item.layer, item.expert_id, item.role);
+        region_submitted_  = true;
+        anchor_            = aos;  // any slice holds the whole reservation
+        if (aos_only) {
+            // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde).
+            region_last_    = copied;
+            aos_only_staged = true;
+            table_[key]     = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };
+        } else {
+            region_last_ = reorder;
+            table_[key]  = { soa, aos, reorder, GGML_LAYOUT_SOA };
+        }
         region_keys_[cur_region_].push_back(key);
         n.bytes += item.src_bytes;
         ++pe.second;
+    }
+    // A copy went in (the barrier is taken at the first one), so the region's last use is now this one.
+    if (reuse_gate) {
+        region_aos_only_[cur_region_] = aos_only_staged;
     }
     for (const auto & kv : per_expert) {
         ++n.wanted;
@@ -334,17 +383,17 @@ bool moe_stream_phase::ring_ready() {
     if (reserve_failed_ || geo_.n_slots == 0 || !in_order_) {
         return false;
     }
-    // stage() takes slots in pairs.
-    GGML_ASSERT(geo_.region_slots % 2 == 0);
     std::unique_ptr<moe_stream_ring> ring = std::make_unique<moe_stream_ring>();
     if (!ring->reserve(device_, geo_)) {
         reserve_failed_ = true;
         return false;
     }
-    ring_                = std::move(ring);
-    cur_region_          = 0;
-    region_submitted_    = false;
-    region_last_reorder_ = sycl::event();
+    ring_               = std::move(ring);
+    cur_region_         = 0;
+    region_submitted_   = false;
+    region_last_        = sycl::event();
+    region_aos_only_[0] = false;
+    region_aos_only_[1] = false;
     return true;
 }
 
@@ -385,10 +434,12 @@ void moe_stream_phase::teardown(sycl::event last_use) {
     table_.clear();
     region_keys_[0].clear();
     region_keys_[1].clear();
-    cur_region_          = 0;
-    region_submitted_    = false;
-    region_last_reorder_ = sycl::event();
-    geo_                 = moe_stream_ring_geometry();
+    cur_region_         = 0;
+    region_submitted_   = false;
+    region_last_        = sycl::event();
+    region_aos_only_[0] = false;
+    region_aos_only_[1] = false;
+    geo_                = moe_stream_ring_geometry();
 }
 
 void moe_stream_phase::report(int                   layer,
@@ -425,8 +476,7 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
     }
     warned_unavailable_ = true;
     const moe_stream_ring_geometry asked =
-        geo_.n_slots != 0 ? geo_ :
-                            moe_stream_ring_size(index_.host_matrices_per_layer_max, index_.matrix_bytes_max, SIZE_MAX);
+        geo_.n_slots != 0 ? geo_ : moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, SIZE_MAX);
     char line[320];
     std::snprintf(line, sizeof(line),
                   "[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "

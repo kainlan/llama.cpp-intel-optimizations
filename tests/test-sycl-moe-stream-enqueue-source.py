@@ -30,13 +30,22 @@ What this gate pins:
   - the AOS slot, the host lease and the SOA slot are retained until the reorder's event, so each submission owns what
     it touches, and the stage-table entry holds the SOA slot with the layout it really carries, SOA (ruling C: the
     slice's AOS tag is not the answer);
+  - AOS-only staging (c-hmey): a matrix the device reads only as AOS takes ONE slot, its copy is its last submission
+    (no reorder), the AOS slot and the host lease are retained until the copy, and its stage-table entry holds the AOS
+    slot with layout AOS; how a matrix stages comes from the device's prompt kernels, which the backend answers from
+    ggml_sycl_moe_query_route_capability (one fact, one source), asked once per micro-batch in the index build;
+  - a region closes on an event after its last copy and its last reorder: AOS-only items go first, so the region's
+    last submission is a reorder when it holds a SOA item and the last copy otherwise;
+  - when a region's last use or its new one holds an AOS-only item, the new copies also wait for a compute-queue
+    barrier submitted at the first of them: the gate layer_done sets belongs to the region holding the next layer, so
+    it precedes the readers of an AOS-only slot (and of a SOA slot that AOS-only items moved off a fixed odd index);
   - a throw from either submission aborts with "[MOE-EXEC] stream enqueue failed: %s" (design 9.3);
   - moe-stream-plan.cpp waits on nothing (.wait(), wait_and_throw()), queries no event status (get_info<), has no
     const_cast (ruling E) and calls no allocator: its slots come from the ring's one reservation;
   - the number of waits in ggml_sycl_mul_mat_id is the one master had at 84fb449da;
   - only a host lease whose retained owner is a host-pinned WEIGHT allocation of this device's host zones is copied
-    (llama.cpp-9y0p: any other lease would take the staged path), and only an item whose type has an AOS->SOA
-    reorder in the one table (soa-reorder-types.hpp) is staged;
+    (llama.cpp-9y0p: any other lease would take the staged path), and only an item staged SOA (its type has an AOS->SOA
+    reorder in the one table, soa-reorder-types.hpp) or AOS-only that fits the slot is staged;
   - teardown gates the open region and holds one slot handle until the last use before the ring is released
     (ruling D, c-fjx1), and the ring is offered only on an in-order compute queue (the SOA overwrite of a reused region
     is ordered after its readers by that queue);
@@ -444,21 +453,28 @@ def test_allocator_mutants():
 
 OWNER_SIG = "static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int device)"
 REORDERABLE_SIG = "static inline bool moe_stream_item_reorderable(const moe_stream_item & item, size_t slot_bytes)"
+AOS_FITS_SIG = "static inline bool moe_stream_item_aos_fits(const moe_stream_item & item, size_t slot_bytes)"
 OWNER_CALL = "host.owner_metadata(&owner) && moe_stream_owner_streamable(owner, device)"
 REORDERABLE_CALL = "moe_stream_item_reorderable(item, geo_.slot_bytes)"
+TYPED_GUARD = ("if (item.staging == moe_stream_staging::NONE || !(aos_only ? moe_stream_item_aos_fits(item, geo_.slot_bytes) "
+               ": " + REORDERABLE_CALL + ")) { ++n.untyped; continue; }")
 
 
 def claim_only_direct_owned_typed_items_stream(phase: str, hpp: str) -> bool:
     """llama.cpp-9y0p: the lease's retained owner is a host-pinned WEIGHT allocation of this device's host zones (the
-    shape mem-ops.cpp copies directly); the type has an AOS->SOA reorder in the one table. Both before the copy."""
+    shape mem-ops.cpp copies directly). The item is staged SOA, whose type has an AOS->SOA reorder in the one table, or
+    AOS-only (c-hmey), and fits the slot as it stages; anything staged NONE is counted untyped. Both before the copy."""
     h = norm(hpp)
     owner = body(h, OWNER_SIG)
     reorderable = body(h, REORDERABLE_SIG)
+    aos_fits = body(h, AOS_FITS_SIG)
     n = norm(phase)
     return ("owner.tier == alloc_tier::HOST_PINNED" in owner and "owner.role == alloc_role::WEIGHT" in owner
             and "owner.host_zone != host_zone_id::COUNT" in owner and "owner.device == device" in owner
             and "ggml_sycl_soa_reorder_supported_type(item.type)" in reorderable
-            and ordered(n, REORDERABLE_CALL, OWNER_CALL, "ring_->acquire_slot()", COPY_DECL))
+            and "detail::moe_stream_item_rows_bytes(item) != 0" in aos_fits
+            and "item.src_bytes <= slot_bytes" in aos_fits
+            and ordered(n, TYPED_GUARD, OWNER_CALL, "ring_->acquire_slot()", COPY_DECL))
 
 
 def test_only_direct_owned_typed_items_stream():
@@ -472,6 +488,245 @@ def test_streamed_item_mutants():
         PHASE, mutate(PLAN_HPP, "owner.role == alloc_role::WEIGHT", "owner.role != alloc_role::OTHER"))
     assert not claim_only_direct_owned_typed_items_stream(
         PHASE, mutate(PLAN_HPP, "ggml_sycl_soa_reorder_supported_type(item.type)", "item.type != GGML_TYPE_COUNT"))
+    # An AOS-only item copied without checking that it fits the slot.
+    assert not claim_only_direct_owned_typed_items_stream(
+        mutate(PHASE, "moe_stream_item_aos_fits(item, geo_.slot_bytes)", "true"), PLAN_HPP)
+    assert not claim_only_direct_owned_typed_items_stream(
+        PHASE, mutate(PLAN_HPP, "item.src_bytes <= slot_bytes", "true"))
+    # An item staged NONE copied anyway.
+    assert not claim_only_direct_owned_typed_items_stream(
+        mutate(PHASE, "item.staging == moe_stream_staging::NONE || ", ""), PLAN_HPP)
+
+
+# ---- AOS-only staging (c-hmey) ----------------------------------------------------------------------------------------
+
+AOS_ONLY_FLAG = "const bool aos_only = item.staging == moe_stream_staging::AOS_ONLY;"
+SLOTS_CHECK = "if (ring_->slots_free() < moe_stream_staging_slots(item.staging)) { ++n.exhausted; continue; }"
+AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot();"
+SOA_ACQUIRE = "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot();"
+STAGING_SLOTS_SIG = "static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging)"
+STAGING_SLOTS_BODY = "{ return staging == moe_stream_staging::SOA ? 2u : staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }"
+REGION_SIZE = "li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));"
+INDEX_BUILD_SIG = "static inline moe_stream_plan_index moe_stream_plan_index_build("
+RING_SIZE_CALL = "moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, index_.resident_expert_bytes)"
+
+
+def claim_aos_only_item_takes_one_slot(phase: str, hpp: str) -> bool:
+    """An AOS-only matrix takes ONE slot and a SOA matrix two, both when the ring is sized (each layer's slots summed
+    from the one slot-count helper, the ring sized from the heaviest layer's) and when a stage acquires them: the region
+    is checked for that many free slots, then the AOS slot is acquired, and the SOA slot only for a SOA item."""
+    h = norm(hpp)
+    n = norm(phase)
+    s = body(n, STAGE_SIG)
+    return (body(h, STAGING_SLOTS_SIG) == STAGING_SLOTS_BODY and REGION_SIZE in body(h, INDEX_BUILD_SIG)
+            and RING_SIZE_CALL in n and n.count("ring_->acquire_slot()") == 2
+            and ordered(s, AOS_ONLY_FLAG, SLOTS_CHECK, AOS_ACQUIRE, SOA_ACQUIRE, COPY_DECL))
+
+
+def test_aos_only_item_takes_one_slot():
+    assert claim_aos_only_item_takes_one_slot(PHASE, PLAN_HPP)
+
+
+def test_aos_only_slot_mutants():
+    # An AOS-only item takes a SOA slot too.
+    assert not claim_aos_only_item_takes_one_slot(
+        mutate(PHASE, SOA_ACQUIRE, "mem_handle soa = ring_->acquire_slot();"), PLAN_HPP)
+    assert not claim_aos_only_item_takes_one_slot(
+        mutate(PHASE, SOA_ACQUIRE, "mem_handle soa = aos_only ? ring_->acquire_slot() : ring_->acquire_slot();"), PLAN_HPP)
+    # The ring sized, or the region checked, as if every item took two.
+    assert not claim_aos_only_item_takes_one_slot(
+        PHASE, mutate(PLAN_HPP, "moe_stream_staging::AOS_ONLY ? 1u", "moe_stream_staging::AOS_ONLY ? 2u"))
+    assert not claim_aos_only_item_takes_one_slot(
+        mutate(PHASE, "ring_->slots_free() < moe_stream_staging_slots(item.staging)", "ring_->slots_free() < 2u"), PLAN_HPP)
+    # The ring sized from the matrix count, as before c-hmey.
+    assert not claim_aos_only_item_takes_one_slot(
+        mutate(PHASE, RING_SIZE_CALL, "moe_stream_ring_size(2 * index_.host_matrices_per_layer_max, "
+                                      "index_.matrix_bytes_max, index_.resident_expert_bytes)"), PLAN_HPP)
+    # The branch keyed on the SOA staging.
+    assert not claim_aos_only_item_takes_one_slot(
+        mutate(PHASE, AOS_ONLY_FLAG, "const bool aos_only = item.staging == moe_stream_staging::SOA;"), PLAN_HPP)
+
+
+AOS_ONLY_SUBMIT = "if (aos_only) { retain_handles_until_event({ aos, host }, copy); copied = copy; } else {"
+AOS_ONLY_TABLE = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"
+AOS_ONLY_RECORD = ("if (aos_only) { region_last_ = copied; aos_only_staged = true; " + AOS_ONLY_TABLE + " } else { "
+                   "region_last_ = reorder; " + TABLE_WRITE + " }")
+
+
+def claim_aos_only_entry_reads_in_place(phase: str) -> bool:
+    """An AOS-only matrix is read where its copy lands: the copy is its only submission, the AOS slot and the host
+    lease are retained until the copy's event (the submission owns what it touches), and the stage-table entry holds
+    no SOA slot, the AOS slot, the copy's event and layout AOS (ruling C: the layout comes from the entry, which for an
+    AOS-only matrix is AOS). The reorder runs only for a SOA item."""
+    n = norm(phase)
+    s = body(n, STAGE_SIG)
+    return (n.count(AOS_ONLY_SUBMIT) == 1 and n.count(AOS_ONLY_TABLE) == 1 and AOS_ONLY_RECORD in s
+            and ordered(s, COPY_DECL, AOS_ONLY_SUBMIT, REORDER_CALL, RETAIN, AOS_ONLY_RECORD))
+
+
+def test_aos_only_entry_reads_in_place():
+    assert claim_aos_only_entry_reads_in_place(PHASE)
+
+
+def test_aos_only_entry_mutants():
+    # Tagged SOA: the resolver would read the slot as a layout it does not hold.
+    assert not claim_aos_only_entry_reads_in_place(
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_SOA };"))
+    # A SOA slot named that no reorder wrote.
+    assert not claim_aos_only_entry_reads_in_place(
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { soa, aos, copied, GGML_LAYOUT_AOS };"))
+    # The slot left to the table's hold.
+    assert not claim_aos_only_entry_reads_in_place(
+        mutate(PHASE, "retain_handles_until_event({ aos, host }, copy);", "retain_handles_until_event({ host }, copy);"))
+    # A reorder submitted for an AOS-only item as well.
+    assert not claim_aos_only_entry_reads_in_place(mutate(PHASE, "copied = copy; } else {", "copied = copy; } {"))
+    # The entry's event a stale reorder instead of the copy.
+    assert not claim_aos_only_entry_reads_in_place(
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, reorder, GGML_LAYOUT_AOS };"))
+
+
+AOS_ONLY_LAMBDA = ("const auto aos_only_item = [](const moe_stream_item & it) { return it.staging == "
+                   "moe_stream_staging::AOS_ONLY; };")
+PARTITION = "std::stable_partition(items.begin(), items.end(), aos_only_item);"
+STAGE_CLOSE = "close_region(region_last_);"
+ITEM_LOOP = "for (const moe_stream_item & item : items) {"
+
+
+def claim_region_closes_after_last_copy(phase: str) -> bool:
+    """c-hmey: the event a region closes on follows its last copy as well as its last reorder. The stage puts its
+    AOS-only items first, so its last submission is a reorder when it holds a SOA item (and that reorder follows its own
+    copy, which the in-order copy queue runs after every earlier copy) and the last copy otherwise; each item records
+    its own last event as the region's, and the next stage closes the region on it."""
+    s = body(norm(phase), STAGE_SIG)
+    return (s.count(PARTITION) == 1 and s.count(STAGE_CLOSE) == 1 and s.count("region_last_ = copied;") == 1
+            and s.count("region_last_ = reorder;") == 1
+            and ordered(s, STAGE_CLOSE, AOS_ONLY_LAMBDA, PARTITION, ITEM_LOOP, AOS_ONLY_RECORD))
+
+
+def test_region_closes_after_last_copy():
+    assert claim_region_closes_after_last_copy(PHASE)
+
+
+def test_region_close_mutants():
+    # No partition: a SOA item's reorder could close a region before a later AOS-only copy into it.
+    assert not claim_region_closes_after_last_copy(mutate(PHASE, PARTITION, ""))
+    # SOA items first.
+    assert not claim_region_closes_after_last_copy(
+        mutate(PHASE, AOS_ONLY_LAMBDA, AOS_ONLY_LAMBDA.replace("moe_stream_staging::AOS_ONLY", "moe_stream_staging::SOA")))
+    # An AOS-only region closed on a reorder of another region.
+    assert not claim_region_closes_after_last_copy(
+        mutate(PHASE, "region_last_ = copied;", "region_last_ = reorder;"))
+    # The region closed on the last reorder only, as before c-hmey.
+    assert not claim_region_closes_after_last_copy(mutate(PHASE, "region_last_ = copied; ", ""))
+
+
+REUSE_COND = ("const bool reuse_after_readers = region_aos_only_[cur_region_] || std::any_of(items.begin(), items.end(), "
+              "aos_only_item);")
+REUSE_TAKE = "if (reuse_after_readers && !reuse_gate) { reuse_gate = ccs_->ext_oneapi_submit_barrier(); }"
+REUSE_DEP = "if (reuse_gate) { deps.push_back(*reuse_gate); }"
+REUSE_RECORD = "if (reuse_gate) { region_aos_only_[cur_region_] = aos_only_staged; }"
+REGION_FLAGS_RESET = "region_aos_only_[0] = false; region_aos_only_[1] = false;"
+
+
+def claim_aos_only_reuse_waits_for_readers(phase: str) -> bool:
+    """When a region's last use or the stage reusing it holds an AOS-only item, a copy may rewrite a slot a kernel
+    read in that last use, and the region's gate does not follow those readers (layer_done gates the region holding the
+    next layer). So every copy of the stage also waits for one compute-queue barrier, the readers' queue (c-las5),
+    submitted at its first copy. Whether the region's last use left an AOS-only slot is recorded only when a copy went
+    in, and a new ring starts with none."""
+    n = norm(phase)
+    s = body(n, STAGE_SIG)
+    return (s.count(REUSE_TAKE) == 1 and s.count(REUSE_DEP) == 1 and s.count(REUSE_RECORD) == 1
+            and ordered(s, PARTITION, REUSE_COND, ITEM_LOOP, COPY_DEPS, READY_DEP, REUSE_TAKE, REUSE_DEP, COPY_DECL,
+                        AOS_ONLY_RECORD, REUSE_RECORD)
+            and REGION_FLAGS_RESET in body(n, RING_READY_SIG))
+
+
+def test_aos_only_reuse_waits_for_readers():
+    assert claim_aos_only_reuse_waits_for_readers(PHASE)
+
+
+def test_aos_only_reuse_mutants():
+    # The barrier taken but not waited on.
+    assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, REUSE_DEP, ""))
+    # The barrier on the copy queue, which the readers do not run on.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "reuse_gate = ccs_->ext_oneapi_submit_barrier();",
+               "reuse_gate = cache.get_bcs_queue().ext_oneapi_submit_barrier();"))
+    # A SOA-only stage after an AOS-only use, unordered after that use's readers.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, "region_aos_only_[cur_region_] || std::any_of(", "std::any_of("))
+    # An AOS-only stage after a SOA-only use: its single slots land on the use's SOA slots.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, " || std::any_of(items.begin(), items.end(), aos_only_item);", ";"))
+    # The last use forgotten when nothing was copied in.
+    assert not claim_aos_only_reuse_waits_for_readers(
+        mutate(PHASE, REUSE_RECORD, "region_aos_only_[cur_region_] = aos_only_staged;"))
+    # Never recorded.
+    assert not claim_aos_only_reuse_waits_for_readers(mutate(PHASE, REUSE_RECORD, ""))
+
+
+PROMPT_KERNEL_SIG = ("static bool ggml_sycl_moe_stream_prompt_kernel(void * graph_ctx, ggml_type type, ggml_layout_mode "
+                     "layout, int64_t ne0, int64_t ne1)")
+PROMPT_KERNEL_QUERY = ("ggml_sycl_moe_query_route_capability(type, layout, moe_route_phase::PROMPT, ne0, ne1, "
+                       "static_cast<size_t>(call->op.n_tokens), call->device, moe_layer_route_residency::DEVICE, "
+                       "call->device);")
+PROMPT_KERNEL_FILL = "call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;"
+STAGING_SIG = "static inline moe_stream_staging moe_stream_item_staging("
+INDEX_CALL = "index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx);"
+PREPARE_SIG = "void moe_stream_phase::prepare("
+
+
+def claim_staging_from_the_capability_query(sycl: str, hpp: str, phase: str) -> bool:
+    """c-hmey item 1, one fact one source: whether the device reads a (type, layout) in a prompt comes from
+    ggml_sycl_moe_query_route_capability, the query the staged route's recipe is built from, asked for the call's own
+    device as both the expert's and the submitting device; the backend's predicate consults no table of its own. The
+    staging asks it for SOA only after the reorder test and for AOS only after the AOS fit, and the phase asks it only
+    through the index build, once per micro-batch, never per stage."""
+    n = norm(sycl)
+    # The forward declaration ends in ";" and the definition in " {": the body is the definition's.
+    at = n.find(PROMPT_KERNEL_SIG + " {")
+    pk = body(n[at:], PROMPT_KERNEL_SIG) if at >= 0 else ""
+    st = body(norm(hpp), STAGING_SIG)
+    p = norm(phase)
+    return (n.count(PROMPT_KERNEL_SIG + " {") == 1 and PROMPT_KERNEL_QUERY in pk and "return cap.supported;" in pk
+            and "moe_mmvq_" not in pk and "soa_reorder" not in pk
+            and n.count(PROMPT_KERNEL_FILL) == 1
+            and ordered(st, "if (prompt_kernel == nullptr) { return moe_stream_staging::NONE; }",
+                        "moe_stream_item_reorderable(item, slot_bytes) && prompt_kernel(graph_ctx, item.type, "
+                        "GGML_LAYOUT_SOA,", "return moe_stream_staging::SOA;",
+                        "moe_stream_item_aos_fits(item, slot_bytes) && prompt_kernel(graph_ctx, item.type, "
+                        "GGML_LAYOUT_AOS,", "return moe_stream_staging::AOS_ONLY;")
+            and INDEX_CALL in body(p, PREPARE_SIG) and p.count("prompt_kernel(") == 0
+            and p.count("moe_stream_plan_index_build(") == 1)
+
+
+def test_staging_from_the_capability_query():
+    assert claim_staging_from_the_capability_query(SYCL, PLAN_HPP, PHASE)
+
+
+def test_staging_source_mutants():
+    # A second table answering what the device reads.
+    assert not claim_staging_from_the_capability_query(
+        mutate(SYCL, PROMPT_KERNEL_QUERY, PROMPT_KERNEL_QUERY + " (void) moe_mmvq_capability_supports_layout(type, layout);"),
+        PLAN_HPP, PHASE)
+    # Asked for the decode phase.
+    assert not claim_staging_from_the_capability_query(
+        mutate(SYCL, "type, layout, moe_route_phase::PROMPT, ne0, ne1,", "type, layout, moe_route_phase::DECODE, ne0, ne1,"),
+        PLAN_HPP, PHASE)
+    # The backend leaves the predicate unset: nothing would ever stage.
+    assert not claim_staging_from_the_capability_query(mutate(SYCL, PROMPT_KERNEL_FILL, ""), PLAN_HPP, PHASE)
+    # The SOA question asked for AOS.
+    assert not claim_staging_from_the_capability_query(
+        SYCL, mutate(PLAN_HPP, "prompt_kernel(graph_ctx, item.type, GGML_LAYOUT_SOA,",
+                     "prompt_kernel(graph_ctx, item.type, GGML_LAYOUT_AOS,"), PHASE)
+    # The index built blind.
+    assert not claim_staging_from_the_capability_query(
+        SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, "index_ = moe_stream_plan_index_build(plan, device, nullptr, nullptr);"))
+    # The predicate asked again at every stage.
+    assert not claim_staging_from_the_capability_query(
+        SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, "
+                                                                  "GGML_LAYOUT_AOS, item.ncols, item.nrows);"))
 
 
 # ---- the policy gate --------------------------------------------------------------------------------------------------

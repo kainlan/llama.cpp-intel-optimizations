@@ -29503,6 +29503,13 @@ static ggml_sycl::mem_handle ggml_sycl_moe_stream_host_lease(void *             
     return std::move(*resolved.lifetime);
 }
 
+// Defined after ggml_sycl_moe_query_route_capability, which answers it.
+static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
+                                               ggml_type        type,
+                                               ggml_layout_mode layout,
+                                               int64_t          ne0,
+                                               int64_t          ne1);
+
 // Fills `call` for a prompt MUL_MAT_ID of `src0` and makes ctx.moe_stream on first use. False when the op names no
 // layer the decision log can hold, the device has no cache, or no plan is published.
 static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
@@ -29534,15 +29541,17 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.graph_ctx     = &call;
     call.op.layer_present = ggml_sycl_moe_stream_layer_present;
     call.op.host_lease    = ggml_sycl_moe_stream_host_lease;
+    call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;
     return true;
 }
 
 // After a prompt layer's down op, an open stream region closes on a barrier behind it. The barrier becomes the gate the
-// region's next copies wait for, so it orders the reuse of the region's AOS slots only: every reorder that read them
-// ran before it on this queue. The region's SOA slots are next rewritten by reorders on this same in-order queue, so
-// the queue, not the barrier, orders that reuse after their readers. Under STREAM_ALL the open region holds layer + 1's
-// slots, staged a layer ahead, whose readers have not run yet; the barrier still follows their reorders. Never while a
-// command graph records: ring work is never recorded.
+// region's next copies wait for: it follows every reorder that read the region's AOS slots before it on this queue.
+// The region's SOA slots are next rewritten by reorders on this same in-order queue, so the queue, not the barrier,
+// orders that reuse after their readers. Under STREAM_ALL the open region holds layer + 1's slots, staged a layer
+// ahead, whose readers have not run yet: the barrier follows their reorders, not their kernels. An AOS-only slot
+// (c-hmey) is read in place by those kernels, so moe_stream_phase::stage() also orders a reuse that may overwrite one
+// behind a later barrier on this queue. Never while a command graph records: ring work is never recorded.
 static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
     if (!ctx.moe_stream || !ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording) {
         return;
@@ -32205,6 +32214,26 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
     cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
     cap.reason        = "local-layout-unsupported";
     return cap;
+}
+
+// The stream ring's prompt-kernel predicate (c-hmey): whether a prompt MUL_MAT_ID runs a device-resident expert of
+// (type, layout) on the call's device. Task 8's staged route builds its device recipe from this same query, so the ring
+// stages only what a route reads: one fact, one source. A ring slot lives on the call's device, so that device both
+// holds the expert and submits the op. The rows are the micro-batch's, the most one expert can take; for the AOS and
+// SOA layouts the ring asks about, the query refuses only zero rows.
+static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
+                                               ggml_type        type,
+                                               ggml_layout_mode layout,
+                                               int64_t          ne0,
+                                               int64_t          ne1) {
+    const auto * call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx);
+    if (call == nullptr) {
+        return false;
+    }
+    const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
+        type, layout, moe_route_phase::PROMPT, ne0, ne1, static_cast<size_t>(call->op.n_tokens), call->device,
+        moe_layer_route_residency::DEVICE, call->device);
+    return cap.supported;
 }
 
 static void ggml_sycl_moe_secondary_dispatch_layout_candidates(ggml_type                  type,

@@ -4,8 +4,9 @@
 //
 // A layer's host-resident expert matrices are copied into equal slots of one
 // WEIGHT-zone allocation and run there with the device kernels resident experts
-// use. Each matrix spends two slots: the AOS copy destination and the SOA
-// reorder destination. This header holds two things:
+// use. A matrix staged as SOA spends two slots, the AOS copy destination and the
+// SOA reorder destination; a matrix staged AOS-only spends one, read in place
+// (c-hmey). This header holds two things:
 //
 //   moe_stream_ring_size()  the pure geometry: two regions, each holding the
 //                           heaviest layer's slots, or no ring. It depends on
@@ -37,11 +38,11 @@ namespace ggml_sycl {
 // whatever the quant's block size.
 static constexpr size_t MOE_STREAM_RING_SLOT_ALIGN = 256;
 
-// slot_bytes is one matrix's slot: the largest host-planned matrix's
-// max(src_size, dst_size) on the device, rounded up to
-// MOE_STREAM_RING_SLOT_ALIGN. A region holds one layer:
-// region_slots = 2 * the heaviest layer's host matrices, so the one-layer floor
-// is per region. n_slots = 2 * region_slots and bytes = n_slots * slot_bytes.
+// slot_bytes is one matrix's slot: the largest streamable matrix's bytes on the
+// device (max(src_size, dst_size) staged as SOA, src_size staged AOS-only),
+// rounded up to MOE_STREAM_RING_SLOT_ALIGN. A region holds one layer:
+// region_slots = the heaviest layer's slots, so the one-layer floor is per
+// region. n_slots = 2 * region_slots and bytes = n_slots * slot_bytes.
 // When the ring does not fit, every field is 0 (the default geometry); the
 // caller then answers RING_UNAVAILABLE.
 struct moe_stream_ring_geometry {
@@ -51,11 +52,13 @@ struct moe_stream_ring_geometry {
     uint32_t region_slots = 0;
 };
 
-// Two regions of 2 * host_matrices_per_layer_max slots of matrix_bytes_max
-// (rounded up to MOE_STREAM_RING_SLOT_ALIGN) each, or no ring when those bytes,
-// padding included, exceed resident_expert_bytes / 10. A
-// partial ring would need chunked streaming, which this revision does not do.
-moe_stream_ring_geometry moe_stream_ring_size(uint32_t host_matrices_per_layer_max,
+// Two regions of region_slots slots of matrix_bytes_max (rounded up to
+// MOE_STREAM_RING_SLOT_ALIGN) each, or no ring when those bytes, padding
+// included, exceed resident_expert_bytes / 10. region_slots is what the
+// heaviest layer takes: 2 per matrix staged as SOA, 1 per matrix staged
+// AOS-only (moe_stream_plan_index::region_slots_max). A partial ring would need
+// chunked streaming, which this revision does not do.
+moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
                                               size_t   matrix_bytes_max,
                                               size_t   resident_expert_bytes);
 
