@@ -21,6 +21,8 @@ What this gate pins:
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
     and the ring's inputs, in a fixed format, through the decision log's WARN sink; the flag is cleared by end_prompt
     and never per graph (lead ruling c-kcyf);
+  - resolve() reports every layer it resolves, AUTO included, so the decision log keeps the cost model's choice
+    (the second half of c-3skf), and the next layer is weighed only below the decision log's MAX_LAYERS;
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
     c-3bde: slot reuse is ordered on the device, never by a host status query), and the reorder is
     ggml_sycl_reorder_weight_gpu on the compute queue with the copy as its one dependency;
@@ -617,6 +619,57 @@ def test_ring_unavailable_once_mutants():
         mutate(PHASE, " || (op.policy != moe_exec_policy::RING && op.log->trace < 1)", ""))
     # Not called for the layer's decision.
     assert not claim_ring_unavailable_once_per_prompt(mutate(PHASE, WARN_CALL, ""))
+
+
+REPORT_CALL = "report(layer, st, n, op);"
+NEXT_LOOKUP = "const auto nxt = next < moe_exec_decision_log::MAX_LAYERS ? index_.layers.find(next) : index_.layers.end();"
+
+
+def brace_depth(text: str, at: int) -> int:
+    """Braces open at `at` in a body that holds no string literal (resolve's does not)."""
+    return text.count("{", 0, at) - text.count("}", 0, at)
+
+
+def claim_auto_still_reports(phase: str) -> bool:
+    """The second half of c-3skf: under AUTO the decision log still records what the cost model would choose. resolve()
+    calls report() once, at the top level of its body after the policy guard has closed, with no return before it."""
+    r = body(norm(phase), RESOLVE_SIG)
+    guard = r.find(POLICY_GUARD)
+    at = r.find(REPORT_CALL)
+    return (r.count(REPORT_CALL) == 1 and 0 <= guard < at and brace_depth(r, at) == 1 and "return" not in r)
+
+
+def test_auto_still_reports():
+    assert claim_auto_still_reports(PHASE)
+
+
+def test_auto_report_mutants():
+    # The spec reviewer's mutant: only an explicit ring reports.
+    assert not claim_auto_still_reports(
+        mutate(PHASE, REPORT_CALL, "if (op.policy == moe_exec_policy::RING) { " + REPORT_CALL + " }"))
+    # AUTO returns before the report.
+    assert not claim_auto_still_reports(
+        mutate(PHASE, "stage_counts n; if (st.decision.choice",
+               "stage_counts n; if (op.policy != moe_exec_policy::RING) { return; } if (st.decision.choice"))
+    # No report at all.
+    assert not claim_auto_still_reports(mutate(PHASE, REPORT_CALL, ""))
+
+
+def claim_next_layer_bounded(phase: str) -> bool:
+    """The next layer is weighed, and so noted in the decision log (which asserts layer < MAX_LAYERS), only below
+    MAX_LAYERS: ggml_sycl_moe_stream_prepare bounds only the current layer."""
+    b = body(norm(phase), BEGIN_LAYER_SIG)
+    return NEXT_LOOKUP in b and b.count("index_.layers.find(next)") == 1
+
+
+def test_next_layer_bounded():
+    assert claim_next_layer_bounded(PHASE)
+
+
+def test_next_layer_bound_mutants():
+    assert not claim_next_layer_bounded(mutate(PHASE, NEXT_LOOKUP, "const auto nxt = index_.layers.find(next);"))
+    assert not claim_next_layer_bounded(
+        mutate(PHASE, "next < moe_exec_decision_log::MAX_LAYERS", "next <= moe_exec_decision_log::MAX_LAYERS"))
 
 
 # ---- the ring's lifetime ----------------------------------------------------------------------------------------------

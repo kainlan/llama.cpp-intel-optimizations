@@ -6287,8 +6287,8 @@ struct ggml_backend_sycl_context {
     std::unique_ptr<void, ggml_sycl::SdpaCacheDeleter> sdpa_cache;
 
     // The prompt's layer-ahead expert stream through a VRAM ring (llama.cpp-xod7): made at the first prompt
-    // MUL_MAT_ID of a plan with host experts, emptied at the first decode graph, reset in the destructor once the
-    // queues have drained.
+    // MUL_MAT_ID of a published plan, emptied at the first decode graph, reset in the destructor once the queues have
+    // drained.
     std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;
 
     // XMX-v2 flash-attention per-context cache (Phase 4 — fattn-xmx-f16-v2.hpp).

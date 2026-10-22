@@ -89,9 +89,10 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     }
 
     // The next layer, under this layer's window. A STREAM_ALL ring knows its experts now and stages now; a
-    // ROUTED_ONLY ring needs its own ids and stages at its own first op; a CPU decision is only logged.
+    // ROUTED_ONLY ring needs its own ids and stages at its own first op; a CPU decision is only logged. The decision log
+    // holds layers below MAX_LAYERS, and ggml_sycl_moe_stream_prepare bounds only the current layer.
     const int  next = layer + 1;
-    const auto nxt  = index_.layers.find(next);
+    const auto nxt  = next < moe_exec_decision_log::MAX_LAYERS ? index_.layers.find(next) : index_.layers.end();
     if (nxt != index_.layers.end() && op.layer_present != nullptr && op.layer_present(op.graph_ctx, next)) {
         layer_state & ns = layers_[next];
         if (!ns.decided) {
