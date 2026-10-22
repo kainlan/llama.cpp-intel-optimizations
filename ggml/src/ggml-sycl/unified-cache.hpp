@@ -6292,15 +6292,32 @@ class unified_cache {
                               const sycl::event *   ready_event      = nullptr,
                               bool                  replace_existing = true);
 
+    // What retire_expert_entry_at_locked() takes out of the lookup maps, kept as the maps' own nodes, so that
+    // restore_expert_entry_at_locked() puts them back without building new ones and a loan's rollback allocates no
+    // node (llama.cpp-mwmr). Either may be empty: the mirror when it named other storage, the mapping when the id was
+    // mapped to another entry or handed to one.
+    struct expert_retire_nodes {
+        direct_entry_map::node_type mirror;
+        id_map::node_type           mapping;
+    };
+
+    // remap_or_erase_id_mapping_locked(), except that a mapping it would erase moves to *erased instead.
+    void remap_or_extract_id_mapping_locked(const ggml_sycl_cache_id & id,
+                                            const unified_cache_key &  removed_key,
+                                            id_map::node_type *        erased);
+
     // Retire exactly the entry at `exact`, never another entry under the same id. The direct mirror goes only when it
-    // names that entry's storage; it moves to *released_mirror, for the caller to drop with no lock held or to hand
-    // back to restore_expert_entry_at_locked(). Callers hold direct_stage_mutex_ and rw_mutex_.
-    expert_retire_status retire_expert_entry_at_locked(const unified_cache_key & exact, weight_entry * released_mirror);
+    // names that entry's storage, and the id mapping only when it names that entry and no other entry takes the id
+    // over. Each moves to *released as its node, for the caller to drop with no lock held or to hand back to
+    // restore_expert_entry_at_locked(). Allocates nothing. Callers hold direct_stage_mutex_ and rw_mutex_.
+    expert_retire_status retire_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes * released);
 
     // Undo retire_expert_entry_at_locked() for an entry the caller still holds a lease on: live again, counted out of
-    // the retired entries, mapped by its id unless another entry is, and its mirror back unless another one is
-    // published. Callers hold direct_stage_mutex_ and rw_mutex_; a mirror not taken stays with the caller.
-    void restore_expert_entry_at_locked(const unified_cache_key & exact, weight_entry & mirror);
+    // the retired entries, and each node retire took re-inserted unless another entry has published its own under the
+    // id since. Re-inserting a node allocates no node; it can grow a map's bucket array only when the map holds more
+    // entries than it did when the node came out. Callers hold direct_stage_mutex_ and rw_mutex_; a node not taken
+    // stays with the caller.
+    void restore_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes & released);
 
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };

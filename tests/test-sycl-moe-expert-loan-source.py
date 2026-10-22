@@ -23,7 +23,9 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     its mirror restored) after withdrawing the host copies already published, only while each is still the entry the
     loan registered, and what the registration checks itself (the load effect, the plan coherence, an existing host
     entry) is checked before anything is copied; the vector the rollback collects into is sized before any entry
-    changes, and an allocation failure the registration does not catch itself fails it like a refusal;
+    changes, and anything the registration throws (after the G-CATCH fallback rethrow) fails it like a refusal; the
+    retire takes the mirror and the id mapping out as the maps' own nodes and the restore re-inserts them, never
+    emplacing, after every host copy is withdrawn, so the rollback allocates no node (llama.cpp-mwmr);
   - an exception while lending (an allocation failure) does not abandon the triplets already lent: the publication's
     allocations come before the first triplet is lent, each extra's device lease is dropped before anything that
     allocates, a lent triplet is flipped in the plan whatever followed, the loop stops, and the exception is rethrown
@@ -38,9 +40,11 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     compare-and-swap; ggml_backend_sycl_synchronize() runs the pending loan after it clears the graph's compute flag
     and before the deferred-free pass; the transaction refuses "graph active"; and mul_mat_id names no loan entry;
   - a loan refused BUSY (a transient refusal) re-posts its request for a later boundary, and a REFUSED one does not;
+    the runner, not the transaction, WARNs a re-posted BUSY refusal: the first in a row and then one in every 64,
+    with the count, and any other outcome resets the count;
   - the CPU expert consumer orders on the host copy's ready event: the planned prompt route carries it into the dispatch
     entry, and the planner CPU dispatch adds it to the copy events it waits on before building the tasks, skipping one
-    equal to the last it pushed;
+    equal to the last it pushed; the batched CPU dispatch skips one equal to the last job input it pushed;
   - the exact-owner check (c-sepd) and the layout check (c-n4gw) refuse before anything is copied;
   - the registration is the typed register_host_expert_owned, carrying the minted owner, never the untyped overload;
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
@@ -186,7 +190,7 @@ STAMP_EVENT = "device_entry[i]->last_write_event = out.copy_events[i];"
 STAMP_FLAG = "device_entry[i]->has_write_event = true;"
 HOLD = 'held[i] = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");'
 ENTRY_CHANGED = '{ refusal = "entry changed"; break; }'
-DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &released_mirrors[i]);"
+DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);"
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
             "k == 0 ? &out.host_handles[i] : nullptr, m.host_owner, &out.copy_events[i], false)")
 DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
@@ -207,9 +211,9 @@ def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
 
 MIRROR_MATCH = ("if (direct != direct_expert_entries_.end() && direct->second.ptr == it->second.device_ptr && "
                 "direct->second.location == it->second.location && direct->second.layout == it->second.layout) {")
-MIRROR_MOVE = "*released_mirror = std::move(direct->second);"
+MIRROR_MOVE = "released->mirror = direct_expert_entries_.extract(direct);"
 EXACT_FIND = "auto it = entries_.find(exact);"
-EXACT_REMAP = "remap_or_erase_id_mapping_locked(exact.id, exact);"
+EXACT_REMAP = "remap_or_extract_id_mapping_locked(exact.id, exact, &released->mapping);"
 
 
 def claim_retire_is_exact(cache: str) -> bool:
@@ -224,16 +228,19 @@ def claim_retire_is_exact(cache: str) -> bool:
 
 UNRETIRE = "it->second.retired = false;"
 COUNT_BACK = "retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);"
-MAPPING_BACK = "id_to_key_.emplace(exact.id, exact);"
-MIRROR_BACK = "direct_expert_entries_.emplace(exact.id, std::move(mirror));"
+MAPPING_BACK = ("if (!released.mapping.empty() && id_to_key_.find(exact.id) == id_to_key_.end()) "
+                "{ id_to_key_.insert(std::move(released.mapping)); }")
+MIRROR_BACK = ("if (!released.mirror.empty() && direct_expert_entries_.find(exact.id) == direct_expert_entries_.end()) "
+               "{ direct_expert_entries_.insert(std::move(released.mirror)); }")
 HOST_WITHDRAW = ("if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) "
-                 "{ (void) retire_expert_entry_at_locked(host_key, &released[r++]); }")
+                 "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
 RESTORE_CALL = ("restore_expert_entry_at_locked(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, "
-                "GGML_LAYOUT_AOS), released_mirrors[i]);")
+                "GGML_LAYOUT_AOS), device_nodes[i]);")
 REGISTRATION_REFUSED = 'out.reason = "host registration failed";'
-RELEASED_SIZED = ("std::vector<weight_entry> released(members[0].host_keys.size() + members[1].host_keys.size() + "
-                  "members[2].host_keys.size());")
-REGISTER_CATCH = "} catch (const std::bad_alloc &) { published = false; } if (!published) { failed = true; break; }"
+RELEASED_SIZED = ("std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + "
+                  "members[1].host_keys.size() + members[2].host_keys.size());")
+REGISTER_CATCH = ("} catch (const ggml_sycl_fallback_error &) { throw; } catch (...) { published = false; } "
+                  "if (!published) { failed = true; break; }")
 
 
 def claim_failed_registration_restores(cache: str) -> bool:
@@ -242,9 +249,40 @@ def claim_failed_registration_restores(cache: str) -> bool:
     b = body(c, LOAN_SIG)
     return (bool(restore) and all(x in restore for x in (UNRETIRE, COUNT_BACK, MAPPING_BACK, MIRROR_BACK))
             and b.count(RESTORE_CALL) == 1 and b.count(HOST_WITHDRAW) == 1
-            and b.count("std::vector<weight_entry> released(") == 1 and b.count(REGISTER_CATCH) == 1
+            and b.count("std::vector<expert_retire_nodes> host_nodes(") == 1 and b.count(REGISTER_CATCH) == 1
             and ordered(b, COPY, RELEASED_SIZED, HOLD, STAMP_EVENT)
             and ordered(b, REGISTER, REGISTER_CATCH, HOST_WITHDRAW, RESTORE_CALL, DROP_HELD, REGISTRATION_REFUSED))
+
+
+REMAP_SIG = "void unified_cache::remap_or_extract_id_mapping_locked("
+REMAP_EXTRACT = "} else if (erased) { *erased = id_to_key_.extract(mapped); } else { id_to_key_.erase(mapped); }"
+TWO_PASS = HOST_WITHDRAW + " } } for (int i = 0; i < 3; ++i) { " + RESTORE_CALL
+NODE_BUILDERS = ("emplace(", "id_to_key_[", "direct_expert_entries_[", "make_shared<", "push_back(")
+
+
+def claim_rollback_reinserts_nodes(cache: str) -> bool:
+    """The retire moves the mirror and the id mapping out as the maps' own nodes, and the restore re-inserts them
+    rather than building new ones, so the rollback after step 4 allocates no node. Every host copy is withdrawn before
+    any device entry goes back, so no map holds more entries at a restore than when its node came out, and a re-insert
+    never grows the bucket array either."""
+    c = norm(cache)
+    exact = body(c, EXACT_SIG)
+    restore = body(c, RESTORE_SIG)
+    remap = body(c, REMAP_SIG)
+    b = body(c, LOAN_SIG)
+    return (bool(exact) and bool(restore) and bool(remap) and bool(b)
+            and exact.count(MIRROR_MOVE) == 1 and exact.count(EXACT_REMAP) == 1 and remap.count(REMAP_EXTRACT) == 1
+            and restore.count(MAPPING_BACK) == 1 and restore.count(MIRROR_BACK) == 1
+            and not any(x in exact or x in restore for x in NODE_BUILDERS)
+            and b.count(TWO_PASS) == 1)
+
+
+def claim_registration_catches_everything(cache: str) -> bool:
+    """Whatever the host registration throws after the device entries are withdrawn fails it like a refusal, so the
+    rollback runs; only the op fallback is rethrown, as G-CATCH requires (nothing in a registration throws it)."""
+    b = body(norm(cache), LOAN_SIG)
+    return (b.count(REGISTER_CATCH) == 1 and "catch (const std::bad_alloc &)" not in b
+            and ordered(b, DEVICE_RETIRE, "try { published = host_ptr && " + REGISTER, REGISTER_CATCH, TWO_PASS))
 
 
 # --- what the registration checks is checked before anything is copied ----------------------------------------------
@@ -327,8 +365,10 @@ PENDING_SKIP = ("if (request.load(std::memory_order_acquire) == 0 || "
                 "ggml_sycl::unified_cache_is_graph_compute_active()) { return false; }")
 PENDING_TAKE = "const size_t bytes_wanted = request.exchange(0, std::memory_order_acq_rel);"
 PENDING_RUN = ("const ggml_sycl_txn_result code = ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, false, "
-               "resolver, out);")
-REPOST = "if (code == ggml_sycl_txn_result::BUSY) { ggml_sycl_request_expert_loan(device, bytes_wanted); }"
+               "resolver, result, false);")
+NOT_BUSY_RETURNS = ("if (code != ggml_sycl_txn_result::BUSY) { busy_streak.store(0, std::memory_order_relaxed); "
+                    "return true; }")
+REPOST = "ggml_sycl_request_expert_loan(device, bytes_wanted); return true; }"
 MMID_FORBIDDEN = ("ggml_sycl_expert_loan_transaction_run(", "ggml_sycl_run_expert_loan_transaction(",
                   "ggml_sycl_run_pending_expert_loan", "loan_expert_triplet(")
 
@@ -345,7 +385,30 @@ def claim_busy_reposts_the_request(sycl: str) -> bool:
     not, since it would only refuse again."""
     pending = body(norm(sycl), PENDING_DEVICE_SIG)
     return (pending.count(REPOST) == 1 and pending.count("ggml_sycl_request_expert_loan(") == 1
-            and ordered(pending, PENDING_TAKE, PENDING_RUN, REPOST, "return true;"))
+            and pending.count(NOT_BUSY_RETURNS) == 1 and ordered(pending, PENDING_TAKE, PENDING_RUN, NOT_BUSY_RETURNS,
+                                                                  REPOST))
+
+
+STREAK_SLOTS = "static std::atomic<uint32_t> g_sycl_expert_loan_busy_streak[GGML_SYCL_MAX_DEVICES];"
+TXN_WARN_BUSY = "ggml_sycl_expert_loan_result * out, bool warn_busy = true) {"
+REFUSE_GATE = "if (!probe_mode && (warn_busy || code != ggml_sycl_txn_result::BUSY)) { " + \
+    'GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\\n", device, reason); }'
+BUSY_EVERY = "constexpr uint32_t warn_every = 64;"
+BUSY_COUNT = "const uint32_t n = busy_streak.fetch_add(1, std::memory_order_relaxed) + 1;"
+BUSY_WARN = ('if ((n - 1) % warn_every == 0) { GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s (%u in a row, '
+             're-posted; logged once per %u)\\n", device, result->reason, n, warn_every); }')
+
+
+def claim_busy_warn_is_rate_limited(sycl: str) -> bool:
+    """A held live-update lease refuses BUSY at every boundary while it lasts. The runner asks the transaction not to
+    WARN a BUSY refusal and WARNs it itself: the first in a row, then one in every 64, with the count; any other
+    outcome resets the count."""
+    s = norm(sycl)
+    txn = body(s, TXN_SIG)
+    pending = body(s, PENDING_DEVICE_SIG)
+    return (s.count(STREAK_SLOTS) == 1 and s.count(TXN_WARN_BUSY) == 1 and txn.count(REFUSE_GATE) == 1
+            and pending.count("GGML_LOG_WARN(") == 1
+            and ordered(pending, PENDING_RUN, NOT_BUSY_RETURNS, BUSY_EVERY, BUSY_COUNT, BUSY_WARN, REPOST))
 
 
 def claim_loan_runs_at_the_graph_boundary(sycl: str) -> bool:
@@ -378,6 +441,17 @@ def claim_host_consumer_orders_on_the_copy(sycl: str) -> bool:
     dispatch = body(mmid, DISPATCH_SIG)
     return (mmid.count(ROUTE_READY) == 1 and dispatch.count(DISPATCH_READY) == 1
             and ordered(dispatch, DISPATCH_READY, DISPATCH_WAIT, "cpu_expert_task task;"))
+
+
+BATCH_READY = ("for (const expert_dispatch_entry & entry : entries) { if (entry.has_ready_event && "
+               "(job_inputs.events.empty() || job_inputs.events.back() != entry.ready_event)) { "
+               "job_inputs.events.push_back(entry.ready_event); } }")
+
+
+def claim_batched_dispatch_skips_a_repeated_ready_event(sycl: str) -> bool:
+    """The batched CPU dispatch adds each entry's ready event to its job's inputs once per run of equal events, so a
+    lent expert's many rows do not each add its copy's event again."""
+    return body(norm(sycl), MMID_SIG).count(BATCH_READY) == 1
 
 
 # --- the exact-owner and layout checks ------------------------------------------------------------------------------
@@ -496,6 +570,22 @@ def test_retire_is_exact():
 
 def test_failed_registration_restores():
     assert claim_failed_registration_restores(CACHE)
+
+
+def test_rollback_reinserts_nodes():
+    assert claim_rollback_reinserts_nodes(CACHE)
+
+
+def test_registration_catches_everything():
+    assert claim_registration_catches_everything(CACHE)
+
+
+def test_busy_warn_is_rate_limited():
+    assert claim_busy_warn_is_rate_limited(SYCL)
+
+
+def test_batched_dispatch_skips_a_repeated_ready_event():
+    assert claim_batched_dispatch_skips_a_repeated_ready_event(SYCL)
 
 
 def test_registration_checked_before_the_copies():
@@ -756,7 +846,49 @@ def test_mutant_registration_allocation_escapes_fails():
 def test_mutant_rollback_withdraws_another_entry_fails():
     """The rollback withdrawing whatever entry sits under the host id, not only the one this loan registered."""
     assert not claim_failed_registration_restores(
-        _once(CACHE, HOST_WITHDRAW, "{ (void) retire_expert_entry_at_locked(host_key, &released[r++]); }"))
+        _once(CACHE, HOST_WITHDRAW, "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }"))
+
+
+def test_mutant_restore_emplaces_the_mapping_fails():
+    """A fresh mapping node: the rollback allocates, and a throw there leaves the triplet withdrawn."""
+    assert not claim_rollback_reinserts_nodes(_once(CACHE, MAPPING_BACK, "id_to_key_.emplace(exact.id, exact);"))
+
+
+def test_mutant_restore_emplaces_the_mirror_fails():
+    assert not claim_rollback_reinserts_nodes(
+        _once(CACHE, MIRROR_BACK, MIRROR_BACK.replace("direct_expert_entries_.insert(std::move(released.mirror));",
+                                                      "direct_expert_entries_.emplace(exact.id, "
+                                                      "std::move(released.mirror.mapped()));")))
+
+
+def test_mutant_retire_erases_the_mapping_fails():
+    """The mapping erased, not kept: the restore would have to build a new node."""
+    assert not claim_rollback_reinserts_nodes(
+        _once(CACHE, EXACT_REMAP, "remap_or_erase_id_mapping_locked(exact.id, exact);"))
+
+
+def test_mutant_remap_frees_the_node_it_was_asked_to_keep_fails():
+    assert not claim_rollback_reinserts_nodes(_once(CACHE, REMAP_EXTRACT, "} else { id_to_key_.erase(mapped); }"))
+
+
+def test_mutant_rollback_restores_between_withdrawals_fails():
+    """One pass: a member's device node goes back while a later member's host copies are still in the maps, which
+    can then hold more entries than when the node came out, so the re-insert can grow the bucket array."""
+    assert not claim_rollback_reinserts_nodes(
+        _once(CACHE, TWO_PASS, HOST_WITHDRAW + " } " + RESTORE_CALL + " } for (int i = 0; i < 3; ++i) {"))
+
+
+def test_mutant_registration_catch_only_bad_alloc_fails():
+    """Any other exception from the registration escapes with the device entries withdrawn and no rollback."""
+    assert not claim_registration_catches_everything(
+        _once(CACHE, REGISTER_CATCH, "} catch (const std::bad_alloc &) { published = false; } "
+                                     "if (!published) { failed = true; break; }"))
+
+
+def test_mutant_registration_catch_swallows_the_fallback_fails():
+    assert not claim_registration_catches_everything(
+        _once(CACHE, REGISTER_CATCH, REGISTER_CATCH.replace("} catch (const ggml_sycl_fallback_error &) { throw; }",
+                                                            "}")))
 
 
 def test_mutant_transaction_takes_the_graph_mutex_fails():
@@ -826,14 +958,44 @@ def test_mutant_mul_mat_id_runs_the_loan_fails():
 
 def test_mutant_busy_drops_the_request_fails():
     """A request taken and then refused BUSY is lost: the ring never gets its bytes."""
-    assert not claim_busy_reposts_the_request(_once(SYCL, REPOST, ""))
+    assert not claim_busy_reposts_the_request(_once(SYCL, REPOST, "return true; }"))
 
 
 def test_mutant_refused_loan_reposted_fails():
     """Every refusal re-posted: a deterministic one would be retried at every boundary, and refused every time."""
     assert not claim_busy_reposts_the_request(
-        _once(SYCL, REPOST,
-              REPOST.replace("code == ggml_sycl_txn_result::BUSY", "code != ggml_sycl_txn_result::ACCEPTED")))
+        _once(SYCL, NOT_BUSY_RETURNS,
+              NOT_BUSY_RETURNS.replace("code != ggml_sycl_txn_result::BUSY", "code == ggml_sycl_txn_result::ACCEPTED")))
+
+
+def test_mutant_busy_warns_at_every_boundary_fails():
+    """A held lease refuses at every synchronize: one WARN per boundary floods the log."""
+    assert not claim_busy_warn_is_rate_limited(
+        _once(SYCL, BUSY_WARN, BUSY_WARN.replace("if ((n - 1) % warn_every == 0) {", "if (true) {")))
+
+
+def test_mutant_busy_streak_never_reset_fails():
+    """The count carried across an accepted loan: the next run of refusals starts mid-count, its first unseen."""
+    assert not claim_busy_warn_is_rate_limited(
+        _once(SYCL, NOT_BUSY_RETURNS, "if (code != ggml_sycl_txn_result::BUSY) { return true; }"))
+
+
+def test_mutant_runner_lets_the_transaction_warn_busy_fails():
+    assert not claim_busy_warn_is_rate_limited(
+        _once(SYCL, PENDING_RUN, PENDING_RUN.replace("resolver, result, false);", "resolver, result);")))
+
+
+def test_mutant_transaction_ignores_warn_busy_fails():
+    assert not claim_busy_warn_is_rate_limited(
+        _once_in(SYCL, TXN_SIG, REFUSE_GATE,
+                 REFUSE_GATE.replace("if (!probe_mode && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {",
+                                     "if (!probe_mode) {")))
+
+
+def test_mutant_busy_warn_drops_the_count_fails():
+    assert not claim_busy_warn_is_rate_limited(
+        _once(SYCL, BUSY_WARN, BUSY_WARN.replace(" (%u in a row, re-posted; logged once per %u)", "")
+              .replace("result->reason, n, warn_every);", "result->reason);")))
 
 
 def test_mutant_lending_exception_escapes_unpublished_fails():
@@ -883,6 +1045,13 @@ def test_mutant_dispatch_pushes_every_row_fails():
     """Each row of a lent expert adds its copy's event again to the blocking host wait."""
     assert not claim_host_consumer_orders_on_the_copy(
         _once(SYCL, DISPATCH_READY, "if (entry.has_ready_event) { copy_events.push_back(entry.ready_event); }"))
+
+
+def test_mutant_batched_dispatch_pushes_every_row_fails():
+    """Each row of a lent expert adds its copy's event again to the batched job's inputs."""
+    assert not claim_batched_dispatch_skips_a_repeated_ready_event(
+        _once(SYCL, BATCH_READY, "for (const expert_dispatch_entry & entry : entries) { if (entry.has_ready_event) { "
+                                 "job_inputs.events.push_back(entry.ready_event); } }"))
 
 
 def test_mutant_bulk_view_lent_fails():

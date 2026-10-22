@@ -20813,7 +20813,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
                                                                   size_t                                 bytes_wanted,
                                                                   bool                                   probe_mode,
                                                                   const ggml_sycl_expert_loan_resolver * resolver,
-                                                                  ggml_sycl_expert_loan_result *         out) {
+                                                                  ggml_sycl_expert_loan_result *         out,
+                                                                  bool warn_busy = true) {
     ggml_sycl_expert_loan_result result{};
 
     auto finish = [&](ggml_sycl_txn_result code, const char * reason) {
@@ -20823,9 +20824,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
         }
         return code;
     };
-    // One WARN per refusal, naming it. A probe is a question, not a loan, so it logs nothing.
+    // One WARN per refusal, naming it. A probe is a question, not a loan, so it logs nothing, and a caller that
+    // re-posts BUSY refusals (the boundary runner, warn_busy false) logs those itself, rate-limited.
     auto refuse = [&](ggml_sycl_txn_result code, const char * reason) {
-        if (!probe_mode) {
+        if (!probe_mode && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {
             GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\n", device, reason);
         }
         return finish(code, reason);
@@ -20966,6 +20968,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
                                                           /*logical_offset=*/0, logical);
             }
         } catch (const ggml_sycl_fallback_error &) {
+            // G-CATCH requires this clause before catch (...). Nothing on the loan path throws the op fallback
+            // (dispatch control flow), so it cannot leave the triplets already lent unpublished (llama.cpp-mwmr).
             throw;
         } catch (...) {
             escaped = std::current_exception();
@@ -21057,6 +21061,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 // Per device, the most bytes any in-graph caller asked to borrow since the last graph boundary; 0 when none did.
 static std::atomic<size_t> g_sycl_expert_loan_requests[GGML_SYCL_MAX_DEVICES];
 
+// Per device, the BUSY refusals in a row the boundary runner has re-posted; any other outcome resets it.
+static std::atomic<uint32_t> g_sycl_expert_loan_busy_streak[GGML_SYCL_MAX_DEVICES];
+
 // Ask for a loan from inside a graph: record the request for the device's next graph boundary. Lock-free, because the
 // caller may hold g_sycl_graph_compute_mutex; the largest request since the last boundary wins. Its in-graph caller
 // lands with the ring's admission when a reserve falls short (plan Tasks 7b and 12); today the boundary runner below
@@ -21077,7 +21084,7 @@ static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted) {
 // boundary. A loan refused BUSY, a transient refusal (a graph started after that check, the live-update lease was
 // held, or the plan moved while the transaction lock was taken), re-posts its request, so it too runs at a later
 // boundary; a REFUSED loan does not, since retrying it would refuse again. The transaction emits the loan's WARN, or
-// its refusal's. `resolver` is null in production.
+// its refusal's, except a BUSY one: that one this runner emits, rate-limited. `resolver` is null in production.
 static bool ggml_sycl_run_pending_expert_loan_on_device(int                                    device,
                                                         const ggml_sycl_expert_loan_resolver * resolver,
                                                         ggml_sycl_expert_loan_result *         out) {
@@ -21092,11 +21099,24 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     if (bytes_wanted == 0) {
         return false;
     }
-    const ggml_sycl_txn_result code =
-        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/false, resolver, out);
-    if (code == ggml_sycl_txn_result::BUSY) {
-        ggml_sycl_request_expert_loan(device, bytes_wanted);
+    ggml_sycl_expert_loan_result   local;
+    ggml_sycl_expert_loan_result * result = out ? out : &local;
+    const ggml_sycl_txn_result code = ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/false,
+                                                                            resolver, result, /*warn_busy=*/false);
+    std::atomic<uint32_t> &    busy_streak = g_sycl_expert_loan_busy_streak[device];
+    if (code != ggml_sycl_txn_result::BUSY) {
+        busy_streak.store(0, std::memory_order_relaxed);
+        return true;
     }
+    // A held live-update lease or a moving plan can refuse at every boundary for as long as it lasts, so the WARN
+    // names the first refusal in a row and then one in every 64, with the count (llama.cpp-mwmr).
+    constexpr uint32_t warn_every = 64;
+    const uint32_t     n          = busy_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n - 1) % warn_every == 0) {
+        GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s (%u in a row, re-posted; logged once per %u)\n", device,
+                      result->reason, n, warn_every);
+    }
+    ggml_sycl_request_expert_loan(device, bytes_wanted);
     return true;
 }
 
@@ -21218,6 +21238,7 @@ struct test_loan_fixture {
             ::ggml_sycl_publish_plan_locked(found);
         }
         g_sycl_expert_loan_requests[device].store(0, std::memory_order_release);
+        g_sycl_expert_loan_busy_streak[device].store(0, std::memory_order_relaxed);
     }
 
     size_t index(int layer, int slot, int expert) const {

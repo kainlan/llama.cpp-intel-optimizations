@@ -8282,6 +8282,12 @@ bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired)
 
 void unified_cache::remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id,
                                                      const unified_cache_key &  removed_key) {
+    remap_or_extract_id_mapping_locked(id, removed_key, nullptr);
+}
+
+void unified_cache::remap_or_extract_id_mapping_locked(const ggml_sycl_cache_id & id,
+                                                       const unified_cache_key &  removed_key,
+                                                       id_map::node_type *        erased) {
     auto mapped = id_to_key_.find(id);
     if (mapped == id_to_key_.end() || !(mapped->second == removed_key)) {
         return;
@@ -8329,6 +8335,8 @@ void unified_cache::remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & 
 
     if (have_replacement) {
         mapped->second = replacement;
+    } else if (erased) {
+        *erased = id_to_key_.extract(mapped);
     } else {
         id_to_key_.erase(mapped);
     }
@@ -9999,8 +10007,8 @@ expert_retire_status unified_cache::retire_expert_entry_exact(ggml_sycl_cache_id
 }
 
 expert_retire_status unified_cache::retire_expert_entry_at_locked(const unified_cache_key & exact,
-                                                                  weight_entry *            released_mirror) {
-    GGML_ASSERT(released_mirror != nullptr);
+                                                                  expert_retire_nodes *     released) {
+    GGML_ASSERT(released != nullptr);
     auto it = entries_.find(exact);
     if (exact.type != cache_entry_type::MOE_EXPERT || it == entries_.end()) {
         return expert_retire_status::NOT_FOUND;
@@ -10010,15 +10018,14 @@ expert_retire_status unified_cache::retire_expert_entry_at_locked(const unified_
     auto direct = direct_expert_entries_.find(exact.id);
     if (direct != direct_expert_entries_.end() && direct->second.ptr == it->second.device_ptr &&
         direct->second.location == it->second.location && direct->second.layout == it->second.layout) {
-        *released_mirror = std::move(direct->second);
-        direct_expert_entries_.erase(direct);
+        released->mirror = direct_expert_entries_.extract(direct);
     }
     (void) transition_to_retired_locked(it->second);
-    remap_or_erase_id_mapping_locked(exact.id, exact);
+    remap_or_extract_id_mapping_locked(exact.id, exact, &released->mapping);
     return expert_retire_status::DEFERRED;
 }
 
-void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exact, weight_entry & mirror) {
+void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes & released) {
     auto it = entries_.find(exact);
     if (it == entries_.end() || !it->second.retired) {
         return;
@@ -10026,9 +10033,11 @@ void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exa
     it->second.retired    = false;
     const size_t previous = retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);
     GGML_ASSERT(previous != 0 && "restored entry without a matching retirement count");
-    id_to_key_.emplace(exact.id, exact);
-    if (mirror.handle && direct_expert_entries_.find(exact.id) == direct_expert_entries_.end()) {
-        direct_expert_entries_.emplace(exact.id, std::move(mirror));
+    if (!released.mapping.empty() && id_to_key_.find(exact.id) == id_to_key_.end()) {
+        id_to_key_.insert(std::move(released.mapping));
+    }
+    if (!released.mirror.empty() && direct_expert_entries_.find(exact.id) == direct_expert_entries_.end()) {
+        direct_expert_entries_.insert(std::move(released.mirror));
     }
 }
 
@@ -10170,13 +10179,14 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     // the fill, so its storage is freed behind the copy, and it is withdrawn exactly, leaving any other entry under its
     // id alone. DEFERRED is the expected status: that lease alone defers the free. The leases are minted in the check
     // loop, before any entry changes: minting allocates, so a throw leaves every entry as it was, and the leases
-    // already minted go with the unwinding. What changes the entries after it allocates nothing. The rollback after
-    // step 4 collects the host copies a failed registration left published into `released`, sized here, before any
+    // already minted go with the unwinding. What changes the entries after it allocates nothing: each retire moves its
+    // entry's mirror and id mapping out as nodes, into device_nodes, for a rollback to put back. The rollback after
+    // step 4 collects the host copies a failed registration left published into `host_nodes`, sized here, before any
     // entry changes, so collecting them cannot throw.
-    std::shared_ptr<mem_handle> held[3];
-    weight_entry                released_mirrors[3];
-    std::vector<weight_entry>   released(members[0].host_keys.size() + members[1].host_keys.size() +
-                                         members[2].host_keys.size());
+    std::shared_ptr<mem_handle>      held[3];
+    expert_retire_nodes              device_nodes[3];
+    std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
+                                                members[2].host_keys.size());
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -10199,7 +10209,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
                 make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
             device_entry[i]->last_write_event = out.copy_events[i];
             device_entry[i]->has_write_event  = true;
-            out.retire_status[i] = retire_expert_entry_at_locked(device_key, &released_mirrors[i]);
+            out.retire_status[i]              = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
         }
     }
     if (refusal) {
@@ -10216,16 +10226,20 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         const expert_loan_member & m        = members[i];
         void *                     host_ptr = m.host_owner.resolve().ptr;
         for (size_t k = 0; k < m.host_keys.size(); ++k) {
-            // The registration undoes and reports its own failures. The one allocation it does not catch, the typed
-            // wrapper's owner copy, comes before anything is registered, so it fails the registration like a refusal
-            // and the rollback below runs, with the device entries already withdrawn.
+            // The registration undoes and reports its own failures. Anything it throws (the typed wrapper's owner
+            // copy, which comes before anything is registered, is the one allocation it does not catch) fails the
+            // registration like a refusal, and the rollback below runs, with the device entries already withdrawn.
             bool published = false;
             try {
                 published = host_ptr && register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
                                                                    k == 0 ? &out.host_handles[i] : nullptr,
                                                                    m.host_owner, &out.copy_events[i],
                                                                    /*replace_existing=*/false);
-            } catch (const std::bad_alloc &) {
+            } catch (const ggml_sycl_fallback_error &) {
+                // G-CATCH requires this clause before catch (...). Nothing in a host registration throws the op
+                // fallback (dispatch control flow), so no loan is stranded by it (llama.cpp-mwmr).
+                throw;
+            } catch (...) {
                 published = false;
             }
             if (!published) {
@@ -10241,7 +10255,9 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         // and put each device entry back as it was, so a refused loan leaves the cache as it found it. A host copy is
         // withdrawn only while its entry is still the one this loan registered, so another registrant's entry under
         // the id is never touched. The held leases kept every withdrawn entry in place, and the copies stay retained
-        // until they complete.
+        // until they complete. Every host copy is withdrawn before any device entry goes back, so at each restore no
+        // lookup map holds more entries than it did before step 3 took the nodes out, and the restores, which re-insert
+        // those nodes, allocate nothing unless other registrations filled a map while the locks were released.
         {
             std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
             std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -10253,15 +10269,17 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
                     const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 };
                     const auto              host = entries_.find(host_key);
                     if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) {
-                        (void) retire_expert_entry_at_locked(host_key, &released[r++]);
+                        (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
                     }
                 }
+            }
+            for (int i = 0; i < 3; ++i) {
                 restore_expert_entry_at_locked(
                     make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS),
-                    released_mirrors[i]);
+                    device_nodes[i]);
             }
         }
-        released.clear();
+        host_nodes.clear();
         for (std::shared_ptr<mem_handle> & lease : held) {
             lease.reset();
         }
@@ -10275,8 +10293,10 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     for (std::shared_ptr<mem_handle> & lease : held) {
         lease.reset();
     }
-    for (weight_entry & mirror : released_mirrors) {
-        mirror.handle.reset();
+    for (expert_retire_nodes & nodes : device_nodes) {
+        if (!nodes.mirror.empty()) {
+            nodes.mirror.mapped().handle.reset();
+        }
     }
 
     out.accepted = true;
