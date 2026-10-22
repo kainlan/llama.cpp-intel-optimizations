@@ -12855,11 +12855,12 @@ static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_aut
 static void ggml_sycl_reset_layer_map_state();
 static void ggml_sycl_reset_moe_phase_demotion_state();
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
-// Defined with the peer-link probes and next to ggml_sycl_info() below. The probe runs from
-// ggml_backend_sycl_model_load_begin, once the unified caches exist (llama.cpp-zujy). Only load-time probes write
-// through the mutable accessor.
+// Defined with the peer-link probes and next to ggml_sycl_info() below. The probe runs at the end of the outermost
+// model load, once the host zones are configured and S1-PRELOAD is done (llama.cpp-zujy). Its host buffer is
+// allocated the way a host-planned expert's is, so a copy from it is a direct DMA.
 static void                    ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info &);
 static ggml_sycl_device_info & ggml_sycl_info_mutable();
+static ggml_sycl::mem_handle   ggml_sycl_host_expert_alloc(int device, size_t size);
 
 static thread_local bool g_sycl_abort_load_exit = false;
 
@@ -12925,6 +12926,10 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
         }
 
         ggml_sycl_preload_model_weights();
+
+        // The host zones are configured and the experts are placed, so a pinned host source is a direct-copy source
+        // (ggml_sycl_init cannot probe: it must not create caches). Once per device; see the probe.
+        ggml_sycl_measure_h2d_pinned(ggml_sycl_info_mutable());
     }
 }
 
@@ -13623,9 +13628,6 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         // explicit UNKNOWN/no-plan candidate before any load effects.
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
         ggml_sycl_model_loading_effects(true, true);
-        // The caches exist now, so the probe may allocate (ggml_sycl_init must not create them), and ggml_sycl_info() is
-        // complete, so the tuning cache is readable. Once per device: a device holding a rate is skipped.
-        ggml_sycl_measure_h2d_pinned(ggml_sycl_info_mutable());
         registry->bind_candidate(result.txn);
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
@@ -28687,14 +28689,23 @@ static void ggml_sycl_measure_peer_host_bounce(ggml_sycl_device_info & info) {
 // mem_copy_async and one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy per 4 MiB chunk would
 // time the submit-and-wait latency of each chunk and read low.
 //
-// Once per process and device: a device that already holds a rate (probed, stored, or the seed) is left alone, which
-// is what lets the model-load boundary call this on every outermost load. GGML_SYCL_H2D_PROBE=1 probes again whatever
-// the tuning cache holds, 0 skips the probe and keeps the seed. A stored record is read back instead of probing.
-// A probe that cannot allocate (a zone with no room, no pinned pool yet) keeps the seed and says so: never an abort.
-// The store accepts only a record with a positive reorder rate, so the record carries Task 2's seed value for it
-// (by reference to the seed, not a literal). That only satisfies the store's validity rule: the executor's rates
-// assembly takes the reorder rate from its own measurement. The tuning cache is keyed by the visible devices, so a
-// device hidden from the scheduler probes again on every start.
+// The rate is only the link's if the copy is a direct DMA. mem_copy_submit takes its direct branch from a host
+// source only when the source's owner is a zone-managed host-pinned allocation of role WEIGHT, STAGING or
+// EXPERT_STAGING (host_endpoint_owner_in_scope), so the source is allocated the way the prefill ring's own copy
+// sources are (ggml_sycl_host_expert_alloc: owner-first, role WEIGHT), and the probe runs at the end of the outermost
+// model load, when the host zones are configured. A device whose cache has no configured zones is left unresolved
+// and tried again at the next load. A staged copy reads a host wait, not the link (4.7 and 6.2 GB/s measured when
+// the source was an unzoned pool buffer), so that rate is never stored or kept: the seed stands, h2d_probed stays
+// false, and the device is retried at the next load. The staged-copy census counts only while
+// GGML_SYCL_MOE_IDS_COPY_TRACE=1, so that check sees a staged copy only then; the zone check above holds without it.
+//
+// Once per process and device for a final answer (probed, stored, or env-skipped): a device that holds a rate is left
+// alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever the tuning
+// cache holds, 0 skips the probe and keeps the seed. A stored record is read back instead of probing. A probe that
+// cannot allocate keeps the seed and says so: never an abort. The store accepts only a record with a positive reorder
+// rate, so the record carries Task 2's seed value for it (by reference to the seed, not a literal). That only satisfies
+// the store's validity rule: the executor's rates assembly takes the reorder rate from its own measurement. The tuning
+// cache is keyed by the visible devices, so a device hidden from the scheduler probes again on every start.
 static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
     const char * sw    = std::getenv("GGML_SYCL_H2D_PROBE");
     const bool   skip  = sw != nullptr && std::strcmp(sw, "0") == 0;
@@ -28706,9 +28717,12 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
 
     const ggml_sycl::moe_exec_rates seed = ggml_sycl::moe_exec_rates_seed({});
 
-    auto report = [&info](int dev, double gbps, bool probed, const char * source) {
-        info.devices[dev].h2d_pinned_gbps = gbps;
-        info.devices[dev].h2d_probed      = probed;
+    // resolved: the device keeps this rate for the process (the once-guard). A retryable outcome logs and leaves 0.
+    auto report = [&info](int dev, double gbps, bool probed, bool resolved, const char * source) {
+        if (resolved) {
+            info.devices[dev].h2d_pinned_gbps = gbps;
+            info.devices[dev].h2d_probed      = probed;
+        }
         GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\n", dev, gbps, source);
     };
 
@@ -28719,39 +28733,39 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
         ggml_sycl_moe_exec_rates_record rec  = {};
         const bool                      have = ggml_backend_sycl_moe_exec_rates_lookup(dev, &rec) && rec.h2d_gbps > 0.0;
         if (have && !force) {
-            report(dev, rec.h2d_gbps, true, "tuning cache");
+            report(dev, rec.h2d_gbps, true, true, "tuning cache");
             continue;
         }
         if (skip) {
-            report(dev, seed.h2d_gbps, false, "seed, GGML_SYCL_H2D_PROBE=0");
+            report(dev, seed.h2d_gbps, false, true, "seed, GGML_SYCL_H2D_PROBE=0");
+            continue;
+        }
+        ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(dev);
+        if (cache == nullptr || !cache->host_zones_configured()) {
+            report(dev, seed.h2d_gbps, false, false, "seed, host zones not configured");
             continue;
         }
         try {
             sycl::queue *            q = &dpct::dev_mgr::instance().get_device(info.gpu_dpct_ids[dev]).default_queue();
-            ggml_sycl::alloc_request src_req{};
-            src_req.queue                                     = q;
-            src_req.device                                    = dev;
-            src_req.size                                      = kBytes;
-            src_req.suppress_failure_log                      = true;
-            src_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
-            src_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
-            src_req.intent.cohort_id                          = "h2d_probe_src";
-            src_req.intent.constraints.must_host_pinned       = true;
-            src_req.intent.constraints.use_pinned_pool        = true;
-            ggml_sycl::alloc_request dst_req                  = src_req;
+            ggml_sycl::alloc_request dst_req{};
+            dst_req.queue                                     = q;
+            dst_req.device                                    = dev;
+            dst_req.size                                      = kBytes;
+            dst_req.suppress_failure_log                      = true;
+            dst_req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+            dst_req.intent.category                           = ggml_sycl::runtime_category::STAGING;
             dst_req.intent.cohort_id                          = "h2d_probe_dst";
-            dst_req.intent.constraints.must_host_pinned       = false;
-            dst_req.intent.constraints.use_pinned_pool        = false;
             dst_req.intent.constraints.must_device            = true;
             dst_req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
             dst_req.intent.constraints.forbid_vram_zone_spill = true;
-            ggml_sycl::mem_handle src                         = ggml_sycl::unified_allocate(src_req);
+            ggml_sycl::mem_handle src                         = ggml_sycl_host_expert_alloc(dev, kBytes);
             ggml_sycl::mem_handle dst                         = ggml_sycl::unified_allocate(dst_req);
             if (!src.valid() || !dst.valid()) {
-                report(dev, seed.h2d_gbps, false, "seed, probe allocation refused");
+                report(dev, seed.h2d_gbps, false, false, "seed, probe allocation refused");
                 continue;
             }
 
+            const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
             ggml_sycl::mem_copy(dst, src, kBytes, *q);  // untimed: first-use costs stay out of the rate
 
             const auto t0 = std::chrono::steady_clock::now();
@@ -28763,8 +28777,12 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             }
             const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
             const double gbps = us > 0.0 ? static_cast<double>(kBytes) * kIters / us / 1e3 : 0.0;
+            if (ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d != staged_before) {
+                report(dev, seed.h2d_gbps, false, false, "seed, probe copy was staged");
+                continue;
+            }
             if (!(gbps > 0.0) || !std::isfinite(gbps)) {
-                report(dev, seed.h2d_gbps, false, "seed, probe measured no rate");
+                report(dev, seed.h2d_gbps, false, false, "seed, probe measured no rate");
                 continue;
             }
             rec.h2d_gbps = gbps;
@@ -28772,14 +28790,14 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
                 rec.reorder_gbps = seed.reorder_gbps;
             }
             ggml_backend_sycl_moe_exec_rates_store(dev, &rec);
-            report(dev, gbps, true, "probed");
+            report(dev, gbps, true, true, "probed");
         } catch (const ggml_sycl_fallback_error &) {
             // The alloc-zone contract's sanctioned form (clause g): ggml_sycl_fallback_error derives from
             // std::exception, so it is caught first and rethrown; nothing the probe calls throws it.
             throw;
         } catch (const std::exception & e) {
             GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed: %s\n", dev, e.what());
-            report(dev, seed.h2d_gbps, false, "seed, probe failed");
+            report(dev, seed.h2d_gbps, false, false, "seed, probe failed");
         }
     }
 }
@@ -29202,6 +29220,8 @@ sycl::queue * ggml_sycl_get_cpu_queue() {
     return info.has_cpu_device ? info.cpu_queue : nullptr;
 }
 
+// The one mutable view of the device info, for the post-init probes that fill fields the init pass cannot (the H2D
+// rate). Nothing else may write through it.
 static ggml_sycl_device_info & ggml_sycl_info_mutable() {
     static ggml_sycl_device_info info = ggml_sycl_init();
     return info;
@@ -37320,7 +37340,8 @@ static std::shared_ptr<void> ggml_sycl_transfer_alloc_owner(ggml_sycl::alloc_han
 // which frees it on release. S1-PRELOAD registers the expert with this typed owner so every lease on the entry
 // reports the allocation's provenance (HOST_PINNED, WEIGHT) through owner_metadata(): the copy path trusts a host
 // source for a direct USM copy only on that evidence, and these experts are the prefill ring's copy source
-// (llama.cpp-36j0). Returns an invalid handle when the pinned pool cannot hold it.
+// (llama.cpp-36j0). The H2D rate probe allocates its source here too, for the same reason. Returns an invalid handle
+// when the pinned pool cannot hold it.
 static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size) {
     ggml_sycl::alloc_request req{};
     req.device                              = device;

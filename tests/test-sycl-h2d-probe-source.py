@@ -6,10 +6,11 @@ Host-only: reads sources, builds nothing, loads no model and touches no device.
 Why: the cost model's h2d_gbps is the real rate of each card from pinned host memory (26.5-27.1 GB/s measured, against
 10.5-19 GB/s from pageable memory), and the peer-bounce probe stages through a pageable std::vector, so it cannot be
 reused. The probe this gate pins:
-  - ggml_sycl_measure_h2d_pinned allocates BOTH buffers through ggml_sycl::unified_allocate (role STAGING, category
-    STAGING, cohort h2d_probe_src / h2d_probe_dst), the host one pinned from the pool (must_host_pinned and
-    use_pinned_pool), the device one in the RUNTIME zone with no spill (must_device, prefer_vram_zone RUNTIME,
-    forbid_vram_zone_spill): clauses (b) and (d) of scripts/check-sycl-alloc-zone-contract.py read those literals;
+  - ggml_sycl_measure_h2d_pinned takes its host source from ggml_sycl_host_expert_alloc (owner-first, role WEIGHT,
+    pinned pool: the same provenance a host-planned expert has, which is what lets mem_copy_submit take its direct
+    branch), and its device buffer from ggml_sycl::unified_allocate (role STAGING, category STAGING, cohort
+    h2d_probe_dst) in the RUNTIME zone with no spill (must_device, prefer_vram_zone RUNTIME, forbid_vram_zone_spill):
+    clauses (b) and (d) of scripts/check-sycl-alloc-zone-contract.py read those literals;
   - no raw allocation and no pageable staging vector;
   - one untimed warm-up copy (ggml_sycl::mem_copy, which is synchronous), then 8 timed iterations of a 64 MiB buffer
     moved in 4 MiB chunks with ggml_sycl::mem_copy_async at an offset, one q->wait() per iteration and never one per
@@ -22,9 +23,13 @@ reused. The probe this gate pins:
   - sycl_device_info carries h2d_pinned_gbps and h2d_probed, and exactly one place reads h2d_pinned_gbps: the probe's
     own once-guard (a device that holds a rate is not probed again). Task 7b's rates assembly makes it two and updates
     this count;
-  - the probe is called from ggml_backend_sycl_model_load_begin, right after ggml_sycl_model_loading_effects(true, true)
-    (the unified caches exist and ggml_sycl_info() is complete there), never from ggml_sycl_init, which must not create
-    caches, and through ggml_sycl_info_mutable() rather than a const_cast of the const accessor;
+  - the probe is called at the end of ggml_sycl_model_loading_effects' outermost exit, right after
+    ggml_sycl_preload_model_weights() (the host zones are configured and the experts placed), never from
+    ggml_sycl_init (it must not create caches) nor from model_load_begin (the zones are not configured yet), and
+    through ggml_sycl_info_mutable(), defined once, rather than a const_cast of the const accessor;
+  - a device whose cache has no configured host zones is not probed (the host source would not be a trusted direct-copy
+    source), and a copy the staged-copy census records as staged is never stored or kept: the seed stands, h2d_probed
+    stays false, and both outcomes leave the device unresolved so the next load retries;
   - the stored record's reorder rate is the Task 2 seed's value (seed = moe_exec_rates_seed({}), seed.reorder_gbps),
     never a numeric literal: it only satisfies the store's validity rule, and the rates assembly measures its own.
 
@@ -130,18 +135,20 @@ def _once(text: str, old: str, new: str) -> str:
 
 # ---- the claims, each a function of the source text so a mutant can run it ----
 
-def claim_allocates_through_unified_allocate_with_literal_tiers(src: str) -> bool:
+def claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(src: str) -> bool:
     fn = probe_body(src)
     return bool(fn) and all([
-        fn.count("ggml_sycl::unified_allocate(") == 2,
+        fn.count("ggml_sycl::unified_allocate(") == 1,
+        fn.count("ggml_sycl_host_expert_alloc(dev, kBytes)") == 1,
         "role = ggml_sycl::alloc_role::STAGING" in fn,
         "category = ggml_sycl::runtime_category::STAGING" in fn,
-        '"h2d_probe_src"' in fn and '"h2d_probe_dst"' in fn,
-        "constraints.must_host_pinned = true" in fn,
-        "constraints.use_pinned_pool = true" in fn,
+        '"h2d_probe_dst"' in fn,
         "constraints.must_device = true" in fn,
         "constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME" in fn,
         "constraints.forbid_vram_zone_spill = true" in fn,
+        # the host source's tier flags live in the one helper, not a second request here
+        "must_host_pinned" not in fn,
+        "use_pinned_pool" not in fn,
         "sycl::malloc" not in fn,
         "std::vector<uint8_t>" not in fn,
         "from_direct" not in fn,
@@ -183,7 +190,8 @@ def claim_wait_closes_the_chunk_loop_before_the_clock_stops(src: str) -> bool:
 def claim_logs_once_at_warn(src: str) -> bool:
     n = norm(src)
     return n.count(LOG_FORMAT) == 1 and all(
-        s in probe_body(src) for s in ('"probed"', '"tuning cache"', '"seed, GGML_SYCL_H2D_PROBE=0"')
+        s in probe_body(src) for s in ('"probed"', '"tuning cache"', '"seed, GGML_SYCL_H2D_PROBE=0"',
+                                       '"seed, probe copy was staged"', '"seed, host zones not configured"')
     ) and "GGML_LOG_WARN(" + LOG_FORMAT in n
 
 
@@ -231,22 +239,42 @@ def claim_store_carries_a_valid_reorder_rate(src: str) -> bool:
     ])
 
 
+EFFECTS_SIG = "static void ggml_sycl_model_loading_effects(bool loading, bool outer)"
 LOAD_BEGIN_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn)"
 INIT_SIG = "static ggml_sycl_device_info ggml_sycl_init()"
 CALL = "ggml_sycl_measure_h2d_pinned(ggml_sycl_info_mutable())"
 
 
-def claim_probe_runs_at_load_begin_through_the_mutable_accessor(src: str) -> bool:
+def claim_probe_runs_after_preload_through_the_mutable_accessor(src: str) -> bool:
     n = norm(src)
+    effects = body(n, EFFECTS_SIG)
     begin = body(n, LOAD_BEGIN_SIG)
     init = body(n, INIT_SIG)
-    return bool(begin) and bool(init) and all([
+    return bool(effects) and bool(begin) and bool(init) and all([
         n.count("ggml_sycl_measure_h2d_pinned(") == 3,  # forward declaration, definition, and the one call
-        begin.count(CALL) == 1,
-        ordered(begin, "ggml_sycl_model_loading_effects(true, true);", CALL, "registry->bind_candidate("),
+        effects.count(CALL) == 1,
+        ordered(effects, "ggml_sycl_preload_model_weights();", CALL),
+        "ggml_sycl_measure_h2d_pinned" not in begin,
         "ggml_sycl_measure_h2d_pinned" not in init,
         "const_cast<ggml_sycl_device_info" not in n,
-        "static ggml_sycl_device_info & ggml_sycl_info_mutable()" in n,
+        n.count("static ggml_sycl_device_info & ggml_sycl_info_mutable() {") == 1,
+        n.count("ggml_sycl_info_mutable()") == 4,  # declaration, definition, ggml_sycl_info()'s call, the probe's call
+    ])
+
+
+def claim_zones_and_staged_copies_never_reach_the_store(src: str) -> bool:
+    fn = probe_body(src)
+    staged_report = 'report(dev, seed.h2d_gbps, false, false, "seed, probe copy was staged"); continue;'
+    zones_report = 'report(dev, seed.h2d_gbps, false, false, "seed, host zones not configured"); continue;'
+    census = "ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d"
+    return bool(fn) and all([
+        fn.count(census) == 2,
+        staged_report in fn,
+        zones_report in fn,
+        ordered(fn, "cache->host_zones_configured()", zones_report, "ggml_sycl_host_expert_alloc(dev, kBytes)"),
+        ordered(fn, "staged_before = " + census, "ggml_sycl::mem_copy(dst, src, kBytes, *q);",
+                "mem_copy_async(", census + " != staged_before", staged_report, "moe_exec_rates_store("),
+        fn.count("moe_exec_rates_store(") == 1,
     ])
 
 
@@ -285,7 +313,7 @@ def claim_one_consumer_reads_the_rate() -> bool:
 # ---- tests ----
 
 def test_probe_allocates_through_unified_allocate_with_literal_tiers():
-    assert claim_allocates_through_unified_allocate_with_literal_tiers(SYCL)
+    assert claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(SYCL)
 
 
 def test_probe_copy_is_chunked_async_with_one_wait_per_iteration():
@@ -308,8 +336,12 @@ def test_probe_stores_a_record_the_cache_will_accept():
     assert claim_store_carries_a_valid_reorder_rate(SYCL)
 
 
-def test_probe_runs_at_load_begin_through_the_mutable_accessor():
-    assert claim_probe_runs_at_load_begin_through_the_mutable_accessor(SYCL)
+def test_probe_runs_after_preload_through_the_mutable_accessor():
+    assert claim_probe_runs_after_preload_through_the_mutable_accessor(SYCL)
+
+
+def test_zones_and_staged_copies_never_reach_the_store():
+    assert claim_zones_and_staged_copies_never_reach_the_store(SYCL)
 
 
 def test_device_info_carries_the_rate_and_one_consumer_reads_it():
@@ -325,19 +357,21 @@ GUARDED_CATCH = ('catch (const ggml_sycl_fallback_error &) { throw; } catch (con
 
 
 def test_mutant_raw_malloc_fails():
-    assert not claim_allocates_through_unified_allocate_with_literal_tiers(
-        _once(SYCL, 'src_req.intent.cohort_id = "h2d_probe_src";',
-              'src_req.intent.cohort_id = "h2d_probe_src"; void * p = sycl::malloc_host(1, *q);'))
+    assert not claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(
+        _once(SYCL, 'dst_req.intent.cohort_id = "h2d_probe_dst";',
+              'dst_req.intent.cohort_id = "h2d_probe_dst"; void * p = sycl::malloc_host(1, *q);'))
 
 
-def test_mutant_pageable_staging_fails():
-    assert not claim_allocates_through_unified_allocate_with_literal_tiers(
-        _once(SYCL, "src_req.intent.constraints.use_pinned_pool = true;",
-              "src_req.intent.constraints.use_pinned_pool = false;"))
+def test_mutant_unzoned_host_source_fails():
+    """The host source built by a bare request in the probe instead of the helper: the provenance the direct branch
+    trusts is then a second, unpinned spelling."""
+    assert not claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(
+        _once(SYCL, "ggml_sycl::mem_handle src = ggml_sycl_host_expert_alloc(dev, kBytes);",
+              "ggml_sycl::mem_handle src = ggml_sycl::unified_allocate(dst_req);"))
 
 
 def test_mutant_device_spill_allowed_fails():
-    assert not claim_allocates_through_unified_allocate_with_literal_tiers(
+    assert not claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(
         _once(SYCL, "dst_req.intent.constraints.forbid_vram_zone_spill = true;",
               "dst_req.intent.constraints.forbid_vram_zone_spill = false;"))
 
@@ -380,21 +414,55 @@ def test_mutant_reorder_rate_missing_fails():
 
 
 def test_mutant_probe_called_from_init_fails():
-    assert not claim_probe_runs_at_load_begin_through_the_mutable_accessor(
+    assert not claim_probe_runs_after_preload_through_the_mutable_accessor(
         _once(SYCL, "ggml_sycl_init_peer_link_defaults(info);",
               "ggml_sycl_init_peer_link_defaults(info); ggml_sycl_measure_h2d_pinned(info);"))
 
 
+def test_mutant_probe_called_from_load_begin_fails():
+    assert not claim_probe_runs_after_preload_through_the_mutable_accessor(
+        _once(SYCL, "ggml_sycl_model_loading_effects(true, true); registry->bind_candidate(result.txn);",
+              "ggml_sycl_model_loading_effects(true, true); " + CALL + "; registry->bind_candidate(result.txn);"))
+
+
 def test_mutant_const_cast_fails():
-    assert not claim_probe_runs_at_load_begin_through_the_mutable_accessor(
-        _once(SYCL, CALL + ";", "ggml_sycl_measure_h2d_pinned(const_cast<ggml_sycl_device_info &>(ggml_sycl_info()));"))
+    assert not claim_probe_runs_after_preload_through_the_mutable_accessor(
+        _once(SYCL, CALL + ";",
+              "ggml_sycl_measure_h2d_pinned(const_cast<ggml_sycl_device_info &>(ggml_sycl_info()));"))
 
 
-def test_mutant_probe_before_effects_fails():
+def test_mutant_probe_before_preload_fails():
     mutant = _once(SYCL, CALL + ";", "")
-    mutant = _once(mutant, "ggml_sycl_model_loading_effects(true, true);",
-                   CALL + "; ggml_sycl_model_loading_effects(true, true);")
-    assert not claim_probe_runs_at_load_begin_through_the_mutable_accessor(mutant)
+    mutant = _once(mutant, "ggml_sycl_preload_model_weights(); }", CALL + "; ggml_sycl_preload_model_weights(); }")
+    assert not claim_probe_runs_after_preload_through_the_mutable_accessor(mutant)
+
+
+def test_mutant_second_mutable_accessor_definition_fails():
+    assert not claim_probe_runs_after_preload_through_the_mutable_accessor(
+        _once(SYCL, "ggml_sycl_device_info & info = ggml_sycl_info_mutable();",
+              "ggml_sycl_device_info & info = ggml_sycl_info_mutable(); ggml_sycl_info_mutable();"))
+
+
+def test_mutant_staged_check_removed_fails():
+    assert not claim_zones_and_staged_copies_never_reach_the_store(
+        _once(SYCL, "mem_copy_staged_wait_census_this_thread().staged_h2d != staged_before",
+              "false"))
+
+
+def test_mutant_staged_rate_is_kept_fails():
+    assert not claim_zones_and_staged_copies_never_reach_the_store(
+        _once(SYCL, 'report(dev, seed.h2d_gbps, false, false, "seed, probe copy was staged");',
+              'report(dev, seed.h2d_gbps, false, true, "seed, probe copy was staged");'))
+
+
+def test_mutant_store_before_staged_check_fails():
+    mutant = _once(SYCL, "rec.h2d_gbps = gbps;", "rec.h2d_gbps = gbps; ggml_backend_sycl_moe_exec_rates_store(dev, &rec);")
+    assert not claim_zones_and_staged_copies_never_reach_the_store(mutant)
+
+
+def test_mutant_zone_check_removed_fails():
+    assert not claim_zones_and_staged_copies_never_reach_the_store(
+        _once(SYCL, "if (cache == nullptr || !cache->host_zones_configured()) {", "if (false) {"))
 
 
 def test_mutant_reorder_literal_fails():
