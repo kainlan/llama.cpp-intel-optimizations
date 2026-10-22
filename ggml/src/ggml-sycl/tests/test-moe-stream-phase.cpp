@@ -743,8 +743,8 @@ int main() {
         // A late down op of a layer no region holds any more records nothing.
         rr.layer_done(3, 31);
         CHECK(!rr.read_gate[0] && rr.read_gate[1] && *rr.read_gate[1] == 41);
-        // reset_regions(), for a new ring or a torn-down one: no layer, no AOS-only slot, no read gate in either region,
-        // so a later layer_done of a layer the old ring held gates nothing.
+        // reset_regions(), for a new ring or a torn-down one: no layer, no AOS-only slot, no read gate in either
+        // region, so a later layer_done of a layer the old ring held gates nothing.
         rr.refill(0, 6, true);
         rr.reset();
         CHECK(rr.layer[0] == -1 && rr.layer[1] == -1 && !rr.aos_only[0] && !rr.aos_only[1]);

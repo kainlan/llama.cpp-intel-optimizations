@@ -32841,10 +32841,14 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 // entry. A refused entry falls through to the route core, whose HOST answer stands, and is counted
                 // with its cause and the capability's reason or the validator's reject reason, in the order asked
                 // here, so the trace says why (plan Task 8). 348c can lift the MMVQ_COMPAT-only refusal for a library
-                // (oneDNN) reader by chaining a region's rewrite on that reader's completion: stage() already makes
-                // the rewrite wait for a compute-queue barrier behind every kernel read submitted before it
-                // (moe-stream-plan.cpp), and a library reader needs the same read gate, fed with its own completion
-                // event.
+                // (oneDNN) reader only by ordering every rewrite of a region that reader read after its completion.
+                // stage() orders a rewrite after the region's readers only when the region's last use or its new one
+                // holds an AOS-only item (reuse_after_readers, moe-stream-plan.cpp): the copies then wait for the
+                // region's read gate, the barrier ggml_sycl_moe_stream_layer_done submits behind the down op of the
+                // layer the region last held, or for a barrier submitted at the stage when none was recorded. A
+                // SOA-only region is reused on the in-order compute queue's order alone, which covers a kernel reader
+                // on that queue, and 348c may not assume a library reader is one. So 348c needs both: the reader's
+                // completion event fed into the read gate, and the reuse condition widened to the regions it read.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
                     if (!stream_claim_asked) {

@@ -818,8 +818,9 @@ class moe_stream_phase {
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
     // Each region's last use: its layer, whether it left an AOS-only slot, and that layer's read gate (stage()).
     moe_stream_region_reads<sycl::event>            region_reads_;
-    const moe_exec_decision_log *                   log_    = nullptr;                // the last op's, for end_prompt
-    moe_exec_policy                                 policy_ = moe_exec_policy::AUTO;  // the last op's, for end_prompt
+    // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor.
+    const moe_exec_decision_log *                   log_    = nullptr;
+    moe_exec_policy                                 policy_ = moe_exec_policy::AUTO;
     moe_staged_route_tally                          staged_routes_;
     uint64_t                                        ring_releases_ = 0;
 };

@@ -281,9 +281,9 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
     // in the last use: an AOS-only slot is read in place, and a pair's SOA slot no longer sits at a fixed odd index.
     // Those readers ran on the compute queue (c-las5), and the gate does not follow them: under STREAM_ALL, layer_done
     // closes the region that holds the NEXT layer, so a region's gate precedes its own layer's readers. So the copies
-    // also wait for the region's read gate (lead ruling c-o9uw-1): the barrier the backend's
-    // ggml_sycl_moe_stream_layer_done submits behind the down op of the layer the region last held, and hands to
-    // layer_done(), which follows every kernel that read the region.
+    // also wait for the region's read gate (lead ruling c-o9uw-1), a barrier that follows every kernel that read the
+    // region: the backend's ggml_sycl_moe_stream_layer_done submits it behind the down op of the layer the region last
+    // held and hands it to layer_done().
     // The backend skips layer_done while no region is open. With no read gate recorded, the copies wait for a
     // compute-queue barrier submitted at the first of them. It follows every reader of the last use as well, because
     // no reader is submitted after it:

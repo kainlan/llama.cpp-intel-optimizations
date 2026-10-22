@@ -360,12 +360,13 @@ COUNT_BODY = "{ staged_routes_.count(refusal, detail); }"
 END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && table_.empty()) {"
 DTOR_SIG = "moe_stream_phase::~moe_stream_phase()"
 DTOR_HEAD = "{ report_staged_routes(); teardown("
-REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && log_->trace >= 1 && "
-               "log_->trace_sink != nullptr) {")
+REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && "
+               "log_->trace >= 1 && log_->trace_sink != nullptr) {")
 REPORT_RESET = "staged_routes_ = moe_staged_route_tally();"
 REFUSALS_WARN_FMT = "[MOE-EXEC] staged route refusals device %d: served=%zu refused=%zu "
 REFUSALS_WARN = (
-    "if (staged_routes_.refused != 0 && policy_ == moe_exec_policy::RING && log_ != nullptr && log_->sink != nullptr) {",
+    ("if (staged_routes_.refused != 0 && policy_ == moe_exec_policy::RING && log_ != nullptr && "
+     "log_->sink != nullptr) {"),
     REFUSALS_WARN_FMT,
     "const std::string warn_line = warn_head + staged_routes_.refusals_text();",
     "log_->sink(log_->sink_ctx, warn_line.c_str()); }",
@@ -383,7 +384,8 @@ def build_body(sycl: str) -> str:
 
 
 def staged_branch(sycl: str) -> str:
-    """The text of the staged branch: the `rows > 1` guard's block inside the build function."""
+    """The text of the staged branch: the block of GUARD (a phase pointer and a layer) inside the build function. A
+    decode build never enters it: `rows > 1` is the first term of the phase pointer's own condition (STREAM_DECL)."""
     b = build_body(sycl)
     at = b.find(GUARD)
     return body(b[at:], GUARD) if at >= 0 else ""
@@ -1028,7 +1030,8 @@ def claim_refusals_warn_under_ring(phase: str, hpp: str, tree: dict) -> bool:
     count = sum(norm(text).count(REFUSALS_WARN_FMT) for text in tree.values())
     return (count == 1 and ordered(r, "log_->trace_sink(log_->sink_ctx, causes.c_str()); } }", *REFUSALS_WARN)
             and r.count(REPORT_RESET) == 1
-            and norm(hpp).count(POLICY_MEMBER) == 1 and n.count(POLICY_SET) == 1 and ordered(bl, "log_ = op.log;", POLICY_SET))
+            and norm(hpp).count(POLICY_MEMBER) == 1 and n.count(POLICY_SET) == 1
+            and ordered(bl, "log_ = op.log;", POLICY_SET))
 
 
 def test_refusals_warn_under_ring():
@@ -1049,7 +1052,8 @@ def test_refusals_warn_under_ring_mutants():
     assert not c(mutate(PHASE, POLICY_SET, ""))
     assert not c(PHASE, mutate(PLAN_HPP, POLICY_MEMBER, "moe_exec_policy policy_ = moe_exec_policy::RING;"))
     # The tally cleared before the WARN reads it.
-    m = mutate(PHASE, "if (staged_routes_.refused != 0 && policy_", REPORT_RESET + " if (staged_routes_.refused != 0 && policy_")
+    m = mutate(PHASE, "if (staged_routes_.refused != 0 && policy_",
+               REPORT_RESET + " if (staged_routes_.refused != 0 && policy_")
     assert not c(m)
     # A second copy of the format elsewhere in the backend.
     tree = dict(SYCL_TREE)
