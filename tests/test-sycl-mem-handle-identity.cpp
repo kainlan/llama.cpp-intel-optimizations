@@ -15,7 +15,12 @@
 //  * the tenant cohort tag lives on the shared control and reads the same through
 //    every copy and slice, and is null for an untagged or ownerless handle;
 //  * the tag is set once: a second set aborts (a forked child), and a null cohort
-//    is ignored.
+//    is ignored;
+//  * a slice of an owned allocation may name the layout its bytes hold
+//    (slice(offset, size, layout), lead ruling c-o9uw-1): it resolves with that
+//    layout through copies, moves and plain sub-slices, while the root and its
+//    plain slices keep theirs; a weight lease (whose layout is a cache-key fact)
+//    and an ownerless handle refuse it, though both still take a plain slice.
 //
 // Nothing here touches a GPU: owners come from the private fixture factory, with an
 // injected release backend, and the registration pins the selector to the CPU.
@@ -34,6 +39,7 @@
 #include <string>
 #include <sycl/sycl.hpp>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -133,6 +139,49 @@ void test_slices() {
     CHECK(!shifted.identity_equal(ia), "a one-byte shift is a different identity");
     mem_handle shorter = root.slice(128, 255);
     CHECK(!shorter.identity_equal(ia), "a one-byte shorter slice is a different identity");
+}
+
+void test_slice_with_layout() {
+    mem_handle root = make_owner(g_block, 1024);
+    mem_handle soa  = root.slice(128, 256, GGML_LAYOUT_SOA);
+    CHECK(soa.valid(), "an owned allocation's slice may name its layout");
+    const resolved_ptr r = soa.resolve();
+    CHECK(r.ptr == g_block + 128 && r.extent == 256, "the tagged slice covers the plain slice's range");
+    CHECK(r.layout == GGML_LAYOUT_SOA, "the tagged slice resolves with the layout it names");
+    CHECK(root.resolve().layout == GGML_LAYOUT_AOS, "the root keeps its own layout");
+    CHECK(root.slice(128, 256).resolve().layout == GGML_LAYOUT_AOS, "a plain slice of the root keeps the root's");
+
+    mem_handle copy = soa;
+    CHECK(copy.resolve().layout == GGML_LAYOUT_SOA, "a copy keeps the tag");
+    mem_handle moved = std::move(copy);
+    CHECK(moved.resolve().layout == GGML_LAYOUT_SOA, "a move keeps the tag");
+    mem_handle assigned;
+    assigned = soa;
+    CHECK(assigned.resolve().layout == GGML_LAYOUT_SOA, "a copy assignment keeps the tag");
+    mem_handle move_assigned;
+    move_assigned = std::move(assigned);
+    CHECK(move_assigned.resolve().layout == GGML_LAYOUT_SOA, "a move assignment keeps the tag");
+    CHECK(soa.slice(0, 64).resolve().layout == GGML_LAYOUT_SOA, "a plain slice of a tagged slice keeps its tag");
+    CHECK(soa.slice(0, 64, GGML_LAYOUT_AOS).resolve().layout == GGML_LAYOUT_AOS, "a tagged slice may be re-tagged");
+    CHECK(!root.slice(1000, 100, GGML_LAYOUT_SOA).valid(), "a tagged slice out of range is refused");
+
+    // Only an owner names what its bytes hold.
+    mem_handle ownerless = make_ownerless();
+    CHECK(ownerless.slice(0, 16).valid(), "control: an ownerless DIRECT with an extent takes a plain slice");
+    CHECK(!ownerless.slice(0, 16, GGML_LAYOUT_SOA).valid(), "an ownerless handle may not name a layout");
+
+    alignas(64) static unsigned char lease_storage[256];
+    ggml_sycl_cache_id               id{};
+    id.valid         = true;
+    id.model_id      = 1;
+    id.aux_id        = reinterpret_cast<uintptr_t>(lease_storage);
+    id.nbytes        = sizeof(lease_storage);
+    mem_handle lease = mem_handle::from_weight_lease_snapshot(
+        id, mem_handle::HOST_DEVICE, lease_storage, GGML_LAYOUT_AOS, false, nullptr, nullptr, false, sycl::event());
+    CHECK(lease.valid() && lease.kind() == mem_handle_kind::WEIGHT, "control: a weight lease is minted");
+    CHECK(lease.slice(0, 16).valid(), "control: a weight lease takes a plain slice");
+    CHECK(!lease.slice(0, 16, GGML_LAYOUT_SOA).valid(), "a weight lease's layout is never re-tagged");
+    CHECK(!lease.slice(0, 16, GGML_LAYOUT_AOS).valid(), "not even with its own layout: only an owner names one");
 }
 
 void test_no_identity() {
@@ -321,6 +370,7 @@ int main() {
     test_tenant_cohort_is_set_once();
     test_identity_of_an_owner();
     test_slices();
+    test_slice_with_layout();
     test_no_identity();
     test_same_address_misses();
     test_identity_holds_no_reference();

@@ -994,10 +994,34 @@ mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     return h;
 }
 
+mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const {
+    // Only an owner names what its bytes hold (lead ruling c-o9uw-1). Refused
+    // before anything else, so a weight lease is never resolved on the way.
+    if (!owned_alloc_) {
+        return {};
+    }
+    // A refused range is the default handle, which owns nothing. (Not valid():
+    // an arena handle not yet resolved has no cached pointer.)
+    mem_handle h = slice(byte_offset, byte_size);
+    if (!h.owned_alloc_) {
+        return {};
+    }
+    {
+        mem_handle_lock_guard g(h.lock_);
+        h.view_layout_ = layout;
+    }
+    return h;
+}
+
 resolved_ptr mem_handle::resolved_view_locked() const {
     resolved_ptr view = cached_;
     if (!view.ptr) {
         return view;
+    }
+    // A tagged slice's layout replaces the backing resolver's, on every
+    // resolve: an arena resolve rewrites cached_ as AOS.
+    if (view_layout_) {
+        view.layout = *view_layout_;
     }
     if (!is_slice_) {
         view.extent = size_;
@@ -1747,6 +1771,7 @@ mem_handle::mem_handle(const mem_handle & other) {
         backing_offset_          = other.backing_offset_;
         slice_offset_            = other.slice_offset_;
         is_slice_                = other.is_slice_;
+        view_layout_             = other.view_layout_;
         arena_gen_               = other.arena_gen_;
         arena_authority_         = other.arena_authority_;
         arena_lease_             = other.arena_lease_;
@@ -1801,6 +1826,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     backing_offset_          = other.backing_offset_;
     slice_offset_            = other.slice_offset_;
     is_slice_                = other.is_slice_;
+    view_layout_             = other.view_layout_;
     arena_gen_               = other.arena_gen_;
     arena_authority_         = std::move(other.arena_authority_);
     arena_lease_             = std::move(other.arena_lease_);
@@ -1830,6 +1856,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     other.backing_offset_          = 0;
     other.slice_offset_            = 0;
     other.is_slice_                = false;
+    other.view_layout_.reset();
     other.arena_gen_               = 0;
     other.arena_authority_.reset();
     other.arena_lease_.reset();
@@ -1859,6 +1886,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     size_t                new_backing_offset         = 0;
     size_t                new_slice_offset           = 0;
     bool                  new_is_slice               = false;
+    std::optional<ggml_layout_mode>  new_view_layout;
     uint64_t              new_arena_gen              = 0;
     std::shared_ptr<arena_authority> new_arena_authority;
     std::shared_ptr<void>            new_arena_lease;
@@ -1884,6 +1912,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_backing_offset          = other.backing_offset_;
         new_slice_offset            = other.slice_offset_;
         new_is_slice                = other.is_slice_;
+        new_view_layout             = other.view_layout_;
         new_arena_gen               = other.arena_gen_;
         new_canonical_allocation_id = other.canonical_allocation_id_;
         new_canonical_generation    = other.canonical_generation_;
@@ -1943,6 +1972,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         backing_offset_          = new_backing_offset;
         slice_offset_            = new_slice_offset;
         is_slice_                = new_is_slice;
+        view_layout_             = new_view_layout;
         arena_gen_               = new_arena_gen;
         canonical_allocation_id_ = new_canonical_allocation_id;
         canonical_generation_    = new_canonical_generation;
@@ -1988,6 +2018,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     size_t                new_backing_offset          = 0;
     size_t                new_slice_offset            = 0;
     bool                  new_is_slice                = false;
+    std::optional<ggml_layout_mode>  new_view_layout;
     uint64_t              new_arena_gen               = 0;
     std::shared_ptr<arena_authority> new_arena_authority;
     std::shared_ptr<void>            new_arena_lease;
@@ -2009,6 +2040,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         new_backing_offset          = other.backing_offset_;
         new_slice_offset            = other.slice_offset_;
         new_is_slice                = other.is_slice_;
+        new_view_layout             = other.view_layout_;
         new_arena_gen               = other.arena_gen_;
         new_canonical_allocation_id = other.canonical_allocation_id_;
         new_canonical_generation    = other.canonical_generation_;
@@ -2031,6 +2063,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         other.backing_offset_          = 0;
         other.slice_offset_            = 0;
         other.is_slice_                = false;
+        other.view_layout_.reset();
         other.arena_gen_               = 0;
         other.arena_authority_.reset();
         other.arena_lease_.reset();
@@ -2060,6 +2093,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         backing_offset_          = new_backing_offset;
         slice_offset_            = new_slice_offset;
         is_slice_                = new_is_slice;
+        view_layout_             = new_view_layout;
         arena_gen_               = new_arena_gen;
         canonical_allocation_id_ = new_canonical_allocation_id;
         canonical_generation_    = new_canonical_generation;
