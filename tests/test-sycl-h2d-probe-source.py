@@ -301,17 +301,38 @@ def claim_probe_runs_after_preload_through_the_mutable_accessor(src: str) -> boo
 
 RETRY_ONCE = ("if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) { const uint32_t bit = 1u << outcome; "
               "if ((d.h2d_retry_logged & bit) != 0) { return; } d.h2d_retry_logged |= bit; }")
-FAILED_ONCE = ("if ((info.devices[dev].h2d_retry_logged & (1u << H2D_PROBE_OUTCOME_RETRY_FAILED)) == 0) { "
-               'GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed: %s\\n", dev, e.what()); }')
+FAILED_ONE_LINE = ('std::snprintf(what, sizeof(what), "seed, probe failed: %s", e.what()); '
+                   "report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_FAILED, what);")
 
 
 def claim_each_unresolved_reason_logs_once_per_device(src: str) -> bool:
     """A device left unresolved (host zones not configured yet) is probed again, silently, at every later load: each
     RETRY outcome logs once per device and process, through the per-device bit set in h2d_retry_logged, before the one
-    WARN line; the exception line is gated by the same bit."""
+    WARN line. An exception logs through that same line, its text folded into the source word, so the probe holds
+    exactly one logging call and a failed device prints one line, not two."""
     fn = probe_body(src)
-    return bool(fn) and fn.count(RETRY_ONCE) == 1 and fn.count(FAILED_ONCE) == 1 and ordered(
-        fn, RETRY_ONCE, "GGML_LOG_WARN(" + LOG_FORMAT)
+    return bool(fn) and fn.count(RETRY_ONCE) == 1 and fn.count(FAILED_ONE_LINE) == 1 and fn.count("GGML_LOG_") == 1 \
+        and ordered(fn, RETRY_ONCE, "GGML_LOG_WARN(" + LOG_FORMAT)
+
+
+def claim_outcome_enum_keeps_the_resolved_values_first(src: str) -> bool:
+    """`outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES` means unresolved and the logged bits are one per RETRY outcome in a
+    uint32_t, so the resolved names precede RETRY_ZONES, which opens the RETRY values, and a static_assert says so."""
+    n = norm(src)
+    m = re.search(r"enum h2d_probe_outcome \{(.*?)\};", n)
+    if not m:
+        return False
+    names = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    first_retry = names.index("H2D_PROBE_OUTCOME_RETRY_ZONES") if "H2D_PROBE_OUTCOME_RETRY_ZONES" in names else -1
+    ok_order = (first_retry == 3 and names[:3] == ["H2D_PROBE_OUTCOME_MEASURED", "H2D_PROBE_OUTCOME_FROM_CACHE",
+                                                  "H2D_PROBE_OUTCOME_SEED_KEPT"]
+                and all(x.startswith("H2D_PROBE_OUTCOME_RETRY_") for x in names[3:]) and len(names) <= 32)
+    sa = re.search(r"static_assert\((.*?), \"h2d_probe_outcome", n)
+    return ok_order and bool(sa) and all(c in sa.group(1) for c in (
+        "H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES",
+        "H2D_PROBE_OUTCOME_FROM_CACHE < H2D_PROBE_OUTCOME_RETRY_ZONES",
+        "H2D_PROBE_OUTCOME_SEED_KEPT < H2D_PROBE_OUTCOME_RETRY_ZONES",
+        "H2D_PROBE_OUTCOME_RETRY_FAILED < 32"))
 
 
 def claim_a_refused_store_is_not_reported_as_persisted(src: str) -> bool:
@@ -447,7 +468,7 @@ def test_device_info_carries_the_rate_and_one_consumer_reads_it():
 
 LOG_CALL = 'GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\\n", dev, gbps, source);'
 GUARDED_CATCH = ("catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) { "
-                 "if ((info.devices[dev].h2d_retry_logged")
+                 "char what[192];")
 
 
 def test_mutant_raw_malloc_fails():
@@ -501,7 +522,7 @@ def test_mutant_abort_on_alloc_failure_fails():
 def test_mutant_unguarded_catch_fails():
     assert not claim_rethrows_fallback_error_first(
         _once(SYCL, GUARDED_CATCH,
-              "catch (const std::exception & e) { if ((info.devices[dev].h2d_retry_logged"))
+              "catch (const std::exception & e) { char what[192];"))
 
 
 def test_mutant_reorder_rate_missing_fails():
@@ -580,10 +601,27 @@ def test_mutant_retry_reason_logs_every_load_fails():
         _once(SYCL, "if ((d.h2d_retry_logged & bit) != 0) {", "if (false) {"))
 
 
-def test_mutant_failed_line_logs_every_load_fails():
+def test_mutant_failed_logs_a_second_line_fails():
     assert not claim_each_unresolved_reason_logs_once_per_device(
-        _once(SYCL, "if ((info.devices[dev].h2d_retry_logged & (1u << H2D_PROBE_OUTCOME_RETRY_FAILED)) == 0) {",
-              "if (true) {"))
+        _once(SYCL, 'std::snprintf(what, sizeof(what), "seed, probe failed: %s", e.what());',
+              'GGML_LOG_WARN("failed %s", e.what()); std::snprintf(what, sizeof(what), "seed, probe failed: %s", '
+              "e.what());"))
+
+
+def test_outcome_enum_keeps_the_resolved_values_first():
+    assert claim_outcome_enum_keeps_the_resolved_values_first(SYCL)
+
+
+def test_mutant_outcome_enum_reordered_fails():
+    assert not claim_outcome_enum_keeps_the_resolved_values_first(
+        _once(SYCL, "H2D_PROBE_OUTCOME_FROM_CACHE, H2D_PROBE_OUTCOME_SEED_KEPT, H2D_PROBE_OUTCOME_RETRY_ZONES,",
+              "H2D_PROBE_OUTCOME_FROM_CACHE, H2D_PROBE_OUTCOME_RETRY_ZONES, H2D_PROBE_OUTCOME_SEED_KEPT,"))
+
+
+def test_mutant_outcome_enum_static_assert_dropped_fails():
+    mutant = re.sub(r"static_assert\(H2D_PROBE_OUTCOME_MEASURED.*?\);", "", strip_comments(SYCL), flags=re.S)
+    assert mutant != strip_comments(SYCL)
+    assert not claim_outcome_enum_keeps_the_resolved_values_first(mutant)
 
 
 def test_mutant_retry_bit_never_set_fails():

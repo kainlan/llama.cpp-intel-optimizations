@@ -28696,6 +28696,14 @@ enum h2d_probe_outcome {
     H2D_PROBE_OUTCOME_RETRY_FAILED,   // an exception other than the fallback error
 };
 
+// The probe tests `outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES` for "unresolved" and keeps one logged bit per RETRY
+// outcome in a uint32_t, so the three resolved outcomes must precede RETRY_ZONES, which opens the RETRY values.
+static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
+                  H2D_PROBE_OUTCOME_FROM_CACHE < H2D_PROBE_OUTCOME_RETRY_ZONES &&
+                  H2D_PROBE_OUTCOME_SEED_KEPT < H2D_PROBE_OUTCOME_RETRY_ZONES &&
+                  H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_ALLOC && H2D_PROBE_OUTCOME_RETRY_FAILED < 32,
+              "h2d_probe_outcome: resolved outcomes first, then RETRY_ZONES and the other RETRY values");
+
 // llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device's host-to-device rate from PINNED host memory, which the
 // MoE executor's cost model divides by (26.5-27.1 GB/s pinned against 10.5-19 GB/s pageable, llama.cpp-8bgi). The peer
 // probe above stages through a pageable std::vector, so it cannot stand in.
@@ -28724,13 +28732,19 @@ enum h2d_probe_outcome {
 //
 // Once per process and device for a final answer (measured, from the cache, or env-skipped): a device that holds a
 // rate is left alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever
-// the tuning cache holds, 0 skips the probe and keeps the seed. A stored record is read back instead of probing. A
-// probe that cannot allocate keeps the seed and says so: never an abort. A refused store (a device the tuning cache is
-// not keyed by, or a disabled cache) still leaves the measured rate resolved for the process and is logged "probed, not
-// stored". The store accepts only a record with a positive reorder rate, so the record carries Task 2's seed value for
-// it (by reference to the seed, not a literal). That only satisfies the store's validity rule: the executor's rates
-// assembly takes the reorder rate from its own measurement. The tuning cache is keyed by the visible devices, so a
+// the tuning cache holds, 0 skips the probe and keeps the seed. Every outcome logs through the one report line, an
+// exception included (its text rides in the source word), so a device logs one WARN line per outcome. A stored record
+// is read back instead of probing. A probe that cannot allocate keeps the seed and says so: never an abort. A refused
+// store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the measured rate resolved for
+// the process and is logged "probed, not stored". The store accepts only a record with a positive reorder rate, so the
+// record carries Task 2's seed value for it (by reference to the seed, not a literal). That only satisfies the store's
+// validity rule: the executor's rates assembly takes the reorder rate from its own measurement. The tuning cache is keyed by the visible devices, so a
 // device hidden from the scheduler probes again on every start.
+//
+// Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE or RETRY_ALLOC allocates 64 MiB and times 8 x 64 MiB again
+// at every outermost load, silently after its reason's first line. That is bounded and load-time only, and it is not
+// capped on purpose: a staged copy is exactly what the probe exists to refuse, and a cap would stop retrying a device
+// that a later load (host zones configured, a buffer freed) could measure correctly.
 static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
     const char * sw    = std::getenv("GGML_SYCL_H2D_PROBE");
     const bool   skip  = sw != nullptr && std::strcmp(sw, "0") == 0;
@@ -28831,10 +28845,9 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             // std::exception, so it is caught first and rethrown; nothing the probe calls throws it.
             throw;
         } catch (const std::exception & e) {
-            if ((info.devices[dev].h2d_retry_logged & (1u << H2D_PROBE_OUTCOME_RETRY_FAILED)) == 0) {
-                GGML_LOG_WARN("[MOE-EXEC] h2d probe device %d failed: %s\n", dev, e.what());
-            }
-            report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_FAILED, "seed, probe failed");
+            char what[192];
+            std::snprintf(what, sizeof(what), "seed, probe failed: %s", e.what());
+            report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_FAILED, what);
         }
     }
 }
