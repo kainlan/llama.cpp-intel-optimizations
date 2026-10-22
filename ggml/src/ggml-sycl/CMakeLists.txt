@@ -3071,6 +3071,43 @@ set_tests_properties(mem-copy-site-census PROPERTIES
     TIMEOUT 120
 )
 
+# MoE prefill expert streaming ring (llama.cpp-36j0): one WEIGHT-zone
+# reservation sliced into mem_handle slots, two epoch regions gated on the
+# device, release through the retained-handle drain. Its positive control for
+# the release reads the allocation registry (allocation_registry_test_contains,
+# GGML_SYCL_PRIVATE_TESTING only), so it links the private fixture carrier, as
+# test-mem-handle-eviction does, and never the ordinary ggml-sycl beside it. It
+# has no device kernel of its own (SYCL_LINK_ONLY_TEST_OPTIONS per rule 1). It
+# allocates device memory, so it carries "cache" and runs serially, outside the
+# throttled sweep.
+add_executable(test-moe-stream-ring
+    tests/test-moe-stream-ring.cpp
+)
+target_include_directories(test-moe-stream-ring PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-stream-ring PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-moe-stream-ring PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-moe-stream-ring PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-moe-stream-ring PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME sycl-moe-stream-ring COMMAND test-moe-stream-ring)
+set_tests_properties(sycl-moe-stream-ring PROPERTIES
+    LABELS "sycl;moe;ring;cache;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    TIMEOUT 120
+    # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped.
+    SKIP_RETURN_CODE 77
+)
+
 # Unregistered-external-pointer byte-contract authority (llama.cpp-fxrg).
 # Regression for the P0 where several ggml-sycl.cpp call sites minted
 # mem_handles for unregistered external pointers with a 3-arg call against the
@@ -6746,6 +6783,27 @@ set_tests_properties(sycl-moe-control-plan PROPERTIES
     TIMEOUT 30
 )
 
+# MoE prefill expert streaming ring sizing (llama.cpp-36j0): the ring's byte
+# budget and slot count. Host-only: moe-stream-ring.cpp is compiled with
+# GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY, which leaves only the pure function, so
+# this target takes no -fsycl and does not link ggml-sycl (the same TU is also
+# globbed into libggml-sycl, where the ring class is compiled too).
+add_executable(test-moe-stream-ring-sizing
+    tests/test-moe-stream-ring-sizing.cpp
+    moe-stream-ring.cpp
+)
+target_include_directories(test-moe-stream-ring-sizing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(test-moe-stream-ring-sizing PRIVATE GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY=1)
+set_target_properties(test-moe-stream-ring-sizing PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-stream-ring-sizing COMMAND test-moe-stream-ring-sizing)
+set_tests_properties(sycl-moe-stream-ring-sizing PROPERTIES
+    LABELS "sycl;moe;ring;hostonly"
+    TIMEOUT 60
+)
+
 add_executable(test-moe-mmid-workspace-plan
     tests/test-moe-mmid-workspace-plan.cpp
     moe-mmid-workspace.cpp
@@ -7415,6 +7473,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
 
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
+        test-moe-stream-ring
         test-sycl-intrusive-allocation-owner
         test-sycl-staging-replacement-failpoints
         test-sycl-cache-backing-provenance
