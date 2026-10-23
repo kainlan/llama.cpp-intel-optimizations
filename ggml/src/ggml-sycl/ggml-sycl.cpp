@@ -411,6 +411,11 @@ int g_ggml_sycl_handle_strict    = 0;
 // config is the one reader of the variables.
 int g_ggml_sycl_moe_exec_policy  = 0;
 int g_ggml_sycl_moe_exec_trace   = 0;
+
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS as the report's integer (llama.cpp-348c): SET from
+// ggml_sycl_moe_pp_f16_batched_aos_enabled() after the table parse, so the report says what is in effect.
+int g_ggml_sycl_moe_pp_f16_batched_aos = 1;
+
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
@@ -32308,6 +32313,9 @@ static void ggml_check_sycl() try {
             // clang-format off
             { ggml_sycl::MOE_EXEC_ENV_POLICY, &g_ggml_sycl_moe_exec_policy, 0 },
             { ggml_sycl::MOE_EXEC_ENV_TRACE,  &g_ggml_sycl_moe_exec_trace,  0 },
+            // The batched MoE prompt executor's AOS opt-out (llama.cpp-348c), named through common.hpp's one spelling.
+            // Its accessor is the reader; the destination is overwritten from it after the loop.
+            { GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV, &g_ggml_sycl_moe_pp_f16_batched_aos, 1 },
             // clang-format on
         };
 
@@ -32316,6 +32324,8 @@ static void ggml_check_sycl() try {
         }
         g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);
         g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;
+
+        g_ggml_sycl_moe_pp_f16_batched_aos = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a

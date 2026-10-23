@@ -1472,10 +1472,13 @@ static inline bool ggml_sycl_moe_pp_onednn_f16_enabled() {
 // llama.cpp-348c: the batched executor's f16 arm takes every expert type with an AOS dequant-to-f16 kernel
 // (moe_pp_batched_f16_supports_layout, moe-mmvq-tables.hpp), not only MXFP4. GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0
 // restricts it to MXFP4 again, both at dispatch and in the plan's f16 weight slot; unset or any other value
-// keeps it on. Read once, like the route knob above.
+// keeps it on. Read once, like the route knob above. The name is spelled once, here: the accessor reads it and its
+// sycl_env_settings[] row in ggml_check_sycl() names it, so the non-default settings report can name the knob.
+static constexpr const char * GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS";
+
 static inline bool ggml_sycl_moe_pp_f16_batched_aos_enabled() {
     static const bool aos_enabled = [] {
-        const char * env = std::getenv("GGML_SYCL_MOE_PP_F16_BATCHED_AOS");
+        const char * env = std::getenv(GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV);
         return env == nullptr || std::atoi(env) != 0;
     }();
     return aos_enabled;
