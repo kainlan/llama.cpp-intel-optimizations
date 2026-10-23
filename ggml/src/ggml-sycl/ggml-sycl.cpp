@@ -89304,6 +89304,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
+            // One f16 dequant and one row gather per active expert (~1024 launches per tensor on Qwen3.8); batching
+            // them through a pointer table, as llama.cpp-1lon did for the repack, is llama.cpp-cl5q.
             for (size_t slot = 0; slot < active_experts.size(); ++slot) {
                 const pp_onednn_batched_expert & expert = active_experts[slot];
                 const size_t                     rows   = expert.row_end - expert.row_begin;
