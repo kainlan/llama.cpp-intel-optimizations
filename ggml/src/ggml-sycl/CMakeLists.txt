@@ -5471,6 +5471,36 @@ set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# llama.cpp-348c: the batched oneDNN MoE prompt executor takes Q4_0, Q8_0, Q4_K, Q6_K, IQ3_S and IQ4_XS experts on a
+# planned model, matches the CPU backend at NMSE <= 5e-4, logs [PP-MOE] once per type, and refuses nothing. Pinned to
+# the B50; a run with no SYCL GPU exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-pp-batched-dequant
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-batched-dequant.cpp
+)
+target_include_directories(test-moe-pp-batched-dequant PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-pp-batched-dequant PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-pp-batched-dequant PRIVATE "-fsycl")
+target_link_libraries(test-moe-pp-batched-dequant PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-pp-batched-dequant PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-moe-pp-batched-dequant PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-pp-batched-dequant COMMAND test-moe-pp-batched-dequant)
+set_tests_properties(test-moe-pp-batched-dequant PROPERTIES
+    LABELS "sycl;moe;device;B50"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # static SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
