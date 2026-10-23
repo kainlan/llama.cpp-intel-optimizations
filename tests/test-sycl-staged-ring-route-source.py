@@ -342,19 +342,31 @@ EXEC_STREAM_KEY = (
     "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) : ggml_sycl::expert_tensor_role::UNKNOWN;",
 )
 EXEC_FIND = "ctx.moe_stream->find(pp_stream_layer, static_cast<int>(i02), pp_stream_role)"
+# The staged branch is a host expert's only: the ring stages only experts the plan puts on the host, and their entries
+# reach the route core, which answers HOST. An executor entry is AOS-only, and its view is checked as the staged
+# route checks a slot's: on this device, and tagged with the entry's layout (lead ruling c-o9uw-1).
+EXEC_HOST_ONLY = "GGML_ASSERT(!executor_entry || route.kind == moe_expert_route_kind::HOST);"
+EXEC_AOS_ONLY = "GGML_ASSERT(staged->layout == GGML_LAYOUT_AOS);"
+EXEC_VIEW_CHECK = ("if (view.ptr == nullptr || !view.on_device) { "
+                   "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, \"staged-slot-view\", i02); }")
+EXEC_TAG_CHECK = ("if (view.layout != staged->layout) { return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT, "
+                  "ggml_sycl_layout_mode_name(view.layout), i02); }")
 EXEC_STAGED_STEPS = (
     "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
     "if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr && route.lease.valid()) {",
     "expert.lease = std::move(route.lease); } else {",
     "const ggml_sycl::moe_stream_staged * staged = pp_stream_layer >= 0 ? " + EXEC_FIND + " : nullptr;",
-    "if (staged == nullptr || staged->consumer != ggml_sycl::moe_stream_consumer::EXECUTOR) { "
-    "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,",
-    "const ggml_sycl::mem_handle & slot = staged->layout == GGML_LAYOUT_SOA ? staged->soa : staged->aos;",
-    "void * const slot_ptr = slot.resolve(ctx.device).ptr;",
+    "const bool executor_entry = staged != nullptr && staged->consumer == ggml_sycl::moe_stream_consumer::EXECUTOR;",
+    EXEC_HOST_ONLY,
+    "if (!executor_entry) { return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,",
+    EXEC_AOS_ONLY,
+    "const ggml_sycl::resolved_ptr view = staged->aos.resolve(ctx.device);",
+    EXEC_VIEW_CHECK,
+    EXEC_TAG_CHECK,
     "ready_events.push_back(staged->ready);",
-    "expert.ptr = slot_ptr;",
+    "expert.ptr = view.ptr;",
     "expert.layout = staged->layout;",
-    "expert.lease = slot;",
+    "expert.lease = staged->aos;",
     "++pp_staged_experts; }",
     "active_experts.push_back(std::move(expert));",
     "stream->ext_oneapi_submit_barrier(ready_events);",
@@ -715,9 +727,12 @@ def claim_executor_reads_staged_slots(sycl: str) -> bool:
     the staged route keys it with. It takes an entry only when the entry's consumer is the executor (the fact the ring
     wrote), and the slot and its layout from the entry (ruling C). It pushes the entry's ready event onto the barrier
     every expert's copy is ordered by, holds the slot's lease like any expert's until the done marker, and counts the
-    slot for the trace and the refusal WARN. Any other non-device expert is declined as EXPERT_NOT_LOCAL."""
+    slot for the trace and the refusal WARN. Any other non-device expert is declined as EXPERT_NOT_LOCAL. The staged
+    branch is a HOST route's alone: an executor entry under any other route asserts. The entry is AOS-only (asserted;
+    no SOA arm), and its view is checked as the staged route checks a slot's: on this device (EXPERT_NOT_LOCAL,
+    staged-slot-view) and tagged with the entry's layout (EXPERT_LAYOUT)."""
     lam = body(norm(sycl), EXEC_SIG)
-    return (lam != "" and lam.count("->find(") == 1 and lam.count(EXEC_FIND) == 1
+    return (lam != "" and lam.count("->find(") == 1 and lam.count(EXEC_FIND) == 1 and "staged->soa" not in lam
             and all(lam.count(k) == 1 for k in EXEC_STREAM_KEY) and ordered(lam, *EXEC_STREAM_KEY, *EXEC_STAGED_STEPS)
             and lam.count("ready_events.push_back(staged->ready);") == 1 and EXEC_LEASE_HOLD in lam)
 
@@ -733,10 +748,20 @@ def test_executor_reads_staged_slots_mutants():
     # The slot taken without its copy's ready event, so the dequant may read it before the copy lands.
     assert not c(mutate(SYCL, "ready_events.push_back(staged->ready);", ""))
     # An entry the route serves taken too: the consumer the ring wrote is not asked.
-    assert not c(mutate(SYCL, "if (staged == nullptr || staged->consumer != ggml_sycl::moe_stream_consumer::EXECUTOR) {",
-                        "if (staged == nullptr) {"))
+    assert not c(mutate(SYCL, "staged != nullptr && staged->consumer == ggml_sycl::moe_stream_consumer::EXECUTOR;",
+                        "staged != nullptr;"))
     # The slot's lease not held, so the ring's release could free it under the dequant.
-    assert not c(mutate(SYCL, "expert.lease = slot;", ""))
+    assert not c(mutate(SYCL, "expert.lease = staged->aos;", ""))
+    # An executor entry taken under a route other than HOST, so a wrong entry passes as a staged expert.
+    assert not c(mutate(SYCL, EXEC_HOST_ONLY, ""))
+    # The dead SOA arm back: an executor entry is AOS-only.
+    assert not c(mutate(SYCL, "staged->aos.resolve(ctx.device);",
+                        "(staged->layout == GGML_LAYOUT_SOA ? staged->soa : staged->aos).resolve(ctx.device);"))
+    assert not c(mutate(SYCL, EXEC_AOS_ONLY, ""))
+    # A slot that does not resolve on this device taken.
+    assert not c(mutate(SYCL, EXEC_VIEW_CHECK, EXEC_VIEW_CHECK.replace(" || !view.on_device", "")))
+    # A slot whose tag is not the entry's layout taken.
+    assert not c(mutate(SYCL, EXEC_TAG_CHECK, ""))
     # The layout re-derived from the route instead of read from the entry.
     assert not c(mutate(SYCL, "expert.layout = staged->layout;", "expert.layout = route_layout;"))
     # The table asked for every expert, a device one's too, ahead of its route.

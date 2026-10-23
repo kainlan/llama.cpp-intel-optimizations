@@ -88953,15 +88953,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     continue;
                 }
 
-                // llama.cpp-sr83 (C3): compare against route_layout (this
-                // tensor's single planned layout -- SOA for down, XMX_TILED
-                // for gate/up under Option T) rather than a hardcoded SOA, so
-                // both repack sources are admitted here. This is also the
-                // homogeneity check: one ggml_tensor has one planned layout,
-                // so a per-expert actual_layout that disagrees with it is
-                // rejected (and, for a tiled-claimed op, the rejection
+                // llama.cpp-sr83 (C3): a device expert is compared against
+                // route_layout, the layout this tensor's device experts are
+                // planned in (SOA for down, XMX_TILED for gate/up under
+                // Option T), rather than a hardcoded SOA, so both repack
+                // sources are admitted here. A device expert in another
+                // layout is rejected (for a tiled-claimed op the rejection
                 // throws via trace_batched_skip rather than silently
-                // degrading to the SOA-only staging fallback).
+                // degrading to the SOA-only staging fallback). The device
+                // experts share route_layout; a host expert the ring staged
+                // for this executor (llama.cpp-3460) is AOS, the host copy as
+                // loaded, so the op's experts are not one layout. Each expert
+                // carries its own (expert.layout), and the dequant converts
+                // each by it (ggml_get_to_fp16_sycl_for_layout, below).
                 moe_expert_route         route = retained_prompt_group_route_for_expert(static_cast<int>(i02));
                 pp_onednn_batched_expert expert;
                 expert.expert_id = static_cast<int32_t>(i02);
@@ -88979,32 +88983,48 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     expert.layout = route.actual_layout;
                     expert.lease  = std::move(route.lease);
                 } else {
-                    // llama.cpp-3460: a host expert the ring staged for this executor. The staged route refused its
-                    // entry by the entry's consumer, so the expert's route is the host one, and the executor reads
-                    // the slot itself. The slot and the layout it holds come from the entry (ruling C, c-3bde): the
-                    // host copy as loaded, AOS. The copy is ordered before the dequant by the entry's ready event, on
-                    // the barrier after this loop, as the retained prompt validator orders a STAGED_RING operand. The
-                    // ring's next copy into the slot waits for the region's read gate, the barrier behind this
-                    // layer's down op (moe_stream_phase::stage, reuse_after_readers), which this in-order queue runs
-                    // after the dequant. The lease is held until the done marker like every expert's
-                    // (retain_expert_leases_until), so the ring's release never frees the slot under the dequant.
+                    // llama.cpp-3460: a host expert the ring staged for this executor. The executor runs on a staged
+                    // weight only when it takes the weight whole (pp_onednn_batched_claims_staged_layer), so the staged
+                    // route handed the entry off and left it to the route core: the expert's route is the host one, and
+                    // the executor reads the slot itself. The slot and the layout it holds come from the entry (ruling
+                    // C, c-3bde): the host copy as loaded, AOS. The copy is ordered before the dequant by the entry's
+                    // ready event, on the barrier after this loop, as the retained prompt validator orders a
+                    // STAGED_RING operand. The ring's next copy into the slot waits for the region's read gate, the
+                    // barrier behind this layer's down op (moe_stream_phase::stage, reuse_after_readers), which this
+                    // in-order queue runs after the dequant. The lease is held until the done marker like every
+                    // expert's (retain_expert_leases_until), so the ring's release never frees the slot under the
+                    // dequant.
                     const ggml_sycl::moe_stream_staged * staged =
                         pp_stream_layer >= 0 ?
                             ctx.moe_stream->find(pp_stream_layer, static_cast<int>(i02), pp_stream_role) :
                             nullptr;
-                    if (staged == nullptr || staged->consumer != ggml_sycl::moe_stream_consumer::EXECUTOR) {
+                    const bool executor_entry =
+                        staged != nullptr && staged->consumer == ggml_sycl::moe_stream_consumer::EXECUTOR;
+                    // The ring stages only experts the plan puts on the host, and the staged route leaves their
+                    // entries to the route core, which answers HOST for them: an executor entry under any other route
+                    // is a wrong entry, never a decline.
+                    GGML_ASSERT(!executor_entry || route.kind == moe_expert_route_kind::HOST);
+                    if (!executor_entry) {
                         return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
                                               ggml_sycl_expert_resolve_reason_name(route.reason), i02);
                     }
-                    const ggml_sycl::mem_handle & slot = staged->layout == GGML_LAYOUT_SOA ? staged->soa : staged->aos;
-                    void * const                  slot_ptr = slot.resolve(ctx.device).ptr;
-                    if (slot_ptr == nullptr) {
-                        return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "staged-slot-unresolved", i02);
+                    // An executor entry is AOS: the ring stages it AOS-only, and only the AOS-only stage writes the
+                    // executor as an entry's consumer.
+                    GGML_ASSERT(staged->layout == GGML_LAYOUT_AOS);
+                    // The view is checked as the staged route checks a slot's: it must resolve on this device, and
+                    // its tag must be the entry's layout (lead ruling c-o9uw-1: the tag is the layout).
+                    const ggml_sycl::resolved_ptr view = staged->aos.resolve(ctx.device);
+                    if (view.ptr == nullptr || !view.on_device) {
+                        return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "staged-slot-view", i02);
+                    }
+                    if (view.layout != staged->layout) {
+                        return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT,
+                                              ggml_sycl_layout_mode_name(view.layout), i02);
                     }
                     ready_events.push_back(staged->ready);
-                    expert.ptr    = slot_ptr;
+                    expert.ptr    = view.ptr;
                     expert.layout = staged->layout;
-                    expert.lease  = slot;
+                    expert.lease  = staged->aos;
                     ++pp_staged_experts;
                 }
                 active_experts.push_back(std::move(expert));
