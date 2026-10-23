@@ -414,7 +414,7 @@ int g_ggml_sycl_moe_exec_trace   = 0;
 
 // GGML_SYCL_MOE_PP_F16_BATCHED_AOS as the report's integer (llama.cpp-348c): SET from
 // ggml_sycl_moe_pp_f16_batched_aos_enabled() after the table parse, so the report says what is in effect.
-int g_ggml_sycl_moe_pp_f16_batched_aos = 1;
+int g_ggml_sycl_moe_pp_f16_batched_aos       = 1;
 // GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX as the report's integer (llama.cpp-348c), SET from
 // ggml_sycl_moe_pp_f16_group_experts_max() after the table parse: 0 is no cap.
 int g_ggml_sycl_moe_pp_f16_group_experts_max = 0;
@@ -89162,8 +89162,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // for where these are read.
             // llama.cpp-348c: the mxfp4.pp.* labels and GGML_SYCL_MXFP4_PP_PROFILE stay MXFP4's, byte for byte; the
             // other types are profiled under moe.pp.* by GGML_SYCL_KERNEL_PROFILE alone.
-            const bool        pp_mxfp4_labels = src0->type == GGML_TYPE_MXFP4;
-            const bool        pp_profile      = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();
+            const bool   pp_mxfp4_labels       = src0->type == GGML_TYPE_MXFP4;
+            const bool   pp_profile            = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();
             const char * pp_dequant_label_name = pp_mxfp4_labels ? nullptr : ggml_sycl_moe_pp_dequant_label(src0->type);
             std::vector<sycl::event> pp_profile_repack_begin;
             std::vector<sycl::event> pp_profile_repack_end;
