@@ -259,32 +259,38 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 //   moe_pp_batched_woq_supports_layout  -- the MXFP4 weight-only-quantized arm: repack each expert into the
 //                                          WOQ nibble/scale slots and let oneDNN dequantize inside the GEMM.
 //
-// The f16 arm admits a type only in a layout an AOS dequant-to-f16 kernel decodes, which is the layout the
-// capability table above advertises for it, so the loaded layout and the kernel cannot disagree. MXFP4 is
-// the exception: its f16 arm has its own SOA row-major dequant and no AOS one in this executor. Q1_0 and
+// The f16 arm admits a (type, layout) pair only where a kernel decodes one expert of that layout to f16,
+// and the executor picks that kernel from the layout the expert is loaded in. Every listed type is admitted
+// on AOS. Q4_0, Q8_0, Q4_K and Q6_K are admitted on SOA too, because the planner materializes experts SOA
+// (the B50 loads Q8_0 and Q6_K that way), and each SOA plane is flat over one expert's blocks: Q4_0, Q4_K
+// and Q6_K decode it with ggml_get_to_fp16_sycl_for_layout's reorder kernels, Q8_0 with
+// dequantize_row_q8_0_soa_to_fp16_rowmajor, since that table answers Q8_0 with the AOS kernel for every
+// layout. MXFP4's f16 arm has its own SOA row-major dequant and no AOS one in this executor. Q1_0 and
 // NVFP4 have converters but are left out, because no Q1_0 or NVFP4 MoE weight has been measured here.
 // IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
 //
 // The executor's candidate gate and its claim predicate (ggml_sycl_moe_pp_onednn_batched_claims_tensor)
 // both ask moe_pp_batched_supports_layout and nothing else about the type. The plan sizes the f16 weight
-// slot by asking the same question at AOS, so a type the arm takes always has its slot planned, and with
-// GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 no AOS slot is planned at all.
+// slot by asking the same question at AOS. That is enough because every non-MXFP4 type taken in any layout
+// is taken on AOS and the slot does not depend on the layout, so a type the arm takes always has its slot
+// planned; with GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 no such slot is planned at all.
 inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_MXFP4:
             return layout == GGML_LAYOUT_SOA;
-        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS:
@@ -305,8 +311,8 @@ inline bool moe_pp_batched_woq_supports_layout(enum ggml_type type, enum ggml_la
 }
 
 // The one question both gates ask. woq_enabled is GGML_SYCL_MOE_PP_WOQ; aos_enabled is
-// GGML_SYCL_MOE_PP_F16_BATCHED_AOS, which set to 0 restricts the executor to MXFP4 as it was before
-// llama.cpp-348c (every non-MXFP4 entry of the f16 arm is an AOS one).
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS, which set to 0 drops every non-MXFP4 entry (the SOA ones too, despite
+// the name) and so restricts the executor to MXFP4 as it was before llama.cpp-348c.
 inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
                                            enum ggml_layout_mode layout,
                                            bool                  woq_enabled,
@@ -314,7 +320,7 @@ inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
     if (woq_enabled && moe_pp_batched_woq_supports_layout(type, layout)) {
         return true;
     }
-    if (layout == GGML_LAYOUT_AOS && !aos_enabled) {
+    if (type != GGML_TYPE_MXFP4 && !aos_enabled) {
         return false;
     }
     return moe_pp_batched_f16_supports_layout(type, layout);

@@ -88871,9 +88871,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             // llama.cpp-348c: the f16 arm dequantizes MXFP4 with its own SOA row-major kernel and every other type with
             // the converter for the layout its experts are materialized in. The loop above refused any expert whose
-            // layout differs from the route's, so the first expert's layout is every expert's.
+            // layout differs from the route's, so the first expert's layout is every expert's. Q8_0's SOA experts
+            // take dequantize_row_q8_0_soa_to_fp16_rowmajor in the loop below, as the PP dequant pipeline's do:
+            // ggml_get_to_fp16_sycl_for_layout answers Q8_0 with the AOS kernel for every layout.
+            const bool pp_q8_0_soa = src0->type == GGML_TYPE_Q8_0 && active_experts.front().layout == GGML_LAYOUT_SOA;
             to_fp16_sycl_t pp_to_fp16 = nullptr;
-            if (!pp_woq_arm && src0->type != GGML_TYPE_MXFP4) {
+            if (!pp_woq_arm && src0->type != GGML_TYPE_MXFP4 && !pp_q8_0_soa) {
                 pp_to_fp16 = ggml_get_to_fp16_sycl_for_layout(src0->type, active_experts.front().layout);
                 if (pp_to_fp16 == nullptr) {
                     return reject_batched(moe_pp_batched_refusal::NO_DEQUANT,
@@ -89070,7 +89073,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const bool        pp_mxfp4_labels = src0->type == GGML_TYPE_MXFP4;
             const bool        pp_profile      = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();
             const std::string pp_dequant_label_name =
-                pp_to_fp16 != nullptr ? std::string("moe.pp.dequant.") + ggml_type_name(src0->type) : std::string();
+                pp_mxfp4_labels ? std::string() : std::string("moe.pp.dequant.") + ggml_type_name(src0->type);
             std::vector<sycl::event> pp_profile_repack_begin;
             std::vector<sycl::event> pp_profile_repack_end;
             std::vector<sycl::event> pp_profile_stage_events;
@@ -89201,7 +89204,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const void * expert_src  = expert.ptr;
                     sycl::half * expert_dst  = batched_weights + slot * weight_elems;
                     (void) ggml_sycl_profile_submit(*stream, dequant_label, [&](sycl::queue & profiled_queue) {
-                        pp_to_fp16(expert_src, expert_dst, static_cast<int64_t>(weight_elems), &profiled_queue);
+                        if (pp_q8_0_soa) {
+                            dequantize_row_q8_0_soa_to_fp16_rowmajor(expert_src, expert_dst,
+                                                                     static_cast<int>(ne00 / QK8_0),
+                                                                     static_cast<int>(ne01), &profiled_queue);
+                        } else {
+                            pp_to_fp16(expert_src, expert_dst, static_cast<int64_t>(weight_elems), &profiled_queue);
+                        }
                         if (!ggml_sycl_kernel_profile_enabled()) {
                             return sycl::event{};
                         }
