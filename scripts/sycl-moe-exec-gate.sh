@@ -76,6 +76,13 @@
 # loan_exercised_any=yes|no, both read from the verdict lines. --score-summary FILE scores a file of verdict lines.
 # <sha> is the head the build was made from, at least 7 hex characters; a shorter or non-hex value is refused.
 #
+# Caveat, found by the first real run (2026-10-23): oneAPI's setvars.sh overwrites shell variables. The advisor and
+# vtune vars.sh files assign BIN_DIR=bin64 as a plain variable, so a gate that set BIN_DIR="$BUILD_DIR/bin" and then
+# sourced setvars looked for bin64/llama-bench and refused every run. The --dry-run never sources setvars and could
+# not see it. So: a real run sources setvars.sh once, at the top, before any variable is derived; the build's bin
+# directory is GATE_BIN_DIR; and no top-level variable of this file shares a name with one oneAPI assigns (the test
+# audits that against /opt/intel/oneapi when it is installed).
+#
 # Options:
 #   --help | --dry-run (print each arm's command and scoring, run nothing) | --arm NAME (repeatable)
 #   --make-prompt [--prompt-out FILE]   regenerate scripts/sycl-moe-exec-prompts/code-2k.txt from docs/
@@ -84,6 +91,10 @@
 #                                       load 1, --ref-out auto load 1, --ref-out2 auto load 2
 #   --score-summary FILE                print the summary line and exit with the code a gate over those verdict lines
 #                                       (one per line) would, GPU-free
+#   --ring-arms                         print the arms whose verdict carries ring_engaged (RING_ARMS), which is what
+#                                       ring_engaged_any is read from
+#   --signal-selftest                   take GPU.lock, start a sleeping child, wait; a TERM must kill the child, release
+#                                       the lock, print the final line and exit 143 (GPU-free, for the test)
 #   --check-controls                    run only the grep controls
 #   --build-dir DIR  --out-dir DIR  --lock-dir DIR  --no-lock  --no-head-check  --since 'YYYY-MM-DD HH:MM:SS'
 #   --qwen F --gptoss F --mistral F   model files
@@ -95,6 +106,21 @@
 set -o pipefail
 export LC_NUMERIC=C
 
+# A real run sources oneAPI here, before any variable of this file is derived, because setvars.sh overwrites shell
+# variables (see the caveat in the header). The modes that run nothing on a device do not source it, so --dry-run,
+# --score-arm and the test need no oneAPI. A refusal still sources it first: it costs about two seconds.
+GATE_NEEDS_ONEAPI=1
+for GATE_ARG in "$@"; do
+    case "$GATE_ARG" in
+        -h | --help | --dry-run | --score-arm | --score-summary | --make-prompt | --check-controls | --lock-selftest | \
+            --ring-arms | --signal-selftest) GATE_NEEDS_ONEAPI=0 ;;
+    esac
+done
+if [ "$GATE_NEEDS_ONEAPI" = 1 ]; then
+    # shellcheck disable=SC1091
+    source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -105,6 +131,8 @@ TAKE_LOCK=1
 HEAD_CHECK=1
 EXPECT_SHA=""
 SCORE_SUMMARY=""
+RING_ARMS_MODE=0
+SIGNAL_SELFTEST=0
 DRY_RUN=0
 MAKE_PROMPT=0
 CHECK_CONTROLS=0
@@ -135,6 +163,8 @@ GO_TG_TOL=2
 PLACE_REF_TG="MoE experts: 38004 on device, 35724 on host"
 PLACE_REF_NOC="MoE experts: 38163 on device, 35565 on host"
 
+# The arms whose verdict carries ring_engaged=yes|no; ring_engaged_any in the summary is read from these and only these.
+RING_ARMS=(Q_pp Q_staged)
 ALL_ARMS=(Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets)
 declare -a ARMS=()
 S_CSV="" S_OUT="" S_OUT2="" S_ERR="" S_REF="" S_REF2="" S_JOURNAL="" S_RC=0
@@ -191,6 +221,8 @@ while [ $# -gt 0 ]; do
         --journal) S_JOURNAL="$2"; shift 2 ;;
         --rc) S_RC="$2"; shift 2 ;;
         --score-summary) SCORE_SUMMARY="$2"; shift 2 ;;
+        --ring-arms) RING_ARMS_MODE=1; shift ;;
+        --signal-selftest) SIGNAL_SELFTEST=1; shift ;;
         --check-controls) CHECK_CONTROLS=1; shift ;;
         --lock-selftest) LOCK_SELFTEST=1; shift ;;
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
@@ -218,7 +250,7 @@ while [ $# -gt 0 ]; do
 done
 [ "${#ARMS[@]}" -gt 0 ] || ARMS=("${ALL_ARMS[@]}")
 
-BIN_DIR="$BUILD_DIR/bin"
+GATE_BIN_DIR="$BUILD_DIR/bin"
 
 # ---------------------------------------------------------------- scoring primitives (pure functions of files)
 
@@ -661,7 +693,7 @@ print_arm_plan() {
     if [ "$A_KIND" = journal ]; then
         say "$arm: journalctl -k --since '<gate start>' --no-pager > <out-dir>/$arm.out"
     else
-        printf -v cmd '%q ' timeout -k 15 "$A_TMO" env "ONEAPI_DEVICE_SELECTOR=$A_SEL" "${A_ENV[@]}" "$BIN_DIR/$A_BIN" "${A_ARGV[@]}"
+        printf -v cmd '%q ' timeout -k 15 "$A_TMO" env "ONEAPI_DEVICE_SELECTOR=$A_SEL" "${A_ENV[@]}" "$GATE_BIN_DIR/$A_BIN" "${A_ARGV[@]}"
         say "$arm: ${cmd}> <out-dir>/$arm.out 2> <out-dir>/$arm.err"
     fi
     say "    score: $(arm_doc "$arm")"
@@ -731,9 +763,18 @@ on_signal() {
 
 # ---------------------------------------------------------------- the final summary, shared with --score-summary
 
+is_ring_arm() {
+    local a
+    for a in "${RING_ARMS[@]}"; do
+        [ "$a" = "$1" ] && return 0
+    done
+    return 1
+}
+
 # summarize <verdict lines...>: prints the summary and final lines and returns the exit code. ring_engaged_any is read
-# from the verdict lines: yes when one says ring_engaged=yes, no when some carry a ring_engaged field and none says
-# yes, na when no arm carries one (a run of only the GPT-OSS or Mistral arms has no ring to score).
+# from the verdict lines of the RING_ARMS: yes when one says ring_engaged=yes, no when some carry ring_engaged=no and
+# none says yes, na when no ring arm ran (a run of only the GPT-OSS or Mistral arms has no ring to score). Q_tg and
+# Q_noc print ring_engaged too, but only as information about their prompt: a new arm counts once it is in RING_ARMS.
 summarize() {
     local v pass=0 fail=0 notx=0 any_loan=no any_ring=na
     for v in "$@"; do
@@ -744,10 +785,12 @@ summarize() {
             *) fail=$((fail + 1)) ;;
         esac
         case "$v" in *"loan_exercised=yes"*) any_loan=yes ;; esac
-        case "$v" in
-            *"ring_engaged=yes"*) any_ring=yes ;;
-            *"ring_engaged=no"*) [ "$any_ring" = yes ] || any_ring=no ;;
-        esac
+        if is_ring_arm "${v%%=*}"; then
+            case "$v" in
+                *"ring_engaged=yes"*) any_ring=yes ;;
+                *"ring_engaged=no"*) [ "$any_ring" = yes ] || any_ring=no ;;
+            esac
+        fi
     done
     say "summary: ring_engaged_any=$any_ring loan_exercised_any=$any_loan verdicts_fail=$fail not_exercised_or_unscored=$notx out=${OUT_DIR:-none}"
     say "verdicts_pass=$pass GATE_DONE"
@@ -793,6 +836,11 @@ if [ "$LOCK_SELFTEST" = 1 ]; then
     exit 0
 fi
 
+if [ "$RING_ARMS_MODE" = 1 ]; then
+    say "${RING_ARMS[*]}"
+    exit 0
+fi
+
 if [ -n "$SCORE_SUMMARY" ]; then
     [ -f "$SCORE_SUMMARY" ] || die_usage "no verdict file $SCORE_SUMMARY"
     mapfile -t SUM_LINES < "$SCORE_SUMMARY"
@@ -826,6 +874,16 @@ LOCK_HELD=0
 trap 'lock_release' EXIT
 trap on_signal TERM INT HUP
 
+if [ "$SIGNAL_SELFTEST" = 1 ]; then
+    lock_take || refuse "signal-selftest: could not take $LOCK_DIR"
+    sleep 30 &
+    CHILD=$!
+    say "signal-selftest: child=$CHILD lock=$LOCK_DIR"
+    wait "$CHILD"
+    say "signal-selftest: the child exited without a signal"
+    exit 1
+fi
+
 if [ "$HEAD_CHECK" = 1 ]; then
     [ -n "$EXPECT_SHA" ] || refuse "no <sha> argument: pass the merge sha the build was made from"
     [[ "$EXPECT_SHA" =~ ^[0-9a-f]{7,40}$ ]] || refuse "<sha> '$EXPECT_SHA' is not 7 to 40 lowercase hex characters"
@@ -838,8 +896,6 @@ fi
 
 # A reconfigure can drop the SYCL backend and a CPU-only build prints the same tokens about 13x slower.
 grep -q '^GGML_SYCL:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null || refuse "GGML_SYCL is not ON in $BUILD_DIR/CMakeCache.txt"
-# shellcheck disable=SC1091
-source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1
 head_time="$(git -C "$ROOT_DIR" log -1 --format=%ct 2>/dev/null)"
 need_bins=()
 for arm in "${ARMS[@]}"; do
@@ -847,11 +903,11 @@ for arm in "${ARMS[@]}"; do
     [ -z "$A_BIN" ] || need_bins+=("$A_BIN")
 done
 for b in $(printf '%s\n' "${need_bins[@]}" | sort -u); do
-    [ -x "$BIN_DIR/$b" ] || refuse "no $BIN_DIR/$b"
-    if [ "$HEAD_CHECK" = 1 ] && [ -n "$head_time" ] && [ "$(stat -c %Y "$BIN_DIR/$b")" -le "$head_time" ]; then
-        refuse "$BIN_DIR/$b is not newer than the head commit"
+    [ -x "$GATE_BIN_DIR/$b" ] || refuse "no $GATE_BIN_DIR/$b"
+    if [ "$HEAD_CHECK" = 1 ] && [ -n "$head_time" ] && [ "$(stat -c %Y "$GATE_BIN_DIR/$b")" -le "$head_time" ]; then
+        refuse "$GATE_BIN_DIR/$b is not newer than the head commit"
     fi
-    [ "$(ldd "$BIN_DIR/$b" 2>/dev/null | grep -cE 'libggml-sycl|libsycl')" -ge 2 ] || refuse "$b does not link the SYCL runtime"
+    [ "$(ldd "$GATE_BIN_DIR/$b" 2>/dev/null | grep -cE 'libggml-sycl|libsycl')" -ge 2 ] || refuse "$b does not link the SYCL runtime"
 done
 for arm in "${ARMS[@]}"; do
     case "$arm" in
@@ -892,7 +948,7 @@ run_arm() { # <arm>: runs it, writes <arm>.out/.err/.rc, prints the sample lines
     settle
     [ "$(builders)" -eq 0 ] || refuse "builders = $(builders) before arm $arm"
     say "arm $arm: pre $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders=$(builders) $(date +%T)"
-    timeout -k 15 "$A_TMO" env ONEAPI_DEVICE_SELECTOR="$A_SEL" "${A_ENV[@]}" "$BIN_DIR/$A_BIN" "${A_ARGV[@]}" \
+    timeout -k 15 "$A_TMO" env ONEAPI_DEVICE_SELECTOR="$A_SEL" "${A_ENV[@]}" "$GATE_BIN_DIR/$A_BIN" "${A_ARGV[@]}" \
         > "$OUT_DIR/$arm.out" 2> "$OUT_DIR/$arm.err" < /dev/null &
     CHILD=$!
     wait "$CHILD"

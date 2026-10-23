@@ -28,7 +28,12 @@
 #     and runs nothing; --help names the arms;
 #   - a real run refuses without a <sha> or with a wrong one, prints verdicts_pass=0 GATE_DONE, exits 2 and never
 #     creates GPU.lock; the lock helper takes, refuses a second take, and releases;
-#   - --make-prompt is deterministic and the committed prompt exists.
+#   - --make-prompt is deterministic and the committed prompt exists;
+#   - oneAPI's setvars.sh overwrites shell variables (the advisor and vtune vars.sh assign BIN_DIR=bin64), which made
+#     the first real run refuse with "no bin64/llama-bench": no bare BIN_DIR=, setvars sourced before the first use of
+#     GATE_BIN_DIR, no top-level name in common with oneAPI's, and a real run's refusal names the build's own bin;
+#   - the exit-143 path: a TERM kills the child, releases GPU.lock, prints the final line;
+#   - RING_ARMS: every arm in the list prints ring_engaged, and an arm outside it cannot move ring_engaged_any.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -435,6 +440,84 @@ expect_rc "summary of a missing file is a usage error" "$rc" 2
 out="$(bash "$GATE" --help 2>&1)"
 expect "help documents exit 143 on a signal" "$out" "143"
 expect "help documents ring_engaged_any" "$out" "ring_engaged_any=yes|no|na"
+
+# ---- the oneAPI variable collision (found by the first real run, 2026-10-23)
+# setvars.sh sources the advisor and vtune vars.sh files, which assign BIN_DIR=bin64 as a plain variable. A gate that
+# set BIN_DIR and then sourced setvars looked for bin64/llama-bench. --dry-run never sources setvars, so only this
+# static check and the real-flow refusal below can see it.
+if cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -qE '(^|[^A-Za-z_])BIN_DIR='; then fail "the gate assigns a bare BIN_DIR, which oneAPI's vars.sh overwrites"; else pass "the gate assigns no bare BIN_DIR"; fi
+src_line="$(cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -n 'source /opt/intel/oneapi/setvars.sh' | head -1 | cut -d: -f1)"
+use_line="$(cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -n 'GATE_BIN_DIR' | head -1 | cut -d: -f1)"
+if [ -n "$src_line" ] && [ -n "$use_line" ] && [ "$src_line" -lt "$use_line" ]; then
+    pass "setvars is sourced (line $src_line) before the first use of GATE_BIN_DIR (line $use_line)"
+else
+    fail "setvars source line '${src_line:-none}' must precede the first GATE_BIN_DIR line '${use_line:-none}'"
+fi
+if [ -f /opt/intel/oneapi/setvars.sh ]; then
+    for f in /opt/intel/oneapi/setvars.sh /opt/intel/oneapi/*/latest/env/vars.sh /opt/intel/oneapi/*/latest/oneapi-vars.sh \
+             /opt/intel/oneapi/*/latest/etc/*/vars.sh /opt/intel/oneapi/*/latest/etc/*/*.sh; do
+        [ -f "$f" ] && cat "$f"
+    done 2>/dev/null | grep -oE '^[[:space:]]*(export +|local +|declare +)?[A-Za-z_][A-Za-z_0-9]*=' \
+        | sed -E 's/^[[:space:]]*(export |local |declare )? *//; s/=$//' | LC_ALL=C sort -u > "$WORK/oneapi-names.txt"
+    cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -oE '(^|[;{(]|then|do)[[:space:]]*[A-Za-z_][A-Za-z_0-9]*(\[[^]]*\])?\+?=' \
+        | sed -E 's/^(;|\{|\(|then|do)?[[:space:]]*//; s/(\[[^]]*\])?\+?=$//' | LC_ALL=C sort -u > "$WORK/gate-names.txt"
+    shared="$(LC_ALL=C comm -12 "$WORK/oneapi-names.txt" "$WORK/gate-names.txt" | tr '\n' ' ')"
+    if [ -s "$WORK/oneapi-names.txt" ] && [ -s "$WORK/gate-names.txt" ] && [ -z "$shared" ]; then
+        pass "no variable the gate assigns is also assigned by oneAPI's setvars and vars.sh files"
+    else
+        fail "the gate assigns names oneAPI also assigns (or an extraction was empty): '${shared}'"
+    fi
+else
+    pass "oneAPI is not installed here: the name audit is skipped (the static BIN_DIR checks above still ran)"
+fi
+# The real flow, up to the first refusal and no further: a build dir that lacks the binaries. The refusal must name
+# the build's own bin directory; with the old BIN_DIR it named bin64 once setvars had run.
+mkdir -p "$WORK/fakebuild"
+echo 'GGML_SYCL:BOOL=ON' > "$WORK/fakebuild/CMakeCache.txt"
+out="$(bash "$GATE" --no-head-check --no-lock --arm Q_pp --build-dir "$WORK/fakebuild" --out-dir "$WORK/fakeout" 2>&1)"; rc=$?
+expect_rc "a real run without binaries refuses with rc 2" "$rc" 2
+expect "the refusal names the build's own bin directory" "$out" "REFUSED: no $WORK/fakebuild/bin/llama-bench"
+expect_not "the refusal never names bin64" "$out" "bin64"
+
+# ---- the exit-143 path: no device, a sleeping child, a TERM
+LOCKD="$WORK/sig.lock"
+bash "$GATE" --signal-selftest --lock-dir "$LOCKD" > "$WORK/sig.out" 2>&1 &
+gpid=$!
+for _ in $(seq 100); do
+    grep -q 'signal-selftest: child=' "$WORK/sig.out" 2>/dev/null && break
+    sleep 0.1
+done
+child="$(sed -n 's/.*signal-selftest: child=\([0-9][0-9]*\) .*/\1/p' "$WORK/sig.out")"
+if [ -d "$LOCKD" ] && [ -f "$LOCKD/holder" ] && [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+    pass "signal selftest: the lock is held with a holder file and the child runs before the TERM"
+else
+    fail "signal selftest did not reach its waiting state (lock '$LOCKD', child '${child:-none}')" "$(cat "$WORK/sig.out" 2>/dev/null)"
+fi
+kill -TERM "$gpid" 2>/dev/null
+wait "$gpid"; rc=$?
+out="$(cat "$WORK/sig.out")"
+expect_rc "a TERM ends the gate with rc 143" "$rc" 143
+expect "a TERM prints ABORTED" "$out" "ABORTED by signal"
+expect "a TERM still ends with the marker line" "$out" "verdicts_pass=0 GATE_DONE"
+if [ -e "$LOCKD" ]; then fail "a TERM left GPU.lock behind"; else pass "a TERM releases GPU.lock"; fi
+if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then fail "a TERM left the child $child running"; else pass "a TERM kills the child"; fi
+
+# ---- RING_ARMS: the arms ring_engaged_any is read from
+read -ra RARMS <<< "$(bash "$GATE" --ring-arms 2>&1)"
+if [ "${#RARMS[@]}" -gt 0 ]; then pass "the gate names its ring arms: ${RARMS[*]}"; else fail "--ring-arms printed nothing"; fi
+for arm in "${RARMS[@]}"; do
+    case "$arm" in
+        Q_pp) line="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")" ;;
+        Q_staged) line="$(score Q_staged --err "$WORK/st-pass.err")" ;;
+        *) line="" ;;
+    esac
+    if [ -z "$line" ]; then fail "ring arm $arm has no fixture in this test: add one"; else expect "ring arm $arm prints ring_engaged=" "$line" "ring_engaged="; fi
+done
+out="$(summ outside "$PASS_RING" "Q_tg=PASS tg=11.9 ring_engaged=no")"
+expect "an arm outside RING_ARMS cannot move ring_engaged_any to no" "$out" "ring_engaged_any=yes"
+out="$(summ outside2 "$CTRL_PASS" "Q_tg=PASS tg=11.9 ring_engaged=no")"; rc=$?
+expect "an arm outside RING_ARMS does not make ring_engaged_any=no" "$out" "ring_engaged_any=na"
+expect_rc "an arm outside RING_ARMS leaves the exit code 0" "$rc" 0
 
 # ---- the prompt
 bash "$GATE" --make-prompt --prompt-out "$WORK/p1.txt" > /dev/null 2>&1
