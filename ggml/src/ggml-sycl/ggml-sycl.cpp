@@ -44845,6 +44845,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffe
             // alignment, not a policy: a host-pinned compute buffer for a device would run its compute over PCIe,
             // which placement-decides-executor forbids (the pinned-pool alignment is a separate ticket). It cannot
             // say why the buffer fell back to host memory; the context refusal names what no device tier held.
+            // The batched MoE prompt executor's claim relies on this refusal (moe_pp_batched_has_expert_entries): a
+            // host-pinned device buffer gets no per-expert AOS slices, so lifting it means that predicate must
+            // decline the host-pinned tier too (llama.cpp-348c).
             snprintf(cause, sizeof(cause),
                      "this is a host-pinned fallback buffer, so its base is not aligned: the pinned pool's base is "
                      "aligned only to %zu bytes",
@@ -80966,13 +80969,16 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     if (!planned) {
         return false;
     }
-    // The executor resolves each active expert's own cache entry, which a device-buffer weight
-    // (GGML_SYCL_WEIGHTS_EVICTABLE=0) has only on AOS: its upload reorders any other layout into one block over every
-    // expert. Claiming such a layout would advertise past what the cache holds and steer the prompt past the fused
-    // and legacy routes into an admission that refuses it (llama.cpp-348c). Declining keeps that weight on the routes
-    // it had before; it does not make this executor serve it. That gap is open, pending an owner decision: serving it
-    // needs per-expert entries for a device-buffer SOA weight (publish per-expert SOA slices, or reorder per expert),
-    // and neither is done here.
+    // The executor resolves each active expert's own cache entry. A device-buffer weight
+    // (GGML_SYCL_WEIGHTS_EVICTABLE=0) has one only where its upload published per-expert AOS slices, which needs three
+    // conditions: a complete upload, no reorder, and a buffer outside the host-pinned tier. Any other layout is
+    // reordered into one block over every expert. moe_pp_batched_has_expert_entries checks only the layout; its
+    // comment says why the other two hold today, the host-pinned one only through the publish refusal of
+    // llama.cpp-mmi1. Claiming a layout without per-expert entries would advertise past what the cache holds and
+    // steer the prompt past the fused and legacy routes into an admission that refuses it (llama.cpp-348c).
+    // Declining keeps that weight on the routes it had before; it does not make this executor serve it. That gap is
+    // open, pending an owner decision: serving it needs per-expert entries for a device-buffer SOA weight (publish
+    // per-expert SOA slices, or reorder per expert), and neither is done here.
     const bool device_buffer = weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);
     if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
         return false;

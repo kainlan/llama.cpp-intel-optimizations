@@ -338,7 +338,15 @@ inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
 // predicate asks this after the table, so the claim never takes a layout the cache does not hold per expert.
 //   - host buffer (device_buffer false; every default load, since GGML_SYCL_WEIGHTS_EVICTABLE defaults on): the
 //     load-end preload stages each device-planned expert in its planned layout, one entry per expert;
-//   - device buffer, AOS: the upload publishes one slice per expert (ggml_sycl_publish_backend_aos_expert_handles);
+//   - device buffer, AOS: ggml_backend_sycl_buffer_set_tensor publishes one slice per expert
+//     (ggml_sycl_publish_backend_aos_expert_handles) only when three conditions hold: the upload is complete, it is
+//     not reordered, and the buffer is not in the host-pinned tier. This predicate encodes only the second, through
+//     the layout: an AOS upload is never reordered. The first holds for every model load, because the device reports
+//     async uploads off while a load is open (ggml_backend_sycl_device_get_props), so the loader writes each tensor
+//     with one full set_tensor. The third holds only because ggml_backend_sycl_buffer_publish refuses a host-pinned
+//     fallback of a device buffer (llama.cpp-mmi1), and that refusal is an accident of the pinned pool's alignment,
+//     not a policy. If it is lifted, this predicate must also decline a host-pinned device buffer, or the claim
+//     takes an AOS weight that has no per-expert entries;
 //   - device buffer, any other layout: the upload reorders the whole tensor into one block over every expert, so
 //     no expert has an entry of its own and the admission refuses the op.
 // MXFP4 keeps the route it had before llama.cpp-348c, so it is not declined here.
