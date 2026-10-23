@@ -39,12 +39,22 @@ namespace ggml_sycl {
 
 // How the ring stages one matrix (c-hmey). SOA: two slots, the AOS slot the copy lands in and the SOA slot the reorder
 // writes, which the device route reads. AOS_ONLY: one slot the copy lands in, read in place by the device's AOS prompt
-// kernel; the type has no AOS->SOA reorder, or no prompt kernel reads its SOA layout. NONE: no slot; a stage counts the
-// matrix untyped.
+// kernel or by the batched prompt executor's dequant kernel; the type has no AOS->SOA reorder, no prompt kernel reads
+// its SOA layout, or the executor reads it. NONE: no slot; a stage counts the matrix untyped.
 enum class moe_stream_staging : uint8_t {
     NONE,
     SOA,
     AOS_ONLY,
+};
+
+// Who reads a staged matrix's slot (llama.cpp-3460). Both read it with a plain SYCL kernel on the in-order compute
+// queue, the order the ring's reuse relies on (c-las5); neither hands the slot to a library. ROUTE: the resolver's
+// STAGED_RING route, served as MMVQ_COMPAT. EXECUTOR: the batched prompt executor (llama.cpp-348c), which dequantizes
+// the AOS slot into its f16 weight slot and gives only that slot to oneDNN; the route leaves such an entry to the route
+// core, as a handoff when the executor takes the weight whole.
+enum class moe_stream_consumer : uint8_t {
+    ROUTE,
+    EXECUTOR,
 };
 
 // True iff the device runs a prompt MUL_MAT_ID over a device-resident expert of `type` in `layout`, ne0 x ne1
@@ -53,22 +63,34 @@ enum class moe_stream_staging : uint8_t {
 using moe_stream_prompt_kernel_fn =
     bool (*)(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1);
 
-// True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight. The staged ring route
-// refuses a claimed weight (c-las5), so the ring stages none of it: the backend answers with the claim the route
-// refuses on, so staging and serving give one answer (llama.cpp-o9uw).
+// True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight once the ring has
+// staged its host experts (llama.cpp-3460). The ring then stages each of that weight's host matrices into one AOS slot
+// whose consumer is the executor, whatever the prompt kernels answer, and the staged route refuses the entry by that
+// consumer: the index build asks the claim once, and the entry carries its answer (one fact, one source).
 using moe_stream_library_claims_fn = bool (*)(void * graph_ctx, int layer, expert_tensor_role role);
 
+// Records a request to borrow `bytes` of resident expert VRAM on `device` at its next graph boundary (llama.cpp-3460,
+// c-0tmn). The backend answers with ggml_sycl_request_expert_loan: lock-free, so the phase may call it while
+// g_sycl_graph_compute_mutex is held, and the largest request since the last boundary wins.
+using moe_stream_request_loan_fn = void (*)(int device, size_t bytes);
+
+// How many loans the boundary runner has refused on `device` (REFUSED, never BUSY, which it re-posts itself); it only
+// grows. The backend answers with ggml_sycl_expert_loan_refusals.
+using moe_stream_loan_refusals_fn = uint64_t (*)(int device);
+
 struct moe_stream_item {
-    int                layer;
-    int                expert_id;
-    expert_tensor_role role;
-    ggml_sycl_cache_id key;  // left default by moe_stream_plan_build: the entry carries no tensor to derive it from
-    size_t             dst_bytes;  // the SOA size the device route wants
-    size_t             src_bytes;  // the AOS size of the host copy
-    ggml_type          type;       // from the plan entry (moe_stream_plan_index_build); moe_stream_plan_build leaves 0
-    int64_t            ncols, nrows;
+    int                 layer;
+    int                 expert_id;
+    expert_tensor_role  role;
+    ggml_sycl_cache_id  key;  // left default by moe_stream_plan_build: the entry carries no tensor to derive it from
+    size_t              dst_bytes;  // the SOA size the device route wants
+    size_t              src_bytes;  // the AOS size of the host copy
+    ggml_type           type;       // from the plan entry (moe_stream_plan_index_build); moe_stream_plan_build leaves 0
+    int64_t             ncols, nrows;
     // From moe_stream_plan_index_build (moe_stream_item_staging); moe_stream_plan_build leaves NONE.
-    moe_stream_staging staging = moe_stream_staging::NONE;
+    moe_stream_staging  staging  = moe_stream_staging::NONE;
+    // From moe_stream_plan_index_build: EXECUTOR for a weight the library executor claims once staged.
+    moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
 };
 
 namespace detail {
@@ -163,12 +185,14 @@ static inline bool moe_stream_layer_fully_staged(const std::vector<moe_stream_it
 // c-3bde), and the resolver's STAGED_RING route reads it from here. Each slot is acquired with the layout written
 // there (lead ruling c-o9uw-1), so the slice's own tag agrees, and the route refuses a slot where it does not. An
 // AOS-only matrix (c-hmey) has no SOA slot: `soa` is empty, `ready` is the copy's event and `layout` is AOS, so the
-// route reads `aos`.
+// route reads `aos`. `consumer` is the item's (llama.cpp-3460): an entry the batched executor consumes is always
+// AOS-only, and the route refuses it.
 struct moe_stream_staged {
-    mem_handle       soa;
-    mem_handle       aos;
-    sycl::event      ready;
-    ggml_layout_mode layout = GGML_LAYOUT_SOA;
+    mem_handle          soa;
+    mem_handle          aos;
+    sycl::event         ready;
+    ggml_layout_mode    layout   = GGML_LAYOUT_SOA;
+    moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
 };
 
 // ---- The prompt phase's pure parts (llama.cpp-xod7, plan Task 7b) ----------------------------------------------------
@@ -307,8 +331,9 @@ static inline bool moe_stream_rate_measured(double rate) {
 // `device` selects only the resident bytes that bound the ring's size. The items take type and shape from the entry,
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE), and their staging from
 // moe_stream_item_staging over the device's prompt kernels. The predicate is asked once per distinct (type, shape,
-// bytes) a build meets, not once per entry (c-7soh): a model has few. A matrix whose weight the library executor
-// claims stages NONE; that is asked once per (layer, role).
+// bytes) a build meets, not once per entry (c-7soh): a model has few. A matrix one AOS slot holds, whose weight the
+// library executor claims once staged, stages AOS_ONLY for the executor whatever the kernels answered: the executor's
+// own tables are the authority there (llama.cpp-3460). That is asked once per (layer, role).
 static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan &       plan,
                                                                 int                          device,
                                                                 moe_stream_prompt_kernel_fn  prompt_kernel,
@@ -326,7 +351,7 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
     };
 
     std::vector<staging_answer>        answers;
-    std::unordered_map<uint64_t, bool> claims;  // (layer, role) keyed with expert 0 -> the library executor claims it
+    std::unordered_map<uint64_t, bool> claims;  // (layer, role) keyed with expert 0 -> the executor claims it staged
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.layer_id < 0) {
             continue;
@@ -374,15 +399,18 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
             item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);
             answers.push_back({ item.type, item.ncols, item.nrows, item.src_bytes, item.staging });
         }
-        // The staged route refuses a weight the library executor claims, so the ring would copy it for nothing.
-        if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {
+        // A weight the library executor claims once staged is read by the executor's dequant kernel from one AOS
+        // slot (llama.cpp-3460, resolving llama.cpp-v7np): no reorder and no second slot, and the route refuses the
+        // entry by its consumer. A matrix no AOS slot can hold keeps the kernels' answer, and its weight is not asked.
+        if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {
             const uint64_t ck = moe_stream_table_key(item.layer, 0, item.role);
             auto           c  = claims.find(ck);
             if (c == claims.end()) {
                 c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;
             }
             if (c->second) {
-                item.staging = moe_stream_staging::NONE;
+                item.staging  = moe_stream_staging::AOS_ONLY;
+                item.consumer = moe_stream_consumer::EXECUTOR;
             }
         }
         li.items.push_back(item);
@@ -413,7 +441,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
 // region slot maximum) changes here once. `index_out`, when given, receives the index the geometry was sized over.
 // A plan with no host expert has no layer and no region slot, so the sizing answers the default geometry. A null
 // `library_claims` claims nothing: a caller with no live graph scan (the auto-ubatch fit) passes none, and the ring it
-// gets is then an upper bound of the phase's.
+// gets is then an upper bound of the phase's. A claim turns a matrix into one AOS slot, and the backend's claim needs a
+// type with an MMID kernel, whose prompt kernel reads AOS (moe_mmvq_admission_supports_type): unclaimed, such a matrix
+// already takes one slot staged AOS-only, or two staged as SOA.
 static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const placement_plan &       plan,
                                                                      int                          device,
                                                                      moe_stream_prompt_kernel_fn  prompt_kernel,
@@ -474,27 +504,40 @@ static inline std::vector<moe_stream_item> moe_stream_select(const moe_stream_la
     return out;
 }
 
-// True iff every host gate/up/down entry of the layer that the micro-batch routes to has a stage-table entry: the
-// table answers, not a rebuilt list (c-7soh). A layer with a host entry the ring cannot stage (fused GATE_UP, CHUNK_*),
-// or with host experts and no item, answers false: Task 10 relies on it. No info (the layer has no host entry) answers
-// true. `staged` is the phase's table, or any set of its keys.
-template <typename staged_keys>
-static inline bool moe_stream_fully_staged(const moe_stream_layer_info * li,
-                                           const std::vector<uint8_t> &  bitmap,
-                                           const staged_keys &           staged) {
-    if (li == nullptr) {
-        return true;
-    }
-    if (li->n_untriplet > 0 || li->items.empty()) {
+// True iff the batched prompt executor takes the layer's `role` weight with its routed host experts read from the
+// ring (llama.cpp-3460). Three things answer, all recorded, none asked again: the layer has a host entry of `role`;
+// every such entry carries consumer EXECUTOR, the claim's answer that the index build recorded once per (layer, role)
+// (moe_stream_plan_index_build); and every one the micro-batch routes to has a stage-table entry carrying that
+// consumer. The table answers, not a rebuilt list (c-7soh). A micro-batch that routes to none of the weight's host
+// experts needs nothing staged. A layer with a host entry the ring cannot stage (fused GATE_UP, CHUNK_*), no host
+// entry of `role`, or no info answers false: a weight with no host expert is the resident claim's to answer. `staged`
+// is the phase's table, or any map from its keys to entries that carry a `consumer`.
+template <typename staged_table>
+static inline bool moe_stream_executor_staged(const moe_stream_layer_info * li,
+                                              expert_tensor_role            role,
+                                              const std::vector<uint8_t> &  bitmap,
+                                              const staged_table &          staged) {
+    if (li == nullptr || li->n_untriplet > 0) {
         return false;
     }
+    bool has_role = false;
     for (const moe_stream_item & item : li->items) {
-        if (detail::moe_stream_routed(bitmap, item.expert_id) &&
-            staged.find(moe_stream_table_key(item.layer, item.expert_id, item.role)) == staged.end()) {
+        if (item.role != role) {
+            continue;
+        }
+        if (item.consumer != moe_stream_consumer::EXECUTOR) {
+            return false;
+        }
+        has_role = true;
+        if (!detail::moe_stream_routed(bitmap, item.expert_id)) {
+            continue;
+        }
+        const auto it = staged.find(moe_stream_table_key(item.layer, item.expert_id, item.role));
+        if (it == staged.end() || it->second.consumer != moe_stream_consumer::EXECUTOR) {
             return false;
         }
     }
-    return true;
+    return has_role;
 }
 
 // True iff a lease's retained owner lets the ring copy from it directly (llama.cpp-9y0p): a host-pinned WEIGHT
@@ -564,11 +607,52 @@ static inline bool moe_stream_ubatch_starts(bool     live,
     return !live || layer < cur_layer || (layer == cur_layer && graph_seq != cur_graph_seq);
 }
 
-// True iff a layer's decision moves bytes now: the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it.
-// Under AUTO the choice is only recorded (lead ruling c-3skf); what an explicit ring stages, the resolver's STAGED_RING
-// route consumes (llama.cpp-o9uw).
+// True iff a layer's decision moves bytes now: the decision is RING and GGML_SYCL_MOE_EXEC is not cpu. AUTO stages when
+// the cost model chose the ring, and ring forces that choice in moe_exec_weigh (llama.cpp-3460, lifting lead ruling
+// c-3skf). What the ring stages, the resolver's STAGED_RING route (llama.cpp-o9uw) or the batched prompt executor
+// (llama.cpp-3460) consumes.
 static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy) {
-    return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING;
+    return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU;
+}
+
+// A prompt's loans for its short ring (llama.cpp-3460, c-0tmn). end_prompt resets it; a micro-batch does not.
+struct moe_stream_loan_latch {
+    bool     asked         = false;  // a loan was asked this prompt
+    bool     refused       = false;  // one came back REFUSED: ask for no other until end_prompt
+    uint64_t refusals_seen = 0;      // the device's REFUSED count at the last ask
+};
+
+enum class moe_stream_loan_step : uint8_t {
+    NONE,     // nothing asked: no shortfall, no request hook, or a loan this prompt was refused
+    REQUEST,  // a loan of the shortfall was asked for the next graph boundary
+    REFUSED,  // the loan asked last came back REFUSED: the latch holds, and the caller WARNs once
+};
+
+// What a short ring reserve does about its shortfall (llama.cpp-3460, closing c-0tmn for production). ring_ready()
+// calls this from its reserve-failed branch, so once per micro-batch (the reserve latch stops the later layers before
+// the reserve, c-i8rz), with the bytes the WEIGHT zone was short of as moe_stream_ring::reserve reported them. It asks
+// for a loan of that much at the next graph boundary (ggml_backend_sycl_synchronize runs it, c-tdra), and the next
+// micro-batch's reserve tries again. A REFUSED count that moved since the last ask means that loan was refused:
+// retrying would refuse again, so the latch holds until end_prompt. An ACCEPTED loan that still left the ring short, or
+// a BUSY one, leaves the count alone, so the next short micro-batch asks again; a repeated request is harmless, since
+// the largest since the last boundary wins.
+static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_loan_latch &     latch,
+                                                                    int                         device,
+                                                                    size_t                      bytes_short,
+                                                                    moe_stream_request_loan_fn  request_loan,
+                                                                    moe_stream_loan_refusals_fn loan_refusals) {
+    if (request_loan == nullptr || latch.refused || bytes_short == 0) {
+        return moe_stream_loan_step::NONE;
+    }
+    const uint64_t refusals_now = loan_refusals != nullptr ? loan_refusals(device) : 0;
+    if (latch.asked && refusals_now != latch.refusals_seen) {
+        latch.refused = true;
+        return moe_stream_loan_step::REFUSED;
+    }
+    latch.asked         = true;
+    latch.refusals_seen = refusals_now;
+    request_loan(device, bytes_short);
+    return moe_stream_loan_step::REQUEST;
 }
 
 // True iff the next layer's decision is resolved a layer ahead, under the current layer's window: any decision but a
@@ -596,8 +680,12 @@ struct moe_stream_op {
         nullptr;
     // Unset, nothing is staged (moe_stream_item_staging).
     moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
-    // Unset, the library executor claims no weight (moe_stream_plan_index_build).
+    // Unset, the library executor claims no weight and nothing stages for it (moe_stream_plan_index_build).
     moe_stream_library_claims_fn library_claims = nullptr;
+    // Unset, a short ring reserve asks for no loan (moe_stream_loan_on_short_reserve).
+    moe_stream_request_loan_fn   request_loan   = nullptr;
+    // Unset, a requested loan is never seen refused, so every short micro-batch asks again.
+    moe_stream_loan_refusals_fn  loan_refusals  = nullptr;
 };
 
 // Why the resolver refused a staged ring slot (llama.cpp-o9uw). The enumerators name the causes; the staged branch's
@@ -605,7 +693,7 @@ struct moe_stream_op {
 // recipe, asked before the route, and the recipe validator's refusal, asked after it. NONE means served.
 enum class moe_staged_route_refusal : uint8_t {
     NONE,
-    CLAIMED,        // the oneDNN batched prompt executor claims the weight (c-las5)
+    CLAIMED,        // the entry's consumer is the batched prompt executor, which reads the slot itself
     UNSUPPORTED,    // the capability query answers no kernel for the type in the entry's layout
     KERNEL,         // it answers a kernel other than the plain MMVQ_COMPAT
     DIRECT_KERNEL,  // Q1_0/NVFP4: only their direct kernel runs them on a device (moe_type_needs_direct_kernel)
@@ -679,7 +767,9 @@ template <typename event_t> struct moe_stream_region_reads {
 
 // The resolver's STAGED_RING lookups over one prompt (llama.cpp-o9uw): how many it served and refused, and the refusals
 // by cause and detail, so the trace says why a staged slot went unserved (plan Task 8). A detail is a string with
-// static storage (a capability reason, or moe_batch_reject_reason_name's), or null.
+// static storage (a capability reason, or moe_batch_reject_reason_name's), or null. An entry the batched prompt
+// executor reads, on a weight it takes whole, is neither: the resolver hands it off (llama.cpp-3460), and handed_off
+// counts it apart, so a refusal is always a slot nobody reads.
 struct moe_staged_route_tally {
     struct refusal_count {
         moe_staged_route_refusal refusal = moe_staged_route_refusal::NONE;
@@ -687,11 +777,13 @@ struct moe_staged_route_tally {
         size_t                   n       = 0;
     };
 
-    size_t                     served  = 0;
-    size_t                     refused = 0;
+    size_t                     served     = 0;
+    size_t                     handed_off = 0;
+    size_t                     refused    = 0;
     std::vector<refusal_count> refusals;  // one per distinct (cause, detail), in the order first seen
 
     void        count(moe_staged_route_refusal refusal, const char * detail);
+    void        count_handoff();
     // "cause(detail)=n", or "cause=n" with no detail, per distinct (cause, detail), space-separated; empty when none.
     std::string refusals_text() const;
 };
@@ -735,8 +827,6 @@ class moe_stream_phase {
                                           size_t                 n_ids,
                                           const moe_stream_op &  op);
     const moe_stream_staged * find(int layer, int expert_id, expert_tensor_role role) const;
-    // True iff every host expert of `layer` that ids route to is staged (moe_stream_fully_staged over the table).
-    bool                      fully_staged(int layer, const int32_t * ids, size_t n_ids, int n_expert) const;
     // True iff slots were taken from the ring's current region since it last flipped.
     bool                      region_open() const;
     // After `layer`'s down op: `down_done`, a device event behind that op, becomes the read gate of the region holding
@@ -749,10 +839,19 @@ class moe_stream_phase {
     // clears them, or the destructor for a prompt no end_prompt ended: on the trace, and at WARN under an explicit ring
     // when any was refused.
     void                      count_staged_route(moe_staged_route_refusal refusal, const char * detail);
+    // An entry the resolver handed to the batched prompt executor (llama.cpp-3460): the weight is executor_staged, so
+    // the executor reads the slot, and the lookup is no refusal.
+    void                      count_executor_handoff();
+
+    // True iff the batched prompt executor takes `layer`'s `role` weight with the host experts ids route to read from
+    // the stage table (moe_stream_executor_staged over the index's recorded consumers and the table).
+    bool executor_staged(int layer, expert_tensor_role role, const int32_t * ids, size_t n_ids, int n_expert) const;
 
     size_t staged_routes_served() const { return staged_routes_.served; }
 
     size_t staged_routes_refused() const { return staged_routes_.refused; }
+
+    size_t staged_routes_handed_off() const { return staged_routes_.handed_off; }
 
     // This prompt's refusals by cause and detail (moe_staged_route_tally::refusals_text).
     std::string staged_route_refusals() const { return staged_routes_.refusals_text(); }
@@ -779,12 +878,12 @@ class moe_stream_phase {
     };
 
     struct stage_counts {
-        int    staged    = 0;  // experts with every selected matrix staged
-        int    wanted    = 0;  // experts selected
-        int    unowned   = 0;  // matrices skipped: no lease, or a lease the ring cannot copy directly
-        int    untyped   = 0;  // matrices skipped: staged NONE (no reader, or claimed), or a shape that does not fit
-        int    exhausted = 0;  // matrices skipped: no ring slot
-        size_t bytes     = 0;  // AOS bytes copied
+        int    staged           = 0;      // experts with every selected matrix staged
+        int    wanted           = 0;      // experts selected
+        int    unowned          = 0;      // matrices skipped: no lease, or a lease the ring cannot copy directly
+        int    untyped          = 0;      // matrices skipped: staged NONE (no reader), or a shape that does not fit
+        int    exhausted        = 0;      // matrices skipped: no ring slot
+        size_t bytes            = 0;      // AOS bytes copied
         bool   ring_unavailable = false;  // the ring could not be reserved
         int    soa              = 0;      // matrices staged SOA: two slots, read after the reorder
         int    aos_only         = 0;      // matrices staged AOS-only: one slot, read in place
@@ -811,6 +910,7 @@ class moe_stream_phase {
     void              report(int layer, const layer_state & st, const stage_counts & n, const moe_stream_op & op) const;
     void              report_staged_routes();
     void              warn_ring_unavailable(const moe_stream_op & op);
+    void              warn_loan_refused(size_t bytes_short) const;
 
     std::unique_ptr<moe_stream_ring>                ring_;
     std::unordered_map<uint64_t, moe_stream_staged> table_;           // key = moe_stream_table_key(layer, expert, role)
@@ -841,8 +941,12 @@ class moe_stream_phase {
     // Each region's last use: its layer, whether it left an AOS-only slot, and that layer's read gate (stage()).
     moe_stream_region_reads<sycl::event>            region_reads_;
     // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor.
-    const moe_exec_decision_log *                   log_    = nullptr;
-    moe_exec_policy                                 policy_ = moe_exec_policy::AUTO;
+    const moe_exec_decision_log *                   log_           = nullptr;
+    moe_exec_policy                                 policy_        = moe_exec_policy::AUTO;
+    // The last op's loan hooks, which ring_ready() calls on a short reserve, and this prompt's loans (llama.cpp-3460).
+    moe_stream_request_loan_fn                      request_loan_  = nullptr;
+    moe_stream_loan_refusals_fn                     loan_refusals_ = nullptr;
+    moe_stream_loan_latch                           loan_latch_;
     moe_staged_route_tally                          staged_routes_;
     uint64_t                                        ring_releases_ = 0;
 };

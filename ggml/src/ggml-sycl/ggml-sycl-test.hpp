@@ -57,21 +57,24 @@ struct moe_resolved_batch;
 struct moe_resolved_batch_result;
 
 // The staged ring route (llama.cpp-o9uw). insert_staged puts one entry in the backend's stream-phase stage table
-// (making the phase when it has none); staged_ring_build runs the resolver on the backend's device and queue as a
-// prompt MUL_MAT_ID does; staged_route_counts and staged_route_refusals read the phase's tally of the resolver's
-// lookups (the refusals as the trace prints them); admission_entry_reusable is the prompt admission cache's reuse
-// predicate.
-bool test_moe_stream_insert_staged(ggml_backend_t     backend,
-                                   int                layer,
-                                   int                expert_id,
-                                   expert_tensor_role role,
-                                   mem_handle         soa,
-                                   mem_handle         aos,
-                                   sycl::event        ready,
-                                   ggml_layout_mode   layout);
+// (making the phase when it has none), read by the staged route, or by the batched prompt executor when
+// executor_consumer is set (llama.cpp-3460); staged_ring_build runs the resolver on the backend's device and queue as a
+// prompt MUL_MAT_ID does; staged_route_counts, staged_route_handed_off and staged_route_refusals read the phase's tally
+// of the resolver's lookups (the refusals as the trace prints them); admission_entry_reusable is the prompt admission
+// cache's reuse predicate.
+bool                      test_moe_stream_insert_staged(ggml_backend_t     backend,
+                                                        int                layer,
+                                                        int                expert_id,
+                                                        expert_tensor_role role,
+                                                        mem_handle         soa,
+                                                        mem_handle         aos,
+                                                        sycl::event        ready,
+                                                        ggml_layout_mode   layout,
+                                                        bool               executor_consumer = false);
 bool test_moe_stream_begin_ubatch(ggml_backend_t backend, uint32_t n_tokens);
 bool test_moe_stream_end_prompt(ggml_backend_t backend);
 bool test_moe_stream_staged_route_counts(ggml_backend_t backend, size_t * served, size_t * refused);
+bool                      test_moe_stream_staged_route_handed_off(ggml_backend_t backend, size_t * handed_off);
 bool test_moe_stream_staged_route_refusals(ggml_backend_t backend, std::string * refusals);
 moe_resolved_batch_result test_moe_staged_ring_build(ggml_backend_t      backend,
                                                      const ggml_tensor * src0,

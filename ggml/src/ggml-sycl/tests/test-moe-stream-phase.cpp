@@ -22,16 +22,24 @@
 // The ring regions' read gates (lead ruling c-o9uw-1) are kept by moe_stream_region_reads, which the phase holds over
 // sycl::event; the test drives it over int, in the order stage(), layer_done() and reset_regions() call it.
 //
-// A matrix whose weight the prompt's library executor claims stages NONE whatever the kernels answer: the staged route
-// refuses that weight (c-las5), so the ring sizes no slot for it (llama.cpp-o9uw). The tests pass the claims as a
-// second predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_tensor, the route's own check.
+// A matrix whose weight the batched prompt executor claims once its host experts are staged stages one AOS slot
+// whatever the kernels answer, and its entry names the executor as its consumer (llama.cpp-3460): the executor
+// dequantizes AOS itself, with a plain kernel on the compute queue, and the staged route leaves such an entry to the
+// route core. The tests pass the claims as a second predicate; the backend answers with
+// ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
+//
+// A short ring reserve asks for an expert loan (llama.cpp-3460, c-0tmn): the test plays ring_ready() over a reserve
+// that refuses with a shortfall, with stub hooks for the backend's loan request and its boundary runner's REFUSED
+// count, and drives the helper ring_ready() calls, moe_stream_loan_on_short_reserve.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -48,6 +56,7 @@ using ggml_sycl::moe_exec_decision;
 using ggml_sycl::moe_exec_policy;
 using ggml_sycl::moe_exec_rates;
 using ggml_sycl::moe_exec_regime;
+using ggml_sycl::moe_stream_consumer;
 using ggml_sycl::moe_stream_item;
 using ggml_sycl::moe_stream_layer_info;
 using ggml_sycl::moe_stream_plan_index;
@@ -230,14 +239,20 @@ const moe_stream_layer_info * layer_info(const moe_stream_plan_index & idx, int 
     return it == idx.layers.end() ? nullptr : &it->second;
 }
 
-std::unordered_set<uint64_t> keys_of(int layer, std::initializer_list<int> experts) {
-    std::unordered_set<uint64_t> keys;
+// A stage table's view as moe_stream_executor_staged reads it: the key and the entry's consumer.
+struct consumer_entry {
+    moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
+};
+
+using consumer_table = std::unordered_map<uint64_t, consumer_entry>;
+
+// `layer`'s `role` entries for `experts`, each carrying `consumer`.
+consumer_table table_of(int layer, std::initializer_list<int> experts, expert_tensor_role role, moe_stream_consumer c) {
+    consumer_table table;
     for (int e : experts) {
-        for (expert_tensor_role r : kRoles) {
-            keys.insert(ggml_sycl::moe_stream_table_key(layer, e, r));
-        }
+        table[ggml_sycl::moe_stream_table_key(layer, e, role)].consumer = c;
     }
-    return keys;
+    return table;
 }
 
 const char * fake_env_h2d(const char * name) {
@@ -246,6 +261,60 @@ const char * fake_env_h2d(const char * name) {
 
 bool near(double a, double b) {
     return std::fabs(a - b) <= 1e-9 * std::fmax(1.0, std::fabs(b));
+}
+
+// The backend's side of a short reserve's loan, as the phase's hooks see it: the requests made, and each device's count
+// of loans its boundary runner refused, which a case moves to play a REFUSED outcome. Every access goes through a fresh
+// read of a volatile pointer, so the compiler cannot prove a check true from the stores before it.
+struct loan_stub_state {
+    int      requests    = 0;
+    int      last_device = -1;
+    size_t   last_bytes  = 0;
+    uint64_t refusals[2] = { 0, 0 };
+};
+
+loan_stub_state g_loan;
+
+loan_stub_state * volatile g_loan_at = &g_loan;
+
+void stub_request_loan(int device, size_t bytes) {
+    loan_stub_state & s = *g_loan_at;
+    ++s.requests;
+    s.last_device = device;
+    s.last_bytes  = bytes;
+}
+
+uint64_t stub_loan_refusals(int device) {
+    return (*g_loan_at).refusals[device];
+}
+
+// moe_stream_ring::reserve on a WEIGHT zone `short_by` bytes short of the ring: it refuses and reports the shortfall.
+bool stub_reserve_refuses(size_t short_by, size_t * bytes_short) {
+    *bytes_short = short_by;
+    return false;
+}
+
+// One micro-batch of a prompt whose ring the WEIGHT zone cannot give, as moe_stream_phase::ring_ready() runs it at each
+// of `n_layers` staging layers: begin_ubatch cleared the reserve latch, the first layer's reserve refuses and sets it,
+// and its reserve-failed branch takes the loan step; the later layers stop at the latch (c-i8rz).
+ggml_sycl::moe_stream_loan_step run_short_ubatch(ggml_sycl::moe_stream_loan_latch & latch,
+                                                 int                                device,
+                                                 size_t                             short_by,
+                                                 int                                n_layers) {
+    ggml_sycl::moe_stream_loan_step step           = ggml_sycl::moe_stream_loan_step::NONE;
+    bool                            reserve_failed = false;
+    for (int l = 0; l < n_layers; ++l) {
+        if (reserve_failed) {
+            continue;
+        }
+        size_t bytes_short = 0;
+        if (!stub_reserve_refuses(short_by, &bytes_short)) {
+            reserve_failed = true;
+            step           = ggml_sycl::moe_stream_loan_on_short_reserve(latch, device, bytes_short, stub_request_loan,
+                                                                         stub_loan_refusals);
+        }
+    }
+    return step;
 }
 
 }  // namespace
@@ -410,9 +479,9 @@ int main() {
         CHECK(calls == 2);
     }
 
-    // ---- a matrix whose weight the library executor claims stages NONE: the staged route refuses that weight
-    // (c-las5), so the ring copies none of it and sizes no slot for it; staging and serving give one answer
-    // (llama.cpp-o9uw) ----
+    // ---- a matrix whose weight the batched executor claims once staged takes one AOS slot, read by the executor's
+    // dequant kernel: no reorder and no second slot, whatever the MMVQ kernels answer (llama.cpp-3460, resolving
+    // llama.cpp-v7np) ----
     {
         claims_probe                probe;
         const moe_stream_plan_index claimed =
@@ -422,29 +491,66 @@ int main() {
         const moe_stream_layer_info * c2 = layer_info(claimed, 2);
         CHECK(c0 != nullptr && c1 != nullptr && c2 != nullptr);
         if (c0 && c1 && c2) {
-            // Still listed, so a stage counts the claimed ones untyped; only the unclaimed ones take slots.
             CHECK(c0->items.size() == 9 && c2->items.size() == 9);
             for (const moe_stream_item & it : c0->items) {
-                CHECK(it.staging ==
-                      (it.role == expert_tensor_role::GATE ? moe_stream_staging::NONE : moe_stream_staging::SOA));
+                const bool gate = it.role == expert_tensor_role::GATE;
+                CHECK(it.staging == (gate ? moe_stream_staging::AOS_ONLY : moe_stream_staging::SOA));
+                CHECK(it.consumer == (gate ? moe_stream_consumer::EXECUTOR : moe_stream_consumer::ROUTE));
             }
             for (const moe_stream_item & it : c2->items) {
-                CHECK(it.staging == moe_stream_staging::NONE);
+                CHECK(it.staging == moe_stream_staging::AOS_ONLY && it.consumer == moe_stream_consumer::EXECUTOR);
             }
-            CHECK(c0->n_streamable == 6 && c0->region_slots == 12 && c0->expert_bytes_max == 2 * src_bytes());
+            // Layer 0: three claimed gates of one slot, six unclaimed SOA matrices of two.
+            CHECK(c0->n_streamable == 9 && c0->region_slots == 15 && c0->expert_bytes_max == 3 * src_bytes());
             CHECK(c1->n_streamable == 9 && c1->region_slots == 18);  // layer 1's weights are not claimed
-            CHECK(c2->n_streamable == 0 && c2->region_slots == 0 && c2->expert_bytes_max == 0);
+            CHECK(c2->n_streamable == 9 && c2->region_slots == 9 && c2->expert_bytes_max == 3 * src_bytes());
         }
         CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.region_slots_max == 18);
-        // Asked once per (layer, role) a kernel reads, not once per expert: layers 0-2, three roles each.
+        // Asked once per (layer, role) with a matrix one AOS slot holds, not once per expert: layers 0-2, three roles.
         CHECK(probe.calls == 9);
 
-        // Every weight claimed: nothing is streamable, so the ring is never reserved for nothing.
+        // Every weight claimed: every matrix takes one slot of its AOS bytes.
         const moe_stream_plan_index all =
             ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
-        CHECK(all.host_matrices_per_layer_max == 0 && all.region_slots_max == 0 && all.matrix_bytes_max == 0);
-        CHECK(std::string(ggml_sycl::moe_stream_ring_unavailable_rule(
-                  all, ggml_sycl::moe_stream_ring_geometry{}, true, false)) == "no host matrices of a streamable type");
+        CHECK(all.host_matrices_per_layer_max == 9 && all.region_slots_max == 9 && all.matrix_bytes_max == src_bytes());
+
+        // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
+        // kernels_soa_q4 reads, takes one AOS slot. Unclaimed it takes none.
+        const moe_stream_plan_index iq_free = index_of(make_mixed_plan(true), kernels_soa_q4);
+        const moe_stream_plan_index iq_claimed =
+            ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(true), 0, kernels_soa_q4, nullptr, claims_all);
+        const moe_stream_layer_info * i1 = layer_info(iq_claimed, 1);
+        const moe_stream_layer_info * f1 = layer_info(iq_free, 1);
+        CHECK(i1 != nullptr && f1 != nullptr);
+        if (i1 && f1) {
+            CHECK(f1->n_streamable == 0 && f1->region_slots == 0);
+            CHECK(i1->items.size() == 12 && i1->n_streamable == 12 && i1->region_slots == 12);
+            for (const moe_stream_item & it : i1->items) {
+                CHECK(it.staging == moe_stream_staging::AOS_ONLY && it.consumer == moe_stream_consumer::EXECUTOR);
+            }
+        }
+        CHECK(iq_claimed.matrix_bytes_max == std::max(src_bytes(), iq_src_bytes()));
+
+        // A claimed matrix one AOS slot cannot hold (a zeroed inventory shape) stays NONE, and the claim is not asked
+        // for its weight.
+        placement_plan zeroed = make_plan();
+        for (placement_entry & e : zeroed.entries) {
+            if (e.layer_id == 2) {
+                e.ne[0] = 0;
+            }
+        }
+        zeroed.build_index();
+        claims_probe                zprobe;
+        const moe_stream_plan_index z =
+            ggml_sycl::moe_stream_plan_index_build(zeroed, 0, kernels_soa_q4, &zprobe, claims_l0_gate_l2);
+        const moe_stream_layer_info * z2 = layer_info(z, 2);
+        CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0 && z2->region_slots == 0);
+        if (z2) {
+            for (const moe_stream_item & it : z2->items) {
+                CHECK(it.staging == moe_stream_staging::NONE && it.consumer == moe_stream_consumer::ROUTE);
+            }
+        }
+        CHECK(zprobe.calls == 6);
 
         // No weight claimed: the index is the one an unset predicate builds.
         const moe_stream_plan_index free_of =
@@ -495,27 +601,60 @@ int main() {
         CHECK(ggml_sycl::moe_stream_select(*l0, moe_exec_regime::NONE, bits).empty());
     }
 
-    // ---- fully staged, answered from the table (c-7soh) ----
-    const int32_t                      ids_15[2] = { 1, 5 };
-    const int32_t                      ids_02[2] = { 0, 2 };
-    const auto                         b15       = ggml_sycl::moe_stream_ids_bitmap(ids_15, 2, kExperts);
-    const auto                         b02       = ggml_sycl::moe_stream_ids_bitmap(ids_02, 2, kExperts);
-    const std::unordered_set<uint64_t> empty_table;
-    std::unordered_set<uint64_t>       t15 = keys_of(0, { 1, 5 });
-    CHECK(ggml_sycl::moe_stream_fully_staged(l0, b15, t15));
-    CHECK(ggml_sycl::moe_stream_fully_staged(l0, b02, empty_table));  // the routed experts are resident
-    t15.erase(ggml_sycl::moe_stream_table_key(0, 5, expert_tensor_role::UP));
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l0, b15, t15));
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l0, b15, keys_of(2, { 1, 5 })));  // another layer's entries
-    CHECK(ggml_sycl::moe_stream_fully_staged(l0, bits, keys_of(0, { 1, 5, 6 })));
-    // A host entry the ring cannot stage makes the layer not staged, whatever the table holds.
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l1, b15, keys_of(1, { 1, 5, 6 })));
-    // Host experts present and no item: not staged (Task 10 relies on it).
-    const int32_t ids_2[1] = { 2 };
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l4, ggml_sycl::moe_stream_ids_bitmap(ids_2, 1, kExperts), empty_table));
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l4, b02, empty_table));
-    // No host expert: nothing to stage.
-    CHECK(ggml_sycl::moe_stream_fully_staged(nullptr, b15, empty_table));
+    // ---- the executor takes a weight from the ring: answered from the recorded consumers and the table (c-7soh,
+    // llama.cpp-3460) ----
+    {
+        // claims_l0_gate_l2: layer 0's gate entries and every entry of layer 2 carry consumer EXECUTOR; layer 0's up
+        // and down entries carry ROUTE. Host experts are 1, 5 and 6 in layers 0 to 2.
+        claims_probe                probe;
+        const moe_stream_plan_index claimed =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2);
+        const moe_stream_layer_info * c0        = layer_info(claimed, 0);
+        const moe_stream_layer_info * c2        = layer_info(claimed, 2);
+        const int32_t                 ids_15[2] = { 1, 5 };
+        const int32_t                 ids_02[2] = { 0, 2 };
+        const auto                    b15       = ggml_sycl::moe_stream_ids_bitmap(ids_15, 2, kExperts);
+        const auto                    b02       = ggml_sycl::moe_stream_ids_bitmap(ids_02, 2, kExperts);
+        const consumer_table          empty;
+        const expert_tensor_role      gate = expert_tensor_role::GATE;
+        const expert_tensor_role      up   = expert_tensor_role::UP;
+        consumer_table                g15  = table_of(0, { 1, 5 }, gate, moe_stream_consumer::EXECUTOR);
+        CHECK(ggml_sycl::moe_stream_executor_staged(c0, gate, b15, g15));
+        // The routed experts are resident: nothing to stage, and the recorded consumer still answers.
+        CHECK(ggml_sycl::moe_stream_executor_staged(c0, gate, b02, empty));
+        // A routed host expert left unstaged keeps the weight hybrid.
+        g15.erase(ggml_sycl::moe_stream_table_key(0, 5, gate));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, gate, b15, g15));
+        // Another layer's entries stage nothing of layer 0.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, gate, b15,
+                                                     table_of(2, { 1, 5 }, gate, moe_stream_consumer::EXECUTOR)));
+        // An entry staged for the route is not one the executor reads.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, gate, b15,
+                                                     table_of(0, { 1, 5 }, gate, moe_stream_consumer::ROUTE)));
+        // The recorded consumer decides, not the table alone: layer 0's up weight is the route's even with every
+        // routed entry in the table, and even when the micro-batch routes to none of its host experts.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, up, b15,
+                                                     table_of(0, { 1, 5 }, up, moe_stream_consumer::EXECUTOR)));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, up, b02, empty));
+        // Every routed host expert of the weight, here all three.
+        const int32_t ids_156[3] = { 1, 5, 6 };
+        const auto    b156       = ggml_sycl::moe_stream_ids_bitmap(ids_156, 3, kExperts);
+        CHECK(ggml_sycl::moe_stream_executor_staged(c2, up, b156,
+                                                    table_of(2, { 1, 5, 6 }, up, moe_stream_consumer::EXECUTOR)));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c2, up, b156,
+                                                     table_of(2, { 1, 5 }, up, moe_stream_consumer::EXECUTOR)));
+        // A role with no host entry, a layer with a host entry the ring cannot stage, a layer with host experts and
+        // no item, and no info all answer false.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, expert_tensor_role::GATE_UP, b15, empty));
+        const moe_stream_plan_index every =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
+        CHECK(!ggml_sycl::moe_stream_executor_staged(layer_info(every, 1), gate, b15,
+                                                     table_of(1, { 1, 5, 6 }, gate, moe_stream_consumer::EXECUTOR)));
+        const int32_t ids_2[1] = { 2 };
+        CHECK(!ggml_sycl::moe_stream_executor_staged(layer_info(every, 4), gate,
+                                                     ggml_sycl::moe_stream_ids_bitmap(ids_2, 1, kExperts), empty));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(nullptr, gate, b15, empty));
+    }
 
     // ---- an item the reorder can take into a slot ----
     moe_stream_item q{};
@@ -654,7 +793,8 @@ int main() {
     // the next layer in the next graph of a split micro-batch
     CHECK(!ggml_sycl::moe_stream_ubatch_starts(true, 16, 15, 8, 7));
 
-    // Bytes move only when the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it (lead ruling c-3skf).
+    // Bytes move when the layer's decision is RING under any policy but cpu: AUTO follows the cost model and ring
+    // forces the choice in moe_exec_weigh (llama.cpp-3460, lifting lead ruling c-3skf).
     moe_exec_decision ring_all;
     ring_all.choice               = moe_exec_choice::RING;
     ring_all.regime               = moe_exec_regime::STREAM_ALL;
@@ -665,8 +805,11 @@ int main() {
     moe_exec_decision unconsulted;
     CHECK(ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::RING));
     CHECK(ggml_sycl::moe_stream_stage_now(ring_routed, moe_exec_policy::RING));
-    CHECK(!ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::AUTO));
+    CHECK(ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::AUTO));
+    CHECK(ggml_sycl::moe_stream_stage_now(ring_routed, moe_exec_policy::AUTO));
     CHECK(!ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::CPU));
+    CHECK(!ggml_sycl::moe_stream_stage_now(cpu_routed, moe_exec_policy::AUTO));
+    CHECK(!ggml_sycl::moe_stream_stage_now(unconsulted, moe_exec_policy::AUTO));
     CHECK(!ggml_sycl::moe_stream_stage_now(cpu_routed, moe_exec_policy::RING));
     CHECK(!ggml_sycl::moe_stream_stage_now(unconsulted, moe_exec_policy::RING));
 
@@ -686,7 +829,7 @@ int main() {
     {
         using ggml_sycl::moe_staged_route_refusal;
         ggml_sycl::moe_staged_route_tally t;
-        CHECK(t.served == 0 && t.refused == 0 && t.refusals_text().empty());
+        CHECK(t.served == 0 && t.handed_off == 0 && t.refused == 0 && t.refusals_text().empty());
         t.count(moe_staged_route_refusal::NONE, nullptr);
         t.count(moe_staged_route_refusal::LAYOUT, nullptr);
         t.count(moe_staged_route_refusal::UNSUPPORTED, "local-layout-unsupported");
@@ -697,6 +840,12 @@ int main() {
         t.count(moe_staged_route_refusal::RECIPE, "RECIPE_MISMATCH");
         t.count(moe_staged_route_refusal::RECIPE, "RECIPE_MISSING");
         CHECK(t.served == 1 && t.refused == 6 && t.refusals.size() == 4);
+        // An executor handoff (llama.cpp-3460) is neither served nor refused and names no cause: the executor reads
+        // the slot itself, so the report's refusals and their WARN do not count it.
+        CHECK(t.handed_off == 0);
+        t.count_handoff();
+        t.count_handoff();
+        CHECK(t.handed_off == 2 && t.served == 1 && t.refused == 6 && t.refusals.size() == 4);
         CHECK(t.refusals_text() ==
               "layout=2 unsupported(local-layout-unsupported)=2 recipe(RECIPE_MISMATCH)=1 recipe(RECIPE_MISSING)=1");
         // Every cause has a name of its own.
@@ -759,6 +908,63 @@ int main() {
         CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
         rr().layer_done(4, 42);
         CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
+    }
+
+    // ---- a short reserve asks for a loan of its shortfall, once per micro-batch, until one comes back REFUSED ----
+    {
+        using ggml_sycl::moe_stream_loan_latch;
+        using ggml_sycl::moe_stream_loan_step;
+        moe_stream_loan_latch latch;
+        moe_stream_loan_latch * volatile latch_at = &latch;
+
+        const auto lt = [&]() -> moe_stream_loan_latch & {
+            return *latch_at;
+        };
+
+        const size_t      short_by = 3 * 1024 * 1024 + 4096;  // what the WEIGHT zone is short of
+        loan_stub_state & st       = *g_loan_at;
+        // Micro-batch 1: its four staging layers reach the reserve once, and the one request names the device and the
+        // shortfall, not the ring's bytes.
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 1 && (*g_loan_at).last_device == 1 && (*g_loan_at).last_bytes == short_by);
+        // The boundary lent something but the ring is still short (ACCEPTED, the count did not move): micro-batch 2
+        // asks again, once.
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 2);
+        // The boundary answered BUSY (the runner re-posts it and counts no refusal): micro-batch 3 asks again.
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 3);
+        // A refusal on another device is not this ring's.
+        ++st.refusals[0];
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 4);
+        // The boundary REFUSED the loan: the next micro-batch answers REFUSED once (the caller's one WARN) and asks
+        // for none, and neither does any later micro-batch of the prompt.
+        ++st.refusals[1];
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REFUSED);
+        CHECK((*g_loan_at).requests == 4 && lt().refused);
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::NONE);
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::NONE);
+        CHECK((*g_loan_at).requests == 4);
+        // end_prompt clears the latch: the next prompt asks again, and a refusal counted before its first ask is not
+        // its own.
+        lt() = moe_stream_loan_latch();
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 5 && (*g_loan_at).last_bytes == short_by);
+        // A reserve refused for another reason reports no shortfall: nothing to ask for, and the latch is untouched.
+        lt() = moe_stream_loan_latch();
+        CHECK(run_short_ubatch(lt(), 1, 0, 4) == moe_stream_loan_step::NONE);
+        CHECK((*g_loan_at).requests == 5 && !lt().asked);
+        // No request hook (a phase no backend op reached): nothing is asked.
+        CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(lt(), 1, short_by, nullptr, stub_loan_refusals) ==
+              moe_stream_loan_step::NONE);
+        CHECK((*g_loan_at).requests == 5 && !lt().asked);
+        // No refusal count: a loan is never seen refused, so every short micro-batch asks.
+        for (int u = 0; u < 3; ++u) {
+            CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(lt(), 0, short_by, stub_request_loan, nullptr) ==
+                  moe_stream_loan_step::REQUEST);
+        }
+        CHECK((*g_loan_at).requests == 8 && (*g_loan_at).last_device == 0);
     }
 
     if (failures) {

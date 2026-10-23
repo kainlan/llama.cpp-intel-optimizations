@@ -10,19 +10,26 @@ What this gate pins:
     `moe_hybrid_with_plan` is computed. The site is the admission branch rather than the later `prompt_batch` local
     because the executor fast paths return before that local is computed, which would skip the layer-ahead staging after
     every all-device layer;
-  - only an explicit GGML_SYCL_MOE_EXEC=ring stages: the phase's one stage() call sits under a guard that needs both
-    the RING choice and the RING policy, the ring's reserve is reachable only through it, and the op's policy is the
-    parsed config's. What an explicit ring stages, the resolver's STAGED_RING route consumes (llama.cpp-o9uw); under
-    AUTO the decision log records what the cost model would choose and no bytes move (lead ruling c-3skf);
+  - staging follows the layer's decision (llama.cpp-3460, lifting lead ruling c-3skf): the phase's one stage() call
+    sits under a guard that needs the RING choice under any policy but GGML_SYCL_MOE_EXEC=cpu, so AUTO stages when the
+    cost model chooses the ring and ring forces it; the ring's reserve is reachable only through stage(), and the op's
+    policy is the parsed config's. What the ring stages, the resolver's STAGED_RING route or the batched executor
+    consumes (llama.cpp-o9uw, llama.cpp-3460);
   - a refused ring reserve is not retried within a micro-batch and is tried once more in the next: the latch is cleared
     by begin_ubatch, which every new micro-batch runs, and by end_prompt. An expert loan (ruling c-tdra, llama.cpp-mwmr)
     can make room before the next micro-batch, so a per-prompt latch would waste the loan its own prompt asked for (lead
     ruling c-i8rz);
+  - a refused reserve asks for that loan (llama.cpp-3460, closing c-0tmn): the request is made once, in ring_ready()'s
+    reserve-failed branch after the latch, with the shortfall the reserve reports (the ring's bytes past the WEIGHT
+    zone's largest free block), through op hooks the backend wires to ggml_sycl_request_expert_loan and to the boundary
+    runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner re-posts)
+    latches until end_prompt, with one WARN under an explicit ring or a trace;
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
     and the ring's inputs, in a fixed format, through the decision log's WARN sink; the flag is cleared by end_prompt
-    and never per micro-batch (lead ruling c-kcyf), and the phase logs nothing else of its own;
-  - resolve() reports every layer it resolves, AUTO included, so the decision log keeps the cost model's choice
-    (the second half of c-3skf), and the next layer is weighed only below the decision log's MAX_LAYERS;
+    and never per micro-batch (lead ruling c-kcyf), and the phase logs nothing else of its own but the refused-loan
+    line, under the same gating;
+  - resolve() reports every layer it resolves, under every policy, so the decision log keeps the cost model's choice,
+    and the next layer is weighed only below the decision log's MAX_LAYERS;
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
     c-3bde: slot reuse is ordered on the device, never by a host status query) and behind the host lease's ready event,
     since the lease admits an entry still being filled; the reorder is ggml_sycl_reorder_weight_gpu on the compute queue
@@ -630,7 +637,7 @@ def test_aos_only_slot_mutants():
 
 
 AOS_ONLY_SUBMIT = "if (aos_only) { retain_handles_until_event({ aos, host }, copy); copied = copy; } else {"
-AOS_ONLY_TABLE = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"
+AOS_ONLY_TABLE = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
 AOS_ONLY_RECORD = ("if (aos_only) { region_last_ = copied; aos_only_staged = true; " + AOS_ONLY_TABLE
                    + " ++n.aos_only; } else { region_last_ = reorder; " + TABLE_WRITE + " ++n.soa; }")
 
@@ -639,7 +646,8 @@ def claim_aos_only_entry_reads_in_place(phase: str) -> bool:
     """An AOS-only matrix is read where its copy lands: the copy is its only submission, the AOS slot and the host
     lease are retained until the copy's event (the submission owns what it touches), and the stage-table entry holds
     no SOA slot, the AOS slot, the copy's event and layout AOS (ruling C: the layout comes from the entry, which for an
-    AOS-only matrix is AOS). The reorder runs only for a SOA item."""
+    AOS-only matrix is AOS), and the consumer the index build gave the item, which the route and the batched executor
+    read (llama.cpp-3460). The reorder runs only for a SOA item."""
     n = norm(phase)
     s = body(n, STAGE_SIG)
     return (n.count(AOS_ONLY_SUBMIT) == 1 and n.count(AOS_ONLY_TABLE) == 1 and AOS_ONLY_RECORD in s
@@ -653,10 +661,10 @@ def test_aos_only_entry_reads_in_place():
 def test_aos_only_entry_mutants():
     # Tagged SOA: the resolver would read the slot as a layout it does not hold.
     assert not claim_aos_only_entry_reads_in_place(
-        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_SOA };"))
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_SOA, item.consumer };"))
     # A SOA slot named that no reorder wrote.
     assert not claim_aos_only_entry_reads_in_place(
-        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { soa, aos, copied, GGML_LAYOUT_AOS };"))
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { soa, aos, copied, GGML_LAYOUT_AOS, item.consumer };"))
     # The slot left to the table's hold.
     assert not claim_aos_only_entry_reads_in_place(
         mutate(PHASE, "retain_handles_until_event({ aos, host }, copy);",
@@ -665,7 +673,10 @@ def test_aos_only_entry_mutants():
     assert not claim_aos_only_entry_reads_in_place(mutate(PHASE, "copied = copy; } else {", "copied = copy; } {"))
     # The entry's event a stale reorder instead of the copy.
     assert not claim_aos_only_entry_reads_in_place(
-        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, reorder, GGML_LAYOUT_AOS };"))
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, reorder, GGML_LAYOUT_AOS, item.consumer };"))
+    # The consumer dropped: every AOS-only entry would read as the route's, and the route would serve the executor's.
+    assert not claim_aos_only_entry_reads_in_place(
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"))
 
 
 AOS_ONLY_LAMBDA = ("const auto aos_only_item = [](const moe_stream_item & it) { return it.staging == "
@@ -993,37 +1004,47 @@ def test_staging_mirrors_serving_mutants():
 LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "
                       "ggml_sycl::expert_tensor_role role)")
 LIBRARY_CLAIMS_WEIGHT = "const ggml_tensor * w = ggml_sycl_moe_stream_layer_weight(layer, role);"
-LIBRARY_CLAIMS_QUERY = "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, call->device);"
+LIBRARY_CLAIMS_QUERY = "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*call->plan, w, call->device);"
 LIBRARY_CLAIMS_GUARD = "return call != nullptr && call->plan && w != nullptr &&"
 CLAIMS_PLAN_SIG = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan, "
-                   "const ggml_tensor * weight, int device)")
-CLAIMS_PLAN_LAYOUT = ("const bool planned = plan != nullptr ? "
+                   "const ggml_tensor * weight, int device, bool host_staged)")
+CLAIMS_PLAN_LAYOUT = ("planned = plan != nullptr ? "
                       "ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) : "
                       "ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);")
+CLAIMS_STAGED_LAYOUT = "ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);"
 CLAIMS_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) { "
-                "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device); }")
+                "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false); }")
+STAGED_CLAIM_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor("
+                      "const ggml_sycl::placement_plan & plan, const ggml_tensor * weight, int device) { "
+                      "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(&plan, weight, device, true); }")
+STAGED_PLAN_SIG = ("static bool ggml_sycl_moe_tensor_plan_staged_layout(const ggml_sycl::placement_plan & plan, "
+                   "const ggml_tensor * src0, int device, layout_mode * out_layout)")
 PRIMARY_PLAN_SIG = ("static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_sycl::placement_plan & plan, "
                     "const ggml_tensor * src0, int device, layout_mode * out_layout)")
 PRIMARY_ENTRY_TAIL = "return ggml_sycl_moe_tensor_plan_primary_layout(*plan_owner, src0, device, out_layout); }"
 PLAN_READERS = ("ggml_sycl_cache_plan_owner(", "coherent_placement_plan_owner(", "coherent_cache_placement_plan_owner(",
                 "global_placement_plan_owner(", "ggml_sycl_global_plan_owner(", "get_unified_cache_for_device(")
 LIBRARY_CLAIMS_FILL = "call.op.library_claims = ggml_sycl_moe_stream_library_claims;"
-ROUTE_LIBRARY_CLAIM = "stream_library_claimed = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);"
+ROUTE_CONSUMER_REFUSAL = ("if (s->consumer == moe_stream_consumer::EXECUTOR) { "
+                          "return moe_staged_route_refusal::CLAIMED; }")
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 INDEX_STAGING_ASK = "item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);"
-INDEX_CLAIM_GUARD = "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"
+INDEX_CLAIM_GUARD = "if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {"
 INDEX_CLAIM_ASK = "c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;"
-INDEX_CLAIM_APPLY = "if (c->second) { item.staging = moe_stream_staging::NONE; }"
+INDEX_CLAIM_APPLY = ("if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; "
+                     "item.consumer = moe_stream_consumer::EXECUTOR; }")
 INDEX_SLOT_SKIP = "if (item.staging == moe_stream_staging::NONE) { continue; }"
 
 
-def claim_staging_declines_library_claimed(sycl: str, hpp: str, phase: str) -> bool:
-    """One fact, one source (llama.cpp-o9uw): the staged route refuses a weight the oneDNN batched prompt executor
-    claims (c-las5), so the index build stages none of it. The backend answers the build's library-claims predicate
-    with that same claim, for the call's device and the graph's own weight tensor of (layer, role); the build asks it
-    after the kernels' answer and before the slot accounting, so a claimed matrix stays listed (a stage counts it
-    untyped) and takes no slot; and the phase asks it only through the index build."""
+def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str) -> bool:
+    """One fact, one source (llama.cpp-3460, resolving llama.cpp-v7np): a weight the batched prompt executor claims
+    once its host experts are staged stages each host matrix into one AOS slot, read by the executor's dequant kernel,
+    with no reorder and no second slot, whatever the MMVQ kernels answer; the item names the executor as its consumer,
+    and the staged route refuses such an entry by that name. The backend answers the build's library-claims predicate
+    with the staged claim, for the call's device and the graph's own weight tensor of (layer, role); the build asks it
+    after the kernels' answer, for every matrix one AOS slot holds, and before the slot accounting, so a claimed matrix
+    takes one slot; and the phase asks it only through the index build."""
     n = norm(sycl)
     at = n.find(LIBRARY_CLAIMS_SIG + " {")
     lc = body(n[at:], LIBRARY_CLAIMS_SIG) if at >= 0 else ""
@@ -1032,7 +1053,7 @@ def claim_staging_declines_library_claimed(sycl: str, hpp: str, phase: str) -> b
     return (n.count(LIBRARY_CLAIMS_SIG + " {") == 1 and LIBRARY_CLAIMS_WEIGHT in lc and LIBRARY_CLAIMS_QUERY in lc
             and "MXFP4" not in lc and "moe_classify_tensor" not in lc
             and "g_moe_gate_up_pairs.find(layer)" in body(n, LAYER_WEIGHT_SIG)
-            and n.count(LIBRARY_CLAIMS_FILL) == 1 and n.count(ROUTE_LIBRARY_CLAIM) == 1
+            and n.count(LIBRARY_CLAIMS_FILL) == 1 and n.count(ROUTE_CONSUMER_REFUSAL) == 1
             and "moe_stream_library_claims_fn library_claims)" in norm(hpp)
             and ordered(build, INDEX_STAGING_ASK, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY,
                         "li.items.push_back(item);", INDEX_SLOT_SKIP, "++li.n_streamable;", REGION_SIZE)
@@ -1040,18 +1061,17 @@ def claim_staging_declines_library_claimed(sycl: str, hpp: str, phase: str) -> b
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
 
 
-def test_staging_declines_library_claimed():
-    assert claim_staging_declines_library_claimed(SYCL, PLAN_HPP, PHASE)
+def test_claimed_weight_stages_for_the_executor():
+    assert claim_claimed_weight_stages_for_the_executor(SYCL, PLAN_HPP, PHASE)
 
 
 def test_library_claim_mutants():
-    # The backend answers from something other than the claim the route refuses on.
-    assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_woq_enabled();"), PLAN_HPP, PHASE)
+    c = claim_claimed_weight_stages_for_the_executor
+    # The backend answers from something other than the staged claim.
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_woq_enabled();"), PLAN_HPP, PHASE)
     # Asked for another device than the call's.
-    assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, 0);"),
-        PLAN_HPP, PHASE)
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY,
+                        "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*call->plan, w, 0);"), PLAN_HPP, PHASE)
     # A second table of its own beside the claim. The host lease takes its weight with the same line, so the mutant is
     # made inside the definition.
     n = norm(SYCL)
@@ -1059,33 +1079,42 @@ def test_library_claim_mutants():
     assert at >= 0 and LIBRARY_CLAIMS_WEIGHT in n[at:], "mutant precondition: the claims definition takes its weight"
     second = n[:at] + n[at:].replace(
         LIBRARY_CLAIMS_WEIGHT, LIBRARY_CLAIMS_WEIGHT + " if (w && w->type != GGML_TYPE_MXFP4) { return false; }", 1)
-    assert not claim_staging_declines_library_claimed(second, PLAN_HPP, PHASE)
-    # The backend leaves the predicate unset: a claimed weight would be staged and then always refused.
-    assert not claim_staging_declines_library_claimed(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
-    # The route refuses on something else, so the two would answer differently.
-    assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, ROUTE_LIBRARY_CLAIM, "stream_library_claimed = false;"), PLAN_HPP, PHASE)
+    assert not c(second, PLAN_HPP, PHASE)
+    # The backend leaves the predicate unset: no weight would ever stage for the executor.
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
+    # The route serves the executor's entries, so a library-free reader is no longer the only one it hands them to.
+    assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, ""), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
-    assert not claim_staging_declines_library_claimed(
-        SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
-    # A claimed matrix still takes a slot: the claim applied after the slot accounting.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
+    # A claimed matrix staged as SOA: a reorder and a second slot the executor does not read.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY,
+                              INDEX_CLAIM_APPLY.replace("moe_stream_staging::AOS_ONLY", "moe_stream_staging::SOA")),
+                 PHASE)
+    # A claimed matrix whose consumer stays the route's: the route would refuse nothing and serve it.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY,
+                              "if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; }"), PHASE)
+    # Asked only where an MMVQ kernel reads the matrix (the llama.cpp-v7np shape): the executor's own table is not the
+    # authority.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD,
+                              "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"), PHASE)
+    # The claim applied after the slot accounting, so a claimed matrix is sized as the kernels answered.
     late = mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "")
     late = mutate(late, "++li.n_streamable;", "++li.n_streamable; " + INDEX_CLAIM_APPLY)
-    assert not claim_staging_declines_library_claimed(SYCL, late, PHASE)
+    assert not c(SYCL, late, PHASE)
     # The phase builds its index without the claims.
-    assert not claim_staging_declines_library_claimed(
-        SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, INDEX_CALL.replace("op.library_claims", "nullptr")))
+    assert not c(SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, INDEX_CALL.replace("op.library_claims", "nullptr")))
     # The phase asks again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.library_claims(op.graph_ctx, item.layer, item.role);"
-    assert not claim_staging_declines_library_claimed(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
+    assert not c(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
 
 
 def claim_library_claims_read_the_index_plan(sycl: str) -> bool:
     """Lead ruling c-gi44, one fact one source: the library-claim predicate answers from call.plan, the plan the index
-    build that asks it holds, through the plan-taking form of the batched executor's claim, and asks only when the
-    call holds a plan. That form takes the planned layout from the plan it is given, and the plan-taking walk behind
-    it reads no plan of its own. Only the claim's two-argument entry point, the batched executor's own route, reads
-    the device's plan: it passes no plan, and the walk's two-argument form reads the cache plan and delegates."""
+    build that asks it holds, through the staged claim (llama.cpp-3460), and asks only when the call holds a plan. The
+    staged claim is the batched executor's own claim with its host_staged mode, which takes the planned layout from
+    the plan it is given through the staged walk; neither plan-taking walk reads a plan of its own. Only the claim's
+    two-argument entry point, the batched executor's own route, reads the device's plan: it passes no plan, and the
+    resident walk's two-argument form reads the cache plan and delegates."""
     n = norm(sycl)
     at = n.find(LIBRARY_CLAIMS_SIG + " {")
     lc = body(n[at:], LIBRARY_CLAIMS_SIG) if at >= 0 else ""
@@ -1093,13 +1122,16 @@ def claim_library_claims_read_the_index_plan(sycl: str) -> bool:
     cl = body(n[at:], CLAIMS_PLAN_SIG) if at >= 0 else ""
     at = n.find(PRIMARY_PLAN_SIG + " {")
     pl = body(n[at:], PRIMARY_PLAN_SIG) if at >= 0 else ""
+    at = n.find(STAGED_PLAN_SIG + " {")
+    sl = body(n[at:], STAGED_PLAN_SIG) if at >= 0 else ""
     return (ordered(lc, LIBRARY_CLAIMS_GUARD, LIBRARY_CLAIMS_QUERY)
-            and lc.count("ggml_sycl_moe_pp_onednn_batched_claims_tensor(") == 1
+            and lc.count("ggml_sycl_moe_pp_onednn_batched_claims") == 1
             and n.count(CLAIMS_PLAN_SIG + " {") == 1 and cl.count(CLAIMS_PLAN_LAYOUT) == 1
-            and cl.count("ggml_sycl_moe_tensor_plan_primary_layout(") == 2
-            and n.count(CLAIMS_ENTRY) == 1
+            and cl.count(CLAIMS_STAGED_LAYOUT) == 1 and cl.count("ggml_sycl_moe_tensor_plan_primary_layout(") == 2
+            and n.count(CLAIMS_ENTRY) == 1 and n.count(STAGED_CLAIM_ENTRY) == 1
             and n.count(PRIMARY_PLAN_SIG + " {") == 1 and "plan.all_experts_on_device(" in pl
-            and not any(r in pl for r in PLAN_READERS) and n.count(PRIMARY_ENTRY_TAIL) == 1)
+            and not any(r in pl for r in PLAN_READERS) and n.count(PRIMARY_ENTRY_TAIL) == 1
+            and n.count(STAGED_PLAN_SIG + " {") == 1 and sl != "" and not any(r in sl for r in PLAN_READERS))
 
 
 def test_library_claims_read_the_index_plan():
@@ -1111,22 +1143,31 @@ def test_library_claims_index_plan_mutants():
     # The predicate reads the device's plan again through the two-argument entry point.
     assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, call->device);"))
     # The predicate passes no plan, so the claim reads the device's plan instead of the index build's.
-    assert not c(mutate(SYCL, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w,",
-                        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, w,"))
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY,
+                        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, w, call->device, true);"))
     # Asked without a plan in hand.
     assert not c(mutate(SYCL, LIBRARY_CLAIMS_GUARD, "return call != nullptr && w != nullptr &&"))
-    # The claim ignores the plan it is given.
+    # The resident claim ignores the plan it is given.
     assert not c(mutate(SYCL, CLAIMS_PLAN_LAYOUT,
-                        "const bool planned = "
-                        "ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);"))
+                        "planned = ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);"))
+    # The staged claim walks the resident plan instead (the shape that never claims a weight with a host expert).
+    assert not c(mutate(SYCL, CLAIMS_STAGED_LAYOUT,
+                        "ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout);"))
     # The plan-taking walk reads the device's plan behind its caller's back.
     assert not c(mutate(SYCL, "if (!plan.all_experts_on_device(src0->name, n_experts, device)) {",
                         "(void) ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device)); "
                         "if (!plan.all_experts_on_device(src0->name, n_experts, device)) {"))
+    # The staged walk reads the device's plan behind its caller's back.
+    n = norm(SYCL)
+    at = n.find(STAGED_PLAN_SIG + " {")
+    assert at >= 0, "mutant precondition: the staged walk is defined"
+    head = STAGED_PLAN_SIG + " {"
+    assert not c(n[:at] + head + " (void) ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device));"
+                 + n[at + len(head):])
     # The executor's own route handed a plan read ahead of its type and role checks.
-    assert not c(mutate(SYCL, "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device); }",
+    assert not c(mutate(SYCL, "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false); }",
                         "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(ggml_sycl_cache_plan_owner("
-                        "ggml_sycl::get_unified_cache_for_device(device)).get(), weight, device); }"))
+                        "ggml_sycl::get_unified_cache_for_device(device)).get(), weight, device, false); }"))
 
 
 # ---- the policy gate -------------------------------------------------------------------------------------------------
@@ -1136,19 +1177,19 @@ STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage("
 RING_READY_SIG = "bool moe_stream_phase::ring_ready()"
 POLICY_GUARD = "if (moe_stream_stage_now(st.decision, op.policy)) {"
 STAGE_PRED_SIG = "static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy)"
-STAGE_PRED_BODY = "{ return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING; }"
+STAGE_PRED_BODY = "{ return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU; }"
 STAGE_CALL = "n = stage(li, st.decision.regime, cache, op);"
 POLICY_FROM_CONFIG = "call.op.policy = ggml_sycl_moe_exec_config().policy;"
 STAGE_CALL_RE = re.compile(r"(?<![:\w])stage\(")
 RING_READY_CALL_RE = re.compile(r"(?<![:\w])ring_ready\(\)")
 
 
-def claim_staging_only_under_explicit_ring(phase: str, sycl: str, hpp: str) -> bool:
-    """Lead ruling c-3skf: only an explicit GGML_SYCL_MOE_EXEC=ring copies, reorders or reserves the ring, and its
-    staged experts are what the resolver's STAGED_RING route consumes (llama.cpp-o9uw); AUTO only records the cost
-    model's choice. The phase's one stage() call is the first statement under a guard, moe_stream_stage_now, that needs
-    both the RING choice and the RING policy, the reserve is reachable only through stage() and ring_ready(), and the
-    op's policy is the parsed config's."""
+def claim_staging_follows_the_decision(phase: str, sycl: str, hpp: str) -> bool:
+    """Staging follows the layer's decision (llama.cpp-3460, lifting lead ruling c-3skf now that the staged slots have
+    consumers, llama.cpp-o9uw and the batched executor). The phase's one stage() call is the first statement under a
+    guard, moe_stream_stage_now, that needs the RING choice under any policy but CPU: AUTO stages when the cost model
+    chooses the ring, ring forces the choice in moe_exec_weigh, and cpu never stages. The reserve is reachable only
+    through stage() and ring_ready(), and the op's policy is the parsed config's."""
     n = norm(phase)
     return (POLICY_GUARD + " " + STAGE_CALL in body(n, RESOLVE_SIG)
             and body(norm(hpp), STAGE_PRED_SIG) == STAGE_PRED_BODY
@@ -1159,30 +1200,27 @@ def claim_staging_only_under_explicit_ring(phase: str, sycl: str, hpp: str) -> b
             and norm(sycl).count(POLICY_FROM_CONFIG) == 1)
 
 
-def test_staging_only_under_explicit_ring():
-    assert claim_staging_only_under_explicit_ring(PHASE, SYCL, PLAN_HPP)
+def test_staging_follows_the_decision():
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP)
 
 
 def test_policy_gate_mutants():
-    # AUTO reaching the stage call: the predicate tests the choice alone.
-    assert not claim_staging_only_under_explicit_ring(
-        PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY, "{ return d.choice == moe_exec_choice::RING; }"))
-    # A predicate that still admits AUTO.
-    assert not claim_staging_only_under_explicit_ring(
-        PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY,
-                            "{ return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU; }"))
+    c = claim_staging_follows_the_decision
+    # AUTO never staging: the record-only predicate of lead ruling c-3skf.
+    assert not c(PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY,
+                                     "{ return d.choice == moe_exec_choice::RING && "
+                                     "policy == moe_exec_policy::RING; }"))
+    # CPU staging: the predicate tests the choice alone.
+    assert not c(PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY, "{ return d.choice == moe_exec_choice::RING; }"))
     # The guard testing the choice alone, past the predicate.
-    assert not claim_staging_only_under_explicit_ring(
-        mutate(PHASE, POLICY_GUARD, "if (st.decision.choice == moe_exec_choice::RING) {"), SYCL, PLAN_HPP)
+    assert not c(mutate(PHASE, POLICY_GUARD, "if (st.decision.choice == moe_exec_choice::RING) {"), SYCL, PLAN_HPP)
     # A second stage call outside the guard.
-    assert not claim_staging_only_under_explicit_ring(
-        mutate(PHASE, "st.resolved = true;", STAGE_CALL + " st.resolved = true;"), SYCL, PLAN_HPP)
+    assert not c(mutate(PHASE, "st.resolved = true;", STAGE_CALL + " st.resolved = true;"), SYCL, PLAN_HPP)
     # The ring reserved outside stage().
-    assert not claim_staging_only_under_explicit_ring(
-        mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = ccs.is_in_order(); ring_ready();"), SYCL, PLAN_HPP)
+    assert not c(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = ccs.is_in_order(); ring_ready();"),
+                 SYCL, PLAN_HPP)
     # The op's policy pinned to RING instead of read from GGML_SYCL_MOE_EXEC.
-    assert not claim_staging_only_under_explicit_ring(
-        PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"), PLAN_HPP)
+    assert not c(PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"), PLAN_HPP)
 
 
 UBATCH_PRED_SIG = "static inline bool moe_stream_ubatch_starts("
@@ -1269,11 +1307,11 @@ def test_claims_count_production_sites_only():
     assert "moe_stream_phase::test_reserve_ring(" in raw and "moe_stream_phase::test_reserve_ring(" not in PHASE
     assert "moe_stream_phase::test_acquire_slot(" in raw and "moe_stream_phase::test_acquire_slot(" not in PHASE
     assert claim_phase_allocates_only_ring_slots(PHASE)
-    assert claim_staging_only_under_explicit_ring(PHASE, SYCL, PLAN_HPP)
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP)
     # The seams outside their block: a second slot acquisition and a second ring_ready() call, both counted.
     unguarded = production(raw.replace(guard, "#if 1"))
     assert not claim_phase_allocates_only_ring_slots(unguarded)
-    assert not claim_staging_only_under_explicit_ring(unguarded, SYCL, PLAN_HPP)
+    assert not claim_staging_follows_the_decision(unguarded, SYCL, PLAN_HPP)
     # An #else arm is production and stays; a nested conditional inside the block goes with it.
     assert production("a\n#if defined(GGML_SYCL_PRIVATE_TESTING)\nb\n#else\nc\n#endif\nd") == "a\n\n\n\nc\n\nd"
     assert production("#ifdef GGML_SYCL_PRIVATE_TESTING\n#ifdef X\nb\n#else\nc\n#endif\n#endif\nd") == "\n" * 7 + "d"
@@ -1295,6 +1333,172 @@ def test_reserve_latch_mutants():
     assert not claim_reserve_failure_lasts_one_ubatch(mutate(PHASE, LATCH_SET, ""))
     # A new micro-batch that skips begin_ubatch.
     assert not claim_reserve_failure_lasts_one_ubatch(mutate(PHASE, NEW_UBATCH, "if (new_ubatch) {"))
+
+
+# ---- a short reserve asks for a loan (llama.cpp-3460, c-0tmn) --------------------------------------------------------
+
+RING_CPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.cpp"
+RING_HPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.hpp"
+RING_CPP = read(RING_CPP_REL)
+RING_HPP = read(RING_HPP_REL)
+
+# The reserve-failed branch's condition, without its brace: body() opens at the first brace after it.
+RESERVE_SHORT_IF = "if (!ring->reserve(device_, geo_, &bytes_short))"
+LOAN_CALL = "moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_)"
+LOAN_REFUSED_WARN = "== moe_stream_loan_step::REFUSED) { warn_loan_refused(bytes_short); }"
+LOAN_LATCH_CLEAR = "loan_latch_ = moe_stream_loan_latch();"
+LOAN_HOOKS_STORED = ("request_loan_ = op.request_loan;", "loan_refusals_ = op.loan_refusals;")
+LOAN_HELPER_SIG = "static inline moe_stream_loan_step moe_stream_loan_on_short_reserve("
+# The helper's steps, in order: nothing to ask, a refusal since the last ask latches, else ask with the shortfall.
+LOAN_HELPER_ORDER = (
+    "if (request_loan == nullptr || latch.refused || bytes_short == 0) { return moe_stream_loan_step::NONE; }",
+    "const uint64_t refusals_now = loan_refusals != nullptr ? loan_refusals(device) : 0;",
+    "if (latch.asked && refusals_now != latch.refusals_seen) { latch.refused = true; "
+    "return moe_stream_loan_step::REFUSED; }",
+    "latch.asked = true; latch.refusals_seen = refusals_now; request_loan(device, bytes_short); "
+    "return moe_stream_loan_step::REQUEST;",
+)
+RESERVE_DECL = "bool reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short = nullptr);"
+RESERVE_DEF_SIG = ("bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, "
+                   "size_t * bytes_short)")
+RESERVE_SHORT_SET = ("if (bytes_short != nullptr) { "
+                     "*bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes); }")
+WEIGHT_REFUSAL_WARN = "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give"
+SHORTFALL_SIG = "size_t moe_stream_ring_weight_shortfall(int device, size_t bytes)"
+SHORTFALL_PARTS = (
+    "cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest_free)",
+    "return bytes > largest_free ? bytes - largest_free : 0;",
+)
+REFUSALS_DECL = "static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_SYCL_MAX_DEVICES];"
+REFUSALS_BUMP = ("if (code == ggml_sycl_txn_result::REFUSED) { "
+                 "g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release); }")
+RUN_PENDING_SIG = "static bool ggml_sycl_run_pending_expert_loan_on_device("
+RUN_PENDING_TXN = "ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, false, resolver, result, false);"
+RUN_PENDING_BUSY = "if (code != ggml_sycl_txn_result::BUSY) {"
+REFUSALS_ACCESSOR_SIG = "static uint64_t ggml_sycl_expert_loan_refusals(int device)"
+REFUSALS_LOAD = "return g_sycl_expert_loan_refusals[device].load(std::memory_order_acquire);"
+STREAM_PREPARE_SIG = "static bool ggml_sycl_moe_stream_prepare("
+WIRE_REQUEST = "call.op.request_loan = ggml_sycl_request_expert_loan;"
+WIRE_REFUSALS = "call.op.loan_refusals = ggml_sycl_expert_loan_refusals;"
+
+
+def claim_short_reserve_requests_a_loan(phase: str, hpp: str, sycl: str, ring_cpp: str, ring_hpp: str) -> bool:
+    """A short ring reserve asks the backend for an expert loan (llama.cpp-3460, closing c-0tmn for production). The
+    request appears exactly once in the phase, inside ring_ready()'s reserve-failed branch after the reserve latch (so
+    once per micro-batch, c-i8rz), with the shortfall the reserve itself reported, never the whole ring's bytes. The
+    hooks it calls are the op's, stored at begin_layer before the layer resolves, and the backend wires them to
+    ggml_sycl_request_expert_loan and to the boundary runner's REFUSED count. The pure helper asks only while no loan
+    this prompt came back REFUSED: the runner counts a REFUSED outcome (never BUSY, which it re-posts itself), a count
+    that moved since the last ask latches, and only end_prompt clears the latch. The reserve's shortfall is the ring's
+    bytes past the WEIGHT zone's largest free block, set where the zone refuses the ring."""
+    n = norm(phase)
+    ready = body(n, RING_READY_SIG)
+    at = ready.find(RESERVE_SHORT_IF + " {")
+    branch = body(ready[at:], RESERVE_SHORT_IF) if at >= 0 else ""
+    h = norm(hpp)
+    s = norm(sycl)
+    rc = norm(ring_cpp)
+    return (n.count("moe_stream_loan_on_short_reserve(") == 1
+            and ordered(branch, LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN)
+            and ordered(body(n, BEGIN_LAYER_SIG), *LOAN_HOOKS_STORED, "resolve(layer, cur->second, st, cache, op);")
+            and n.count(LOAN_LATCH_CLEAR) == 1 and LOAN_LATCH_CLEAR in body(n, END_PROMPT_SIG)
+            and h.count("request_loan(device, ") == 1
+            and ordered(body(h, LOAN_HELPER_SIG), *LOAN_HELPER_ORDER)
+            and RESERVE_DECL in norm(ring_hpp)
+            and ordered(body(rc, RESERVE_DEF_SIG), "allocation = unified_allocate_owner(req);", RESERVE_SHORT_SET,
+                        WEIGHT_REFUSAL_WARN)
+            and all(part in body(rc, SHORTFALL_SIG) for part in SHORTFALL_PARTS)
+            and s.count(REFUSALS_DECL) == 1
+            and s.count("g_sycl_expert_loan_refusals[device].fetch_add(") == 1
+            and ordered(body(s, RUN_PENDING_SIG), RUN_PENDING_TXN, REFUSALS_BUMP, RUN_PENDING_BUSY)
+            and REFUSALS_LOAD in body(s, REFUSALS_ACCESSOR_SIG)
+            and s.count(WIRE_REQUEST) == 1 and WIRE_REQUEST in body(s, STREAM_PREPARE_SIG)
+            and s.count(WIRE_REFUSALS) == 1 and WIRE_REFUSALS in body(s, STREAM_PREPARE_SIG))
+
+
+def test_short_reserve_requests_a_loan():
+    assert claim_short_reserve_requests_a_loan(PHASE, PLAN_HPP, SYCL, RING_CPP, RING_HPP)
+
+
+def test_short_reserve_loan_mutants():
+    def c(phase=PHASE, hpp=PLAN_HPP, sycl=SYCL, ring_cpp=RING_CPP, ring_hpp=RING_HPP):
+        return claim_short_reserve_requests_a_loan(phase, hpp, sycl, ring_cpp, ring_hpp)
+
+    stmt = "if (" + LOAN_CALL + " " + LOAN_REFUSED_WARN
+    # No request: the short reserve asks for nothing.
+    assert not c(phase=mutate(PHASE, stmt, ""))
+    # The request outside the reserve-failed branch: every ring_ready() call, or a reserve that succeeded, would ask.
+    moved = mutate(PHASE, stmt, "").replace(RING_READY_RESET, stmt + " " + RING_READY_RESET, 1)
+    assert not c(phase=moved)
+    # The request with the whole ring's bytes instead of the shortfall.
+    assert not c(phase=mutate(PHASE, "device_, bytes_short, request_loan_", "device_, geo_.bytes, request_loan_"))
+    # The reserve's shortfall not taken: the phase would have to recompute it.
+    assert not c(phase=mutate(PHASE, RESERVE_SHORT_IF, "if (!ring->reserve(device_, geo_))"))
+    # The hooks never stored: the request would go nowhere.
+    assert not c(phase=mutate(PHASE, LOAN_HOOKS_STORED[0], ""))
+    # The latch cleared per micro-batch: a REFUSED loan would be asked again in every micro-batch.
+    assert not c(phase=mutate(PHASE, "reserve_failed_ = false; table_.clear();",
+                              "reserve_failed_ = false; " + LOAN_LATCH_CLEAR + " table_.clear();"))
+    # The latch never cleared: one refusal would silence every later prompt of the context.
+    assert not c(phase=drop_in(PHASE, END_PROMPT_SIG, LOAN_LATCH_CLEAR))
+    # The helper re-asks after a REFUSED outcome, or never latches one.
+    assert not c(hpp=mutate(PLAN_HPP, "latch.refused || bytes_short == 0", "bytes_short == 0"))
+    assert not c(hpp=mutate(PLAN_HPP, "latch.refused = true; return moe_stream_loan_step::REFUSED;",
+                            "return moe_stream_loan_step::REFUSED;"))
+    # The helper asks for the whole ring, or asks a second time.
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short);", "request_loan(device, SIZE_MAX);"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short);",
+                            "request_loan(device, bytes_short); request_loan(device, bytes_short);"))
+    # The reserve exposes no shortfall, or exposes the whole ring.
+    assert not c(ring_hpp=mutate(RING_HPP, RESERVE_DECL,
+                                 "bool reserve(int device, const moe_stream_ring_geometry & geo);"))
+    assert not c(ring_cpp=mutate(RING_CPP, RESERVE_SHORT_SET, ""))
+    assert not c(ring_cpp=mutate(RING_CPP, "return bytes > largest_free ? bytes - largest_free : 0;",
+                                 "return bytes;"))
+    # The refusal counted on BUSY too (the runner re-posts BUSY itself), or never counted.
+    assert not c(sycl=mutate(SYCL, "if (code == ggml_sycl_txn_result::REFUSED) {",
+                             "if (code != ggml_sycl_txn_result::ACCEPTED) {"))
+    assert not c(sycl=mutate(SYCL, REFUSALS_BUMP, ""))
+    # The hooks not wired by the backend.
+    assert not c(sycl=mutate(SYCL, WIRE_REQUEST, ""))
+    assert not c(sycl=mutate(SYCL, WIRE_REFUSALS, ""))
+
+
+LOAN_WARN_SIG = "void moe_stream_phase::warn_loan_refused(size_t bytes_short) const"
+LOAN_WARN_GUARD = ("if (log_ == nullptr || log_->sink == nullptr || "
+                   "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+LOAN_WARN_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
+                 "prompt")
+LOAN_WARN_EMIT = "log_->sink(log_->sink_ctx, line);"
+
+
+def claim_refused_loan_warns_once(phase: str, tree: dict) -> bool:
+    """The brief's one WARN for a REFUSED loan (llama.cpp-3460): the helper answers REFUSED once per prompt, the branch
+    calls warn_loan_refused for it, and that WARN goes out through the decision log's sink under the gate of lead
+    ruling c-kcyf (an explicit ring or a trace), so the phase still prints nothing of its own at default verbosity
+    under AUTO (c-xod7-q1). There, the loan transaction's own "[MOE-EXEC] loan device %d refused" line, which the
+    latch now makes print once per prompt, is the one WARN. The format exists once in the backend."""
+    w = body(norm(phase), LOAN_WARN_SIG)
+    count = sum(norm(text).count(LOAN_WARN_FMT) for text in tree.values())
+    return (count == 1 and w.startswith("{ " + LOAN_WARN_GUARD)
+            and ordered(w, LOAN_WARN_GUARD, LOAN_WARN_FMT, LOAN_WARN_EMIT))
+
+
+def test_refused_loan_warns_once():
+    assert claim_refused_loan_warns_once(PHASE, SYCL_TREE)
+
+
+def test_refused_loan_warn_mutants():
+    # Ungated: AUTO would print the phase's own line at default verbosity.
+    ungated = mutate(PHASE, " || (policy_ != moe_exec_policy::RING && log_->trace < 1)", "")
+    assert not claim_refused_loan_warns_once(ungated, {PHASE_REL: ungated})
+    # Never emitted.
+    silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
+    assert not claim_refused_loan_warns_once(silent, {PHASE_REL: silent})
+    # The format restated elsewhere.
+    tree = dict(SYCL_TREE)
+    tree["extra.cpp"] = '"' + LOAN_WARN_FMT + '"'
+    assert not claim_refused_loan_warns_once(PHASE, tree)
 
 
 DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u "
@@ -1407,8 +1611,9 @@ def brace_depth(text: str, at: int) -> int:
 
 
 def claim_auto_still_reports(phase: str) -> bool:
-    """The second half of c-3skf: under AUTO the decision log still records what the cost model would choose. resolve()
-    calls report() once, at the top level of its body after the policy guard has closed, with no return before it."""
+    """The decision log records every layer's decision under every policy, AUTO included, whether or not it staged.
+    resolve() calls report() once, at the top level of its body after the policy guard has closed, with no return
+    before it."""
     r = body(norm(phase), RESOLVE_SIG)
     guard = r.find(POLICY_GUARD)
     at = r.find(REPORT_CALL)

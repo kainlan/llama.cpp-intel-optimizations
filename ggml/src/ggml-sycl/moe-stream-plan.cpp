@@ -77,6 +77,8 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
     policy_        = op.policy;
+    request_loan_  = op.request_loan;
+    loan_refusals_ = op.loan_refusals;
     bitmap_        = moe_stream_ids_bitmap(ids, n_ids, op.n_expert);
 
     // The layer itself: weighed here only when the previous layer did not weigh it (the micro-batch's first host
@@ -117,10 +119,17 @@ const moe_stream_staged * moe_stream_phase::find(int layer, int expert_id, exper
     return it == table_.end() ? nullptr : &it->second;
 }
 
-bool moe_stream_phase::fully_staged(int layer, const int32_t * ids, size_t n_ids, int n_expert) const {
+// The index lookup comes first: a layer with no host entry answers without marking the ids.
+bool moe_stream_phase::executor_staged(int                layer,
+                                       expert_tensor_role role,
+                                       const int32_t *    ids,
+                                       size_t             n_ids,
+                                       int                n_expert) const {
     const auto it = index_.layers.find(layer);
-    return moe_stream_fully_staged(it == index_.layers.end() ? nullptr : &it->second,
-                                   moe_stream_ids_bitmap(ids, n_ids, n_expert), table_);
+    if (it == index_.layers.end()) {
+        return false;
+    }
+    return moe_stream_executor_staged(&it->second, role, moe_stream_ids_bitmap(ids, n_ids, n_expert), table_);
 }
 
 bool moe_stream_phase::region_open() const {
@@ -143,8 +152,9 @@ void moe_stream_phase::end_prompt() {
     if (!ubatch_live_ && !ring_ && table_.empty()) {
         return;  // every decode graph after the first: nothing to drop
     }
-    // The next prompt explains its own unavailable ring.
+    // The next prompt explains its own unavailable ring, and asks for its own loans (a refusal held only this one).
     warned_unavailable_ = false;
+    loan_latch_         = moe_stream_loan_latch();
     teardown(ring_ ? compute_barrier() : sycl::event());
     layers_.clear();
     index_            = moe_stream_plan_index();
@@ -228,8 +238,8 @@ void moe_stream_phase::resolve(int                           layer,
                                unified_cache &               cache,
                                const moe_stream_op &         op) {
     stage_counts n;
-    // Only an explicit GGML_SYCL_MOE_EXEC=ring moves bytes or reserves the ring: AUTO only records what the cost model
-    // would choose (lead ruling c-3skf).
+    // A RING decision moves bytes and reserves the ring under any policy but cpu (moe_stream_stage_now): AUTO when the
+    // cost model chose the ring, ring always (llama.cpp-3460). Every decision is reported, staged or not.
     if (moe_stream_stage_now(st.decision, op.policy)) {
         n = stage(li, st.decision.regime, cache, op);
         if (n.ring_unavailable) {
@@ -372,10 +382,11 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
         copied_in          = true;
         anchor_            = aos;  // any slice holds the whole reservation
         if (aos_only) {
-            // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde).
+            // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader
+            // the index build named for the item (llama.cpp-3460).
             region_last_    = copied;
             aos_only_staged = true;
-            table_[key]     = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };
+            table_[key]     = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };
             ++n.aos_only;
         } else {
             region_last_ = reorder;
@@ -399,7 +410,9 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
 }
 
 // The ring is reserved at the first layer that stages, so a prompt whose every layer runs on the CPU reserves
-// nothing. A failed reserve stays failed for the rest of the micro-batch: one attempt per micro-batch.
+// nothing. A failed reserve stays failed for the rest of the micro-batch: one attempt per micro-batch. A reserve the
+// WEIGHT zone was short of asks the backend for an expert loan of the shortfall at the next graph boundary, so the next
+// micro-batch's attempt may succeed, until a loan this prompt asked for comes back refused (llama.cpp-3460, c-0tmn).
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;
@@ -407,9 +420,14 @@ bool moe_stream_phase::ring_ready() {
     if (reserve_failed_ || geo_.n_slots == 0 || !in_order_) {
         return false;
     }
-    std::unique_ptr<moe_stream_ring> ring = std::make_unique<moe_stream_ring>();
-    if (!ring->reserve(device_, geo_)) {
+    std::unique_ptr<moe_stream_ring> ring        = std::make_unique<moe_stream_ring>();
+    size_t                           bytes_short = 0;
+    if (!ring->reserve(device_, geo_, &bytes_short)) {
         reserve_failed_ = true;
+        if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_) ==
+            moe_stream_loan_step::REFUSED) {
+            warn_loan_refused(bytes_short);
+        }
         return false;
     }
     ring_ = std::move(ring);
@@ -520,6 +538,10 @@ void moe_staged_route_tally::count(moe_staged_route_refusal refusal, const char 
     refusals.push_back(c);
 }
 
+void moe_staged_route_tally::count_handoff() {
+    ++handed_off;
+}
+
 std::string moe_staged_route_tally::refusals_text() const {
     std::string out;
     for (const refusal_count & c : refusals) {
@@ -541,17 +563,23 @@ void moe_stream_phase::count_staged_route(moe_staged_route_refusal refusal, cons
     staged_routes_.count(refusal, detail);
 }
 
+void moe_stream_phase::count_executor_handoff() {
+    staged_routes_.count_handoff();
+}
+
 // The resolver's STAGED_RING lookups for the prompt that ends, on the trace (llama.cpp-o9uw): without it a ring that
-// stages and a route that serves none of it read alike in the stage lines. A prompt that refused any also gets a line
-// naming each refusal's cause and detail (plan Task 8: the trace says why). Under an explicit ring the refusals also go
-// out at WARN: a refused expert runs on another route than the one asked for. Cleared last, so the destructor after an
-// end_prompt prints nothing.
+// stages and a route that serves none of it read alike in the stage lines. The executor's handoffs (llama.cpp-3460)
+// are counted apart from the refusals: the batched prompt executor reads those slots. A prompt that refused any also
+// gets a line naming each refusal's cause and detail (plan Task 8: the trace says why). Under an explicit ring the
+// refusals also go out at WARN: a refused expert runs on another route than the one asked for, and its copy is wasted.
+// Cleared last, so the destructor after an end_prompt prints nothing.
 void moe_stream_phase::report_staged_routes() {
-    if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && log_->trace >= 1 &&
-        log_->trace_sink != nullptr) {
+    if ((staged_routes_.served != 0 || staged_routes_.handed_off != 0 || staged_routes_.refused != 0) &&
+        log_ != nullptr && log_->trace >= 1 && log_->trace_sink != nullptr) {
         char line[160];
-        std::snprintf(line, sizeof(line), "[MOE-EXEC-TRACE] staged route device %d: served=%zu refused=%zu", device_,
-                      staged_routes_.served, staged_routes_.refused);
+        std::snprintf(line, sizeof(line),
+                      "[MOE-EXEC-TRACE] staged route device %d: served=%zu handed_off=%zu refused=%zu", device_,
+                      staged_routes_.served, staged_routes_.handed_off, staged_routes_.refused);
         log_->trace_sink(log_->sink_ctx, line);
         if (staged_routes_.refused != 0) {
             char head[64];
@@ -561,10 +589,10 @@ void moe_stream_phase::report_staged_routes() {
         }
     }
     if (staged_routes_.refused != 0 && policy_ == moe_exec_policy::RING && log_ != nullptr && log_->sink != nullptr) {
-        char warn_head[112];
+        char warn_head[160];
         std::snprintf(warn_head, sizeof(warn_head),
-                      "[MOE-EXEC] staged route refusals device %d: served=%zu refused=%zu ", device_,
-                      staged_routes_.served, staged_routes_.refused);
+                      "[MOE-EXEC] staged route refusals device %d: served=%zu handed_off=%zu refused=%zu ", device_,
+                      staged_routes_.served, staged_routes_.handed_off, staged_routes_.refused);
         const std::string warn_line = warn_head + staged_routes_.refusals_text();
         log_->sink(log_->sink_ctx, warn_line.c_str());
     }
@@ -617,6 +645,22 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
                   index_.host_matrices_per_layer_max, index_.region_slots_max, index_.matrix_bytes_max,
                   index_.resident_expert_bytes, asked.n_slots, asked.bytes);
     op.log->sink(op.log->sink_ctx, line);
+}
+
+// One WARN per prompt when a loan the short ring asked for comes back REFUSED (llama.cpp-3460): the helper answers
+// REFUSED once and then latches. It goes out under the same gate as the ring-unavailable line (lead ruling c-kcyf), so
+// at default verbosity under AUTO the phase still prints nothing of its own; there the loan transaction's own
+// "[MOE-EXEC] loan device %d refused: %s" line, which the latch makes print once per prompt, is the one WARN.
+void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
+    if (log_ == nullptr || log_->sink == nullptr || (policy_ != moe_exec_policy::RING && log_->trace < 1)) {
+        return;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
+                  "prompt",
+                  device_, bytes_short / (1024.0 * 1024.0));
+    log_->sink(log_->sink_ctx, line);
 }
 
 }  // namespace ggml_sycl

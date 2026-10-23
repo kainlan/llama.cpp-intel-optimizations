@@ -77,6 +77,13 @@ dequant. These claims pin that shape:
       The oneDNN primitive is not ordered with the queue (llama.cpp-dboi), so without the barrier a GEMM still
       running could write the slot after the next dispatch claims it. One helper holds the leases, for this path
       and for both success branches.
+  (s) one type question for a host-staged weight (llama.cpp-3460): moe_pp_batched_takes_staged_type in
+      moe-mmvq-tables.hpp is exactly an MMVQ-ID kernel (moe_mmvq_admission_supports_type) and an f16 row at AOS. The
+      staged claim asks it, beside the runtime knobs (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost
+      model's device-rate seed (moe_exec_dev_gflops_seed) asks it before it seeds any type but MXFP4; neither asks
+      either table term itself. So no type is seeded at the executor's rate while the claim refuses it (IQ1_S, IQ1_M
+      and IQ4_XS have the f16 row and no MMVQ-ID kernel), and (h) holds for the staged claim too: it never takes a
+      type with no MMVQ-ID kernel, so such a type is never admitted on a hybrid layer.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -92,6 +99,7 @@ SYCL_DIR = ROOT / "ggml" / "src" / "ggml-sycl"
 FILES = {
     "sycl": SYCL_DIR / "ggml-sycl.cpp",
     "tables": SYCL_DIR / "moe-mmvq-tables.hpp",
+    "cost": SYCL_DIR / "moe-exec-cost.hpp",
     "convert": SYCL_DIR / "convert.cpp",
     "gemm": SYCL_DIR / "gemm.hpp",
     "common": SYCL_DIR / "common.hpp",
@@ -130,7 +138,10 @@ POST_CLAIM = [
     "EXPERT_NOT_LOCAL", "EXPERT_LAYOUT", "XMX_TILE_CAPS", "F16_TILED", "NO_DEQUANT", "SCRATCH_SIZE", "SCRATCH_CACHE",
     "SCRATCH_RESERVE", "SCRATCH_SLOT", "SCRATCH_SLOT_SIZE", "GEMM",
 ]
-WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) && "
+# A decline after the dispatch took a staged ring slot, or on a weight the ring staged in full for this executor, is
+# printed whatever its cause (llama.cpp-3460): its staged experts then run on the CPU path.
+WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+                  "pp_onednn_batched_claims_staged_layer) && "
                   "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
 # Types the f16 table takes that the device test does not run, each with its reason. The fixture quantizes its
 # weights with no importance matrix, so these three are the whole list.
@@ -159,6 +170,14 @@ FAIL_BARRIER = ("const sycl::event drained = gemm_events.empty() ? stream->ext_o
 FAIL_RETAIN = "retain_expert_leases_until(drained);"
 CLAIM_RELEASE = "batched_scratch_claim.finish_or_release();"
 LEASE_HELPER = "auto retain_expert_leases_until = [&](const sycl::event & until) {"
+STAGED_TYPE = "moe_pp_batched_takes_staged_type"
+STAGED_TYPE_BODY = ("{ return moe_mmvq_admission_supports_type(type) && "
+                    "moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS); }")
+STAGED_CLAIM_HEAD = "planned = plan != nullptr && moe_pp_batched_takes_staged_type(weight->type) && "
+STAGED_CLAIM_KNOBS = "ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) && "
+SEED_GATE = "if (!moe_pp_batched_takes_staged_type(t)) { return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED; }"
+SEED_MXFP4 = "if (t == GGML_TYPE_MXFP4) { return 3990.0; }"
+TABLE_TERMS = ("moe_mmvq_admission_supports_type(", "moe_pp_batched_f16_supports_layout(")
 UNTESTED_ON_DEVICE = {
     "GGML_TYPE_IQ1_S": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
     "GGML_TYPE_IQ2_XXS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
@@ -451,16 +470,18 @@ def claim_b_table_types(s):
         if "use_reorder" not in body or "_reorder" not in body.replace("use_reorder", ""):
             fails.append(f"ggml_get_to_fp16_sycl_for_layout's {t} case has no reorder kernel for SOA")
     lam = lambda_body(s["sycl"]) or ""
-    q8_soa = ("const bool pp_q8_0_soa = src0->type == GGML_TYPE_Q8_0 && "
-              "active_experts.front().layout == GGML_LAYOUT_SOA;")
-    if q8_soa not in lam:
-        fails.append("the lambda does not name its Q8_0 SOA experts (pp_q8_0_soa)")
+    # Each expert's reader follows its own layout (llama.cpp-3460): a staged expert is AOS beside device experts in the
+    # route's layout, so the converter is picked per expert, never from the first one.
+    q8_soa = ("return src0->type == GGML_TYPE_Q8_0 && expert.layout == GGML_LAYOUT_SOA;")
+    if q8_soa not in lam or "active_experts.front().layout" in lam:
+        fails.append("the lambda does not name each expert's Q8_0 SOA layout (pp_q8_0_soa(expert))")
     q8_kernel = lam.find("dequantize_row_q8_0_soa_to_fp16_rowmajor(")
-    if q8_kernel < 0 or (enclosing_if_condition(lam, q8_kernel) or "").strip() != "pp_q8_0_soa":
+    if q8_kernel < 0 or (enclosing_if_condition(lam, q8_kernel) or "").strip() != "pp_q8_0_soa(expert)":
         fails.append("the lambda does not take Q8_0 SOA experts to dequantize_row_q8_0_soa_to_fp16_rowmajor")
-    getter = lam.find("pp_to_fp16 = ggml_get_to_fp16_sycl_for_layout(")
-    if getter < 0 or "!pp_q8_0_soa" not in (enclosing_if_condition(lam, getter) or ""):
-        fails.append("the lambda asks ggml_get_to_fp16_sycl_for_layout for Q8_0 SOA, which answers the AOS kernel")
+    getter = lam.find("expert.to_fp16 = ggml_get_to_fp16_sycl_for_layout(src0->type, expert.layout);")
+    if getter < 0 or "!pp_q8_0_soa(expert)" not in (enclosing_if_condition(lam, getter) or ""):
+        fails.append("the lambda does not ask ggml_get_to_fp16_sycl_for_layout per expert, and never for Q8_0 SOA, "
+                     "which it answers with the AOS kernel")
     woq_types = set(re.findall(r"GGML_TYPE_\w+", woq))
     if woq_types != {"GGML_TYPE_MXFP4"} or "GGML_LAYOUT_SOA" not in woq or "GGML_LAYOUT_XMX_TILED" not in woq:
         fails.append("the WOQ table must be MXFP4 on SOA and XMX_TILED")
@@ -477,7 +498,8 @@ def claim_c_q4k_fallback(s):
         fails.append("device_weight_cpu_fallback is not exactly Q4_K: a claim term there only strips the CPU "
                      "fallback from hybrid ops the executor never runs")
     claims = statement(sycl, "const bool pp_onednn_batched_route_claims_prompt =") or ""
-    if "prompt_batch && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device)" not in claims:
+    if ("prompt_batch && (pp_onednn_batched_claims_staged_layer || "
+            "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device))") not in claims:
         fails.append("pp_onednn_batched_route_claims_prompt is not the prompt-only claim")
     needs = statement(sycl, "const bool planner_needs_prompt_route =") or ""
     if "!pp_onednn_batched_route_claims_prompt" not in needs:
@@ -499,10 +521,10 @@ def claim_d_decode_terms(s):
     for text in (
         "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;",
         "const bool pp_onednn_batched_route_claims_prompt = prompt_batch && "
-        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);",
+        "(pp_onednn_batched_claims_staged_layer || ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));",
         "const bool prompt_batch = ids && ids->ne[1] > 1;",
         "const bool pp_onednn_batched_claims_op = ne12 > 1 && "
-        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);",
+        "(pp_onednn_batched_claims_staged_layer || ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));",
     ):
         if text not in sycl:
             fails.append(f"missing decode-preserving term: {text}")
@@ -1031,6 +1053,40 @@ def claim_r_failure_drain(s):
     return fails
 
 
+def claim_s_staged_type(s):
+    fails = []
+    helper = one_definition(s["tables"], STAGED_TYPE)
+    if helper is None:
+        return [f"{STAGED_TYPE} is not defined exactly once in moe-mmvq-tables.hpp"]
+    if helper != STAGED_TYPE_BODY:
+        fails.append(f"{STAGED_TYPE} is not exactly an MMVQ-ID kernel and an f16 row at AOS")
+    claim = claim_predicate_body(s["sycl"])
+    if claim is None:
+        return fails + ["the plan-taking ggml_sycl_moe_pp_onednn_batched_claims_tensor definition was not found"]
+    staged = statement(claim, STAGED_CLAIM_HEAD)
+    if staged is None:
+        fails.append(f"the staged claim does not ask {STAGED_TYPE} about the weight's type")
+    elif STAGED_CLAIM_KNOBS not in staged:
+        fails.append("the staged claim does not ask ggml_sycl_moe_pp_batched_takes_layout at AOS (the runtime knobs)")
+    for term in TABLE_TERMS:
+        if term in claim:
+            fails.append(f"the claim predicate asks {term}...) itself, a second source for the type question")
+    seed = one_definition(s["cost"], "moe_exec_dev_gflops_seed")
+    if seed is None:
+        return fails + ["moe_exec_dev_gflops_seed is not defined exactly once in moe-exec-cost.hpp"]
+    gate = seed.find(SEED_GATE)
+    if gate < 0:
+        fails.append(f"moe_exec_dev_gflops_seed does not seed the per-row rate for a type {STAGED_TYPE} refuses")
+    else:
+        head = seed[:gate]
+        if head.count("return ") != 1 or SEED_MXFP4 not in head:
+            fails.append(f"moe_exec_dev_gflops_seed seeds a type other than MXFP4 before it asks {STAGED_TYPE}")
+    for term in TABLE_TERMS:
+        if term in seed:
+            fails.append(f"moe_exec_dev_gflops_seed asks {term}...) itself, a second source for the type question")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -1050,6 +1106,7 @@ CLAIMS = {
     "p": claim_p_device_counts,
     "q": claim_q_group_knob,
     "r": claim_r_failure_drain,
+    "s": claim_s_staged_type,
 }
 
 
@@ -1077,8 +1134,11 @@ MUTANTS = [
     ("b", "tables", "case GGML_TYPE_IQ4_XS:", "case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q1_0:"),
     ("b", "tables", " || layout == GGML_LAYOUT_SOA;", ";"),
     ("b", "convert", "return dequantize_row_q6_K_sycl_reorder;", "return nullptr;"),
-    ("b", "sycl", "if (pp_q8_0_soa) {", "if (false) {"),
-    ("b", "sycl", "src0->type != GGML_TYPE_MXFP4 && !pp_q8_0_soa", "src0->type != GGML_TYPE_MXFP4"),
+    ("b", "sycl", "if (pp_q8_0_soa(expert)) {", "if (false) {"),
+    ("b", "sycl", "} else if (!pp_q8_0_soa(expert)) {", "} else {"),
+    # One converter for every expert, from the first one's layout (the shape before llama.cpp-3460).
+    ("b", "sycl", "ggml_get_to_fp16_sycl_for_layout(src0->type, expert.layout);",
+     "ggml_get_to_fp16_sycl_for_layout(src0->type, active_experts.front().layout);"),
     ("c", "sycl", "const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K);",
      "const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K) && "
      "!pp_onednn_batched_route_claims_prompt;"),
@@ -1103,10 +1163,18 @@ MUTANTS = [
      "case moe_pp_batched_refusal::EXPERT_LAYOUT:"),
     ("e", "tables", "case moe_pp_batched_refusal::GEMM: return true;",
      "case moe_pp_batched_refusal::GEMM: case moe_pp_batched_refusal::DECODE: return true;"),
-    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&",
-     "pp_f16_batched_trace &&"),
-    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&",
-     "(true || moe_pp_batched_refusal_after_claim(refusal)) &&"),
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+     "pp_onednn_batched_claims_staged_layer) &&", "pp_f16_batched_trace &&"),
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+     "pp_onednn_batched_claims_staged_layer) &&",
+     "(true || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+     "pp_onednn_batched_claims_staged_layer) &&"),
+    # A decline after a staged slot left quiet when its cause is a precheck (llama.cpp-3460).
+    ("e", "sycl", "|| pp_staged_experts > 0 || pp_onednn_batched_claims_staged_layer) &&",
+     "|| pp_onednn_batched_claims_staged_layer) &&"),
+    # A precheck decline on a weight the ring staged in full left quiet (llama.cpp-3460).
+    ("e", "sycl", "|| pp_staged_experts > 0 || pp_onednn_batched_claims_staged_layer) &&",
+     "|| pp_staged_experts > 0) &&"),
     ("f", "sycl", "if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout))", "if (true)"),
     ("f", "sycl", "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)",
      "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, GGML_LAYOUT_AOS)"),
@@ -1208,6 +1276,18 @@ MUTANTS = [
      CLAIM_RELEASE + " " + FAIL_BARRIER + " " + FAIL_RETAIN),
     ("r", "sycl", FAIL_RETAIN, ""),
     ("r", "sycl", "ggml_sycl::retain_handles_until_event(std::move(leases), until);", ""),
+    ("s", "tables", "return moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(",
+     "return moe_pp_batched_f16_supports_layout("),
+    ("s", "tables", "&& moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS); }",
+     "&& moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA); }"),
+    ("s", "sycl", STAGED_CLAIM_HEAD, "planned = plan != nullptr && moe_mmvq_admission_supports_type(weight->type) && "),
+    ("s", "sycl", STAGED_CLAIM_HEAD,
+     STAGED_CLAIM_HEAD + "moe_pp_batched_f16_supports_layout(weight->type, GGML_LAYOUT_AOS) && "),
+    ("s", "sycl", STAGED_CLAIM_HEAD + STAGED_CLAIM_KNOBS, STAGED_CLAIM_HEAD),
+    ("s", "cost", "if (!moe_pp_batched_takes_staged_type(t)) {",
+     "if (!moe_pp_batched_f16_supports_layout(t, GGML_LAYOUT_AOS)) {"),
+    ("s", "cost", SEED_MXFP4, SEED_MXFP4 + " if (t == GGML_TYPE_IQ4_XS) { return 5000.0; }"),
+    ("s", "cost", SEED_GATE, ""),
 ]
 
 
@@ -1226,6 +1306,8 @@ def test_claims_are_not_vacuous(sources):
     assert one_definition(sources["convert"], "ggml_get_to_fp16_sycl_for_layout") is not None
     assert one_definition(sources["sycl"], "ggml_sycl_moe_query_route_capability") is not None
     assert one_definition(sources["ggml_c"], "ggml_quantize_requires_imatrix") is not None
+    assert one_definition(sources["tables"], STAGED_TYPE) is not None
+    assert one_definition(sources["cost"], "moe_exec_dev_gflops_seed") is not None
 
 
 if __name__ == "__main__":

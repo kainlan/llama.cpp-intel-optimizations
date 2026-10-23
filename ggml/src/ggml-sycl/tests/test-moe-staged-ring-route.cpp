@@ -27,7 +27,13 @@
 //    (llama.cpp-348c), and a staged slot is served only with MMVQ_COMPAT
 //    (c-las5), so the staged route refuses the kernel. The phase's refusals name
 //    each cause, as the trace prints them: two layout refusals and one kernel
-//    refusal, with the query's reason (plan Task 8).
+//    refusal, with the query's reason (plan Task 8). A Q4_0 AOS entry over the
+//    AOS slot whose consumer is the batched prompt executor (llama.cpp-3460) is
+//    one the route would serve in every other respect, as case 1 shows, so only
+//    the entry's consumer refuses it, as claimed, and the build falls through to
+//    the route core; in a prompt that core answers HOST, and the executor reads
+//    the slot itself. The weight has no index entry, so the executor does not
+//    take it whole and the entry counts as a refusal, not a handoff.
 // 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.
@@ -102,6 +108,13 @@ static void counts(ggml_backend_t backend, size_t * served, size_t * refused) {
     *served  = SIZE_MAX;
     *refused = SIZE_MAX;
     (void) test_moe_stream_staged_route_counts(backend, served, refused);
+}
+
+// The phase's executor handoffs (llama.cpp-3460), or SIZE_MAX with no phase.
+static size_t handed_off(ggml_backend_t backend) {
+    size_t n = SIZE_MAX;
+    (void) test_moe_stream_staged_route_handed_off(backend, &n);
+    return n;
 }
 
 // The phase's refusals as the trace prints them, or "(no phase)".
@@ -219,6 +232,7 @@ int main() {
         const int32_t tag_ids[]     = { 7, 7 };
         const int32_t soa_tag_ids[] = { 2, 2 };
         const int32_t soa_q4_ids[]  = { 4, 4 };
+        const int32_t claimed_ids[] = { 1, 1 };
         size_t        served = 0, refused = 0;
 
         // The build results hold slot leases; they all go before the ring is released below.
@@ -299,9 +313,28 @@ int main() {
             counts(backend, &served, &refused);
             CHECK(served == 2 && refused == 3, "the Q4_0 SOA refusal is counted (served %zu, refused %zu)", served,
                   refused);
+            // A Q4_0 AOS entry over the AOS slot, as case 1's, that the batched executor consumes: only the consumer
+            // refuses it.
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, 1, role, mem_handle(), slot_a, fill_a, GGML_LAYOUT_AOS,
+                                                /*executor_consumer=*/true),
+                  "an AOS entry the batched executor consumes goes into the stage table");
+            const moe_resolved_batch_result claimed =
+                test_moe_staged_ring_build(backend, src0, claimed_ids, 2, 1, GGML_LAYOUT_AOS);
+            CHECK(!claimed && claimed.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
+                  "an entry the executor consumes is refused and falls through to the route core (reject %s)",
+                  moe_batch_reject_reason_name(claimed.reject));
+            counts(backend, &served, &refused);
+            CHECK(served == 2 && refused == 4, "the consumer refusal is counted (served %zu, refused %zu)", served,
+                  refused);
+            // The phase has no index entry for the weight, so the executor does not take it whole: the entry is a
+            // refusal, not a handoff.
+            const size_t n_handed_off = handed_off(backend);
+            CHECK(n_handed_off == 0, "an executor entry on a weight the executor does not take is no handoff (%zu)",
+                  n_handed_off);
             const std::string causes = refusals(backend);
-            CHECK(causes == "layout=2 kernel(local-onednn-batched-prompt)=1",
-                  "the refusals name their causes: two layout, one kernel with the query's reason (got \"%s\")",
+            CHECK(causes == "layout=2 kernel(local-onednn-batched-prompt)=1 claimed=1",
+                  "the refusals name their causes: two layout, one kernel with the query's reason, one claimed "
+                  "(got \"%s\")",
                   causes.c_str());
 
             // Case 5: the next micro-batch starts with an empty table and reads its own slot.

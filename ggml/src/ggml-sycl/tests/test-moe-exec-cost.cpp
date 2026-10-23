@@ -195,9 +195,12 @@ int main() {
         });
         CHECK(std::fabs(r.cpu_gbps - 200.0 / (100.0 / 5.6 + 100.0 / 22.0)) < 1e-9, "two measured types: harmonic mean");
     }
-    // dev_gflops seeds per type from the Task 9 measurement (llama.cpp-g4uy), byte-weighted harmonic mean over the mix:
-    // bytes / sum(bytes_i / rate_i). The fixtures above that call weigh set their own rates, so none of their
-    // expectations depended on the old 20000 seed; the only pin that did is the unset-variable check below (600).
+    // dev_gflops seeds per type, byte-weighted harmonic mean over the mix: bytes / sum(bytes_i / rate_i). MXFP4 keeps
+    // the Task 9 measurement (llama.cpp-g4uy); Q4_0 and every other type the executor takes from a staged slot
+    // (moe_pp_batched_takes_staged_type) take the batched executor's rates measured on d52110c80 (llama.cpp-348c,
+    // re-seeded in llama.cpp-3460); any other type keeps the per-row 600. The fixtures above that call weigh set their
+    // own rates, so none of their expectations depended on a seed; the unset-variable check below pins the empty mix's
+    // 600.
     {
         moe_exec_rates r = moe_exec_rates_seed({
             { GGML_TYPE_MXFP4, 1000 }
@@ -206,27 +209,61 @@ int main() {
         r = moe_exec_rates_seed({
             { GGML_TYPE_Q4_0, 1000 }
         });
-        CHECK(r.dev_gflops == 630.0, "a pure Q4_0 mix seeds the per-row MMVQ path's 630 GFLOP/s");
-        r = moe_exec_rates_seed({
-            { GGML_TYPE_IQ3_S, 1000 }
-        });
-        CHECK(r.dev_gflops == 600.0, "a type with no batched executor seeds the per-row 600 GFLOP/s");
+        CHECK(r.dev_gflops == 9000.0, "a pure Q4_0 mix seeds the batched f16 executor's 9000 GFLOP/s");
+        // the Qwen3.8 GSQ-RCO expert types and the other types the staged claim takes share the f16 arm's 5000
+        const ggml_type f16_arm_types[] = { GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                                            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL,
+                                            GGML_TYPE_Q2_0,  GGML_TYPE_Q8_0,    GGML_TYPE_Q6_K };
+        for (ggml_type t : f16_arm_types) {
+            r = moe_exec_rates_seed({
+                { t, 1000 }
+            });
+            CHECK(r.dev_gflops == 5000.0, "a type the staged claim takes seeds the f16 arm's 5000 GFLOP/s");
+        }
+        // a type the batched executor does not claim keeps the per-row rate
+        const ggml_type per_row_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_F16 };
+        for (ggml_type t : per_row_types) {
+            r = moe_exec_rates_seed({
+                { t, 1000 }
+            });
+            CHECK(r.dev_gflops == 600.0, "a type with no batched executor seeds the per-row 600 GFLOP/s");
+        }
+        // the f16 arm dequantizes these, but they have no MMVQ-ID kernel, so the staged claim refuses them and the ring
+        // does not stage them: they keep the per-row rate until a kernel exists (llama.cpp-w4qk)
+        const ggml_type unstaged_f16_types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS };
+        for (ggml_type t : unstaged_f16_types) {
+            r = moe_exec_rates_seed({
+                { t, 1000 }
+            });
+            CHECK(r.dev_gflops == 600.0, "a type the staged claim refuses seeds the per-row 600 GFLOP/s");
+        }
+        // one type question (moe_pp_batched_takes_staged_type): apart from MXFP4, whose 3990 is the WOQ arm's Task 9
+        // measurement, a type is seeded above the per-row rate exactly when the staged claim takes it
+        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const ggml_type t = static_cast<ggml_type>(i);
+            if (t == GGML_TYPE_MXFP4) {
+                continue;
+            }
+            const bool executor_rate = moe_exec_dev_gflops_seed(t) > MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
+            CHECK(executor_rate == moe_pp_batched_takes_staged_type(t),
+                  "a type is seeded at an executor rate exactly when the staged claim takes it");
+        }
         r = moe_exec_rates_seed({
             { GGML_TYPE_MXFP4, 500 },
             { GGML_TYPE_Q4_0,  500 }
         });
-        CHECK(std::fabs(r.dev_gflops - 2.0 / (1.0 / 3990.0 + 1.0 / 630.0)) < 0.1 &&
-                  std::fabs(r.dev_gflops - 1088.1) < 0.1,
-              "equal MXFP4 and Q4_0 bytes seed the harmonic mean, 1088.1 (not the 2310 arithmetic mean)");
-        // unequal bytes tell the byte weighting from an unweighted harmonic mean (which would give the 1088.1 above):
-        // 400 / (100 / 3990 + 300 / 630) = 400 / (0.025063 + 0.476190) = 798.0
+        CHECK(std::fabs(r.dev_gflops - 2.0 / (1.0 / 3990.0 + 1.0 / 9000.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 5528.9) < 0.1,
+              "equal MXFP4 and Q4_0 bytes seed the harmonic mean, 5528.9 (not the 6495 arithmetic mean)");
+        // unequal bytes tell the byte weighting from an unweighted harmonic mean (which would give the 5528.9 above):
+        // 400 / (100 / 3990 + 300 / 9000) = 400 / (0.025063 + 0.033333) = 6849.8
         r = moe_exec_rates_seed({
             { GGML_TYPE_MXFP4, 100 },
             { GGML_TYPE_Q4_0,  300 }
         });
-        CHECK(std::fabs(r.dev_gflops - 400.0 / (100.0 / 3990.0 + 300.0 / 630.0)) < 0.1 &&
-                  std::fabs(r.dev_gflops - 798.0) < 0.1,
-              "100 B MXFP4 + 300 B Q4_0 seed the byte-weighted harmonic mean, 798.0");
+        CHECK(std::fabs(r.dev_gflops - 400.0 / (100.0 / 3990.0 + 300.0 / 9000.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 6849.8) < 0.1,
+              "100 B MXFP4 + 300 B Q4_0 seed the byte-weighted harmonic mean, 6849.8");
         r = moe_exec_rates_seed({});
         CHECK(r.dev_gflops == 600.0, "an empty mix seeds 600 GFLOP/s");
         CHECK(moe_exec_rates_valid(r), "the empty-mix seed is valid");

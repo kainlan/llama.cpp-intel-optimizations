@@ -112,13 +112,26 @@ device. `moe_exec_decision_log` prints one `[MOE-EXEC]` line when a layer's
 recorded choice changes. The regimes below say what each choice does.
 
 **Two regimes.** In decode, host-resident experts compute on the CPU. In prompt
-processing, the path depends on `GGML_SYCL_MOE_EXEC`. Under `ring`, a layer's
-host-resident experts are staged through the ring, and the batched device
-executor runs them. Under `cpu`, nothing is staged. Under `auto`, the default,
-the cost model's choice is only recorded, and no bytes move. Only an explicit
-`ring` stages (`moe_stream_stage_now`). This record-only gate is ruling c-3skf
-(llama.cpp-xod7). It stands until Task 10 (llama.cpp-3460) lifts it, after which
-`auto` stages whenever the cost model chooses the ring.
+processing, the path depends on `GGML_SYCL_MOE_EXEC`. Under `auto`, the default,
+a layer's host-resident experts are staged through the ring when the cost model
+chooses the ring. Under `ring`, they are staged wherever a ring fits. Under
+`cpu`, nothing is staged. `moe_stream_stage_now` is the one predicate. Task 10
+(llama.cpp-3460) lifted ruling c-3skf (llama.cpp-xod7), under which `auto` only
+recorded the choice. A weight the batched prompt executor claims once its host
+experts are staged is staged as AOS slots that the executor's dequant reads.
+The ring's index build records that claim as each host entry's consumer, and
+`moe_stream_phase::executor_staged` reads it back. A prompt op whose weight's
+routed host experts are all staged that way leaves the hybrid world and runs on
+the device. Any other staged weight is served by the staged ring route
+(llama.cpp-o9uw) in the hybrid world. The resolver still looks up the executor
+entries of a weight staged whole, and counts each one as a handoff
+(`handed_off` on the trace line), not as a refusal: the executor reads those
+slots. Under `ring`, a claimed weight that the ring stages only partly stays
+hybrid: the resolver refuses its executor entries as CLAIMED, so those experts
+run on the CPU from their host leases. Those copies are the waste, and
+`report_staged_routes` lists the refusals at WARN. Under `auto` this happens
+only on a layer the cost model sends to the ring, and the refusals then show
+only on the trace.
 
 **The ring.** `moe_stream_ring::reserve` takes the ring's slots from the WEIGHT
 zone. It first calls `unified_cache_zone_allocate_owner`. If the zone refuses,
@@ -141,14 +154,20 @@ is the only route from a host-resident entry to the device, and
 published plan. The cache copies each to pinned host storage and withdraws its
 device copy, and the WEIGHT-zone bytes it frees are the ring's slots. The loan
 and the refill are plan transactions: `ggml_sycl_expert_txn_run` runs them in
-the LOAN and REFILL directions, and each one republishes the expert plan. Today
-nothing in production originates a loan. `ggml_sycl_request_expert_loan` is
-called only by the boundary runner, to re-post a request that a transient
-refusal sent back, and by tests. The auto-ubatch fit probes the loan bytes
-(`ggml_sycl_expert_loan_probe_bytes`) for its ring term,
-`ggml_sycl_hold_ring_uncovered`, and lends nothing. So outside tests the refill
-has no lent triplets to re-admit. When a loan does run, the refill runs at the
-decode boundary through `ggml_sycl_expert_refill_transaction_run`. It re-admits
+the LOAN and REFILL directions, and each one republishes the expert plan. A
+loan originates in the prompt phase (llama.cpp-3460). When the WEIGHT zone
+cannot give the ring, `moe_stream_ring::reserve` reports the shortfall: the
+ring's bytes past the zone's largest free block. `ring_ready()` then asks for a
+loan of that many bytes through the op's `request_loan` hook, which the backend
+wires to `ggml_sycl_request_expert_loan`. It asks once per micro-batch, since
+the reserve latch stops later layers before the reserve. The loan runs at the
+next graph boundary, and the next micro-batch tries the reserve again. A loan
+the boundary runner refuses stops the asking for the rest of the prompt. A BUSY
+refusal does not, because the runner re-posts that request itself. The
+auto-ubatch fit only probes the loan bytes (`ggml_sycl_expert_loan_probe_bytes`)
+for its ring term, `ggml_sycl_hold_ring_uncovered`, and lends nothing. When a loan
+runs, the refill runs at the decode boundary through
+`ggml_sycl_expert_refill_transaction_run`. It re-admits
 lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying
 each lent host copy back owner to owner on the copy queue, behind its writes. A
 triplet that can never be prepared stays on the host, with one WARN. The fit's

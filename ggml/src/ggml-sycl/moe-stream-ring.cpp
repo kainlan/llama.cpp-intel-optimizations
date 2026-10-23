@@ -55,7 +55,28 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
 
 #if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)
 
-bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) {
+namespace {
+
+// What the WEIGHT zone of `device` is short of for one reservation of `bytes`: the bytes past its largest free block,
+// the most one allocation there can take. 0 when the zone's figures are not available (no cache, or no arena).
+size_t moe_stream_ring_weight_shortfall(int device, size_t bytes) {
+    unified_cache * cache        = get_unified_cache_for_device(device);
+    size_t          capacity     = 0;
+    size_t          used         = 0;
+    size_t          available    = 0;
+    size_t          largest_free = 0;
+    if (cache == nullptr || !cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest_free)) {
+        return 0;
+    }
+    return bytes > largest_free ? bytes - largest_free : 0;
+}
+
+}  // namespace
+
+bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short) {
+    if (bytes_short != nullptr) {
+        *bytes_short = 0;
+    }
     if (base_.valid()) {
         GGML_LOG_WARN("[MOE-STREAM-RING] reserve: device %d already holds a ring of %.1f MB; release it first\n",
                       device_, geo_.bytes / (1024.0 * 1024.0));
@@ -98,6 +119,10 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo) 
         allocation                                    = unified_allocate_owner(req);
     }
     if (!allocation) {
+        // The shortfall the phase asks an expert loan for (llama.cpp-3460, c-0tmn), read after the refusal.
+        if (bytes_short != nullptr) {
+            *bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes);
+        }
         GGML_LOG_WARN(
             "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give %.1f MB (%u slots x %.2f MB) on device "
             "%d\n",

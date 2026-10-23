@@ -344,6 +344,21 @@ inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
     return moe_pp_batched_f16_supports_layout(type, layout);
 }
 
+// The types the batched executor takes from a host-staged ring slot (llama.cpp-3460): the one type question that the
+// staged claim (ggml_sycl_moe_pp_onednn_batched_claims_tensor, host_staged) and the cost model's device-rate seed
+// (moe_exec_dev_gflops_seed) both ask. So the two agree on type, and on type only: the claim can still refuse a type
+// this helper takes while the seed stays at the executor's rate (9000 or 5000). It refuses one with
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0, GGML_SYCL_MOE_PP_ONEDNN_F16=0 or the route not selected, in a build without
+// oneDNN, and for a weight with no per-expert entries (moe_pp_batched_has_expert_entries). Two terms:
+//   - an f16 row at AOS: the ring stages a claimed weight's host experts as AOS slots, which the f16 arm dequantizes;
+//   - an MMVQ-ID kernel (moe_mmvq_admission_supports_type): a layer the ring stages only partly stays hybrid, and
+//     supports_op admits no other type on a hybrid layer (ggml_sycl_moe_pp_batched_admits_op).
+// IQ1_S, IQ1_M and IQ4_XS have the f16 row but no MMVQ-ID kernel, so they are left out until one exists
+// (llama.cpp-w4qk). MXFP4 has no f16 row at AOS: the ring stages its experts for the hybrid route.
+inline bool moe_pp_batched_takes_staged_type(enum ggml_type type) {
+    return moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS);
+}
+
 // Whether the cache holds one entry per expert of a `type` weight at `layout`, which the batched executor needs:
 // the retained prompt admission resolves each active expert's own entry before the executor runs. The claim
 // predicate asks this after the table, so the claim never takes a layout the cache does not hold per expert.
