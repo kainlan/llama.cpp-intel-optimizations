@@ -54,7 +54,10 @@ dequant. These claims pin that shape:
       builds;
   (o) every type the f16 table takes runs in the device test (test-moe-pp-batched-dequant.cpp's k_types), or is named
       in UNTESTED_ON_DEVICE with its reason, and never both; the untested ones are exactly the table's types that
-      ggml_quantize_requires_imatrix names, since the fixture quantizes with no importance matrix.
+      ggml_quantize_requires_imatrix names, since the fixture quantizes with no importance matrix;
+  (p) the device test counts each case's own lines (a [PP-MOE] line in the type's first case only, once per run, and
+      a success line per case), and its cases fit the backend's per-process cap on the success line, whose value
+      the test copies.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -833,6 +836,31 @@ def claim_o_device_coverage(s):
     return fails
 
 
+def claim_p_device_counts(s):
+    fails = []
+    test = s["device_test"]
+    for needle, what in (
+        ('g_log.count_since(from, { "[PP-MOE] device=", type_field.c_str() })', "the case's own [PP-MOE] lines"),
+        ('g_log.count_since(0, { "[PP-MOE] device=", type_field.c_str() })', "the run's [PP-MOE] total"),
+        ('g_log.count_since(from, { "[MOE-PP-ONEDNN-F16-BATCHED] tensor=" })', "the case's own success lines"),
+    ):
+        if needle not in test:
+            fails.append(f"the device test does not count {what} (`{needle}`)")
+    if "pp_moe != (first_of_type ? 1u : 0u) || pp_total != 1" not in test:
+        fails.append("the device test does not require the [PP-MOE] line in the type's first case only, once per run")
+    backend = re.search(r"static std::atomic<int> batched_log\{ 0 \}; "
+                        r"if \(batched_log\.fetch_add\(1, std::memory_order_relaxed\) < (\d+)\)", s["sycl"])
+    test_cap = re.search(r"constexpr int k_route_log_cap = (\d+);", test)
+    if not backend:
+        fails.append("the backend's batched success-line cap was not found")
+    elif not test_cap or test_cap.group(1) != backend.group(1):
+        got = test_cap.group(1) if test_cap else None
+        fails.append(f"the device test's k_route_log_cap is {got}, the backend's cap is {backend.group(1)}")
+    if "static_assert(k_cases <= k_route_log_cap," not in test:
+        fails.append("the device test does not static_assert that its cases fit the success line's cap")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -849,6 +877,7 @@ CLAIMS = {
     "m": claim_m_widening,
     "n": claim_n_dequant_label,
     "o": claim_o_device_coverage,
+    "p": claim_p_device_counts,
 }
 
 
@@ -954,6 +983,12 @@ MUTANTS = [
     ("o", "device_test", "GGML_TYPE_IQ4_NL,", ""),
     ("o", "device_test", "constexpr ggml_type k_types[] = {", "constexpr ggml_type k_types[] = { GGML_TYPE_IQ1_S,"),
     ("o", "ggml_c", "type == GGML_TYPE_IQ1_S;", "type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;"),
+    ("p", "device_test", 'g_log.count_since(from, { "[PP-MOE] device=", type_field.c_str() })',
+     'g_log.count_since(0, { "[PP-MOE] device=", type_field.c_str() })'),
+    ("p", "device_test", "pp_moe != (first_of_type ? 1u : 0u) || pp_total != 1", "pp_moe != 1"),
+    ("p", "sycl", "if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96)",
+     "if (batched_log.fetch_add(1, std::memory_order_relaxed) < 64)"),
+    ("p", "device_test", "static_assert(k_cases <= k_route_log_cap,", "static_assert(true,"),
     ("m", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
      "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0; "
      "static size_t g_tensor_inventory_pp_moe_onednn_scratch_bytes = 0;"),
