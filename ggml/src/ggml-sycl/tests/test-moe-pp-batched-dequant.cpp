@@ -1,12 +1,12 @@
 // Live check of the type-keyed batched oneDNN MoE prompt executor (llama.cpp-348c).
 //
 // For each expert type below, one MUL_MAT_ID prompt op runs on a planned model loaded the way libllama loads one:
-// the three expert tensors sit in the card's SYCL host buffer type, each is registered (weight identity, host weight,
-// usage) while the load is open, and all are filled before it commits, so the commit's preload materializes every
-// expert on the pinned card in the layout the planner chose for that type. On the B50 at this shape that is SOA for
-// Q8_0 and Q6_K and AOS for the rest. The shape is test-backend-ops' MUL_MAT_ID (32 experts, 4 used, k 2048, m 768),
-// run at 64 and 300 tokens. The result is compared with the CPU backend at NMSE <= 5e-4, and the log must show the
-// executor ran:
+// the three expert tensors sit in the card's SYCL host buffer type, each is registered (file identity, weight
+// identity, host weight, usage) while the load is open, and all are filled before it commits, so the commit's preload
+// materializes every expert on the pinned card in the layout the planner chose for that type. On the B50 at this
+// shape that is SOA for Q8_0 and Q6_K and AOS for the rest. The shape is test-backend-ops' MUL_MAT_ID (32 experts, 4
+// used, k 2048, m 768), run at 64 and 300 tokens. The result is compared with the CPU backend at NMSE <= 5e-4, and the
+// log must show the executor ran:
 //   * the [PP-MOE] line, once per (device, type), the first time the type-keyed arm runs;
 //   * one [MOE-PP-ONEDNN-F16-BATCHED] success line per case (GGML_SYCL_MOE_ROUTE_LOG=1, set below);
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
@@ -16,12 +16,13 @@
 // WOQ arm, about a quarter of an f16 slot. Only the backend's plan-time widening of the weight slot for the types
 // the f16 arm takes lets these ops fit, so a missing widening shows as the unplanned-scratch refusal.
 //
-// The weights are not uploaded into a device buffer, because that is not how a model loads by default
-// (GGML_SYCL_WEIGHTS_EVICTABLE is on): a device-buffer upload reorders an SOA type over the whole tensor and publishes
-// no per-expert records for it, so the prompt route finds no expert to resolve.
+// The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on. With it off, libllama puts these
+// device-planned experts in the device buffer instead, which this fixture does not model: that upload reorders an SOA
+// type over the whole tensor and publishes no per-expert records for it, and the claim declines such a layout. So with
+// it off the process exits 77 before any case.
 //
 // Every case runs, and each prints one CASE line naming what it saw. The process exits 1 if any case failed, 77 when
-// there is no SYCL GPU. Pin one card (the registration selects level_zero:1, the B50).
+// there is no SYCL GPU or the weights are not evictable. Pin one card (the registration selects level_zero:1, the B50).
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -208,21 +209,27 @@ struct lifecycle_fixture {
         }
     }
 
-    // What libllama's loader does for each weight, in its order: create the tensor and register its identity, its
-    // host-weight row and its usage while the load is open (register_sycl_tensor_metadata), allocate the tensors in
-    // the device's SYCL host buffer type, then fill them.
+    // What libllama's loader does for each weight, in its order: create the tensor and register its split's file
+    // identity, its own identity, its host-weight row (only while weights are evictable, as the loader gates it) and
+    // its usage while the load is open (register_sycl_tensor_metadata in src/llama-model-loader.cpp), allocate the
+    // tensors in the device's SYCL host buffer type, then fill them. The one split is named per type, so no two
+    // cases' weights share a file identity.
     void load_weights(ggml_type type, std::mt19937 & rng) {
         ggml_init_params params = { 3 * ggml_tensor_overhead(), nullptr, true };
         weight_ctx              = ggml_init(params);
         require(weight_ctx != nullptr, "ggml_init for the weights failed");
         ggml_backend_dev_t dev        = ggml_backend_get_device(backend);
         ggml_tensor *      tensors[3] = {};
+        const std::string  split_path = std::string("test-moe-pp-batched-dequant-") + ggml_type_name(type) + ".gguf";
         for (int i = 0; i < 3; ++i) {
             tensors[i] = ggml_new_tensor_3d(weight_ctx, type, k_in, k_out, k_experts);
             ggml_set_name(tensors[i], k_tensor_names[i]);
             const size_t nbytes = ggml_nbytes(tensors[i]);
+            ggml_backend_sycl_register_gguf_file_identity(0, split_path.c_str(), uint64_t(3 * nbytes));
             ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
-            ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
+            if (ggml_backend_sycl_weights_evictable()) {
+                ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
+            }
             require(ggml_backend_sycl_try_register_weight_usage(k_tensor_names[i],
                                                                 GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
                     std::string("usage registration refused for ") + k_tensor_names[i]);
@@ -448,6 +455,12 @@ int main() {
         }
         if (!have_gpu || ggml_backend_sycl_get_device_count() < 1) {
             std::fprintf(stderr, "SKIP: no usable SYCL GPU\n");
+            return LLAMA_TEST_EXIT_SKIP;
+        }
+        if (!ggml_backend_sycl_weights_evictable()) {
+            std::fprintf(stderr,
+                         "SKIP: GGML_SYCL_WEIGHTS_EVICTABLE is off, so libllama would load these experts into the "
+                         "device buffer, which this fixture does not model\n");
             return LLAMA_TEST_EXIT_SKIP;
         }
         std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(
