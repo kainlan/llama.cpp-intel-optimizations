@@ -596,6 +596,9 @@ def _owning_reader_sites():
 # ggml_sycl_republish_current_plan_into_empty instead of re-reading the cache plan: 12 statement counts moved
 # (mostly down) and one helper statement came in; no new reader kind, and none of the removed reads survives as
 # an unowned one.
+# llama.cpp-kjef: the auto-ubatch fit's ring term (ggml_sycl_hold_ring_uncovered) reads the published plan once,
+# `const auto current`, to size the prefill ring the way the stream phase does; it reads the same snapshot the expert
+# loan transaction reads, so no new reader kind, and the statement count under that name moves 4 -> 5.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
         "(*ggml_sycl_cache_plan_owner(cache))": 1,
@@ -676,7 +679,7 @@ INTERNAL_WRAPPER_SITES = {
         "const auto active = ggml_sycl_global_plan_snapshot();": 1,
         # llama.cpp-mwmr took this from 3 to 4: the expert loan transaction's one acquire load, held for the whole
         # transaction as the runtime context transaction holds its own.
-        "const auto current = ggml_sycl_global_plan_snapshot();": 4,
+        "const auto current = ggml_sycl_global_plan_snapshot();": 5,  # llama.cpp-kjef: +1, the ring helper
         # llama.cpp-sif1: the refill device case reads the plan its first refill published, to tell which triplet
         # came back and which is still lent.
         "const auto first = ::ggml_sycl_global_plan_snapshot();": 1,

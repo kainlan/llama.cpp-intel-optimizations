@@ -18639,6 +18639,11 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
     return plan;
 }
 
+// Defined after the stream phase's prompt-kernel and library-claim hooks, which decide each matrix's staging and so
+// size the ring it asks about, about 15,000 lines below the fit. It is the prefill ring's bytes no loan can cover on
+// `device` for a rung of `n_ubatch` rows (llama.cpp-kjef); see its definition.
+static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch);
+
 static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
     ggml_sycl_hold_fit_answer  a;
     ggml_sycl::unified_cache * cache    = ggml_sycl::get_unified_cache_for_device(q.device);
@@ -18676,6 +18681,8 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.rungs        = rungs;
     in.plan_of      = ggml_sycl_hold_plan_at;
     in.plan_ctx     = &device;
+    // Lent bytes cost the card nothing; the part of the ring no loan covers is a demand (zone_hold_fit_demand).
+    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);
     a.demand        = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);
     a.free_before   = in.free_before;
     const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);
@@ -18689,7 +18696,7 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
 }
 
 // What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the
-// rung, from the one fit function.
+// rung, plus the prefill-ring bytes no loan covers, from the one fit function.
 static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
     ggml_sycl_hold_fit_answer a;
     (void) ggml_sycl_hold_spill_fit(q, &a);
@@ -18726,9 +18733,9 @@ static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query &
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
         "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
-        "net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free (of %.1f MB free "
-        "before it), under the %.1f MB driver headroom the arena expects; %s; or free VRAM on this card (another "
-        "process) before loading\n",
+        "net of the KV-zone room a compute buffer can use, plus the prefill-ring bytes no loan covers) would leave "
+        "device %d %.1f MB free (of %.1f MB free before it), under the %.1f MB driver headroom the arena expects; "
+        "%s; or free VRAM on this card (another process) before loading\n",
         a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
         ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
     return false;
@@ -18765,9 +18772,10 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: at n_ubatch=%u the compute buffers the planned dense scratch "
-        "keeps out of the RUNTIME zone (worst case %.1f MB; %llu request(s) totalling %.1f MB were held out and now "
-        "live outside the arena) leave device %d %.1f MB free (of %.1f MB free before them), under the %.1f MB "
-        "driver headroom the arena expects; a smaller -ub keeps those buffers in the zone\n",
+        "keeps out of the RUNTIME zone (worst case %.1f MB, with any prefill-ring bytes no loan covers; %llu "
+        "request(s) totalling %.1f MB were held out and now live outside the arena) leave device %d %.1f MB free "
+        "(of %.1f MB free before them), under the %.1f MB driver headroom the arena expects; a smaller -ub keeps "
+        "those buffers in the zone\n",
         n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
         free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
@@ -19012,10 +19020,11 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     // headroom, using the free-memory reading taken above.
 
     // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan
-    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max) is counted here,
-    // in the check that already asks what the device can take outside the arena; those bytes and the non-FA scratch
-    // compete for the same headroom. (A flash-attention context asks the same live free-memory question without the
-    // non-FA terms, at the top of this function.) Saturating: a wrapped sum must not read as a small demand.
+    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max, and the prefill-ring
+    // bytes no loan covers) is counted here, in the check that already asks what the device can take outside the
+    // arena; those bytes and the non-FA scratch compete for the same headroom. (A flash-attention context asks the
+    // same live free-memory question without the non-FA terms, at the top of this function.) Saturating: a wrapped
+    // sum must not read as a small demand.
     const size_t hold_spill_bytes = hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;
     const size_t nonfa_scratch_demand =
         ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
@@ -20790,8 +20799,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // to the host and is published once, so each lent expert executes where it now lives. File-static. Today its one
 // production caller is the boundary runner ggml_backend_sycl_synchronize() calls, which finds no request until a
 // requester lands.
-// Once plan Task 12 lands, the auto-ubatch fit term will call it in probe mode (ggml_sycl_run_expert_loan_transaction),
-// and the ring's admission in mul_mat_id (the ring phase, Task 7b) will call only ggml_sycl_request_expert_loan().
+// The auto-ubatch fit's ring term calls it in probe mode (ggml_sycl_expert_loan_probe_bytes), and once plan Task 12
+// lands the ring's admission in mul_mat_id (the ring phase, Task 7b) will call only ggml_sycl_request_expert_loan().
 //
 // Where it runs (c-tdra): at a graph boundary, never inside a graph. The ring's admission runs inside one, holding
 // g_sycl_graph_compute_mutex (L2), and the inventory mutex (L1) ranks below it (canonical contract section 12.5), so it
@@ -21397,7 +21406,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 
 // Lend resident expert triplets worth at least bytes_wanted of VRAM on the backend's device to the prefill ring, or,
 // in probe mode, say what a loan would lend while copying and publishing nothing. The direct entry, for a caller
-// outside any graph; refused "graph active" inside one. Unused until its caller lands (the fit term, plan Task 12).
+// outside any graph; refused "graph active" inside one. Unused until its caller lands (plan Task 12); the fit term asks
+// ggml_sycl_expert_loan_probe_bytes, which takes a device because the fit has no backend.
 [[maybe_unused]] static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction(ggml_backend_t backend,
                                                                                    size_t         bytes_wanted,
                                                                                    bool           probe_mode,
@@ -21411,6 +21421,17 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
         return ggml_sycl_txn_result::REFUSED;
     }
     return ggml_sycl_expert_loan_transaction_run(ctx->device, bytes_wanted, probe_mode, nullptr, out);
+}
+
+// What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused
+// (a graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks it
+// (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
+static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted) {
+    ggml_sycl_expert_loan_result probe;
+    const ggml_sycl_txn_result   code =
+        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/true, nullptr, &probe,
+                                              /*warn_busy=*/false);
+    return code == ggml_sycl_txn_result::ACCEPTED ? probe.bytes_freed : 0;
 }
 
 // Per device, the most bytes any in-graph caller asked to borrow since the last graph boundary; 0 when none did.
@@ -35188,6 +35209,46 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
     const ggml_tensor * w    = ggml_sycl_moe_stream_layer_weight(layer, role);
     return call != nullptr && call->plan && w != nullptr &&
            ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, call->device);
+}
+
+// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
+// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
+// ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
+// host. 0 with no published plan, no host expert, or no ring (the sizing refuses one past a tenth of the resident
+// expert bytes). A refused probe (a graph is active) lends nothing, so the whole ring counts.
+//
+// The geometry is the stream phase's own: moe_stream_plan_ring_geometry over the same prompt-kernel predicate, so the
+// fit and the ring cannot disagree about its size. The predicate reads a stream call: the device and the rows. At the
+// PROMPT phase the capability it queries reads the rows only to refuse zero (ggml_sycl_moe_query_route_capability);
+// the decode rows == 1 case of the Q1_0 / NVFP4 AOS candidate is not reached, and the XMX-tiled row limit is for a
+// layout the ring never asks about. So the geometry does not depend on the rung and `n_ubatch` stands in for the
+// micro-batch's rows. The fit passes NO library-claims hook: the backend's hook reads g_moe_gate_up_pairs, a
+// thread-local scan of a graph that is stale outside compute (a previous model's weight tensors can still be in it),
+// so asking it here could read freed tensors. The fit therefore counts no library claim, and its ring is an upper
+// bound of the phase's, never an under-count.
+// The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
+// context transaction, before it publishes, this can see the previous plan or none, and the realized check (run
+// after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
+// and the loan selection); the callers are the transaction and the auto-ubatch trial's checks, never a per-graph
+// path, so a per-query cache is not warranted today.
+static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
+    const auto current = ggml_sycl_global_plan_snapshot();
+    if (!current || !current->plan) {
+        return 0;
+    }
+    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the prompt-kernel hook reads it through graph_ctx
+    call.plan        = current->plan;
+    call.cache       = ggml_sycl::get_unified_cache_for_device(device);
+    call.device      = device;
+    call.op.n_tokens = n_ubatch;
+
+    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
+        *call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr);
+    if (geo.bytes == 0) {
+        return 0;
+    }
+    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);
+    return geo.bytes > lent ? geo.bytes - lent : 0;
 }
 
 namespace ggml_sycl {

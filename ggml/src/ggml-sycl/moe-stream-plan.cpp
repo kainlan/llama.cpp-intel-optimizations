@@ -162,9 +162,8 @@ void moe_stream_phase::end_prompt() {
 // the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache record is read once
 // per prompt.
 void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
-    index_ = moe_stream_plan_index_build(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims);
     const moe_stream_ring_geometry geo =
-        moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, index_.resident_expert_bytes);
+        moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, &index_);
     const bool same_queue = ccs_.has_value() && *ccs_ == ccs;
     const bool same_geo = geo.slot_bytes == geo_.slot_bytes && geo.n_slots == geo_.n_slots && geo.bytes == geo_.bytes &&
                           geo.region_slots == geo_.region_slots;
