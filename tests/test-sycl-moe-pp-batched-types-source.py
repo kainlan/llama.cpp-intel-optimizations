@@ -9,7 +9,8 @@ for the types the planner materializes SOA that have a per-expert SOA dequant. T
       ggml_sycl_moe_pp_batched_takes_layout(), which asks moe_pp_batched_supports_layout() in moe-mmvq-tables.hpp,
       and neither tests GGML_TYPE_MXFP4 itself;
   (b) the f16 table lists each required type on AOS, Q4_0, Q8_0, Q4_K and Q6_K on AOS and SOA, MXFP4 on SOA only,
-      never the direct-kernel types, and every type it lists has a case in convert.cpp's
+      never the direct-kernel types, its non-MXFP4 types and REQUIRED_AOS are one set (a type added to the table
+      without a pin is red), and every type it lists has a case in convert.cpp's
       ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
       since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
       dequantize_row_q8_0_soa_to_fp16_rowmajor and never asks it; the WOQ table is MXFP4 on SOA and XMX_TILED;
@@ -19,10 +20,14 @@ for the types the planner materializes SOA that have a per-expert SOA dequant. T
       lives, and the fallback itself stays exactly Q4_K for the hybrid ops the executor never runs;
   (d) decode keeps its ne12 == 1 / ids->ne[1] > 1 terms: the hybrid-with-plan disjunct, the two claim call sites
       and the lambda's single-token refusal;
-  (e) one refusal enum with a name for every cause, every refusal in the lambda names one, and one WARN line per
-      (device, cause) under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE, printed by one helper that the GEMM-stage
-      failure uses too, so every refusal reads "[PP-MOE] refused";
-  (f) one [PP-MOE] INFO line per (device, type), naming the type, layout, experts per dispatch and the planned slot;
+  (e) one refusal enum with a name for every cause, ending in COUNT, which the per-(device, cause) latch
+      static_asserts fits its 32-bit mask and refuses at or past; every refusal in the lambda names one; one WARN line
+      per (device, cause), printed by one helper that the GEMM-stage failure uses too, so every refusal reads
+      "[PP-MOE] refused". A cause reached after the claim steered the op past the MMVQ probes
+      (moe_pp_batched_refusal_after_claim, exactly POST_CLAIM) prints at default verbosity; a precheck cause prints
+      only under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE;
+  (f) one [PP-MOE] INFO line per (device, type, layout), naming the type, layout, experts per dispatch and the
+      planned slot;
   (g) the MXFP4 profiler label strings are byte-identical and keep their counts, the non-MXFP4 labels are moe.pp.*,
       and the MXFP4 dispatch-record profile stays MXFP4-only;
   (h) the capability query admits a prompt-phase op the executor takes only after the MMVQ check (so no type that
@@ -42,7 +47,11 @@ for the types the planner materializes SOA that have a per-expert SOA dequant. T
       so with it at 0 the claim takes nothing the executor would then decline, and the executor names the knob as
       route-off rather than as a candidate miss; the catalog has its row;
   (m) the plan-time widening of the ring's weight slot is logged once per load (the early and the late plan of one
-      load both populate the inventory), and no unread ring total is kept beside the unified cache's own.
+      load both populate the inventory), and no unread ring total is kept beside the unified cache's own;
+  (n) the dequant profiler label's name comes from a table built once per type, never from a string the dispatch
+      builds;
+  (o) every type the f16 table takes runs in the device test (test-moe-pp-batched-dequant.cpp's k_types), or is named
+      in UNTESTED_ON_DEVICE with its reason, and never both.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -63,6 +72,7 @@ FILES = {
     "common": SYCL_DIR / "common.hpp",
     "layer_plan": SYCL_DIR / "moe-layer-plan.hpp",
     "catalog": ROOT / "docs" / "backend" / "sycl-env-vars.md",
+    "device_test": SYCL_DIR / "tests" / "test-moe-pp-batched-dequant.cpp",
 }
 
 # The brief's list (Q4_0 plus the Qwen3.8 GSQ-RCO mix types it named) plus the rest of the GSQ-RCO census
@@ -83,6 +93,24 @@ AOS_EXPR = "layout == GGML_LAYOUT_AOS"
 KNOB = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS"
 KNOB_CONST = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV"
 F16_KNOB = "GGML_SYCL_MOE_PP_ONEDNN_F16"
+# The refusal causes the batched executor reaches only after the claim has steered the op past the MMVQ probes and
+# the fused routes: a decline there loses the fast path, so it is reported at default verbosity. The others are
+# prechecks (the op was never this executor's, or there is nothing to run), plus SCRATCH_UNPLANNED, whose admission
+# refusal already warns at default verbosity with the sizes, once per process.
+POST_CLAIM = [
+    "EXPERT_NOT_LOCAL", "EXPERT_LAYOUT", "XMX_TILE_CAPS", "F16_TILED", "NO_DEQUANT", "SCRATCH_SIZE", "SCRATCH_CACHE",
+    "SCRATCH_RESERVE", "SCRATCH_SLOT", "SCRATCH_SLOT_SIZE", "GEMM",
+]
+WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) && "
+                  "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
+# Types the f16 table takes that the device test does not run, each with its reason.
+UNTESTED_ON_DEVICE = {
+    "GGML_TYPE_IQ1_S": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
+    "GGML_TYPE_IQ2_XXS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
+    "GGML_TYPE_IQ2_XS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
+    "GGML_TYPE_Q2_0": "quantizes without an imatrix but is not in the device test yet",
+    "GGML_TYPE_IQ2_S": "quantizes without an imatrix but is not in the device test yet",
+}
 
 
 def strip_comments(src):
@@ -354,6 +382,9 @@ def claim_b_table_types(s):
     for t in FORBIDDEN:
         if t in cases:
             fails.append(f"the f16 table names {t}")
+    unpinned = sorted(t for t in cases if t not in ("default", "GGML_TYPE_MXFP4") and t not in REQUIRED_AOS)
+    if unpinned:
+        fails.append(f"the f16 table takes {unpinned}, which REQUIRED_AOS does not pin")
     if cases.get("default") != "false":
         fails.append("the f16 table's default must be `return false`")
     converter_types = set(re.findall(r"case (GGML_TYPE_\w+) ?:", for_layout))
@@ -435,16 +466,41 @@ def claim_e_refusal_enum(s):
     if defs != 1:
         return [f"`{head}` is defined {defs} times in the backend sources, want 1"]
     holder = next(k for k in ("tables", "sycl") if head in s[k])
-    values = enum_values(s[holder], head)
-    if not values or len(values) > 32:
-        fails.append(f"the refusal enum has {len(values or [])} values; the per-device latch holds at most 32")
+    values = enum_values(s[holder], head) or []
+    if not values or values[-1] != "COUNT":
+        fails.append("the refusal enum does not end in COUNT, so nothing bounds it at compile time")
+    causes = [v for v in values if v != "COUNT"]
+    if len(causes) > 32:
+        fails.append(f"the refusal enum has {len(causes)} causes; the per-device latch holds at most 32")
     names = one_definition(s[holder], "moe_pp_batched_refusal_name")
     if names is None:
         fails.append("moe_pp_batched_refusal_name is not defined exactly once beside the enum")
     else:
-        for v in values or []:
+        for v in causes:
             if f"case moe_pp_batched_refusal::{v}:" not in names:
                 fails.append(f"moe_pp_batched_refusal_name has no case for {v}")
+    after = one_definition(s[holder], "moe_pp_batched_refusal_after_claim")
+    if after is None:
+        fails.append("moe_pp_batched_refusal_after_claim is not defined exactly once beside the enum")
+    else:
+        loud = []
+        pending = []
+        for m in re.finditer(r"case moe_pp_batched_refusal::(\w+) ?:|return (true|false) ?;|default ?:", after):
+            if m.group(1):
+                pending.append(m.group(1))
+            elif m.group(2):
+                if m.group(2) == "true":
+                    loud.extend(pending)
+                pending = []
+            else:
+                pending = []
+        if sorted(loud) != sorted(POST_CLAIM):
+            extra = sorted(set(loud) - set(POST_CLAIM))
+            missing = sorted(set(POST_CLAIM) - set(loud))
+            fails.append("moe_pp_batched_refusal_after_claim is loud for the wrong causes "
+                         f"(precheck printed by default: {extra}; post-claim left trace-only: {missing})")
+        if "default: return false;" not in after:
+            fails.append("moe_pp_batched_refusal_after_claim does not default to false (a new cause would be loud)")
     lam = lambda_body(s["sycl"]) or ""
     calls = list(re.finditer(r"\b(trace_batched_skip|reject_batched)\(", lam))
     if not calls:
@@ -460,8 +516,8 @@ def claim_e_refusal_enum(s):
         lam_pos = lam.find(literal)
         cond = enclosing_if_condition(lam, lam_pos) if lam_pos >= 0 else ""
         cond = cond or ""
-        if "pp_f16_batched_trace" not in cond or "ggml_sycl_moe_pp_batched_refusal_first(" not in cond:
-            fails.append("the refusal WARN is not guarded by the trace knob and the per-(device, cause) latch")
+        if cond.strip() != WARN_CONDITION:
+            fails.append(f"the refusal WARN is guarded by `{cond.strip()}`, not `{WARN_CONDITION}`")
         stmt_start = s["sycl"].rfind("GGML_LOG_", 0, pos)
         if not s["sycl"].startswith("GGML_LOG_WARN(", stmt_start):
             fails.append("the refusal line is not emitted with GGML_LOG_WARN")
@@ -471,6 +527,12 @@ def claim_e_refusal_enum(s):
     latch = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_refusal_first")
     if latch is None or "fetch_or(" not in latch or "std::atomic<uint32_t>" not in latch:
         fails.append("ggml_sycl_moe_pp_batched_refusal_first is not one per-device atomic bitmask latch")
+    else:
+        bound = "static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,"
+        if bound not in latch:
+            fails.append("the refusal latch does not static_assert that moe_pp_batched_refusal::COUNT fits 32 bits")
+        if "refusal >= moe_pp_batched_refusal::COUNT" not in latch:
+            fails.append("the refusal latch does not refuse a value at or past COUNT before it shifts")
     old_prefix = '"[MOE-PP-ONEDNN-F16-BATCHED] refused'
     if old_prefix in s["sycl"]:
         fails.append(f"{old_prefix} is still printed: every refusal must read \"[PP-MOE] refused\"")
@@ -494,8 +556,8 @@ def claim_f_first_run_line(s):
     lam_pos = lam.find(literal)
     cond = enclosing_if_condition(lam, lam_pos) if lam_pos >= 0 else ""
     cond = cond or ""
-    if cond.strip() != "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type)":
-        fails.append(f"the [PP-MOE] line is guarded by `{cond.strip()}`, not the per-(device, type) latch")
+    if cond.strip() != "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)":
+        fails.append(f"the [PP-MOE] line is guarded by `{cond.strip()}`, not the per-(device, type, layout) latch")
     stmt_start = sycl.rfind("GGML_LOG_", 0, pos)
     if not sycl.startswith("GGML_LOG_INFO(", stmt_start):
         fails.append("the [PP-MOE] line is not emitted with GGML_LOG_INFO")
@@ -504,10 +566,12 @@ def claim_f_first_run_line(s):
         if field not in stmt:
             fails.append(f"the [PP-MOE] line does not name {field}")
     latch = one_definition(sycl, "ggml_sycl_moe_pp_batched_first_run")
-    if latch is None or "fetch_or(" not in latch or "std::atomic<uint64_t>" not in latch:
-        fails.append("ggml_sycl_moe_pp_batched_first_run is not one per-device atomic bitmask latch")
-    if "static_assert(GGML_TYPE_COUNT <= 64" not in sycl:
-        fails.append("no static_assert that every ggml_type fits the 64-bit first-run mask")
+    if latch is None or "fetch_or(" not in latch or "std::atomic<uint32_t>" not in latch:
+        fails.append("ggml_sycl_moe_pp_batched_first_run is not one atomic layout bitmask per (device, type)")
+    elif "[GGML_SYCL_MAX_DEVICES][GGML_TYPE_COUNT]" not in latch:
+        fails.append("ggml_sycl_moe_pp_batched_first_run does not keep one mask per (device, type)")
+    elif "static_assert(GGML_LAYOUT_MXFP4_DPAS < 32," not in latch:
+        fails.append("no static_assert that every layout fits the first-run latch's 32-bit mask")
     return fails
 
 
@@ -717,6 +781,42 @@ def claim_m_widening(s):
     return fails
 
 
+def claim_n_dequant_label(s):
+    fails = []
+    sycl = s["sycl"]
+    lam = lambda_body(sycl) or ""
+    if 'std::string("moe.pp.dequant.")' in sycl:
+        fails.append("a dispatch still builds the moe.pp.dequant.<type> label as a std::string")
+    if "ggml_sycl_moe_pp_dequant_label(src0->type)" not in lam:
+        fails.append("the lambda does not take the dequant label from ggml_sycl_moe_pp_dequant_label")
+    helper = one_definition(sycl, "ggml_sycl_moe_pp_dequant_label")
+    if helper is None:
+        fails.append("ggml_sycl_moe_pp_dequant_label is not defined exactly once")
+    elif not re.search(r"static const std::array<std::string, GGML_TYPE_COUNT> \w+ = \[\]\(\) \{", helper):
+        fails.append("ggml_sycl_moe_pp_dequant_label does not build its names once, in a function-local static table")
+    return fails
+
+
+def claim_o_device_coverage(s):
+    fails = []
+    f16 = one_definition(s["tables"], "moe_pp_batched_f16_supports_layout")
+    if f16 is None:
+        return ["the f16 table was not found"]
+    table = {t for t in switch_cases(f16) if t not in ("default", "GGML_TYPE_MXFP4")}
+    m = re.search(r"constexpr ggml_type k_types\[\] = \{([^}]*)\}", s["device_test"])
+    if not m:
+        return ["test-moe-pp-batched-dequant.cpp has no `constexpr ggml_type k_types[] = { ... }`"]
+    tested = set(re.findall(r"GGML_TYPE_\w+", m.group(1)))
+    untested = set(UNTESTED_ON_DEVICE)
+    for t in sorted(tested & untested):
+        fails.append(f"{t} is in the device test and also named untested on device")
+    for t in sorted(table - tested - untested):
+        fails.append(f"the f16 table takes {t}, which the device test does not run and nothing names untested")
+    for t in sorted((tested | untested) - table):
+        fails.append(f"{t} is device-tested or named untested, but the f16 table does not take it")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -731,6 +831,8 @@ CLAIMS = {
     "k": claim_k_expert_entries,
     "l": claim_l_f16_knob,
     "m": claim_m_widening,
+    "n": claim_n_dequant_label,
+    "o": claim_o_device_coverage,
 }
 
 
@@ -775,7 +877,22 @@ MUTANTS = [
      "return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS"),
     ("e", "sycl", "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)", "true"),
     ("e", "tables", "case moe_pp_batched_refusal::GEMM:", ""),
-    ("f", "sycl", "if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type))", "if (true)"),
+    ("e", "tables", "GEMM, COUNT", "GEMM"),
+    ("e", "sycl", "static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,",
+     "static_assert(true,"),
+    ("e", "sycl", "refusal >= moe_pp_batched_refusal::COUNT", "false"),
+    # A post-claim cause left trace-only, and a precheck cause printed without the trace knob.
+    ("e", "tables", "case moe_pp_batched_refusal::EXPERT_NOT_LOCAL: case moe_pp_batched_refusal::EXPERT_LAYOUT:",
+     "case moe_pp_batched_refusal::EXPERT_LAYOUT:"),
+    ("e", "tables", "case moe_pp_batched_refusal::GEMM: return true;",
+     "case moe_pp_batched_refusal::GEMM: case moe_pp_batched_refusal::DECODE: return true;"),
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&",
+     "pp_f16_batched_trace &&"),
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&",
+     "(true || moe_pp_batched_refusal_after_claim(refusal)) &&"),
+    ("f", "sycl", "if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout))", "if (true)"),
+    ("f", "sycl", "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)",
+     "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, GGML_LAYOUT_AOS)"),
     ("f", "sycl", "planned_weight_slot=", "planned_weight="),
     ("g", "sycl", 'pp_mxfp4_labels ? "mxfp4.pp.stage.act" : "moe.pp.stage.act"', '"moe.pp.stage.act"'),
     ("g", "sycl", "const bool pp_profile = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();",
@@ -812,6 +929,11 @@ MUTANTS = [
     ("m", "sycl", "&& ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, ",
      "|| ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, "),
     ("m", "sycl", "last.owner == owner && ", ""),
+    ("n", "sycl", "ggml_sycl_moe_pp_dequant_label(src0->type)",
+     'std::string("moe.pp.dequant.") + ggml_type_name(src0->type)'),
+    ("b", "tables", "case GGML_TYPE_Q4_1:", "case GGML_TYPE_Q4_1: case GGML_TYPE_TQ2_0:"),
+    ("o", "device_test", "GGML_TYPE_IQ4_NL,", ""),
+    ("o", "device_test", "constexpr ggml_type k_types[] = {", "constexpr ggml_type k_types[] = { GGML_TYPE_IQ1_S,"),
     ("m", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
      "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0; "
      "static size_t g_tensor_inventory_pp_moe_onednn_scratch_bytes = 0;"),
