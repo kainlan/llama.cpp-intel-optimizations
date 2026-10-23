@@ -496,10 +496,22 @@ no number in this section is a baseline, and none of the figures in the plan are
 ### Method
 
 - **Script.** `scripts/sycl-moe-exec-gate.sh <merge sha>`, run by the lead only, detached, one run at a
-  time, under `GPU.lock`, with the build in `build/` made from that sha. It refuses unless builders
-  (ninja plus icpx) are 0 and the host has settled (`Shmem` under 30 GB, `MemAvailable` over 150 GB),
-  and it samples both before every arm and 5 s after it. The log ends `verdicts_pass=N GATE_DONE`.
-- **Repeats and spread.** Every `llama-bench` arm uses `-r 3`. A cell is the mean of the three, with the
+  time, under `GPU.lock`. The lead form runs a snapshot copy of the script against a build whose source
+  tree is the merge tree:
+  `cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snapshot>/scripts/`,
+  then `bash <snapshot>/scripts/sycl-moe-exec-gate.sh --build-dir <merge-tree>/build --out-dir <fresh dir> <sha>`.
+  The prompts resolve next to the script (the snapshot); the head check and the binary-newer-than-head
+  check read the build's own source tree, `--src-dir`, which defaults to the parent of `--build-dir`. The
+  sha is checked against that tree's `HEAD`. `--no-head-check` is only an explicit escape. It skips the
+  head comparison and the newer-than-head check, so it gives up the guarantee that the binaries were built
+  from the sha, and it still validates the sha format and still refuses a missing binary. A table taken
+  under it is not a baseline.
+  The script refuses unless builders (ninja plus icpx) are 0 at the start and the host has settled
+  (`Shmem` under 30 GB, `MemAvailable` over 150 GB). Before each arm it waits for the builders to clear,
+  like the settle wait (15 minutes at most), and it samples both before every arm and 5 s after it, with
+  builders also sampled every 5 s during the arm. The log ends `verdicts_pass=N GATE_DONE`.
+- **Repeats and spread.** Every `llama-bench` arm uses `-r 3` except `Q_staged`, which uses `-r 1`: it
+  counts staged slots, not throughput, so a repeat adds nothing. A cell is the mean of the three, with the
   standard deviation `llama-bench` prints beside it (`stddev_ts`). Three repeats make a spread, not a
   confidence interval, and the B70 token-generation axis is the noisy one (see "Current baselines" above).
 - **Micro-batch.** The Qwen prefill arms pass no `-ub`: the auto micro-batch trial chooses it, and the
@@ -509,12 +521,21 @@ no number in this section is a baseline, and none of the figures in the plan are
   `-n 60 -ub 256 -t 4`), so their floors (11.0 and 9.5 tok/s) and output md5 (`25b7738a`) carry over. A
   changed md5 there is a regression, not a new baseline.
 - **Driver and load.** Driver `__DRIVER__` (compute-runtime 26.31, or 26.35 with
-  `GGML_SYCL_MMQ_ESIMD=OFF`, per the plan's end-to-end section). Ambient host load `__LOAD__`, recorded
-  by the gate before each arm and never deferred for a quiet host. Builders are 0 for every arm.
+  `GGML_SYCL_MMQ_ESIMD=OFF`, per the plan's end-to-end section). Ambient host load `__LOAD__`, the per-arm
+  load range: the minimum and maximum of the one-minute load the gate logs in each arm's pre line. It is
+  recorded for the reader and never deferred for a quiet host. Every verdict line carries `builders_pre=`
+  and `builders_post=`; an arm whose `builders_post` is above 0 is `NOT_SCORED(tainted=builders,...)` and
+  its row is not a baseline.
 - **Tuning cache.** The gate does not redirect `GGML_SYCL_TUNING_CACHE_DIR` unless `--tuning-dir` is
   given, so a run writes the real cache, including the H2D rate the executor reads.
 
 ### Table
+
+One row per verdict-bearing arm and per recorded metric, filled by the lead from the gate's log. The
+columns are:
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
 
 __TABLE__
 
@@ -546,6 +567,11 @@ __TABLE__
 - **`place=unchanged`.** The `MoE experts: N on device, M on host` line equals the reference the gate was
   given (`--place-ref-tg`, `--place-ref-noc`), which defaults to the q0xu run's values. `place=unscored`
   means the reference was disabled with `-`.
+- **`rc=` and `builders_post=`.** Every arm scores a non-zero exit status as a `FAIL` naming it (`rc=124` is
+  the timeout, `rc=137` a kill, `rc=134` an abort, including one in teardown after the right answer was
+  printed). The `resets` arm keeps `journalctl`'s own status, so a failed `journalctl` is a `FAIL` rather
+  than a clean log. A `PASS` with `builders_post` above 0 is reported as
+  `NOT_SCORED(tainted=builders,was=PASS)` and the exit code is 3.
 - **`Q_pp_cpu`.** Recorded, not gated. It is the before-number, taken with `GGML_SYCL_MOE_EXEC=cpu`. The
   plan records the before-number from the q0xu gate as 13.5-14.4 tok/s for pp512 at `-ub 256`; at the auto
   micro-batch it may read higher.
