@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -237,14 +238,20 @@ const moe_stream_layer_info * layer_info(const moe_stream_plan_index & idx, int 
     return it == idx.layers.end() ? nullptr : &it->second;
 }
 
-std::unordered_set<uint64_t> keys_of(int layer, std::initializer_list<int> experts) {
-    std::unordered_set<uint64_t> keys;
+// A stage table's view as moe_stream_executor_staged reads it: the key and the entry's consumer.
+struct consumer_entry {
+    moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
+};
+
+using consumer_table = std::unordered_map<uint64_t, consumer_entry>;
+
+// `layer`'s `role` entries for `experts`, each carrying `consumer`.
+consumer_table table_of(int layer, std::initializer_list<int> experts, expert_tensor_role role, moe_stream_consumer c) {
+    consumer_table table;
     for (int e : experts) {
-        for (expert_tensor_role r : kRoles) {
-            keys.insert(ggml_sycl::moe_stream_table_key(layer, e, r));
-        }
+        table[ggml_sycl::moe_stream_table_key(layer, e, role)].consumer = c;
     }
-    return keys;
+    return table;
 }
 
 const char * fake_env_h2d(const char * name) {
@@ -593,27 +600,60 @@ int main() {
         CHECK(ggml_sycl::moe_stream_select(*l0, moe_exec_regime::NONE, bits).empty());
     }
 
-    // ---- fully staged, answered from the table (c-7soh) ----
-    const int32_t                      ids_15[2] = { 1, 5 };
-    const int32_t                      ids_02[2] = { 0, 2 };
-    const auto                         b15       = ggml_sycl::moe_stream_ids_bitmap(ids_15, 2, kExperts);
-    const auto                         b02       = ggml_sycl::moe_stream_ids_bitmap(ids_02, 2, kExperts);
-    const std::unordered_set<uint64_t> empty_table;
-    std::unordered_set<uint64_t>       t15 = keys_of(0, { 1, 5 });
-    CHECK(ggml_sycl::moe_stream_fully_staged(l0, b15, t15));
-    CHECK(ggml_sycl::moe_stream_fully_staged(l0, b02, empty_table));  // the routed experts are resident
-    t15.erase(ggml_sycl::moe_stream_table_key(0, 5, expert_tensor_role::UP));
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l0, b15, t15));
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l0, b15, keys_of(2, { 1, 5 })));  // another layer's entries
-    CHECK(ggml_sycl::moe_stream_fully_staged(l0, bits, keys_of(0, { 1, 5, 6 })));
-    // A host entry the ring cannot stage makes the layer not staged, whatever the table holds.
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l1, b15, keys_of(1, { 1, 5, 6 })));
-    // Host experts present and no item: not staged (Task 10 relies on it).
-    const int32_t ids_2[1] = { 2 };
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l4, ggml_sycl::moe_stream_ids_bitmap(ids_2, 1, kExperts), empty_table));
-    CHECK(!ggml_sycl::moe_stream_fully_staged(l4, b02, empty_table));
-    // No host expert: nothing to stage.
-    CHECK(ggml_sycl::moe_stream_fully_staged(nullptr, b15, empty_table));
+    // ---- the executor takes a weight from the ring: answered from the recorded consumers and the table (c-7soh,
+    // llama.cpp-3460) ----
+    {
+        // claims_l0_gate_l2: layer 0's gate entries and every entry of layer 2 carry consumer EXECUTOR; layer 0's up
+        // and down entries carry ROUTE. Host experts are 1, 5 and 6 in layers 0 to 2.
+        claims_probe                probe;
+        const moe_stream_plan_index claimed =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2);
+        const moe_stream_layer_info * c0        = layer_info(claimed, 0);
+        const moe_stream_layer_info * c2        = layer_info(claimed, 2);
+        const int32_t                 ids_15[2] = { 1, 5 };
+        const int32_t                 ids_02[2] = { 0, 2 };
+        const auto                    b15       = ggml_sycl::moe_stream_ids_bitmap(ids_15, 2, kExperts);
+        const auto                    b02       = ggml_sycl::moe_stream_ids_bitmap(ids_02, 2, kExperts);
+        const consumer_table          empty;
+        const expert_tensor_role      gate = expert_tensor_role::GATE;
+        const expert_tensor_role      up   = expert_tensor_role::UP;
+        consumer_table                g15  = table_of(0, { 1, 5 }, gate, moe_stream_consumer::EXECUTOR);
+        CHECK(ggml_sycl::moe_stream_executor_staged(c0, gate, b15, g15));
+        // The routed experts are resident: nothing to stage, and the recorded consumer still answers.
+        CHECK(ggml_sycl::moe_stream_executor_staged(c0, gate, b02, empty));
+        // A routed host expert left unstaged keeps the weight hybrid.
+        g15.erase(ggml_sycl::moe_stream_table_key(0, 5, gate));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, gate, b15, g15));
+        // Another layer's entries stage nothing of layer 0.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, gate, b15,
+                                                     table_of(2, { 1, 5 }, gate, moe_stream_consumer::EXECUTOR)));
+        // An entry staged for the route is not one the executor reads.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, gate, b15,
+                                                     table_of(0, { 1, 5 }, gate, moe_stream_consumer::ROUTE)));
+        // The recorded consumer decides, not the table alone: layer 0's up weight is the route's even with every
+        // routed entry in the table, and even when the micro-batch routes to none of its host experts.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, up, b15,
+                                                     table_of(0, { 1, 5 }, up, moe_stream_consumer::EXECUTOR)));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, up, b02, empty));
+        // Every routed host expert of the weight, here all three.
+        const int32_t ids_156[3] = { 1, 5, 6 };
+        const auto    b156       = ggml_sycl::moe_stream_ids_bitmap(ids_156, 3, kExperts);
+        CHECK(ggml_sycl::moe_stream_executor_staged(c2, up, b156,
+                                                    table_of(2, { 1, 5, 6 }, up, moe_stream_consumer::EXECUTOR)));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c2, up, b156,
+                                                     table_of(2, { 1, 5 }, up, moe_stream_consumer::EXECUTOR)));
+        // A role with no host entry, a layer with a host entry the ring cannot stage, a layer with host experts and
+        // no item, and no info all answer false.
+        CHECK(!ggml_sycl::moe_stream_executor_staged(c0, expert_tensor_role::GATE_UP, b15, empty));
+        const moe_stream_plan_index every =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
+        CHECK(!ggml_sycl::moe_stream_executor_staged(layer_info(every, 1), gate, b15,
+                                                     table_of(1, { 1, 5, 6 }, gate, moe_stream_consumer::EXECUTOR)));
+        const int32_t ids_2[1] = { 2 };
+        CHECK(!ggml_sycl::moe_stream_executor_staged(layer_info(every, 4), gate,
+                                                     ggml_sycl::moe_stream_ids_bitmap(ids_2, 1, kExperts), empty));
+        CHECK(!ggml_sycl::moe_stream_executor_staged(nullptr, gate, b15, empty));
+    }
 
     // ---- an item the reorder can take into a slot ----
     moe_stream_item q{};

@@ -503,27 +503,40 @@ static inline std::vector<moe_stream_item> moe_stream_select(const moe_stream_la
     return out;
 }
 
-// True iff every host gate/up/down entry of the layer that the micro-batch routes to has a stage-table entry: the
-// table answers, not a rebuilt list (c-7soh). A layer with a host entry the ring cannot stage (fused GATE_UP, CHUNK_*),
-// or with host experts and no item, answers false: Task 10 relies on it. No info (the layer has no host entry) answers
-// true. `staged` is the phase's table, or any set of its keys.
-template <typename staged_keys>
-static inline bool moe_stream_fully_staged(const moe_stream_layer_info * li,
-                                           const std::vector<uint8_t> &  bitmap,
-                                           const staged_keys &           staged) {
-    if (li == nullptr) {
-        return true;
-    }
-    if (li->n_untriplet > 0 || li->items.empty()) {
+// True iff the batched prompt executor takes the layer's `role` weight with its routed host experts read from the
+// ring (llama.cpp-3460). Three things answer, all recorded, none asked again: the layer has a host entry of `role`;
+// every such entry carries consumer EXECUTOR, the claim's answer that the index build recorded once per (layer, role)
+// (moe_stream_plan_index_build); and every one the micro-batch routes to has a stage-table entry carrying that
+// consumer. The table answers, not a rebuilt list (c-7soh). A micro-batch that routes to none of the weight's host
+// experts needs nothing staged. A layer with a host entry the ring cannot stage (fused GATE_UP, CHUNK_*), no host
+// entry of `role`, or no info answers false: a weight with no host expert is the resident claim's to answer. `staged`
+// is the phase's table, or any map from its keys to entries that carry a `consumer`.
+template <typename staged_table>
+static inline bool moe_stream_executor_staged(const moe_stream_layer_info * li,
+                                              expert_tensor_role            role,
+                                              const std::vector<uint8_t> &  bitmap,
+                                              const staged_table &          staged) {
+    if (li == nullptr || li->n_untriplet > 0) {
         return false;
     }
+    bool has_role = false;
     for (const moe_stream_item & item : li->items) {
-        if (detail::moe_stream_routed(bitmap, item.expert_id) &&
-            staged.find(moe_stream_table_key(item.layer, item.expert_id, item.role)) == staged.end()) {
+        if (item.role != role) {
+            continue;
+        }
+        if (item.consumer != moe_stream_consumer::EXECUTOR) {
+            return false;
+        }
+        has_role = true;
+        if (!detail::moe_stream_routed(bitmap, item.expert_id)) {
+            continue;
+        }
+        const auto it = staged.find(moe_stream_table_key(item.layer, item.expert_id, item.role));
+        if (it == staged.end() || it->second.consumer != moe_stream_consumer::EXECUTOR) {
             return false;
         }
     }
-    return true;
+    return has_role;
 }
 
 // True iff a lease's retained owner lets the ring copy from it directly (llama.cpp-9y0p): a host-pinned WEIGHT
@@ -809,8 +822,6 @@ class moe_stream_phase {
                                           size_t                 n_ids,
                                           const moe_stream_op &  op);
     const moe_stream_staged * find(int layer, int expert_id, expert_tensor_role role) const;
-    // True iff every host expert of `layer` that ids route to is staged (moe_stream_fully_staged over the table).
-    bool                      fully_staged(int layer, const int32_t * ids, size_t n_ids, int n_expert) const;
     // True iff slots were taken from the ring's current region since it last flipped.
     bool                      region_open() const;
     // After `layer`'s down op: `down_done`, a device event behind that op, becomes the read gate of the region holding
@@ -823,6 +834,10 @@ class moe_stream_phase {
     // clears them, or the destructor for a prompt no end_prompt ended: on the trace, and at WARN under an explicit ring
     // when any was refused.
     void                      count_staged_route(moe_staged_route_refusal refusal, const char * detail);
+
+    // True iff the batched prompt executor takes `layer`'s `role` weight with the host experts ids route to read from
+    // the stage table (moe_stream_executor_staged over the index's recorded consumers and the table).
+    bool executor_staged(int layer, expert_tensor_role role, const int32_t * ids, size_t n_ids, int n_expert) const;
 
     size_t staged_routes_served() const { return staged_routes_.served; }
 

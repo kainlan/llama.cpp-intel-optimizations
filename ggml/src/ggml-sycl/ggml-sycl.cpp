@@ -82085,12 +82085,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     layout_mode override_layout    = GGML_LAYOUT_AOS;
     const bool  has_override       = ggml_sycl_layout_override_active(override_layout);
 
-    // plan Task 10 (llama.cpp-3460): true when this prompt op's weight is one the batched executor claims once its
-    // host experts are staged (ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor) and the stream ring has staged
-    // every host expert the micro-batch routes to in this layer (moe_stream_phase::fully_staged). Set once, after
-    // begin_layer staged the layer. Such an op leaves the hybrid world: the bool clears plan_has_cpu_experts and joins
-    // the executor's resident claim at the MMVQ-probe skip and at the prompt route, so the executor reads the staged
-    // slots. A layer with an un-staged host expert, or a weight the executor does not claim, stays hybrid as before.
+    // plan Task 10 (llama.cpp-3460): true when the batched executor takes this prompt op's weight with its routed host
+    // experts read from the stream ring (moe_stream_phase::executor_staged): the ring's index build recorded the
+    // staged claim (ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor) as the consumer of every host entry of the
+    // weight, and the ring has staged every one the micro-batch routes to. The recorded consumer answers; the claim is
+    // not asked again here. Set once, after begin_layer staged the layer. Such an op leaves the hybrid world: the bool
+    // clears plan_has_cpu_experts and joins the executor's resident claim at the MMVQ-probe skip and at the prompt
+    // route, so the executor reads the staged slots. A weight with an un-staged routed host expert, or one the
+    // executor does not claim, stays hybrid as before.
     bool pp_onednn_batched_claims_staged_layer = false;
 
     // Prompt IDs and routes are admitted exactly once, before any specialized
@@ -82178,11 +82180,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                             *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
                                             stream_call.op);
                 ggml_sycl_moe_stream_release_payload(ctx);
-                // The claim reads the plan the phase was given (c-gi44); the table is the one begin_layer just staged.
-                pp_onednn_batched_claims_staged_layer =
-                    ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*stream_call.plan, src0, ctx.device) &&
-                    ctx.moe_stream->fully_staged(stream_call.layer, prompt_ids_snapshot.data(),
-                                                 prompt_ids_snapshot.size(), stream_call.op.n_expert);
+                // The index and the table are the ones begin_layer just built and staged, keyed as the staged route
+                // keys them: the layer begin_layer was given, and the plan's role classifier.
+                pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_staged(
+                    stream_call.layer, ggml_sycl::expert_tensor_role_from_tensor_name(src0->name),
+                    prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), stream_call.op.n_expert);
             }
         }
         // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1): sweep_a/
@@ -83904,7 +83906,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // with GGML_SYCL_MOE_PP_WOQ=0, stays on its normal route and
                 // never reaches the executor's per-expert staging fallback,
                 // which reads SOA only.
-                // llama.cpp-3460: a layer the ring staged in full for the
+                // llama.cpp-3460: a weight the ring staged in full for the
                 // executor (pp_onednn_batched_claims_staged_layer) skips them too.
                 const bool pp_onednn_batched_claims_op =
                     ne12 > 1 && (pp_onednn_batched_claims_staged_layer ||
@@ -84910,8 +84912,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     if (has_placement_plan && src0->name && src0->name[0] != '\0') {
         const int64_t n_exp      = src0->ne[2] > 0 ? src0->ne[2] : 1;
         const auto    plan_owner = ggml_sycl_cache_plan_owner(route_cache);
-        // llama.cpp-3460: a layer the ring staged in full for the batched executor has no host expert left to
-        // route to the CPU (pp_onednn_batched_claims_staged_layer), so it leaves the hybrid world.
+        // llama.cpp-3460: a weight the ring staged in full for the batched executor has no routed host expert left
+        // to send to the CPU (pp_onednn_batched_claims_staged_layer), so it leaves the hybrid world.
         plan_has_cpu_experts =
             plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && !pp_onednn_batched_claims_staged_layer;
         // An expert planned on a device other than ctx.device (llama.cpp-5tdy: from the summary).
@@ -85376,7 +85378,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // routing must not select the hybrid per-entry world, whose single-kernel
     // MMVQ dispatch would consume the op first. Plans with host-resident
     // experts keep hybrid via plan_hybrid (the resident claim needs every
-    // expert planned on this device), except a layer the ring staged in full
+    // expert planned on this device), except a weight the ring staged in full
     // for the executor (llama.cpp-3460): pp_onednn_batched_claims_staged_layer
     // cleared plan_has_cpu_experts and joins the claim here, and the executor
     // reads the staged slots.
@@ -88779,8 +88781,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // GGML_SYCL_MOE_ROUTE_LOG line reject_batched has always printed. `detail` is the site's own reason (a
             // resolver, layout or admission reason name), or null when the cause says it all.
             // The one "[PP-MOE] refused" printer: every decline below and the GEMM stage's failure report through it.
-            // llama.cpp-3460: a decline after this dispatch took a staged ring slot, or on a layer the ring staged in
-            // full for this executor (pp_onednn_batched_claims_staged_layer, a precheck decline included), prints at
+            // llama.cpp-3460: a decline after this dispatch took a staged ring slot, or on a weight the ring staged
+            // in full for this executor (pp_onednn_batched_claims_staged_layer, a precheck decline included), prints at
             // default verbosity too, whatever its cause: the staged experts then run on the CPU path, so the ring
             // copied them for nothing. pp_staged_experts counts the slots taken (the expert loop below) and the line
             // prints it as staged=.

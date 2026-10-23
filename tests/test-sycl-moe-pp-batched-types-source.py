@@ -138,7 +138,7 @@ POST_CLAIM = [
     "EXPERT_NOT_LOCAL", "EXPERT_LAYOUT", "XMX_TILE_CAPS", "F16_TILED", "NO_DEQUANT", "SCRATCH_SIZE", "SCRATCH_CACHE",
     "SCRATCH_RESERVE", "SCRATCH_SLOT", "SCRATCH_SLOT_SIZE", "GEMM",
 ]
-# A decline after the dispatch took a staged ring slot, or on a layer the ring staged in full for this executor, is
+# A decline after the dispatch took a staged ring slot, or on a weight the ring staged in full for this executor, is
 # printed whatever its cause (llama.cpp-3460): its staged experts then run on the CPU path.
 WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
                   "pp_onednn_batched_claims_staged_layer) && ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
@@ -1171,7 +1171,7 @@ MUTANTS = [
     # A decline after a staged slot left quiet when its cause is a precheck (llama.cpp-3460).
     ("e", "sycl", "|| pp_staged_experts > 0 || pp_onednn_batched_claims_staged_layer) &&",
      "|| pp_onednn_batched_claims_staged_layer) &&"),
-    # A precheck decline on a layer the ring staged in full left quiet (llama.cpp-3460).
+    # A precheck decline on a weight the ring staged in full left quiet (llama.cpp-3460).
     ("e", "sycl", "|| pp_staged_experts > 0 || pp_onednn_batched_claims_staged_layer) &&",
      "|| pp_staged_experts > 0) &&"),
     ("f", "sycl", "if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout))", "if (true)"),

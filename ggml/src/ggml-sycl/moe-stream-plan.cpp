@@ -119,10 +119,17 @@ const moe_stream_staged * moe_stream_phase::find(int layer, int expert_id, exper
     return it == table_.end() ? nullptr : &it->second;
 }
 
-bool moe_stream_phase::fully_staged(int layer, const int32_t * ids, size_t n_ids, int n_expert) const {
+// The index lookup comes first: a layer with no host entry answers without marking the ids.
+bool moe_stream_phase::executor_staged(int                layer,
+                                       expert_tensor_role role,
+                                       const int32_t *    ids,
+                                       size_t             n_ids,
+                                       int                n_expert) const {
     const auto it = index_.layers.find(layer);
-    return moe_stream_fully_staged(it == index_.layers.end() ? nullptr : &it->second,
-                                   moe_stream_ids_bitmap(ids, n_ids, n_expert), table_);
+    if (it == index_.layers.end()) {
+        return false;
+    }
+    return moe_stream_executor_staged(&it->second, role, moe_stream_ids_bitmap(ids, n_ids, n_expert), table_);
 }
 
 bool moe_stream_phase::region_open() const {
