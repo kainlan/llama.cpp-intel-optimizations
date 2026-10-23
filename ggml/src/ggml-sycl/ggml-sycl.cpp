@@ -20938,7 +20938,7 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
 }
 
 // A refill refusal a later boundary would meet again: the host copy is not a loan's (or no longer is), or the device
-// storage the plan's size mints cannot take its bytes. Such a triplet leaves the ledger rather than being retried at
+// storage minted at its size is not its size. Such a triplet leaves the ledger rather than being retried at
 // every decode graph; any other refusal is transient and the triplet is tried again at the next one.
 static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason) {
     static const char * const final_reasons[] = {
@@ -21087,8 +21087,16 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 stop = refill ? "no tensor for a lent expert" : "no tensor for a selected expert";
                 break;
             }
+            // Each copy is minted at the size of the cache entry it will hold, which the cache compares it with, not
+            // at the plan's dst_size, which leaves out the quantized tail direct staging pads (llama.cpp-pu8v). No
+            // entry stops with the refusal the cache would give.
+            const size_t bytes = refill ? cache->refill_copy_bytes(target.key) : cache->loan_copy_bytes(target.key);
+            if (bytes == 0) {
+                stop = refill ? "not lent" : "not resident";
+                break;
+            }
             if (refill) {
-                ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, e->dst_size);
+                ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, bytes);
                 if (!storage.valid()) {
                     // A full zone is transient: the ring gives its room back, so the next boundary tries again. No
                     // WEIGHT arena is not, since only a model load makes one, and a load replaces the ledger too.
@@ -21104,7 +21112,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 triplet.refill_members[r].vram_charge_size = e->vram_charge_size;
                 triplet.refill_members[r].device_owner     = std::move(storage);
             } else {
-                ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, e->dst_size);
+                ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, bytes);
                 if (!host.valid()) {
                     stop = "host pinned pool exhausted";
                     break;
@@ -21799,9 +21807,9 @@ struct test_loan_fixture {
                         }
                         const size_t i = index(l, s, e);
                         mem_handle   lease;
-                        auto stage = cache->direct_stage_expert(keys[i], bytes[i].data(), test_loan_expert_bytes(),
-                                                                staged_bytes, GGML_LAYOUT_AOS, nullptr, nullptr, queue,
-                                                                &lease);
+                        auto         stage =
+                            cache->direct_stage_expert(keys[i], bytes[i].data(), test_loan_expert_bytes(), staged_bytes,
+                                                       GGML_LAYOUT_AOS, nullptr, nullptr, queue, &lease);
                         if (!stage.ok || !stage.ptr) {
                             return test_loan_fail("direct_stage_expert refused layer %d slot %d expert %d: %s", l, s, e,
                                                   test_loan_stage_refusal(cache, stage).c_str());
@@ -23223,10 +23231,10 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
         accepted = fx.cache->loan_expert_triplet(members, refused);
     }
     if (accepted || std::strcmp(refused.reason, "host storage too small") != 0) {
-        return test_loan_fail("a host copy of the plan's %zu bytes for a %zu-byte entry was %s (%s), not refused "
-                              "\"host storage too small\"",
-                              test_loan_expert_bytes(), fx.staged_bytes, accepted ? "accepted" : "refused",
-                              refused.reason);
+        return test_loan_fail(
+            "a host copy of the plan's %zu bytes for a %zu-byte entry was %s (%s), not refused "
+            "\"host storage too small\"",
+            test_loan_expert_bytes(), fx.staged_bytes, accepted ? "accepted" : "refused", refused.reason);
     }
     for (int s = 0; s < 3; ++s) {
         if (!fx.device_entry_present(1, s, 2) || fx.host_entry_present(1, s, 2)) {

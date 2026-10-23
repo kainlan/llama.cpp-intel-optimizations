@@ -3663,6 +3663,16 @@ class unified_cache {
     // the device lease, and flips the plan.
     bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
 
+    // The size each direction's copy must be minted at (llama.cpp-pu8v): the size of the entry it will hold, which
+    // the transaction compares it with. loan_copy_bytes() is the AOS device entry direct staging filed under key, which
+    // a loan copies whole; refill_copy_bytes() is the host copy a loan published under key, which a refill's device
+    // storage must equal. Each can exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to
+    // MATRIX_ROW_PADDING columns, and the plan does not count it. Read under direct_stage_mutex_ and rw_mutex_, shared;
+    // the transaction checks again under its own locks, so an entry that changes in between is refused there. 0 when
+    // there is no such entry, or it is retired.
+    size_t loan_copy_bytes(ggml_sycl_cache_id key) const;
+    size_t refill_copy_bytes(ggml_sycl_cache_id key) const;
+
     // Re-admit one lent triplet to the device (llama.cpp-sif1), the inverse of loan_expert_triplet(). Each member's
     // host copy must be the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is
     // its whole pinned storage, which the direct mirror and the id mapping both name, with no device entry under the
