@@ -103,7 +103,8 @@ FILES = {
 
 # Every quantized type ggml_get_to_fp16_sycl_for_layout decodes on AOS, except MXFP4 (its own SOA arm) and Q1_0 and
 # NVFP4 (FORBIDDEN below). The first thirteen are the brief's list and the Qwen3.8 GSQ-RCO census (see the memory "a
-# GGUF file name is not its expert quant type"); the review's ruling added the last seven.
+# GGUF file name is not its expert quant type"); the last seven complete the f16 arm's rule in moe-mmvq-tables.hpp,
+# that every type the converter decodes is admitted but the three above (llama.cpp-348c).
 REQUIRED_AOS = [
     "GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K", "GGML_TYPE_IQ3_XXS",
     "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ4_XS", "GGML_TYPE_IQ4_NL", "GGML_TYPE_Q2_0", "GGML_TYPE_IQ2_S",

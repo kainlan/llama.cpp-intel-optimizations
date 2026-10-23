@@ -34784,10 +34784,11 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         return cap;
     }
     // llama.cpp-348c: a (type, layout) the MMVQ id table above does not serve still has a prompt executor when the
-    // batched oneDNN prompt executor takes it: it dequantizes each expert to f16 and multiplies them in one batched
-    // GEMM. That covers a type with no MMVQ id kernel at all (IQ4_XS, IQ1_S, IQ1_M) and a layout the table has no
-    // kernel for, such as Q4_0, Q8_0, Q4_K and Q6_K loaded SOA (c-jx9g). Prompt only, since that executor declines
-    // one-token rows, so decode stays refused; and only for a K the dequant reads in whole blocks.
+    // batched oneDNN prompt executor takes it: it dequantizes the active experts to f16, in groups that fit the weight
+    // slot the plan sized, and runs batched GEMMs over each group. That covers a type with no MMVQ id kernel at all
+    // (IQ4_XS, IQ1_S, IQ1_M) and a layout the table has no kernel for, such as Q4_0, Q8_0, Q4_K and Q6_K loaded SOA
+    // (c-jx9g). Prompt only, since that executor declines one-token rows, so decode stays refused; and only for a K the
+    // dequant reads in whole blocks.
     if (phase == moe_route_phase::PROMPT && ggml_sycl_moe_pp_batched_takes_layout(type, layout) &&
         K % ggml_blck_size(type) == 0) {
         cap.supported     = true;

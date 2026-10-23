@@ -270,6 +270,13 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 // plans Q4_0 and Q4_K experts AOS (layout_policy::get_optimal, common.hpp) and no knob changes that, so the Q4_0
 // and Q4_K SOA rows have no device evidence: nothing reaches them until a plan chooses SOA for those types. MXFP4's
 // f16 arm has its own SOA row-major dequant and no AOS one in this executor.
+// The rule covers AOS and SOA only. COALESCED is left out although ggml_get_to_fp16_sycl_for_layout answers Q4_0
+// COALESCED: that converter takes only an element count and indexes the tiled blocks as one flat run, so it does not
+// promise row-major output. The oneDNN prompt path decodes a COALESCED weight with
+// dequantize_row_q4_0_sycl_coalesced_rowmajor, which takes blocks_per_row and nrows, and that function's Q8_0 case
+// records the same limit (llama.cpp-dkw0). This executor's per-expert call passes only the element count. No plan
+// reaches the case either: the planner materializes an expert COALESCED only for MXFP4 without XMX
+// (layout_policy::get_optimal), and MXFP4's f16 arm admits SOA alone.
 // Q1_0 and NVFP4 have converters but are left out, because they run on a device only through their direct kernel
 // (moe_type_needs_direct_kernel, moe-resolved-batch.hpp): validate_moe_execution_recipe and
 // choose_moe_batch_executor refuse any other device recipe for them, so this executor would never be allowed to run
@@ -360,8 +367,8 @@ inline bool moe_pp_batched_has_expert_entries(enum ggml_type type, enum ggml_lay
 
 // How the batched executor's f16 arm fits a dispatch's active experts into the weight slot it claimed
 // (llama.cpp-348c). The slot is the one the plan sized for the ring, which holds about a quarter of every expert in
-// f16, so the arm does not widen it: that took the room from routed experts with no cost decision (quality review,
-// c-kj22). It dequantizes the experts in groups instead.
+// f16, so the arm does not widen it: that took the room from routed experts with no cost decision (llama.cpp-348c
+// c-kj22; the room rulings llama.cpp-8ecj and llama.cpp-w013). It dequantizes the experts in groups instead.
 //   - The slot holds every active expert, and no cap is smaller: one group in one buffer, exactly the single
 //     batched pass the arm ran before.
 //   - Otherwise the slot is split into two halves when it holds two experts, and groups alternate between them,
