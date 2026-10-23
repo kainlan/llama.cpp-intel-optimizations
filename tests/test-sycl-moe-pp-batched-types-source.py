@@ -13,7 +13,10 @@ for the types the planner materializes SOA that have a per-expert SOA dequant. T
       ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
       since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
       dequantize_row_q8_0_soa_to_fp16_rowmajor and never asks it; the WOQ table is MXFP4 on SOA and XMX_TILED;
-  (c) the Q4_K device-weight CPU fallback (a D2H copy per dispatch) does not fire for a prompt the executor claims;
+  (c) the Q4_K device-weight CPU fallback (a D2H copy per dispatch) does not fire for a prompt the executor claims,
+      and the mechanism is precedence, not a term on the fallback: a claimed prompt drops the planner's prompt route
+      (planner_needs_prompt_route), so an all-local claimed prompt never enters the hybrid world where the fallback
+      lives, and the fallback itself stays exactly Q4_K for the hybrid ops the executor never runs;
   (d) decode keeps its ne12 == 1 / ids->ne[1] > 1 terms: the hybrid-with-plan disjunct, the two claim call sites
       and the lambda's single-token refusal;
   (e) one refusal enum with a name for every cause, every refusal in the lambda names one, and one WARN line per
@@ -366,14 +369,28 @@ def claim_b_table_types(s):
 
 def claim_c_q4k_fallback(s):
     sycl = s["sycl"]
-    gated = ("const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K) && "
-             "!pp_onednn_batched_route_claims_prompt;")
-    pos = sycl.find(gated)
-    if pos < 0:
-        return ["the Q4_K device_weight_cpu_fallback is not gated on !pp_onednn_batched_route_claims_prompt"]
-    if sycl.find("const bool pp_onednn_batched_route_claims_prompt =") > pos:
-        return ["pp_onednn_batched_route_claims_prompt is defined after the fallback that reads it"]
-    return []
+    fails = []
+    fallback = statement(sycl, "const bool device_weight_cpu_fallback =")
+    if fallback is None:
+        return ["the device_weight_cpu_fallback definition was not found"]
+    if fallback != "const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K);":
+        fails.append("device_weight_cpu_fallback is not exactly Q4_K: a claim term there only strips the CPU "
+                     "fallback from hybrid ops the executor never runs")
+    claims = statement(sycl, "const bool pp_onednn_batched_route_claims_prompt =") or ""
+    if "prompt_batch && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device)" not in claims:
+        fails.append("pp_onednn_batched_route_claims_prompt is not the prompt-only claim")
+    needs = statement(sycl, "const bool planner_needs_prompt_route =") or ""
+    if "!pp_onednn_batched_route_claims_prompt" not in needs:
+        fails.append("a claimed prompt does not drop the planner's prompt route (planner_needs_prompt_route)")
+    selected = statement(sycl, "const bool selected_hybrid_route =") or ""
+    if "planner_needs_prompt_route" not in selected:
+        fails.append("selected_hybrid_route no longer reads planner_needs_prompt_route")
+    hybrid = sycl.find("if (moe_hybrid_with_plan) {")
+    at = sycl.find("const bool device_weight_cpu_fallback =")
+    lam = sycl.find("auto try_pp_mxfp4_soa_onednn_f16_batched = [&]() -> bool {")
+    if not (0 <= hybrid < at < lam):
+        fails.append("the fallback is not inside the hybrid world ahead of the batched executor's branch")
+    return fails
 
 
 def claim_d_decode_terms(s):
@@ -642,8 +659,10 @@ MUTANTS = [
     ("b", "convert", "return dequantize_row_q6_K_sycl_reorder;", "return nullptr;"),
     ("b", "sycl", "if (pp_q8_0_soa) {", "if (false) {"),
     ("b", "sycl", "src0->type != GGML_TYPE_MXFP4 && !pp_q8_0_soa", "src0->type != GGML_TYPE_MXFP4"),
-    ("c", "sycl", "(src0->type == GGML_TYPE_Q4_K) && !pp_onednn_batched_route_claims_prompt;",
-     "(src0->type == GGML_TYPE_Q4_K);"),
+    ("c", "sycl", "const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K);",
+     "const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K) && "
+     "!pp_onednn_batched_route_claims_prompt;"),
+    ("c", "sycl", "!exact_layout_override && !pp_onednn_batched_route_claims_prompt;", "!exact_layout_override;"),
     ("d", "sycl", "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;",
      "const bool moe_hybrid_with_plan = selected_hybrid_route;"),
     ("d", "sycl", "const bool pp_onednn_batched_claims_op = ne12 > 1 && ",
