@@ -337,6 +337,7 @@ these or be migrated (see §9 for temporary allowlisted sites):
 | `unified_allocate(req)` | Handle-returning wrapper around `unified_alloc` | `mem_handle` |
 | `unified_allocate_owner(req)` | **Owner-first allocator** (`unified-cache.hpp:4330`). The intrusive `alloc_owner_control` is created *before* any physical allocation, so an allocation can never exist without an owner | `allocation_result` (`alloc_owner` + typed `allocation_error`) |
 | `unified_cache_zone_allocate_owner(device_id, zone, size, align = 256)` | Owner-first VRAM-zone variant (`unified-cache.hpp:5064`); control and exact registry identity exist before the zone pointer can escape | `allocation_result` |
+| `moe_stream_ring::reserve` → `unified_cache_zone_allocate_owner`, then `unified_allocate_owner` when the zone call is refused | Prompt expert ring (llama.cpp-36j0): one WEIGHT-zone reservation, sliced into per-slot handles by `moe_stream_ring::acquire_slot` | `alloc_owner` (wrapped with `mem_handle::from_owned_alloc`), then per-slot `mem_handle`s |
 | `unified_allocate_owner_backing(req, cache_backing_token)` | **Private, token-gated** (`allocation-provenance.hpp:56`). Classifies the owner `CACHE_BACKING`. Only `pinned_chunk_pool` can construct the token, and the header may be included only by `unified-cache.cpp` and `pinned-pool.cpp`. This is **one of two** `CACHE_BACKING` mint paths — see §3.1 | `allocation_result` |
 | `detail::promote_legacy_alloc_owner(handle)` | Allocator-private bridge (`unified-cache.hpp:4337`) promoting an existing legacy `alloc_handle` row to intrusive ownership. Not a caller entry point | `allocation_result` |
 | `unified_cache_allocate(device, size, category, queue)` | Bulk weight/arena slot allocator | `unified_alloc_result` (`unified-cache.hpp:2374`) |
@@ -703,6 +704,13 @@ Setting `GGML_SYCL_DISABLE_GRAPH=1` in the `test-thread-safety` registration
 a workaround for the defect above, not a statement about it, and the green
 result in §11.2 must not be read as though it were. Once the pairing is fixed,
 the pin is removable and its removal is the regression test.
+
+The prompt expert ring (llama.cpp-36j0) is per backend context (one device each)
+and per prompt phase. It is owned through the context's `moe_stream` member,
+reserved when a prompt first stages a layer, and released by
+`moe_stream_phase::end_prompt`. Its loan and its refill are plan transactions
+that republish the expert plan, not direct edits to the plan. A lent triplet's
+host copy keeps its owner until the refill retires it.
 
 ---
 
