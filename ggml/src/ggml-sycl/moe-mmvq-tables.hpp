@@ -251,4 +251,164 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
     return classified_expert || ne2 > 1 || consumer_is_mul_mat_id;
 }
 
+// The batched mul_mat_id prompt executor (try_pp_mxfp4_soa_onednn_f16_batched in ggml-sycl.cpp): which
+// (type, layout) pairs it runs, as two arms (llama.cpp-348c).
+//
+//   moe_pp_batched_f16_supports_layout  -- the f16 arm: dequantize every active expert into one planned f16
+//                                          slot, then one batched oneDNN GEMM over them.
+//   moe_pp_batched_woq_supports_layout  -- the MXFP4 weight-only-quantized arm: repack each expert into the
+//                                          WOQ nibble/scale slots and let oneDNN dequantize inside the GEMM.
+//
+// The f16 arm admits a type only in a layout an AOS dequant-to-f16 kernel decodes, which is the layout the
+// capability table above advertises for it, so the loaded layout and the kernel cannot disagree. MXFP4 is
+// the exception: its f16 arm has its own SOA row-major dequant and no AOS one in this executor. Q1_0 and
+// NVFP4 have converters but are left out, because no Q1_0 or NVFP4 MoE weight has been measured here.
+// IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
+// so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
+//
+// The executor's candidate gate and its claim predicate (ggml_sycl_moe_pp_onednn_batched_claims_tensor)
+// both ask moe_pp_batched_supports_layout and nothing else about the type. The plan's f16 weight slot is
+// sized from moe_pp_batched_f16_supports_layout, so a type the arm takes always has its slot planned.
+inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
+    switch (type) {
+        case GGML_TYPE_MXFP4:
+            return layout == GGML_LAYOUT_SOA;
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return layout == GGML_LAYOUT_AOS;
+        default:
+            return false;
+    }
+}
+
+inline bool moe_pp_batched_woq_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
+    return type == GGML_TYPE_MXFP4 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED);
+}
+
+// The one question both gates ask. woq_enabled is GGML_SYCL_MOE_PP_WOQ; aos_enabled is
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS, which set to 0 restricts the executor to MXFP4 as it was before
+// llama.cpp-348c (every non-MXFP4 entry of the f16 arm is an AOS one).
+inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
+                                           enum ggml_layout_mode layout,
+                                           bool                  woq_enabled,
+                                           bool                  aos_enabled) {
+    if (woq_enabled && moe_pp_batched_woq_supports_layout(type, layout)) {
+        return true;
+    }
+    if (layout == GGML_LAYOUT_AOS && !aos_enabled) {
+        return false;
+    }
+    return moe_pp_batched_f16_supports_layout(type, layout);
+}
+
+// Whether any layout of the type is taken, for the cheap type-only check before a plan lookup. Same
+// contiguous enum walk as moe_mmvq_admission_supports_type, fail-closed for an appended layout.
+inline bool moe_pp_batched_supports_type(enum ggml_type type, bool woq_enabled, bool aos_enabled) {
+    for (int layout = 0; layout <= (int) GGML_LAYOUT_MXFP4_DPAS; ++layout) {
+        if (moe_pp_batched_supports_layout(type, (enum ggml_layout_mode) layout, woq_enabled, aos_enabled)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is traced
+// once per (device, cause) by its name (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1). The latch is a 32-bit
+// mask per device, so this enum must stay under 32 values.
+enum class moe_pp_batched_refusal : uint8_t {
+    NONE = 0,
+    CPU_REFERENCE,      // GGML_SYCL_MOE_CPU_REFERENCE asked for the CPU reference instead
+    ROUTE_OFF,          // the batched route is not selected (GGML_SYCL_MOE_PP_ONEDNN_BATCHED=0, or no oneDNN)
+    CANDIDATE,          // the (type, layout) pair is not in the tables above, or src1/dst are not f32
+    NO_EXPERT_CACHE,    // the dispatch has no expert cache to resolve experts through
+    NO_PLAN,            // the layer has no execution plan
+    DECODE,             // one token per expert row: decode stays on MMVQ
+    NO_ROWS,            // zero tokens
+    DIMS,               // the weight row is not a whole number of quant blocks, or a stride is not packed
+    DIMS_OVERFLOW,      // a dimension does not fit the GEMM's integer types
+    EXPERT_NOT_LOCAL,   // an active expert is not device-resident on this device
+    EXPERT_LAYOUT,      // an active expert is materialized in another layout than the route's
+    NO_ACTIVE_EXPERTS,  // no expert received a token
+    XMX_TILE_CAPS,      // the XMX-tiled WOQ repack is not supported on this device
+    F16_TILED,          // XMX-tiled experts reached the f16 arm, which has no tiled dequant
+    NO_DEQUANT,         // no f16 dequant kernel for the expert's materialized layout
+    SCRATCH_SIZE,       // the scratch arithmetic overflowed
+    SCRATCH_CACHE,      // no unified cache for this device
+    SCRATCH_UNPLANNED,  // the plan's ring is smaller than this dispatch needs
+    SCRATCH_RESERVE,    // the planned ring could not be reserved
+    SCRATCH_SLOT,       // a ring slot could not be acquired
+    SCRATCH_SLOT_SIZE,  // an acquired slot is smaller than planned
+    GEMM,               // the batched GEMM failed after the experts were staged
+};
+
+inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) {
+    switch (refusal) {
+        case moe_pp_batched_refusal::NONE:
+            return "none";
+        case moe_pp_batched_refusal::CPU_REFERENCE:
+            return "cpu-reference";
+        case moe_pp_batched_refusal::ROUTE_OFF:
+            return "route-off";
+        case moe_pp_batched_refusal::CANDIDATE:
+            return "candidate";
+        case moe_pp_batched_refusal::NO_EXPERT_CACHE:
+            return "no-expert-cache";
+        case moe_pp_batched_refusal::NO_PLAN:
+            return "no-plan";
+        case moe_pp_batched_refusal::DECODE:
+            return "decode";
+        case moe_pp_batched_refusal::NO_ROWS:
+            return "no-rows";
+        case moe_pp_batched_refusal::DIMS:
+            return "dims";
+        case moe_pp_batched_refusal::DIMS_OVERFLOW:
+            return "dims-overflow";
+        case moe_pp_batched_refusal::EXPERT_NOT_LOCAL:
+            return "expert-not-local";
+        case moe_pp_batched_refusal::EXPERT_LAYOUT:
+            return "expert-layout";
+        case moe_pp_batched_refusal::NO_ACTIVE_EXPERTS:
+            return "no-active-experts";
+        case moe_pp_batched_refusal::XMX_TILE_CAPS:
+            return "xmx-tile-caps";
+        case moe_pp_batched_refusal::F16_TILED:
+            return "f16-tiled";
+        case moe_pp_batched_refusal::NO_DEQUANT:
+            return "no-dequant";
+        case moe_pp_batched_refusal::SCRATCH_SIZE:
+            return "scratch-size";
+        case moe_pp_batched_refusal::SCRATCH_CACHE:
+            return "scratch-cache";
+        case moe_pp_batched_refusal::SCRATCH_UNPLANNED:
+            return "scratch-unplanned";
+        case moe_pp_batched_refusal::SCRATCH_RESERVE:
+            return "scratch-reserve";
+        case moe_pp_batched_refusal::SCRATCH_SLOT:
+            return "scratch-slot";
+        case moe_pp_batched_refusal::SCRATCH_SLOT_SIZE:
+            return "scratch-slot-size";
+        case moe_pp_batched_refusal::GEMM:
+            return "gemm";
+    }
+    return "unknown";
+}
+
 #endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP

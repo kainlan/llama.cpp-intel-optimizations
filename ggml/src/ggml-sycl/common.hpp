@@ -1456,6 +1456,18 @@ static inline bool ggml_sycl_moe_pp_onednn_batched_route_selected() {
     return enabled;
 }
 
+// llama.cpp-348c: the batched executor's f16 arm takes every expert type with an AOS dequant-to-f16 kernel
+// (moe_pp_batched_f16_supports_layout, moe-mmvq-tables.hpp), not only MXFP4. GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0
+// restricts it to MXFP4 again, both at dispatch and in the plan's f16 weight slot; unset or any other value
+// keeps it on. Read once, like the route knob above.
+static inline bool ggml_sycl_moe_pp_f16_batched_aos_enabled() {
+    static const bool aos_enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_PP_F16_BATCHED_AOS");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return aos_enabled;
+}
+
 static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const XMXCapabilities & caps,
                                                                           int64_t                 in_dim,
                                                                           int64_t                 out_dim,

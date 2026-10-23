@@ -16,6 +16,7 @@
 #include "ggml.h"
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -414,6 +415,91 @@ int main() {
         if (moe_aos_expert_publication_wanted(c.classified, c.ne2, c.mul_mat_id) != c.want) {
             std::printf("FAIL: AoS expert publication wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
             ++failures;
+        }
+    }
+
+    // 8. The batched mul_mat_id prompt executor's tables (llama.cpp-348c). The f16 arm takes every type in
+    //    the brief's roster on AOS only, MXFP4 on SOA only, and nothing it has no measured weight for.
+    const ggml_type pp_f16_aos_types[] = {
+        GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,    GGML_TYPE_Q4_K,  GGML_TYPE_Q5_K,
+        GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    };
+    for (const ggml_type type : pp_f16_aos_types) {
+        for (const ggml_layout_mode layout : all_layouts()) {
+            const bool want = layout == GGML_LAYOUT_AOS;
+            if (moe_pp_batched_f16_supports_layout(type, layout) != want) {
+                std::printf("FAIL: batched f16 arm wrong for type=%s layout=%d (want %d)\n", ggml_type_name(type),
+                            static_cast<int>(layout), want ? 1 : 0);
+                ++failures;
+            }
+        }
+    }
+    const ggml_type pp_never_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_F32,
+                                         GGML_TYPE_BF16 };
+    for (const ggml_type type : pp_never_types) {
+        if (moe_pp_batched_supports_type(type, true, true)) {
+            std::printf("FAIL: batched executor admits type=%s, which it has no measured weight for\n",
+                        ggml_type_name(type));
+            ++failures;
+        }
+    }
+
+    const struct {
+        ggml_type        type;
+        ggml_layout_mode layout;
+        bool             woq_enabled;
+        bool             aos_enabled;
+        bool             want;
+        const char *     name;
+    } pp_batched_cases[] = {
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_SOA,       false, false, true,  "MXFP4 SOA f16 arm, both knobs off"      },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_AOS,       true,  true,  false, "MXFP4 AOS has no arm"                   },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_XMX_TILED, true,  false, true,  "MXFP4 XMX_TILED WOQ arm"                },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_XMX_TILED, false, true,  false, "MXFP4 XMX_TILED without WOQ"            },
+        { GGML_TYPE_Q4_0,   GGML_LAYOUT_AOS,       false, true,  true,  "Q4_0 AOS f16 arm"                       },
+        { GGML_TYPE_Q4_0,   GGML_LAYOUT_AOS,       true,  false, false, "Q4_0 AOS with the AOS knob off"         },
+        { GGML_TYPE_Q4_0,   GGML_LAYOUT_SOA,       true,  true,  false, "Q4_0 SOA is not the loaded expert form" },
+        { GGML_TYPE_IQ4_XS, GGML_LAYOUT_AOS,       false, true,  true,  "IQ4_XS AOS f16 arm"                     },
+    };
+
+    for (const auto & c : pp_batched_cases) {
+        if (moe_pp_batched_supports_layout(c.type, c.layout, c.woq_enabled, c.aos_enabled) != c.want) {
+            std::printf("FAIL: batched executor wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = static_cast<ggml_type>(t);
+        if (moe_pp_batched_woq_supports_layout(type, GGML_LAYOUT_SOA) && type != GGML_TYPE_MXFP4) {
+            std::printf("FAIL: the WOQ arm admits type=%d; it is MXFP4 only\n", t);
+            ++failures;
+        }
+        for (const ggml_layout_mode layout : all_layouts()) {
+            // GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 must leave exactly the MXFP4 executor.
+            if (moe_pp_batched_supports_layout(type, layout, true, false) && type != GGML_TYPE_MXFP4) {
+                std::printf("FAIL: the AOS knob off still admits type=%d layout=%d\n", t, static_cast<int>(layout));
+                ++failures;
+            }
+        }
+    }
+
+    // 9. Refusal names: every cause has its own name, and the per-device latch's 32-bit mask holds them all.
+    const int pp_refusal_last = static_cast<int>(moe_pp_batched_refusal::GEMM);
+    if (pp_refusal_last >= 32) {
+        std::printf("FAIL: moe_pp_batched_refusal has %d values; the trace latch holds 32\n", pp_refusal_last + 1);
+        ++failures;
+    }
+    for (int a = 0; a <= pp_refusal_last; ++a) {
+        const char * name_a = moe_pp_batched_refusal_name(static_cast<moe_pp_batched_refusal>(a));
+        if (std::strcmp(name_a, "unknown") == 0) {
+            std::printf("FAIL: refusal %d has no name\n", a);
+            ++failures;
+        }
+        for (int b = a + 1; b <= pp_refusal_last; ++b) {
+            if (std::strcmp(name_a, moe_pp_batched_refusal_name(static_cast<moe_pp_batched_refusal>(b))) == 0) {
+                std::printf("FAIL: refusals %d and %d share the name %s\n", a, b, name_a);
+                ++failures;
+            }
         }
     }
 
