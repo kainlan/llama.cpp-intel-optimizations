@@ -20969,14 +20969,15 @@ static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_d
 
 // Take every view `extra` holds of the device entry a loan retired under `withdrawn` off the extra, keeping a lease on
 // each in `retained` (llama.cpp-6aj4). The caller keeps `retained` until the device's queue passes a barrier, so no
-// kernel still reading a dropped table sees a freed buffer, and the deferred-free pass erases the entry once that
-// retention releases. Views are matched by the entry's key, never by a resolve: once the cache generation moves, a
-// retired entry refuses the resolve forget_moe_storage_handle_on_device() matches by. The views are the expert's
-// storage records, its slot in the pointer table's handles, the table's per-expert leases
-// (ggml_sycl_set_moe_ptr_table_leases), the route table when one of its entries leases the entry (invalidated, with
-// every lease it held retained, since another expert it names may be lent next), and the hybrid decode record, which
-// holds every expert's lease and its table, all retained. Dropping any of them marks the device table stale, so the
-// next MUL_MAT_ID or preload rebuilds it under the plan the loan publishes.
+// kernel still reading a dropped table sees a freed buffer. The boundary that ran the loan drains that retention
+// (ggml_sycl_expert_loan_boundary_drain), so the deferred-free pass right after it erases the entry; when that bounded
+// drain times out, the retention stands and the erase lags one pass. Views are matched by the entry's key, never by a
+// resolve: once the cache generation moves, a retired entry refuses the resolve forget_moe_storage_handle_on_device()
+// matches by. The views are the expert's storage records, its slot in the pointer table's handles, the table's
+// per-expert leases (ggml_sycl_set_moe_ptr_table_leases), the route table when one of its entries leases the entry
+// (invalidated, with every lease it held retained, since another expert it names may be lent next), and the hybrid
+// decode record, which holds every expert's lease and its table, all retained. Dropping any of them marks the device
+// table stale, so the next MUL_MAT_ID or preload rebuilds it under the plan the loan publishes.
 static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
                                              int                                  device,
                                              int                                  expert_id,
@@ -21324,8 +21325,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                     stop = record.reason;
                     break;
                 }
-                // Drop each extra's leases on its withdrawn device copy, so the retired entry can be reclaimed by the
-                // deferred-free pass that follows the loan, before anything that allocates: every storage-record,
+                // Drop each extra's leases on its withdrawn device copy, before anything that allocates, so only the
+                // retention below holds the retired entry until the loan's boundary drains it: every storage-record,
                 // pointer-table, route-table and hybrid-record view of the entry, matched by the key the loan retired
                 // it under (llama.cpp-6aj4), and then any device record left for the expert. Then remember each host
                 // copy the way S1-PRELOAD remembers a host-planned expert, behind its copy event. A remember that
@@ -21380,8 +21381,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         }
     }
     // The views the loan dropped stay leased until the device's execution queue passes a barrier, so no kernel still
-    // reading a pointer table or a hybrid decode record sees a freed buffer; the deferred-free pass erases each
-    // withdrawn entry once that retention releases (llama.cpp-6aj4). A failure to retain them (the barrier's submit, or
+    // reading a pointer table or a hybrid decode record sees a freed buffer. The boundary that ran the loan drains the
+    // retention, so the deferred-free pass that follows erases each withdrawn entry, or the next pass does when that
+    // bounded drain times out (llama.cpp-6aj4). A failure to retain them (the barrier's submit, or
     // the retention's allocation) joins the loop's exception, so the triplets already lent are still published; only
     // then do the views go at once.
     if (!lent_views.empty()) {
@@ -21604,12 +21606,41 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
 }
 
 // The graph boundary's half of a request: ggml_backend_sycl_synchronize() calls this once the graph's work is done
-// and its compute flag is cleared, before the deferred-free pass.
-static void ggml_sycl_run_pending_expert_loan(ggml_backend_t backend) {
+// and its compute flag is cleared, before the deferred-free pass. True when the loan it ran was accepted and lent at
+// least one triplet, the one case the boundary's drain below runs for.
+static bool ggml_sycl_run_pending_expert_loan(ggml_backend_t backend) {
     const auto * ctx = backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (ctx) {
-        (void) ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, nullptr);
+    if (!ctx) {
+        return false;
     }
+    ggml_sycl_expert_loan_result result;
+    return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result) && result.accepted &&
+           result.n_triplets != 0;
+}
+
+// Defined with the MoE executor's knobs (llama.cpp-36j0); the drain below reads its trace level.
+static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config();
+
+// The one wait on the loan's path (llama.cpp-6aj4): at the boundary that accepted a loan, wait up to 100 ms for the
+// retained store to drain. The loan's records in it are each D2H copy's two owners and the views the loan dropped,
+// retained to a barrier on the device's execution queue; once they drain, the deferred-free pass that follows erases
+// each withdrawn device entry and returns its room to the WEIGHT zone, so an accepted loan's room is back before the
+// next graph's reserve. The loan code never waits or asks an event's status (c-3bde), since it runs on inference
+// paths; ggml_backend_sycl_synchronize() is the designated boundary and has just waited the whole stream, so a bounded
+// wait for the loan's own copies and barrier is the boundary's. A loan is rare (at most one accepted per prompt) and
+// copies for about 20 ms. drain_retained_handles() takes no scope, so this drains the whole store, every device's
+// records. On a timeout (another context's work still on the queue, or copies past the bound) the retention stands,
+// the erase lags one pass, and one trace line says so. False only then; true at once when no loan was accepted, so a
+// decode boundary pays nothing.
+static bool ggml_sycl_expert_loan_boundary_drain(int device, bool loan_accepted) {
+    constexpr uint32_t drain_ms = 100;
+    if (!loan_accepted || ggml_sycl::drain_retained_handles(/*wait_all=*/true, drain_ms)) {
+        return true;
+    }
+    if (ggml_sycl_moe_exec_config().trace >= 1) {
+        GGML_LOG_INFO("[MOE-EXEC-TRACE] loan device %d: room pending, boundary drain timed out\n", device);
+    }
+    return false;
 }
 
 // ---- The refill (llama.cpp-sif1, plan Task 12 of llama.cpp-36j0) --------------------------------------------------
@@ -22243,18 +22274,50 @@ struct test_loan_fixture {
         return lent;
     }
 
+    // How lend() checks that the lent device entries are reclaimed (llama.cpp-6aj4). POLL runs deferred-free passes and
+    // drains for up to 2 s. AT_BOUNDARY checks once, after the loan's own boundary drain and the one pass synchronize
+    // runs after it, with no polling. DRAIN_TIMES_OUT holds the drain worker on the loan's first retained record, so
+    // the boundary's drain times out: the entries must survive that boundary's pass, and the next pass, once the worker
+    // goes, must reclaim them.
+    enum class reclaim_check { POLL, AT_BOUNDARY, DRAIN_TIMES_OUT };
+
     // A loan of bytes_wanted run at the graph boundary, which must lend n_expected triplets; then each lent device
     // entry is reclaimed and its storage handed back, so a refill meets no withdrawn entry under the ids it re-admits.
-    std::string lend(size_t bytes_wanted, uint32_t n_expected, int host_expert) {
+    std::string lend(size_t        bytes_wanted,
+                     uint32_t      n_expected,
+                     int           host_expert,
+                     reclaim_check check = reclaim_check::POLL) {
         const device_bytes                     before   = sample();
         const ::ggml_sycl_expert_loan_resolver resolver = this->resolver();
         ::ggml_sycl_expert_loan_result         result;
+
+        // Released on every return, so a failed case never leaves the worker held for the next.
+        struct drain_hold {
+            bool held = false;
+
+            ~drain_hold() {
+                if (held) {
+                    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+                }
+            }
+        } hold;
+
+        if (check == reclaim_check::DRAIN_TIMES_OUT) {
+            // An empty store first, so the worker is held on the loan's own first record, not an earlier fill's.
+            if (!drain_retained_handles(true, 5000)) {
+                return "the retained store did not drain before the loan";
+            }
+            retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
+            hold.held = true;
+        }
         ::ggml_sycl_request_expert_loan(device, bytes_wanted);
         if (!::ggml_sycl_run_pending_expert_loan_on_device(device, &resolver, &result) || !result.accepted ||
             result.n_triplets != n_expected) {
             return test_loan_fail("the loan of %zu bytes lent %u triplets (%s), not %u", bytes_wanted,
                                   result.n_triplets, result.reason, n_expected);
         }
+        // As synchronize runs it: after the loan, before the deferred-free pass.
+        const bool drained = ::ggml_sycl_expert_loan_boundary_drain(device, result.accepted && result.n_triplets != 0);
         const std::vector<std::pair<int, int>> lent     = lent_triplets(host_expert);
         const size_t                           expected = 3 * n_expected * test_loan_expert_bytes();
         // Each lent copy is a host-pinned slice of a host zone, the one provenance the copy path reads as host USM,
@@ -22272,17 +22335,63 @@ struct test_loan_fixture {
                 }
             }
         }
-        const bool gone = reclaim_until([&] {
+        auto entries_present = [&] {
+            size_t n = 0;
             for (const auto & t : lent) {
                 for (int s = 0; s < 3; ++s) {
-                    if (device_entry_present(t.first, s, t.second)) {
-                        return false;
-                    }
+                    n += device_entry_present(t.first, s, t.second) ? 1 : 0;
                 }
             }
-            return returned_since(before) >= expected;
-        });
-        return gone ? std::string() : "a lent device entry, or its storage, was not reclaimed within 2 s";
+            return n;
+        };
+        auto reclaimed = [&] {
+            return entries_present() == 0 && returned_since(before) >= expected;
+        };
+        // The pass synchronize runs after the loan's drain.
+        auto boundary_pass = [&] {
+            if (cache->has_pending_deferred_frees()) {
+                cache->process_deferred_frees_public();
+            }
+        };
+        auto not_reclaimed = [&](const char * when) {
+            return test_loan_fail(
+                "%s, %zu of the %zu lent device entries remain and the WEIGHT zone got %zu of %zu bytes", when,
+                entries_present(), 3 * lent.size(), returned_since(before), expected);
+        };
+        switch (check) {
+            case reclaim_check::POLL:
+                return reclaim_until(reclaimed) ? std::string() :
+                                                  "a lent device entry, or its storage, was not reclaimed within 2 s";
+            case reclaim_check::AT_BOUNDARY:
+                if (!drained) {
+                    return "the loan's boundary drain timed out with no drain worker held";
+                }
+                boundary_pass();
+                return reclaimed() ? std::string() : not_reclaimed("after the loan's boundary drain and its one pass");
+            case reclaim_check::DRAIN_TIMES_OUT:
+                // The control: the worker is held on the loan's record and the drain gave up, and the boundary's pass
+                // erases nothing the retention still holds, so this is the lag path, not an early drain.
+                if (drained || !retained_drain_test_parked()) {
+                    return test_loan_fail(
+                        "the boundary drain did not time out on the held worker (drained=%d parked=%d)", (int) drained,
+                        (int) retained_drain_test_parked());
+                }
+                boundary_pass();
+                if (entries_present() != 3 * lent.size()) {
+                    return test_loan_fail(
+                        "%zu of the %zu lent device entries survived the pass after a timed-out drain",
+                        entries_present(), 3 * lent.size());
+                }
+                retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+                hold.held = false;
+                // The next graph's work, here nothing: the worker finishes the loan's records on its own.
+                if (!drain_retained_handles(true, 5000)) {
+                    return "the loan's retained records did not drain once the worker went";
+                }
+                boundary_pass();
+                return reclaimed() ? std::string() : not_reclaimed("at the pass after a timed-out boundary drain");
+        }
+        return "unknown reclaim check";
     }
 
     // The device copy the extra remembers for (layer, slot, expert), read back once its copy lands, against the
@@ -23497,13 +23606,13 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
     return {};
 }
 
-std::string test_expert_loan_reclaims_pointer_table_leases() {
-    // llama.cpp-6aj4: a prompt graph's preload builds each MoE tensor's expert pointer table with
-    // ggml_sycl_update_moe_ptr_table, and the tensor's extra keeps a lease on every expert the table names
-    // (moe_expert_ptrs_leases) until that table is next built, which for a tensor the loan leaves with experts on both
-    // sides may be never. A loan that withdraws one of those experts must leave no such lease: the boundary's
-    // deferred-free pass erases the retired device entry, the WEIGHT zone gets the entry's room back, and the first
-    // decode boundary's refill re-admits the triplet.
+// llama.cpp-6aj4: a prompt graph's preload builds each MoE tensor's expert pointer table with
+// ggml_sycl_update_moe_ptr_table, and the tensor's extra keeps a lease on every expert the table names
+// (moe_expert_ptrs_leases) until that table is next built, which for a tensor the loan leaves with experts on both
+// sides may be never. A loan that withdraws one of those experts must leave no such lease: once the loan's views are
+// released, the deferred-free pass erases the retired device entry, the WEIGHT zone gets the entry's room back, and the
+// first decode boundary's refill re-admits the triplet. `check` says when the release must have happened.
+static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check check) {
     test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x36616a3401ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -23543,7 +23652,7 @@ std::string test_expert_loan_reclaims_pointer_table_leases() {
         }
     }
 
-    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
+    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3, check); !why.empty()) {
         for (int s = 0; s < 3; ++s) {
             why += "; " + fx.device_entry_holders(0, s, 2);
         }
@@ -23563,6 +23672,18 @@ std::string test_expert_loan_reclaims_pointer_table_leases() {
                               result.n_triplets, remaining, result.reason);
     }
     return fx.readmitted(0, 2);
+}
+
+// The loan's own boundary drains its retained views, so the one pass after it has erased the three withdrawn device
+// entries and returned their room, with no polling.
+std::string test_expert_loan_reclaims_pointer_table_leases() {
+    return test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check::AT_BOUNDARY);
+}
+
+// The lag path: the boundary's drain times out on a held drain worker, the entries survive that boundary's pass, and
+// the pass after the worker goes erases them and returns their room.
+std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain() {
+    return test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check::DRAIN_TIMES_OUT);
 }
 
 }  // namespace ggml_sycl
@@ -95532,8 +95653,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         sycl_ctx->has_pending_barrier              = false;
         sycl_ctx->barrier_event.reset();
         ggml_sycl::unified_cache_set_graph_compute_active(false);
-        // A loan an in-graph caller requested runs here, at the graph boundary (llama.cpp-mwmr, c-tdra).
-        ggml_sycl_run_pending_expert_loan(backend);
+        // A loan an in-graph caller requested runs here, at the graph boundary (llama.cpp-mwmr, c-tdra). When it
+        // lent, the boundary drains the loan's retained records, so the deferred-free pass below erases the withdrawn
+        // device entries and returns their room before the next graph's reserve (llama.cpp-6aj4).
+        const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);
+        (void) ggml_sycl_expert_loan_boundary_drain(sycl_ctx->device, loan_accepted);
         {
             auto * cache = ggml_sycl::get_unified_cache_for_device(sycl_ctx->device);
             if (cache && cache->has_pending_deferred_frees()) {

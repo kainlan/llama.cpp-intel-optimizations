@@ -12,7 +12,8 @@ host storage owner-first, and under the inventory mutex has the cache lend each 
 (unified_cache::loan_expert_triplet), then flips the plan copy and publishes it once. It runs at a graph boundary.
 What this gate pins (the retire, the boundary and the ready event are lead ruling c-tdra):
   - the loan code never waits and never asks an event's status (c-3bde and c-fjx1): no .wait(, no wait_and_throw(,
-    no get_info<, no event_complete(, and not finalize_retired_entries_locked(, which asks;
+    no get_info<, no event_complete(, not finalize_retired_entries_locked(, which asks, and no
+    drain_retained_handles(; the one sanctioned wait on the loan's path is the boundary's (below), not the loan's;
   - the device free is gated on the copy event, with no host_task: each D2H copy is submitted on the DMA queue reading
     the entry's own allocation owner; the transaction then re-checks each device entry and mints the lease that holds
     it in place, all three before any entry changes, since minting allocates; then each device entry's last write
@@ -41,6 +42,12 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
   - the loan runs at the graph boundary, never inside a graph: an in-graph caller records a request with a lock-free
     compare-and-swap; ggml_backend_sycl_synchronize() runs the pending loan after it clears the graph's compute flag
     and before the deferred-free pass; the transaction refuses "graph active"; and mul_mat_id names no loan entry;
+  - the boundary that accepted a loan drains the loan's retained records (llama.cpp-6aj4, lead ruling A): the runner
+    reports an accepted loan that lent, and synchronize then calls ggml_sycl_expert_loan_boundary_drain, after the
+    runner and before the deferred-free pass, so that pass erases the withdrawn device entries and returns their room
+    before the next graph's reserve. It is the one sanctioned wait (synchronize has just waited the whole stream): it
+    runs only for an accepted loan, waits at most 100 ms on drain_retained_handles (the whole store; the call takes no
+    scope), and on a timeout leaves the retention standing, the erase one pass late, with one trace line;
   - a loan is refused "host zones not configured", REFUSED and so never re-posted, before anything is selected,
     leased, allocated or lent, when its device's cache has no host zones (lead ruling, llama.cpp-sif1): an unzoned
     pinned copy sends every later copy from it down the staged branch. The transaction asks the same query the pinned
@@ -224,7 +231,7 @@ RESOLVE_SIG = "static bool ggml_sycl_expert_loan_resolve_registered("
 WRAPPER_SIG = "static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction("
 REQUEST_SIG = "static void ggml_sycl_request_expert_loan("
 PENDING_DEVICE_SIG = "static bool ggml_sycl_run_pending_expert_loan_on_device("
-PENDING_SIG = "static void ggml_sycl_run_pending_expert_loan("
+PENDING_SIG = "static bool ggml_sycl_run_pending_expert_loan("
 SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend)"
 MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst)"
 DISPATCH_SIG = "auto dispatch_cpu_entries_now = [&](const std::vector<expert_dispatch_entry> & entries)"
@@ -242,7 +249,11 @@ def loan_bodies(cache: str, sycl: str) -> list[str]:
 
 # --- waits and status queries ---------------------------------------------------------------------------------------
 
-FORBIDDEN_WAITS = (".wait(", "wait_and_throw(", "get_info<", "event_complete(", "finalize_retired_entries_locked(")
+# The loan bodies never wait or ask (c-3bde): they run on inference paths. The one sanctioned wait on the loan's path is
+# ggml_sycl_expert_loan_boundary_drain, which synchronize calls after the runner (claim_loan_boundary_drains_its_room);
+# it is not a loan body, and draining the retained store from one is forbidden here like any other wait.
+EVENT_WAITS = (".wait(", "wait_and_throw(", "get_info<", "event_complete(", "finalize_retired_entries_locked(")
+FORBIDDEN_WAITS = EVENT_WAITS + ("drain_retained_handles(",)
 
 
 def claim_loan_never_waits(cache: str, sycl: str) -> bool:
@@ -496,6 +507,34 @@ def claim_loan_runs_at_the_graph_boundary(sycl: str) -> bool:
             and ordered(txn, GRAPH_ACTIVE, "registry.acquire_live_update(", INVENTORY_LOCK)
             and ordered(pending, PENDING_SKIP, PENDING_TAKE, PENDING_RUN)
             and not any(x in mmid for x in MMID_FORBIDDEN))
+
+
+# The boundary that accepted a loan drains the loan's retained records before the deferred-free pass (llama.cpp-6aj4,
+# lead ruling A): the copies' owners and the dropped views go, so that pass erases the withdrawn device entries and
+# returns their room before the next graph's reserve. The runner reports only an accepted loan that lent, so a decode
+# boundary pays nothing; the wait is bounded at 100 ms, and a timeout leaves the retention to a later pass with one
+# trace line. The drain asks no event itself.
+LOAN_DRAIN_SIG = "static bool ggml_sycl_expert_loan_boundary_drain(int device, bool loan_accepted)"
+RUN_PENDING_ACCEPTED = "const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);"
+LOAN_DRAIN_CALL = "(void) ggml_sycl_expert_loan_boundary_drain(sycl_ctx->device, loan_accepted);"
+PENDING_LENT = ("return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result) && result.accepted && "
+                "result.n_triplets != 0;")
+LOAN_DRAIN_BOUND = "constexpr uint32_t drain_ms = 100;"
+LOAN_DRAIN_ONLY_ACCEPTED = "if (!loan_accepted || ggml_sycl::drain_retained_handles(true, drain_ms)) { return true; }"
+LOAN_DRAIN_TRACE = ('if (ggml_sycl_moe_exec_config().trace >= 1) { GGML_LOG_INFO("[MOE-EXEC-TRACE] loan device %d: '
+                    'room pending, boundary drain timed out\\n", device); } return false;')
+
+
+def claim_loan_boundary_drains_its_room(sycl: str) -> bool:
+    s = norm(sycl)
+    sync = body(s, SYNC_SIG)
+    drain = body(s, LOAN_DRAIN_SIG)
+    return (s.count(LOAN_DRAIN_CALL) == 1 and sync.count(LOAN_DRAIN_CALL) == 1
+            and ordered(sync, SET_INACTIVE, RUN_PENDING_ACCEPTED, LOAN_DRAIN_CALL, DEFERRED_FREES, RUN_REFILL)
+            and body(s, PENDING_SIG).count(PENDING_LENT) == 1
+            and drain.count("drain_retained_handles(") == 1
+            and ordered(drain, LOAN_DRAIN_BOUND, LOAN_DRAIN_ONLY_ACCEPTED, LOAN_DRAIN_TRACE)
+            and not any(token in drain for token in EVENT_WAITS))
 
 
 # --- a loan without host zones is refused (lead ruling, llama.cpp-sif1) ----------------------------------------------
@@ -1240,6 +1279,10 @@ def test_loan_runs_at_the_graph_boundary():
     assert claim_loan_runs_at_the_graph_boundary(SYCL)
 
 
+def test_loan_boundary_drains_its_room():
+    assert claim_loan_boundary_drains_its_room(SYCL)
+
+
 def test_busy_reposts_the_request():
     assert claim_busy_reposts_the_request(SYCL)
 
@@ -1399,6 +1442,12 @@ def test_mutant_transaction_waits_fails():
 
 def test_mutant_pending_runner_waits_fails():
     assert not claim_loan_never_waits(CACHE, _once(SYCL, PENDING_TAKE, "cache_queue_wait.wait(); " + PENDING_TAKE))
+
+
+def test_mutant_pending_runner_drains_the_store_fails():
+    """The drain belongs to the boundary: the runner draining it would be a wait inside the loan code."""
+    assert not claim_loan_never_waits(
+        CACHE, _once(SYCL, PENDING_TAKE, "(void) ggml_sycl::drain_retained_handles(true, 100); " + PENDING_TAKE))
 
 
 def test_mutant_retire_chained_through_a_host_task_fails():
@@ -1641,6 +1690,39 @@ def test_mutant_loan_runs_after_the_deferred_frees_fails():
     n = _once_in(SYCL, SYNC_SIG, RUN_PENDING, "")
     n = _once_in(n, SYNC_SIG, DEFERRED_FREES, DEFERRED_FREES + " " + RUN_PENDING)
     assert not claim_loan_runs_at_the_graph_boundary(n)
+
+
+def test_mutant_loan_boundary_drain_removed_fails():
+    """Without the drain the retention outlives the boundary's pass, so the room comes back after the next reserve."""
+    assert not claim_loan_boundary_drains_its_room(_once_in(SYCL, SYNC_SIG, LOAN_DRAIN_CALL, ""))
+
+
+def test_mutant_loan_boundary_drain_after_the_pass_fails():
+    n = _once_in(SYCL, SYNC_SIG, LOAN_DRAIN_CALL, "")
+    n = _once_in(n, SYNC_SIG, RUN_REFILL, LOAN_DRAIN_CALL + " " + RUN_REFILL)
+    assert not claim_loan_boundary_drains_its_room(n)
+
+
+def test_mutant_loan_boundary_drains_at_every_boundary_fails():
+    """A decode boundary would pay the wait, and another context's work on the queue could hold it 100 ms."""
+    assert not claim_loan_boundary_drains_its_room(
+        _once(SYCL, LOAN_DRAIN_ONLY_ACCEPTED,
+              "if (ggml_sycl::drain_retained_handles(true, drain_ms)) { return true; }"))
+
+
+def test_mutant_loan_boundary_drain_unbounded_fails():
+    assert not claim_loan_boundary_drains_its_room(
+        _once(SYCL, LOAN_DRAIN_BOUND, "constexpr uint32_t drain_ms = 10000;"))
+
+
+def test_mutant_runner_reports_a_refused_loan_fails():
+    """A BUSY or REFUSED loan lent nothing, so its boundary must not wait."""
+    assert not claim_loan_boundary_drains_its_room(
+        _once(SYCL, PENDING_LENT, "return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result);"))
+
+
+def test_mutant_loan_boundary_timeout_is_silent_fails():
+    assert not claim_loan_boundary_drains_its_room(_once(SYCL, LOAN_DRAIN_TRACE, "return false;"))
 
 
 def test_mutant_transaction_runs_inside_a_graph_fails():

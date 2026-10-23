@@ -73,11 +73,17 @@
 //   loan_reclaims_pointer_table_leases
 //                           llama.cpp-6aj4: one layer's three tensors each get the pointer table a prompt graph's
 //                           preload builds (ggml_sycl_update_moe_ptr_table over the routed device experts), and each
-//                           table leases expert 2's device entry (checked first). The one-triplet loan takes expert 2:
-//                           within 2 s the boundary pass erases its three device entries and the WEIGHT zone gets
-//                           their room back, and the first decode boundary re-admits the triplet. A failure names
-//                           each entry's lease count and the extra's handles on it per view, counted without
-//                           resolving any.
+//                           table leases expert 2's device entry (checked first). The one-triplet loan takes expert 2
+//                           and no other triplet; after the loan's own boundary drain and the one deferred-free pass
+//                           synchronize runs after it, with no polling, its three device entries are gone and the
+//                           WEIGHT zone has their room back, and the first decode boundary re-admits the triplet. A
+//                           failure names each entry's lease count and the extra's handles on it per view, counted
+//                           without resolving any.
+//   loan_reclaims_after_a_timed_out_boundary_drain
+//                           llama.cpp-6aj4: the same loan with the drain worker held on the loan's first retained
+//                           record, so the boundary's 100 ms drain times out (checked, with the worker parked). The
+//                           three device entries survive that boundary's pass; once the worker goes and drains, the
+//                           next pass erases them and returns their room, and the refill re-admits the triplet.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -140,6 +146,8 @@ int main() {
     ok &= run_case("refill_moves_two_triplets_per_call", ggml_sycl::test_expert_refill_moves_two_triplets_per_call);
     ok &= run_case("loan_sizes_its_copies_from_the_entry", ggml_sycl::test_expert_loan_sizes_its_copies_from_the_entry);
     ok &= run_case("loan_reclaims_pointer_table_leases", ggml_sycl::test_expert_loan_reclaims_pointer_table_leases);
+    ok &= run_case("loan_reclaims_after_a_timed_out_boundary_drain",
+                   ggml_sycl::test_expert_loan_reclaims_after_a_timed_out_boundary_drain);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
