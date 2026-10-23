@@ -27,7 +27,11 @@ for the types the planner materializes SOA that have a per-expert SOA dequant. T
   (i) the planned weight slot is widened at plan time from the f16 table, so the executor never needs an
       unplanned allocation;
   (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, read once, consulted by the support helper, and
-      dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor.
+      dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor;
+  (k) the claim takes a planned layout only where the cache holds one entry per expert at it: the claim predicate
+      reads device-buffer storage from the weight's own buffer and asks moe_pp_batched_has_expert_entries, which
+      declines exactly a non-AOS layout in a device buffer (GGML_SYCL_WEIGHTS_EVICTABLE=0 reorders such a tensor
+      into one block over every expert) and never MXFP4, whose route is unchanged.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -575,6 +579,28 @@ def claim_j_knob(s):
     return fails
 
 
+def claim_k_expert_entries(s):
+    fails = []
+    entries = one_definition(s["tables"], "moe_pp_batched_has_expert_entries")
+    if entries is None:
+        return ["moe_pp_batched_has_expert_entries is not defined exactly once in moe-mmvq-tables.hpp"]
+    if "return type == GGML_TYPE_MXFP4 || !device_buffer || layout == GGML_LAYOUT_AOS;" not in entries:
+        fails.append("moe_pp_batched_has_expert_entries does not decline exactly a non-AOS layout in a device buffer")
+    claim = claim_predicate_body(s["sycl"])
+    if claim is None:
+        return fails + ["the plan-taking ggml_sycl_moe_pp_onednn_batched_claims_tensor definition was not found"]
+    storage = "const bool device_buffer = weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);"
+    if storage not in claim:
+        fails.append("the claim predicate does not read device-buffer storage from the weight's own buffer")
+    ask = "if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) { return false; }"
+    at = claim.find(ask)
+    if at < 0:
+        fails.append("the claim predicate does not decline a planned layout the cache holds no per-expert entries at")
+    elif at < claim.find("if (!planned) { return false; }"):
+        fails.append("the claim predicate asks for per-expert entries before it has read the planned layout")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -586,6 +612,7 @@ CLAIMS = {
     "h": claim_h_capability,
     "i": claim_i_sizing,
     "j": claim_j_knob,
+    "k": claim_k_expert_entries,
 }
 
 
@@ -645,6 +672,10 @@ MUTANTS = [
     ("j", "tables", "if (type != GGML_TYPE_MXFP4 && !aos_enabled)", "if (layout == GGML_LAYOUT_AOS && !aos_enabled)"),
     ("j", "common", "return env == nullptr || std::atoi(env) != 0; }(); return aos_enabled;",
      "return env != nullptr && std::atoi(env) != 0; }(); return aos_enabled;"),
+    ("k", "tables", "|| !device_buffer || layout == GGML_LAYOUT_AOS;", "|| layout == GGML_LAYOUT_AOS;"),
+    ("k", "sycl", "weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);", "false;"),
+    ("k", "sycl",
+     "if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) { return false; }", ""),
 ]
 
 
