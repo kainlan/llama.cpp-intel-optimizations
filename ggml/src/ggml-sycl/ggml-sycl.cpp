@@ -411,6 +411,14 @@ int g_ggml_sycl_handle_strict    = 0;
 // config is the one reader of the variables.
 int g_ggml_sycl_moe_exec_policy  = 0;
 int g_ggml_sycl_moe_exec_trace   = 0;
+
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS as the report's integer (llama.cpp-348c): SET from
+// ggml_sycl_moe_pp_f16_batched_aos_enabled() after the table parse, so the report says what is in effect.
+int g_ggml_sycl_moe_pp_f16_batched_aos       = 1;
+// GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX as the report's integer (llama.cpp-348c), SET from
+// ggml_sycl_moe_pp_f16_group_experts_max() after the table parse: 0 is no cap.
+int g_ggml_sycl_moe_pp_f16_group_experts_max = 0;
+
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
@@ -15635,7 +15643,6 @@ static size_t                                        g_tensor_inventory_pp_pipel
 static size_t                                        g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
 static size_t                                        g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
 static size_t                                        g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
-static size_t                                        g_tensor_inventory_pp_moe_onednn_scratch_bytes         = 0;
 static uint32_t                                      g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
 static int                                           g_tensor_inventory_device                              = 0;
 static size_t                                        g_moe_expert_total_bytes                               = 0;
@@ -15713,7 +15720,6 @@ static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_aut
         g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
         g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
         g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
-        g_tensor_inventory_pp_moe_onednn_scratch_bytes         = 0;
         g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
         g_tensor_inventory_device                              = 0;
         g_moe_expert_total_bytes                               = 0;
@@ -17108,6 +17114,10 @@ static double ggml_sycl_plan_cost_param(const char * name, double def, double ma
     return std::min(value, max);
 }
 
+// Whether the batched mul_mat_id prompt executor takes `type` loaded in `layout` (llama.cpp-348c). Defined with the
+// executor's claim predicate; declared here for the capability query's prompt route.
+static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout);
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17123,7 +17133,6 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
     g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
     g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
-    g_tensor_inventory_pp_moe_onednn_scratch_bytes         = 0;
     g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
     g_tensor_inventory_device                              = ctx->device;
     g_tensor_inventory.reserve(inventory->count);
@@ -17227,7 +17236,6 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = inventory->pp_moe_onednn_weight_slot_bytes;
     g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = inventory->pp_moe_onednn_activation_slot_bytes;
     g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = inventory->pp_moe_onednn_output_slot_bytes;
-    g_tensor_inventory_pp_moe_onednn_scratch_bytes         = inventory->pp_moe_onednn_scratch_bytes;
     g_tensor_inventory_pp_moe_onednn_ring_depth            = inventory->pp_moe_onednn_ring_depth;
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(
         ctx->device, g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,
@@ -32233,6 +32241,11 @@ static void ggml_check_sycl() try {
             // clang-format off
             { ggml_sycl::MOE_EXEC_ENV_POLICY, &g_ggml_sycl_moe_exec_policy, 0 },
             { ggml_sycl::MOE_EXEC_ENV_TRACE,  &g_ggml_sycl_moe_exec_trace,  0 },
+            // The batched MoE prompt executor's AOS opt-out (llama.cpp-348c), named through common.hpp's one spelling.
+            // Its accessor is the reader; the destination is overwritten from it after the loop.
+            { GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV, &g_ggml_sycl_moe_pp_f16_batched_aos, 1 },
+            // The f16 arm's debugging group cap (llama.cpp-348c), likewise overwritten from its accessor.
+            { GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV, &g_ggml_sycl_moe_pp_f16_group_experts_max, 0 },
             // clang-format on
         };
 
@@ -32241,6 +32254,9 @@ static void ggml_check_sycl() try {
         }
         g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);
         g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;
+
+        g_ggml_sycl_moe_pp_f16_batched_aos       = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;
+        g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a
@@ -34765,6 +34781,20 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         cap.kernel        = moe_route_kernel::MMVQ_COMPAT;
         cap.reject_reason = moe_layer_reject_reason::NONE;
         cap.reason        = "local-mmvq";
+        return cap;
+    }
+    // llama.cpp-348c: a (type, layout) the MMVQ id table above does not serve still has a prompt executor when the
+    // batched oneDNN prompt executor takes it: it dequantizes the active experts to f16, in groups that fit the weight
+    // slot the plan sized, and runs batched GEMMs over each group. That covers a type with no MMVQ id kernel at all
+    // (IQ4_XS, IQ1_S, IQ1_M) and a layout the table has no kernel for, such as Q4_0, Q8_0, Q4_K and Q6_K loaded SOA
+    // (c-jx9g). Prompt only, since that executor declines one-token rows, so decode stays refused; and only for a K the
+    // dequant reads in whole blocks.
+    if (phase == moe_route_phase::PROMPT && ggml_sycl_moe_pp_batched_takes_layout(type, layout) &&
+        K % ggml_blck_size(type) == 0) {
+        cap.supported     = true;
+        cap.kernel        = moe_route_kernel::ONEDNN_BATCHED_PROMPT;
+        cap.reject_reason = moe_layer_reject_reason::NONE;
+        cap.reason        = "local-onednn-batched-prompt";
         return cap;
     }
 
@@ -44748,6 +44778,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffe
             // alignment, not a policy: a host-pinned compute buffer for a device would run its compute over PCIe,
             // which placement-decides-executor forbids (the pinned-pool alignment is a separate ticket). It cannot
             // say why the buffer fell back to host memory; the context refusal names what no device tier held.
+            // The batched MoE prompt executor's claim relies on this refusal (moe_pp_batched_has_expert_entries): a
+            // host-pinned device buffer gets no per-expert AOS slices, so lifting it means that predicate must
+            // decline the host-pinned tier too (llama.cpp-348c).
             snprintf(cause, sizeof(cause),
                      "this is a host-pinned fallback buffer, so its base is not aligned: the pinned pool's base is "
                      "aligned only to %zu bytes",
@@ -77695,6 +77728,9 @@ static void ggml_sycl_moe_row_agg_log_descriptor(const moe_layer_decode_plan &  
                 case moe_route_kernel::MMVQ_COMPAT:
                     local_mmvq_rows += group.rows.size();
                     break;
+                case moe_route_kernel::ONEDNN_BATCHED_PROMPT:
+                    // Counted in capable_rows only: the batched prompt executor has no bucket of its own here.
+                    break;
                 case moe_route_kernel::NONE:
                     break;
             }
@@ -79619,7 +79655,7 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
 // llama.cpp-sr83 (fix cycle, 2026-08-22): single source of truth for whether
 // the batched executor's WOQ arm is enabled, shared between the claims
 // predicate below and the executor lambda itself (ggml-sycl.cpp search
-// try_pp_mxfp4_soa_onednn_f16_batched) -- previously each read the
+// try_pp_onednn_f16_batched) -- previously each read the
 // GGML_SYCL_MOE_PP_WOQ env independently, and only the executor's copy
 // gated the tiled-dequant refusal (defect 1 fix), so the claims predicate
 // kept claiming XMX_TILED gate/up even when WOQ=0 had no tiled dequant to
@@ -79633,7 +79669,7 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
 // here, so they keep running through whatever route handled them before C3.
 // llama.cpp-sr83 (quality review finding #8): every call site of this
 // helper -- the claims predicate's XMX_TILED branch below, the candidate
-// gate inside try_pp_mxfp4_soa_onednn_f16_batched, and the lambda's own
+// gate inside try_pp_onednn_f16_batched, and the lambda's own
 // pp_woq_enabled -- is already reachable only under GGML_SYCL_DNNL, so the
 // definition itself is scoped the same way for consistency (this is the
 // direction the finding B fix already took for the predicate's tail).
@@ -79648,7 +79684,7 @@ static bool ggml_sycl_moe_pp_woq_enabled() {
 
 // llama.cpp-6405 (perf-recovery epic, PP gap analysis sub-task): device-event
 // breakdown of the batched PP MoE oneDNN executor
-// (try_pp_mxfp4_soa_onednn_f16_batched below), gated on GGML_SYCL_MXFP4_PP_PROFILE
+// (try_pp_onednn_f16_batched below), gated on GGML_SYCL_MXFP4_PP_PROFILE
 // -- the SAME env var mmvq.cpp's mmvq_moe_pp_profile_enabled() already reads
 // for a complementary instrument (that one times the small-batch MMVQ GEMV
 // MoE kernels; this one times the batched oneDNN GEMM executor -- one
@@ -80781,13 +80817,100 @@ static void mxfp4_pp_batched_profile_record_graph_total(double graph_us) {
 }
 #endif
 
+// Whether the batched mul_mat_id prompt executor takes `type` loaded in `layout` (llama.cpp-348c): the one question its
+// candidate gate, its claim predicate and the capability query's prompt route ask about the type. The answer is the
+// tables in moe-mmvq-tables.hpp under the route knob, GGML_SYCL_MOE_PP_ONEDNN_F16 (the executor's own switch),
+// GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_F16_BATCHED_AOS. Without oneDNN the executor does not exist, and the #else
+// arm below takes only MXFP4 SOA, as before llama.cpp-348c.
+static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout) {
+    if (!ggml_sycl_moe_pp_onednn_batched_route_selected()) {
+        return false;
+    }
+#if GGML_SYCL_DNNL
+    if (!ggml_sycl_moe_pp_onednn_f16_enabled()) {
+        return false;
+    }
+    return moe_pp_batched_supports_layout(type, layout, ggml_sycl_moe_pp_woq_enabled(),
+                                          ggml_sycl_moe_pp_f16_batched_aos_enabled());
+#else
+    return moe_pp_batched_supports_layout(type, layout, false, false);
+#endif
+}
+
+// The type-only form, for the cheap check before a plan lookup: whether any layout of `type` is taken.
+static bool ggml_sycl_moe_pp_batched_takes_type(ggml_type type) {
+    for (int layout = 0; layout <= (int) GGML_LAYOUT_MXFP4_DPAS; ++layout) {
+        if (ggml_sycl_moe_pp_batched_takes_layout(type, (layout_mode) layout)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether supports_op may admit a MUL_MAT_ID whose expert type has no MMID kernel (llama.cpp-348c): only a prompt
+// (more than one token per expert row) whose weight the batched prompt executor claims on this device, which needs a
+// published plan. Decode, and every op without a plan (test-backend-ops' graphs), stay refused to the CPU backend.
+// The claim reads its planned layout through ggml_sycl_moe_tensor_plan_primary_layout, which answers only when every
+// expert of the weight is planned on `device`. So a hybrid layer (an expert on the host or another device) is never
+// admitted: the hybrid route would run it there, and these types have no MMVQ-ID kernel for that route.
+static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int device) {
+    return op != nullptr && op->src[0] != nullptr && op->src[2] != nullptr && op->src[2]->ne[1] > 1 &&
+           ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, op->src[0], device);
+}
+
+#if GGML_SYCL_DNNL
+// True the first time `refusal` is seen on `device`: the batched executor's refusal WARN fires once per (device,
+// cause). One bit per cause, so the shift below is defined only while COUNT fits the mask.
+static bool ggml_sycl_moe_pp_batched_refusal_first(int device, moe_pp_batched_refusal refusal) {
+    static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,
+                  "the batched executor's refusal latch holds one bit per moe_pp_batched_refusal cause");
+    static std::atomic<uint32_t> seen[GGML_SYCL_MAX_DEVICES] = {};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || refusal >= moe_pp_batched_refusal::COUNT) {
+        return false;
+    }
+    const uint32_t bit = 1u << static_cast<uint32_t>(refusal);
+    return (seen[device].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+}
+
+// True the first time the batched executor runs `type` at `layout` on `device`: its [PP-MOE] line fires once per
+// (device, type, layout), so a type the planner materializes in two layouts on one card reports both. One bit per
+// layout in a 32-bit mask per (device, type), so the shift below is defined only while every layout fits it.
+static bool ggml_sycl_moe_pp_batched_first_run(int device, ggml_type type, layout_mode layout) {
+    static_assert(GGML_LAYOUT_MXFP4_DPAS < 32, "the batched executor's first-run mask holds one bit per layout");
+    static std::atomic<uint32_t> seen[GGML_SYCL_MAX_DEVICES][GGML_TYPE_COUNT] = {};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || type < 0 || type >= GGML_TYPE_COUNT || layout < 0 ||
+        layout > GGML_LAYOUT_MXFP4_DPAS) {
+        return false;
+    }
+    const uint32_t bit = 1u << static_cast<uint32_t>(layout);
+    return (seen[device][type].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+}
+
+// The batched executor's per-expert dequant profiler label, "moe.pp.dequant.<type>". The names are built once, on
+// first use, so a dispatch only indexes the table and never allocates on the prompt path.
+static const char * ggml_sycl_moe_pp_dequant_label(ggml_type type) {
+    static const std::array<std::string, GGML_TYPE_COUNT> names = []() {
+        std::array<std::string, GGML_TYPE_COUNT> built;
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const char * type_name = ggml_type_name(static_cast<ggml_type>(t));
+            built[t]               = std::string("moe.pp.dequant.") + (type_name ? type_name : "unknown");
+        }
+        return built;
+    }();
+    if (type < 0 || type >= GGML_TYPE_COUNT) {
+        return "moe.pp.dequant.unknown";
+    }
+    return names[type].c_str();
+}
+#endif
+
 // Whether the oneDNN batched prompt executor claims `weight` on `device`. With a plan, the planned layout comes from
 // that plan: the stream ring's library-claim predicate passes the plan its index build holds (c-gi44). Without one it
 // comes from the device's cache plan, read after the type and role checks, which is the executor's own route.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan,
                                                           const ggml_tensor *               weight,
                                                           int                               device) {
-    if (!weight || weight->type != GGML_TYPE_MXFP4 || !ggml_sycl_moe_pp_onednn_batched_route_selected()) {
+    if (!weight || !ggml_sycl_moe_pp_batched_takes_type(weight->type)) {
         return false;
     }
     const moe_tensor_type role = moe_classify_tensor(weight->name ? weight->name : "");
@@ -80801,31 +80924,30 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     if (!planned) {
         return false;
     }
-    if (planned_layout == GGML_LAYOUT_SOA) {
-        return true;
-    }
-#if GGML_SYCL_DNNL
-    // Down never plans XMX_TILED, so this cannot widen its route -- only
-    // gate/up, which is exactly what repack_mxfp4_xmx_tiled_to_woq covers,
-    // and only when the WOQ arm that owns that repack is actually enabled --
-    // the f16 arm has no tiled-aware dequant (see ggml_sycl_moe_pp_woq_enabled
-    // above).
-    if (!ggml_sycl_moe_pp_woq_enabled()) {
+    // The executor resolves each active expert's own cache entry. A device-buffer weight
+    // (GGML_SYCL_WEIGHTS_EVICTABLE=0) has one only where its upload published per-expert AOS slices, which needs three
+    // conditions: a complete upload, no reorder, and a buffer outside the host-pinned tier. Any other layout is
+    // reordered into one block over every expert. moe_pp_batched_has_expert_entries checks only the layout; its
+    // comment says why the other two hold today, the host-pinned one only through the publish refusal of
+    // llama.cpp-mmi1. Claiming a layout without per-expert entries would advertise past what the cache holds and
+    // steer the prompt past the fused and legacy routes into an admission that refuses it (llama.cpp-348c).
+    // Declining keeps that weight on the routes it had before; it does not make this executor serve it. That gap is
+    // open, pending an owner decision: serving it needs per-expert entries for a device-buffer SOA weight (publish
+    // per-expert SOA slices, or reorder per expert), and neither is done here.
+    const bool device_buffer = weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);
+    if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
         return false;
     }
-    return planned_layout == GGML_LAYOUT_XMX_TILED && (role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP);
-#else
-    // llama.cpp-sr83 (spec-review finding B, 2026-08-22): the batched
-    // executor's whole XMX_TILED arm (WOQ repack + GEMM, and everything
-    // else in try_pp_mxfp4_soa_onednn_f16_batched) only exists under
-    // GGML_SYCL_DNNL -- in a non-DNNL build the lambda's #else arm is a
-    // bare `return false;` with no fail-closed throw, so claiming a tiled
-    // op here would fall through to the tiled-illiterate per-expert
-    // staging path (llama.cpp-71hx silent-garbage hazard). Never claim
-    // XMX_TILED in that configuration; down (SOA) already returned above
-    // and is unaffected.
-    return false;
-#endif
+    // Down never plans XMX_TILED, so the table's XMX_TILED entry (the WOQ arm's repack_mxfp4_xmx_tiled_to_woq, taken
+    // only while GGML_SYCL_MOE_PP_WOQ is on) cannot widen down's route: only gate/up's. Without oneDNN the table
+    // answers with neither knob, so XMX_TILED is never claimed there. That matters because the non-DNNL lambda has no
+    // fail-closed throw for a claimed tiled op it declines (tiled_claimed_op exists only in the oneDNN build), so a
+    // claimed tiled op would fall through to the per-expert staging path, which cannot read tiled bytes and computes
+    // garbage silently (llama.cpp-71hx).
+    if (planned_layout == GGML_LAYOUT_XMX_TILED && role == MOE_TENSOR_DOWN) {
+        return false;
+    }
+    return ggml_sycl_moe_pp_batched_takes_layout(weight->type, planned_layout);
 }
 
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {
@@ -82417,15 +82539,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         return src0 == roles.gate.weight_identity || src0 == roles.up.weight_identity;
     }();
     const bool cpu_tg_candidate = prompt_pair_retained_roles_capable && prompt_pair_current_node;
-    // llama.cpp-dboi: when the oneDNN-batched MoE PP route is selected, the
-    // fused pair-GLU fast path declines PP admission so dispatch continues to
-    // the retained unfused flow and reaches the batched executor
-    // (try_pp_mxfp4_soa_onednn_f16_batched) below. Decode (ne12 == 1) is
-    // untouched -- the batched route is PP-only.
-    // llama.cpp-1tjn (Option T follow-up): must decline ONLY when this op is
-    // actually claimed (SOA-planned) -- under Option T gate/up stay
-    // XMX_TILED-planned even with the policy selected, and the fused tiled
-    // executor here is their CORRECT path, not the batched one.
+    // llama.cpp-dboi: when the batched oneDNN MoE PP executor claims this op,
+    // the fused pair-GLU fast path declines PP admission so dispatch continues
+    // to the retained unfused flow and reaches the executor
+    // (try_pp_onednn_f16_batched) below. Decode (ne12 == 1) is untouched --
+    // the executor is PP-only.
+    // llama.cpp-1tjn, llama.cpp-348c: decline ONLY when this op's planned
+    // layout is a (type, layout) the batched executor claims
+    // (ggml_sycl_moe_pp_onednn_batched_claims_tensor). Any other layout, such
+    // as MXFP4 gate/up planned XMX_TILED with GGML_SYCL_MOE_PP_WOQ=0, keeps
+    // the fused tiled executor here, which is its correct path.
     const bool pp_onednn_batched_route = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
     if (cpu_tg_candidate && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         fprintf(stderr,
@@ -83665,21 +83788,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         return;
                     }
                 }
-                // llama.cpp-dboi: at PP under the oneDNN-batched route policy,
-                // MXFP4 gate/up/down must fall past the per-row MMVQ probes
-                // (the try-soa probe would otherwise consume the op here at
-                // ~53 t/s pp512) so dispatch reaches the batched oneDNN
-                // executor below. Down is claimed too: leaving it on the
-                // per-row route capped the whole pass at ~155 t/s, and its I8
-                // planning upgrade is disabled under this policy so its SOA
-                // primaries satisfy the batched route. Decode (ne12 == 1) is
-                // untouched -- MMVQ remains the decode route for SOA-planned
-                // weights.
-                // llama.cpp-1tjn (Option T follow-up): claim only when this
-                // op's PLANNED layout is actually SOA -- under Option T
-                // gate/up plan XMX_TILED even with the policy selected, and
-                // must stay on their normal (tiled) route, not fall through
-                // to the batched executor's SOA-only staging fallback.
+                // llama.cpp-dboi: at PP, a gate/up/down op the batched oneDNN
+                // executor claims must fall past the per-row MMVQ probes (for
+                // MXFP4 the try-soa probe would otherwise consume the op here
+                // at ~53 t/s pp512) so dispatch reaches the executor below.
+                // Down is claimed too: leaving MXFP4 down on the per-row route
+                // capped the whole pass at ~155 t/s, and its I8 planning
+                // upgrade is disabled under the route policy so its SOA
+                // primaries satisfy the executor. Decode (ne12 == 1) is
+                // untouched -- MMVQ remains the decode route.
+                // llama.cpp-1tjn, llama.cpp-348c: skip the probes only when
+                // this op's planned layout is a (type, layout) the batched
+                // executor claims (ggml_sycl_moe_pp_onednn_batched_claims_tensor).
+                // Any other layout, such as MXFP4 gate/up planned XMX_TILED
+                // with GGML_SYCL_MOE_PP_WOQ=0, stays on its normal route and
+                // never reaches the executor's per-expert staging fallback,
+                // which reads SOA only.
                 const bool pp_onednn_batched_claims_op =
                     ne12 > 1 && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
                 if (pp_onednn_batched_claims_op && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -85141,16 +85265,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool planner_needs_decode_route = has_placement_plan &&
                                             g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
                                             (plan_has_cpu_experts || plan_has_secondary_experts);
-    // llama.cpp-dboi: the oneDNN-batched PP executor lives in the retained
-    // (non-hybrid) dispatch world below; when its route policy claims an MXFP4
-    // gate/up prompt op, prompt routing must not select the hybrid per-entry
-    // world, whose single-kernel MMVQ dispatch would consume the op first.
-    // Plans with host-resident experts keep hybrid via plan_hybrid regardless
-    // (the batched executor requires every active expert local anyway and
-    // rejects into its staging fallback otherwise).
-    // llama.cpp-1tjn (Option T follow-up): claim only when this op's PLANNED
-    // layout is actually SOA -- under Option T gate/up plan XMX_TILED even
-    // with the policy selected and must keep their normal prompt route.
+    // llama.cpp-dboi: the batched oneDNN PP executor lives in the retained
+    // (non-hybrid) dispatch world below; when it claims a prompt op, prompt
+    // routing must not select the hybrid per-entry world, whose single-kernel
+    // MMVQ dispatch would consume the op first. Plans with host-resident
+    // experts keep hybrid via plan_hybrid regardless (the claim needs every
+    // expert planned on this device, and the executor refuses an expert that
+    // is not local).
+    // llama.cpp-1tjn, llama.cpp-348c: the claim holds only when this op's
+    // planned layout is a (type, layout) the batched executor claims
+    // (ggml_sycl_moe_pp_onednn_batched_claims_tensor); any other layout keeps
+    // its normal prompt route.
     const bool pp_onednn_batched_route_claims_prompt =
         prompt_batch && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
     const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && prompt_batch &&
@@ -88473,10 +88598,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         };
 
 #if GGML_SYCL_DNNL
-        static const bool pp_mxfp4_soa_f16_env_enabled = []() {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16");
-            return env == nullptr || std::atoi(env) != 0;
-        }();
+        const bool pp_mxfp4_soa_f16_env_enabled = ggml_sycl_moe_pp_onednn_f16_enabled();
         // llama.cpp-sr83 (C3, Option T): gate/up plan XMX_TILED by default;
         // the batched lambda now repacks that layout too
         // (repack_mxfp4_xmx_tiled_to_woq), so it must be admitted as a
@@ -88495,21 +88617,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const bool pp_mxfp4_soa_f16_candidate = pp_mxfp4_soa_f16_env_enabled && src0->type == GGML_TYPE_MXFP4 &&
                                                 pp_mxfp4_soa_or_tiled_route && src1->type == GGML_TYPE_F32 &&
                                                 dst->type == GGML_TYPE_F32;
+        // llama.cpp-348c: the batched executor's own candidate gate asks the claim predicate's table, on the layout
+        // this tensor is routed in, for every expert type; pp_mxfp4_soa_f16_candidate above stays the MXFP4 staging
+        // fallback's. XMX_TILED stays gate/up only (down never plans it). GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the
+        // executor off through the same table, and the executor reports it as route-off before it asks this.
+        const bool pp_batched_candidate =
+            ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout) &&
+            (route_layout != GGML_LAYOUT_XMX_TILED || pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 #else
         const bool pp_mxfp4_soa_f16_candidate = false;
+        const bool pp_batched_candidate       = false;
 #endif
         const bool   pp_cpu_reference              = ggml_sycl_moe_pp_cpu_reference_enabled();
         const size_t src1_contiguous_rows          = static_cast<size_t>(ids->ne[1]) * static_cast<size_t>(n_ids);
         const size_t src1_contiguous_f32_row_bytes = nb11;
         const size_t src1_contiguous_f16_row_bytes = static_cast<size_t>(ne10) * sizeof(sycl::half);
 
-        auto try_pp_mxfp4_soa_onednn_f16_batched = [&]() -> bool {
+        auto try_pp_onednn_f16_batched = [&]() -> bool {
 #if GGML_SYCL_DNNL
             // llama.cpp-dboi: enablement comes from the shared route policy
             // (env override + built-in default), the same predicate that made
             // the planner keep SOA and the fused pair-GLU PP path decline.
-            const bool        pp_mxfp4_soa_f16_batched_env_enabled = ggml_sycl_moe_pp_onednn_batched_route_selected();
-            static const bool pp_mxfp4_soa_f16_batched_trace = []() {
+            // llama.cpp-348c: and from the executor's own switch, so either knob at 0 is refused as route-off.
+            const bool pp_f16_batched_env_enabled =
+                ggml_sycl_moe_pp_onednn_batched_route_selected() && ggml_sycl_moe_pp_onednn_f16_enabled();
+            static const bool pp_f16_batched_trace = []() {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE");
                 return env && std::atoi(env) != 0;
             }();
@@ -88528,8 +88661,36 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // and is exempted -- it is not a failure of this executor.
             const bool tiled_claimed_op = !pp_cpu_reference && route_layout == GGML_LAYOUT_XMX_TILED &&
                                           ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
-            const auto trace_batched_skip = [&](const char * reason, int64_t expert_id = -1) {
-                if (pp_mxfp4_soa_f16_batched_trace) {
+            // llama.cpp-348c: every decline names its cause from moe_pp_batched_refusal, reported once per (device,
+            // cause) as a WARN beside the capped per-dispatch trace. A post-claim cause
+            // (moe_pp_batched_refusal_after_claim) prints at default verbosity: the claim already steered the op past
+            // the MMVQ probes and the fused routes, so the decline quietly loses the fast path, and a run that lost it
+            // looks exactly like one that never had it (the scratch admission refusal below warns for the same
+            // reason). A precheck cause prints only under the trace knob. route_logged adds the
+            // GGML_SYCL_MOE_ROUTE_LOG line reject_batched has always printed. `detail` is the site's own reason (a
+            // resolver, layout or admission reason name), or null when the cause says it all.
+            // The one "[PP-MOE] refused" printer: every decline below and the GEMM stage's failure report through it.
+            const auto warn_batched_refusal = [&](moe_pp_batched_refusal refusal, const char * detail) {
+                if ((pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&
+                    ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)) {
+                    GGML_LOG_WARN("[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s\n",
+                                  ctx.device, moe_pp_batched_refusal_name(refusal), detail ? detail : "-", src0->name,
+                                  ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout));
+                }
+            };
+            const auto decline_batched = [&](moe_pp_batched_refusal refusal, const char * detail, int64_t expert_id,
+                                             bool route_logged) -> bool {
+                const char * reason = detail ? detail : moe_pp_batched_refusal_name(refusal);
+                if (route_logged && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    static std::atomic<int> reject_log{ 0 };
+                    if (reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                        GGML_LOG_INFO(
+                            "[MOE-PP-ONEDNN-F16-BATCHED] rejected tensor=%s device=%d expert=%lld reason=%s\n",
+                            src0 && src0->name ? src0->name : "?", ctx.device, (long long) expert_id, reason);
+                    }
+                }
+                warn_batched_refusal(refusal, detail);
+                if (pp_f16_batched_trace) {
                     static std::atomic<int> trace_count{ 0 };
                     if (trace_count.fetch_add(1, std::memory_order_relaxed) < 128) {
                         fprintf(stderr,
@@ -88537,13 +88698,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 "cpu_ref=%d env=%d candidate=%d use_cache=%d plan=%d ids_ne1=%lld n_ids=%lld "
                                 "row_maps=%zu route=%s src0_type=%d src1_type=%d dst_type=%d ne00=%lld ne01=%lld "
                                 "ne10=%lld ne0=%lld ne12=%lld nb11=%zu nb1=%zu\n",
-                                src0 && src0->name ? src0->name : "?", ctx.device, (long long) expert_id,
-                                reason ? reason : "unknown", pp_cpu_reference ? 1 : 0,
-                                pp_mxfp4_soa_f16_batched_env_enabled ? 1 : 0, pp_mxfp4_soa_f16_candidate ? 1 : 0,
-                                use_expert_cache ? 1 : 0, has_placement_plan ? 1 : 0, (long long) ids->ne[1],
-                                (long long) n_ids, row_maps_total, ggml_sycl_layout_mode_name(route_layout),
-                                (int) src0->type, (int) src1->type, (int) dst->type, (long long) ne00, (long long) ne01,
-                                (long long) ne10, (long long) ne0, (long long) ne12, nb11, nb1);
+                                src0 && src0->name ? src0->name : "?", ctx.device, (long long) expert_id, reason,
+                                pp_cpu_reference ? 1 : 0, pp_f16_batched_env_enabled ? 1 : 0,
+                                pp_batched_candidate ? 1 : 0, use_expert_cache ? 1 : 0, has_placement_plan ? 1 : 0,
+                                (long long) ids->ne[1], (long long) n_ids, row_maps_total,
+                                ggml_sycl_layout_mode_name(route_layout), (int) src0->type, (int) src1->type,
+                                (int) dst->type, (long long) ne00, (long long) ne01, (long long) ne10, (long long) ne0,
+                                (long long) ne12, nb11, nb1);
                     }
                 }
                 if (tiled_claimed_op) {
@@ -88554,26 +88715,50 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // the time a caller reads what().
                     static thread_local std::string tiled_claim_msg;
                     tiled_claim_msg = std::string("[MOE-PP-ONEDNN-BATCHED] XMX_TILED-claimed op '") +
-                                      (src0 && src0->name ? src0->name : "?") + "' declined (" +
-                                      (reason ? reason : "unknown") +
+                                      (src0 && src0->name ? src0->name : "?") + "' declined (" + reason +
                                       "); refusing rather than falling through to the SOA-only staging fallback "
                                       "(llama.cpp-71hx)";
                     throw ggml_sycl_fallback_error(tiled_claim_msg.c_str());
                 }
                 return false;
             };
-            if (pp_cpu_reference || !pp_mxfp4_soa_f16_batched_env_enabled || !pp_mxfp4_soa_f16_candidate ||
-                !use_expert_cache || !has_placement_plan || ids->ne[1] <= 1 || row_maps_total == 0) {
-                return trace_batched_skip("precheck");
+            const auto trace_batched_skip = [&](moe_pp_batched_refusal refusal, const char * detail,
+                                                int64_t expert_id = -1) {
+                return decline_batched(refusal, detail, expert_id, false);
+            };
+            const auto reject_batched = [&](moe_pp_batched_refusal refusal, const char * detail,
+                                            int64_t expert_id = -1) {
+                return decline_batched(refusal, detail, expert_id, true);
+            };
+            if (pp_cpu_reference) {
+                return trace_batched_skip(moe_pp_batched_refusal::CPU_REFERENCE, nullptr);
+            }
+            if (!pp_f16_batched_env_enabled) {
+                return trace_batched_skip(moe_pp_batched_refusal::ROUTE_OFF, nullptr);
+            }
+            if (!pp_batched_candidate) {
+                return trace_batched_skip(moe_pp_batched_refusal::CANDIDATE, nullptr);
+            }
+            if (!use_expert_cache) {
+                return trace_batched_skip(moe_pp_batched_refusal::NO_EXPERT_CACHE, nullptr);
+            }
+            if (!has_placement_plan) {
+                return trace_batched_skip(moe_pp_batched_refusal::NO_PLAN, nullptr);
+            }
+            if (ids->ne[1] <= 1) {
+                return trace_batched_skip(moe_pp_batched_refusal::DECODE, nullptr);
+            }
+            if (row_maps_total == 0) {
+                return trace_batched_skip(moe_pp_batched_refusal::NO_ROWS, nullptr);
             }
             if (ne00 <= 0 || ne01 <= 0 || ne10 <= 0 || ne0 <= 0 || ne00 != ne10 || ne01 != ne0 ||
-                (ne00 % QK_MXFP4) != 0 || nb11 != static_cast<size_t>(ne10) * sizeof(float) ||
+                (ne00 % ggml_blck_size(src0->type)) != 0 || nb11 != static_cast<size_t>(ne10) * sizeof(float) ||
                 nb1 != static_cast<size_t>(ne0) * sizeof(float)) {
-                return trace_batched_skip("dims");
+                return trace_batched_skip(moe_pp_batched_refusal::DIMS, nullptr);
             }
             if (ne00 > std::numeric_limits<int>::max() || ne01 > std::numeric_limits<int>::max() ||
                 ne0 > std::numeric_limits<int>::max()) {
-                return trace_batched_skip("dims-overflow");
+                return trace_batched_skip(moe_pp_batched_refusal::DIMS_OVERFLOW, nullptr);
             }
 
             struct pp_onednn_batched_expert {
@@ -88581,20 +88766,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 size_t                row_begin = 0;
                 size_t                row_end   = 0;
                 void *                ptr       = nullptr;
+                layout_mode           layout    = GGML_LAYOUT_AOS;  // the layout the expert is materialized in
                 ggml_sycl::mem_handle lease;
-            };
-
-            const auto reject_batched = [&](const char * reason, int64_t expert_id = -1) {
-                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                    static std::atomic<int> reject_log{ 0 };
-                    if (reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
-                        GGML_LOG_INFO(
-                            "[MOE-PP-ONEDNN-F16-BATCHED] rejected tensor=%s device=%d expert=%lld reason=%s\n",
-                            src0 && src0->name ? src0->name : "?", ctx.device, (long long) expert_id,
-                            reason ? reason : "unknown");
-                    }
-                }
-                return trace_batched_skip(reason, expert_id);
             };
 
             // host-stall attribution cycle, phase 3/6: everything from
@@ -88633,9 +88806,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // throws via trace_batched_skip rather than silently
                 // degrading to the SOA-only staging fallback).
                 moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));
-                if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || !route.ptr ||
-                    route.actual_layout != route_layout || !route.lease.valid()) {
-                    return reject_batched(ggml_sycl_expert_resolve_reason_name(route.reason), i02);
+                if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || !route.ptr || !route.lease.valid()) {
+                    return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
+                                          ggml_sycl_expert_resolve_reason_name(route.reason), i02);
+                }
+                if (route.actual_layout != route_layout) {
+                    return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT,
+                                          ggml_sycl_layout_mode_name(route.actual_layout), i02);
                 }
                 if (route.has_ready_event) {
                     ready_events.push_back(route.ready_event);
@@ -88646,17 +88823,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 expert.row_begin = row_begin;
                 expert.row_end   = row_end;
                 expert.ptr       = route.ptr;
+                expert.layout    = route.actual_layout;
                 expert.lease     = std::move(route.lease);
                 active_experts.push_back(std::move(expert));
                 max_rows_per_expert = std::max(max_rows_per_expert, rows);
             }
 
             if (active_experts.empty() || max_rows_per_expert == 0) {
-                return trace_batched_skip("no-active-experts");
+                return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS, nullptr);
             }
             if (active_experts.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
                 max_rows_per_expert > static_cast<size_t>(std::numeric_limits<int>::max())) {
-                return reject_batched("dims-overflow");
+                return reject_batched(moe_pp_batched_refusal::DIMS_OVERFLOW, "experts-or-rows");
             }
 
             // llama.cpp-dboi: one rectangular GEMM padded to the busiest expert
@@ -88733,8 +88911,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const int64_t tile_n_total      = static_cast<int64_t>(xmx_caps_for_tile.N) *
                                          static_cast<int64_t>(std::max(xmx_caps_for_tile.optimal_tiles_n, 0));
             if (experts_are_tiled && tile_n_total <= 0) {
-                return reject_batched("xmx-tile-caps-unavailable");
+                return reject_batched(moe_pp_batched_refusal::XMX_TILE_CAPS, nullptr);
             }
+            // llama.cpp-348c: the WOQ arm is MXFP4's alone (moe_pp_batched_woq_supports_layout); every other type the
+            // tables take, and MXFP4 under GGML_SYCL_MOE_PP_WOQ=0, runs the f16 arm.
+            const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);
             // llama.cpp-sr83 (fix cycle, defect 1 -- team-lead COMPARE evidence
             // 2026-08-22): dequantize_row_mxfp4_soa_to_fp16_rowmajor (the f16
             // arm's only dequant kernel) reads its SOA-shaped index math
@@ -88758,7 +88939,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // ggml_sycl_moe_pp_onednn_batched_claims_tensor() call the
             // claims predicate uses, which is now ALSO gated on
             // ggml_sycl_moe_pp_woq_enabled() -- so whenever this branch's
-            // condition (experts_are_tiled && !pp_woq_enabled) is true,
+            // condition (experts_are_tiled && !pp_woq_arm) is true,
             // tiled_claimed_op is false too, and reject_batched() returns
             // false silently rather than throwing. That is fine here
             // specifically: the op was never truly claimed either, so a
@@ -88766,12 +88947,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // exactly right (the same shape WOQ=0 already produces via the
             // predicate). Do not read this as evidence the throw path
             // fires from this branch -- it does not.
-            if (experts_are_tiled && !pp_woq_enabled) {
-                return reject_batched("f16-arm-no-tiled-dequant");
+            if (experts_are_tiled && !pp_woq_arm) {
+                return reject_batched(moe_pp_batched_refusal::F16_TILED, nullptr);
+            }
+            // llama.cpp-348c: the f16 arm dequantizes MXFP4 with its own SOA row-major kernel and every other type with
+            // the converter for the layout its experts are materialized in. The loop above refused any expert whose
+            // layout differs from the route's, so the first expert's layout is every expert's. Q8_0's SOA experts
+            // take dequantize_row_q8_0_soa_to_fp16_rowmajor in the loop below, as the PP dequant pipeline's do:
+            // ggml_get_to_fp16_sycl_for_layout answers Q8_0 with the AOS kernel for every layout.
+            const bool pp_q8_0_soa = src0->type == GGML_TYPE_Q8_0 && active_experts.front().layout == GGML_LAYOUT_SOA;
+            to_fp16_sycl_t pp_to_fp16 = nullptr;
+            if (!pp_woq_arm && src0->type != GGML_TYPE_MXFP4 && !pp_q8_0_soa) {
+                pp_to_fp16 = ggml_get_to_fp16_sycl_for_layout(src0->type, active_experts.front().layout);
+                if (pp_to_fp16 == nullptr) {
+                    return reject_batched(moe_pp_batched_refusal::NO_DEQUANT,
+                                          ggml_sycl_layout_mode_name(active_experts.front().layout));
+                }
             }
 
             const size_t active_count          = active_experts.size();
             size_t       weight_elems          = 0;  // f16-arm only: half-elements per expert weight slot
+            size_t       f16_expert_bytes      = 0;  // f16-arm only: one expert's f16 matrix
             size_t       act_slot_elems        = 0;
             size_t       out_slot_elems        = 0;
             size_t       total_act_elems       = 0;
@@ -88788,9 +88984,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 !checked_mul(out_slot_elems, active_count, total_out_elems) ||
                 !checked_mul(total_act_elems, sizeof(sycl::half), act_bytes) ||
                 !checked_mul(total_out_elems, sizeof(float), out_bytes)) {
-                return reject_batched("scratch-size-overflow");
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
             }
-            if (pp_woq_enabled) {
+            if (pp_woq_arm) {
                 // The weight slot holds the two WOQ planes back to back --
                 // nibbles (K*N/2 bytes) then e8m0 scales ((K/QK_MXFP4)*N
                 // bytes), each 256-byte aligned. ~4x smaller than the
@@ -88803,21 +88999,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (!checked_mul(static_cast<size_t>(ne01), static_cast<size_t>(ne00) / 2, nibble_bytes_per_expert) ||
                     !checked_mul(static_cast<size_t>(blocks_per_row), static_cast<size_t>(ne01),
                                  scale_bytes_per_expert)) {
-                    return reject_batched("scratch-size-overflow");
+                    return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                 }
                 woq_nibble_slot_bytes = align_up_256(nibble_bytes_per_expert);
                 woq_scale_slot_bytes  = align_up_256(scale_bytes_per_expert);
                 weight_slot_bytes     = woq_nibble_slot_bytes + woq_scale_slot_bytes;
                 if (!checked_mul(weight_slot_bytes, active_count, weight_bytes)) {
-                    return reject_batched("scratch-size-overflow");
+                    return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                 }
             } else {
-                size_t total_weight_elems = 0;
+                // llama.cpp-348c: the f16 arm asks the admission for one expert's f16 matrix. It runs in the weight
+                // slot the plan sized for the ring, which holds about a quarter of every expert in f16, and groups
+                // the active experts to fit the slot it claims (moe_pp_batched_f16_plan_groups, after the claim).
                 if (!checked_mul(static_cast<size_t>(ne01), static_cast<size_t>(ne00), weight_elems) ||
-                    !checked_mul(weight_elems, active_count, total_weight_elems) ||
-                    !checked_mul(total_weight_elems, sizeof(sycl::half), weight_bytes)) {
-                    return reject_batched("scratch-size-overflow");
+                    !checked_mul(weight_elems, sizeof(sycl::half), f16_expert_bytes)) {
+                    return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                 }
+                weight_bytes = f16_expert_bytes;
             }
 
             sycl::half * batched_weights      = nullptr;  // f16-arm only
@@ -88836,7 +89034,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*ctx.stream());
             if (!cache) {
-                return reject_batched("scratch-cache-unavailable");
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_CACHE, nullptr);
             }
 
             const size_t planned_weight =
@@ -88878,7 +89076,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         weight_bytes, act_bytes, out_bytes, planned_weight, planned_act, planned_out,
                         required_shape.ring_depth, planned_ring_depth);
                 }
-                if (pp_mxfp4_soa_f16_batched_trace) {
+                if (pp_f16_batched_trace) {
                     fprintf(stderr,
                             "[MOE-PP-ONEDNN-F16-BATCHED-ADMISSION] tensor=%s device=%d reason=%s active=%zu "
                             "planned_weight=%zu required_weight=%zu planned_act=%zu required_act=%zu "
@@ -88888,7 +89086,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             planned_weight, weight_bytes, planned_act, act_bytes, planned_out, out_bytes,
                             planned_ring_depth, required_shape.ring_depth);
                 }
-                return reject_batched(ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason));
+                const char * reason_name = ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason);
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_UNPLANNED, reason_name);
             }
 
             // Admission has already refused a zero planned ring depth, so the
@@ -88897,27 +89096,36 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // derived in exactly one place.
             const uint32_t ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth);
             if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {
-                return reject_batched("planned-scratch-unavailable");
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_RESERVE, nullptr);
             }
 
             uint32_t                                             scratch_slot = std::numeric_limits<uint32_t>::max();
             ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
             if (!pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)) {
-                return reject_batched("scratch-slot-unavailable");
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_SLOT, "local-slot");
             }
             const bool fail_after_local_reservation = pp_moe_onednn_claim_fail_after_local_reservation();
             if (fail_after_local_reservation || !cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)) {
                 pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);
-                return reject_batched("scratch-slot-unavailable");
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_SLOT, "cache-slot");
             }
             batched_scratch_claim.activate(ctx.device, ring_depth, scratch_slot, reserved.generation, ctx.stream());
             if (reserved.weight_size < weight_bytes || reserved.activation_size < act_bytes ||
                 reserved.output_size < out_bytes) {
                 batched_scratch_claim.release_unused();
-                return reject_batched("scratch-slot-size");
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_SLOT_SIZE, nullptr);
+            }
+            // The f16 arm's groups: what the slot it claimed holds, capped by GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX.
+            // The check above leaves room for one expert, so there is at least one group. The WOQ arm repacks every
+            // active expert into its own planned slot and runs as one group.
+            moe_pp_batched_f16_groups f16_groups;
+            if (!pp_woq_arm) {
+                f16_groups = moe_pp_batched_f16_plan_groups(reserved.weight_size, f16_expert_bytes, active_count,
+                                                            ggml_sycl_moe_pp_f16_group_experts_max());
+                GGML_ASSERT(f16_groups.groups > 0);
             }
 
-            if (pp_woq_enabled) {
+            if (pp_woq_arm) {
                 batched_weight_bytes = static_cast<uint8_t *>(reserved.weight);
             } else {
                 batched_weights = static_cast<sycl::half *>(reserved.weight);
@@ -88953,7 +89161,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // nothing unused. See mxfp4_pp_batched_profile_accum above for
             // the component definitions and mxfp4_pp_batched_profile_print_and_reset
             // for where these are read.
-            const bool               pp_profile = mxfp4_pp_batched_profile_enabled();
+            // llama.cpp-348c: the mxfp4.pp.* labels and GGML_SYCL_MXFP4_PP_PROFILE stay MXFP4's, byte for byte; the
+            // other types are profiled under moe.pp.* by GGML_SYCL_KERNEL_PROFILE alone.
+            const bool   pp_mxfp4_labels       = src0->type == GGML_TYPE_MXFP4;
+            const bool   pp_profile            = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();
+            const char * pp_dequant_label_name = pp_mxfp4_labels ? nullptr : ggml_sycl_moe_pp_dequant_label(src0->type);
             std::vector<sycl::event> pp_profile_repack_begin;
             std::vector<sycl::event> pp_profile_repack_end;
             std::vector<sycl::event> pp_profile_stage_events;
@@ -88992,7 +89204,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // has more active slots than that (not reached by any shipped
             // MXFP4 model; GPT-OSS 20B's max is 32).
             const bool woq_repack_batched =
-                pp_woq_enabled && active_experts.size() <= static_cast<size_t>(GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
+                pp_woq_arm && active_experts.size() <= static_cast<size_t>(GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
             if (woq_repack_batched) {
                 std::vector<const void *> repack_srcs;
                 repack_srcs.reserve(active_experts.size());
@@ -89036,10 +89248,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
+            // One row gather per active expert here, and one f16 dequant per active expert in the phase loop below
+            // (~1024 launches per tensor on Qwen3.8); batching them through a pointer table, as llama.cpp-1lon did
+            // for the repack, is llama.cpp-cl5q.
             for (size_t slot = 0; slot < active_experts.size(); ++slot) {
                 const pp_onednn_batched_expert & expert = active_experts[slot];
                 const size_t                     rows   = expert.row_end - expert.row_begin;
-                if (pp_woq_enabled) {
+                if (pp_woq_arm) {
                     if (!woq_repack_batched) {
                         // Fallback: this dispatch exceeded the batched
                         // launch's slot capacity (see GGML_SYCL_MXFP4_WOQ_
@@ -89067,9 +89282,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
                     // else: already repacked in one batched launch above.
-                } else {
-                    dequantize_row_mxfp4_soa_to_fp16_rowmajor(expert.ptr, batched_weights + slot * weight_elems,
-                                                              blocks_per_row, static_cast<int>(ne01), ctx.stream());
                 }
 
                 sycl::range<3>          block_dims(1, 1, pp_copy_work_group_size(ne10));
@@ -89090,8 +89302,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // thing gated on GGML_SYCL_KERNEL_PROFILE, and skips all
                 // chrono/recording work when it's off.
                 ggml_sycl_profile_label stage_label{};
-                stage_label.name       = "mxfp4.pp.stage.act";
-                stage_label.category   = "mxfp4.pp.stage";
+                stage_label.name       = pp_mxfp4_labels ? "mxfp4.pp.stage.act" : "moe.pp.stage.act";
+                stage_label.category   = pp_mxfp4_labels ? "mxfp4.pp.stage" : "moe.pp.stage";
                 stage_label.queue_kind = "compute";
                 stage_label.metadata   = "phase=activation_copy_in";
                 stage_label.device     = ctx.device;
@@ -89115,19 +89327,78 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
+            // llama.cpp-348c: one expert's ne00 x ne01 matrix into f16 at `dst`, from the pointer its lease resolved;
+            // the lease is held until the done marker below. MXFP4 has its own SOA row-major kernel. The other
+            // converters return no event, so the profiler gets the in-order queue's last one, asked only while it
+            // records.
+            auto dequant_expert_f16 = [&](const pp_onednn_batched_expert & expert, sycl::half * dst) {
+                if (src0->type == GGML_TYPE_MXFP4) {
+                    dequantize_row_mxfp4_soa_to_fp16_rowmajor(expert.ptr, dst, blocks_per_row, static_cast<int>(ne01),
+                                                              ctx.stream());
+                    return;
+                }
+                ggml_sycl_profile_label dequant_label{};
+                dequant_label.name       = pp_dequant_label_name;
+                dequant_label.category   = "moe.pp.dequant";
+                dequant_label.queue_kind = "compute";
+                dequant_label.metadata   = "phase=expert_dequant_f16";
+                dequant_label.device     = ctx.device;
+                dequant_label.bytes      = weight_elems * sizeof(sycl::half);
+                const void * expert_src  = expert.ptr;
+                (void) ggml_sycl_profile_submit(*stream, dequant_label, [&](sycl::queue & profiled_queue) {
+                    if (pp_q8_0_soa) {
+                        dequantize_row_q8_0_soa_to_fp16_rowmajor(expert_src, dst, static_cast<int>(ne00 / QK8_0),
+                                                                 static_cast<int>(ne01), &profiled_queue);
+                    } else {
+                        pp_to_fp16(expert_src, dst, static_cast<int64_t>(weight_elems), &profiled_queue);
+                    }
+                    if (!ggml_sycl_kernel_profile_enabled()) {
+                        return sycl::event{};
+                    }
+                    const std::optional<sycl::event> last = profiled_queue.ext_oneapi_get_last_event();
+                    return last ? *last : profiled_queue.ext_oneapi_submit_barrier();
+                });
+            };
+
+            // llama.cpp-348c: the phases the GEMMs run in. The WOQ arm, and an f16 arm whose slot holds every active
+            // expert, run one phase over all of them: the single batched pass this executor has always run.
+            // Otherwise the f16 arm runs f16_groups.groups phases of at most experts_per_group experts, each
+            // dequantized into one buffer of the slot. With two buffers, the slot's halves, phase p uses half p % 2,
+            // so phase p + 1 dequantizes into the other half while phase p's GEMMs still read theirs. A half's
+            // readers, the GEMM events of the phase that last used it, gate the next dequant into it on the device
+            // (the loop below); no host wait.
+            struct pp_batched_phase {
+                size_t begin  = 0;  // the phase's first active expert, an index into active_experts
+                size_t end    = 0;
+                size_t buffer = 0;  // the f16 slot buffer its experts are dequantized into
+            };
+            const size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group;
+            const size_t phase_buffers = pp_woq_arm ? 1 : f16_groups.buffers;
+            const size_t half_elems    = phase_experts * weight_elems;  // one buffer's half-elements (f16 arm)
+            std::vector<pp_batched_phase> phases;
+            phases.reserve((active_count + phase_experts - 1) / phase_experts);
+            for (size_t begin = 0; begin < active_count; begin += phase_experts) {
+                pp_batched_phase phase;
+                phase.begin  = begin;
+                phase.end    = std::min(active_count, begin + phase_experts);
+                phase.buffer = phases.size() % phase_buffers;
+                phases.push_back(phase);
+            }
+            std::array<std::vector<sycl::event>, 2> half_readers;
+
             // The batched oneDNN primitive's execution is not reliably ordered
             // with the wrapped in-order SYCL queue by submission order alone
             // (llama.cpp-dboi -- empirically bisected: async scatter+tail
             // hangs/aborts without explicit event chaining, a host wait right
             // after the GEMM cures it, sync-only-first-dispatch does not). Fix
             // with explicit events instead of a host wait: capture a barrier
-            // over everything queued so far (the per-expert dequant + activation
-            // copies above) as the GEMM's input dependency, then barrier again
-            // on the GEMM's own completion event so every later submission on
-            // this in-order queue -- the dst-scatter loop and the done marker --
-            // observes it.
+            // over everything queued so far (the activation copies above and
+            // the phase's per-expert dequant) as each phase's GEMM input
+            // dependency, then barrier again on every GEMM's own completion
+            // event so every later submission on this in-order queue -- the
+            // dst-scatter loop and the done marker -- observes it.
             std::vector<sycl::event> gemm_events;
-            gemm_events.reserve(gemm_groups.size());
+            gemm_events.reserve(gemm_groups.size() + phases.size());
             // llama.cpp-6405 fix cycle (F1, BLOCKING -- confirmed on hardware:
             // woq_gemm=0.000 ms/459-462 on both B70 and B50 profiling runs):
             // gemm_events' own profiling info is NOT a valid timing source for
@@ -89167,9 +89438,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // reached at all).
             std::optional<sycl::event> gemm_profile_begin;
             std::optional<sycl::event> gemm_profile_end;
+
+            // Holds every active expert's lease until `until` completes: the dequants read the expert from its
+            // lease, so the lease outlives them. Used on the failure path below and by both success branches.
+            auto retain_expert_leases_until = [&](const sycl::event & until) {
+                std::vector<ggml_sycl::mem_handle> leases;
+                leases.reserve(active_experts.size());
+                for (pp_onednn_batched_expert & expert : active_experts) {
+                    if (expert.lease.valid()) {
+                        leases.push_back(std::move(expert.lease));
+                    }
+                }
+                if (!leases.empty()) {
+                    ggml_sycl::retain_handles_until_event(std::move(leases), until);
+                }
+            };
             // Both ways this stage can fail (a thrown error, or a declined scratchpad) take the same path, so the tail
             // is shared: the non-batched MoE path, or the named error for an XMX_TILED-claimed op. Returns false.
-            auto                       gemm_stage_failed = [&](const char * what) -> bool {
+            auto gemm_stage_failed = [&](const char * what) -> bool {
+                warn_batched_refusal(moe_pp_batched_refusal::GEMM, what);
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> gemm_fail_log{ 0 };
                     if (gemm_fail_log.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -89177,6 +89464,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                       src0 && src0->name ? src0->name : "?", what);
                     }
                 }
+                // The stage may fail after some phases ran, with dequants and GEMMs still in flight. The oneDNN
+                // primitive is not ordered with this queue (llama.cpp-dboi), so the claim's release marker, ordered
+                // by submission alone, could complete before a GEMM that still writes the slot. Barrier on the GEMMs
+                // already submitted (a plain barrier, after the dequants, when there are none), hold the experts'
+                // leases until it, and only then finish the claim, whose marker follows the barrier on this queue.
+                // A barrier that cannot be submitted means a broken queue; it throws, as any submission here does.
+                const sycl::event drained = gemm_events.empty() ? stream->ext_oneapi_submit_barrier() :
+                                                                  stream->ext_oneapi_submit_barrier(gemm_events);
+                retain_expert_leases_until(drained);
                 batched_scratch_claim.finish_or_release();
                 // llama.cpp-sr83: an XMX_TILED-claimed op must not fall
                 // through to the SOA-only staging fallback (see
@@ -89195,55 +89491,83 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return false;
             };
             bool gemm_declined = false;
-            // host-stall attribution cycle, phase 5/6: repack/activation-
-            // stage kernel dispatch (components 1/2/4's own device-event
-            // markers cover their DEVICE time; this is that dispatch's HOST
-            // submission cost, not previously measured) plus any other prep
-            // between grouping and here.
-            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
-                            &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
-            try {
-                const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
-                if (pp_profile) {
-                    gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
-                }
-                for (const pp_gemm_group & group : gemm_groups) {
-                    // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
-                    // batched scratch buffers, never dst, so the whole stage takes the failure path below.
-                    std::optional<sycl::event> group_event;
-                    if (pp_woq_enabled) {
-                        group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
-                            ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
-                            /* k = */ static_cast<int>(ne00), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
-                            batched_weight_bytes + group.begin * weight_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
-                            batched_weight_bytes + group.begin * weight_slot_bytes + woq_nibble_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes), batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
-                            static_cast<int>(group.end - group.begin), ctx.stream(), { deps_in });
-                    } else {
-                        group_event = DnnlGemmWrapper::gemm_batch_strided(
-                            ctx,
-                            /* trans_a = */ true,
-                            /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
-                            static_cast<int>(ne00), 1.0f, batched_weights + group.begin * weight_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
-                            static_cast<int64_t>(weight_elems), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
-                            static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
-                            static_cast<int64_t>(out_slot_elems), static_cast<int>(group.end - group.begin),
-                            ctx.stream(), { deps_in });
+            for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {
+                const pp_batched_phase & phase         = phases[p];
+                sycl::half *             phase_weights = batched_weights + phase.buffer * half_elems;
+                if (!pp_woq_arm) {
+                    // The GEMMs that last read this half finish before its experts are overwritten: a barrier on
+                    // their events orders every later submission on this in-order queue after them, on the device.
+                    // Submission order alone does not, because the oneDNN primitive is not ordered with the queue
+                    // (llama.cpp-dboi, the comment above).
+                    if (!half_readers[phase.buffer].empty()) {
+                        stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);
+                        half_readers[phase.buffer].clear();
                     }
-                    if (!group_event) {
-                        gemm_declined = true;
-                        break;
+                    for (size_t i = phase.begin; i < phase.end; ++i) {
+                        dequant_expert_f16(active_experts[i], phase_weights + (i - phase.begin) * weight_elems);
                     }
-                    gemm_events.push_back(*group_event);
                 }
-            } catch (const std::exception & e) {
-                return gemm_stage_failed(e.what());
+                if (p == 0) {
+                    // host-stall attribution cycle, phase 5/6: repack/activation-
+                    // stage kernel dispatch (components 1/2/4's own device-event
+                    // markers cover their DEVICE time; this is that dispatch's HOST
+                    // submission cost, not previously measured) plus any other prep
+                    // between grouping and here. A later phase's dequant lands in
+                    // phase 6/6 below.
+                    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
+                                    &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
+                }
+                try {
+                    const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
+                    if (pp_profile && p == 0) {
+                        gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
+                    }
+                    // Each GEMM group (experts of similar row counts) clipped to this phase's experts.
+                    for (const pp_gemm_group & group : gemm_groups) {
+                        const size_t lo = std::max(group.begin, phase.begin);
+                        const size_t hi = std::min(group.end, phase.end);
+                        if (lo >= hi) {
+                            continue;
+                        }
+                        // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
+                        // batched scratch buffers, never dst, so the whole stage takes the failure path below.
+                        std::optional<sycl::event> group_event;
+                        if (pp_woq_arm) {
+                            group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
+                                ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
+                                /* k = */ static_cast<int>(ne00), batched_acts + lo * act_slot_elems,
+                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
+                                batched_weight_bytes + lo * weight_slot_bytes,
+                                static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
+                                batched_weight_bytes + lo * weight_slot_bytes + woq_nibble_slot_bytes,
+                                static_cast<int64_t>(weight_slot_bytes), batched_out + lo * out_slot_elems,
+                                DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
+                                static_cast<int>(hi - lo), ctx.stream(), { deps_in });
+                        } else {
+                            group_event = DnnlGemmWrapper::gemm_batch_strided(
+                                ctx,
+                                /* trans_a = */ true,
+                                /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
+                                static_cast<int>(ne00), 1.0f, phase_weights + (lo - phase.begin) * weight_elems,
+                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
+                                static_cast<int64_t>(weight_elems), batched_acts + lo * act_slot_elems,
+                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
+                                static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + lo * out_slot_elems,
+                                DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
+                                static_cast<int64_t>(out_slot_elems), static_cast<int>(hi - lo), ctx.stream(),
+                                { deps_in }, pp_mxfp4_labels ? nullptr : "moe.pp.gemm.execute",
+                                pp_mxfp4_labels ? nullptr : "moe.pp.gemm");
+                        }
+                        if (!group_event) {
+                            gemm_declined = true;
+                            break;
+                        }
+                        gemm_events.push_back(*group_event);
+                        half_readers[phase.buffer].push_back(*group_event);
+                    }
+                } catch (const std::exception & e) {
+                    return gemm_stage_failed(e.what());
+                }
             }
             if (gemm_declined) {
                 return gemm_stage_failed("oneDNN scratchpad declined");
@@ -89455,8 +89779,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // this is now ggml_sycl_profile_submit instead of record-
                 // event.
                 ggml_sycl_profile_label stage_label{};
-                stage_label.name       = "mxfp4.pp.stage.scatter";
-                stage_label.category   = "mxfp4.pp.stage";
+                stage_label.name       = pp_mxfp4_labels ? "mxfp4.pp.stage.scatter" : "moe.pp.stage.scatter";
+                stage_label.category   = pp_mxfp4_labels ? "mxfp4.pp.stage" : "moe.pp.stage";
                 stage_label.queue_kind = "compute";
                 stage_label.metadata   = "phase=output_scatter_out";
                 stage_label.device     = ctx.device;
@@ -89502,7 +89826,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 mxfp4_pp_dispatch_record record;
                 record.tensor_name       = src0 && src0->name ? src0->name : "?";
                 record.experts_are_tiled = experts_are_tiled;
-                record.pp_woq_enabled    = pp_woq_enabled;
+                record.pp_woq_enabled    = pp_woq_arm;
                 record.repack_begin      = std::move(pp_profile_repack_begin);
                 record.repack_end        = std::move(pp_profile_repack_end);
                 record.stage_events      = std::move(pp_profile_stage_events);
@@ -89531,17 +89855,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (release_prompt_down_soa_after_dispatch) {
                 (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
                 const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
-                std::vector<ggml_sycl::mem_handle> leases;
-                leases.reserve(active_experts.size());
-                for (pp_onednn_batched_expert & expert : active_experts) {
-                    if (expert.lease.valid()) {
-                        leases.push_back(std::move(expert.lease));
-                    }
-                }
+                retain_expert_leases_until(done);
                 active_experts.clear();
-                if (!leases.empty()) {
-                    ggml_sycl::retain_handles_until_event(std::move(leases), done);
-                }
                 if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> transient_down_release_log{ 0 };
                     if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
@@ -89553,27 +89868,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
             } else {
-                std::vector<ggml_sycl::mem_handle> leases;
-                leases.reserve(active_experts.size());
-                for (pp_onednn_batched_expert & expert : active_experts) {
-                    if (expert.lease.valid()) {
-                        leases.push_back(std::move(expert.lease));
-                    }
-                }
-                if (!leases.empty()) {
-                    ggml_sycl::retain_handles_until_event(std::move(leases), done);
-                }
+                retain_expert_leases_until(done);
             }
 
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                // The weight figure is what this dispatch used of the slot: the WOQ planes of every active expert,
+                // or the f16 arm's buffers.
+                const size_t weight_used_bytes =
+                    pp_woq_arm ? weight_bytes : phase_buffers * half_elems * sizeof(sycl::half);
                 static std::atomic<int> batched_log{ 0 };
                 if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96) {
                     GGML_LOG_INFO(
                         "[MOE-PP-ONEDNN-F16-BATCHED] tensor=%s device=%d layout=%s experts=%zu rows=%zu "
-                        "max_rows=%zu scratch=planned-unified-cache weight=%.1fMB act=%.1fMB out=%.1fMB\n",
+                        "max_rows=%zu scratch=planned-unified-cache weight=%.1fMB act=%.1fMB out=%.1fMB "
+                        "groups=%zu group_experts=%zu buffers=%zu\n",
                         src0 && src0->name ? src0->name : "?", ctx.device, ggml_sycl_layout_mode_name(route_layout),
-                        active_count, row_maps_total, max_rows_per_expert, weight_bytes / (1024.0 * 1024.0),
-                        act_bytes / (1024.0 * 1024.0), out_bytes / (1024.0 * 1024.0));
+                        active_count, row_maps_total, max_rows_per_expert, weight_used_bytes / (1024.0 * 1024.0),
+                        act_bytes / (1024.0 * 1024.0), out_bytes / (1024.0 * 1024.0), phases.size(), phase_experts,
+                        phase_buffers);
                 }
             }
             if (g_moe_profile_enabled) {
@@ -89586,12 +89898,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 auto & stats = ggml_sycl::get_moe_dispatch_stats(ctx.device);
                 stats.record_route_residency(static_cast<int>(row_maps_total), 0, 0, 0, 0, 0);
             }
+            // llama.cpp-348c: one line per (device, type, layout) saying the executor took this type in this layout,
+            // in which arm, how many experts the dispatch batched, in how many groups, and the planned weight slot
+            // it ran in.
+            if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)) {
+                GGML_LOG_INFO(
+                    "[PP-MOE] device=%d type=%s layout=%s arm=%s experts=%zu groups=%zu planned_weight_slot=%zu\n",
+                    ctx.device, ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout),
+                    pp_woq_arm ? "woq" : "f16", active_count, phases.size(), planned_weight);
+            }
             return true;
 #else
             return false;
 #endif
         };
-        if (try_pp_mxfp4_soa_onednn_f16_batched()) {
+        if (try_pp_onednn_f16_batched()) {
             return;
         }
 
@@ -120861,7 +121182,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // activation (ggml_add_id -> ggml_dup_tensor(ctx, a)), not an expert
             // weight, so an MMID expert-weight coverage table would refuse every
             // MoE bias-add to the CPU backend. It keeps the allowlist below.
-            if (!moe_mmvq_admission_supports_type(indexed_a_type)) {
+            // llama.cpp-348c: a type with no MMID kernel is still admitted for a prompt the batched prompt executor
+            // claims (ggml_sycl_moe_pp_batched_admits_op), which needs a published plan, so an op without one stays
+            // refused to the CPU backend.
+            if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device)) {
                 return false;
             }
         } else if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&

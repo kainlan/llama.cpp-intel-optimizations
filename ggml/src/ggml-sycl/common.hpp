@@ -1420,7 +1420,7 @@ static inline mxfp4_grouped_dpas_decision ggml_sycl_select_mxfp4_grouped_dpas(co
 }
 
 // llama.cpp-dboi: first-class route policy for the oneDNN-batched MoE PP
-// executor (try_pp_mxfp4_soa_onednn_f16_batched, ggml-sycl.cpp). When selected,
+// executor (try_pp_onednn_f16_batched, ggml-sycl.cpp). When selected,
 // three things follow from this one predicate: (a) the layout chokepoint below
 // keeps MXFP4 MoE weights on SOA instead of promoting to XMX_TILED, so the
 // single planned layout is one the batched executor can consume (the
@@ -1454,6 +1454,59 @@ static inline bool ggml_sycl_moe_pp_onednn_batched_route_selected() {
         return env == nullptr || std::atoi(env) != 0;
     }();
     return enabled;
+}
+
+// GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the batched executor off, both its arms, and the MXFP4 per-expert f16 staging
+// fallback with it; unset or any other value keeps them on. It used to be read inside the dispatch alone, so with it at
+// 0 the claim predicate still took ops the executor then declined. The executor's support helper now asks it as well
+// (ggml_sycl_moe_pp_batched_takes_layout), so the claim and the capability query both see the executor off
+// (llama.cpp-348c).
+static inline bool ggml_sycl_moe_pp_onednn_f16_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// llama.cpp-348c: the batched executor's f16 arm takes every expert type with an AOS dequant-to-f16 kernel
+// (moe_pp_batched_f16_supports_layout, moe-mmvq-tables.hpp), not only MXFP4. GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0
+// restricts it to MXFP4 again, at the claim and at dispatch; unset or any other value keeps it on. Read once, like
+// the route knob above. The name is spelled once, here: the accessor reads it and its sycl_env_settings[] row in
+// ggml_check_sycl() names it, so the non-default settings report can name the knob.
+static constexpr const char * GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS";
+
+static inline bool ggml_sycl_moe_pp_f16_batched_aos_enabled() {
+    static const bool aos_enabled = [] {
+        const char * env = std::getenv(GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV);
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return aos_enabled;
+}
+
+// llama.cpp-348c: a debugging cap on the experts one group of the batched executor's f16 arm dequantizes into its
+// buffer of the planned weight slot (moe_pp_batched_f16_plan_groups, moe-mmvq-tables.hpp). Unset or 0 leaves the
+// slot's own fit. A count from 1 to 1024 caps each group at that many experts, so a test can force several groups on
+// a shape whose slot holds more. Anything else warns once and is ignored. Read once; spelled once, here, for the
+// accessor and its sycl_env_settings[] row.
+static constexpr const char * GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV = "GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX";
+
+static inline size_t ggml_sycl_moe_pp_f16_group_experts_max() {
+    static const size_t group_max = [] {
+        const char * env = std::getenv(GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV);
+        if (env == nullptr || env[0] == '\0') {
+            return size_t(0);
+        }
+        char *     end   = nullptr;
+        const long value = std::strtol(env, &end, 10);
+        if (end == env || *end != '\0' || (value != 0 && (value < 1 || value > 1024))) {
+            GGML_LOG_WARN("[PP-MOE] %s=%s is not a count from 1 to 1024; ignoring it\n",
+                          GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV, env);
+            return size_t(0);
+        }
+        return static_cast<size_t>(value);
+    }();
+    return group_max;
 }
 
 static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const XMXCapabilities & caps,

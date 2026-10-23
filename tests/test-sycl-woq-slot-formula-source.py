@@ -2,7 +2,7 @@
 """Host-only source contract: the WOQ scratch-slot byte formula must match,
 byte-for-byte, between the two independent sites that compute it --
 llama_model_sycl_populate_inventory (plan-time sizing, src/llama-model.cpp)
-and try_pp_mxfp4_soa_onednn_f16_batched (per-dispatch sizing,
+and try_pp_onednn_f16_batched (per-dispatch sizing,
 ggml-sycl.cpp). The two sites cannot share a helper (llama-model.cpp does
 not link the SYCL backend's device headers), so this test is the only
 thing that keeps them from silently drifting apart -- an under-sized plan

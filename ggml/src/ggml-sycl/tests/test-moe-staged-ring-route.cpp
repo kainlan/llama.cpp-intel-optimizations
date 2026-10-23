@@ -22,10 +22,12 @@
 //    layout SOA. The same entry naming the AOS-tagged slot as its SOA slot is
 //    refused and counted. So is a Q4_0 AOS entry over the SOA-tagged slot, which
 //    the capability query alone would serve. A Q4_0 SOA entry over the
-//    SOA-tagged slot agrees with its tag but is refused all the same: no prompt
-//    kernel reads Q4_0 as SOA, so the capability query answers no kernel. The
-//    phase's refusals name each cause, as the trace prints them: two layout
-//    refusals and one unsupported, with the query's reason (plan Task 8).
+//    SOA-tagged slot agrees with its tag but is refused all the same: the only
+//    prompt kernel that reads Q4_0 as SOA is the oneDNN batched prompt executor
+//    (llama.cpp-348c), and a staged slot is served only with MMVQ_COMPAT
+//    (c-las5), so the staged route refuses the kernel. The phase's refusals name
+//    each cause, as the trace prints them: two layout refusals and one kernel
+//    refusal, with the query's reason (plan Task 8).
 // 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.
@@ -285,8 +287,9 @@ int main() {
                   moe_batch_reject_reason_name(mistagged.reject));
             counts(backend, &served, &refused);
             CHECK(served == 2 && refused == 2, "the tag refusal is counted (served %zu, refused %zu)", served, refused);
-            // A Q4_0 SOA entry over the SOA-tagged slot: the tags agree, but no prompt kernel reads Q4_0 as SOA (it is
-            // not MMVQ_COMPAT), so the capability refuses it before the tag is looked at.
+            // A Q4_0 SOA entry over the SOA-tagged slot: the tags agree, but the only prompt kernel that reads Q4_0 as
+            // SOA is the oneDNN batched executor (ONEDNN_BATCHED_PROMPT, llama.cpp-348c), and a staged slot is served
+            // only with MMVQ_COMPAT, so the staged route refuses the kernel before the tag is looked at.
             CHECK(test_moe_stream_insert_staged(backend, kLayer, 4, role, slot_s, slot_a, fill_s, GGML_LAYOUT_SOA),
                   "a Q4_0 SOA entry over the SOA-tagged slot goes into the stage table");
             const moe_resolved_batch_result soa_q4 =
@@ -297,8 +300,8 @@ int main() {
             CHECK(served == 2 && refused == 3, "the Q4_0 SOA refusal is counted (served %zu, refused %zu)", served,
                   refused);
             const std::string causes = refusals(backend);
-            CHECK(causes == "layout=2 unsupported(local-layout-unsupported)=1",
-                  "the refusals name their causes: two layout, one unsupported with the query's reason (got \"%s\")",
+            CHECK(causes == "layout=2 kernel(local-onednn-batched-prompt)=1",
+                  "the refusals name their causes: two layout, one kernel with the query's reason (got \"%s\")",
                   causes.c_str());
 
             // Case 5: the next micro-batch starts with an empty table and reads its own slot.

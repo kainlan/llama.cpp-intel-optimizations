@@ -366,8 +366,8 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
 
     # The batched MXFP4 SoA oneDNN executor: the site that must run on planner
     # scratch or not at all.
-    batched = between(sycl, "auto try_pp_mxfp4_soa_onednn_f16_batched = ",
-                      "if (try_pp_mxfp4_soa_onednn_f16_batched())")
+    batched = between(sycl, "auto try_pp_onednn_f16_batched = ",
+                      "if (try_pp_onednn_f16_batched())")
     # The non-batched PP MXFP4 SoA f16 staging: the terminal MoE PP route, which
     # keeps its transient staging but must not enlarge the planned ring.
     staging_start = sycl.find("scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;")
@@ -407,8 +407,10 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
                     "dequantize_row_mxfp4_soa_to_fp16_rowmajor(",
                     "DnnlGemmWrapper::gemm_batch_strided("),
         "the batched executor refuses with the typed reason name":
-            "return reject_batched(ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason));"
-            in batched,
+            ordered(batched,
+                    "const char * reason_name = "
+                    "ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason);",
+                    "return reject_batched(moe_pp_batched_refusal::SCRATCH_UNPLANNED, reason_name);"),
         "the non-batched staging admits before it reserves":
             ordered(staging, "pp_moe_onednn_admit_scratch(planned_shape, required_shape)",
                     "reserve_pp_moe_onednn_scratch(planned_weight_slot, planned_activation_slot,"),
@@ -566,7 +568,7 @@ ABSENCE_MUTANTS = {
     "the batched executor warns unconditionally, once, on refusal": (
         "sycl",
         "if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {",
-        "if (pp_mxfp4_soa_f16_batched_trace &&\n"
+        "if (pp_f16_batched_trace &&\n"
         " ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {"),
     # A latch that is not `static` is reconstructed on every dispatch, so
     # "once per process" silently becomes "every time" -- the spam this exists

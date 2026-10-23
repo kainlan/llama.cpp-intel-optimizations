@@ -5471,6 +5471,40 @@ set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# llama.cpp-348c: the batched oneDNN MoE prompt executor takes every expert type its f16 table admits that the
+# fixture can quantize without an importance matrix (17 types, the k_types list in the test) on a planned model,
+# matches the CPU backend at NMSE <= 5e-4, logs [PP-MOE] once per type, and refuses nothing. Each case runs in the
+# planned weight slot in f16 groups across its two halves: at least three at the slot's own grouping, and exactly
+# what the cap gives in two more Q4_0 cases that the test runs as child processes of itself with
+# GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX at 1 and 3. Pinned to the B50; a run with no SYCL GPU exits 77. The timeout
+# covers 36 cases and the single-threaded IQ quantizers.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-pp-batched-dequant
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-batched-dequant.cpp
+)
+target_include_directories(test-moe-pp-batched-dequant PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-pp-batched-dequant PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-pp-batched-dequant PRIVATE "-fsycl")
+target_link_libraries(test-moe-pp-batched-dequant PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-pp-batched-dequant PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-moe-pp-batched-dequant PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-pp-batched-dequant COMMAND test-moe-pp-batched-dequant)
+set_tests_properties(test-moe-pp-batched-dequant PROPERTIES
+    LABELS "sycl;moe;device;B50"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 600
+)
+endif() # static SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
