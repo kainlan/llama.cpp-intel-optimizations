@@ -438,4 +438,29 @@ inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) 
     return "unknown";
 }
 
+// Whether `refusal` is a decline the executor reaches only after the claim steered the op to it, past the MMVQ
+// probes and the fused routes. Such a decline loses the fast path silently, so the executor reports it once per
+// (device, cause) at default verbosity. The other causes are prechecks: the op was never this executor's, or it had
+// nothing to run, so they stay behind GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE. SCRATCH_UNPLANNED is left out
+// because its admission refusal already warns at default verbosity, once per process, with the sizes. DIMS_OVERFLOW
+// stays trace-only at both of its sites, since one cause has one latch bit and its first site is a precheck.
+inline bool moe_pp_batched_refusal_after_claim(moe_pp_batched_refusal refusal) {
+    switch (refusal) {
+        case moe_pp_batched_refusal::EXPERT_NOT_LOCAL:
+        case moe_pp_batched_refusal::EXPERT_LAYOUT:
+        case moe_pp_batched_refusal::XMX_TILE_CAPS:
+        case moe_pp_batched_refusal::F16_TILED:
+        case moe_pp_batched_refusal::NO_DEQUANT:
+        case moe_pp_batched_refusal::SCRATCH_SIZE:
+        case moe_pp_batched_refusal::SCRATCH_CACHE:
+        case moe_pp_batched_refusal::SCRATCH_RESERVE:
+        case moe_pp_batched_refusal::SCRATCH_SLOT:
+        case moe_pp_batched_refusal::SCRATCH_SLOT_SIZE:
+        case moe_pp_batched_refusal::GEMM:
+            return true;
+        default:
+            return false;
+    }
+}
+
 #endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP

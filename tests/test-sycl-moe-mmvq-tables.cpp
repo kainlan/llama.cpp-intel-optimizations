@@ -531,6 +531,34 @@ int main() {
         }
     }
 
+    // 9b. Post-claim causes warn at default verbosity; prechecks stay behind the trace knob. The list is written out
+    //     here rather than read from the header, so a cause moved across the split fails this table.
+    const moe_pp_batched_refusal pp_post_claim[] = {
+        moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
+        moe_pp_batched_refusal::EXPERT_LAYOUT,
+        moe_pp_batched_refusal::XMX_TILE_CAPS,
+        moe_pp_batched_refusal::F16_TILED,
+        moe_pp_batched_refusal::NO_DEQUANT,
+        moe_pp_batched_refusal::SCRATCH_SIZE,
+        moe_pp_batched_refusal::SCRATCH_CACHE,
+        moe_pp_batched_refusal::SCRATCH_RESERVE,
+        moe_pp_batched_refusal::SCRATCH_SLOT,
+        moe_pp_batched_refusal::SCRATCH_SLOT_SIZE,
+        moe_pp_batched_refusal::GEMM,
+    };
+    for (int r = 0; r <= pp_refusal_count; ++r) {
+        const moe_pp_batched_refusal refusal = static_cast<moe_pp_batched_refusal>(r);
+        bool                         want    = false;
+        for (const moe_pp_batched_refusal post : pp_post_claim) {
+            want = want || post == refusal;
+        }
+        if (moe_pp_batched_refusal_after_claim(refusal) != want) {
+            std::printf("FAIL: refusal %s is %s, want %s\n", moe_pp_batched_refusal_name(refusal),
+                        want ? "trace-only" : "loud", want ? "loud (post-claim)" : "trace-only (precheck)");
+            ++failures;
+        }
+    }
+
     // 10. Per-expert entries: the batched executor resolves each expert's own cache entry, so its claim takes a
     // planned layout only where those entries exist. A host-buffer weight (every default load) has one per expert in
     // any planned layout, staged by the load-end preload. A device-buffer weight (GGML_SYCL_WEIGHTS_EVICTABLE=0) has

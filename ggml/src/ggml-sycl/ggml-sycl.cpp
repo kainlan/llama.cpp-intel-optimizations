@@ -88703,13 +88703,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // and is exempted -- it is not a failure of this executor.
             const bool tiled_claimed_op = !pp_cpu_reference && route_layout == GGML_LAYOUT_XMX_TILED &&
                                           ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
-            // llama.cpp-348c: every decline names its cause from moe_pp_batched_refusal. Under the trace knob a cause
-            // is reported once per (device, cause) as a WARN, beside the capped per-dispatch trace; route_logged adds
-            // the GGML_SYCL_MOE_ROUTE_LOG line reject_batched has always printed. `detail` is the site's own reason (a
+            // llama.cpp-348c: every decline names its cause from moe_pp_batched_refusal, reported once per (device,
+            // cause) as a WARN beside the capped per-dispatch trace. A post-claim cause
+            // (moe_pp_batched_refusal_after_claim) prints at default verbosity: the claim already steered the op past
+            // the MMVQ probes and the fused routes, so the decline quietly loses the fast path, and a run that lost it
+            // looks exactly like one that never had it (the scratch admission refusal below warns for the same
+            // reason). A precheck cause prints only under the trace knob. route_logged adds the
+            // GGML_SYCL_MOE_ROUTE_LOG line reject_batched has always printed. `detail` is the site's own reason (a
             // resolver, layout or admission reason name), or null when the cause says it all.
             // The one "[PP-MOE] refused" printer: every decline below and the GEMM stage's failure report through it.
             const auto warn_batched_refusal = [&](moe_pp_batched_refusal refusal, const char * detail) {
-                if (pp_f16_batched_trace && ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)) {
+                if ((pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&
+                    ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)) {
                     GGML_LOG_WARN("[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s\n",
                                   ctx.device, moe_pp_batched_refusal_name(refusal), detail ? detail : "-", src0->name,
                                   ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout));
