@@ -130,7 +130,9 @@ POST_CLAIM = [
     "EXPERT_NOT_LOCAL", "EXPERT_LAYOUT", "XMX_TILE_CAPS", "F16_TILED", "NO_DEQUANT", "SCRATCH_SIZE", "SCRATCH_CACHE",
     "SCRATCH_RESERVE", "SCRATCH_SLOT", "SCRATCH_SLOT_SIZE", "GEMM",
 ]
-WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) && "
+# A decline after the dispatch took a staged ring slot is printed whatever its cause (llama.cpp-3460): its staged
+# experts then run on the CPU path.
+WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) && "
                   "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
 # Types the f16 table takes that the device test does not run, each with its reason. The fixture quantizes its
 # weights with no importance matrix, so these three are the whole list.
@@ -451,16 +453,18 @@ def claim_b_table_types(s):
         if "use_reorder" not in body or "_reorder" not in body.replace("use_reorder", ""):
             fails.append(f"ggml_get_to_fp16_sycl_for_layout's {t} case has no reorder kernel for SOA")
     lam = lambda_body(s["sycl"]) or ""
-    q8_soa = ("const bool pp_q8_0_soa = src0->type == GGML_TYPE_Q8_0 && "
-              "active_experts.front().layout == GGML_LAYOUT_SOA;")
-    if q8_soa not in lam:
-        fails.append("the lambda does not name its Q8_0 SOA experts (pp_q8_0_soa)")
+    # Each expert's reader follows its own layout (llama.cpp-3460): a staged expert is AOS beside device experts in the
+    # route's layout, so the converter is picked per expert, never from the first one.
+    q8_soa = ("return src0->type == GGML_TYPE_Q8_0 && expert.layout == GGML_LAYOUT_SOA;")
+    if q8_soa not in lam or "active_experts.front().layout" in lam:
+        fails.append("the lambda does not name each expert's Q8_0 SOA layout (pp_q8_0_soa(expert))")
     q8_kernel = lam.find("dequantize_row_q8_0_soa_to_fp16_rowmajor(")
-    if q8_kernel < 0 or (enclosing_if_condition(lam, q8_kernel) or "").strip() != "pp_q8_0_soa":
+    if q8_kernel < 0 or (enclosing_if_condition(lam, q8_kernel) or "").strip() != "pp_q8_0_soa(expert)":
         fails.append("the lambda does not take Q8_0 SOA experts to dequantize_row_q8_0_soa_to_fp16_rowmajor")
-    getter = lam.find("pp_to_fp16 = ggml_get_to_fp16_sycl_for_layout(")
-    if getter < 0 or "!pp_q8_0_soa" not in (enclosing_if_condition(lam, getter) or ""):
-        fails.append("the lambda asks ggml_get_to_fp16_sycl_for_layout for Q8_0 SOA, which answers the AOS kernel")
+    getter = lam.find("expert.to_fp16 = ggml_get_to_fp16_sycl_for_layout(src0->type, expert.layout);")
+    if getter < 0 or "!pp_q8_0_soa(expert)" not in (enclosing_if_condition(lam, getter) or ""):
+        fails.append("the lambda does not ask ggml_get_to_fp16_sycl_for_layout per expert, and never for Q8_0 SOA, "
+                     "which it answers with the AOS kernel")
     woq_types = set(re.findall(r"GGML_TYPE_\w+", woq))
     if woq_types != {"GGML_TYPE_MXFP4"} or "GGML_LAYOUT_SOA" not in woq or "GGML_LAYOUT_XMX_TILED" not in woq:
         fails.append("the WOQ table must be MXFP4 on SOA and XMX_TILED")
@@ -1077,8 +1081,11 @@ MUTANTS = [
     ("b", "tables", "case GGML_TYPE_IQ4_XS:", "case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q1_0:"),
     ("b", "tables", " || layout == GGML_LAYOUT_SOA;", ";"),
     ("b", "convert", "return dequantize_row_q6_K_sycl_reorder;", "return nullptr;"),
-    ("b", "sycl", "if (pp_q8_0_soa) {", "if (false) {"),
-    ("b", "sycl", "src0->type != GGML_TYPE_MXFP4 && !pp_q8_0_soa", "src0->type != GGML_TYPE_MXFP4"),
+    ("b", "sycl", "if (pp_q8_0_soa(expert)) {", "if (false) {"),
+    ("b", "sycl", "} else if (!pp_q8_0_soa(expert)) {", "} else {"),
+    # One converter for every expert, from the first one's layout (the shape before llama.cpp-3460).
+    ("b", "sycl", "ggml_get_to_fp16_sycl_for_layout(src0->type, expert.layout);",
+     "ggml_get_to_fp16_sycl_for_layout(src0->type, active_experts.front().layout);"),
     ("c", "sycl", "const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K);",
      "const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K) && "
      "!pp_onednn_batched_route_claims_prompt;"),
@@ -1103,10 +1110,13 @@ MUTANTS = [
      "case moe_pp_batched_refusal::EXPERT_LAYOUT:"),
     ("e", "tables", "case moe_pp_batched_refusal::GEMM: return true;",
      "case moe_pp_batched_refusal::GEMM: case moe_pp_batched_refusal::DECODE: return true;"),
-    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&",
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&",
      "pp_f16_batched_trace &&"),
-    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&",
-     "(true || moe_pp_batched_refusal_after_claim(refusal)) &&"),
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&",
+     "(true || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&"),
+    # A decline after a staged slot left quiet when its cause is a precheck (llama.cpp-3460).
+    ("e", "sycl", "|| moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&",
+     "|| moe_pp_batched_refusal_after_claim(refusal)) &&"),
     ("f", "sycl", "if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout))", "if (true)"),
     ("f", "sycl", "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)",
      "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, GGML_LAYOUT_AOS)"),

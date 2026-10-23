@@ -35520,7 +35520,8 @@ bool test_moe_stream_insert_staged(ggml_backend_t     backend,
                                    mem_handle         soa,
                                    mem_handle         aos,
                                    sycl::event        ready,
-                                   ggml_layout_mode   layout) {
+                                   ggml_layout_mode   layout,
+                                   bool               executor_consumer) {
     ggml_backend_sycl_context * ctx = test_get_backend_ctx(backend);
     if (ctx == nullptr) {
         return false;
@@ -35529,10 +35530,11 @@ bool test_moe_stream_insert_staged(ggml_backend_t     backend,
         ctx->moe_stream.reset(new moe_stream_phase());
     }
     moe_stream_staged entry;
-    entry.soa    = std::move(soa);
-    entry.aos    = std::move(aos);
-    entry.ready  = ready;
-    entry.layout = layout;
+    entry.soa      = std::move(soa);
+    entry.aos      = std::move(aos);
+    entry.ready    = ready;
+    entry.layout   = layout;
+    entry.consumer = executor_consumer ? moe_stream_consumer::EXECUTOR : moe_stream_consumer::ROUTE;
     ctx->moe_stream->test_insert_staged(layer, expert_id, role, std::move(entry));
     return true;
 }
@@ -88735,12 +88737,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // GGML_SYCL_MOE_ROUTE_LOG line reject_batched has always printed. `detail` is the site's own reason (a
             // resolver, layout or admission reason name), or null when the cause says it all.
             // The one "[PP-MOE] refused" printer: every decline below and the GEMM stage's failure report through it.
+            // llama.cpp-3460: a decline after this dispatch took a staged ring slot prints at default verbosity too,
+            // whatever its cause: the staged experts then run on the CPU path, so the ring copied them for nothing.
+            // pp_staged_experts counts those slots (the expert loop below) and the line prints it as staged=.
+            size_t     pp_staged_experts    = 0;
             const auto warn_batched_refusal = [&](moe_pp_batched_refusal refusal, const char * detail) {
-                if ((pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) &&
+                if ((pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&
                     ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)) {
-                    GGML_LOG_WARN("[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s\n",
-                                  ctx.device, moe_pp_batched_refusal_name(refusal), detail ? detail : "-", src0->name,
-                                  ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout));
+                    GGML_LOG_WARN(
+                        "[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s staged=%zu\n",
+                        ctx.device, moe_pp_batched_refusal_name(refusal), detail ? detail : "-", src0->name,
+                        ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout), pp_staged_experts);
                 }
             };
             const auto decline_batched = [&](moe_pp_batched_refusal refusal, const char * detail, int64_t expert_id,
@@ -88832,6 +88839,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 size_t                row_end   = 0;
                 void *                ptr       = nullptr;
                 layout_mode           layout    = GGML_LAYOUT_AOS;  // the layout the expert is materialized in
+                to_fp16_sycl_t        to_fp16   = nullptr;  // the f16 arm's converter for `layout` (see pp_q8_0_soa)
                 ggml_sycl::mem_handle lease;
             };
 
@@ -88852,6 +88860,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             active_experts.reserve(static_cast<size_t>(n_as));
             ready_events.reserve(static_cast<size_t>(n_as));
             size_t max_rows_per_expert = 0;
+            // llama.cpp-3460: the stage-table key of this op's experts, as the staged route builds it
+            // (ggml_sycl_build_moe_resolved_batch): the layer begin_layer was given, and the plan's role classifier.
+            // This prompt runs on the context that owns the phase, on its in-order queue, outside a recording (the
+            // retained prompt batch refuses one).
+            const int pp_stream_layer     = ctx.moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;
+            const ggml_sycl::expert_tensor_role pp_stream_role =
+                ctx.moe_stream ? ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) :
+                                 ggml_sycl::expert_tensor_role::UNKNOWN;
 
             for (int64_t i02 = 0; i02 < n_as; ++i02) {
                 const size_t row_begin = row_map_offsets[static_cast<size_t>(i02)];
@@ -88870,26 +88886,51 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // rejected (and, for a tiled-claimed op, the rejection
                 // throws via trace_batched_skip rather than silently
                 // degrading to the SOA-only staging fallback).
-                moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));
-                if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || !route.ptr || !route.lease.valid()) {
-                    return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
-                                          ggml_sycl_expert_resolve_reason_name(route.reason), i02);
-                }
-                if (route.actual_layout != route_layout) {
-                    return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT,
-                                          ggml_sycl_layout_mode_name(route.actual_layout), i02);
-                }
-                if (route.has_ready_event) {
-                    ready_events.push_back(route.ready_event);
-                }
-
+                moe_expert_route         route = retained_prompt_group_route_for_expert(static_cast<int>(i02));
                 pp_onednn_batched_expert expert;
                 expert.expert_id = static_cast<int32_t>(i02);
                 expert.row_begin = row_begin;
                 expert.row_end   = row_end;
-                expert.ptr       = route.ptr;
-                expert.layout    = route.actual_layout;
-                expert.lease     = std::move(route.lease);
+                if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr && route.lease.valid()) {
+                    if (route.actual_layout != route_layout) {
+                        return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT,
+                                              ggml_sycl_layout_mode_name(route.actual_layout), i02);
+                    }
+                    if (route.has_ready_event) {
+                        ready_events.push_back(route.ready_event);
+                    }
+                    expert.ptr    = route.ptr;
+                    expert.layout = route.actual_layout;
+                    expert.lease  = std::move(route.lease);
+                } else {
+                    // llama.cpp-3460: a host expert the ring staged for this executor. The staged route refused its
+                    // entry by the entry's consumer, so the expert's route is the host one, and the executor reads
+                    // the slot itself. The slot and the layout it holds come from the entry (ruling C, c-3bde): the
+                    // host copy as loaded, AOS. The copy is ordered before the dequant by the entry's ready event, on
+                    // the barrier after this loop, as the retained prompt validator orders a STAGED_RING operand. The
+                    // ring's next copy into the slot waits for the region's read gate, the barrier behind this
+                    // layer's down op (moe_stream_phase::stage, reuse_after_readers), which this in-order queue runs
+                    // after the dequant. The lease is held until the done marker like every expert's
+                    // (retain_expert_leases_until), so the ring's release never frees the slot under the dequant.
+                    const ggml_sycl::moe_stream_staged * staged =
+                        pp_stream_layer >= 0 ?
+                            ctx.moe_stream->find(pp_stream_layer, static_cast<int>(i02), pp_stream_role) :
+                            nullptr;
+                    if (staged == nullptr || staged->consumer != ggml_sycl::moe_stream_consumer::EXECUTOR) {
+                        return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
+                                              ggml_sycl_expert_resolve_reason_name(route.reason), i02);
+                    }
+                    const ggml_sycl::mem_handle & slot = staged->layout == GGML_LAYOUT_SOA ? staged->soa : staged->aos;
+                    void * const                  slot_ptr = slot.resolve(ctx.device).ptr;
+                    if (slot_ptr == nullptr) {
+                        return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "staged-slot-unresolved", i02);
+                    }
+                    ready_events.push_back(staged->ready);
+                    expert.ptr    = slot_ptr;
+                    expert.layout = staged->layout;
+                    expert.lease  = slot;
+                    ++pp_staged_experts;
+                }
                 active_experts.push_back(std::move(expert));
                 max_rows_per_expert = std::max(max_rows_per_expert, rows);
             }
@@ -89015,18 +89056,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (experts_are_tiled && !pp_woq_arm) {
                 return reject_batched(moe_pp_batched_refusal::F16_TILED, nullptr);
             }
-            // llama.cpp-348c: the f16 arm dequantizes MXFP4 with its own SOA row-major kernel and every other type with
-            // the converter for the layout its experts are materialized in. The loop above refused any expert whose
-            // layout differs from the route's, so the first expert's layout is every expert's. Q8_0's SOA experts
-            // take dequantize_row_q8_0_soa_to_fp16_rowmajor in the loop below, as the PP dequant pipeline's do:
-            // ggml_get_to_fp16_sycl_for_layout answers Q8_0 with the AOS kernel for every layout.
-            const bool pp_q8_0_soa = src0->type == GGML_TYPE_Q8_0 && active_experts.front().layout == GGML_LAYOUT_SOA;
-            to_fp16_sycl_t pp_to_fp16 = nullptr;
-            if (!pp_woq_arm && src0->type != GGML_TYPE_MXFP4 && !pp_q8_0_soa) {
-                pp_to_fp16 = ggml_get_to_fp16_sycl_for_layout(src0->type, active_experts.front().layout);
-                if (pp_to_fp16 == nullptr) {
-                    return reject_batched(moe_pp_batched_refusal::NO_DEQUANT,
-                                          ggml_sycl_layout_mode_name(active_experts.front().layout));
+            // llama.cpp-348c, llama.cpp-3460: each expert's reader follows the layout that expert is in: a device
+            // expert's is the route's (the loop above refused any other), a staged one's is its slot's, AOS. MXFP4's
+            // readers, the WOQ repacks and its f16 arm's SOA row-major dequant, read the route's layout alone. Q8_0's
+            // SOA experts take dequantize_row_q8_0_soa_to_fp16_rowmajor in the phase loop below, as the PP dequant
+            // pipeline's do: ggml_get_to_fp16_sycl_for_layout answers Q8_0 with the AOS kernel for every layout.
+            // Every other expert takes that table's converter for its layout. An expert with no reader for its layout
+            // refuses the dispatch.
+            const auto pp_q8_0_soa = [&](const pp_onednn_batched_expert & expert) {
+                return src0->type == GGML_TYPE_Q8_0 && expert.layout == GGML_LAYOUT_SOA;
+            };
+            for (pp_onednn_batched_expert & expert : active_experts) {
+                if (src0->type == GGML_TYPE_MXFP4) {
+                    if (expert.layout != route_layout) {
+                        return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT,
+                                              ggml_sycl_layout_mode_name(expert.layout), expert.expert_id);
+                    }
+                } else if (!pp_q8_0_soa(expert)) {
+                    expert.to_fp16 = ggml_get_to_fp16_sycl_for_layout(src0->type, expert.layout);
+                    if (expert.to_fp16 == nullptr) {
+                        return reject_batched(moe_pp_batched_refusal::NO_DEQUANT,
+                                              ggml_sycl_layout_mode_name(expert.layout), expert.expert_id);
+                    }
                 }
             }
 
@@ -89393,9 +89444,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             // llama.cpp-348c: one expert's ne00 x ne01 matrix into f16 at `dst`, from the pointer its lease resolved;
-            // the lease is held until the done marker below. MXFP4 has its own SOA row-major kernel. The other
-            // converters return no event, so the profiler gets the in-order queue's last one, asked only while it
-            // records.
+            // the lease is held until the done marker below. MXFP4 has its own SOA row-major kernel; every other
+            // expert takes the reader its layout picked above (llama.cpp-3460). The other converters return no event,
+            // so the profiler gets the in-order queue's last one, asked only while it records.
             auto dequant_expert_f16 = [&](const pp_onednn_batched_expert & expert, sycl::half * dst) {
                 if (src0->type == GGML_TYPE_MXFP4) {
                     dequantize_row_mxfp4_soa_to_fp16_rowmajor(expert.ptr, dst, blocks_per_row, static_cast<int>(ne01),
@@ -89411,11 +89462,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 dequant_label.bytes      = weight_elems * sizeof(sycl::half);
                 const void * expert_src  = expert.ptr;
                 (void) ggml_sycl_profile_submit(*stream, dequant_label, [&](sycl::queue & profiled_queue) {
-                    if (pp_q8_0_soa) {
+                    if (pp_q8_0_soa(expert)) {
                         dequantize_row_q8_0_soa_to_fp16_rowmajor(expert_src, dst, static_cast<int>(ne00 / QK8_0),
                                                                  static_cast<int>(ne01), &profiled_queue);
                     } else {
-                        pp_to_fp16(expert_src, dst, static_cast<int64_t>(weight_elems), &profiled_queue);
+                        expert.to_fp16(expert_src, dst, static_cast<int64_t>(weight_elems), &profiled_queue);
                     }
                     if (!ggml_sycl_kernel_profile_enabled()) {
                         return sycl::event{};
@@ -89835,7 +89886,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const pp_onednn_batched_expert & expert = active_experts[slot];
                 const size_t                     rows   = expert.row_end - expert.row_begin;
                 append_pp_log_entries(pp_local_entries_for_log, expert.row_begin, expert.row_end, expert.expert_id,
-                                      expert.ptr, ctx.device, route_layout, &expert.lease);
+                                      expert.ptr, ctx.device, expert.layout, &expert.lease);
 
                 sycl::range<3>          block_dims(1, 1, pp_copy_work_group_size(ne0));
                 sycl::range<3>          grid_dims(1, 1, rows);
@@ -89971,6 +90022,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     "[PP-MOE] device=%d type=%s layout=%s arm=%s experts=%zu groups=%zu planned_weight_slot=%zu\n",
                     ctx.device, ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout),
                     pp_woq_arm ? "woq" : "f16", active_count, phases.size(), planned_weight);
+            }
+            // llama.cpp-3460: under GGML_SYCL_MOE_EXEC_TRACE, one line per dispatch saying how many of its experts the
+            // executor read from ring slots, so a census can tell a staged layer that took this executor from a
+            // resident one. The tensor name carries the layer and the role.
+            if (ggml_sycl_moe_exec_config().trace >= 1) {
+                char exec_line[256];
+                std::snprintf(exec_line, sizeof(exec_line),
+                              "[MOE-EXEC-TRACE] executor device %d tensor=%s experts=%zu staged=%zu arm=%s", ctx.device,
+                              src0->name, active_count, pp_staged_experts, pp_woq_arm ? "woq" : "f16");
+                ggml_sycl_moe_exec_trace_sink(nullptr, exec_line);
             }
             return true;
 #else

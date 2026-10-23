@@ -27,6 +27,10 @@ What this gate pins:
     to the route core. Every lookup is counted served or refused, and every refusal with its cause, in the order
     asked, and with the capability's reason or the validator's reject reason (plan Task 8: the trace says why); the
     capability part is one helper the ring's staging asks too;
+  - the batched executor consumes a staged slot whose entry names it as the consumer, for an expert it would otherwise
+    decline (llama.cpp-3460): one stage-table lookup in its expert loop, only for a non-device expert, keyed as the
+    staged route keys it, the slot and layout from the entry, the entry's ready event on the executor's barrier, and
+    the slot's lease held until the done marker;
   - the device recipe is one function shared by a resident expert and a staged slot (one fact, one source);
   - the staged branch keeps no persistent handle: no moe_expert_handles[] write, no remember_moe_storage_handle, no
     handle retention; the transient pointer-table upload clears a staged slot's handle entry and keeps it out of the
@@ -304,7 +308,7 @@ EXEC_PTR_USES = (
 )
 EXEC_SRC_USES = (
     "dequantize_row_q8_0_soa_to_fp16_rowmajor(expert_src,",
-    "pp_to_fp16(expert_src,",
+    "expert.to_fp16(expert_src,",
 )
 EXEC_SRCS_USES = (
     "std::vector<const void *> repack_srcs;",
@@ -315,6 +319,33 @@ EXEC_SRCS_USES = (
 )
 ONEDNN_CALLS = ("DnnlGemmWrapper::gemm_batch_strided(", "DnnlGemmWrapper::woq_gemm_batch_mxfp4(")
 EXPERT_NAMES = ("expert.ptr", "expert_src", "repack_srcs", "active_experts", "route.ptr", "moe_stream")
+# The executor's read of a staged slot (llama.cpp-3460): the stage-table key, built as the staged route builds it, and
+# the expert loop's two branches in order, the device expert's and the staged one's, up to the barrier on every
+# expert's ready event.
+EXEC_STREAM_KEY = (
+    "const int pp_stream_layer = ctx.moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;",
+    "const ggml_sycl::expert_tensor_role pp_stream_role = ctx.moe_stream ? "
+    "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) : ggml_sycl::expert_tensor_role::UNKNOWN;",
+)
+EXEC_FIND = "ctx.moe_stream->find(pp_stream_layer, static_cast<int>(i02), pp_stream_role)"
+EXEC_STAGED_STEPS = (
+    "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
+    "if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr && route.lease.valid()) {",
+    "expert.lease = std::move(route.lease); } else {",
+    "const ggml_sycl::moe_stream_staged * staged = pp_stream_layer >= 0 ? " + EXEC_FIND + " : nullptr;",
+    "if (staged == nullptr || staged->consumer != ggml_sycl::moe_stream_consumer::EXECUTOR) { "
+    "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,",
+    "const ggml_sycl::mem_handle & slot = staged->layout == GGML_LAYOUT_SOA ? staged->soa : staged->aos;",
+    "void * const slot_ptr = slot.resolve(ctx.device).ptr;",
+    "ready_events.push_back(staged->ready);",
+    "expert.ptr = slot_ptr;",
+    "expert.layout = staged->layout;",
+    "expert.lease = slot;",
+    "++pp_staged_experts; }",
+    "active_experts.push_back(std::move(expert));",
+    "stream->ext_oneapi_submit_barrier(ready_events);",
+)
+EXEC_LEASE_HOLD = "leases.push_back(std::move(expert.lease));"
 CORE_RECIPE_CALL = ("(void) ggml_sycl_moe_build_device_recipe(src0, submit_device, rows, invocation_backend, "
                     "invocation_queue, queue_capability, normalized);")
 CAP_QUERY = "ggml_sycl_moe_query_route_capability("
@@ -572,7 +603,7 @@ def test_served_only_as_plain_kernel_mutants():
     assert not c(mutate(SYCL, "const void * expert_src = expert.ptr;",
                         "const void * expert_src = expert.ptr; ggml_sycl_onednn_read(expert.ptr);"))
     # The dequant reads its source through a name the pin does not follow.
-    assert not c(mutate(SYCL, "pp_to_fp16(expert_src,", "pp_to_fp16(expert.lease.resolve(ctx.device).ptr,"))
+    assert not c(mutate(SYCL, "expert.to_fp16(expert_src,", "expert.to_fp16(expert.lease.resolve(ctx.device).ptr,"))
 
 
 def claim_executor_entry_refused_by_its_consumer(sycl: str) -> bool:
@@ -609,6 +640,48 @@ def test_executor_entry_refused_by_its_consumer_mutants():
     m = mutate(SYCL, EXECUTOR_REFUSAL + " ", "")
     m = m.replace("if (view.ptr == nullptr", EXECUTOR_REFUSAL + " if (view.ptr == nullptr", 1)
     assert not c(m)
+
+
+def claim_executor_reads_staged_slots(sycl: str) -> bool:
+    """The batched executor consumes a staged slot for an expert it would otherwise decline (llama.cpp-3460). Its expert
+    loop asks the stage table once, and only for an expert whose route is not a device one, keyed by the layer and role
+    the staged route keys it with. It takes an entry only when the entry's consumer is the executor (the fact the ring
+    wrote), and the slot and its layout from the entry (ruling C). It pushes the entry's ready event onto the barrier
+    every expert's copy is ordered by, holds the slot's lease like any expert's until the done marker, and counts the
+    slot for the trace and the refusal WARN. Any other non-device expert is declined as EXPERT_NOT_LOCAL."""
+    lam = body(norm(sycl), EXEC_SIG)
+    return (lam != "" and lam.count("->find(") == 1 and lam.count(EXEC_FIND) == 1
+            and all(lam.count(k) == 1 for k in EXEC_STREAM_KEY) and ordered(lam, *EXEC_STREAM_KEY, *EXEC_STAGED_STEPS)
+            and lam.count("ready_events.push_back(staged->ready);") == 1 and EXEC_LEASE_HOLD in lam)
+
+
+def test_executor_reads_staged_slots():
+    assert claim_executor_reads_staged_slots(SYCL)
+
+
+def test_executor_reads_staged_slots_mutants():
+    c = claim_executor_reads_staged_slots
+    # The executor declines a staged expert without asking the table (the shape before llama.cpp-3460).
+    assert not c(mutate(SYCL, EXEC_FIND, "nullptr"))
+    # The slot taken without its copy's ready event, so the dequant may read it before the copy lands.
+    assert not c(mutate(SYCL, "ready_events.push_back(staged->ready);", ""))
+    # An entry the route serves taken too: the consumer the ring wrote is not asked.
+    assert not c(mutate(SYCL, "if (staged == nullptr || staged->consumer != ggml_sycl::moe_stream_consumer::EXECUTOR) {",
+                        "if (staged == nullptr) {"))
+    # The slot's lease not held, so the ring's release could free it under the dequant.
+    assert not c(mutate(SYCL, "expert.lease = slot;", ""))
+    # The layout re-derived from the route instead of read from the entry.
+    assert not c(mutate(SYCL, "expert.layout = staged->layout;", "expert.layout = route_layout;"))
+    # The table asked for every expert, a device one's too, ahead of its route.
+    m = mutate(SYCL, "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
+               "(void) " + EXEC_FIND + "; moe_expert_route route = "
+               "retained_prompt_group_route_for_expert(static_cast<int>(i02));")
+    assert not c(m)
+    # Keyed by another layer than the staged route's.
+    assert not c(mutate(SYCL, "ctx.moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;",
+                        "ctx.moe_stream ? moe_cache_layer_id(src0->name) : -1;"))
+    # The staged slot not counted, so a decline after it stays quiet.
+    assert not c(mutate(SYCL, "++pp_staged_experts; }", "}"))
 
 
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
