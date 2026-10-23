@@ -20963,21 +20963,26 @@ static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t si
     return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
 }
 
-// Drop every view `extra` holds on the device entry a loan retired under `withdrawn`, so that the deferred-free pass
-// after the loan can erase the entry and return its storage to the WEIGHT zone (llama.cpp-6aj4). Views are matched by
-// the entry's key, never by a resolve: once the cache generation moves, a retired entry refuses the resolve
-// forget_moe_storage_handle_on_device() matches by. The views are the expert's storage records, its slot in the
-// pointer table's handles, the table's per-expert leases (ggml_sycl_set_moe_ptr_table_leases), the route table when
-// one of its entries leases the entry, and the hybrid decode record, which holds every expert's lease. Dropping any
-// of them marks the device table stale, so the next MUL_MAT_ID or preload rebuilds it under the plan the loan
-// publishes. The loan runs at the graph boundary after the queue is drained, so no queued work reads a dropped view.
-// Returns whether anything was dropped.
+// Defined with the record (llama.cpp-7pvo): appends every handle a hybrid decode record holds, its table among them.
+static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
+                                                              std::vector<ggml_sycl::mem_handle> & out);
+
+// Take every view `extra` holds of the device entry a loan retired under `withdrawn` off the extra, keeping a lease on
+// each in `retained` (llama.cpp-6aj4). The caller keeps `retained` until the device's queue passes a barrier, so no
+// kernel still reading a dropped table sees a freed buffer, and the deferred-free pass erases the entry once that
+// retention releases. Views are matched by the entry's key, never by a resolve: once the cache generation moves, a
+// retired entry refuses the resolve forget_moe_storage_handle_on_device() matches by. The views are the expert's
+// storage records, its slot in the pointer table's handles, the table's per-expert leases
+// (ggml_sycl_set_moe_ptr_table_leases), the route table when one of its entries leases the entry (invalidated, with
+// every lease it held retained, since another expert it names may be lent next), and the hybrid decode record, which
+// holds every expert's lease and its table, all retained. Dropping any of them marks the device table stale, so the
+// next MUL_MAT_ID or preload rebuilds it under the plan the loan publishes. Returns whether anything was dropped.
 static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
                                              int                                  device,
                                              int                                  expert_id,
-                                             const ggml_sycl::unified_cache_key & withdrawn) {
-    // Boundary premise: the views go at once because the loan runs after synchronize's stream wait, outside a graph.
-    GGML_ASSERT(!ggml_sycl::unified_cache_is_graph_compute_active());
+                                             const ggml_sycl::unified_cache_key & withdrawn,
+                                             std::vector<ggml_sycl::mem_handle> & retained) {
+    // Boundary premise: the loan runs after synchronize's stream wait; the retention covers work still on the queue.
     if (!extra || !extra->weight_ext || expert_id < 0 || !ggml_sycl_valid_device_index(device)) {
         return false;
     }
@@ -20991,7 +20996,12 @@ static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
     const auto records = w.moe_expert_storage_handles.find(
         ggml_tensor_extra_gpu_weight_ext::moe_storage_handle_key(expert_id, GGML_LAYOUT_AOS));
     if (records != w.moe_expert_storage_handles.end()) {
-        auto &       list   = records->second;
+        auto & list = records->second;
+        for (const ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record & record : list) {
+            if (on_entry(record.handle)) {
+                retained.push_back(record.handle);
+            }
+        }
         const size_t before = list.size();
         list.erase(std::remove_if(list.begin(), list.end(),
                                   [&](const ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record & record) {
@@ -21006,6 +21016,7 @@ static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
 
     const size_t slot = static_cast<size_t>(expert_id);
     if (slot < w.moe_expert_handles[device].size() && on_entry(w.moe_expert_handles[device][slot])) {
+        retained.push_back(std::move(w.moe_expert_handles[device][slot]));
         w.moe_expert_handles[device][slot] = ggml_sycl::mem_handle{};
         if (slot < w.moe_expert_ptr_payload[device].size()) {
             w.moe_expert_ptr_payload[device][slot] = nullptr;
@@ -21013,19 +21024,31 @@ static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
         stored = true;
     }
 
-    std::vector<ggml_sycl::mem_handle> & leases   = w.moe_expert_ptrs_leases[device];
-    const size_t                         n_leases = leases.size();
+    std::vector<ggml_sycl::mem_handle> & leases = w.moe_expert_ptrs_leases[device];
+    for (const ggml_sycl::mem_handle & lease : leases) {
+        if (on_entry(lease)) {
+            retained.push_back(lease);
+        }
+    }
+    const size_t n_leases = leases.size();
     leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());
     table = leases.size() != n_leases;
 
-    for (const ggml_sycl::moe_route_entry & route : w.moe_route_tables[device].experts) {
+    ggml_sycl::moe_route_table & routes = w.moe_route_tables[device];
+    for (const ggml_sycl::moe_route_entry & route : routes.experts) {
         if (on_entry(route.lease)) {
-            w.moe_route_tables[device].invalidate();
+            for (const ggml_sycl::moe_route_entry & held : routes.experts) {
+                if (held.lease.valid()) {
+                    retained.push_back(held.lease);
+                }
+            }
+            routes.invalidate();
             table = true;
             break;
         }
     }
     if (w.moe_hybrid_decode[device]) {
+        ggml_sycl_moe_hybrid_decode_record_append_handles(*w.moe_hybrid_decode[device], retained);
         w.moe_hybrid_decode[device].reset();
         w.moe_hybrid_decode_stamp[device] = {};
         table                             = true;
@@ -21256,6 +21279,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     // An exception while moving a triplet stops the loop; the triplets already moved are still published below, and it
     // is rethrown once the inventory lock is released.
     std::exception_ptr escaped;
+    // A loan's drops keep a lease on every view they take here, retained after the loop (llama.cpp-6aj4).
+    std::vector<ggml_sycl::mem_handle> lent_views;
     for (prepared_triplet & triplet : prepared) {
         ggml_sycl::expert_loan_record   record;
         ggml_sycl::expert_refill_record refilled;
@@ -21312,7 +21337,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 for (int r = 0; r < 3; ++r) {
                     const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
                     ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
-                    (void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r]);
+                    (void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r],
+                                                            lent_views);
                     (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
                 }
                 for (int r = 0; r < 3; ++r) {
@@ -21356,6 +21382,26 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         }
         if (escaped) {
             break;
+        }
+    }
+    // The views the loan dropped stay leased until the device's execution queue passes a barrier, so no kernel still
+    // reading a pointer table or a hybrid decode record sees a freed buffer; the deferred-free pass erases each
+    // withdrawn entry once that retention releases (llama.cpp-6aj4). A failure to retain them (the barrier's submit, or
+    // the retention's allocation) joins the loop's exception, so the triplets already lent are still published; only
+    // then do the views go at once.
+    if (!lent_views.empty()) {
+        try {
+            sycl::queue * queue = ggml_sycl_execution_queue_for_device(device);
+            ggml_sycl::retain_handles_until_event(std::move(lent_views),
+                                                  queue ? queue->ext_oneapi_submit_barrier() : sycl::event{});
+        } catch (const ggml_sycl_fallback_error &) {
+            // G-CATCH requires this clause before catch (...). Neither the barrier nor the retention throws the op
+            // fallback, so it cannot leave the triplets already lent unpublished.
+            throw;
+        } catch (...) {
+            if (!escaped) {
+                escaped = std::current_exception();
+            }
         }
     }
     // The triplet the preparation could not prepare leaves the ledger only from its back: every triplet selected before
@@ -81487,6 +81533,14 @@ struct moe_hybrid_decode_record {
     sycl::event                        ready;             // one barrier over the leases' producer events
     bool                               has_ready = false;
 };
+
+static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
+                                                              std::vector<ggml_sycl::mem_handle> & out) {
+    out.insert(out.end(), record.lease.begin(), record.lease.end());
+    if (record.table.valid()) {
+        out.push_back(record.table);
+    }
+}
 
 // The record's table (llama.cpp-7pvo): host-pinned, n_as device weight pointers by expert id, copied to the planned
 // scratch per op. Owner-first, so the record's handle is the allocation's only owner from the start.

@@ -57,7 +57,9 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
   - each extra drops every view it holds of a withdrawn device entry before it forgets the entry's record and
     remembers the host copy (llama.cpp-6aj4): ggml_sycl_drop_lent_expert_views matches each view by the key the loan
     retired the entry under and never resolves one, since a retired entry refuses a resolve once the cache generation
-    moves;
+    moves; it keeps a lease on every view it takes, and the transaction retains those leases until the device's
+    execution queue passes a barrier, after the loop and before the publication, so no kernel still reading a dropped
+    table sees a freed buffer;
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
     epoch;
   - the WARN format strings;
@@ -579,7 +581,7 @@ PROBE = ('if (probe_mode) { result.accepted = n_selected != 0; result.bytes_free
          'finish(ggml_sycl_txn_result::REFUSED, "nothing lendable"); }')
 LEASE = "registry.acquire_live_update(current_token)"
 FORGET = "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);"
-DROP = "(void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r]);"
+DROP = "(void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);"
 REMEMBER = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
             "std::move(record.host_handles[r]), &record.copy_events[r], 0, logical);")
 FLIP = "(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, refill, refill ? device : -1);"
@@ -604,6 +606,29 @@ DROP_MATCH = "return h.is_weight() && h.device() == device && h.key() == withdra
 def claim_lent_views_dropped_by_key(sycl: str) -> bool:
     b = body(norm(sycl), DROP_SIG)
     return b.count(DROP_MATCH) == 1 and "resolve(" not in b
+
+
+# Each view the helper takes off an extra keeps a lease in `retained` before it goes, and the transaction keeps every
+# such lease until the device's execution queue passes a barrier, after the loop: a kernel still reading a dropped
+# table never sees a freed buffer, wherever the loan runs.
+RETAIN_RECORD = "retained.push_back(record.handle);"
+RETAIN_SLOT = "retained.push_back(std::move(w.moe_expert_handles[device][slot]));"
+RETAIN_LEASE = "if (on_entry(lease)) { retained.push_back(lease); }"
+RETAIN_ROUTES = "if (held.lease.valid()) { retained.push_back(held.lease); }"
+RETAIN_HYBRID = "ggml_sycl_moe_hybrid_decode_record_append_handles(*w.moe_hybrid_decode[device], retained);"
+RETAIN_VIEWS = ("ggml_sycl::retain_handles_until_event(std::move(lent_views), "
+                "queue ? queue->ext_oneapi_submit_barrier() : sycl::event{});")
+
+
+def claim_lent_views_retained_to_a_barrier(sycl: str) -> bool:
+    n = norm(sycl)
+    helper = body(n, DROP_SIG)
+    txn = body(n, TXN_SIG)
+    return (all(helper.count(x) == 1 for x in (RETAIN_RECORD, RETAIN_SLOT, RETAIN_LEASE, RETAIN_ROUTES, RETAIN_HYBRID))
+            and ordered(helper, RETAIN_RECORD, "list.erase(", RETAIN_SLOT, RETAIN_LEASE, "leases.erase(", RETAIN_ROUTES,
+                        "routes.invalidate();", RETAIN_HYBRID, "w.moe_hybrid_decode[device].reset();")
+            and txn.count(RETAIN_VIEWS) == 1
+            and ordered(txn, LEND, DROP, REMEMBER, BREAK_ESCAPED, RETAIN_VIEWS, PUBLISH))
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -1221,6 +1246,10 @@ def test_lent_views_dropped_by_key():
     assert claim_lent_views_dropped_by_key(SYCL)
 
 
+def test_lent_views_retained_to_a_barrier():
+    assert claim_lent_views_retained_to_a_barrier(SYCL)
+
+
 def test_warn_formats():
     assert claim_warn_formats(SYCL)
 
@@ -1775,6 +1804,17 @@ def test_mutant_lent_views_matched_by_resolve_fails():
     assert not claim_lent_views_dropped_by_key(
         _once_in(SYCL, DROP_SIG, DROP_MATCH,
                  DROP_MATCH.replace("h.key() == withdrawn", "h.resolve(device).on_device && h.key() == withdrawn")))
+
+
+def test_mutant_lent_views_released_at_once_fails():
+    """The transaction lets the dropped views go when it returns: a kernel another context still has on the queue can
+    read a pointer table whose expert the deferred-free pass just freed."""
+    assert not claim_lent_views_retained_to_a_barrier(_once(SYCL, RETAIN_VIEWS, "lent_views.clear();"))
+
+
+def test_mutant_table_leases_released_at_once_fails():
+    """The helper erases the pointer table's leases on the entry without keeping them: they go at once."""
+    assert not claim_lent_views_retained_to_a_barrier(_once_in(SYCL, DROP_SIG, RETAIN_LEASE, ""))
 
 
 def test_mutant_no_epoch_bump_fails():
