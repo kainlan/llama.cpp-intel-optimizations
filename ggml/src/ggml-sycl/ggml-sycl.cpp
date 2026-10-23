@@ -21750,6 +21750,19 @@ struct test_loan_fixture {
                 (void) extras[t]->forget_moe_storage_handle_on_device(e, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE);
             }
         }
+        // A case that built pointer tables leaves their views on the extras: they go with the records, so no lease on
+        // the case's entries outlives the deferred-free pass below (llama.cpp-6aj4).
+        for (const auto & extra : extras) {
+            if (extra->weight_ext) {
+                ggml_tensor_extra_gpu_weight_ext & w = *extra->weight_ext;
+                w.moe_expert_ptrs_leases[device].clear();
+                w.moe_expert_handles[device].clear();
+                w.moe_expert_ptr_payload[device].clear();
+                w.moe_route_tables[device].invalidate();
+                w.moe_hybrid_decode[device].reset();
+                w.moe_device_table_valid[device] = false;
+            }
+        }
         for (const ggml_sycl_cache_id & key : keys) {
             (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/expert loan cleanup");
         }
@@ -21979,6 +21992,77 @@ struct test_loan_fixture {
         uint32_t in_use  = 0;
         bool     retired = false;
         return cache->test_expert_host_entry_state(keys[index(layer, slot, expert)], &in_use, &retired);
+    }
+
+    // A ggml tensor for (layer, slot) with the fixture's geometry, bound to its extra, as a model's MUL_MAT_ID reads
+    // its src0: n_experts f32 experts of test_loan_expert_bytes() each. Its data stays null, since every expert a case
+    // reads is direct-staged and remembered by the extra (llama.cpp-6aj4).
+    void bind_tensor(ggml_tensor & tensor, int layer, int slot) const {
+        tensor       = {};
+        tensor.type  = GGML_TYPE_F32;
+        tensor.ne[0] = static_cast<int64_t>(test_loan_expert_bytes() / sizeof(float));
+        tensor.ne[1] = 1;
+        tensor.ne[2] = n_experts;
+        tensor.ne[3] = 1;
+        tensor.nb[0] = sizeof(float);
+        tensor.nb[1] = test_loan_expert_bytes();
+        tensor.nb[2] = test_loan_expert_bytes();
+        tensor.nb[3] = test_loan_expert_bytes() * static_cast<size_t>(n_experts);
+        ggml_set_name(&tensor, names[layer * 3 + slot].c_str());
+        tensor.extra = extras[layer * 3 + slot].get();
+    }
+
+    // Whether h leases (layer, slot, expert)'s device entry: a weight lease on this device under the expert's id whose
+    // key is not its host copy's. Read from the handle's identity alone: resolving a lease on a retired entry drops
+    // the lease, so a census that resolved would erase the holder it looks for.
+    bool leases_device_entry(const mem_handle & h, int layer, int slot, int expert) const {
+        const ggml_sycl_cache_id & id = keys[index(layer, slot, expert)];
+        const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+        return h.is_weight() && h.device() == device && detail::cache_id_equal(h.key().id, id) &&
+               !(h.key() == host_key);
+    }
+
+    // The pointer-table leases (layer, slot)'s extra holds on that expert's device entry.
+    int table_leases_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const mem_handle & h : w->moe_expert_ptrs_leases[device]) {
+                n += leases_device_entry(h, layer, slot, expert) ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
+    // Who holds (layer, slot, expert)'s device entry: its lease count, and the handles on it in each view the extra
+    // keeps.
+    std::string device_entry_holders(int layer, int slot, int expert) const {
+        uint32_t     in_use     = 0;
+        const bool   present    = cache->test_expert_device_entry_in_use(keys[index(layer, slot, expert)], &in_use);
+        int          records    = 0;
+        int          slot_cache = 0;
+        int          route      = 0;
+        bool         hybrid     = false;
+        const auto & w          = extras[layer * 3 + slot]->weight_ext;
+        if (w) {
+            for (const auto & kv : w->moe_expert_storage_handles) {
+                for (const auto & record : kv.second) {
+                    records += leases_device_entry(record.handle, layer, slot, expert) ? 1 : 0;
+                }
+            }
+            for (const mem_handle & h : w->moe_expert_handles[device]) {
+                slot_cache += leases_device_entry(h, layer, slot, expert) ? 1 : 0;
+            }
+            for (const moe_route_entry & entry : w->moe_route_tables[device].experts) {
+                route += leases_device_entry(entry.lease, layer, slot, expert) ? 1 : 0;
+            }
+            hybrid = w->moe_hybrid_decode[device] != nullptr;
+        }
+        return test_loan_fail(
+            "layer %d slot %d expert %d's device entry %s with %u leases; its extra's handles on it: records=%d "
+            "slot_cache=%d table_leases=%d route_table=%d, hybrid_record=%d",
+            layer, slot, expert, present ? "present" : "gone", in_use, records, slot_cache,
+            table_leases_on_device_entry(layer, slot, expert), route, (int) hybrid);
     }
 
     // A host entry still in the cache under (layer, slot, expert)'s exact key, retired: a withdrawn host copy the
@@ -23285,6 +23369,68 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
         }
     }
     return {};
+}
+
+std::string test_expert_loan_reclaims_pointer_table_leases() {
+    // llama.cpp-6aj4: a prompt graph's preload builds each MoE tensor's expert pointer table with
+    // ggml_sycl_update_moe_ptr_table, and the tensor's extra keeps a lease on every expert the table names
+    // (moe_expert_ptrs_leases) until that table is next built, which for a tensor the loan leaves with experts on both
+    // sides may be never. A loan that withdraws one of those experts must leave no such lease: the boundary's
+    // deferred-free pass erases the retired device entry, the WEIGHT zone gets the entry's room back, and the first
+    // decode boundary's refill re-admits the triplet.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x36616a3401ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+
+    // The layer's three tensors, each table built as the preload builds a prompt ubatch's: the ids it routed, the
+    // device experts, in the layout they were staged in.
+    ggml_tensor tensors[3];
+    for (int s = 0; s < 3; ++s) {
+        fx.bind_tensor(tensors[s], 0, s);
+    }
+    ggml_backend_sycl_context  ctx(fx.device);
+    const std::vector<int32_t> routed = { 0, 1, 2 };
+    ggml_tensor                ids{};
+    for (int s = 0; s < 3; ++s) {
+        sycl::event table_event;
+        if (!ggml_sycl_update_moe_ptr_table(ctx, &tensors[s], &ids, GGML_LAYOUT_AOS, &table_event,
+                                            moe_ptr_table_coverage::SELECTED_IDS, &routed,
+                                            /*skip_device_copy=*/false,
+                                            /*force_cache_aos=*/false,
+                                            /*skip_cpu_routed_experts=*/false,
+                                            /*exact_layout_required=*/false)) {
+            return test_loan_fail("slot %d's pointer table was not built", s);
+        }
+        table_event.wait_and_throw();
+    }
+    ctx.stream()->wait();
+    // The control: each table leases expert 2's device entry, the triplet the loan selects from the plan's tail.
+    for (int s = 0; s < 3; ++s) {
+        if (fx.table_leases_on_device_entry(0, s, 2) == 0) {
+            return "no pointer-table lease before the loan: " + fx.device_entry_holders(0, s, 2);
+        }
+    }
+
+    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
+        for (int s = 0; s < 3; ++s) {
+            why += "; " + fx.device_entry_holders(0, s, 2);
+        }
+        return why;
+    }
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1 || remaining != 0) {
+        return test_loan_fail("the first decode boundary re-admitted %u triplets with %u remaining (%s), not 1 and 0",
+                              result.n_triplets, remaining, result.reason);
+    }
+    return fx.readmitted(0, 2);
 }
 
 }  // namespace ggml_sycl

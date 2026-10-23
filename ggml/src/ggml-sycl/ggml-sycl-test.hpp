@@ -629,6 +629,10 @@ std::string test_expert_refill_moves_two_triplets_per_call();
 // The loan and the refill size their copies from the cache entry, which can exceed the plan's dst_size by the tail
 // S1-PRELOAD pads, and a host copy smaller than its entry is still refused (llama.cpp-pu8v).
 std::string test_expert_loan_sizes_its_copies_from_the_entry();
+// A loan leaves no lease on a withdrawn device entry in the pointer tables a prompt graph's preload built: the entry is
+// erased by the boundary's deferred-free pass, its zone room returns, and the first decode boundary re-admits it
+// (llama.cpp-6aj4).
+std::string test_expert_loan_reclaims_pointer_table_leases();
 #endif
 
 }  // namespace ggml_sycl
