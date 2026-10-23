@@ -691,9 +691,12 @@ INTERNAL_WRAPPER_SITES = {
         # refused or cancelled refill must leave in place. It then took it to 9: the case for a loan refused without
         # host zones reads the publication that loan must leave in place. It then took it to 12: the fixture's still_lent
         # helper reads the current plan, and the once-per-decode-graph and unpreparable-triplet cases read the
-        # publication a skipped refill and a refill that moved nothing must leave in place.
-        "const auto now = ::ggml_sycl_global_plan_snapshot();": 1,
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 12,
+        # publication a skipped refill and a refill that moved nothing must leave in place. llama.cpp-pu8v took it to
+        # 14 and `now` to 2: test_expert_loan_and_refill_stop_on_a_missing_entry reads the publication a loan refused
+        # "not resident" and a refill that dropped a triplet "not lent" must leave in place, and then reads the current
+        # plan to show the dropped triplet is still on the host.
+        "const auto now = ::ggml_sycl_global_plan_snapshot();": 2,
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 14,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
@@ -707,6 +710,10 @@ INTERNAL_WRAPPER_SITES = {
         # then took it to 9: a boundary with no decode graph since the refill, and a refill whose only triplet was
         # dropped, published nothing.
         "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 9,
+        # llama.cpp-pu8v: test_expert_loan_and_refill_stop_on_a_missing_entry checks, in one condition each, that the
+        # refused loan and the refill that dropped a triplet published nothing and left the request and the ledger
+        # as they must be.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get() ||": 2,
         # llama.cpp-mwmr: the expert loan transaction re-checks the publication's identity under
         # g_tensor_inventory_mutex before it lends, with the lifecycle row check after the ||.
         "if (ggml_sycl_global_plan_snapshot().get() != current.get() ||": 1,

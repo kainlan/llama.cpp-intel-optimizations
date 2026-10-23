@@ -2877,17 +2877,17 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
 // member's AOS device entry was direct-staged under. host_keys are the ids the host copy is registered under, the set
 // S1-PRELOAD registers a host-planned expert under; the first must equal key, and its lease is the one returned.
 // host_owner is pinned host storage minted owner-first (unified_allocate_owner) by the caller before it took any listed
-// lock, so no allocation runs under one. vram_charge_size is the plan's charge for the member, reported as bytes freed.
+// lock, so no allocation runs under one; its size must hold the device entry's (loan_copy_bytes()).
 struct expert_loan_member {
     expert_placement_key            placement;
     ggml_sycl_cache_id              key;
     std::vector<ggml_sycl_cache_id> host_keys;
-    size_t                          vram_charge_size = 0;
     mem_handle                      host_owner;
 };
 
 // What one loan did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
-// loan carries the bytes the plan stops charging the device, a lease on each member's host entry (whose bytes are valid
+// loan carries the device storage it returns, the three device entries' sizes (llama.cpp-pu8v: an entry can exceed the
+// plan's charge by the quantized tail direct staging pads), a lease on each member's host entry (whose bytes are valid
 // once copy_events[i] completes; the entry carries that event as its ready event) and each device entry's retire
 // status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after the entry's
 // leases are gone and behind the copy, which is the entry's last write.
@@ -2905,19 +2905,18 @@ struct expert_loan_record {
 // inverted. key is the cache id the member's AOS device entry was staged under and its host copy is published under;
 // host_keys are every id the loan published the host copy under, key first. device_owner is the member's device
 // storage, minted owner-first by the caller from the WEIGHT zone before it took any listed lock, so no allocation for
-// the bytes runs under one; its size must be the host copy's. vram_charge_size is the plan's charge for the member,
-// reported as bytes re-admitted.
+// the bytes runs under one; its size must be the host copy's (refill_copy_bytes()).
 struct expert_refill_member {
     expert_placement_key            placement;
     ggml_sycl_cache_id              key;
     std::vector<ggml_sycl_cache_id> host_keys;
-    size_t                          vram_charge_size = 0;
     mem_handle                      device_owner;
 };
 
 // What one refill did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
-// refill carries the bytes the plan charges the device again and a lease on each member's new device entry, whose
-// bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its last write).
+// refill carries the device storage it takes, the three host copies' sizes, and a lease on each member's new device
+// entry, whose bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its
+// last write).
 struct expert_refill_record {
     bool         accepted         = false;
     const char * reason           = "none";
@@ -3662,6 +3661,16 @@ class unified_cache {
     // here waits and nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of
     // the device lease, and flips the plan.
     bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
+
+    // The size each direction's copy must be minted at (llama.cpp-pu8v): the size of the entry it will hold, which
+    // the transaction compares it with. loan_copy_bytes() is the AOS device entry direct staging filed under key, which
+    // a loan copies whole; refill_copy_bytes() is the host copy a loan published under key, which a refill's device
+    // storage must equal. Each can exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to
+    // MATRIX_ROW_PADDING columns, and the plan does not count it. Read under direct_stage_mutex_ and rw_mutex_, shared;
+    // the transaction checks again under its own locks, so an entry that changes in between is refused there. 0 when
+    // there is no such entry, or it is retired.
+    size_t loan_copy_bytes(ggml_sycl_cache_id key) const;
+    size_t refill_copy_bytes(ggml_sycl_cache_id key) const;
 
     // Re-admit one lent triplet to the device (llama.cpp-sif1), the inverse of loan_expert_triplet(). Each member's
     // host copy must be the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is

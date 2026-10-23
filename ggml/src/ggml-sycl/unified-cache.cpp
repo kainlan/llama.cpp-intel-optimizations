@@ -10047,6 +10047,24 @@ void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exa
     }
 }
 
+// llama.cpp-pu8v: one source for each copy's size, the entry the copy will hold. A copy minted from the plan's dst_size
+// is short of an entry whose quantized tail direct staging padded, and the transaction refuses it.
+size_t unified_cache::loan_copy_bytes(ggml_sycl_cache_id key) const {
+    std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
+    const auto it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
+    return it != entries_.end() && !it->second.retired ? it->second.size : 0;
+}
+
+size_t unified_cache::refill_copy_bytes(ggml_sycl_cache_id key) const {
+    std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
+    const auto it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });
+    return it != entries_.end() && !it->second.retired ? it->second.size : 0;
+}
+
 // llama.cpp-mwmr, c-tdra: lend one resident expert triplet to the host for a prompt phase. The order keeps every
 // reader correct and every byte owned. The copies go first. Each device entry's last write then becomes its copy,
 // which ran behind every earlier write, so release_entry_allocation_locked() queues the storage's free behind the copy
@@ -10308,7 +10326,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_freed += members[i].vram_charge_size;
+        out.bytes_freed += bytes[i];
     }
     return true;
 }
@@ -10594,7 +10612,7 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_readmitted += members[i].vram_charge_size;
+        out.bytes_readmitted += bytes[i];
     }
     return true;
 }
@@ -29736,6 +29754,9 @@ static size_t planner_layout_bytes_for_dims(ggml_type        type,
         case GGML_LAYOUT_AOS:
         case GGML_LAYOUT_SOA:
         default:
+            // Unpadded: a direct-staged AOS expert's entry can exceed this by the MATRIX_ROW_PADDING tail
+            // (ggml_sycl_get_padded_weight_bytes), so expert loans and refills size copies from the entry
+            // (llama.cpp-pu8v).
             return ggml_row_size(type, ncols) * static_cast<size_t>(nrows);
     }
 }

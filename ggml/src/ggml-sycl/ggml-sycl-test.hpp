@@ -626,6 +626,12 @@ std::string test_expert_refill_cancelled_by_a_loan();
 std::string test_expert_refill_runs_once_per_decode_graph();
 std::string test_expert_refill_drops_an_unpreparable_triplet();
 std::string test_expert_refill_moves_two_triplets_per_call();
+// The loan and the refill size their copies from the cache entry, which can exceed the plan's dst_size by the tail
+// S1-PRELOAD pads, and a host copy smaller than its entry is still refused (llama.cpp-pu8v).
+std::string test_expert_loan_sizes_its_copies_from_the_entry();
+// With no entry to size a copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
+// ledger's back, and either moves and publishes nothing (llama.cpp-pu8v).
+std::string test_expert_loan_and_refill_stop_on_a_missing_entry();
 #endif
 
 }  // namespace ggml_sycl
