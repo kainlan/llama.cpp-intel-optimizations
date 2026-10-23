@@ -13,8 +13,7 @@ satisfy one by accident, and each count is read against a positive control in th
   3. the per-change WARN format, the level-1 trace format and the teardown summary format each appear exactly once;
   4. sycl_env_settings[] carries a row for both names, so the non-default report names them;
   5. ggml_sycl_moe_exec_config() is defined once in ggml-sycl.cpp and the backend free path prints the summary;
-  6. docs/backend/sycl-env-vars.md has a row for each name.  XFAIL until Task 14 (llama.cpp-36j0) writes the
-     rows; when Task 14 merges, delete the xfail marker so a missing row fails.
+  6. docs/backend/sycl-env-vars.md has a row for each name.
 """
 import re
 from pathlib import Path
@@ -108,7 +107,6 @@ def test_config_accessor_and_teardown_summary():
     assert re.search(r"(?m)^\s*ggml_sycl_moe_exec_log_report\(\);", free.group(1))
 
 
-@pytest.mark.xfail(reason="Task 14 (llama.cpp-36j0) writes the sycl-env-vars.md rows", strict=False)
 @pytest.mark.parametrize("name", NAMES)
 def test_catalog_has_row(name):
     assert re.search(r"`%s`" % name, (ROOT / "docs" / "backend" / "sycl-env-vars.md").read_text())
