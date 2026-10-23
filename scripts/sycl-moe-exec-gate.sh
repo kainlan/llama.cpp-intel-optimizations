@@ -9,7 +9,9 @@
 #   setsid nohup bash scripts/sycl-moe-exec-gate.sh <sha> > <scratchpad>/gate.log 2>&1 < /dev/null &
 # It loads models onto both discrete cards. Never run it from a subagent, never in a loop.
 #
-# Arms (selector pinned in every arm; no -ngl anywhere; Qwen arms carry timeout 900):
+# Arms (selector pinned in every arm; no -ngl anywhere; timeouts: Q_pp and Q_pp_cpu 1500 s, the other Qwen arms 900 s,
+# GO_gate and GO_noc 600 s, the Mistral arms 300 s; a run that hits its timeout exits 124 and one that has to be
+# killed exits 137, and every arm scores a non-zero rc as a FAIL naming it):
 #   Q_pp       llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v          B70  pp512 >= 500, pp2048 >= 800,
 #              at least one distinct "[MOE-EXEC] layer N:" line (exactly --q-layers N when given), at least one
 #              "[MOE-EXEC] summary:" (llama-bench makes one context per -p value, so -p 512,2048 prints two),
@@ -23,7 +25,7 @@
 #              "stream ring unavailable" WARN: under auto at default verbosity that WARN is not printed at all
 #              (it needs GGML_SYCL_MOE_EXEC=ring or the trace), so its absence proves nothing (llama.cpp-bcre).
 #              loan_exercised=yes|no is a "[MOE-EXEC] loan device N: K triplets" line.
-#   Q_pp_cpu   Q_pp with GGML_SYCL_MOE_EXEC=cpu                                  B70  recorded, not gated
+#   Q_pp_cpu   Q_pp with GGML_SYCL_MOE_EXEC=cpu                       B70  recorded, not gated (FAIL on rc != 0)
 #   Q_staged   llama-bench -p 512 -n 0 -r 1 -fa 1 -o csv -v, GGML_SYCL_MOE_EXEC_TRACE=1   B70
 #              the executor prints "[MOE-EXEC-TRACE] executor device D tensor=T experts=E staged=S arm=A" for EVERY
 #              dispatch, resident layers included (staged=0 there is correct). So only the layers the ring served
@@ -32,17 +34,20 @@
 #              Also at least one "[PP-MOE] device=D type=T layout=L arm=f16" line and zero "[PP-MOE] refused".
 #              NOT_EXERCISED (neither pass nor fail) when ring_engaged=no: nothing was staged to count.
 #   Q_tok      llama-completion -m $Q -f code-2k.txt -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4
-#              B70  md5 of stdout recorded (load 1 of 2)
+#              B70  md5 of stdout recorded (load 1 of 2); an rc != 0 or an empty stdout is a FAIL, not a recorded md5
 #   Q_tok_2    Q_tok again, a second load                                         B70  md5 recorded
 #   Q_tok_cpu_1  Q_tok with GGML_SYCL_MOE_EXEC=cpu                                B70  md5 recorded (load 1 of 2)
 #   Q_tok_cpu  Q_tok_cpu_1 again, a second load, and the verdict                  B70  every auto output md5 equals
 #              the md5 of some cpu output. Qwen3.8 greedy decoding on the B70 flips run to run (a near-tie, about
 #              one load in five to eight), so one load per arm cannot tell a flip from a defect: two per arm, stdout
-#              only (the log goes to stderr). On a mismatch the verdict names the first differing byte.
+#              only (the log goes to stderr). On a mismatch the verdict names the first differing byte. All four
+#              outputs must be non-empty and all four loads must have exited 0, else the arm FAILs.
 #   Q_tg       the q0xu Q_c4096 arm verbatim (code.txt, -n 60 -c 4096 -ub 256 -t 4)   B70  tg >= 11.0, md5 25b7738a,
-#              watchdog 0, place line as --place-ref-tg, every "[MOE-EXEC] refill device D: R/L" has R = L
+#              watchdog 0, place line as --place-ref-tg, every "[MOE-EXEC] refill device D: R/L" has R = L (checked per
+#              line, so 24/23 on one device and 23/24 on another is unbalanced although the sums agree). tg is the
+#              figure on the last " eval time = " line, never the prompt-eval rate: a nan eval line is no_tg.
 #   Q_noc      the q0xu Q_noc arm (the same without -c)                          B70  tg >= 9.5, md5 25b7738a,
-#              watchdog 0, place line as --place-ref-noc
+#              watchdog 0, place line as --place-ref-noc, and the same refill rule as Q_tg
 #   GO_gate    llama-cli GPT-OSS count gate at -c 4096 (all in VRAM)            B50  grep -cx '1, 2, 3, 4, 5' = 1,
 #              zero "[MOE-EXEC] layer" lines
 #   GO_pp      llama-bench -m $GO -p 512 -n 128 -r 3 -o csv                     B50  pp512 within 5 % of 871,
@@ -52,7 +57,9 @@
 #              (exactly --go-noc-layers N when given; the plan guessed 12 and no run has measured it)
 #   MI_b70     llama-completion Mistral digits gate                             B70  grep -c '1, 2, ..., 10' = 1
 #   MI_b50     the same                                                         B50
-#   resets     journalctl -k --since <gate start> | grep -icE 'GT reset|guc_id|CAT error|Engine reset|exec queue reset' = 0
+#   resets     journalctl -k --since <gate start> | grep -icE
+#              'GT reset|guc_id|CAT error|Engine reset|exec queue reset' = 0
+#              (journalctl's own rc is kept: a failed journalctl or a missing journal file is a FAIL, never a clean log)
 # Note on the plan table: llama-bench has no -c option (its context is n_prompt + n_gen), so GO_pp carries none.
 # Verdict-bearing arms (11): Q_pp Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets.
 # Arms in all (15): the eleven, Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
@@ -63,9 +70,17 @@
 #
 # Preflights refuse (rc 2): no <sha> or a head that differs from it; GGML_SYCL not ON; a binary missing, older than
 # the head commit, or not linked to the SYCL runtime; a model file missing; a failed grep control; builders
-# (ninja + icpx) > 0; Shmem >= 30 GB or MemAvailable <= 150 GB; GPU.lock already held. Before each arm the host must
-# settle (Shmem < 30 GB and MemAvailable > 150 GB, up to 10 minutes, else the gate stops and releases the lock) and
-# builders must be 0. Shmem and MemAvailable are sampled before each arm and 5 s after it into the log.
+# (ninja + icpx) > 0 at the start; Shmem >= 30 GB or MemAvailable <= 150 GB; GPU.lock already held; a GGML_SYCL_* or
+# LLAMA_ARG_* variable in the environment (every arm would inherit it; each arm sets its own); a non-empty --out-dir
+# unless --arm names the arms to redo or --clobber is given (a reused directory would score one run's files as
+# another's). Before each arm the host must settle (Shmem < 30 GB and MemAvailable > 150 GB, up to 10 minutes) and
+# the builders must reach 0 (the gate waits for them like settle, up to 15 minutes, 10 s polls); only an expired wait
+# stops the gate. Shmem, MemAvailable, load and builders are sampled before each arm and 5 s after it, and builders
+# every 5 s during it; every verdict line carries builders_pre= and builders_post= (the highest count seen during or
+# after the arm). A PASS with builders_post > 0 becomes NOT_SCORED(tainted=builders,was=PASS), exit class 3: a build
+# running next to the arm depresses throughput and flips CPU-path timing. A FAIL stays a FAIL and carries the flag.
+# Once the lock is held, every stop (a refusal such as an expired wait, or a signal) prints STOPPED: <reason>, the
+# summary over the verdicts scored so far, and the final line; exit 2 for a refusal, 143 for a signal.
 # GPU.lock is `mkdir $LOCK_DIR` with a `holder` file inside, released with `rm -f holder && rmdir`.
 #
 # Exit codes: 0 every requested verdict PASS; 1 at least one FAIL; 2 refused or usage; 3 none failed but at least
@@ -74,7 +89,18 @@
 # gate was stopped by TERM, INT or HUP (it prints ABORTED and the final line, and releases the lock).
 # The summary line carries ring_engaged_any=yes|no|na (na: no arm that run carries a ring_engaged field) and
 # loan_exercised_any=yes|no, both read from the verdict lines. --score-summary FILE scores a file of verdict lines.
-# <sha> is the head the build was made from, at least 7 hex characters; a shorter or non-hex value is refused.
+# <sha> is the head the build was made from, at least 7 hex characters; a shorter or non-hex value is refused, also
+# under --no-head-check. A usage error (a typo in a detached run) prints REFUSED and the final line too, so the waiter
+# is released; --help and --dry-run keep the plain form.
+#
+# The lead form: the script runs from a snapshot copy, against a build whose source tree is the merge tree:
+#   cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snap>/scripts/
+#   bash <snap>/scripts/sycl-moe-exec-gate.sh --build-dir <merge-tree>/build --out-dir <fresh dir> <sha>
+# The prompts resolve next to the script (the snapshot); the head check, the binary-newer-than-head check and the
+# prompt source docs come from --src-dir, which defaults to the parent of --build-dir. --no-head-check stays as an
+# explicit escape: it skips the head comparison and the binary-newer-than-head check, and it gives up exactly the
+# guarantee that the binaries were built from <sha>. It still validates the sha format and still refuses a missing
+# binary or a missing SYCL backend.
 #
 # Caveat, found by the first real run (2026-10-23): oneAPI's setvars.sh overwrites shell variables. The advisor and
 # vtune vars.sh files assign BIN_DIR=bin64 as a plain variable, so a gate that set BIN_DIR="$BUILD_DIR/bin" and then
@@ -87,6 +113,8 @@
 #   --help | --dry-run (print each arm's command and scoring, run nothing) | --arm NAME (repeatable)
 #   --make-prompt [--prompt-out FILE]   regenerate scripts/sycl-moe-exec-prompts/code-2k.txt from docs/
 #   --score-arm NAME [--csv F] [--out F] [--out2 F] [--err F] [--ref-out F] [--ref-out2 F] [--journal F] [--rc N]
+#                                       [--rc-out2 N --rc-ref N --rc-ref2 N: the rcs of Q_tok_cpu_1, Q_tok, Q_tok_2]
+#                                       [--builders-pre N --builders-post N]
 #                                       score existing files, GPU-free; for Q_tok_cpu: --out cpu load 2, --out2 cpu
 #                                       load 1, --ref-out auto load 1, --ref-out2 auto load 2
 #   --score-summary FILE                print the summary line and exit with the code a gate over those verdict lines
@@ -95,31 +123,22 @@
 #                                       ring_engaged_any is read from
 #   --signal-selftest                   take GPU.lock, start a sleeping child, wait; a TERM must kill the child, release
 #                                       the lock, print the final line and exit 143 (GPU-free, for the test)
+#   --refuse-selftest / --wait-builders-selftest   GPU-free hooks of the stop paths (--seed-verdicts F preloads
+#                                       verdict lines; --builders-file F, --builders-wait-max N and --builders-poll N
+#                                       replace the pgrep count and the wait bound), for the test
 #   --check-controls                    run only the grep controls
-#   --build-dir DIR  --out-dir DIR  --lock-dir DIR  --no-lock  --no-head-check  --since 'YYYY-MM-DD HH:MM:SS'
+#   --build-dir DIR  --src-dir DIR (source tree of the build; default: the parent of --build-dir)
+#   --out-dir DIR  --clobber (accept a non-empty --out-dir)  --lock-dir DIR  --no-lock  --no-head-check
+#   --since 'YYYY-MM-DD HH:MM:SS'
 #   --qwen F --gptoss F --mistral F   model files
 #   --tuning-dir DIR   export GGML_SYCL_TUNING_CACHE_DIR (default: the real cache, so acceptance runs write it)
 #   --place-ref-tg STR --place-ref-noc STR   expected "MoE experts: N on device, M on host" ("-" = unscored)
-#   --qmd5 HEX8 (25b7738a)  --q-layers N (any) --go-noc-layers N (any) --pp512-min N (500) --pp2048-min N (800) --go-pp-ref N (871)
+#   --qmd5 HEX8 (25b7738a)  --q-layers N (any) --go-noc-layers N (any) --pp512-min N (500) --pp2048-min N (800)
+#   --go-pp-ref N (871)
 #   --go-tg-ref N (33.7)
 
 set -o pipefail
 export LC_NUMERIC=C
-
-# A real run sources oneAPI here, before any variable of this file is derived, because setvars.sh overwrites shell
-# variables (see the caveat in the header). The modes that run nothing on a device do not source it, so --dry-run,
-# --score-arm and the test need no oneAPI. A refusal still sources it first: it costs about two seconds.
-GATE_NEEDS_ONEAPI=1
-for GATE_ARG in "$@"; do
-    case "$GATE_ARG" in
-        -h | --help | --dry-run | --score-arm | --score-summary | --make-prompt | --check-controls | --lock-selftest | \
-            --ring-arms | --signal-selftest) GATE_NEEDS_ONEAPI=0 ;;
-    esac
-done
-if [ "$GATE_NEEDS_ONEAPI" = 1 ]; then
-    # shellcheck disable=SC1091
-    source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -138,7 +157,19 @@ MAKE_PROMPT=0
 CHECK_CONTROLS=0
 SCORE_ARM=""
 PROMPT_OUT="$SCRIPT_DIR/sycl-moe-exec-prompts/code-2k.txt"
-PROMPT_DOC="$ROOT_DIR/docs/backend/gpt-oss-testing.md"
+SRC_DIR=""
+CLOBBER=0
+ARMS_EXPLICIT=0
+SEED_VERDICTS=""
+REFUSE_SELFTEST=0
+WAIT_BUILDERS_SELFTEST=0
+BUILDERS_FILE=""
+BUILDERS_WAIT_MAX=900
+BUILDERS_POLL=10
+RUN_STARTED=0
+declare -a VERDICTS=()
+SAMPLER=""
+S_BPRE=na S_BPOST=na S_RC_OUT2=0 S_RC_REF=0 S_RC_REF2=0
 TUNING_DIR=""
 SINCE=""
 LOCK_SELFTEST=0
@@ -165,7 +196,8 @@ PLACE_REF_NOC="MoE experts: 38163 on device, 35565 on host"
 
 # The arms whose verdict carries ring_engaged=yes|no; ring_engaged_any in the summary is read from these and only these.
 RING_ARMS=(Q_pp Q_staged)
-ALL_ARMS=(Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets)
+ALL_ARMS=(Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc
+          GO_gate GO_pp GO_noc MI_b70 MI_b50 resets)
 declare -a ARMS=()
 S_CSV="" S_OUT="" S_OUT2="" S_ERR="" S_REF="" S_REF2="" S_JOURNAL="" S_RC=0
 
@@ -189,8 +221,11 @@ usage() {
     sed -n '2,/^set -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
+# die_usage: a typo in a detached run must not leave its waiter hanging, so the final line is printed too.
 die_usage() {
     echo "sycl-moe-exec-gate: $*" >&2
+    say "REFUSED: usage: $*"
+    say "verdicts_pass=0 GATE_DONE"
     exit 2
 }
 
@@ -208,10 +243,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -h | --help) usage; exit 0 ;;
         --dry-run) DRY_RUN=1; shift ;;
-        --arm) is_arm "${2:-}" || die_usage "--arm '${2:-}' is not one of: ${ALL_ARMS[*]}"; ARMS+=("$2"); shift 2 ;;
+        --arm)
+            is_arm "${2:-}" || die_usage "--arm '${2:-}' is not one of: ${ALL_ARMS[*]}"
+            ARMS+=("$2"); ARMS_EXPLICIT=1; shift 2 ;;
         --make-prompt) MAKE_PROMPT=1; shift ;;
         --prompt-out) PROMPT_OUT="$2"; shift 2 ;;
-        --score-arm) is_arm "${2:-}" || die_usage "--score-arm '${2:-}' is not one of: ${ALL_ARMS[*]}"; SCORE_ARM="$2"; shift 2 ;;
+        --score-arm)
+            is_arm "${2:-}" || die_usage "--score-arm '${2:-}' is not one of: ${ALL_ARMS[*]}"
+            SCORE_ARM="$2"; shift 2 ;;
         --csv) S_CSV="$2"; shift 2 ;;
         --out) S_OUT="$2"; shift 2 ;;
         --out2) S_OUT2="$2"; shift 2 ;;
@@ -220,6 +259,19 @@ while [ $# -gt 0 ]; do
         --ref-out2) S_REF2="$2"; shift 2 ;;
         --journal) S_JOURNAL="$2"; shift 2 ;;
         --rc) S_RC="$2"; shift 2 ;;
+        --rc-out2) S_RC_OUT2="$2"; shift 2 ;;
+        --rc-ref) S_RC_REF="$2"; shift 2 ;;
+        --rc-ref2) S_RC_REF2="$2"; shift 2 ;;
+        --builders-pre) S_BPRE="$2"; shift 2 ;;
+        --builders-post) S_BPOST="$2"; shift 2 ;;
+        --src-dir) SRC_DIR="$2"; shift 2 ;;
+        --clobber) CLOBBER=1; shift ;;
+        --seed-verdicts) SEED_VERDICTS="$2"; shift 2 ;;
+        --refuse-selftest) REFUSE_SELFTEST=1; shift ;;
+        --wait-builders-selftest) WAIT_BUILDERS_SELFTEST=1; shift ;;
+        --builders-file) BUILDERS_FILE="$2"; shift 2 ;;
+        --builders-wait-max) BUILDERS_WAIT_MAX="$2"; shift 2 ;;
+        --builders-poll) BUILDERS_POLL="$2"; shift 2 ;;
         --score-summary) SCORE_SUMMARY="$2"; shift 2 ;;
         --ring-arms) RING_ARMS_MODE=1; shift ;;
         --signal-selftest) SIGNAL_SELFTEST=1; shift ;;
@@ -250,6 +302,43 @@ while [ $# -gt 0 ]; do
 done
 [ "${#ARMS[@]}" -gt 0 ] || ARMS=("${ALL_ARMS[@]}")
 
+# A real run sources oneAPI here, after the options are parsed and before any variable is derived from them, because
+# setvars.sh overwrites shell variables (see the caveat in the header). The modes that run nothing on a device do not
+# source it, so --dry-run, --score-arm and the test need no oneAPI. A refusal still sources it first (about 2 s). The
+# decision reads the parsed mode flags, never the raw words, so an option value that equals a mode name cannot skip it.
+GATE_NEEDS_ONEAPI=1
+modes="$DRY_RUN$MAKE_PROMPT$CHECK_CONTROLS$LOCK_SELFTEST$RING_ARMS_MODE"
+modes="$modes$SIGNAL_SELFTEST$REFUSE_SELFTEST$WAIT_BUILDERS_SELFTEST"
+if [ "$modes" != 00000000 ] || [ -n "$SCORE_ARM$SCORE_SUMMARY" ]; then
+    GATE_NEEDS_ONEAPI=0
+fi
+
+# require_tools <tool...>: a missing tool is a skip (77), never a pass: scoring through a missing awk or cmp would be a
+# clean answer about nothing.
+require_tools() {
+    local t miss=""
+    for t in "$@"; do
+        command -v "$t" > /dev/null 2>&1 || miss="$miss $t"
+    done
+    if [ -n "$miss" ]; then
+        say "SKIP: missing tool(s):$miss"
+        say "verdicts_pass=0 GATE_DONE"
+        exit 77
+    fi
+}
+require_tools awk md5sum cmp comm
+[ "$GATE_NEEDS_ONEAPI" = 0 ] || require_tools journalctl pgrep timeout git
+
+if [ "$GATE_NEEDS_ONEAPI" = 1 ]; then
+    # shellcheck disable=SC1091
+    source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1
+fi
+
+# Everything the gate reads from the tree under test comes from SRC_DIR, the source tree of the build: the parent of
+# --build-dir unless --src-dir says otherwise. The prompts and this script come from where the script lives, so a
+# snapshot copy of the script runs against another tree's build.
+[ -n "$SRC_DIR" ] || SRC_DIR="$(dirname "$BUILD_DIR")"
+PROMPT_DOC="$SRC_DIR/docs/backend/gpt-oss-testing.md"
 GATE_BIN_DIR="$BUILD_DIR/bin"
 
 # ---------------------------------------------------------------- scoring primitives (pure functions of files)
@@ -294,9 +383,11 @@ csv_row() {
 
 md5_8() { md5sum < "$1" | cut -c1-8; }
 
-# tps <err-log>: the last "N tokens per second" figure (the eval line), or empty.
+# tps <err-log>: the figure on the last " eval time = " line (not "prompt eval time"), or empty. The prompt-eval rate
+# must never stand in for it: a nan eval line leaves no figure, and the arm then fails as no_tg.
 tps() {
-    grep -aoE -- "$RE_TPS" "$1" 2>/dev/null | tail -1 | cut -d' ' -f1
+    cat "$1" 2>/dev/null | grep -a ' eval time = ' | grep -av 'prompt eval time' | tail -1 \
+        | grep -aoE -- "$RE_TPS" | cut -d' ' -f1
 }
 
 # place_line <err-log>: the last "MoE experts: N on device, M on host" line, or empty.
@@ -304,7 +395,7 @@ place_line() {
     grep -aoE -- "$RE_PLACE" "$1" 2>/dev/null | tail -1
 }
 
-# join_fail <items...>: "FAIL(a,b)" for a non-empty list, else "PASS".
+# verdict_of <items...>: "FAIL(a,b)" for a non-empty list, else "PASS".
 verdict_of() {
     local IFS=','
     if [ $# -eq 0 ]; then
@@ -376,16 +467,18 @@ score_q_pp() { # <csv> <err> <rc>
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
     r512="$(awk -v v="$pp512" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
     r2048="$(awk -v v="$pp2048" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
-    echo "Q_pp=$(verdict_of "${fails[@]}") pp512=$r512 sd512=$sd512 pp2048=$r2048 sd2048=$sd2048 ub=$ub layers=$layers" \
+    echo "Q_pp=$(verdict_of "${fails[@]}") pp512=$r512 sd512=$sd512 pp2048=$r2048" \
+        "sd2048=$sd2048 ub=$ub layers=$layers" \
         "summary=$summary pp_moe_refused=$refused ring_engaged=$(ring_engaged "$err")" \
         "ring_layer_ubatches=$(ring_layer_ubatches "$err") loan_exercised=$(loan_exercised "$err")"
 }
 
 score_q_pp_cpu() { # <csv> <err> <rc>
-    local pp512 pp2048 _
+    local pp512 pp2048 _ st=RECORDED
     read -r pp512 _ <<< "$(csv_row "$1" 512 0)"
     read -r pp2048 _ <<< "$(csv_row "$1" 2048 0)"
-    echo "Q_pp_cpu=RECORDED pp512=$pp512 pp2048=$pp2048 layers=$(distinct_layers "$2")" \
+    [ -z "$(rc_item "$3")" ] || st="FAIL($(rc_item "$3"))"
+    echo "Q_pp_cpu=$st pp512=$pp512 pp2048=$pp2048 layers=$(distinct_layers "$2")" \
         "forced_cpu_lines=$(count_re '\[MOE-EXEC\] layer [0-9]+: cpu .*forced' "$2") rc=$3"
 }
 
@@ -431,37 +524,56 @@ score_q_staged() { # <err> <rc>
     [ "$nonf16" -eq 0 ] || fails+=("arm_not_f16=$nonf16/$served")
     [ "$arms" -gt 0 ] || fails+=("no_pp_moe_arm_f16_line")
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
-    echo "Q_staged=$(verdict_of "${fails[@]}") ring_layers=$nids executor_dispatches=$total ring_layer_dispatches=$served" \
-        "pp_moe_arm_f16_lines=$arms pp_moe_refused=$refused ring_engaged=yes ring_layer_ubatches=$(ring_layer_ubatches "$err")"
+    echo "Q_staged=$(verdict_of "${fails[@]}") ring_layers=$nids executor_dispatches=$total" \
+        "ring_layer_dispatches=$served pp_moe_arm_f16_lines=$arms pp_moe_refused=$refused ring_engaged=yes" \
+        "ring_layer_ubatches=$(ring_layer_ubatches "$err")"
 }
 
 # score_q_tok <name> <out> <rc>: a recorded md5 of stdout.
+# A crashed or empty load is a FAIL, not a recorded md5: the md5 of nothing is d41d8cd9.
 score_q_tok() {
-    echo "$1=RECORDED md5=$(md5_8 "$2") rc=$3"
+    local fails=()
+    [ -z "$(rc_item "$3")" ] || fails+=("$(rc_item "$3")")
+    [ -s "$2" ] || fails+=("empty_output")
+    if [ "${#fails[@]}" -eq 0 ]; then
+        echo "$1=RECORDED md5=$(md5_8 "$2") rc=$3"
+    else
+        echo "$1=$(verdict_of "${fails[@]}") md5=$(md5_8 "$2") rc=$3"
+    fi
 }
 
 # first_diff_byte <a> <b>: the 1-based byte where two files first differ, "eof" when one is a prefix of the other.
 first_diff_byte() {
     local r
-    r="$(cmp "$1" "$2" 2>&1 | head -1)"
+    r="$(LC_ALL=C cmp "$1" "$2" 2>&1 | head -1)"
     case "$r" in
         *"differ: byte "*) r="${r#*differ: byte }"; echo "${r%%,*}" ;;
+        *"differ: char "*) r="${r#*differ: char }"; echo "${r%%,*}" ;; # the C locale says char, the others byte
         *EOF*) echo eof ;;
         *) echo none ;;
     esac
 }
 
-# score_q_tok_cpu <cpu load 2 out> <cpu load 1 out> <auto load 1 out> <auto load 2 out> <rc>: Qwen3.8 greedy decoding
-# on the B70 flips from load to load, so one output per arm cannot tell a flip from a defect. Two loads per arm, and
-# the arm passes when every auto output equals SOME cpu output. stdout only: the log goes to stderr.
+# score_q_tok_cpu <cpu load 2 out> <cpu load 1 out> <auto load 1 out> <auto load 2 out> <rc of the first> <rc of the
+# second> <rc of the third> <rc of the fourth>: Qwen3.8 greedy decoding on the B70 flips from load to load, so one
+# output per arm cannot tell a flip from a defect. Two loads per arm, and the arm passes when every auto output equals
+# SOME cpu output. stdout only: the log goes to stderr. All four outputs must be non-empty and all four loads must have
+# exited 0: three crashed loads and one good one would otherwise agree on the md5 of nothing.
 score_q_tok_cpu() {
-    local cb="$1" ca="$2" aa="$3" ab="$4" rc="$5" fails=() ma mb mca mcb k f m flips_a=no flips_c=no
-    local names=(Q_tok Q_tok_2 Q_tok_cpu_1) files=("$aa" "$ab" "$ca") i
-    for i in 0 1 2; do
+    local cb="$1" ca="$2" aa="$3" ab="$4" fails=() ma mb mca mcb k f m flips_a=no flips_c=no
+    local rcs=("$5" "$6" "$7" "$8") names=(Q_tok_cpu Q_tok_cpu_1 Q_tok Q_tok_2) files=("$cb" "$ca" "$aa" "$ab") i
+    for i in 1 2 3; do
         [ -e "${files[$i]}" ] || { echo "Q_tok_cpu=NOT_SCORED(no_${names[$i]}_output)"; return; }
     done
-    [ -z "$(rc_item "$rc")" ] || fails+=("$(rc_item "$rc")")
-    [ -s "$cb" ] || fails+=("empty_output")
+    for i in 0 1 2 3; do
+        if [ "$i" = 0 ]; then # this arm's own load keeps the plain item names
+            [ "${rcs[0]:-0}" = 0 ] || fails+=("rc=${rcs[0]}")
+            [ -s "${files[0]}" ] || fails+=("empty_output")
+        else
+            [ "${rcs[$i]:-0}" = 0 ] || fails+=("rc_${names[$i]}=${rcs[$i]}")
+            [ -s "${files[$i]}" ] || fails+=("empty_${names[$i]}_output")
+        fi
+    done
     ma="$(md5_8 "$aa")"; mb="$(md5_8 "$ab")"; mca="$(md5_8 "$ca")"; mcb="$(md5_8 "$cb")"
     [ "$ma" = "$mb" ] || flips_a=yes
     [ "$mca" = "$mcb" ] || flips_c=yes
@@ -537,7 +649,8 @@ score_go_pp() { # <csv> <rc>
     [ -z "$item" ] || fails+=("$item")
     item="$(within_item tg128 "$tg" "$GO_TG_REF" "$GO_TG_TOL")"
     [ -z "$item" ] || fails+=("$item")
-    echo "GO_pp=$(verdict_of "${fails[@]}") pp512=$pp sd512=$sdp tg128=$tg sd128=$sdt ref_pp512=$GO_PP_REF ref_tg128=$GO_TG_REF"
+    echo "GO_pp=$(verdict_of "${fails[@]}") pp512=$pp sd512=$sdp tg128=$tg sd128=$sdt" \
+        "ref_pp512=$GO_PP_REF ref_tg128=$GO_TG_REF"
 }
 
 score_mi() { # <name> <out> <rc>
@@ -548,33 +661,60 @@ score_mi() { # <name> <out> <rc>
     echo "${name}=$(verdict_of "${fails[@]}") digits=${n:-0}"
 }
 
-score_resets() { # <journal-text>
-    local n
+# score_resets <journal-text> <journalctl rc>: an empty journal is a pass only when journalctl itself succeeded; a
+# missing file or a failed journalctl is a FAIL, never a clean log.
+score_resets() {
+    local n fails=()
+    [ -f "$1" ] || fails+=("no_journal")
+    [ -z "$(rc_item "$2")" ] || fails+=("journalctl_$(rc_item "$2")")
     n="$(cat "$1" 2>/dev/null | grep -aciE -- "$RE_RESETS")"
-    if [ "${n:-0}" -eq 0 ]; then
-        echo "resets=PASS count=0"
-    else
-        echo "resets=FAIL(count=$n) count=$n"
-    fi
+    [ "${n:-0}" -eq 0 ] || fails+=("count=$n")
+    echo "resets=$(verdict_of "${fails[@]}") count=${n:-0}"
 }
 
-# score_arm_files <arm> <csv> <out> <err> <ref-out> <journal> <rc> <out2> <ref-out2>
-score_arm_files() {
+# score_arm_raw <arm> <csv> <out> <err> <ref-out> <journal> <rc> <out2> <ref-out2>; the rcs of the recorded Q_tok arms
+# come from S_RC_OUT2 (Q_tok_cpu_1), S_RC_REF (Q_tok) and S_RC_REF2 (Q_tok_2).
+score_arm_raw() {
     local arm="$1" csv="$2" out="$3" err="$4" ref="$5" journal="$6" rc="$7" out2="${8:-}" ref2="${9:-}"
     case "$arm" in
         Q_pp) score_q_pp "$csv" "$err" "$rc" ;;
         Q_pp_cpu) score_q_pp_cpu "$csv" "$err" "$rc" ;;
         Q_staged) score_q_staged "$err" "$rc" ;;
         Q_tok | Q_tok_2 | Q_tok_cpu_1) score_q_tok "$arm" "$out" "$rc" ;;
-        Q_tok_cpu) score_q_tok_cpu "$out" "$out2" "$ref" "$ref2" "$rc" ;;
+        Q_tok_cpu) score_q_tok_cpu "$out" "$out2" "$ref" "$ref2" "$rc" "$S_RC_OUT2" "$S_RC_REF" "$S_RC_REF2" ;;
         Q_tg) score_decode Q_tg "$out" "$err" "$rc" "$QTG_MIN" "$PLACE_REF_TG" ;;
         Q_noc) score_decode Q_noc "$out" "$err" "$rc" "$QNOC_MIN" "$PLACE_REF_NOC" ;;
         GO_gate) score_go GO_gate "$out" "$err" "$rc" 0 ;;
         GO_noc) score_go GO_noc "$out" "$err" "$rc" "$GO_NOC_LAYERS" ;;
         GO_pp) score_go_pp "$csv" "$rc" ;;
         MI_b70 | MI_b50) score_mi "$arm" "$out" "$rc" ;;
-        resets) score_resets "$journal" ;;
+        resets) score_resets "$journal" "$rc" ;;
     esac
+}
+
+# decorate_verdict <line> <builders pre> <builders post>: every verdict line carries builders_pre= and builders_post=
+# ("na" when the run recorded none). A build running during the arm depresses throughput and flips CPU-path timing, so
+# a PASS with builders_post above 0 becomes NOT_SCORED(tainted=builders,was=PASS), which is exit class 3. A FAIL stays
+# a FAIL (a taint cannot make a real failure go away) and a RECORDED line stays recorded; both carry the flag.
+decorate_verdict() {
+    local line="$1" pre="$2" post="$3" name st rest
+    if [[ "$post" =~ ^[0-9]+$ ]] && [ "$post" -gt 0 ]; then
+        name="${line%%=*}"
+        st="$(status_of "$line")"
+        rest="${line#* }"
+        if [ "$st" = PASS ]; then
+            line="$name=NOT_SCORED(tainted=builders,was=PASS) $rest"
+        fi
+        line="$line builders_pre=$pre builders_post=$post tainted=builders"
+    else
+        line="$line builders_pre=$pre builders_post=$post"
+    fi
+    echo "$line"
+}
+
+# score_arm_files: the same arguments as score_arm_raw, plus the builders sampled around the arm (S_BPRE, S_BPOST).
+score_arm_files() {
+    decorate_verdict "$(score_arm_raw "$@")" "$S_BPRE" "$S_BPOST"
 }
 
 # status_of <verdict line>: PASS | FAIL | RECORDED | NOT_EXERCISED | NOT_SCORED
@@ -605,7 +745,8 @@ check_controls() {
         '[MOE-EXEC-TRACE] dev 0 layer 7: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
     ctl summary "$RE_SUMMARY" '[MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed' \
         '[MOE-EXEC] layer 7: ring (p=0.99)'
-    ctl summary_ring "$RE_SUMMARY_RING" '[MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed' \
+    ctl summary_ring "$RE_SUMMARY_RING" \
+        '[MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed' \
         '[MOE-EXEC] layer 7: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
     ctl loan_ok "$RE_LOAN_OK" '[MOE-EXEC] loan device 0: 24 triplets, 300 MiB lent to the ring (ok)' \
         '[MOE-EXEC] loan device 0 refused: host storage too small'
@@ -614,7 +755,8 @@ check_controls() {
     ctl pp_refused "$RE_PP_REFUSED" \
         '[PP-MOE] refused device=0 cause=x detail=- tensor=blk.0.ffn_up_exps.weight type=q4_0 layout=aos staged=4' \
         '[PP-MOE] device=0 type=q4_0 layout=aos arm=f16 experts=8 groups=1 planned_weight_slot=100'
-    ctl pp_arm "$RE_PP_ARM_F16" '[PP-MOE] device=0 type=q4_0 layout=aos arm=f16 experts=8 groups=1 planned_weight_slot=100' \
+    ctl pp_arm "$RE_PP_ARM_F16" \
+        '[PP-MOE] device=0 type=q4_0 layout=aos arm=f16 experts=8 groups=1 planned_weight_slot=100' \
         '[PP-MOE] device=0 type=q4_0 layout=aos arm=woq experts=8 groups=1 planned_weight_slot=100'
     ctl trace_exec "$RE_TRACE_EXEC" \
         '[MOE-EXEC-TRACE] executor device 0 tensor=blk.3.ffn_up_exps.weight experts=8 staged=8 arm=f16' \
@@ -622,15 +764,18 @@ check_controls() {
     ctl watchdog "$RE_WATCHDOG" '[SYCL-WATCHDOG] No GPU progress for 30 s' '[SYCL-WATCHDOG] armed'
     ctl place "$RE_PLACE" '[PLACEMENT] MoE experts: 38004 on device, 35724 on host (of 73728 total)' \
         '[PLACEMENT] MoE experts: all on device'
-    ctl tps "$RE_TPS" 'llama_perf_context_print:        eval time =    4954.02 ms /    59 runs   (   83.97 ms per token,    11.91 tokens per second)' \
-        'llama_perf_context_print:        eval time =    4954.02 ms /    59 runs'
+    local tps_head='llama_perf_context_print:        eval time =    4954.02 ms /    59 runs'
+    ctl tps "$RE_TPS" "$tps_head   (   83.97 ms per token,    11.91 tokens per second)" "$tps_head"
     ctl resets "$RE_RESETS" 'xe 0000:03:00.0: [drm] GT reset started' 'xe 0000:03:00.0: [drm] GT0: suspended'
     ctl mi "$RE_MI" '1, 2, 3, 4, 5, 6, 7, 8, 9, 10' '1, 2, 3, 4, 5,'
     # The count scorer is grep -cx, not grep -c: the echo line ends with the answer (CLAUDE.md, GPT-OSS gate).
     local echo_line='> Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5'
-    [ "$(printf '%s\n' "$echo_line" | grep -cx '1, 2, 3, 4, 5')" = 0 ] || { echo "control FAIL: echo line scores" >&2; bad=1; }
-    [ "$(printf '%s\n1, 2, 3, 4, 5\n' "$echo_line" | grep -cx '1, 2, 3, 4, 5')" = 1 ] || { echo "control FAIL: answer line" >&2; bad=1; }
-    [ "$(printf '%s\n1, 2, 3, 4, 5\n' "$echo_line" | grep -c '1, 2, 3, 4, 5')" = 2 ] || { echo "control FAIL: loose grep premise" >&2; bad=1; }
+    [ "$(printf '%s\n' "$echo_line" | grep -cx '1, 2, 3, 4, 5')" = 0 ] ||
+        { echo "control FAIL: echo line scores" >&2; bad=1; }
+    [ "$(printf '%s\n1, 2, 3, 4, 5\n' "$echo_line" | grep -cx '1, 2, 3, 4, 5')" = 1 ] ||
+        { echo "control FAIL: answer line" >&2; bad=1; }
+    [ "$(printf '%s\n1, 2, 3, 4, 5\n' "$echo_line" | grep -c '1, 2, 3, 4, 5')" = 2 ] ||
+        { echo "control FAIL: loose grep premise" >&2; bad=1; }
     return "$bad"
 }
 
@@ -645,11 +790,12 @@ arm_setup() {
     local gpt_cli=(-st --simple-io --no-display-prompt --chat-template-kwargs '{"reasoning_effort":"medium"}'
         --reasoning-format none --reasoning-budget 0 -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5'
         -n 48 --seed 42 --temp 0)
-    local q_decode=(-m "$QWEN" -f "$DECODE_PROMPT" -n 60 --seed 42 --temp 0 -no-cnv -ub 256 --no-display-prompt -lv 4 -t 4)
+    local q_decode=(-m "$QWEN" -f "$DECODE_PROMPT" -n 60 --seed 42 --temp 0 -no-cnv -ub 256
+                    --no-display-prompt -lv 4 -t 4)
     local q_tok=(-m "$QWEN" -f "$TOK_PROMPT" -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4)
     case "$arm" in
-        Q_pp) A_KIND=bench A_BIN=llama-bench; A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
-        Q_pp_cpu) A_KIND=bench A_BIN=llama-bench; A_ENV=(GGML_SYCL_MOE_EXEC=cpu)
+        Q_pp) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
+        Q_pp_cpu) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ENV=(GGML_SYCL_MOE_EXEC=cpu)
             A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
         Q_staged) A_KIND=bench A_BIN=llama-bench; A_ENV=(GGML_SYCL_MOE_EXEC_TRACE=1)
             A_ARGV=(-m "$QWEN" -p 512 -n 0 -r 1 -fa 1 -o csv -v) ;;
@@ -657,9 +803,13 @@ arm_setup() {
         Q_tok_cpu_1 | Q_tok_cpu) A_BIN=llama-completion; A_ENV=(GGML_SYCL_MOE_EXEC=cpu); A_ARGV=("${q_tok[@]}") ;;
         Q_tg) A_BIN=llama-completion; A_ARGV=("${q_decode[@]}" -c 4096) ;;
         Q_noc) A_BIN=llama-completion; A_ARGV=("${q_decode[@]}") ;;
-        GO_gate) A_KIND=cli A_BIN=llama-cli A_SEL=level_zero:1 A_TMO=600; A_ARGV=(-m "$GPTOSS" -c 4096 "${gpt_cli[@]}") ;;
+        GO_gate)
+            A_KIND=cli A_BIN=llama-cli A_SEL=level_zero:1 A_TMO=600
+            A_ARGV=(-m "$GPTOSS" -c 4096 "${gpt_cli[@]}") ;;
         GO_noc) A_KIND=cli A_BIN=llama-cli A_SEL=level_zero:1 A_TMO=600; A_ARGV=(-m "$GPTOSS" "${gpt_cli[@]}") ;;
-        GO_pp) A_KIND=bench A_BIN=llama-bench A_SEL=level_zero:1 A_TMO=900; A_ARGV=(-m "$GPTOSS" -p 512 -n 128 -r 3 -o csv) ;;
+        GO_pp)
+            A_KIND=bench A_BIN=llama-bench A_SEL=level_zero:1 A_TMO=900
+            A_ARGV=(-m "$GPTOSS" -p 512 -n 128 -r 3 -o csv) ;;
         MI_b70) A_BIN=llama-completion A_SEL=level_zero:0 A_TMO=300
             A_ARGV=(-m "$MISTRAL" -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0) ;;
         MI_b50) A_BIN=llama-completion A_SEL=level_zero:1 A_TMO=300
@@ -670,16 +820,30 @@ arm_setup() {
 
 arm_doc() {
     case "$1" in
-        Q_pp) echo "pp512 >= $PP512_MIN, pp2048 >= $PP2048_MIN, $Q_LAYERS distinct '$RE_LAYER' lines, at least one '$RE_SUMMARY', zero '$RE_PP_REFUSED'; reports ring_engaged (the '$RE_SUMMARY_RING' lines add up to > 0) and loan_exercised ('$RE_LOAN_OK')" ;;
+        Q_pp)
+            echo "pp512 >= $PP512_MIN, pp2048 >= $PP2048_MIN, $Q_LAYERS distinct '$RE_LAYER' lines," \
+                "at least one '$RE_SUMMARY', zero '$RE_PP_REFUSED'; reports ring_engaged" \
+                "(the '$RE_SUMMARY_RING' lines add up to > 0) and loan_exercised ('$RE_LOAN_OK')" ;;
         Q_pp_cpu) echo "recorded only: pp512, pp2048, forced cpu layer lines" ;;
-        Q_staged) echo "every '$RE_TRACE_EXEC' line of a layer with a '[MOE-EXEC] layer N: ring' line has staged > 0 and arm=f16 (resident layers are ignored); at least one '$RE_PP_ARM_F16'; zero '$RE_PP_REFUSED'; NOT_EXERCISED when the ring is unavailable" ;;
+        Q_staged)
+            echo "every '$RE_TRACE_EXEC' line of a layer with a '[MOE-EXEC] layer N: ring' line has" \
+                "staged > 0 and arm=f16 (resident layers are ignored); at least one '$RE_PP_ARM_F16';" \
+                "zero '$RE_PP_REFUSED'; NOT_EXERCISED when the ring is unavailable" ;;
         Q_tok) echo "recorded only: md5 of stdout, load 1 of 2" ;;
         Q_tok_2) echo "recorded only: md5 of stdout, load 2 of 2" ;;
         Q_tok_cpu_1) echo "recorded only: md5 of stdout with GGML_SYCL_MOE_EXEC=cpu, load 1 of 2" ;;
-        Q_tok_cpu) echo "cpu load 2 of 2; every Q_tok / Q_tok_2 stdout md5 equals the md5 of Q_tok_cpu_1 or of this output (the B70 greedy flip); names the first differing byte" ;;
-        Q_tg) echo "tg ('$RE_TPS', last) >= $QTG_MIN, md5 $QMD5, zero '$RE_WATCHDOG', place line == '$PLACE_REF_TG', every '$RE_REFILL' has R == L" ;;
-        Q_noc) echo "tg >= $QNOC_MIN, md5 $QMD5, zero '$RE_WATCHDOG', place line == '$PLACE_REF_NOC'" ;;
-        GO_gate) echo "grep -cx '1, 2, 3, 4, 5' == 1 (control: the echo line scores 0), zero distinct '$RE_LAYER' lines" ;;
+        Q_tok_cpu)
+            echo "cpu load 2 of 2; every Q_tok / Q_tok_2 stdout md5 equals the md5 of Q_tok_cpu_1 or of this" \
+                "output (the B70 greedy flip); names the first differing byte; all four loads rc 0, stdout non-empty" ;;
+        Q_tg)
+            echo "tg ('$RE_TPS' on the last eval line) >= $QTG_MIN, md5 $QMD5, zero '$RE_WATCHDOG'," \
+                "place line == '$PLACE_REF_TG', every '$RE_REFILL' has R == L (per line)" ;;
+        Q_noc)
+            echo "tg >= $QNOC_MIN, md5 $QMD5, zero '$RE_WATCHDOG', place line == '$PLACE_REF_NOC'," \
+                "every '$RE_REFILL' has R == L (per line, the same rule as Q_tg)" ;;
+        GO_gate)
+            echo "grep -cx '1, 2, 3, 4, 5' == 1 (control: the echo line scores 0)," \
+                "zero distinct '$RE_LAYER' lines" ;;
         GO_pp) echo "pp512 within $GO_PP_TOL % of $GO_PP_REF, tg128 within $GO_TG_TOL % of $GO_TG_REF" ;;
         GO_noc) echo "grep -cx '1, 2, 3, 4, 5' == 1, $GO_NOC_LAYERS distinct '$RE_LAYER' lines (any = at least one)" ;;
         MI_b70 | MI_b50) echo "grep -c '$RE_MI' == 1" ;;
@@ -693,7 +857,8 @@ print_arm_plan() {
     if [ "$A_KIND" = journal ]; then
         say "$arm: journalctl -k --since '<gate start>' --no-pager > <out-dir>/$arm.out"
     else
-        printf -v cmd '%q ' timeout -k 15 "$A_TMO" env "ONEAPI_DEVICE_SELECTOR=$A_SEL" "${A_ENV[@]}" "$GATE_BIN_DIR/$A_BIN" "${A_ARGV[@]}"
+        printf -v cmd '%q ' timeout -k 15 "$A_TMO" env "ONEAPI_DEVICE_SELECTOR=$A_SEL" "${A_ENV[@]}" \
+            "$GATE_BIN_DIR/$A_BIN" "${A_ARGV[@]}"
         say "$arm: ${cmd}> <out-dir>/$arm.out 2> <out-dir>/$arm.err"
     fi
     say "    score: $(arm_doc "$arm")"
@@ -703,8 +868,9 @@ print_arm_plan() {
 
 lock_take() {
     mkdir "$LOCK_DIR" 2>/dev/null || return 1
-    printf 'sycl-moe-exec-gate pid=%s sha=%s start=%s\n' "$$" "${EXPECT_SHA:-none}" "$(date +%FT%T)" > "$LOCK_DIR/holder"
     LOCK_HELD=1
+    printf 'sycl-moe-exec-gate pid=%s sha=%s start=%s\n' "$$" "${EXPECT_SHA:-none}" "$(date +%FT%T)" \
+        > "$LOCK_DIR/holder"
 }
 
 lock_release() {
@@ -720,6 +886,10 @@ kb() { awk -v k="$1" '$1 == k ":" { print $2 }' /proc/meminfo; }
 mem_line() { echo "Shmem=$(kb Shmem) kB MemAvailable=$(kb MemAvailable) kB"; }
 builders() {
     local n i c
+    if [ -n "$BUILDERS_FILE" ]; then # test hook: a file holding the count
+        cat "$BUILDERS_FILE" 2>/dev/null || echo 0
+        return
+    fi
     n="$(pgrep -xc ninja)"
     i="$(pgrep -c icpx)"
     c=$((${n:-0} + ${i:-0}))
@@ -732,11 +902,34 @@ host_settled() {
     [ "${s:-999999999}" -lt 31457280 ] && [ "${a:-0}" -gt 157286400 ]
 }
 
+# refuse <why>: before the first arm it prints REFUSED and the final line. Once arms have run, a refusal must not drop
+# the verdicts already scored: it prints STOPPED and the summary over them, then the final line from the summary.
 refuse() {
-    say "REFUSED: $*"
-    say "verdicts_pass=0 GATE_DONE"
+    if [ "$RUN_STARTED" = 1 ]; then
+        say "STOPPED: $* (${#VERDICTS[@]} of ${#ARMS[@]} arms scored)"
+        summarize "${VERDICTS[@]}" || true
+    else
+        say "REFUSED: $*"
+        say "verdicts_pass=0 GATE_DONE"
+    fi
     lock_release
     exit 2
+}
+
+# wait_builders <arm>: a build that is running is a reason to wait, not to end the run: poll like settle, up to
+# BUILDERS_WAIT_MAX seconds, and refuse only when the bound expires.
+wait_builders() {
+    local waited=0 b
+    b="$(builders)"
+    while [ "$b" -ne 0 ]; do
+        [ "$waited" -lt "$BUILDERS_WAIT_MAX" ] || refuse "builders = $b after waiting ${waited}s before arm ${1:-}"
+        [ "$waited" -gt 0 ] || say "builders = $b before arm ${1:-}: waiting up to ${BUILDERS_WAIT_MAX}s"
+        sleep "$BUILDERS_POLL"
+        waited=$((waited + BUILDERS_POLL))
+        b="$(builders)"
+    done
+    [ "$waited" -eq 0 ] || say "builders cleared after ${waited}s"
+    return 0
 }
 
 settle() { # waits up to 10 minutes; GPU.lock serialises access, not memory recovery
@@ -748,15 +941,34 @@ settle() { # waits up to 10 minutes; GPU.lock serialises access, not memory reco
     refuse "host never settled (Shmem < 30 GB and MemAvailable > 150 GB): $(mem_line)"
 }
 
+# sample_builders_during <pid> <file>: the highest builder count seen every 5 s while <pid> runs.
+sample_builders_during() {
+    local m=0 b
+    while kill -0 "$1" 2> /dev/null; do
+        b="$(builders)"
+        [ "$b" -le "$m" ] || m="$b"
+        echo "$m" > "$2"
+        sleep 5
+    done
+}
+
 CHILD=""
 # shellcheck disable=SC2329  # installed through trap below
 on_signal() {
+    if [ -n "$SAMPLER" ]; then
+        kill -TERM "$SAMPLER" 2>/dev/null
+    fi
     if [ -n "$CHILD" ]; then
         kill -TERM "$CHILD" 2>/dev/null
         wait "$CHILD" 2>/dev/null
     fi
     say "ABORTED by signal"
-    say "verdicts_pass=0 GATE_DONE"
+    if [ "$RUN_STARTED" = 1 ]; then
+        say "STOPPED: signal (${#VERDICTS[@]} of ${#ARMS[@]} arms scored)"
+        summarize "${VERDICTS[@]}" || true
+    else
+        say "verdicts_pass=0 GATE_DONE"
+    fi
     lock_release
     exit 143
 }
@@ -780,7 +992,9 @@ summarize() {
     for v in "$@"; do
         case "$(status_of "$v")" in
             PASS) pass=$((pass + 1)) ;;
-            RECORDED) ;;
+            RECORDED)
+                # a recorded line whose process failed is a failure; the scorers already say FAIL, this covers old files
+                case "$v" in *" rc="[1-9]*) fail=$((fail + 1)) ;; esac ;;
             NOT_EXERCISED | NOT_SCORED) notx=$((notx + 1)) ;;
             *) fail=$((fail + 1)) ;;
         esac
@@ -792,7 +1006,8 @@ summarize() {
             esac
         fi
     done
-    say "summary: ring_engaged_any=$any_ring loan_exercised_any=$any_loan verdicts_fail=$fail not_exercised_or_unscored=$notx out=${OUT_DIR:-none}"
+    say "summary: ring_engaged_any=$any_ring loan_exercised_any=$any_loan verdicts_fail=$fail" \
+        "not_exercised_or_unscored=$notx out=${OUT_DIR:-none}"
     say "verdicts_pass=$pass GATE_DONE"
     if [ "$fail" -gt 0 ]; then
         return 1
@@ -848,6 +1063,12 @@ if [ -n "$SCORE_SUMMARY" ]; then
     exit $?
 fi
 
+if [ "$WAIT_BUILDERS_SELFTEST" = 1 ]; then
+    wait_builders selftest
+    say "wait-builders-selftest: cleared"
+    exit 0
+fi
+
 if [ -n "$SCORE_ARM" ]; then
     line="$(score_arm_files "$SCORE_ARM" "$S_CSV" "$S_OUT" "$S_ERR" "$S_REF" "$S_JOURNAL" "$S_RC" "$S_OUT2" "$S_REF2")"
     say "$line"
@@ -860,7 +1081,10 @@ fi
 
 if [ "$DRY_RUN" = 1 ]; then
     say "dry-run: nothing is executed, no lock is taken, no device is touched"
-    say "build-dir: $BUILD_DIR   lock: $LOCK_DIR (take=$TAKE_LOCK)   preflights: <sha> == head, GGML_SYCL ON, binaries newer than head and linked to SYCL, models, grep controls, builders 0, Shmem < 30 GB, MemAvailable > 150 GB"
+    say "build-dir: $BUILD_DIR   src-dir: $SRC_DIR   lock: $LOCK_DIR (take=$TAKE_LOCK)"
+    say "preflights: <sha> == head of src-dir, GGML_SYCL ON, binaries newer than head and linked to SYCL, models," \
+        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders 0, Shmem < 30 GB, MemAvailable > 150 GB," \
+        "an empty or --arm/--clobber out-dir"
     for arm in "${ARMS[@]}"; do
         print_arm_plan "$arm"
     done
@@ -874,8 +1098,21 @@ LOCK_HELD=0
 trap 'lock_release' EXIT
 trap on_signal TERM INT HUP
 
+# seed_verdicts: the selftests preload the verdicts a run would have scored, so the stop paths can be tested
+# without arms.
+seed_verdicts() {
+    [ -z "$SEED_VERDICTS" ] || { mapfile -t VERDICTS < "$SEED_VERDICTS"; RUN_STARTED=1; }
+}
+
+if [ "$REFUSE_SELFTEST" = 1 ]; then
+    lock_take || refuse "refuse-selftest: could not take $LOCK_DIR"
+    seed_verdicts
+    refuse "synthetic stop"
+fi
+
 if [ "$SIGNAL_SELFTEST" = 1 ]; then
     lock_take || refuse "signal-selftest: could not take $LOCK_DIR"
+    seed_verdicts
     sleep 30 &
     CHILD=$!
     say "signal-selftest: child=$CHILD lock=$LOCK_DIR"
@@ -884,19 +1121,36 @@ if [ "$SIGNAL_SELFTEST" = 1 ]; then
     exit 1
 fi
 
+# Exported tuning variables would reach every arm; the arms set their own through env, so none may be inherited.
+leaked="$(env | grep -aoE '^(GGML_SYCL_|LLAMA_ARG_)[A-Za-z0-9_]*' | tr '\n' ' ')"
+[ -z "$leaked" ] ||
+    refuse "exported variable(s) would leak into every arm: ${leaked}(unset them; each arm sets its own)"
+
+# The sha format is checked even with --no-head-check. The head comparison reads the build's own source tree.
+[ -n "$EXPECT_SHA" ] || refuse "no <sha> argument: pass the merge sha the build was made from"
+[[ "$EXPECT_SHA" =~ ^[0-9a-f]{7,40}$ ]] || refuse "<sha> '$EXPECT_SHA' is not 7 to 40 lowercase hex characters"
 if [ "$HEAD_CHECK" = 1 ]; then
-    [ -n "$EXPECT_SHA" ] || refuse "no <sha> argument: pass the merge sha the build was made from"
-    [[ "$EXPECT_SHA" =~ ^[0-9a-f]{7,40}$ ]] || refuse "<sha> '$EXPECT_SHA' is not 7 to 40 lowercase hex characters"
-    head_sha="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null)"
+    head_sha="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null)"
     case "$head_sha" in
         "$EXPECT_SHA"*) ;;
-        *) refuse "head ${head_sha:-unknown} does not start with $EXPECT_SHA" ;;
+        *) refuse "head ${head_sha:-unknown} of $SRC_DIR does not start with $EXPECT_SHA" ;;
     esac
 fi
 
+if [ -z "$OUT_DIR" ]; then
+    short_sha="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo run)"
+    OUT_DIR="$BUILD_DIR/moe-exec-gate-$short_sha-$(date +%H%M%S)"
+fi
+# A reused out-dir would let one run's files be scored as another's. A non-empty one is refused unless --arm names the
+# arms to redo (only their files are overwritten) or --clobber says so.
+if [ -d "$OUT_DIR" ] && [ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ] && [ "$ARMS_EXPLICIT" = 0 ] && [ "$CLOBBER" = 0 ]; then
+    refuse "out-dir $OUT_DIR is not empty: use a fresh one, --arm to redo named arms, or --clobber"
+fi
+
 # A reconfigure can drop the SYCL backend and a CPU-only build prints the same tokens about 13x slower.
-grep -q '^GGML_SYCL:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null || refuse "GGML_SYCL is not ON in $BUILD_DIR/CMakeCache.txt"
-head_time="$(git -C "$ROOT_DIR" log -1 --format=%ct 2>/dev/null)"
+grep -q '^GGML_SYCL:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null ||
+    refuse "GGML_SYCL is not ON in $BUILD_DIR/CMakeCache.txt"
+head_time="$(git -C "$SRC_DIR" log -1 --format=%ct 2>/dev/null)"
 need_bins=()
 for arm in "${ARMS[@]}"; do
     arm_setup "$arm"
@@ -907,7 +1161,8 @@ for b in $(printf '%s\n' "${need_bins[@]}" | sort -u); do
     if [ "$HEAD_CHECK" = 1 ] && [ -n "$head_time" ] && [ "$(stat -c %Y "$GATE_BIN_DIR/$b")" -le "$head_time" ]; then
         refuse "$GATE_BIN_DIR/$b is not newer than the head commit"
     fi
-    [ "$(ldd "$GATE_BIN_DIR/$b" 2>/dev/null | grep -cE 'libggml-sycl|libsycl')" -ge 2 ] || refuse "$b does not link the SYCL runtime"
+    [ "$(ldd "$GATE_BIN_DIR/$b" 2>/dev/null | grep -cE 'libggml-sycl|libsycl')" -ge 2 ] ||
+        refuse "$b does not link the SYCL runtime"
 done
 for arm in "${ARMS[@]}"; do
     case "$arm" in
@@ -921,13 +1176,19 @@ for arm in "${ARMS[@]}"; do
     esac
 done
 check_controls || refuse "a grep control failed (see stderr)"
-[ "$(builders)" -eq 0 ] || refuse "builders (ninja + icpx) = $(builders)"
-host_settled || refuse "host not settled: $(mem_line)"
+# An arm list that is only the journal arm touches no device and loads no model: nothing to protect from a build.
+device_arms=0
+for arm in "${ARMS[@]}"; do
+    arm_setup "$arm"
+    [ "$A_KIND" = journal ] || device_arms=1
+done
+[ "$device_arms" = 0 ] || [ "$(builders)" -eq 0 ] ||
+    refuse "builders (ninja + icpx) = $(builders) at the start (the arms wait for a build; the start does not)"
+[ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $(mem_line)"
 if [ "$TAKE_LOCK" = 1 ]; then
     lock_take || refuse "could not take $LOCK_DIR (held: $(cat "$LOCK_DIR/holder" 2>/dev/null || echo unknown))"
 fi
 
-[ -n "$OUT_DIR" ] || OUT_DIR="$BUILD_DIR/moe-exec-gate-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo run)-$(date +%H%M%S)"
 mkdir -p "$OUT_DIR"
 [ -z "$TUNING_DIR" ] || { mkdir -p "$TUNING_DIR"; export GGML_SYCL_TUNING_CACHE_DIR="$TUNING_DIR"; }
 [ -n "$SINCE" ] || SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -935,28 +1196,43 @@ mkdir -p "$OUT_DIR"
 say "gate: sha=${EXPECT_SHA:-unchecked} build=$BUILD_DIR out=$OUT_DIR since='$SINCE' arms=${ARMS[*]}"
 say "pre: $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders=$(builders)"
 
-declare -a VERDICTS=()
+RUN_STARTED=1
 
 run_arm() { # <arm>: runs it, writes <arm>.out/.err/.rc, prints the sample lines
-    local arm="$1" rc
+    local arm="$1" rc pre post during
     arm_setup "$arm"
     if [ "$A_KIND" = journal ]; then
         journalctl -k --since "$SINCE" --no-pager > "$OUT_DIR/$arm.out" 2> "$OUT_DIR/$arm.err"
-        echo 0 > "$OUT_DIR/$arm.rc"
+        echo "$?" > "$OUT_DIR/$arm.rc"
+        echo na > "$OUT_DIR/$arm.builders_pre"
+        echo na > "$OUT_DIR/$arm.builders_post"
         return 0
     fi
+    wait_builders "$arm"
     settle
-    [ "$(builders)" -eq 0 ] || refuse "builders = $(builders) before arm $arm"
-    say "arm $arm: pre $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders=$(builders) $(date +%T)"
+    pre="$(builders)"
+    echo "$pre" > "$OUT_DIR/$arm.builders_pre"
+    echo 0 > "$OUT_DIR/$arm.builders_max"
+    say "arm $arm: pre $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders=$pre $(date +%T)"
     timeout -k 15 "$A_TMO" env ONEAPI_DEVICE_SELECTOR="$A_SEL" "${A_ENV[@]}" "$GATE_BIN_DIR/$A_BIN" "${A_ARGV[@]}" \
         > "$OUT_DIR/$arm.out" 2> "$OUT_DIR/$arm.err" < /dev/null &
     CHILD=$!
+    sample_builders_during "$CHILD" "$OUT_DIR/$arm.builders_max" &
+    SAMPLER=$!
     wait "$CHILD"
     rc=$?
     CHILD=""
+    kill -TERM "$SAMPLER" 2>/dev/null
+    wait "$SAMPLER" 2>/dev/null
+    SAMPLER=""
     echo "$rc" > "$OUT_DIR/$arm.rc"
     sleep 5
-    say "arm $arm: rc=$rc post(+5s) $(mem_line) $(date +%T)"
+    post="$(builders)"
+    during="$(cat "$OUT_DIR/$arm.builders_max" 2>/dev/null || echo 0)"
+    [ "$post" -ge "$during" ] || post="$during"
+    echo "$post" > "$OUT_DIR/$arm.builders_post"
+    say "arm $arm: rc=$rc post(+5s) $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders_post=$post (max of the" \
+        "5 s samples during the arm and the one after it) $(date +%T)"
 }
 
 score_arm_in_outdir() { # <arm>
@@ -966,7 +1242,13 @@ score_arm_in_outdir() { # <arm>
     err="$OUT_DIR/$arm.err"
     csv="$OUT_DIR/$arm.out"
     ref="$OUT_DIR/Q_tok.out"
-    line="$(score_arm_files "$arm" "$csv" "$out" "$err" "$ref" "$out" "$rc" "$OUT_DIR/Q_tok_cpu_1.out" "$OUT_DIR/Q_tok_2.out")"
+    S_RC_OUT2="$(cat "$OUT_DIR/Q_tok_cpu_1.rc" 2>/dev/null || echo 0)"
+    S_RC_REF="$(cat "$OUT_DIR/Q_tok.rc" 2>/dev/null || echo 0)"
+    S_RC_REF2="$(cat "$OUT_DIR/Q_tok_2.rc" 2>/dev/null || echo 0)"
+    S_BPRE="$(cat "$OUT_DIR/$arm.builders_pre" 2>/dev/null || echo na)"
+    S_BPOST="$(cat "$OUT_DIR/$arm.builders_post" 2>/dev/null || echo na)"
+    line="$(score_arm_files "$arm" "$csv" "$out" "$err" "$ref" "$out" "$rc" \
+        "$OUT_DIR/Q_tok_cpu_1.out" "$OUT_DIR/Q_tok_2.out")"
     say "$line"
     VERDICTS+=("$line")
 }

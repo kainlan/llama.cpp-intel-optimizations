@@ -39,6 +39,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GATE="$ROOT_DIR/scripts/sycl-moe-exec-gate.sh"
 [ -f "$GATE" ] || { echo "SKIP: no $GATE"; exit 77; }
+# A missing tool is a skip (77), never a pass: a score through a missing awk or cmp would prove nothing.
+for tool in awk md5sum cmp comm journalctl git pgrep timeout; do
+    command -v "$tool" > /dev/null 2>&1 || { echo "SKIP: no $tool on PATH"; exit 77; }
+done
+# The gate refuses a real run when a GGML_SYCL_* or LLAMA_ARG_* variable is exported; this test must not inherit one.
+for v in $(compgen -e | grep -E '^(GGML_SYCL_|LLAMA_ARG_)'); do unset "$v"; done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/moe-exec-gate-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -66,19 +72,20 @@ n_batch n_ubatch n_threads cpu_mask cpu_strict poll type_k type_v n_gpu_layers n
 no_kv_offload flash_attn devices tensor_split tensor_buft_overrides load_mode lazy_mode embeddings no_op_offload
 no_host repack fit_target fit_min_ctx n_prompt n_gen n_depth test_time avg_ns stddev_ns avg_ts stddev_ts'
 
-# mkcsv <file> <row>...: the llama-bench csv header, then one row per "n_prompt:n_gen:avg_ts:stddev_ts:n_ubatch".
+# mkcsv <file> <row>...: the llama-bench csv header, then one row per
+# "n_prompt:n_gen:avg_ts:stddev_ts:n_ubatch[:n_depth]".
 mkcsv() {
     local f="$1" r
     shift
     # shellcheck disable=SC2086
     echo $FIELDS | tr ' ' ',' > "$f"
     for r in "$@"; do
-        IFS=: read -r np ng ts sd ub <<< "$r"
+        IFS=: read -r np ng ts sd ub dp <<< "$r"
         # shellcheck disable=SC2086
         for k in $FIELDS; do
             case "$k" in
                 n_prompt) v=$np ;; n_gen) v=$ng ;; avg_ts) v=$ts ;; stddev_ts) v=$sd ;; n_ubatch) v=$ub ;;
-                n_depth) v=0 ;; cpu_info) v='Intel(R) Core(TM), 24 threads' ;; *) v=x ;;
+                n_depth) v=${dp:-0} ;; cpu_info) v='Intel(R) Core(TM), 24 threads' ;; *) v=x ;;
             esac
             printf '"%s",' "$v"
         done | sed 's/,$//' >> "$f"
@@ -94,9 +101,16 @@ mklayers() {
     done
 }
 
+TRACE_EXEC_PREFIX='0.05.100.000 I [MOE-EXEC-TRACE] executor device 0'
 SUMMARY='0.09.000.000 W [MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed'
 TRACE_DECOY='0.05.200.000 I [MOE-EXEC-TRACE] dev 0 layer 3: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
-UNAVAIL='0.04.000.000 W [MOE-EXEC] device 0: stream ring unavailable: cap (host_matrices_per_layer_max=3 n_slots=0 bytes=0)'
+UNAVAIL='0.04.000.000 W [MOE-EXEC] device 0: stream ring unavailable: cap'
+UNAVAIL="$UNAVAIL (host_matrices_per_layer_max=3 n_slots=0 bytes=0)"
+SUMMARY_NORING='0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed'
+SUMMARY_NORING2='0.19.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 372 cpu, 0 forced, 0 MiB streamed'
+SUMMARY_RING2='0.19.000.000 W [MOE-EXEC] summary: 40 layer-ubatches ring, 7 cpu, 0 forced, 600 MiB streamed'
+PPMOE_REFUSED='0.07.000.000 W [PP-MOE] refused device=0 cause=x detail=- tensor=blk.3.ffn_up_exps.weight'
+PPMOE_REFUSED="$PPMOE_REFUSED type=q4_0 layout=aos staged=4"
 LOAN_OK='0.06.000.000 W [MOE-EXEC] loan device 0: 24 triplets, 300 MiB lent to the ring (ok)'
 LOAN_REFUSED='0.06.000.000 W [MOE-EXEC] loan device 0 refused: host storage too small'
 
@@ -119,8 +133,8 @@ cp "$WORK/pp-pass.err" "$WORK/pp-fail.err"
 for i in $(seq 24 47); do
     echo "1.36.000.000 W [MOE-EXEC] layer $i: cpu (p=1.00 t_cpu=201827 us t_ring=45000 us ring-unavailable)"
 done > "$WORK/pp-refused.err"
-echo '0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed' >> "$WORK/pp-refused.err"
-echo '0.19.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 372 cpu, 0 forced, 0 MiB streamed' >> "$WORK/pp-refused.err"
+echo "$SUMMARY_NORING" >> "$WORK/pp-refused.err"
+echo "$SUMMARY_NORING2" >> "$WORK/pp-refused.err"
 
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"; rc=$?
 expect "Q_pp pass verdict" "$out" "Q_pp=PASS"
@@ -147,7 +161,7 @@ expect "Q_pp passing numbers without the ring still pass honestly" "$out" "Q_pp=
 { echo "$UNAVAIL"; cat "$WORK/pp-pass.err"; } > "$WORK/pp-mixed.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-mixed.err")"
 expect "Q_pp the unavailable WARN alone does not decide ring_engaged" "$out" "ring_engaged=yes"
-{ cat "$WORK/pp-pass.err"; echo '0.19.000.000 W [MOE-EXEC] summary: 40 layer-ubatches ring, 7 cpu, 0 forced, 600 MiB streamed'; } > "$WORK/pp-sum2.err"
+{ cat "$WORK/pp-pass.err"; echo "$SUMMARY_RING2"; } > "$WORK/pp-sum2.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-sum2.err")"
 expect "Q_pp ring layer-ubatches add up over the summaries" "$out" "ring_layer_ubatches=136"
 expect "Q_pp two summaries pass (one per llama-bench context)" "$out" "Q_pp=PASS"
@@ -155,18 +169,18 @@ expect "Q_pp two summaries pass (one per llama-bench context)" "$out" "Q_pp=PASS
 cp "$WORK/pp-pass.err" "$WORK/pp-47.err"
 sed -i '/layer 47:/d' "$WORK/pp-47.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-47.err" --q-layers 48)"
-expect "Q_pp --q-layers 48 and 47 layers fails by name" "$out" "layers=47!=48"
+expect "Q_pp --q-layers 48 and 47 layers fails by name" "$out" "Q_pp=FAIL(layers=47!=48"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-47.err")"
 expect "Q_pp by default any layer count of at least one passes" "$out" "Q_pp=PASS"
 grep -v 'layer [0-9]*:' "$WORK/pp-pass.err" > "$WORK/pp-nolayer.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-nolayer.err")"
-expect "Q_pp no layer line fails by name" "$out" "layers=0<1"
+expect "Q_pp no layer line fails by name" "$out" "Q_pp=FAIL(layers=0<1"
 grep -v 'summary:' "$WORK/pp-pass.err" > "$WORK/pp-nosum.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-nosum.err")"
-expect "Q_pp no summary fails by name" "$out" "summary=0<1"
+expect "Q_pp no summary fails by name" "$out" "Q_pp=FAIL(summary=0<1"
 expect "Q_pp no summary also means ring_engaged=no" "$out" "ring_engaged=no"
 cp "$WORK/pp-pass.err" "$WORK/pp-ref.err"
-echo '0.07.000.000 W [PP-MOE] refused device=0 cause=x detail=- tensor=blk.3.ffn_up_exps.weight type=q4_0 layout=aos staged=4' >> "$WORK/pp-ref.err"
+echo "$PPMOE_REFUSED" >> "$WORK/pp-ref.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-ref.err")"
 expect "Q_pp [PP-MOE] refused fails by name" "$out" "Q_pp=FAIL(pp_moe_refused=1)"
 cp "$WORK/pp-pass.err" "$WORK/pp-loan.err"; echo "$LOAN_REFUSED" >> "$WORK/pp-loan.err"
@@ -176,10 +190,10 @@ echo "$LOAN_OK" >> "$WORK/pp-loan.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-loan.err")"
 expect "Q_pp a granted loan is loan_exercised" "$out" "loan_exercised=yes"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err" --rc 124)"
-expect "Q_pp a timeout is a failure" "$out" "rc=124"
+expect "Q_pp a timeout is a failure" "$out" "Q_pp=FAIL(rc=124"
 mkcsv "$WORK/pp-none.csv" 128:0:900:1:128
 out="$(score Q_pp --csv "$WORK/pp-none.csv" --err "$WORK/pp-pass.err")"
-expect "Q_pp a csv without the rows fails, never passes" "$out" "no_pp512_row"
+expect "Q_pp a csv without the rows fails, never passes" "$out" "Q_pp=FAIL(no_pp512_row"
 
 out="$(score Q_pp_cpu --csv "$WORK/pp-slow.csv" --err "$WORK/pp-refused.err")"
 expect "Q_pp_cpu is recorded" "$out" "Q_pp_cpu=RECORDED pp512=14.1 pp2048=31.5"
@@ -191,10 +205,10 @@ mklayers "$WORK/st-pass.err" 3
     echo "0.05.050.000 W [MOE-EXEC] layer 5: cpu (p=1.00 t_cpu=100 us t_ring=900 us cheaper)"
     echo '0.05.000.000 I [PP-MOE] device=0 type=q4_0 layout=aos arm=f16 experts=8 groups=1 planned_weight_slot=100'
     for i in 0 1 2; do
-        echo "0.05.100.000 I [MOE-EXEC-TRACE] executor device 0 tensor=blk.$i.ffn_up_exps.weight experts=8 staged=8 arm=f16"
+        echo "$TRACE_EXEC_PREFIX tensor=blk.$i.ffn_up_exps.weight experts=8 staged=8 arm=f16"
     done
     for i in 5 10 11; do
-        echo "0.05.150.000 I [MOE-EXEC-TRACE] executor device 0 tensor=blk.$i.ffn_up_exps.weight experts=8 staged=0 arm=f16"
+        echo "$TRACE_EXEC_PREFIX tensor=blk.$i.ffn_up_exps.weight experts=8 staged=0 arm=f16"
     done
     echo "$TRACE_DECOY"
     echo "$SUMMARY"
@@ -202,17 +216,20 @@ mklayers "$WORK/st-pass.err" 3
 out="$(score Q_staged --err "$WORK/st-pass.err")"
 expect "Q_staged passes with resident staged=0 lines present" "$out" \
     "Q_staged=PASS ring_layers=3 executor_dispatches=6 ring_layer_dispatches=3"
-sed 's/blk.1.ffn_up_exps.weight experts=8 staged=8/blk.1.ffn_up_exps.weight experts=8 staged=0/' "$WORK/st-pass.err" > "$WORK/st-unstaged.err"
+sed 's/blk.1.ffn_up_exps.weight experts=8 staged=8/blk.1.ffn_up_exps.weight experts=8 staged=0/' \
+    "$WORK/st-pass.err" > "$WORK/st-unstaged.err"
 out="$(score Q_staged --err "$WORK/st-unstaged.err")"
 expect "Q_staged a ring-served layer at staged=0 fails by name" "$out" "Q_staged=FAIL(unstaged=1/3)"
-sed 's/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=f16/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=woq/' "$WORK/st-pass.err" > "$WORK/st-woq.err"
+sed 's/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=f16/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=woq/' \
+    "$WORK/st-pass.err" > "$WORK/st-woq.err"
 out="$(score Q_staged --err "$WORK/st-woq.err")"
 expect "Q_staged a non-f16 ring-served arm fails by name" "$out" "Q_staged=FAIL(arm_not_f16=1/3)"
-sed 's/blk.10.ffn_up_exps.weight experts=8 staged=0 arm=f16/blk.10.ffn_up_exps.weight experts=8 staged=0 arm=woq/' "$WORK/st-pass.err" > "$WORK/st-resident-woq.err"
+sed 's/blk.10.ffn_up_exps.weight experts=8 staged=0 arm=f16/blk.10.ffn_up_exps.weight experts=8 staged=0 arm=woq/' \
+    "$WORK/st-pass.err" > "$WORK/st-resident-woq.err"
 out="$(score Q_staged --err "$WORK/st-resident-woq.err")"
 expect "Q_staged a resident layer's arm is not scored" "$out" "Q_staged=PASS"
 cp "$WORK/st-pass.err" "$WORK/st-refused.err"
-echo '0.07.000.000 W [PP-MOE] refused device=0 cause=x detail=- tensor=blk.3.ffn_up_exps.weight type=q4_0 layout=aos staged=4' >> "$WORK/st-refused.err"
+echo "$PPMOE_REFUSED" >> "$WORK/st-refused.err"
 out="$(score Q_staged --err "$WORK/st-refused.err")"; rc=$?
 expect "Q_staged a [PP-MOE] refused line fails by name" "$out" "Q_staged=FAIL(pp_moe_refused=1)"
 expect_rc "Q_staged a refused line rc" "$rc" 1
@@ -222,7 +239,7 @@ expect "Q_staged a missing [PP-MOE] arm=f16 line fails by name" "$out" "Q_staged
 grep -v 'tensor=blk\.[012]\.' "$WORK/st-pass.err" > "$WORK/st-nodispatch.err"
 out="$(score Q_staged --err "$WORK/st-nodispatch.err")"
 expect "Q_staged no ring-served dispatch fails, never passes" "$out" "Q_staged=FAIL(no_ring_layer_dispatch)"
-{ echo "$UNAVAIL"; grep -v 'summary:' "$WORK/st-pass.err"; echo '0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed'; } > "$WORK/st-unavail.err"
+{ echo "$UNAVAIL"; grep -v 'summary:' "$WORK/st-pass.err"; echo "$SUMMARY_NORING"; } > "$WORK/st-unavail.err"
 out="$(score Q_staged --err "$WORK/st-unavail.err")"; rc=$?
 expect "Q_staged ring-unavailable is NOT_EXERCISED" "$out" "Q_staged=NOT_EXERCISED(ring_engaged=no)"
 expect_not "Q_staged ring-unavailable is not a pass" "$out" "Q_staged=PASS"
@@ -268,18 +285,20 @@ out="$(tokcpu "$WORK/tok-c2.out" "$WORK/absent.out" "$WORK/tok-a1.out" "$WORK/to
 expect "Q_tok_cpu without Q_tok_cpu_1 is not scored" "$out" "Q_tok_cpu=NOT_SCORED(no_Q_tok_cpu_1_output)"
 : > "$WORK/tok-empty.out"
 out="$(tokcpu "$WORK/tok-empty.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-a2.out")"
-expect "Q_tok_cpu an empty cpu output fails by name" "$out" "empty_output"
-out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-c1.out" --ref-out "$WORK/tok-a1.out" --ref-out2 "$WORK/tok-a2.out" --rc 124)"
-expect "Q_tok_cpu a timeout fails" "$out" "rc=124"
+expect "Q_tok_cpu an empty cpu output fails by name" "$out" "Q_tok_cpu=FAIL(empty_output"
+out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-c1.out" --ref-out "$WORK/tok-a1.out" \
+    --ref-out2 "$WORK/tok-a2.out" --rc 124)"
+expect "Q_tok_cpu a timeout fails" "$out" "Q_tok_cpu=FAIL(rc=124"
 
 # ---- Q_tg / Q_noc
 echo "decode output" > "$WORK/dec.out"
 MD5="$(md5sum < "$WORK/dec.out" | cut -c1-8)"
 PLACE_TG='MoE experts: 38004 on device, 35724 on host'
+PERF_EVAL_HEAD='1.42.962.387 I llama_perf_context_print:        eval time =    4954.02 ms /    59 runs'
 dec_err() { # <file> <tps> <place> [extra line]
     {
         echo "0.01.601.984 I [PLACEMENT] $3 (of 73728 total)"
-        echo "1.42.962.387 I llama_perf_context_print:        eval time =    4954.02 ms /    59 runs   (83.97 ms per token,    $2 tokens per second)"
+        echo "$PERF_EVAL_HEAD   (83.97 ms per token,    $2 tokens per second)"
         [ -z "${4:-}" ] || echo "$4"
     } > "$1"
 }
@@ -290,28 +309,29 @@ expect "Q_tg refill balanced" "$out" "refill=balanced(24/24)"
 expect "Q_tg place unchanged" "$out" "place=unchanged"
 dec_err "$WORK/tg-slow.err" 10.20 "$PLACE_TG"
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-slow.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
-expect "Q_tg below the floor fails" "$out" "tg=10.20<11.0"
+expect "Q_tg below the floor fails" "$out" "Q_tg=FAIL(tg=10.20<11.0)"
 expect "Q_tg without a loan says refill not_exercised" "$out" "refill=not_exercised"
 expect "Q_tg without a loan says loan_exercised=no" "$out" "loan_exercised=no"
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 deadbeef --place-ref-tg "$PLACE_TG")"
-expect "Q_tg wrong md5 fails" "$out" "md5=$MD5!=deadbeef"
+expect "Q_tg wrong md5 fails" "$out" "Q_tg=FAIL(md5=$MD5!=deadbeef)"
 dec_err "$WORK/tg-unbal.err" 11.91 "$PLACE_TG" '0.09.000.000 W [MOE-EXEC] refill device 0: 23/24 triplets re-admitted'
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-unbal.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
-expect "Q_tg unbalanced refill fails" "$out" "refill=unbalanced(23/24)"
+expect "Q_tg unbalanced refill fails" "$out" "Q_tg=FAIL(refill=unbalanced(23/24))"
 dec_err "$WORK/tg-place.err" 11.91 'MoE experts: 37000 on device, 36728 on host'
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-place.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
-expect "Q_tg changed place line fails" "$out" "place='MoE experts: 37000 on device, 36728 on host'!="
+expect "Q_tg changed place line fails" "$out" "Q_tg=FAIL(place='MoE experts: 37000 on device, 36728 on host'!="
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-place.err" --qmd5 "$MD5" --place-ref-tg -)"
 expect "Q_tg place ref - is reported as unscored" "$out" "place=unscored"
 dec_err "$WORK/tg-wd.err" 11.91 "$PLACE_TG" '0.09.000.000 W [SYCL-WATCHDOG] No GPU progress for 30 s'
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-wd.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
-expect "Q_tg watchdog fails by name" "$out" "watchdog=1"
+expect "Q_tg watchdog fails by name" "$out" "Q_tg=FAIL(watchdog=1)"
 dec_err "$WORK/noc.err" 9.80 'MoE experts: 38163 on device, 35565 on host'
-out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc.err" --qmd5 "$MD5" --place-ref-noc 'MoE experts: 38163 on device, 35565 on host')"
+out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc.err" --qmd5 "$MD5" \
+    --place-ref-noc 'MoE experts: 38163 on device, 35565 on host')"
 expect "Q_noc pass at 9.80 against the 9.5 floor" "$out" "Q_noc=PASS tg=9.80"
 dec_err "$WORK/noc-slow.err" 9.30 'MoE experts: 38163 on device, 35565 on host'
 out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc-slow.err" --qmd5 "$MD5" --place-ref-noc -)"
-expect "Q_noc below the floor fails" "$out" "tg=9.30<9.5"
+expect "Q_noc below the floor fails" "$out" "Q_noc=FAIL(tg=9.30<9.5)"
 
 # ---- GPT-OSS and Mistral
 ECHO='> Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5'
@@ -326,15 +346,15 @@ expect "GO_gate a count of 2 fails: the gate is exactly 1" "$out" "GO_gate=FAIL(
 out="$(score GO_gate --out "$WORK/go-echo.out" --err "$WORK/empty.err")"
 expect "GO_gate the echo line alone must not pass" "$out" "GO_gate=FAIL(count=0!=1)"
 out="$(score GO_gate --out "$WORK/go.out" --err "$WORK/pp-pass.err")"
-expect "GO_gate layer lines fail it" "$out" "layer_lines=48!=0"
+expect "GO_gate layer lines fail it" "$out" "GO_gate=FAIL(layer_lines=48!=0)"
 mklayers "$WORK/go12.err" 12
 out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/go12.err")"
 expect "GO_noc 12 layer lines pass by default" "$out" "GO_noc=PASS count=1 layer_lines=12"
 mklayers "$WORK/go11.err" 11
 out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/go11.err" --go-noc-layers 12)"
-expect "GO_noc --go-noc-layers 12 and 11 layer lines fail" "$out" "layer_lines=11!=12"
+expect "GO_noc --go-noc-layers 12 and 11 layer lines fail" "$out" "GO_noc=FAIL(layer_lines=11!=12)"
 out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/empty.err")"
-expect "GO_noc with no layer line fails: the demoted layers were never consulted" "$out" "layer_lines=0<1"
+expect "GO_noc with no layer line fails: the demoted layers were never consulted" "$out" "GO_noc=FAIL(layer_lines=0<1)"
 
 mkcsv "$WORK/gopp-ok.csv" 512:0:880.0:4.0:512 0:128:33.9:0.1:512
 mkcsv "$WORK/gopp-low.csv" 512:0:770.0:4.0:512 0:128:33.9:0.1:512
@@ -344,7 +364,7 @@ expect "GO_pp inside both windows passes" "$out" "GO_pp=PASS pp512=880.0"
 out="$(score GO_pp --csv "$WORK/gopp-low.csv")"
 expect "GO_pp pp512 770 fails low" "$out" "GO_pp=FAIL(pp512=770.0<827."
 out="$(score GO_pp --csv "$WORK/gopp-tg.csv")"
-expect "GO_pp tg128 32.0 fails low" "$out" "tg128=32.0<33.0"
+expect "GO_pp tg128 32.0 fails low" "$out" "GO_pp=FAIL(tg128=32.0<33.0"
 
 printf '1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n' > "$WORK/mi.out"
 printf '1, 2, 3, 4, 5,\n' > "$WORK/mi-prompt.out"
@@ -363,13 +383,16 @@ expect "resets a GT reset fails" "$out" "resets=FAIL(count=1)"
 # ---- dry run and help
 out="$(bash "$GATE" --dry-run 2>&1)"; rc=$?
 expect_rc "dry-run rc" "$rc" 0
-for arm in Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
+for arm in Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc \
+           GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
     expect "dry-run lists $arm" "$out" "$arm: "
 done
 n_sel="$(printf '%s\n' "$out" | grep -c 'ONEAPI_DEVICE_SELECTOR=level_zero:[01] ')"
 expect_rc "dry-run pins the selector in all fourteen device arms" "$n_sel" 14
 n_q900="$(printf '%s\n' "$out" | grep -E '^Q_[A-Za-z0-9_]+: ' | grep -c 'timeout -k 15 900 ')"
-expect_rc "dry-run gives every Qwen arm timeout 900" "$n_q900" 9
+expect_rc "dry-run gives the seven short Qwen arms timeout 900" "$n_q900" 7
+n_q1500="$(printf '%s\n' "$out" | grep -E '^Q_pp(_cpu)?: ' | grep -c 'timeout -k 15 1500 ')"
+expect_rc "dry-run gives Q_pp and Q_pp_cpu timeout 1500 (run 1 took 11.5 min of 15 with the ring off)" "$n_q1500" 2
 expect_not "dry-run passes no -ngl" "$out" " -ngl"
 n_cnv="$(printf '%s\n' "$out" | grep -E '^GO_(gate|noc): ' | grep -cE '(^| )-cnv( |$)')"
 expect_rc "dry-run passes no -cnv to llama-cli" "$n_cnv" 0
@@ -390,7 +413,11 @@ if [ -e "$WORK/GPU.lock" ]; then fail "a refusal created GPU.lock"; else pass "a
 out="$(bash "$GATE" --lock-dir "$WORK/GPU.lock" --arm resets 0000000000000000000000000000000000000000 2>&1)"; rc=$?
 expect_rc "wrong sha refuses with rc 2" "$rc" 2
 expect "wrong sha says REFUSED" "$out" "REFUSED: head "
-if [ -e "$WORK/GPU.lock" ]; then fail "a wrong-sha refusal created GPU.lock"; else pass "a wrong-sha refusal never creates GPU.lock"; fi
+if [ -e "$WORK/GPU.lock" ]; then
+    fail "a wrong-sha refusal created GPU.lock"
+else
+    pass "a wrong-sha refusal never creates GPU.lock"
+fi
 for badsha in abc abcdef xyz1234 0000000G; do
     out="$(bash "$GATE" --lock-dir "$WORK/GPU.lock" --arm resets "$badsha" 2>&1)"; rc=$?
     expect_rc "a <sha> of '$badsha' (under 7 hex characters or not hex) refuses with rc 2" "$rc" 2
@@ -445,8 +472,13 @@ expect "help documents ring_engaged_any" "$out" "ring_engaged_any=yes|no|na"
 # setvars.sh sources the advisor and vtune vars.sh files, which assign BIN_DIR=bin64 as a plain variable. A gate that
 # set BIN_DIR and then sourced setvars looked for bin64/llama-bench. --dry-run never sources setvars, so only this
 # static check and the real-flow refusal below can see it.
-if cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -qE '(^|[^A-Za-z_])BIN_DIR='; then fail "the gate assigns a bare BIN_DIR, which oneAPI's vars.sh overwrites"; else pass "the gate assigns no bare BIN_DIR"; fi
-src_line="$(cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -n 'source /opt/intel/oneapi/setvars.sh' | head -1 | cut -d: -f1)"
+if cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -qE '(^|[^A-Za-z_])BIN_DIR='; then
+    fail "the gate assigns a bare BIN_DIR, which oneAPI's vars.sh overwrites"
+else
+    pass "the gate assigns no bare BIN_DIR"
+fi
+src_line="$(cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -n 'source /opt/intel/oneapi/setvars.sh' | head -1 \
+    | cut -d: -f1)"
 use_line="$(cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -n 'GATE_BIN_DIR' | head -1 | cut -d: -f1)"
 if [ -n "$src_line" ] && [ -n "$use_line" ] && [ "$src_line" -lt "$use_line" ]; then
     pass "setvars is sourced (line $src_line) before the first use of GATE_BIN_DIR (line $use_line)"
@@ -454,13 +486,16 @@ else
     fail "setvars source line '${src_line:-none}' must precede the first GATE_BIN_DIR line '${use_line:-none}'"
 fi
 if [ -f /opt/intel/oneapi/setvars.sh ]; then
-    for f in /opt/intel/oneapi/setvars.sh /opt/intel/oneapi/*/latest/env/vars.sh /opt/intel/oneapi/*/latest/oneapi-vars.sh \
+    for f in /opt/intel/oneapi/setvars.sh /opt/intel/oneapi/*/latest/env/vars.sh \
+             /opt/intel/oneapi/*/latest/oneapi-vars.sh \
              /opt/intel/oneapi/*/latest/etc/*/vars.sh /opt/intel/oneapi/*/latest/etc/*/*.sh; do
         [ -f "$f" ] && cat "$f"
     done 2>/dev/null | grep -oE '^[[:space:]]*(export +|local +|declare +)?[A-Za-z_][A-Za-z_0-9]*=' \
         | sed -E 's/^[[:space:]]*(export |local |declare )? *//; s/=$//' | LC_ALL=C sort -u > "$WORK/oneapi-names.txt"
-    cat "$GATE" | grep -vE '^[[:space:]]*#' | grep -oE '(^|[;{(]|then|do)[[:space:]]*[A-Za-z_][A-Za-z_0-9]*(\[[^]]*\])?\+?=' \
-        | sed -E 's/^(;|\{|\(|then|do)?[[:space:]]*//; s/(\[[^]]*\])?\+?=$//' | LC_ALL=C sort -u > "$WORK/gate-names.txt"
+    cat "$GATE" | grep -vE '^[[:space:]]*#' \
+        | grep -oE '(^|[;{(]|then|do)[[:space:]]*[A-Za-z_][A-Za-z_0-9]*(\[[^]]*\])?\+?=' \
+        | sed -E 's/^(;|\{|\(|then|do)?[[:space:]]*//; s/(\[[^]]*\])?\+?=$//' \
+        | LC_ALL=C sort -u > "$WORK/gate-names.txt"
     shared="$(LC_ALL=C comm -12 "$WORK/oneapi-names.txt" "$WORK/gate-names.txt" | tr '\n' ' ')"
     if [ -s "$WORK/oneapi-names.txt" ] && [ -s "$WORK/gate-names.txt" ] && [ -z "$shared" ]; then
         pass "no variable the gate assigns is also assigned by oneAPI's setvars and vars.sh files"
@@ -474,7 +509,8 @@ fi
 # the build's own bin directory; with the old BIN_DIR it named bin64 once setvars had run.
 mkdir -p "$WORK/fakebuild"
 echo 'GGML_SYCL:BOOL=ON' > "$WORK/fakebuild/CMakeCache.txt"
-out="$(bash "$GATE" --no-head-check --no-lock --arm Q_pp --build-dir "$WORK/fakebuild" --out-dir "$WORK/fakeout" 2>&1)"; rc=$?
+out="$(bash "$GATE" --no-head-check --no-lock --arm Q_pp --build-dir "$WORK/fakebuild" --out-dir "$WORK/fakeout" \
+    abcdef0 2>&1)"; rc=$?
 expect_rc "a real run without binaries refuses with rc 2" "$rc" 2
 expect "the refusal names the build's own bin directory" "$out" "REFUSED: no $WORK/fakebuild/bin/llama-bench"
 expect_not "the refusal never names bin64" "$out" "bin64"
@@ -491,7 +527,8 @@ child="$(sed -n 's/.*signal-selftest: child=\([0-9][0-9]*\) .*/\1/p' "$WORK/sig.
 if [ -d "$LOCKD" ] && [ -f "$LOCKD/holder" ] && [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
     pass "signal selftest: the lock is held with a holder file and the child runs before the TERM"
 else
-    fail "signal selftest did not reach its waiting state (lock '$LOCKD', child '${child:-none}')" "$(cat "$WORK/sig.out" 2>/dev/null)"
+    fail "signal selftest did not reach its waiting state (lock '$LOCKD', child '${child:-none}')" \
+        "$(cat "$WORK/sig.out" 2>/dev/null)"
 fi
 kill -TERM "$gpid" 2>/dev/null
 wait "$gpid"; rc=$?
@@ -500,18 +537,30 @@ expect_rc "a TERM ends the gate with rc 143" "$rc" 143
 expect "a TERM prints ABORTED" "$out" "ABORTED by signal"
 expect "a TERM still ends with the marker line" "$out" "verdicts_pass=0 GATE_DONE"
 if [ -e "$LOCKD" ]; then fail "a TERM left GPU.lock behind"; else pass "a TERM releases GPU.lock"; fi
-if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then fail "a TERM left the child $child running"; else pass "a TERM kills the child"; fi
+if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+    fail "a TERM left the child $child running"
+else
+    pass "a TERM kills the child"
+fi
 
 # ---- RING_ARMS: the arms ring_engaged_any is read from
 read -ra RARMS <<< "$(bash "$GATE" --ring-arms 2>&1)"
-if [ "${#RARMS[@]}" -gt 0 ]; then pass "the gate names its ring arms: ${RARMS[*]}"; else fail "--ring-arms printed nothing"; fi
+if [ "${#RARMS[@]}" -gt 0 ]; then
+    pass "the gate names its ring arms: ${RARMS[*]}"
+else
+    fail "--ring-arms printed nothing"
+fi
 for arm in "${RARMS[@]}"; do
     case "$arm" in
         Q_pp) line="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")" ;;
         Q_staged) line="$(score Q_staged --err "$WORK/st-pass.err")" ;;
         *) line="" ;;
     esac
-    if [ -z "$line" ]; then fail "ring arm $arm has no fixture in this test: add one"; else expect "ring arm $arm prints ring_engaged=" "$line" "ring_engaged="; fi
+    if [ -z "$line" ]; then
+        fail "ring arm $arm has no fixture in this test: add one"
+    else
+        expect "ring arm $arm prints ring_engaged=" "$line" "ring_engaged="
+    fi
 done
 out="$(summ outside "$PASS_RING" "Q_tg=PASS tg=11.9 ring_engaged=no")"
 expect "an arm outside RING_ARMS cannot move ring_engaged_any to no" "$out" "ring_engaged_any=yes"
@@ -519,12 +568,325 @@ out="$(summ outside2 "$CTRL_PASS" "Q_tg=PASS tg=11.9 ring_engaged=no")"; rc=$?
 expect "an arm outside RING_ARMS does not make ring_engaged_any=no" "$out" "ring_engaged_any=na"
 expect_rc "an arm outside RING_ARMS leaves the exit code 0" "$rc" 0
 
+# ---- quality review r1: the arms fail closed ---------------------------------------------------------------------
+
+# I1: the resets arm reads journalctl's own rc and a missing journal; an empty journal is a pass only with rc 0
+out="$(score resets --journal "$WORK/absent-journal.txt")"; rc=$?
+expect "resets a missing journal file is a FAIL, never a clean log" "$out" "resets=FAIL(no_journal"
+expect_rc "resets a missing journal rc" "$rc" 1
+: > "$WORK/j-empty.txt"
+out="$(score resets --journal "$WORK/j-empty.txt")"
+expect "resets an empty journal with journalctl rc 0 is a legitimate PASS" "$out" "resets=PASS count=0"
+out="$(score resets --journal "$WORK/j-empty.txt" --rc 1)"; rc=$?
+expect "resets an empty journal with journalctl rc 1 is a FAIL" "$out" "resets=FAIL(journalctl_rc=1)"
+expect_rc "resets journalctl failure rc" "$rc" 1
+out="$(score resets --journal "$WORK/j-clean.txt" --rc 7)"
+expect "resets a clean journal with journalctl rc 7 is a FAIL naming the rc" "$out" "resets=FAIL(journalctl_rc=7)"
+printf 'xe 0000:03:00.0: [drm] gt reset started\n' > "$WORK/j-lower.txt"
+out="$(score resets --journal "$WORK/j-lower.txt")"
+expect "resets matches case-insensitively" "$out" "resets=FAIL(count=1)"
+
+# I2: Q_tok_cpu needs all four outputs non-empty and all four loads rc 0; a recorded arm that failed is a FAIL
+: > "$WORK/tok-none.out"
+out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-none.out" --ref-out "$WORK/tok-none.out" \
+    --ref-out2 "$WORK/tok-none.out" --rc-out2 134 --rc-ref 134 --rc-ref2 134)"; rc=$?
+expect "Q_tok_cpu three crashed loads and one good cpu load FAIL" "$out" "Q_tok_cpu=FAIL("
+expect_not "Q_tok_cpu three crashed loads never PASS" "$out" "Q_tok_cpu=PASS"
+expect "Q_tok_cpu names the crashed Q_tok load" "$out" "rc_Q_tok=134"
+expect "Q_tok_cpu names the empty Q_tok output" "$out" "empty_Q_tok_output"
+expect_rc "Q_tok_cpu three crashed loads rc" "$rc" 1
+out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-c1.out" --ref-out "$WORK/tok-a1.out" \
+    --ref-out2 "$WORK/tok-a2.out" --rc-ref 134)"
+expect "Q_tok_cpu equal md5s with one auto load at rc 134 still FAIL" "$out" "Q_tok_cpu=FAIL(rc_Q_tok=134)"
+out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-c1.out" --ref-out "$WORK/tok-a1.out" \
+    --ref-out2 "$WORK/tok-a2.out" --rc-out2 137)"
+expect "Q_tok_cpu a killed first cpu load FAILs" "$out" "Q_tok_cpu=FAIL(rc_Q_tok_cpu_1=137)"
+out="$(score Q_tok --out "$WORK/tok-a1.out" --rc 134)"
+expect "Q_tok a crashed load is a FAIL, not a recorded md5" "$out" "Q_tok=FAIL(rc=134)"
+out="$(score Q_tok_2 --out "$WORK/tok-none.out")"
+expect "Q_tok_2 an empty stdout is a FAIL, not md5 d41d8cd9" "$out" "Q_tok_2=FAIL(empty_output)"
+out="$(score Q_pp_cpu --csv "$WORK/pp-slow.csv" --err "$WORK/pp-refused.err" --rc 124)"
+expect "Q_pp_cpu a timeout is a FAIL" "$out" "Q_pp_cpu=FAIL(rc=124)"
+out="$(summ rec134 "Q_tok=RECORDED md5=d41d8cd9 rc=134")"; rc=$?
+expect_rc "summary a RECORDED line with rc 134 is exit 1" "$rc" 1
+out="$(summ rec0 "Q_tok=RECORDED md5=c4589dac rc=0")"; rc=$?
+expect_rc "summary a RECORDED line with rc 0 is neutral" "$rc" 0
+expect "summary a RECORDED line is not counted as a pass" "$out" "verdicts_pass=0 GATE_DONE"
+out="$(summ recpass "Q_tok=RECORDED md5=c4589dac rc=0" "$CTRL_PASS")"
+expect "summary RECORDED beside one PASS counts one pass" "$out" "verdicts_pass=1 GATE_DONE"
+
+# I3: a usage error ends with the final line so a detached waiter is released; help and dry-run keep the plain form
+out="$(bash "$GATE" --no-such-option 2>&1)"; rc=$?
+expect_rc "an unknown option exits 2" "$rc" 2
+expect "an unknown option still prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
+expect "an unknown option says REFUSED: usage" "$out" "REFUSED: usage: unknown option: --no-such-option"
+out="$(bash "$GATE" --arm Q_nope 2>&1)"
+expect "an unknown arm prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
+out="$(bash "$GATE" abcdef0 1234567 2>&1)"; rc=$?
+expect_rc "two <sha> arguments exit 2" "$rc" 2
+expect "two <sha> arguments print the final line" "$out" "verdicts_pass=0 GATE_DONE"
+out="$(bash "$GATE" --help 2>&1)"
+expect_not "help is not a usage refusal" "$out" "REFUSED: usage"
+
+# I4: the sha format is checked under --no-head-check; the head check reads the build's own source tree
+mkdir -p "$WORK/stubbin"
+mkstub() { printf '#!/bin/sh\n%s\n' "$1" > "$WORK/stubbin/journalctl"; chmod +x "$WORK/stubbin/journalctl"; }
+# rf <build-dir> <gate option>... <sha>: a real run of the journal arm alone (no device, no model, no lock)
+rf() { PATH="$WORK/stubbin:$PATH" bash "${GATE_UNDER:-$GATE}" --no-lock --arm resets --build-dir "$@" 2>&1; }
+mkstub 'exit 0'
+out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-badsha" xyz1234)"; rc=$?
+expect_rc "--no-head-check still validates the sha format" "$rc" 2
+expect "--no-head-check with a bad sha says why" "$out" "is not 7 to 40 lowercase hex characters"
+out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-nosha")"; rc=$?
+expect_rc "--no-head-check still requires a <sha>" "$rc" 2
+expect "--no-head-check without a sha says so" "$out" "REFUSED: no <sha> argument"
+git init -q "$WORK/srcrepo"
+git -C "$WORK/srcrepo" -c user.name=gate-test -c user.email=gate-test@example.invalid \
+    commit -q --allow-empty -m "the tree under test"
+SRC_SHA="$(git -C "$WORK/srcrepo" rev-parse HEAD)"
+mkdir -p "$WORK/srcrepo/build"
+echo 'GGML_SYCL:BOOL=ON' > "$WORK/srcrepo/build/CMakeCache.txt"
+out="$(rf "$WORK/srcrepo/build" --out-dir "$WORK/rf-src-ok" "$SRC_SHA")"; rc=$?
+expect "the head check compares the sha with the build's own source tree" "$out" "resets=PASS"
+expect_rc "the head check against the build's source tree passes" "$rc" 0
+out="$(rf "$WORK/srcrepo/build" --out-dir "$WORK/rf-src-short" "${SRC_SHA:0:7}")"
+expect "a 7-character sha prefix of the build's source head is accepted" "$out" "resets=PASS"
+out="$(rf "$WORK/srcrepo/build" --out-dir "$WORK/rf-src-bad" 0000000000000000000000000000000000000000)"; rc=$?
+expect_rc "a sha that is not the build's source head refuses" "$rc" 2
+expect "the head refusal names the source tree it read" "$out" "of $WORK/srcrepo does not start with"
+out="$(rf "$WORK/fakebuild" --src-dir "$WORK/srcrepo" --out-dir "$WORK/rf-srcdir" "$SRC_SHA")"
+expect "--src-dir names the tree the head check reads" "$out" "resets=PASS"
+out="$(rf "$WORK/srcrepo/build" --no-head-check --out-dir "$WORK/rf-nohead" 0000000)"; rc=$?
+expect_rc "--no-head-check is the explicit escape: the wrong head passes" "$rc" 0
+mkdir -p "$WORK/snap/scripts"
+cp -a "$ROOT_DIR/scripts/sycl-moe-exec-gate.sh" "$ROOT_DIR/scripts/sycl-moe-exec-prompts" \
+    "$ROOT_DIR/scripts/qwen4exp-mtp-prompts" "$WORK/snap/scripts/"
+SNAP="$WORK/snap/scripts/sycl-moe-exec-gate.sh"
+out="$(GATE_UNDER="$SNAP" rf "$WORK/srcrepo/build" --out-dir "$WORK/rf-snap" "$SRC_SHA")"; rc=$?
+expect "the lead form: a snapshot copy of the script runs against another tree's build" "$out" "resets=PASS"
+expect_rc "the snapshot run rc" "$rc" 0
+out="$(bash "$SNAP" --dry-run 2>&1)"
+expect "snapshot prompts resolve next to the script (code-2k)" "$out" \
+    "-f $WORK/snap/scripts/sycl-moe-exec-prompts/code-2k.txt"
+expect "snapshot prompts resolve next to the script (decode)" "$out" \
+    "-f $WORK/snap/scripts/qwen4exp-mtp-prompts/code.txt"
+out="$(bash "$SNAP" --dry-run --build-dir "$WORK/srcrepo/build" 2>&1)"
+expect "the dry-run names the source tree the build's head is read from" "$out" "src-dir: $WORK/srcrepo "
+
+# I1 in the real flow: journalctl's rc survives into the verdict, and the verdict line carries the builders fields
+mkstub 'exit 7'
+out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-j7" abcdef0)"; rc=$?
+expect "a failing journalctl scores resets=FAIL naming its rc" "$out" "resets=FAIL(journalctl_rc=7)"
+expect_rc "a failing journalctl is exit 1" "$rc" 1
+mkstub 'echo "xe 0000:03:00.0: [drm] GT reset started"'
+out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-reset" abcdef0)"; rc=$?
+expect "a GT reset in the journal scores resets=FAIL" "$out" "resets=FAIL(count=1)"
+expect_rc "a GT reset is exit 1" "$rc" 1
+mkstub 'exit 0'
+out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-clean" abcdef0)"; rc=$?
+expect "an empty journal with rc 0 passes" "$out" "resets=PASS count=0 builders_pre=na builders_post=na"
+expect "the run ends with the final line" "$out" "verdicts_pass=1 GATE_DONE"
+expect_rc "a clean journal run is exit 0" "$rc" 0
+
+# m3: an exported GGML_SYCL_* or LLAMA_ARG_* variable would reach every arm: refuse and name it
+out="$(GGML_SYCL_MOE_EXEC=cpu rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-leak" abcdef0)"; rc=$?
+expect_rc "an exported GGML_SYCL_ variable refuses with rc 2" "$rc" 2
+expect "the refusal names the variable" "$out" "GGML_SYCL_MOE_EXEC"
+out="$(LLAMA_ARG_N_GPU_LAYERS=99 rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-leak2" abcdef0)"; rc=$?
+expect_rc "an exported LLAMA_ARG_ variable refuses with rc 2" "$rc" 2
+expect "the refusal names the LLAMA_ARG_ variable" "$out" "LLAMA_ARG_N_GPU_LAYERS"
+expect "a leak refusal ends with the final line" "$out" "verdicts_pass=0 GATE_DONE"
+
+# m5: a reused --out-dir
+mkdir -p "$WORK/rf-used"
+echo stale > "$WORK/rf-used/Q_pp.out"
+out="$(PATH="$WORK/stubbin:$PATH" bash "$GATE" --no-lock --build-dir "$WORK/fakebuild" --no-head-check \
+    --out-dir "$WORK/rf-used" abcdef0 2>&1)"; rc=$?
+expect_rc "a non-empty --out-dir without --arm or --clobber refuses with rc 2" "$rc" 2
+expect "the out-dir refusal says why" "$out" "is not empty: use a fresh one, --arm to redo named arms, or --clobber"
+expect "the stale file is untouched by the refusal" "$(cat "$WORK/rf-used/Q_pp.out")" "stale"
+out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-used" abcdef0)"; rc=$?
+expect "--arm lets a non-empty --out-dir be reused (only that arm's files are written)" "$out" "resets=PASS"
+expect "the other arms' files in the reused out-dir are untouched" "$(cat "$WORK/rf-used/Q_pp.out")" "stale"
+echo stale > "$WORK/rf-used2.marker"
+mkdir -p "$WORK/rf-used2"; echo stale > "$WORK/rf-used2/Q_pp.out"
+out="$(PATH="$WORK/stubbin:$PATH" bash "$GATE" --no-lock --build-dir "$WORK/fakebuild" --no-head-check --clobber \
+    --out-dir "$WORK/rf-used2" abcdef0 2>&1)"
+expect_not "--clobber accepts a non-empty --out-dir (it gets past the out-dir check)" "$out" "is not empty"
+
+# I5: builders_pre and builders_post on every verdict line; a build during the arm taints a PASS
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err" --builders-pre 0 --builders-post 0)"; rc=$?
+expect "a verdict line carries builders_pre and builders_post" "$out" "builders_pre=0 builders_post=0"
+expect "builders 0 and 0 leaves the PASS" "$out" "Q_pp=PASS"
+expect_not "builders 0 and 0 is not tainted" "$out" "tainted"
+expect_rc "builders 0 and 0 rc" "$rc" 0
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err" --builders-pre 0 --builders-post 2)"; rc=$?
+expect "a PASS with builders_post 2 becomes NOT_SCORED(tainted=builders,was=PASS)" "$out" \
+    "Q_pp=NOT_SCORED(tainted=builders,was=PASS)"
+expect "a tainted verdict carries the flag" "$out" "builders_pre=0 builders_post=2 tainted=builders"
+expect_rc "a tainted PASS is exit class 3" "$rc" 3
+out="$(score Q_pp --csv "$WORK/pp-fail.csv" --err "$WORK/pp-fail.err" --builders-pre 0 --builders-post 3)"; rc=$?
+expect "a FAIL with builders_post 3 stays a FAIL" "$out" "Q_pp=FAIL(pp512=412<500)"
+expect "a tainted FAIL carries the flag" "$out" "tainted=builders"
+expect_rc "a tainted FAIL is exit 1" "$rc" 1
+out="$(score MI_b70 --out "$WORK/mi.out" --builders-pre 1 --builders-post 0)"
+expect "builders_pre above 0 with builders_post 0 does not taint" "$out" \
+    "MI_b70=PASS digits=1 builders_pre=1 builders_post=0"
+TAINTED="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err" --builders-pre 0 --builders-post 2)"
+out="$(summ taint "$TAINTED" "$CTRL_PASS")"; rc=$?
+expect_rc "summary a tainted arm makes exit 3" "$rc" 3
+expect "summary a tainted PASS is not counted as a pass" "$out" "verdicts_pass=1 GATE_DONE"
+
+# I6: every stop once the lock is held prints the verdicts scored so far; a builder wait is bounded like settle
+printf '%s\n' "$PASS_RING" "$CTRL_PASS" > "$WORK/seed.txt"
+out="$(bash "$GATE" --refuse-selftest --seed-verdicts "$WORK/seed.txt" --lock-dir "$WORK/ref.lock" 2>&1)"; rc=$?
+expect_rc "a refusal after arms ran exits 2" "$rc" 2
+expect "a refusal after arms ran prints STOPPED with the reason" "$out" "STOPPED: synthetic stop (2 of 15 arms scored)"
+expect "a refusal after arms ran prints the summary over the scored verdicts" "$out" "summary: ring_engaged_any=yes"
+expect "a refusal after arms ran keeps the scored passes in the final line" "$out" "verdicts_pass=2 GATE_DONE"
+expect_not "a refusal after arms ran is not a bare REFUSED" "$out" "REFUSED"
+if [ -e "$WORK/ref.lock" ]; then
+    fail "a stop left GPU.lock behind"
+else
+    pass "a stop after arms ran releases GPU.lock"
+fi
+out="$(bash "$GATE" --refuse-selftest --lock-dir "$WORK/ref.lock" 2>&1)"; rc=$?
+expect "a refusal before any arm keeps the plain REFUSED form" "$out" "REFUSED: synthetic stop"
+expect "a refusal before any arm ends with verdicts_pass=0" "$out" "verdicts_pass=0 GATE_DONE"
+LOCKS="$WORK/sig2.lock"
+bash "$GATE" --signal-selftest --seed-verdicts "$WORK/seed.txt" --lock-dir "$LOCKS" > "$WORK/sig2.out" 2>&1 &
+gpid=$!
+for _ in $(seq 100); do
+    grep -q 'signal-selftest: child=' "$WORK/sig2.out" 2>/dev/null && break
+    sleep 0.1
+done
+kill -TERM "$gpid" 2>/dev/null
+wait "$gpid"; rc=$?
+out="$(cat "$WORK/sig2.out")"
+expect_rc "a TERM after arms ran exits 143" "$rc" 143
+expect "a TERM after arms ran prints STOPPED: signal" "$out" "STOPPED: signal (2 of 15 arms scored)"
+expect "a TERM after arms ran prints the summary over the scored verdicts" "$out" "summary: ring_engaged_any=yes"
+expect "a TERM after arms ran keeps the scored passes" "$out" "verdicts_pass=2 GATE_DONE"
+if [ -e "$LOCKS" ]; then
+    fail "a TERM after arms ran left GPU.lock behind"
+else
+    pass "a TERM after arms ran releases GPU.lock"
+fi
+echo 2 > "$WORK/b-count"
+out="$(bash "$GATE" --wait-builders-selftest --builders-file "$WORK/b-count" --builders-wait-max 3 \
+    --builders-poll 1 2>&1)"; rc=$?
+expect_rc "a builder count that never clears refuses after the bound with rc 2" "$rc" 2
+expect "the expired wait names the count and the wait" "$out" "REFUSED: builders = 2 after waiting 3s"
+expect "the expired wait ends with the final line" "$out" "verdicts_pass=0 GATE_DONE"
+( sleep 1.5; echo 0 > "$WORK/b-count" ) &
+bpid=$!
+out="$(bash "$GATE" --wait-builders-selftest --builders-file "$WORK/b-count" --builders-wait-max 20 \
+    --builders-poll 1 2>&1)"; rc=$?
+wait "$bpid"
+expect_rc "a builder count that clears inside the bound continues with rc 0" "$rc" 0
+expect "the wait says it waited" "$out" "waiting up to 20s"
+expect "the wait says it cleared" "$out" "builders cleared after"
+expect_not "a cleared wait does not refuse" "$out" "REFUSED"
+echo 0 > "$WORK/b-count"
+out="$(bash "$GATE" --wait-builders-selftest --builders-file "$WORK/b-count" --builders-wait-max 3 \
+    --builders-poll 1 2>&1)"; rc=$?
+expect_rc "zero builders does not wait" "$rc" 0
+expect_not "zero builders prints no wait line" "$out" "waiting up to"
+
+# I7: every arm scores a non-zero rc as a FAIL; a GO run that prints the answer and aborts in teardown must FAIL
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG" --rc 134)"; rc=$?
+expect "Q_tg rc 134 fails with the rc named" "$out" "Q_tg=FAIL(rc=134)"
+expect_rc "Q_tg rc 134 exit" "$rc" 1
+out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc.err" --qmd5 "$MD5" --place-ref-noc - --rc 124)"
+expect "Q_noc a timeout fails with the rc named" "$out" "Q_noc=FAIL(rc=124)"
+out="$(score GO_gate --out "$WORK/go.out" --err "$WORK/empty.err" --rc 134)"; rc=$?
+expect "GO_gate prints the answer and aborts in teardown: FAIL" "$out" "GO_gate=FAIL(rc=134)"
+expect_rc "GO_gate rc 134 exit" "$rc" 1
+out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/go12.err" --rc 134)"
+expect "GO_noc rc 134 fails" "$out" "GO_noc=FAIL(rc=134)"
+out="$(score GO_pp --csv "$WORK/gopp-ok.csv" --rc 137)"
+expect "GO_pp rc 137 fails" "$out" "GO_pp=FAIL(rc=137)"
+out="$(score MI_b70 --out "$WORK/mi.out" --rc 134)"
+expect "MI_b70 prints the digits and aborts in teardown: FAIL" "$out" "MI_b70=FAIL(rc=134)"
+out="$(score MI_b50 --out "$WORK/mi.out" --rc 124)"
+expect "MI_b50 a timeout fails" "$out" "MI_b50=FAIL(rc=124)"
+out="$(score Q_staged --err "$WORK/st-pass.err" --rc 134)"
+expect "Q_staged rc 134 fails" "$out" "Q_staged=FAIL(rc=134"
+
+# m1: cases that pin the mutants the first round left alive
+# the last " eval time = " line wins, not the first (head vs tail)
+{
+    echo "0.01.601.984 I [PLACEMENT] $PLACE_TG (of 73728 total)"
+    echo "1.40.000.000 I llama_perf_context_print:        eval time =    9999.00 ms /    30 runs" \
+        "  (333.30 ms per token,     3.00 tokens per second)"
+    echo "$PERF_EVAL_HEAD   (83.97 ms per token,    11.91 tokens per second)"
+} > "$WORK/tg-two.err"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-two.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg reads the last eval line, not the first" "$out" "Q_tg=PASS tg=11.91"
+# m2: a nan eval line must not let the prompt-eval rate stand in for tg
+{
+    echo "0.01.601.984 I [PLACEMENT] $PLACE_TG (of 73728 total)"
+    echo "1.40.000.000 I llama_perf_context_print: prompt eval time =     400.00 ms /   800 tokens" \
+        "(    0.50 ms per token,  2000.00 tokens per second)"
+    echo "1.42.962.387 I llama_perf_context_print:        eval time =       0.00 ms /     1 runs" \
+        "  (  nan ms per token,   nan tokens per second)"
+} > "$WORK/tg-nan.err"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-nan.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg a nan eval line is no_tg, never the prompt-eval rate" "$out" "Q_tg=FAIL(no_tg)"
+expect_not "Q_tg a nan eval line does not report tg=2000" "$out" "tg=2000"
+# Mistral digits: exactly one line
+printf '1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n' > "$WORK/mi-two.out"
+out="$(score MI_b70 --out "$WORK/mi-two.out")"
+expect "MI_b70 two digit lines fail: the gate is exactly 1" "$out" "MI_b70=FAIL(digits=2!=1)"
+# GO_pp upper bounds
+mkcsv "$WORK/gopp-high.csv" 512:0:1000.0:4.0:512 0:128:33.9:0.1:512
+mkcsv "$WORK/gopp-tghigh.csv" 512:0:880.0:4.0:512 0:128:40.0:0.1:512
+out="$(score GO_pp --csv "$WORK/gopp-high.csv")"
+expect "GO_pp pp512 1000 fails high" "$out" "GO_pp=FAIL(pp512=1000.0>"
+out="$(score GO_pp --csv "$WORK/gopp-tghigh.csv")"
+expect "GO_pp tg128 40.0 fails high" "$out" "GO_pp=FAIL(tg128=40.0>"
+# refill is checked per device line: 24/23 on one device and 23/24 on another sum to a balanced 47/47
+dec_err "$WORK/tg-twodev.err" 11.91 "$PLACE_TG" '0.09.000.000 W [MOE-EXEC] refill device 0: 24/23 triplets re-admitted'
+echo '0.09.100.000 W [MOE-EXEC] refill device 1: 23/24 triplets re-admitted' >> "$WORK/tg-twodev.err"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-twodev.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg a two-device refill that sums to balanced is still unbalanced" "$out" "Q_tg=FAIL(refill=unbalanced(47/47))"
+out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/tg-twodev.err" --qmd5 "$MD5" --place-ref-noc "$PLACE_TG")"
+expect "Q_noc applies the same refill rule" "$out" "Q_noc=FAIL(refill=unbalanced(47/47))"
+# a llama-bench depth row never stands in for the n_depth 0 row, wherever it sits in the csv
+mkcsv "$WORK/pp-depth-first.csv" 512:0:99.0:1.0:512:4096 512:0:523.4:3.1:512 2048:0:851.2:5.0:2048
+mkcsv "$WORK/pp-depth-last.csv" 512:0:523.4:3.1:512 2048:0:851.2:5.0:2048 512:0:99.0:1.0:512:4096
+for f in pp-depth-first pp-depth-last; do
+    out="$(score Q_pp --csv "$WORK/$f.csv" --err "$WORK/pp-pass.err")"
+    expect "Q_pp ignores a depth row ($f)" "$out" "Q_pp=PASS pp512=523.4"
+done
+
+# m7 and m11: the C-locale cmp spelling, and a missing tool is a skip in the gate too
+out="$(LC_ALL=de_DE.UTF-8 tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-flip.out" "$WORK/tok-a2.out")"
+expect "first_diff_byte is the same under another locale" "$out" "first_diff_byte=22"
+mkdir -p "$WORK/nocmp"
+for t in dirname cat grep sed tr cut head tail wc sort date ls env awk md5sum comm git pgrep timeout journalctl \
+         mkdir rm cp stat seq sleep uname basename readlink mktemp; do
+    tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$WORK/nocmp/$t"
+done
+out="$(PATH="$WORK/nocmp" "$BASH" "$GATE" --score-arm resets --journal "$WORK/j-clean.txt" 2>&1)"; rc=$?
+expect_rc "the gate without cmp on PATH exits 77, never a verdict" "$rc" 77
+expect "the gate names the missing tool" "$out" "missing tool(s): cmp"
+expect_not "the gate without cmp prints no verdict" "$out" "resets="
+
 # ---- the prompt
 bash "$GATE" --make-prompt --prompt-out "$WORK/p1.txt" > /dev/null 2>&1
 bash "$GATE" --make-prompt --prompt-out "$WORK/p2.txt" > /dev/null 2>&1
-if [ -s "$WORK/p1.txt" ] && cmp -s "$WORK/p1.txt" "$WORK/p2.txt"; then pass "--make-prompt is deterministic"; else fail "--make-prompt differs between runs"; fi
+if [ -s "$WORK/p1.txt" ] && cmp -s "$WORK/p1.txt" "$WORK/p2.txt"; then
+    pass "--make-prompt is deterministic"
+else
+    fail "--make-prompt differs between runs"
+fi
 sz="$(wc -c < "$ROOT_DIR/scripts/sycl-moe-exec-prompts/code-2k.txt" 2>/dev/null || echo 0)"
-if [ "$sz" -ge 4000 ] && [ "$sz" -le 9000 ]; then pass "the committed code-2k.txt is $sz bytes"; else fail "the committed code-2k.txt is $sz bytes, expected 4000-9000"; fi
+if [ "$sz" -ge 4000 ] && [ "$sz" -le 9000 ]; then
+    pass "the committed code-2k.txt is $sz bytes"
+else
+    fail "the committed code-2k.txt is $sz bytes, expected 4000-9000"
+fi
 
 echo "cases=$CASES fails=$FAILS"
 [ "$FAILS" -eq 0 ]
