@@ -506,19 +506,24 @@ int main() {
         }
     }
 
-    // 9. Refusal names: every cause has its own name, and the per-device latch's 32-bit mask holds them all.
-    const int pp_refusal_last = static_cast<int>(moe_pp_batched_refusal::GEMM);
-    if (pp_refusal_last >= 32) {
-        std::printf("FAIL: moe_pp_batched_refusal has %d values; the trace latch holds 32\n", pp_refusal_last + 1);
+    // 9. Refusal names: every cause below COUNT has its own name, and the per-device latch's 32-bit mask holds
+    //    them all.
+    const int pp_refusal_count = static_cast<int>(moe_pp_batched_refusal::COUNT);
+    if (pp_refusal_count > 32) {
+        std::printf("FAIL: moe_pp_batched_refusal has %d causes; the refusal latch holds 32\n", pp_refusal_count);
         ++failures;
     }
-    for (int a = 0; a <= pp_refusal_last; ++a) {
+    if (std::strcmp(moe_pp_batched_refusal_name(moe_pp_batched_refusal::COUNT), "unknown") != 0) {
+        std::printf("FAIL: COUNT is named as if it were a cause\n");
+        ++failures;
+    }
+    for (int a = 0; a < pp_refusal_count; ++a) {
         const char * name_a = moe_pp_batched_refusal_name(static_cast<moe_pp_batched_refusal>(a));
         if (std::strcmp(name_a, "unknown") == 0) {
             std::printf("FAIL: refusal %d has no name\n", a);
             ++failures;
         }
-        for (int b = a + 1; b <= pp_refusal_last; ++b) {
+        for (int b = a + 1; b < pp_refusal_count; ++b) {
             if (std::strcmp(name_a, moe_pp_batched_refusal_name(static_cast<moe_pp_batched_refusal>(b))) == 0) {
                 std::printf("FAIL: refusals %d and %d share the name %s\n", a, b, name_a);
                 ++failures;

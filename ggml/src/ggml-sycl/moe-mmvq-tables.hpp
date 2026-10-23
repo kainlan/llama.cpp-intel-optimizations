@@ -354,9 +354,9 @@ inline bool moe_pp_batched_has_expert_entries(enum ggml_type type, enum ggml_lay
     return type == GGML_TYPE_MXFP4 || !device_buffer || layout == GGML_LAYOUT_AOS;
 }
 
-// Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is traced
-// once per (device, cause) by its name (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1). The latch is a 32-bit
-// mask per device, so this enum must stay under 32 values.
+// Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is reported
+// once per (device, cause) by its name. The latch is a 32-bit mask per device: COUNT, last, is the number of
+// causes, and the latch static_asserts that it fits.
 enum class moe_pp_batched_refusal : uint8_t {
     NONE = 0,
     CPU_REFERENCE,      // GGML_SYCL_MOE_CPU_REFERENCE asked for the CPU reference instead
@@ -381,6 +381,7 @@ enum class moe_pp_batched_refusal : uint8_t {
     SCRATCH_SLOT,       // a ring slot could not be acquired
     SCRATCH_SLOT_SIZE,  // an acquired slot is smaller than planned
     GEMM,               // the batched GEMM failed after the experts were staged
+    COUNT,              // not a cause: the number of causes
 };
 
 inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) {
@@ -431,6 +432,8 @@ inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) 
             return "scratch-slot-size";
         case moe_pp_batched_refusal::GEMM:
             return "gemm";
+        case moe_pp_batched_refusal::COUNT:
+            break;
     }
     return "unknown";
 }

@@ -80927,10 +80927,12 @@ static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int devic
 
 #if GGML_SYCL_DNNL
 // True the first time `refusal` is seen on `device`: the batched executor's refusal WARN fires once per (device,
-// cause). One bit per moe_pp_batched_refusal value, which the enum keeps under 32.
+// cause). One bit per cause, so the shift below is defined only while COUNT fits the mask.
 static bool ggml_sycl_moe_pp_batched_refusal_first(int device, moe_pp_batched_refusal refusal) {
+    static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,
+                  "the batched executor's refusal latch holds one bit per moe_pp_batched_refusal cause");
     static std::atomic<uint32_t> seen[GGML_SYCL_MAX_DEVICES] = {};
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || refusal >= moe_pp_batched_refusal::COUNT) {
         return false;
     }
     const uint32_t bit = 1u << static_cast<uint32_t>(refusal);
