@@ -96,8 +96,12 @@ class moe_stream_ring {
     // what moe_stream_ring_size() produces (n_slots == 2 * region_slots, at
     // least two slots, bytes == n_slots * slot_bytes, slot_bytes a nonzero
     // multiple of MOE_STREAM_RING_SLOT_ALIGN) or when the zone cannot give the
-    // bytes.
-    bool reserve(int device, const moe_stream_ring_geometry & geo);
+    // bytes. `bytes_short`, when given, is set to what the zone was short of
+    // when it could not give the bytes: geo.bytes past its largest free block,
+    // which an expert loan of that much may cover (llama.cpp-3460, c-0tmn). It
+    // is 0 on success, on every other refusal, and when the zone's figures are
+    // not available (no arena).
+    bool reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short = nullptr);
 
     // The next slot of the current region as a slice of the ring's allocation
     // that resolves with `layout`, the layout the caller will write there (lead

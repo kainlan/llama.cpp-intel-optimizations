@@ -68,6 +68,15 @@ using moe_stream_prompt_kernel_fn =
 // consumer: the index build asks the claim once, and the entry carries its answer (one fact, one source).
 using moe_stream_library_claims_fn = bool (*)(void * graph_ctx, int layer, expert_tensor_role role);
 
+// Records a request to borrow `bytes` of resident expert VRAM on `device` at its next graph boundary (llama.cpp-3460,
+// c-0tmn). The backend answers with ggml_sycl_request_expert_loan: lock-free, so the phase may call it while
+// g_sycl_graph_compute_mutex is held, and the largest request since the last boundary wins.
+using moe_stream_request_loan_fn = void (*)(int device, size_t bytes);
+
+// How many loans the boundary runner has refused on `device` (REFUSED, never BUSY, which it re-posts itself); it only
+// grows. The backend answers with ggml_sycl_expert_loan_refusals.
+using moe_stream_loan_refusals_fn = uint64_t (*)(int device);
+
 struct moe_stream_item {
     int                layer;
     int                expert_id;
@@ -592,6 +601,46 @@ static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_po
     return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU;
 }
 
+// A prompt's loans for its short ring (llama.cpp-3460, c-0tmn). end_prompt resets it; a micro-batch does not.
+struct moe_stream_loan_latch {
+    bool     asked         = false;  // a loan was asked this prompt
+    bool     refused       = false;  // one came back REFUSED: ask for no other until end_prompt
+    uint64_t refusals_seen = 0;      // the device's REFUSED count at the last ask
+};
+
+enum class moe_stream_loan_step : uint8_t {
+    NONE,     // nothing asked: no shortfall, no request hook, or a loan this prompt was refused
+    REQUEST,  // a loan of the shortfall was asked for the next graph boundary
+    REFUSED,  // the loan asked last came back REFUSED: the latch holds, and the caller WARNs once
+};
+
+// What a short ring reserve does about its shortfall (llama.cpp-3460, closing c-0tmn for production). ring_ready()
+// calls this from its reserve-failed branch, so once per micro-batch (the reserve latch stops the later layers before
+// the reserve, c-i8rz), with the bytes the WEIGHT zone was short of as moe_stream_ring::reserve reported them. It asks
+// for a loan of that much at the next graph boundary (ggml_backend_sycl_synchronize runs it, c-tdra), and the next
+// micro-batch's reserve tries again. A REFUSED count that moved since the last ask means that loan was refused: retrying
+// would refuse again, so the latch holds until end_prompt. An ACCEPTED loan that still left the ring short, or a BUSY
+// one, leaves the count alone, so the next short micro-batch asks again; a repeated request is harmless, since the
+// largest since the last boundary wins.
+static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_loan_latch &     latch,
+                                                                    int                         device,
+                                                                    size_t                      bytes_short,
+                                                                    moe_stream_request_loan_fn  request_loan,
+                                                                    moe_stream_loan_refusals_fn loan_refusals) {
+    if (request_loan == nullptr || latch.refused || bytes_short == 0) {
+        return moe_stream_loan_step::NONE;
+    }
+    const uint64_t refusals_now = loan_refusals != nullptr ? loan_refusals(device) : 0;
+    if (latch.asked && refusals_now != latch.refusals_seen) {
+        latch.refused = true;
+        return moe_stream_loan_step::REFUSED;
+    }
+    latch.asked         = true;
+    latch.refusals_seen = refusals_now;
+    request_loan(device, bytes_short);
+    return moe_stream_loan_step::REQUEST;
+}
+
 // True iff the next layer's decision is resolved a layer ahead, under the current layer's window: any decision but a
 // ROUTED_ONLY ring, which needs that layer's own ids and resolves at its first op.
 static inline bool moe_stream_resolve_ahead(const moe_exec_decision & d) {
@@ -619,6 +668,10 @@ struct moe_stream_op {
     moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
     // Unset, the library executor claims no weight and nothing stages for it (moe_stream_plan_index_build).
     moe_stream_library_claims_fn library_claims = nullptr;
+    // Unset, a short ring reserve asks for no loan (moe_stream_loan_on_short_reserve).
+    moe_stream_request_loan_fn   request_loan   = nullptr;
+    // Unset, a requested loan is never seen refused, so every short micro-batch asks again.
+    moe_stream_loan_refusals_fn  loan_refusals  = nullptr;
 };
 
 // Why the resolver refused a staged ring slot (llama.cpp-o9uw). The enumerators name the causes; the staged branch's
@@ -832,6 +885,7 @@ class moe_stream_phase {
     void              report(int layer, const layer_state & st, const stage_counts & n, const moe_stream_op & op) const;
     void              report_staged_routes();
     void              warn_ring_unavailable(const moe_stream_op & op);
+    void              warn_loan_refused(size_t bytes_short) const;
 
     std::unique_ptr<moe_stream_ring>                ring_;
     std::unordered_map<uint64_t, moe_stream_staged> table_;           // key = moe_stream_table_key(layer, expert, role)
@@ -864,6 +918,10 @@ class moe_stream_phase {
     // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor.
     const moe_exec_decision_log *                   log_    = nullptr;
     moe_exec_policy                                 policy_ = moe_exec_policy::AUTO;
+    // The last op's loan hooks, which ring_ready() calls on a short reserve, and this prompt's loans (llama.cpp-3460).
+    moe_stream_request_loan_fn                      request_loan_  = nullptr;
+    moe_stream_loan_refusals_fn                     loan_refusals_ = nullptr;
+    moe_stream_loan_latch                           loan_latch_;
     moe_staged_route_tally                          staged_routes_;
     uint64_t                                        ring_releases_ = 0;
 };

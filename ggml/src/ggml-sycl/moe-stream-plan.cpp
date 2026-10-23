@@ -77,6 +77,8 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
     policy_        = op.policy;
+    request_loan_  = op.request_loan;
+    loan_refusals_ = op.loan_refusals;
     bitmap_        = moe_stream_ids_bitmap(ids, n_ids, op.n_expert);
 
     // The layer itself: weighed here only when the previous layer did not weigh it (the micro-batch's first host
@@ -143,8 +145,9 @@ void moe_stream_phase::end_prompt() {
     if (!ubatch_live_ && !ring_ && table_.empty()) {
         return;  // every decode graph after the first: nothing to drop
     }
-    // The next prompt explains its own unavailable ring.
+    // The next prompt explains its own unavailable ring, and asks for its own loans (a refusal held only this one).
     warned_unavailable_ = false;
+    loan_latch_         = moe_stream_loan_latch();
     teardown(ring_ ? compute_barrier() : sycl::event());
     layers_.clear();
     index_            = moe_stream_plan_index();
@@ -400,7 +403,9 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
 }
 
 // The ring is reserved at the first layer that stages, so a prompt whose every layer runs on the CPU reserves
-// nothing. A failed reserve stays failed for the rest of the micro-batch: one attempt per micro-batch.
+// nothing. A failed reserve stays failed for the rest of the micro-batch: one attempt per micro-batch. A reserve the
+// WEIGHT zone was short of asks the backend for an expert loan of the shortfall at the next graph boundary, so the next
+// micro-batch's attempt may succeed, until a loan this prompt asked for comes back refused (llama.cpp-3460, c-0tmn).
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;
@@ -408,9 +413,14 @@ bool moe_stream_phase::ring_ready() {
     if (reserve_failed_ || geo_.n_slots == 0 || !in_order_) {
         return false;
     }
-    std::unique_ptr<moe_stream_ring> ring = std::make_unique<moe_stream_ring>();
-    if (!ring->reserve(device_, geo_)) {
+    std::unique_ptr<moe_stream_ring> ring        = std::make_unique<moe_stream_ring>();
+    size_t                           bytes_short = 0;
+    if (!ring->reserve(device_, geo_, &bytes_short)) {
         reserve_failed_ = true;
+        if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_) ==
+            moe_stream_loan_step::REFUSED) {
+            warn_loan_refused(bytes_short);
+        }
         return false;
     }
     ring_ = std::move(ring);
@@ -618,6 +628,22 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
                   index_.host_matrices_per_layer_max, index_.region_slots_max, index_.matrix_bytes_max,
                   index_.resident_expert_bytes, asked.n_slots, asked.bytes);
     op.log->sink(op.log->sink_ctx, line);
+}
+
+// One WARN per prompt when a loan the short ring asked for comes back REFUSED (llama.cpp-3460): the helper answers
+// REFUSED once and then latches. It goes out under the same gate as the ring-unavailable line (lead ruling c-kcyf), so
+// at default verbosity under AUTO the phase still prints nothing of its own; there the loan transaction's own
+// "[MOE-EXEC] loan device %d refused: %s" line, which the latch makes print once per prompt, is the one WARN.
+void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
+    if (log_ == nullptr || log_->sink == nullptr || (policy_ != moe_exec_policy::RING && log_->trace < 1)) {
+        return;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
+                  "prompt",
+                  device_, bytes_short / (1024.0 * 1024.0));
+    log_->sink(log_->sink_ctx, line);
 }
 
 }  // namespace ggml_sycl

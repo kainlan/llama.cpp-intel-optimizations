@@ -19,9 +19,15 @@ What this gate pins:
     by begin_ubatch, which every new micro-batch runs, and by end_prompt. An expert loan (ruling c-tdra, llama.cpp-mwmr)
     can make room before the next micro-batch, so a per-prompt latch would waste the loan its own prompt asked for (lead
     ruling c-i8rz);
+  - a refused reserve asks for that loan (llama.cpp-3460, closing c-0tmn): the request is made once, in ring_ready()'s
+    reserve-failed branch after the latch, with the shortfall the reserve reports (the ring's bytes past the WEIGHT
+    zone's largest free block), through op hooks the backend wires to ggml_sycl_request_expert_loan and to the boundary
+    runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner re-posts)
+    latches until end_prompt, with one WARN under an explicit ring or a trace;
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
     and the ring's inputs, in a fixed format, through the decision log's WARN sink; the flag is cleared by end_prompt
-    and never per micro-batch (lead ruling c-kcyf), and the phase logs nothing else of its own;
+    and never per micro-batch (lead ruling c-kcyf), and the phase logs nothing else of its own but the refused-loan
+    line, under the same gating;
   - resolve() reports every layer it resolves, under every policy, so the decision log keeps the cost model's choice,
     and the next layer is weighed only below the decision log's MAX_LAYERS;
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
@@ -1326,6 +1332,171 @@ def test_reserve_latch_mutants():
     assert not claim_reserve_failure_lasts_one_ubatch(mutate(PHASE, LATCH_SET, ""))
     # A new micro-batch that skips begin_ubatch.
     assert not claim_reserve_failure_lasts_one_ubatch(mutate(PHASE, NEW_UBATCH, "if (new_ubatch) {"))
+
+
+# ---- a short reserve asks for a loan (llama.cpp-3460, c-0tmn) ---------------------------------------------------------
+
+RING_CPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.cpp"
+RING_HPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.hpp"
+RING_CPP = read(RING_CPP_REL)
+RING_HPP = read(RING_HPP_REL)
+
+# The reserve-failed branch's condition, without its brace: body() opens at the first brace after it.
+RESERVE_SHORT_IF = "if (!ring->reserve(device_, geo_, &bytes_short))"
+LOAN_CALL = "moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_)"
+LOAN_REFUSED_WARN = "== moe_stream_loan_step::REFUSED) { warn_loan_refused(bytes_short); }"
+LOAN_LATCH_CLEAR = "loan_latch_ = moe_stream_loan_latch();"
+LOAN_HOOKS_STORED = ("request_loan_ = op.request_loan;", "loan_refusals_ = op.loan_refusals;")
+LOAN_HELPER_SIG = "static inline moe_stream_loan_step moe_stream_loan_on_short_reserve("
+# The helper's steps, in order: nothing to ask, a refusal since the last ask latches, else ask with the shortfall.
+LOAN_HELPER_ORDER = (
+    "if (request_loan == nullptr || latch.refused || bytes_short == 0) { return moe_stream_loan_step::NONE; }",
+    "const uint64_t refusals_now = loan_refusals != nullptr ? loan_refusals(device) : 0;",
+    "if (latch.asked && refusals_now != latch.refusals_seen) { latch.refused = true; "
+    "return moe_stream_loan_step::REFUSED; }",
+    "latch.asked = true; latch.refusals_seen = refusals_now; request_loan(device, bytes_short); "
+    "return moe_stream_loan_step::REQUEST;",
+)
+RESERVE_DECL = "bool reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short = nullptr);"
+RESERVE_DEF_SIG = "bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short)"
+RESERVE_SHORT_SET = ("if (bytes_short != nullptr) { *bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes); "
+                     "}")
+WEIGHT_REFUSAL_WARN = "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give"
+SHORTFALL_SIG = "size_t moe_stream_ring_weight_shortfall(int device, size_t bytes)"
+SHORTFALL_PARTS = (
+    "cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest_free)",
+    "return bytes > largest_free ? bytes - largest_free : 0;",
+)
+REFUSALS_DECL = "static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_SYCL_MAX_DEVICES];"
+REFUSALS_BUMP = ("if (code == ggml_sycl_txn_result::REFUSED) { "
+                 "g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release); }")
+RUN_PENDING_SIG = "static bool ggml_sycl_run_pending_expert_loan_on_device("
+RUN_PENDING_TXN = "ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, false, resolver, result, false);"
+RUN_PENDING_BUSY = "if (code != ggml_sycl_txn_result::BUSY) {"
+REFUSALS_ACCESSOR_SIG = "static uint64_t ggml_sycl_expert_loan_refusals(int device)"
+REFUSALS_LOAD = "return g_sycl_expert_loan_refusals[device].load(std::memory_order_acquire);"
+STREAM_PREPARE_SIG = "static bool ggml_sycl_moe_stream_prepare("
+WIRE_REQUEST = "call.op.request_loan = ggml_sycl_request_expert_loan;"
+WIRE_REFUSALS = "call.op.loan_refusals = ggml_sycl_expert_loan_refusals;"
+
+
+def claim_short_reserve_requests_a_loan(phase: str, hpp: str, sycl: str, ring_cpp: str, ring_hpp: str) -> bool:
+    """A short ring reserve asks the backend for an expert loan (llama.cpp-3460, closing c-0tmn for production). The
+    request appears exactly once in the phase, inside ring_ready()'s reserve-failed branch after the reserve latch (so
+    once per micro-batch, c-i8rz), with the shortfall the reserve itself reported, never the whole ring's bytes. The
+    hooks it calls are the op's, stored at begin_layer before the layer resolves, and the backend wires them to
+    ggml_sycl_request_expert_loan and to the boundary runner's REFUSED count. The pure helper asks only while no loan
+    this prompt came back REFUSED: the runner counts a REFUSED outcome (never BUSY, which it re-posts itself), a count
+    that moved since the last ask latches, and only end_prompt clears the latch. The reserve's shortfall is the ring's
+    bytes past the WEIGHT zone's largest free block, set where the zone refuses the ring."""
+    n = norm(phase)
+    ready = body(n, RING_READY_SIG)
+    at = ready.find(RESERVE_SHORT_IF + " {")
+    branch = body(ready[at:], RESERVE_SHORT_IF) if at >= 0 else ""
+    h = norm(hpp)
+    s = norm(sycl)
+    rc = norm(ring_cpp)
+    return (n.count("moe_stream_loan_on_short_reserve(") == 1
+            and ordered(branch, LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN)
+            and ordered(body(n, BEGIN_LAYER_SIG), *LOAN_HOOKS_STORED, "resolve(layer, cur->second, st, cache, op);")
+            and n.count(LOAN_LATCH_CLEAR) == 1 and LOAN_LATCH_CLEAR in body(n, END_PROMPT_SIG)
+            and h.count("request_loan(device, ") == 1
+            and ordered(body(h, LOAN_HELPER_SIG), *LOAN_HELPER_ORDER)
+            and RESERVE_DECL in norm(ring_hpp)
+            and ordered(body(rc, RESERVE_DEF_SIG), "allocation = unified_allocate_owner(req);", RESERVE_SHORT_SET,
+                        WEIGHT_REFUSAL_WARN)
+            and all(part in body(rc, SHORTFALL_SIG) for part in SHORTFALL_PARTS)
+            and s.count(REFUSALS_DECL) == 1
+            and s.count("g_sycl_expert_loan_refusals[device].fetch_add(") == 1
+            and ordered(body(s, RUN_PENDING_SIG), RUN_PENDING_TXN, REFUSALS_BUMP, RUN_PENDING_BUSY)
+            and REFUSALS_LOAD in body(s, REFUSALS_ACCESSOR_SIG)
+            and s.count(WIRE_REQUEST) == 1 and WIRE_REQUEST in body(s, STREAM_PREPARE_SIG)
+            and s.count(WIRE_REFUSALS) == 1 and WIRE_REFUSALS in body(s, STREAM_PREPARE_SIG))
+
+
+def test_short_reserve_requests_a_loan():
+    assert claim_short_reserve_requests_a_loan(PHASE, PLAN_HPP, SYCL, RING_CPP, RING_HPP)
+
+
+def test_short_reserve_loan_mutants():
+    def c(phase=PHASE, hpp=PLAN_HPP, sycl=SYCL, ring_cpp=RING_CPP, ring_hpp=RING_HPP):
+        return claim_short_reserve_requests_a_loan(phase, hpp, sycl, ring_cpp, ring_hpp)
+
+    stmt = "if (" + LOAN_CALL + " " + LOAN_REFUSED_WARN
+    # No request: the short reserve asks for nothing.
+    assert not c(phase=mutate(PHASE, stmt, ""))
+    # The request outside the reserve-failed branch: every ring_ready() call, or a reserve that succeeded, would ask.
+    moved = mutate(PHASE, stmt, "").replace(RING_READY_RESET, stmt + " " + RING_READY_RESET, 1)
+    assert not c(phase=moved)
+    # The request with the whole ring's bytes instead of the shortfall.
+    assert not c(phase=mutate(PHASE, "device_, bytes_short, request_loan_", "device_, geo_.bytes, request_loan_"))
+    # The reserve's shortfall not taken: the phase would have to recompute it.
+    assert not c(phase=mutate(PHASE, RESERVE_SHORT_IF, "if (!ring->reserve(device_, geo_))"))
+    # The hooks never stored: the request would go nowhere.
+    assert not c(phase=mutate(PHASE, LOAN_HOOKS_STORED[0], ""))
+    # The latch cleared per micro-batch: a REFUSED loan would be asked again in every micro-batch.
+    assert not c(phase=mutate(PHASE, "reserve_failed_ = false; table_.clear();",
+                              "reserve_failed_ = false; " + LOAN_LATCH_CLEAR + " table_.clear();"))
+    # The latch never cleared: one refusal would silence every later prompt of the context.
+    assert not c(phase=drop_in(PHASE, END_PROMPT_SIG, LOAN_LATCH_CLEAR))
+    # The helper re-asks after a REFUSED outcome, or never latches one.
+    assert not c(hpp=mutate(PLAN_HPP, "latch.refused || bytes_short == 0", "bytes_short == 0"))
+    assert not c(hpp=mutate(PLAN_HPP, "latch.refused = true; return moe_stream_loan_step::REFUSED;",
+                            "return moe_stream_loan_step::REFUSED;"))
+    # The helper asks for the whole ring, or asks a second time.
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short);", "request_loan(device, SIZE_MAX);"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short);",
+                            "request_loan(device, bytes_short); request_loan(device, bytes_short);"))
+    # The reserve exposes no shortfall, or exposes the whole ring.
+    assert not c(ring_hpp=mutate(RING_HPP, RESERVE_DECL,
+                                 "bool reserve(int device, const moe_stream_ring_geometry & geo);"))
+    assert not c(ring_cpp=mutate(RING_CPP, RESERVE_SHORT_SET, ""))
+    assert not c(ring_cpp=mutate(RING_CPP, "return bytes > largest_free ? bytes - largest_free : 0;",
+                                 "return bytes;"))
+    # The refusal counted on BUSY too (the runner re-posts BUSY itself), or never counted.
+    assert not c(sycl=mutate(SYCL, "if (code == ggml_sycl_txn_result::REFUSED) {",
+                             "if (code != ggml_sycl_txn_result::ACCEPTED) {"))
+    assert not c(sycl=mutate(SYCL, REFUSALS_BUMP, ""))
+    # The hooks not wired by the backend.
+    assert not c(sycl=mutate(SYCL, WIRE_REQUEST, ""))
+    assert not c(sycl=mutate(SYCL, WIRE_REFUSALS, ""))
+
+
+LOAN_WARN_SIG = "void moe_stream_phase::warn_loan_refused(size_t bytes_short) const"
+LOAN_WARN_GUARD = ("if (log_ == nullptr || log_->sink == nullptr || "
+                   "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+LOAN_WARN_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
+                 "prompt")
+LOAN_WARN_EMIT = "log_->sink(log_->sink_ctx, line);"
+
+
+def claim_refused_loan_warns_once(phase: str, tree: dict) -> bool:
+    """The brief's one WARN for a REFUSED loan (llama.cpp-3460): the helper answers REFUSED once per prompt, the branch
+    calls warn_loan_refused for it, and that WARN goes out through the decision log's sink under the gate of lead
+    ruling c-kcyf (an explicit ring or a trace), so the phase still prints nothing of its own at default verbosity
+    under AUTO (c-xod7-q1). There, the loan transaction's own "[MOE-EXEC] loan device %d refused" line, which the
+    latch now makes print once per prompt, is the one WARN. The format exists once in the backend."""
+    w = body(norm(phase), LOAN_WARN_SIG)
+    count = sum(norm(text).count(LOAN_WARN_FMT) for text in tree.values())
+    return (count == 1 and w.startswith("{ " + LOAN_WARN_GUARD)
+            and ordered(w, LOAN_WARN_GUARD, LOAN_WARN_FMT, LOAN_WARN_EMIT))
+
+
+def test_refused_loan_warns_once():
+    assert claim_refused_loan_warns_once(PHASE, SYCL_TREE)
+
+
+def test_refused_loan_warn_mutants():
+    # Ungated: AUTO would print the phase's own line at default verbosity.
+    ungated = mutate(PHASE, " || (policy_ != moe_exec_policy::RING && log_->trace < 1)", "")
+    assert not claim_refused_loan_warns_once(ungated, {PHASE_REL: ungated})
+    # Never emitted.
+    silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
+    assert not claim_refused_loan_warns_once(silent, {PHASE_REL: silent})
+    # The format restated elsewhere.
+    tree = dict(SYCL_TREE)
+    tree["extra.cpp"] = '"' + LOAN_WARN_FMT + '"'
+    assert not claim_refused_loan_warns_once(PHASE, tree)
 
 
 DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u "

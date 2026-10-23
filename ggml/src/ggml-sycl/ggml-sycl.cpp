@@ -21395,10 +21395,15 @@ static std::atomic<size_t> g_sycl_expert_loan_requests[GGML_SYCL_MAX_DEVICES];
 // Per device, the BUSY refusals in a row the boundary runner has re-posted; any other outcome resets it.
 static std::atomic<uint32_t> g_sycl_expert_loan_busy_streak[GGML_SYCL_MAX_DEVICES];
 
+// Per device, the loans the boundary runner has run that came back REFUSED (never BUSY, which it re-posts). It only
+// grows: the prompt phase compares it across its own requests to tell a refused loan from one still pending
+// (moe_stream_loan_on_short_reserve, llama.cpp-3460).
+static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_SYCL_MAX_DEVICES];
+
 // Ask for a loan from inside a graph: record the request for the device's next graph boundary. Lock-free, because the
-// caller may hold g_sycl_graph_compute_mutex; the largest request since the last boundary wins. Its in-graph caller
-// lands with the ring's admission when a reserve falls short (plan Tasks 7b and 12); today the boundary runner below
-// calls it to re-post a request a transient refusal sent back.
+// caller may hold g_sycl_graph_compute_mutex; the largest request since the last boundary wins. Its in-graph caller is
+// the prompt phase's ring, when the WEIGHT zone cannot give its reserve (through the op's request_loan hook,
+// llama.cpp-3460, c-0tmn); the boundary runner below also calls it to re-post a request a transient refusal sent back.
 static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes_wanted == 0) {
         return;
@@ -21408,6 +21413,15 @@ static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted) {
     while (seen < bytes_wanted &&
            !request.compare_exchange_weak(seen, bytes_wanted, std::memory_order_release, std::memory_order_relaxed)) {
     }
+}
+
+// The REFUSED loans the boundary runner has run on `device` since the process started; 0 for a device out of range. The
+// prompt phase reads it through the op's loan_refusals hook.
+static uint64_t ggml_sycl_expert_loan_refusals(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_sycl_expert_loan_refusals[device].load(std::memory_order_acquire);
 }
 
 // Run the loan requested on the device since the last boundary, and clear the request. False when nothing ran: no
@@ -21434,6 +21448,10 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     ggml_sycl_expert_loan_result * result = out ? out : &local;
     const ggml_sycl_txn_result code = ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/false,
                                                                             resolver, result, /*warn_busy=*/false);
+    // A REFUSED loan is counted, so the phase that asked stops asking for the rest of its prompt (llama.cpp-3460).
+    if (code == ggml_sycl_txn_result::REFUSED) {
+        g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release);
+    }
     std::atomic<uint32_t> &    busy_streak = g_sycl_expert_loan_busy_streak[device];
     if (code != ggml_sycl_txn_result::BUSY) {
         busy_streak.store(0, std::memory_order_relaxed);
@@ -32045,6 +32063,8 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.host_lease    = ggml_sycl_moe_stream_host_lease;
     call.op.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;
+    call.op.request_loan   = ggml_sycl_request_expert_loan;
+    call.op.loan_refusals  = ggml_sycl_expert_loan_refusals;
     return true;
 }
 

@@ -26,6 +26,10 @@
 // the kernels answer, and its entry names the executor as its consumer (llama.cpp-3460): the executor dequantizes AOS
 // itself, with a plain kernel on the compute queue, and the staged route refuses such an entry. The tests pass the
 // claims as a second predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
+//
+// A short ring reserve asks for an expert loan (llama.cpp-3460, c-0tmn): the test plays ring_ready() over a reserve that
+// refuses with a shortfall, with stub hooks for the backend's loan request and its boundary runner's REFUSED count, and
+// drives the helper ring_ready() calls, moe_stream_loan_on_short_reserve.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
@@ -249,6 +253,60 @@ const char * fake_env_h2d(const char * name) {
 
 bool near(double a, double b) {
     return std::fabs(a - b) <= 1e-9 * std::fmax(1.0, std::fabs(b));
+}
+
+// The backend's side of a short reserve's loan, as the phase's hooks see it: the requests made, and each device's count
+// of loans its boundary runner refused, which a case moves to play a REFUSED outcome. Every access goes through a fresh
+// read of a volatile pointer, so the compiler cannot prove a check true from the stores before it.
+struct loan_stub_state {
+    int      requests    = 0;
+    int      last_device = -1;
+    size_t   last_bytes  = 0;
+    uint64_t refusals[2] = { 0, 0 };
+};
+
+loan_stub_state g_loan;
+
+loan_stub_state * volatile g_loan_at = &g_loan;
+
+void stub_request_loan(int device, size_t bytes) {
+    loan_stub_state & s = *g_loan_at;
+    ++s.requests;
+    s.last_device = device;
+    s.last_bytes  = bytes;
+}
+
+uint64_t stub_loan_refusals(int device) {
+    return (*g_loan_at).refusals[device];
+}
+
+// moe_stream_ring::reserve on a WEIGHT zone `short_by` bytes short of the ring: it refuses and reports the shortfall.
+bool stub_reserve_refuses(size_t short_by, size_t * bytes_short) {
+    *bytes_short = short_by;
+    return false;
+}
+
+// One micro-batch of a prompt whose ring the WEIGHT zone cannot give, as moe_stream_phase::ring_ready() runs it at each
+// of `n_layers` staging layers: begin_ubatch cleared the reserve latch, the first layer's reserve refuses and sets it,
+// and its reserve-failed branch takes the loan step; the later layers stop at the latch (c-i8rz).
+ggml_sycl::moe_stream_loan_step run_short_ubatch(ggml_sycl::moe_stream_loan_latch & latch,
+                                                 int                                device,
+                                                 size_t                             short_by,
+                                                 int                                n_layers) {
+    ggml_sycl::moe_stream_loan_step step           = ggml_sycl::moe_stream_loan_step::NONE;
+    bool                            reserve_failed = false;
+    for (int l = 0; l < n_layers; ++l) {
+        if (reserve_failed) {
+            continue;
+        }
+        size_t bytes_short = 0;
+        if (!stub_reserve_refuses(short_by, &bytes_short)) {
+            reserve_failed = true;
+            step           = ggml_sycl::moe_stream_loan_on_short_reserve(latch, device, bytes_short, stub_request_loan,
+                                                                         stub_loan_refusals);
+        }
+    }
+    return step;
 }
 
 }  // namespace
@@ -803,6 +861,63 @@ int main() {
         CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
         rr().layer_done(4, 42);
         CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
+    }
+
+    // ---- a short reserve asks for a loan of its shortfall, once per micro-batch, until one comes back REFUSED ----
+    {
+        using ggml_sycl::moe_stream_loan_latch;
+        using ggml_sycl::moe_stream_loan_step;
+        moe_stream_loan_latch latch;
+        moe_stream_loan_latch * volatile latch_at = &latch;
+
+        const auto lt = [&]() -> moe_stream_loan_latch & {
+            return *latch_at;
+        };
+
+        const size_t      short_by = 3 * 1024 * 1024 + 4096;  // what the WEIGHT zone is short of
+        loan_stub_state & st       = *g_loan_at;
+        // Micro-batch 1: its four staging layers reach the reserve once, and the one request names the device and the
+        // shortfall, not the ring's bytes.
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 1 && (*g_loan_at).last_device == 1 && (*g_loan_at).last_bytes == short_by);
+        // The boundary lent something but the ring is still short (ACCEPTED, the count did not move): micro-batch 2
+        // asks again, once.
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 2);
+        // The boundary answered BUSY (the runner re-posts it and counts no refusal): micro-batch 3 asks again.
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 3);
+        // A refusal on another device is not this ring's.
+        ++st.refusals[0];
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 4);
+        // The boundary REFUSED the loan: the next micro-batch answers REFUSED once (the caller's one WARN) and asks
+        // for none, and neither does any later micro-batch of the prompt.
+        ++st.refusals[1];
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REFUSED);
+        CHECK((*g_loan_at).requests == 4 && lt().refused);
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::NONE);
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::NONE);
+        CHECK((*g_loan_at).requests == 4);
+        // end_prompt clears the latch: the next prompt asks again, and a refusal counted before its first ask is not
+        // its own.
+        lt() = moe_stream_loan_latch();
+        CHECK(run_short_ubatch(lt(), 1, short_by, 4) == moe_stream_loan_step::REQUEST);
+        CHECK((*g_loan_at).requests == 5 && (*g_loan_at).last_bytes == short_by);
+        // A reserve refused for another reason reports no shortfall: nothing to ask for, and the latch is untouched.
+        lt() = moe_stream_loan_latch();
+        CHECK(run_short_ubatch(lt(), 1, 0, 4) == moe_stream_loan_step::NONE);
+        CHECK((*g_loan_at).requests == 5 && !lt().asked);
+        // No request hook (a phase no backend op reached): nothing is asked.
+        CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(lt(), 1, short_by, nullptr, stub_loan_refusals) ==
+              moe_stream_loan_step::NONE);
+        CHECK((*g_loan_at).requests == 5 && !lt().asked);
+        // No refusal count: a loan is never seen refused, so every short micro-batch asks.
+        for (int u = 0; u < 3; ++u) {
+            CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(lt(), 0, short_by, stub_request_loan, nullptr) ==
+                  moe_stream_loan_step::REQUEST);
+        }
+        CHECK((*g_loan_at).requests == 8 && (*g_loan_at).last_device == 0);
     }
 
     if (failures) {

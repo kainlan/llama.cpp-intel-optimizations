@@ -144,14 +144,20 @@ is the only route from a host-resident entry to the device, and
 published plan. The cache copies each to pinned host storage and withdraws its
 device copy, and the WEIGHT-zone bytes it frees are the ring's slots. The loan
 and the refill are plan transactions: `ggml_sycl_expert_txn_run` runs them in
-the LOAN and REFILL directions, and each one republishes the expert plan. Today
-nothing in production originates a loan. `ggml_sycl_request_expert_loan` is
-called only by the boundary runner, to re-post a request that a transient
-refusal sent back, and by tests. The auto-ubatch fit probes the loan bytes
-(`ggml_sycl_expert_loan_probe_bytes`) for its ring term,
-`ggml_sycl_hold_ring_uncovered`, and lends nothing. So outside tests the refill
-has no lent triplets to re-admit. When a loan does run, the refill runs at the
-decode boundary through `ggml_sycl_expert_refill_transaction_run`. It re-admits
+the LOAN and REFILL directions, and each one republishes the expert plan. A
+loan originates in the prompt phase (llama.cpp-3460). When the WEIGHT zone
+cannot give the ring, `moe_stream_ring::reserve` reports the shortfall: the
+ring's bytes past the zone's largest free block. `ring_ready()` then asks for a
+loan of that many bytes through the op's `request_loan` hook, which the backend
+wires to `ggml_sycl_request_expert_loan`. It asks once per micro-batch, since
+the reserve latch stops later layers before the reserve. The loan runs at the
+next graph boundary, and the next micro-batch tries the reserve again. A loan
+the boundary runner refuses stops the asking for the rest of the prompt. A BUSY
+refusal does not, because the runner re-posts that request itself. The
+auto-ubatch fit only probes the loan bytes (`ggml_sycl_expert_loan_probe_bytes`)
+for its ring term, `ggml_sycl_hold_ring_uncovered`, and lends nothing. When a loan
+runs, the refill runs at the decode boundary through
+`ggml_sycl_expert_refill_transaction_run`. It re-admits
 lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying
 each lent host copy back owner to owner on the copy queue, behind its writes. A
 triplet that can never be prepared stays on the host, with one WARN. The fit's
