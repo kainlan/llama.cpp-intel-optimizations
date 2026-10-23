@@ -1601,12 +1601,12 @@ git commit -m "docs: the executor cost model and the prefill expert ring amend t
 | Q_pp | `ONEAPI_DEVICE_SELECTOR=level_zero:0 llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v` (no `-ub`, no `-ngl`) | pp512 >= 500, pp2048 >= 800; `[MOE-EXEC] layer` lines = 48 at the first ubatch; `[MOE-EXEC] summary` once |
 | Q_pp_cpu | same with `GGML_SYCL_MOE_EXEC=cpu` | the before-number (13.5-14.4 at `-ub 256`); recorded, not gated |
 | Q_tok | `llama-completion -m $Q -f scripts/sycl-moe-exec-prompts/code-2k.txt -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4` | md5 of the output |
-| Q_tok_cpu | same with `GGML_SYCL_MOE_EXEC=cpu` | md5 equal to Q_tok |
-| Q_tg | `llama-completion -m $Q -f $P -n 60 -c 4096 ... -ub 256` (the q0xu Q_c4096 arm verbatim) | tg >= 11.0, md5 25b7738a, `[MOE-EXEC] refill` re-admitted = lent |
-| Q_noc | the q0xu Q_noc arm | tg >= 9.5, place line unchanged |
+| Q_tok_cpu | same with `GGML_SYCL_MOE_EXEC=cpu`, two loads per arm | some auto md5 equals some cpu md5 and every auto output shares >= 64 bytes with its best cpu match (was: md5 equal to Q_tok; the greedy near-tie flips in both policies, see the amendment) |
+| Q_tg | `llama-completion -m $Q -f $P -n 60 -c 4096 ... -ub 256` (the q0xu Q_c4096 arm verbatim) | tg >= 11.0, md5 25b7738a or a flip (>= 128 bytes shared with the reference text), `[MOE-EXEC] refill` re-admitted = lent |
+| Q_noc | the q0xu Q_noc arm | tg >= 9.5, md5 as Q_tg; the place line is recorded, and scored only against a reference the lead passes |
 | GO_gate | the CLAUDE.md GPT-OSS B50 count gate | `grep -cx '1, 2, 3, 4, 5'` = 1; `[MOE-EXEC] layer` lines = 0 |
-| GO_pp | `level_zero:1 llama-bench -m $GO -p 512 -n 128 -r 3 -c 4096` | pp512 within 5 % of 871, tg128 within 2 % of 33.7 |
-| GO_noc | `llama-cli` GPT-OSS gate without `-c` | count gate = 1; `[MOE-EXEC] layer` lines = 12 (the demoted layers) at the prompt |
+| GO_pp | `level_zero:1 llama-bench -m $GO -p 512 -n 128 -r 3` | pp512 within 5 % of 871, tg128 within 3 % of 32.0 (was: within 2 % of 33.7, and `-c 4096`, which `llama-bench` does not have) |
+| GO_noc | `llama-cli` GPT-OSS gate without `-c` | count gate = 1; `[MOE-EXEC] layer` line count recorded, not gated (was: = 12, "the demoted layers"; run 2 measured 0, see the amendment) |
 | MI | the Mistral gate on both cards | `grep -c '1, 2, 3, 4, 5, 6, 7, 8, 9, 10'` = 1 |
 | resets | `journalctl -k --since $T0 \| grep -icE 'GT reset\|guc_id\|CAT error\|Engine reset\|exec queue reset'` | 0 |
 
@@ -1656,15 +1656,30 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
   unbalanced or not_exercised from the teardown `R/L` lines.
 - Layer and summary counts: `[MOE-EXEC] layer N:` lines exist only for layers with host experts (24 on the Task 10
   run, not 48) and `llama-bench` prints one summary per context (two for `-p 512,2048`). `Q_pp` needs at least one of
-  each, and `--q-layers N` makes the layer count exact. `GO_noc` likewise defaults to at least one layer line, because
-  the plan's 12 was never measured.
+  each, and `--q-layers N` makes the layer count exact. `GO_noc` records its layer count and does not gate it (the
+  plan's 12 was wrong: run 2 measured 0, because GPT-OSS without `-c` keeps every expert on the device and what
+  overflows at the default context is KV, which the planner demotes to host tiers per llama.cpp-uize, so no executor
+  decision prints; `--go-noc-layers N` makes it an exact check).
 - Qwen3.8 on the B70 flips under greedy decoding about one load in five to eight (c-ani9). The md5 row scores two
-  loads per arm on stdout only: `Q_tok_cpu` passes when every auto output md5 equals some cpu output md5, reports
-  `auto_flip` and `cpu_flip`, and names the first differing byte on a mismatch.
+  loads per arm on stdout only. Run 2 showed two loads per arm cannot enumerate the flip (four loads, three distinct
+  32-token outputs, every divergence at byte 106-116 after an identical prefix, in both policies). `Q_tok_cpu`
+  therefore passes when at least one auto md5 equals at least one cpu md5 and every auto output is identical to a cpu
+  output or shares a prefix of at least 64 bytes with its best-matching cpu output, and prints `distinct_auto`,
+  `distinct_cpu`, `pairs_equal` and `min_prefix`: a defect is `pairs_equal=0` with an early `min_prefix`, a flip is
+  `pairs_equal` of 1 or more with a late one. `Q_tg` and `Q_noc` follow the same idea: an md5 equal to the reference is
+  a PASS, a different md5 is a PASS with `flip=yes` when the output shares at least 128 bytes with the reference text
+  (`scripts/sycl-moe-exec-prompts/code-ref-25b7738a.txt`), and a FAIL with `flip=no` below that. The placement
+  references default to `-` (recorded): Qwen3.8's `Q_noc` places 25950 on device and 47778 on host on this tree, not
+  the q0xu reference 38163/35565, because the cost-based KV room (llama.cpp-w013) demotes more experts at the default
+  context.
 - Placement: the baselines section sits after the Correctness gates subsection and before the MMVQ section, because
   inserting it before would re-parent that subsection. Its table is pending the lead's first run.
-- `GO_pp` compares against 871 and 33.7, and master reads pp512 about 770 on the B50 (llama.cpp-zuze), so a low pp512
-  there is that open regression and not this plan's.
+- `GO_pp` compares against 871 (5 %) and 32.0 (3 %; the plan's 33.7 contradicted the baselines document's B50 TG128
+  of about 32), and master reads pp512 about 770 on the B50 (llama.cpp-zuze), so a pp512 within 15 % below 871 is that
+  open regression, expected to FAIL until zuze lands, and the verdict names it.
+- A complete run of all 15 arms takes about 45 minutes with the ring off (run 2: Q_pp 9.5 min, Q_pp_cpu 9.3,
+  Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the GPT-OSS and Mistral arms about 1 each);
+  Q_pp and Q_pp_cpu carry a 1500 s timeout.
 
 ---
 

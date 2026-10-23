@@ -518,8 +518,9 @@ no number in this section is a baseline, and none of the figures in the plan are
   verdict line carries the value it chose (`ub=`). The table records that value. A number taken at a
   different `-ub` is not comparable.
 - **Decode arms.** `Q_tg` and `Q_noc` are the q0xu `Q_c4096` and `Q_noc` arms verbatim (`code.txt`,
-  `-n 60 -ub 256 -t 4`), so their floors (11.0 and 9.5 tok/s) and output md5 (`25b7738a`) carry over. A
-  changed md5 there is a regression, not a new baseline.
+  `-n 60 -ub 256 -t 4`), so their floors (11.0 and 9.5 tok/s) and reference output (md5 `25b7738a`) carry over.
+  A changed md5 is a regression only when it shares fewer than 128 bytes with the reference text
+  (`flip=no`); a later divergence is the greedy near-tie flip and passes with `flip=yes`.
 - **Driver and load.** Driver `__DRIVER__` (compute-runtime 26.31, or 26.35 with
   `GGML_SYCL_MMQ_ESIMD=OFF`, per the plan's end-to-end section). Ambient host load `__LOAD__`, the per-arm
   load range: the minimum and maximum of the one-minute load the gate logs in each arm's pre line. It is
@@ -564,9 +565,13 @@ __TABLE__
 - **`loan_exercised=no` and `refill=not_exercised`.** Nothing lent experts to the ring in that arm, so the
   "re-admitted equals lent" check had nothing to count. Production only originates a loan at a short
   reserve under `auto` (`llama.cpp-3460`), and the loan can still be refused (`llama.cpp-pu8v`).
-- **`place=unchanged`.** The `MoE experts: N on device, M on host` line equals the reference the gate was
-  given (`--place-ref-tg`, `--place-ref-noc`), which defaults to the q0xu run's values. `place=unscored`
-  means the reference was disabled with `-`.
+- **`place=unscored` and `place=unchanged`.** The references `--place-ref-tg` and `--place-ref-noc` default to
+  `-`, so the `MoE experts: N on device, M on host` line is recorded and `place=unscored`. The lead passes the
+  values of this table; `place=unchanged` then means the line equals them, and a different line is a `FAIL`.
+  This tree's values (run 2 on `8c44f3b3c`): `Q_tg` is `MoE experts: 38004 on device, 35724 on host` (equal to
+  the q0xu reference), and `Q_noc` is `MoE experts: 25950 on device, 47778 on host`. The q0xu `Q_noc` reference
+  (38163 on device, 35565 on host) is stale for this tree: the cost-based KV room (`llama.cpp-w013`) demotes more
+  experts at the default context.
 - **`rc=` and `builders_post=`.** Every arm scores a non-zero exit status as a `FAIL` naming it (`rc=124` is
   the timeout, `rc=137` a kill, `rc=134` an abort, including one in teardown after the right answer was
   printed). The `resets` arm keeps `journalctl`'s own status, so a failed `journalctl` is a `FAIL` rather
@@ -575,22 +580,40 @@ __TABLE__
 - **`Q_pp_cpu`.** Recorded, not gated. It is the before-number, taken with `GGML_SYCL_MOE_EXEC=cpu`. The
   plan records the before-number from the q0xu gate as 13.5-14.4 tok/s for pp512 at `-ub 256`; at the auto
   micro-batch it may read higher.
-- **`Q_tok_cpu` scores two loads per arm.** Qwen3.8 greedy decoding on the B70 flips from load to load (a
-  near-tie, about one load in five to eight), so a single output per arm cannot tell a flip from a defect.
-  `Q_tok`, `Q_tok_2`, `Q_tok_cpu_1` and `Q_tok_cpu` each load the model once and write stdout to its own
-  file (the log goes to stderr). `Q_tok_cpu` passes when every auto output equals some cpu output, reports
-  `auto_flip` and `cpu_flip`, and on a real mismatch names the first differing byte.
+- **`Q_tok_cpu` and the greedy flip.** Qwen3.8 greedy decoding on the B70 has a near-tie that flips from load to
+  load, in both policies, and the flip cascades after its token. Run 2 gave four loads and three distinct 32-token
+  outputs: auto load 1 equals cpu load 2 byte for byte, and every other pair diverges at byte 106-116, after the
+  identical prefix `<think> The user wants me to summarize the document about GPT-OSS Testing & Prompt Template
+  Rationale.` Two loads per arm cannot enumerate that. `Q_tok`, `Q_tok_2`, `Q_tok_cpu_1` and `Q_tok_cpu` each
+  load the model once and write stdout to its own file (the log goes to stderr). `Q_tok_cpu` passes when at least
+  one auto md5 equals at least one cpu md5 (identical 32-token text across the policies is the evidence the math
+  agrees) and every auto output is identical to a cpu output or shares a prefix of at least 64 bytes with its
+  best-matching cpu output. It prints `distinct_auto=`, `distinct_cpu=`, `pairs_equal=` (the number of equal
+  auto/cpu pairs, of 4) and `min_prefix=` (the shortest best-match prefix, in bytes). **A defect shows as
+  `pairs_equal=0` with an early `min_prefix`; a flip shows as `pairs_equal` of 1 or more with a late one.**
+- **`Q_tg` and `Q_noc`: `md5=`, `flip=`, `prefix=`.** An md5 equal to the reference `25b7738a` is a `PASS` with
+  `flip=no`. A different md5 is the same greedy near-tie flip: `PASS` with `flip=yes` when the output shares at
+  least 128 bytes with the reference text (`scripts/sycl-moe-exec-prompts/code-ref-25b7738a.txt`, taken from run
+  2's `Q_noc` output), and `FAIL` with `flip=no` below that. `prefix=` is the shared byte count. In run 2 `Q_noc`
+  reproduced the reference and `Q_tg` diverged at byte 174 (`prefix=173`, a flip).
 
 ### Caveats
 
-- **The GPT-OSS B50 control compares against 871 / 33.7.** `GO_pp` fails a pp512 outside 5 % of 871 and a
-  tg128 outside 2 % of 33.7. Master already reads pp512 about 770 on the B50 (`llama.cpp-zuze`), so a low
-  `GO_pp` pp512 is that open regression until it is bisected, not this plan. Its decode and count gates are
-  unaffected.
+- **The GPT-OSS B50 control compares against 871 / 32.0.** `GO_pp` fails a pp512 outside 5 % of 871 and a
+  tg128 outside 3 % of 32.0 (the B50 is steady, cv 0.7 %, and the table above states B50 GPT-OSS TG128 as about
+  32). Master already reads pp512 about 770 on the B50 (`llama.cpp-zuze`), so a `GO_pp` pp512 below the window but
+  within 15 % below 871 is that open regression: it is expected to `FAIL` until zuze lands, and the verdict names
+  it (`see=llama.cpp-zuze`). Its decode and count gates are unaffected.
+- **`GO_noc` records its layer count.** GPT-OSS without `-c` keeps every expert on the device, and what overflows
+  at the default context is KV, which the planner demotes to host tiers (`llama.cpp-uize`), so no executor
+  decision prints and `layer_lines=0` is the expected answer. `--go-noc-layers N` makes it an exact check.
+- **A complete run takes about 45 minutes** on this host with the ring off: `Q_pp` 9.5 min, `Q_pp_cpu` 9.3,
+  `Q_staged` 3.5, each `Q_tok` load about 2, `Q_tg` and `Q_noc` about 2.5 each, the GPT-OSS and Mistral arms about
+  1 each. `Q_pp` and `Q_pp_cpu` carry a 1500 s timeout, the other Qwen arms 900 s.
 - **`llama-bench` has no `-c`.** Its context is `n_prompt + n_gen`, so `GO_pp` runs at 640, not at the
   `-c 4096` the plan's table wrote.
 - **Cold load.** The Qwen model is about 70 GB read from `/models`; a cold first arm takes minutes and
-  every Qwen arm carries `timeout 900`.
+  the Qwen arms carry `timeout 900` (`Q_pp` and `Q_pp_cpu` 1500).
 - **The numbers are this build, on this host's drivers and load.** A table from another driver, card
   pairing or load is not a baseline for this one.
 
