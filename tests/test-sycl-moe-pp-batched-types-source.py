@@ -838,7 +838,9 @@ def claim_m_chain(s):
     fails = []
     lam = lambda_body(s["sycl"]) or ""
     start = lam.find(PHASE_LOOP_HEAD)
-    end = lam.find(PHASE_LOOP_END)
+    # The first barrier on the GEMM events after the loop head: the failure path, defined before the loop, ends
+    # in the same barrier.
+    end = lam.find(PHASE_LOOP_END, start) if start >= 0 else -1
     if start < 0 or end < start:
         return ["the lambda has no phase loop ending in the barrier on every GEMM event"]
     loop = lam[start:end]

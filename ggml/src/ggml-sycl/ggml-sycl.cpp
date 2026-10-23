@@ -89437,9 +89437,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // reached at all).
             std::optional<sycl::event> gemm_profile_begin;
             std::optional<sycl::event> gemm_profile_end;
+
+            // Holds every active expert's lease until `until` completes: the dequants read the expert from its
+            // lease, so the lease outlives them. Used on the failure path below and by both success branches.
+            auto retain_expert_leases_until = [&](const sycl::event & until) {
+                std::vector<ggml_sycl::mem_handle> leases;
+                leases.reserve(active_experts.size());
+                for (pp_onednn_batched_expert & expert : active_experts) {
+                    if (expert.lease.valid()) {
+                        leases.push_back(std::move(expert.lease));
+                    }
+                }
+                if (!leases.empty()) {
+                    ggml_sycl::retain_handles_until_event(std::move(leases), until);
+                }
+            };
             // Both ways this stage can fail (a thrown error, or a declined scratchpad) take the same path, so the tail
             // is shared: the non-batched MoE path, or the named error for an XMX_TILED-claimed op. Returns false.
-            auto                       gemm_stage_failed = [&](const char * what) -> bool {
+            auto gemm_stage_failed = [&](const char * what) -> bool {
                 warn_batched_refusal(moe_pp_batched_refusal::GEMM, what);
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> gemm_fail_log{ 0 };
@@ -89448,6 +89463,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                       src0 && src0->name ? src0->name : "?", what);
                     }
                 }
+                // The stage may fail after some phases ran, with dequants and GEMMs still in flight. The oneDNN
+                // primitive is not ordered with this queue (llama.cpp-dboi), so the claim's release marker, ordered
+                // by submission alone, could complete before a GEMM that still writes the slot. Barrier on the GEMMs
+                // already submitted (a plain barrier, after the dequants, when there are none), hold the experts'
+                // leases until it, and only then finish the claim, whose marker follows the barrier on this queue.
+                // A barrier that cannot be submitted means a broken queue; it throws, as any submission here does.
+                const sycl::event drained = gemm_events.empty() ? stream->ext_oneapi_submit_barrier() :
+                                                                  stream->ext_oneapi_submit_barrier(gemm_events);
+                retain_expert_leases_until(drained);
                 batched_scratch_claim.finish_or_release();
                 // llama.cpp-sr83: an XMX_TILED-claimed op must not fall
                 // through to the SOA-only staging fallback (see
@@ -89830,17 +89854,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (release_prompt_down_soa_after_dispatch) {
                 (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
                 const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
-                std::vector<ggml_sycl::mem_handle> leases;
-                leases.reserve(active_experts.size());
-                for (pp_onednn_batched_expert & expert : active_experts) {
-                    if (expert.lease.valid()) {
-                        leases.push_back(std::move(expert.lease));
-                    }
-                }
+                retain_expert_leases_until(done);
                 active_experts.clear();
-                if (!leases.empty()) {
-                    ggml_sycl::retain_handles_until_event(std::move(leases), done);
-                }
                 if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> transient_down_release_log{ 0 };
                     if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
@@ -89852,16 +89867,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
             } else {
-                std::vector<ggml_sycl::mem_handle> leases;
-                leases.reserve(active_experts.size());
-                for (pp_onednn_batched_expert & expert : active_experts) {
-                    if (expert.lease.valid()) {
-                        leases.push_back(std::move(expert.lease));
-                    }
-                }
-                if (!leases.empty()) {
-                    ggml_sycl::retain_handles_until_event(std::move(leases), done);
-                }
+                retain_expert_leases_until(done);
             }
 
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
