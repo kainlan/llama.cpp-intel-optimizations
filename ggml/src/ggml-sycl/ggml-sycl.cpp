@@ -415,6 +415,9 @@ int g_ggml_sycl_moe_exec_trace   = 0;
 // GGML_SYCL_MOE_PP_F16_BATCHED_AOS as the report's integer (llama.cpp-348c): SET from
 // ggml_sycl_moe_pp_f16_batched_aos_enabled() after the table parse, so the report says what is in effect.
 int g_ggml_sycl_moe_pp_f16_batched_aos = 1;
+// GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX as the report's integer (llama.cpp-348c), SET from
+// ggml_sycl_moe_pp_f16_group_experts_max() after the table parse: 0 is no cap.
+int g_ggml_sycl_moe_pp_f16_group_experts_max = 0;
 
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
@@ -17112,64 +17115,8 @@ static double ggml_sycl_plan_cost_param(const char * name, double def, double ma
 }
 
 // Whether the batched mul_mat_id prompt executor takes `type` loaded in `layout` (llama.cpp-348c). Defined with the
-// executor's claim predicate; declared here for the plan's f16 slot sizing below and the capability query's prompt
-// route.
+// executor's claim predicate; declared here for the capability query's prompt route.
 static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout);
-
-// llama.cpp-348c: the bytes the batched MoE prompt executor's f16 arm needs in one planned weight slot. It dequantizes
-// every active expert of one tensor into the slot before one batched GEMM, and a prompt can activate every expert, so
-// the slot holds n_expert experts of the largest expert matrix it takes, in f16. Only types it takes on AOS count,
-// asked through the executor's own predicate, so a knob that turns the arm off also plans nothing for it. MXFP4 is not
-// one: its WOQ slot is the inventory's own. 0 when the executor cannot run (no oneDNN) or the model has no experts.
-static size_t ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(const ggml_sycl_tensor_inventory * inventory) {
-#if GGML_SYCL_DNNL
-    if (inventory == nullptr || inventory->n_expert <= 0) {
-        return 0;
-    }
-    size_t per_expert = 0;
-    for (size_t i = 0; i < inventory->count; ++i) {
-        const ggml_sycl_tensor_info & tensor = inventory->tensors[i];
-        const moe_tensor_type         role   = moe_classify_tensor(tensor.name);
-        if (role == MOE_TENSOR_UNKNOWN || tensor.ne[0] <= 0 || tensor.ne[1] <= 0 ||
-            !ggml_sycl_moe_pp_batched_takes_layout(tensor.type, GGML_LAYOUT_AOS)) {
-            continue;
-        }
-        const size_t elements  = static_cast<size_t>(tensor.ne[0]) * static_cast<size_t>(tensor.ne[1]);
-        const size_t f16_bytes = elements * sizeof(sycl::half);
-        per_expert             = std::max(per_expert, (f16_bytes + 255) & ~static_cast<size_t>(255));
-    }
-    return per_expert * static_cast<size_t>(inventory->n_expert);
-#else
-    (void) inventory;
-    return 0;
-#endif
-}
-
-// True the first time a load widens the PP MoE ring's weight slot from `from_bytes` to `to_bytes` on `device`. One load
-// populates the inventory twice (ggml_backend_sycl_compute_placement_plan_early, then the late set_tensor_inventory),
-// and the widening is logged once per load (llama.cpp-348c). Without a staged owner (generation 0) there is no load to
-// latch on, so it always logs. The caller holds g_tensor_inventory_mutex, which guards the latch.
-static bool ggml_sycl_pp_moe_widened_first(int                             device,
-                                           ggml_sycl::lifecycle::SlotToken owner,
-                                           size_t                          from_bytes,
-                                           size_t                          to_bytes) {
-    struct logged_widening {
-        ggml_sycl::lifecycle::SlotToken owner;
-        size_t                          from_bytes = 0;
-        size_t                          to_bytes   = 0;
-    };
-
-    static logged_widening logged[GGML_SYCL_MAX_DEVICES];
-    if (owner.generation == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
-        return true;
-    }
-    logged_widening & last = logged[device];
-    if (last.owner == owner && last.from_bytes == from_bytes && last.to_bytes == to_bytes) {
-        return false;
-    }
-    last = { owner, from_bytes, to_bytes };
-    return true;
-}
 
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
@@ -17290,25 +17237,6 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = inventory->pp_moe_onednn_activation_slot_bytes;
     g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = inventory->pp_moe_onednn_output_slot_bytes;
     g_tensor_inventory_pp_moe_onednn_ring_depth            = inventory->pp_moe_onednn_ring_depth;
-    // llama.cpp-348c: the inventory sizes each ring slot's weight part for MXFP4's WOQ planes. Where it planned a ring,
-    // the slot is widened to what the f16 arm needs for the other expert types, so an expert type the executor takes
-    // always has its scratch planned and is never refused as unplanned. The unified cache derives the ring's total
-    // from the slot sizes (unified_cache_set_planned_pp_moe_onednn_scratch below), so the total follows the wider slot.
-    // The early and the late plan of one load both come through here; the widening is logged once per load.
-    if (g_tensor_inventory_pp_moe_onednn_weight_slot_bytes > 0 && g_tensor_inventory_pp_moe_onednn_ring_depth > 0) {
-        g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(
-            inventory->pp_moe_onednn_weight_slot_bytes, ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(inventory));
-        if (g_tensor_inventory_pp_moe_onednn_weight_slot_bytes > inventory->pp_moe_onednn_weight_slot_bytes &&
-            ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, inventory->pp_moe_onednn_weight_slot_bytes,
-                                           g_tensor_inventory_pp_moe_onednn_weight_slot_bytes)) {
-            GGML_LOG_INFO(
-                "[SYCL-PLAN] PP MoE oneDNN batched weight slot widened for the f16 arm: %.1f MB -> %.1f MB "
-                "(n_expert=%d, ring depth %u) on device %d\n",
-                inventory->pp_moe_onednn_weight_slot_bytes / (1024.0 * 1024.0),
-                g_tensor_inventory_pp_moe_onednn_weight_slot_bytes / (1024.0 * 1024.0), inventory->n_expert,
-                g_tensor_inventory_pp_moe_onednn_ring_depth, ctx->device);
-        }
-    }
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(
         ctx->device, g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,
         g_tensor_inventory_pp_moe_onednn_activation_slot_bytes, g_tensor_inventory_pp_moe_onednn_output_slot_bytes,
@@ -32316,6 +32244,8 @@ static void ggml_check_sycl() try {
             // The batched MoE prompt executor's AOS opt-out (llama.cpp-348c), named through common.hpp's one spelling.
             // Its accessor is the reader; the destination is overwritten from it after the loop.
             { GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV, &g_ggml_sycl_moe_pp_f16_batched_aos, 1 },
+            // The f16 arm's debugging group cap (llama.cpp-348c), likewise overwritten from its accessor.
+            { GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV, &g_ggml_sycl_moe_pp_f16_group_experts_max, 0 },
             // clang-format on
         };
 
@@ -32325,7 +32255,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);
         g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;
 
-        g_ggml_sycl_moe_pp_f16_batched_aos = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;
+        g_ggml_sycl_moe_pp_f16_batched_aos       = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;
+        g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a
@@ -80886,10 +80817,10 @@ static void mxfp4_pp_batched_profile_record_graph_total(double graph_us) {
 #endif
 
 // Whether the batched mul_mat_id prompt executor takes `type` loaded in `layout` (llama.cpp-348c): the one question its
-// candidate gate, its claim predicate, the plan's f16 slot sizing and the capability query's prompt route ask about the
-// type. The answer is the tables in moe-mmvq-tables.hpp under the route knob, GGML_SYCL_MOE_PP_ONEDNN_F16 (the
-// executor's own switch), GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_F16_BATCHED_AOS. Without oneDNN the executor does
-// not exist, and the #else arm below takes only MXFP4 SOA, as before llama.cpp-348c.
+// candidate gate, its claim predicate and the capability query's prompt route ask about the type. The answer is the
+// tables in moe-mmvq-tables.hpp under the route knob, GGML_SYCL_MOE_PP_ONEDNN_F16 (the executor's own switch),
+// GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_F16_BATCHED_AOS. Without oneDNN the executor does not exist, and the #else
+// arm below takes only MXFP4 SOA, as before llama.cpp-348c.
 static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout) {
     if (!ggml_sycl_moe_pp_onednn_batched_route_selected()) {
         return false;
@@ -89035,6 +88966,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             const size_t active_count          = active_experts.size();
             size_t       weight_elems          = 0;  // f16-arm only: half-elements per expert weight slot
+            size_t       f16_expert_bytes      = 0;  // f16-arm only: one expert's f16 matrix
             size_t       act_slot_elems        = 0;
             size_t       out_slot_elems        = 0;
             size_t       total_act_elems       = 0;
@@ -89075,12 +89007,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                 }
             } else {
-                size_t total_weight_elems = 0;
+                // llama.cpp-348c: the f16 arm asks the admission for one expert's f16 matrix. It runs in the weight
+                // slot the plan sized for the ring, which holds about a quarter of every expert in f16, and groups
+                // the active experts to fit the slot it claims (moe_pp_batched_f16_plan_groups, after the claim).
                 if (!checked_mul(static_cast<size_t>(ne01), static_cast<size_t>(ne00), weight_elems) ||
-                    !checked_mul(weight_elems, active_count, total_weight_elems) ||
-                    !checked_mul(total_weight_elems, sizeof(sycl::half), weight_bytes)) {
+                    !checked_mul(weight_elems, sizeof(sycl::half), f16_expert_bytes)) {
                     return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                 }
+                weight_bytes = f16_expert_bytes;
             }
 
             sycl::half * batched_weights      = nullptr;  // f16-arm only
@@ -89179,6 +89113,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 reserved.output_size < out_bytes) {
                 batched_scratch_claim.release_unused();
                 return reject_batched(moe_pp_batched_refusal::SCRATCH_SLOT_SIZE, nullptr);
+            }
+            // The f16 arm's groups: what the slot it claimed holds, capped by GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX.
+            // The check above leaves room for one expert, so there is at least one group. The WOQ arm repacks every
+            // active expert into its own planned slot and runs as one group.
+            moe_pp_batched_f16_groups f16_groups;
+            if (!pp_woq_arm) {
+                f16_groups = moe_pp_batched_f16_plan_groups(reserved.weight_size, f16_expert_bytes, active_count,
+                                                            ggml_sycl_moe_pp_f16_group_experts_max());
+                GGML_ASSERT(f16_groups.groups > 0);
             }
 
             if (pp_woq_arm) {
@@ -89304,8 +89247,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
-            // One f16 dequant and one row gather per active expert (~1024 launches per tensor on Qwen3.8); batching
-            // them through a pointer table, as llama.cpp-1lon did for the repack, is llama.cpp-cl5q.
+            // One row gather per active expert here, and one f16 dequant per active expert in the phase loop below
+            // (~1024 launches per tensor on Qwen3.8); batching them through a pointer table, as llama.cpp-1lon did
+            // for the repack, is llama.cpp-cl5q.
             for (size_t slot = 0; slot < active_experts.size(); ++slot) {
                 const pp_onednn_batched_expert & expert = active_experts[slot];
                 const size_t                     rows   = expert.row_end - expert.row_begin;
@@ -89337,36 +89281,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
                     // else: already repacked in one batched launch above.
-                } else if (src0->type == GGML_TYPE_MXFP4) {
-                    dequantize_row_mxfp4_soa_to_fp16_rowmajor(expert.ptr, batched_weights + slot * weight_elems,
-                                                              blocks_per_row, static_cast<int>(ne01), ctx.stream());
-                } else {
-                    // llama.cpp-348c: one expert's ne00 x ne01 matrix into its f16 slot, from the pointer its lease
-                    // resolved; the lease is held until the done marker below. The converters return no event, so the
-                    // profiler gets the in-order queue's last one, asked only while it records.
-                    ggml_sycl_profile_label dequant_label{};
-                    dequant_label.name       = pp_dequant_label_name;
-                    dequant_label.category   = "moe.pp.dequant";
-                    dequant_label.queue_kind = "compute";
-                    dequant_label.metadata   = "phase=expert_dequant_f16";
-                    dequant_label.device     = ctx.device;
-                    dequant_label.bytes      = weight_elems * sizeof(sycl::half);
-                    const void * expert_src  = expert.ptr;
-                    sycl::half * expert_dst  = batched_weights + slot * weight_elems;
-                    (void) ggml_sycl_profile_submit(*stream, dequant_label, [&](sycl::queue & profiled_queue) {
-                        if (pp_q8_0_soa) {
-                            dequantize_row_q8_0_soa_to_fp16_rowmajor(expert_src, expert_dst,
-                                                                     static_cast<int>(ne00 / QK8_0),
-                                                                     static_cast<int>(ne01), &profiled_queue);
-                        } else {
-                            pp_to_fp16(expert_src, expert_dst, static_cast<int64_t>(weight_elems), &profiled_queue);
-                        }
-                        if (!ggml_sycl_kernel_profile_enabled()) {
-                            return sycl::event{};
-                        }
-                        const std::optional<sycl::event> last = profiled_queue.ext_oneapi_get_last_event();
-                        return last ? *last : profiled_queue.ext_oneapi_submit_barrier();
-                    });
                 }
 
                 sycl::range<3>          block_dims(1, 1, pp_copy_work_group_size(ne10));
@@ -89412,19 +89326,78 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
+            // llama.cpp-348c: one expert's ne00 x ne01 matrix into f16 at `dst`, from the pointer its lease resolved;
+            // the lease is held until the done marker below. MXFP4 has its own SOA row-major kernel. The other
+            // converters return no event, so the profiler gets the in-order queue's last one, asked only while it
+            // records.
+            auto dequant_expert_f16 = [&](const pp_onednn_batched_expert & expert, sycl::half * dst) {
+                if (src0->type == GGML_TYPE_MXFP4) {
+                    dequantize_row_mxfp4_soa_to_fp16_rowmajor(expert.ptr, dst, blocks_per_row, static_cast<int>(ne01),
+                                                              ctx.stream());
+                    return;
+                }
+                ggml_sycl_profile_label dequant_label{};
+                dequant_label.name       = pp_dequant_label_name;
+                dequant_label.category   = "moe.pp.dequant";
+                dequant_label.queue_kind = "compute";
+                dequant_label.metadata   = "phase=expert_dequant_f16";
+                dequant_label.device     = ctx.device;
+                dequant_label.bytes      = weight_elems * sizeof(sycl::half);
+                const void * expert_src  = expert.ptr;
+                (void) ggml_sycl_profile_submit(*stream, dequant_label, [&](sycl::queue & profiled_queue) {
+                    if (pp_q8_0_soa) {
+                        dequantize_row_q8_0_soa_to_fp16_rowmajor(expert_src, dst, static_cast<int>(ne00 / QK8_0),
+                                                                 static_cast<int>(ne01), &profiled_queue);
+                    } else {
+                        pp_to_fp16(expert_src, dst, static_cast<int64_t>(weight_elems), &profiled_queue);
+                    }
+                    if (!ggml_sycl_kernel_profile_enabled()) {
+                        return sycl::event{};
+                    }
+                    const std::optional<sycl::event> last = profiled_queue.ext_oneapi_get_last_event();
+                    return last ? *last : profiled_queue.ext_oneapi_submit_barrier();
+                });
+            };
+
+            // llama.cpp-348c: the phases the GEMMs run in. The WOQ arm, and an f16 arm whose slot holds every active
+            // expert, run one phase over all of them: the single batched pass this executor has always run.
+            // Otherwise the f16 arm runs f16_groups.groups phases of at most experts_per_group experts, each
+            // dequantized into one buffer of the slot. With two buffers, the slot's halves, phase p uses half p % 2,
+            // so phase p + 1 dequantizes into the other half while phase p's GEMMs still read theirs. A half's
+            // readers, the GEMM events of the phase that last used it, gate the next dequant into it on the device
+            // (the loop below); no host wait.
+            struct pp_batched_phase {
+                size_t begin  = 0;  // the phase's first active expert, an index into active_experts
+                size_t end    = 0;
+                size_t buffer = 0;  // the f16 slot buffer its experts are dequantized into
+            };
+            const size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group;
+            const size_t phase_buffers = pp_woq_arm ? 1 : f16_groups.buffers;
+            const size_t half_elems    = phase_experts * weight_elems;  // one buffer's half-elements (f16 arm)
+            std::vector<pp_batched_phase> phases;
+            phases.reserve((active_count + phase_experts - 1) / phase_experts);
+            for (size_t begin = 0; begin < active_count; begin += phase_experts) {
+                pp_batched_phase phase;
+                phase.begin  = begin;
+                phase.end    = std::min(active_count, begin + phase_experts);
+                phase.buffer = phases.size() % phase_buffers;
+                phases.push_back(phase);
+            }
+            std::array<std::vector<sycl::event>, 2> half_readers;
+
             // The batched oneDNN primitive's execution is not reliably ordered
             // with the wrapped in-order SYCL queue by submission order alone
             // (llama.cpp-dboi -- empirically bisected: async scatter+tail
             // hangs/aborts without explicit event chaining, a host wait right
             // after the GEMM cures it, sync-only-first-dispatch does not). Fix
             // with explicit events instead of a host wait: capture a barrier
-            // over everything queued so far (the per-expert dequant + activation
-            // copies above) as the GEMM's input dependency, then barrier again
-            // on the GEMM's own completion event so every later submission on
-            // this in-order queue -- the dst-scatter loop and the done marker --
-            // observes it.
+            // over everything queued so far (the activation copies above and
+            // the phase's per-expert dequant) as each phase's GEMM input
+            // dependency, then barrier again on every GEMM's own completion
+            // event so every later submission on this in-order queue -- the
+            // dst-scatter loop and the done marker -- observes it.
             std::vector<sycl::event> gemm_events;
-            gemm_events.reserve(gemm_groups.size());
+            gemm_events.reserve(gemm_groups.size() + phases.size());
             // llama.cpp-6405 fix cycle (F1, BLOCKING -- confirmed on hardware:
             // woq_gemm=0.000 ms/459-462 on both B70 and B50 profiling runs):
             // gemm_events' own profiling info is NOT a valid timing source for
@@ -89493,56 +89466,83 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return false;
             };
             bool gemm_declined = false;
-            // host-stall attribution cycle, phase 5/6: repack/activation-
-            // stage kernel dispatch (components 1/2/4's own device-event
-            // markers cover their DEVICE time; this is that dispatch's HOST
-            // submission cost, not previously measured) plus any other prep
-            // between grouping and here.
-            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
-                            &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
-            try {
-                const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
-                if (pp_profile) {
-                    gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
-                }
-                for (const pp_gemm_group & group : gemm_groups) {
-                    // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
-                    // batched scratch buffers, never dst, so the whole stage takes the failure path below.
-                    std::optional<sycl::event> group_event;
-                    if (pp_woq_arm) {
-                        group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
-                            ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
-                            /* k = */ static_cast<int>(ne00), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
-                            batched_weight_bytes + group.begin * weight_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
-                            batched_weight_bytes + group.begin * weight_slot_bytes + woq_nibble_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes), batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
-                            static_cast<int>(group.end - group.begin), ctx.stream(), { deps_in });
-                    } else {
-                        group_event = DnnlGemmWrapper::gemm_batch_strided(
-                            ctx,
-                            /* trans_a = */ true,
-                            /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
-                            static_cast<int>(ne00), 1.0f, batched_weights + group.begin * weight_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
-                            static_cast<int64_t>(weight_elems), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
-                            static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
-                            static_cast<int64_t>(out_slot_elems), static_cast<int>(group.end - group.begin),
-                            ctx.stream(), { deps_in }, pp_mxfp4_labels ? nullptr : "moe.pp.gemm.execute",
-                            pp_mxfp4_labels ? nullptr : "moe.pp.gemm");
+            for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {
+                const pp_batched_phase & phase         = phases[p];
+                sycl::half *             phase_weights = batched_weights + phase.buffer * half_elems;
+                if (!pp_woq_arm) {
+                    // The GEMMs that last read this half finish before its experts are overwritten: a barrier on
+                    // their events orders every later submission on this in-order queue after them, on the device.
+                    // Submission order alone does not, because the oneDNN primitive is not ordered with the queue
+                    // (llama.cpp-dboi, the comment above).
+                    if (!half_readers[phase.buffer].empty()) {
+                        stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);
+                        half_readers[phase.buffer].clear();
                     }
-                    if (!group_event) {
-                        gemm_declined = true;
-                        break;
+                    for (size_t i = phase.begin; i < phase.end; ++i) {
+                        dequant_expert_f16(active_experts[i], phase_weights + (i - phase.begin) * weight_elems);
                     }
-                    gemm_events.push_back(*group_event);
                 }
-            } catch (const std::exception & e) {
-                return gemm_stage_failed(e.what());
+                if (p == 0) {
+                    // host-stall attribution cycle, phase 5/6: repack/activation-
+                    // stage kernel dispatch (components 1/2/4's own device-event
+                    // markers cover their DEVICE time; this is that dispatch's HOST
+                    // submission cost, not previously measured) plus any other prep
+                    // between grouping and here. A later phase's dequant lands in
+                    // phase 6/6 below.
+                    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
+                                    &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
+                }
+                try {
+                    const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
+                    if (pp_profile && p == 0) {
+                        gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
+                    }
+                    // Each GEMM group (experts of similar row counts) clipped to this phase's experts.
+                    for (const pp_gemm_group & group : gemm_groups) {
+                        const size_t lo = std::max(group.begin, phase.begin);
+                        const size_t hi = std::min(group.end, phase.end);
+                        if (lo >= hi) {
+                            continue;
+                        }
+                        // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
+                        // batched scratch buffers, never dst, so the whole stage takes the failure path below.
+                        std::optional<sycl::event> group_event;
+                        if (pp_woq_arm) {
+                            group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
+                                ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
+                                /* k = */ static_cast<int>(ne00), batched_acts + lo * act_slot_elems,
+                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
+                                batched_weight_bytes + lo * weight_slot_bytes,
+                                static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
+                                batched_weight_bytes + lo * weight_slot_bytes + woq_nibble_slot_bytes,
+                                static_cast<int64_t>(weight_slot_bytes), batched_out + lo * out_slot_elems,
+                                DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
+                                static_cast<int>(hi - lo), ctx.stream(), { deps_in });
+                        } else {
+                            group_event = DnnlGemmWrapper::gemm_batch_strided(
+                                ctx,
+                                /* trans_a = */ true,
+                                /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
+                                static_cast<int>(ne00), 1.0f, phase_weights + (lo - phase.begin) * weight_elems,
+                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
+                                static_cast<int64_t>(weight_elems), batched_acts + lo * act_slot_elems,
+                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
+                                static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + lo * out_slot_elems,
+                                DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
+                                static_cast<int64_t>(out_slot_elems), static_cast<int>(hi - lo), ctx.stream(),
+                                { deps_in }, pp_mxfp4_labels ? nullptr : "moe.pp.gemm.execute",
+                                pp_mxfp4_labels ? nullptr : "moe.pp.gemm");
+                        }
+                        if (!group_event) {
+                            gemm_declined = true;
+                            break;
+                        }
+                        gemm_events.push_back(*group_event);
+                        half_readers[phase.buffer].push_back(*group_event);
+                    }
+                } catch (const std::exception & e) {
+                    return gemm_stage_failed(e.what());
+                }
             }
             if (gemm_declined) {
                 return gemm_stage_failed("oneDNN scratchpad declined");
@@ -89865,14 +89865,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                // The weight figure is what this dispatch used of the slot: the WOQ planes of every active expert,
+                // or the f16 arm's buffers.
+                const size_t weight_used_bytes =
+                    pp_woq_arm ? weight_bytes : phase_buffers * half_elems * sizeof(sycl::half);
                 static std::atomic<int> batched_log{ 0 };
                 if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96) {
                     GGML_LOG_INFO(
                         "[MOE-PP-ONEDNN-F16-BATCHED] tensor=%s device=%d layout=%s experts=%zu rows=%zu "
-                        "max_rows=%zu scratch=planned-unified-cache weight=%.1fMB act=%.1fMB out=%.1fMB\n",
+                        "max_rows=%zu scratch=planned-unified-cache weight=%.1fMB act=%.1fMB out=%.1fMB "
+                        "groups=%zu group_experts=%zu buffers=%zu\n",
                         src0 && src0->name ? src0->name : "?", ctx.device, ggml_sycl_layout_mode_name(route_layout),
-                        active_count, row_maps_total, max_rows_per_expert, weight_bytes / (1024.0 * 1024.0),
-                        act_bytes / (1024.0 * 1024.0), out_bytes / (1024.0 * 1024.0));
+                        active_count, row_maps_total, max_rows_per_expert, weight_used_bytes / (1024.0 * 1024.0),
+                        act_bytes / (1024.0 * 1024.0), out_bytes / (1024.0 * 1024.0), phases.size(), phase_experts,
+                        phase_buffers);
                 }
             }
             if (g_moe_profile_enabled) {
@@ -89886,11 +89892,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 stats.record_route_residency(static_cast<int>(row_maps_total), 0, 0, 0, 0, 0);
             }
             // llama.cpp-348c: one line per (device, type, layout) saying the executor took this type in this layout,
-            // in which arm, how many experts the dispatch batched and the planned weight slot it ran in.
+            // in which arm, how many experts the dispatch batched, in how many groups, and the planned weight slot
+            // it ran in.
             if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)) {
-                GGML_LOG_INFO("[PP-MOE] device=%d type=%s layout=%s arm=%s experts=%zu planned_weight_slot=%zu\n",
-                              ctx.device, ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout),
-                              pp_woq_arm ? "woq" : "f16", active_count, planned_weight);
+                GGML_LOG_INFO(
+                    "[PP-MOE] device=%d type=%s layout=%s arm=%s experts=%zu groups=%zu planned_weight_slot=%zu\n",
+                    ctx.device, ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout),
+                    pp_woq_arm ? "woq" : "f16", active_count, phases.size(), planned_weight);
             }
             return true;
 #else

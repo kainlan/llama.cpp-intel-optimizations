@@ -254,8 +254,9 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 // The batched mul_mat_id prompt executor (try_pp_onednn_f16_batched in ggml-sycl.cpp): which
 // (type, layout) pairs it runs, as two arms (llama.cpp-348c).
 //
-//   moe_pp_batched_f16_supports_layout  -- the f16 arm: dequantize every active expert into one planned f16
-//                                          slot, then one batched oneDNN GEMM over them.
+//   moe_pp_batched_f16_supports_layout  -- the f16 arm: dequantize the active experts into the planned weight
+//                                          slot, in groups that fit it (moe_pp_batched_f16_plan_groups), and run
+//                                          batched oneDNN GEMMs over each group.
 //   moe_pp_batched_woq_supports_layout  -- the MXFP4 weight-only-quantized arm: repack each expert into the
 //                                          WOQ nibble/scale slots and let oneDNN dequantize inside the GEMM.
 //
@@ -282,11 +283,9 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 // both ask moe_pp_batched_supports_layout about the type. The claim then also asks
 // moe_pp_batched_has_expert_entries (below), which declines a non-AOS layout of a weight in a device buffer:
 // under GGML_SYCL_WEIGHTS_EVICTABLE=0 the SOA rows here are therefore never claimed, since that upload holds
-// no per-expert entry at SOA, and such a weight keeps the routes it had before. The plan sizes the f16 weight
-// slot by asking moe_pp_batched_supports_layout at AOS. That is enough because every non-MXFP4 type taken in
-// any layout is taken on AOS and the slot does not depend on the layout, so a type the arm takes always has
-// its slot planned; with GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 or GGML_SYCL_MOE_PP_ONEDNN_F16=0 no such slot is
-// planned at all.
+// no per-expert entry at SOA, and such a weight keeps the routes it had before. The f16 arm needs no slot of its
+// own: it runs in the weight slot libllama plans for the ring (sized for MXFP4's WOQ planes, about a quarter of
+// every expert in f16) and groups the active experts to fit it.
 inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_MXFP4:
@@ -359,6 +358,47 @@ inline bool moe_pp_batched_has_expert_entries(enum ggml_type type, enum ggml_lay
     return type == GGML_TYPE_MXFP4 || !device_buffer || layout == GGML_LAYOUT_AOS;
 }
 
+// How the batched executor's f16 arm fits a dispatch's active experts into the weight slot it claimed
+// (llama.cpp-348c). The slot is the one the plan sized for the ring, which holds about a quarter of every expert in
+// f16, so the arm does not widen it: that took the room from routed experts with no cost decision (quality review,
+// c-kj22). It dequantizes the experts in groups instead.
+//   - The slot holds every active expert, and no cap is smaller: one group in one buffer, exactly the single
+//     batched pass the arm ran before.
+//   - Otherwise the slot is split into two halves when it holds two experts, and groups alternate between them,
+//     so group k + 1 dequantizes while group k's GEMMs run. A slot that holds one expert is one buffer that every
+//     group reuses. The dispatch chains each group on the GEMMs that last read its half, on the device.
+// `cap` is GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX: 0 means none, otherwise at most that many experts per group.
+// groups is 0 only when the slot cannot hold one expert, which the admission refuses first.
+struct moe_pp_batched_f16_groups {
+    size_t experts_per_group = 0;  // the experts one group dequantizes into its buffer
+    size_t buffers           = 0;  // 1: one buffer (every expert fits, or the slot holds one); 2: two halves
+    size_t groups            = 0;  // ceil(active / experts_per_group)
+};
+
+inline moe_pp_batched_f16_groups moe_pp_batched_f16_plan_groups(size_t slot_bytes,
+                                                                size_t expert_bytes,
+                                                                size_t active,
+                                                                size_t cap) {
+    moe_pp_batched_f16_groups plan;
+    const size_t              fit = expert_bytes > 0 ? slot_bytes / expert_bytes : 0;
+    if (fit == 0 || active == 0) {
+        return plan;
+    }
+    if (fit >= active && (cap == 0 || cap >= active)) {
+        plan.experts_per_group = active;
+        plan.buffers           = 1;
+        plan.groups            = 1;
+        return plan;
+    }
+    plan.buffers           = fit >= 2 ? 2 : 1;
+    plan.experts_per_group = fit / plan.buffers;
+    if (cap != 0 && cap < plan.experts_per_group) {
+        plan.experts_per_group = cap;
+    }
+    plan.groups = (active + plan.experts_per_group - 1) / plan.experts_per_group;
+    return plan;
+}
+
 // Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is reported
 // once per (device, cause) by its name. The latch is a 32-bit mask per device: COUNT, last, is the number of
 // causes, and the latch static_asserts that it fits.
@@ -381,7 +421,7 @@ enum class moe_pp_batched_refusal : uint8_t {
     NO_DEQUANT,         // no f16 dequant kernel for the expert's materialized layout
     SCRATCH_SIZE,       // the scratch arithmetic overflowed
     SCRATCH_CACHE,      // no unified cache for this device
-    SCRATCH_UNPLANNED,  // the plan's ring is smaller than this dispatch needs
+    SCRATCH_UNPLANNED,  // the plan's ring is smaller than this dispatch needs (for the f16 arm: one expert)
     SCRATCH_RESERVE,    // the planned ring could not be reserved
     SCRATCH_SLOT,       // a ring slot could not be acquired
     SCRATCH_SLOT_SIZE,  // an acquired slot is smaller than planned

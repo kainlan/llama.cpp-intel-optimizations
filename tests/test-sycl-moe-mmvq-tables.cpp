@@ -517,18 +517,6 @@ int main() {
             std::printf("FAIL: the WOQ arm admits type=%d; it is MXFP4 only\n", t);
             ++failures;
         }
-        // The plan sizes the f16 slot by asking at AOS, which is right only while every non-MXFP4 type the
-        // f16 arm takes in any layout is also taken on AOS.
-        if (type != GGML_TYPE_MXFP4 && !moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS)) {
-            for (const ggml_layout_mode layout : all_layouts()) {
-                if (moe_pp_batched_f16_supports_layout(type, layout)) {
-                    std::printf(
-                        "FAIL: the f16 arm takes type=%d on layout=%d but not on AOS, so its slot is unplanned\n", t,
-                        static_cast<int>(layout));
-                    ++failures;
-                }
-            }
-        }
         for (const ggml_layout_mode layout : all_layouts()) {
             // GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 must leave exactly the MXFP4 executor.
             if (moe_pp_batched_supports_layout(type, layout, true, false) && type != GGML_TYPE_MXFP4) {
@@ -625,6 +613,61 @@ int main() {
                 std::printf("FAIL: a host-buffer weight is declined for type=%d layout=%d\n", t,
                             static_cast<int>(layout));
                 ++failures;
+            }
+        }
+    }
+
+    // 11. The f16 arm's groups (llama.cpp-348c). The arm runs in the weight slot the plan sized for the ring and
+    // groups the active experts to fit it: one group when every expert fits and no cap is smaller, otherwise groups
+    // alternating between the slot's two halves, or reusing one buffer when the slot holds a single expert. The
+    // device test's shape (32 experts of 768 x 2048) has a 835584-byte WOQ slot per expert, so its planned slot holds
+    // 8 f16 experts of 3145728 bytes: 8 groups of 4 by default, 11 of 3 under the test's cap of 3.
+    const size_t expert = size_t(768) * 2048 * 2;
+    const size_t woq    = size_t(835584) * 32;
+
+    const struct {
+        size_t       slot, expert_bytes, active, cap;
+        size_t       per, buffers, groups;
+        const char * name;
+    } group_cases[] = {
+        { 8 * expert, expert, 8,  0, 8, 1, 1,  "every expert fits: one group, one buffer"         },
+        { 8 * expert, expert, 8,  8, 8, 1, 1,  "a cap equal to the active count changes nothing"  },
+        { 8 * expert, expert, 8,  3, 3, 2, 3,  "every expert fits but the cap splits them"        },
+        { woq,        expert, 32, 0, 4, 2, 8,  "the device test's shape, no cap"                  },
+        { woq,        expert, 32, 3, 3, 2, 11, "the device test's shape under its cap of 3"       },
+        { woq,        expert, 32, 1, 1, 2, 32, "a cap of 1: one expert per group, two halves"     },
+        { 3 * expert, expert, 4,  0, 1, 2, 4,  "a three-expert slot: two halves of one"           },
+        { expert,     expert, 5,  0, 1, 1, 5,  "a one-expert slot: one buffer every group reuses" },
+        { expert + 1, expert, 1,  0, 1, 1, 1,  "one active expert in a one-expert slot"           },
+        { expert - 1, expert, 4,  0, 0, 0, 0,  "a slot smaller than one expert: no group"         },
+        { 8 * expert, expert, 0,  0, 0, 0, 0,  "no active expert: no group"                       },
+        { 8 * expert, 0,      4,  0, 0, 0, 0,  "a zero-byte expert: no group"                     },
+    };
+
+    for (const auto & c : group_cases) {
+        const moe_pp_batched_f16_groups g = moe_pp_batched_f16_plan_groups(c.slot, c.expert_bytes, c.active, c.cap);
+        if (g.experts_per_group != c.per || g.buffers != c.buffers || g.groups != c.groups) {
+            std::printf("FAIL: f16 groups for: %s: got %zu x %zu buffers, %zu groups; want %zu x %zu, %zu\n", c.name,
+                        g.experts_per_group, g.buffers, g.groups, c.per, c.buffers, c.groups);
+            ++failures;
+        }
+    }
+    // Over a grid: the buffers fit in the slot, the groups cover every active expert with none empty, and a slot
+    // that holds two experts always splits into halves once there is more than one group.
+    for (size_t fit = 1; fit <= 12; ++fit) {
+        for (size_t active = 1; active <= 40; ++active) {
+            for (size_t cap = 0; cap <= 5; ++cap) {
+                const moe_pp_batched_f16_groups g =
+                    moe_pp_batched_f16_plan_groups(fit * expert + 7, expert, active, cap);
+                const bool ok =
+                    g.groups > 0 && g.buffers >= 1 && g.buffers <= 2 && g.buffers * g.experts_per_group <= fit &&
+                    g.groups * g.experts_per_group >= active && (g.groups - 1) * g.experts_per_group < active &&
+                    (cap == 0 || g.experts_per_group <= cap) && (g.groups == 1 || fit < 2 || g.buffers == 2);
+                if (!ok) {
+                    std::printf("FAIL: f16 groups break an invariant at fit=%zu active=%zu cap=%zu: %zu x %zu, %zu\n",
+                                fit, active, cap, g.experts_per_group, g.buffers, g.groups);
+                    ++failures;
+                }
             }
         }
     }

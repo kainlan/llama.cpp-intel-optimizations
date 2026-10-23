@@ -1077,7 +1077,7 @@ MUTANTS = [
     ("q", "common", "value < 1 || value > 1024", "value < 1"),
     ("q", "sycl", f"{{ {GROUP_KNOB_CONST}, &g_ggml_sycl_moe_pp_f16_group_experts_max, 0 }},", ""),
     ("q", "catalog", f"| `{GROUP_KNOB}=<1..1024>` |", f"| `{GROUP_KNOB}` |"),
-    ("q", "sycl", "out=%.1fMB groups=%zu", "out=%.1fMB phases=%zu"),
+    ("q", "sycl", 'out=%.1fMB " "groups=%zu', 'out=%.1fMB " "phases=%zu'),
     ("q", "device_test", f'setenv("{GROUP_KNOB}", "3", 1);', ""),
     ("q", "device_test", "groups < k_min_groups", "groups < 1"),
 ]
