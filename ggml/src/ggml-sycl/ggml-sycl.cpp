@@ -20976,6 +20976,8 @@ static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
                                              int                                  device,
                                              int                                  expert_id,
                                              const ggml_sycl::unified_cache_key & withdrawn) {
+    // Boundary premise: the views go at once because the loan runs after synchronize's stream wait, outside a graph.
+    GGML_ASSERT(!ggml_sycl::unified_cache_is_graph_compute_active());
     if (!extra || !extra->weight_ext || expert_id < 0 || !ggml_sycl_valid_device_index(device)) {
         return false;
     }
