@@ -101,6 +101,18 @@ What this gate pins for it:
     move, so at more than one per call each moved triplet is counted, its bytes summed, and the next is checked
     against the ledger's new back.
 
+Both directions size their copies from the cache entry the copy will hold (llama.cpp-pu8v). Direct staging pads an AOS
+quantized expert's tail to MATRIX_ROW_PADDING columns and the plan's dst_size does not count it, so a copy minted from
+dst_size is short and the cache refuses it ("host storage too small", or the final "device storage size"). What this
+gate pins:
+  - the preparation asks the cache for each member's size (the AOS device entry for a loan, the lent host copy for a
+    refill), stops with the refusal the cache would give when there is none, and mints from that size, never from
+    dst_size;
+  - each query reads its entry under direct_stage_mutex_ and rw_mutex_, shared, taken together with std::lock, and
+    returns the entry's own size;
+  - the cache's checks stay as the guards: a host copy smaller than its device entry, and device storage not exactly
+    the lent copy's size, are still refused.
+
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
 
@@ -389,7 +401,7 @@ def claim_graph_mutex_untouched(cache: str, sycl: str) -> bool:
 
 # --- lock order -----------------------------------------------------------------------------------------------------
 
-HOST_ALLOC = "ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, e->dst_size);"
+HOST_ALLOC = "ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, bytes);"
 INVENTORY_LOCK = "std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);"
 LEND = "loaned = cache->loan_expert_triplet(triplet.members, record);"
 CACHE_LOCKS = ("std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
@@ -787,7 +799,7 @@ def claim_refill_checks_before_copying(cache: str) -> bool:
             and ordered(b, REFILL_LOAD_EFFECT, COHERENCE, *REFILL_CHECKS, REFILL_SRC, REFUSE_EARLY, REFILL_COPY))
 
 
-DEVICE_ALLOC = "ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, e->dst_size);"
+DEVICE_ALLOC = "ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, bytes);"
 ZONE_ALLOC = ("ggml_sycl::allocation_result allocation = ggml_sycl::unified_cache_zone_allocate_owner(device, "
               "ggml_sycl::vram_zone_id::WEIGHT, size);")
 
@@ -1073,6 +1085,41 @@ def claim_one_decode_graph_admits_one_refill(sycl: str, common: str, sources: li
 
 
 # --- positive tests -------------------------------------------------------------------------------------------------
+
+# --- copies are sized from the cache entry they will hold (llama.cpp-pu8v) ------------------------------------------
+
+COPY_SIZE = ("const size_t bytes = refill ? cache->refill_copy_bytes(target.key) : "
+             "cache->loan_copy_bytes(target.key);")
+COPY_SIZE_MISSING = 'if (bytes == 0) { stop = refill ? "not lent" : "not resident"; break; }'
+LOAN_BYTES_SIG = "size_t unified_cache::loan_copy_bytes(ggml_sycl_cache_id key) const"
+REFILL_BYTES_SIG = "size_t unified_cache::refill_copy_bytes(ggml_sycl_cache_id key) const"
+SHARED_CACHE_LOCKS = ("std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
+                      "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
+                      "std::lock(direct_lock, cache_lock);")
+LOAN_BYTES_FIND = ("const auto it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, "
+                   "GGML_LAYOUT_AOS));")
+REFILL_BYTES_FIND = "const auto it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });"
+BYTES_RETURN = "return it != entries_.end() && !it->second.retired ? it->second.size : 0;"
+LOAN_SIZE_GUARD = 'if (host_md[i].size < e.size) { refusal = "host storage too small"; break; }'
+REFILL_SIZE_GUARD = 'if (device_size[i] != e.size) { refusal = "device storage size"; break; }'
+
+
+def claim_copies_are_sized_from_the_entry(cache: str, sycl: str) -> bool:
+    """The preparation mints each member's copy at the size of the cache entry it will hold, which the cache reads
+    under its two locks, and never at the plan's dst_size; the cache's size checks stay as the guards."""
+    txn = body(norm(sycl), TXN_SIG)
+    c = norm(cache)
+    loan_bytes = body(c, LOAN_BYTES_SIG)
+    refill_bytes = body(c, REFILL_BYTES_SIG)
+    return (txn.count(COPY_SIZE) == 1 and txn.count(COPY_SIZE_MISSING) == 1
+            and txn.count(HOST_ALLOC) == 1 and txn.count(DEVICE_ALLOC) == 1
+            and ordered(txn, COPY_SIZE, COPY_SIZE_MISSING, DEVICE_ALLOC, HOST_ALLOC)
+            and "_expert_alloc(device, e->dst_size)" not in txn
+            and all(b.count(SHARED_CACHE_LOCKS) == 1 and b.count(BYTES_RETURN) == 1
+                    and ordered(b, SHARED_CACHE_LOCKS, BYTES_RETURN) for b in (loan_bytes, refill_bytes))
+            and loan_bytes.count(LOAN_BYTES_FIND) == 1 and refill_bytes.count(REFILL_BYTES_FIND) == 1
+            and body(c, LOAN_SIG).count(LOAN_SIZE_GUARD) == 1 and body(c, REFILL_SIG).count(REFILL_SIZE_GUARD) == 1)
+
 
 def test_loan_never_waits():
     assert claim_loan_never_waits(CACHE, SYCL)
@@ -2131,6 +2178,42 @@ def test_mutant_refill_runs_before_the_count_is_checked_fails():
     mutant = _once_in(SYCL, BOUNDARY_DEVICE_SIG, run, "")
     mutant = _once_in(mutant, BOUNDARY_DEVICE_SIG, ONCE_PER_GRAPH, run + " " + ONCE_PER_GRAPH)
     assert not claim_one_decode_graph_admits_one_refill(mutant, COMMON, [mutant, COMMON])
+
+
+def test_copies_are_sized_from_the_entry():
+    assert claim_copies_are_sized_from_the_entry(CACHE, SYCL)
+
+
+def test_mutant_loan_copy_sized_from_dst_size_fails():
+    """The defect (llama.cpp-pu8v): the host copy minted from the plan's dst_size, short of a padded entry."""
+    mutant = _once_in(SYCL, TXN_SIG, HOST_ALLOC, HOST_ALLOC.replace("(device, bytes)", "(device, e->dst_size)"))
+    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+
+
+def test_mutant_refill_storage_sized_from_dst_size_fails():
+    mutant = _once_in(SYCL, TXN_SIG, DEVICE_ALLOC, DEVICE_ALLOC.replace("(device, bytes)", "(device, e->dst_size)"))
+    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+
+
+def test_mutant_loan_query_reads_the_host_entry_fails():
+    mutant = _once_in(CACHE, LOAN_BYTES_SIG, LOAN_BYTES_FIND, REFILL_BYTES_FIND)
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+
+
+def test_mutant_query_without_the_direct_stage_lock_fails():
+    mutant = _once_in(CACHE, REFILL_BYTES_SIG, SHARED_CACHE_LOCKS,
+                      "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_);")
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+
+
+def test_mutant_loan_size_guard_removed_fails():
+    mutant = _once_in(CACHE, LOAN_SIG, LOAN_SIZE_GUARD, "")
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+
+
+def test_mutant_refill_size_guard_removed_fails():
+    mutant = _once_in(CACHE, REFILL_SIG, REFILL_SIZE_GUARD, "")
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
 
 
 if __name__ == "__main__":

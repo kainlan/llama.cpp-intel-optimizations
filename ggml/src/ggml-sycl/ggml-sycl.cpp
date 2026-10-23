@@ -21682,6 +21682,9 @@ struct test_loan_fixture {
     // has run, and that count when the boundary last ran the refill (llama.cpp-sif1).
     uint64_t                                            decode_graphs = 0;
     std::atomic<uint64_t>                               refilled_at{ 0 };
+    // What stage_per_expert() gives each device entry: the expert's bytes, or more, as S1-PRELOAD pads an AOS
+    // quantized expert's tail while the plan keeps the unpadded size (llama.cpp-pu8v). The padding is zeros.
+    size_t                                              staged_bytes = test_loan_expert_bytes();
 
     test_loan_fixture(int layers, int experts, uint64_t model_id, bool configure_zones = true) :
         n_layers(layers),
@@ -21797,8 +21800,8 @@ struct test_loan_fixture {
                         const size_t i = index(l, s, e);
                         mem_handle   lease;
                         auto stage = cache->direct_stage_expert(keys[i], bytes[i].data(), test_loan_expert_bytes(),
-                                                                test_loan_expert_bytes(), GGML_LAYOUT_AOS, nullptr,
-                                                                nullptr, queue, &lease);
+                                                                staged_bytes, GGML_LAYOUT_AOS, nullptr, nullptr, queue,
+                                                                &lease);
                         if (!stage.ok || !stage.ptr) {
                             return test_loan_fail("direct_stage_expert refused layer %d slot %d expert %d: %s", l, s, e,
                                                   test_loan_stage_refusal(cache, stage).c_str());
@@ -22103,9 +22106,9 @@ struct test_loan_fixture {
                                       entry->target_device, device);
             }
             const expert_resolve_result resolved = resolve(layer, s, expert);
-            if (!resolved || resolved.location != cache_location::DEVICE || resolved.size != test_loan_expert_bytes()) {
+            if (!resolved || resolved.location != cache_location::DEVICE || resolved.size != staged_bytes) {
                 return test_loan_fail("layer %d expert %d slot %d does not resolve to a %zu-byte device copy", layer,
-                                      expert, s, test_loan_expert_bytes());
+                                      expert, s, staged_bytes);
             }
             const auto * record =
                 extras[layer * 3 + s]->find_moe_storage_handle_on_device(expert, GGML_LAYOUT_AOS, device);
@@ -23176,6 +23179,102 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
         return test_loan_fail("the teardown counts read %u/%u, not 3/3",
                               g_sycl_expert_readmitted_total[fx.device].load(),
                               g_sycl_expert_lent_total[fx.device].load());
+    }
+    return {};
+}
+
+std::string test_expert_loan_sizes_its_copies_from_the_entry() {
+    // llama.cpp-pu8v: each device entry is 72 bytes larger than the plan's dst_size, as S1-PRELOAD stages a Q4_0
+    // expert whose rows are not a multiple of MATRIX_ROW_PADDING (Qwen1.5-MoE's ffn_down_exps, 1408 columns, padded by
+    // 128 columns of Q4_0). A host copy minted at the plan's size is still refused "host storage too small" and moves
+    // nothing. The transaction sizes its copies from the entry, so the loan lends both triplets, each host copy the
+    // entry's size with its zero tail, and the refill re-admits both at that size.
+    constexpr size_t  tail = 72;
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7075387601ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    fx.staged_bytes = test_loan_expert_bytes() + tail;
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * fx.staged_bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+
+    // The guard stays: a host copy smaller than the entry it must hold is refused, whatever sized it.
+    expert_loan_member members[3];
+    for (int s = 0; s < 3; ++s) {
+        members[s].placement        = { 1, 2, test_loan_fixture::role(s) };
+        members[s].key              = fx.keys[fx.index(1, s, 2)];
+        members[s].host_keys        = { members[s].key };
+        members[s].vram_charge_size = charge;
+        members[s].host_owner       = ::ggml_sycl_host_expert_alloc(fx.device, test_loan_expert_bytes());
+        if (!members[s].host_owner.valid()) {
+            return "no pinned host storage for the short host copy";
+        }
+    }
+    expert_loan_record refused;
+    bool               accepted = false;
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        accepted = fx.cache->loan_expert_triplet(members, refused);
+    }
+    if (accepted || std::strcmp(refused.reason, "host storage too small") != 0) {
+        return test_loan_fail("a host copy of the plan's %zu bytes for a %zu-byte entry was %s (%s), not refused "
+                              "\"host storage too small\"",
+                              test_loan_expert_bytes(), fx.staged_bytes, accepted ? "accepted" : "refused",
+                              refused.reason);
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (!fx.device_entry_present(1, s, 2) || fx.host_entry_present(1, s, 2)) {
+            return test_loan_fail("the refused loan moved layer 1 expert 2 slot %d", s);
+        }
+    }
+    for (expert_loan_member & m : members) {
+        m.host_owner = mem_handle();
+    }
+
+    if (std::string why = fx.lend(6 * charge, 2, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (lent.size() != 2) {
+        return test_loan_fail("the published plan has %zu lent triplets, not 2", lent.size());
+    }
+    const std::vector<uint8_t> zeros(tail, 0);
+    for (const auto & t : lent) {
+        for (int s = 0; s < 3; ++s) {
+            expert_resolve_result host = fx.resolve(t.first, s, t.second);
+            if (!host || host.location != cache_location::HOST_PINNED || host.size != fx.staged_bytes) {
+                return test_loan_fail("layer %d expert %d slot %d does not resolve to a %zu-byte host-pinned copy",
+                                      t.first, t.second, s, fx.staged_bytes);
+            }
+            if (host.has_ready_event) {
+                host.ready_event.wait_and_throw();
+            }
+            const uint8_t * copy = static_cast<const uint8_t *>(host.ptr);
+            if (std::memcmp(copy, fx.bytes[fx.index(t.first, s, t.second)].data(), test_loan_expert_bytes()) != 0 ||
+                std::memcmp(copy + test_loan_expert_bytes(), zeros.data(), tail) != 0) {
+                return test_loan_fail("layer %d expert %d slot %d's host copy is not the whole padded entry", t.first,
+                                      t.second, s);
+            }
+        }
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 2 || result.n_dropped != 0 || remaining != 0) {
+        return test_loan_fail("the refill re-admitted %u triplets, dropped %u, with %u remaining (%s), not 2, 0 and 0",
+                              result.n_triplets, result.n_dropped, remaining, result.reason);
+    }
+    for (const auto & t : lent) {
+        if (std::string why = fx.readmitted(t.first, t.second); !why.empty()) {
+            return "a padded triplet: " + why;
+        }
     }
     return {};
 }

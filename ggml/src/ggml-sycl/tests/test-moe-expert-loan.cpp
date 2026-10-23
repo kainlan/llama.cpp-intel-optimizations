@@ -64,6 +64,12 @@
 //                           6 charges of bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
 //                           to a device entry IN_PROGRESS behind its copy, and the third stays lent until the next
 //                           decode boundary re-admits it. The teardown counts read 3/3.
+//   loan_sizes_its_copies_from_the_entry
+//                           llama.cpp-pu8v: each device entry 72 bytes past the plan's dst_size, as S1-PRELOAD pads a
+//                           Q4_0 expert whose rows are not a multiple of MATRIX_ROW_PADDING. A host copy minted at the
+//                           plan's size is refused "host storage too small" and moves nothing; then the loan lends two
+//                           triplets, each host copy the entry's size with its zero tail, and one decode boundary
+//                           re-admits both at that size.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -124,6 +130,7 @@ int main() {
     ok &= run_case("refill_runs_once_per_decode_graph", ggml_sycl::test_expert_refill_runs_once_per_decode_graph);
     ok &= run_case("refill_drops_an_unpreparable_triplet", ggml_sycl::test_expert_refill_drops_an_unpreparable_triplet);
     ok &= run_case("refill_moves_two_triplets_per_call", ggml_sycl::test_expert_refill_moves_two_triplets_per_call);
+    ok &= run_case("loan_sizes_its_copies_from_the_entry", ggml_sycl::test_expert_loan_sizes_its_copies_from_the_entry);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
