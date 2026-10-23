@@ -16,8 +16,9 @@
 //   lends_two_triplets      2 layers x 4 experts, expert 3 on the host: three requests leave the largest pending,
 //                           the graph-boundary runner lends two triplets and clears it, the plan shows them on the
 //                           host, resolve_expert finds host-pinned copies equal to the originals, the device entries
-//                           are gone within 2 s and the device gets their storage back: the entries' sizes, which
-//                           equal the reported charge only because a 1 MiB expert is 256-byte aligned.
+//                           are gone within 2 s and the device gets their storage back: the entries' sizes, which the
+//                           loan reports, and which equal the requested charge only because a 1 MiB expert is
+//                           256-byte aligned.
 //   probe_changes_nothing   c-tdra first: inside a graph the transaction refuses "graph active" and a request waits.
 //                           Then the same plan probed: the selection is reported and nothing is copied or published.
 //   refuses_replacing_a_host_entry
@@ -61,7 +62,7 @@
 //                           once the room is back. The teardown counts read 2/4.
 //   refill_moves_two_triplets_per_call
 //                           A three-triplet loan, then one decode boundary at two per call: both move (2 triplets,
-//                           6 charges of bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
+//                           six entries' bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
 //                           to a device entry IN_PROGRESS behind its copy, and the third stays lent until the next
 //                           decode boundary re-admits it. The teardown counts read 3/3.
 //   loan_sizes_its_copies_from_the_entry

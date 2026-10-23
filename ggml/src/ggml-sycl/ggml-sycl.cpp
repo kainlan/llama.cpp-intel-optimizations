@@ -21106,20 +21106,20 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                     transient = arena;
                     break;
                 }
-                triplet.refill_members[r].placement        = k;
-                triplet.refill_members[r].key              = target.key;
-                triplet.refill_members[r].host_keys        = std::move(target.host_keys);
-                triplet.refill_members[r].device_owner     = std::move(storage);
+                triplet.refill_members[r].placement    = k;
+                triplet.refill_members[r].key          = target.key;
+                triplet.refill_members[r].host_keys    = std::move(target.host_keys);
+                triplet.refill_members[r].device_owner = std::move(storage);
             } else {
                 ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, bytes);
                 if (!host.valid()) {
                     stop = "host pinned pool exhausted";
                     break;
                 }
-                triplet.members[r].placement        = k;
-                triplet.members[r].key              = target.key;
-                triplet.members[r].host_keys        = std::move(target.host_keys);
-                triplet.members[r].host_owner       = std::move(host);
+                triplet.members[r].placement  = k;
+                triplet.members[r].key        = target.key;
+                triplet.members[r].host_keys  = std::move(target.host_keys);
+                triplet.members[r].host_owner = std::move(host);
             }
             triplet.extras[r] = target.extra;
         }
@@ -21673,7 +21673,10 @@ std::string test_loan_stage_refusal(const unified_cache * cache, const direct_st
 }
 
 // The WARN lines logged while it lives, each line also passed on to the callback it replaced, which it puts back
-// (llama.cpp-pu8v).
+// (llama.cpp-pu8v). It swaps ggml's global logger, a callback and its user data stored as two plain fields, so it is
+// safe only because this test binary is serial and every WARN a case asserts is logged synchronously on the thread
+// running the transaction (refuse() in ggml_sycl_expert_txn_run and its warn_dropped()), the thread that swaps it, so
+// each asserted line is logged strictly between the swap and the restore.
 struct test_loan_warn_capture {
     ggml_log_callback        previous      = nullptr;
     void *                   previous_data = nullptr;
@@ -22290,9 +22293,9 @@ std::string test_expert_loan_lends_two_triplets() {
         ::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, nullptr)) {
         return "the loan that ran the request did not clear it";
     }
-    if (result.n_triplets != 2 || result.bytes_freed != 6 * charge) {
+    if (result.n_triplets != 2 || result.bytes_freed != 6 * fx.staged_bytes) {
         return test_loan_fail("the loan lent %u triplets and %zu bytes, not 2 and %zu", result.n_triplets,
-                              result.bytes_freed, 6 * charge);
+                              result.bytes_freed, 6 * fx.staged_bytes);
     }
 
     // Selection walks the plan from its tail, so it takes layer 1's experts 2 and 1.
@@ -22667,11 +22670,11 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
                               (unsigned long long) staged);
     }
     if (!result.accepted || result.n_triplets != 1 || remaining != 1 || result.n_remaining != 1 ||
-        result.bytes_readmitted != 3 * charge) {
+        result.bytes_readmitted != 3 * fx.staged_bytes) {
         return test_loan_fail(
             "the first refill re-admitted %u triplets and %zu bytes with %u remaining (%s), not 1, "
             "%zu and 1",
-            result.n_triplets, result.bytes_readmitted, remaining, result.reason, 3 * charge);
+            result.n_triplets, result.bytes_readmitted, remaining, result.reason, 3 * fx.staged_bytes);
     }
     // The ledger is a stack: the last triplet lent is the first re-admitted, the first lent still waits.
     const auto first = ::ggml_sycl_global_plan_snapshot();
@@ -22742,11 +22745,12 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
         return test_loan_fail("the second refill took %llu staged host-to-device copies, not the direct DMA",
                               (unsigned long long) staged);
     }
-    if (!result.accepted || result.n_triplets != 1 || remaining != 0 || result.bytes_readmitted != 3 * charge) {
+    if (!result.accepted || result.n_triplets != 1 || remaining != 0 ||
+        result.bytes_readmitted != 3 * fx.staged_bytes) {
         return test_loan_fail(
             "the second refill re-admitted %u triplets and %zu bytes with %u remaining (%s), not 1, "
             "%zu and 0",
-            result.n_triplets, result.bytes_readmitted, remaining, result.reason, 3 * charge);
+            result.n_triplets, result.bytes_readmitted, remaining, result.reason, 3 * fx.staged_bytes);
     }
     for (const auto & t : lent) {
         if (std::string why = fx.readmitted(t.first, t.second); !why.empty()) {
@@ -23043,13 +23047,13 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     refused   = 1;
     remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &refusing, &result);
     if (!result.accepted || result.n_triplets != 1 || result.n_dropped != 1 || remaining != 1 ||
-        result.bytes_readmitted != 3 * charge || std::strcmp(result.reason, "no tensor for a lent expert") != 0 ||
-        asked.size() != 2) {
+        result.bytes_readmitted != 3 * fx.staged_bytes ||
+        std::strcmp(result.reason, "no tensor for a lent expert") != 0 || asked.size() != 2) {
         return test_loan_fail(
             "the two-triplet refill with its second refused answered accepted=%d triplets=%u dropped=%u remaining=%u "
             "bytes=%zu (%s) after asking about %zu triplets, not 1, 1, 1 and %zu (no tensor for a lent expert) after 2",
             (int) result.accepted, result.n_triplets, result.n_dropped, remaining, result.bytes_readmitted,
-            result.reason, asked.size(), 3 * charge);
+            result.reason, asked.size(), 3 * fx.staged_bytes);
     }
     const std::pair<int, int> moved          = asked[0];
     const std::pair<int, int> dropped_behind = asked[1];
@@ -23168,11 +23172,12 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
                               (unsigned long long) staged);
     }
     if (!result.accepted || result.n_triplets != 2 || result.n_dropped != 0 || remaining != 1 ||
-        result.n_remaining != 1 || result.bytes_readmitted != 6 * charge) {
+        result.n_remaining != 1 || result.bytes_readmitted != 6 * fx.staged_bytes) {
         return test_loan_fail(
             "the two-triplet refill re-admitted %u triplets and %zu bytes, dropped %u, with %u remaining (%s), not 2, "
             "%zu, 0 and 1",
-            result.n_triplets, result.bytes_readmitted, result.n_dropped, remaining, result.reason, 6 * charge);
+            result.n_triplets, result.bytes_readmitted, result.n_dropped, remaining, result.reason,
+            6 * fx.staged_bytes);
     }
     const std::vector<std::pair<int, int>> on_host = fx.lent_triplets(/*host_expert=*/3);
     if (on_host.size() != 1 || g_sycl_expert_lent_count[fx.device].load() != 1) {
@@ -23212,11 +23217,12 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
 
     // It is still in the ledger: the next decode graph's boundary re-admits it, and nothing else.
     remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &resolver, &result);
-    if (!result.accepted || result.n_triplets != 1 || remaining != 0 || result.bytes_readmitted != 3 * charge) {
+    if (!result.accepted || result.n_triplets != 1 || remaining != 0 ||
+        result.bytes_readmitted != 3 * fx.staged_bytes) {
         return test_loan_fail(
             "the next decode graph's boundary re-admitted %u triplets and %zu bytes with %u remaining (%s), not 1, "
             "%zu and 0",
-            result.n_triplets, result.bytes_readmitted, remaining, result.reason, 3 * charge);
+            result.n_triplets, result.bytes_readmitted, remaining, result.reason, 3 * fx.staged_bytes);
     }
     if (std::string why = fx.readmitted(still.first, still.second); !why.empty()) {
         return "the triplet the two-triplet call left, re-admitted next: " + why;
@@ -23362,7 +23368,9 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
         if (!::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, &result)) {
             return "the graph boundary ran no loan for the pending request";
         }
-        const std::string refused_line = test_loan_fail("[MOE-EXEC] loan device %d refused: not resident\n", fx.device);
+        char refused_text[128];
+        snprintf(refused_text, sizeof(refused_text), "[MOE-EXEC] loan device %d refused: not resident\n", fx.device);
+        const std::string refused_line = refused_text;
         if (warns.count(refused_line) != 1) {
             return test_loan_fail("the refused loan WARNed \"%.*s\" %zu times, not once",
                                   static_cast<int>(refused_line.size() - 1), refused_line.c_str(),
@@ -23408,9 +23416,11 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
     test_loan_warn_capture                 warns;
-    const std::string                      dropped_line =
-        test_loan_fail("[MOE-EXEC] refill device %d: layer 1 expert 2 stays on the host: not lent\n", fx.device);
-    uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    char                                   dropped_text[128];
+    snprintf(dropped_text, sizeof(dropped_text),
+             "[MOE-EXEC] refill device %d: layer 1 expert 2 stays on the host: not lent\n", fx.device);
+    const std::string dropped_line = dropped_text;
+    uint32_t          remaining    = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
     if (warns.count(dropped_line) != 0) {
         return "the refill that kept the triplet behind the back WARNed it dropped";
     }
@@ -40772,6 +40782,8 @@ static void ggml_sycl_release_stale_materialization_handles(const std::vector<gg
     }
 }
 
+// A direct-staged AOS expert's entry is this size, which exceeds the plan's dst_size by the row-padding tail, so an
+// expert loan or refill sizes its copy from the cache entry, not the plan (llama.cpp-pu8v).
 static size_t ggml_sycl_get_padded_weight_bytes(ggml_type type, int64_t ncols, size_t base_size) {
     if (!ggml_is_quantized(type)) {
         return base_size;

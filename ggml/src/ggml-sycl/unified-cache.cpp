@@ -29754,6 +29754,9 @@ static size_t planner_layout_bytes_for_dims(ggml_type        type,
         case GGML_LAYOUT_AOS:
         case GGML_LAYOUT_SOA:
         default:
+            // Unpadded: a direct-staged AOS expert's entry can exceed this by the MATRIX_ROW_PADDING tail
+            // (ggml_sycl_get_padded_weight_bytes), so expert loans and refills size copies from the entry
+            // (llama.cpp-pu8v).
             return ggml_row_size(type, ncols) * static_cast<size_t>(nrows);
     }
 }
