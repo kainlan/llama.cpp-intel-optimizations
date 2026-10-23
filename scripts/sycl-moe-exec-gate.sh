@@ -70,10 +70,11 @@
 #
 # Preflights refuse (rc 2): no <sha> or a head that differs from it; GGML_SYCL not ON; a binary missing, older than
 # the head commit, or not linked to the SYCL runtime; a model file missing; a failed grep control; builders
-# (ninja + icpx) > 0 at the start; Shmem >= 30 GB or MemAvailable <= 150 GB; GPU.lock already held; a GGML_SYCL_* or
-# LLAMA_ARG_* variable in the environment (every arm would inherit it; each arm sets its own); a non-empty --out-dir
-# unless --arm names the arms to redo or --clobber is given (a reused directory would score one run's files as
-# another's). Before each arm the host must settle (Shmem < 30 GB and MemAvailable > 150 GB, up to 10 minutes) and
+# (ninja + icpx) that do not clear within 15 minutes; Shmem >= 30 GB or MemAvailable <= 150 GB; GPU.lock already held;
+# a GGML_SYCL_* or LLAMA_ARG_* variable in the environment (every arm would inherit it; each arm sets its own); a
+# non-empty --out-dir unless --arm names the arms to redo or --clobber is given (a reused directory would score one
+# run's files as another's). Before each arm the host must settle (Shmem < 30 GB and MemAvailable > 150 GB, up to
+# 10 minutes) and
 # the builders must reach 0 (the gate waits for them like settle, up to 15 minutes, 10 s polls); only an expired wait
 # stops the gate. Shmem, MemAvailable, load and builders are sampled before each arm and 5 s after it, and builders
 # every 5 s during it; every verdict line carries builders_pre= and builders_post= (the highest count seen during or
@@ -329,9 +330,12 @@ require_tools() {
 require_tools awk md5sum cmp comm
 [ "$GATE_NEEDS_ONEAPI" = 0 ] || require_tools journalctl pgrep timeout git
 
+GATE_ONEAPI=not_needed
 if [ "$GATE_NEEDS_ONEAPI" = 1 ]; then
     # shellcheck disable=SC1091
     source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1
+    GATE_ONEAPI=absent
+    [ -z "${ONEAPI_ROOT:-}" ] || GATE_ONEAPI=sourced
 fi
 
 # Everything the gate reads from the tree under test comes from SRC_DIR, the source tree of the build: the parent of
@@ -1083,7 +1087,8 @@ if [ "$DRY_RUN" = 1 ]; then
     say "dry-run: nothing is executed, no lock is taken, no device is touched"
     say "build-dir: $BUILD_DIR   src-dir: $SRC_DIR   lock: $LOCK_DIR (take=$TAKE_LOCK)"
     say "preflights: <sha> == head of src-dir, GGML_SYCL ON, binaries newer than head and linked to SYCL, models," \
-        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders 0, Shmem < 30 GB, MemAvailable > 150 GB," \
+        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders clear (waited for, 15 min), Shmem < 30 GB," \
+        "MemAvailable > 150 GB," \
         "an empty or --arm/--clobber out-dir"
     for arm in "${ARMS[@]}"; do
         print_arm_plan "$arm"
@@ -1182,8 +1187,7 @@ for arm in "${ARMS[@]}"; do
     arm_setup "$arm"
     [ "$A_KIND" = journal ] || device_arms=1
 done
-[ "$device_arms" = 0 ] || [ "$(builders)" -eq 0 ] ||
-    refuse "builders (ninja + icpx) = $(builders) at the start (the arms wait for a build; the start does not)"
+[ "$device_arms" = 0 ] || wait_builders start
 [ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $(mem_line)"
 if [ "$TAKE_LOCK" = 1 ]; then
     lock_take || refuse "could not take $LOCK_DIR (held: $(cat "$LOCK_DIR/holder" 2>/dev/null || echo unknown))"
@@ -1193,7 +1197,8 @@ mkdir -p "$OUT_DIR"
 [ -z "$TUNING_DIR" ] || { mkdir -p "$TUNING_DIR"; export GGML_SYCL_TUNING_CACHE_DIR="$TUNING_DIR"; }
 [ -n "$SINCE" ] || SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
 
-say "gate: sha=${EXPECT_SHA:-unchecked} build=$BUILD_DIR out=$OUT_DIR since='$SINCE' arms=${ARMS[*]}"
+say "gate: sha=${EXPECT_SHA:-unchecked} build=$BUILD_DIR out=$OUT_DIR since='$SINCE' oneapi=$GATE_ONEAPI" \
+    "arms=${ARMS[*]}"
 say "pre: $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders=$(builders)"
 
 RUN_STARTED=1

@@ -506,10 +506,10 @@ no number in this section is a baseline, and none of the figures in the plan are
   head comparison and the newer-than-head check, so it gives up the guarantee that the binaries were built
   from the sha, and it still validates the sha format and still refuses a missing binary. A table taken
   under it is not a baseline.
-  The script refuses unless builders (ninja plus icpx) are 0 at the start and the host has settled
-  (`Shmem` under 30 GB, `MemAvailable` over 150 GB). Before each arm it waits for the builders to clear,
-  like the settle wait (15 minutes at most), and it samples both before every arm and 5 s after it, with
-  builders also sampled every 5 s during the arm. The log ends `verdicts_pass=N GATE_DONE`.
+  The script refuses unless the host has settled (`Shmem` under 30 GB, `MemAvailable` over 150 GB) and the
+  builders (ninja plus icpx) clear. A running build is waited out, before the lock at the start and before
+  every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem` and
+  `MemAvailable` before every arm and 5 s after it, with builders also sampled every 5 s during the arm. The log ends `verdicts_pass=N GATE_DONE`.
 - **Repeats and spread.** Every `llama-bench` arm uses `-r 3` except `Q_staged`, which uses `-r 1`: it
   counts staged slots, not throughput, so a repeat adds nothing. A cell is the mean of the three, with the
   standard deviation `llama-bench` prints beside it (`stddev_ts`). Three repeats make a spread, not a

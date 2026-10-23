@@ -33,7 +33,18 @@
 #     the first real run refuse with "no bin64/llama-bench": no bare BIN_DIR=, setvars sourced before the first use of
 #     GATE_BIN_DIR, no top-level name in common with oneAPI's, and a real run's refusal names the build's own bin;
 #   - the exit-143 path: a TERM kills the child, releases GPU.lock, prints the final line;
-#   - RING_ARMS: every arm in the list prints ring_engaged, and an arm outside it cannot move ring_engaged_any.
+#   - RING_ARMS: every arm in the list prints ring_engaged, and an arm outside it cannot move ring_engaged_any;
+#   - the arms fail closed: every arm scores rc != 0 as a FAIL (a GO or MI run that prints the answer and aborts in
+#     teardown must FAIL); the resets arm keeps journalctl's rc and fails a missing journal; Q_tok_cpu needs all four
+#     outputs non-empty and all four rcs 0; a RECORDED line with rc != 0 is exit 1; tps anchors on the eval line, so
+#     a nan eval is no_tg; refill is checked per device line;
+#   - a usage error prints the final line; the sha format is checked under --no-head-check; the head check reads
+#     the build's own source tree (--src-dir, a snapshot copy of the script); an exported GGML_SYCL_* or LLAMA_ARG_*
+#     variable and a non-empty --out-dir are refused (the journal arm alone runs the real flow GPU-free);
+#   - builders: builders_pre and builders_post on every verdict, a taint makes NOT_SCORED (exit 3), a builder wait
+#     is bounded, and every stop once the lock is held prints the summary over the verdicts scored so far (the
+#     --refuse-selftest, --signal-selftest and --wait-builders-selftest hooks);
+#   - prerequisites: a missing awk, md5sum, cmp, comm or journalctl is exit 77, in the test and in the gate.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -687,6 +698,19 @@ out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-clean" abcdef0)"
 expect "an empty journal with rc 0 passes" "$out" "resets=PASS count=0 builders_pre=na builders_post=na"
 expect "the run ends with the final line" "$out" "verdicts_pass=1 GATE_DONE"
 expect_rc "a clean journal run is exit 0" "$rc" 0
+
+# m16: a real run sources oneAPI, and an option VALUE that equals a mode flag must not skip it
+if [ -f /opt/intel/oneapi/setvars.sh ]; then
+    out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-oneapi" abcdef0)"
+    expect "a real run sources oneAPI" "$out" "oneapi=sourced"
+    out="$(rf "$WORK/fakebuild" --no-head-check --since --dry-run --out-dir "$WORK/rf-oneapi2" abcdef0)"
+    expect "an option value equal to a mode flag does not skip setvars" "$out" "oneapi=sourced"
+    expect "an option value equal to a mode flag does not turn the run into a dry run" "$out" "resets=PASS"
+else
+    pass "oneAPI is not installed here: the setvars-sourced checks are skipped"
+fi
+out="$(bash "$GATE" --score-arm resets --journal "$WORK/j-clean.txt" 2>&1)"
+expect_not "a scoring mode does not source oneAPI" "$out" "oneapi="
 
 # m3: an exported GGML_SYCL_* or LLAMA_ARG_* variable would reach every arm: refuse and name it
 out="$(GGML_SYCL_MOE_EXEC=cpu rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-leak" abcdef0)"; rc=$?
