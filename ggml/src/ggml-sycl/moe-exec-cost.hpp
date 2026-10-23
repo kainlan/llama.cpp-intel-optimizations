@@ -153,8 +153,10 @@ static inline double moe_exec_env_param(moe_exec_getenv_fn getenv_fn, const char
 //   MXFP4: B50, the batched XMX executor as a whole (gemm.execute + repack.tiled + repack.soa + stage: 12.25 s over
 //          48.9 TFLOP); the GEMM kernel alone is 10070, but the executor's cost is the whole.
 //   Q4_0:  B70, mulmat.mmvq.id_aos_q4_0, the per-row MMVQ path (11.81 GFLOP per 2048-row call in 18.68 ms).
-//   other: no batched mul_mat_id executor exists for them on this fork, so the per-row rate is the honest seed (the
-//          Q4_0 down matrix measured 590).
+//   other: the per-row rate (the Q4_0 down matrix measured 590).
+// These per-row seeds are stale: since llama.cpp-348c a prompt whose expert type is in
+// moe_pp_batched_f16_supports_layout runs through the batched oneDNN executor (moe.pp.gemm.execute), not per-row
+// MMVQ. They stand until the lead re-measures Q4_0 and the other types on that executor (llama.cpp-348c).
 static constexpr double MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED = 600.0;
 
 static inline double moe_exec_dev_gflops_seed(ggml_type t) {
