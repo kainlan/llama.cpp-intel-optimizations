@@ -130,10 +130,10 @@ POST_CLAIM = [
     "EXPERT_NOT_LOCAL", "EXPERT_LAYOUT", "XMX_TILE_CAPS", "F16_TILED", "NO_DEQUANT", "SCRATCH_SIZE", "SCRATCH_CACHE",
     "SCRATCH_RESERVE", "SCRATCH_SLOT", "SCRATCH_SLOT_SIZE", "GEMM",
 ]
-# A decline after the dispatch took a staged ring slot is printed whatever its cause (llama.cpp-3460): its staged
-# experts then run on the CPU path.
-WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) && "
-                  "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
+# A decline after the dispatch took a staged ring slot, or on a layer the ring staged in full for this executor, is
+# printed whatever its cause (llama.cpp-3460): its staged experts then run on the CPU path.
+WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+                  "pp_onednn_batched_claims_staged_layer) && ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
 # Types the f16 table takes that the device test does not run, each with its reason. The fixture quantizes its
 # weights with no importance matrix, so these three are the whole list.
 GROUP_KNOB = "GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX"
@@ -481,7 +481,8 @@ def claim_c_q4k_fallback(s):
         fails.append("device_weight_cpu_fallback is not exactly Q4_K: a claim term there only strips the CPU "
                      "fallback from hybrid ops the executor never runs")
     claims = statement(sycl, "const bool pp_onednn_batched_route_claims_prompt =") or ""
-    if "prompt_batch && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device)" not in claims:
+    if ("prompt_batch && (pp_onednn_batched_claims_staged_layer || "
+            "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device))") not in claims:
         fails.append("pp_onednn_batched_route_claims_prompt is not the prompt-only claim")
     needs = statement(sycl, "const bool planner_needs_prompt_route =") or ""
     if "!pp_onednn_batched_route_claims_prompt" not in needs:
@@ -503,10 +504,10 @@ def claim_d_decode_terms(s):
     for text in (
         "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;",
         "const bool pp_onednn_batched_route_claims_prompt = prompt_batch && "
-        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);",
+        "(pp_onednn_batched_claims_staged_layer || ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));",
         "const bool prompt_batch = ids && ids->ne[1] > 1;",
         "const bool pp_onednn_batched_claims_op = ne12 > 1 && "
-        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);",
+        "(pp_onednn_batched_claims_staged_layer || ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));",
     ):
         if text not in sycl:
             fails.append(f"missing decode-preserving term: {text}")
@@ -1110,13 +1111,18 @@ MUTANTS = [
      "case moe_pp_batched_refusal::EXPERT_LAYOUT:"),
     ("e", "tables", "case moe_pp_batched_refusal::GEMM: return true;",
      "case moe_pp_batched_refusal::GEMM: case moe_pp_batched_refusal::DECODE: return true;"),
-    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&",
-     "pp_f16_batched_trace &&"),
-    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&",
-     "(true || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&"),
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+     "pp_onednn_batched_claims_staged_layer) &&", "pp_f16_batched_trace &&"),
+    ("e", "sycl", "(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+     "pp_onednn_batched_claims_staged_layer) &&",
+     "(true || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
+     "pp_onednn_batched_claims_staged_layer) &&"),
     # A decline after a staged slot left quiet when its cause is a precheck (llama.cpp-3460).
-    ("e", "sycl", "|| moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0) &&",
-     "|| moe_pp_batched_refusal_after_claim(refusal)) &&"),
+    ("e", "sycl", "|| pp_staged_experts > 0 || pp_onednn_batched_claims_staged_layer) &&",
+     "|| pp_onednn_batched_claims_staged_layer) &&"),
+    # A precheck decline on a layer the ring staged in full left quiet (llama.cpp-3460).
+    ("e", "sycl", "|| pp_staged_experts > 0 || pp_onednn_batched_claims_staged_layer) &&",
+     "|| pp_staged_experts > 0) &&"),
     ("f", "sycl", "if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout))", "if (true)"),
     ("f", "sycl", "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)",
      "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, GGML_LAYOUT_AOS)"),

@@ -31,6 +31,11 @@ What this gate pins:
     decline (llama.cpp-3460): one stage-table lookup in its expert loop, only for a non-device expert, keyed as the
     staged route keys it, the slot and layout from the entry, the entry's ready event on the executor's barrier, and
     the slot's lease held until the done marker;
+  - a prompt layer whose routed host experts are all staged, for a weight the batched executor claims once its host
+    experts are staged, leaves the hybrid world (plan Task 10, llama.cpp-3460): ggml_sycl_mul_mat_id asks the stage
+    table once, after begin_layer, on the ids begin_layer was given, together with the staged claim, and the one bool
+    clears plan_has_cpu_experts and joins the resident claim at the MMVQ-probe skip and the prompt route; decode keeps
+    `ne12 == 1 ||` and the retained prompt batch keeps allow_materialize=false;
   - the device recipe is one function shared by a resident expert and a staged slot (one fact, one source);
   - the staged branch keeps no persistent handle: no moe_expert_handles[] write, no remember_moe_storage_handle, no
     handle retention; the transient pointer-table upload clears a staged slot's handle entry and keeps it out of the
@@ -683,6 +688,95 @@ def test_executor_reads_staged_slots_mutants():
     # The staged slot not counted, so a decline after it stays quiet.
     assert not c(mutate(SYCL, "++pp_staged_experts; }", "}"))
 
+
+
+# ---- a fully staged prompt layer leaves the hybrid world -------------------------------------------------------------
+
+# plan Task 10 (llama.cpp-3460): one bool, set once after begin_layer staged the layer, from the staged claim and the
+# stage table, on the ids begin_layer was given; it clears plan_has_cpu_experts and joins the resident claim at the
+# MMVQ-probe skip and at the prompt route, so the op reaches the batched executor in the non-hybrid world.
+STAGED_LAYER_DECL = "bool pp_onednn_batched_claims_staged_layer = false;"
+STAGED_LAYER_BEGIN = ("if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) { "
+                      "ctx.moe_stream->begin_layer(")
+STAGED_LAYER_SET = ("pp_onednn_batched_claims_staged_layer = "
+                    "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*stream_call.plan, src0, ctx.device) && "
+                    "ctx.moe_stream->fully_staged(stream_call.layer, prompt_ids_snapshot.data(), "
+                    "prompt_ids_snapshot.size(), stream_call.op.n_expert);")
+# The release site stays directly after begin_layer (claim_staged_pointer_released_with_ring); the bool follows it,
+# inside the same block.
+STAGED_LAYER_SITE = ("prompt_ids_snapshot.size(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx); "
+                     + STAGED_LAYER_SET + " } }")
+RETAINED_BUILD = ("retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, ctx.device, "
+                  "prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]), "
+                  "retained_prompt_layout, false, &ctx, ctx.stream());")
+PROBE_CLAIM = ("const bool pp_onednn_batched_claims_op = ne12 > 1 && (pp_onednn_batched_claims_staged_layer || "
+               "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));")
+PLAN_HAS_CPU = ("plan_has_cpu_experts = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && "
+                "!pp_onednn_batched_claims_staged_layer;")
+ROUTE_CLAIM = ("const bool pp_onednn_batched_route_claims_prompt = prompt_batch && "
+               "(pp_onednn_batched_claims_staged_layer || "
+               "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));")
+HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;"
+
+
+def claim_fully_staged_layer_leaves_hybrid(sycl: str) -> bool:
+    """A prompt layer whose routed host experts are all staged in the ring, for a weight the batched executor claims
+    once its host experts are staged, leaves the hybrid world (plan Task 10, llama.cpp-3460). ggml_sycl_mul_mat_id
+    asks the stage table exactly once (`->fully_staged(`), after begin_layer staged the layer, keyed by the layer the
+    phase stages under and on the ids begin_layer was given (no second copy of them), and only together with the
+    staged claim, so a staged layer the executor does not claim stays hybrid. The one bool clears plan_has_cpu_experts
+    and joins the resident claim at the MMVQ-probe skip and at the prompt route; decode keeps its unconditional
+    `ne12 == 1 ||` term, and the retained prompt batch still builds with allow_materialize=false."""
+    m = body(norm(sycl), MMID_SIG)
+    return (m != "" and m.count("->fully_staged(") == 1 and m.count(STAGED_LAYER_DECL) == 1
+            and m.count(STAGED_LAYER_SET) == 1 and m.count(STAGED_LAYER_SITE) == 1
+            and m.count("pp_onednn_batched_claims_staged_layer =") == 2
+            and ordered(m, STAGED_LAYER_DECL, STAGED_LAYER_BEGIN, STAGED_LAYER_SITE, RETAINED_BUILD, PROBE_CLAIM,
+                        PLAN_HAS_CPU, ROUTE_CLAIM, HYBRID_WITH_PLAN))
+
+
+def test_fully_staged_layer_leaves_hybrid():
+    assert claim_fully_staged_layer_leaves_hybrid(SYCL)
+
+
+def test_fully_staged_layer_leaves_hybrid_mutants():
+    c = claim_fully_staged_layer_leaves_hybrid
+    fully = (" && ctx.moe_stream->fully_staged(stream_call.layer, prompt_ids_snapshot.data(), "
+             "prompt_ids_snapshot.size(), stream_call.op.n_expert);")
+    # A layer with an un-staged host expert leaves the hybrid world: the stage table is not asked.
+    assert not c(mutate(SYCL, fully, ";"))
+    # A staged layer the executor does not claim leaves it too: the staged claim is not asked.
+    assert not c(mutate(SYCL, "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*stream_call.plan, src0, "
+                              "ctx.device) && ctx.moe_stream->fully_staged(", "ctx.moe_stream->fully_staged("))
+    # The stage table asked a second time, on the plan_has_cpu_experts line, as the brief's one-liner wrote it.
+    assert not c(mutate(SYCL, PLAN_HAS_CPU,
+                        "plan_has_cpu_experts = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && "
+                        "!pp_onednn_batched_claims_staged_layer && !(ctx.moe_stream && ctx.moe_stream->fully_staged("
+                        "stream_call_layer, ids_host.data(), ids_host.size(), n_exp));"))
+    # Keyed by another layer than the one the phase stages under.
+    assert not c(mutate(SYCL, "fully_staged(stream_call.layer,", "fully_staged(moe_cache_layer_id(src0->name),"))
+    # The table asked before begin_layer staged the layer, so the first op of a layer always stays hybrid.
+    m = mutate(SYCL, " " + STAGED_LAYER_SET + " } }", " } }")
+    m = m.replace(STAGED_LAYER_BEGIN, STAGED_LAYER_BEGIN.replace("ctx.moe_stream->begin_layer(",
+                                                                   STAGED_LAYER_SET + " ctx.moe_stream->begin_layer("), 1)
+    assert not c(m)
+    # The plan's host experts keep the op hybrid: plan_has_cpu_experts is not cleared.
+    assert not c(mutate(SYCL, " && !pp_onednn_batched_claims_staged_layer;", ";"))
+    # The MMVQ probes may consume a staged op before the executor sees it.
+    assert not c(mutate(SYCL, "ne12 > 1 && (pp_onednn_batched_claims_staged_layer || "
+                              "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));",
+                        "ne12 > 1 && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);"))
+    # The planner's prompt route keeps a staged op hybrid.
+    assert not c(mutate(SYCL, "prompt_batch && (pp_onednn_batched_claims_staged_layer || "
+                              "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));",
+                        "prompt_batch && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);"))
+    # Decode steered by the staged bool: the unconditional decode term dropped.
+    assert not c(mutate(SYCL, HYBRID_WITH_PLAN, "const bool moe_hybrid_with_plan = selected_hybrid_route;"))
+    # The retained prompt batch materializes, so a staged layer's host experts are copied twice.
+    assert not c(mutate(SYCL, "retained_prompt_layout, false, &ctx, ctx.stream());",
+                        "retained_prompt_layout, true, &ctx, ctx.stream());"))
+    # A second writer of the bool.
+    assert not c(mutate(SYCL, PLAN_HAS_CPU, "pp_onednn_batched_claims_staged_layer = false; " + PLAN_HAS_CPU))
 
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
     """A decode build never takes the phase: `rows > 1` is the first term of the phase pointer's condition, ahead of
