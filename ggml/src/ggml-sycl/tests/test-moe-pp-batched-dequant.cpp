@@ -492,8 +492,9 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     if (refused != 0 || prompt_rf != 0 || unplanned != 0) {
         why += " refusal";
     }
-    if (batched != 0 && groups < k_min_groups) {
-        why += " groups";
+    // A success line with no groups= field fails too: the parse returns SIZE_MAX for it, which no minimum catches.
+    if (batched != 0 && (groups == SIZE_MAX || groups < k_min_groups)) {
+        why += groups == SIZE_MAX ? " groups-field" : " groups";
     }
     std::fprintf(stderr,
                  "CASE type=%s tokens=%d ne11=%d status=%d nmse=%.3e pp_moe_lines=%zu pp_moe_total=%zu "
