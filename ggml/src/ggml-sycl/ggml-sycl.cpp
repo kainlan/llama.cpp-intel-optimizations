@@ -34852,10 +34852,11 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         cap.reason        = "local-mmvq";
         return cap;
     }
-    // llama.cpp-348c: a type with no MMVQ id kernel (IQ4_XS, IQ1_S, IQ1_M) still has a prompt executor when the
-    // batched oneDNN prompt executor takes its loaded layout: it dequantizes each expert to f16 and multiplies them in
-    // one batched GEMM. Prompt only, since that executor declines one-token rows, so decode stays refused; and only
-    // for a K the dequant reads in whole blocks.
+    // llama.cpp-348c: a (type, layout) the MMVQ id table above does not serve still has a prompt executor when the
+    // batched oneDNN prompt executor takes it: it dequantizes each expert to f16 and multiplies them in one batched
+    // GEMM. That covers a type with no MMVQ id kernel at all (IQ4_XS, IQ1_S, IQ1_M) and a layout the table has no
+    // kernel for, such as Q4_0, Q8_0, Q4_K and Q6_K loaded SOA (c-jx9g). Prompt only, since that executor declines
+    // one-token rows, so decode stays refused; and only for a K the dequant reads in whole blocks.
     if (phase == moe_route_phase::PROMPT && ggml_sycl_moe_pp_batched_takes_layout(type, layout) &&
         K % ggml_blck_size(type) == 0) {
         cap.supported     = true;
@@ -80888,7 +80889,7 @@ static void mxfp4_pp_batched_profile_record_graph_total(double graph_us) {
 // candidate gate, its claim predicate, the plan's f16 slot sizing and the capability query's prompt route ask about the
 // type. The answer is the tables in moe-mmvq-tables.hpp under the route knob, GGML_SYCL_MOE_PP_ONEDNN_F16 (the
 // executor's own switch), GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_F16_BATCHED_AOS. Without oneDNN the executor does
-// not exist, and only MXFP4 SOA is taken, as before (see the claim's #else arm).
+// not exist, and the #else arm below takes only MXFP4 SOA, as before llama.cpp-348c.
 static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout) {
     if (!ggml_sycl_moe_pp_onednn_batched_route_selected()) {
         return false;
@@ -81007,8 +81008,10 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     }
     // Down never plans XMX_TILED, so the table's XMX_TILED entry (the WOQ arm's repack_mxfp4_xmx_tiled_to_woq, taken
     // only while GGML_SYCL_MOE_PP_WOQ is on) cannot widen down's route: only gate/up's. Without oneDNN the table
-    // answers with neither knob, so XMX_TILED is never claimed there and a tiled op cannot fall through to the
-    // tiled-illiterate per-expert staging path (llama.cpp-sr83 finding B, llama.cpp-71hx silent-garbage hazard).
+    // answers with neither knob, so XMX_TILED is never claimed there. That matters because the non-DNNL lambda has no
+    // fail-closed throw for a claimed tiled op it declines (tiled_claimed_op exists only in the oneDNN build), so a
+    // claimed tiled op would fall through to the per-expert staging path, which cannot read tiled bytes and computes
+    // garbage silently (llama.cpp-71hx).
     if (planned_layout == GGML_LAYOUT_XMX_TILED && role == MOE_TENSOR_DOWN) {
         return false;
     }
@@ -82604,15 +82607,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         return src0 == roles.gate.weight_identity || src0 == roles.up.weight_identity;
     }();
     const bool cpu_tg_candidate = prompt_pair_retained_roles_capable && prompt_pair_current_node;
-    // llama.cpp-dboi: when the oneDNN-batched MoE PP route is selected, the
-    // fused pair-GLU fast path declines PP admission so dispatch continues to
-    // the retained unfused flow and reaches the batched executor
-    // (try_pp_onednn_f16_batched) below. Decode (ne12 == 1) is
-    // untouched -- the batched route is PP-only.
-    // llama.cpp-1tjn (Option T follow-up): must decline ONLY when this op is
-    // actually claimed (SOA-planned) -- under Option T gate/up stay
-    // XMX_TILED-planned even with the policy selected, and the fused tiled
-    // executor here is their CORRECT path, not the batched one.
+    // llama.cpp-dboi: when the batched oneDNN MoE PP executor claims this op,
+    // the fused pair-GLU fast path declines PP admission so dispatch continues
+    // to the retained unfused flow and reaches the executor
+    // (try_pp_onednn_f16_batched) below. Decode (ne12 == 1) is untouched --
+    // the executor is PP-only.
+    // llama.cpp-1tjn, llama.cpp-348c: decline ONLY when this op's planned
+    // layout is a (type, layout) the batched executor claims
+    // (ggml_sycl_moe_pp_onednn_batched_claims_tensor). Any other layout, such
+    // as MXFP4 gate/up planned XMX_TILED with GGML_SYCL_MOE_PP_WOQ=0, keeps
+    // the fused tiled executor here, which is its correct path.
     const bool pp_onednn_batched_route = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
     if (cpu_tg_candidate && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         fprintf(stderr,
@@ -83852,21 +83856,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         return;
                     }
                 }
-                // llama.cpp-dboi: at PP under the oneDNN-batched route policy,
-                // MXFP4 gate/up/down must fall past the per-row MMVQ probes
-                // (the try-soa probe would otherwise consume the op here at
-                // ~53 t/s pp512) so dispatch reaches the batched oneDNN
-                // executor below. Down is claimed too: leaving it on the
-                // per-row route capped the whole pass at ~155 t/s, and its I8
-                // planning upgrade is disabled under this policy so its SOA
-                // primaries satisfy the batched route. Decode (ne12 == 1) is
-                // untouched -- MMVQ remains the decode route for SOA-planned
-                // weights.
-                // llama.cpp-1tjn (Option T follow-up): claim only when this
-                // op's PLANNED layout is actually SOA -- under Option T
-                // gate/up plan XMX_TILED even with the policy selected, and
-                // must stay on their normal (tiled) route, not fall through
-                // to the batched executor's SOA-only staging fallback.
+                // llama.cpp-dboi: at PP, a gate/up/down op the batched oneDNN
+                // executor claims must fall past the per-row MMVQ probes (for
+                // MXFP4 the try-soa probe would otherwise consume the op here
+                // at ~53 t/s pp512) so dispatch reaches the executor below.
+                // Down is claimed too: leaving MXFP4 down on the per-row route
+                // capped the whole pass at ~155 t/s, and its I8 planning
+                // upgrade is disabled under the route policy so its SOA
+                // primaries satisfy the executor. Decode (ne12 == 1) is
+                // untouched -- MMVQ remains the decode route.
+                // llama.cpp-1tjn, llama.cpp-348c: skip the probes only when
+                // this op's planned layout is a (type, layout) the batched
+                // executor claims (ggml_sycl_moe_pp_onednn_batched_claims_tensor).
+                // Any other layout, such as MXFP4 gate/up planned XMX_TILED
+                // with GGML_SYCL_MOE_PP_WOQ=0, stays on its normal route and
+                // never reaches the executor's per-expert staging fallback,
+                // which reads SOA only.
                 const bool pp_onednn_batched_claims_op =
                     ne12 > 1 && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
                 if (pp_onednn_batched_claims_op && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -85328,16 +85333,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool planner_needs_decode_route = has_placement_plan &&
                                             g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
                                             (plan_has_cpu_experts || plan_has_secondary_experts);
-    // llama.cpp-dboi: the oneDNN-batched PP executor lives in the retained
-    // (non-hybrid) dispatch world below; when its route policy claims an MXFP4
-    // gate/up prompt op, prompt routing must not select the hybrid per-entry
-    // world, whose single-kernel MMVQ dispatch would consume the op first.
-    // Plans with host-resident experts keep hybrid via plan_hybrid regardless
-    // (the batched executor requires every active expert local anyway and
-    // rejects into its staging fallback otherwise).
-    // llama.cpp-1tjn (Option T follow-up): claim only when this op's PLANNED
-    // layout is actually SOA -- under Option T gate/up plan XMX_TILED even
-    // with the policy selected and must keep their normal prompt route.
+    // llama.cpp-dboi: the batched oneDNN PP executor lives in the retained
+    // (non-hybrid) dispatch world below; when it claims a prompt op, prompt
+    // routing must not select the hybrid per-entry world, whose single-kernel
+    // MMVQ dispatch would consume the op first. Plans with host-resident
+    // experts keep hybrid via plan_hybrid regardless (the claim needs every
+    // expert planned on this device, and the executor refuses an expert that
+    // is not local).
+    // llama.cpp-1tjn, llama.cpp-348c: the claim holds only when this op's
+    // planned layout is a (type, layout) the batched executor claims
+    // (ggml_sycl_moe_pp_onednn_batched_claims_tensor); any other layout keeps
+    // its normal prompt route.
     const bool pp_onednn_batched_route_claims_prompt =
         prompt_batch && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
     const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && prompt_batch &&

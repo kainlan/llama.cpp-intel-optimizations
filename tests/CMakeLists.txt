@@ -977,8 +977,10 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
-    # llama.cpp-348c: the batched oneDNN prompt executor is type-keyed: one support table, the Q4_K D2H fallback
-    # off for claimed prompts, one refusal enum, one [PP-MOE] line per (device, type), byte-identical MXFP4 labels.
+    # llama.cpp-348c: the batched oneDNN prompt executor is type-keyed: one support table that the device test
+    # covers, claimed prompts reaching the executor ahead of the Q4_K D2H fallback by route precedence (the fallback
+    # itself unchanged), one refusal enum whose post-claim causes warn by default, one [PP-MOE] line per (device,
+    # type, layout), byte-identical MXFP4 labels.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-pp-batched-types-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-pp-batched-types-source.py

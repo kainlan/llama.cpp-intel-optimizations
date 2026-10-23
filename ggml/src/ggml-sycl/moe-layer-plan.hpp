@@ -597,7 +597,8 @@ enum class moe_route_kernel : uint8_t {
     MXFP4_I8                 = 5,
     MXFP4_DPAS               = 6,
     DEVICE_MMVQ_Q1_NVFP4_AOS = 7,
-    // llama.cpp-348c: the batched oneDNN prompt executor, for a prompt whose expert type has no MMVQ id kernel.
+    // llama.cpp-348c: the batched oneDNN prompt executor, for a prompt whose (type, layout) the MMVQ id table does
+    // not serve: a type with no MMVQ id kernel (IQ4_XS, IQ1_S, IQ1_M), or Q4_0, Q8_0, Q4_K or Q6_K loaded SOA.
     ONEDNN_BATCHED_PROMPT    = 8,
 };
 
