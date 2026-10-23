@@ -345,7 +345,7 @@ inline bool moe_pp_batched_has_expert_entries(enum ggml_type type, enum ggml_lay
 enum class moe_pp_batched_refusal : uint8_t {
     NONE = 0,
     CPU_REFERENCE,      // GGML_SYCL_MOE_CPU_REFERENCE asked for the CPU reference instead
-    ROUTE_OFF,          // the batched route is not selected (GGML_SYCL_MOE_PP_ONEDNN_BATCHED=0, or no oneDNN)
+    ROUTE_OFF,          // GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=0 (route not selected) or GGML_SYCL_MOE_PP_ONEDNN_F16=0
     CANDIDATE,          // the (type, layout) pair is not in the tables above, or src1/dst are not f32
     NO_EXPERT_CACHE,    // the dispatch has no expert cache to resolve experts through
     NO_PLAN,            // the layer has no execution plan

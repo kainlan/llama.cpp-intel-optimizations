@@ -1456,6 +1456,19 @@ static inline bool ggml_sycl_moe_pp_onednn_batched_route_selected() {
     return enabled;
 }
 
+// GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the batched executor off, both its arms, and the MXFP4 per-expert f16 staging
+// fallback with it; unset or any other value keeps them on. It used to be read inside the dispatch alone, so with it at
+// 0 the claim predicate still took ops the executor then declined. The executor's support helper now asks it as well
+// (ggml_sycl_moe_pp_batched_takes_layout), so the claim, the capability query and the plan's slot sizing all see the
+// executor off (llama.cpp-348c).
+static inline bool ggml_sycl_moe_pp_onednn_f16_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // llama.cpp-348c: the batched executor's f16 arm takes every expert type with an AOS dequant-to-f16 kernel
 // (moe_pp_batched_f16_supports_layout, moe-mmvq-tables.hpp), not only MXFP4. GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0
 // restricts it to MXFP4 again, both at dispatch and in the plan's f16 weight slot; unset or any other value

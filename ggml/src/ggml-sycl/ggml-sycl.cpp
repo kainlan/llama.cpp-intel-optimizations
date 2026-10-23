@@ -80851,14 +80851,17 @@ static void mxfp4_pp_batched_profile_record_graph_total(double graph_us) {
 
 // Whether the batched mul_mat_id prompt executor takes `type` loaded in `layout` (llama.cpp-348c): the one question its
 // candidate gate, its claim predicate, the plan's f16 slot sizing and the capability query's prompt route ask about the
-// type. The answer is the tables in moe-mmvq-tables.hpp under the route knob, GGML_SYCL_MOE_PP_WOQ and
-// GGML_SYCL_MOE_PP_F16_BATCHED_AOS. Without oneDNN the executor does not exist, and only MXFP4 SOA is taken, as before
-// (see the claim's #else arm).
+// type. The answer is the tables in moe-mmvq-tables.hpp under the route knob, GGML_SYCL_MOE_PP_ONEDNN_F16 (the
+// executor's own switch), GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_F16_BATCHED_AOS. Without oneDNN the executor does
+// not exist, and only MXFP4 SOA is taken, as before (see the claim's #else arm).
 static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout) {
     if (!ggml_sycl_moe_pp_onednn_batched_route_selected()) {
         return false;
     }
 #if GGML_SYCL_DNNL
+    if (!ggml_sycl_moe_pp_onednn_f16_enabled()) {
+        return false;
+    }
     return moe_pp_batched_supports_layout(type, layout, ggml_sycl_moe_pp_woq_enabled(),
                                           ggml_sycl_moe_pp_f16_batched_aos_enabled());
 #else
@@ -88591,10 +88594,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         };
 
 #if GGML_SYCL_DNNL
-        static const bool pp_mxfp4_soa_f16_env_enabled = []() {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16");
-            return env == nullptr || std::atoi(env) != 0;
-        }();
+        const bool pp_mxfp4_soa_f16_env_enabled = ggml_sycl_moe_pp_onednn_f16_enabled();
         // llama.cpp-sr83 (C3, Option T): gate/up plan XMX_TILED by default;
         // the batched lambda now repacks that layout too
         // (repack_mxfp4_xmx_tiled_to_woq), so it must be admitted as a
@@ -88615,10 +88615,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                 dst->type == GGML_TYPE_F32;
         // llama.cpp-348c: the batched executor's own candidate gate asks the claim predicate's table, on the layout
         // this tensor is routed in, for every expert type; pp_mxfp4_soa_f16_candidate above stays the MXFP4 staging
-        // fallback's. XMX_TILED stays gate/up only (down never plans it) and GGML_SYCL_MOE_PP_ONEDNN_F16=0 still turns
-        // the executor off.
+        // fallback's. XMX_TILED stays gate/up only (down never plans it). GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the
+        // executor off through the same table, and the executor reports it as route-off before it asks this.
         const bool pp_batched_candidate =
-            pp_mxfp4_soa_f16_env_enabled && ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout) &&
+            ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout) &&
             (route_layout != GGML_LAYOUT_XMX_TILED || pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 #else
@@ -88635,7 +88635,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // llama.cpp-dboi: enablement comes from the shared route policy
             // (env override + built-in default), the same predicate that made
             // the planner keep SOA and the fused pair-GLU PP path decline.
-            const bool        pp_mxfp4_soa_f16_batched_env_enabled = ggml_sycl_moe_pp_onednn_batched_route_selected();
+            // llama.cpp-348c: and from the executor's own switch, so either knob at 0 is refused as route-off.
+            const bool pp_mxfp4_soa_f16_batched_env_enabled =
+                ggml_sycl_moe_pp_onednn_batched_route_selected() && ggml_sycl_moe_pp_onednn_f16_enabled();
             static const bool pp_mxfp4_soa_f16_batched_trace = []() {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE");
                 return env && std::atoi(env) != 0;
