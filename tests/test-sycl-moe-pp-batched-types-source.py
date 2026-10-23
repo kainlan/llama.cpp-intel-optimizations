@@ -29,6 +29,7 @@ pin that shape:
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
 """
+import functools
 import re
 from pathlib import Path
 
@@ -97,6 +98,16 @@ def all_backend_sources():
             yield path
 
 
+@functools.lru_cache(maxsize=None)
+def backend_texts():
+    """(comment-stripped, squeezed) text of every backend source, read once: the mutants never touch these files."""
+    out = []
+    for path in all_backend_sources():
+        stripped = strip_comments(path.read_text())
+        out.append((stripped, squeeze(stripped)))
+    return tuple(out)
+
+
 def match_close(text, open_pos):
     """Index just past the bracket matching text[open_pos], skipping string and char literals; -1 if unmatched."""
     pairs = {"(": ")", "{": "}", "[": "]"}
@@ -161,9 +172,10 @@ def lambda_body(sycl):
     return sycl[m.end() - 1 : close] if close > 0 else None
 
 
-def statement(text, head):
-    """The statement starting at `head` up to its terminating ';' at bracket depth 0, or None."""
-    start = text.find(head)
+def statement(text, head, start=None):
+    """The statement starting at `head` (or at offset `start`) up to its terminating ';' at bracket depth 0, or None."""
+    if start is None:
+        start = text.find(head)
     if start < 0:
         return None
     depth = 0
@@ -345,7 +357,7 @@ def claim_d_decode_terms(s):
 def claim_e_refusal_enum(s):
     fails = []
     head = "enum class moe_pp_batched_refusal : uint8_t"
-    defs = sum(squeeze(strip_comments(p.read_text())).count(head) for p in all_backend_sources())
+    defs = sum(squeezed.count(head) for _, squeezed in backend_texts())
     if defs != 1:
         return [f"`{head}` is defined {defs} times in the backend sources, want 1"]
     holder = next(k for k in ("tables", "sycl") if head in s[k])
@@ -371,13 +383,15 @@ def claim_e_refusal_enum(s):
         fails.append(f"{literal} appears {s['sycl'].count(literal)} times in ggml-sycl.cpp, want 1")
     else:
         pos = s["sycl"].find(literal)
-        cond = enclosing_if_condition(s["sycl"], pos) or ""
+        lam_pos = lam.find(literal)
+        cond = enclosing_if_condition(lam, lam_pos) if lam_pos >= 0 else ""
+        cond = cond or ""
         if "pp_mxfp4_soa_f16_batched_trace" not in cond or "ggml_sycl_moe_pp_batched_refusal_first(" not in cond:
             fails.append("the refusal WARN is not guarded by the trace knob and the per-(device, cause) latch")
         stmt_start = s["sycl"].rfind("GGML_LOG_", 0, pos)
         if not s["sycl"].startswith("GGML_LOG_WARN(", stmt_start):
             fails.append("the refusal line is not emitted with GGML_LOG_WARN")
-        stmt = statement(s["sycl"], s["sycl"][stmt_start:pos]) or ""
+        stmt = statement(s["sycl"], None, start=stmt_start) or ""
         if "moe_pp_batched_refusal_name(" not in stmt:
             fails.append("the refusal WARN does not print the cause name")
     latch = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_refusal_first")
@@ -393,13 +407,16 @@ def claim_f_first_run_line(s):
     if sycl.count(literal) != 1:
         return [f"{literal} appears {sycl.count(literal)} times in ggml-sycl.cpp, want 1"]
     pos = sycl.find(literal)
-    cond = enclosing_if_condition(sycl, pos) or ""
+    lam = lambda_body(sycl) or ""
+    lam_pos = lam.find(literal)
+    cond = enclosing_if_condition(lam, lam_pos) if lam_pos >= 0 else ""
+    cond = cond or ""
     if cond.strip() != "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type)":
         fails.append(f"the [PP-MOE] line is guarded by `{cond.strip()}`, not the per-(device, type) latch")
     stmt_start = sycl.rfind("GGML_LOG_", 0, pos)
     if not sycl.startswith("GGML_LOG_INFO(", stmt_start):
         fails.append("the [PP-MOE] line is not emitted with GGML_LOG_INFO")
-    stmt = statement(sycl, sycl[stmt_start:pos]) or ""
+    stmt = statement(sycl, None, start=stmt_start) or ""
     for field in ("experts=", "planned_weight_slot="):
         if field not in stmt:
             fails.append(f"the [PP-MOE] line does not name {field}")
@@ -487,8 +504,10 @@ def claim_i_sizing(s):
     body = one_definition(sycl, "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes")
     if body is None:
         return ["ggml_sycl_moe_pp_batched_f16_weight_slot_bytes is not defined exactly once"]
-    if "moe_pp_batched_f16_supports_layout(" not in body:
-        fails.append("the f16 slot sizing does not ask the f16 table which experts it covers")
+    # The sizing asks the executor's own predicate on AOS (one fact, one source): the f16 arm's entries for every
+    # type but MXFP4, under the same knobs the dispatch reads.
+    if "ggml_sycl_moe_pp_batched_takes_layout(tensor.type, GGML_LAYOUT_AOS)" not in body:
+        fails.append("the f16 slot sizing does not ask the executor's predicate which AOS experts it takes")
     if "n_expert" not in body:
         fails.append("the f16 slot sizing does not size for every expert (n_expert)")
     if "sizeof(sycl::half)" not in body:
@@ -502,7 +521,7 @@ def claim_i_sizing(s):
 def claim_j_knob(s):
     fails = []
     literal = f'"{KNOB}"'
-    total = sum(strip_comments(p.read_text()).count(literal) for p in all_backend_sources())
+    total = sum(stripped.count(literal) for stripped, _ in backend_texts())
     if total != 1:
         fails.append(f"{literal} appears {total} times in the backend sources, want 1")
     body = one_definition(s["common"], "ggml_sycl_moe_pp_f16_batched_aos_enabled")
@@ -552,7 +571,8 @@ MUTANTS = [
     ("b", "tables", "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_SOA;",
      "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_AOS;"),
     ("b", "tables", "case GGML_TYPE_IQ4_XS:", "case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q1_0:"),
-    ("c", "sycl", " && !pp_onednn_batched_route_claims_prompt;", ";"),
+    ("c", "sycl", "(src0->type == GGML_TYPE_Q4_K) && !pp_onednn_batched_route_claims_prompt;",
+     "(src0->type == GGML_TYPE_Q4_K);"),
     ("d", "sycl", "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;",
      "const bool moe_hybrid_with_plan = selected_hybrid_route;"),
     ("d", "sycl", "const bool pp_onednn_batched_claims_op = ne12 > 1 && ",
@@ -576,7 +596,7 @@ MUTANTS = [
      "ggml_sycl_moe_pp_onednn_batched_claims_tensor("),
     ("h", "sycl", " && !ggml_sycl_moe_pp_batched_admits_op(op, device)) {", ") {"),
     ("i", "sycl", "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(inventory))", "size_t(0))"),
-    ("i", "sycl", "moe_pp_batched_f16_supports_layout(tensor.type, GGML_LAYOUT_AOS)", "true"),
+    ("i", "sycl", "ggml_sycl_moe_pp_batched_takes_layout(tensor.type, GGML_LAYOUT_AOS)", "true"),
     ("j", "sycl", "ggml_sycl_moe_pp_f16_batched_aos_enabled()", "true"),
     ("j", "common", "return env == nullptr || std::atoi(env) != 0; }(); return aos_enabled;",
      "return env != nullptr && std::atoi(env) != 0; }(); return aos_enabled;"),

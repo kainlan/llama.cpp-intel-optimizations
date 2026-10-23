@@ -407,8 +407,10 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
                     "dequantize_row_mxfp4_soa_to_fp16_rowmajor(",
                     "DnnlGemmWrapper::gemm_batch_strided("),
         "the batched executor refuses with the typed reason name":
-            "return reject_batched(ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason));"
-            in batched,
+            ordered(batched,
+                    "const char * reason_name = "
+                    "ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason);",
+                    "return reject_batched(moe_pp_batched_refusal::SCRATCH_UNPLANNED, reason_name);"),
         "the non-batched staging admits before it reserves":
             ordered(staging, "pp_moe_onednn_admit_scratch(planned_shape, required_shape)",
                     "reserve_pp_moe_onednn_scratch(planned_weight_slot, planned_activation_slot,"),

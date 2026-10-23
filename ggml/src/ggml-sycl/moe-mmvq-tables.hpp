@@ -267,8 +267,9 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
 //
 // The executor's candidate gate and its claim predicate (ggml_sycl_moe_pp_onednn_batched_claims_tensor)
-// both ask moe_pp_batched_supports_layout and nothing else about the type. The plan's f16 weight slot is
-// sized from moe_pp_batched_f16_supports_layout, so a type the arm takes always has its slot planned.
+// both ask moe_pp_batched_supports_layout and nothing else about the type. The plan sizes the f16 weight
+// slot by asking the same question at AOS, so a type the arm takes always has its slot planned, and with
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 no AOS slot is planned at all.
 inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_MXFP4:
@@ -317,17 +318,6 @@ inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
         return false;
     }
     return moe_pp_batched_f16_supports_layout(type, layout);
-}
-
-// Whether any layout of the type is taken, for the cheap type-only check before a plan lookup. Same
-// contiguous enum walk as moe_mmvq_admission_supports_type, fail-closed for an appended layout.
-inline bool moe_pp_batched_supports_type(enum ggml_type type, bool woq_enabled, bool aos_enabled) {
-    for (int layout = 0; layout <= (int) GGML_LAYOUT_MXFP4_DPAS; ++layout) {
-        if (moe_pp_batched_supports_layout(type, (enum ggml_layout_mode) layout, woq_enabled, aos_enabled)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is traced

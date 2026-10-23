@@ -259,7 +259,15 @@ def contract(text: str) -> bool:
         executor_helper_reads_the_latch(text)
         and function_body_open < early < early_close < router_flag < planner < planner_close < switch
         and executable_body(function[function_body_open + 1 : early]) == EXPECTED_PRE_INDEXED_GUARD_PREFIX
-        and executable_body(early_body) == "constggml_typeindexed_a_type=op->src[0]->type;if(op->op==GGML_OP_MUL_MAT_ID){if(!moe_mmvq_admission_supports_type(indexed_a_type)){returnfalse;}}elseif(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}returntrue;"
+        and executable_body(early_body) == (
+            "constggml_typeindexed_a_type=op->src[0]->type;"
+            "if(op->op==GGML_OP_MUL_MAT_ID){"
+            "if(!moe_mmvq_admission_supports_type(indexed_a_type)&&!ggml_sycl_moe_pp_batched_admits_op(op,device)){"
+            "returnfalse;}}"
+            "elseif(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4"
+            "&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}"
+            "returntrue;"
+        )
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
         and router_residency_exception ==

@@ -437,10 +437,12 @@ int main() {
     const ggml_type pp_never_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_F32,
                                          GGML_TYPE_BF16 };
     for (const ggml_type type : pp_never_types) {
-        if (moe_pp_batched_supports_type(type, true, true)) {
-            std::printf("FAIL: batched executor admits type=%s, which it has no measured weight for\n",
-                        ggml_type_name(type));
-            ++failures;
+        for (const ggml_layout_mode layout : all_layouts()) {
+            if (moe_pp_batched_supports_layout(type, layout, true, true)) {
+                std::printf("FAIL: batched executor admits type=%s layout=%d, which it has no measured weight for\n",
+                            ggml_type_name(type), static_cast<int>(layout));
+                ++failures;
+            }
         }
     }
 
