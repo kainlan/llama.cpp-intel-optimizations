@@ -22,14 +22,15 @@
 // The ring regions' read gates (lead ruling c-o9uw-1) are kept by moe_stream_region_reads, which the phase holds over
 // sycl::event; the test drives it over int, in the order stage(), layer_done() and reset_regions() call it.
 //
-// A matrix whose weight the batched prompt executor claims once its host experts are staged stages one AOS slot whatever
-// the kernels answer, and its entry names the executor as its consumer (llama.cpp-3460): the executor dequantizes AOS
-// itself, with a plain kernel on the compute queue, and the staged route refuses such an entry. The tests pass the
-// claims as a second predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
+// A matrix whose weight the batched prompt executor claims once its host experts are staged stages one AOS slot
+// whatever the kernels answer, and its entry names the executor as its consumer (llama.cpp-3460): the executor
+// dequantizes AOS itself, with a plain kernel on the compute queue, and the staged route leaves such an entry to the
+// route core. The tests pass the claims as a second predicate; the backend answers with
+// ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
 //
-// A short ring reserve asks for an expert loan (llama.cpp-3460, c-0tmn): the test plays ring_ready() over a reserve that
-// refuses with a shortfall, with stub hooks for the backend's loan request and its boundary runner's REFUSED count, and
-// drives the helper ring_ready() calls, moe_stream_loan_on_short_reserve.
+// A short ring reserve asks for an expert loan (llama.cpp-3460, c-0tmn): the test plays ring_ready() over a reserve
+// that refuses with a shortfall, with stub hooks for the backend's loan request and its boundary runner's REFUSED
+// count, and drives the helper ring_ready() calls, moe_stream_loan_on_short_reserve.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
@@ -792,8 +793,8 @@ int main() {
     // the next layer in the next graph of a split micro-batch
     CHECK(!ggml_sycl::moe_stream_ubatch_starts(true, 16, 15, 8, 7));
 
-    // Bytes move when the layer's decision is RING under any policy but cpu: AUTO follows the cost model and ring forces
-    // the choice in moe_exec_weigh (llama.cpp-3460, lifting lead ruling c-3skf).
+    // Bytes move when the layer's decision is RING under any policy but cpu: AUTO follows the cost model and ring
+    // forces the choice in moe_exec_weigh (llama.cpp-3460, lifting lead ruling c-3skf).
     moe_exec_decision ring_all;
     ring_all.choice               = moe_exec_choice::RING;
     ring_all.regime               = moe_exec_regime::STREAM_ALL;

@@ -141,7 +141,8 @@ POST_CLAIM = [
 # A decline after the dispatch took a staged ring slot, or on a weight the ring staged in full for this executor, is
 # printed whatever its cause (llama.cpp-3460): its staged experts then run on the CPU path.
 WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal) || pp_staged_experts > 0 || "
-                  "pp_onednn_batched_claims_staged_layer) && ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
+                  "pp_onednn_batched_claims_staged_layer) && "
+                  "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
 # Types the f16 table takes that the device test does not run, each with its reason. The fixture quantizes its
 # weights with no importance matrix, so these three are the whole list.
 GROUP_KNOB = "GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX"

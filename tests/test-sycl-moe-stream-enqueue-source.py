@@ -1014,8 +1014,8 @@ CLAIMS_PLAN_LAYOUT = ("planned = plan != nullptr ? "
 CLAIMS_STAGED_LAYOUT = "ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);"
 CLAIMS_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) { "
                 "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false); }")
-STAGED_CLAIM_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(const ggml_sycl::placement_plan & "
-                      "plan, const ggml_tensor * weight, int device) { "
+STAGED_CLAIM_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor("
+                      "const ggml_sycl::placement_plan & plan, const ggml_tensor * weight, int device) { "
                       "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(&plan, weight, device, true); }")
 STAGED_PLAN_SIG = ("static bool ggml_sycl_moe_tensor_plan_staged_layout(const ggml_sycl::placement_plan & plan, "
                    "const ggml_tensor * src0, int device, layout_mode * out_layout)")
@@ -1208,7 +1208,8 @@ def test_policy_gate_mutants():
     c = claim_staging_follows_the_decision
     # AUTO never staging: the record-only predicate of lead ruling c-3skf.
     assert not c(PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY,
-                                     "{ return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING; }"))
+                                     "{ return d.choice == moe_exec_choice::RING && "
+                                     "policy == moe_exec_policy::RING; }"))
     # CPU staging: the predicate tests the choice alone.
     assert not c(PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY, "{ return d.choice == moe_exec_choice::RING; }"))
     # The guard testing the choice alone, past the predicate.
@@ -1334,7 +1335,7 @@ def test_reserve_latch_mutants():
     assert not claim_reserve_failure_lasts_one_ubatch(mutate(PHASE, NEW_UBATCH, "if (new_ubatch) {"))
 
 
-# ---- a short reserve asks for a loan (llama.cpp-3460, c-0tmn) ---------------------------------------------------------
+# ---- a short reserve asks for a loan (llama.cpp-3460, c-0tmn) --------------------------------------------------------
 
 RING_CPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.cpp"
 RING_HPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.hpp"
@@ -1358,9 +1359,10 @@ LOAN_HELPER_ORDER = (
     "return moe_stream_loan_step::REQUEST;",
 )
 RESERVE_DECL = "bool reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short = nullptr);"
-RESERVE_DEF_SIG = "bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short)"
-RESERVE_SHORT_SET = ("if (bytes_short != nullptr) { *bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes); "
-                     "}")
+RESERVE_DEF_SIG = ("bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, "
+                   "size_t * bytes_short)")
+RESERVE_SHORT_SET = ("if (bytes_short != nullptr) { "
+                     "*bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes); }")
 WEIGHT_REFUSAL_WARN = "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give"
 SHORTFALL_SIG = "size_t moe_stream_ring_weight_shortfall(int device, size_t bytes)"
 SHORTFALL_PARTS = (

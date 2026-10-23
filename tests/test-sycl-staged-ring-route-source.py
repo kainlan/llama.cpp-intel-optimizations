@@ -260,7 +260,8 @@ ROLE_DECL = ("const expert_tensor_role stream_role = moe_stream && src0 ? "
              "expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;")
 PREPARE_LAYER = "call.layer = ggml_sycl_moe_stream_layer_of(src0);"
 # The batched executor's claims: the route asks neither; the ring's index build asked the second (llama.cpp-3460).
-CLAIM_CALLS = ("ggml_sycl_moe_pp_onednn_batched_claims_tensor(", "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(")
+CLAIM_CALLS = ("ggml_sycl_moe_pp_onednn_batched_claims_tensor(",
+               "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(")
 EXECUTOR_REFUSAL = "if (s->consumer == moe_stream_consumer::EXECUTOR) { return moe_staged_route_refusal::CLAIMED; }"
 
 SLOT = "const mem_handle & slot = s->layout == GGML_LAYOUT_SOA ? s->soa : s->aos;"
@@ -776,7 +777,6 @@ def test_executor_reads_staged_slots_mutants():
     assert not c(mutate(SYCL, "++pp_staged_experts; }", "}"))
 
 
-
 # ---- a fully staged prompt layer leaves the hybrid world -------------------------------------------------------------
 
 # plan Task 10 (llama.cpp-3460): one bool, set once after begin_layer staged the layer, from the phase's
@@ -857,8 +857,9 @@ def test_fully_staged_layer_leaves_hybrid_mutants():
     assert not c(mutate(SYCL, "executor_staged(stream_call.layer,", "executor_staged(moe_cache_layer_id(src0->name),"))
     # The table asked before begin_layer staged the layer, so the first op of a layer always stays hybrid.
     m = mutate(SYCL, " " + STAGED_LAYER_SET + " } }", " } }")
-    m = m.replace(STAGED_LAYER_BEGIN, STAGED_LAYER_BEGIN.replace("ctx.moe_stream->begin_layer(",
-                                                                   STAGED_LAYER_SET + " ctx.moe_stream->begin_layer("), 1)
+    early = STAGED_LAYER_BEGIN.replace("ctx.moe_stream->begin_layer(",
+                                       STAGED_LAYER_SET + " ctx.moe_stream->begin_layer(")
+    m = m.replace(STAGED_LAYER_BEGIN, early, 1)
     assert not c(m)
     # The plan's host experts keep the op hybrid: plan_has_cpu_experts is not cleared.
     assert not c(mutate(SYCL, " && !pp_onednn_batched_claims_staged_layer;", ";"))
@@ -877,6 +878,7 @@ def test_fully_staged_layer_leaves_hybrid_mutants():
                         "retained_prompt_layout, true, &ctx, ctx.stream());"))
     # A second writer of the bool.
     assert not c(mutate(SYCL, PLAN_HAS_CPU, "pp_onednn_batched_claims_staged_layer = false; " + PLAN_HAS_CPU))
+
 
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
     """A decode build never takes the phase: `rows > 1` is the first term of the phase pointer's condition, ahead of

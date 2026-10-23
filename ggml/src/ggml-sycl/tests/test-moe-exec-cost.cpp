@@ -195,8 +195,8 @@ int main() {
         });
         CHECK(std::fabs(r.cpu_gbps - 200.0 / (100.0 / 5.6 + 100.0 / 22.0)) < 1e-9, "two measured types: harmonic mean");
     }
-    // dev_gflops seeds per type, byte-weighted harmonic mean over the mix: bytes / sum(bytes_i / rate_i). MXFP4 keeps the
-    // Task 9 measurement (llama.cpp-g4uy); Q4_0 and every other type the executor takes from a staged slot
+    // dev_gflops seeds per type, byte-weighted harmonic mean over the mix: bytes / sum(bytes_i / rate_i). MXFP4 keeps
+    // the Task 9 measurement (llama.cpp-g4uy); Q4_0 and every other type the executor takes from a staged slot
     // (moe_pp_batched_takes_staged_type) take the batched executor's rates measured on d52110c80 (llama.cpp-348c,
     // re-seeded in llama.cpp-3460); any other type keeps the per-row 600. The fixtures above that call weigh set their
     // own rates, so none of their expectations depended on a seed; the unset-variable check below pins the empty mix's
