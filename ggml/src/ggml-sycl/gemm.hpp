@@ -930,6 +930,8 @@ class DnnlGemmWrapper {
     // dependent submissions onto it (e.g. via cgh.depends_on(...) or a barrier)
     // instead of relying on in-order-queue ordering with an async primitive.
     // std::nullopt: the scratchpad request was declined before anything was submitted; c is untouched.
+    // `label_name`/`label_category` name the kernel-profiler row; null keeps "mulmat.onednn_gemm.execute"/"mulmat".
+    // The batched MoE prompt executor names its non-MXFP4 GEMMs moe.pp.gemm.execute with them (llama.cpp-348c).
     [[nodiscard]] static std::optional<sycl::event> gemm_batch_strided(ggml_backend_sycl_context &      ctx,
                                                                        bool                             trans_a,
                                                                        bool                             trans_b,
@@ -952,7 +954,9 @@ class DnnlGemmWrapper {
                                                                        int64_t                          stride_c,
                                                                        int                              batch_size,
                                                                        const queue_ptr &                q,
-                                                                       const std::vector<sycl::event> & deps = {}) {
+                                                                       const std::vector<sycl::event> & deps = {},
+                                                                       const char * label_name               = nullptr,
+                                                                       const char * label_category = nullptr) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
         auto                        stream = ctx.stream_dnnl(q);
         auto                        eng    = ctx.engine_dnnl(q);
@@ -1058,8 +1062,8 @@ class DnnlGemmWrapper {
             // below which already carry this wrap (see their comments for
             // the fuller rationale on why a host submit-span matters here).
             ggml_sycl_profile_label gemm_label{};
-            gemm_label.name       = "mulmat.onednn_gemm.execute";
-            gemm_label.category   = "mulmat";
+            gemm_label.name       = label_name ? label_name : "mulmat.onednn_gemm.execute";
+            gemm_label.category   = label_category ? label_category : "mulmat";
             gemm_label.queue_kind = "compute";
             gemm_label.metadata   = "variant=fallback_create";
             gemm_label.device     = ctx.device;
@@ -1098,8 +1102,8 @@ class DnnlGemmWrapper {
         // primitive path -- the one actually taken on every steady-state
         // decode/PP call once the primitive is warm.
         ggml_sycl_profile_label gemm_label{};
-        gemm_label.name       = "mulmat.onednn_gemm.execute";
-        gemm_label.category   = "mulmat";
+        gemm_label.name       = label_name ? label_name : "mulmat.onednn_gemm.execute";
+        gemm_label.category   = label_category ? label_category : "mulmat";
         gemm_label.queue_kind = "compute";
         gemm_label.metadata   = "variant=cached";
         gemm_label.device     = ctx.device;
