@@ -5474,8 +5474,10 @@ endif() # static SYCL backend fixture
 # llama.cpp-348c: the batched oneDNN MoE prompt executor takes every expert type its f16 table admits that the
 # fixture can quantize without an importance matrix (17 types, the k_types list in the test) on a planned model,
 # matches the CPU backend at NMSE <= 5e-4, logs [PP-MOE] once per type, and refuses nothing. Each case runs in the
-# planned weight slot in at least three f16 groups (the test caps a group at 3 experts). Pinned to the B50; a run
-# with no SYCL GPU exits 77. The timeout covers 34 cases and the single-threaded IQ quantizers.
+# planned weight slot in f16 groups across its two halves: at least three at the slot's own grouping, and exactly
+# what the cap gives in two more Q4_0 cases that the test runs as child processes of itself with
+# GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX at 1 and 3. Pinned to the B50; a run with no SYCL GPU exits 77. The timeout
+# covers 36 cases and the single-threaded IQ quantizers.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-pp-batched-dequant
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-batched-dequant.cpp

@@ -12,31 +12,37 @@
 //     second, and exactly once over the run;
 //   * a [MOE-PP-ONEDNN-F16-BATCHED] success line during each case (GGML_SYCL_MOE_ROUTE_LOG=1, set below). The
 //     backend prints that line at most 96 times per process, so the cases must stay under that cap (static_assert
-//     below). Every such line in the case must name at least three groups (groups=, see below);
+//     below). Every such line names the case's f16 groups (groups=, group_experts=, buffers=; see below);
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
 //     "[MOE-PROMPT-REFUSAL]", no "refusing unplanned PP MoE oneDNN batched scratch".
 //
 // The ring is planned the way libllama plans it by default (src/llama-model.cpp): weight slots sized for the MXFP4
 // WOQ arm, about a quarter of every expert in f16. The f16 arm runs in that slot, never a wider one: it groups the
 // active experts to fit it, alternating between the slot's two halves, each group's dequant chained on the GEMMs
-// that last read its half. At this shape the slot holds 8 f16 experts, so groups of 4.
-// GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX (set below) caps each group at 3 experts, so every case runs at least three
-// groups (11 when all 32 experts are active) whatever the planner's slot size, and the halves are reused several
-// times.
+// that last read its half. At this shape the slot holds 8 f16 experts, and every case activates all 32, so a case
+// runs 8 groups of 4 and must name at least three groups.
+// GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX caps the experts per group. The backend reads it once per process, so the
+// capped cases run in child processes: the test runs itself again as --group-cap N for each N in k_group_caps (1 and
+// 3), each child runs one Q4_0 case at 300 tokens with the cap at N, and that case must name exactly ceil(32 / N)
+// groups of N experts in both halves. A cap of 1 gives the longest chain, 32 groups of one expert.
 //
 // The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on. With it off, libllama puts these
 // device-planned experts in the device buffer instead, which this fixture does not model: that upload reorders an SOA
 // type over the whole tensor and publishes no per-expert records for it, and the claim declines such a layout. So with
 // it off the process exits 77 before any case.
 //
-// Every case runs, and each prints one CASE line naming what it saw. The process exits 1 if any case failed, 77 when
-// there is no SYCL GPU or the weights are not evictable. Pin one card (the registration selects level_zero:1, the B50).
+// Every case runs, and each prints one CASE line naming what it saw; a capped case's exit status is its verdict. The
+// process exits 1 if any case failed, 77 when there is no SYCL GPU or the weights are not evictable. Pin one card (the
+// registration selects level_zero:1, the B50).
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -85,9 +91,14 @@ constexpr int k_cases          = k_cases_per_type * int(sizeof(k_types) / sizeof
 constexpr int k_route_log_cap = 96;
 static_assert(k_cases <= k_route_log_cap, "a case past the route log's cap has no success line to count");
 
-// The fewest f16 groups a case's success line may name. The group cap set in main() makes it at least
-// ceil(active experts / 3), and a 64-token case activates nearly all 32 experts.
+// The fewest f16 groups a case's success line may name at the slot's own grouping. The slot holds 8 f16 experts at
+// this shape, so a case runs 8 groups of 4; a slot that held every expert would run one group, and the case fails
+// rather than pass without the chain.
 constexpr size_t k_min_groups = 3;
+
+// The group caps of the capped cases, one Q4_0 case each, each in its own child process (run_capped_child).
+constexpr int k_group_caps[] = { 1, 3 };
+constexpr int k_capped_cases = int(sizeof(k_group_caps) / sizeof(k_group_caps[0]));
 
 void require(bool condition, const std::string & message) {
     if (!condition) {
@@ -454,8 +465,9 @@ double nmse(const std::vector<float> & ref, const std::vector<float> & got) {
 
 // Runs one case and prints its CASE line. Returns true when it passed. Every count is of the lines that appeared
 // while this case ran, except the [PP-MOE] total, which is over the run so far. `first_of_type` is true for the
-// type's first case, the only one in which its [PP-MOE] line may appear.
-bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c, bool first_of_type) {
+// type's first case, the only one in which its [PP-MOE] line may appear. `group_cap` is the process's
+// GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX, 0 when it is unset.
+bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c, bool first_of_type, int group_cap) {
     const std::string type_name  = ggml_type_name(c.type);
     const std::string type_field = "type=" + type_name + " ";
 
@@ -476,6 +488,13 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     const size_t       unplanned = g_log.count_since(from, { "refusing unplanned PP MoE oneDNN batched scratch" });
     const size_t       groups    = g_log.min_field_since(from, "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", "groups=");
 
+    // The rest of the group plan the success line names, and what a cap must give: every case activates all k_experts
+    // experts, so a cap gives ceil(k_experts / cap) groups of that many experts, alternating between both halves.
+    const char * success       = "[MOE-PP-ONEDNN-F16-BATCHED] tensor=";
+    const size_t group_experts = g_log.min_field_since(from, success, "group_experts=");
+    const size_t buffers       = g_log.min_field_since(from, success, "buffers=");
+    const size_t want_groups   = group_cap > 0 ? (size_t(k_experts) + size_t(group_cap) - 1) / size_t(group_cap) : 0;
+
     std::string why;
     if (status != GGML_STATUS_SUCCESS) {
         why += " compute-status";
@@ -493,26 +512,79 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
         why += " refusal";
     }
     // A success line with no groups= field fails too: the parse returns SIZE_MAX for it, which no minimum catches.
-    if (batched != 0 && (groups == SIZE_MAX || groups < k_min_groups)) {
-        why += groups == SIZE_MAX ? " groups-field" : " groups";
+    if (batched != 0 && groups == SIZE_MAX) {
+        why += " groups-field";
+    } else if (batched != 0 && group_cap == 0 && groups < k_min_groups) {
+        why += " groups";
+    } else if (batched != 0 && group_cap > 0 &&
+               (groups != want_groups || group_experts != size_t(group_cap) || buffers != 2)) {
+        why += " group-cap";
     }
+    auto shown = [](size_t field) {
+        return field == SIZE_MAX ? size_t(0) : field;
+    };
     std::fprintf(stderr,
-                 "CASE type=%s tokens=%d ne11=%d status=%d nmse=%.3e pp_moe_lines=%zu pp_moe_total=%zu "
-                 "batched_lines=%zu min_groups=%zu pp_moe_refused=%zu prompt_refusal=%zu unplanned_scratch=%zu "
-                 "-> %s%s\n",
-                 type_name.c_str(), c.n_tokens, c.ne11, static_cast<int>(status), err, pp_moe, pp_total, batched,
-                 groups == SIZE_MAX ? size_t(0) : groups, refused, prompt_rf, unplanned,
+                 "CASE type=%s tokens=%d ne11=%d cap=%d status=%d nmse=%.3e pp_moe_lines=%zu pp_moe_total=%zu "
+                 "batched_lines=%zu groups=%zu group_experts=%zu buffers=%zu pp_moe_refused=%zu prompt_refusal=%zu "
+                 "unplanned_scratch=%zu -> %s%s\n",
+                 type_name.c_str(), c.n_tokens, c.ne11, group_cap, static_cast<int>(status), err, pp_moe, pp_total,
+                 batched, shown(groups), shown(group_experts), shown(buffers), refused, prompt_rf, unplanned,
                  why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
+// Runs one capped case: this binary again, as `--group-cap <cap>`, in a child process, so the cap is set before that
+// process's backend reads it. The child's CASE line shares this process's stderr; its exit status is the verdict.
+bool run_capped_child(int cap) {
+    const std::string arg = std::to_string(cap);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execl("/proc/self/exe", "test-moe-pp-batched-dequant", "--group-cap", arg.c_str(),
+              static_cast<char *>(nullptr));
+        _exit(127);
+    }
+    if (pid < 0) {
+        std::fprintf(stderr, "FAIL: fork for the group cap %d case failed\n", cap);
+        return false;
+    }
+    int        status = 0;
+    const bool waited = waitpid(pid, &status, 0) == pid;
+    if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return true;
+    }
+    if (!waited) {
+        std::fprintf(stderr, "FAIL: waitpid for the group cap %d case failed\n", cap);
+    } else if (WIFEXITED(status)) {
+        // 77 is a skip, which this process ruled out before it started the child; 127 is a failed exec.
+        std::fprintf(stderr, "FAIL: the group cap %d case exited %d\n", cap, WEXITSTATUS(status));
+    } else {
+        std::fprintf(stderr, "FAIL: the group cap %d case died on signal %d\n", cap,
+                     WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    }
+    return false;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    // A capped case's child process (run_capped_child) runs one Q4_0 case with the group cap at argv[2].
+    int group_cap = 0;
+    if (argc == 3 && std::strcmp(argv[1], "--group-cap") == 0) {
+        group_cap = std::atoi(argv[2]);
+        if (group_cap < 1) {
+            std::fprintf(stderr, "FAIL: --group-cap takes a count of at least 1, not %s\n", argv[2]);
+            return 1;
+        }
+        setenv("GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX", argv[2], 1);
+    } else if (argc != 1) {
+        std::fprintf(stderr, "usage: %s [--group-cap N]\n", argv[0]);
+        return 1;
+    }
     // Read once by the backend, so they are set before anything touches it.
     setenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE", "1", 1);
     setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);
-    setenv("GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX", "3", 1);
     ggml_log_set(log_callback, nullptr);
     try {
         bool have_gpu = false;
@@ -534,21 +606,33 @@ int main() {
         require(cpu != nullptr, "CPU backend init failed");
 
         std::mt19937 rng(348);
-        int          failed = 0;
+        if (group_cap > 0) {
+            lifecycle_fixture life(GGML_TYPE_Q4_0, rng);
+            return run_case(life, cpu.get(), make_case(GGML_TYPE_Q4_0, 300, k_used, rng), true, group_cap) ? 0 : 1;
+        }
+        // The capped cases first, each in its own process, so this one holds no model while a child runs.
+        int failed = 0;
+        for (int cap : k_group_caps) {
+            if (!run_capped_child(cap)) {
+                ++failed;
+            }
+        }
         for (ggml_type type : k_types) {
             lifecycle_fixture life(type, rng);
-            if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng), true)) {
+            if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng), true, 0)) {
                 ++failed;
             }
-            if (!run_case(life, cpu.get(), make_case(type, 300, k_used, rng), false)) {
+            if (!run_case(life, cpu.get(), make_case(type, 300, k_used, rng), false, 0)) {
                 ++failed;
             }
         }
+        const int total = k_cases + k_capped_cases;
         if (failed != 0) {
-            std::fprintf(stderr, "FAIL: %d of %d cases failed\n", failed, k_cases);
+            std::fprintf(stderr, "FAIL: %d of %d cases failed\n", failed, total);
             return 1;
         }
-        std::fprintf(stderr, "PASS: batched MoE prompt executor, %d cases\n", k_cases);
+        std::fprintf(stderr, "PASS: batched MoE prompt executor, %d cases (%d at the slot's own grouping, %d capped)\n",
+                     total, k_cases, k_capped_cases);
         return 0;
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "SKIP: no usable SYCL GPU: %s\n", e.what());
