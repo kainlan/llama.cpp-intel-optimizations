@@ -15635,7 +15635,6 @@ static size_t                                        g_tensor_inventory_pp_pipel
 static size_t                                        g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
 static size_t                                        g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
 static size_t                                        g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
-static size_t                                        g_tensor_inventory_pp_moe_onednn_scratch_bytes         = 0;
 static uint32_t                                      g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
 static int                                           g_tensor_inventory_device                              = 0;
 static size_t                                        g_moe_expert_total_bytes                               = 0;
@@ -15713,7 +15712,6 @@ static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_aut
         g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
         g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
         g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
-        g_tensor_inventory_pp_moe_onednn_scratch_bytes         = 0;
         g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
         g_tensor_inventory_device                              = 0;
         g_moe_expert_total_bytes                               = 0;
@@ -17142,6 +17140,32 @@ static size_t ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(const ggml_sycl_ten
 #endif
 }
 
+// True the first time a load widens the PP MoE ring's weight slot from `from_bytes` to `to_bytes` on `device`. One load
+// populates the inventory twice (ggml_backend_sycl_compute_placement_plan_early, then the late set_tensor_inventory),
+// and the widening is logged once per load (llama.cpp-348c). Without a staged owner (generation 0) there is no load to
+// latch on, so it always logs. The caller holds g_tensor_inventory_mutex, which guards the latch.
+static bool ggml_sycl_pp_moe_widened_first(int                             device,
+                                           ggml_sycl::lifecycle::SlotToken owner,
+                                           size_t                          from_bytes,
+                                           size_t                          to_bytes) {
+    struct logged_widening {
+        ggml_sycl::lifecycle::SlotToken owner;
+        size_t                          from_bytes = 0;
+        size_t                          to_bytes   = 0;
+    };
+
+    static logged_widening logged[GGML_SYCL_MAX_DEVICES];
+    if (owner.generation == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return true;
+    }
+    logged_widening & last = logged[device];
+    if (last.owner == owner && last.from_bytes == from_bytes && last.to_bytes == to_bytes) {
+        return false;
+    }
+    last = { owner, from_bytes, to_bytes };
+    return true;
+}
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17157,7 +17181,6 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
     g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
     g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
-    g_tensor_inventory_pp_moe_onednn_scratch_bytes         = 0;
     g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
     g_tensor_inventory_device                              = ctx->device;
     g_tensor_inventory.reserve(inventory->count);
@@ -17261,19 +17284,18 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = inventory->pp_moe_onednn_weight_slot_bytes;
     g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = inventory->pp_moe_onednn_activation_slot_bytes;
     g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = inventory->pp_moe_onednn_output_slot_bytes;
-    g_tensor_inventory_pp_moe_onednn_scratch_bytes         = inventory->pp_moe_onednn_scratch_bytes;
     g_tensor_inventory_pp_moe_onednn_ring_depth            = inventory->pp_moe_onednn_ring_depth;
     // llama.cpp-348c: the inventory sizes each ring slot's weight part for MXFP4's WOQ planes. Where it planned a ring,
     // the slot is widened to what the f16 arm needs for the other expert types, so an expert type the executor takes
-    // always has its scratch planned and is never refused as unplanned. The ring's total follows the wider slot.
+    // always has its scratch planned and is never refused as unplanned. The unified cache derives the ring's total
+    // from the slot sizes (unified_cache_set_planned_pp_moe_onednn_scratch below), so the total follows the wider slot.
+    // The early and the late plan of one load both come through here; the widening is logged once per load.
     if (g_tensor_inventory_pp_moe_onednn_weight_slot_bytes > 0 && g_tensor_inventory_pp_moe_onednn_ring_depth > 0) {
         g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(
             inventory->pp_moe_onednn_weight_slot_bytes, ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(inventory));
-        const size_t widened_by =
-            g_tensor_inventory_pp_moe_onednn_weight_slot_bytes - inventory->pp_moe_onednn_weight_slot_bytes;
-        if (widened_by > 0) {
-            g_tensor_inventory_pp_moe_onednn_scratch_bytes +=
-                widened_by * static_cast<size_t>(g_tensor_inventory_pp_moe_onednn_ring_depth);
+        if (g_tensor_inventory_pp_moe_onednn_weight_slot_bytes > inventory->pp_moe_onednn_weight_slot_bytes &&
+            ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, inventory->pp_moe_onednn_weight_slot_bytes,
+                                           g_tensor_inventory_pp_moe_onednn_weight_slot_bytes)) {
             GGML_LOG_INFO(
                 "[SYCL-PLAN] PP MoE oneDNN batched weight slot widened for the f16 arm: %.1f MB -> %.1f MB "
                 "(n_expert=%d, ring depth %u) on device %d\n",
