@@ -521,8 +521,8 @@ no number in this section is a baseline, and none of the figures in the plan are
   `-n 60 -ub 256 -t 4`), so their floors (11.0 and 9.5 tok/s) and reference output (md5 `25b7738a`) carry over.
   A changed md5 is a regression only when it shares fewer than 128 bytes with the reference text
   (`flip=no`); a later divergence is the greedy near-tie flip and passes with `flip=yes`.
-- **Driver and load.** Driver `__DRIVER__` (compute-runtime 26.31, or 26.35 with
-  `GGML_SYCL_MMQ_ESIMD=OFF`, per the plan's end-to-end section). Ambient host load `__LOAD__`, the per-arm
+- **Driver and load.** Driver `26.35.39758.11` (libze-intel-gpu1 26.35.39758.11-1~26.04~ppa1), built with
+  `GGML_SYCL_MMQ_ESIMD=OFF` (the plan's end-to-end section). Ambient host load 35.7-48.1, the per-arm
   load range: the minimum and maximum of the one-minute load the gate logs in each arm's pre line. It is
   recorded for the reader and never deferred for a quiet host. Every verdict line carries `builders_pre=`
   and `builders_post=`; an arm whose `builders_post` is above 0 is `NOT_SCORED(tainted=builders,...)` and
@@ -535,10 +535,37 @@ no number in this section is a baseline, and none of the figures in the plan are
 One row per verdict-bearing arm and per recorded metric, filled by the lead from the gate's log. The
 columns are:
 
+Taken 2026-10-23 at 8c44f3b3c from the merge tree's build (its `build_commit` column reads 8c44f3b3c in every
+csv), by the lead from a snapshot of the gate script as of d92a4e632 with `--no-head-check`, because that
+version read the lead checkout's HEAD rather than `--src-dir` (fixed since). The sha was checked by hand, and
+the row values were re-scored with the final script's `--score-arm`. Six arms were re-run after a teammate's
+build overlapped their first run (Q_pp, Q_pp_cpu, GO_pp, MI_b70, MI_b50 and resets at 16:18-16:39; GO_noc at
+16:50). `builders_post` is derived from the builds' timestamps (15:29-15:42 and 16:10-16:17; no arm kept
+overlaps either), because that script version did not sample builders during an arm. The Qwen placement lines
+were `MoE experts: 38004 on device, 35724 on host` (`Q_tg`) and `MoE experts: 25950 on device, 47778 on host`
+(`Q_noc`). Summary: `verdicts_pass=11` of 15 arms scored (4 RECORDED, 1 NOT_EXERCISED, 2 FAIL: `Q_pp` and
+`GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`, gate exit 1.
+
 | arm | metric | value | floor | verdict | builders_post | notes |
 |-----|--------|-------|-------|---------|---------------|-------|
-
-__TABLE__
+| Q_pp | pp512 t/s | 13.3 ± 0.70 | 500 | FAIL | 0 | ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no; the 10 % cap refuses the ring (llama.cpp-bcre) |
+| Q_pp | pp2048 t/s | 30.7 ± 0.60 | 800 | FAIL | 0 | same run |
+| Q_pp_cpu | pp512 t/s | 14.0 | - | RECORDED | 0 | forced_cpu_lines=24 rc=0 |
+| Q_pp_cpu | pp2048 t/s | 31.8 | - | RECORDED | 0 | same run |
+| Q_staged | ring_layers | 0 | - | NOT_EXERCISED | 0 | ring_engaged=no |
+| Q_tok | md5 | 9577403b | - | RECORDED | 0 | auto load 1 |
+| Q_tok_2 | md5 | 2a6c2cf6 | - | RECORDED | 0 | auto load 2 |
+| Q_tok_cpu_1 | md5 | 199c6905 | - | RECORDED | 0 | cpu load 1 |
+| Q_tok_cpu | md5 | 9577403b | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=1 min_prefix=115 auto_flip=yes cpu_flip=yes (auto load 1 equals cpu load 2) |
+| Q_tg | tg t/s | 11.16 | 11.0 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised |
+| Q_noc | tg t/s | 11.54 | 9.5 | PASS | 0 | md5=25b7738a (the reference) prefix=277 place=unscored refill=not_exercised |
+| GO_gate | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| GO_noc | count | 1 | 1 | PASS | 0 | layer_lines=0 recorded |
+| GO_pp | pp512 t/s | 764.1 ± 9.3 | 827.4 (95 % of 871) | FAIL | 0 | llama.cpp-zuze: master regression, expected until it lands |
+| GO_pp | tg128 t/s | 32.6 ± 0.46 | 31.0 (97 % of 32.0) | PASS | 0 | same run |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | journalctl -k since 15:25:03 |
 
 ### How to read the verdict fields
 
