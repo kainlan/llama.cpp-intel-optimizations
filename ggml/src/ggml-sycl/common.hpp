@@ -1420,7 +1420,7 @@ static inline mxfp4_grouped_dpas_decision ggml_sycl_select_mxfp4_grouped_dpas(co
 }
 
 // llama.cpp-dboi: first-class route policy for the oneDNN-batched MoE PP
-// executor (try_pp_mxfp4_soa_onednn_f16_batched, ggml-sycl.cpp). When selected,
+// executor (try_pp_onednn_f16_batched, ggml-sycl.cpp). When selected,
 // three things follow from this one predicate: (a) the layout chokepoint below
 // keeps MXFP4 MoE weights on SOA instead of promoting to XMX_TILED, so the
 // single planned layout is one the batched executor can consume (the

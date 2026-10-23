@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Source gate for the type-keyed batched MoE prompt executor (llama.cpp-348c).
 
-The batched oneDNN prompt executor (the try_pp_mxfp4_soa_onednn_f16_batched lambda in ggml_sycl_mul_mat_id) used to
+The batched oneDNN prompt executor (the try_pp_onednn_f16_batched lambda in ggml_sycl_mul_mat_id) used to
 take MXFP4 experts only. Its f16 arm now takes every expert type that has an AOS dequant-to-f16 kernel, and SOA too
 for the types the planner materializes SOA that have a per-expert SOA dequant. These claims pin that shape:
 
@@ -195,7 +195,7 @@ def claim_predicate_body(sycl):
 
 
 def lambda_body(sycl):
-    m = re.search(r"auto try_pp_mxfp4_soa_onednn_f16_batched = \[&\]\(\) -> bool \{", sycl)
+    m = re.search(r"auto try_pp_onednn_f16_batched = \[&\]\(\) -> bool \{", sycl)
     if not m:
         return None
     close = match_close(sycl, m.end() - 1)
@@ -325,7 +325,7 @@ def claim_a_one_table(s):
             fails.append("the candidate gate still tests the src0 type itself")
     lam = lambda_body(s["sycl"])
     if lam is None:
-        fails.append("the try_pp_mxfp4_soa_onednn_f16_batched lambda was not found")
+        fails.append("the try_pp_onednn_f16_batched lambda was not found")
     else:
         if "!pp_batched_candidate" not in lam:
             fails.append("the lambda does not refuse on !pp_batched_candidate")
@@ -403,7 +403,7 @@ def claim_c_q4k_fallback(s):
         fails.append("selected_hybrid_route no longer reads planner_needs_prompt_route")
     hybrid = sycl.find("if (moe_hybrid_with_plan) {")
     at = sycl.find("const bool device_weight_cpu_fallback =")
-    lam = sycl.find("auto try_pp_mxfp4_soa_onednn_f16_batched = [&]() -> bool {")
+    lam = sycl.find("auto try_pp_onednn_f16_batched = [&]() -> bool {")
     if not (0 <= hybrid < at < lam):
         fails.append("the fallback is not inside the hybrid world ahead of the batched executor's branch")
     return fails
@@ -460,7 +460,7 @@ def claim_e_refusal_enum(s):
         lam_pos = lam.find(literal)
         cond = enclosing_if_condition(lam, lam_pos) if lam_pos >= 0 else ""
         cond = cond or ""
-        if "pp_mxfp4_soa_f16_batched_trace" not in cond or "ggml_sycl_moe_pp_batched_refusal_first(" not in cond:
+        if "pp_f16_batched_trace" not in cond or "ggml_sycl_moe_pp_batched_refusal_first(" not in cond:
             fails.append("the refusal WARN is not guarded by the trace knob and the per-(device, cause) latch")
         stmt_start = s["sycl"].rfind("GGML_LOG_", 0, pos)
         if not s["sycl"].startswith("GGML_LOG_WARN(", stmt_start):
@@ -686,7 +686,7 @@ def claim_l_f16_knob(s):
     if "if (!ggml_sycl_moe_pp_onednn_f16_enabled()) { return false; }" not in takes:
         fails.append("the support helper does not ask the knob, so the claim takes ops the executor declines")
     lam = lambda_body(s["sycl"]) or ""
-    route = ("const bool pp_mxfp4_soa_f16_batched_env_enabled = ggml_sycl_moe_pp_onednn_batched_route_selected() && "
+    route = ("const bool pp_f16_batched_env_enabled = ggml_sycl_moe_pp_onednn_batched_route_selected() && "
              "ggml_sycl_moe_pp_onednn_f16_enabled();")
     if route not in lam:
         fails.append("the executor's route-off refusal does not cover the knob, so it is traced as a candidate miss")

@@ -773,7 +773,7 @@ def test_staged_pointer_release_mutants():
 PER_EXPERT_REFUSE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) { "
                      "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt per-expert path refused a "
                      "staged ring slot\"); }")
-PER_EXPERT_ANCHOR = "if (try_pp_mxfp4_soa_onednn_f16_batched()) { return; }"
+PER_EXPERT_ANCHOR = "if (try_pp_onednn_f16_batched()) { return; }"
 PER_EXPERT_STEPS = (
     "pp_moe_onednn_scratch_claim pp_moe_onednn_scratch_claim_state;",
     'GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for',

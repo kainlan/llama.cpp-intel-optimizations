@@ -251,7 +251,7 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
     return classified_expert || ne2 > 1 || consumer_is_mul_mat_id;
 }
 
-// The batched mul_mat_id prompt executor (try_pp_mxfp4_soa_onednn_f16_batched in ggml-sycl.cpp): which
+// The batched mul_mat_id prompt executor (try_pp_onednn_f16_batched in ggml-sycl.cpp): which
 // (type, layout) pairs it runs, as two arms (llama.cpp-348c).
 //
 //   moe_pp_batched_f16_supports_layout  -- the f16 arm: dequantize every active expert into one planned f16

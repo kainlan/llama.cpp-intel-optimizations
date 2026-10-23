@@ -451,7 +451,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
         // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16
         // dequant (GGML_SYCL_MOE_PP_WOQ default ON, mirrors the same env
-        // read in ggml-sycl.cpp's try_pp_mxfp4_soa_onednn_f16_batched) --
+        // read in ggml-sycl.cpp's try_pp_onednn_f16_batched) --
         // size the plan for whichever arm will actually run, or admission
         // refuses every real dispatch (f2bdfbffe's fail-closed contract,
         // cited below). The two arms are NOT summed: only one of them
@@ -480,7 +480,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             max_k          = std::max(max_k, k);
             max_n          = std::max(max_n, n);
             if (pp_woq_enabled_at_plan) {
-                // Must match try_pp_mxfp4_soa_onednn_f16_batched's WOQ-arm
+                // Must match try_pp_onednn_f16_batched's WOQ-arm
                 // slot layout byte-for-byte: nibbles (k*n/2 bytes) then e8m0
                 // scales ((k/kMxfp4BlockSize)*n bytes), each 256-aligned.
                 const size_t nibble_bytes = llama_model_sycl_align_up(n * (k / 2), 256);
@@ -493,7 +493,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         }
         if (max_weight_slot > 0 && max_k > 0 && max_n > 0) {
             constexpr uint32_t pp_moe_onednn_ring_depth     = 1;
-            // The batched PP MoE oneDNN executor (try_pp_mxfp4_soa_onednn_f16_batched,
+            // The batched PP MoE oneDNN executor (try_pp_onednn_f16_batched,
             // ggml-sycl.cpp) requests scratch sized for every expert active in a
             // single dispatch, not one -- active_count is bounded by n_expert, not
             // n_expert_used (llama.cpp-dboi; f2bdfbffe made admission fail-closed,
