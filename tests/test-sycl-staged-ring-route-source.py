@@ -343,10 +343,15 @@ EXEC_STREAM_KEY = (
     "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) : ggml_sycl::expert_tensor_role::UNKNOWN;",
 )
 EXEC_FIND = "ctx.moe_stream->find(pp_stream_layer, static_cast<int>(i02), pp_stream_role)"
-# The staged branch is a host expert's only: the ring stages only experts the plan puts on the host, and their entries
-# reach the route core, which answers HOST. An executor entry is AOS-only, and its view is checked as the staged
-# route checks a slot's: on this device, and tagged with the entry's layout (lead ruling c-o9uw-1).
-EXEC_HOST_ONLY = "GGML_ASSERT(!executor_entry || route.kind == moe_expert_route_kind::HOST);"
+# The staged branch is a HOST route's only. An executor entry never pairs with a device route (the index build lists
+# host entries only), so that alone is asserted; any other route the core can answer for a staged expert (UNAVAILABLE,
+# REFUSED) is recoverable and is declined like an expert the executor cannot read (lead ruling, quality r2). An
+# executor entry is AOS-only, and its view is checked as the staged route checks a slot's: on this device, and tagged
+# with the entry's layout (lead ruling c-o9uw-1).
+EXEC_NOT_DEVICE = "GGML_ASSERT(!executor_entry || route.kind != moe_expert_route_kind::LOCAL_DEVICE);"
+EXEC_HOST_ONLY = ("if (!executor_entry || route.kind != moe_expert_route_kind::HOST) { "
+                  "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "
+                  "ggml_sycl_expert_resolve_reason_name(route.reason), i02); }")
 EXEC_AOS_ONLY = "GGML_ASSERT(staged->layout == GGML_LAYOUT_AOS);"
 EXEC_VIEW_CHECK = ("if (view.ptr == nullptr || !view.on_device) { "
                    "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, \"staged-slot-view\", i02); }")
@@ -358,8 +363,8 @@ EXEC_STAGED_STEPS = (
     "expert.lease = std::move(route.lease); } else {",
     "const ggml_sycl::moe_stream_staged * staged = pp_stream_layer >= 0 ? " + EXEC_FIND + " : nullptr;",
     "const bool executor_entry = staged != nullptr && staged->consumer == ggml_sycl::moe_stream_consumer::EXECUTOR;",
+    EXEC_NOT_DEVICE,
     EXEC_HOST_ONLY,
-    "if (!executor_entry) { return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,",
     EXEC_AOS_ONLY,
     "const ggml_sycl::resolved_ptr view = staged->aos.resolve(ctx.device);",
     EXEC_VIEW_CHECK,
@@ -734,6 +739,7 @@ def claim_executor_reads_staged_slots(sycl: str) -> bool:
     staged-slot-view) and tagged with the entry's layout (EXPERT_LAYOUT)."""
     lam = body(norm(sycl), EXEC_SIG)
     return (lam != "" and lam.count("->find(") == 1 and lam.count(EXEC_FIND) == 1 and "staged->soa" not in lam
+            and "route.kind == moe_expert_route_kind::HOST);" not in lam
             and all(lam.count(k) == 1 for k in EXEC_STREAM_KEY) and ordered(lam, *EXEC_STREAM_KEY, *EXEC_STAGED_STEPS)
             and lam.count("ready_events.push_back(staged->ready);") == 1 and EXEC_LEASE_HOLD in lam)
 
@@ -753,8 +759,15 @@ def test_executor_reads_staged_slots_mutants():
                         "staged != nullptr;"))
     # The slot's lease not held, so the ring's release could free it under the dequant.
     assert not c(mutate(SYCL, "expert.lease = staged->aos;", ""))
-    # An executor entry taken under a route other than HOST, so a wrong entry passes as a staged expert.
-    assert not c(mutate(SYCL, EXEC_HOST_ONLY, ""))
+    # An executor entry taken under a route other than HOST (UNAVAILABLE, REFUSED), so the executor reads a slot whose
+    # expert the route core could not place.
+    any_route = EXEC_HOST_ONLY.replace(" || route.kind != moe_expert_route_kind::HOST", "")
+    assert not c(mutate(SYCL, EXEC_HOST_ONLY, any_route))
+    # The recoverable route aborts instead of declining (the r1 shape).
+    assert not c(mutate(SYCL, EXEC_NOT_DEVICE,
+                        "GGML_ASSERT(!executor_entry || route.kind == moe_expert_route_kind::HOST);"))
+    # A device route paired with an executor entry no longer caught.
+    assert not c(mutate(SYCL, EXEC_NOT_DEVICE, ""))
     # The dead SOA arm back: an executor entry is AOS-only.
     assert not c(mutate(SYCL, "staged->aos.resolve(ctx.device);",
                         "(staged->layout == GGML_LAYOUT_SOA ? staged->soa : staged->aos).resolve(ctx.device);"))

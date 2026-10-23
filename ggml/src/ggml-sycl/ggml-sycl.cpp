@@ -89000,11 +89000,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             nullptr;
                     const bool executor_entry =
                         staged != nullptr && staged->consumer == ggml_sycl::moe_stream_consumer::EXECUTOR;
-                    // The ring stages only experts the plan puts on the host, and the staged route leaves their
-                    // entries to the route core, which answers HOST for them: an executor entry under any other route
-                    // is a wrong entry, never a decline.
-                    GGML_ASSERT(!executor_entry || route.kind == moe_expert_route_kind::HOST);
-                    if (!executor_entry) {
+                    // The ring stages only experts the plan puts on the host (the index build lists host entries
+                    // only), so an executor entry never pairs with a device route. The route core may still answer
+                    // something other than HOST for a staged expert (UNAVAILABLE, REFUSED): a recoverable state, which
+                    // the executor declines like any expert it cannot read, through the same printer and with the
+                    // staged count.
+                    GGML_ASSERT(!executor_entry || route.kind != moe_expert_route_kind::LOCAL_DEVICE);
+                    if (!executor_entry || route.kind != moe_expert_route_kind::HOST) {
                         return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
                                               ggml_sycl_expert_resolve_reason_name(route.reason), i02);
                     }
