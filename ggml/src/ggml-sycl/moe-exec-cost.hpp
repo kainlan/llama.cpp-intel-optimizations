@@ -5,7 +5,8 @@
 // through the VRAM ring and run on the device. Plain values, no SYCL: test-moe-exec-cost pins it with no device.
 
 #include "ggml.h"
-#include "kv-room-cost.hpp"  // the per-type CPU expert rate table moe_exec_rates_seed folds
+#include "kv-room-cost.hpp"     // the per-type CPU expert rate table moe_exec_rates_seed folds
+#include "moe-mmvq-tables.hpp"  // moe_pp_batched_f16_supports_layout: the types the batched f16 arm serves
 
 #include <algorithm>
 #include <cmath>
@@ -147,33 +148,40 @@ static inline double moe_exec_env_param(moe_exec_getenv_fn getenv_fn, const char
     return value;
 }
 
-// The device expert executor's seed rate, GFLOP/s, for one ggml type. Task 9 (llama.cpp-g4uy, 2026-10-21): llama-bench
-// -p 512,2048 through bench-guard on Qwen1.5-MoE Q4_0 (B70) and GPT-OSS 20B MXFP4 (B50) with
-// GGML_SYCL_KERNEL_PROFILE=1; the persisted per-device record replaces the seed once measured.
-//   MXFP4: B50, the batched XMX executor as a whole (gemm.execute + repack.tiled + repack.soa + stage: 12.25 s over
-//          48.9 TFLOP); the GEMM kernel alone is 10070, but the executor's cost is the whole.
-//   Q4_0:  B70, mulmat.mmvq.id_aos_q4_0, the per-row MMVQ path (11.81 GFLOP per 2048-row call in 18.68 ms).
-//   other: the per-row rate (the Q4_0 down matrix measured 590).
-// These per-row seeds are stale: since llama.cpp-348c a prompt whose expert type is in
-// moe_pp_batched_f16_supports_layout runs through the batched oneDNN executor (moe.pp.gemm.execute), not per-row
-// MMVQ. They stand until the lead re-measures Q4_0 and the other types on that executor (llama.cpp-348c).
+// The device expert executor's seed rate, GFLOP/s, for one ggml type: the batched prompt executor as a whole (GEMM,
+// staging and dequant or repack), since that whole is what a staged layer costs on the device. The persisted per-device
+// record replaces a seed once measured.
+//   MXFP4: Task 9 (llama.cpp-g4uy, 2026-10-21), B50, GPT-OSS 20B through bench-guard with GGML_SYCL_KERNEL_PROFILE=1:
+//          the batched XMX executor as a whole (gemm.execute + repack.tiled + repack.soa + stage: 12.25 s over
+//          48.9 TFLOP); the GEMM kernel alone is 10070.
+//   The f16 arm's types: measured by the lead on d52110c80 (llama.cpp-348c, 2026-10-23), B70, llama-bench -v with
+//   GGML_SYCL_KERNEL_PROFILE=1 at auto -ub 512, re-seeded in llama.cpp-3460.
+//   Q4_0:  Qwen1.5-MoE Q4_0, 20 ubatches of 512 = 17.0 TFLOP: moe.pp.gemm.execute 1.383 s, stage.act 0.226 s,
+//          stage.scatter 0.266 s, dequant.q4_0 0.009 s, so about 12,300 GEMM-only and about 9,000 as a whole.
+//   other: every other type the f16 arm serves (moe_pp_batched_f16_supports_layout at AOS, the layout a staged slot
+//          holds). Qwen3.8 GSQ-RCO runs one f16 GEMM for iq2_xxs, iq2_xs, iq2_s, iq3_s, iq4_nl and q2_0, with the
+//          per-type dequant under 1% of the time: gemm 0.248 s, stage 0.163 s, dequant 0.001 s, so about 8,200
+//          GEMM-only and about 5,000 as a whole.
+//   A type the batched executor does not claim keeps the per-row MMVQ rate (Task 9: the Q4_0 down matrix measured 590).
 static constexpr double MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED = 600.0;
+static constexpr double MOE_EXEC_DEV_GFLOPS_F16_ARM_SEED = 5000.0;
 
 static inline double moe_exec_dev_gflops_seed(ggml_type t) {
     switch (t) {
         case GGML_TYPE_MXFP4:
             return 3990.0;
         case GGML_TYPE_Q4_0:
-            return 630.0;
+            return 9000.0;
         default:
-            return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
+            return moe_pp_batched_f16_supports_layout(t, GGML_LAYOUT_AOS) ? MOE_EXEC_DEV_GFLOPS_F16_ARM_SEED :
+                                                                            MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
     }
 }
 
 // The seed record for a layer whose host-resident experts are `host_mix` (type, bytes). cpu_gbps is the byte-weighted
 // harmonic mean over the measured types, as kv_room_expert_types::add folds them; the room's default when none is.
 // dev_gflops is the byte-weighted harmonic mean of moe_exec_dev_gflops_seed (bytes / sum(bytes_i / rate_i): the cost
-// is bytes-proportional time), 600 for an empty mix.
+// is bytes-proportional time), the per-row 600 for an empty mix.
 static inline moe_exec_rates moe_exec_rates_seed(const std::vector<std::pair<ggml_type, size_t>> & host_mix) {
     kv_room_expert_types types;
     for (const auto & tb : host_mix) {
