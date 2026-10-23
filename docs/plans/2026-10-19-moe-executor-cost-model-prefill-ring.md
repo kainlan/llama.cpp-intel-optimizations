@@ -73,29 +73,29 @@ digraph dependencies {
     4  [label="Task 4: knobs + [MOE-EXEC] log"];
     5  [label="Task 5: spike: trusted H2D from host expert handles"];
     6  [label="Task 6: ring reservation + epochs"];
-    7a [label="Task 7a: layer stream plan (host-only)"];
-    7b [label="Task 7b: layer-ahead enqueue + wiring"];
+    "7a" [label="Task 7a: layer stream plan (host-only)"];
+    "7b" [label="Task 7b: layer-ahead enqueue + wiring"];
     8  [label="Task 8: STAGED_RING resolver route"];
     9  [label="Task 9: spike: batched prompt executor rates (lead)"];
-    10pre [label="Task 10-pre: batched f16 prompt executor, every expert type (llama.cpp-348c)"];
+    "10pre" [label="Task 10-pre: batched f16 prompt executor, every expert type (llama.cpp-348c)"];
     bcre [label="llama.cpp-bcre: ring geometry vs the 10% cap (open, P0)", style=dashed];
     pu8v [label="llama.cpp-pu8v: the loan is refused, host storage too small (open)", style=dashed];
     xr4i [label="llama.cpp-xr4i: probe rate = max over iterations 2..8"];
     10 [label="Task 10: fully staged layer leaves hybrid"];
-    11a [label="Task 11a: loan selection (host-only)"];
-    11b [label="Task 11b: loan transaction"];
+    "11a" [label="Task 11a: loan selection (host-only)"];
+    "11b" [label="Task 11b: loan transaction"];
     12 [label="Task 12: refill transaction"];
     13 [label="Task 13: auto-ubatch ring fit term"];
     14 [label="Task 14: docs + contract"];
     15 [label="Task 15: gate script + baselines"];
     0 -> 1; 0 -> 2;
     1 -> 2; 2 -> 3; 1 -> 4; 2 -> 4;
-    1 -> 7a; 7a -> 7b; 5 -> 7b; 6 -> 7b; 4 -> 7b; 7b -> 8; 8 -> 10; 9 -> 10pre; 10pre -> 10;
+    1 -> "7a"; "7a" -> "7b"; 5 -> "7b"; 6 -> "7b"; 4 -> "7b"; "7b" -> 8; 8 -> 10; 9 -> "10pre"; "10pre" -> 10;
     8 -> bcre; bcre -> 10 [style=dashed, label="ring-engaged acceptance"];
     12 -> pu8v; pu8v -> 10 [style=dashed, label="loan acceptance"];
     3 -> xr4i; xr4i -> 12;
-    7a -> 11a; 6 -> 11b; 11a -> 11b; 11b -> 12; 6 -> 13; 11b -> 13;
-    1 -> 14; 8 -> 14; 11b -> 14;
+    "7a" -> "11a"; 6 -> "11b"; "11a" -> "11b"; "11b" -> 12; 6 -> 13; "11b" -> 13;
+    1 -> 14; 8 -> 14; "11b" -> 14;
     4 -> 15; 8 -> 15; 10 -> 15; 12 -> 15;
 }
 ```
@@ -737,7 +737,9 @@ changed by llama.cpp-xr4i after the first GPU census.
 **Description:** Three knobs, parsed once: `GGML_SYCL_MOE_EXEC=auto|cpu|ring` (default auto; `cpu` reproduces today's
 behaviour exactly and is the A/B control arm; `ring` forces the ring wherever one exists),
 `GGML_SYCL_MOE_EXEC_TRACE=1` (one INFO line per layer per micro-batch with the decision's terms),
-`GGML_SYCL_MOE_RING_LAYERS=N` (NOT BUILT: owner ruling B, c-3bde, removed it; see the Amendment). One WARN line
+`GGML_SYCL_MOE_RING_LAYERS=N` (NOT BUILT: owner ruling B, c-3bde, removed it; see the Amendment; was: ring bytes = N
+layers' host expert bytes instead of the default 2, still capped at 10 % of resident expert bytes, with an unparsable
+or 0 value read as 2 and a value above 8 read as 8). One WARN line
 `[MOE-EXEC] layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)` per DECISION CHANGE (the first decision, and every
 layer whose choice differs from its own previous micro-batch's), never per op; and a teardown summary `[MOE-EXEC]
 summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed`.
@@ -745,7 +747,8 @@ summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed`.
 **Acceptance Criteria:**
 - [ ] `moe_exec_config_parse(getenv_fn)` returns `{policy, trace, bad_policy}` (`ring_layers` was removed, c-3bde):
       `MOE_EXEC` unset or `auto` -> AUTO, `cpu` -> CPU, `ring` -> RING, anything else -> AUTO plus one WARN naming the
-      value; there is no `RING_LAYERS`.
+      value; there is no `RING_LAYERS` (was: `{policy, trace, ring_layers}`, with `RING_LAYERS` unparsable or 0 -> 2
+      and > 8 -> 8).
 - [ ] `moe_exec_decision_log` keeps per-(device, layer) the last `moe_exec_choice` and emits the WARN only when it changes; the host-only test drives 48 layers x 3 micro-batches and counts exactly 48 lines when nothing changes after the first, 49 when one layer flips once.
 - [ ] The three knobs appear in `sycl_env_settings[]` so `[SYCL] non-default settings in effect` reports them (`tests/test-sycl-env-report.cpp` already checks that table's mechanism).
 - [ ] Source gate: each `getenv` literal appears exactly once in `ggml/src/ggml-sycl/` (the catalog's literal-search command in `docs/backend/sycl-env-vars.md:7-14` is the oracle), the WARN format string appears once, and `docs/backend/sycl-env-vars.md` has a row for each (Task 14 writes the rows; this gate's doc assertion is marked `xfail` until Task 14 merges, then flipped: state it in the test's docstring).
@@ -1022,7 +1025,8 @@ git commit -m "sycl, tests: a prompt layer's stream list is a pure function of t
 - [ ] The stage table is cleared at the first decode graph after the prompt and at every new prompt's first layer; cleared entries release their handles only through the ring's epoch events.
 - [ ] Trace (`GGML_SYCL_MOE_EXEC_TRACE=1`) prints per layer: `[MOE-EXEC-TRACE] stage layer %d ubatch %u: %s regime=%s
       p=%.2f t_cpu=%.0f t_ring=%.0f window=%.0f staged=%d/%d bytes=%zu unowned=%d untyped=%d exhausted=%d` (the prefix
-      and the last three fields are as built).
+      and the last three fields are as built; was: `[MOE-EXEC] trace layer %d ubatch %u: %s regime=%s p=%.2f
+      t_cpu=%.0f t_ring=%.0f window=%.0f staged=%d/%d bytes=%zu`; see the Task 7b amendment).
 
 **Implementation Guide:**
 
