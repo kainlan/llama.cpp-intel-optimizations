@@ -419,14 +419,18 @@ int main() {
     }
 
     // 8. The batched mul_mat_id prompt executor's tables (llama.cpp-348c). The f16 arm takes every type in
-    //    the brief's roster on AOS only, MXFP4 on SOA only, and nothing it has no measured weight for.
+    //    the brief's roster on AOS, the four with a per-expert SOA dequant to f16 (Q4_0, Q8_0, Q4_K, Q6_K) on
+    //    SOA too, since the planner materializes experts SOA (the B50 does Q8_0 and Q6_K), MXFP4 on SOA only,
+    //    and nothing it has no measured weight for.
     const ggml_type pp_f16_aos_types[] = {
         GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,    GGML_TYPE_Q4_K,  GGML_TYPE_Q5_K,
         GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
     };
     for (const ggml_type type : pp_f16_aos_types) {
+        const bool soa_too =
+            type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K;
         for (const ggml_layout_mode layout : all_layouts()) {
-            const bool want = layout == GGML_LAYOUT_AOS;
+            const bool want = layout == GGML_LAYOUT_AOS || (soa_too && layout == GGML_LAYOUT_SOA);
             if (moe_pp_batched_f16_supports_layout(type, layout) != want) {
                 std::printf("FAIL: batched f16 arm wrong for type=%s layout=%d (want %d)\n", ggml_type_name(type),
                             static_cast<int>(layout), want ? 1 : 0);
@@ -454,14 +458,19 @@ int main() {
         bool             want;
         const char *     name;
     } pp_batched_cases[] = {
-        { GGML_TYPE_MXFP4,  GGML_LAYOUT_SOA,       false, false, true,  "MXFP4 SOA f16 arm, both knobs off"      },
-        { GGML_TYPE_MXFP4,  GGML_LAYOUT_AOS,       true,  true,  false, "MXFP4 AOS has no arm"                   },
-        { GGML_TYPE_MXFP4,  GGML_LAYOUT_XMX_TILED, true,  false, true,  "MXFP4 XMX_TILED WOQ arm"                },
-        { GGML_TYPE_MXFP4,  GGML_LAYOUT_XMX_TILED, false, true,  false, "MXFP4 XMX_TILED without WOQ"            },
-        { GGML_TYPE_Q4_0,   GGML_LAYOUT_AOS,       false, true,  true,  "Q4_0 AOS f16 arm"                       },
-        { GGML_TYPE_Q4_0,   GGML_LAYOUT_AOS,       true,  false, false, "Q4_0 AOS with the AOS knob off"         },
-        { GGML_TYPE_Q4_0,   GGML_LAYOUT_SOA,       true,  true,  false, "Q4_0 SOA is not the loaded expert form" },
-        { GGML_TYPE_IQ4_XS, GGML_LAYOUT_AOS,       false, true,  true,  "IQ4_XS AOS f16 arm"                     },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_SOA,       false, false, true,  "MXFP4 SOA f16 arm, both knobs off"  },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_AOS,       true,  true,  false, "MXFP4 AOS has no arm"               },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_XMX_TILED, true,  false, true,  "MXFP4 XMX_TILED WOQ arm"            },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_XMX_TILED, false, true,  false, "MXFP4 XMX_TILED without WOQ"        },
+        { GGML_TYPE_Q4_0,   GGML_LAYOUT_AOS,       false, true,  true,  "Q4_0 AOS f16 arm"                   },
+        { GGML_TYPE_Q4_0,   GGML_LAYOUT_AOS,       true,  false, false, "Q4_0 AOS with the AOS knob off"     },
+        { GGML_TYPE_Q4_0,   GGML_LAYOUT_SOA,       true,  true,  true,  "Q4_0 SOA f16 arm (reorder dequant)" },
+        { GGML_TYPE_Q8_0,   GGML_LAYOUT_SOA,       true,  true,  true,  "Q8_0 SOA f16 arm (SOA row-major)"   },
+        { GGML_TYPE_Q6_K,   GGML_LAYOUT_SOA,       true,  true,  true,  "Q6_K SOA f16 arm (reorder dequant)" },
+        { GGML_TYPE_Q6_K,   GGML_LAYOUT_SOA,       true,  false, false, "Q6_K SOA with the AOS knob off"     },
+        { GGML_TYPE_Q8_0,   GGML_LAYOUT_COALESCED, true,  true,  false, "Q8_0 COALESCED has no arm"          },
+        { GGML_TYPE_IQ4_XS, GGML_LAYOUT_AOS,       false, true,  true,  "IQ4_XS AOS f16 arm"                 },
+        { GGML_TYPE_IQ4_XS, GGML_LAYOUT_SOA,       false, true,  false, "IQ4_XS has no SOA dequant"          },
     };
 
     for (const auto & c : pp_batched_cases) {
@@ -475,6 +484,18 @@ int main() {
         if (moe_pp_batched_woq_supports_layout(type, GGML_LAYOUT_SOA) && type != GGML_TYPE_MXFP4) {
             std::printf("FAIL: the WOQ arm admits type=%d; it is MXFP4 only\n", t);
             ++failures;
+        }
+        // The plan sizes the f16 slot by asking at AOS, which is right only while every non-MXFP4 type the
+        // f16 arm takes in any layout is also taken on AOS.
+        if (type != GGML_TYPE_MXFP4 && !moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS)) {
+            for (const ggml_layout_mode layout : all_layouts()) {
+                if (moe_pp_batched_f16_supports_layout(type, layout)) {
+                    std::printf(
+                        "FAIL: the f16 arm takes type=%d on layout=%d but not on AOS, so its slot is unplanned\n", t,
+                        static_cast<int>(layout));
+                    ++failures;
+                }
+            }
         }
         for (const ggml_layout_mode layout : all_layouts()) {
             // GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 must leave exactly the MXFP4 executor.

@@ -2,15 +2,17 @@
 """Source gate for the type-keyed batched MoE prompt executor (llama.cpp-348c).
 
 The batched oneDNN prompt executor (the try_pp_mxfp4_soa_onednn_f16_batched lambda in ggml_sycl_mul_mat_id) used to
-take MXFP4 experts only. Its f16 arm now takes every expert type that has an AOS dequant-to-f16 kernel. These claims
-pin that shape:
+take MXFP4 experts only. Its f16 arm now takes every expert type that has an AOS dequant-to-f16 kernel, and SOA too
+for the types the planner materializes SOA that have a per-expert SOA dequant. These claims pin that shape:
 
   (a) one support table: the claim predicate and the lambda's candidate gate both ask
       ggml_sycl_moe_pp_batched_takes_layout(), which asks moe_pp_batched_supports_layout() in moe-mmvq-tables.hpp,
       and neither tests GGML_TYPE_MXFP4 itself;
-  (b) the f16 table lists each required type on AOS only, MXFP4 on SOA only, never the direct-kernel types, and
-      every AOS type it lists has a case in convert.cpp's ggml_get_to_fp16_sycl_for_layout; the WOQ table is MXFP4
-      on SOA and XMX_TILED;
+  (b) the f16 table lists each required type on AOS, Q4_0, Q8_0, Q4_K and Q6_K on AOS and SOA, MXFP4 on SOA only,
+      never the direct-kernel types, and every type it lists has a case in convert.cpp's
+      ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
+      since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
+      dequantize_row_q8_0_soa_to_fp16_rowmajor and never asks it; the WOQ table is MXFP4 on SOA and XMX_TILED;
   (c) the Q4_K device-weight CPU fallback (a D2H copy per dispatch) does not fire for a prompt the executor claims;
   (d) decode keeps its ne12 == 1 / ids->ne[1] > 1 terms: the hybrid-with-plan disjunct, the two claim call sites
       and the lambda's single-token refusal;
@@ -24,7 +26,8 @@ pin that shape:
       a prompt the executor claims;
   (i) the planned weight slot is widened at plan time from the f16 table, so the executor never needs an
       unplanned allocation;
-  (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, read once and consulted by the support helper.
+  (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, read once, consulted by the support helper, and
+      dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -53,6 +56,10 @@ REQUIRED_AOS = [
     "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ4_XS", "GGML_TYPE_IQ4_NL", "GGML_TYPE_Q2_0", "GGML_TYPE_IQ2_S",
     "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_XXS",
 ]
+# The types the planner may materialize SOA that have a per-expert SOA dequant to f16 (the B50 loads Q8_0 and Q6_K
+# experts SOA; the device test's RED run refused both).
+REQUIRED_SOA = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q6_K"]
+AOS_SOA_EXPR = "layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA"
 # Q1_0 and NVFP4 run on a device only through their direct kernel (moe_type_needs_direct_kernel); float experts are
 # not a dequant case.
 FORBIDDEN = ["GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4", "GGML_TYPE_F16", "GGML_TYPE_F32", "GGML_TYPE_BF16"]
@@ -232,6 +239,15 @@ def switch_cases(body):
     return out
 
 
+def case_body(switch_text, label):
+    """Text after `case <label>:` up to the next type case or default, or None."""
+    m = re.search(r"case " + re.escape(label) + r" ?:", switch_text)
+    if not m:
+        return None
+    nxt = re.search(r"case GGML_TYPE_\w+ ?:|default ?:", switch_text[m.end():])
+    return switch_text[m.end() : m.end() + (nxt.start() if nxt else len(switch_text))]
+
+
 def enum_values(text, enum_head):
     start = text.find(enum_head)
     if start < 0:
@@ -304,8 +320,12 @@ def claim_b_table_types(s):
         return ["the f16 table, the WOQ table or convert.cpp's ggml_get_to_fp16_sycl_for_layout was not found"]
     cases = switch_cases(f16)
     for t in REQUIRED_AOS:
-        if cases.get(t) != AOS_EXPR:
-            fails.append(f"the f16 table does not answer {t} with `{AOS_EXPR}` (got {cases.get(t)!r})")
+        want = AOS_SOA_EXPR if t in REQUIRED_SOA else AOS_EXPR
+        if cases.get(t) != want:
+            fails.append(f"the f16 table does not answer {t} with `{want}` (got {cases.get(t)!r})")
+    for t, expr in cases.items():
+        if expr == AOS_SOA_EXPR and t not in REQUIRED_SOA:
+            fails.append(f"the f16 table takes {t} on SOA, but no per-expert SOA dequant is pinned for it")
     if cases.get("GGML_TYPE_MXFP4") != "layout == GGML_LAYOUT_SOA":
         fails.append(f"the f16 table must take MXFP4 on SOA only (got {cases.get('GGML_TYPE_MXFP4')!r})")
     for t in FORBIDDEN:
@@ -315,8 +335,25 @@ def claim_b_table_types(s):
         fails.append("the f16 table's default must be `return false`")
     converter_types = set(re.findall(r"case (GGML_TYPE_\w+) ?:", for_layout))
     for t, expr in cases.items():
-        if expr == AOS_EXPR and t not in converter_types:
-            fails.append(f"the f16 table takes {t} on AOS but ggml_get_to_fp16_sycl_for_layout has no case for it")
+        if expr in (AOS_EXPR, AOS_SOA_EXPR) and t not in converter_types:
+            fails.append(f"the f16 table takes {t} but ggml_get_to_fp16_sycl_for_layout has no case for it")
+    for t in REQUIRED_SOA:
+        if t == "GGML_TYPE_Q8_0":
+            continue
+        body = case_body(for_layout, t) or ""
+        if "use_reorder" not in body or "_reorder" not in body.replace("use_reorder", ""):
+            fails.append(f"ggml_get_to_fp16_sycl_for_layout's {t} case has no reorder kernel for SOA")
+    lam = lambda_body(s["sycl"]) or ""
+    q8_soa = ("const bool pp_q8_0_soa = src0->type == GGML_TYPE_Q8_0 && "
+              "active_experts.front().layout == GGML_LAYOUT_SOA;")
+    if q8_soa not in lam:
+        fails.append("the lambda does not name its Q8_0 SOA experts (pp_q8_0_soa)")
+    q8_kernel = lam.find("dequantize_row_q8_0_soa_to_fp16_rowmajor(")
+    if q8_kernel < 0 or (enclosing_if_condition(lam, q8_kernel) or "").strip() != "pp_q8_0_soa":
+        fails.append("the lambda does not take Q8_0 SOA experts to dequantize_row_q8_0_soa_to_fp16_rowmajor")
+    getter = lam.find("pp_to_fp16 = ggml_get_to_fp16_sycl_for_layout(")
+    if getter < 0 or "!pp_q8_0_soa" not in (enclosing_if_condition(lam, getter) or ""):
+        fails.append("the lambda asks ggml_get_to_fp16_sycl_for_layout for Q8_0 SOA, which answers the AOS kernel")
     woq_types = set(re.findall(r"GGML_TYPE_\w+", woq))
     if woq_types != {"GGML_TYPE_MXFP4"} or "GGML_LAYOUT_SOA" not in woq or "GGML_LAYOUT_XMX_TILED" not in woq:
         fails.append("the WOQ table must be MXFP4 on SOA and XMX_TILED")
@@ -532,6 +569,9 @@ def claim_j_knob(s):
     takes = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_takes_layout") or ""
     if "ggml_sycl_moe_pp_f16_batched_aos_enabled()" not in takes:
         fails.append("ggml_sycl_moe_pp_batched_takes_layout does not consult the knob")
+    support = one_definition(s["tables"], "moe_pp_batched_supports_layout") or ""
+    if "if (type != GGML_TYPE_MXFP4 && !aos_enabled) { return false; }" not in support:
+        fails.append("the knob does not drop every non-MXFP4 entry (an SOA entry would survive it)")
     return fails
 
 
@@ -571,6 +611,10 @@ MUTANTS = [
     ("b", "tables", "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_SOA;",
      "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_AOS;"),
     ("b", "tables", "case GGML_TYPE_IQ4_XS:", "case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q1_0:"),
+    ("b", "tables", " || layout == GGML_LAYOUT_SOA;", ";"),
+    ("b", "convert", "return dequantize_row_q6_K_sycl_reorder;", "return nullptr;"),
+    ("b", "sycl", "if (pp_q8_0_soa) {", "if (false) {"),
+    ("b", "sycl", "src0->type != GGML_TYPE_MXFP4 && !pp_q8_0_soa", "src0->type != GGML_TYPE_MXFP4"),
     ("c", "sycl", "(src0->type == GGML_TYPE_Q4_K) && !pp_onednn_batched_route_claims_prompt;",
      "(src0->type == GGML_TYPE_Q4_K);"),
     ("d", "sycl", "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;",
@@ -598,6 +642,7 @@ MUTANTS = [
     ("i", "sycl", "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(inventory))", "size_t(0))"),
     ("i", "sycl", "ggml_sycl_moe_pp_batched_takes_layout(tensor.type, GGML_LAYOUT_AOS)", "true"),
     ("j", "sycl", "ggml_sycl_moe_pp_f16_batched_aos_enabled()", "true"),
+    ("j", "tables", "if (type != GGML_TYPE_MXFP4 && !aos_enabled)", "if (layout == GGML_LAYOUT_AOS && !aos_enabled)"),
     ("j", "common", "return env == nullptr || std::atoi(env) != 0; }(); return aos_enabled;",
      "return env != nullptr && std::atoi(env) != 0; }(); return aos_enabled;"),
 ]
