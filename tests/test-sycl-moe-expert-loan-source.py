@@ -517,8 +517,8 @@ def claim_loan_runs_at_the_graph_boundary(sycl: str) -> bool:
 LOAN_DRAIN_SIG = "static bool ggml_sycl_expert_loan_boundary_drain(int device, bool loan_accepted)"
 RUN_PENDING_ACCEPTED = "const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);"
 LOAN_DRAIN_CALL = "(void) ggml_sycl_expert_loan_boundary_drain(sycl_ctx->device, loan_accepted);"
-PENDING_LENT = ("return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result) && result.accepted && "
-                "result.n_triplets != 0;")
+PENDING_LENT = ("return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result) && "
+                "result.accepted && result.n_triplets != 0;")
 LOAN_DRAIN_BOUND = "constexpr uint32_t drain_ms = 100;"
 LOAN_DRAIN_ONLY_ACCEPTED = "if (!loan_accepted || ggml_sycl::drain_retained_handles(true, drain_ms)) { return true; }"
 LOAN_DRAIN_TRACE = ('if (ggml_sycl_moe_exec_config().trace >= 1) { GGML_LOG_INFO("[MOE-EXEC-TRACE] loan device %d: '
