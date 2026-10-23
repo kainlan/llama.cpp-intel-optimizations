@@ -12,13 +12,17 @@
 //     second, and exactly once over the run;
 //   * a [MOE-PP-ONEDNN-F16-BATCHED] success line during each case (GGML_SYCL_MOE_ROUTE_LOG=1, set below). The
 //     backend prints that line at most 96 times per process, so the cases must stay under that cap (static_assert
-//     below);
+//     below). Every such line in the case must name at least three groups (groups=, see below);
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
 //     "[MOE-PROMPT-REFUSAL]", no "refusing unplanned PP MoE oneDNN batched scratch".
 //
 // The ring is planned the way libllama plans it by default (src/llama-model.cpp): weight slots sized for the MXFP4
-// WOQ arm, about a quarter of an f16 slot. Only the backend's plan-time widening of the weight slot for the types
-// the f16 arm takes lets these ops fit, so a missing widening shows as the unplanned-scratch refusal.
+// WOQ arm, about a quarter of every expert in f16. The f16 arm runs in that slot, never a wider one: it groups the
+// active experts to fit it, alternating between the slot's two halves, each group's dequant chained on the GEMMs
+// that last read its half. At this shape the slot holds 8 f16 experts, so groups of 4.
+// GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX (set below) caps each group at 3 experts, so every case runs at least three
+// groups (11 when all 32 experts are active) whatever the planner's slot size, and the halves are reused several
+// times.
 //
 // The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on. With it off, libllama puts these
 // device-planned experts in the device buffer instead, which this fixture does not model: that upload reorders an SOA
@@ -34,7 +38,9 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,6 +85,10 @@ constexpr int k_cases          = k_cases_per_type * int(sizeof(k_types) / sizeof
 constexpr int k_route_log_cap = 96;
 static_assert(k_cases <= k_route_log_cap, "a case past the route log's cap has no success line to count");
 
+// The fewest f16 groups a case's success line may name. The group cap set in main() makes it at least
+// ceil(active experts / 3), and a 64-token case activates nearly all 32 experts.
+constexpr size_t k_min_groups = 3;
+
 void require(bool condition, const std::string & message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -112,6 +122,26 @@ struct log_capture {
             n += all ? 1 : 0;
         }
         return n;
+    }
+
+    // The smallest count that follows `field` (such as "groups=") in the chunks from `from` on that contain `needle`,
+    // or SIZE_MAX when none of them carries the field.
+    size_t min_field_since(size_t from, const char * needle, const char * field) {
+        std::lock_guard<std::mutex> lock(mu);
+        size_t                      least = SIZE_MAX;
+        for (size_t i = from; i < chunks.size(); ++i) {
+            const size_t at = chunks[i].find(needle) != std::string::npos ? chunks[i].find(field) : std::string::npos;
+            if (at == std::string::npos) {
+                continue;
+            }
+            const char * digits = chunks[i].c_str() + at + std::strlen(field);
+            char *       end    = nullptr;
+            const auto   value  = std::strtoull(digits, &end, 10);
+            if (end != digits) {
+                least = std::min(least, static_cast<size_t>(value));
+            }
+        }
+        return least;
     }
 };
 
@@ -444,6 +474,7 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     const size_t       refused   = g_log.count_since(from, { "[PP-MOE] refused" });
     const size_t       prompt_rf = g_log.count_since(from, { "[MOE-PROMPT-REFUSAL]" });
     const size_t       unplanned = g_log.count_since(from, { "refusing unplanned PP MoE oneDNN batched scratch" });
+    const size_t       groups    = g_log.min_field_since(from, "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", "groups=");
 
     std::string why;
     if (status != GGML_STATUS_SUCCESS) {
@@ -461,11 +492,16 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     if (refused != 0 || prompt_rf != 0 || unplanned != 0) {
         why += " refusal";
     }
+    if (batched != 0 && groups < k_min_groups) {
+        why += " groups";
+    }
     std::fprintf(stderr,
                  "CASE type=%s tokens=%d ne11=%d status=%d nmse=%.3e pp_moe_lines=%zu pp_moe_total=%zu "
-                 "batched_lines=%zu pp_moe_refused=%zu prompt_refusal=%zu unplanned_scratch=%zu -> %s%s\n",
+                 "batched_lines=%zu min_groups=%zu pp_moe_refused=%zu prompt_refusal=%zu unplanned_scratch=%zu "
+                 "-> %s%s\n",
                  type_name.c_str(), c.n_tokens, c.ne11, static_cast<int>(status), err, pp_moe, pp_total, batched,
-                 refused, prompt_rf, unplanned, why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 groups == SIZE_MAX ? size_t(0) : groups, refused, prompt_rf, unplanned,
+                 why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
@@ -475,6 +511,7 @@ int main() {
     // Read once by the backend, so they are set before anything touches it.
     setenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE", "1", 1);
     setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);
+    setenv("GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX", "3", 1);
     ggml_log_set(log_callback, nullptr);
     try {
         bool have_gpu = false;
