@@ -179,6 +179,7 @@ ARMS_EXPLICIT=0
 SEED_VERDICTS=""
 REFUSE_SELFTEST=0
 WAIT_BUILDERS_SELFTEST=0
+BUILDERS_POST_SELFTEST=""
 BUILDERS_FILE=""
 BUILDERS_WAIT_MAX=900
 BUILDERS_POLL=10
@@ -262,6 +263,12 @@ is_arm() {
     return 1
 }
 
+# need_value <argc> <option>: a value-taking option with no word after it is a usage error. Without the guard `shift 2`
+# fails on one remaining word, shifts nothing, and the loop re-reads the same option forever.
+need_value() {
+    [ "$1" -ge 2 ] || die_usage "$2 needs a value"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         -h | --help) usage; exit 0 ;;
@@ -270,56 +277,59 @@ while [ $# -gt 0 ]; do
             is_arm "${2:-}" || die_usage "--arm '${2:-}' is not one of: ${ALL_ARMS[*]}"
             ARMS+=("$2"); ARMS_EXPLICIT=1; shift 2 ;;
         --make-prompt) MAKE_PROMPT=1; shift ;;
-        --prompt-out) PROMPT_OUT="$2"; shift 2 ;;
+        --prompt-out) need_value "$#" "$1"; PROMPT_OUT="$2"; shift 2 ;;
         --score-arm)
             is_arm "${2:-}" || die_usage "--score-arm '${2:-}' is not one of: ${ALL_ARMS[*]}"
             SCORE_ARM="$2"; shift 2 ;;
-        --csv) S_CSV="$2"; shift 2 ;;
-        --out) S_OUT="$2"; shift 2 ;;
-        --out2) S_OUT2="$2"; shift 2 ;;
-        --err) S_ERR="$2"; shift 2 ;;
-        --ref-out) S_REF="$2"; shift 2 ;;
-        --ref-out2) S_REF2="$2"; shift 2 ;;
-        --journal) S_JOURNAL="$2"; shift 2 ;;
-        --rc) S_RC="$2"; shift 2 ;;
-        --rc-out2) S_RC_OUT2="$2"; shift 2 ;;
-        --rc-ref) S_RC_REF="$2"; shift 2 ;;
-        --rc-ref2) S_RC_REF2="$2"; shift 2 ;;
-        --builders-pre) S_BPRE="$2"; shift 2 ;;
-        --builders-post) S_BPOST="$2"; shift 2 ;;
-        --src-dir) SRC_DIR="$2"; shift 2 ;;
+        --csv) need_value "$#" "$1"; S_CSV="$2"; shift 2 ;;
+        --out) need_value "$#" "$1"; S_OUT="$2"; shift 2 ;;
+        --out2) need_value "$#" "$1"; S_OUT2="$2"; shift 2 ;;
+        --err) need_value "$#" "$1"; S_ERR="$2"; shift 2 ;;
+        --ref-out) need_value "$#" "$1"; S_REF="$2"; shift 2 ;;
+        --ref-out2) need_value "$#" "$1"; S_REF2="$2"; shift 2 ;;
+        --journal) need_value "$#" "$1"; S_JOURNAL="$2"; shift 2 ;;
+        --rc) need_value "$#" "$1"; S_RC="$2"; shift 2 ;;
+        --rc-out2) need_value "$#" "$1"; S_RC_OUT2="$2"; shift 2 ;;
+        --rc-ref) need_value "$#" "$1"; S_RC_REF="$2"; shift 2 ;;
+        --rc-ref2) need_value "$#" "$1"; S_RC_REF2="$2"; shift 2 ;;
+        --builders-pre) need_value "$#" "$1"; S_BPRE="$2"; shift 2 ;;
+        --builders-post) need_value "$#" "$1"; S_BPOST="$2"; shift 2 ;;
+        --src-dir) need_value "$#" "$1"; SRC_DIR="$2"; shift 2 ;;
         --clobber) CLOBBER=1; shift ;;
-        --seed-verdicts) SEED_VERDICTS="$2"; shift 2 ;;
+        --seed-verdicts) need_value "$#" "$1"; SEED_VERDICTS="$2"; shift 2 ;;
         --refuse-selftest) REFUSE_SELFTEST=1; shift ;;
         --wait-builders-selftest) WAIT_BUILDERS_SELFTEST=1; shift ;;
-        --builders-file) BUILDERS_FILE="$2"; shift 2 ;;
-        --builders-wait-max) BUILDERS_WAIT_MAX="$2"; shift 2 ;;
-        --builders-poll) BUILDERS_POLL="$2"; shift 2 ;;
-        --score-summary) SCORE_SUMMARY="$2"; shift 2 ;;
+        --builders-post-selftest)
+            is_arm "${2:-}" || die_usage "--builders-post-selftest '${2:-}' is not one of: ${ALL_ARMS[*]}"
+            BUILDERS_POST_SELFTEST="$2"; shift 2 ;;
+        --builders-file) need_value "$#" "$1"; BUILDERS_FILE="$2"; shift 2 ;;
+        --builders-wait-max) need_value "$#" "$1"; BUILDERS_WAIT_MAX="$2"; shift 2 ;;
+        --builders-poll) need_value "$#" "$1"; BUILDERS_POLL="$2"; shift 2 ;;
+        --score-summary) need_value "$#" "$1"; SCORE_SUMMARY="$2"; shift 2 ;;
         --ring-arms) RING_ARMS_MODE=1; shift ;;
         --signal-selftest) SIGNAL_SELFTEST=1; shift ;;
         --check-controls) CHECK_CONTROLS=1; shift ;;
         --lock-selftest) LOCK_SELFTEST=1; shift ;;
-        --build-dir) BUILD_DIR="$2"; shift 2 ;;
-        --out-dir) OUT_DIR="$2"; shift 2 ;;
-        --lock-dir) LOCK_DIR="$2"; shift 2 ;;
+        --build-dir) need_value "$#" "$1"; BUILD_DIR="$2"; shift 2 ;;
+        --out-dir) need_value "$#" "$1"; OUT_DIR="$2"; shift 2 ;;
+        --lock-dir) need_value "$#" "$1"; LOCK_DIR="$2"; shift 2 ;;
         --no-lock) TAKE_LOCK=0; shift ;;
         --no-head-check) HEAD_CHECK=0; shift ;;
-        --since) SINCE="$2"; shift 2 ;;
-        --qwen) QWEN="$2"; shift 2 ;;
-        --gptoss) GPTOSS="$2"; shift 2 ;;
-        --mistral) MISTRAL="$2"; shift 2 ;;
-        --tuning-dir) TUNING_DIR="$2"; shift 2 ;;
-        --decode-ref) DECODE_REF="$2"; shift 2 ;;
-        --place-ref-tg) PLACE_REF_TG="$2"; shift 2 ;;
-        --place-ref-noc) PLACE_REF_NOC="$2"; shift 2 ;;
-        --qmd5) QMD5="$2"; shift 2 ;;
-        --q-layers) Q_LAYERS="$2"; shift 2 ;;
-        --go-noc-layers) GO_NOC_LAYERS="$2"; shift 2 ;;
-        --pp512-min) PP512_MIN="$2"; shift 2 ;;
-        --pp2048-min) PP2048_MIN="$2"; shift 2 ;;
-        --go-pp-ref) GO_PP_REF="$2"; shift 2 ;;
-        --go-tg-ref) GO_TG_REF="$2"; shift 2 ;;
+        --since) need_value "$#" "$1"; SINCE="$2"; shift 2 ;;
+        --qwen) need_value "$#" "$1"; QWEN="$2"; shift 2 ;;
+        --gptoss) need_value "$#" "$1"; GPTOSS="$2"; shift 2 ;;
+        --mistral) need_value "$#" "$1"; MISTRAL="$2"; shift 2 ;;
+        --tuning-dir) need_value "$#" "$1"; TUNING_DIR="$2"; shift 2 ;;
+        --decode-ref) need_value "$#" "$1"; DECODE_REF="$2"; shift 2 ;;
+        --place-ref-tg) need_value "$#" "$1"; PLACE_REF_TG="$2"; shift 2 ;;
+        --place-ref-noc) need_value "$#" "$1"; PLACE_REF_NOC="$2"; shift 2 ;;
+        --qmd5) need_value "$#" "$1"; QMD5="$2"; shift 2 ;;
+        --q-layers) need_value "$#" "$1"; Q_LAYERS="$2"; shift 2 ;;
+        --go-noc-layers) need_value "$#" "$1"; GO_NOC_LAYERS="$2"; shift 2 ;;
+        --pp512-min) need_value "$#" "$1"; PP512_MIN="$2"; shift 2 ;;
+        --pp2048-min) need_value "$#" "$1"; PP2048_MIN="$2"; shift 2 ;;
+        --go-pp-ref) need_value "$#" "$1"; GO_PP_REF="$2"; shift 2 ;;
+        --go-tg-ref) need_value "$#" "$1"; GO_TG_REF="$2"; shift 2 ;;
         -*) die_usage "unknown option: $1" ;;
         *) [ -z "$EXPECT_SHA" ] || die_usage "more than one <sha>: $EXPECT_SHA and $1"; EXPECT_SHA="$1"; shift ;;
     esac
@@ -333,7 +343,7 @@ done
 GATE_NEEDS_ONEAPI=1
 modes="$DRY_RUN$MAKE_PROMPT$CHECK_CONTROLS$LOCK_SELFTEST$RING_ARMS_MODE"
 modes="$modes$SIGNAL_SELFTEST$REFUSE_SELFTEST$WAIT_BUILDERS_SELFTEST"
-if [ "$modes" != 00000000 ] || [ -n "$SCORE_ARM$SCORE_SUMMARY" ]; then
+if [ "$modes" != 00000000 ] || [ -n "$SCORE_ARM$SCORE_SUMMARY$BUILDERS_POST_SELFTEST" ]; then
     GATE_NEEDS_ONEAPI=0
 fi
 
@@ -1045,6 +1055,16 @@ sample_builders_during() {
     done
 }
 
+# arm_builders_post <arm>: the builders_post of an arm that has just ended: the count now, raised to the highest count
+# the sampler saw while the arm ran (a build that started and finished inside the arm still depressed it).
+arm_builders_post() {
+    local post during
+    post="$(builders)"
+    during="$(cat "$OUT_DIR/$1.builders_max" 2>/dev/null || echo 0)"
+    [ "$post" -ge "$during" ] || post="$during"
+    echo "$post"
+}
+
 CHILD=""
 # shellcheck disable=SC2329  # installed through trap below
 on_signal() {
@@ -1159,6 +1179,11 @@ fi
 if [ "$WAIT_BUILDERS_SELFTEST" = 1 ]; then
     wait_builders selftest
     say "wait-builders-selftest: cleared"
+    exit 0
+fi
+
+if [ -n "$BUILDERS_POST_SELFTEST" ]; then
+    say "builders-post-selftest: post=$(arm_builders_post "$BUILDERS_POST_SELFTEST")"
     exit 0
 fi
 
@@ -1295,7 +1320,7 @@ say "pre: $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders=$(builders)"
 RUN_STARTED=1
 
 run_arm() { # <arm>: runs it, writes <arm>.out/.err/.rc, prints the sample lines
-    local arm="$1" rc pre post during
+    local arm="$1" rc pre post
     arm_setup "$arm"
     if [ "$A_KIND" = journal ]; then
         journalctl -k --since "$SINCE" --no-pager > "$OUT_DIR/$arm.out" 2> "$OUT_DIR/$arm.err"
@@ -1323,9 +1348,7 @@ run_arm() { # <arm>: runs it, writes <arm>.out/.err/.rc, prints the sample lines
     SAMPLER=""
     echo "$rc" > "$OUT_DIR/$arm.rc"
     sleep 5
-    post="$(builders)"
-    during="$(cat "$OUT_DIR/$arm.builders_max" 2>/dev/null || echo 0)"
-    [ "$post" -ge "$during" ] || post="$during"
+    post="$(arm_builders_post "$arm")"
     echo "$post" > "$OUT_DIR/$arm.builders_post"
     say "arm $arm: rc=$rc post(+5s) $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders_post=$post (max of the" \
         "5 s samples during the arm and the one after it) $(date +%T)"

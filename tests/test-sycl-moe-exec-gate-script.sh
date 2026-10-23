@@ -18,10 +18,13 @@
 #     layer-ubatch used the ring;
 #   - the summary: ring_engaged_any yes, no and na, exit 3 for a Q_pp that passed without the ring, loan_exercised_any,
 #     a FAIL beating it;
-#   - Q_tok / Q_tok_2 / Q_tok_cpu_1 recorded, Q_tok_cpu across two loads per arm: equal, a flip on either side,
-#     a real mismatch naming the first differing byte, a missing reference;
-#   - Q_tg / Q_noc: floor, md5, place line (unchanged, changed, unscored), refill balanced / unbalanced /
-#     not_exercised, watchdog;
+#   - Q_tok / Q_tok_2 / Q_tok_cpu_1 recorded; Q_tok_cpu across two loads per arm, scored by common prefix because
+#     the B70's greedy near-tie flips in both policies: some auto md5 equals some cpu md5 and every auto output
+#     shares >= 64 bytes with its best cpu match (fixtures at 64 and 63 bytes), a defect (pairs_equal=0, early
+#     min_prefix) against a flip (pairs_equal >= 1, late), a truncated output, a missing reference;
+#   - Q_tg / Q_noc: floor, md5 equal to the reference, or a flip (>= 128 bytes shared with the committed reference
+#     text, fixtures at 128 and 127 bytes) and the md5 of that committed text (25b7738a); the place line (unscored
+#     by default, unchanged, changed); refill balanced / unbalanced / not_exercised; watchdog;
 #   - GO_gate / GO_noc count and layer lines (the echo line alone must not score), GO_pp window, MI digits,
 #     resets;
 #   - --dry-run lists every arm, pins the selector in all fourteen device arms, passes no -ngl, no -cnv to llama-cli,
@@ -41,8 +44,11 @@
 #   - a usage error prints the final line; the sha format is checked under --no-head-check; the head check reads
 #     the build's own source tree (--src-dir, a snapshot copy of the script); an exported GGML_SYCL_* or LLAMA_ARG_*
 #     variable and a non-empty --out-dir are refused (the journal arm alone runs the real flow GPU-free);
-#   - builders: builders_pre and builders_post on every verdict, a taint makes NOT_SCORED (exit 3), a builder wait
-#     is bounded, and every stop once the lock is held prints the summary over the verdicts scored so far (the
+#   - a value-taking option given last is refused (rc 2, final line), never spun on;
+#   - builders: builders_pre and builders_post on every verdict (the larger of the count after an arm and the
+#     highest the sampler saw during it), a taint makes NOT_SCORED (exit 3), the start waits for a build before
+#     the settle check and the lock, a builder wait is bounded, and every stop once the lock is held prints the
+#     summary over the verdicts scored so far (the
 #     --refuse-selftest, --signal-selftest and --wait-builders-selftest hooks);
 #   - prerequisites: a missing awk, md5sum, cmp, comm or journalctl is exit 77, in the test and in the gate.
 set -u
@@ -302,8 +308,9 @@ out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-c1.out" --ref-
     --ref-out2 "$WORK/tok-a2.out" --rc 124)"
 expect "Q_tok_cpu a timeout fails" "$out" "Q_tok_cpu=FAIL(rc=124"
 
-# R1: the greedy near-tie flips in both policies and cascades after its token. The rule is: some auto md5 equals some
-# cpu md5, and every auto output is identical to a cpu output or shares >= 64 bytes with its best-matching one.
+# Q_tok_cpu: the greedy near-tie flips in both policies and cascades after its token. The rule is: some auto md5
+# equals some cpu md5, and every auto output is identical to a cpu output or shares >= 64 bytes with its
+# best-matching one.
 TOKBASE='The user wants me to summarize the document about GPT-OSS Testing and Prompt Template Rationale'
 TOKBASE="$TOKBASE in plain words."
 printf '%s\n' "$TOKBASE" > "$WORK/lt-base.out"
@@ -346,7 +353,6 @@ expect "Q_tok_cpu a shared prefix of exactly 64 bytes passes" "$out" "Q_tok_cpu=
 out="$(tokcpu "$WORK/lt-base.out" "$WORK/lt-p63c.out" "$WORK/lt-base.out" "$WORK/lt-p63a.out")"
 expect "Q_tok_cpu a shared prefix of 63 bytes fails" "$out" "Q_tok_cpu=FAIL(auto2_prefix=63<64)"
 # a prefix of the other output (one is a prefix of the other) counts the shorter length
-printf '%s' "$TOKBASE" > "$WORK/lt-cut.out"
 head -c 80 "$WORK/lt-base.out" > "$WORK/lt-trunc.out"
 out="$(tokcpu "$WORK/lt-base.out" "$WORK/lt-base.out" "$WORK/lt-base.out" "$WORK/lt-trunc.out")"
 expect "Q_tok_cpu a truncated auto output counts the shared length (80 >= 64)" "$out" "Q_tok_cpu=PASS"
@@ -400,7 +406,7 @@ dec_err "$WORK/noc-slow.err" 9.30 'MoE experts: 38163 on device, 35565 on host'
 out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc-slow.err" --qmd5 "$MD5" --place-ref-noc -)"
 expect "Q_noc below the floor fails" "$out" "Q_noc=FAIL(tg=9.30<9.5)"
 
-# R2: a different md5 is a greedy near-tie flip when the output shares >= 128 bytes with the reference TEXT
+# Q_tg and Q_noc: a different md5 is a greedy near-tie flip when the output shares >= 128 bytes with the reference TEXT
 head -c 300 /dev/zero | tr '\0' 'a' > "$WORK/dref.txt"
 DREF_MD5="$(md5sum < "$WORK/dref.txt" | cut -c1-8)"
 { head -c 199 "$WORK/dref.txt"; printf 'Z'; head -c 100 "$WORK/dref.txt"; } > "$WORK/dflip.out"
@@ -440,7 +446,8 @@ expect "Q_noc a late divergence is PASS with flip=yes" "$out" "Q_noc=PASS tg=9.8
 expect "Q_noc a flip prints flip=yes" "$out" "flip=yes prefix=199"
 out="$(dscore Q_noc "$WORK/dearly.out")"
 expect "Q_noc an early divergence is a FAIL with flip=no" "$out" "Q_noc=FAIL(md5="
-# R3: the placement references default to "-": recorded, not scored
+# the placement references default to "-": the line is recorded and not scored, because the right value moves with the
+# cost-based KV room and only the lead can name it for a tree
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 "$MD5")"
 expect "Q_tg without --place-ref-tg the place line is recorded, not scored" "$out" "place=unscored"
 expect "Q_tg unscored place still passes" "$out" "Q_tg=PASS"
@@ -711,9 +718,9 @@ out="$(summ outside2 "$CTRL_PASS" "Q_tg=PASS tg=11.9 ring_engaged=no")"; rc=$?
 expect "an arm outside RING_ARMS does not make ring_engaged_any=no" "$out" "ring_engaged_any=na"
 expect_rc "an arm outside RING_ARMS leaves the exit code 0" "$rc" 0
 
-# ---- quality review r1: the arms fail closed ---------------------------------------------------------------------
+# ---- the arms fail closed ---------------------------------------------------------------------
 
-# I1: the resets arm reads journalctl's own rc and a missing journal; an empty journal is a pass only with rc 0
+# the resets arm reads journalctl's own rc and a missing journal; an empty journal is a pass only with rc 0
 out="$(score resets --journal "$WORK/absent-journal.txt")"; rc=$?
 expect "resets a missing journal file is a FAIL, never a clean log" "$out" "resets=FAIL(no_journal"
 expect_rc "resets a missing journal rc" "$rc" 1
@@ -729,7 +736,7 @@ printf 'xe 0000:03:00.0: [drm] gt reset started\n' > "$WORK/j-lower.txt"
 out="$(score resets --journal "$WORK/j-lower.txt")"
 expect "resets matches case-insensitively" "$out" "resets=FAIL(count=1)"
 
-# I2: Q_tok_cpu needs all four outputs non-empty and all four loads rc 0; a recorded arm that failed is a FAIL
+# Q_tok_cpu needs all four outputs non-empty and all four loads rc 0; a recorded arm that failed is a FAIL
 : > "$WORK/tok-none.out"
 out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-none.out" --ref-out "$WORK/tok-none.out" \
     --ref-out2 "$WORK/tok-none.out" --rc-out2 134 --rc-ref 134 --rc-ref2 134)"; rc=$?
@@ -758,11 +765,34 @@ expect "summary a RECORDED line is not counted as a pass" "$out" "verdicts_pass=
 out="$(summ recpass "Q_tok=RECORDED md5=c4589dac rc=0" "$CTRL_PASS")"
 expect "summary RECORDED beside one PASS counts one pass" "$out" "verdicts_pass=1 GATE_DONE"
 
-# I3: a usage error ends with the final line so a detached waiter is released; help and dry-run keep the plain form
+# a usage error ends with the final line so a detached waiter is released; help and dry-run keep the plain form
 out="$(bash "$GATE" --no-such-option 2>&1)"; rc=$?
 expect_rc "an unknown option exits 2" "$rc" 2
 expect "an unknown option still prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
 expect "an unknown option says REFUSED: usage" "$out" "REFUSED: usage: unknown option: --no-such-option"
+# a value-taking option given last must be refused, not spun on: `shift 2` fails on one remaining word, so without the
+# guard the loop re-reads the option forever. Every option the script guards is tried as the final word, under a
+# timeout.
+out="$(timeout 10 bash "$GATE" --dry-run --out-dir 2>&1)"; rc=$?
+expect_rc "a trailing --out-dir exits 2, not 124" "$rc" 2
+expect "a trailing --out-dir says REFUSED: usage ... needs a value" "$out" "REFUSED: usage: --out-dir needs a value"
+expect "a trailing --out-dir prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
+out="$(timeout 10 bash "$GATE" --since 2>&1)"; rc=$?
+expect_rc "a trailing --since exits 2, not 124" "$rc" 2
+n_opts=0
+bad_opts=""
+mapfile -t guarded_opts < <(cat "$GATE" | grep -o -E '^ +--[a-z0-9-]+\) need_value' | grep -o -E -- '--[a-z0-9-]+')
+for opt in "${guarded_opts[@]}"; do
+    n_opts=$((n_opts + 1))
+    out="$(timeout 10 bash "$GATE" "$opt" 2>&1)"; rc=$?
+    [ "$rc" = 2 ] && printf '%s\n' "$out" | grep -qF -- "$opt needs a value" || bad_opts="$bad_opts $opt(rc=$rc)"
+done
+expect_rc "no guarded option is left without a refusal when it is the last word:$bad_opts" "${bad_opts:+bad}" ""
+if [ "$n_opts" -ge 30 ]; then
+    pass "the loop above covered $n_opts value-taking options"
+else
+    fail "only $n_opts value-taking options found"
+fi
 out="$(bash "$GATE" --arm Q_nope 2>&1)"
 expect "an unknown arm prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
 out="$(bash "$GATE" abcdef0 1234567 2>&1)"; rc=$?
@@ -771,7 +801,7 @@ expect "two <sha> arguments print the final line" "$out" "verdicts_pass=0 GATE_D
 out="$(bash "$GATE" --help 2>&1)"
 expect_not "help is not a usage refusal" "$out" "REFUSED: usage"
 
-# I4: the sha format is checked under --no-head-check; the head check reads the build's own source tree
+# the sha format is checked under --no-head-check; the head check reads the build's own source tree
 mkdir -p "$WORK/stubbin"
 mkstub() { printf '#!/bin/sh\n%s\n' "$1" > "$WORK/stubbin/journalctl"; chmod +x "$WORK/stubbin/journalctl"; }
 # rf <build-dir> <gate option>... <sha>: a real run of the journal arm alone (no device, no model, no lock)
@@ -816,7 +846,7 @@ expect "snapshot prompts resolve next to the script (decode)" "$out" \
 out="$(bash "$SNAP" --dry-run --build-dir "$WORK/srcrepo/build" 2>&1)"
 expect "the dry-run names the source tree the build's head is read from" "$out" "src-dir: $WORK/srcrepo "
 
-# I1 in the real flow: journalctl's rc survives into the verdict, and the verdict line carries the builders fields
+# in the real flow journalctl's rc survives into the verdict, and the verdict line carries the builders fields
 mkstub 'exit 7'
 out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-j7" abcdef0)"; rc=$?
 expect "a failing journalctl scores resets=FAIL naming its rc" "$out" "resets=FAIL(journalctl_rc=7)"
@@ -831,7 +861,7 @@ expect "an empty journal with rc 0 passes" "$out" "resets=PASS count=0 builders_
 expect "the run ends with the final line" "$out" "verdicts_pass=1 GATE_DONE"
 expect_rc "a clean journal run is exit 0" "$rc" 0
 
-# m16: a real run sources oneAPI, and an option VALUE that equals a mode flag must not skip it
+# a real run sources oneAPI, and an option VALUE that equals a mode flag must not skip it
 if [ -f /opt/intel/oneapi/setvars.sh ]; then
     out="$(rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-oneapi" abcdef0)"
     expect "a real run sources oneAPI" "$out" "oneapi=sourced"
@@ -844,7 +874,7 @@ fi
 out="$(bash "$GATE" --score-arm resets --journal "$WORK/j-clean.txt" 2>&1)"
 expect_not "a scoring mode does not source oneAPI" "$out" "oneapi="
 
-# m3: an exported GGML_SYCL_* or LLAMA_ARG_* variable would reach every arm: refuse and name it
+# an exported GGML_SYCL_* or LLAMA_ARG_* variable would reach every arm: refuse and name it
 out="$(GGML_SYCL_MOE_EXEC=cpu rf "$WORK/fakebuild" --no-head-check --out-dir "$WORK/rf-leak" abcdef0)"; rc=$?
 expect_rc "an exported GGML_SYCL_ variable refuses with rc 2" "$rc" 2
 expect "the refusal names the variable" "$out" "GGML_SYCL_MOE_EXEC"
@@ -853,7 +883,8 @@ expect_rc "an exported LLAMA_ARG_ variable refuses with rc 2" "$rc" 2
 expect "the refusal names the LLAMA_ARG_ variable" "$out" "LLAMA_ARG_N_GPU_LAYERS"
 expect "a leak refusal ends with the final line" "$out" "verdicts_pass=0 GATE_DONE"
 
-# m5: a reused --out-dir
+# a reused --out-dir: stale outputs must not be scored as this run's, so it is refused unless --arm names what to redo
+# or --clobber says to overwrite
 mkdir -p "$WORK/rf-used"
 echo stale > "$WORK/rf-used/Q_pp.out"
 out="$(PATH="$WORK/stubbin:$PATH" bash "$GATE" --no-lock --build-dir "$WORK/fakebuild" --no-head-check \
@@ -870,7 +901,7 @@ out="$(PATH="$WORK/stubbin:$PATH" bash "$GATE" --no-lock --build-dir "$WORK/fake
     --out-dir "$WORK/rf-used2" abcdef0 2>&1)"
 expect_not "--clobber accepts a non-empty --out-dir (it gets past the out-dir check)" "$out" "is not empty"
 
-# I5: builders_pre and builders_post on every verdict line; a build during the arm taints a PASS
+# builders_pre and builders_post on every verdict line; a build during the arm taints a PASS
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err" --builders-pre 0 --builders-post 0)"; rc=$?
 expect "a verdict line carries builders_pre and builders_post" "$out" "builders_pre=0 builders_post=0"
 expect "builders 0 and 0 leaves the PASS" "$out" "Q_pp=PASS"
@@ -893,7 +924,7 @@ out="$(summ taint "$TAINTED" "$CTRL_PASS")"; rc=$?
 expect_rc "summary a tainted arm makes exit 3" "$rc" 3
 expect "summary a tainted PASS is not counted as a pass" "$out" "verdicts_pass=1 GATE_DONE"
 
-# I6: every stop once the lock is held prints the verdicts scored so far; a builder wait is bounded like settle
+# every stop once the lock is held prints the verdicts scored so far; a builder wait is bounded like settle
 printf '%s\n' "$PASS_RING" "$CTRL_PASS" > "$WORK/seed.txt"
 out="$(bash "$GATE" --refuse-selftest --seed-verdicts "$WORK/seed.txt" --lock-dir "$WORK/ref.lock" 2>&1)"; rc=$?
 expect_rc "a refusal after arms ran exits 2" "$rc" 2
@@ -949,7 +980,36 @@ out="$(bash "$GATE" --wait-builders-selftest --builders-file "$WORK/b-count" --b
 expect_rc "zero builders does not wait" "$rc" 0
 expect_not "zero builders prints no wait line" "$out" "waiting up to"
 
-# I7: every arm scores a non-zero rc as a FAIL; a GO run that prints the answer and aborts in teardown must FAIL
+# builders_post is the larger of the count after the arm and the highest count the sampler saw during it: a build that
+# started and ended inside the arm taints it although none is running afterwards.
+mkdir -p "$WORK/bp"
+bpost() { # <during> <after>
+    printf '%s\n' "$1" > "$WORK/bp/Q_pp.builders_max"
+    printf '%s\n' "$2" > "$WORK/bp/b-after"
+    bash "$GATE" --builders-post-selftest Q_pp --out-dir "$WORK/bp" --builders-file "$WORK/bp/b-after" 2>&1
+}
+expect "builders_post: a build during the arm only is counted" "$(bpost 2 0)" "post=2"
+expect "builders_post: a build after the arm only is counted" "$(bpost 0 3)" "post=3"
+expect "builders_post: the larger of the two wins" "$(bpost 1 4)" "post=4"
+expect "builders_post: none is zero" "$(bpost 0 0)" "post=0"
+rm -f "$WORK/bp/Q_pp.builders_max"
+echo 1 > "$WORK/bp/b-after"
+expect "builders_post: no sampler file reads as zero during" \
+    "$(bash "$GATE" --builders-post-selftest Q_pp --out-dir "$WORK/bp" --builders-file "$WORK/bp/b-after" 2>&1)" \
+    "post=1"
+# the wait for a running build comes before the lock and the settle check: an arm list with a device arm must not
+# take GPU.lock or sample the host while a build still runs
+wb_line="$(cat "$GATE" | grep -n -F 'wait_builders start' | cut -d: -f1 | head -1)"
+lk_line="$(cat "$GATE" | grep -n -F 'lock_take || refuse "could not take' | cut -d: -f1 | head -1)"
+st_line="$(cat "$GATE" | grep -n -F 'host_settled || refuse' | cut -d: -f1 | head -1)"
+if [ -n "$wb_line" ] && [ -n "$lk_line" ] && [ -n "$st_line" ] \
+    && [ "$wb_line" -lt "$st_line" ] && [ "$st_line" -lt "$lk_line" ]; then
+    pass "the start waits for builders before the settle check and before the lock"
+else
+    fail "wait_builders start ($wb_line) must precede host_settled ($st_line) and lock_take ($lk_line)"
+fi
+
+# every arm scores a non-zero rc as a FAIL; a GO run that prints the answer and aborts in teardown must FAIL
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG" --rc 134)"; rc=$?
 expect "Q_tg rc 134 fails with the rc named" "$out" "Q_tg=FAIL(rc=134)"
 expect_rc "Q_tg rc 134 exit" "$rc" 1
@@ -969,7 +1029,7 @@ expect "MI_b50 a timeout fails" "$out" "MI_b50=FAIL(rc=124)"
 out="$(score Q_staged --err "$WORK/st-pass.err" --rc 134)"
 expect "Q_staged rc 134 fails" "$out" "Q_staged=FAIL(rc=134"
 
-# m1: cases that pin the mutants the first round left alive
+# scorer details a wrong implementation would otherwise pass
 # the last " eval time = " line wins, not the first (head vs tail)
 {
     echo "0.01.601.984 I [PLACEMENT] $PLACE_TG (of 73728 total)"
@@ -979,7 +1039,7 @@ expect "Q_staged rc 134 fails" "$out" "Q_staged=FAIL(rc=134"
 } > "$WORK/tg-two.err"
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-two.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
 expect "Q_tg reads the last eval line, not the first" "$out" "Q_tg=PASS tg=11.91"
-# m2: a nan eval line must not let the prompt-eval rate stand in for tg
+# a nan eval line must not let the prompt-eval rate stand in for tg
 {
     echo "0.01.601.984 I [PLACEMENT] $PLACE_TG (of 73728 total)"
     echo "1.40.000.000 I llama_perf_context_print: prompt eval time =     400.00 ms /   800 tokens" \
@@ -1016,7 +1076,7 @@ for f in pp-depth-first pp-depth-last; do
     expect "Q_pp ignores a depth row ($f)" "$out" "Q_pp=PASS pp512=523.4"
 done
 
-# m7 and m11: the C-locale cmp spelling, and a missing tool is a skip in the gate too
+# the C-locale cmp spelling, and a missing tool is a skip in the gate too
 mkdir -p "$WORK/nocmp"
 for t in dirname cat grep sed tr cut head tail wc sort date ls env awk md5sum comm git pgrep timeout journalctl \
          mkdir rm cp stat seq sleep uname basename readlink mktemp; do
