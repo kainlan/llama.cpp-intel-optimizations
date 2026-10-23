@@ -21672,6 +21672,42 @@ std::string test_loan_stage_refusal(const unified_cache * cache, const direct_st
                           coherent_cache_placement_plan_owner(cache)->entries.size());
 }
 
+// The WARN lines logged while it lives, each line also passed on to the callback it replaced, which it puts back
+// (llama.cpp-pu8v).
+struct test_loan_warn_capture {
+    ggml_log_callback        previous      = nullptr;
+    void *                   previous_data = nullptr;
+    std::mutex               mutex;
+    std::vector<std::string> lines;
+
+    test_loan_warn_capture() {
+        ggml_log_get(&previous, &previous_data);
+        ggml_log_set(&test_loan_warn_capture::callback, this);
+    }
+
+    ~test_loan_warn_capture() { ggml_log_set(previous, previous_data); }
+
+    test_loan_warn_capture(const test_loan_warn_capture &)             = delete;
+    test_loan_warn_capture & operator=(const test_loan_warn_capture &) = delete;
+
+    static void callback(ggml_log_level level, const char * text, void * user_data) {
+        auto * self = static_cast<test_loan_warn_capture *>(user_data);
+        if (level == GGML_LOG_LEVEL_WARN && text) {
+            std::lock_guard<std::mutex> lock(self->mutex);
+            self->lines.emplace_back(text);
+        }
+        if (self->previous) {
+            self->previous(level, text, self->previous_data);
+        }
+    }
+
+    // How many captured lines are exactly `line`.
+    size_t count(const std::string & line) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return static_cast<size_t>(std::count(lines.begin(), lines.end(), line));
+    }
+};
+
 // n_layers x (gate, up, down) tensors of n_experts 1 MiB experts each, under cache ids no model registered.
 struct test_loan_fixture {
     int                                                 device    = 0;
@@ -23321,9 +23357,16 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
         const auto                             published = ::ggml_sycl_global_plan_snapshot();
         const ::ggml_sycl_expert_loan_resolver resolver  = fx.resolver();
         ::ggml_sycl_expert_loan_result         result;
+        test_loan_warn_capture                 warns;
         ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
         if (!::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, &result)) {
             return "the graph boundary ran no loan for the pending request";
+        }
+        const std::string refused_line = test_loan_fail("[MOE-EXEC] loan device %d refused: not resident\n", fx.device);
+        if (warns.count(refused_line) != 1) {
+            return test_loan_fail("the refused loan WARNed \"%.*s\" %zu times, not once",
+                                  static_cast<int>(refused_line.size() - 1), refused_line.c_str(),
+                                  warns.count(refused_line));
         }
         if (result.accepted || result.n_triplets != 0 || result.bytes_freed != 0 ||
             std::strcmp(result.reason, "not resident") != 0) {
@@ -23364,7 +23407,13 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
     }
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
+    test_loan_warn_capture                 warns;
+    const std::string                      dropped_line =
+        test_loan_fail("[MOE-EXEC] refill device %d: layer 1 expert 2 stays on the host: not lent\n", fx.device);
     uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (warns.count(dropped_line) != 0) {
+        return "the refill that kept the triplet behind the back WARNed it dropped";
+    }
     if (!result.accepted || result.n_triplets != 1 || result.n_dropped != 0 || remaining != 1) {
         return test_loan_fail(
             "the refill of the back triplet answered accepted=%d triplets=%u dropped=%u remaining=%u (%s), not 1, 0 "
@@ -23387,6 +23436,10 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
             "the refill of a back triplet with no host copy answered accepted=%d triplets=%u dropped=%u remaining=%u "
             "(%s), not 0, 0, 1 and 0 (not lent)",
             (int) result.accepted, result.n_triplets, result.n_dropped, remaining, result.reason);
+    }
+    if (warns.count(dropped_line) != 1) {
+        return test_loan_fail("the drop WARNed \"%.*s\" %zu times, not once", static_cast<int>(dropped_line.size() - 1),
+                              dropped_line.c_str(), warns.count(dropped_line));
     }
     if (::ggml_sycl_global_plan_snapshot().get() != published.get() ||
         g_sycl_expert_lent_count[fx.device].load() != 0) {

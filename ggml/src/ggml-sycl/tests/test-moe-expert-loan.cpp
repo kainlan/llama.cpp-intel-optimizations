@@ -72,10 +72,11 @@
 //                           entries' sizes freed, and one decode boundary re-admits both, reporting the same bytes.
 //   loan_and_refill_stop_on_a_missing_entry
 //                           llama.cpp-pu8v: a one-triplet loan whose down member has no device entry stops "not
-//                           resident": nothing lent, published or re-posted. After a two-triplet loan, the triplet
-//                           behind the ledger's back loses its gate host copy: one decode boundary re-admits the back
-//                           and keeps it, the next stops "not lent" and drops it (one WARN, "stays on the host: not
-//                           lent"), publishing nothing.
+//                           resident" (its refusal WARNed once): nothing lent, published or re-posted. After a
+//                           two-triplet loan, the triplet behind the ledger's back loses its gate host copy: one
+//                           decode boundary re-admits the back and keeps it, WARNing no drop, and the next stops "not
+//                           lent" and drops it, WARNing "stays on the host: not lent" once, publishing nothing. Both
+//                           WARNs are captured and asserted.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from

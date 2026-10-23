@@ -2915,8 +2915,8 @@ struct expert_refill_member {
 
 // What one refill did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
 // refill carries the device storage it takes, the three host copies' sizes, and a lease on each member's new device
-// entry, whose
-// bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its last write).
+// entry, whose bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its
+// last write).
 struct expert_refill_record {
     bool         accepted         = false;
     const char * reason           = "none";
