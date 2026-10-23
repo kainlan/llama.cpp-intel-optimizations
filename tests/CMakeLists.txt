@@ -977,6 +977,14 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
+    # llama.cpp-348c: the batched oneDNN prompt executor is type-keyed: one support table, the Q4_K D2H fallback
+    # off for claimed prompts, one refusal enum, one [PP-MOE] line per (device, type), byte-identical MXFP4 labels.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-pp-batched-types-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-pp-batched-types-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
     # staging allocation fails, and the registry must not fail an allocation on a
     # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.

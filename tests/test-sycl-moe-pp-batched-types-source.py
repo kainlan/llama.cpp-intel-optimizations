@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""Source gate for the type-keyed batched MoE prompt executor (llama.cpp-348c).
+
+The batched oneDNN prompt executor (the try_pp_mxfp4_soa_onednn_f16_batched lambda in ggml_sycl_mul_mat_id) used to
+take MXFP4 experts only. Its f16 arm now takes every expert type that has an AOS dequant-to-f16 kernel. These claims
+pin that shape:
+
+  (a) one support table: the claim predicate and the lambda's candidate gate both ask
+      ggml_sycl_moe_pp_batched_takes_layout(), which asks moe_pp_batched_supports_layout() in moe-mmvq-tables.hpp,
+      and neither tests GGML_TYPE_MXFP4 itself;
+  (b) the f16 table lists each required type on AOS only, MXFP4 on SOA only, never the direct-kernel types, and
+      every AOS type it lists has a case in convert.cpp's ggml_get_to_fp16_sycl_for_layout; the WOQ table is MXFP4
+      on SOA and XMX_TILED;
+  (c) the Q4_K device-weight CPU fallback (a D2H copy per dispatch) does not fire for a prompt the executor claims;
+  (d) decode keeps its ne12 == 1 / ids->ne[1] > 1 terms: the hybrid-with-plan disjunct, the two claim call sites
+      and the lambda's single-token refusal;
+  (e) one refusal enum with a name for every cause, every refusal in the lambda names one, and one WARN line per
+      (device, cause) under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE;
+  (f) one [PP-MOE] INFO line per (device, type), naming the type, layout, experts per dispatch and the planned slot;
+  (g) the MXFP4 profiler label strings are byte-identical and keep their counts, the non-MXFP4 labels are moe.pp.*,
+      and the MXFP4 dispatch-record profile stays MXFP4-only;
+  (h) the capability query admits a prompt-phase op the executor takes only after the MMVQ check (so no type that
+      has an MMVQ-ID kernel changes kernel), and MUL_MAT_ID admission takes a type with no MMVQ-ID kernel only for
+      a prompt the executor claims;
+  (i) the planned weight slot is widened at plan time from the f16 table, so the executor never needs an
+      unplanned allocation;
+  (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, read once and consulted by the support helper.
+
+Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
+probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
+"""
+import re
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+SYCL_DIR = ROOT / "ggml" / "src" / "ggml-sycl"
+FILES = {
+    "sycl": SYCL_DIR / "ggml-sycl.cpp",
+    "tables": SYCL_DIR / "moe-mmvq-tables.hpp",
+    "convert": SYCL_DIR / "convert.cpp",
+    "gemm": SYCL_DIR / "gemm.hpp",
+    "common": SYCL_DIR / "common.hpp",
+    "layer_plan": SYCL_DIR / "moe-layer-plan.hpp",
+}
+
+# The brief's list (Q4_0 plus the Qwen3.8 GSQ-RCO mix types it named) plus the rest of the GSQ-RCO census
+# (iq4_nl, q2_0, iq2_s, iq2_xs, iq2_xxs): see the memory "a GGUF file name is not its expert quant type".
+REQUIRED_AOS = [
+    "GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K", "GGML_TYPE_IQ3_XXS",
+    "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ4_XS", "GGML_TYPE_IQ4_NL", "GGML_TYPE_Q2_0", "GGML_TYPE_IQ2_S",
+    "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_XXS",
+]
+# Q1_0 and NVFP4 run on a device only through their direct kernel (moe_type_needs_direct_kernel); float experts are
+# not a dequant case.
+FORBIDDEN = ["GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4", "GGML_TYPE_F16", "GGML_TYPE_F32", "GGML_TYPE_BF16"]
+AOS_EXPR = "layout == GGML_LAYOUT_AOS"
+KNOB = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS"
+
+
+def strip_comments(src):
+    """Drop // and /* */ comments, leaving string and char literals intact (a quoted "//" is not a comment)."""
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and src[j] != c:
+                j += 2 if src[j] == "\\" else 1
+            out.append(src[i : j + 1])
+            i = j + 1
+        elif src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def squeeze(src):
+    return re.sub(r"\s+", " ", src)
+
+
+def load():
+    return {key: squeeze(strip_comments(path.read_text())) for key, path in FILES.items()}
+
+
+def all_backend_sources():
+    for path in sorted(SYCL_DIR.rglob("*")):
+        if path.suffix in (".cpp", ".hpp", ".h") and "tests" not in path.relative_to(SYCL_DIR).parts:
+            yield path
+
+
+def match_close(text, open_pos):
+    """Index just past the bracket matching text[open_pos], skipping string and char literals; -1 if unmatched."""
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    opener = text[open_pos]
+    closer = pairs[opener]
+    depth = 0
+    i, n = open_pos, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def definitions(text, name):
+    """Bodies (including braces) of every function definition named `name` (a call or declaration is skipped)."""
+    bodies = []
+    for m in re.finditer(r"\b" + re.escape(name) + r" ?\(", text):
+        params_end = match_close(text, m.end() - 1)
+        if params_end < 0:
+            continue
+        rest = text[params_end:]
+        k = re.match(r" ?(const )?(noexcept )?\{", rest)
+        if not k:
+            continue
+        open_pos = params_end + k.end() - 1
+        close = match_close(text, open_pos)
+        if close > 0:
+            bodies.append(text[open_pos:close])
+    return bodies
+
+
+def one_definition(text, name):
+    bodies = definitions(text, name)
+    return bodies[0] if len(bodies) == 1 else None
+
+
+def claim_predicate_body(sycl):
+    """The three-argument ggml_sycl_moe_pp_onednn_batched_claims_tensor (the one with the plan) -- the real body."""
+    for body in definitions(sycl, "ggml_sycl_moe_pp_onednn_batched_claims_tensor"):
+        if "moe_classify_tensor(" in body:
+            return body
+    return None
+
+
+def lambda_body(sycl):
+    m = re.search(r"auto try_pp_mxfp4_soa_onednn_f16_batched = \[&\]\(\) -> bool \{", sycl)
+    if not m:
+        return None
+    close = match_close(sycl, m.end() - 1)
+    return sycl[m.end() - 1 : close] if close > 0 else None
+
+
+def statement(text, head):
+    """The statement starting at `head` up to its terminating ';' at bracket depth 0, or None."""
+    start = text.find(head)
+    if start < 0:
+        return None
+    depth = 0
+    i = start
+    while i < len(text):
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < len(text) and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            return text[start : i + 1]
+        i += 1
+    return None
+
+
+def enclosing_if_condition(text, pos):
+    """Condition text of the innermost `if (...) { ... }` whose block contains pos, or None."""
+    best = None
+    for m in re.finditer(r"\bif \(", text[:pos]):
+        cond_end = match_close(text, m.end() - 1)
+        if cond_end < 0 or cond_end > pos:
+            continue
+        rest = text[cond_end:]
+        k = re.match(r" ?\{", rest)
+        if not k:
+            continue
+        open_pos = cond_end + k.end() - 1
+        close = match_close(text, open_pos)
+        if open_pos < pos < close:
+            best = text[m.end() : cond_end - 1]
+    return best
+
+
+def switch_cases(body):
+    """{case label: return expression} for a switch whose arms are case-label runs ending in one return."""
+    out = {}
+    pending = []
+    for m in re.finditer(r"case (GGML_TYPE_\w+) ?:|return ([^;]*);|default ?:", body):
+        if m.group(1):
+            pending.append(m.group(1))
+        elif m.group(2) is not None:
+            for label in pending:
+                out[label] = m.group(2).strip()
+            pending = []
+        else:
+            pending = ["default"]
+    return out
+
+
+def enum_values(text, enum_head):
+    start = text.find(enum_head)
+    if start < 0:
+        return None
+    open_pos = text.find("{", start)
+    close = match_close(text, open_pos)
+    names = []
+    for item in text[open_pos + 1 : close - 1].split(","):
+        item = item.strip()
+        if item:
+            names.append(item.split("=")[0].strip())
+    return names
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Claims. Each returns a list of failures (empty = holds).
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def claim_a_one_table(s):
+    fails = []
+    for fn in ("moe_pp_batched_f16_supports_layout", "moe_pp_batched_woq_supports_layout",
+               "moe_pp_batched_supports_layout"):
+        n = len(definitions(s["tables"], fn))
+        if n != 1:
+            fails.append(f"{fn} is defined {n} times in moe-mmvq-tables.hpp, want 1")
+        if definitions(s["sycl"], fn):
+            fails.append(f"{fn} has a second definition in ggml-sycl.cpp")
+    takes = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_takes_layout")
+    if takes is None:
+        fails.append("ggml_sycl_moe_pp_batched_takes_layout is not defined exactly once in ggml-sycl.cpp")
+    else:
+        if "moe_pp_batched_supports_layout(" not in takes:
+            fails.append("ggml_sycl_moe_pp_batched_takes_layout does not ask moe_pp_batched_supports_layout")
+        if "GGML_TYPE_" in takes:
+            fails.append("ggml_sycl_moe_pp_batched_takes_layout names a type itself instead of asking the table")
+    claim = claim_predicate_body(s["sycl"])
+    if claim is None:
+        fails.append("the plan-taking ggml_sycl_moe_pp_onednn_batched_claims_tensor definition was not found")
+    else:
+        if "ggml_sycl_moe_pp_batched_takes_layout(" not in claim:
+            fails.append("the claim predicate does not ask ggml_sycl_moe_pp_batched_takes_layout")
+        if "GGML_TYPE_" in claim:
+            fails.append("the claim predicate still tests a GGML_TYPE_ itself")
+    cand = statement(s["sycl"], "const bool pp_batched_candidate =")
+    if cand is None:
+        fails.append("the lambda's candidate gate `const bool pp_batched_candidate = ...;` was not found")
+    else:
+        if "ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout)" not in cand:
+            fails.append("the candidate gate does not ask ggml_sycl_moe_pp_batched_takes_layout(src0->type, ...)")
+        if "src0->type ==" in cand or "GGML_TYPE_MXFP4" in cand:
+            fails.append("the candidate gate still tests the src0 type itself")
+    lam = lambda_body(s["sycl"])
+    if lam is None:
+        fails.append("the try_pp_mxfp4_soa_onednn_f16_batched lambda was not found")
+    else:
+        if "!pp_batched_candidate" not in lam:
+            fails.append("the lambda does not refuse on !pp_batched_candidate")
+        if "pp_mxfp4_soa_f16_candidate" in lam:
+            fails.append("the lambda still reads the MXFP4-only pp_mxfp4_soa_f16_candidate")
+    return fails
+
+
+def claim_b_table_types(s):
+    fails = []
+    f16 = one_definition(s["tables"], "moe_pp_batched_f16_supports_layout")
+    woq = one_definition(s["tables"], "moe_pp_batched_woq_supports_layout")
+    for_layout = one_definition(s["convert"], "ggml_get_to_fp16_sycl_for_layout")
+    if f16 is None or woq is None or for_layout is None:
+        return ["the f16 table, the WOQ table or convert.cpp's ggml_get_to_fp16_sycl_for_layout was not found"]
+    cases = switch_cases(f16)
+    for t in REQUIRED_AOS:
+        if cases.get(t) != AOS_EXPR:
+            fails.append(f"the f16 table does not answer {t} with `{AOS_EXPR}` (got {cases.get(t)!r})")
+    if cases.get("GGML_TYPE_MXFP4") != "layout == GGML_LAYOUT_SOA":
+        fails.append(f"the f16 table must take MXFP4 on SOA only (got {cases.get('GGML_TYPE_MXFP4')!r})")
+    for t in FORBIDDEN:
+        if t in cases:
+            fails.append(f"the f16 table names {t}")
+    if cases.get("default") != "false":
+        fails.append("the f16 table's default must be `return false`")
+    converter_types = set(re.findall(r"case (GGML_TYPE_\w+) ?:", for_layout))
+    for t, expr in cases.items():
+        if expr == AOS_EXPR and t not in converter_types:
+            fails.append(f"the f16 table takes {t} on AOS but ggml_get_to_fp16_sycl_for_layout has no case for it")
+    woq_types = set(re.findall(r"GGML_TYPE_\w+", woq))
+    if woq_types != {"GGML_TYPE_MXFP4"} or "GGML_LAYOUT_SOA" not in woq or "GGML_LAYOUT_XMX_TILED" not in woq:
+        fails.append("the WOQ table must be MXFP4 on SOA and XMX_TILED")
+    return fails
+
+
+def claim_c_q4k_fallback(s):
+    sycl = s["sycl"]
+    gated = ("const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K) && "
+             "!pp_onednn_batched_route_claims_prompt;")
+    pos = sycl.find(gated)
+    if pos < 0:
+        return ["the Q4_K device_weight_cpu_fallback is not gated on !pp_onednn_batched_route_claims_prompt"]
+    if sycl.find("const bool pp_onednn_batched_route_claims_prompt =") > pos:
+        return ["pp_onednn_batched_route_claims_prompt is defined after the fallback that reads it"]
+    return []
+
+
+def claim_d_decode_terms(s):
+    fails = []
+    sycl = s["sycl"]
+    for text in (
+        "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;",
+        "const bool pp_onednn_batched_route_claims_prompt = prompt_batch && "
+        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);",
+        "const bool prompt_batch = ids && ids->ne[1] > 1;",
+        "const bool pp_onednn_batched_claims_op = ne12 > 1 && "
+        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);",
+    ):
+        if text not in sycl:
+            fails.append(f"missing decode-preserving term: {text}")
+    lam = lambda_body(sycl) or ""
+    if not re.search(r"if \([^{]*ids->ne\[1\] <= 1[^{]*\) \{ return trace_batched_skip\(", lam):
+        fails.append("the lambda no longer refuses a single-token (decode) op with trace_batched_skip")
+    return fails
+
+
+def claim_e_refusal_enum(s):
+    fails = []
+    head = "enum class moe_pp_batched_refusal : uint8_t"
+    defs = sum(squeeze(strip_comments(p.read_text())).count(head) for p in all_backend_sources())
+    if defs != 1:
+        return [f"`{head}` is defined {defs} times in the backend sources, want 1"]
+    holder = next(k for k in ("tables", "sycl") if head in s[k])
+    values = enum_values(s[holder], head)
+    if not values or len(values) > 32:
+        fails.append(f"the refusal enum has {len(values or [])} values; the per-device latch holds at most 32")
+    names = one_definition(s[holder], "moe_pp_batched_refusal_name")
+    if names is None:
+        fails.append("moe_pp_batched_refusal_name is not defined exactly once beside the enum")
+    else:
+        for v in values or []:
+            if f"case moe_pp_batched_refusal::{v}:" not in names:
+                fails.append(f"moe_pp_batched_refusal_name has no case for {v}")
+    lam = lambda_body(s["sycl"]) or ""
+    calls = list(re.finditer(r"\b(trace_batched_skip|reject_batched)\(", lam))
+    if not calls:
+        fails.append("the lambda makes no trace_batched_skip/reject_batched calls")
+    for m in calls:
+        if not lam.startswith("moe_pp_batched_refusal::", m.end()):
+            fails.append(f"{m.group(1)}({lam[m.end():m.end() + 40]}...) does not name a moe_pp_batched_refusal")
+    literal = '"[PP-MOE] refused'
+    if s["sycl"].count(literal) != 1:
+        fails.append(f"{literal} appears {s['sycl'].count(literal)} times in ggml-sycl.cpp, want 1")
+    else:
+        pos = s["sycl"].find(literal)
+        cond = enclosing_if_condition(s["sycl"], pos) or ""
+        if "pp_mxfp4_soa_f16_batched_trace" not in cond or "ggml_sycl_moe_pp_batched_refusal_first(" not in cond:
+            fails.append("the refusal WARN is not guarded by the trace knob and the per-(device, cause) latch")
+        stmt_start = s["sycl"].rfind("GGML_LOG_", 0, pos)
+        if not s["sycl"].startswith("GGML_LOG_WARN(", stmt_start):
+            fails.append("the refusal line is not emitted with GGML_LOG_WARN")
+        stmt = statement(s["sycl"], s["sycl"][stmt_start:pos]) or ""
+        if "moe_pp_batched_refusal_name(" not in stmt:
+            fails.append("the refusal WARN does not print the cause name")
+    latch = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_refusal_first")
+    if latch is None or "fetch_or(" not in latch or "std::atomic<uint32_t>" not in latch:
+        fails.append("ggml_sycl_moe_pp_batched_refusal_first is not one per-device atomic bitmask latch")
+    return fails
+
+
+def claim_f_first_run_line(s):
+    fails = []
+    sycl = s["sycl"]
+    literal = '"[PP-MOE] device=%d type=%s layout=%s'
+    if sycl.count(literal) != 1:
+        return [f"{literal} appears {sycl.count(literal)} times in ggml-sycl.cpp, want 1"]
+    pos = sycl.find(literal)
+    cond = enclosing_if_condition(sycl, pos) or ""
+    if cond.strip() != "ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type)":
+        fails.append(f"the [PP-MOE] line is guarded by `{cond.strip()}`, not the per-(device, type) latch")
+    stmt_start = sycl.rfind("GGML_LOG_", 0, pos)
+    if not sycl.startswith("GGML_LOG_INFO(", stmt_start):
+        fails.append("the [PP-MOE] line is not emitted with GGML_LOG_INFO")
+    stmt = statement(sycl, sycl[stmt_start:pos]) or ""
+    for field in ("experts=", "planned_weight_slot="):
+        if field not in stmt:
+            fails.append(f"the [PP-MOE] line does not name {field}")
+    latch = one_definition(sycl, "ggml_sycl_moe_pp_batched_first_run")
+    if latch is None or "fetch_or(" not in latch or "std::atomic<uint64_t>" not in latch:
+        fails.append("ggml_sycl_moe_pp_batched_first_run is not one per-device atomic bitmask latch")
+    if "static_assert(GGML_TYPE_COUNT <= 64" not in sycl:
+        fails.append("no static_assert that every ggml_type fits the 64-bit first-run mask")
+    return fails
+
+
+def claim_g_labels(s):
+    fails = []
+    counts = {
+        ("sycl", '"mxfp4.pp.stage"'): 2,
+        ("sycl", '"mxfp4.pp.stage.act"'): 1,
+        ("sycl", '"mxfp4.pp.stage.scatter"'): 1,
+        ("gemm", '"mxfp4.pp.gemm"'): 2,
+        ("gemm", '"mxfp4.pp.gemm.execute"'): 2,
+        ("convert", '"mxfp4.pp.repack"'): 8,
+        ("convert", '"mxfp4.pp.repack.soa"'): 4,
+        ("convert", '"mxfp4.pp.repack.tiled"'): 4,
+    }
+    for (key, lit), want in counts.items():
+        got = s[key].count(lit)
+        if got != want:
+            fails.append(f"{lit} appears {got} times in {FILES[key].name}, want {want} (byte-identical MXFP4 labels)")
+    sycl = s["sycl"]
+    for text, want in (
+        ("const bool pp_mxfp4_labels = src0->type == GGML_TYPE_MXFP4;", 1),
+        ('pp_mxfp4_labels ? "mxfp4.pp.stage.act" : "moe.pp.stage.act"', 1),
+        ('pp_mxfp4_labels ? "mxfp4.pp.stage.scatter" : "moe.pp.stage.scatter"', 1),
+        ('pp_mxfp4_labels ? "mxfp4.pp.stage" : "moe.pp.stage"', 2),
+        ('pp_mxfp4_labels ? nullptr : "moe.pp.gemm.execute"', 1),
+        ('"moe.pp.dequant."', 1),
+        ("const bool pp_profile = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();", 1),
+    ):
+        got = sycl.count(text)
+        if got != want:
+            fails.append(f"`{text}` appears {got} times in ggml-sycl.cpp, want {want}")
+    gemm = s["gemm"]
+    if gemm.count('label_name ? label_name : "mulmat.onednn_gemm.execute"') != 2:
+        fails.append("gemm_batch_strided's two label sites do not default to mulmat.onednn_gemm.execute")
+    return fails
+
+
+def claim_h_capability(s):
+    fails = []
+    plan = s["layer_plan"]
+    if "ONEDNN_BATCHED_PROMPT = 8," not in plan and "ONEDNN_BATCHED_PROMPT = 8 }" not in plan:
+        fails.append("moe_route_kernel has no ONEDNN_BATCHED_PROMPT = 8")
+    if 'case moe_route_kernel::ONEDNN_BATCHED_PROMPT: return "onednn-batched-prompt";' not in plan:
+        fails.append("moe_route_kernel_name has no onednn-batched-prompt case")
+    cap = one_definition(s["sycl"], "ggml_sycl_moe_query_route_capability")
+    if cap is None:
+        return fails + ["ggml_sycl_moe_query_route_capability was not found"]
+    mmvq = cap.find("cap.kernel = moe_route_kernel::MMVQ_COMPAT;")
+    onednn = cap.find("cap.kernel = moe_route_kernel::ONEDNN_BATCHED_PROMPT;")
+    if onednn < 0:
+        fails.append("the capability query never answers ONEDNN_BATCHED_PROMPT")
+    else:
+        if onednn < mmvq:
+            fails.append("the ONEDNN_BATCHED_PROMPT branch precedes the MMVQ check, so MMVQ types change kernel")
+        cond = enclosing_if_condition(cap, onednn) or ""
+        if "phase == moe_route_phase::PROMPT" not in cond or "ggml_sycl_moe_pp_batched_takes_layout(" not in cond:
+            fails.append("the ONEDNN_BATCHED_PROMPT branch is not prompt-only and table-derived")
+    gate = ("if (!moe_mmvq_admission_supports_type(indexed_a_type) && "
+            "!ggml_sycl_moe_pp_batched_admits_op(op, device)) {")
+    if gate not in s["sycl"]:
+        fails.append("MUL_MAT_ID admission does not fall back to ggml_sycl_moe_pp_batched_admits_op")
+    admits = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_admits_op")
+    if admits is None:
+        fails.append("ggml_sycl_moe_pp_batched_admits_op is not defined exactly once")
+    else:
+        if "->ne[1] > 1" not in admits:
+            fails.append("ggml_sycl_moe_pp_batched_admits_op does not require a prompt (ids ne[1] > 1)")
+        if "ggml_sycl_moe_pp_onednn_batched_claims_tensor(" not in admits:
+            fails.append("ggml_sycl_moe_pp_batched_admits_op does not require the executor's claim")
+    return fails
+
+
+def claim_i_sizing(s):
+    fails = []
+    sycl = s["sycl"]
+    body = one_definition(sycl, "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes")
+    if body is None:
+        return ["ggml_sycl_moe_pp_batched_f16_weight_slot_bytes is not defined exactly once"]
+    if "moe_pp_batched_f16_supports_layout(" not in body:
+        fails.append("the f16 slot sizing does not ask the f16 table which experts it covers")
+    if "n_expert" not in body:
+        fails.append("the f16 slot sizing does not size for every expert (n_expert)")
+    if "sizeof(sycl::half)" not in body:
+        fails.append("the f16 slot sizing does not count f16 bytes")
+    assign = statement(sycl, "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(") or ""
+    if "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(" not in assign:
+        fails.append("the planned weight slot is not widened by the f16 slot sizing")
+    return fails
+
+
+def claim_j_knob(s):
+    fails = []
+    literal = f'"{KNOB}"'
+    total = sum(strip_comments(p.read_text()).count(literal) for p in all_backend_sources())
+    if total != 1:
+        fails.append(f"{literal} appears {total} times in the backend sources, want 1")
+    body = one_definition(s["common"], "ggml_sycl_moe_pp_f16_batched_aos_enabled")
+    if body is None or literal not in body or "static const bool" not in body:
+        fails.append("ggml_sycl_moe_pp_f16_batched_aos_enabled does not read the knob once into a static")
+    elif "env == nullptr || std::atoi(env) != 0" not in body:
+        fails.append("the knob is not default ON (unset or non-zero)")
+    takes = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_takes_layout") or ""
+    if "ggml_sycl_moe_pp_f16_batched_aos_enabled()" not in takes:
+        fails.append("ggml_sycl_moe_pp_batched_takes_layout does not consult the knob")
+    return fails
+
+
+CLAIMS = {
+    "a": claim_a_one_table,
+    "b": claim_b_table_types,
+    "c": claim_c_q4k_fallback,
+    "d": claim_d_decode_terms,
+    "e": claim_e_refusal_enum,
+    "f": claim_f_first_run_line,
+    "g": claim_g_labels,
+    "h": claim_h_capability,
+    "i": claim_i_sizing,
+    "j": claim_j_knob,
+}
+
+
+@pytest.fixture(scope="module")
+def sources():
+    return load()
+
+
+@pytest.mark.parametrize("claim", sorted(CLAIMS))
+def test_claim_holds(sources, claim):
+    fails = CLAIMS[claim](sources)
+    assert not fails, f"claim ({claim}) failed:\n  " + "\n  ".join(fails)
+
+
+# (claim, file, old, new). `old` is matched in the squeezed, comment-stripped text and must occur in it.
+MUTANTS = [
+    ("a", "sycl", "ggml_sycl_moe_pp_batched_takes_layout(weight->type, planned_layout)",
+     "weight->type == GGML_TYPE_MXFP4 && ggml_sycl_moe_pp_batched_takes_layout(weight->type, planned_layout)"),
+    ("a", "sycl", "const bool pp_batched_candidate =",
+     "const bool pp_batched_candidate = src0->type == GGML_TYPE_MXFP4 &&"),
+    ("a", "sycl", "!pp_batched_candidate", "!pp_mxfp4_soa_f16_candidate"),
+    ("b", "tables", "case GGML_TYPE_IQ4_XS:", ""),
+    ("b", "tables", "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_SOA;",
+     "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_AOS;"),
+    ("b", "tables", "case GGML_TYPE_IQ4_XS:", "case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q1_0:"),
+    ("c", "sycl", " && !pp_onednn_batched_route_claims_prompt;", ";"),
+    ("d", "sycl", "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route;",
+     "const bool moe_hybrid_with_plan = selected_hybrid_route;"),
+    ("d", "sycl", "const bool pp_onednn_batched_claims_op = ne12 > 1 && ",
+     "const bool pp_onednn_batched_claims_op = "),
+    ("d", "sycl", "if (ids->ne[1] <= 1) { return trace_batched_skip(",
+     "if (ids->ne[1] < 1) { return trace_batched_skip("),
+    ("e", "sycl", "return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS",
+     'return trace_batched_skip("no-active-experts"); '
+     "return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS"),
+    ("e", "sycl", "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)", "true"),
+    ("e", "tables", "case moe_pp_batched_refusal::GEMM:", ""),
+    ("f", "sycl", "if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type))", "if (true)"),
+    ("f", "sycl", "planned_weight_slot=", "planned_weight="),
+    ("g", "sycl", 'pp_mxfp4_labels ? "mxfp4.pp.stage.act" : "moe.pp.stage.act"', '"moe.pp.stage.act"'),
+    ("g", "sycl", "const bool pp_profile = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();",
+     "const bool pp_profile = mxfp4_pp_batched_profile_enabled();"),
+    ("g", "gemm", 'label_name ? label_name : "mulmat.onednn_gemm.execute"', '"mulmat.onednn_gemm.execute"'),
+    ("h", "sycl", "phase == moe_route_phase::PROMPT && ggml_sycl_moe_pp_batched_takes_layout(",
+     "ggml_sycl_moe_pp_batched_takes_layout("),
+    ("h", "sycl", "->ne[1] > 1 && ggml_sycl_moe_pp_onednn_batched_claims_tensor(",
+     "ggml_sycl_moe_pp_onednn_batched_claims_tensor("),
+    ("h", "sycl", " && !ggml_sycl_moe_pp_batched_admits_op(op, device)) {", ") {"),
+    ("i", "sycl", "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(inventory))", "size_t(0))"),
+    ("i", "sycl", "moe_pp_batched_f16_supports_layout(tensor.type, GGML_LAYOUT_AOS)", "true"),
+    ("j", "sycl", "ggml_sycl_moe_pp_f16_batched_aos_enabled()", "true"),
+    ("j", "common", "return env == nullptr || std::atoi(env) != 0; }(); return aos_enabled;",
+     "return env != nullptr && std::atoi(env) != 0; }(); return aos_enabled;"),
+]
+
+
+@pytest.mark.parametrize("claim,key,old,new", MUTANTS, ids=[f"{m[0]}-{i}" for i, m in enumerate(MUTANTS)])
+def test_mutant_turns_claim_red(sources, claim, key, old, new):
+    assert old in sources[key], f"mutant anchor missing from {FILES[key].name}: {old!r}"
+    mutated = dict(sources)
+    mutated[key] = sources[key].replace(old, new, 1)
+    assert CLAIMS[claim](mutated), f"claim ({claim}) stayed green under the mutant {old!r} -> {new!r}"
+
+
+def test_claims_are_not_vacuous(sources):
+    """Positive controls: the probes find the real anchors, so a red claim is a missing shape, not a parse miss."""
+    assert lambda_body(sources["sycl"]) is not None
+    assert claim_predicate_body(sources["sycl"]) is not None
+    assert one_definition(sources["convert"], "ggml_get_to_fp16_sycl_for_layout") is not None
+    assert one_definition(sources["sycl"], "ggml_sycl_moe_query_route_capability") is not None
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-q"]))
