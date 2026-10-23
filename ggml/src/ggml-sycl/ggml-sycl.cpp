@@ -88661,6 +88661,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // is reported once per (device, cause) as a WARN, beside the capped per-dispatch trace; route_logged adds
             // the GGML_SYCL_MOE_ROUTE_LOG line reject_batched has always printed. `detail` is the site's own reason (a
             // resolver, layout or admission reason name), or null when the cause says it all.
+            // The one "[PP-MOE] refused" printer: every decline below and the GEMM stage's failure report through it.
+            const auto warn_batched_refusal = [&](moe_pp_batched_refusal refusal, const char * detail) {
+                if (pp_mxfp4_soa_f16_batched_trace && ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)) {
+                    GGML_LOG_WARN("[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s\n",
+                                  ctx.device, moe_pp_batched_refusal_name(refusal), detail ? detail : "-", src0->name,
+                                  ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout));
+                }
+            };
             const auto decline_batched = [&](moe_pp_batched_refusal refusal, const char * detail, int64_t expert_id,
                                              bool route_logged) -> bool {
                 const char * reason = detail ? detail : moe_pp_batched_refusal_name(refusal);
@@ -88672,11 +88680,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             src0 && src0->name ? src0->name : "?", ctx.device, (long long) expert_id, reason);
                     }
                 }
-                if (pp_mxfp4_soa_f16_batched_trace && ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)) {
-                    GGML_LOG_WARN("[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s\n",
-                                  ctx.device, moe_pp_batched_refusal_name(refusal), detail ? detail : "-", src0->name,
-                                  ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout));
-                }
+                warn_batched_refusal(refusal, detail);
                 if (pp_mxfp4_soa_f16_batched_trace) {
                     static std::atomic<int> trace_count{ 0 };
                     if (trace_count.fetch_add(1, std::memory_order_relaxed) < 128) {
@@ -89385,12 +89389,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Both ways this stage can fail (a thrown error, or a declined scratchpad) take the same path, so the tail
             // is shared: the non-batched MoE path, or the named error for an XMX_TILED-claimed op. Returns false.
             auto                       gemm_stage_failed = [&](const char * what) -> bool {
-                if (pp_mxfp4_soa_f16_batched_trace &&
-                    ggml_sycl_moe_pp_batched_refusal_first(ctx.device, moe_pp_batched_refusal::GEMM)) {
-                    GGML_LOG_WARN(
-                        "[MOE-PP-ONEDNN-F16-BATCHED] refused after staging device=%d cause=%s tensor=%s: %s\n",
-                        ctx.device, moe_pp_batched_refusal_name(moe_pp_batched_refusal::GEMM), src0->name, what);
-                }
+                warn_batched_refusal(moe_pp_batched_refusal::GEMM, what);
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> gemm_fail_log{ 0 };
                     if (gemm_fail_log.fetch_add(1, std::memory_order_relaxed) < 8) {
