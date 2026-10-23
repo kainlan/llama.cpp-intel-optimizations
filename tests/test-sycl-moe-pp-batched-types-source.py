@@ -785,11 +785,12 @@ def claim_n_dequant_label(s):
     fails = []
     sycl = s["sycl"]
     lam = lambda_body(sycl) or ""
-    if 'std::string("moe.pp.dequant.")' in sycl:
+    helper = one_definition(sycl, "ggml_sycl_moe_pp_dequant_label")
+    # The helper builds each name once; anywhere else, building one is a per-dispatch allocation.
+    if 'std::string("moe.pp.dequant.")' in sycl.replace(helper or "", ""):
         fails.append("a dispatch still builds the moe.pp.dequant.<type> label as a std::string")
     if "ggml_sycl_moe_pp_dequant_label(src0->type)" not in lam:
         fails.append("the lambda does not take the dequant label from ggml_sycl_moe_pp_dequant_label")
-    helper = one_definition(sycl, "ggml_sycl_moe_pp_dequant_label")
     if helper is None:
         fails.append("ggml_sycl_moe_pp_dequant_label is not defined exactly once")
     elif not re.search(r"static const std::array<std::string, GGML_TYPE_COUNT> \w+ = \[\]\(\) \{", helper):
@@ -931,6 +932,8 @@ MUTANTS = [
     ("m", "sycl", "last.owner == owner && ", ""),
     ("n", "sycl", "ggml_sycl_moe_pp_dequant_label(src0->type)",
      'std::string("moe.pp.dequant.") + ggml_type_name(src0->type)'),
+    ("n", "sycl", "static const std::array<std::string, GGML_TYPE_COUNT> names = []() {",
+     "const std::array<std::string, GGML_TYPE_COUNT> names = []() {"),
     ("b", "tables", "case GGML_TYPE_Q4_1:", "case GGML_TYPE_Q4_1: case GGML_TYPE_TQ2_0:"),
     ("o", "device_test", "GGML_TYPE_IQ4_NL,", ""),
     ("o", "device_test", "constexpr ggml_type k_types[] = {", "constexpr ggml_type k_types[] = { GGML_TYPE_IQ1_S,"),

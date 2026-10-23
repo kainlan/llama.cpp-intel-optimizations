@@ -80949,6 +80949,23 @@ static bool ggml_sycl_moe_pp_batched_first_run(int device, ggml_type type) {
     const uint64_t bit = uint64_t{ 1 } << static_cast<uint32_t>(type);
     return (seen[device].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
 }
+
+// The batched executor's per-expert dequant profiler label, "moe.pp.dequant.<type>". The names are built once, on
+// first use, so a dispatch only indexes the table and never allocates on the prompt path.
+static const char * ggml_sycl_moe_pp_dequant_label(ggml_type type) {
+    static const std::array<std::string, GGML_TYPE_COUNT> names = []() {
+        std::array<std::string, GGML_TYPE_COUNT> built;
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const char * type_name = ggml_type_name(static_cast<ggml_type>(t));
+            built[t]               = std::string("moe.pp.dequant.") + (type_name ? type_name : "unknown");
+        }
+        return built;
+    }();
+    if (type < 0 || type >= GGML_TYPE_COUNT) {
+        return "moe.pp.dequant.unknown";
+    }
+    return names[type].c_str();
+}
 #endif
 
 // Whether the oneDNN batched prompt executor claims `weight` on `device`. With a plan, the planned layout comes from
@@ -89195,8 +89212,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // other types are profiled under moe.pp.* by GGML_SYCL_KERNEL_PROFILE alone.
             const bool        pp_mxfp4_labels = src0->type == GGML_TYPE_MXFP4;
             const bool        pp_profile      = pp_mxfp4_labels && mxfp4_pp_batched_profile_enabled();
-            const std::string pp_dequant_label_name =
-                pp_mxfp4_labels ? std::string() : std::string("moe.pp.dequant.") + ggml_type_name(src0->type);
+            const char * pp_dequant_label_name = pp_mxfp4_labels ? nullptr : ggml_sycl_moe_pp_dequant_label(src0->type);
             std::vector<sycl::event> pp_profile_repack_begin;
             std::vector<sycl::event> pp_profile_repack_end;
             std::vector<sycl::event> pp_profile_stage_events;
@@ -89318,7 +89334,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // resolved; the lease is held until the done marker below. The converters return no event, so the
                     // profiler gets the in-order queue's last one, asked only while it records.
                     ggml_sycl_profile_label dequant_label{};
-                    dequant_label.name       = pp_dequant_label_name.c_str();
+                    dequant_label.name       = pp_dequant_label_name;
                     dequant_label.category   = "moe.pp.dequant";
                     dequant_label.queue_kind = "compute";
                     dequant_label.metadata   = "phase=expert_dequant_f16";
