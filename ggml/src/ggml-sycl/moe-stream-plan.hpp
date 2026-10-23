@@ -78,14 +78,14 @@ using moe_stream_request_loan_fn = void (*)(int device, size_t bytes);
 using moe_stream_loan_refusals_fn = uint64_t (*)(int device);
 
 struct moe_stream_item {
-    int                layer;
-    int                expert_id;
-    expert_tensor_role role;
-    ggml_sycl_cache_id key;  // left default by moe_stream_plan_build: the entry carries no tensor to derive it from
-    size_t             dst_bytes;  // the SOA size the device route wants
-    size_t             src_bytes;  // the AOS size of the host copy
-    ggml_type          type;       // from the plan entry (moe_stream_plan_index_build); moe_stream_plan_build leaves 0
-    int64_t            ncols, nrows;
+    int                 layer;
+    int                 expert_id;
+    expert_tensor_role  role;
+    ggml_sycl_cache_id  key;  // left default by moe_stream_plan_build: the entry carries no tensor to derive it from
+    size_t              dst_bytes;  // the SOA size the device route wants
+    size_t              src_bytes;  // the AOS size of the host copy
+    ggml_type           type;       // from the plan entry (moe_stream_plan_index_build); moe_stream_plan_build leaves 0
+    int64_t             ncols, nrows;
     // From moe_stream_plan_index_build (moe_stream_item_staging); moe_stream_plan_build leaves NONE.
     moe_stream_staging  staging  = moe_stream_staging::NONE;
     // From moe_stream_plan_index_build: EXECUTOR for a weight the library executor claims once staged.
@@ -868,12 +868,12 @@ class moe_stream_phase {
     };
 
     struct stage_counts {
-        int    staged    = 0;  // experts with every selected matrix staged
-        int    wanted    = 0;  // experts selected
-        int    unowned   = 0;  // matrices skipped: no lease, or a lease the ring cannot copy directly
-        int    untyped          = 0;  // matrices skipped: staged NONE (no reader), or a shape that does not fit
-        int    exhausted = 0;  // matrices skipped: no ring slot
-        size_t bytes     = 0;  // AOS bytes copied
+        int    staged           = 0;      // experts with every selected matrix staged
+        int    wanted           = 0;      // experts selected
+        int    unowned          = 0;      // matrices skipped: no lease, or a lease the ring cannot copy directly
+        int    untyped          = 0;      // matrices skipped: staged NONE (no reader), or a shape that does not fit
+        int    exhausted        = 0;      // matrices skipped: no ring slot
+        size_t bytes            = 0;      // AOS bytes copied
         bool   ring_unavailable = false;  // the ring could not be reserved
         int    soa              = 0;      // matrices staged SOA: two slots, read after the reorder
         int    aos_only         = 0;      // matrices staged AOS-only: one slot, read in place
@@ -931,8 +931,8 @@ class moe_stream_phase {
     // Each region's last use: its layer, whether it left an AOS-only slot, and that layer's read gate (stage()).
     moe_stream_region_reads<sycl::event>            region_reads_;
     // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor.
-    const moe_exec_decision_log *                   log_    = nullptr;
-    moe_exec_policy                                 policy_ = moe_exec_policy::AUTO;
+    const moe_exec_decision_log *                   log_           = nullptr;
+    moe_exec_policy                                 policy_        = moe_exec_policy::AUTO;
     // The last op's loan hooks, which ring_ready() calls on a short reserve, and this prompt's loans (llama.cpp-3460).
     moe_stream_request_loan_fn                      request_loan_  = nullptr;
     moe_stream_loan_refusals_fn                     loan_refusals_ = nullptr;
