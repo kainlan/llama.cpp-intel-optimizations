@@ -8,8 +8,11 @@
 // used, k 2048, m 768), run at 64 and 300 tokens. The result is compared with the CPU backend at NMSE <= 5e-4, and the
 // log must show the executor ran:
 //   * the [PP-MOE] line, once per (device, type, layout), the first time the type-keyed arm runs it (each type
-//     here runs in one layout, so once per type);
-//   * one [MOE-PP-ONEDNN-F16-BATCHED] success line per case (GGML_SYCL_MOE_ROUTE_LOG=1, set below);
+//     here runs in one layout, so once per type): it must appear during the type's first case, not during its
+//     second, and exactly once over the run;
+//   * a [MOE-PP-ONEDNN-F16-BATCHED] success line during each case (GGML_SYCL_MOE_ROUTE_LOG=1, set below). The
+//     backend prints that line at most 96 times per process, so the cases must stay under that cap (static_assert
+//     below);
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
 //     "[MOE-PROMPT-REFUSAL]", no "refusing unplanned PP MoE oneDNN batched scratch".
 //
@@ -69,6 +72,12 @@ constexpr ggml_type k_types[] = {
 // activation row per used expert (down, ne11 k_used).
 constexpr int k_cases_per_type = 2;
 constexpr int k_cases          = k_cases_per_type * int(sizeof(k_types) / sizeof(k_types[0]));
+
+// The backend prints its [MOE-PP-ONEDNN-F16-BATCHED] success line at most this many times per process (the
+// batched_log counter in ggml-sycl.cpp). Each case runs one MUL_MAT_ID op and so prints one line, and a case past the
+// cap would print none and read as an executor that did not run.
+constexpr int k_route_log_cap = 96;
+static_assert(k_cases <= k_route_log_cap, "a case past the route log's cap has no success line to count");
 
 void require(bool condition, const std::string & message) {
     if (!condition) {
@@ -413,8 +422,10 @@ double nmse(const std::vector<float> & ref, const std::vector<float> & got) {
     return err / (norm > 0.0 ? norm : 1.0);
 }
 
-// Runs one case and prints its CASE line. Returns true when it passed.
-bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c) {
+// Runs one case and prints its CASE line. Returns true when it passed. Every count is of the lines that appeared
+// while this case ran, except the [PP-MOE] total, which is over the run so far. `first_of_type` is true for the
+// type's first case, the only one in which its [PP-MOE] line may appear.
+bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c, bool first_of_type) {
     const std::string type_name  = ggml_type_name(c.type);
     const std::string type_field = "type=" + type_name + " ";
 
@@ -426,8 +437,10 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c)
     std::vector<float> got;
     const ggml_status  status    = run_backend(life.backend, life.gate, life.gate_bytes, c, got);
     const double       err       = status == GGML_STATUS_SUCCESS ? nmse(ref, got) : NAN;
-    const size_t       pp_moe    = g_log.count_since(0, { "[PP-MOE] device=", type_field.c_str() });
+    const size_t       pp_moe    = g_log.count_since(from, { "[PP-MOE] device=", type_field.c_str() });
+    const size_t       pp_total  = g_log.count_since(0, { "[PP-MOE] device=", type_field.c_str() });
     const size_t       batched   = g_log.count_since(from, { "[MOE-PP-ONEDNN-F16-BATCHED] tensor=" });
+    const size_t       batch_all = g_log.count_since(0, { "[MOE-PP-ONEDNN-F16-BATCHED] tensor=" });
     const size_t       refused   = g_log.count_since(from, { "[PP-MOE] refused" });
     const size_t       prompt_rf = g_log.count_since(from, { "[MOE-PROMPT-REFUSAL]" });
     const size_t       unplanned = g_log.count_since(from, { "refusing unplanned PP MoE oneDNN batched scratch" });
@@ -438,20 +451,21 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c)
     } else if (!(std::isfinite(err) && err <= k_nmse_tol)) {
         why += " nmse";
     }
-    if (pp_moe != 1) {
+    if (pp_moe != (first_of_type ? 1u : 0u) || pp_total != 1) {
         why += " pp-moe-line";
     }
     if (batched == 0) {
-        why += " executor-did-not-run";
+        // Unreachable while the static_assert above holds, but a cap reached would otherwise read as a skip.
+        why += batch_all >= size_t(k_route_log_cap) ? " route-log-cap" : " executor-did-not-run";
     }
     if (refused != 0 || prompt_rf != 0 || unplanned != 0) {
         why += " refusal";
     }
     std::fprintf(stderr,
-                 "CASE type=%s tokens=%d ne11=%d status=%d nmse=%.3e pp_moe_lines=%zu batched_lines=%zu "
-                 "pp_moe_refused=%zu prompt_refusal=%zu unplanned_scratch=%zu -> %s%s\n",
-                 type_name.c_str(), c.n_tokens, c.ne11, static_cast<int>(status), err, pp_moe, batched, refused,
-                 prompt_rf, unplanned, why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 "CASE type=%s tokens=%d ne11=%d status=%d nmse=%.3e pp_moe_lines=%zu pp_moe_total=%zu "
+                 "batched_lines=%zu pp_moe_refused=%zu prompt_refusal=%zu unplanned_scratch=%zu -> %s%s\n",
+                 type_name.c_str(), c.n_tokens, c.ne11, static_cast<int>(status), err, pp_moe, pp_total, batched,
+                 refused, prompt_rf, unplanned, why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
@@ -485,10 +499,10 @@ int main() {
         int          failed = 0;
         for (ggml_type type : k_types) {
             lifecycle_fixture life(type, rng);
-            if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng))) {
+            if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng), true)) {
                 ++failed;
             }
-            if (!run_case(life, cpu.get(), make_case(type, 300, k_used, rng))) {
+            if (!run_case(life, cpu.get(), make_case(type, 300, k_used, rng), false)) {
                 ++failed;
             }
         }
