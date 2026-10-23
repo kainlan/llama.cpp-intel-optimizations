@@ -59,7 +59,8 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     retired the entry under and never resolves one, since a retired entry refuses a resolve once the cache generation
     moves; it keeps a lease on every view it takes, and the transaction retains those leases until the device's
     execution queue passes a barrier, after the loop and before the publication, so no kernel still reading a dropped
-    table sees a freed buffer;
+    table sees a freed buffer; and every drop leaves the device table stale (the slot's payload nulled, the storage
+    generation bumped, and the table marked stale through mark_moe_device_table_stale, whose marks are pinned);
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
     epoch;
   - the WARN format strings;
@@ -581,7 +582,7 @@ PROBE = ('if (probe_mode) { result.accepted = n_selected != 0; result.bytes_free
          'finish(ggml_sycl_txn_result::REFUSED, "nothing lendable"); }')
 LEASE = "registry.acquire_live_update(current_token)"
 FORGET = "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);"
-DROP = "(void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);"
+DROP = "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);"
 REMEMBER = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
             "std::move(record.host_handles[r]), &record.copy_events[r], 0, logical);")
 FLIP = "(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, refill, refill ? device : -1);"
@@ -599,7 +600,7 @@ def claim_probe_changes_nothing_and_a_loan_publishes_once(sycl: str) -> bool:
 
 # --- a loan drops the extras' views of each withdrawn device entry by its key (llama.cpp-6aj4) -----------------------
 
-DROP_SIG = "static bool ggml_sycl_drop_lent_expert_views("
+DROP_SIG = "static void ggml_sycl_drop_lent_expert_views("
 DROP_MATCH = "return h.is_weight() && h.device() == device && h.key() == withdrawn;"
 
 
@@ -629,6 +630,27 @@ def claim_lent_views_retained_to_a_barrier(sycl: str) -> bool:
                         "routes.invalidate();", RETAIN_HYBRID, "w.moe_hybrid_decode[device].reset();")
             and txn.count(RETAIN_VIEWS) == 1
             and ordered(txn, LEND, DROP, REMEMBER, BREAK_ESCAPED, RETAIN_VIEWS, PUBLISH))
+
+
+# Dropping a view leaves the device table stale, so neither the full-local fast path nor the transient table trusts a
+# raw pointer to the withdrawn entry once the zone hands its room to the ring: the slot's kernel payload is nulled with
+# the slot, a dropped storage record or slot bumps the storage generation, and any drop marks the table stale through
+# the one member that does it for every site (its four marks pinned in common.hpp).
+STALE_SIG = "void mark_moe_device_table_stale(int dev)"
+STALE_MARKS = ("moe_device_table_valid[dev] = false;", "moe_full_local_probe_generation[dev] = 0;",
+               "moe_full_local_probe_layout[dev] = GGML_LAYOUT_AOS;", "moe_full_local_probe_ok[dev] = false;")
+NULL_PAYLOAD = "w.moe_expert_ptr_payload[device][slot] = nullptr;"
+BUMP_GENERATION = "if (stored) { ++w.moe_expert_storage_generation; }"
+MARK_STALE = "if (stored || table_dropped) { w.mark_moe_device_table_stale(device); }"
+
+
+def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
+    helper = body(norm(sycl), DROP_SIG)
+    member = body(norm(common), STALE_SIG)
+    return (all(member.count(x) == 1 for x in STALE_MARKS)
+            and helper.count(NULL_PAYLOAD) == 1 and ordered(helper, RETAIN_SLOT, NULL_PAYLOAD, "stored = true;")
+            and helper.count(BUMP_GENERATION) == 1 and helper.count(MARK_STALE) == 1
+            and ordered(helper, RETAIN_HYBRID, BUMP_GENERATION, MARK_STALE))
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -1250,6 +1272,10 @@ def test_lent_views_retained_to_a_barrier():
     assert claim_lent_views_retained_to_a_barrier(SYCL)
 
 
+def test_lent_views_mark_the_table_stale():
+    assert claim_lent_views_mark_the_table_stale(SYCL, COMMON)
+
+
 def test_warn_formats():
     assert claim_warn_formats(SYCL)
 
@@ -1815,6 +1841,31 @@ def test_mutant_lent_views_released_at_once_fails():
 def test_mutant_table_leases_released_at_once_fails():
     """The helper erases the pointer table's leases on the entry without keeping them: they go at once."""
     assert not claim_lent_views_retained_to_a_barrier(_once_in(SYCL, DROP_SIG, RETAIN_LEASE, ""))
+
+
+def test_mutant_stale_mark_dropped_fails():
+    """The member loses one of its marks: the table stays valid (moe_ptrs_ptr() hands out the old table), or the
+    full-local probe keeps a verdict taken while the withdrawn entry was in the table."""
+    for mark in STALE_MARKS:
+        assert not claim_lent_views_mark_the_table_stale(SYCL, _once_in(COMMON, STALE_SIG, mark, "")), mark
+
+
+def test_mutant_stale_mark_never_applied_fails():
+    """The helper drops views but never marks the table stale: a MUL_MAT_ID trusts a table naming the withdrawn
+    entry."""
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, "if (stored || table_dropped) {", "if (false) {"), COMMON)
+
+
+def test_mutant_storage_generation_not_bumped_fails():
+    """A dropped storage record or slot leaves the generation alone: whatever is keyed on it reads as current."""
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, "++w.moe_expert_storage_generation;", ""), COMMON)
+
+
+def test_mutant_slot_payload_kept_fails():
+    """The slot's handle goes but its raw kernel payload stays: the next table upload carries the freed pointer."""
+    assert not claim_lent_views_mark_the_table_stale(_once_in(SYCL, DROP_SIG, NULL_PAYLOAD, ""), COMMON)
 
 
 def test_mutant_no_epoch_bump_fails():

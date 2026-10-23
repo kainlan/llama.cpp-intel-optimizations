@@ -20976,22 +20976,22 @@ static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_d
 // (ggml_sycl_set_moe_ptr_table_leases), the route table when one of its entries leases the entry (invalidated, with
 // every lease it held retained, since another expert it names may be lent next), and the hybrid decode record, which
 // holds every expert's lease and its table, all retained. Dropping any of them marks the device table stale, so the
-// next MUL_MAT_ID or preload rebuilds it under the plan the loan publishes. Returns whether anything was dropped.
-static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
+// next MUL_MAT_ID or preload rebuilds it under the plan the loan publishes.
+static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
                                              int                                  device,
                                              int                                  expert_id,
                                              const ggml_sycl::unified_cache_key & withdrawn,
                                              std::vector<ggml_sycl::mem_handle> & retained) {
     // Boundary premise: the loan runs after synchronize's stream wait; the retention covers work still on the queue.
     if (!extra || !extra->weight_ext || expert_id < 0 || !ggml_sycl_valid_device_index(device)) {
-        return false;
+        return;
     }
     ggml_tensor_extra_gpu_weight_ext & w        = *extra->weight_ext;
     auto                               on_entry = [&](const ggml_sycl::mem_handle & h) {
         return h.is_weight() && h.device() == device && h.key() == withdrawn;
     };
-    bool stored = false;
-    bool table  = false;
+    bool stored        = false;
+    bool table_dropped = false;
 
     const auto records = w.moe_expert_storage_handles.find(
         ggml_tensor_extra_gpu_weight_ext::moe_storage_handle_key(expert_id, GGML_LAYOUT_AOS));
@@ -21032,7 +21032,7 @@ static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
     }
     const size_t n_leases = leases.size();
     leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());
-    table = leases.size() != n_leases;
+    table_dropped = leases.size() != n_leases;
 
     ggml_sycl::moe_route_table & routes = w.moe_route_tables[device];
     for (const ggml_sycl::moe_route_entry & route : routes.experts) {
@@ -21043,7 +21043,7 @@ static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
                 }
             }
             routes.invalidate();
-            table = true;
+            table_dropped = true;
             break;
         }
     }
@@ -21051,19 +21051,15 @@ static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
         ggml_sycl_moe_hybrid_decode_record_append_handles(*w.moe_hybrid_decode[device], retained);
         w.moe_hybrid_decode[device].reset();
         w.moe_hybrid_decode_stamp[device] = {};
-        table                             = true;
+        table_dropped                     = true;
     }
 
     if (stored) {
         ++w.moe_expert_storage_generation;
     }
-    if (stored || table) {
-        w.moe_device_table_valid[device]          = false;
-        w.moe_full_local_probe_generation[device] = 0;
-        w.moe_full_local_probe_layout[device]     = GGML_LAYOUT_AOS;
-        w.moe_full_local_probe_ok[device]         = false;
+    if (stored || table_dropped) {
+        w.mark_moe_device_table_stale(device);
     }
-    return stored || table;
 }
 
 // The body, both directions (llama.cpp-sif1). `amount` is the bytes a loan should free, or the most triplets a refill
@@ -21337,8 +21333,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 for (int r = 0; r < 3; ++r) {
                     const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
                     ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
-                    (void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r],
-                                                            lent_views);
+                    ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);
                     (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
                 }
                 for (int r = 0; r < 3; ++r) {
@@ -21391,6 +21386,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     // then do the views go at once.
     if (!lent_views.empty()) {
         try {
+            // Null only before the device has a cache or a TP queue, and a loan runs on the cache; a null queue would
+            // retain the views to a default event, already complete, so they would go at once.
             sycl::queue * queue = ggml_sycl_execution_queue_for_device(device);
             ggml_sycl::retain_handles_until_event(std::move(lent_views),
                                                   queue ? queue->ext_oneapi_submit_barrier() : sycl::event{});
@@ -23551,6 +23548,12 @@ std::string test_expert_loan_reclaims_pointer_table_leases() {
             why += "; " + fx.device_entry_holders(0, s, 2);
         }
         return why;
+    }
+    // The loan moved expert 2's triplet and no other, so the refill below cannot pass on a triplet that never left.
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (lent.size() != 1 || lent[0] != std::make_pair(0, 2)) {
+        return test_loan_fail("the loan lent %zu triplets (first layer %d expert %d), not layer 0 expert 2 alone",
+                              lent.size(), lent.empty() ? -1 : lent[0].first, lent.empty() ? -1 : lent[0].second);
     }
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
@@ -68697,10 +68700,7 @@ static bool ggml_sycl_release_moe_ptr_table_leases_for_layout(const ggml_tensor 
         return false;
     }
 
-    extra->weight().moe_device_table_valid[device]          = false;
-    extra->weight().moe_full_local_probe_generation[device] = 0;
-    extra->weight().moe_full_local_probe_layout[device]     = GGML_LAYOUT_AOS;
-    extra->weight().moe_full_local_probe_ok[device]         = false;
+    extra->weight().mark_moe_device_table_stale(device);
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         static std::atomic<int> lease_release_log{ 0 };
         const int               n = lease_release_log.fetch_add(1, std::memory_order_relaxed);
@@ -81780,10 +81780,8 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     std::shared_ptr<const moe_hybrid_decode_record> & held = weight.moe_hybrid_decode[device];
     if (held) {
         // The replaced record's table and device leases may back a table copy or kernel still on the queue.
-        std::vector<ggml_sycl::mem_handle> handles = held->lease;
-        if (held->table.valid()) {
-            handles.push_back(held->table);
-        }
+        std::vector<ggml_sycl::mem_handle> handles;
+        ggml_sycl_moe_hybrid_decode_record_append_handles(*held, handles);
         ggml_sycl::retain_handles_until_event(std::move(handles), ctx.stream()->ext_oneapi_submit_barrier());
     }
     if (settled == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) {

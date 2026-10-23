@@ -3802,6 +3802,18 @@ struct ggml_tensor_extra_gpu_weight_ext {
         return moe_ptrs_ptr_raw(dev);
     }
 
+    // Marks `dev`'s device pointer table stale and forgets its full-local probe, so moe_ptrs_ptr() answers nullptr and
+    // the next MUL_MAT_ID or preload rebuilds the table instead of trusting a pointer to an expert it no longer holds.
+    void mark_moe_device_table_stale(int dev) {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return;
+        }
+        moe_device_table_valid[dev]          = false;
+        moe_full_local_probe_generation[dev] = 0;
+        moe_full_local_probe_layout[dev]     = GGML_LAYOUT_AOS;
+        moe_full_local_probe_ok[dev]         = false;
+    }
+
     bool build_moe_ptr_payload_from_handles(int                   dev,
                                             size_t                count,
                                             std::vector<void *> & payload,
@@ -4084,11 +4096,8 @@ struct ggml_tensor_extra_gpu_weight_ext {
                     if (slot < moe_expert_ptr_payload[owner_device].size()) {
                         moe_expert_ptr_payload[owner_device][slot] = nullptr;
                     }
-                    moe_device_table_valid[owner_device]          = false;
-                    moe_full_local_probe_generation[owner_device] = 0;
-                    moe_full_local_probe_layout[owner_device]     = GGML_LAYOUT_AOS;
-                    moe_full_local_probe_ok[owner_device]         = false;
-                    erased                                        = true;
+                    mark_moe_device_table_stale(owner_device);
+                    erased = true;
                 }
             }
         }
@@ -4138,10 +4147,7 @@ struct ggml_tensor_extra_gpu_weight_ext {
                     if (slot < moe_expert_ptr_payload[owner_device].size()) {
                         moe_expert_ptr_payload[owner_device][slot] = nullptr;
                     }
-                    moe_device_table_valid[owner_device]          = false;
-                    moe_full_local_probe_generation[owner_device] = 0;
-                    moe_full_local_probe_layout[owner_device]     = GGML_LAYOUT_AOS;
-                    moe_full_local_probe_ok[owner_device]         = false;
+                    mark_moe_device_table_stale(owner_device);
                 }
             }
         }
