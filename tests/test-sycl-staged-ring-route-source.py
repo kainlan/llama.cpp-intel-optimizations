@@ -237,8 +237,17 @@ ASSIGN = "staged.recipe.transfer = moe_recipe_transfer::STAGED_RING;"
 ASSIGN_RE = r"(?<![=!<>])=\s*(?:ggml_sycl::)?moe_recipe_transfer::STAGED_RING\b"
 GUARD = "if (moe_stream != nullptr && stream_layer >= 0) {"
 FIND = "if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {"
-SERVE_RETURN = ("moe_stream->count_staged_route(refusal, refusal_detail); "
-                "if (refusal == moe_staged_route_refusal::NONE) { return staged; }")
+# An executor entry on a weight the executor takes whole is its handoff, counted apart from the refusals; CLAIMED is
+# a refusal only on a weight the ring staged partly (llama.cpp-3460).
+HANDOFF = ("if (refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()) { "
+           "moe_stream->count_executor_handoff(); } else { moe_stream->count_staged_route(refusal, refusal_detail); } ")
+SERVE_RETURN = HANDOFF + "if (refusal == moe_staged_route_refusal::NONE) { return staged; }"
+# Asked once per build, at the first executor entry, on the build's own ids: the answer the prompt path takes after
+# begin_layer (STAGED_LAYER_SET).
+EXECUTOR_TAKES = ("bool executor_asked = false; bool executor_takes = false; "
+                  "const auto executor_takes_weight = [&]() { if (!executor_asked) { executor_asked = true; "
+                  "executor_takes = moe_stream->executor_staged(stream_layer, stream_role, ids, count, "
+                  "static_cast<int>(src0->ne[2])); } return executor_takes; };")
 ROUTE_CORE = "::ggml_sycl_resolve_moe_expert_route_for_dispatch("
 LAMBDA_OPEN = ("auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, "
                "[&](int32_t expert_id) {")
@@ -406,7 +415,8 @@ VALIDATOR_CLAUSE = ("if (recipe.transfer == moe_recipe_transfer::STAGED_RING && 
 VALIDATOR_PARAM = "moe_batch_residency residency, bool has_ready_event, int submit_device,"
 WORKSPACE_REFUSE = "return refuse(moe_batch_reject_reason::WORKSPACE_UNDERSIZED);"
 
-TRACE_FMT = "[MOE-EXEC-TRACE] staged route device %d: served=%zu refused=%zu"
+TRACE_FMT = "[MOE-EXEC-TRACE] staged route device %d: served=%zu handed_off=%zu refused=%zu"
+TALLY_ARGS = "device_, staged_routes_.served, staged_routes_.handed_off, staged_routes_.refused);"
 TRACE_EMIT = "log_->trace_sink(log_->sink_ctx, line);"
 TRACE_REFUSALS_FMT = "[MOE-EXEC-TRACE] staged route refusals device %d: "
 TRACE_REFUSALS = (
@@ -418,17 +428,23 @@ TRACE_REFUSALS = (
 )
 COUNT_SIG = "void moe_stream_phase::count_staged_route(moe_staged_route_refusal refusal, const char * detail)"
 COUNT_BODY = "{ staged_routes_.count(refusal, detail); }"
+HANDOFF_SIG = "void moe_stream_phase::count_executor_handoff()"
+HANDOFF_BODY = "{ staged_routes_.count_handoff(); }"
+TALLY_HANDED_OFF = "size_t handed_off = 0;"
+TALLY_HANDOFF_SIG = "void moe_staged_route_tally::count_handoff()"
+TALLY_HANDOFF_BODY = "{ ++handed_off; }"
 END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && table_.empty()) {"
 DTOR_SIG = "moe_stream_phase::~moe_stream_phase()"
 DTOR_HEAD = "{ report_staged_routes(); teardown("
-REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && "
+REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.handed_off != 0 || "
+               "staged_routes_.refused != 0) && log_ != nullptr && "
                "log_->trace >= 1 && log_->trace_sink != nullptr) {")
 REPORT_RESET = "staged_routes_ = moe_staged_route_tally();"
-REFUSALS_WARN_FMT = "[MOE-EXEC] staged route refusals device %d: served=%zu refused=%zu "
+REFUSALS_WARN_FMT = "[MOE-EXEC] staged route refusals device %d: served=%zu handed_off=%zu refused=%zu "
 REFUSALS_WARN = (
     ("if (staged_routes_.refused != 0 && policy_ == moe_exec_policy::RING && log_ != nullptr && "
      "log_->sink != nullptr) {"),
-    REFUSALS_WARN_FMT,
+    REFUSALS_WARN_FMT + '", ' + TALLY_ARGS,
     "const std::string warn_line = warn_head + staged_routes_.refusals_text();",
     "log_->sink(log_->sink_ctx, warn_line.c_str()); }",
     REPORT_RESET + " }",
@@ -645,6 +661,52 @@ def test_executor_entry_refused_by_its_consumer_mutants():
     m = mutate(SYCL, EXECUTOR_REFUSAL + " ", "")
     m = m.replace("if (view.ptr == nullptr", EXECUTOR_REFUSAL + " if (view.ptr == nullptr", 1)
     assert not c(m)
+
+
+def claim_executor_handoff_counted_apart(sycl: str, phase: str, hpp: str) -> bool:
+    """An executor entry is a refusal only when the executor will not read it (llama.cpp-3460). On a weight the
+    executor takes whole, every host expert the build's ids route to staged for it (moe_stream_phase::executor_staged,
+    the answer the prompt path takes after begin_layer), the entry is the executor's handoff: counted apart from the
+    refusals, in the tally's own field, so the report's WARN stays for real refusals. The build asks executor_staged
+    once, lazily, at its first executor entry, before the lambda, on its own ids. Either way the expert falls through
+    to the route core, whose HOST answer the executor's expert loop takes to the stage table."""
+    b = build_body(sycl)
+    br = staged_branch(sycl)
+    n = norm(phase)
+    return (b.count("->executor_staged(") == 1 and b.count(EXECUTOR_TAKES) == 1
+            and ordered(b, EXECUTOR_TAKES, LAMBDA_OPEN) and br.count("executor_takes_weight()") == 1
+            and ordered(br, REFUSAL_OPEN, EXECUTOR_REFUSAL, SERVE_RETURN)
+            and body(n, HANDOFF_SIG) == HANDOFF_BODY and body(n, TALLY_HANDOFF_SIG) == TALLY_HANDOFF_BODY
+            and norm(hpp).count(TALLY_HANDED_OFF) == 1)
+
+
+def test_executor_handoff_counted_apart():
+    assert claim_executor_handoff_counted_apart(SYCL, PHASE, PLAN_HPP)
+
+
+def test_executor_handoff_counted_apart_mutants():
+    def c(sycl=SYCL, phase=PHASE, hpp=PLAN_HPP):
+        return claim_executor_handoff_counted_apart(sycl, phase, hpp)
+    # Every executor entry counted as a handoff, a partly staged weight's too, so its wasted copies never warn.
+    assert not c(mutate(SYCL, "refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()",
+                        "refusal == moe_staged_route_refusal::CLAIMED"))
+    # Every executor entry counted as a refusal again (the shape before the handoff field).
+    assert not c(mutate(SYCL, HANDOFF, "moe_stream->count_staged_route(refusal, refusal_detail); "))
+    # The phase asked per expert instead of once per build.
+    assert not c(mutate(SYCL, "&& executor_takes_weight()",
+                        "&& moe_stream->executor_staged(stream_layer, stream_role, ids, count, "
+                        "static_cast<int>(src0->ne[2]))"))
+    # The phase asked on another weight's role, so the gate's handoff reads the up weight's staging.
+    assert not c(mutate(SYCL, "executor_staged(stream_layer, stream_role, ids,",
+                        "executor_staged(stream_layer, expert_tensor_role::UP, ids,"))
+    # A handoff counted as a refusal by the phase.
+    assert not c(phase=mutate(PHASE, HANDOFF_BODY,
+                              "{ staged_routes_.count(moe_staged_route_refusal::CLAIMED, nullptr); }"))
+    # A handoff counted in the tally's refused field.
+    assert not c(phase=mutate(PHASE, TALLY_HANDOFF_SIG + " " + TALLY_HANDOFF_BODY,
+                              TALLY_HANDOFF_SIG + " { ++refused; }"))
+    # The tally without its own field.
+    assert not c(hpp=mutate(PLAN_HPP, TALLY_HANDED_OFF, ""))
 
 
 def claim_executor_reads_staged_slots(sycl: str) -> bool:
@@ -1206,7 +1268,8 @@ def claim_trace(phase: str, tree: dict) -> bool:
     count = sum(norm(text).count(TRACE_FMT) for text in tree.values())
     refusals = sum(norm(text).count(TRACE_REFUSALS_FMT) for text in tree.values())
     n = norm(phase)
-    return (count == 1 and refusals == 1 and ordered(body(n, REPORT_SIG), TRACE_FMT, TRACE_EMIT, *TRACE_REFUSALS)
+    return (count == 1 and refusals == 1
+            and ordered(body(n, REPORT_SIG), TRACE_FMT + '", ' + TALLY_ARGS, TRACE_EMIT, *TRACE_REFUSALS)
             and body(n, END_PROMPT_SIG).startswith(END_PROMPT_HEAD) and body(n, COUNT_SIG) == COUNT_BODY)
 
 
@@ -1258,7 +1321,8 @@ def test_reported_once_on_every_exit_mutants():
         mutate(PHASE, REPORT_HEAD, "{ " + REPORT_RESET + " " + REPORT_HEAD[2:]))
     # An empty tally printed: the destructor after an end_prompt prints served=0 refused=0.
     assert not claim_reported_once_on_every_exit(
-        mutate(PHASE, "(staged_routes_.served != 0 || staged_routes_.refused != 0) && ", ""))
+        mutate(PHASE, "(staged_routes_.served != 0 || staged_routes_.handed_off != 0 || "
+               "staged_routes_.refused != 0) && ", ""))
     # A report per micro-batch splits a prompt's counts.
     assert not claim_reported_once_on_every_exit(
         mutate(PHASE, "reserve_failed_ = false; table_.clear();", "report_staged_routes(); reserve_failed_ = false; "

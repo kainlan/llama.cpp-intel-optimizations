@@ -35354,6 +35354,19 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
     const int          stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;
     const expert_tensor_role stream_role =
         moe_stream && src0 ? expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;
+    // Whether the batched prompt executor takes this weight whole, every host expert these ids route to staged for it
+    // (llama.cpp-3460): moe_stream_phase::executor_staged, the answer the prompt path takes after begin_layer, on the
+    // same ids. Asked once, at the build's first executor entry.
+    bool       executor_asked        = false;
+    bool       executor_takes        = false;
+    const auto executor_takes_weight = [&]() {
+        if (!executor_asked) {
+            executor_asked = true;
+            executor_takes =
+                moe_stream->executor_staged(stream_layer, stream_role, ids, count, static_cast<int>(src0->ne[2]));
+        }
+        return executor_takes;
+    };
     auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
         if (moe_stream != nullptr && stream_layer >= 0) {
             if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {
@@ -35400,9 +35413,12 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 // it waits for the copy into the slot (the entry's ready event), and a rewrite of an AOS-only slot
                 // waits for the region's read gate, the barrier ggml_sycl_moe_stream_layer_done submits on this queue
                 // behind the down op of the layer the region last held, or for a barrier submitted at the stage when
-                // none was recorded (reuse_after_readers, moe_stream_phase::stage). Refusing it here keeps the route
-                // core's HOST answer for that expert, so a batch the executor declines reaches the per-expert path's
-                // CPU route for it instead of a staged slot that path cannot read.
+                // none was recorded (reuse_after_readers, moe_stream_phase::stage). Leaving it to the route core keeps
+                // that core's HOST answer for the expert, which the executor's expert loop takes to the stage table,
+                // and a batch the executor declines reaches the per-expert path's CPU route for it instead of a staged
+                // slot that path cannot read. On a weight the executor takes whole (executor_takes_weight) the entry
+                // is the executor's handoff, counted apart from the refusals; on a weight the ring staged only partly
+                // the executor does not run, so CLAIMED is a refusal: the expert runs on the CPU, its copy wasted.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
                     if (s->consumer == moe_stream_consumer::EXECUTOR) {
@@ -35438,7 +35454,11 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     }
                     return moe_staged_route_refusal::NONE;
                 }();
-                moe_stream->count_staged_route(refusal, refusal_detail);
+                if (refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()) {
+                    moe_stream->count_executor_handoff();
+                } else {
+                    moe_stream->count_staged_route(refusal, refusal_detail);
+                }
                 if (refusal == moe_staged_route_refusal::NONE) {
                     return staged;
                 }
@@ -35585,6 +35605,15 @@ bool test_moe_stream_staged_route_counts(ggml_backend_t backend, size_t * served
     }
     *served  = ctx->moe_stream->staged_routes_served();
     *refused = ctx->moe_stream->staged_routes_refused();
+    return true;
+}
+
+bool test_moe_stream_staged_route_handed_off(ggml_backend_t backend, size_t * handed_off) {
+    ggml_backend_sycl_context * ctx = test_get_backend_ctx(backend);
+    if (ctx == nullptr || !ctx->moe_stream || handed_off == nullptr) {
+        return false;
+    }
+    *handed_off = ctx->moe_stream->staged_routes_handed_off();
     return true;
 }
 

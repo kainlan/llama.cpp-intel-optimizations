@@ -538,6 +538,10 @@ void moe_staged_route_tally::count(moe_staged_route_refusal refusal, const char 
     refusals.push_back(c);
 }
 
+void moe_staged_route_tally::count_handoff() {
+    ++handed_off;
+}
+
 std::string moe_staged_route_tally::refusals_text() const {
     std::string out;
     for (const refusal_count & c : refusals) {
@@ -559,17 +563,23 @@ void moe_stream_phase::count_staged_route(moe_staged_route_refusal refusal, cons
     staged_routes_.count(refusal, detail);
 }
 
+void moe_stream_phase::count_executor_handoff() {
+    staged_routes_.count_handoff();
+}
+
 // The resolver's STAGED_RING lookups for the prompt that ends, on the trace (llama.cpp-o9uw): without it a ring that
-// stages and a route that serves none of it read alike in the stage lines. A prompt that refused any also gets a line
-// naming each refusal's cause and detail (plan Task 8: the trace says why). Under an explicit ring the refusals also go
-// out at WARN: a refused expert runs on another route than the one asked for. Cleared last, so the destructor after an
-// end_prompt prints nothing.
+// stages and a route that serves none of it read alike in the stage lines. The executor's handoffs (llama.cpp-3460)
+// are counted apart from the refusals: the batched prompt executor reads those slots. A prompt that refused any also
+// gets a line naming each refusal's cause and detail (plan Task 8: the trace says why). Under an explicit ring the
+// refusals also go out at WARN: a refused expert runs on another route than the one asked for, and its copy is wasted.
+// Cleared last, so the destructor after an end_prompt prints nothing.
 void moe_stream_phase::report_staged_routes() {
-    if ((staged_routes_.served != 0 || staged_routes_.refused != 0) && log_ != nullptr && log_->trace >= 1 &&
-        log_->trace_sink != nullptr) {
+    if ((staged_routes_.served != 0 || staged_routes_.handed_off != 0 || staged_routes_.refused != 0) &&
+        log_ != nullptr && log_->trace >= 1 && log_->trace_sink != nullptr) {
         char line[160];
-        std::snprintf(line, sizeof(line), "[MOE-EXEC-TRACE] staged route device %d: served=%zu refused=%zu", device_,
-                      staged_routes_.served, staged_routes_.refused);
+        std::snprintf(line, sizeof(line),
+                      "[MOE-EXEC-TRACE] staged route device %d: served=%zu handed_off=%zu refused=%zu", device_,
+                      staged_routes_.served, staged_routes_.handed_off, staged_routes_.refused);
         log_->trace_sink(log_->sink_ctx, line);
         if (staged_routes_.refused != 0) {
             char head[64];
@@ -579,10 +589,10 @@ void moe_stream_phase::report_staged_routes() {
         }
     }
     if (staged_routes_.refused != 0 && policy_ == moe_exec_policy::RING && log_ != nullptr && log_->sink != nullptr) {
-        char warn_head[112];
+        char warn_head[160];
         std::snprintf(warn_head, sizeof(warn_head),
-                      "[MOE-EXEC] staged route refusals device %d: served=%zu refused=%zu ", device_,
-                      staged_routes_.served, staged_routes_.refused);
+                      "[MOE-EXEC] staged route refusals device %d: served=%zu handed_off=%zu refused=%zu ", device_,
+                      staged_routes_.served, staged_routes_.handed_off, staged_routes_.refused);
         const std::string warn_line = warn_head + staged_routes_.refusals_text();
         log_->sink(log_->sink_ctx, warn_line.c_str());
     }

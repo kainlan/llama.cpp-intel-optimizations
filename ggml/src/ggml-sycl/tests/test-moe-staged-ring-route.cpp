@@ -32,7 +32,8 @@
 //    one the route would serve in every other respect, as case 1 shows, so only
 //    the entry's consumer refuses it, as claimed, and the build falls through to
 //    the route core; in a prompt that core answers HOST, and the executor reads
-//    the slot itself.
+//    the slot itself. The weight has no index entry, so the executor does not
+//    take it whole and the entry counts as a refusal, not a handoff.
 // 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.
@@ -107,6 +108,13 @@ static void counts(ggml_backend_t backend, size_t * served, size_t * refused) {
     *served  = SIZE_MAX;
     *refused = SIZE_MAX;
     (void) test_moe_stream_staged_route_counts(backend, served, refused);
+}
+
+// The phase's executor handoffs (llama.cpp-3460), or SIZE_MAX with no phase.
+static size_t handed_off(ggml_backend_t backend) {
+    size_t n = SIZE_MAX;
+    (void) test_moe_stream_staged_route_handed_off(backend, &n);
+    return n;
 }
 
 // The phase's refusals as the trace prints them, or "(no phase)".
@@ -318,6 +326,11 @@ int main() {
             counts(backend, &served, &refused);
             CHECK(served == 2 && refused == 4, "the consumer refusal is counted (served %zu, refused %zu)", served,
                   refused);
+            // The phase has no index entry for the weight, so the executor does not take it whole: the entry is a
+            // refusal, not a handoff.
+            const size_t n_handed_off = handed_off(backend);
+            CHECK(n_handed_off == 0, "an executor entry on a weight the executor does not take is no handoff (%zu)",
+                  n_handed_off);
             const std::string causes = refusals(backend);
             CHECK(causes == "layout=2 kernel(local-onednn-batched-prompt)=1 claimed=1",
                   "the refusals name their causes: two layout, one kernel with the query's reason, one claimed "

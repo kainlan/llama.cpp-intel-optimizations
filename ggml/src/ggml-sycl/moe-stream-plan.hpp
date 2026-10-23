@@ -766,7 +766,9 @@ template <typename event_t> struct moe_stream_region_reads {
 
 // The resolver's STAGED_RING lookups over one prompt (llama.cpp-o9uw): how many it served and refused, and the refusals
 // by cause and detail, so the trace says why a staged slot went unserved (plan Task 8). A detail is a string with
-// static storage (a capability reason, or moe_batch_reject_reason_name's), or null.
+// static storage (a capability reason, or moe_batch_reject_reason_name's), or null. An entry the batched prompt
+// executor reads, on a weight it takes whole, is neither: the resolver hands it off (llama.cpp-3460), and handed_off
+// counts it apart, so a refusal is always a slot nobody reads.
 struct moe_staged_route_tally {
     struct refusal_count {
         moe_staged_route_refusal refusal = moe_staged_route_refusal::NONE;
@@ -774,11 +776,13 @@ struct moe_staged_route_tally {
         size_t                   n       = 0;
     };
 
-    size_t                     served  = 0;
-    size_t                     refused = 0;
+    size_t                     served     = 0;
+    size_t                     handed_off = 0;
+    size_t                     refused    = 0;
     std::vector<refusal_count> refusals;  // one per distinct (cause, detail), in the order first seen
 
     void        count(moe_staged_route_refusal refusal, const char * detail);
+    void        count_handoff();
     // "cause(detail)=n", or "cause=n" with no detail, per distinct (cause, detail), space-separated; empty when none.
     std::string refusals_text() const;
 };
@@ -834,6 +838,9 @@ class moe_stream_phase {
     // clears them, or the destructor for a prompt no end_prompt ended: on the trace, and at WARN under an explicit ring
     // when any was refused.
     void                      count_staged_route(moe_staged_route_refusal refusal, const char * detail);
+    // An entry the resolver handed to the batched prompt executor (llama.cpp-3460): the weight is executor_staged, so
+    // the executor reads the slot, and the lookup is no refusal.
+    void                      count_executor_handoff();
 
     // True iff the batched prompt executor takes `layer`'s `role` weight with the host experts ids route to read from
     // the stage table (moe_stream_executor_staged over the index's recorded consumers and the table).
@@ -842,6 +849,8 @@ class moe_stream_phase {
     size_t staged_routes_served() const { return staged_routes_.served; }
 
     size_t staged_routes_refused() const { return staged_routes_.refused; }
+
+    size_t staged_routes_handed_off() const { return staged_routes_.handed_off; }
 
     // This prompt's refusals by cause and detail (moe_staged_route_tally::refusals_text).
     std::string staged_route_refusals() const { return staged_routes_.refusals_text(); }

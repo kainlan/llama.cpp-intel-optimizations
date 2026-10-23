@@ -123,12 +123,15 @@ The ring's index build records that claim as each host entry's consumer, and
 `moe_stream_phase::executor_staged` reads it back. A prompt op whose weight's
 routed host experts are all staged that way leaves the hybrid world and runs on
 the device. Any other staged weight is served by the staged ring route
-(llama.cpp-o9uw) in the hybrid world. Under `ring`, a claimed weight that the
-ring stages only partly stays hybrid: the resolver refuses its executor entries
-as CLAIMED, so those experts run on the CPU from their host leases, their
-copies are wasted, and `report_staged_routes` lists the refusals at WARN. Under
-`auto` this happens only on a layer the cost model sends to the ring, and the
-refusals then show only on the trace.
+(llama.cpp-o9uw) in the hybrid world. The resolver still looks up the executor
+entries of a weight staged whole, and counts each one as a handoff
+(`handed_off` on the trace line), not as a refusal: the executor reads those
+slots. Under `ring`, a claimed weight that the ring stages only partly stays
+hybrid: the resolver refuses its executor entries as CLAIMED, so those experts
+run on the CPU from their host leases. Those copies are the waste, and
+`report_staged_routes` lists the refusals at WARN. Under `auto` this happens
+only on a layer the cost model sends to the ring, and the refusals then show
+only on the trace.
 
 **The ring.** `moe_stream_ring::reserve` takes the ring's slots from the WEIGHT
 zone. It first calls `unified_cache_zone_allocate_owner`. If the zone refuses,

@@ -828,7 +828,7 @@ int main() {
     {
         using ggml_sycl::moe_staged_route_refusal;
         ggml_sycl::moe_staged_route_tally t;
-        CHECK(t.served == 0 && t.refused == 0 && t.refusals_text().empty());
+        CHECK(t.served == 0 && t.handed_off == 0 && t.refused == 0 && t.refusals_text().empty());
         t.count(moe_staged_route_refusal::NONE, nullptr);
         t.count(moe_staged_route_refusal::LAYOUT, nullptr);
         t.count(moe_staged_route_refusal::UNSUPPORTED, "local-layout-unsupported");
@@ -839,6 +839,12 @@ int main() {
         t.count(moe_staged_route_refusal::RECIPE, "RECIPE_MISMATCH");
         t.count(moe_staged_route_refusal::RECIPE, "RECIPE_MISSING");
         CHECK(t.served == 1 && t.refused == 6 && t.refusals.size() == 4);
+        // An executor handoff (llama.cpp-3460) is neither served nor refused and names no cause: the executor reads
+        // the slot itself, so the report's refusals and their WARN do not count it.
+        CHECK(t.handed_off == 0);
+        t.count_handoff();
+        t.count_handoff();
+        CHECK(t.handed_off == 2 && t.served == 1 && t.refused == 6 && t.refusals.size() == 4);
         CHECK(t.refusals_text() ==
               "layout=2 unsupported(local-layout-unsupported)=2 recipe(RECIPE_MISMATCH)=1 recipe(RECIPE_MISSING)=1");
         // Every cause has a name of its own.
