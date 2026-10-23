@@ -12,7 +12,12 @@
 #     layer-ubatches: ring_engaged=no), ring_engaged read from the summary and not from the unavailable WARN
 #     (which auto does not print), layer count, missing summary and [PP-MOE] refused each fail by name,
 #     loan_exercised counts a granted loan and not a refused one;
-#   - Q_staged: pass, an unstaged dispatch, a non-f16 arm, and NOT_EXERCISED when no layer-ubatch used the ring;
+#   - Q_staged: only the layers the ring served are scored (the executor also dispatches resident layers, whose
+#     staged=0 lines are correct): a pass with resident staged=0 lines, a ring-served layer at staged=0, a non-f16
+#     ring-served arm, a refused line, a missing arm=f16 line, no ring-served dispatch, and NOT_EXERCISED when no
+#     layer-ubatch used the ring;
+#   - the summary: ring_engaged_any yes, no and na, exit 3 for a Q_pp that passed without the ring, loan_exercised_any,
+#     a FAIL beating it;
 #   - Q_tok / Q_tok_2 / Q_tok_cpu_1 recorded, Q_tok_cpu across two loads per arm: equal, a flip on either side,
 #     a real mismatch naming the first differing byte, a missing reference;
 #   - Q_tg / Q_noc: floor, md5, place line (unchanged, changed, unscored), refill balanced / unbalanced /
@@ -158,7 +163,7 @@ expect "Q_pp no summary also means ring_engaged=no" "$out" "ring_engaged=no"
 cp "$WORK/pp-pass.err" "$WORK/pp-ref.err"
 echo '0.07.000.000 W [PP-MOE] refused device=0 cause=x detail=- tensor=blk.3.ffn_up_exps.weight type=q4_0 layout=aos staged=4' >> "$WORK/pp-ref.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-ref.err")"
-expect "Q_pp [PP-MOE] refused fails by name" "$out" "pp_moe_refused=1"
+expect "Q_pp [PP-MOE] refused fails by name" "$out" "Q_pp=FAIL(pp_moe_refused=1)"
 cp "$WORK/pp-pass.err" "$WORK/pp-loan.err"; echo "$LOAN_REFUSED" >> "$WORK/pp-loan.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-loan.err")"
 expect "Q_pp a refused loan is not loan_exercised" "$out" "loan_exercised=no"
@@ -174,23 +179,44 @@ expect "Q_pp a csv without the rows fails, never passes" "$out" "no_pp512_row"
 out="$(score Q_pp_cpu --csv "$WORK/pp-slow.csv" --err "$WORK/pp-refused.err")"
 expect "Q_pp_cpu is recorded" "$out" "Q_pp_cpu=RECORDED pp512=14.1 pp2048=31.5"
 
-# ---- Q_staged
+# ---- Q_staged: layers 0-2 are ring layers (host experts), layers 10 and 11 are resident and run the executor at
+# staged=0, layer 5 decided cpu. Only blk.0-2 are scored.
+mklayers "$WORK/st-pass.err" 3
 {
+    echo "0.05.050.000 W [MOE-EXEC] layer 5: cpu (p=1.00 t_cpu=100 us t_ring=900 us cheaper)"
     echo '0.05.000.000 I [PP-MOE] device=0 type=q4_0 layout=aos arm=f16 experts=8 groups=1 planned_weight_slot=100'
     for i in 0 1 2; do
         echo "0.05.100.000 I [MOE-EXEC-TRACE] executor device 0 tensor=blk.$i.ffn_up_exps.weight experts=8 staged=8 arm=f16"
     done
+    for i in 5 10 11; do
+        echo "0.05.150.000 I [MOE-EXEC-TRACE] executor device 0 tensor=blk.$i.ffn_up_exps.weight experts=8 staged=0 arm=f16"
+    done
     echo "$TRACE_DECOY"
     echo "$SUMMARY"
-} > "$WORK/st-pass.err"
+} >> "$WORK/st-pass.err"
 out="$(score Q_staged --err "$WORK/st-pass.err")"
-expect "Q_staged pass" "$out" "Q_staged=PASS executor_dispatches=3"
+expect "Q_staged passes with resident staged=0 lines present" "$out" \
+    "Q_staged=PASS ring_layers=3 executor_dispatches=6 ring_layer_dispatches=3"
 sed 's/blk.1.ffn_up_exps.weight experts=8 staged=8/blk.1.ffn_up_exps.weight experts=8 staged=0/' "$WORK/st-pass.err" > "$WORK/st-unstaged.err"
 out="$(score Q_staged --err "$WORK/st-unstaged.err")"
-expect "Q_staged an unstaged dispatch fails by name" "$out" "Q_staged=FAIL(unstaged=1/3)"
+expect "Q_staged a ring-served layer at staged=0 fails by name" "$out" "Q_staged=FAIL(unstaged=1/3)"
 sed 's/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=f16/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=woq/' "$WORK/st-pass.err" > "$WORK/st-woq.err"
 out="$(score Q_staged --err "$WORK/st-woq.err")"
-expect "Q_staged a non-f16 arm fails by name" "$out" "arm_not_f16=1/3"
+expect "Q_staged a non-f16 ring-served arm fails by name" "$out" "Q_staged=FAIL(arm_not_f16=1/3)"
+sed 's/blk.10.ffn_up_exps.weight experts=8 staged=0 arm=f16/blk.10.ffn_up_exps.weight experts=8 staged=0 arm=woq/' "$WORK/st-pass.err" > "$WORK/st-resident-woq.err"
+out="$(score Q_staged --err "$WORK/st-resident-woq.err")"
+expect "Q_staged a resident layer's arm is not scored" "$out" "Q_staged=PASS"
+cp "$WORK/st-pass.err" "$WORK/st-refused.err"
+echo '0.07.000.000 W [PP-MOE] refused device=0 cause=x detail=- tensor=blk.3.ffn_up_exps.weight type=q4_0 layout=aos staged=4' >> "$WORK/st-refused.err"
+out="$(score Q_staged --err "$WORK/st-refused.err")"; rc=$?
+expect "Q_staged a [PP-MOE] refused line fails by name" "$out" "Q_staged=FAIL(pp_moe_refused=1)"
+expect_rc "Q_staged a refused line rc" "$rc" 1
+grep -v 'PP-MOE\] device=' "$WORK/st-pass.err" > "$WORK/st-noarm.err"
+out="$(score Q_staged --err "$WORK/st-noarm.err")"
+expect "Q_staged a missing [PP-MOE] arm=f16 line fails by name" "$out" "Q_staged=FAIL(no_pp_moe_arm_f16_line)"
+grep -v 'tensor=blk\.[012]\.' "$WORK/st-pass.err" > "$WORK/st-nodispatch.err"
+out="$(score Q_staged --err "$WORK/st-nodispatch.err")"
+expect "Q_staged no ring-served dispatch fails, never passes" "$out" "Q_staged=FAIL(no_ring_layer_dispatch)"
 { echo "$UNAVAIL"; grep -v 'summary:' "$WORK/st-pass.err"; echo '0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed'; } > "$WORK/st-unavail.err"
 out="$(score Q_staged --err "$WORK/st-unavail.err")"; rc=$?
 expect "Q_staged ring-unavailable is NOT_EXERCISED" "$out" "Q_staged=NOT_EXERCISED(ring_engaged=no)"
@@ -198,7 +224,7 @@ expect_not "Q_staged ring-unavailable is not a pass" "$out" "Q_staged=PASS"
 expect_rc "Q_staged ring-unavailable rc" "$rc" 3
 { echo "$TRACE_DECOY"; echo "$SUMMARY"; } > "$WORK/st-none.err"
 out="$(score Q_staged --err "$WORK/st-none.err")"
-expect "Q_staged without executor lines fails, never passes" "$out" "no_executor_trace_lines"
+expect "Q_staged without executor lines fails, never passes" "$out" "no_ring_layer_dispatch"
 
 # ---- Q_tok / Q_tok_cpu: two loads per arm, stdout only
 printf 'the same generated text\n' > "$WORK/tok-a1.out"
@@ -248,7 +274,7 @@ PLACE_TG='MoE experts: 38004 on device, 35724 on host'
 dec_err() { # <file> <tps> <place> [extra line]
     {
         echo "0.01.601.984 I [PLACEMENT] $3 (of 73728 total)"
-        echo "1.42.962.387 I common_perf_print:        eval time =    4954.02 ms /    59 runs   (83.97 ms per token,    $2 tokens per second)"
+        echo "1.42.962.387 I llama_perf_context_print:        eval time =    4954.02 ms /    59 runs   (83.97 ms per token,    $2 tokens per second)"
         [ -z "${4:-}" ] || echo "$4"
     } > "$1"
 }
@@ -289,6 +315,9 @@ printf '%s\n' "$ECHO" > "$WORK/go-echo.out"
 : > "$WORK/empty.err"
 out="$(score GO_gate --out "$WORK/go.out" --err "$WORK/empty.err")"
 expect "GO_gate answer line scores 1 and zero layer lines" "$out" "GO_gate=PASS count=1 layer_lines=0"
+printf '%s\n1, 2, 3, 4, 5\n1, 2, 3, 4, 5\n' "$ECHO" > "$WORK/go-two.out"
+out="$(score GO_gate --out "$WORK/go-two.out" --err "$WORK/empty.err")"
+expect "GO_gate a count of 2 fails: the gate is exactly 1" "$out" "GO_gate=FAIL(count=2!=1)"
 out="$(score GO_gate --out "$WORK/go-echo.out" --err "$WORK/empty.err")"
 expect "GO_gate the echo line alone must not pass" "$out" "GO_gate=FAIL(count=0!=1)"
 out="$(score GO_gate --out "$WORK/go.out" --err "$WORK/pp-pass.err")"
@@ -357,11 +386,55 @@ out="$(bash "$GATE" --lock-dir "$WORK/GPU.lock" --arm resets 0000000000000000000
 expect_rc "wrong sha refuses with rc 2" "$rc" 2
 expect "wrong sha says REFUSED" "$out" "REFUSED: head "
 if [ -e "$WORK/GPU.lock" ]; then fail "a wrong-sha refusal created GPU.lock"; else pass "a wrong-sha refusal never creates GPU.lock"; fi
+for badsha in abc abcdef xyz1234 0000000G; do
+    out="$(bash "$GATE" --lock-dir "$WORK/GPU.lock" --arm resets "$badsha" 2>&1)"; rc=$?
+    expect_rc "a <sha> of '$badsha' (under 7 hex characters or not hex) refuses with rc 2" "$rc" 2
+    expect "a <sha> of '$badsha' says why" "$out" "is not 7 to 40 lowercase hex characters"
+done
 out="$(bash "$GATE" --lock-dir "$WORK/GPU.lock" --lock-selftest 2>&1)"; rc=$?
 expect_rc "lock selftest rc" "$rc" 0
 expect "lock selftest ok" "$out" "lock-selftest: ok"
 out="$(bash "$GATE" --arm Q_nope 2>&1)"; rc=$?
 expect_rc "an unknown arm is a usage error" "$rc" 2
+
+# ---- the summary: ring_engaged_any and the exit code, scored from real verdict lines
+PASS_RING="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
+PASS_NORING="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-refused.err")"
+FAIL_LINE="$(score Q_pp --csv "$WORK/pp-fail.csv" --err "$WORK/pp-fail.err")"
+CTRL_PASS="GO_gate=PASS count=1 layer_lines=0"
+summ() { # <name> <verdict line>...: writes them to a file and runs --score-summary
+    local f="$WORK/summ-$1.txt"
+    shift
+    printf '%s\n' "$@" > "$f"
+    bash "$GATE" --score-summary "$f" 2>&1
+}
+out="$(summ ring "$PASS_RING" "$CTRL_PASS")"; rc=$?
+expect "summary ring engaged: ring_engaged_any=yes" "$out" "ring_engaged_any=yes"
+expect_rc "summary ring engaged rc" "$rc" 0
+expect "summary ends with the marker" "$out" "verdicts_pass=2 GATE_DONE"
+out="$(summ noring "$PASS_NORING" "$CTRL_PASS")"; rc=$?
+expect "summary Q_pp PASS without the ring: ring_engaged_any=no" "$out" "ring_engaged_any=no"
+expect "summary Q_pp PASS without the ring still counts as a pass" "$out" "verdicts_pass=2 GATE_DONE"
+expect_rc "summary nothing failed but no ring engaged is exit 3" "$rc" 3
+out="$(summ mixed "$PASS_NORING" "$PASS_RING")"; rc=$?
+expect "summary one ring-engaged arm makes ring_engaged_any=yes" "$out" "ring_engaged_any=yes"
+expect_rc "summary mixed rc" "$rc" 0
+out="$(summ na "$CTRL_PASS" "MI_b70=PASS digits=1")"; rc=$?
+expect "summary without a ring-scoring arm: ring_engaged_any=na" "$out" "ring_engaged_any=na"
+expect_rc "summary without a ring-scoring arm rc" "$rc" 0
+out="$(summ fail "$FAIL_LINE" "$CTRL_PASS")"; rc=$?
+expect_rc "summary a FAIL is exit 1 even without the ring" "$rc" 1
+out="$(summ loan "$PASS_RING" "$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-loan.err")")"
+expect "summary loan_exercised_any=yes from a granted loan" "$out" "loan_exercised_any=yes"
+out="$(summ noloan "$PASS_RING")"
+expect "summary loan_exercised_any=no without one" "$out" "loan_exercised_any=no"
+out="$(summ notx "$PASS_RING" "Q_staged=NOT_EXERCISED(ring_engaged=no) rc=0")"; rc=$?
+expect_rc "summary a NOT_EXERCISED arm is exit 3" "$rc" 3
+out="$(bash "$GATE" --score-summary "$WORK/absent.txt" 2>&1)"; rc=$?
+expect_rc "summary of a missing file is a usage error" "$rc" 2
+out="$(bash "$GATE" --help 2>&1)"
+expect "help documents exit 143 on a signal" "$out" "143"
+expect "help documents ring_engaged_any" "$out" "ring_engaged_any=yes|no|na"
 
 # ---- the prompt
 bash "$GATE" --make-prompt --prompt-out "$WORK/p1.txt" > /dev/null 2>&1

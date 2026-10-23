@@ -14,6 +14,10 @@
 #              at least one distinct "[MOE-EXEC] layer N:" line (exactly --q-layers N when given), at least one
 #              "[MOE-EXEC] summary:" (llama-bench makes one context per -p value, so -p 512,2048 prints two),
 #              zero "[PP-MOE] refused".
+#              The plan wrote 48 layers "at the first ubatch". Both were wrong, and the real log is the evidence:
+#              Qwen3.8 prints 24 distinct "[MOE-EXEC] layer N:" lines (only layers with host experts have one), and
+#              the line prints once per change of choice, so "at the first ubatch" names no fixed moment. The default
+#              is therefore "at least one layer line", and --q-layers N makes the count exact.
 #              The verdict carries ring_engaged=yes|no and ring_layer_ubatches=K. ring_engaged is yes only when the
 #              "[MOE-EXEC] summary: K layer-ubatches ring" lines add up to K > 0. It is NOT read from the
 #              "stream ring unavailable" WARN: under auto at default verbosity that WARN is not printed at all
@@ -21,8 +25,11 @@
 #              loan_exercised=yes|no is a "[MOE-EXEC] loan device N: K triplets" line.
 #   Q_pp_cpu   Q_pp with GGML_SYCL_MOE_EXEC=cpu                                  B70  recorded, not gated
 #   Q_staged   llama-bench -p 512 -n 0 -r 1 -fa 1 -o csv -v, GGML_SYCL_MOE_EXEC_TRACE=1   B70
-#              every "[MOE-EXEC-TRACE] executor device D tensor=T experts=E staged=S arm=A" line has S > 0 and
-#              A = f16, at least one "[PP-MOE] device=D type=T layout=L arm=f16" line, zero "[PP-MOE] refused".
+#              the executor prints "[MOE-EXEC-TRACE] executor device D tensor=T experts=E staged=S arm=A" for EVERY
+#              dispatch, resident layers included (staged=0 there is correct). So only the layers the ring served
+#              are scored: a layer N with a "[MOE-EXEC] layer N: ring" line in the run is a host layer, and every
+#              trace line whose tensor is blk.N.* must have S > 0 and A = f16. At least one such dispatch must exist.
+#              Also at least one "[PP-MOE] device=D type=T layout=L arm=f16" line and zero "[PP-MOE] refused".
 #              NOT_EXERCISED (neither pass nor fail) when ring_engaged=no: nothing was staged to count.
 #   Q_tok      llama-completion -m $Q -f code-2k.txt -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4
 #              B70  md5 of stdout recorded (load 1 of 2)
@@ -62,7 +69,12 @@
 # GPU.lock is `mkdir $LOCK_DIR` with a `holder` file inside, released with `rm -f holder && rmdir`.
 #
 # Exit codes: 0 every requested verdict PASS; 1 at least one FAIL; 2 refused or usage; 3 none failed but at least
-# one arm was NOT_EXERCISED or NOT_SCORED.
+# one arm was NOT_EXERCISED or NOT_SCORED, or a ring-scoring arm ran and no arm engaged the ring (the summary line
+# says ring_engaged_any=no: a Q_pp that PASSed its floors without the ring is still not the ring working); 143 the
+# gate was stopped by TERM, INT or HUP (it prints ABORTED and the final line, and releases the lock).
+# The summary line carries ring_engaged_any=yes|no|na (na: no arm that run carries a ring_engaged field) and
+# loan_exercised_any=yes|no, both read from the verdict lines. --score-summary FILE scores a file of verdict lines.
+# <sha> is the head the build was made from, at least 7 hex characters; a shorter or non-hex value is refused.
 #
 # Options:
 #   --help | --dry-run (print each arm's command and scoring, run nothing) | --arm NAME (repeatable)
@@ -70,6 +82,8 @@
 #   --score-arm NAME [--csv F] [--out F] [--out2 F] [--err F] [--ref-out F] [--ref-out2 F] [--journal F] [--rc N]
 #                                       score existing files, GPU-free; for Q_tok_cpu: --out cpu load 2, --out2 cpu
 #                                       load 1, --ref-out auto load 1, --ref-out2 auto load 2
+#   --score-summary FILE                print the summary line and exit with the code a gate over those verdict lines
+#                                       (one per line) would, GPU-free
 #   --check-controls                    run only the grep controls
 #   --build-dir DIR  --out-dir DIR  --lock-dir DIR  --no-lock  --no-head-check  --since 'YYYY-MM-DD HH:MM:SS'
 #   --qwen F --gptoss F --mistral F   model files
@@ -90,6 +104,7 @@ LOCK_DIR="${LLAMA_GPU_LOCK:-/Apps/llama.cpp/GPU.lock}"
 TAKE_LOCK=1
 HEAD_CHECK=1
 EXPECT_SHA=""
+SCORE_SUMMARY=""
 DRY_RUN=0
 MAKE_PROMPT=0
 CHECK_CONTROLS=0
@@ -175,6 +190,7 @@ while [ $# -gt 0 ]; do
         --ref-out2) S_REF2="$2"; shift 2 ;;
         --journal) S_JOURNAL="$2"; shift 2 ;;
         --rc) S_RC="$2"; shift 2 ;;
+        --score-summary) SCORE_SUMMARY="$2"; shift 2 ;;
         --check-controls) CHECK_CONTROLS=1; shift ;;
         --lock-selftest) LOCK_SELFTEST=1; shift ;;
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
@@ -341,24 +357,50 @@ score_q_pp_cpu() { # <csv> <err> <rc>
         "forced_cpu_lines=$(count_re '\[MOE-EXEC\] layer [0-9]+: cpu .*forced' "$2") rc=$3"
 }
 
+# ring_layer_ids <file...>: the layer ids that have a "[MOE-EXEC] layer N: ring" line, one per line, sorted. A layer
+# that is ring in any ubatch counts as a host layer whose dispatches must be staged.
+ring_layer_ids() {
+    cat "$@" 2>/dev/null | grep -aoE '\[MOE-EXEC\] layer [0-9]+: ring ' | grep -oE ' [0-9]+:' | tr -d ' :' | sort -un
+}
+
+# trace_counts <ids> <file>: "total served unstaged nonf16" over the "[MOE-EXEC-TRACE] executor device" lines. total is
+# every dispatch; served are those whose tensor is blk.N.* for an N in <ids> (whitespace separated); unstaged and
+# nonf16 are counted over the served ones only, because resident layers run the executor too, with staged=0.
+trace_counts() {
+    local ids
+    ids="$(echo "$1" | tr '\n' ' ')"
+    cat "$2" 2>/dev/null | awk -v ring="$ids" '
+        BEGIN { n = split(ring, a, " "); for (i = 1; i <= n; i++) R[a[i]] = 1 }
+        match($0, /executor device [0-9]+ tensor=blk\.[0-9]+\.[^ ]* experts=[0-9]+ staged=[0-9]+ arm=[a-z0-9]+/) {
+            split(substr($0, RSTART, RLENGTH), f, " ")
+            t = f[4]; sub(/^tensor=blk\./, "", t); sub(/\..*/, "", t)
+            st = f[6]; sub(/^staged=/, "", st)
+            ar = f[7]; sub(/^arm=/, "", ar)
+            total++
+            if (t in R) { served++; if (st + 0 == 0) unstaged++; if (ar != "f16") nonf16++ }
+        }
+        END { printf "%d %d %d %d\n", total + 0, served + 0, unstaged + 0, nonf16 + 0 }'
+}
+
 score_q_staged() { # <err> <rc>
-    local err="$1" rc="$2" fails=() n unstaged nonf16 refused arms
+    local err="$1" rc="$2" fails=() ids nids total served unstaged nonf16 refused arms
     if [ "$(ring_engaged "$err")" = no ]; then
         echo "Q_staged=NOT_EXERCISED(ring_engaged=no) rc=$rc"
         return
     fi
     [ -z "$(rc_item "$rc")" ] || fails+=("$(rc_item "$rc")")
-    n="$(count_re "$RE_TRACE_EXEC" "$err")"
-    unstaged="$(cat "$err" 2>/dev/null | grep -aoE -- "$RE_TRACE_EXEC" | grep -acE ' staged=0 ')"
-    nonf16="$(cat "$err" 2>/dev/null | grep -aoE -- "$RE_TRACE_EXEC" | grep -acvE ' arm=f16$')"
+    ids="$(ring_layer_ids "$err")"
+    nids="$(echo "$ids" | grep -c .)"
+    read -r total served unstaged nonf16 <<< "$(trace_counts "$ids" "$err")"
     arms="$(count_re "$RE_PP_ARM_F16" "$err")"
     refused="$(count_re "$RE_PP_REFUSED" "$err")"
-    [ "$n" -gt 0 ] || fails+=("no_executor_trace_lines")
-    [ "${unstaged:-0}" -eq 0 ] || fails+=("unstaged=$unstaged/$n")
-    [ "${nonf16:-0}" -eq 0 ] || fails+=("arm_not_f16=$nonf16/$n")
+    [ "$served" -gt 0 ] || fails+=("no_ring_layer_dispatch")
+    [ "$unstaged" -eq 0 ] || fails+=("unstaged=$unstaged/$served")
+    [ "$nonf16" -eq 0 ] || fails+=("arm_not_f16=$nonf16/$served")
     [ "$arms" -gt 0 ] || fails+=("no_pp_moe_arm_f16_line")
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
-    echo "Q_staged=$(verdict_of "${fails[@]}") executor_dispatches=$n pp_moe_arm_f16_lines=$arms pp_moe_refused=$refused ring_engaged=yes ring_layer_ubatches=$(ring_layer_ubatches "$err")"
+    echo "Q_staged=$(verdict_of "${fails[@]}") ring_layers=$nids executor_dispatches=$total ring_layer_dispatches=$served" \
+        "pp_moe_arm_f16_lines=$arms pp_moe_refused=$refused ring_engaged=yes ring_layer_ubatches=$(ring_layer_ubatches "$err")"
 }
 
 # score_q_tok <name> <out> <rc>: a recorded md5 of stdout.
@@ -548,8 +590,8 @@ check_controls() {
     ctl watchdog "$RE_WATCHDOG" '[SYCL-WATCHDOG] No GPU progress for 30 s' '[SYCL-WATCHDOG] armed'
     ctl place "$RE_PLACE" '[PLACEMENT] MoE experts: 38004 on device, 35724 on host (of 73728 total)' \
         '[PLACEMENT] MoE experts: all on device'
-    ctl tps "$RE_TPS" 'common_perf_print:        eval time =    4954.02 ms /    59 runs (11.91 tokens per second)' \
-        'common_perf_print:        eval time =    4954.02 ms /    59 runs (83.97 ms per token)'
+    ctl tps "$RE_TPS" 'llama_perf_context_print:        eval time =    4954.02 ms /    59 runs   (   83.97 ms per token,    11.91 tokens per second)' \
+        'llama_perf_context_print:        eval time =    4954.02 ms /    59 runs'
     ctl resets "$RE_RESETS" 'xe 0000:03:00.0: [drm] GT reset started' 'xe 0000:03:00.0: [drm] GT0: suspended'
     ctl mi "$RE_MI" '1, 2, 3, 4, 5, 6, 7, 8, 9, 10' '1, 2, 3, 4, 5,'
     # The count scorer is grep -cx, not grep -c: the echo line ends with the answer (CLAUDE.md, GPT-OSS gate).
@@ -598,7 +640,7 @@ arm_doc() {
     case "$1" in
         Q_pp) echo "pp512 >= $PP512_MIN, pp2048 >= $PP2048_MIN, $Q_LAYERS distinct '$RE_LAYER' lines, at least one '$RE_SUMMARY', zero '$RE_PP_REFUSED'; reports ring_engaged (the '$RE_SUMMARY_RING' lines add up to > 0) and loan_exercised ('$RE_LOAN_OK')" ;;
         Q_pp_cpu) echo "recorded only: pp512, pp2048, forced cpu layer lines" ;;
-        Q_staged) echo "every '$RE_TRACE_EXEC' line has staged > 0 and arm=f16; at least one '$RE_PP_ARM_F16'; zero '$RE_PP_REFUSED'; NOT_EXERCISED when the ring is unavailable" ;;
+        Q_staged) echo "every '$RE_TRACE_EXEC' line of a layer with a '[MOE-EXEC] layer N: ring' line has staged > 0 and arm=f16 (resident layers are ignored); at least one '$RE_PP_ARM_F16'; zero '$RE_PP_REFUSED'; NOT_EXERCISED when the ring is unavailable" ;;
         Q_tok) echo "recorded only: md5 of stdout, load 1 of 2" ;;
         Q_tok_2) echo "recorded only: md5 of stdout, load 2 of 2" ;;
         Q_tok_cpu_1) echo "recorded only: md5 of stdout with GGML_SYCL_MOE_EXEC=cpu, load 1 of 2" ;;
@@ -687,6 +729,36 @@ on_signal() {
     exit 143
 }
 
+# ---------------------------------------------------------------- the final summary, shared with --score-summary
+
+# summarize <verdict lines...>: prints the summary and final lines and returns the exit code. ring_engaged_any is read
+# from the verdict lines: yes when one says ring_engaged=yes, no when some carry a ring_engaged field and none says
+# yes, na when no arm carries one (a run of only the GPT-OSS or Mistral arms has no ring to score).
+summarize() {
+    local v pass=0 fail=0 notx=0 any_loan=no any_ring=na
+    for v in "$@"; do
+        case "$(status_of "$v")" in
+            PASS) pass=$((pass + 1)) ;;
+            RECORDED) ;;
+            NOT_EXERCISED | NOT_SCORED) notx=$((notx + 1)) ;;
+            *) fail=$((fail + 1)) ;;
+        esac
+        case "$v" in *"loan_exercised=yes"*) any_loan=yes ;; esac
+        case "$v" in
+            *"ring_engaged=yes"*) any_ring=yes ;;
+            *"ring_engaged=no"*) [ "$any_ring" = yes ] || any_ring=no ;;
+        esac
+    done
+    say "summary: ring_engaged_any=$any_ring loan_exercised_any=$any_loan verdicts_fail=$fail not_exercised_or_unscored=$notx out=${OUT_DIR:-none}"
+    say "verdicts_pass=$pass GATE_DONE"
+    if [ "$fail" -gt 0 ]; then
+        return 1
+    elif [ "$notx" -gt 0 ] || [ "$any_ring" = no ]; then
+        return 3
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- modes that run no arm
 
 if [ "$MAKE_PROMPT" = 1 ]; then
@@ -721,6 +793,13 @@ if [ "$LOCK_SELFTEST" = 1 ]; then
     exit 0
 fi
 
+if [ -n "$SCORE_SUMMARY" ]; then
+    [ -f "$SCORE_SUMMARY" ] || die_usage "no verdict file $SCORE_SUMMARY"
+    mapfile -t SUM_LINES < "$SCORE_SUMMARY"
+    summarize "${SUM_LINES[@]}"
+    exit $?
+fi
+
 if [ -n "$SCORE_ARM" ]; then
     line="$(score_arm_files "$SCORE_ARM" "$S_CSV" "$S_OUT" "$S_ERR" "$S_REF" "$S_JOURNAL" "$S_RC" "$S_OUT2" "$S_REF2")"
     say "$line"
@@ -749,6 +828,7 @@ trap on_signal TERM INT HUP
 
 if [ "$HEAD_CHECK" = 1 ]; then
     [ -n "$EXPECT_SHA" ] || refuse "no <sha> argument: pass the merge sha the build was made from"
+    [[ "$EXPECT_SHA" =~ ^[0-9a-f]{7,40}$ ]] || refuse "<sha> '$EXPECT_SHA' is not 7 to 40 lowercase hex characters"
     head_sha="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null)"
     case "$head_sha" in
         "$EXPECT_SHA"*) ;;
@@ -800,7 +880,6 @@ say "gate: sha=${EXPECT_SHA:-unchecked} build=$BUILD_DIR out=$OUT_DIR since='$SI
 say "pre: $(mem_line) load=$(cut -d' ' -f1 /proc/loadavg) builders=$(builders)"
 
 declare -a VERDICTS=()
-PASS=0 FAIL=0 NOTX=0
 
 run_arm() { # <arm>: runs it, writes <arm>.out/.err/.rc, prints the sample lines
     local arm="$1" rc
@@ -834,12 +913,6 @@ score_arm_in_outdir() { # <arm>
     line="$(score_arm_files "$arm" "$csv" "$out" "$err" "$ref" "$out" "$rc" "$OUT_DIR/Q_tok_cpu_1.out" "$OUT_DIR/Q_tok_2.out")"
     say "$line"
     VERDICTS+=("$line")
-    case "$(status_of "$line")" in
-        PASS) PASS=$((PASS + 1)) ;;
-        RECORDED) ;;
-        NOT_EXERCISED | NOT_SCORED) NOTX=$((NOTX + 1)) ;;
-        *) FAIL=$((FAIL + 1)) ;;
-    esac
 }
 
 for arm in "${ARMS[@]}"; do
@@ -848,16 +921,6 @@ for arm in "${ARMS[@]}"; do
 done
 
 lock_release
-any_loan=no
-for v in "${VERDICTS[@]}"; do
-    case "$v" in *"loan_exercised=yes"*) any_loan=yes ;; esac
-done
 say "post: $(mem_line)"
-say "summary: loan_exercised_any=$any_loan verdicts_fail=$FAIL not_exercised_or_unscored=$NOTX out=$OUT_DIR"
-say "verdicts_pass=$PASS GATE_DONE"
-if [ "$FAIL" -gt 0 ]; then
-    exit 1
-elif [ "$NOTX" -gt 0 ]; then
-    exit 3
-fi
-exit 0
+summarize "${VERDICTS[@]}"
+exit $?
