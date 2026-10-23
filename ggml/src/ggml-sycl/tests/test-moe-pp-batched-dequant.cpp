@@ -29,8 +29,8 @@
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <vector>
 #include <sycl/sycl.hpp>
+#include <vector>
 
 namespace {
 
@@ -151,8 +151,7 @@ struct lifecycle_fixture {
             require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
             load_open = true;
             expert_inventory fixture(type);
-            const auto       stage = ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope,
-                                                                            false);
+            const auto stage = ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false);
             require(stage == GGML_SYCL_LIFECYCLE_OK,
                     "inventory staging result=" + std::to_string(static_cast<int>(stage)));
             // Staging uses temporary backends; the retained backend is created after it, so load_end's exact-queue
@@ -169,11 +168,11 @@ struct lifecycle_fixture {
                     "context create failed");
             require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
                     "context bind failed");
-            require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, k_n_ctx, k_n_ubatch, 1,
-                                                                    /*kv_unified=*/false, /*swa_full=*/false,
-                                                                    /*flash_attn_enabled=*/true) ==
-                        GGML_SYCL_LIFECYCLE_OK,
-                    "runtime context bind failed");
+            require(
+                ggml_backend_sycl_set_runtime_context_for_model(backend, model, k_n_ctx, k_n_ubatch, 1,
+                                                                /*kv_unified=*/false, /*swa_full=*/false,
+                                                                /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
+                "runtime context bind failed");
         } catch (...) {
             cleanup();
             throw;
@@ -207,8 +206,9 @@ struct lifecycle_fixture {
     ~lifecycle_fixture() { cleanup(); }
 };
 
-ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * tensor,
-                                   ggml_backend_buffer_usage usage) {
+ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft,
+                                   ggml_tensor *              tensor,
+                                   ggml_backend_buffer_usage  usage) {
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, tensor));
     if (!buffer) {
         return nullptr;
@@ -228,7 +228,7 @@ struct case_data {
 };
 
 case_data make_case(ggml_type type, int n_tokens, int ne11, std::mt19937 & rng) {
-    case_data c{ type, n_tokens, ne11, {}, {}, {} };
+    case_data                             c{ type, n_tokens, ne11, {}, {}, {} };
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float>                    weight_f32(size_t(k_experts) * k_out * k_in);
     for (float & v : weight_f32) {
@@ -255,7 +255,7 @@ case_data make_case(ggml_type type, int n_tokens, int ne11, std::mt19937 & rng) 
 
 // Builds MUL_MAT_ID over the case's data on `backend` and computes it. Fills `out` on success.
 ggml_status run_backend(ggml_backend_t backend, const case_data & c, bool sycl, std::vector<float> & out) {
-    ggml_init_params params = { 1024 * 1024, nullptr, true };
+    ggml_init_params                                    params = { 1024 * 1024, nullptr, true };
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), &ggml_free);
     require(ctx != nullptr, "ggml_init failed");
     ggml_tensor * weights = ggml_new_tensor_3d(ctx.get(), c.type, k_in, k_out, k_experts);
@@ -270,13 +270,14 @@ ggml_status run_backend(ggml_backend_t backend, const case_data & c, bool sycl, 
         ggml_backend_sycl_register_weight_usage(k_tensor_names[0], GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
     }
 
-    ggml_backend_buffer_type_t         buft = ggml_backend_get_default_buffer_type(backend);
+    ggml_backend_buffer_type_t         buft    = ggml_backend_get_default_buffer_type(backend);
     std::vector<ggml_backend_buffer_t> buffers = {
         alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS),
         alloc_tensor(buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
         alloc_tensor(buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
         alloc_tensor(buft, dst, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
     };
+
     struct buffers_guard {
         std::vector<ggml_backend_buffer_t> & b;
 
@@ -288,6 +289,7 @@ ggml_status run_backend(ggml_backend_t backend, const case_data & c, bool sycl, 
             }
         }
     } guard{ buffers };
+
     for (ggml_backend_buffer_t buffer : buffers) {
         require(buffer != nullptr, "tensor buffer allocation failed");
     }
@@ -377,7 +379,7 @@ int main() {
             ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr), &ggml_backend_free);
         require(cpu != nullptr, "CPU backend init failed");
 
-        const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K,
+        const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,  GGML_TYPE_Q4_K,
                                     GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS };
         std::mt19937    rng(348);
         int             failed = 0;
