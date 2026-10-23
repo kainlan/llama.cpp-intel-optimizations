@@ -10326,7 +10326,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_freed += members[i].vram_charge_size;
+        out.bytes_freed += bytes[i];
     }
     return true;
 }
@@ -10612,7 +10612,7 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_readmitted += members[i].vram_charge_size;
+        out.bytes_readmitted += bytes[i];
     }
     return true;
 }

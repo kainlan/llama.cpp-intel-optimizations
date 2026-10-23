@@ -2195,6 +2195,12 @@ def test_mutant_refill_storage_sized_from_dst_size_fails():
     assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
 
 
+def test_mutant_missing_entry_does_not_stop_fails():
+    """No entry to size from must stop the preparation with the cache's refusal, not mint a zero-byte copy."""
+    mutant = _once_in(SYCL, TXN_SIG, COPY_SIZE_MISSING, "")
+    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+
+
 def test_mutant_loan_query_reads_the_host_entry_fails():
     mutant = _once_in(CACHE, LOAN_BYTES_SIG, LOAN_BYTES_FIND, REFILL_BYTES_FIND)
     assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)

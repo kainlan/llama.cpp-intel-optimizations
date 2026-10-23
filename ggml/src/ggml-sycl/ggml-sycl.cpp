@@ -20786,8 +20786,8 @@ static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size
 // `reason` holding the refusal that stopped it, not "OK". A partial refill reports the same way.
 struct ggml_sycl_expert_loan_result {
     bool         accepted         = false;
-    size_t       bytes_freed      = 0;  // the lent (or, probing, the selected) triplets' summed vram_charge_size
-    size_t       bytes_readmitted = 0;  // a refill's: the re-admitted triplets' summed vram_charge_size
+    size_t       bytes_freed      = 0;  // device storage the lent triplets returned (a probe: the selection's charge)
+    size_t       bytes_readmitted = 0;  // a refill's: device storage the re-admitted triplets took
     uint32_t     n_triplets       = 0;  // the triplets lent, or re-admitted
     uint32_t     n_remaining      = 0;  // a refill's: the lent triplets its armed cursor still holds after it ran
     uint32_t     n_dropped        = 0;  // a refill's: the lent triplets it dropped from the ledger, to stay on the host
@@ -20938,7 +20938,7 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
 }
 
 // A refill refusal a later boundary would meet again: the host copy is not a loan's (or no longer is), or the device
-// storage minted at its size is not its size. Such a triplet leaves the ledger rather than being retried at
+// storage's size does not equal the lent copy's size. Such a triplet leaves the ledger rather than being retried at
 // every decode graph; any other refusal is transient and the triplet is tried again at the next one.
 static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason) {
     static const char * const final_reasons[] = {
@@ -21109,7 +21109,6 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 triplet.refill_members[r].placement        = k;
                 triplet.refill_members[r].key              = target.key;
                 triplet.refill_members[r].host_keys        = std::move(target.host_keys);
-                triplet.refill_members[r].vram_charge_size = e->vram_charge_size;
                 triplet.refill_members[r].device_owner     = std::move(storage);
             } else {
                 ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, bytes);
@@ -21120,7 +21119,6 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 triplet.members[r].placement        = k;
                 triplet.members[r].key              = target.key;
                 triplet.members[r].host_keys        = std::move(target.host_keys);
-                triplet.members[r].vram_charge_size = e->vram_charge_size;
                 triplet.members[r].host_owner       = std::move(host);
             }
             triplet.extras[r] = target.extra;
@@ -22035,7 +22033,8 @@ struct test_loan_fixture {
 
     // A loan of bytes_wanted run at the graph boundary, which must lend n_expected triplets; then each lent device
     // entry is reclaimed and its storage handed back, so a refill meets no withdrawn entry under the ids it re-admits.
-    std::string lend(size_t bytes_wanted, uint32_t n_expected, int host_expert) {
+    // `freed`, when given, receives the loan's bytes_freed.
+    std::string lend(size_t bytes_wanted, uint32_t n_expected, int host_expert, size_t * freed = nullptr) {
         const device_bytes                     before   = sample();
         const ::ggml_sycl_expert_loan_resolver resolver = this->resolver();
         ::ggml_sycl_expert_loan_result         result;
@@ -22045,8 +22044,11 @@ struct test_loan_fixture {
             return test_loan_fail("the loan of %zu bytes lent %u triplets (%s), not %u", bytes_wanted,
                                   result.n_triplets, result.reason, n_expected);
         }
+        if (freed) {
+            *freed = result.bytes_freed;
+        }
         const std::vector<std::pair<int, int>> lent     = lent_triplets(host_expert);
-        const size_t                           expected = 3 * n_expected * test_loan_expert_bytes();
+        const size_t                           expected = 3 * n_expected * staged_bytes;
         // Each lent copy is a host-pinned slice of a host zone, the one provenance the copy path reads as host USM,
         // so a refill's copy from it can be the direct DMA (llama.cpp-sif1).
         for (const auto & t : lent) {
@@ -22305,9 +22307,9 @@ std::string test_expert_loan_lends_two_triplets() {
 
     // The retired device entries go once their last lease is gone; the storage once the copies reading it complete.
     // The device gets back what it allocated, the entries' own sizes: a zone owner's extent is its requested size
-    // (unified_cache_zone_allocate_owner) and a raw allocation is held at its size. bytes_freed reports the
-    // planner's charge, those sizes rounded up to 256 bytes, so the two agree only for a 256-aligned expert. The
-    // fixture's is; this says so, so the physical check below cannot pass on the rounding.
+    // (unified_cache_zone_allocate_owner) and a raw allocation is held at its size. bytes_freed reports those sizes
+    // (llama.cpp-pu8v), and the request above was in the planner's charge, those sizes rounded up to 256 bytes, so the
+    // request and bytes_freed agree only for a 256-aligned expert. The fixture's is; this says so.
     if (charge != test_loan_expert_bytes()) {
         return test_loan_fail("a %zu-byte expert charges %zu: the physical return cannot equal bytes_freed",
                               test_loan_expert_bytes(), charge);
@@ -23215,11 +23217,10 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
     // The guard stays: a host copy smaller than the entry it must hold is refused, whatever sized it.
     expert_loan_member members[3];
     for (int s = 0; s < 3; ++s) {
-        members[s].placement        = { 1, 2, test_loan_fixture::role(s) };
-        members[s].key              = fx.keys[fx.index(1, s, 2)];
-        members[s].host_keys        = { members[s].key };
-        members[s].vram_charge_size = charge;
-        members[s].host_owner       = ::ggml_sycl_host_expert_alloc(fx.device, test_loan_expert_bytes());
+        members[s].placement  = { 1, 2, test_loan_fixture::role(s) };
+        members[s].key        = fx.keys[fx.index(1, s, 2)];
+        members[s].host_keys  = { members[s].key };
+        members[s].host_owner = ::ggml_sycl_host_expert_alloc(fx.device, test_loan_expert_bytes());
         if (!members[s].host_owner.valid()) {
             return "no pinned host storage for the short host copy";
         }
@@ -23245,8 +23246,13 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
         m.host_owner = mem_handle();
     }
 
-    if (std::string why = fx.lend(6 * charge, 2, /*host_expert=*/3); !why.empty()) {
+    size_t freed = 0;
+    if (std::string why = fx.lend(6 * charge, 2, /*host_expert=*/3, &freed); !why.empty()) {
         return why;
+    }
+    // The storage the loan returned, exactly: the entries' sizes, past the plan's charge by the six tails.
+    if (freed != 6 * fx.staged_bytes) {
+        return test_loan_fail("the loan reports %zu bytes freed, not the six entries' %zu", freed, 6 * fx.staged_bytes);
     }
     const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
     if (lent.size() != 2) {
@@ -23275,13 +23281,124 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
     const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &resolver, &result);
-    if (!result.accepted || result.n_triplets != 2 || result.n_dropped != 0 || remaining != 0) {
-        return test_loan_fail("the refill re-admitted %u triplets, dropped %u, with %u remaining (%s), not 2, 0 and 0",
-                              result.n_triplets, result.n_dropped, remaining, result.reason);
+    if (!result.accepted || result.n_triplets != 2 || result.n_dropped != 0 || remaining != 0 ||
+        result.bytes_readmitted != 6 * fx.staged_bytes) {
+        return test_loan_fail(
+            "the refill re-admitted %u triplets and %zu bytes, dropped %u, with %u remaining (%s), not 2, %zu, 0 and 0",
+            result.n_triplets, result.bytes_readmitted, result.n_dropped, remaining, result.reason,
+            6 * fx.staged_bytes);
     }
     for (const auto & t : lent) {
         if (std::string why = fx.readmitted(t.first, t.second); !why.empty()) {
             return "a padded triplet: " + why;
+        }
+    }
+    return {};
+}
+
+std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
+    // llama.cpp-pu8v: the preparation asks the cache for each member's entry and, when there is none, stops with the
+    // refusal the cache would give. A loan whose selected triplet has a member with no device entry stops "not
+    // resident" and lends, publishes and moves nothing. A refill meets a lent triplet whose host copy is gone only at
+    // the ledger's back: one decode boundary re-admits the triplet behind it and keeps it, and the next stops "not
+    // lent" and drops it, publishing nothing.
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    {
+        test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7075387602ull);
+        if (!fx.cache) {
+            return "no unified cache for device 0";
+        }
+        if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+            return why;
+        }
+        ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+        // Selection walks the plan from its tail, so a one-triplet loan selects layer 1 expert 2. Its down member's
+        // device entry is withdrawn while the plan still has it on the device.
+        if (!expert_retire_succeeded(fx.cache->retire_expert_entry_exact(fx.keys[fx.index(1, 2, 2)], GGML_LAYOUT_AOS,
+                                                                         "test/expert loan missing entry"))) {
+            return "the down member's device entry could not be withdrawn";
+        }
+        const auto                             published = ::ggml_sycl_global_plan_snapshot();
+        const ::ggml_sycl_expert_loan_resolver resolver  = fx.resolver();
+        ::ggml_sycl_expert_loan_result         result;
+        ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
+        if (!::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, &result)) {
+            return "the graph boundary ran no loan for the pending request";
+        }
+        if (result.accepted || result.n_triplets != 0 || result.bytes_freed != 0 ||
+            std::strcmp(result.reason, "not resident") != 0) {
+            return test_loan_fail(
+                "the loan of a triplet with no device entry answered accepted=%d triplets=%u bytes=%zu (%s), not "
+                "refused \"not resident\"",
+                (int) result.accepted, result.n_triplets, result.bytes_freed, result.reason);
+        }
+        if (::ggml_sycl_global_plan_snapshot().get() != published.get() ||
+            g_sycl_expert_loan_requests[fx.device].load() != 0 || g_sycl_expert_lent_count[fx.device].load() != 0) {
+            return "the refused loan published a plan, re-posted its request or recorded a lent triplet";
+        }
+        for (int s = 0; s < 2; ++s) {
+            if (!fx.device_entry_present(1, s, 2) || fx.host_entry_present(1, s, 2)) {
+                return test_loan_fail("the refused loan moved layer 1 expert 2 slot %d", s);
+            }
+        }
+    }
+
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7075387603ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    // The loan lends layer 1 experts 2 and then 1, so expert 1 is the ledger's back and expert 2 is behind it.
+    if (std::string why = fx.lend(6 * charge, 2, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    if (!expert_retire_succeeded(fx.cache->retire_expert_entry_exact(fx.keys[fx.index(1, 0, 2)], GGML_LAYOUT_AOS,
+                                                                     "test/expert refill missing host copy"))) {
+        return "expert 2's gate host copy could not be withdrawn";
+    }
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1 || result.n_dropped != 0 || remaining != 1) {
+        return test_loan_fail(
+            "the refill of the back triplet answered accepted=%d triplets=%u dropped=%u remaining=%u (%s), not 1, 0 "
+            "and 1",
+            (int) result.accepted, result.n_triplets, result.n_dropped, remaining, result.reason);
+    }
+    if (std::string why = fx.readmitted(1, 1); !why.empty()) {
+        return "the back triplet: " + why;
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return test_loan_fail("the ledger counts %u lent triplets with expert 2 behind the back, not 1",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+
+    const auto published = ::ggml_sycl_global_plan_snapshot();
+    remaining            = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (result.accepted || result.n_triplets != 0 || result.n_dropped != 1 || remaining != 0 ||
+        std::strcmp(result.reason, "not lent") != 0) {
+        return test_loan_fail(
+            "the refill of a back triplet with no host copy answered accepted=%d triplets=%u dropped=%u remaining=%u "
+            "(%s), not 0, 0, 1 and 0 (not lent)",
+            (int) result.accepted, result.n_triplets, result.n_dropped, remaining, result.reason);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get() ||
+        g_sycl_expert_lent_count[fx.device].load() != 0) {
+        return "the refill that dropped a triplet published a plan or kept it in the ledger";
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    if (!now || !now->plan || test_loan_fixture::triplet_on_device(*now, 1, 2) != 0) {
+        return "the dropped triplet is not on the host in the published plan";
+    }
+    for (int s = 1; s < 3; ++s) {
+        if (!fx.host_entry_present(1, s, 2) || fx.device_entry_present(1, s, 2)) {
+            return test_loan_fail("the dropped triplet's slot %d is not still on the host", s);
         }
     }
     return {};
