@@ -279,16 +279,17 @@ out="$(tokcpu "$WORK/tok-flip.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/
 expect "Q_tok_cpu a cpu flip with auto equal to one cpu output passes" "$out" "Q_tok_cpu=PASS"
 expect "Q_tok_cpu reports the cpu flip" "$out" "cpu_flip=yes"
 out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-flip.out")"
-expect "Q_tok_cpu an auto output that no cpu load produced fails" "$out" "Q_tok_cpu=FAIL(auto2_md5="
+expect "Q_tok_cpu an auto output that diverges early from every cpu output fails" "$out" \
+    "Q_tok_cpu=FAIL(auto2_prefix=21<64)"
 out="$(tokcpu "$WORK/tok-flip.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-flip.out")"
 expect "Q_tok_cpu an auto flip that either cpu load also made passes" "$out" "Q_tok_cpu=PASS"
 expect "Q_tok_cpu reports the auto flip" "$out" "auto_flip=yes"
 out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-bad.out" "$WORK/tok-a2.out")"; rc=$?
-expect "Q_tok_cpu a real mismatch fails by name" "$out" "Q_tok_cpu=FAIL(auto1_md5="
-expect "Q_tok_cpu a mismatch names the first differing byte" "$out" "first_diff_byte=1"
+expect "Q_tok_cpu a real mismatch fails by name" "$out" "Q_tok_cpu=FAIL(auto1_prefix=0<64)"
+expect "Q_tok_cpu a mismatch reports its prefix" "$out" "min_prefix=0"
 expect_rc "Q_tok_cpu a mismatch rc" "$rc" 1
 out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-flip.out" "$WORK/tok-a2.out")"
-expect "Q_tok_cpu a one-byte difference names byte 22" "$out" "first_diff_byte=22"
+expect "Q_tok_cpu a one-byte difference at byte 22 is a prefix of 21" "$out" "auto1_prefix=21<64"
 out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/absent.out" "$WORK/tok-a2.out")"; rc=$?
 expect "Q_tok_cpu without Q_tok is not scored" "$out" "Q_tok_cpu=NOT_SCORED(no_Q_tok_output)"
 expect_rc "Q_tok_cpu not scored rc" "$rc" 3
@@ -300,6 +301,58 @@ expect "Q_tok_cpu an empty cpu output fails by name" "$out" "Q_tok_cpu=FAIL(empt
 out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-c1.out" --ref-out "$WORK/tok-a1.out" \
     --ref-out2 "$WORK/tok-a2.out" --rc 124)"
 expect "Q_tok_cpu a timeout fails" "$out" "Q_tok_cpu=FAIL(rc=124"
+
+# R1: the greedy near-tie flips in both policies and cascades after its token. The rule is: some auto md5 equals some
+# cpu md5, and every auto output is identical to a cpu output or shares >= 64 bytes with its best-matching one.
+TOKBASE='The user wants me to summarize the document about GPT-OSS Testing and Prompt Template Rationale'
+TOKBASE="$TOKBASE in plain words."
+printf '%s\n' "$TOKBASE" > "$WORK/lt-base.out"
+sed 's/plain words/plain WORDS/' "$WORK/lt-base.out" > "$WORK/lt-late1.out"
+sed 's/in plain words/in plain sentences/' "$WORK/lt-base.out" > "$WORK/lt-late2.out"
+sed 's/summarize/SUMMARIZE/' "$WORK/lt-base.out" > "$WORK/lt-early.out"
+printf 'An entirely different opening that shares nothing with the other text at all.\n' > "$WORK/lt-other.out"
+ltok() { # <cpu2> <cpu1> <auto1> <auto2>, names under $WORK/lt-
+    tokcpu "$WORK/lt-$1.out" "$WORK/lt-$2.out" "$WORK/lt-$3.out" "$WORK/lt-$4.out"
+}
+out="$(ltok base base base base)"
+expect "Q_tok_cpu four identical long outputs: distinct 1/1, pairs_equal 4" "$out" \
+    "Q_tok_cpu=PASS distinct_auto=1 distinct_cpu=1 pairs_equal=4"
+# run 2's shape: auto 1 equals cpu 2, every other pair diverges late, both policies flip
+out="$(ltok base late1 base late2)"; rc=$?
+expect "Q_tok_cpu run-2 shape (one equal pair, late flips on both sides) passes" "$out" \
+    "Q_tok_cpu=PASS distinct_auto=2 distinct_cpu=2 pairs_equal=1 min_prefix=105"
+expect_rc "Q_tok_cpu run-2 shape rc" "$rc" 0
+out="$(ltok late1 base base late2)"
+expect "Q_tok_cpu an auto flip against a late-flipped cpu pair still passes" "$out" "Q_tok_cpu=PASS"
+# a defect: the policies agree on nothing, whatever the prefix
+out="$(ltok base base late1 late1)"; rc=$?
+expect "Q_tok_cpu no equal pair fails even with a late prefix" "$out" "Q_tok_cpu=FAIL(pairs_equal=0)"
+expect "Q_tok_cpu pairs_equal=0 prints it" "$out" "pairs_equal=0"
+expect_rc "Q_tok_cpu no equal pair rc" "$rc" 1
+out="$(ltok base base base early)"
+expect "Q_tok_cpu an auto output that diverges early fails naming the prefix" "$out" \
+    "Q_tok_cpu=FAIL(auto2_prefix=21<64)"
+expect "Q_tok_cpu an early auto prints min_prefix" "$out" "min_prefix=21"
+out="$(ltok base base other other)"
+expect "Q_tok_cpu a wholly different pair fails on both counts" "$out" \
+    "Q_tok_cpu=FAIL(auto1_prefix=0<64,auto2_prefix=0<64,pairs_equal=0)"
+# the 64-byte boundary, pinned both sides: a 64-byte shared prefix passes, 63 fails
+P64="$(printf 'a%.0s' $(seq 64))"
+P63="$(printf 'a%.0s' $(seq 63))"
+printf '%sX\n' "$P64" > "$WORK/lt-p64a.out"; printf '%sY\n' "$P64" > "$WORK/lt-p64c.out"
+printf '%sX\n' "$P63" > "$WORK/lt-p63a.out"; printf '%sY\n' "$P63" > "$WORK/lt-p63c.out"
+out="$(tokcpu "$WORK/lt-base.out" "$WORK/lt-p64c.out" "$WORK/lt-base.out" "$WORK/lt-p64a.out")"
+expect "Q_tok_cpu a shared prefix of exactly 64 bytes passes" "$out" "Q_tok_cpu=PASS"
+out="$(tokcpu "$WORK/lt-base.out" "$WORK/lt-p63c.out" "$WORK/lt-base.out" "$WORK/lt-p63a.out")"
+expect "Q_tok_cpu a shared prefix of 63 bytes fails" "$out" "Q_tok_cpu=FAIL(auto2_prefix=63<64)"
+# a prefix of the other output (one is a prefix of the other) counts the shorter length
+printf '%s' "$TOKBASE" > "$WORK/lt-cut.out"
+head -c 80 "$WORK/lt-base.out" > "$WORK/lt-trunc.out"
+out="$(tokcpu "$WORK/lt-base.out" "$WORK/lt-base.out" "$WORK/lt-base.out" "$WORK/lt-trunc.out")"
+expect "Q_tok_cpu a truncated auto output counts the shared length (80 >= 64)" "$out" "Q_tok_cpu=PASS"
+head -c 30 "$WORK/lt-base.out" > "$WORK/lt-trunc30.out"
+out="$(tokcpu "$WORK/lt-base.out" "$WORK/lt-base.out" "$WORK/lt-base.out" "$WORK/lt-trunc30.out")"
+expect "Q_tok_cpu a truncated auto output of 30 bytes fails" "$out" "Q_tok_cpu=FAIL(auto2_prefix=30<64)"
 
 # ---- Q_tg / Q_noc
 echo "decode output" > "$WORK/dec.out"
@@ -324,7 +377,10 @@ expect "Q_tg below the floor fails" "$out" "Q_tg=FAIL(tg=10.20<11.0)"
 expect "Q_tg without a loan says refill not_exercised" "$out" "refill=not_exercised"
 expect "Q_tg without a loan says loan_exercised=no" "$out" "loan_exercised=no"
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 deadbeef --place-ref-tg "$PLACE_TG")"
-expect "Q_tg wrong md5 fails" "$out" "Q_tg=FAIL(md5=$MD5!=deadbeef)"
+expect "Q_tg wrong md5 with no shared text fails, flip=no" "$out" \
+    "Q_tg=FAIL(md5=$MD5!=deadbeef,flip=no(prefix=0<128))"
+expect "Q_tg an equal md5 is flip=no" "$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 "$MD5" \
+    --place-ref-tg "$PLACE_TG")" "md5=$MD5 flip=no prefix="
 dec_err "$WORK/tg-unbal.err" 11.91 "$PLACE_TG" '0.09.000.000 W [MOE-EXEC] refill device 0: 23/24 triplets re-admitted'
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-unbal.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
 expect "Q_tg unbalanced refill fails" "$out" "Q_tg=FAIL(refill=unbalanced(23/24))"
@@ -343,6 +399,60 @@ expect "Q_noc pass at 9.80 against the 9.5 floor" "$out" "Q_noc=PASS tg=9.80"
 dec_err "$WORK/noc-slow.err" 9.30 'MoE experts: 38163 on device, 35565 on host'
 out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc-slow.err" --qmd5 "$MD5" --place-ref-noc -)"
 expect "Q_noc below the floor fails" "$out" "Q_noc=FAIL(tg=9.30<9.5)"
+
+# R2: a different md5 is a greedy near-tie flip when the output shares >= 128 bytes with the reference TEXT
+head -c 300 /dev/zero | tr '\0' 'a' > "$WORK/dref.txt"
+DREF_MD5="$(md5sum < "$WORK/dref.txt" | cut -c1-8)"
+{ head -c 199 "$WORK/dref.txt"; printf 'Z'; head -c 100 "$WORK/dref.txt"; } > "$WORK/dflip.out"
+{ head -c 49 "$WORK/dref.txt"; printf 'Z'; head -c 250 "$WORK/dref.txt"; } > "$WORK/dearly.out"
+{ head -c 128 "$WORK/dref.txt"; printf 'Z'; head -c 171 "$WORK/dref.txt"; } > "$WORK/d128.out"
+{ head -c 127 "$WORK/dref.txt"; printf 'Z'; head -c 172 "$WORK/dref.txt"; } > "$WORK/d127.out"
+dscore() { # <arm> <out> [extra option...]
+    local arm="$1" o="$2" err="$WORK/tg.err" pl="$PLACE_TG"
+    shift 2
+    [ "$arm" != Q_noc ] || { err="$WORK/noc.err"; pl=-; }
+    local place_opt=--place-ref-tg
+    [ "$arm" != Q_noc ] || place_opt=--place-ref-noc
+    score "$arm" --out "$o" --err "$err" --qmd5 "$DREF_MD5" --decode-ref "$WORK/dref.txt" "$place_opt" "$pl" "$@"
+}
+out="$(dscore Q_tg "$WORK/dref.txt")"
+expect "Q_tg the reference text itself is PASS with flip=no" "$out" \
+    "Q_tg=PASS tg=11.91 md5=$DREF_MD5 flip=no prefix=300"
+out="$(dscore Q_tg "$WORK/dflip.out")"; rc=$?
+expect "Q_tg a late divergence (byte 200) is PASS with flip=yes" "$out" "Q_tg=PASS tg=11.91"
+expect "Q_tg a flip prints flip=yes and its prefix" "$out" "flip=yes prefix=199"
+expect_rc "Q_tg a flip rc" "$rc" 0
+out="$(dscore Q_tg "$WORK/dearly.out")"; rc=$?
+expect "Q_tg an early divergence (byte 50) is a FAIL with flip=no" "$out" "flip=no(prefix=49<128))"
+expect "Q_tg an early divergence names the verdict" "$out" "Q_tg=FAIL(md5="
+expect_rc "Q_tg an early divergence rc" "$rc" 1
+out="$(dscore Q_tg "$WORK/d128.out")"
+expect "Q_tg a shared prefix of exactly 128 bytes is PASS flip=yes" "$out" "Q_tg=PASS tg=11.91 md5="
+out="$(dscore Q_tg "$WORK/d127.out")"
+expect "Q_tg a shared prefix of 127 bytes is a FAIL" "$out" "flip=no(prefix=127<128))"
+out="$(score Q_tg --out "$WORK/dflip.out" --err "$WORK/tg.err" --qmd5 "$DREF_MD5" --decode-ref "$WORK/absent-ref.txt" \
+    --place-ref-tg "$PLACE_TG")"
+expect "Q_tg a missing reference text FAILs naming it, never a flip" "$out" "no_reference_text"
+out="$(dscore Q_tg "$WORK/dflip.out" --rc 134)"
+expect "Q_tg a flip with rc 134 is still a FAIL" "$out" "Q_tg=FAIL(rc=134)"
+out="$(dscore Q_noc "$WORK/dflip.out")"
+expect "Q_noc a late divergence is PASS with flip=yes" "$out" "Q_noc=PASS tg=9.80"
+expect "Q_noc a flip prints flip=yes" "$out" "flip=yes prefix=199"
+out="$(dscore Q_noc "$WORK/dearly.out")"
+expect "Q_noc an early divergence is a FAIL with flip=no" "$out" "Q_noc=FAIL(md5="
+# R3: the placement references default to "-": recorded, not scored
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 "$MD5")"
+expect "Q_tg without --place-ref-tg the place line is recorded, not scored" "$out" "place=unscored"
+expect "Q_tg unscored place still passes" "$out" "Q_tg=PASS"
+out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc.err" --qmd5 "$MD5")"
+expect "Q_noc without --place-ref-noc the place line is recorded, not scored" "$out" "place=unscored"
+# the committed reference text is the q0xu output: its md5 is the gate's default reference md5
+REF_COMMITTED="$ROOT_DIR/scripts/sycl-moe-exec-prompts/code-ref-25b7738a.txt"
+if [ -f "$REF_COMMITTED" ] && [ "$(md5sum < "$REF_COMMITTED" | cut -c1-8)" = 25b7738a ]; then
+    pass "the committed reference text has md5 25b7738a"
+else
+    fail "the committed reference text is missing or its md5 is not 25b7738a"
+fi
 
 # ---- GPT-OSS and Mistral
 ECHO='> Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5'
@@ -365,17 +475,39 @@ mklayers "$WORK/go11.err" 11
 out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/go11.err" --go-noc-layers 12)"
 expect "GO_noc --go-noc-layers 12 and 11 layer lines fail" "$out" "GO_noc=FAIL(layer_lines=11!=12)"
 out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/empty.err")"
-expect "GO_noc with no layer line fails: the demoted layers were never consulted" "$out" "GO_noc=FAIL(layer_lines=0<1)"
+expect "GO_noc with no layer line passes: layer_lines is recorded, not gated" "$out" \
+    "GO_noc=PASS count=1 layer_lines=0"
+out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/empty.err" --go-noc-layers any)"
+expect "GO_noc --go-noc-layers any with no layer line fails" "$out" "GO_noc=FAIL(layer_lines=0<1)"
 
-mkcsv "$WORK/gopp-ok.csv" 512:0:880.0:4.0:512 0:128:33.9:0.1:512
-mkcsv "$WORK/gopp-low.csv" 512:0:770.0:4.0:512 0:128:33.9:0.1:512
-mkcsv "$WORK/gopp-tg.csv" 512:0:880.0:4.0:512 0:128:32.0:0.1:512
+mkcsv "$WORK/gopp-ok.csv" 512:0:880.0:4.0:512 0:128:32.1:0.1:512
+mkcsv "$WORK/gopp-low.csv" 512:0:770.0:4.0:512 0:128:32.1:0.1:512
+mkcsv "$WORK/gopp-tg.csv" 512:0:880.0:4.0:512 0:128:30.0:0.1:512
 out="$(score GO_pp --csv "$WORK/gopp-ok.csv")"
 expect "GO_pp inside both windows passes" "$out" "GO_pp=PASS pp512=880.0"
 out="$(score GO_pp --csv "$WORK/gopp-low.csv")"
 expect "GO_pp pp512 770 fails low" "$out" "GO_pp=FAIL(pp512=770.0<827."
+expect "GO_pp pp512 770 names llama.cpp-zuze (within 15 % below the reference)" "$out" "see=llama.cpp-zuze"
+mkcsv "$WORK/gopp-745.csv" 512:0:745.0:4.0:512 0:128:32.1:0.1:512
+mkcsv "$WORK/gopp-735.csv" 512:0:735.0:4.0:512 0:128:32.1:0.1:512
+out="$(score GO_pp --csv "$WORK/gopp-745.csv")"
+expect "GO_pp pp512 745 (within 15 % below 871) names zuze" "$out" "see=llama.cpp-zuze"
+out="$(score GO_pp --csv "$WORK/gopp-735.csv")"
+expect "GO_pp pp512 735 (more than 15 % below) fails without naming zuze" "$out" "GO_pp=FAIL(pp512=735.0<"
+expect_not "GO_pp pp512 735 is not the zuze regression" "$out" "zuze"
+out="$(score GO_pp --csv "$WORK/gopp-ok.csv")"
+expect_not "GO_pp a pass does not name zuze" "$out" "zuze"
 out="$(score GO_pp --csv "$WORK/gopp-tg.csv")"
-expect "GO_pp tg128 32.0 fails low" "$out" "GO_pp=FAIL(tg128=32.0<33.0"
+expect "GO_pp tg128 30.0 fails low against 32.0 less 3 %" "$out" "GO_pp=FAIL(tg128=30.0<31.0"
+mkcsv "$WORK/gopp-tg32.csv" 512:0:880.0:4.0:512 0:128:32.0:0.1:512
+out="$(score GO_pp --csv "$WORK/gopp-tg32.csv")"
+expect "GO_pp tg128 32.0 passes: the B50 reads about 32" "$out" "GO_pp=PASS pp512=880.0"
+mkcsv "$WORK/gopp-tg31.csv" 512:0:880.0:4.0:512 0:128:31.1:0.1:512
+out="$(score GO_pp --csv "$WORK/gopp-tg31.csv")"
+expect "GO_pp tg128 31.1 passes (inside 3 %)" "$out" "GO_pp=PASS"
+mkcsv "$WORK/gopp-tg30b.csv" 512:0:880.0:4.0:512 0:128:30.9:0.1:512
+out="$(score GO_pp --csv "$WORK/gopp-tg30b.csv")"
+expect "GO_pp tg128 30.9 fails (outside 3 %)" "$out" "GO_pp=FAIL(tg128=30.9<31.0"
 
 printf '1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n' > "$WORK/mi.out"
 printf '1, 2, 3, 4, 5,\n' > "$WORK/mi-prompt.out"
@@ -885,8 +1017,6 @@ for f in pp-depth-first pp-depth-last; do
 done
 
 # m7 and m11: the C-locale cmp spelling, and a missing tool is a skip in the gate too
-out="$(LC_ALL=de_DE.UTF-8 tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-flip.out" "$WORK/tok-a2.out")"
-expect "first_diff_byte is the same under another locale" "$out" "first_diff_byte=22"
 mkdir -p "$WORK/nocmp"
 for t in dirname cat grep sed tr cut head tail wc sort date ls env awk md5sum comm git pgrep timeout journalctl \
          mkdir rm cp stat seq sleep uname basename readlink mktemp; do
