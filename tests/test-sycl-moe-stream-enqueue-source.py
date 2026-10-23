@@ -10,10 +10,11 @@ What this gate pins:
     `moe_hybrid_with_plan` is computed. The site is the admission branch rather than the later `prompt_batch` local
     because the executor fast paths return before that local is computed, which would skip the layer-ahead staging after
     every all-device layer;
-  - only an explicit GGML_SYCL_MOE_EXEC=ring stages: the phase's one stage() call sits under a guard that needs both
-    the RING choice and the RING policy, the ring's reserve is reachable only through it, and the op's policy is the
-    parsed config's. What an explicit ring stages, the resolver's STAGED_RING route consumes (llama.cpp-o9uw); under
-    AUTO the decision log records what the cost model would choose and no bytes move (lead ruling c-3skf);
+  - staging follows the layer's decision (llama.cpp-3460, lifting lead ruling c-3skf): the phase's one stage() call
+    sits under a guard that needs the RING choice under any policy but GGML_SYCL_MOE_EXEC=cpu, so AUTO stages when the
+    cost model chooses the ring and ring forces it; the ring's reserve is reachable only through stage(), and the op's
+    policy is the parsed config's. What the ring stages, the resolver's STAGED_RING route or the batched executor
+    consumes (llama.cpp-o9uw, llama.cpp-3460);
   - a refused ring reserve is not retried within a micro-batch and is tried once more in the next: the latch is cleared
     by begin_ubatch, which every new micro-batch runs, and by end_prompt. An expert loan (ruling c-tdra, llama.cpp-mwmr)
     can make room before the next micro-batch, so a per-prompt latch would waste the loan its own prompt asked for (lead
@@ -21,8 +22,8 @@ What this gate pins:
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
     and the ring's inputs, in a fixed format, through the decision log's WARN sink; the flag is cleared by end_prompt
     and never per micro-batch (lead ruling c-kcyf), and the phase logs nothing else of its own;
-  - resolve() reports every layer it resolves, AUTO included, so the decision log keeps the cost model's choice
-    (the second half of c-3skf), and the next layer is weighed only below the decision log's MAX_LAYERS;
+  - resolve() reports every layer it resolves, under every policy, so the decision log keeps the cost model's choice,
+    and the next layer is weighed only below the decision log's MAX_LAYERS;
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
     c-3bde: slot reuse is ordered on the device, never by a host status query) and behind the host lease's ready event,
     since the lease admits an entry still being filled; the reorder is ggml_sycl_reorder_weight_gpu on the compute queue
@@ -1170,19 +1171,19 @@ STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage("
 RING_READY_SIG = "bool moe_stream_phase::ring_ready()"
 POLICY_GUARD = "if (moe_stream_stage_now(st.decision, op.policy)) {"
 STAGE_PRED_SIG = "static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy)"
-STAGE_PRED_BODY = "{ return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING; }"
+STAGE_PRED_BODY = "{ return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU; }"
 STAGE_CALL = "n = stage(li, st.decision.regime, cache, op);"
 POLICY_FROM_CONFIG = "call.op.policy = ggml_sycl_moe_exec_config().policy;"
 STAGE_CALL_RE = re.compile(r"(?<![:\w])stage\(")
 RING_READY_CALL_RE = re.compile(r"(?<![:\w])ring_ready\(\)")
 
 
-def claim_staging_only_under_explicit_ring(phase: str, sycl: str, hpp: str) -> bool:
-    """Lead ruling c-3skf: only an explicit GGML_SYCL_MOE_EXEC=ring copies, reorders or reserves the ring, and its
-    staged experts are what the resolver's STAGED_RING route consumes (llama.cpp-o9uw); AUTO only records the cost
-    model's choice. The phase's one stage() call is the first statement under a guard, moe_stream_stage_now, that needs
-    both the RING choice and the RING policy, the reserve is reachable only through stage() and ring_ready(), and the
-    op's policy is the parsed config's."""
+def claim_staging_follows_the_decision(phase: str, sycl: str, hpp: str) -> bool:
+    """Staging follows the layer's decision (llama.cpp-3460, lifting lead ruling c-3skf now that the staged slots have
+    consumers, llama.cpp-o9uw and the batched executor). The phase's one stage() call is the first statement under a
+    guard, moe_stream_stage_now, that needs the RING choice under any policy but CPU: AUTO stages when the cost model
+    chooses the ring, ring forces the choice in moe_exec_weigh, and cpu never stages. The reserve is reachable only
+    through stage() and ring_ready(), and the op's policy is the parsed config's."""
     n = norm(phase)
     return (POLICY_GUARD + " " + STAGE_CALL in body(n, RESOLVE_SIG)
             and body(norm(hpp), STAGE_PRED_SIG) == STAGE_PRED_BODY
@@ -1193,30 +1194,26 @@ def claim_staging_only_under_explicit_ring(phase: str, sycl: str, hpp: str) -> b
             and norm(sycl).count(POLICY_FROM_CONFIG) == 1)
 
 
-def test_staging_only_under_explicit_ring():
-    assert claim_staging_only_under_explicit_ring(PHASE, SYCL, PLAN_HPP)
+def test_staging_follows_the_decision():
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP)
 
 
 def test_policy_gate_mutants():
-    # AUTO reaching the stage call: the predicate tests the choice alone.
-    assert not claim_staging_only_under_explicit_ring(
-        PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY, "{ return d.choice == moe_exec_choice::RING; }"))
-    # A predicate that still admits AUTO.
-    assert not claim_staging_only_under_explicit_ring(
-        PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY,
-                            "{ return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU; }"))
+    c = claim_staging_follows_the_decision
+    # AUTO never staging: the record-only predicate of lead ruling c-3skf.
+    assert not c(PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY,
+                                     "{ return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING; }"))
+    # CPU staging: the predicate tests the choice alone.
+    assert not c(PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY, "{ return d.choice == moe_exec_choice::RING; }"))
     # The guard testing the choice alone, past the predicate.
-    assert not claim_staging_only_under_explicit_ring(
-        mutate(PHASE, POLICY_GUARD, "if (st.decision.choice == moe_exec_choice::RING) {"), SYCL, PLAN_HPP)
+    assert not c(mutate(PHASE, POLICY_GUARD, "if (st.decision.choice == moe_exec_choice::RING) {"), SYCL, PLAN_HPP)
     # A second stage call outside the guard.
-    assert not claim_staging_only_under_explicit_ring(
-        mutate(PHASE, "st.resolved = true;", STAGE_CALL + " st.resolved = true;"), SYCL, PLAN_HPP)
+    assert not c(mutate(PHASE, "st.resolved = true;", STAGE_CALL + " st.resolved = true;"), SYCL, PLAN_HPP)
     # The ring reserved outside stage().
-    assert not claim_staging_only_under_explicit_ring(
-        mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = ccs.is_in_order(); ring_ready();"), SYCL, PLAN_HPP)
+    assert not c(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = ccs.is_in_order(); ring_ready();"),
+                 SYCL, PLAN_HPP)
     # The op's policy pinned to RING instead of read from GGML_SYCL_MOE_EXEC.
-    assert not claim_staging_only_under_explicit_ring(
-        PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"), PLAN_HPP)
+    assert not c(PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"), PLAN_HPP)
 
 
 UBATCH_PRED_SIG = "static inline bool moe_stream_ubatch_starts("
@@ -1303,11 +1300,11 @@ def test_claims_count_production_sites_only():
     assert "moe_stream_phase::test_reserve_ring(" in raw and "moe_stream_phase::test_reserve_ring(" not in PHASE
     assert "moe_stream_phase::test_acquire_slot(" in raw and "moe_stream_phase::test_acquire_slot(" not in PHASE
     assert claim_phase_allocates_only_ring_slots(PHASE)
-    assert claim_staging_only_under_explicit_ring(PHASE, SYCL, PLAN_HPP)
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP)
     # The seams outside their block: a second slot acquisition and a second ring_ready() call, both counted.
     unguarded = production(raw.replace(guard, "#if 1"))
     assert not claim_phase_allocates_only_ring_slots(unguarded)
-    assert not claim_staging_only_under_explicit_ring(unguarded, SYCL, PLAN_HPP)
+    assert not claim_staging_follows_the_decision(unguarded, SYCL, PLAN_HPP)
     # An #else arm is production and stays; a nested conditional inside the block goes with it.
     assert production("a\n#if defined(GGML_SYCL_PRIVATE_TESTING)\nb\n#else\nc\n#endif\nd") == "a\n\n\n\nc\n\nd"
     assert production("#ifdef GGML_SYCL_PRIVATE_TESTING\n#ifdef X\nb\n#else\nc\n#endif\n#endif\nd") == "\n" * 7 + "d"
@@ -1441,8 +1438,9 @@ def brace_depth(text: str, at: int) -> int:
 
 
 def claim_auto_still_reports(phase: str) -> bool:
-    """The second half of c-3skf: under AUTO the decision log still records what the cost model would choose. resolve()
-    calls report() once, at the top level of its body after the policy guard has closed, with no return before it."""
+    """The decision log records every layer's decision under every policy, AUTO included, whether or not it staged.
+    resolve() calls report() once, at the top level of its body after the policy guard has closed, with no return
+    before it."""
     r = body(norm(phase), RESOLVE_SIG)
     guard = r.find(POLICY_GUARD)
     at = r.find(REPORT_CALL)

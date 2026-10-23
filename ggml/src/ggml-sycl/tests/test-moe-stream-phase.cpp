@@ -694,7 +694,8 @@ int main() {
     // the next layer in the next graph of a split micro-batch
     CHECK(!ggml_sycl::moe_stream_ubatch_starts(true, 16, 15, 8, 7));
 
-    // Bytes move only when the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it (lead ruling c-3skf).
+    // Bytes move when the layer's decision is RING under any policy but cpu: AUTO follows the cost model and ring forces
+    // the choice in moe_exec_weigh (llama.cpp-3460, lifting lead ruling c-3skf).
     moe_exec_decision ring_all;
     ring_all.choice               = moe_exec_choice::RING;
     ring_all.regime               = moe_exec_regime::STREAM_ALL;
@@ -705,8 +706,11 @@ int main() {
     moe_exec_decision unconsulted;
     CHECK(ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::RING));
     CHECK(ggml_sycl::moe_stream_stage_now(ring_routed, moe_exec_policy::RING));
-    CHECK(!ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::AUTO));
+    CHECK(ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::AUTO));
+    CHECK(ggml_sycl::moe_stream_stage_now(ring_routed, moe_exec_policy::AUTO));
     CHECK(!ggml_sycl::moe_stream_stage_now(ring_all, moe_exec_policy::CPU));
+    CHECK(!ggml_sycl::moe_stream_stage_now(cpu_routed, moe_exec_policy::AUTO));
+    CHECK(!ggml_sycl::moe_stream_stage_now(unconsulted, moe_exec_policy::AUTO));
     CHECK(!ggml_sycl::moe_stream_stage_now(cpu_routed, moe_exec_policy::RING));
     CHECK(!ggml_sycl::moe_stream_stage_now(unconsulted, moe_exec_policy::RING));
 

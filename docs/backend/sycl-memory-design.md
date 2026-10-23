@@ -112,13 +112,16 @@ device. `moe_exec_decision_log` prints one `[MOE-EXEC]` line when a layer's
 recorded choice changes. The regimes below say what each choice does.
 
 **Two regimes.** In decode, host-resident experts compute on the CPU. In prompt
-processing, the path depends on `GGML_SYCL_MOE_EXEC`. Under `ring`, a layer's
-host-resident experts are staged through the ring, and the batched device
-executor runs them. Under `cpu`, nothing is staged. Under `auto`, the default,
-the cost model's choice is only recorded, and no bytes move. Only an explicit
-`ring` stages (`moe_stream_stage_now`). This record-only gate is ruling c-3skf
-(llama.cpp-xod7). It stands until Task 10 (llama.cpp-3460) lifts it, after which
-`auto` stages whenever the cost model chooses the ring.
+processing, the path depends on `GGML_SYCL_MOE_EXEC`. Under `auto`, the default,
+a layer's host-resident experts are staged through the ring when the cost model
+chooses the ring. Under `ring`, they are staged wherever a ring fits. Under
+`cpu`, nothing is staged. `moe_stream_stage_now` is the one predicate. Task 10
+(llama.cpp-3460) lifted ruling c-3skf (llama.cpp-xod7), under which `auto` only
+recorded the choice. A weight the batched prompt executor claims once its host
+experts are staged is staged as AOS slots that the executor's dequant reads. A
+prompt layer whose routed host experts are all staged that way leaves the
+hybrid world and runs on the device. Any other staged weight is served by the
+staged ring route (llama.cpp-o9uw) in the hybrid world.
 
 **The ring.** `moe_stream_ring::reserve` takes the ring's slots from the WEIGHT
 zone. It first calls `unified_cache_zone_allocate_owner`. If the zone refuses,

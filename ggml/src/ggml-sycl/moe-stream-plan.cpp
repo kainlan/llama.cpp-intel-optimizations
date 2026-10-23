@@ -228,8 +228,8 @@ void moe_stream_phase::resolve(int                           layer,
                                unified_cache &               cache,
                                const moe_stream_op &         op) {
     stage_counts n;
-    // Only an explicit GGML_SYCL_MOE_EXEC=ring moves bytes or reserves the ring: AUTO only records what the cost model
-    // would choose (lead ruling c-3skf).
+    // A RING decision moves bytes and reserves the ring under any policy but cpu (moe_stream_stage_now): AUTO when the
+    // cost model chose the ring, ring always (llama.cpp-3460). Every decision is reported, staged or not.
     if (moe_stream_stage_now(st.decision, op.policy)) {
         n = stage(li, st.decision.regime, cache, op);
         if (n.ring_unavailable) {

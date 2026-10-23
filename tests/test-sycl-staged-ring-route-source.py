@@ -9,9 +9,9 @@ What this gate pins:
     before the route core; moe_batch_route carries no `staged_ring` flag (brief amendment: the recipe's transfer is
     the fact);
   - a decode build costs nothing: the phase is taken only for a prompt build (`rows > 1` is the first term of the
-    phase pointer's condition), so a decode build computes no layer, no role and no claim. The library claim reads
-    the device's plan, so it is asked inside the refusal lambda at the first stage-table hit and at most once per
-    build: a build that finds no entry, such as every prompt build under AUTO, never asks it (llama.cpp-o9uw);
+    phase pointer's condition), so a decode build computes no layer and no role. The refusal lambda runs only at a
+    stage-table hit, and it refuses an entry the batched executor consumes by the entry's consumer, so the build asks
+    no claim at all (llama.cpp-3460);
   - the phase is consulted only from the context that owns it, on that context's own queue, outside a graph recording,
     and keyed by the layer and role the phase itself uses (ggml_sycl_moe_stream_layer_of, the plan's role classifier);
   - ruling C (c-3bde): the slot and its layout come from the stage-table entry (`s->layout`), never from the slice's

@@ -584,11 +584,12 @@ static inline bool moe_stream_ubatch_starts(bool     live,
     return !live || layer < cur_layer || (layer == cur_layer && graph_seq != cur_graph_seq);
 }
 
-// True iff a layer's decision moves bytes now: the cost model chose the ring and GGML_SYCL_MOE_EXEC=ring asked for it.
-// Under AUTO the choice is only recorded (lead ruling c-3skf); what an explicit ring stages, the resolver's STAGED_RING
-// route consumes (llama.cpp-o9uw).
+// True iff a layer's decision moves bytes now: the decision is RING and GGML_SYCL_MOE_EXEC is not cpu. AUTO stages when
+// the cost model chose the ring, and ring forces that choice in moe_exec_weigh (llama.cpp-3460, lifting lead ruling
+// c-3skf). What the ring stages, the resolver's STAGED_RING route (llama.cpp-o9uw) or the batched prompt executor
+// (llama.cpp-3460) consumes.
 static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy) {
-    return d.choice == moe_exec_choice::RING && policy == moe_exec_policy::RING;
+    return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU;
 }
 
 // True iff the next layer's decision is resolved a layer ahead, under the current layer's window: any decision but a
