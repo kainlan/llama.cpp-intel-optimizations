@@ -80939,15 +80939,18 @@ static bool ggml_sycl_moe_pp_batched_refusal_first(int device, moe_pp_batched_re
     return (seen[device].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
 }
 
-// True the first time the batched executor runs `type` on `device`: its [PP-MOE] line fires once per (device, type).
-static bool ggml_sycl_moe_pp_batched_first_run(int device, ggml_type type) {
-    static_assert(GGML_TYPE_COUNT <= 64, "the batched executor's first-run mask holds one bit per ggml_type");
-    static std::atomic<uint64_t> seen[GGML_SYCL_MAX_DEVICES] = {};
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || type < 0 || type >= GGML_TYPE_COUNT) {
+// True the first time the batched executor runs `type` at `layout` on `device`: its [PP-MOE] line fires once per
+// (device, type, layout), so a type the planner materializes in two layouts on one card reports both. One bit per
+// layout in a 32-bit mask per (device, type), so the shift below is defined only while every layout fits it.
+static bool ggml_sycl_moe_pp_batched_first_run(int device, ggml_type type, layout_mode layout) {
+    static_assert(GGML_LAYOUT_MXFP4_DPAS < 32, "the batched executor's first-run mask holds one bit per layout");
+    static std::atomic<uint32_t> seen[GGML_SYCL_MAX_DEVICES][GGML_TYPE_COUNT] = {};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || type < 0 || type >= GGML_TYPE_COUNT || layout < 0 ||
+        layout > GGML_LAYOUT_MXFP4_DPAS) {
         return false;
     }
-    const uint64_t bit = uint64_t{ 1 } << static_cast<uint32_t>(type);
-    return (seen[device].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+    const uint32_t bit = 1u << static_cast<uint32_t>(layout);
+    return (seen[device][type].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
 }
 
 // The batched executor's per-expert dequant profiler label, "moe.pp.dequant.<type>". The names are built once, on
@@ -89874,9 +89877,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 auto & stats = ggml_sycl::get_moe_dispatch_stats(ctx.device);
                 stats.record_route_residency(static_cast<int>(row_maps_total), 0, 0, 0, 0, 0);
             }
-            // llama.cpp-348c: one line per (device, type) saying the executor took this type, in which layout and
-            // arm, how many experts the dispatch batched and the planned weight slot it ran in.
-            if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type)) {
+            // llama.cpp-348c: one line per (device, type, layout) saying the executor took this type in this layout,
+            // in which arm, how many experts the dispatch batched and the planned weight slot it ran in.
+            if (ggml_sycl_moe_pp_batched_first_run(ctx.device, src0->type, route_layout)) {
                 GGML_LOG_INFO("[PP-MOE] device=%d type=%s layout=%s arm=%s experts=%zu planned_weight_slot=%zu\n",
                               ctx.device, ggml_type_name(src0->type), ggml_sycl_layout_mode_name(route_layout),
                               pp_woq_arm ? "woq" : "f16", active_count, planned_weight);

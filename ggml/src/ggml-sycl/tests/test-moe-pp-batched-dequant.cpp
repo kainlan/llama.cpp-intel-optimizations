@@ -7,7 +7,8 @@
 // shape that is SOA for Q8_0 and Q6_K and AOS for the rest. The shape is test-backend-ops' MUL_MAT_ID (32 experts, 4
 // used, k 2048, m 768), run at 64 and 300 tokens. The result is compared with the CPU backend at NMSE <= 5e-4, and the
 // log must show the executor ran:
-//   * the [PP-MOE] line, once per (device, type), the first time the type-keyed arm runs;
+//   * the [PP-MOE] line, once per (device, type, layout), the first time the type-keyed arm runs it (each type
+//     here runs in one layout, so once per type);
 //   * one [MOE-PP-ONEDNN-F16-BATCHED] success line per case (GGML_SYCL_MOE_ROUTE_LOG=1, set below);
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
 //     "[MOE-PROMPT-REFUSAL]", no "refusing unplanned PP MoE oneDNN batched scratch".
