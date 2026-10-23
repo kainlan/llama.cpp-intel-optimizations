@@ -54,6 +54,10 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     equal to the last it pushed; the batched CPU dispatch skips one equal to the last job input it pushed;
   - the exact-owner check (c-sepd) and the layout check (c-n4gw) refuse before anything is copied;
   - the registration is the typed register_host_expert_owned, carrying the minted owner, never the untyped overload;
+  - each extra drops every view it holds of a withdrawn device entry before it forgets the entry's record and
+    remembers the host copy (llama.cpp-6aj4): ggml_sycl_drop_lent_expert_views matches each view by the key the loan
+    retired the entry under and never resolves one, since a retired entry refuses a resolve once the cache generation
+    moves;
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
     epoch;
   - the WARN format strings;
@@ -575,6 +579,7 @@ PROBE = ('if (probe_mode) { result.accepted = n_selected != 0; result.bytes_free
          'finish(ggml_sycl_txn_result::REFUSED, "nothing lendable"); }')
 LEASE = "registry.acquire_live_update(current_token)"
 FORGET = "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);"
+DROP = "(void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r]);"
 REMEMBER = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
             "std::move(record.host_handles[r]), &record.copy_events[r], 0, logical);")
 FLIP = "(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, refill, refill ? device : -1);"
@@ -586,8 +591,19 @@ UNLOCK = "} lock.unlock(); warn_dropped(); if (!swapped) {"
 def claim_probe_changes_nothing_and_a_loan_publishes_once(sycl: str) -> bool:
     b = body(norm(sycl), TXN_SIG)
     return (b.count(PROBE) == 1 and b.count(PUBLISH) == 1 and b.count(FLIP) == 1
-            and ordered(b, PROBE, LEASE, HOST_ALLOC, INVENTORY_LOCK, LEND, FORGET, REMEMBER, FLIP, PUBLISH, EPOCH,
-                        UNLOCK))
+            and ordered(b, PROBE, LEASE, HOST_ALLOC, INVENTORY_LOCK, LEND, DROP, FORGET, REMEMBER, FLIP, PUBLISH,
+                        EPOCH, UNLOCK))
+
+
+# --- a loan drops the extras' views of each withdrawn device entry by its key (llama.cpp-6aj4) -----------------------
+
+DROP_SIG = "static bool ggml_sycl_drop_lent_expert_views("
+DROP_MATCH = "return h.is_weight() && h.device() == device && h.key() == withdrawn;"
+
+
+def claim_lent_views_dropped_by_key(sycl: str) -> bool:
+    b = body(norm(sycl), DROP_SIG)
+    return b.count(DROP_MATCH) == 1 and "resolve(" not in b
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -1201,6 +1217,10 @@ def test_probe_changes_nothing_and_a_loan_publishes_once():
     assert claim_probe_changes_nothing_and_a_loan_publishes_once(SYCL)
 
 
+def test_lent_views_dropped_by_key():
+    assert claim_lent_views_dropped_by_key(SYCL)
+
+
 def test_warn_formats():
     assert claim_warn_formats(SYCL)
 
@@ -1735,6 +1755,26 @@ def test_mutant_publish_per_triplet_fails():
 def test_mutant_device_lease_kept_fails():
     """The extra keeps its lease on the withdrawn device copy: the retired entry is never reclaimed."""
     assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(SYCL, FORGET, ""))
+
+
+def test_mutant_lent_views_kept_fails():
+    """The extras keep their pointer-table, route-table and hybrid-record views on the withdrawn device entry: it stays
+    leased, and the deferred-free pass never reclaims it (llama.cpp-6aj4)."""
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(SYCL, DROP + " " + FORGET, FORGET))
+
+
+def test_mutant_lent_views_dropped_after_remember_fails():
+    """The views dropped in the remember loop: a remember that throws leaves the later members' views in place."""
+    kept = _once(SYCL, DROP + " " + FORGET, FORGET)
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(kept, REMEMBER, REMEMBER + " " + DROP))
+
+
+def test_mutant_lent_views_matched_by_resolve_fails():
+    """A view matched through a resolve: once the cache generation moves, the retired entry refuses it and the view
+    survives the loan."""
+    assert not claim_lent_views_dropped_by_key(
+        _once_in(SYCL, DROP_SIG, DROP_MATCH,
+                 DROP_MATCH.replace("h.key() == withdrawn", "h.resolve(device).on_device && h.key() == withdrawn")))
 
 
 def test_mutant_no_epoch_bump_fails():
