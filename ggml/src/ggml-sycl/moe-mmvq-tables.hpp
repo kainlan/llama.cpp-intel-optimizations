@@ -259,19 +259,24 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 //   moe_pp_batched_woq_supports_layout  -- the MXFP4 weight-only-quantized arm: repack each expert into the
 //                                          WOQ nibble/scale slots and let oneDNN dequantize inside the GEMM.
 //
-// The f16 arm admits a (type, layout) pair only where a kernel decodes one expert of that layout to f16,
-// and the executor picks that kernel from the layout the expert is loaded in. Every listed type is admitted
-// on AOS. Q4_0, Q8_0, Q4_K and Q6_K are admitted on SOA too, because each SOA plane is flat over one
-// expert's blocks: Q4_0, Q4_K and Q6_K decode it with ggml_get_to_fp16_sycl_for_layout's reorder kernels,
-// Q8_0 with dequantize_row_q8_0_soa_to_fp16_rowmajor, since that table answers Q8_0 with the AOS kernel for
-// every layout. The planner materializes Q8_0 experts SOA on an XMX card and Q6_K experts SOA (the B50
-// loads both that way). It plans Q4_0 and Q4_K experts AOS (layout_policy::get_optimal, common.hpp) and no
-// knob changes that, so the Q4_0 and Q4_K SOA rows have no device evidence: nothing reaches them until a plan
-// chooses SOA for those types. MXFP4's f16 arm has its own SOA row-major dequant and no AOS one in this
-// executor. Q1_0 and NVFP4 have converters but are left out, because no Q1_0 or NVFP4 MoE weight has been
-// measured here.
+// The rule for the f16 arm: a (type, layout) pair is admitted when a kernel exists that decodes one expert, in the
+// layout the cache materialized it in, to f16. That kernel is ggml_get_to_fp16_sycl_for_layout's answer for the
+// pair, except Q8_0 SOA, which uses dequantize_row_q8_0_soa_to_fp16_rowmajor because that table answers Q8_0 with
+// the AOS kernel for every layout. The executor picks the kernel from the layout the expert is loaded in, never
+// from a policy. Every quantized type that table decodes is listed, except the two below, and each is admitted on
+// AOS. Q4_0, Q8_0, Q4_K and Q6_K are admitted on SOA too, because each SOA plane is flat over one expert's blocks.
+// The planner materializes Q8_0 experts SOA on an XMX card and Q6_K experts SOA (the B50 loads both that way). It
+// plans Q4_0 and Q4_K experts AOS (layout_policy::get_optimal, common.hpp) and no knob changes that, so the Q4_0
+// and Q4_K SOA rows have no device evidence: nothing reaches them until a plan chooses SOA for those types. MXFP4's
+// f16 arm has its own SOA row-major dequant and no AOS one in this executor.
+// Q1_0 and NVFP4 have converters but are left out, because they run on a device only through their direct kernel
+// (moe_type_needs_direct_kernel, moe-resolved-batch.hpp): validate_moe_execution_recipe and
+// choose_moe_batch_executor refuse any other device recipe for them, so this executor would never be allowed to run
+// them. The float types need no dequant and keep their own routes.
 // IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
+// test-moe-pp-batched-dequant runs every listed type on a device except IQ1_S, IQ2_XXS and IQ2_XS, which need an
+// importance matrix to quantize (ggml_quantize_requires_imatrix), so the fixture cannot make their weights.
 //
 // The executor's candidate gate and its claim predicate (ggml_sycl_moe_pp_onednn_batched_claims_tensor)
 // both ask moe_pp_batched_supports_layout about the type. The claim then also asks

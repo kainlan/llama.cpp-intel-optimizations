@@ -2,8 +2,10 @@
 """Source gate for the type-keyed batched MoE prompt executor (llama.cpp-348c).
 
 The batched oneDNN prompt executor (the try_pp_onednn_f16_batched lambda in ggml_sycl_mul_mat_id) used to
-take MXFP4 experts only. Its f16 arm now takes every expert type that has an AOS dequant-to-f16 kernel, and SOA too
-for the types the planner materializes SOA that have a per-expert SOA dequant. These claims pin that shape:
+take MXFP4 experts only. Its f16 arm now admits a (type, layout) pair when a kernel decodes one expert of that
+materialized layout to f16: every quantized type with an AOS dequant-to-f16 kernel except the two that only their
+direct kernel may run on a device, and SOA too for the types the planner materializes SOA that have a per-expert SOA
+dequant. These claims pin that shape:
 
   (a) one support table: the claim predicate and the lambda's candidate gate both ask
       ggml_sycl_moe_pp_batched_takes_layout(), which asks moe_pp_batched_supports_layout() in moe-mmvq-tables.hpp,
@@ -51,7 +53,8 @@ for the types the planner materializes SOA that have a per-expert SOA dequant. T
   (n) the dequant profiler label's name comes from a table built once per type, never from a string the dispatch
       builds;
   (o) every type the f16 table takes runs in the device test (test-moe-pp-batched-dequant.cpp's k_types), or is named
-      in UNTESTED_ON_DEVICE with its reason, and never both.
+      in UNTESTED_ON_DEVICE with its reason, and never both; the untested ones are exactly the table's types that
+      ggml_quantize_requires_imatrix names, since the fixture quantizes with no importance matrix.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -73,14 +76,17 @@ FILES = {
     "layer_plan": SYCL_DIR / "moe-layer-plan.hpp",
     "catalog": ROOT / "docs" / "backend" / "sycl-env-vars.md",
     "device_test": SYCL_DIR / "tests" / "test-moe-pp-batched-dequant.cpp",
+    "ggml_c": ROOT / "ggml" / "src" / "ggml.c",
 }
 
-# The brief's list (Q4_0 plus the Qwen3.8 GSQ-RCO mix types it named) plus the rest of the GSQ-RCO census
-# (iq4_nl, q2_0, iq2_s, iq2_xs, iq2_xxs): see the memory "a GGUF file name is not its expert quant type".
+# Every quantized type ggml_get_to_fp16_sycl_for_layout decodes on AOS, except MXFP4 (its own SOA arm) and Q1_0 and
+# NVFP4 (FORBIDDEN below). The first thirteen are the brief's list and the Qwen3.8 GSQ-RCO census (see the memory "a
+# GGUF file name is not its expert quant type"); the review's ruling added the last seven.
 REQUIRED_AOS = [
     "GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K", "GGML_TYPE_IQ3_XXS",
     "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ4_XS", "GGML_TYPE_IQ4_NL", "GGML_TYPE_Q2_0", "GGML_TYPE_IQ2_S",
-    "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_XXS",
+    "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_XXS", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q2_K",
+    "GGML_TYPE_Q3_K", "GGML_TYPE_IQ1_S", "GGML_TYPE_IQ1_M",
 ]
 # The types the planner may materialize SOA that have a per-expert SOA dequant to f16 (the B50 loads Q8_0 and Q6_K
 # experts SOA; the device test's RED run refused both).
@@ -103,13 +109,12 @@ POST_CLAIM = [
 ]
 WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(refusal)) && "
                   "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
-# Types the f16 table takes that the device test does not run, each with its reason.
+# Types the f16 table takes that the device test does not run, each with its reason. The fixture quantizes its
+# weights with no importance matrix, so these three are the whole list.
 UNTESTED_ON_DEVICE = {
     "GGML_TYPE_IQ1_S": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
     "GGML_TYPE_IQ2_XXS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
     "GGML_TYPE_IQ2_XS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
-    "GGML_TYPE_Q2_0": "quantizes without an imatrix but is not in the device test yet",
-    "GGML_TYPE_IQ2_S": "quantizes without an imatrix but is not in the device test yet",
 }
 
 
@@ -815,6 +820,16 @@ def claim_o_device_coverage(s):
         fails.append(f"the f16 table takes {t}, which the device test does not run and nothing names untested")
     for t in sorted((tested | untested) - table):
         fails.append(f"{t} is device-tested or named untested, but the f16 table does not take it")
+    # The fixture quantizes with no importance matrix, so the untested types are exactly the table's types that
+    # ggml_quantize_requires_imatrix names (comments stripped, so a commented-out type is not one).
+    needs = one_definition(s["ggml_c"], "ggml_quantize_requires_imatrix")
+    if needs is None:
+        fails.append("ggml_quantize_requires_imatrix is not defined exactly once in ggml.c")
+    else:
+        imatrix = set(re.findall(r"GGML_TYPE_\w+", needs)) & table
+        if untested != imatrix:
+            fails.append(f"UNTESTED_ON_DEVICE is {sorted(untested)}, but the table types that need an imatrix "
+                         f"are {sorted(imatrix)}")
     return fails
 
 
@@ -934,9 +949,11 @@ MUTANTS = [
      'std::string("moe.pp.dequant.") + ggml_type_name(src0->type)'),
     ("n", "sycl", "static const std::array<std::string, GGML_TYPE_COUNT> names = []() {",
      "const std::array<std::string, GGML_TYPE_COUNT> names = []() {"),
-    ("b", "tables", "case GGML_TYPE_Q4_1:", "case GGML_TYPE_Q4_1: case GGML_TYPE_TQ2_0:"),
+    ("b", "tables", "case GGML_TYPE_Q2_0: case GGML_TYPE_Q4_1:",
+     "case GGML_TYPE_Q2_0: case GGML_TYPE_Q4_1: case GGML_TYPE_TQ2_0:"),
     ("o", "device_test", "GGML_TYPE_IQ4_NL,", ""),
     ("o", "device_test", "constexpr ggml_type k_types[] = {", "constexpr ggml_type k_types[] = { GGML_TYPE_IQ1_S,"),
+    ("o", "ggml_c", "type == GGML_TYPE_IQ1_S;", "type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;"),
     ("m", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
      "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0; "
      "static size_t g_tensor_inventory_pp_moe_onednn_scratch_bytes = 0;"),
@@ -957,6 +974,7 @@ def test_claims_are_not_vacuous(sources):
     assert claim_predicate_body(sources["sycl"]) is not None
     assert one_definition(sources["convert"], "ggml_get_to_fp16_sycl_for_layout") is not None
     assert one_definition(sources["sycl"], "ggml_sycl_moe_query_route_capability") is not None
+    assert one_definition(sources["ggml_c"], "ggml_quantize_requires_imatrix") is not None
 
 
 if __name__ == "__main__":

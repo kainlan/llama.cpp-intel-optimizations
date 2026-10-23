@@ -56,6 +56,20 @@ constexpr double   k_nmse_tol = 5e-4;
 constexpr const char * k_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
                                              "blk.0.ffn_down_exps.weight" };
 
+// Every expert type the batched executor's f16 table takes (moe_pp_batched_f16_supports_layout) that this fixture
+// can quantize, each of which must run the executor. The fixture quantizes with no importance matrix, so the table's
+// IQ1_S, IQ2_XXS and IQ2_XS, which need one (ggml_quantize_requires_imatrix), are not here; the source gate
+// test-sycl-moe-pp-batched-types-source pins that the two lists cover the table between them.
+constexpr ggml_type k_types[] = {
+    GGML_TYPE_Q4_0,  GGML_TYPE_Q8_0,   GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K,  GGML_TYPE_IQ3_XXS,
+    GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0,  GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K,  GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_M,
+};
+// 64 tokens with the activation broadcast to every used expert (gate/up, ne11 1), and 300 tokens with one
+// activation row per used expert (down, ne11 k_used).
+constexpr int k_cases_per_type = 2;
+constexpr int k_cases          = k_cases_per_type * int(sizeof(k_types) / sizeof(k_types[0]));
+
 void require(bool condition, const std::string & message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -240,12 +254,11 @@ struct lifecycle_fixture {
         weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
         require(weight_buffer != nullptr, "host weight buffer allocation failed");
         ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        // One quantization serves all three tensors: only the gate runs, and the single-threaded IQ quantizers
+        // (IQ2_S, IQ1_M) dominate the test's time.
+        gate_bytes = make_weights(type, rng);
         for (int i = 0; i < 3; ++i) {
-            std::vector<uint8_t> bytes = make_weights(type, rng);
-            ggml_backend_tensor_set(tensors[i], bytes.data(), 0, bytes.size());
-            if (i == 0) {
-                gate_bytes = std::move(bytes);
-            }
+            ggml_backend_tensor_set(tensors[i], gate_bytes.data(), 0, gate_bytes.size());
         }
         gate = tensors[0];
     }
@@ -468,12 +481,9 @@ int main() {
             ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr), &ggml_backend_free);
         require(cpu != nullptr, "CPU backend init failed");
 
-        // The eight expert types the owner's ruling names (llama.cpp-348c); each must run the executor.
-        const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,    GGML_TYPE_Q4_K,  GGML_TYPE_Q5_K,
-                                    GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS };
-        std::mt19937    rng(348);
-        int             failed = 0;
-        for (ggml_type type : types) {
+        std::mt19937 rng(348);
+        int          failed = 0;
+        for (ggml_type type : k_types) {
             lifecycle_fixture life(type, rng);
             if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng))) {
                 ++failed;
@@ -483,10 +493,10 @@ int main() {
             }
         }
         if (failed != 0) {
-            std::fprintf(stderr, "FAIL: %d of %zu cases failed\n", failed, 2 * (sizeof(types) / sizeof(types[0])));
+            std::fprintf(stderr, "FAIL: %d of %d cases failed\n", failed, k_cases);
             return 1;
         }
-        std::fprintf(stderr, "PASS: batched MoE prompt executor, %zu cases\n", 2 * (sizeof(types) / sizeof(types[0])));
+        std::fprintf(stderr, "PASS: batched MoE prompt executor, %d cases\n", k_cases);
         return 0;
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "SKIP: no usable SYCL GPU: %s\n", e.what());

@@ -418,13 +418,34 @@ int main() {
         }
     }
 
-    // 8. The batched mul_mat_id prompt executor's tables (llama.cpp-348c). The f16 arm takes every type in
-    //    the brief's roster on AOS, the four with a per-expert SOA dequant to f16 (Q4_0, Q8_0, Q4_K, Q6_K) on
-    //    SOA too, since the planner materializes experts SOA (the B50 does Q8_0 and Q6_K), MXFP4 on SOA only,
-    //    and nothing it has no measured weight for.
+    // 8. The batched mul_mat_id prompt executor's tables (llama.cpp-348c). The f16 arm admits a (type, layout) pair
+    //    when a kernel decodes one expert of that materialized layout to f16: every quantized type
+    //    ggml_get_to_fp16_sycl_for_layout decodes, on AOS; the four with a per-expert SOA dequant (Q4_0, Q8_0, Q4_K,
+    //    Q6_K) on SOA too, since the planner materializes experts SOA (the B50 does Q8_0 and Q6_K); MXFP4 on SOA
+    //    only. Q1_0 and NVFP4 are left out, because only their direct kernel may run them on a device. The list is
+    //    the whole set: any other type the f16 arm admits on AOS fails below.
     const ggml_type pp_f16_aos_types[] = {
-        GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,    GGML_TYPE_Q4_K,  GGML_TYPE_Q5_K,
-        GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_K,
+        GGML_TYPE_Q5_K,
+        GGML_TYPE_Q6_K,
+        GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ3_S,
+        GGML_TYPE_IQ4_XS,
+        GGML_TYPE_Q4_1,
+        GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K,
+        GGML_TYPE_IQ4_NL,
+        GGML_TYPE_Q2_0,
+        GGML_TYPE_IQ2_S,
+        GGML_TYPE_IQ1_M,
+        // Not run by test-moe-pp-batched-dequant: they need an importance matrix to quantize.
+        GGML_TYPE_IQ1_S,
+        GGML_TYPE_IQ2_XXS,
+        GGML_TYPE_IQ2_XS,
     };
     for (const ggml_type type : pp_f16_aos_types) {
         const bool soa_too =
@@ -438,12 +459,23 @@ int main() {
             }
         }
     }
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type   = static_cast<ggml_type>(t);
+        bool            listed = type == GGML_TYPE_MXFP4;
+        for (const ggml_type listed_type : pp_f16_aos_types) {
+            listed = listed || listed_type == type;
+        }
+        if (!listed && moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS)) {
+            std::printf("FAIL: batched f16 arm admits type=%d on AOS, which the table above does not list\n", t);
+            ++failures;
+        }
+    }
     const ggml_type pp_never_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_F32,
                                          GGML_TYPE_BF16 };
     for (const ggml_type type : pp_never_types) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_pp_batched_supports_layout(type, layout, true, true)) {
-                std::printf("FAIL: batched executor admits type=%s layout=%d, which it has no measured weight for\n",
+                std::printf("FAIL: batched executor admits type=%s layout=%d, a direct-kernel or float type\n",
                             ggml_type_name(type), static_cast<int>(layout));
                 ++failures;
             }
