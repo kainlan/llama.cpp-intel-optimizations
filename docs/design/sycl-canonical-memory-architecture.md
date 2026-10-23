@@ -495,8 +495,6 @@ inference on the same SYCL device is not supported. The mutex does not
 universally serialize submission or device execution; §5.3 defines the mixed
 path taxonomy and the resulting overlap. The contract distinguishes:
 
-The prompt expert ring (llama.cpp-36j0) is per device and per prompt phase. Its loan and its refill are plan transactions that republish the expert plan, not direct edits to the plan. A lent triplet's host copy keeps its owner until the refill retires it.
-
 ### 5.1 Process-scoped (model) state
 
 Associated with the currently active model load; immutable after that load
@@ -708,6 +706,8 @@ result in §11.2 must not be read as though it were. Once the pairing is fixed,
 the pin is removable and its removal is the regression test.
 
 ---
+
+The prompt expert ring (llama.cpp-36j0) is per device and per prompt phase. Its loan and its refill are plan transactions that republish the expert plan, not direct edits to the plan. A lent triplet's host copy keeps its owner until the refill retires it.
 
 ## 6. Memory Operation Helpers
 
