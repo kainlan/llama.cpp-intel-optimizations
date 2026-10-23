@@ -630,7 +630,7 @@ def test_aos_only_slot_mutants():
 
 
 AOS_ONLY_SUBMIT = "if (aos_only) { retain_handles_until_event({ aos, host }, copy); copied = copy; } else {"
-AOS_ONLY_TABLE = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"
+AOS_ONLY_TABLE = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
 AOS_ONLY_RECORD = ("if (aos_only) { region_last_ = copied; aos_only_staged = true; " + AOS_ONLY_TABLE
                    + " ++n.aos_only; } else { region_last_ = reorder; " + TABLE_WRITE + " ++n.soa; }")
 
@@ -639,7 +639,8 @@ def claim_aos_only_entry_reads_in_place(phase: str) -> bool:
     """An AOS-only matrix is read where its copy lands: the copy is its only submission, the AOS slot and the host
     lease are retained until the copy's event (the submission owns what it touches), and the stage-table entry holds
     no SOA slot, the AOS slot, the copy's event and layout AOS (ruling C: the layout comes from the entry, which for an
-    AOS-only matrix is AOS). The reorder runs only for a SOA item."""
+    AOS-only matrix is AOS), and the consumer the index build gave the item, which the route and the batched executor
+    read (llama.cpp-3460). The reorder runs only for a SOA item."""
     n = norm(phase)
     s = body(n, STAGE_SIG)
     return (n.count(AOS_ONLY_SUBMIT) == 1 and n.count(AOS_ONLY_TABLE) == 1 and AOS_ONLY_RECORD in s
@@ -653,10 +654,10 @@ def test_aos_only_entry_reads_in_place():
 def test_aos_only_entry_mutants():
     # Tagged SOA: the resolver would read the slot as a layout it does not hold.
     assert not claim_aos_only_entry_reads_in_place(
-        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_SOA };"))
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_SOA, item.consumer };"))
     # A SOA slot named that no reorder wrote.
     assert not claim_aos_only_entry_reads_in_place(
-        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { soa, aos, copied, GGML_LAYOUT_AOS };"))
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { soa, aos, copied, GGML_LAYOUT_AOS, item.consumer };"))
     # The slot left to the table's hold.
     assert not claim_aos_only_entry_reads_in_place(
         mutate(PHASE, "retain_handles_until_event({ aos, host }, copy);",
@@ -665,7 +666,10 @@ def test_aos_only_entry_mutants():
     assert not claim_aos_only_entry_reads_in_place(mutate(PHASE, "copied = copy; } else {", "copied = copy; } {"))
     # The entry's event a stale reorder instead of the copy.
     assert not claim_aos_only_entry_reads_in_place(
-        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, reorder, GGML_LAYOUT_AOS };"))
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, reorder, GGML_LAYOUT_AOS, item.consumer };"))
+    # The consumer dropped: every AOS-only entry would read as the route's, and the route would serve the executor's.
+    assert not claim_aos_only_entry_reads_in_place(
+        mutate(PHASE, AOS_ONLY_TABLE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"))
 
 
 AOS_ONLY_LAMBDA = ("const auto aos_only_item = [](const moe_stream_item & it) { return it.staging == "
@@ -993,37 +997,47 @@ def test_staging_mirrors_serving_mutants():
 LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "
                       "ggml_sycl::expert_tensor_role role)")
 LIBRARY_CLAIMS_WEIGHT = "const ggml_tensor * w = ggml_sycl_moe_stream_layer_weight(layer, role);"
-LIBRARY_CLAIMS_QUERY = "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, call->device);"
+LIBRARY_CLAIMS_QUERY = "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*call->plan, w, call->device);"
 LIBRARY_CLAIMS_GUARD = "return call != nullptr && call->plan && w != nullptr &&"
 CLAIMS_PLAN_SIG = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan, "
-                   "const ggml_tensor * weight, int device)")
-CLAIMS_PLAN_LAYOUT = ("const bool planned = plan != nullptr ? "
+                   "const ggml_tensor * weight, int device, bool host_staged)")
+CLAIMS_PLAN_LAYOUT = ("planned = plan != nullptr ? "
                       "ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) : "
                       "ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);")
+CLAIMS_STAGED_LAYOUT = "ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);"
 CLAIMS_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) { "
-                "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device); }")
+                "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false); }")
+STAGED_CLAIM_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(const ggml_sycl::placement_plan & "
+                      "plan, const ggml_tensor * weight, int device) { "
+                      "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(&plan, weight, device, true); }")
+STAGED_PLAN_SIG = ("static bool ggml_sycl_moe_tensor_plan_staged_layout(const ggml_sycl::placement_plan & plan, "
+                   "const ggml_tensor * src0, int device, layout_mode * out_layout)")
 PRIMARY_PLAN_SIG = ("static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_sycl::placement_plan & plan, "
                     "const ggml_tensor * src0, int device, layout_mode * out_layout)")
 PRIMARY_ENTRY_TAIL = "return ggml_sycl_moe_tensor_plan_primary_layout(*plan_owner, src0, device, out_layout); }"
 PLAN_READERS = ("ggml_sycl_cache_plan_owner(", "coherent_placement_plan_owner(", "coherent_cache_placement_plan_owner(",
                 "global_placement_plan_owner(", "ggml_sycl_global_plan_owner(", "get_unified_cache_for_device(")
 LIBRARY_CLAIMS_FILL = "call.op.library_claims = ggml_sycl_moe_stream_library_claims;"
-ROUTE_LIBRARY_CLAIM = "stream_library_claimed = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);"
+ROUTE_CONSUMER_REFUSAL = ("if (s->consumer == moe_stream_consumer::EXECUTOR) { "
+                          "return moe_staged_route_refusal::CLAIMED; }")
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 INDEX_STAGING_ASK = "item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);"
-INDEX_CLAIM_GUARD = "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"
+INDEX_CLAIM_GUARD = "if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {"
 INDEX_CLAIM_ASK = "c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;"
-INDEX_CLAIM_APPLY = "if (c->second) { item.staging = moe_stream_staging::NONE; }"
+INDEX_CLAIM_APPLY = ("if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; "
+                     "item.consumer = moe_stream_consumer::EXECUTOR; }")
 INDEX_SLOT_SKIP = "if (item.staging == moe_stream_staging::NONE) { continue; }"
 
 
-def claim_staging_declines_library_claimed(sycl: str, hpp: str, phase: str) -> bool:
-    """One fact, one source (llama.cpp-o9uw): the staged route refuses a weight the oneDNN batched prompt executor
-    claims (c-las5), so the index build stages none of it. The backend answers the build's library-claims predicate
-    with that same claim, for the call's device and the graph's own weight tensor of (layer, role); the build asks it
-    after the kernels' answer and before the slot accounting, so a claimed matrix stays listed (a stage counts it
-    untyped) and takes no slot; and the phase asks it only through the index build."""
+def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str) -> bool:
+    """One fact, one source (llama.cpp-3460, resolving llama.cpp-v7np): a weight the batched prompt executor claims
+    once its host experts are staged stages each host matrix into one AOS slot, read by the executor's dequant kernel,
+    with no reorder and no second slot, whatever the MMVQ kernels answer; the item names the executor as its consumer,
+    and the staged route refuses such an entry by that name. The backend answers the build's library-claims predicate
+    with the staged claim, for the call's device and the graph's own weight tensor of (layer, role); the build asks it
+    after the kernels' answer, for every matrix one AOS slot holds, and before the slot accounting, so a claimed matrix
+    takes one slot; and the phase asks it only through the index build."""
     n = norm(sycl)
     at = n.find(LIBRARY_CLAIMS_SIG + " {")
     lc = body(n[at:], LIBRARY_CLAIMS_SIG) if at >= 0 else ""
@@ -1032,7 +1046,7 @@ def claim_staging_declines_library_claimed(sycl: str, hpp: str, phase: str) -> b
     return (n.count(LIBRARY_CLAIMS_SIG + " {") == 1 and LIBRARY_CLAIMS_WEIGHT in lc and LIBRARY_CLAIMS_QUERY in lc
             and "MXFP4" not in lc and "moe_classify_tensor" not in lc
             and "g_moe_gate_up_pairs.find(layer)" in body(n, LAYER_WEIGHT_SIG)
-            and n.count(LIBRARY_CLAIMS_FILL) == 1 and n.count(ROUTE_LIBRARY_CLAIM) == 1
+            and n.count(LIBRARY_CLAIMS_FILL) == 1 and n.count(ROUTE_CONSUMER_REFUSAL) == 1
             and "moe_stream_library_claims_fn library_claims)" in norm(hpp)
             and ordered(build, INDEX_STAGING_ASK, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY,
                         "li.items.push_back(item);", INDEX_SLOT_SKIP, "++li.n_streamable;", REGION_SIZE)
@@ -1040,18 +1054,17 @@ def claim_staging_declines_library_claimed(sycl: str, hpp: str, phase: str) -> b
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
 
 
-def test_staging_declines_library_claimed():
-    assert claim_staging_declines_library_claimed(SYCL, PLAN_HPP, PHASE)
+def test_claimed_weight_stages_for_the_executor():
+    assert claim_claimed_weight_stages_for_the_executor(SYCL, PLAN_HPP, PHASE)
 
 
 def test_library_claim_mutants():
-    # The backend answers from something other than the claim the route refuses on.
-    assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_woq_enabled();"), PLAN_HPP, PHASE)
+    c = claim_claimed_weight_stages_for_the_executor
+    # The backend answers from something other than the staged claim.
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_woq_enabled();"), PLAN_HPP, PHASE)
     # Asked for another device than the call's.
-    assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, 0);"),
-        PLAN_HPP, PHASE)
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY,
+                        "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*call->plan, w, 0);"), PLAN_HPP, PHASE)
     # A second table of its own beside the claim. The host lease takes its weight with the same line, so the mutant is
     # made inside the definition.
     n = norm(SYCL)
@@ -1059,33 +1072,42 @@ def test_library_claim_mutants():
     assert at >= 0 and LIBRARY_CLAIMS_WEIGHT in n[at:], "mutant precondition: the claims definition takes its weight"
     second = n[:at] + n[at:].replace(
         LIBRARY_CLAIMS_WEIGHT, LIBRARY_CLAIMS_WEIGHT + " if (w && w->type != GGML_TYPE_MXFP4) { return false; }", 1)
-    assert not claim_staging_declines_library_claimed(second, PLAN_HPP, PHASE)
-    # The backend leaves the predicate unset: a claimed weight would be staged and then always refused.
-    assert not claim_staging_declines_library_claimed(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
-    # The route refuses on something else, so the two would answer differently.
-    assert not claim_staging_declines_library_claimed(
-        mutate(SYCL, ROUTE_LIBRARY_CLAIM, "stream_library_claimed = false;"), PLAN_HPP, PHASE)
+    assert not c(second, PLAN_HPP, PHASE)
+    # The backend leaves the predicate unset: no weight would ever stage for the executor.
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
+    # The route serves the executor's entries, so a library-free reader is no longer the only one it hands them to.
+    assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, ""), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
-    assert not claim_staging_declines_library_claimed(
-        SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
-    # A claimed matrix still takes a slot: the claim applied after the slot accounting.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
+    # A claimed matrix staged as SOA: a reorder and a second slot the executor does not read.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY,
+                              INDEX_CLAIM_APPLY.replace("moe_stream_staging::AOS_ONLY", "moe_stream_staging::SOA")),
+                 PHASE)
+    # A claimed matrix whose consumer stays the route's: the route would refuse nothing and serve it.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY,
+                              "if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; }"), PHASE)
+    # Asked only where an MMVQ kernel reads the matrix (the llama.cpp-v7np shape): the executor's own table is not the
+    # authority.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD,
+                              "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"), PHASE)
+    # The claim applied after the slot accounting, so a claimed matrix is sized as the kernels answered.
     late = mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "")
     late = mutate(late, "++li.n_streamable;", "++li.n_streamable; " + INDEX_CLAIM_APPLY)
-    assert not claim_staging_declines_library_claimed(SYCL, late, PHASE)
+    assert not c(SYCL, late, PHASE)
     # The phase builds its index without the claims.
-    assert not claim_staging_declines_library_claimed(
-        SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, INDEX_CALL.replace("op.library_claims", "nullptr")))
+    assert not c(SYCL, PLAN_HPP, mutate(PHASE, INDEX_CALL, INDEX_CALL.replace("op.library_claims", "nullptr")))
     # The phase asks again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.library_claims(op.graph_ctx, item.layer, item.role);"
-    assert not claim_staging_declines_library_claimed(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
+    assert not c(SYCL, PLAN_HPP, mutate(PHASE, AOS_ONLY_FLAG, asked_again))
 
 
 def claim_library_claims_read_the_index_plan(sycl: str) -> bool:
     """Lead ruling c-gi44, one fact one source: the library-claim predicate answers from call.plan, the plan the index
-    build that asks it holds, through the plan-taking form of the batched executor's claim, and asks only when the
-    call holds a plan. That form takes the planned layout from the plan it is given, and the plan-taking walk behind
-    it reads no plan of its own. Only the claim's two-argument entry point, the batched executor's own route, reads
-    the device's plan: it passes no plan, and the walk's two-argument form reads the cache plan and delegates."""
+    build that asks it holds, through the staged claim (llama.cpp-3460), and asks only when the call holds a plan. The
+    staged claim is the batched executor's own claim with its host_staged mode, which takes the planned layout from
+    the plan it is given through the staged walk; neither plan-taking walk reads a plan of its own. Only the claim's
+    two-argument entry point, the batched executor's own route, reads the device's plan: it passes no plan, and the
+    resident walk's two-argument form reads the cache plan and delegates."""
     n = norm(sycl)
     at = n.find(LIBRARY_CLAIMS_SIG + " {")
     lc = body(n[at:], LIBRARY_CLAIMS_SIG) if at >= 0 else ""
@@ -1093,13 +1115,16 @@ def claim_library_claims_read_the_index_plan(sycl: str) -> bool:
     cl = body(n[at:], CLAIMS_PLAN_SIG) if at >= 0 else ""
     at = n.find(PRIMARY_PLAN_SIG + " {")
     pl = body(n[at:], PRIMARY_PLAN_SIG) if at >= 0 else ""
+    at = n.find(STAGED_PLAN_SIG + " {")
+    sl = body(n[at:], STAGED_PLAN_SIG) if at >= 0 else ""
     return (ordered(lc, LIBRARY_CLAIMS_GUARD, LIBRARY_CLAIMS_QUERY)
-            and lc.count("ggml_sycl_moe_pp_onednn_batched_claims_tensor(") == 1
+            and lc.count("ggml_sycl_moe_pp_onednn_batched_claims") == 1
             and n.count(CLAIMS_PLAN_SIG + " {") == 1 and cl.count(CLAIMS_PLAN_LAYOUT) == 1
-            and cl.count("ggml_sycl_moe_tensor_plan_primary_layout(") == 2
-            and n.count(CLAIMS_ENTRY) == 1
+            and cl.count(CLAIMS_STAGED_LAYOUT) == 1 and cl.count("ggml_sycl_moe_tensor_plan_primary_layout(") == 2
+            and n.count(CLAIMS_ENTRY) == 1 and n.count(STAGED_CLAIM_ENTRY) == 1
             and n.count(PRIMARY_PLAN_SIG + " {") == 1 and "plan.all_experts_on_device(" in pl
-            and not any(r in pl for r in PLAN_READERS) and n.count(PRIMARY_ENTRY_TAIL) == 1)
+            and not any(r in pl for r in PLAN_READERS) and n.count(PRIMARY_ENTRY_TAIL) == 1
+            and n.count(STAGED_PLAN_SIG + " {") == 1 and sl != "" and not any(r in sl for r in PLAN_READERS))
 
 
 def test_library_claims_read_the_index_plan():
@@ -1111,22 +1136,31 @@ def test_library_claims_index_plan_mutants():
     # The predicate reads the device's plan again through the two-argument entry point.
     assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(w, call->device);"))
     # The predicate passes no plan, so the claim reads the device's plan instead of the index build's.
-    assert not c(mutate(SYCL, "ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w,",
-                        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, w,"))
+    assert not c(mutate(SYCL, LIBRARY_CLAIMS_QUERY,
+                        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, w, call->device, true);"))
     # Asked without a plan in hand.
     assert not c(mutate(SYCL, LIBRARY_CLAIMS_GUARD, "return call != nullptr && w != nullptr &&"))
-    # The claim ignores the plan it is given.
+    # The resident claim ignores the plan it is given.
     assert not c(mutate(SYCL, CLAIMS_PLAN_LAYOUT,
-                        "const bool planned = "
-                        "ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);"))
+                        "planned = ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);"))
+    # The staged claim walks the resident plan instead (the shape that never claims a weight with a host expert).
+    assert not c(mutate(SYCL, CLAIMS_STAGED_LAYOUT,
+                        "ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout);"))
     # The plan-taking walk reads the device's plan behind its caller's back.
     assert not c(mutate(SYCL, "if (!plan.all_experts_on_device(src0->name, n_experts, device)) {",
                         "(void) ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device)); "
                         "if (!plan.all_experts_on_device(src0->name, n_experts, device)) {"))
+    # The staged walk reads the device's plan behind its caller's back.
+    n = norm(SYCL)
+    at = n.find(STAGED_PLAN_SIG + " {")
+    assert at >= 0, "mutant precondition: the staged walk is defined"
+    head = STAGED_PLAN_SIG + " {"
+    assert not c(n[:at] + head + " (void) ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device));"
+                 + n[at + len(head):])
     # The executor's own route handed a plan read ahead of its type and role checks.
-    assert not c(mutate(SYCL, "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device); }",
+    assert not c(mutate(SYCL, "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false); }",
                         "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(ggml_sycl_cache_plan_owner("
-                        "ggml_sycl::get_unified_cache_for_device(device)).get(), weight, device); }"))
+                        "ggml_sycl::get_unified_cache_for_device(device)).get(), weight, device, false); }"))
 
 
 # ---- the policy gate -------------------------------------------------------------------------------------------------

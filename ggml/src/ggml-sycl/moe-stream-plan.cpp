@@ -372,10 +372,11 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
         copied_in          = true;
         anchor_            = aos;  // any slice holds the whole reservation
         if (aos_only) {
-            // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde).
+            // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader
+            // the index build named for the item (llama.cpp-3460).
             region_last_    = copied;
             aos_only_staged = true;
-            table_[key]     = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };
+            table_[key]     = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };
             ++n.aos_only;
         } else {
             region_last_ = reorder;

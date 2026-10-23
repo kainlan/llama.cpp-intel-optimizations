@@ -22,12 +22,14 @@
 // The ring regions' read gates (lead ruling c-o9uw-1) are kept by moe_stream_region_reads, which the phase holds over
 // sycl::event; the test drives it over int, in the order stage(), layer_done() and reset_regions() call it.
 //
-// A matrix whose weight the prompt's library executor claims stages NONE whatever the kernels answer: the staged route
-// refuses that weight (c-las5), so the ring sizes no slot for it (llama.cpp-o9uw). The tests pass the claims as a
-// second predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_tensor, the route's own check.
+// A matrix whose weight the batched prompt executor claims once its host experts are staged stages one AOS slot whatever
+// the kernels answer, and its entry names the executor as its consumer (llama.cpp-3460): the executor dequantizes AOS
+// itself, with a plain kernel on the compute queue, and the staged route refuses such an entry. The tests pass the
+// claims as a second predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -48,6 +50,7 @@ using ggml_sycl::moe_exec_decision;
 using ggml_sycl::moe_exec_policy;
 using ggml_sycl::moe_exec_rates;
 using ggml_sycl::moe_exec_regime;
+using ggml_sycl::moe_stream_consumer;
 using ggml_sycl::moe_stream_item;
 using ggml_sycl::moe_stream_layer_info;
 using ggml_sycl::moe_stream_plan_index;
@@ -410,9 +413,9 @@ int main() {
         CHECK(calls == 2);
     }
 
-    // ---- a matrix whose weight the library executor claims stages NONE: the staged route refuses that weight
-    // (c-las5), so the ring copies none of it and sizes no slot for it; staging and serving give one answer
-    // (llama.cpp-o9uw) ----
+    // ---- a matrix whose weight the batched executor claims once staged takes one AOS slot, read by the executor's
+    // dequant kernel: no reorder and no second slot, whatever the MMVQ kernels answer (llama.cpp-3460, resolving
+    // llama.cpp-v7np) ----
     {
         claims_probe                probe;
         const moe_stream_plan_index claimed =
@@ -422,29 +425,66 @@ int main() {
         const moe_stream_layer_info * c2 = layer_info(claimed, 2);
         CHECK(c0 != nullptr && c1 != nullptr && c2 != nullptr);
         if (c0 && c1 && c2) {
-            // Still listed, so a stage counts the claimed ones untyped; only the unclaimed ones take slots.
             CHECK(c0->items.size() == 9 && c2->items.size() == 9);
             for (const moe_stream_item & it : c0->items) {
-                CHECK(it.staging ==
-                      (it.role == expert_tensor_role::GATE ? moe_stream_staging::NONE : moe_stream_staging::SOA));
+                const bool gate = it.role == expert_tensor_role::GATE;
+                CHECK(it.staging == (gate ? moe_stream_staging::AOS_ONLY : moe_stream_staging::SOA));
+                CHECK(it.consumer == (gate ? moe_stream_consumer::EXECUTOR : moe_stream_consumer::ROUTE));
             }
             for (const moe_stream_item & it : c2->items) {
-                CHECK(it.staging == moe_stream_staging::NONE);
+                CHECK(it.staging == moe_stream_staging::AOS_ONLY && it.consumer == moe_stream_consumer::EXECUTOR);
             }
-            CHECK(c0->n_streamable == 6 && c0->region_slots == 12 && c0->expert_bytes_max == 2 * src_bytes());
+            // Layer 0: three claimed gates of one slot, six unclaimed SOA matrices of two.
+            CHECK(c0->n_streamable == 9 && c0->region_slots == 15 && c0->expert_bytes_max == 3 * src_bytes());
             CHECK(c1->n_streamable == 9 && c1->region_slots == 18);  // layer 1's weights are not claimed
-            CHECK(c2->n_streamable == 0 && c2->region_slots == 0 && c2->expert_bytes_max == 0);
+            CHECK(c2->n_streamable == 9 && c2->region_slots == 9 && c2->expert_bytes_max == 3 * src_bytes());
         }
         CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.region_slots_max == 18);
-        // Asked once per (layer, role) a kernel reads, not once per expert: layers 0-2, three roles each.
+        // Asked once per (layer, role) with a matrix one AOS slot holds, not once per expert: layers 0-2, three roles.
         CHECK(probe.calls == 9);
 
-        // Every weight claimed: nothing is streamable, so the ring is never reserved for nothing.
+        // Every weight claimed: every matrix takes one slot of its AOS bytes.
         const moe_stream_plan_index all =
             ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
-        CHECK(all.host_matrices_per_layer_max == 0 && all.region_slots_max == 0 && all.matrix_bytes_max == 0);
-        CHECK(std::string(ggml_sycl::moe_stream_ring_unavailable_rule(
-                  all, ggml_sycl::moe_stream_ring_geometry{}, true, false)) == "no host matrices of a streamable type");
+        CHECK(all.host_matrices_per_layer_max == 9 && all.region_slots_max == 9 && all.matrix_bytes_max == src_bytes());
+
+        // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
+        // kernels_soa_q4 reads, takes one AOS slot. Unclaimed it takes none.
+        const moe_stream_plan_index iq_free = index_of(make_mixed_plan(true), kernels_soa_q4);
+        const moe_stream_plan_index iq_claimed =
+            ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(true), 0, kernels_soa_q4, nullptr, claims_all);
+        const moe_stream_layer_info * i1 = layer_info(iq_claimed, 1);
+        const moe_stream_layer_info * f1 = layer_info(iq_free, 1);
+        CHECK(i1 != nullptr && f1 != nullptr);
+        if (i1 && f1) {
+            CHECK(f1->n_streamable == 0 && f1->region_slots == 0);
+            CHECK(i1->items.size() == 12 && i1->n_streamable == 12 && i1->region_slots == 12);
+            for (const moe_stream_item & it : i1->items) {
+                CHECK(it.staging == moe_stream_staging::AOS_ONLY && it.consumer == moe_stream_consumer::EXECUTOR);
+            }
+        }
+        CHECK(iq_claimed.matrix_bytes_max == std::max(src_bytes(), iq_src_bytes()));
+
+        // A claimed matrix one AOS slot cannot hold (a zeroed inventory shape) stays NONE, and the claim is not asked
+        // for its weight.
+        placement_plan zeroed = make_plan();
+        for (placement_entry & e : zeroed.entries) {
+            if (e.layer_id == 2) {
+                e.ne[0] = 0;
+            }
+        }
+        zeroed.build_index();
+        claims_probe                zprobe;
+        const moe_stream_plan_index z =
+            ggml_sycl::moe_stream_plan_index_build(zeroed, 0, kernels_soa_q4, &zprobe, claims_l0_gate_l2);
+        const moe_stream_layer_info * z2 = layer_info(z, 2);
+        CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0 && z2->region_slots == 0);
+        if (z2) {
+            for (const moe_stream_item & it : z2->items) {
+                CHECK(it.staging == moe_stream_staging::NONE && it.consumer == moe_stream_consumer::ROUTE);
+            }
+        }
+        CHECK(zprobe.calls == 6);
 
         // No weight claimed: the index is the one an unset predicate builds.
         const moe_stream_plan_index free_of =

@@ -39,12 +39,21 @@ namespace ggml_sycl {
 
 // How the ring stages one matrix (c-hmey). SOA: two slots, the AOS slot the copy lands in and the SOA slot the reorder
 // writes, which the device route reads. AOS_ONLY: one slot the copy lands in, read in place by the device's AOS prompt
-// kernel; the type has no AOS->SOA reorder, or no prompt kernel reads its SOA layout. NONE: no slot; a stage counts the
-// matrix untyped.
+// kernel or by the batched prompt executor's dequant kernel; the type has no AOS->SOA reorder, no prompt kernel reads
+// its SOA layout, or the executor reads it. NONE: no slot; a stage counts the matrix untyped.
 enum class moe_stream_staging : uint8_t {
     NONE,
     SOA,
     AOS_ONLY,
+};
+
+// Who reads a staged matrix's slot (llama.cpp-3460). Both read it with a plain SYCL kernel on the in-order compute
+// queue, the order the ring's reuse relies on (c-las5); neither hands the slot to a library. ROUTE: the resolver's
+// STAGED_RING route, served as MMVQ_COMPAT. EXECUTOR: the batched prompt executor (llama.cpp-348c), which dequantizes the
+// AOS slot into its f16 weight slot and gives only that slot to oneDNN; the route refuses such an entry.
+enum class moe_stream_consumer : uint8_t {
+    ROUTE,
+    EXECUTOR,
 };
 
 // True iff the device runs a prompt MUL_MAT_ID over a device-resident expert of `type` in `layout`, ne0 x ne1
@@ -53,9 +62,10 @@ enum class moe_stream_staging : uint8_t {
 using moe_stream_prompt_kernel_fn =
     bool (*)(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1);
 
-// True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight. The staged ring route
-// refuses a claimed weight (c-las5), so the ring stages none of it: the backend answers with the claim the route
-// refuses on, so staging and serving give one answer (llama.cpp-o9uw).
+// True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight once the ring has
+// staged its host experts (llama.cpp-3460). The ring then stages each of that weight's host matrices into one AOS slot
+// whose consumer is the executor, whatever the prompt kernels answer, and the staged route refuses the entry by that
+// consumer: the index build asks the claim once, and the entry carries its answer (one fact, one source).
 using moe_stream_library_claims_fn = bool (*)(void * graph_ctx, int layer, expert_tensor_role role);
 
 struct moe_stream_item {
@@ -68,7 +78,9 @@ struct moe_stream_item {
     ggml_type          type;       // from the plan entry (moe_stream_plan_index_build); moe_stream_plan_build leaves 0
     int64_t            ncols, nrows;
     // From moe_stream_plan_index_build (moe_stream_item_staging); moe_stream_plan_build leaves NONE.
-    moe_stream_staging staging = moe_stream_staging::NONE;
+    moe_stream_staging  staging  = moe_stream_staging::NONE;
+    // From moe_stream_plan_index_build: EXECUTOR for a weight the library executor claims once staged.
+    moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
 };
 
 namespace detail {
@@ -163,12 +175,14 @@ static inline bool moe_stream_layer_fully_staged(const std::vector<moe_stream_it
 // c-3bde), and the resolver's STAGED_RING route reads it from here. Each slot is acquired with the layout written
 // there (lead ruling c-o9uw-1), so the slice's own tag agrees, and the route refuses a slot where it does not. An
 // AOS-only matrix (c-hmey) has no SOA slot: `soa` is empty, `ready` is the copy's event and `layout` is AOS, so the
-// route reads `aos`.
+// route reads `aos`. `consumer` is the item's (llama.cpp-3460): an entry the batched executor consumes is always
+// AOS-only, and the route refuses it.
 struct moe_stream_staged {
-    mem_handle       soa;
-    mem_handle       aos;
-    sycl::event      ready;
-    ggml_layout_mode layout = GGML_LAYOUT_SOA;
+    mem_handle          soa;
+    mem_handle          aos;
+    sycl::event         ready;
+    ggml_layout_mode    layout   = GGML_LAYOUT_SOA;
+    moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
 };
 
 // ---- The prompt phase's pure parts (llama.cpp-xod7, plan Task 7b) ----------------------------------------------------
@@ -307,8 +321,9 @@ static inline bool moe_stream_rate_measured(double rate) {
 // `device` selects only the resident bytes that bound the ring's size. The items take type and shape from the entry,
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE), and their staging from
 // moe_stream_item_staging over the device's prompt kernels. The predicate is asked once per distinct (type, shape,
-// bytes) a build meets, not once per entry (c-7soh): a model has few. A matrix whose weight the library executor
-// claims stages NONE; that is asked once per (layer, role).
+// bytes) a build meets, not once per entry (c-7soh): a model has few. A matrix one AOS slot holds, whose weight the
+// library executor claims once staged, stages AOS_ONLY for the executor whatever the kernels answered: the executor's
+// own tables are the authority there (llama.cpp-3460). That is asked once per (layer, role).
 static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan &       plan,
                                                                 int                          device,
                                                                 moe_stream_prompt_kernel_fn  prompt_kernel,
@@ -326,7 +341,7 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
     };
 
     std::vector<staging_answer>        answers;
-    std::unordered_map<uint64_t, bool> claims;  // (layer, role) keyed with expert 0 -> the library executor claims it
+    std::unordered_map<uint64_t, bool> claims;  // (layer, role) keyed with expert 0 -> the executor claims it staged
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.layer_id < 0) {
             continue;
@@ -374,15 +389,18 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
             item.staging = moe_stream_item_staging(item, SIZE_MAX, prompt_kernel, graph_ctx);
             answers.push_back({ item.type, item.ncols, item.nrows, item.src_bytes, item.staging });
         }
-        // The staged route refuses a weight the library executor claims, so the ring would copy it for nothing.
-        if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {
+        // A weight the library executor claims once staged is read by the executor's dequant kernel from one AOS
+        // slot (llama.cpp-3460, resolving llama.cpp-v7np): no reorder and no second slot, and the route refuses the
+        // entry by its consumer. A matrix no AOS slot can hold keeps the kernels' answer, and its weight is not asked.
+        if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {
             const uint64_t ck = moe_stream_table_key(item.layer, 0, item.role);
             auto           c  = claims.find(ck);
             if (c == claims.end()) {
                 c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;
             }
             if (c->second) {
-                item.staging = moe_stream_staging::NONE;
+                item.staging  = moe_stream_staging::AOS_ONLY;
+                item.consumer = moe_stream_consumer::EXECUTOR;
             }
         }
         li.items.push_back(item);
@@ -413,7 +431,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
 // region slot maximum) changes here once. `index_out`, when given, receives the index the geometry was sized over.
 // A plan with no host expert has no layer and no region slot, so the sizing answers the default geometry. A null
 // `library_claims` claims nothing: a caller with no live graph scan (the auto-ubatch fit) passes none, and the ring it
-// gets is then an upper bound of the phase's.
+// gets is then an upper bound of the phase's. A claim turns a matrix into one AOS slot, and the backend's claim needs a
+// type with an MMID kernel, whose prompt kernel reads AOS (moe_mmvq_admission_supports_type): unclaimed, such a matrix
+// already takes one slot staged AOS-only, or two staged as SOA.
 static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const placement_plan &       plan,
                                                                      int                          device,
                                                                      moe_stream_prompt_kernel_fn  prompt_kernel,
@@ -596,7 +616,7 @@ struct moe_stream_op {
         nullptr;
     // Unset, nothing is staged (moe_stream_item_staging).
     moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
-    // Unset, the library executor claims no weight (moe_stream_plan_index_build).
+    // Unset, the library executor claims no weight and nothing stages for it (moe_stream_plan_index_build).
     moe_stream_library_claims_fn library_claims = nullptr;
 };
 
@@ -605,7 +625,7 @@ struct moe_stream_op {
 // recipe, asked before the route, and the recipe validator's refusal, asked after it. NONE means served.
 enum class moe_staged_route_refusal : uint8_t {
     NONE,
-    CLAIMED,        // the oneDNN batched prompt executor claims the weight (c-las5)
+    CLAIMED,        // the entry's consumer is the batched prompt executor, which reads the slot itself
     UNSUPPORTED,    // the capability query answers no kernel for the type in the entry's layout
     KERNEL,         // it answers a kernel other than the plain MMVQ_COMPAT
     DIRECT_KERNEL,  // Q1_0/NVFP4: only their direct kernel runs them on a device (moe_type_needs_direct_kernel)
@@ -782,7 +802,7 @@ class moe_stream_phase {
         int    staged    = 0;  // experts with every selected matrix staged
         int    wanted    = 0;  // experts selected
         int    unowned   = 0;  // matrices skipped: no lease, or a lease the ring cannot copy directly
-        int    untyped   = 0;  // matrices skipped: staged NONE (no reader, or claimed), or a shape that does not fit
+        int    untyped          = 0;  // matrices skipped: staged NONE (no reader), or a shape that does not fit
         int    exhausted = 0;  // matrices skipped: no ring slot
         size_t bytes     = 0;  // AOS bytes copied
         bool   ring_unavailable = false;  // the ring could not be reserved

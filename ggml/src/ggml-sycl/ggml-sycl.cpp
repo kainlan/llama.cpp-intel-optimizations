@@ -32002,7 +32002,7 @@ static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
                                                ggml_layout_mode layout,
                                                int64_t          ne0,
                                                int64_t          ne1);
-// Defined after ggml_sycl_moe_pp_onednn_batched_claims_tensor's declaration, which answers it.
+// Defined after ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor's declaration, which answers it.
 static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role);
 
 // The layer the stream phase keys `src0` under: its name's layer id when the decision log can hold it, else -1. The
@@ -35157,23 +35157,26 @@ static ggml_sycl::moe_expert_route ggml_sycl_resolve_moe_expert_route_for_dispat
     return route;
 }
 
-// Defined with the prompt executors below. The staged ring route refuses a weight it claims (c-las5). The plan-taking
-// form answers from a plan its caller already holds; the two-argument form reads the device's cache plan.
-static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device);
+// Defined with the prompt executors below. The plan-taking form answers from a plan its caller already holds, and with
+// host_staged for a weight the stream ring stages the host experts of (llama.cpp-3460); the staged form is that mode.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan,
                                                           const ggml_tensor *               weight,
-                                                          int                               device);
+                                                          int                               device,
+                                                          bool                              host_staged);
+static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(const ggml_sycl::placement_plan & plan,
+                                                                 const ggml_tensor *               weight,
+                                                                 int                               device);
 
 // The stream ring's library-claim predicate: whether the oneDNN batched prompt executor claims `layer`'s `role` weight
-// on the call's device. It answers from call.plan, the plan the index build that asks it holds (lead ruling c-gi44: one
-// fact, one source), never from a second read of the device's plan. The staged ring route refuses such a weight with
-// the same claim at dispatch, reading the device's plan as the executor itself does, so the ring does not stage what
-// the route refuses; a plan republished in between can only turn a staged slot into a refusal, never into a misread.
+// on the call's device once the ring has staged its host experts (llama.cpp-3460). It answers from call.plan, the plan
+// the index build that asks it holds (lead ruling c-gi44: one fact, one source), never from a second read of the
+// device's plan. The ring then stages each host matrix of that weight into one AOS slot whose consumer is the
+// executor, and the staged route refuses the entry by that consumer, so the route never asks the claim again.
 static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role) {
     const auto *        call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx);
     const ggml_tensor * w    = ggml_sycl_moe_stream_layer_weight(layer, role);
     return call != nullptr && call->plan && w != nullptr &&
-           ggml_sycl_moe_pp_onednn_batched_claims_tensor(call->plan.get(), w, call->device);
+           ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*call->plan, w, call->device);
 }
 
 // The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
@@ -35190,7 +35193,8 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
 // micro-batch's rows. The fit passes NO library-claims hook: the backend's hook reads g_moe_gate_up_pairs, a
 // thread-local scan of a graph that is stale outside compute (a previous model's weight tensors can still be in it),
 // so asking it here could read freed tensors. The fit therefore counts no library claim, and its ring is an upper
-// bound of the phase's, never an under-count.
+// bound of the phase's, never an under-count: a claim makes a matrix one AOS slot, never more than the kernels' answer
+// gives it (moe_stream_plan_ring_geometry).
 // The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
 // context transaction, before it publishes, this can see the previous plan or none, and the realized check (run
 // after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
@@ -35330,13 +35334,6 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
     const int          stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;
     const expert_tensor_role stream_role =
         moe_stream && src0 ? expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;
-    // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the slot's reuse;
-    // it does not order a library's internals. The oneDNN batched prompt executor claims the weights it runs, so a
-    // weight it claims never takes a slot. The claim reads the device's plan, so it is asked at the first stage-table
-    // hit and once per build: a build that finds no entry (every prompt build under AUTO, whose stage table stays
-    // empty) never asks it.
-    bool stream_claim_asked     = false;
-    bool stream_library_claimed = false;
     auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
         if (moe_stream != nullptr && stream_layer >= 0) {
             if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {
@@ -35366,29 +35363,29 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     src0, submit_device, rows, invocation_backend, invocation_queue, queue_capability, staged);
                 staged.recipe.transfer                        = moe_recipe_transfer::STAGED_RING;
                 staged.recipe_reason                          = "staged-ring";
-                // Served only as a plain MMVQ_COMPAT kernel on the submit queue (c-las5): a library claim, any other
-                // kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), or a type that
-                // needs its direct kernel refuses it (ggml_sycl_moe_staged_capability_refusal, which the ring's
-                // staging asks too). So does a slot whose resolved layout is not the entry's: the phase acquires each
-                // slot with the layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a wrong
-                // entry. A refused entry falls through to the route core, whose HOST answer stands, and is counted
-                // with its cause and the capability's reason or the validator's reject reason, in the order asked
-                // here, so the trace says why (plan Task 8). 348c can lift the MMVQ_COMPAT-only refusal for a library
-                // (oneDNN) reader only by ordering every rewrite of a region that reader read after its completion.
-                // stage() orders a rewrite after the region's readers only when the region's last use or its new one
-                // holds an AOS-only item (reuse_after_readers, moe-stream-plan.cpp): the copies then wait for the
-                // region's read gate, the barrier ggml_sycl_moe_stream_layer_done submits behind the down op of the
-                // layer the region last held, or for a barrier submitted at the stage when none was recorded. A
-                // SOA-only region is reused on the in-order compute queue's order alone, which covers a kernel reader
-                // on that queue, and 348c may not assume a library reader is one. So 348c needs both: the reader's
-                // completion event fed into the read gate, and the reuse condition widened to the regions it read.
+                // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the
+                // slot's reuse; it does not order a library's internals. The route serves a slot only as a plain
+                // MMVQ_COMPAT kernel: an entry the batched prompt executor consumes, any other kernel (XMX_TILED,
+                // MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), or a type that needs its direct
+                // kernel refuses it (ggml_sycl_moe_staged_capability_refusal, which the ring's staging asks too). So
+                // does a slot whose resolved layout is not the entry's: the phase acquires each slot with the layout
+                // it writes there (lead ruling c-o9uw-1), so the two disagree only for a wrong entry. A refused entry
+                // falls through to the route core, whose HOST answer stands, and is counted with its cause and the
+                // capability's reason or the validator's reject reason, in the order asked here, so the trace says
+                // why (plan Task 8).
+                // The executor's entry (llama.cpp-3460) is refused by the consumer the ring's index build wrote into
+                // it, not by a claim asked again here (one fact, one source). Its reader is the executor's dequant
+                // kernel, a plain kernel on this same in-order compute queue, which writes the executor's f16 weight
+                // slot; oneDNN reads only that slot, never the ring's. The dequant is ordered like the route's kernel:
+                // it waits for the copy into the slot (the entry's ready event), and a rewrite of an AOS-only slot
+                // waits for the region's read gate, the barrier ggml_sycl_moe_stream_layer_done submits on this queue
+                // behind the down op of the layer the region last held, or for a barrier submitted at the stage when
+                // none was recorded (reuse_after_readers, moe_stream_phase::stage). Refusing it here keeps the route
+                // core's HOST answer for that expert, so a batch the executor declines reaches the per-expert path's
+                // CPU route for it instead of a staged slot that path cannot read.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
-                    if (!stream_claim_asked) {
-                        stream_library_claimed = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device);
-                        stream_claim_asked     = true;
-                    }
-                    if (stream_library_claimed) {
+                    if (s->consumer == moe_stream_consumer::EXECUTOR) {
                         return moe_staged_route_refusal::CLAIMED;
                     }
                     const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);
@@ -68009,6 +68006,54 @@ static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, i
     return ggml_sycl_moe_tensor_plan_primary_layout(*plan_owner, src0, device, out_layout);
 }
 
+// The layout `src0`'s device experts are planned in on `device`, from `plan`, for a weight the stream ring stages the
+// other experts of (llama.cpp-3460): false unless every expert has an entry, each planned on `device` or on the host,
+// at least one on the host, and every device expert in one layout. A weight with every expert on the host answers AOS,
+// the layout a staged slot holds. The batched executor's staged claim asks it with the plan the ring's index build
+// holds (c-gi44), so it reads no plan of its own.
+static bool ggml_sycl_moe_tensor_plan_staged_layout(const ggml_sycl::placement_plan & plan,
+                                                    const ggml_tensor *               src0,
+                                                    int                               device,
+                                                    layout_mode *                     out_layout) {
+    if (!src0 || !src0->name || src0->name[0] == '\0' || device < 0 || device >= ggml_sycl_info().device_count ||
+        plan.entries.empty()) {
+        return false;
+    }
+    const int64_t                            n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    const int                                layer_id  = ggml_sycl::expert_layer_from_tensor_name(src0->name);
+    const ggml_sycl::expert_tensor_role      role      = ggml_sycl::expert_tensor_role_from_tensor_name(src0->name);
+    // The residency summary answers "on this device or on the host, one at least on the host" before any per-expert
+    // read; the walk then only checks the device experts' layouts.
+    const ggml_sycl::expert_residency_counts counts    = plan.count_planned_experts(layer_id, role, n_experts, device);
+    if (counts.found != n_experts || counts.host == 0 || counts.on_device != counts.on_target) {
+        return false;
+    }
+    bool        have_layout = false;
+    layout_mode planned     = GGML_LAYOUT_AOS;
+    for (int64_t e = 0; e < n_experts && counts.on_target > 0; ++e) {
+        const ggml_sycl::placement_entry * placement = plan.find_expert_entry(layer_id, static_cast<int>(e), role);
+        if (!placement) {
+            return false;
+        }
+        if (!placement->on_device) {
+            continue;
+        }
+        if (placement->target_device != device) {
+            return false;
+        }
+        if (!have_layout) {
+            planned     = placement->layout;
+            have_layout = true;
+        } else if (placement->layout != planned) {
+            return false;
+        }
+    }
+    if (out_layout) {
+        *out_layout = planned;
+    }
+    return true;
+}
+
 // True when the active plan rewrote XMX_TILED gate/up primaries to PP-safe
 // SOA. Prompt owns the SOA layout; decode may rematerialize XMX_TILED through
 // phase-layout materialization when the device supports that path.
@@ -80855,7 +80900,7 @@ static bool ggml_sycl_moe_pp_batched_takes_type(ggml_type type) {
 // admitted: the hybrid route would run it there, and these types have no MMVQ-ID kernel for that route.
 static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int device) {
     return op != nullptr && op->src[0] != nullptr && op->src[2] != nullptr && op->src[2]->ne[1] > 1 &&
-           ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, op->src[0], device);
+           ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, op->src[0], device, false);
 }
 
 #if GGML_SYCL_DNNL
@@ -80904,12 +80949,20 @@ static const char * ggml_sycl_moe_pp_dequant_label(ggml_type type) {
 }
 #endif
 
-// Whether the oneDNN batched prompt executor claims `weight` on `device`. With a plan, the planned layout comes from
-// that plan: the stream ring's library-claim predicate passes the plan its index build holds (c-gi44). Without one it
-// comes from the device's cache plan, read after the type and role checks, which is the executor's own route.
+// Whether the oneDNN batched prompt executor claims `weight` on `device`. The resident claim (host_staged false) needs
+// every expert planned on `device`; its planned layout comes from `plan` when one is given, else from the device's
+// cache plan, read after the type and role checks, which is the executor's own route.
+// The staged claim (host_staged, llama.cpp-3460) answers for the weight once the stream ring has staged its host
+// experts, from the plan the ring's index build holds (c-gi44); the ring then stages them for the executor. Its planned
+// layout is the device experts' (ggml_sycl_moe_tensor_plan_staged_layout, which lets the other experts be on the
+// host), and it needs two more things. The type has an MMID kernel, so the hybrid route can still take the op when
+// the ring stages too little: supports_op admits no other type on a hybrid layer (ggml_sycl_moe_pp_batched_admits_op).
+// And the executor takes the type at AOS, the layout a staged slot holds. The device experts' layout then passes the
+// same checks below as a resident weight's.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan,
                                                           const ggml_tensor *               weight,
-                                                          int                               device) {
+                                                          int                               device,
+                                                          bool                              host_staged) {
     if (!weight || !ggml_sycl_moe_pp_batched_takes_type(weight->type)) {
         return false;
     }
@@ -80918,9 +80971,15 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
         return false;
     }
     layout_mode planned_layout = GGML_LAYOUT_AOS;
-    const bool  planned        = plan != nullptr ?
-                                     ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) :
-                                     ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);
+    bool        planned        = false;
+    if (host_staged) {
+        planned = plan != nullptr && moe_mmvq_admission_supports_type(weight->type) &&
+                  ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) &&
+                  ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);
+    } else {
+        planned = plan != nullptr ? ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) :
+                                    ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);
+    }
     if (!planned) {
         return false;
     }
@@ -80951,7 +81010,13 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
 }
 
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {
-    return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device);
+    return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false);
+}
+
+static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(const ggml_sycl::placement_plan & plan,
+                                                                 const ggml_tensor *               weight,
+                                                                 int                               device) {
+    return ggml_sycl_moe_pp_onednn_batched_claims_tensor(&plan, weight, device, true);
 }
 
 // Whether any role of the bundle names a staged ring slot (STAGED_RING, llama.cpp-o9uw).
@@ -89918,7 +89983,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
         // A staged ring slot (STAGED_RING, llama.cpp-o9uw) holds the layout its stage-table entry records, and the
         // per-expert path below multiplies every expert at the tensor's route_layout from route.ptr. The batched
-        // executor above never meets one (the staged route refuses a weight it claims, c-las5). A staged batch is
+        // executor above never meets one as a route (the staged route refuses an entry the executor consumes, and
+        // serves the others only to a layer the executor does not claim). A staged batch is
         // refused here, before the scratch setup below claims the oneDNN scratch slot, allocates the staging, or can
         // abort on a failed allocation, so it reaches its fallback instead.
         if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) {
