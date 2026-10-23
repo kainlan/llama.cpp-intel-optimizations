@@ -38,8 +38,9 @@ dequant. These claims pin that shape:
       planned-layout lookup refuses a layer with a host or other-device expert, so a hybrid layer is never admitted;
   (i) the f16 arm runs in the weight slot the inventory planned, never a wider one: the backend keeps the planned
       slot size as the inventory gave it (no plan-time widening, which displaced routed experts with no cost
-      decision), the arm asks the admission for one f16 expert, and it groups the active experts by what the slot it
-      claimed holds;
+      decision), the planner site that publishes the ring's sizes computes no expert-count or f16 formula and hands
+      the unified cache the inventory's slot, the arm asks the admission for one f16 expert, and it groups the active
+      experts by what the slot it claimed holds;
   (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, spelled once, read once, consulted by the support helper,
       dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor, registered in
       sycl_env_settings[] so the non-default report names it, and catalogued;
@@ -52,8 +53,8 @@ dequant. These claims pin that shape:
       route-off rather than as a candidate miss; the catalog has its row;
   (m) the f16 arm's groups alternate between the slot's two halves and chain through events: before a group
       dequantizes into a half, the stream waits, on the device, for the GEMMs that last read that half, every GEMM
-      is recorded as a reader of its half, the dequant and the GEMM address the same half, and the phase loop holds
-      no host wait;
+      is recorded as a reader of its half, the dequant and the GEMM address the same half, and the lambda holds no
+      host wait outside the debugging compare arm's CPU readback (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE);
   (n) the dequant profiler label's name comes from a table built once per type, never from a string the dispatch
       builds;
   (o) every type the f16 table takes runs in the device test (test-moe-pp-batched-dequant.cpp's k_types), or is named
@@ -64,8 +65,10 @@ dequant. These claims pin that shape:
       the test copies;
   (q) one debugging knob, GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX, caps the experts in one f16 group: spelled once,
       read once into a static, registered in sycl_env_settings[] with the report's integer set from the accessor,
-      and catalogued; the success line names the group count, and the device test sets the knob and requires at
-      least three groups in every case.
+      and catalogued; the success line names the group count, experts per group and buffers. The device test runs
+      its cases at the slot's own grouping and requires at least three groups in each; it also runs one Q4_0 case at
+      each cap in k_group_caps (1 and 3), each in a child process because the knob is read once per process, and
+      requires exactly the groups that cap gives, that many experts per group, and both halves.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -127,6 +130,18 @@ GROUP_KNOB_CONST = "GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV"
 # The f16 arm's phase loop, from its head to the barrier on every GEMM event that ends it.
 PHASE_LOOP_HEAD = "for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {"
 PHASE_LOOP_END = "stream->ext_oneapi_submit_barrier(gemm_events);"
+# The debugging compare arm (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE), the one block in the lambda that may wait on
+# the host: it copies the result back and checks it on the CPU.
+COMPARE_HEAD = "if (batched_compare && !active_experts.empty()) {"
+# A host wait, spelled as the stream-enqueue gate spells it.
+ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
+# The planner site: the inventory's ring sizes become the backend's globals and the unified cache's planned scratch.
+PLAN_SITE_HEAD = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;"
+PLAN_SITE_CALL = ("unified_cache_set_planned_pp_moe_onednn_scratch( ctx->device, "
+                  "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,")
+# The device test's capped cases: one Q4_0 case per cap, each in its own process.
+GROUP_CAPS = "constexpr int k_group_caps[] = { 1, 3 };"
+GROUP_EXACT = "groups != want_groups || group_experts != size_t(group_cap) || buffers != 2"
 UNTESTED_ON_DEVICE = {
     "GGML_TYPE_IQ1_S": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
     "GGML_TYPE_IQ2_XXS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
@@ -696,6 +711,19 @@ def claim_i_slot(s):
     for m in writes:
         if m.group(1) != "=" or m.group(2).strip() not in ("0", "inventory->pp_moe_onednn_weight_slot_bytes"):
             fails.append(f"the planned weight slot is written as `{m.group(0)}`, not reset or taken from the inventory")
+    # The planner site publishes the inventory's slot, with no formula of its own between the two.
+    head = sycl.find(PLAN_SITE_HEAD)
+    call = sycl.find("unified_cache_set_planned_pp_moe_onednn_scratch(", head) if head >= 0 else -1
+    site = statement(sycl, None, start=call) if call >= 0 else None
+    if head < 0 or site is None:
+        fails.append("the planner site that takes the weight slot from the inventory and plans the ring was not found")
+    else:
+        site = sycl[head:call] + site
+        if PLAN_SITE_CALL not in site:
+            fails.append("the unified cache's planned scratch is not given the inventory's weight slot")
+        for formula in ("n_expert", "255", "sizeof(sycl::half)"):
+            if formula in site:
+                fails.append(f"the planner site sizes the ring with `{formula}`: the weight slot is widened again")
     lam = lambda_body(sycl) or ""
     one = "checked_mul(weight_elems, sizeof(sycl::half), f16_expert_bytes)"
     if one not in lam or "weight_bytes = f16_expert_bytes;" not in lam:
@@ -815,9 +843,11 @@ def claim_m_chain(s):
         fails.append("a phase's GEMM does not read the half its experts were dequantized into")
     if "half_readers[phase.buffer].push_back(*group_event);" not in loop:
         fails.append("a GEMM is not recorded as a reader of its half, so the next group to use it does not wait")
-    for host_wait in (".wait(", "wait_and_throw", "::wait("):
-        if host_wait in loop:
-            fails.append(f"the phase loop holds a host wait ({host_wait!r})")
+    compare = lam.find(COMPARE_HEAD)
+    compare_end = match_close(lam, compare + len(COMPARE_HEAD) - 1) if compare >= 0 else -1
+    for wait in ANY_WAIT_RE.finditer(lam):
+        if not compare < wait.start() < compare_end:
+            fails.append(f"the lambda waits on the host outside the compare arm: `{lam[wait.start() - 30:wait.end()]}`")
     helper = one_definition(s["tables"], "moe_pp_batched_f16_plan_groups")
     if helper is None:
         fails.append("moe_pp_batched_f16_plan_groups is not defined exactly once in moe-mmvq-tables.hpp")
@@ -924,10 +954,21 @@ def claim_q_group_knob(s):
     if not success or "groups=%zu" not in success.group(0) or "phases.size()" not in success.group(0):
         fails.append("the batched success line does not name the number of groups (phases.size())")
     test = s["device_test"]
-    if f'setenv("{GROUP_KNOB}", "3", 1);' not in test:
-        fails.append("the device test does not cap the f16 groups at three experts")
     if "constexpr size_t k_min_groups = 3;" not in test or "groups < k_min_groups" not in test:
-        fails.append("the device test does not require at least three groups in every case")
+        fails.append("the device test does not require at least three groups at the slot's own grouping")
+    if GROUP_CAPS not in test:
+        fails.append(f"the device test does not run the capped cases `{GROUP_CAPS}`")
+    if "for (int cap : k_group_caps) { if (!run_capped_child(cap)) {" not in test:
+        fails.append("the device test does not run a child process for every cap in k_group_caps")
+    if 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", "--group-cap",' not in test:
+        fails.append("a capped case does not run in a fresh process of the test itself")
+    sets = test.count(f'setenv("{GROUP_KNOB}",')
+    if sets != 1 or f'setenv("{GROUP_KNOB}", argv[2], 1);' not in test:
+        fails.append(f"the device test sets {GROUP_KNOB} {sets} times, want once, from the child's --group-cap")
+    want = ("const size_t want_groups = group_cap > 0 ? "
+            "(size_t(k_experts) + size_t(group_cap) - 1) / size_t(group_cap) : 0;")
+    if want not in test or GROUP_EXACT not in test:
+        fails.append("a capped case does not require exactly the groups, experts per group and buffers its cap gives")
     if 'g_log.min_field_since(from, "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", "groups=")' not in test:
         fails.append("the device test does not read the group count from the case's own success lines")
     return fails
@@ -1056,6 +1097,11 @@ MUTANTS = [
     ("m", "sycl", "half_readers[phase.buffer].push_back(*group_event);", ""),
     ("m", "sycl", "batched_weights + phase.buffer * half_elems;", "batched_weights;"),
     ("m", "tables", "plan.buffers = fit >= 2 ? 2 : 1;", "plan.buffers = 1;"),
+    # The wait on the other half's readers; a host wait after the phase loop, outside the compare arm.
+    ("m", "sycl", "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);",
+     "stream->ext_oneapi_submit_barrier(half_readers[1 - phase.buffer]);"),
+    ("m", "sycl", "gemm_profile_end = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_end_marker>(*stream);",
+     "gemm_profile_end = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_end_marker>(*stream); stream->wait();"),
     ("n", "sycl", "ggml_sycl_moe_pp_dequant_label(src0->type)",
      'std::string("moe.pp.dequant.") + ggml_type_name(src0->type)'),
     ("n", "sycl", "static const std::array<std::string, GGML_TYPE_COUNT> names = []() {",
@@ -1074,12 +1120,26 @@ MUTANTS = [
     ("i", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
      "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0; "
      "static size_t g_tensor_inventory_pp_moe_onednn_scratch_bytes = 0;"),
+    # The n_expert x align256 widening re-added at the planner site, on the global or on the call's argument.
+    ("i", "sycl", PLAN_SITE_HEAD,
+     PLAN_SITE_HEAD + " g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max("
+     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes, ((f16_bytes + 255) & ~static_cast<size_t>(255)) * "
+     "static_cast<size_t>(inventory->n_expert));"),
+    ("i", "sycl", PLAN_SITE_CALL,
+     "unified_cache_set_planned_pp_moe_onednn_scratch( ctx->device, ((f16_bytes + 255) & ~static_cast<size_t>(255)) * "
+     "static_cast<size_t>(inventory->n_expert),"),
     ("q", "common", "value < 1 || value > 1024", "value < 1"),
     ("q", "sycl", f"{{ {GROUP_KNOB_CONST}, &g_ggml_sycl_moe_pp_f16_group_experts_max, 0 }},", ""),
     ("q", "catalog", f"| `{GROUP_KNOB}=<1..1024>` |", f"| `{GROUP_KNOB}` |"),
     ("q", "sycl", 'out=%.1fMB " "groups=%zu', 'out=%.1fMB " "phases=%zu'),
-    ("q", "device_test", f'setenv("{GROUP_KNOB}", "3", 1);', ""),
     ("q", "device_test", "groups < k_min_groups", "groups < 1"),
+    # No single-expert case; no child run; the cap set for the whole run; the child's cap never set; a loose count.
+    ("q", "device_test", GROUP_CAPS, "constexpr int k_group_caps[] = { 3 };"),
+    ("q", "device_test", "if (!run_capped_child(cap)) {", "if (false) {"),
+    ("q", "device_test", 'setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);',
+     f'setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1); setenv("{GROUP_KNOB}", "3", 1);'),
+    ("q", "device_test", f'setenv("{GROUP_KNOB}", argv[2], 1);', ""),
+    ("q", "device_test", GROUP_EXACT, "groups < want_groups"),
 ]
 
 
