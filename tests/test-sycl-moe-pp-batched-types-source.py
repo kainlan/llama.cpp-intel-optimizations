@@ -68,7 +68,15 @@ dequant. These claims pin that shape:
       and catalogued; the success line names the group count, experts per group and buffers. The device test runs
       its cases at the slot's own grouping and requires at least three groups in each; it also runs one Q4_0 case at
       each cap in k_group_caps (1 and 3), each in a child process because the knob is read once per process, and
-      requires exactly the groups that cap gives, that many experts per group, and both halves.
+      requires exactly the groups that cap gives, that many experts per group, and both halves. A failing child fails
+      the run: the child exits 1 when its case fails, the parent counts any child that does not exit 0, and it
+      counts that as a failed case;
+  (r) a GEMM stage that fails partway drains before it lets go: it barriers on the GEMM events it already submitted
+      (a plain barrier, after the dequants, when there are none), holds every expert's lease until that barrier,
+      and only then finishes or releases its scratch claim, whose release marker follows the barrier in queue order.
+      The oneDNN primitive is not ordered with the queue (llama.cpp-dboi), so without the barrier a GEMM still
+      running could write the slot after the next dispatch claims it. One helper holds the leases, for this path
+      and for both success branches.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -142,6 +150,14 @@ PLAN_SITE_CALL = ("unified_cache_set_planned_pp_moe_onednn_scratch( ctx->device,
 # The device test's capped cases: one Q4_0 case per cap, each in its own process.
 GROUP_CAPS = "constexpr int k_group_caps[] = { 1, 3 };"
 GROUP_EXACT = "groups != want_groups || group_experts != size_t(group_cap) || buffers != 2"
+# The GEMM stage's failure path: its head, the barrier on the GEMMs already submitted, the leases held to it, and the
+# scratch claim's release.
+FAIL_HEAD = "auto gemm_stage_failed = [&](const char * what) -> bool {"
+FAIL_BARRIER = ("const sycl::event drained = gemm_events.empty() ? stream->ext_oneapi_submit_barrier() : "
+                "stream->ext_oneapi_submit_barrier(gemm_events);")
+FAIL_RETAIN = "retain_expert_leases_until(drained);"
+CLAIM_RELEASE = "batched_scratch_claim.finish_or_release();"
+LEASE_HELPER = "auto retain_expert_leases_until = [&](const sycl::event & until) {"
 UNTESTED_ON_DEVICE = {
     "GGML_TYPE_IQ1_S": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
     "GGML_TYPE_IQ2_XXS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
@@ -958,8 +974,12 @@ def claim_q_group_knob(s):
         fails.append("the device test does not require at least three groups at the slot's own grouping")
     if GROUP_CAPS not in test:
         fails.append(f"the device test does not run the capped cases `{GROUP_CAPS}`")
-    if "for (int cap : k_group_caps) { if (!run_capped_child(cap)) {" not in test:
-        fails.append("the device test does not run a child process for every cap in k_group_caps")
+    if "for (int cap : k_group_caps) { if (!run_capped_child(cap)) { ++failed; } }" not in test:
+        fails.append("the device test does not run a child process for every cap and count each failed one")
+    if "if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) { return true; }" not in test:
+        fails.append("a capped case passes on something other than its child exiting 0")
+    if "make_case(GGML_TYPE_Q4_0, 300, k_used, rng), true, group_cap) ? 0 : 1;" not in test:
+        fails.append("a capped case's child does not exit 1 when its case fails")
     if 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", "--group-cap",' not in test:
         fails.append("a capped case does not run in a fresh process of the test itself")
     sets = test.count(f'setenv("{GROUP_KNOB}",')
@@ -971,6 +991,40 @@ def claim_q_group_knob(s):
         fails.append("a capped case does not require exactly the groups, experts per group and buffers its cap gives")
     if 'g_log.min_field_since(from, "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", "groups=")' not in test:
         fails.append("the device test does not read the group count from the case's own success lines")
+    return fails
+
+
+def claim_r_failure_drain(s):
+    fails = []
+    lam = lambda_body(s["sycl"]) or ""
+    at = lam.find(FAIL_HEAD)
+    if at < 0:
+        return ["the lambda has no gemm_stage_failed helper"]
+    body = lam[at:match_close(lam, at + len(FAIL_HEAD) - 1)]
+    barrier, retain, release = body.find(FAIL_BARRIER), body.find(FAIL_RETAIN), body.find(CLAIM_RELEASE)
+    if barrier < 0:
+        fails.append("a failed GEMM stage does not barrier on the GEMMs it already submitted")
+    if retain < 0:
+        fails.append("a failed GEMM stage does not hold the experts' leases until that barrier")
+    if body.count(CLAIM_RELEASE) != 1:
+        fails.append("a failed GEMM stage does not finish or release its scratch claim exactly once")
+    elif barrier >= 0 and release < barrier:
+        fails.append("a failed GEMM stage releases its scratch claim before the barrier on its GEMMs")
+    elif retain >= 0 and release < retain:
+        fails.append("a failed GEMM stage releases its scratch claim before it holds the experts' leases")
+    helper_at = lam.find(LEASE_HELPER)
+    helper = lam[helper_at:match_close(lam, helper_at + len(LEASE_HELPER) - 1)] if helper_at >= 0 else ""
+    for needle in ("for (pp_onednn_batched_expert & expert : active_experts) {",
+                   "leases.push_back(std::move(expert.lease));",
+                   "ggml_sycl::retain_handles_until_event(std::move(leases), until);"):
+        if needle not in helper:
+            fails.append(f"retain_expert_leases_until does not hold every expert's lease until its event (`{needle}`)")
+    if helper_at > at:
+        fails.append("retain_expert_leases_until is defined after the failure path that calls it")
+    if lam.count("retain_expert_leases_until(done);") != 2:
+        fails.append("the two success branches do not hold the leases through retain_expert_leases_until(done)")
+    if lam.count("retain_handles_until_event(") != 1:
+        fails.append("the lambda holds leases outside retain_expert_leases_until")
     return fails
 
 
@@ -992,6 +1046,7 @@ CLAIMS = {
     "o": claim_o_device_coverage,
     "p": claim_p_device_counts,
     "q": claim_q_group_knob,
+    "r": claim_r_failure_drain,
 }
 
 
@@ -1140,6 +1195,16 @@ MUTANTS = [
      f'setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1); setenv("{GROUP_KNOB}", "3", 1);'),
     ("q", "device_test", f'setenv("{GROUP_KNOB}", argv[2], 1);', ""),
     ("q", "device_test", GROUP_EXACT, "groups < want_groups"),
+    # A waited child passes whatever its status; the child exits 0 on a failed case; a failed child is not counted.
+    ("q", "device_test", "if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) {", "if (waited) {"),
+    ("q", "device_test", "true, group_cap) ? 0 : 1;", "true, group_cap) ? 0 : 0;"),
+    ("q", "device_test", "if (!run_capped_child(cap)) { ++failed; }", "if (!run_capped_child(cap)) { }"),
+    # No barrier on the GEMMs; the scratch released before the barrier; the leases not held; the helper holds none.
+    ("r", "sycl", FAIL_BARRIER, "const sycl::event drained = stream->ext_oneapi_submit_barrier();"),
+    ("r", "sycl", FAIL_BARRIER + " " + FAIL_RETAIN + " " + CLAIM_RELEASE,
+     CLAIM_RELEASE + " " + FAIL_BARRIER + " " + FAIL_RETAIN),
+    ("r", "sycl", FAIL_RETAIN, ""),
+    ("r", "sycl", "ggml_sycl::retain_handles_until_event(std::move(leases), until);", ""),
 ]
 
 
