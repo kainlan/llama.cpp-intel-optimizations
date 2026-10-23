@@ -20963,6 +20963,84 @@ static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t si
     return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
 }
 
+// Drop every view `extra` holds on the device entry a loan retired under `withdrawn`, so that the deferred-free pass
+// after the loan can erase the entry and return its storage to the WEIGHT zone (llama.cpp-6aj4). Views are matched by
+// the entry's key, never by a resolve: once the cache generation moves, a retired entry refuses the resolve
+// forget_moe_storage_handle_on_device() matches by. The views are the expert's storage records, its slot in the
+// pointer table's handles, the table's per-expert leases (ggml_sycl_set_moe_ptr_table_leases), the route table when
+// one of its entries leases the entry, and the hybrid decode record, which holds every expert's lease. Dropping any
+// of them marks the device table stale, so the next MUL_MAT_ID or preload rebuilds it under the plan the loan
+// publishes. The loan runs at the graph boundary after the queue is drained, so no queued work reads a dropped view.
+// Returns whether anything was dropped.
+static bool ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
+                                             int                                  device,
+                                             int                                  expert_id,
+                                             const ggml_sycl::unified_cache_key & withdrawn) {
+    if (!extra || !extra->weight_ext || expert_id < 0 || !ggml_sycl_valid_device_index(device)) {
+        return false;
+    }
+    ggml_tensor_extra_gpu_weight_ext & w        = *extra->weight_ext;
+    auto                               on_entry = [&](const ggml_sycl::mem_handle & h) {
+        return h.is_weight() && h.device() == device && h.key() == withdrawn;
+    };
+    bool stored = false;
+    bool table  = false;
+
+    const auto records = w.moe_expert_storage_handles.find(
+        ggml_tensor_extra_gpu_weight_ext::moe_storage_handle_key(expert_id, GGML_LAYOUT_AOS));
+    if (records != w.moe_expert_storage_handles.end()) {
+        auto &       list   = records->second;
+        const size_t before = list.size();
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record & record) {
+                                      return on_entry(record.handle);
+                                  }),
+                   list.end());
+        stored = list.size() != before;
+        if (list.empty()) {
+            w.moe_expert_storage_handles.erase(records);
+        }
+    }
+
+    const size_t slot = static_cast<size_t>(expert_id);
+    if (slot < w.moe_expert_handles[device].size() && on_entry(w.moe_expert_handles[device][slot])) {
+        w.moe_expert_handles[device][slot] = ggml_sycl::mem_handle{};
+        if (slot < w.moe_expert_ptr_payload[device].size()) {
+            w.moe_expert_ptr_payload[device][slot] = nullptr;
+        }
+        stored = true;
+    }
+
+    std::vector<ggml_sycl::mem_handle> & leases   = w.moe_expert_ptrs_leases[device];
+    const size_t                         n_leases = leases.size();
+    leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());
+    table = leases.size() != n_leases;
+
+    for (const ggml_sycl::moe_route_entry & route : w.moe_route_tables[device].experts) {
+        if (on_entry(route.lease)) {
+            w.moe_route_tables[device].invalidate();
+            table = true;
+            break;
+        }
+    }
+    if (w.moe_hybrid_decode[device]) {
+        w.moe_hybrid_decode[device].reset();
+        w.moe_hybrid_decode_stamp[device] = {};
+        table                             = true;
+    }
+
+    if (stored) {
+        ++w.moe_expert_storage_generation;
+    }
+    if (stored || table) {
+        w.moe_device_table_valid[device]          = false;
+        w.moe_full_local_probe_generation[device] = 0;
+        w.moe_full_local_probe_layout[device]     = GGML_LAYOUT_AOS;
+        w.moe_full_local_probe_ok[device]         = false;
+    }
+    return stored || table;
+}
+
 // The body, both directions (llama.cpp-sif1). `amount` is the bytes a loan should free, or the most triplets a refill
 // re-admits. `resolver` is null in production (the registry resolver above, bound to the published plan's owner); the
 // private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless the caller re-posts
@@ -21223,13 +21301,16 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                     stop = record.reason;
                     break;
                 }
-                // Drop each extra's lease on its withdrawn device copy, so the retired entry can be reclaimed, before
-                // anything that allocates; then remember each host copy the way S1-PRELOAD remembers a host-planned
-                // expert, behind its copy event. A remember that fails leaves the expert to the cache's own host
-                // entries.
+                // Drop each extra's leases on its withdrawn device copy, so the retired entry can be reclaimed by the
+                // deferred-free pass that follows the loan, before anything that allocates: every storage-record,
+                // pointer-table, route-table and hybrid-record view of the entry, matched by the key the loan retired
+                // it under (llama.cpp-6aj4), and then any device record left for the expert. Then remember each host
+                // copy the way S1-PRELOAD remembers a host-planned expert, behind its copy event. A remember that
+                // fails leaves the expert to the cache's own host entries.
                 for (int r = 0; r < 3; ++r) {
                     const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
                     ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
+                    (void) ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r]);
                     (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
                 }
                 for (int r = 0; r < 3; ++r) {

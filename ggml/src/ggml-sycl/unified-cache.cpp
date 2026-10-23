@@ -10234,6 +10234,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
             device_entry[i]->last_write_event = out.copy_events[i];
             device_entry[i]->has_write_event  = true;
             out.retire_status[i]              = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
+            out.device_keys[i]                = device_key;
         }
     }
     if (refusal) {
