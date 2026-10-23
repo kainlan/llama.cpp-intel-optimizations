@@ -87641,10 +87641,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // device data plus weight streaming. Q4_K is still listed although it has an _id kernel
             // (llama.cpp-zzb5); IQ2_XXS left with its _id kernel (llama.cpp-s36q), so the GPU runs it.
             // tests/test-sycl-moe-device-weight-cpu-fallback-source.py keeps advertised types out.
-            // A prompt the batched prompt executor claims never reaches here as a CPU-fallback candidate
-            // (llama.cpp-348c): that executor runs it on the device.
-            const bool   device_weight_cpu_fallback =
-                (src0->type == GGML_TYPE_Q4_K) && !pp_onednn_batched_route_claims_prompt;
+            const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K);
             const bool pp_mmvq_batched_supported = ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, route_layout);
             const bool pp_mmvq_batched_shape =
                 ne11 == 1 || (src0->type == GGML_TYPE_MXFP4 && route_layout == GGML_LAYOUT_MXFP4_I8);
