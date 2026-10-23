@@ -80977,10 +80977,10 @@ static const char * ggml_sycl_moe_pp_dequant_label(ggml_type type) {
 // The staged claim (host_staged, llama.cpp-3460) answers for the weight once the stream ring has staged its host
 // experts, from the plan the ring's index build holds (c-gi44); the ring then stages them for the executor. Its planned
 // layout is the device experts' (ggml_sycl_moe_tensor_plan_staged_layout, which lets the other experts be on the
-// host), and it needs two more things. The type has an MMID kernel, so the hybrid route can still take the op when
-// the ring stages too little: supports_op admits no other type on a hybrid layer (ggml_sycl_moe_pp_batched_admits_op).
-// And the executor takes the type at AOS, the layout a staged slot holds. The device experts' layout then passes the
-// same checks below as a resident weight's.
+// host), and it needs two more things. The type is one moe_pp_batched_takes_staged_type names, the helper the cost
+// model's seed asks too: it has an MMID kernel, so the hybrid route can still take the op when the ring stages too
+// little, and an f16 row at AOS, the layout a staged slot holds. And ggml_sycl_moe_pp_batched_takes_layout takes AOS
+// under the runtime knobs. The device experts' layout then passes the same checks below as a resident weight's.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan,
                                                           const ggml_tensor *               weight,
                                                           int                               device,
@@ -80995,7 +80995,7 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     layout_mode planned_layout = GGML_LAYOUT_AOS;
     bool        planned        = false;
     if (host_staged) {
-        planned = plan != nullptr && moe_mmvq_admission_supports_type(weight->type) &&
+        planned = plan != nullptr && moe_pp_batched_takes_staged_type(weight->type) &&
                   ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) &&
                   ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);
     } else {

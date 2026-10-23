@@ -196,10 +196,11 @@ int main() {
         CHECK(std::fabs(r.cpu_gbps - 200.0 / (100.0 / 5.6 + 100.0 / 22.0)) < 1e-9, "two measured types: harmonic mean");
     }
     // dev_gflops seeds per type, byte-weighted harmonic mean over the mix: bytes / sum(bytes_i / rate_i). MXFP4 keeps the
-    // Task 9 measurement (llama.cpp-g4uy); Q4_0 and every other type the batched f16 arm serves take the batched
-    // executor's rates measured on d52110c80 (llama.cpp-348c, re-seeded in llama.cpp-3460); a type the executor does not
-    // claim keeps the per-row 600. The fixtures above that call weigh set their own rates, so none of their
-    // expectations depended on a seed; the unset-variable check below pins the empty mix's 600.
+    // Task 9 measurement (llama.cpp-g4uy); Q4_0 and every other type the executor takes from a staged slot
+    // (moe_pp_batched_takes_staged_type) take the batched executor's rates measured on d52110c80 (llama.cpp-348c,
+    // re-seeded in llama.cpp-3460); any other type keeps the per-row 600. The fixtures above that call weigh set their
+    // own rates, so none of their expectations depended on a seed; the unset-variable check below pins the empty mix's
+    // 600.
     {
         moe_exec_rates r = moe_exec_rates_seed({
             { GGML_TYPE_MXFP4, 1000 }
@@ -209,7 +210,7 @@ int main() {
             { GGML_TYPE_Q4_0, 1000 }
         });
         CHECK(r.dev_gflops == 9000.0, "a pure Q4_0 mix seeds the batched f16 executor's 9000 GFLOP/s");
-        // the Qwen3.8 GSQ-RCO expert types and the other AOS/SOA types share the f16 arm's 5000
+        // the Qwen3.8 GSQ-RCO expert types and the other types the staged claim takes share the f16 arm's 5000
         const ggml_type f16_arm_types[] = { GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
                                             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL,
                                             GGML_TYPE_Q2_0,  GGML_TYPE_Q8_0,    GGML_TYPE_Q6_K };
@@ -217,7 +218,7 @@ int main() {
             r = moe_exec_rates_seed({
                 { t, 1000 }
             });
-            CHECK(r.dev_gflops == 5000.0, "a type the batched f16 arm serves seeds 5000 GFLOP/s");
+            CHECK(r.dev_gflops == 5000.0, "a type the staged claim takes seeds the f16 arm's 5000 GFLOP/s");
         }
         // a type the batched executor does not claim keeps the per-row rate
         const ggml_type per_row_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_F16 };
@@ -226,6 +227,26 @@ int main() {
                 { t, 1000 }
             });
             CHECK(r.dev_gflops == 600.0, "a type with no batched executor seeds the per-row 600 GFLOP/s");
+        }
+        // the f16 arm dequantizes these, but they have no MMVQ-ID kernel, so the staged claim refuses them and the ring
+        // does not stage them: they keep the per-row rate until a kernel exists (llama.cpp-w4qk)
+        const ggml_type unstaged_f16_types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS };
+        for (ggml_type t : unstaged_f16_types) {
+            r = moe_exec_rates_seed({
+                { t, 1000 }
+            });
+            CHECK(r.dev_gflops == 600.0, "a type the staged claim refuses seeds the per-row 600 GFLOP/s");
+        }
+        // one type question (moe_pp_batched_takes_staged_type): apart from MXFP4, whose 3990 is the WOQ arm's Task 9
+        // measurement, a type is seeded above the per-row rate exactly when the staged claim takes it
+        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const ggml_type t = static_cast<ggml_type>(i);
+            if (t == GGML_TYPE_MXFP4) {
+                continue;
+            }
+            const bool executor_rate = moe_exec_dev_gflops_seed(t) > MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
+            CHECK(executor_rate == moe_pp_batched_takes_staged_type(t),
+                  "a type is seeded at an executor rate exactly when the staged claim takes it");
         }
         r = moe_exec_rates_seed({
             { GGML_TYPE_MXFP4, 500 },

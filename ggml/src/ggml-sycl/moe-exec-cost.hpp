@@ -6,7 +6,7 @@
 
 #include "ggml.h"
 #include "kv-room-cost.hpp"     // the per-type CPU expert rate table moe_exec_rates_seed folds
-#include "moe-mmvq-tables.hpp"  // moe_pp_batched_f16_supports_layout: the types the batched f16 arm serves
+#include "moe-mmvq-tables.hpp"  // moe_pp_batched_takes_staged_type: the types the executor takes staged
 
 #include <algorithm>
 #include <cmath>
@@ -158,24 +158,24 @@ static inline double moe_exec_env_param(moe_exec_getenv_fn getenv_fn, const char
 //   GGML_SYCL_KERNEL_PROFILE=1 at auto -ub 512, re-seeded in llama.cpp-3460.
 //   Q4_0:  Qwen1.5-MoE Q4_0, 20 ubatches of 512 = 17.0 TFLOP: moe.pp.gemm.execute 1.383 s, stage.act 0.226 s,
 //          stage.scatter 0.266 s, dequant.q4_0 0.009 s, so about 12,300 GEMM-only and about 9,000 as a whole.
-//   other: every other type the f16 arm serves (moe_pp_batched_f16_supports_layout at AOS, the layout a staged slot
-//          holds). Qwen3.8 GSQ-RCO runs one f16 GEMM for iq2_xxs, iq2_xs, iq2_s, iq3_s, iq4_nl and q2_0, with the
-//          per-type dequant under 1% of the time: gemm 0.248 s, stage 0.163 s, dequant 0.001 s, so about 8,200
-//          GEMM-only and about 5,000 as a whole.
-//   A type the batched executor does not claim keeps the per-row MMVQ rate (Task 9: the Q4_0 down matrix measured 590).
+//   other: every other type the executor takes from a staged slot (moe_pp_batched_takes_staged_type, the one type
+//          question the staged claim asks too). Qwen3.8 GSQ-RCO runs one f16 GEMM for iq2_xxs, iq2_xs, iq2_s, iq3_s,
+//          iq4_nl and q2_0, with the per-type dequant under 1% of the time: gemm 0.248 s, stage 0.163 s, dequant
+//          0.001 s, so about 8,200 GEMM-only and about 5,000 as a whole.
+//   A type the executor does not take from a staged slot keeps the per-row MMVQ rate (Task 9: the Q4_0 down matrix
+//   measured 590). IQ1_S, IQ1_M and IQ4_XS are among them: the f16 arm dequantizes them, but they have no MMVQ-ID
+//   kernel, so the staged claim refuses them and the ring does not stage them (llama.cpp-w4qk).
 static constexpr double MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED = 600.0;
 static constexpr double MOE_EXEC_DEV_GFLOPS_F16_ARM_SEED = 5000.0;
 
 static inline double moe_exec_dev_gflops_seed(ggml_type t) {
-    switch (t) {
-        case GGML_TYPE_MXFP4:
-            return 3990.0;
-        case GGML_TYPE_Q4_0:
-            return 9000.0;
-        default:
-            return moe_pp_batched_f16_supports_layout(t, GGML_LAYOUT_AOS) ? MOE_EXEC_DEV_GFLOPS_F16_ARM_SEED :
-                                                                            MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
+    if (t == GGML_TYPE_MXFP4) {
+        return 3990.0;
     }
+    if (!moe_pp_batched_takes_staged_type(t)) {
+        return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
+    }
+    return t == GGML_TYPE_Q4_0 ? 9000.0 : MOE_EXEC_DEV_GFLOPS_F16_ARM_SEED;
 }
 
 // The seed record for a layer whose host-resident experts are `host_mix` (type, bytes). cpu_gbps is the byte-weighted
