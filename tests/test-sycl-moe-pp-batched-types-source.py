@@ -20,21 +20,29 @@ for the types the planner materializes SOA that have a per-expert SOA dequant. T
   (d) decode keeps its ne12 == 1 / ids->ne[1] > 1 terms: the hybrid-with-plan disjunct, the two claim call sites
       and the lambda's single-token refusal;
   (e) one refusal enum with a name for every cause, every refusal in the lambda names one, and one WARN line per
-      (device, cause) under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE;
+      (device, cause) under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE, printed by one helper that the GEMM-stage
+      failure uses too, so every refusal reads "[PP-MOE] refused";
   (f) one [PP-MOE] INFO line per (device, type), naming the type, layout, experts per dispatch and the planned slot;
   (g) the MXFP4 profiler label strings are byte-identical and keep their counts, the non-MXFP4 labels are moe.pp.*,
       and the MXFP4 dispatch-record profile stays MXFP4-only;
   (h) the capability query admits a prompt-phase op the executor takes only after the MMVQ check (so no type that
       has an MMVQ-ID kernel changes kernel), and MUL_MAT_ID admission takes a type with no MMVQ-ID kernel only for
-      a prompt the executor claims;
+      a prompt the executor claims, which is only a layer whose every expert is planned on this device: the claim's
+      planned-layout lookup refuses a layer with a host or other-device expert, so a hybrid layer is never admitted;
   (i) the planned weight slot is widened at plan time from the f16 table, so the executor never needs an
       unplanned allocation;
-  (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, read once, consulted by the support helper, and
-      dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor;
+  (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, spelled once, read once, consulted by the support helper,
+      dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor, registered in
+      sycl_env_settings[] so the non-default report names it, and catalogued;
   (k) the claim takes a planned layout only where the cache holds one entry per expert at it: the claim predicate
       reads device-buffer storage from the weight's own buffer and asks moe_pp_batched_has_expert_entries, which
       declines exactly a non-AOS layout in a device buffer (GGML_SYCL_WEIGHTS_EVICTABLE=0 reorders such a tensor
-      into one block over every expert) and never MXFP4, whose route is unchanged.
+      into one block over every expert) and never MXFP4, whose route is unchanged;
+  (l) GGML_SYCL_MOE_PP_ONEDNN_F16 is read once, by a common.hpp accessor, and the executor's support helper asks it,
+      so with it at 0 the claim takes nothing the executor would then decline, and the executor names the knob as
+      route-off rather than as a candidate miss; the catalog has its row;
+  (m) the plan-time widening of the ring's weight slot is logged once per load (the early and the late plan of one
+      load both populate the inventory), and no unread ring total is kept beside the unified cache's own.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -54,6 +62,7 @@ FILES = {
     "gemm": SYCL_DIR / "gemm.hpp",
     "common": SYCL_DIR / "common.hpp",
     "layer_plan": SYCL_DIR / "moe-layer-plan.hpp",
+    "catalog": ROOT / "docs" / "backend" / "sycl-env-vars.md",
 }
 
 # The brief's list (Q4_0 plus the Qwen3.8 GSQ-RCO mix types it named) plus the rest of the GSQ-RCO census
@@ -72,6 +81,8 @@ AOS_SOA_EXPR = "layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA"
 FORBIDDEN = ["GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4", "GGML_TYPE_F16", "GGML_TYPE_F32", "GGML_TYPE_BF16"]
 AOS_EXPR = "layout == GGML_LAYOUT_AOS"
 KNOB = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS"
+KNOB_CONST = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV"
+F16_KNOB = "GGML_SYCL_MOE_PP_ONEDNN_F16"
 
 
 def strip_comments(src):
@@ -103,7 +114,12 @@ def squeeze(src):
 
 
 def load():
-    return {key: squeeze(strip_comments(path.read_text())) for key, path in FILES.items()}
+    """Squeezed text per file; C++ sources lose their comments first, the Markdown catalog is kept whole."""
+    out = {}
+    for key, path in FILES.items():
+        text = path.read_text()
+        out[key] = squeeze(text if path.suffix == ".md" else strip_comments(text))
+    return out
 
 
 def all_backend_sources():
@@ -455,6 +471,15 @@ def claim_e_refusal_enum(s):
     latch = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_refusal_first")
     if latch is None or "fetch_or(" not in latch or "std::atomic<uint32_t>" not in latch:
         fails.append("ggml_sycl_moe_pp_batched_refusal_first is not one per-device atomic bitmask latch")
+    old_prefix = '"[MOE-PP-ONEDNN-F16-BATCHED] refused'
+    if old_prefix in s["sycl"]:
+        fails.append(f"{old_prefix} is still printed: every refusal must read \"[PP-MOE] refused\"")
+    if "warn_batched_refusal(refusal, detail);" not in lam:
+        fails.append("decline_batched does not print its refusal through warn_batched_refusal")
+    gemm = re.search(r"auto gemm_stage_failed = \[&\]\(const char \* what\) -> bool \{", lam)
+    gemm_body = lam[gemm.end() - 1 : match_close(lam, gemm.end() - 1)] if gemm else ""
+    if "warn_batched_refusal(moe_pp_batched_refusal::GEMM, what);" not in gemm_body:
+        fails.append("the GEMM-stage failure does not print its refusal through warn_batched_refusal")
     return fails
 
 
@@ -553,6 +578,23 @@ def claim_h_capability(s):
             fails.append("ggml_sycl_moe_pp_batched_admits_op does not require a prompt (ids ne[1] > 1)")
         if "ggml_sycl_moe_pp_onednn_batched_claims_tensor(" not in admits:
             fails.append("ggml_sycl_moe_pp_batched_admits_op does not require the executor's claim")
+    # The claim reads its planned layout through the plan-taking lookup, which answers only for a layer whose every
+    # expert is planned on this device: a hybrid layer (a host or other-device expert) is never claimed, so never
+    # admitted for a type without an MMVQ-ID kernel.
+    claim = claim_predicate_body(s["sycl"]) or ""
+    if claim.count("ggml_sycl_moe_tensor_plan_primary_layout(") != 2:
+        fails.append("the claim does not read its planned layout through ggml_sycl_moe_tensor_plan_primary_layout")
+    lookup = next((b for b in definitions(s["sycl"], "ggml_sycl_moe_tensor_plan_primary_layout")
+                   if "find_expert_entry(" in b), None)
+    if lookup is None:
+        fails.append("the plan-taking ggml_sycl_moe_tensor_plan_primary_layout was not found")
+    else:
+        if "if (!plan.all_experts_on_device(src0->name, n_experts, device)) { return false; }" not in lookup:
+            fails.append("the planned-layout lookup answers for a layer not wholly planned on this device")
+        per_expert = ("if (!placement || !placement->on_device || placement->target_device != device) "
+                      "{ return false; }")
+        if per_expert not in lookup:
+            fails.append("the planned-layout lookup answers although an expert is on the host or another device")
     return fails
 
 
@@ -582,11 +624,22 @@ def claim_j_knob(s):
     total = sum(stripped.count(literal) for stripped, _ in backend_texts())
     if total != 1:
         fails.append(f"{literal} appears {total} times in the backend sources, want 1")
+    spelling = f"static constexpr const char * {KNOB_CONST} = {literal};"
+    if spelling not in s["common"]:
+        fails.append(f"common.hpp does not spell the knob once as {KNOB_CONST}")
     body = one_definition(s["common"], "ggml_sycl_moe_pp_f16_batched_aos_enabled")
-    if body is None or literal not in body or "static const bool" not in body:
+    if body is None or f"std::getenv({KNOB_CONST})" not in body or "static const bool" not in body:
         fails.append("ggml_sycl_moe_pp_f16_batched_aos_enabled does not read the knob once into a static")
     elif "env == nullptr || std::atoi(env) != 0" not in body:
         fails.append("the knob is not default ON (unset or non-zero)")
+    row = f"{{ {KNOB_CONST}, &g_ggml_sycl_moe_pp_f16_batched_aos, 1 }},"
+    if row not in s["sycl"]:
+        fails.append("sycl_env_settings[] has no row for the knob, so the non-default report never names it")
+    report = "g_ggml_sycl_moe_pp_f16_batched_aos = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;"
+    if report not in s["sycl"]:
+        fails.append("the report's integer is not set from the accessor, so it can disagree with what is in effect")
+    if f"| `{KNOB}=0` |" not in s["catalog"]:
+        fails.append(f"docs/backend/sycl-env-vars.md has no `{KNOB}=0` row")
     takes = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_takes_layout") or ""
     if "ggml_sycl_moe_pp_f16_batched_aos_enabled()" not in takes:
         fails.append("ggml_sycl_moe_pp_batched_takes_layout does not consult the knob")
@@ -618,6 +671,52 @@ def claim_k_expert_entries(s):
     return fails
 
 
+def claim_l_f16_knob(s):
+    fails = []
+    literal = f'"{F16_KNOB}"'
+    total = sum(stripped.count(literal) for stripped, _ in backend_texts())
+    if total != 1:
+        fails.append(f"{literal} appears {total} times in the backend sources, want 1 (one reader)")
+    body = one_definition(s["common"], "ggml_sycl_moe_pp_onednn_f16_enabled")
+    if body is None or literal not in body or "static const bool" not in body:
+        fails.append("ggml_sycl_moe_pp_onednn_f16_enabled does not read the knob once into a static")
+    elif "env == nullptr || std::atoi(env) != 0" not in body:
+        fails.append(f"{F16_KNOB} is not default ON (unset or non-zero)")
+    takes = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_takes_layout") or ""
+    if "if (!ggml_sycl_moe_pp_onednn_f16_enabled()) { return false; }" not in takes:
+        fails.append("the support helper does not ask the knob, so the claim takes ops the executor declines")
+    lam = lambda_body(s["sycl"]) or ""
+    route = ("const bool pp_mxfp4_soa_f16_batched_env_enabled = ggml_sycl_moe_pp_onednn_batched_route_selected() && "
+             "ggml_sycl_moe_pp_onednn_f16_enabled();")
+    if route not in lam:
+        fails.append("the executor's route-off refusal does not cover the knob, so it is traced as a candidate miss")
+    if f"| `{F16_KNOB}=0` |" not in s["catalog"]:
+        fails.append(f"docs/backend/sycl-env-vars.md has no `{F16_KNOB}=0` row")
+    return fails
+
+
+def claim_m_widening(s):
+    fails = []
+    sycl = s["sycl"]
+    literal = '"[SYCL-PLAN] PP MoE oneDNN batched weight slot widened'
+    if sycl.count(literal) != 1:
+        return [f"{literal} appears {sycl.count(literal)} times in ggml-sycl.cpp, want 1"]
+    cond = enclosing_if_condition(sycl, sycl.find(literal)) or ""
+    if "&& ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, " not in cond or "||" in cond:
+        fails.append("the widened line is not guarded by the per-load latch, so each of a load's two plans logs it")
+    latch = one_definition(sycl, "ggml_sycl_pp_moe_widened_first")
+    if latch is None:
+        fails.append("ggml_sycl_pp_moe_widened_first is not defined exactly once")
+    else:
+        if "last.owner == owner && last.from_bytes == from_bytes && last.to_bytes == to_bytes" not in latch:
+            fails.append("the widening latch does not key on the load owner and both slot sizes")
+        if "owner.generation == 0" not in latch:
+            fails.append("the widening latch latches a load no staged owner holds")
+    if "g_tensor_inventory_pp_moe_onednn_scratch_bytes" in sycl:
+        fails.append("g_tensor_inventory_pp_moe_onednn_scratch_bytes is kept although nothing reads it")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -630,6 +729,8 @@ CLAIMS = {
     "i": claim_i_sizing,
     "j": claim_j_knob,
     "k": claim_k_expert_entries,
+    "l": claim_l_f16_knob,
+    "m": claim_m_widening,
 }
 
 
@@ -695,6 +796,25 @@ MUTANTS = [
     ("k", "sycl", "weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);", "false;"),
     ("k", "sycl",
      "if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) { return false; }", ""),
+    ("e", "sycl", "warn_batched_refusal(moe_pp_batched_refusal::GEMM, what);", ""),
+    ("e", "sycl", "warn_batched_refusal(refusal, detail);", ""),
+    ("h", "sycl", "if (!plan.all_experts_on_device(src0->name, n_experts, device)) { return false; }", ""),
+    ("h", "sycl",
+     "= plan.find_expert_entry(layer_id, static_cast<int>(e), role); if (!placement || !placement->on_device ||",
+     "= plan.find_expert_entry(layer_id, static_cast<int>(e), role); if (!placement ||"),
+    ("j", "sycl", f"{{ {KNOB_CONST}, &g_ggml_sycl_moe_pp_f16_batched_aos, 1 }},", ""),
+    ("j", "sycl", "g_ggml_sycl_moe_pp_f16_batched_aos = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;", ""),
+    ("j", "catalog", f"| `{KNOB}=0` |", f"| `{KNOB}` |"),
+    ("l", "sycl", "if (!ggml_sycl_moe_pp_onednn_f16_enabled()) { return false; }", ""),
+    ("l", "sycl", " && ggml_sycl_moe_pp_onednn_f16_enabled();", ";"),
+    ("l", "common", "return env == nullptr || std::atoi(env) != 0; }(); return enabled; } static constexpr",
+     "return env != nullptr && std::atoi(env) != 0; }(); return enabled; } static constexpr"),
+    ("m", "sycl", "&& ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, ",
+     "|| ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, "),
+    ("m", "sycl", "last.owner == owner && ", ""),
+    ("m", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
+     "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0; "
+     "static size_t g_tensor_inventory_pp_moe_onednn_scratch_bytes = 0;"),
 ]
 
 
