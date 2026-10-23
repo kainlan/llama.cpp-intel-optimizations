@@ -48,8 +48,8 @@
 #   - builders: builders_pre and builders_post on every verdict (the larger of the count after an arm and the
 #     highest the sampler saw during it), a taint makes NOT_SCORED (exit 3), the start waits for a build before
 #     the settle check and the lock, a builder wait is bounded, and every stop once the lock is held prints the
-#     summary over the verdicts scored so far (the
-#     --refuse-selftest, --signal-selftest and --wait-builders-selftest hooks);
+#     summary over the verdicts scored so far (the --refuse-selftest, --signal-selftest and --wait-builders-selftest
+#     hooks);
 #   - prerequisites: a missing awk, md5sum, cmp, comm or journalctl is exit 77, in the test and in the gate.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -771,8 +771,8 @@ expect_rc "an unknown option exits 2" "$rc" 2
 expect "an unknown option still prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
 expect "an unknown option says REFUSED: usage" "$out" "REFUSED: usage: unknown option: --no-such-option"
 # a value-taking option given last must be refused, not spun on: `shift 2` fails on one remaining word, so without the
-# guard the loop re-reads the option forever. Every option the script guards is tried as the final word, under a
-# timeout.
+# guard the loop re-reads the option forever. Every value-taking option, spelled out below and not read back from the
+# script (a list read from the script would shrink with a removed guard), is tried as the final word under a timeout.
 out="$(timeout 10 bash "$GATE" --dry-run --out-dir 2>&1)"; rc=$?
 expect_rc "a trailing --out-dir exits 2, not 124" "$rc" 2
 expect "a trailing --out-dir says REFUSED: usage ... needs a value" "$out" "REFUSED: usage: --out-dir needs a value"
@@ -781,18 +781,30 @@ out="$(timeout 10 bash "$GATE" --since 2>&1)"; rc=$?
 expect_rc "a trailing --since exits 2, not 124" "$rc" 2
 n_opts=0
 bad_opts=""
-mapfile -t guarded_opts < <(cat "$GATE" | grep -o -E '^ +--[a-z0-9-]+\) need_value' | grep -o -E -- '--[a-z0-9-]+')
-for opt in "${guarded_opts[@]}"; do
+VALUE_OPTS="--prompt-out --csv --out --out2 --err --ref-out --ref-out2 --journal --rc --rc-out2 --rc-ref --rc-ref2
+--builders-pre --builders-post --src-dir --seed-verdicts --builders-file --builders-wait-max --builders-poll
+--score-summary --build-dir --out-dir --lock-dir --since --qwen --gptoss --mistral --tuning-dir --decode-ref
+--place-ref-tg --place-ref-noc --qmd5 --q-layers --go-noc-layers --pp512-min --pp2048-min --go-pp-ref --go-tg-ref
+--arm --score-arm --builders-post-selftest"
+for opt in $VALUE_OPTS; do
     n_opts=$((n_opts + 1))
     out="$(timeout 10 bash "$GATE" "$opt" 2>&1)"; rc=$?
-    [ "$rc" = 2 ] && printf '%s\n' "$out" | grep -qF -- "$opt needs a value" || bad_opts="$bad_opts $opt(rc=$rc)"
+    case "$opt" in
+        --arm | --score-arm | --builders-post-selftest) want="REFUSED: usage: $opt '' is not one of" ;;
+        *) want="REFUSED: usage: $opt needs a value" ;;
+    esac
+    [ "$rc" = 2 ] && printf '%s\n' "$out" | grep -qF -- "$want" || bad_opts="$bad_opts $opt(rc=$rc)"
 done
 expect_rc "no guarded option is left without a refusal when it is the last word:$bad_opts" "${bad_opts:+bad}" ""
-if [ "$n_opts" -ge 30 ]; then
-    pass "the loop above covered $n_opts value-taking options"
-else
-    fail "only $n_opts value-taking options found"
-fi
+expect_rc "the loop above covered all 41 value-taking options" "$n_opts" 41
+# every `shift 2` arm in the script carries the guard, except the three whose is_arm check refuses an empty value
+# itself, so a guard removed from an option is caught even if the list above forgot the option
+unguarded="$(cat "$GATE" | grep -n 'shift 2 ;;' | grep -v 'need_value' | cut -d: -f2- \
+    | grep -c -v -E 'ARMS\+=|SCORE_ARM=|BUILDERS_POST_SELFTEST=')"
+expect_rc "every shift 2 arm in the option loop has a need_value guard" "$unguarded" 0
+n_shift2="$(cat "$GATE" | grep -c 'shift 2 ;;')"
+expect_rc "the option loop has 41 shift 2 arms (a new one must join the list above)" \
+    "$n_shift2" 41
 out="$(bash "$GATE" --arm Q_nope 2>&1)"
 expect "an unknown arm prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
 out="$(bash "$GATE" abcdef0 1234567 2>&1)"; rc=$?
