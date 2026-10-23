@@ -7,17 +7,19 @@
 # Cases (each asserts the exact verdict text the lead will read):
 #   - the grep controls hold (every regex matches its own line and not its nearest decoy; the GPT-OSS echo line
 #     scores 0 under grep -cx and 2 under a loose grep -c);
-#   - Q_pp: a pass (Q_pp=PASS), a failing pp512 (Q_pp=FAIL(pp512=412<500)), a ring-refused log (ring_engaged=no,
-#     both with failing and with passing numbers, so the field is independent of the verdict), layer count,
-#     summary count and [PP-MOE] refused each fail by name, loan_exercised counts a granted loan and not a
-#     refused one;
-#   - Q_staged: pass, an unstaged dispatch, a non-f16 arm, and NOT_EXERCISED when the ring is unavailable;
-#   - Q_tok / Q_tok_cpu md5 equality, a mismatch, a missing reference;
+#   - Q_pp: a pass (Q_pp=PASS), a failing pp512 (Q_pp=FAIL(pp512=412<500)), the log a real default-verbosity auto run
+#     prints (24 host layers, "ring-unavailable" reasons, one summary per llama-bench context, zero ring
+#     layer-ubatches: ring_engaged=no), ring_engaged read from the summary and not from the unavailable WARN
+#     (which auto does not print), layer count, missing summary and [PP-MOE] refused each fail by name,
+#     loan_exercised counts a granted loan and not a refused one;
+#   - Q_staged: pass, an unstaged dispatch, a non-f16 arm, and NOT_EXERCISED when no layer-ubatch used the ring;
+#   - Q_tok / Q_tok_2 / Q_tok_cpu_1 recorded, Q_tok_cpu across two loads per arm: equal, a flip on either side,
+#     a real mismatch naming the first differing byte, a missing reference;
 #   - Q_tg / Q_noc: floor, md5, place line (unchanged, changed, unscored), refill balanced / unbalanced /
 #     not_exercised, watchdog;
 #   - GO_gate / GO_noc count and layer lines (the echo line alone must not score), GO_pp window, MI digits,
 #     resets;
-#   - --dry-run lists every arm, pins the selector in all twelve device arms, passes no -ngl, no -cnv to llama-cli,
+#   - --dry-run lists every arm, pins the selector in all fourteen device arms, passes no -ngl, no -cnv to llama-cli,
 #     and runs nothing; --help names the arms;
 #   - a real run refuses without a <sha> or with a wrong one, prints verdicts_pass=0 GATE_DONE, exits 2 and never
 #     creates GPU.lock; the lock helper takes, refuses a second take, and releases;
@@ -101,9 +103,14 @@ mkcsv "$WORK/pp-fail.csv" 512:0:412.3:2.0:512 2048:0:851.2:5.0:2048
 mkcsv "$WORK/pp-slow.csv" 512:0:14.1:0.2:256 2048:0:31.5:0.3:256
 { mklayers "$WORK/pp-pass.err" 48; echo "$SUMMARY" >> "$WORK/pp-pass.err"; echo "$TRACE_DECOY" >> "$WORK/pp-pass.err"; }
 cp "$WORK/pp-pass.err" "$WORK/pp-fail.err"
-{ echo "$UNAVAIL"; mklayers "$WORK/x" 0; } > "$WORK/pp-refused.err"
-mklayers "$WORK/pp-refused.err" 48 cpu
-echo "$SUMMARY" >> "$WORK/pp-refused.err"
+# The log a real auto run prints at default verbosity (3460-gpu2-q38-tip-1): layers 24..47 each decide cpu with
+# the reason ring-unavailable, and llama-bench prints one summary per context (two for -p 512,2048), with zero
+# ring layer-ubatches. The "stream ring unavailable" WARN is absent: auto does not print it.
+for i in $(seq 24 47); do
+    echo "1.36.000.000 W [MOE-EXEC] layer $i: cpu (p=1.00 t_cpu=201827 us t_ring=45000 us ring-unavailable)"
+done > "$WORK/pp-refused.err"
+echo '0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed' >> "$WORK/pp-refused.err"
+echo '0.19.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 372 cpu, 0 forced, 0 MiB streamed' >> "$WORK/pp-refused.err"
 
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"; rc=$?
 expect "Q_pp pass verdict" "$out" "Q_pp=PASS"
@@ -119,18 +126,35 @@ expect_rc "Q_pp fail rc" "$rc" 1
 
 out="$(score Q_pp --csv "$WORK/pp-slow.csv" --err "$WORK/pp-refused.err")"
 expect "Q_pp ring-refused says ring_engaged=no" "$out" "ring_engaged=no"
+expect "Q_pp ring-refused counts no ring layer-ubatches" "$out" "ring_layer_ubatches=0"
+expect "Q_pp the real log has 24 layers and two summaries" "$out" "layers=24 summary=2"
 expect "Q_pp ring-refused fails the floors" "$out" "Q_pp=FAIL(pp512=14<500,pp2048=32<800)"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-refused.err")"
 expect "Q_pp ring_engaged=no is independent of the verdict" "$out" "ring_engaged=no"
 expect "Q_pp passing numbers without the ring still pass honestly" "$out" "Q_pp=PASS"
+# The unavailable WARN is not the signal: with it printed AND ring layer-ubatches counted, the ring engaged; with
+# it absent and zero ring layer-ubatches (the real auto log above), it did not.
+{ echo "$UNAVAIL"; cat "$WORK/pp-pass.err"; } > "$WORK/pp-mixed.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-mixed.err")"
+expect "Q_pp the unavailable WARN alone does not decide ring_engaged" "$out" "ring_engaged=yes"
+{ cat "$WORK/pp-pass.err"; echo '0.19.000.000 W [MOE-EXEC] summary: 40 layer-ubatches ring, 7 cpu, 0 forced, 600 MiB streamed'; } > "$WORK/pp-sum2.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-sum2.err")"
+expect "Q_pp ring layer-ubatches add up over the summaries" "$out" "ring_layer_ubatches=136"
+expect "Q_pp two summaries pass (one per llama-bench context)" "$out" "Q_pp=PASS"
 
 cp "$WORK/pp-pass.err" "$WORK/pp-47.err"
 sed -i '/layer 47:/d' "$WORK/pp-47.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-47.err" --q-layers 48)"
+expect "Q_pp --q-layers 48 and 47 layers fails by name" "$out" "layers=47!=48"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-47.err")"
-expect "Q_pp 47 layers fails by name" "$out" "layers=47!=48"
-cp "$WORK/pp-pass.err" "$WORK/pp-2sum.err"; echo "$SUMMARY" >> "$WORK/pp-2sum.err"
-out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-2sum.err")"
-expect "Q_pp two summaries fail by name" "$out" "summary=2!=1"
+expect "Q_pp by default any layer count of at least one passes" "$out" "Q_pp=PASS"
+grep -v 'layer [0-9]*:' "$WORK/pp-pass.err" > "$WORK/pp-nolayer.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-nolayer.err")"
+expect "Q_pp no layer line fails by name" "$out" "layers=0<1"
+grep -v 'summary:' "$WORK/pp-pass.err" > "$WORK/pp-nosum.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-nosum.err")"
+expect "Q_pp no summary fails by name" "$out" "summary=0<1"
+expect "Q_pp no summary also means ring_engaged=no" "$out" "ring_engaged=no"
 cp "$WORK/pp-pass.err" "$WORK/pp-ref.err"
 echo '0.07.000.000 W [PP-MOE] refused device=0 cause=x detail=- tensor=blk.3.ffn_up_exps.weight type=q4_0 layout=aos staged=4' >> "$WORK/pp-ref.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-ref.err")"
@@ -157,6 +181,7 @@ expect "Q_pp_cpu is recorded" "$out" "Q_pp_cpu=RECORDED pp512=14.1 pp2048=31.5"
         echo "0.05.100.000 I [MOE-EXEC-TRACE] executor device 0 tensor=blk.$i.ffn_up_exps.weight experts=8 staged=8 arm=f16"
     done
     echo "$TRACE_DECOY"
+    echo "$SUMMARY"
 } > "$WORK/st-pass.err"
 out="$(score Q_staged --err "$WORK/st-pass.err")"
 expect "Q_staged pass" "$out" "Q_staged=PASS executor_dispatches=3"
@@ -166,28 +191,55 @@ expect "Q_staged an unstaged dispatch fails by name" "$out" "Q_staged=FAIL(unsta
 sed 's/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=f16/blk.2.ffn_up_exps.weight experts=8 staged=8 arm=woq/' "$WORK/st-pass.err" > "$WORK/st-woq.err"
 out="$(score Q_staged --err "$WORK/st-woq.err")"
 expect "Q_staged a non-f16 arm fails by name" "$out" "arm_not_f16=1/3"
-{ echo "$UNAVAIL"; cat "$WORK/st-pass.err"; } > "$WORK/st-unavail.err"
+{ echo "$UNAVAIL"; grep -v 'summary:' "$WORK/st-pass.err"; echo '0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed'; } > "$WORK/st-unavail.err"
 out="$(score Q_staged --err "$WORK/st-unavail.err")"; rc=$?
 expect "Q_staged ring-unavailable is NOT_EXERCISED" "$out" "Q_staged=NOT_EXERCISED(ring_engaged=no)"
 expect_not "Q_staged ring-unavailable is not a pass" "$out" "Q_staged=PASS"
 expect_rc "Q_staged ring-unavailable rc" "$rc" 3
-echo "$TRACE_DECOY" > "$WORK/st-none.err"
+{ echo "$TRACE_DECOY"; echo "$SUMMARY"; } > "$WORK/st-none.err"
 out="$(score Q_staged --err "$WORK/st-none.err")"
 expect "Q_staged without executor lines fails, never passes" "$out" "no_executor_trace_lines"
 
-# ---- Q_tok / Q_tok_cpu
-echo "the same generated text" > "$WORK/tok.out"
-echo "the same generated text" > "$WORK/tok-cpu.out"
-echo "different generated text" > "$WORK/tok-bad.out"
-out="$(score Q_tok --out "$WORK/tok.out")"
-expect "Q_tok is recorded" "$out" "Q_tok=RECORDED md5="
-out="$(score Q_tok_cpu --out "$WORK/tok-cpu.out" --ref-out "$WORK/tok.out")"
-expect "Q_tok_cpu equal md5 passes" "$out" "Q_tok_cpu=PASS"
-out="$(score Q_tok_cpu --out "$WORK/tok-bad.out" --ref-out "$WORK/tok.out")"
-expect "Q_tok_cpu different md5 fails" "$out" "Q_tok_cpu=FAIL(md5="
-out="$(score Q_tok_cpu --out "$WORK/tok-cpu.out" --ref-out "$WORK/absent.out")"; rc=$?
+# ---- Q_tok / Q_tok_cpu: two loads per arm, stdout only
+printf 'the same generated text\n' > "$WORK/tok-a1.out"
+printf 'the same generated text\n' > "$WORK/tok-a2.out"
+printf 'the same generated text\n' > "$WORK/tok-c1.out"
+printf 'the same generated text\n' > "$WORK/tok-c2.out"
+printf 'the same generated tent\n' > "$WORK/tok-flip.out"
+printf 'a wholly different text\n' > "$WORK/tok-bad.out"
+for arm in Q_tok Q_tok_2 Q_tok_cpu_1; do
+    out="$(score "$arm" --out "$WORK/tok-a1.out")"
+    expect "$arm is recorded" "$out" "$arm=RECORDED md5="
+done
+tokcpu() { score Q_tok_cpu --out "$1" --out2 "$2" --ref-out "$3" --ref-out2 "$4"; }
+out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-a2.out")"
+expect "Q_tok_cpu four equal outputs pass" "$out" "Q_tok_cpu=PASS"
+expect "Q_tok_cpu reports no flip when there is none" "$out" "auto_flip=no cpu_flip=no"
+# the B70 greedy flip: the second cpu load differs, and the auto outputs equal one of the two cpu outputs
+out="$(tokcpu "$WORK/tok-flip.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-a2.out")"
+expect "Q_tok_cpu a cpu flip with auto equal to one cpu output passes" "$out" "Q_tok_cpu=PASS"
+expect "Q_tok_cpu reports the cpu flip" "$out" "cpu_flip=yes"
+out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-flip.out")"
+expect "Q_tok_cpu an auto output that no cpu load produced fails" "$out" "Q_tok_cpu=FAIL(auto2_md5="
+out="$(tokcpu "$WORK/tok-flip.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-flip.out")"
+expect "Q_tok_cpu an auto flip that either cpu load also made passes" "$out" "Q_tok_cpu=PASS"
+expect "Q_tok_cpu reports the auto flip" "$out" "auto_flip=yes"
+out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-bad.out" "$WORK/tok-a2.out")"; rc=$?
+expect "Q_tok_cpu a real mismatch fails by name" "$out" "Q_tok_cpu=FAIL(auto1_md5="
+expect "Q_tok_cpu a mismatch names the first differing byte" "$out" "first_diff_byte=1"
+expect_rc "Q_tok_cpu a mismatch rc" "$rc" 1
+out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/tok-flip.out" "$WORK/tok-a2.out")"
+expect "Q_tok_cpu a one-byte difference names byte 22" "$out" "first_diff_byte=22"
+out="$(tokcpu "$WORK/tok-c2.out" "$WORK/tok-c1.out" "$WORK/absent.out" "$WORK/tok-a2.out")"; rc=$?
 expect "Q_tok_cpu without Q_tok is not scored" "$out" "Q_tok_cpu=NOT_SCORED(no_Q_tok_output)"
 expect_rc "Q_tok_cpu not scored rc" "$rc" 3
+out="$(tokcpu "$WORK/tok-c2.out" "$WORK/absent.out" "$WORK/tok-a1.out" "$WORK/tok-a2.out")"
+expect "Q_tok_cpu without Q_tok_cpu_1 is not scored" "$out" "Q_tok_cpu=NOT_SCORED(no_Q_tok_cpu_1_output)"
+: > "$WORK/tok-empty.out"
+out="$(tokcpu "$WORK/tok-empty.out" "$WORK/tok-c1.out" "$WORK/tok-a1.out" "$WORK/tok-a2.out")"
+expect "Q_tok_cpu an empty cpu output fails by name" "$out" "empty_output"
+out="$(score Q_tok_cpu --out "$WORK/tok-c2.out" --out2 "$WORK/tok-c1.out" --ref-out "$WORK/tok-a1.out" --ref-out2 "$WORK/tok-a2.out" --rc 124)"
+expect "Q_tok_cpu a timeout fails" "$out" "rc=124"
 
 # ---- Q_tg / Q_noc
 echo "decode output" > "$WORK/dec.out"
@@ -243,10 +295,12 @@ out="$(score GO_gate --out "$WORK/go.out" --err "$WORK/pp-pass.err")"
 expect "GO_gate layer lines fail it" "$out" "layer_lines=48!=0"
 mklayers "$WORK/go12.err" 12
 out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/go12.err")"
-expect "GO_noc 12 layer lines pass" "$out" "GO_noc=PASS count=1 layer_lines=12"
+expect "GO_noc 12 layer lines pass by default" "$out" "GO_noc=PASS count=1 layer_lines=12"
 mklayers "$WORK/go11.err" 11
-out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/go11.err")"
-expect "GO_noc 11 layer lines fail" "$out" "layer_lines=11!=12"
+out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/go11.err" --go-noc-layers 12)"
+expect "GO_noc --go-noc-layers 12 and 11 layer lines fail" "$out" "layer_lines=11!=12"
+out="$(score GO_noc --out "$WORK/go.out" --err "$WORK/empty.err")"
+expect "GO_noc with no layer line fails: the demoted layers were never consulted" "$out" "layer_lines=0<1"
 
 mkcsv "$WORK/gopp-ok.csv" 512:0:880.0:4.0:512 0:128:33.9:0.1:512
 mkcsv "$WORK/gopp-low.csv" 512:0:770.0:4.0:512 0:128:33.9:0.1:512
@@ -275,13 +329,13 @@ expect "resets a GT reset fails" "$out" "resets=FAIL(count=1)"
 # ---- dry run and help
 out="$(bash "$GATE" --dry-run 2>&1)"; rc=$?
 expect_rc "dry-run rc" "$rc" 0
-for arm in Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
+for arm in Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
     expect "dry-run lists $arm" "$out" "$arm: "
 done
 n_sel="$(printf '%s\n' "$out" | grep -c 'ONEAPI_DEVICE_SELECTOR=level_zero:[01] ')"
-expect_rc "dry-run pins the selector in all twelve device arms" "$n_sel" 12
-n_q900="$(printf '%s\n' "$out" | grep -E '^Q_[a-z_]+: ' | grep -c 'timeout -k 15 900 ')"
-expect_rc "dry-run gives every Qwen arm timeout 900" "$n_q900" 7
+expect_rc "dry-run pins the selector in all fourteen device arms" "$n_sel" 14
+n_q900="$(printf '%s\n' "$out" | grep -E '^Q_[A-Za-z0-9_]+: ' | grep -c 'timeout -k 15 900 ')"
+expect_rc "dry-run gives every Qwen arm timeout 900" "$n_q900" 9
 expect_not "dry-run passes no -ngl" "$out" " -ngl"
 n_cnv="$(printf '%s\n' "$out" | grep -E '^GO_(gate|noc): ' | grep -cE '(^| )-cnv( |$)')"
 expect_rc "dry-run passes no -cnv to llama-cli" "$n_cnv" 0

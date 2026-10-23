@@ -520,18 +520,30 @@ __TABLE__
 
 ### How to read the verdict fields
 
-- **`ring_engaged=no`.** The ring was refused for this run (`llama.cpp-bcre`: the 10 % cap refuses it on
-  both canonical models under whole-layer host placement). `Q_staged` then reports `NOT_EXERCISED`, which
-  is neither a pass nor a fail, and the gate's exit code is 3 rather than 0. Do not read it as green.
+- **`ring_engaged=no`.** No layer-ubatch used the ring: the `[MOE-EXEC] summary: K layer-ubatches ring`
+  lines add up to 0 (`ring_layer_ubatches=0`). On this host that is the expected answer until
+  `llama.cpp-bcre` is decided, because the 10 % cap refuses the ring on both canonical models under
+  whole-layer host placement. The gate does not read it from the `stream ring unavailable` WARN, because
+  `auto` at default verbosity does not print that line. `Q_staged` then reports `NOT_EXERCISED`, which is
+  neither a pass nor a fail, and the gate's exit code is 3 rather than 0. Do not read it as green.
+- **`layers=` and `summary=`.** `Q_pp` needs at least one `[MOE-EXEC] layer N:` line and at least one summary.
+  The layer count is the number of layers that have host experts under the chosen placement (24 on the
+  3460 run, not the 48 the plan wrote), and `llama-bench` prints one summary per context, so `-p 512,2048`
+  prints two. The table records both; `--q-layers N` makes the layer count exact.
 - **`loan_exercised=no` and `refill=not_exercised`.** Nothing lent experts to the ring in that arm, so the
   "re-admitted equals lent" check had nothing to count. Production only originates a loan at a short
   reserve under `auto` (`llama.cpp-3460`), and the loan can still be refused (`llama.cpp-pu8v`).
 - **`place=unchanged`.** The `MoE experts: N on device, M on host` line equals the reference the gate was
   given (`--place-ref-tg`, `--place-ref-noc`), which defaults to the q0xu run's values. `place=unscored`
   means the reference was disabled with `-`.
-- **`Q_pp_cpu` and `Q_tok`.** Recorded, not gated. `Q_pp_cpu` is the before-number, taken with
-  `GGML_SYCL_MOE_EXEC=cpu`. The q0xu gate measured it at 13.53, 13.54 and 14.36 tok/s for pp512 at
-  `-ub 256`; at the auto micro-batch it may read higher.
+- **`Q_pp_cpu`.** Recorded, not gated. It is the before-number, taken with `GGML_SYCL_MOE_EXEC=cpu`. The
+  q0xu gate measured it at 13.53, 13.54 and 14.36 tok/s for pp512 at `-ub 256`; at the auto micro-batch it
+  may read higher.
+- **`Q_tok_cpu` scores two loads per arm.** Qwen3.8 greedy decoding on the B70 flips from load to load (a
+  near-tie, about one load in five to eight), so a single output per arm cannot tell a flip from a defect.
+  `Q_tok`, `Q_tok_2`, `Q_tok_cpu_1` and `Q_tok_cpu` each load the model once and write stdout to its own
+  file (the log goes to stderr). `Q_tok_cpu` passes when every auto output equals some cpu output, reports
+  `auto_flip` and `cpu_flip`, and on a real mismatch names the first differing byte.
 
 ### Caveats
 
