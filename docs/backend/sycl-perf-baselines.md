@@ -487,11 +487,14 @@ rather than from their own logs.
 The executor cost model and the prefill expert ring (epic `llama.cpp-36j0`) exist to move prompt
 processing for a MoE model with host-resident experts off the CPU. The case that motivated them is
 Qwen3.8-Flash-Next IQ3_XXS on the Arc Pro B70, where half the experts live on the host. This section
-is where the gate's first green table goes, and what it needs to be read correctly.
+is where the gate's recorded run goes, and what it needs to be read correctly.
 
-**Status: the table below is pending.** It is filled from the first run of
-`scripts/sycl-moe-exec-gate.sh` that the lead makes on the merged tree (`llama.cpp-x6zo`). Until then
-no number in this section is a baseline, and none of the figures in the plan are.
+**Status: the table below is a record, not a baseline.** It is run 2 of `scripts/sycl-moe-exec-gate.sh` at
+8c44f3b3c (`llama.cpp-x6zo`), taken under `--no-head-check`, with `build_commit` reading 8c44f3b3c in every csv
+standing in for the head check and the sha checked by hand. The ring did not engage (`llama.cpp-bcre`,
+`llama.cpp-pu8v`, `llama.cpp-6aj4`) and `Q_pp` and `GO_pp` FAIL, so no row is a gate floor, and none of the
+figures in the plan is a baseline either. It becomes a baseline when a run under the final script's head
+check engages the ring.
 
 ### Method
 
@@ -509,7 +512,8 @@ no number in this section is a baseline, and none of the figures in the plan are
   The script refuses unless the host has settled (`Shmem` under 30 GB, `MemAvailable` over 150 GB) and the
   builders (ninja plus icpx) clear. A running build is waited out, before the lock at the start and before
   every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem` and
-  `MemAvailable` before every arm and 5 s after it, with builders also sampled every 5 s during the arm. The log ends `verdicts_pass=N GATE_DONE`.
+  `MemAvailable` before every arm and 5 s after it, with builders also sampled every 5 s during the arm.
+  The log ends `verdicts_pass=N GATE_DONE`.
 - **Repeats and spread.** Every `llama-bench` arm uses `-r 3` except `Q_staged`, which uses `-r 1`: it
   counts staged slots, not throughput, so a repeat adds nothing. A cell is the mean of the three, with the
   standard deviation `llama-bench` prints beside it (`stddev_ts`). Three repeats make a spread, not a
@@ -532,19 +536,19 @@ no number in this section is a baseline, and none of the figures in the plan are
 
 ### Table
 
-One row per verdict-bearing arm and per recorded metric, filled by the lead from the gate's log. The
-columns are:
+One row per verdict-bearing arm and per recorded metric, filled by the lead from the gate's log, with the
+columns arm, metric, value, floor, verdict, builders_post and notes.
 
 Taken 2026-10-23 at 8c44f3b3c from the merge tree's build (its `build_commit` column reads 8c44f3b3c in every
 csv), by the lead from a snapshot of the gate script as of d92a4e632 with `--no-head-check`, because that
 version read the lead checkout's HEAD rather than `--src-dir` (fixed since). The sha was checked by hand, and
-the row values were re-scored with the final script's `--score-arm`. Six arms were re-run after a teammate's
-build overlapped their first run (Q_pp, Q_pp_cpu, GO_pp, MI_b70, MI_b50 and resets at 16:18-16:39; GO_noc at
-16:50). `builders_post` is derived from the builds' timestamps (15:29-15:42 and 16:10-16:17; no arm kept
+the row values were re-scored with the final script's `--score-arm`. Seven arms were re-run after a teammate's
+build overlapped their first run (six at 16:18-16:39: Q_pp, Q_pp_cpu, GO_pp, MI_b70, MI_b50 and resets; GO_noc
+at 16:50). `builders_post` is derived from the builds' timestamps (15:29-15:42 and 16:10-16:17; no arm kept
 overlaps either), because that script version did not sample builders during an arm. The Qwen placement lines
 were `MoE experts: 38004 on device, 35724 on host` (`Q_tg`) and `MoE experts: 25950 on device, 47778 on host`
-(`Q_noc`). Summary: `verdicts_pass=11` of 15 arms scored (4 RECORDED, 1 NOT_EXERCISED, 2 FAIL: `Q_pp` and
-`GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`, gate exit 1.
+(`Q_noc`). Summary: `verdicts_pass=8` of 15 arms scored (8 PASS, 4 RECORDED, 1 NOT_EXERCISED, 2 FAIL: `Q_pp`
+and `GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`, gate exit 1.
 
 | arm | metric | value | floor | verdict | builders_post | notes |
 |-----|--------|-------|-------|---------|---------------|-------|
@@ -565,7 +569,7 @@ were `MoE experts: 38004 on device, 35724 on host` (`Q_tg`) and `MoE experts: 25
 | GO_pp | tg128 t/s | 32.6 ± 0.46 | 31.0 (97 % of 32.0) | PASS | 0 | same run |
 | MI_b70 | digits | 1 | 1 | PASS | 0 | |
 | MI_b50 | digits | 1 | 1 | PASS | 0 | |
-| resets | count | 0 | 0 | PASS | 0 | journalctl -k since 15:25:03 |
+| resets | count | 0 | 0 | PASS | 0 | journalctl -k since 15:25:03; its resets.out was taken at 16:38:56 and does not cover the kept GO_noc run (16:50:59-16:51:21), so the reviewer also ran `journalctl -k --since "2026-10-23 16:38:50" --until "2026-10-23 16:53:00"`: rc 0, 26 lines, 0 reset matches |
 
 ### How to read the verdict fields
 

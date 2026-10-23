@@ -1598,7 +1598,7 @@ git commit -m "docs: the executor cost model and the prefill expert ring amend t
 
 | arm | command | score |
 |---|---|---|
-| Q_pp | `ONEAPI_DEVICE_SELECTOR=level_zero:0 llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v` (no `-ub`, no `-ngl`) | pp512 >= 500, pp2048 >= 800; `[MOE-EXEC] layer` lines = 48 at the first ubatch; `[MOE-EXEC] summary` once |
+| Q_pp | `ONEAPI_DEVICE_SELECTOR=level_zero:0 llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v` (no `-ub`, no `-ngl`) | pp512 >= 500, pp2048 >= 800; at least one `[MOE-EXEC] layer` line and at least one `[MOE-EXEC] summary` (was: = 48 layer lines at the first ubatch and one summary: only layers with host experts print, 24 on this tree, and `llama-bench` prints one summary per context, two for `-p 512,2048`; see the amendment) |
 | Q_pp_cpu | same with `GGML_SYCL_MOE_EXEC=cpu` | the before-number (13.5-14.4 at `-ub 256`); recorded, not gated |
 | Q_tok | `llama-completion -m $Q -f scripts/sycl-moe-exec-prompts/code-2k.txt -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4` | md5 of the output |
 | Q_tok_cpu | same with `GGML_SYCL_MOE_EXEC=cpu`, two loads per arm | some auto md5 equals some cpu md5 and every auto output shares >= 64 bytes with its best cpu match (was: md5 equal to Q_tok; the greedy near-tie flips in both policies, see the amendment) |
@@ -1673,7 +1673,7 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
   the q0xu reference 38163/35565, because the cost-based KV room (llama.cpp-w013) demotes more experts at the default
   context.
 - Placement: the baselines section sits after the Correctness gates subsection and before the MMVQ section, because
-  inserting it before would re-parent that subsection. Its table is pending the lead's first run.
+  inserting it before would re-parent that subsection. Its table is run 2 at 8c44f3b3c, a record and not a baseline (the ring did not engage; see the section's Status).
 - `GO_pp` compares against 871 (5 %) and 32.0 (3 %; the plan's 33.7 contradicted the baselines document's B50 TG128
   of about 32), and master reads pp512 about 770 on the B50 (llama.cpp-zuze), so a pp512 within 15 % below 871 is that
   open regression, expected to FAIL until zuze lands, and the verdict names it.
@@ -1710,11 +1710,16 @@ steps otherwise stand.
 - Step 4: `verdicts_pass=11` needs the pp512 >= 500 and pp2048 >= 800 floors, which need the ring. On a tree where the
   ring does not engage, `Q_pp` fails its floors and says `ring_engaged=no`, so the failure names its cause. The floors
   are not lowered, and `Q_staged` reports NOT_EXERCISED. The gate exits 3, not 0, when no arm engaged the ring, even
-  if nothing failed. The Qwen md5 row is scored across two loads per arm on stdout only.
+  if nothing failed. The original "Q_tok md5 == Q_tok_cpu md5" is replaced: `Q_tok_cpu` is scored across two loads per
+  arm by common prefix (some auto md5 equals some cpu md5, and every auto output shares >= 64 bytes with its best
+  cpu match), because the greedy near-tie flips in both policies. `Q_tg` and `Q_noc` pass on the reference md5 or on
+  a flip that shares >= 128 bytes with the committed reference text.
 - Step 5: the number of `[MOE-EXEC] layer ... CPU (forced)` lines is the number of layers with host experts, not 48.
 - Step 6: the loan and the refill appear only when a reserve falls short and the loan is granted. The gate reports
   `loan_exercised` and `refill`, and `no` and `not_exercised` are the honest answer until llama.cpp-pu8v lands.
-- Observed success: the Qwen3.8 B70 targets (pp512 >= 500, pp2048 >= 800, tokens identical to the CPU arm) and the
-  loan and refill counts are owned by llama.cpp-bcre and llama.cpp-pu8v. Until they land, success is the gate
-  reporting `ring_engaged=no` with the neutral numbers, every GPT-OSS B50 arm (with zuze's pp512 caveat) and the
-  Mistral gate unchanged, and no kernel resets.
+- Observed success: the Qwen3.8 B70 targets (pp512 >= 500, pp2048 >= 800, tokens identical to the CPU arm or a
+  flip by the common-prefix rule) and the loan and refill counts are owned by llama.cpp-bcre and llama.cpp-pu8v.
+  Until they land, success is the gate reporting `ring_engaged=no` with the neutral numbers, the decode arms inside
+  their floors with the md5 as the reference or a flip and the place line recorded (not "unchanged"), every GPT-OSS
+  B50 arm (with zuze's pp512 caveat) and the Mistral gate unchanged, and no kernel resets. The baselines section
+  carries run 2 as a record, not as the first green table.
