@@ -526,6 +526,44 @@ int main() {
         }
     }
 
+    // 10. Per-expert entries: the batched executor resolves each expert's own cache entry, so its claim takes a
+    // planned layout only where those entries exist. A host-buffer weight (every default load) has one per expert in
+    // any planned layout, staged by the load-end preload. A device-buffer weight (GGML_SYCL_WEIGHTS_EVICTABLE=0) has
+    // them only on AOS, whose slices the upload publishes, because the upload reorders any other layout into one
+    // block over every expert. MXFP4 keeps the route it had, so it is never declined here.
+    const struct {
+        ggml_type        type;
+        ggml_layout_mode layout;
+        bool             device_buffer;
+        bool             want;
+        const char *     name;
+    } pp_entry_cases[] = {
+        { GGML_TYPE_Q8_0,   GGML_LAYOUT_SOA, false, true,  "Q8_0 SOA in a host buffer (preloaded per expert)" },
+        { GGML_TYPE_Q6_K,   GGML_LAYOUT_SOA, false, true,  "Q6_K SOA in a host buffer (preloaded per expert)" },
+        { GGML_TYPE_Q8_0,   GGML_LAYOUT_SOA, true,  false, "Q8_0 SOA in a device buffer (one block)"          },
+        { GGML_TYPE_Q6_K,   GGML_LAYOUT_SOA, true,  false, "Q6_K SOA in a device buffer (one block)"          },
+        { GGML_TYPE_Q4_K,   GGML_LAYOUT_SOA, true,  false, "Q4_K SOA in a device buffer (one block)"          },
+        { GGML_TYPE_Q6_K,   GGML_LAYOUT_AOS, true,  true,  "Q6_K AOS in a device buffer (published slices)"   },
+        { GGML_TYPE_IQ4_XS, GGML_LAYOUT_AOS, true,  true,  "IQ4_XS AOS in a device buffer (published slices)" },
+        { GGML_TYPE_MXFP4,  GGML_LAYOUT_SOA, true,  true,  "MXFP4 SOA in a device buffer (route unchanged)"   },
+    };
+
+    for (const auto & c : pp_entry_cases) {
+        if (moe_pp_batched_has_expert_entries(c.type, c.layout, c.device_buffer) != c.want) {
+            std::printf("FAIL: per-expert entries wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        for (const ggml_layout_mode layout : all_layouts()) {
+            if (!moe_pp_batched_has_expert_entries(static_cast<ggml_type>(t), layout, false)) {
+                std::printf("FAIL: a host-buffer weight is declined for type=%d layout=%d\n", t,
+                            static_cast<int>(layout));
+                ++failures;
+            }
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;

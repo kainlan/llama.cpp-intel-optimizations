@@ -80928,6 +80928,14 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     if (!planned) {
         return false;
     }
+    // The executor resolves each active expert's own cache entry, which a device-buffer weight
+    // (GGML_SYCL_WEIGHTS_EVICTABLE=0) has only on AOS: its upload reorders any other layout into one block over every
+    // expert. Claiming such a layout would advertise past what the cache holds and steer the prompt past the fused
+    // and legacy routes into an admission that refuses it (llama.cpp-348c).
+    const bool device_buffer = weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);
+    if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
+        return false;
+    }
     // Down never plans XMX_TILED, so the table's XMX_TILED entry (the WOQ arm's repack_mxfp4_xmx_tiled_to_woq, taken
     // only while GGML_SYCL_MOE_PP_WOQ is on) cannot widen down's route: only gate/up's. Without oneDNN the table
     // answers with neither knob, so XMX_TILED is never claimed there and a tiled op cannot fall through to the

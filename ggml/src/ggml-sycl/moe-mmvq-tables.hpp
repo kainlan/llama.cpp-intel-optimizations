@@ -326,6 +326,19 @@ inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
     return moe_pp_batched_f16_supports_layout(type, layout);
 }
 
+// Whether the cache holds one entry per expert of a `type` weight at `layout`, which the batched executor needs:
+// the retained prompt admission resolves each active expert's own entry before the executor runs. The claim
+// predicate asks this after the table, so the claim never takes a layout the cache does not hold per expert.
+//   - host buffer (device_buffer false; every default load, since GGML_SYCL_WEIGHTS_EVICTABLE defaults on): the
+//     load-end preload stages each device-planned expert in its planned layout, one entry per expert;
+//   - device buffer, AOS: the upload publishes one slice per expert (ggml_sycl_publish_backend_aos_expert_handles);
+//   - device buffer, any other layout: the upload reorders the whole tensor into one block over every expert, so
+//     no expert has an entry of its own and the admission refuses the op.
+// MXFP4 keeps the route it had before llama.cpp-348c, so it is not declined here.
+inline bool moe_pp_batched_has_expert_entries(enum ggml_type type, enum ggml_layout_mode layout, bool device_buffer) {
+    return type == GGML_TYPE_MXFP4 || !device_buffer || layout == GGML_LAYOUT_AOS;
+}
+
 // Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is traced
 // once per (device, cause) by its name (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1). The latch is a 32-bit
 // mask per device, so this enum must stay under 32 values.
