@@ -525,7 +525,17 @@ __TABLE__
   `llama.cpp-bcre` is decided, because the 10 % cap refuses the ring on both canonical models under
   whole-layer host placement. The gate does not read it from the `stream ring unavailable` WARN, because
   `auto` at default verbosity does not print that line. `Q_staged` then reports `NOT_EXERCISED`, which is
-  neither a pass nor a fail, and the gate's exit code is 3 rather than 0. Do not read it as green.
+  neither a pass nor a fail. The summary line says `ring_engaged_any=no` and the gate's exit code is 3 rather
+  than 0, even when `Q_pp` passed its floors and nothing failed. Do not read it as green.
+  `llama.cpp-pu8v` is the second reason the ring does not engage. A model that passes the cap (Qwen1.5 at a
+  33-35 % VRAM budget) finds the ring short and asks for a loan. At `5d0727255` the loan is accepted (41
+  triplets, 190 MiB) but the ring still cannot engage, because of a reclaim defect (`llama.cpp-6aj4`): only
+  190 of the 557 MiB it needs are lendable.
+- **`Q_staged`.** The executor prints its `[MOE-EXEC-TRACE] executor device` line for every dispatch,
+  resident layers included, and `staged=0` is correct for those. The arm scores only the layers the ring
+  served: a layer with a `[MOE-EXEC] layer N: ring` line is a host layer, and every `blk.N.*` dispatch of it
+  needs `staged` above 0 and `arm=f16`. It also needs a `[PP-MOE] ... arm=f16` line and zero
+  `[PP-MOE] refused`. `ring_layers=` and `ring_layer_dispatches=` in the verdict say how much it scored.
 - **`layers=` and `summary=`.** `Q_pp` needs at least one `[MOE-EXEC] layer N:` line and at least one summary.
   The layer count is the number of layers that have host experts under the chosen placement (24 on the
   3460 run, not the 48 the plan wrote), and `llama-bench` prints one summary per context, so `-p 512,2048`
@@ -537,8 +547,8 @@ __TABLE__
   given (`--place-ref-tg`, `--place-ref-noc`), which defaults to the q0xu run's values. `place=unscored`
   means the reference was disabled with `-`.
 - **`Q_pp_cpu`.** Recorded, not gated. It is the before-number, taken with `GGML_SYCL_MOE_EXEC=cpu`. The
-  q0xu gate measured it at 13.53, 13.54 and 14.36 tok/s for pp512 at `-ub 256`; at the auto micro-batch it
-  may read higher.
+  plan records the before-number from the q0xu gate as 13.5-14.4 tok/s for pp512 at `-ub 256`; at the auto
+  micro-batch it may read higher.
 - **`Q_tok_cpu` scores two loads per arm.** Qwen3.8 greedy decoding on the B70 flips from load to load (a
   near-tie, about one load in five to eight), so a single output per arm cannot tell a flip from a defect.
   `Q_tok`, `Q_tok_2`, `Q_tok_cpu_1` and `Q_tok_cpu` each load the model once and write stdout to its own
