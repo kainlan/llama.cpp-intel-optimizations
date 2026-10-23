@@ -482,6 +482,72 @@ rather than from their own logs.
 
 ---
 
+## MoE executor: Qwen3.8 B70 prefill and the GPT-OSS B50 control (2026-10, llama.cpp-36j0)
+
+The executor cost model and the prefill expert ring (epic `llama.cpp-36j0`) exist to move prompt
+processing for a MoE model with host-resident experts off the CPU. The case that motivated them is
+Qwen3.8-Flash-Next IQ3_XXS on the Arc Pro B70, where half the experts live on the host. This section
+is where the gate's first green table goes, and what it needs to be read correctly.
+
+**Status: the table below is pending.** It is filled from the first run of
+`scripts/sycl-moe-exec-gate.sh` that the lead makes on the merged tree (`llama.cpp-x6zo`). Until then
+no number in this section is a baseline, and none of the figures in the plan are.
+
+### Method
+
+- **Script.** `scripts/sycl-moe-exec-gate.sh <merge sha>`, run by the lead only, detached, one run at a
+  time, under `GPU.lock`, with the build in `build/` made from that sha. It refuses unless builders
+  (ninja plus icpx) are 0 and the host has settled (`Shmem` under 30 GB, `MemAvailable` over 150 GB),
+  and it samples both before every arm and 5 s after it. The log ends `verdicts_pass=N GATE_DONE`.
+- **Repeats and spread.** Every `llama-bench` arm uses `-r 3`. A cell is the mean of the three, with the
+  standard deviation `llama-bench` prints beside it (`stddev_ts`). Three repeats make a spread, not a
+  confidence interval, and the B70 token-generation axis is the noisy one (see "Current baselines" above).
+- **Micro-batch.** The Qwen prefill arms pass no `-ub`: the auto micro-batch trial chooses it, and the
+  verdict line carries the value it chose (`ub=`). The table records that value. A number taken at a
+  different `-ub` is not comparable.
+- **Decode arms.** `Q_tg` and `Q_noc` are the q0xu `Q_c4096` and `Q_noc` arms verbatim (`code.txt`,
+  `-n 60 -ub 256 -t 4`), so their floors (11.0 and 9.5 tok/s) and output md5 (`25b7738a`) carry over. A
+  changed md5 there is a regression, not a new baseline.
+- **Driver and load.** Driver `__DRIVER__` (compute-runtime 26.31, or 26.35 with
+  `GGML_SYCL_MMQ_ESIMD=OFF`, per the plan's end-to-end section). Ambient host load `__LOAD__`, recorded
+  by the gate before each arm and never deferred for a quiet host. Builders are 0 for every arm.
+- **Tuning cache.** The gate does not redirect `GGML_SYCL_TUNING_CACHE_DIR` unless `--tuning-dir` is
+  given, so a run writes the real cache, including the H2D rate the executor reads.
+
+### Table
+
+__TABLE__
+
+### How to read the verdict fields
+
+- **`ring_engaged=no`.** The ring was refused for this run (`llama.cpp-bcre`: the 10 % cap refuses it on
+  both canonical models under whole-layer host placement). `Q_staged` then reports `NOT_EXERCISED`, which
+  is neither a pass nor a fail, and the gate's exit code is 3 rather than 0. Do not read it as green.
+- **`loan_exercised=no` and `refill=not_exercised`.** Nothing lent experts to the ring in that arm, so the
+  "re-admitted equals lent" check had nothing to count. Production only originates a loan at a short
+  reserve under `auto` (`llama.cpp-3460`), and the loan can still be refused (`llama.cpp-pu8v`).
+- **`place=unchanged`.** The `MoE experts: N on device, M on host` line equals the reference the gate was
+  given (`--place-ref-tg`, `--place-ref-noc`), which defaults to the q0xu run's values. `place=unscored`
+  means the reference was disabled with `-`.
+- **`Q_pp_cpu` and `Q_tok`.** Recorded, not gated. `Q_pp_cpu` is the before-number, taken with
+  `GGML_SYCL_MOE_EXEC=cpu`. The q0xu gate measured it at 13.53, 13.54 and 14.36 tok/s for pp512 at
+  `-ub 256`; at the auto micro-batch it may read higher.
+
+### Caveats
+
+- **The GPT-OSS B50 control compares against 871 / 33.7.** `GO_pp` fails a pp512 outside 5 % of 871 and a
+  tg128 outside 2 % of 33.7. Master already reads pp512 about 770 on the B50 (`llama.cpp-zuze`), so a low
+  `GO_pp` pp512 is that open regression until it is bisected, not this plan. Its decode and count gates are
+  unaffected.
+- **`llama-bench` has no `-c`.** Its context is `n_prompt + n_gen`, so `GO_pp` runs at 640, not at the
+  `-c 4096` the plan's table wrote.
+- **Cold load.** The Qwen model is about 70 GB read from `/models`; a cold first arm takes minutes and
+  every Qwen arm carries `timeout 900`.
+- **The numbers are this build, on this host's drivers and load.** A table from another driver, card
+  pairing or load is not a baseline for this one.
+
+---
+
 ## The production TG path is MMVQ with q8_1 activations — not DMMV
 
 **For a batch=1 quantized `MUL_MAT` whose weight resolved to a non-AoS layout, a
