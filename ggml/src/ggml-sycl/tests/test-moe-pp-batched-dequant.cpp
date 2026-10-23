@@ -1,8 +1,12 @@
 // Live check of the type-keyed batched oneDNN MoE prompt executor (llama.cpp-348c).
 //
-// For each expert type below, one MUL_MAT_ID prompt op runs on a planned model whose experts are all resident on the
-// pinned card in AOS: test-backend-ops' MUL_MAT_ID shape (32 experts, 4 used, k 2048, m 768) at 64 and 300 tokens.
-// The result is compared with the CPU backend at NMSE <= 5e-4, and the log must show the executor ran:
+// For each expert type below, one MUL_MAT_ID prompt op runs on a planned model loaded the way libllama loads one:
+// the three expert tensors sit in the card's SYCL host buffer type, each is registered (weight identity, host weight,
+// usage) while the load is open, and all are filled before it commits, so the commit's preload materializes every
+// expert on the pinned card in the layout the planner chose for that type. On the B50 at this shape that is SOA for
+// Q8_0 and Q6_K and AOS for the rest. The shape is test-backend-ops' MUL_MAT_ID (32 experts, 4 used, k 2048, m 768),
+// run at 64 and 300 tokens. The result is compared with the CPU backend at NMSE <= 5e-4, and the log must show the
+// executor ran:
 //   * the [PP-MOE] line, once per (device, type), the first time the type-keyed arm runs;
 //   * one [MOE-PP-ONEDNN-F16-BATCHED] success line per case (GGML_SYCL_MOE_ROUTE_LOG=1, set below);
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
@@ -12,9 +16,14 @@
 // WOQ arm, about a quarter of an f16 slot. Only the backend's plan-time widening of the weight slot for the types
 // the f16 arm takes lets these ops fit, so a missing widening shows as the unplanned-scratch refusal.
 //
+// The weights are not uploaded into a device buffer, because that is not how a model loads by default
+// (GGML_SYCL_WEIGHTS_EVICTABLE is on): a device-buffer upload reorders an SOA type over the whole tensor and publishes
+// no per-expert records for it, so the prompt route finds no expert to resolve.
+//
 // Every case runs, and each prints one CASE line naming what it saw. The process exits 1 if any case failed, 77 when
 // there is no SYCL GPU. Pin one card (the registration selects level_zero:1, the B50).
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
@@ -96,6 +105,20 @@ void log_callback(ggml_log_level level, const char * text, void * user_data) {
     std::fputs(text, stderr);
 }
 
+// One expert tensor's quantized bytes: k_experts experts of k_out rows of k_in values.
+std::vector<uint8_t> make_weights(ggml_type type, std::mt19937 & rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float>                    weight_f32(size_t(k_experts) * k_out * k_in);
+    for (float & v : weight_f32) {
+        v = 0.5f * dist(rng);
+    }
+    std::vector<uint8_t> bytes(ggml_row_size(type, k_in) * k_out * k_experts);
+    const size_t         written =
+        ggml_quantize_chunk(type, weight_f32.data(), bytes.data(), 0, int64_t(k_experts) * k_out, k_in, nullptr);
+    require(written == bytes.size(), std::string("quantize wrote a short buffer for ") + ggml_type_name(type));
+    return bytes;
+}
+
 // One planned model: its three expert tensors share one shape, so the gate tensor the cases run is representative.
 // The PP MoE ring fields are what libllama computes for this shape with GGML_SYCL_MOE_PP_WOQ at its default (on).
 struct expert_inventory {
@@ -137,16 +160,21 @@ struct expert_inventory {
     }
 };
 
-// The model lifecycle a real load drives, through the public entry points: stage the inventory plan, commit the
-// load, activate the plan, and bind an execution context and the runtime context to a backend on the pinned card.
+// The model lifecycle a real load drives, through the public entry points: stage the inventory plan, load the
+// weights, commit the load (its preload materializes the experts), activate the plan, and bind an execution context
+// and the runtime context to a backend on the pinned card.
 struct lifecycle_fixture {
     ggml_backend_t            backend = nullptr;
     ggml_sycl_load_txn        load{};
     bool                      load_open = false;
     ggml_sycl_model_token     model{};
     ggml_sycl_exec_context_id context{};
+    ggml_context *            weight_ctx    = nullptr;
+    ggml_backend_buffer_t     weight_buffer = nullptr;
+    ggml_tensor *             gate          = nullptr;  // the loaded expert tensor every case runs
+    std::vector<uint8_t>      gate_bytes;               // its quantized bytes, for the CPU reference
 
-    explicit lifecycle_fixture(ggml_type type) {
+    lifecycle_fixture(ggml_type type, std::mt19937 & rng) {
         try {
             require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
             load_open = true;
@@ -158,6 +186,7 @@ struct lifecycle_fixture {
             // lookup cannot observe a transient context that was cleared.
             backend = ggml_backend_sycl_init(0);
             require(backend != nullptr, "ggml_backend_sycl_init(0) returned null");
+            load_weights(type, rng);
             const auto commit = ggml_backend_sycl_model_load_end(load, true, &model);
             if (commit != GGML_SYCL_LIFECYCLE_BUSY) {
                 load_open = false;
@@ -179,6 +208,40 @@ struct lifecycle_fixture {
         }
     }
 
+    // What libllama's loader does for each weight, in its order: create the tensor and register its identity, its
+    // host-weight row and its usage while the load is open (register_sycl_tensor_metadata), allocate the tensors in
+    // the device's SYCL host buffer type, then fill them.
+    void load_weights(ggml_type type, std::mt19937 & rng) {
+        ggml_init_params params = { 3 * ggml_tensor_overhead(), nullptr, true };
+        weight_ctx              = ggml_init(params);
+        require(weight_ctx != nullptr, "ggml_init for the weights failed");
+        ggml_backend_dev_t dev        = ggml_backend_get_device(backend);
+        ggml_tensor *      tensors[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            tensors[i] = ggml_new_tensor_3d(weight_ctx, type, k_in, k_out, k_experts);
+            ggml_set_name(tensors[i], k_tensor_names[i]);
+            const size_t nbytes = ggml_nbytes(tensors[i]);
+            ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
+            ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
+            require(ggml_backend_sycl_try_register_weight_usage(k_tensor_names[i],
+                                                                GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
+                    std::string("usage registration refused for ") + k_tensor_names[i]);
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
+        require(buft != nullptr, "no SYCL host buffer type for the pinned card");
+        weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
+        require(weight_buffer != nullptr, "host weight buffer allocation failed");
+        ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (int i = 0; i < 3; ++i) {
+            std::vector<uint8_t> bytes = make_weights(type, rng);
+            ggml_backend_tensor_set(tensors[i], bytes.data(), 0, bytes.size());
+            if (i == 0) {
+                gate_bytes = std::move(bytes);
+            }
+        }
+        gate = tensors[0];
+    }
+
     void cleanup() noexcept {
         ggml_sycl_exec_drain_ticket             ticket{};
         ggml_sycl_exec_control_host_alloc_batch batch{};
@@ -190,6 +253,16 @@ struct lifecycle_fixture {
             (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
         }
         context = {};
+        // libllama frees the model's buffers before it reports the model unloaded (llama_model's destructor).
+        if (weight_buffer) {
+            ggml_backend_buffer_free(weight_buffer);
+            weight_buffer = nullptr;
+        }
+        if (weight_ctx) {
+            ggml_free(weight_ctx);
+            weight_ctx = nullptr;
+        }
+        gate = nullptr;
         if (model.model_id) {
             (void) ggml_backend_sycl_model_unloaded_token(model);
             model = {};
@@ -222,22 +295,13 @@ struct case_data {
     ggml_type            type;
     int                  n_tokens;
     int                  ne11;  // 1: the activation broadcasts to every used expert (gate/up); k_used: one row each
-    std::vector<uint8_t> weights;
     std::vector<float>   input;
     std::vector<int32_t> ids;
 };
 
 case_data make_case(ggml_type type, int n_tokens, int ne11, std::mt19937 & rng) {
-    case_data                             c{ type, n_tokens, ne11, {}, {}, {} };
+    case_data                             c{ type, n_tokens, ne11, {}, {} };
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float>                    weight_f32(size_t(k_experts) * k_out * k_in);
-    for (float & v : weight_f32) {
-        v = 0.5f * dist(rng);
-    }
-    c.weights.resize(ggml_row_size(type, k_in) * k_out * k_experts);
-    const size_t written =
-        ggml_quantize_chunk(type, weight_f32.data(), c.weights.data(), 0, int64_t(k_experts) * k_out, k_in, nullptr);
-    require(written == c.weights.size(), std::string("quantize wrote a short buffer for ") + ggml_type_name(type));
     c.input.resize(size_t(k_in) * ne11 * n_tokens);
     for (float & v : c.input) {
         v = dist(rng);
@@ -253,30 +317,38 @@ case_data make_case(ggml_type type, int n_tokens, int ne11, std::mt19937 & rng) 
     return c;
 }
 
-// Builds MUL_MAT_ID over the case's data on `backend` and computes it. Fills `out` on success.
-ggml_status run_backend(ggml_backend_t backend, const case_data & c, bool sycl, std::vector<float> & out) {
+// Builds MUL_MAT_ID over the case's input and ids on `backend` and computes it. Fills `out` on success. The SYCL run
+// passes the fixture's loaded gate tensor as `loaded_weights`; the CPU reference passes null, and `weight_bytes` go
+// into a fresh tensor on the CPU backend.
+ggml_status run_backend(ggml_backend_t               backend,
+                        ggml_tensor *                loaded_weights,
+                        const std::vector<uint8_t> & weight_bytes,
+                        const case_data &            c,
+                        std::vector<float> &         out) {
     ggml_init_params                                    params = { 1024 * 1024, nullptr, true };
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), &ggml_free);
     require(ctx != nullptr, "ggml_init failed");
-    ggml_tensor * weights = ggml_new_tensor_3d(ctx.get(), c.type, k_in, k_out, k_experts);
-    ggml_tensor * input   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k_in, c.ne11, c.n_tokens);
-    ggml_tensor * ids     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k_used, c.n_tokens);
-    ggml_set_name(weights, k_tensor_names[0]);
+    ggml_tensor * weights = loaded_weights;
+    if (!weights) {
+        weights = ggml_new_tensor_3d(ctx.get(), c.type, k_in, k_out, k_experts);
+        ggml_set_name(weights, k_tensor_names[0]);
+    }
+    ggml_tensor * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k_in, c.ne11, c.n_tokens);
+    ggml_tensor * ids   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k_used, c.n_tokens);
     ggml_set_name(input, "moe_input");
     ggml_set_name(ids, "moe_ids");
     ggml_tensor * dst = ggml_mul_mat_id(ctx.get(), weights, input, ids);
     ggml_set_name(dst, "moe_out");
-    if (sycl) {
-        ggml_backend_sycl_register_weight_usage(k_tensor_names[0], GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
-    }
 
     ggml_backend_buffer_type_t         buft    = ggml_backend_get_default_buffer_type(backend);
     std::vector<ggml_backend_buffer_t> buffers = {
-        alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS),
         alloc_tensor(buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
         alloc_tensor(buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
         alloc_tensor(buft, dst, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
     };
+    if (!loaded_weights) {
+        buffers.push_back(alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS));
+    }
 
     struct buffers_guard {
         std::vector<ggml_backend_buffer_t> & b;
@@ -293,7 +365,9 @@ ggml_status run_backend(ggml_backend_t backend, const case_data & c, bool sycl, 
     for (ggml_backend_buffer_t buffer : buffers) {
         require(buffer != nullptr, "tensor buffer allocation failed");
     }
-    ggml_backend_tensor_set(weights, c.weights.data(), 0, c.weights.size());
+    if (!loaded_weights) {
+        ggml_backend_tensor_set(weights, weight_bytes.data(), 0, weight_bytes.size());
+    }
     ggml_backend_tensor_set(input, c.input.data(), 0, c.input.size() * sizeof(float));
     ggml_backend_tensor_set(ids, c.ids.data(), 0, c.ids.size() * sizeof(int32_t));
 
@@ -324,11 +398,12 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c)
     const std::string type_field = "type=" + type_name + " ";
 
     std::vector<float> ref;
-    require(run_backend(cpu, c, false, ref) == GGML_STATUS_SUCCESS, "CPU reference compute failed for " + type_name);
+    require(run_backend(cpu, nullptr, life.gate_bytes, c, ref) == GGML_STATUS_SUCCESS,
+            "CPU reference compute failed for " + type_name);
 
     const size_t       from = g_log.mark();
     std::vector<float> got;
-    const ggml_status  status    = run_backend(life.backend, c, true, got);
+    const ggml_status  status    = run_backend(life.backend, life.gate, life.gate_bytes, c, got);
     const double       err       = status == GGML_STATUS_SUCCESS ? nmse(ref, got) : NAN;
     const size_t       pp_moe    = g_log.count_since(0, { "[PP-MOE] device=", type_field.c_str() });
     const size_t       batched   = g_log.count_since(from, { "[MOE-PP-ONEDNN-F16-BATCHED] tensor=" });
@@ -379,12 +454,13 @@ int main() {
             ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr), &ggml_backend_free);
         require(cpu != nullptr, "CPU backend init failed");
 
-        const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,  GGML_TYPE_Q4_K,
-                                    GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS };
+        // The eight expert types the owner's ruling names (llama.cpp-348c); each must run the executor.
+        const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,    GGML_TYPE_Q4_K,  GGML_TYPE_Q5_K,
+                                    GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS };
         std::mt19937    rng(348);
         int             failed = 0;
         for (ggml_type type : types) {
-            lifecycle_fixture life(type);
+            lifecycle_fixture life(type, rng);
             if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng))) {
                 ++failed;
             }
