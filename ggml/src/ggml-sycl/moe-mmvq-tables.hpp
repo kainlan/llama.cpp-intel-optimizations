@@ -261,20 +261,27 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 //
 // The f16 arm admits a (type, layout) pair only where a kernel decodes one expert of that layout to f16,
 // and the executor picks that kernel from the layout the expert is loaded in. Every listed type is admitted
-// on AOS. Q4_0, Q8_0, Q4_K and Q6_K are admitted on SOA too, because the planner materializes experts SOA
-// (the B50 loads Q8_0 and Q6_K that way), and each SOA plane is flat over one expert's blocks: Q4_0, Q4_K
-// and Q6_K decode it with ggml_get_to_fp16_sycl_for_layout's reorder kernels, Q8_0 with
-// dequantize_row_q8_0_soa_to_fp16_rowmajor, since that table answers Q8_0 with the AOS kernel for every
-// layout. MXFP4's f16 arm has its own SOA row-major dequant and no AOS one in this executor. Q1_0 and
-// NVFP4 have converters but are left out, because no Q1_0 or NVFP4 MoE weight has been measured here.
+// on AOS. Q4_0, Q8_0, Q4_K and Q6_K are admitted on SOA too, because each SOA plane is flat over one
+// expert's blocks: Q4_0, Q4_K and Q6_K decode it with ggml_get_to_fp16_sycl_for_layout's reorder kernels,
+// Q8_0 with dequantize_row_q8_0_soa_to_fp16_rowmajor, since that table answers Q8_0 with the AOS kernel for
+// every layout. The planner materializes Q8_0 experts SOA on an XMX card and Q6_K experts SOA (the B50
+// loads both that way). It plans Q4_0 and Q4_K experts AOS (layout_policy::get_optimal, common.hpp) and no
+// knob changes that, so the Q4_0 and Q4_K SOA rows have no device evidence: nothing reaches them until a plan
+// chooses SOA for those types. MXFP4's f16 arm has its own SOA row-major dequant and no AOS one in this
+// executor. Q1_0 and NVFP4 have converters but are left out, because no Q1_0 or NVFP4 MoE weight has been
+// measured here.
 // IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
 //
 // The executor's candidate gate and its claim predicate (ggml_sycl_moe_pp_onednn_batched_claims_tensor)
-// both ask moe_pp_batched_supports_layout and nothing else about the type. The plan sizes the f16 weight
-// slot by asking the same question at AOS. That is enough because every non-MXFP4 type taken in any layout
-// is taken on AOS and the slot does not depend on the layout, so a type the arm takes always has its slot
-// planned; with GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 no such slot is planned at all.
+// both ask moe_pp_batched_supports_layout about the type. The claim then also asks
+// moe_pp_batched_has_expert_entries (below), which declines a non-AOS layout of a weight in a device buffer:
+// under GGML_SYCL_WEIGHTS_EVICTABLE=0 the SOA rows here are therefore never claimed, since that upload holds
+// no per-expert entry at SOA, and such a weight keeps the routes it had before. The plan sizes the f16 weight
+// slot by asking moe_pp_batched_supports_layout at AOS. That is enough because every non-MXFP4 type taken in
+// any layout is taken on AOS and the slot does not depend on the layout, so a type the arm takes always has
+// its slot planned; with GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 or GGML_SYCL_MOE_PP_ONEDNN_F16=0 no such slot is
+// planned at all.
 inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_MXFP4:

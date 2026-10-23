@@ -80914,6 +80914,9 @@ static bool ggml_sycl_moe_pp_batched_takes_type(ggml_type type) {
 // Whether supports_op may admit a MUL_MAT_ID whose expert type has no MMID kernel (llama.cpp-348c): only a prompt
 // (more than one token per expert row) whose weight the batched prompt executor claims on this device, which needs a
 // published plan. Decode, and every op without a plan (test-backend-ops' graphs), stay refused to the CPU backend.
+// The claim reads its planned layout through ggml_sycl_moe_tensor_plan_primary_layout, which answers only when every
+// expert of the weight is planned on `device`. So a hybrid layer (an expert on the host or another device) is never
+// admitted: the hybrid route would run it there, and these types have no MMVQ-ID kernel for that route.
 static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int device) {
     return op != nullptr && op->src[0] != nullptr && op->src[2] != nullptr && op->src[2]->ne[1] > 1 &&
            ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, op->src[0], device);
@@ -80966,7 +80969,10 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     // The executor resolves each active expert's own cache entry, which a device-buffer weight
     // (GGML_SYCL_WEIGHTS_EVICTABLE=0) has only on AOS: its upload reorders any other layout into one block over every
     // expert. Claiming such a layout would advertise past what the cache holds and steer the prompt past the fused
-    // and legacy routes into an admission that refuses it (llama.cpp-348c).
+    // and legacy routes into an admission that refuses it (llama.cpp-348c). Declining keeps that weight on the routes
+    // it had before; it does not make this executor serve it. That gap is open, pending an owner decision: serving it
+    // needs per-expert entries for a device-buffer SOA weight (publish per-expert SOA slices, or reorder per expert),
+    // and neither is done here.
     const bool device_buffer = weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);
     if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
         return false;
