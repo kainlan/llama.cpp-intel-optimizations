@@ -36,8 +36,10 @@ dequant. These claims pin that shape:
       has an MMVQ-ID kernel changes kernel), and MUL_MAT_ID admission takes a type with no MMVQ-ID kernel only for
       a prompt the executor claims, which is only a layer whose every expert is planned on this device: the claim's
       planned-layout lookup refuses a layer with a host or other-device expert, so a hybrid layer is never admitted;
-  (i) the planned weight slot is widened at plan time from the f16 table, so the executor never needs an
-      unplanned allocation;
+  (i) the f16 arm runs in the weight slot the inventory planned, never a wider one: the backend keeps the planned
+      slot size as the inventory gave it (no plan-time widening, which displaced routed experts with no cost
+      decision), the arm asks the admission for one f16 expert, and it groups the active experts by what the slot it
+      claimed holds;
   (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, spelled once, read once, consulted by the support helper,
       dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor, registered in
       sycl_env_settings[] so the non-default report names it, and catalogued;
@@ -48,8 +50,10 @@ dequant. These claims pin that shape:
   (l) GGML_SYCL_MOE_PP_ONEDNN_F16 is read once, by a common.hpp accessor, and the executor's support helper asks it,
       so with it at 0 the claim takes nothing the executor would then decline, and the executor names the knob as
       route-off rather than as a candidate miss; the catalog has its row;
-  (m) the plan-time widening of the ring's weight slot is logged once per load (the early and the late plan of one
-      load both populate the inventory), and no unread ring total is kept beside the unified cache's own;
+  (m) the f16 arm's groups alternate between the slot's two halves and chain through events: before a group
+      dequantizes into a half, the stream waits, on the device, for the GEMMs that last read that half, every GEMM
+      is recorded as a reader of its half, the dequant and the GEMM address the same half, and the phase loop holds
+      no host wait;
   (n) the dequant profiler label's name comes from a table built once per type, never from a string the dispatch
       builds;
   (o) every type the f16 table takes runs in the device test (test-moe-pp-batched-dequant.cpp's k_types), or is named
@@ -57,7 +61,11 @@ dequant. These claims pin that shape:
       ggml_quantize_requires_imatrix names, since the fixture quantizes with no importance matrix;
   (p) the device test counts each case's own lines (a [PP-MOE] line in the type's first case only, once per run, and
       a success line per case), and its cases fit the backend's per-process cap on the success line, whose value
-      the test copies.
+      the test copies;
+  (q) one debugging knob, GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX, caps the experts in one f16 group: spelled once,
+      read once into a static, registered in sycl_env_settings[] with the report's integer set from the accessor,
+      and catalogued; the success line names the group count, and the device test sets the knob and requires at
+      least three groups in every case.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -114,6 +122,11 @@ WARN_CONDITION = ("(pp_f16_batched_trace || moe_pp_batched_refusal_after_claim(r
                   "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)")
 # Types the f16 table takes that the device test does not run, each with its reason. The fixture quantizes its
 # weights with no importance matrix, so these three are the whole list.
+GROUP_KNOB = "GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX"
+GROUP_KNOB_CONST = "GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV"
+# The f16 arm's phase loop, from its head to the barrier on every GEMM event that ends it.
+PHASE_LOOP_HEAD = "for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {"
+PHASE_LOOP_END = "stream->ext_oneapi_submit_barrier(gemm_events);"
 UNTESTED_ON_DEVICE = {
     "GGML_TYPE_IQ1_S": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
     "GGML_TYPE_IQ2_XXS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
@@ -670,23 +683,33 @@ def claim_h_capability(s):
     return fails
 
 
-def claim_i_sizing(s):
+def claim_i_slot(s):
     fails = []
     sycl = s["sycl"]
-    body = one_definition(sycl, "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes")
-    if body is None:
-        return ["ggml_sycl_moe_pp_batched_f16_weight_slot_bytes is not defined exactly once"]
-    # The sizing asks the executor's own predicate on AOS (one fact, one source): the f16 arm's entries for every
-    # type but MXFP4, under the same knobs the dispatch reads.
-    if "ggml_sycl_moe_pp_batched_takes_layout(tensor.type, GGML_LAYOUT_AOS)" not in body:
-        fails.append("the f16 slot sizing does not ask the executor's predicate which AOS experts it takes")
-    if "n_expert" not in body:
-        fails.append("the f16 slot sizing does not size for every expert (n_expert)")
-    if "sizeof(sycl::half)" not in body:
-        fails.append("the f16 slot sizing does not count f16 bytes")
-    assign = statement(sycl, "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(") or ""
-    if "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(" not in assign:
-        fails.append("the planned weight slot is not widened by the f16 slot sizing")
+    for gone in ("ggml_sycl_moe_pp_batched_f16_weight_slot_bytes", "ggml_sycl_pp_moe_widened_first",
+                 '"[SYCL-PLAN] PP MoE oneDNN batched weight slot widened',
+                 "g_tensor_inventory_pp_moe_onednn_scratch_bytes"):
+        if gone in sycl:
+            fails.append(f"{gone} is still in ggml-sycl.cpp: the planned weight slot must not be widened")
+    # Every write to the planned weight slot's global is a reset or the inventory's own value.
+    writes = re.finditer(r"\bg_tensor_inventory_pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", sycl)
+    for m in writes:
+        if m.group(1) != "=" or m.group(2).strip() not in ("0", "inventory->pp_moe_onednn_weight_slot_bytes"):
+            fails.append(f"the planned weight slot is written as `{m.group(0)}`, not reset or taken from the inventory")
+    lam = lambda_body(sycl) or ""
+    one = "checked_mul(weight_elems, sizeof(sycl::half), f16_expert_bytes)"
+    if one not in lam or "weight_bytes = f16_expert_bytes;" not in lam:
+        fails.append("the f16 arm does not ask the admission for one f16 expert")
+    if re.search(r"checked_mul\(weight_elems, active_count\b", lam):
+        fails.append("the f16 arm still asks the admission for every active expert at once")
+    plan = "moe_pp_batched_f16_plan_groups(reserved.weight_size, f16_expert_bytes, active_count, "
+    at = lam.find(plan)
+    if at < 0:
+        fails.append("the f16 arm does not group its experts by what the slot it claimed holds")
+    elif at < lam.find("batched_scratch_claim.activate("):
+        fails.append("the f16 arm plans its groups before it has claimed a slot")
+    elif "ggml_sycl_moe_pp_f16_group_experts_max()" not in (statement(lam, None, start=at) or ""):
+        fails.append(f"the group plan does not take the {GROUP_KNOB} cap")
     return fails
 
 
@@ -767,25 +790,39 @@ def claim_l_f16_knob(s):
     return fails
 
 
-def claim_m_widening(s):
+def claim_m_chain(s):
     fails = []
-    sycl = s["sycl"]
-    literal = '"[SYCL-PLAN] PP MoE oneDNN batched weight slot widened'
-    if sycl.count(literal) != 1:
-        return [f"{literal} appears {sycl.count(literal)} times in ggml-sycl.cpp, want 1"]
-    cond = enclosing_if_condition(sycl, sycl.find(literal)) or ""
-    if "&& ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, " not in cond or "||" in cond:
-        fails.append("the widened line is not guarded by the per-load latch, so each of a load's two plans logs it")
-    latch = one_definition(sycl, "ggml_sycl_pp_moe_widened_first")
-    if latch is None:
-        fails.append("ggml_sycl_pp_moe_widened_first is not defined exactly once")
-    else:
-        if "last.owner == owner && last.from_bytes == from_bytes && last.to_bytes == to_bytes" not in latch:
-            fails.append("the widening latch does not key on the load owner and both slot sizes")
-        if "owner.generation == 0" not in latch:
-            fails.append("the widening latch latches a load no staged owner holds")
-    if "g_tensor_inventory_pp_moe_onednn_scratch_bytes" in sycl:
-        fails.append("g_tensor_inventory_pp_moe_onednn_scratch_bytes is kept although nothing reads it")
+    lam = lambda_body(s["sycl"]) or ""
+    start = lam.find(PHASE_LOOP_HEAD)
+    end = lam.find(PHASE_LOOP_END)
+    if start < 0 or end < start:
+        return ["the lambda has no phase loop ending in the barrier on every GEMM event"]
+    loop = lam[start:end]
+    half = "sycl::half * phase_weights = batched_weights + phase.buffer * half_elems;"
+    if half not in loop:
+        fails.append("a phase does not address its own half of the f16 slot")
+    wait = ("if (!half_readers[phase.buffer].empty()) { stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]); "
+            "half_readers[phase.buffer].clear(); }")
+    dequant = "dequant_expert_f16(active_experts[i], phase_weights + (i - phase.begin) * weight_elems);"
+    at_wait, at_dequant = loop.find(wait), loop.find(dequant)
+    if at_wait < 0:
+        fails.append("a group does not wait, on the device, for the GEMMs that last read its half")
+    if at_dequant < 0:
+        fails.append("a group does not dequantize its experts into its own half")
+    elif at_wait > at_dequant:
+        fails.append("a group dequantizes into its half before it waits for that half's readers")
+    if "phase_weights + (lo - phase.begin) * weight_elems" not in loop:
+        fails.append("a phase's GEMM does not read the half its experts were dequantized into")
+    if "half_readers[phase.buffer].push_back(*group_event);" not in loop:
+        fails.append("a GEMM is not recorded as a reader of its half, so the next group to use it does not wait")
+    for host_wait in (".wait(", "wait_and_throw", "::wait("):
+        if host_wait in loop:
+            fails.append(f"the phase loop holds a host wait ({host_wait!r})")
+    helper = one_definition(s["tables"], "moe_pp_batched_f16_plan_groups")
+    if helper is None:
+        fails.append("moe_pp_batched_f16_plan_groups is not defined exactly once in moe-mmvq-tables.hpp")
+    elif "plan.buffers = fit >= 2 ? 2 : 1;" not in helper:
+        fails.append("the group plan does not split a slot that holds two experts into two halves")
     return fails
 
 
@@ -861,6 +898,41 @@ def claim_p_device_counts(s):
     return fails
 
 
+def claim_q_group_knob(s):
+    fails = []
+    literal = f'"{GROUP_KNOB}"'
+    total = sum(stripped.count(literal) for stripped, _ in backend_texts())
+    if total != 1:
+        fails.append(f"{literal} appears {total} times in the backend sources, want 1")
+    if f"static constexpr const char * {GROUP_KNOB_CONST} = {literal};" not in s["common"]:
+        fails.append(f"common.hpp does not spell the knob once as {GROUP_KNOB_CONST}")
+    body = one_definition(s["common"], "ggml_sycl_moe_pp_f16_group_experts_max")
+    if body is None or f"std::getenv({GROUP_KNOB_CONST})" not in body or "static const size_t" not in body:
+        fails.append("ggml_sycl_moe_pp_f16_group_experts_max does not read the knob once into a static")
+    elif "value < 1 || value > 1024" not in body:
+        fails.append("the knob does not reject a value outside 1 to 1024")
+    row = f"{{ {GROUP_KNOB_CONST}, &g_ggml_sycl_moe_pp_f16_group_experts_max, 0 }},"
+    if row not in s["sycl"]:
+        fails.append("sycl_env_settings[] has no row for the group knob, so the non-default report never names it")
+    report = ("g_ggml_sycl_moe_pp_f16_group_experts_max = "
+              "static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());")
+    if report not in s["sycl"]:
+        fails.append("the group knob's report integer is not set from the accessor")
+    if f"| `{GROUP_KNOB}=<1..1024>` |" not in s["catalog"]:
+        fails.append(f"docs/backend/sycl-env-vars.md has no `{GROUP_KNOB}=<1..1024>` row")
+    success = re.search(r'"\[MOE-PP-ONEDNN-F16-BATCHED\] tensor=[^;]*;', s["sycl"])
+    if not success or "groups=%zu" not in success.group(0) or "phases.size()" not in success.group(0):
+        fails.append("the batched success line does not name the number of groups (phases.size())")
+    test = s["device_test"]
+    if f'setenv("{GROUP_KNOB}", "3", 1);' not in test:
+        fails.append("the device test does not cap the f16 groups at three experts")
+    if "constexpr size_t k_min_groups = 3;" not in test or "groups < k_min_groups" not in test:
+        fails.append("the device test does not require at least three groups in every case")
+    if 'g_log.min_field_since(from, "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", "groups=")' not in test:
+        fails.append("the device test does not read the group count from the case's own success lines")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -870,14 +942,15 @@ CLAIMS = {
     "f": claim_f_first_run_line,
     "g": claim_g_labels,
     "h": claim_h_capability,
-    "i": claim_i_sizing,
+    "i": claim_i_slot,
     "j": claim_j_knob,
     "k": claim_k_expert_entries,
     "l": claim_l_f16_knob,
-    "m": claim_m_widening,
+    "m": claim_m_chain,
     "n": claim_n_dequant_label,
     "o": claim_o_device_coverage,
     "p": claim_p_device_counts,
+    "q": claim_q_group_knob,
 }
 
 
@@ -948,8 +1021,13 @@ MUTANTS = [
     ("h", "sycl", "->ne[1] > 1 && ggml_sycl_moe_pp_onednn_batched_claims_tensor(",
      "ggml_sycl_moe_pp_onednn_batched_claims_tensor("),
     ("h", "sycl", " && !ggml_sycl_moe_pp_batched_admits_op(op, device)) {", ") {"),
-    ("i", "sycl", "ggml_sycl_moe_pp_batched_f16_weight_slot_bytes(inventory))", "size_t(0))"),
-    ("i", "sycl", "ggml_sycl_moe_pp_batched_takes_layout(tensor.type, GGML_LAYOUT_AOS)", "true"),
+    # The widening back, the admission asked for every expert, and the groups sized from the request, not the slot.
+    ("i", "sycl", "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;",
+     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(inventory->pp_moe_onednn_weight_slot_bytes, "
+     "size_t(inventory->n_expert) << 20);"),
+    ("i", "sycl", "weight_bytes = f16_expert_bytes;", "weight_bytes = f16_expert_bytes * active_count;"),
+    ("i", "sycl", "moe_pp_batched_f16_plan_groups(reserved.weight_size, ",
+     "moe_pp_batched_f16_plan_groups(weight_bytes * active_count, "),
     ("j", "sycl", "ggml_sycl_moe_pp_f16_batched_aos_enabled()", "true"),
     ("j", "tables", "if (type != GGML_TYPE_MXFP4 && !aos_enabled)", "if (layout == GGML_LAYOUT_AOS && !aos_enabled)"),
     ("j", "common", "return env == nullptr || std::atoi(env) != 0; }(); return aos_enabled;",
@@ -971,9 +1049,13 @@ MUTANTS = [
     ("l", "sycl", " && ggml_sycl_moe_pp_onednn_f16_enabled();", ";"),
     ("l", "common", 'std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16"); return env == nullptr || std::atoi(env) != 0;',
      'std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16"); return env != nullptr && std::atoi(env) != 0;'),
-    ("m", "sycl", "&& ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, ",
-     "|| ggml_sycl_pp_moe_widened_first(ctx->device, plan_owner, "),
-    ("m", "sycl", "last.owner == owner && ", ""),
+    # The wait on the half's readers gone, made a host wait, or the readers never recorded; both halves one.
+    ("m", "sycl", "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);", ""),
+    ("m", "sycl", "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);",
+     "sycl::event::wait(half_readers[phase.buffer]);"),
+    ("m", "sycl", "half_readers[phase.buffer].push_back(*group_event);", ""),
+    ("m", "sycl", "batched_weights + phase.buffer * half_elems;", "batched_weights;"),
+    ("m", "tables", "plan.buffers = fit >= 2 ? 2 : 1;", "plan.buffers = 1;"),
     ("n", "sycl", "ggml_sycl_moe_pp_dequant_label(src0->type)",
      'std::string("moe.pp.dequant.") + ggml_type_name(src0->type)'),
     ("n", "sycl", "static const std::array<std::string, GGML_TYPE_COUNT> names = []() {",
@@ -989,9 +1071,15 @@ MUTANTS = [
     ("p", "sycl", "if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96)",
      "if (batched_log.fetch_add(1, std::memory_order_relaxed) < 64)"),
     ("p", "device_test", "static_assert(k_cases <= k_route_log_cap,", "static_assert(true,"),
-    ("m", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
+    ("i", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
      "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0; "
      "static size_t g_tensor_inventory_pp_moe_onednn_scratch_bytes = 0;"),
+    ("q", "common", "value < 1 || value > 1024", "value < 1"),
+    ("q", "sycl", f"{{ {GROUP_KNOB_CONST}, &g_ggml_sycl_moe_pp_f16_group_experts_max, 0 }},", ""),
+    ("q", "catalog", f"| `{GROUP_KNOB}=<1..1024>` |", f"| `{GROUP_KNOB}` |"),
+    ("q", "sycl", "out=%.1fMB groups=%zu", "out=%.1fMB phases=%zu"),
+    ("q", "device_test", f'setenv("{GROUP_KNOB}", "3", 1);', ""),
+    ("q", "device_test", "groups < k_min_groups", "groups < 1"),
 ]
 
 
