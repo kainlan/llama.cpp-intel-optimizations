@@ -31968,9 +31968,10 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
 // leaf mutex, which only brackets plain field accesses (no call is made while it is held): the probe's once-guard
 // (ggml_sycl_h2d_pinned_resolved), its store, and the one reader the cost model uses (ggml_sycl_h2d_probed_gbps).
 // The mutex orders a writer against weigh. It does not serialise two probes: the guard's check-then-act is safe
-// because the probe runs only inside load_end's body (g_sycl_abort_load_exit makes every other exit return before
-// it), and the L0 LOAD token serialises those bodies (g_load_end_bodies_running, a witness, checks it). No further
-// witness is added at the probe's entry: the preload that precedes it in the same exit already carries one.
+// because load_end's body is the only exit that reaches the probe (the two abort paths set g_sycl_abort_load_exit,
+// which makes the exit return before it), and that body's witness, g_load_end_bodies_running, is unconditional and
+// checks that no two bodies overlap. For that reason no witness is added at the probe's entry. The LOAD-token witness
+// in the preload that precedes the probe is conditional (early returns, global_plan != nullptr) and is not relied on.
 static std::mutex g_sycl_h2d_pinned_mutex;
 
 static bool ggml_sycl_h2d_pinned_resolved(const ggml_sycl_device_info & info, int dev) {
