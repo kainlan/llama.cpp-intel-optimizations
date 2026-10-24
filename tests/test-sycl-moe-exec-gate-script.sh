@@ -230,7 +230,7 @@ mkcsv "$WORK/pp-none.csv" 128:0:900:1:128
 out="$(score Q_pp --csv "$WORK/pp-none.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp a csv without the rows fails, never passes" "$out" "Q_pp=FAIL(no_pp512_row"
 
-# ---- Q_pp, the window ring (plan 2026-10-24 Task 6): windows/exposed/misses, bus-derived floors, the two new arms
+# ---- Q_pp, the window ring (plan 2026-10-24 Task 6): windows/exposed/misses, bus-derived floors, the new arm Q_pp_ub2048
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp engaged pass: the exact verdict line" "$out" \
     "Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0 trace_misses=0"
@@ -673,8 +673,9 @@ expect_rc "an unknown arm is a usage error" "$rc" 2
 
 # ---- the summary: ring_engaged_any and the exit code, scored from real verdict lines
 PASS_RING="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
-# A Q_pp PASS without the ring is unreachable since Task 6, but summarize() is a pure function of verdict lines and keeps
-# its ring_engaged_any=no / exit 3 rule for any ring arm that prints a PASS with ring_engaged=no: score that literal line.
+# A Q_pp PASS without the ring is unreachable since Task 6, but summarize() is a pure function of verdict lines
+# and keeps its ring_engaged_any=no / exit 3 rule for any ring arm that prints a PASS with ring_engaged=no: score that
+# literal line.
 PASS_NORING="Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no windows=0 exposed=0 misses=0"
 FAIL_LINE="$(score Q_pp --csv "$WORK/pp-fail.csv" --err "$WORK/pp-fail.err")"
 CTRL_PASS="GO_gate=PASS count=1 layer_lines=0"

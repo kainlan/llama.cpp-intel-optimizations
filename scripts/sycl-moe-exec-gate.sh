@@ -12,8 +12,8 @@
 # Arms (selector pinned in every arm; no -ngl anywhere; timeouts: the three Q_pp arms 1500 s, the other Qwen arms 900 s,
 # GO_gate and GO_noc 600 s, the Mistral arms 300 s; a run that hits its timeout exits 124 and one that has to be
 # killed exits 137, and every arm scores a non-zero rc as a FAIL naming it):
-#   Q_pp       llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v          B70  pp512 >= 200, pp2048 >= 500 (the bus-derived
-#              floors, see PP512_MIN), ring_engaged=yes, zero window misses, the window fields on every summary line,
+#   Q_pp       llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v          B70  pp512 >= 200, pp2048 >= 500
+#              (the bus-derived floors, see PP512_MIN), ring_engaged=yes, zero window misses, the window fields on every summary line,
 #              at least one distinct "[MOE-EXEC] layer N:" line (exactly --q-layers N when given), at least one
 #              "[MOE-EXEC] summary:" (llama-bench makes one context per -p value, so -p 512,2048 prints two),
 #              zero "[PP-MOE] refused".
@@ -26,8 +26,8 @@
 #              "stream ring unavailable" WARN: under auto at default verbosity that WARN is not printed at all
 #              (it needs GGML_SYCL_MOE_EXEC=ring or the trace), so its absence proves nothing (llama.cpp-bcre).
 #              loan_exercised=yes|no is a "[MOE-EXEC] loan device N: K triplets" line.
-#   Q_pp_ub2048  llama-bench -m $Q -ub 2048 -p 2048 -n 0 -r 3 -fa 1 -o csv -v       B70  pp2048 >= 500 only (no pp512 row),
-#              scored like Q_pp otherwise; the pp2048 floor's natural setting and llama.cpp-dfo0's measurement arm
+#   Q_pp_ub2048  llama-bench -m $Q -ub 2048 -p 2048 -n 0 -r 3 -fa 1 -o csv -v    B70
+#              pp2048 >= 500 only (no pp512 row), scored like Q_pp otherwise; the pp2048 floor's natural setting and llama.cpp-dfo0's measurement arm
 #   Q_pp_cpu   Q_pp with GGML_SYCL_MOE_EXEC=cpu                       B70  recorded, not gated (FAIL on rc != 0)
 #   Q_staged   llama-bench -p 512 -n 0 -r 1 -fa 1 -o csv -v, GGML_SYCL_MOE_EXEC_TRACE=1   B70
 #              the executor prints "[MOE-EXEC-TRACE] executor device D tensor=T experts=E staged=S arm=A" for EVERY
@@ -74,10 +74,9 @@
 #   resets     journalctl -k --since <gate start> | grep -icE
 #              'GT reset|guc_id|CAT error|Engine reset|exec queue reset' = 0
 #              (journalctl's own rc is kept: a failed journalctl or a missing journal file is a FAIL, never a clean log)
-# Duration: a complete run of all 16 arms takes about 55 minutes on this host with the ring off (run 2, of the original 15 arms,
-# 45 minutes; Q_pp_ub2048 adds about a Q_pp: Q_pp 9.5 min,
-# Q_pp_cpu 9.3, Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the GPT-OSS and Mistral arms
-# about 1 each).
+# Duration: a complete run of all 16 arms takes about 55 minutes on this host with the ring off (Q_pp 9.5 min,
+# Q_pp_cpu 9.3, Q_pp_ub2048 about the same, Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the
+# GPT-OSS and Mistral arms about 1 each; the 15 arms of run 2 took 45).
 # Note on the plan table: llama-bench has no -c option (its context is n_prompt + n_gen), so GO_pp carries none.
 # Verdict-bearing arms (12): Q_pp Q_pp_ub2048 Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70
 # MI_b50 resets.
@@ -908,7 +907,8 @@ check_controls() {
         '[MOE-EXEC-TRACE] dev 0 layer 7: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
     ctl summary "$RE_SUMMARY" '[MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed' \
         '[MOE-EXEC] layer 7: ring (p=0.99)'
-    local sum_long='[MOE-EXEC] summary: 24 layer-ubatches ring, 0 cpu, 0 forced, 41000 MiB streamed, 216 windows, 24 exposed, 0 misses'
+    local sum_long='[MOE-EXEC] summary: 24 layer-ubatches ring, 0 cpu, 0 forced, 41000 MiB streamed,'
+    sum_long+=' 216 windows, 24 exposed, 0 misses'
     local sum_short='[MOE-EXEC] summary: 24 layer-ubatches ring, 0 cpu, 0 forced, 41000 MiB streamed'
     ctl summary_ring "$RE_SUMMARY_RING" "$sum_long" \
         '[MOE-EXEC] layer 7: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
