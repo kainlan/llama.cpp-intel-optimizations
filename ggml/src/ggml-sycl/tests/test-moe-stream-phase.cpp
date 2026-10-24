@@ -38,6 +38,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -753,7 +754,7 @@ int main() {
         { GGML_TYPE_Q4_0, 1000 }
     };
     const moe_exec_rates seed      = ggml_sycl::moe_exec_rates_seed(q4);
-    const moe_exec_rates no_record = ggml_sycl::moe_stream_rates_assemble(q4, nullptr, nullptr);
+    const moe_exec_rates no_record = ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 0.0, nullptr);
     CHECK(near(no_record.h2d_gbps, seed.h2d_gbps) && near(no_record.reorder_gbps, seed.reorder_gbps));
     CHECK(near(no_record.dev_gflops, seed.dev_gflops) && near(no_record.cpu_gbps, seed.cpu_gbps));
     ggml_sycl_moe_exec_rates_record rec{};
@@ -762,21 +763,43 @@ int main() {
     rec.n_types                   = 1;
     rec.types[0]                  = GGML_TYPE_Q4_0;
     rec.dev_gflops[0]             = 1260.0;
-    const moe_exec_rates measured = ggml_sycl::moe_stream_rates_assemble(q4, &rec, nullptr);
+    const moe_exec_rates measured = ggml_sycl::moe_stream_rates_assemble(q4, &rec, 0.0, nullptr);
     CHECK(near(measured.h2d_gbps, 25.0) && near(measured.reorder_gbps, 300.0) && near(measured.dev_gflops, 1260.0));
     const std::vector<std::pair<ggml_type, size_t>> mix = {
         { GGML_TYPE_Q4_0,  1000 },
         { GGML_TYPE_MXFP4, 1000 }
     };
-    const moe_exec_rates mixed = ggml_sycl::moe_stream_rates_assemble(mix, &rec, nullptr);
+    const moe_exec_rates mixed = ggml_sycl::moe_stream_rates_assemble(mix, &rec, 0.0, nullptr);
     CHECK(near(mixed.dev_gflops,
                2000.0 / (1000.0 / 1260.0 + 1000.0 / ggml_sycl::moe_exec_dev_gflops_seed(GGML_TYPE_MXFP4))));
     ggml_sycl_moe_exec_rates_record unmeasured = rec;
     unmeasured.h2d_gbps                        = 0.0;
     unmeasured.reorder_gbps                    = -1.0;
-    const moe_exec_rates fallback              = ggml_sycl::moe_stream_rates_assemble(q4, &unmeasured, nullptr);
+    const moe_exec_rates fallback              = ggml_sycl::moe_stream_rates_assemble(q4, &unmeasured, 0.0, nullptr);
     CHECK(near(fallback.h2d_gbps, seed.h2d_gbps) && near(fallback.reorder_gbps, seed.reorder_gbps));
-    CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, fake_env_h2d).h2d_gbps, 31.0));
+    CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, 0.0, fake_env_h2d).h2d_gbps, 31.0));
+
+    // llama.cpp-kp1l: h2d is the record's, else the device's probed rate, else the seed; the override wins over all.
+    // No record at all (the tuning cache disabled): the probed rate prices, not the seed.
+    const moe_exec_rates probed_only = ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 26.5, nullptr);
+    CHECK(near(probed_only.h2d_gbps, 26.5) && near(probed_only.reorder_gbps, seed.reorder_gbps));
+    // A record that measured h2d wins over the probed rate.
+    CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, 26.5, nullptr).h2d_gbps, 25.0));
+    // A record without an h2d rate falls to the probed rate, then to the seed when that is not a rate either.
+    CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &unmeasured, 26.5, nullptr).h2d_gbps, 26.5));
+    const double not_rates[] = { 0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::infinity() };
+    for (double bad : not_rates) {
+        CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, nullptr, bad, nullptr).h2d_gbps, seed.h2d_gbps));
+    }
+    // The environment override is applied last: over the record and over the probed rate.
+    CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 26.5, fake_env_h2d).h2d_gbps, 31.0));
+
+    // A record that says reorder is unmeasured (0) takes the seed for it, and a later seed change is not masked.
+    ggml_sycl_moe_exec_rates_record no_reorder = rec;
+    no_reorder.reorder_gbps                    = 0.0;
+    const moe_exec_rates no_reorder_rates      = ggml_sycl::moe_stream_rates_assemble(q4, &no_reorder, 0.0, nullptr);
+    CHECK(near(no_reorder_rates.reorder_gbps, seed.reorder_gbps) && near(no_reorder_rates.h2d_gbps, 25.0));
     CHECK(ggml_sycl::moe_exec_rates_valid(measured) && ggml_sycl::moe_exec_rates_valid(fallback));
 
     // ---- the predicates begin_layer and resolve decide by ----

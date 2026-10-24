@@ -548,17 +548,27 @@ static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int
            owner.host_zone != host_zone_id::COUNT && owner.device == device;
 }
 
-// A layer's rates: the per-type seeds over its host mix, then the device's tuning-cache record where it measured (a
-// value is taken only when finite and positive), then the environment overrides.
+// A layer's rates, one source per fact (llama.cpp-kp1l). Each starts at the per-type seeds over the layer's host mix.
+//   h2d:     the device's tuning-cache record where it measured, else `probed_h2d_gbps` (the device's own resolved rate
+//            from ggml_sycl_measure_h2d_pinned: 0 when the probe has not measured or read one back), else the seed. A
+//            run with the tuning cache disabled, or a record the store refused, still prices with the probed rate.
+//   reorder: the record's rate where it measured, else the seed. A record rate that is not positive means
+//            "unmeasured": the probe measures the H2D rate only and stores reorder as 0, so a later change of the seed
+//            is not masked by a copy of the old seed in the file.
+//   dev:     each type's recorded rate (the record's per-type slot, which has no writer yet), else its seed, as a
+//            byte-weighted harmonic mean over the mix.
+// A value is taken only when finite and positive. The environment overrides apply last and win over all of them.
 static inline moe_exec_rates moe_stream_rates_assemble(const std::vector<std::pair<ggml_type, size_t>> & host_mix,
                                                        const ggml_sycl_moe_exec_rates_record *           record,
-                                                       moe_exec_getenv_fn                                getenv_fn) {
+                                                       double             probed_h2d_gbps,
+                                                       moe_exec_getenv_fn getenv_fn) {
     moe_exec_rates r = moe_exec_rates_seed(host_mix);
+    if (record != nullptr && detail::moe_stream_rate_measured(record->h2d_gbps)) {
+        r.h2d_gbps = record->h2d_gbps;
+    } else if (detail::moe_stream_rate_measured(probed_h2d_gbps)) {
+        r.h2d_gbps = probed_h2d_gbps;
+    }
     if (record != nullptr) {
-        // h2d: tuning-cache record, else seed; the T3 probe field is read here once it lands.
-        if (detail::moe_stream_rate_measured(record->h2d_gbps)) {
-            r.h2d_gbps = record->h2d_gbps;
-        }
         if (detail::moe_stream_rate_measured(record->reorder_gbps)) {
             r.reorder_gbps = record->reorder_gbps;
         }

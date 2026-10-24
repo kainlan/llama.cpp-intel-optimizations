@@ -1739,7 +1739,8 @@ struct sycl_device_info {
     char            driver_version[64] = { 0 };
     // llama.cpp-zujy: the pinned host-to-device rate, GB/s, that ggml_sycl_measure_h2d_pinned fills once per device (a
     // probe, the tuning cache, or the seed). 0 means "not resolved yet"; h2d_probed is true for a measured or stored
-    // rate and false for the seed.
+    // rate and false for the seed. moe_stream_phase::weigh hands it to the cost model's rates assembly when h2d_probed
+    // (llama.cpp-kp1l), after the tuning-cache record and before the seed.
     double          h2d_pinned_gbps    = 0.0;
     bool            h2d_probed         = false;
     // The retry outcomes the H2D probe has already logged for this device, one bit per h2d_probe_outcome, so a device

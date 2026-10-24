@@ -31966,9 +31966,11 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
 // MoE executor's cost model divides by (26.5-27.1 GB/s pinned against 10.5-19 GB/s pageable, llama.cpp-8bgi). The peer
 // probe above stages through a pageable std::vector, so it cannot stand in.
 //
-// Consumers: h2d_pinned_gbps is 0 until a device resolves, and stays 0 for a device left in a RETRY outcome, so a
-// consumer (Task 7b's rates assembly) must fall back to the seed rate on 0. h2d_probed is true for a measured or stored
-// rate and false for the seed.
+// Consumers: h2d_pinned_gbps is 0 until a device resolves, and stays 0 for a device left in a RETRY outcome. h2d_probed
+// is true for a measured or stored rate and false for the seed. moe_stream_phase::weigh reads both and passes the rate
+// to moe_stream_rates_assemble when h2d_probed, which prices the ring's copy term with: the environment override, else
+// the tuning-cache record, else this probed rate, else the seed (llama.cpp-kp1l). The measured rate therefore reaches
+// the cost model whether or not the store accepted it.
 //
 // What it times: 64 MiB in 4 MiB chunks, 8 iterations after one untimed copy, on the cache's queue (cache->get_queue():
 // mem_copy_submit's direct branch needs the copy queue to share a context with it, and the dpct default queue does
@@ -32001,10 +32003,10 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
 // exception included (its text rides in the source word), so a device logs one WARN line per outcome. A stored record
 // is read back instead of probing. A probe that cannot allocate keeps the seed and says so: never an abort. A refused
 // store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the measured rate resolved for
-// the process and is logged "probed, not stored". The store accepts only a record with a positive reorder rate, so the
-// record carries Task 2's seed value for it (by reference to the seed, not a literal). That only satisfies the store's
-// validity rule: the executor's rates assembly takes the reorder rate from its own measurement. The tuning cache is
-// keyed by the visible devices, so a device hidden from the scheduler probes again on every start.
+// the process and is logged "probed, not stored", and the cost model still prices with it (see Consumers). The probe
+// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0
+// (unmeasured) when there was none, and the rates assembly takes the seed for it. The tuning cache is keyed by the
+// visible devices, so a device hidden from the scheduler probes again on every start.
 //
 // Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE, RETRY_ALLOC or RETRY_FAILED allocates 64 MiB and times
 // 8 x 64 MiB again at every outermost load, silently after its reason's first line. That is bounded and load-time
@@ -32120,10 +32122,7 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
                 report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_NO_RATE, why);
                 continue;
             }
-            rec.h2d_gbps = gbps;
-            if (!(rec.reorder_gbps > 0.0)) {
-                rec.reorder_gbps = seed.reorder_gbps;
-            }
+            rec.h2d_gbps           = gbps;
             // A refused store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the rate
             // resolved for this process, but the line must not claim it persisted.
             const bool   stored    = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);

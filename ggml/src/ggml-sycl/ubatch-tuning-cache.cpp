@@ -362,7 +362,10 @@ bool ggml_backend_sycl_ubatch_cache_store_layout1(const ggml_sycl_ubatch_cache_k
 // "<sanitized name>-moe-exec-rates.json" (tuning-cache-io.hpp's MoeExecRatesEntry). Both calls honour
 // GGML_SYCL_TUNING_CACHE=0 and GGML_SYCL_TUNING_CACHE_DIR like the ubatch pair above. The validity and bounds rules
 // live in the header (moe_exec_rates_find / moe_exec_rates_upsert), where test-tuning-cache-io reaches them with no
-// device: a record with a rate that is not finite and positive is refused, and a stored entry like that is a miss.
+// device: a record whose H2D rate is not finite and positive, or whose reorder rate is negative or not finite, is
+// refused, and a stored entry like that is a miss. A reorder rate of 0 is valid and means unmeasured (llama.cpp-kp1l).
+// dev_gflops[i] is the per-type slot for a measured device GEMM rate; no probe writes it yet, and the executor's rates
+// assembly falls back to the type's seed for any type it does not carry.
 
 namespace {
 
@@ -429,7 +432,7 @@ bool ggml_backend_sycl_moe_exec_rates_store(int device, const struct ggml_sycl_m
     std::vector<MoeExecRatesEntry> entries;
     load_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries);
     if (!moe_exec_rates_upsert(entries, stored, GGML_TYPE_COUNT)) {
-        return false;  // a rate that is not finite and positive
+        return false;  // an H2D rate that is not finite and positive, or a negative or non-finite reorder rate
     }
     return save_moe_exec_rates(ubatch_tuning_cache_dir(), device_name, entries);
 }
