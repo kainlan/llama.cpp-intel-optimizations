@@ -277,6 +277,9 @@ static inline int moe_stream_role_slot(expert_tensor_role role) {
 struct moe_stream_window_hints {
     size_t weight_slot_bytes = 0;  // unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device)
     size_t group_cap         = 0;  // ggml_sycl_moe_pp_f16_group_experts_max(); 0 = none
+    // Device bytes of the triplets lent to the ring on this device, counted back as resident so the cap is
+    // loan-invariant.
+    size_t lent_bytes        = 0;
 };
 
 // The experts one executor phase holds for an expert of `expert_f16_bytes`: G_plan above, 0 when the slot holds none.
@@ -436,8 +439,16 @@ static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const place
                                                                      moe_stream_plan_index * index_out = nullptr) {
     moe_stream_plan_index index =
         moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints);
+    // The cap reads the device's expert set with the ring's own loan counted back (llama.cpp-7999): a loan moves
+    // hints.lent_bytes out of index.resident_expert_bytes, so the sum is the same before and after it. The add
+    // saturates defensively: a real sum of device bytes cannot approach SIZE_MAX, so the clamp only keeps a corrupt
+    // or sentinel lent_bytes from wrapping into a refusal.
+    size_t resident_with_lent = index.resident_expert_bytes + hints.lent_bytes;
+    if (resident_with_lent < index.resident_expert_bytes) {
+        resident_with_lent = SIZE_MAX;
+    }
     const moe_stream_ring_geometry geo =
-        moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, index.resident_expert_bytes);
+        moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, resident_with_lent);
     if (index_out != nullptr) {
         *index_out = std::move(index);
     }

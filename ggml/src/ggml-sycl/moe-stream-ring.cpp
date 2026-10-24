@@ -28,7 +28,7 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
         return {};
     }
 
-    // A whole layer's slots per region, two regions.
+    // One executor window's slots per region, two regions.
     const uint64_t n_slots = 2ull * region_slots;
 
     // Round each slot up to the alignment so every slot starts aligned.
@@ -41,7 +41,12 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
         return {};
     }
     const size_t bytes = static_cast<size_t>(n_slots) * slot_bytes;
-    if (bytes > resident_expert_bytes / 10) {
+    // The ring may take 10 % of what the device's expert set keeps once the ring's own bytes are lent out of it:
+    // bytes <= (resident - bytes) / 10, which is 11 * bytes <= resident, tested in the division form, which cannot
+    // overflow. The caller passes resident as the device's resident expert bytes plus the bytes lent to the ring now
+    // (moe_stream_plan_ring_geometry, llama.cpp-7999). A loan moves bytes from the first term to the second, so the
+    // figure, and with it the answer, is the same before the loan and after it.
+    if (bytes > resident_expert_bytes / 11) {
         return {};
     }
 
