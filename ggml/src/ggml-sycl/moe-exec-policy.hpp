@@ -103,7 +103,7 @@ struct moe_exec_decision_log {
     uint32_t n_cpu                                   = 0;
     uint32_t n_forced                                = 0;
     size_t   bytes_streamed                          = 0;
-    uint32_t n_windows = 0;  // executor windows the ring served this prompt (Task 2b window_begin)
+    uint32_t n_windows = 0;  // executor windows the ring served this prompt (fed once per window by the ring's window_begin)
     uint32_t n_exposed = 0;  // of them, a layer's first UP window: copied with no earlier phase to hide under
     uint32_t n_misses  = 0;  // experts a window asked for that were not staged ahead, exposed windows excluded
 
