@@ -21077,7 +21077,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                                                      bool                                   warn_busy) {
     const bool                   refill = direction == ggml_sycl_expert_txn_direction::REFILL;
     ggml_sycl_expert_loan_result result{};
-    auto finish = [&](ggml_sycl_txn_result code, const char * reason) {
+    auto                         finish = [&](ggml_sycl_txn_result code, const char * reason) {
         result.reason = reason;
         if (out) {
             *out = result;
@@ -21273,7 +21273,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
 
     // An exception while moving a triplet stops the loop; the triplets already moved are still published below, and it
     // is rethrown once the inventory lock is released.
-    std::exception_ptr escaped;
+    std::exception_ptr                 escaped;
     // A loan's drops keep a lease on every view they take here, retained after the loop (llama.cpp-6aj4).
     std::vector<ggml_sycl::mem_handle> lent_views;
     for (prepared_triplet & triplet : prepared) {
@@ -21567,7 +21567,7 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     if (code == ggml_sycl_txn_result::REFUSED) {
         g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release);
     }
-    std::atomic<uint32_t> &    busy_streak = g_sycl_expert_loan_busy_streak[device];
+    std::atomic<uint32_t> & busy_streak = g_sycl_expert_loan_busy_streak[device];
     if (code != ggml_sycl_txn_result::BUSY) {
         busy_streak.store(0, std::memory_order_relaxed);
         return true;
@@ -32796,15 +32796,15 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     if (!ctx.moe_stream) {
         ctx.moe_stream.reset(new ggml_sycl::moe_stream_phase());
     }
-    call.op.n_tokens      = static_cast<uint32_t>(ids->ne[1]);
-    call.op.n_expert      = static_cast<int>(src0->ne[2]);
-    call.op.n_expert_used = static_cast<int>(ids->ne[0]);
-    call.op.graph_seq     = ctx.graph_compute_seq;
-    call.op.policy        = ggml_sycl_moe_exec_config().policy;
-    call.op.log           = &ggml_sycl_moe_exec_log();
-    call.op.graph_ctx     = &call;
-    call.op.layer_present = ggml_sycl_moe_stream_layer_present;
-    call.op.host_lease    = ggml_sycl_moe_stream_host_lease;
+    call.op.n_tokens       = static_cast<uint32_t>(ids->ne[1]);
+    call.op.n_expert       = static_cast<int>(src0->ne[2]);
+    call.op.n_expert_used  = static_cast<int>(ids->ne[0]);
+    call.op.graph_seq      = ctx.graph_compute_seq;
+    call.op.policy         = ggml_sycl_moe_exec_config().policy;
+    call.op.log            = &ggml_sycl_moe_exec_log();
+    call.op.graph_ctx      = &call;
+    call.op.layer_present  = ggml_sycl_moe_stream_layer_present;
+    call.op.host_lease     = ggml_sycl_moe_stream_host_lease;
     call.op.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;
     call.op.request_loan   = ggml_sycl_request_expert_loan;
@@ -95482,7 +95482,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // `[SYCL-MOE-SEQUENCE-GRAPHLET] summary phase=final` line may print here too.
     ggml_sycl_graph_diag_report("final", sycl_ctx && sycl_ctx->exec_graph, sycl_ctx);
 #endif
-    ggml_sycl_moe_exec_log_report();  // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
+    ggml_sycl_moe_exec_log_report();       // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
     ggml_sycl_expert_refill_log_report();  // the [MOE-EXEC] refill line, if any triplet was lent (llama.cpp-sif1)
     // Stop adaptive prestage background thread before tearing down SYCL resources.
     g_adaptive_prestage.stop();
