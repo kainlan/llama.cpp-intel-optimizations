@@ -42,7 +42,7 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
   - the loan runs at the graph boundary, never inside a graph: an in-graph caller records a request with a lock-free
     compare-and-swap; ggml_backend_sycl_synchronize() runs the pending loan after it clears the graph's compute flag
     and before the deferred-free pass; the transaction refuses "graph active"; and mul_mat_id names no loan entry;
-  - the boundary that accepted a loan drains the loan's retained records (llama.cpp-6aj4, lead ruling A): the runner
+  - the boundary that accepted a loan drains the loan's retained records (llama.cpp-6aj4, c-769m): the runner
     reports an accepted loan that lent, and synchronize then calls ggml_sycl_expert_loan_boundary_drain, after the
     runner and before the deferred-free pass, so that pass erases the withdrawn device entries and returns their room
     before the next graph's reserve. It is the one sanctioned wait (synchronize has just waited the whole stream): it
@@ -67,7 +67,9 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     moves; it keeps a lease on every view it takes, and the transaction retains those leases until the device's
     execution queue passes a barrier, after the loop and before the publication, so no kernel still reading a dropped
     table sees a freed buffer; and every drop leaves the device table stale (the slot's payload nulled, the storage
-    generation bumped, and the table marked stale through mark_moe_device_table_stale, whose marks are pinned);
+    generation bumped, and the table marked stale through mark_moe_device_table_stale, whose marks are pinned, behind
+    its device guard as its first statement): a dropped pointer-table lease, route table or hybrid record each sets
+    the flag that marks it, so a drop of the table's views alone still does;
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
     epoch;
   - the WARN format strings;
@@ -510,7 +512,7 @@ def claim_loan_runs_at_the_graph_boundary(sycl: str) -> bool:
 
 
 # The boundary that accepted a loan drains the loan's retained records before the deferred-free pass (llama.cpp-6aj4,
-# lead ruling A): the copies' owners and the dropped views go, so that pass erases the withdrawn device entries and
+# c-769m): the copies' owners and the dropped views go, so that pass erases the withdrawn device entries and
 # returns their room before the next graph's reserve. The runner reports only an accepted loan that lent, so a decode
 # boundary pays nothing; the wait is bounded at 100 ms, and a timeout leaves the retention to a later pass with one
 # trace line. The drain asks no event itself.
@@ -681,15 +683,27 @@ STALE_MARKS = ("moe_device_table_valid[dev] = false;", "moe_full_local_probe_gen
 NULL_PAYLOAD = "w.moe_expert_ptr_payload[device][slot] = nullptr;"
 BUMP_GENERATION = "if (stored) { ++w.moe_expert_storage_generation; }"
 MARK_STALE = "if (stored || table_dropped) { w.mark_moe_device_table_stale(device); }"
+# The flag behind a drop of the table's views alone: a pointer-table lease erased (the holder a prompt graph's preload
+# leaves, with no storage record and no slot naming the entry), the route table invalidated, or the hybrid record
+# reset. Without it a table whose only view of the entry was its leases stays valid, its raw pointer into room the
+# ring reuses.
+TABLE_FROM_LEASES = "table_dropped = leases.size() != n_leases;"
+TABLE_FROM_ROUTES = "routes.invalidate(); table_dropped = true; break;"
+TABLE_FROM_HYBRID = "w.moe_hybrid_decode_stamp[device] = {}; table_dropped = true; }"
+# The member's guard is its first statement: inverted, every stale mark is a no-op on a valid device.
+STALE_GUARD = "{ if (!ggml_sycl_valid_device_index(dev)) { return; }"
 
 
 def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
     helper = body(norm(sycl), DROP_SIG)
     member = body(norm(common), STALE_SIG)
-    return (all(member.count(x) == 1 for x in STALE_MARKS)
+    return (member.startswith(STALE_GUARD) and all(member.count(x) == 1 for x in STALE_MARKS)
             and helper.count(NULL_PAYLOAD) == 1 and ordered(helper, RETAIN_SLOT, NULL_PAYLOAD, "stored = true;")
             and helper.count(BUMP_GENERATION) == 1 and helper.count(MARK_STALE) == 1
-            and ordered(helper, RETAIN_HYBRID, BUMP_GENERATION, MARK_STALE))
+            and all(helper.count(x) == 1 for x in (TABLE_FROM_LEASES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID))
+            and helper.count("table_dropped = true;") == 2
+            and ordered(helper, RETAIN_LEASE, "leases.erase(", TABLE_FROM_LEASES, RETAIN_ROUTES, TABLE_FROM_ROUTES,
+                        RETAIN_HYBRID, TABLE_FROM_HYBRID, BUMP_GENERATION, MARK_STALE))
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -1948,6 +1962,28 @@ def test_mutant_storage_generation_not_bumped_fails():
 def test_mutant_slot_payload_kept_fails():
     """The slot's handle goes but its raw kernel payload stays: the next table upload carries the freed pointer."""
     assert not claim_lent_views_mark_the_table_stale(_once_in(SYCL, DROP_SIG, NULL_PAYLOAD, ""), COMMON)
+
+
+def test_mutant_table_lease_drop_sets_no_flag_fails():
+    """The preload's holder: only the table's leases name the entry, so with no flag the table stays valid."""
+    assert not claim_lent_views_mark_the_table_stale(_once_in(SYCL, DROP_SIG, TABLE_FROM_LEASES, ""), COMMON)
+
+
+def test_mutant_route_table_drop_sets_no_flag_fails():
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_ROUTES, "routes.invalidate(); break;"), COMMON)
+
+
+def test_mutant_hybrid_record_drop_sets_no_flag_fails():
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_HYBRID, "w.moe_hybrid_decode_stamp[device] = {}; }"), COMMON)
+
+
+def test_mutant_stale_guard_inverted_fails():
+    """Inverted, the guard returns for every valid device, so no drop ever marks a table stale."""
+    assert not claim_lent_views_mark_the_table_stale(
+        SYCL, _once_in(COMMON, STALE_SIG, "if (!ggml_sycl_valid_device_index(dev)) {",
+                       "if (ggml_sycl_valid_device_index(dev)) {"))
 
 
 def test_mutant_no_epoch_bump_fails():

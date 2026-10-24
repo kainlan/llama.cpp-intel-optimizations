@@ -21625,13 +21625,13 @@ static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config();
 // retained store to drain. The loan's records in it are each D2H copy's two owners and the views the loan dropped,
 // retained to a barrier on the device's execution queue; once they drain, the deferred-free pass that follows erases
 // each withdrawn device entry and returns its room to the WEIGHT zone, so an accepted loan's room is back before the
-// next graph's reserve. The loan code never waits or asks an event's status (c-3bde), since it runs on inference
-// paths; ggml_backend_sycl_synchronize() is the designated boundary and has just waited the whole stream, so a bounded
-// wait for the loan's own copies and barrier is the boundary's. A loan is rare (at most one accepted per prompt) and
-// copies for about 20 ms. drain_retained_handles() takes no scope, so this drains the whole store, every device's
-// records. On a timeout (another context's work still on the queue, or copies past the bound) the retention stands,
-// the erase lags one pass, and one trace line says so. False only then; true at once when no loan was accepted, so a
-// decode boundary pays nothing.
+// next graph's reserve. The loan code never waits or asks an event's status (c-3bde), since it runs on inference paths;
+// ggml_backend_sycl_synchronize() is the designated boundary and has just waited the whole stream, so a bounded wait
+// for the loan's own copies and barrier is the boundary's. A loan is rare (at most one per short micro-batch, and only
+// while lendable triplets remain) and copies for about 20 ms. drain_retained_handles() takes no scope, so this drains
+// the whole store, every device's records. On a timeout (another context's work still on the queue, or copies past the
+// bound) the retention stands, the erase lags one pass, and one trace line says so. False only then; true at once when
+// no loan was accepted, so a decode boundary pays nothing.
 static bool ggml_sycl_expert_loan_boundary_drain(int device, bool loan_accepted) {
     constexpr uint32_t drain_ms = 100;
     if (!loan_accepted || ggml_sycl::drain_retained_handles(/*wait_all=*/true, drain_ms)) {
@@ -22177,6 +22177,19 @@ struct test_loan_fixture {
         const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
         return h.is_weight() && h.device() == device && detail::cache_id_equal(h.key().id, id) &&
                !(h.key() == host_key);
+    }
+
+    // Whether (layer, slot)'s device pointer table is trusted (moe_device_table_valid) and its kernel payload still
+    // names `expert`: what a MUL_MAT_ID reads without rebuilding the table.
+    bool device_table_valid(int layer, int slot) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        return w && w->moe_device_table_valid[device];
+    }
+
+    bool payload_names_expert(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        return w && static_cast<size_t>(expert) < w->moe_expert_ptr_payload[device].size() &&
+               w->moe_expert_ptr_payload[device][static_cast<size_t>(expert)] != nullptr;
     }
 
     // The pointer-table leases (layer, slot)'s extra holds on that expert's device entry.
@@ -23645,10 +23658,15 @@ static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture:
         table_event.wait_and_throw();
     }
     ctx.stream()->wait();
-    // The control: each table leases expert 2's device entry, the triplet the loan selects from the plan's tail.
+    // The control: each table leases expert 2's device entry, the triplet the loan selects from the plan's tail, and
+    // is trusted with a payload naming it, so the check after the loan can fail.
     for (int s = 0; s < 3; ++s) {
         if (fx.table_leases_on_device_entry(0, s, 2) == 0) {
             return "no pointer-table lease before the loan: " + fx.device_entry_holders(0, s, 2);
+        }
+        if (!fx.device_table_valid(0, s) || !fx.payload_names_expert(0, s, 2)) {
+            return test_loan_fail("slot %d's table before the loan: valid=%d, payload names expert 2=%d, not 1 and 1",
+                                  s, (int) fx.device_table_valid(0, s), (int) fx.payload_names_expert(0, s, 2));
         }
     }
 
@@ -23657,6 +23675,14 @@ static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture:
             why += "; " + fx.device_entry_holders(0, s, 2);
         }
         return why;
+    }
+    // No table still trusted with a raw pointer into the room the zone got back: each is stale, and its payload no
+    // longer names expert 2, so the next MUL_MAT_ID or preload rebuilds it.
+    for (int s = 0; s < 3; ++s) {
+        if (fx.device_table_valid(0, s) || fx.payload_names_expert(0, s, 2)) {
+            return test_loan_fail("slot %d's table after the loan: valid=%d, payload names expert 2=%d, not 0 and 0", s,
+                                  (int) fx.device_table_valid(0, s), (int) fx.payload_names_expert(0, s, 2));
+        }
     }
     // The loan moved expert 2's triplet and no other, so the refill below cannot pass on a triplet that never left.
     const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
