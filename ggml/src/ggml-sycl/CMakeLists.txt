@@ -3124,6 +3124,43 @@ set_tests_properties(sycl-moe-stream-ring PROPERTIES
     SKIP_RETURN_CODE 77
 )
 
+# Copy-overlap spike (llama.cpp-efck, Task 4 of
+# docs/plans/2026-10-24-prefill-window-ring.md): times pinned H2D copies on the
+# cache's BCS and compute queues alone and under a spin kernel on the backend's
+# compute queue, and prints one [COPY-OVERLAP] row per queue. Links the private
+# fixture carrier as test-moe-stream-ring does. Its spin kernel is device code
+# of its own, which SYCL_LINK_ONLY_TEST_OPTIONS' -fsycl JIT-compiles for spir64
+# (as test-sycl-bf16-mul-mat's kernels are); the test warms it before timing.
+# It allocates device memory and runs serially. Lead-run on both cards: the
+# ENVIRONMENT pins the B50, and the B70 run invokes the binary directly.
+add_executable(test-sycl-copy-overlap
+    tests/test-sycl-copy-overlap.cpp
+)
+target_include_directories(test-sycl-copy-overlap PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-copy-overlap PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-copy-overlap PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-copy-overlap PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-copy-overlap PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME sycl-copy-overlap COMMAND test-sycl-copy-overlap)
+set_tests_properties(sycl-copy-overlap PROPERTIES
+    LABELS "sycl;copy;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    TIMEOUT 120
+    # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped.
+    SKIP_RETURN_CODE 77
+)
+
 # MoE expert loan transaction (llama.cpp-mwmr): resident expert triplets lent to
 # the prefill ring, copied to pinned host storage, flipped in the published plan
 # and retired on the device. The transaction is file-static in ggml-sycl.cpp, so
