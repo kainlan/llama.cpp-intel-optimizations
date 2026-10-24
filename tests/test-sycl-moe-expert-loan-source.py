@@ -774,6 +774,8 @@ ARM_SIG = "static void ggml_sycl_expert_refill_set_armed(int device, bool armed)
 BOUNDARY_DEVICE_SIG = "static uint32_t ggml_sycl_run_expert_refill_at_boundary_on_device("
 BOUNDARY_SIG = "static void ggml_sycl_run_expert_refill_at_boundary(ggml_backend_t backend)"
 LEDGER_SIG = "static ggml_sycl_expert_lent_ledger & ggml_sycl_expert_lent_ledger_locked("
+RECONCILE_SIG = "static void ggml_sycl_expert_lent_ledger_reconcile_locked("
+RECONCILE_DEF = RECONCILE_SIG + "int device, const ggml_sycl::lifecycle_plan_snapshot * current) noexcept {"
 REPORT_SIG = "static void ggml_sycl_expert_refill_log_report()"
 PER_GRAPH_SIG = "static uint32_t ggml_sycl_moe_refill_per_graph()"
 FREE_SIG = "static void ggml_backend_sycl_free(ggml_backend_t backend)"
@@ -983,14 +985,20 @@ LEDGER_IN_TXN = "ggml_sycl_expert_lent_ledger & ledger = ggml_sycl_expert_lent_l
 def claim_ledger_is_guarded_by_the_inventory_mutex(sycl: str) -> bool:
     """Every site that reaches a device's ledger holds g_tensor_inventory_mutex: the selection and the arming take it,
     the body reaches the ledger only after its own lock, and the one direct reader besides those is the private
-    fixture's teardown, under the same lock. The four subscripts are the declaration and those three."""
+    fixture's teardown, under the same lock. The reconcile helper subscripts it too; its only callers are the
+    accessor and the publication, whose caller holds the lock, so the helper's name appears exactly four times: the
+    forward declaration, the definition and those two calls. The five subscripts are the declaration, the helper, the
+    accessor's return, the arming and the teardown."""
     s = norm(sycl)
     select = body(s, SELECT_SIG)
     arm = body(s, ARM_SIG)
     txn = body(s, TXN_SIG)
-    return (s.count("g_sycl_expert_lent[") == 4
+    return (s.count("g_sycl_expert_lent[") == 5
             and s.count("static ggml_sycl_expert_lent_ledger g_sycl_expert_lent[GGML_SYCL_MAX_DEVICES];") == 1
             and body(s, LEDGER_SIG).count("g_sycl_expert_lent[device]") == 1
+            and s.count(RECONCILE_DEF) == 1
+            and body(s[s.find(RECONCILE_DEF):], RECONCILE_SIG).count("g_sycl_expert_lent[device]") == 1
+            and s.count("ggml_sycl_expert_lent_ledger_reconcile_locked(") == 4
             and ordered(select, LEDGER_LOCK, "ggml_sycl_expert_lent_ledger_locked(device, current)")
             and ordered(arm, LEDGER_LOCK, "g_sycl_expert_lent[device]")
             and txn.count(LEDGER_IN_TXN) == 1 and ordered(txn, INVENTORY_LOCK, LEDGER_IN_TXN)
@@ -2197,6 +2205,11 @@ def test_mutant_boundary_writes_the_ledger_unlocked_fails():
     assert not claim_ledger_is_guarded_by_the_inventory_mutex(mutant)
 
 
+def test_mutant_an_unlocked_caller_reconciles_the_ledger_fails():
+    call = "ggml_sycl_expert_lent_ledger_reconcile_locked(device, &current); "
+    assert not claim_ledger_is_guarded_by_the_inventory_mutex(_once(SYCL, BOUNDARY_ARM, call + BOUNDARY_ARM))
+
+
 def test_mutant_refill_runs_before_the_deferred_frees_fails():
     sync_moved = _once(SYCL, RUN_REFILL, ";")
     mutant = _once_in(sync_moved, SYNC_SIG, DEFERRED_FREES, RUN_REFILL + " " + DEFERRED_FREES)
@@ -2521,6 +2534,55 @@ def test_mutant_loan_size_guard_removed_fails():
 def test_mutant_refill_size_guard_removed_fails():
     mutant = _once_in(CACHE, REFILL_SIG, REFILL_SIZE_GUARD, "")
     assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+
+
+# llama.cpp-7999: the lent ledger follows the publication. A plan published under another identity, or no plan, empties
+# every device's ledger right after the publication is written, so the ring sizing that reads the ledger's lent bytes
+# never counts a previous plan's loan back. The loan's own transaction reconciles too, through the ledger accessor.
+PUBLISH_DEF = ("static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) "
+               "noexcept {")
+PUBLICATION_WRITE = "std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release); });"
+RECONCILE_EVERY_DEVICE = ("for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) { "
+                          "ggml_sycl_expert_lent_ledger_reconcile_locked(d, snapshot.get()); }")
+LEDGER_ACCESSOR_DEF = "static ggml_sycl_expert_lent_ledger & ggml_sycl_expert_lent_ledger_locked("
+LEDGER_ACCESSOR_RECONCILE = "ggml_sycl_expert_lent_ledger_reconcile_locked(device, &current);"
+
+
+def _definition_body(n: str, definition: str, signature: str) -> str:
+    """The body of the definition that starts with `definition`, past any forward declaration of the same name."""
+    at = n.find(definition)
+    return body(n[at:], signature) if at >= 0 else ""
+
+
+def claim_the_ledger_follows_the_publication(sycl: str) -> bool:
+    n = norm(sycl)
+    publish = _definition_body(n, PUBLISH_DEF, "static void ggml_sycl_publish_prepared_plan_locked(")
+    accessor = _definition_body(n, LEDGER_ACCESSOR_DEF, LEDGER_ACCESSOR_DEF)
+    return (n.count(PUBLISH_DEF) == 1 and publish.count(RECONCILE_EVERY_DEVICE) == 1
+            and n.count("ggml_sycl_expert_lent_ledger_reconcile_locked(d, ") == 1
+            and ordered(publish, "return;", PUBLICATION_WRITE, RECONCILE_EVERY_DEVICE)
+            and accessor.count(LEDGER_ACCESSOR_RECONCILE) == 1)
+
+
+def test_the_ledger_follows_the_publication():
+    assert claim_the_ledger_follows_the_publication(SYCL)
+
+
+def test_mutant_publication_leaves_the_ledger_fails():
+    assert not claim_the_ledger_follows_the_publication(_once(SYCL, RECONCILE_EVERY_DEVICE, "{ }"))
+
+
+def test_mutant_ledger_reconciled_before_the_publication_write_fails():
+    n = _once(SYCL, RECONCILE_EVERY_DEVICE, "")
+    n = n.replace("ggml_sycl_tenant_publish_gen_bump(); const auto & snapshot = publication.snapshot;",
+                  "ggml_sycl_tenant_publish_gen_bump(); const auto & snapshot = publication.snapshot; "
+                  + RECONCILE_EVERY_DEVICE, 1)
+    assert n.count(RECONCILE_EVERY_DEVICE) == 1, "the mutant must move the reconcile, not drop it"
+    assert not claim_the_ledger_follows_the_publication(n)
+
+
+def test_mutant_ledger_accessor_skips_the_reconcile_fails():
+    assert not claim_the_ledger_follows_the_publication(_once(SYCL, LEDGER_ACCESSOR_RECONCILE, ""))
 
 
 if __name__ == "__main__":

@@ -2780,6 +2780,8 @@ static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_lo
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) noexcept;
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
+static void ggml_sycl_expert_lent_ledger_reconcile_locked(int                                        device,
+                                                          const ggml_sycl::lifecycle_plan_snapshot * current) noexcept;
 
 // The process-global tenant publish generation (g_data_ptr_cache's stamp), defined
 // beside the cache.  Bumped by every plan publication and every teardown release.
@@ -16502,6 +16504,13 @@ static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publi
             publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);
         },
         [&] { std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release); });
+    // The lent ledgers describe the published plan's lent set: a publication under another identity, or of no plan,
+    // empties them here, so the next ring sizing never counts a previous plan's loan back (llama.cpp-7999). Every
+    // device's ledger, not only the cached ones: a device with no cache has an empty ledger, and the loop calls
+    // nothing that can throw.
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        ggml_sycl_expert_lent_ledger_reconcile_locked(d, snapshot.get());
+    }
 }
 
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
@@ -20906,23 +20915,37 @@ static size_t ggml_sycl_expert_lent_ledger_bytes(const ggml_sycl_expert_lent_led
     return bytes;
 }
 
-// The device's ledger under the publication `current`. A ledger kept under another publication (another model, or
-// another load of it) names experts of a plan that is gone and cannot be refilled, so it is emptied first. The caller
+// The device's ledger follows the published plan (llama.cpp-7999). The ledger describes the published plan's lent set,
+// so a publication under another identity (another model, or another load of it), or of no plan (`current` null),
+// names experts of a plan that is gone and cannot be refilled: the ledger is emptied, with its count and lent bytes,
+// and takes the new identity (0, 0 for no plan). A publication under the same identity keeps it: the loan's own
+// republish and the KV transactions keep the identity, and their lent triplets stay lent. The publication calls this
+// for every device after it writes the plan; ggml_sycl_expert_lent_ledger_locked calls it too. The caller holds
+// g_tensor_inventory_mutex.
+static void ggml_sycl_expert_lent_ledger_reconcile_locked(int                                        device,
+                                                          const ggml_sycl::lifecycle_plan_snapshot * current) noexcept {
+    ggml_sycl_expert_lent_ledger & ledger      = g_sycl_expert_lent[device];
+    const uint64_t                 model_id    = current ? current->model_id : 0;
+    const uint64_t                 load_txn_id = current ? current->load_txn_id : 0;
+    if (ledger.model_id == model_id && ledger.load_txn_id == load_txn_id) {
+        return;
+    }
+    ledger.triplets.clear();
+    ledger.triplet_bytes.clear();
+    ledger.refill_armed = false;
+    ledger.model_id     = model_id;
+    ledger.load_txn_id  = load_txn_id;
+    g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
+    g_sycl_expert_lent_bytes[device].store(0, std::memory_order_release);
+}
+
+// The device's ledger under the publication `current`, emptied first when it was kept under another one. The caller
 // holds g_tensor_inventory_mutex.
 static ggml_sycl_expert_lent_ledger & ggml_sycl_expert_lent_ledger_locked(
     int                                        device,
     const ggml_sycl::lifecycle_plan_snapshot & current) {
-    ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
-    if (ledger.model_id != current.model_id || ledger.load_txn_id != current.load_txn_id) {
-        ledger.triplets.clear();
-        ledger.triplet_bytes.clear();
-        ledger.refill_armed = false;
-        ledger.model_id     = current.model_id;
-        ledger.load_txn_id  = current.load_txn_id;
-        g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
-        g_sycl_expert_lent_bytes[device].store(0, std::memory_order_release);
-    }
-    return ledger;
+    ggml_sycl_expert_lent_ledger_reconcile_locked(device, &current);
+    return g_sycl_expert_lent[device];
 }
 
 static bool ggml_sycl_expert_triplet_is(const std::array<ggml_sycl::expert_placement_key, 3> & lent,
@@ -22819,6 +22842,34 @@ std::string test_expert_loan_lends_two_triplets() {
     if (!fx.device_entry_present(1, 0, 0) || !fx.device_entry_present(0, 2, 2)) {
         return "a device entry the loan did not select is gone";
     }
+
+    // The ledger follows the publication (llama.cpp-7999). A republish under the same identity, the shape of a KV
+    // transaction, keeps the lent triplets and their bytes.
+    ::ggml_sycl_republish_current_plan();
+    if (g_sycl_expert_lent_count[fx.device].load() != 2) {
+        return test_loan_fail("a republish under the same identity left the ledger counting %u lent triplets, not 2",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are({ lent_first, lent_second }, "after a same-identity republish");
+        !why.empty()) {
+        return why;
+    }
+    // A publication under another identity (another model's plan, with no loan run since) empties the ledger at once,
+    // so the next ring sizing does not count this plan's loan back.
+    {
+        const auto other_plan = ::ggml_sycl_make_provisional_plan_snapshot(fx.plan(/*host_expert=*/3));
+        auto       other      = std::make_shared<lifecycle_plan_snapshot>(*other_plan);
+        other->model_id ^= 0x7999ull;
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        ::ggml_sycl_publish_plan_locked(other);
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 0) {
+        return test_loan_fail("a publication under another identity left the ledger counting %u lent triplets",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are({}, "after a publication under another identity"); !why.empty()) {
+        return why;
+    }
     return {};
 }
 
@@ -23256,6 +23307,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
     if (lent.size() != 2) {
         return test_loan_fail("the published plan has %zu lent triplets, not 2", lent.size());
+    }
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
     }
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
