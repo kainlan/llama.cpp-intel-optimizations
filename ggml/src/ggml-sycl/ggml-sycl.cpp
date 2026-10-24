@@ -32714,7 +32714,7 @@ static void ggml_sycl_moe_exec_log_report() {
     }
 }
 
-// ---- The prompt's layer-ahead expert stream (llama.cpp-xod7, plan Task 7b of llama.cpp-36j0) ----------------------
+// ---- The prompt's expert stream (llama.cpp-xod7, plan Task 7b of llama.cpp-36j0; executor windows, llama.cpp-9433) --
 // ggml_sycl_mul_mat_id hands each prompt layer to ctx.moe_stream at its admission; the two answers only the graph has
 // come from the graph's MoE scan (g_moe_gate_up_pairs).
 
@@ -32852,13 +32852,12 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
 }
 
 // After a prompt layer's down op, an open stream region closes on a barrier behind it. The barrier becomes the gate the
-// region's next copies wait for: it follows every reorder that read the region's AOS slots before it on this queue.
-// The region's SOA slots are next rewritten by reorders on this same in-order queue, so the queue, not the barrier,
-// orders that reuse after their readers. Under STREAM_ALL the open region holds layer + 1's slots, staged a layer
-// ahead, whose readers have not run yet: the barrier follows their reorders, not their kernels. An AOS-only slot
-// (c-hmey) is read in place by those kernels, so the barrier is also the read gate of the region holding `layer`,
-// whose kernels it follows, and moe_stream_phase::stage() orders a reuse that may overwrite such a slot behind it
-// (lead ruling c-o9uw-1). Never while a command graph records: ring work is never recorded.
+// region's next copies wait for: it follows every kernel this in-order queue ran before it, the window dequants that
+// read the region's slots in place included. It is not a region's read gate: a region turns over several times per
+// layer, once per executor window, so the executor hands moe_stream_phase::window_done the barrier behind each
+// window's dequants, and a refill of the region holding that window waits for it (lead ruling c-o9uw-1). Nothing is
+// staged a layer ahead (there is no cross-layer prefetch), so the open region holds a window of this layer. Never while
+// a command graph records: ring work is never recorded.
 static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
     if (!ctx.moe_stream || !ctx.moe_stream->region_open() || g_ggml_sycl_graph_recording) {
         return;
@@ -36139,16 +36138,16 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
     const int          stream_layer = moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;
     const expert_tensor_role stream_role =
         moe_stream && src0 ? expert_tensor_role_from_tensor_name(src0->name) : expert_tensor_role::UNKNOWN;
-    // Whether the batched prompt executor takes this weight whole, every host expert these ids route to staged for it
-    // (llama.cpp-3460): moe_stream_phase::executor_staged, the answer the prompt path takes after begin_layer, on the
-    // same ids. Asked once, at the build's first executor entry.
+    // Whether the batched prompt executor takes this layer's weights whole from the ring (llama.cpp-3460):
+    // moe_stream_phase::executor_claims, the answer the prompt path takes after begin_layer. The executor stages each
+    // window it reads itself, so the claim is the layer's, not these ids'. Asked once, at the build's first executor
+    // entry.
     bool       executor_asked        = false;
     bool       executor_takes        = false;
     const auto executor_takes_weight = [&]() {
         if (!executor_asked) {
             executor_asked = true;
-            executor_takes =
-                moe_stream->executor_staged(stream_layer, stream_role, ids, count, static_cast<int>(src0->ne[2]));
+            executor_takes = moe_stream->executor_claims(stream_layer);
         }
         return executor_takes;
     };
@@ -36195,10 +36194,10 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 // it, not by a claim asked again here (one fact, one source). Its reader is the executor's dequant
                 // kernel, a plain kernel on this same in-order compute queue, which writes the executor's f16 weight
                 // slot; oneDNN reads only that slot, never the ring's. The dequant is ordered like the route's kernel:
-                // it waits for the copy into the slot (the entry's ready event), and a rewrite of an AOS-only slot
-                // waits for the region's read gate, the barrier ggml_sycl_moe_stream_layer_done submits on this queue
-                // behind the down op of the layer the region last held, or for a barrier submitted at the stage when
-                // none was recorded (reuse_after_readers, moe_stream_phase::stage). Leaving it to the route core keeps
+                // it waits for the copy into the slot (the entry's ready event), and a rewrite of the slot waits for
+                // the region's read gate, the barrier the executor submits on this queue behind the dequants of the
+                // window the region last held (moe_stream_phase::window_done), or for a barrier submitted at the
+                // refill when none was recorded (moe_stream_phase::stage_window). Leaving it to the route core keeps
                 // that core's HOST answer for the expert, which the executor's expert loop takes to the stage table,
                 // and a batch the executor declines reaches the per-expert path's CPU route for it instead of a staged
                 // slot that path cannot read. On a weight the executor takes whole (executor_takes_weight) the entry
@@ -82904,14 +82903,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     layout_mode override_layout    = GGML_LAYOUT_AOS;
     const bool  has_override       = ggml_sycl_layout_override_active(override_layout);
 
-    // plan Task 10 (llama.cpp-3460): true when the batched executor takes this prompt op's weight with its routed host
-    // experts read from the stream ring (moe_stream_phase::executor_staged): the ring's index build recorded the
-    // staged claim (ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor) as the consumer of every host entry of the
-    // weight, and the ring has staged every one the micro-batch routes to. The recorded consumer answers; the claim is
-    // not asked again here. Set once, after begin_layer staged the layer. Such an op leaves the hybrid world: the bool
-    // clears plan_has_cpu_experts and joins the executor's resident claim at the MMVQ-probe skip and at the prompt
-    // route, so the executor reads the staged slots. A weight with an un-staged routed host expert, or one the
-    // executor does not claim, stays hybrid as before.
+    // plan Task 10 (llama.cpp-3460): true when the batched executor takes this prompt op's layer with its host experts
+    // read from the stream ring (moe_stream_phase::executor_claims): the ring's index build recorded the staged claim
+    // (ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor) as the consumer of every host entry of the layer, the
+    // layer's decision is RING and the ring is reserved. The recorded consumer answers; the claim is not asked again
+    // here. Set once, after begin_layer decided the layer. Such an op leaves the hybrid world: the bool clears
+    // plan_has_cpu_experts and joins the executor's resident claim at the MMVQ-probe skip and at the prompt route, so
+    // the executor reads the ring's slots, which it stages a window at a time. A layer the executor does not claim
+    // whole stays hybrid as before.
     bool pp_onednn_batched_claims_staged_layer = false;
 
     // Prompt IDs and routes are admitted exactly once, before any specialized
@@ -82989,9 +82988,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
         }
 #endif
-        // The layer-ahead stream (llama.cpp-xod7): weighs this layer and the next on the ids the layer routes on, and
-        // stages a ring decision's host experts through the VRAM ring. The resolved-batch builds below read the stage
-        // table through the STAGED_RING route (llama.cpp-o9uw).
+        // The prompt stream (llama.cpp-xod7, llama.cpp-9433): weighs and decides this layer at its first op. The ring
+        // stages only the executor's windows of a layer the executor claims (moe_stream_phase::window_begin). The
+        // resolved-batch builds below read the stage table through the STAGED_RING route (llama.cpp-o9uw).
         {
             ggml_sycl_moe_stream_call stream_call;
             if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) {
@@ -82999,11 +82998,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                             *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
                                             stream_call.op);
                 ggml_sycl_moe_stream_release_payload(ctx);
-                // The index and the table are the ones begin_layer just built and staged, keyed as the staged route
-                // keys them: the layer begin_layer was given, and the plan's role classifier.
-                pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_staged(
-                    stream_call.layer, ggml_sycl::expert_tensor_role_from_tensor_name(src0->name),
-                    prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), stream_call.op.n_expert);
+                // The index and the decision are the ones begin_layer just built, for the layer begin_layer was given.
+                pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_claims(stream_call.layer);
             }
         }
         // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1): sweep_a/
