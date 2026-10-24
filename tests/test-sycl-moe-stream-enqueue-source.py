@@ -1207,6 +1207,54 @@ def test_policy_gate_mutants():
     assert not c(PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"), PLAN_HPP)
 
 
+# ---- a matrix the ring cannot take reaches the executor as a decline, not an abort (llama.cpp-9433) -----------------
+
+NO_LEASE_SKIP = ("if (!host.valid() || host_bytes < item.src_bytes || "
+                 "!(host.owner_metadata(&owner) && moe_stream_owner_streamable(owner, device))) { continue; }")
+PREFETCHED_BRANCH = "if (wid == next_window_id_) { if (next_window_whole_ && missing != 0) { GGML_ABORT("
+WHOLE_SET = "next_window_whole_ = n.staged == static_cast<int>(nitems.size());"
+RESTAGE_UNPREFETCHED = "} else if (missing != 0) { stage_or_abort(items, req.role, req.phase); }"
+STAGED_COUNT = "staged += find(item.layer, item.expert_id, item.role) != nullptr ? 1u : 0u;"
+
+
+def claim_window_decline_reaches_the_executor(phase: str) -> bool:
+    """A matrix the ring cannot take directly (no lease, a short lease, or an owner it cannot copy from) is skipped by
+    stage_window before the free-slot check, so it is neither an abort nor an exhausted slot, and is never copied
+    another way. window_begin re-stages only a window no prefetch took, aborts on a prefetched one only when that
+    prefetch took the whole window, and returns the count the table holds, so the executor finds no entry for the
+    skipped expert and declines it. window_begin's three aborts are the claim guard, a window larger than its region
+    and entries lost after a whole prefetch. No host test reaches window_begin (it needs a device cache), so this pin
+    is the decline path's witness."""
+    n = norm(phase)
+    wb = body(n, WINDOW_BEGIN_SIG)
+    sw = body(n, STAGE_SIG)
+    return (ordered(sw, NO_LEASE_SKIP, SLOTS_CHECK, AOS_ACQUIRE) and wb.count("GGML_ABORT(") == 3
+            and ordered(wb, PREFETCHED_BRANCH, RESTAGE_UNPREFETCHED, WHOLE_SET, STAGED_COUNT)
+            and wb.endswith("return staged; }"))
+
+
+def test_window_decline_reaches_the_executor():
+    assert claim_window_decline_reaches_the_executor(PHASE)
+
+
+def test_window_decline_mutants():
+    c = claim_window_decline_reaches_the_executor
+    # A lease the ring cannot copy aborts the prompt, or counts as an exhausted slot (which window_begin aborts on).
+    assert not c(mutate(PHASE, NO_LEASE_SKIP, NO_LEASE_SKIP.replace("{ continue; }", '{ GGML_ABORT("no lease"); }')))
+    assert not c(mutate(PHASE, NO_LEASE_SKIP, NO_LEASE_SKIP.replace("{ continue; }", "{ ++n.exhausted; continue; }")))
+    # A prefetched window aborts on any missing entry, so a skipped matrix kills the prompt.
+    assert not c(mutate(PHASE, "if (next_window_whole_ && missing != 0) {", "if (missing != 0) {"))
+    # The prefetch reported whole whatever it took.
+    assert not c(mutate(PHASE, WHOLE_SET, "next_window_whole_ = true;"))
+    # A prefetched window re-staged, asking the same lease again.
+    assert not c(mutate(PHASE, "} else if (missing != 0) {", "} if (missing != 0) {"))
+    # A fourth abort: a window short of its items.
+    short = 'if (missing != 0) { GGML_ABORT("short"); } const bool exposed ='
+    assert not c(mutate(PHASE, "const bool exposed =", short))
+    # The window's size returned instead of what the table holds.
+    assert not c(mutate(PHASE, "return staged; }", "return static_cast<uint32_t>(items.size()); }"))
+
+
 UBATCH_PRED_SIG = "static inline bool moe_stream_ubatch_starts("
 EXPOSED_PRED_SIG = "static inline bool moe_stream_window_exposed("
 WINDOW_ID_SIG = "static inline uint32_t moe_stream_window_id("
