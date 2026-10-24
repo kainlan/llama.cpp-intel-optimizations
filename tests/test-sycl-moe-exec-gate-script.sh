@@ -7,11 +7,16 @@
 # Cases (each asserts the exact verdict text the lead will read):
 #   - the grep controls hold (every regex matches its own line and not its nearest decoy; the GPT-OSS echo line
 #     scores 0 under grep -cx and 2 under a loose grep -c);
-#   - Q_pp: a pass (Q_pp=PASS), a failing pp512 (Q_pp=FAIL(pp512=412<500)), the log a real default-verbosity auto run
+#   - Q_pp: a pass (Q_pp=PASS), a failing pp512 (Q_pp=FAIL(pp512=112<200)), the log a real default-verbosity auto run
 #     prints (24 host layers, "ring-unavailable" reasons, one summary per llama-bench context, zero ring
 #     layer-ubatches: ring_engaged=no), ring_engaged read from the summary and not from the unavailable WARN
 #     (which auto does not print), layer count, missing summary and [PP-MOE] refused each fail by name,
 #     loan_exercised counts a granted loan and not a refused one;
+#     the window ring (plan 2026-10-24, Task 6): the summary's windows/exposed/misses fields and the executor trace's
+#     misses=, so an engaged run passes with windows= exposed= misses= in the verdict, ring_engaged=no and misses=3
+#     fail by name, an older summary without the window fields fails summary_windows=missing, floors are the bus
+#     arithmetic (pp512 200, pp2048 500, overridable), and the two new arms Q_pp_ub2048 (pp2048 floor only) and
+#     Q_pp_nocopyq (GGML_SYCL_COPY_ENGINE=0) score like Q_pp;
 #   - Q_staged: only the layers the ring served are scored (the executor also dispatches resident layers, whose
 #     staged=0 lines are correct): a pass with resident staged=0 lines, a ring-served layer at staged=0, a non-f16
 #     ring-served arm, a refused line, a missing arm=f16 line, no ring-served dispatch, and NOT_EXERCISED when no
@@ -27,7 +32,7 @@
 #     by default, unchanged, changed); refill balanced / unbalanced / not_exercised; watchdog;
 #   - GO_gate / GO_noc count and layer lines (the echo line alone must not score), GO_pp window, MI digits,
 #     resets;
-#   - --dry-run lists every arm, pins the selector in all fourteen device arms, passes no -ngl, no -cnv to llama-cli,
+#   - --dry-run lists every arm, pins the selector in all sixteen device arms, passes no -ngl, no -cnv to llama-cli,
 #     and runs nothing; --help names the arms;
 #   - a real run refuses without a <sha> or with a wrong one, prints verdicts_pass=0 GATE_DONE, exits 2 and never
 #     creates GPU.lock; the lock helper takes, refuses a second take, and releases;
@@ -119,13 +124,13 @@ mklayers() {
 }
 
 TRACE_EXEC_PREFIX='0.05.100.000 I [MOE-EXEC-TRACE] executor device 0'
-SUMMARY='0.09.000.000 W [MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed'
+SUMMARY='0.09.000.000 W [MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed, 216 windows, 24 exposed, 0 misses'
 TRACE_DECOY='0.05.200.000 I [MOE-EXEC-TRACE] dev 0 layer 3: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
 UNAVAIL='0.04.000.000 W [MOE-EXEC] device 0: stream ring unavailable: cap'
 UNAVAIL="$UNAVAIL (host_matrices_per_layer_max=3 n_slots=0 bytes=0)"
-SUMMARY_NORING='0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed'
-SUMMARY_NORING2='0.19.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 372 cpu, 0 forced, 0 MiB streamed'
-SUMMARY_RING2='0.19.000.000 W [MOE-EXEC] summary: 40 layer-ubatches ring, 7 cpu, 0 forced, 600 MiB streamed'
+SUMMARY_NORING='0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 96 cpu, 0 forced, 0 MiB streamed, 0 windows, 0 exposed, 0 misses'
+SUMMARY_NORING2='0.19.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 372 cpu, 0 forced, 0 MiB streamed, 0 windows, 0 exposed, 0 misses'
+SUMMARY_RING2='0.19.000.000 W [MOE-EXEC] summary: 40 layer-ubatches ring, 7 cpu, 0 forced, 600 MiB streamed, 80 windows, 8 exposed, 0 misses'
 PPMOE_REFUSED='0.07.000.000 W [PP-MOE] refused device=0 cause=x detail=- tensor=blk.3.ffn_up_exps.weight'
 PPMOE_REFUSED="$PPMOE_REFUSED type=q4_0 layout=aos staged=4"
 LOAN_OK='0.06.000.000 W [MOE-EXEC] loan device 0: 24 triplets, 300 MiB lent to the ring (ok)'
@@ -140,7 +145,7 @@ expect "controls print ok" "$out" "controls: ok"
 
 # ---- Q_pp
 mkcsv "$WORK/pp-pass.csv" 512:0:523.4:3.1:512 2048:0:851.2:5.0:2048
-mkcsv "$WORK/pp-fail.csv" 512:0:412.3:2.0:512 2048:0:851.2:5.0:2048
+mkcsv "$WORK/pp-fail.csv" 512:0:112.3:2.0:512 2048:0:851.2:5.0:2048
 mkcsv "$WORK/pp-slow.csv" 512:0:14.1:0.2:256 2048:0:31.5:0.3:256
 { mklayers "$WORK/pp-pass.err" 48; echo "$SUMMARY" >> "$WORK/pp-pass.err"; echo "$TRACE_DECOY" >> "$WORK/pp-pass.err"; }
 cp "$WORK/pp-pass.err" "$WORK/pp-fail.err"
@@ -161,7 +166,7 @@ expect "Q_pp pass reports the auto ubatch" "$out" "ub=512"
 expect_rc "Q_pp pass rc" "$rc" 0
 
 out="$(score Q_pp --csv "$WORK/pp-fail.csv" --err "$WORK/pp-fail.err")"; rc=$?
-expect "Q_pp fail verdict" "$out" "Q_pp=FAIL(pp512=412<500)"
+expect "Q_pp fail verdict" "$out" "Q_pp=FAIL(pp512=112<200)"
 expect_not "Q_pp fail names only pp512" "$out" "pp2048=851.2<"
 expect_rc "Q_pp fail rc" "$rc" 1
 
@@ -169,10 +174,10 @@ out="$(score Q_pp --csv "$WORK/pp-slow.csv" --err "$WORK/pp-refused.err")"
 expect "Q_pp ring-refused says ring_engaged=no" "$out" "ring_engaged=no"
 expect "Q_pp ring-refused counts no ring layer-ubatches" "$out" "ring_layer_ubatches=0"
 expect "Q_pp the real log has 24 layers and two summaries" "$out" "layers=24 summary=2"
-expect "Q_pp ring-refused fails the floors" "$out" "Q_pp=FAIL(pp512=14<500,pp2048=32<800)"
+expect "Q_pp ring-refused fails the floors" "$out" "Q_pp=FAIL(pp512=14<200,pp2048=32<500,ring_engaged=no)"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-refused.err")"
 expect "Q_pp ring_engaged=no is independent of the verdict" "$out" "ring_engaged=no"
-expect "Q_pp passing numbers without the ring still pass honestly" "$out" "Q_pp=PASS"
+expect "Q_pp passing numbers without the ring fail by name: the old pass without the ring is retired" "$out" "Q_pp=FAIL(ring_engaged=no)"
 # The unavailable WARN is not the signal: with it printed AND ring layer-ubatches counted, the ring engaged; with
 # it absent and zero ring layer-ubatches (the real auto log above), it did not.
 { echo "$UNAVAIL"; cat "$WORK/pp-pass.err"; } > "$WORK/pp-mixed.err"
@@ -211,6 +216,78 @@ expect "Q_pp a timeout is a failure" "$out" "Q_pp=FAIL(rc=124"
 mkcsv "$WORK/pp-none.csv" 128:0:900:1:128
 out="$(score Q_pp --csv "$WORK/pp-none.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp a csv without the rows fails, never passes" "$out" "Q_pp=FAIL(no_pp512_row"
+
+# ---- Q_pp, the window ring (plan 2026-10-24 Task 6): windows/exposed/misses, bus-derived floors, the two new arms
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp engaged pass: the exact verdict line" "$out" \
+    "Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0"
+# The two summaries of a -p 512,2048 run add up like ring_layer_ubatches does: a miss in the first context counts.
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-sum2.err")"
+expect "Q_pp windows add up over the summaries" "$out" "windows=296 exposed=32 misses=0"
+sed 's/80 windows, 8 exposed, 0 misses/80 windows, 8 exposed, 2 misses/' "$WORK/pp-sum2.err" > "$WORK/pp-miss2.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-miss2.err")"
+expect "Q_pp a miss in the last summary fails by name" "$out" "Q_pp=FAIL(misses=2)"
+sed 's/216 windows, 24 exposed, 0 misses/216 windows, 24 exposed, 3 misses/' "$WORK/pp-sum2.err" > "$WORK/pp-miss1.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-miss1.err")"
+expect "Q_pp a miss in the FIRST summary is not hidden by a clean last one" "$out" "Q_pp=FAIL(misses=3)"
+expect "Q_pp the failing verdict still prints windows exposed misses" "$out" "windows=296 exposed=32 misses=3"
+sed 's/0 misses/3 misses/' "$WORK/pp-pass.err" > "$WORK/pp-miss3.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-miss3.err")"
+expect "Q_pp misses=3 fails by name" "$out" "Q_pp=FAIL(misses=3)"
+# the old short summary (an older binary): windows=NA and a named failure, never a quiet pass
+sed 's/, 216 windows, 24 exposed, 0 misses//' "$WORK/pp-pass.err" > "$WORK/pp-oldsum.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-oldsum.err")"
+expect "Q_pp the old summary without window fields fails summary_windows=missing" "$out" "Q_pp=FAIL(summary_windows=missing)"
+expect "Q_pp the old summary scores windows=NA" "$out" "windows=NA exposed=NA misses=NA"
+# one summary with the fields and one without (mixed binaries) is as missing as none
+{ cat "$WORK/pp-pass.err"; sed 's/, 80 windows, 8 exposed, 0 misses//' <<< "$SUMMARY_RING2"; } > "$WORK/pp-halfsum.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-halfsum.err")"
+expect "Q_pp one summary without the window fields is summary_windows=missing" "$out" "Q_pp=FAIL(summary_windows=missing)"
+# the executor trace's misses= counts too, and a trace line without it counts for nothing
+{ cat "$WORK/pp-pass.err"
+  echo "$TRACE_EXEC_PREFIX tensor=blk.0.ffn_up_exps.weight experts=480 staged=300 arm=f16 misses=2"
+  echo "$TRACE_EXEC_PREFIX tensor=blk.1.ffn_up_exps.weight experts=480 staged=300 arm=f16 misses=1"
+  echo "$TRACE_EXEC_PREFIX tensor=blk.2.ffn_up_exps.weight experts=480 staged=300 arm=f16"; } > "$WORK/pp-tracemiss.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-tracemiss.err")"
+expect "Q_pp the executor trace misses add to the summary misses" "$out" "Q_pp=FAIL(misses=3)"
+out="$(score Q_staged --err "$WORK/pp-tracemiss.err")"
+expect "Q_staged names the executor trace misses" "$out" "trace_misses=3"
+out="$(score Q_staged --err "$WORK/st-pass.err")"
+expect_not "Q_staged without misses= fields names no trace_misses" "$out" "trace_misses"
+# floors: the bus arithmetic, overridable
+mkcsv "$WORK/pp-floor.csv" 512:0:199.0:1.0:512 2048:0:499.0:1.0:2048
+out="$(score Q_pp --csv "$WORK/pp-floor.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp floors are 200 and 500" "$out" "Q_pp=FAIL(pp512=199<200,pp2048=499<500)"
+mkcsv "$WORK/pp-floor-ok.csv" 512:0:200.0:1.0:512 2048:0:500.0:1.0:2048
+out="$(score Q_pp --csv "$WORK/pp-floor-ok.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp exactly at both floors passes" "$out" "Q_pp=PASS pp512=200.0"
+out="$(score Q_pp --csv "$WORK/pp-floor.csv" --err "$WORK/pp-pass.err" --pp512-min 150 --pp2048-min 400)"
+expect "Q_pp --pp512-min and --pp2048-min override the floors" "$out" "Q_pp=PASS pp512=199.0"
+# Q_pp_ub2048: a -p 2048 run has no pp512 row, only the pp2048 floor applies, ub is the 2048 row's
+mkcsv "$WORK/ub-pass.csv" 2048:0:610.0:4.0:2048
+out="$(score Q_pp_ub2048 --csv "$WORK/ub-pass.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp_ub2048 scores pp2048 alone and names itself" "$out" \
+    "Q_pp_ub2048=PASS pp512=NA sd512=NA pp2048=610.0 sd2048=4.0 ub=2048 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0"
+mkcsv "$WORK/ub-slow.csv" 2048:0:450.0:4.0:2048
+out="$(score Q_pp_ub2048 --csv "$WORK/ub-slow.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp_ub2048 below the pp2048 floor fails" "$out" "Q_pp_ub2048=FAIL(pp2048=450<500)"
+out="$(score Q_pp_ub2048 --csv "$WORK/ub-slow.csv" --err "$WORK/pp-pass.err" --pp2048-min 400)"
+expect "Q_pp_ub2048 honours --pp2048-min" "$out" "Q_pp_ub2048=PASS"
+out="$(score Q_pp_ub2048 --csv "$WORK/ub-pass.csv" --err "$WORK/pp-refused.err")"
+expect "Q_pp_ub2048 without the ring fails ring_engaged=no" "$out" "Q_pp_ub2048=FAIL(ring_engaged=no)"
+out="$(score Q_pp_ub2048 --csv "$WORK/ub-pass.csv" --err "$WORK/pp-miss3.err")"
+expect "Q_pp_ub2048 misses fail by name" "$out" "Q_pp_ub2048=FAIL(misses=3)"
+mkcsv "$WORK/ub-none.csv" 512:0:900:1:512
+out="$(score Q_pp_ub2048 --csv "$WORK/ub-none.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp_ub2048 without a pp2048 row fails, never passes" "$out" "Q_pp_ub2048=FAIL(no_pp2048_row)"
+# Q_pp_nocopyq: scored exactly like Q_pp, under its own name
+out="$(score Q_pp_nocopyq --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp_nocopyq is scored like Q_pp" "$out" \
+    "Q_pp_nocopyq=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0"
+out="$(score Q_pp_nocopyq --csv "$WORK/pp-floor.csv" --err "$WORK/pp-pass.err")"
+expect "Q_pp_nocopyq carries both Q_pp floors" "$out" "Q_pp_nocopyq=FAIL(pp512=199<200,pp2048=499<500)"
+out="$(score Q_pp_nocopyq --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err" --rc 124)"
+expect "Q_pp_nocopyq a timeout is a failure" "$out" "Q_pp_nocopyq=FAIL(rc=124"
 
 out="$(score Q_pp_cpu --csv "$WORK/pp-slow.csv" --err "$WORK/pp-refused.err")"
 expect "Q_pp_cpu is recorded" "$out" "Q_pp_cpu=RECORDED pp512=14.1 pp2048=31.5"
@@ -533,17 +610,26 @@ expect "resets a GT reset fails" "$out" "resets=FAIL(count=1)"
 # ---- dry run and help
 out="$(bash "$GATE" --dry-run 2>&1)"; rc=$?
 expect_rc "dry-run rc" "$rc" 0
-for arm in Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc \
+for arm in Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc \
            GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
     expect "dry-run lists $arm" "$out" "$arm: "
 done
 n_sel="$(printf '%s\n' "$out" | grep -c 'ONEAPI_DEVICE_SELECTOR=level_zero:[01] ')"
-expect_rc "dry-run pins the selector in all fourteen device arms" "$n_sel" 14
+expect_rc "dry-run pins the selector in all sixteen device arms" "$n_sel" 16
 n_q900="$(printf '%s\n' "$out" | grep -E '^Q_[A-Za-z0-9_]+: ' | grep -c 'timeout -k 15 900 ')"
 expect_rc "dry-run gives the seven short Qwen arms timeout 900" "$n_q900" 7
-n_q1500="$(printf '%s\n' "$out" | grep -E '^Q_pp(_cpu)?: ' | grep -c 'timeout -k 15 1500 ')"
-expect_rc "dry-run gives Q_pp and Q_pp_cpu timeout 1500 (run 1 took 11.5 min of 15 with the ring off)" "$n_q1500" 2
+n_q1500="$(printf '%s\n' "$out" | grep -E '^Q_pp(_[a-z0-9]+)?: ' | grep -c 'timeout -k 15 1500 ')"
+expect_rc "dry-run gives the four Q_pp arms timeout 1500 (run 1 took 11.5 min of 15 with the ring off)" "$n_q1500" 4
 expect_not "dry-run passes no -ngl" "$out" " -ngl"
+line_ub="$(printf '%s\n' "$out" | grep -E '^Q_pp_ub2048: ')"
+expect "dry-run Q_pp_ub2048 runs -ub 2048 -p 2048" "$line_ub" "-ub 2048 -p 2048"
+expect "dry-run Q_pp_ub2048 pins the B70" "$line_ub" "ONEAPI_DEVICE_SELECTOR=level_zero:0 "
+expect_not "dry-run Q_pp_ub2048 leaves the copy engine alone" "$line_ub" "GGML_SYCL_COPY_ENGINE"
+line_nc="$(printf '%s\n' "$out" | grep -E '^Q_pp_nocopyq: ')"
+expect "dry-run Q_pp_nocopyq sets GGML_SYCL_COPY_ENGINE=0" "$line_nc" "GGML_SYCL_COPY_ENGINE=0"
+expect "dry-run Q_pp_nocopyq runs Q_pp's -p 512,2048" "$line_nc" '-p 512\,2048'
+expect "dry-run Q_pp_nocopyq pins the B70" "$line_nc" "ONEAPI_DEVICE_SELECTOR=level_zero:0 "
+expect_not "dry-run Q_pp itself leaves the copy engine alone" "$(printf '%s\n' "$out" | grep -E '^Q_pp: ')" "GGML_SYCL_COPY_ENGINE"
 n_cnv="$(printf '%s\n' "$out" | grep -E '^GO_(gate|noc): ' | grep -cE '(^| )-cnv( |$)')"
 expect_rc "dry-run passes no -cnv to llama-cli" "$n_cnv" 0
 expect "dry-run states it runs nothing" "$out" "nothing is executed"
@@ -581,7 +667,9 @@ expect_rc "an unknown arm is a usage error" "$rc" 2
 
 # ---- the summary: ring_engaged_any and the exit code, scored from real verdict lines
 PASS_RING="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
-PASS_NORING="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-refused.err")"
+# A Q_pp PASS without the ring is unreachable since Task 6, but summarize() is a pure function of verdict lines and keeps
+# its ring_engaged_any=no / exit 3 rule for any ring arm that prints a PASS with ring_engaged=no: score that literal line.
+PASS_NORING="Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no windows=0 exposed=0 misses=0"
 FAIL_LINE="$(score Q_pp --csv "$WORK/pp-fail.csv" --err "$WORK/pp-fail.err")"
 CTRL_PASS="GO_gate=PASS count=1 layer_lines=0"
 summ() { # <name> <verdict line>...: writes them to a file and runs --score-summary
@@ -700,9 +788,12 @@ if [ "${#RARMS[@]}" -gt 0 ]; then
 else
     fail "--ring-arms printed nothing"
 fi
+expect "the ring arms include the window-ring arms" "${RARMS[*]}" "Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_staged"
 for arm in "${RARMS[@]}"; do
     case "$arm" in
         Q_pp) line="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")" ;;
+        Q_pp_ub2048) line="$(score Q_pp_ub2048 --csv "$WORK/ub-pass.csv" --err "$WORK/pp-pass.err")" ;;
+        Q_pp_nocopyq) line="$(score Q_pp_nocopyq --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")" ;;
         Q_staged) line="$(score Q_staged --err "$WORK/st-pass.err")" ;;
         *) line="" ;;
     esac
@@ -925,7 +1016,7 @@ expect "a PASS with builders_post 2 becomes NOT_SCORED(tainted=builders,was=PASS
 expect "a tainted verdict carries the flag" "$out" "builders_pre=0 builders_post=2 tainted=builders"
 expect_rc "a tainted PASS is exit class 3" "$rc" 3
 out="$(score Q_pp --csv "$WORK/pp-fail.csv" --err "$WORK/pp-fail.err" --builders-pre 0 --builders-post 3)"; rc=$?
-expect "a FAIL with builders_post 3 stays a FAIL" "$out" "Q_pp=FAIL(pp512=412<500)"
+expect "a FAIL with builders_post 3 stays a FAIL" "$out" "Q_pp=FAIL(pp512=112<200)"
 expect "a tainted FAIL carries the flag" "$out" "tainted=builders"
 expect_rc "a tainted FAIL is exit 1" "$rc" 1
 out="$(score MI_b70 --out "$WORK/mi.out" --builders-pre 1 --builders-post 0)"
@@ -940,7 +1031,7 @@ expect "summary a tainted PASS is not counted as a pass" "$out" "verdicts_pass=1
 printf '%s\n' "$PASS_RING" "$CTRL_PASS" > "$WORK/seed.txt"
 out="$(bash "$GATE" --refuse-selftest --seed-verdicts "$WORK/seed.txt" --lock-dir "$WORK/ref.lock" 2>&1)"; rc=$?
 expect_rc "a refusal after arms ran exits 2" "$rc" 2
-expect "a refusal after arms ran prints STOPPED with the reason" "$out" "STOPPED: synthetic stop (2 of 15 arms scored)"
+expect "a refusal after arms ran prints STOPPED with the reason" "$out" "STOPPED: synthetic stop (2 of 17 arms scored)"
 expect "a refusal after arms ran prints the summary over the scored verdicts" "$out" "summary: ring_engaged_any=yes"
 expect "a refusal after arms ran keeps the scored passes in the final line" "$out" "verdicts_pass=2 GATE_DONE"
 expect_not "a refusal after arms ran is not a bare REFUSED" "$out" "REFUSED"
@@ -963,7 +1054,7 @@ kill -TERM "$gpid" 2>/dev/null
 wait "$gpid"; rc=$?
 out="$(cat "$WORK/sig2.out")"
 expect_rc "a TERM after arms ran exits 143" "$rc" 143
-expect "a TERM after arms ran prints STOPPED: signal" "$out" "STOPPED: signal (2 of 15 arms scored)"
+expect "a TERM after arms ran prints STOPPED: signal" "$out" "STOPPED: signal (2 of 17 arms scored)"
 expect "a TERM after arms ran prints the summary over the scored verdicts" "$out" "summary: ring_engaged_any=yes"
 expect "a TERM after arms ran keeps the scored passes" "$out" "verdicts_pass=2 GATE_DONE"
 if [ -e "$LOCKS" ]; then

@@ -9,10 +9,11 @@
 #   setsid nohup bash scripts/sycl-moe-exec-gate.sh <sha> > <scratchpad>/gate.log 2>&1 < /dev/null &
 # It loads models onto both discrete cards. Never run it from a subagent, never in a loop.
 #
-# Arms (selector pinned in every arm; no -ngl anywhere; timeouts: Q_pp and Q_pp_cpu 1500 s, the other Qwen arms 900 s,
+# Arms (selector pinned in every arm; no -ngl anywhere; timeouts: the four Q_pp arms 1500 s, the other Qwen arms 900 s,
 # GO_gate and GO_noc 600 s, the Mistral arms 300 s; a run that hits its timeout exits 124 and one that has to be
 # killed exits 137, and every arm scores a non-zero rc as a FAIL naming it):
-#   Q_pp       llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v          B70  pp512 >= 500, pp2048 >= 800,
+#   Q_pp       llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v          B70  pp512 >= 200, pp2048 >= 500 (the bus-derived
+#              floors, see PP512_MIN), ring_engaged=yes, zero window misses, the window fields on every summary line,
 #              at least one distinct "[MOE-EXEC] layer N:" line (exactly --q-layers N when given), at least one
 #              "[MOE-EXEC] summary:" (llama-bench makes one context per -p value, so -p 512,2048 prints two),
 #              zero "[PP-MOE] refused".
@@ -25,6 +26,9 @@
 #              "stream ring unavailable" WARN: under auto at default verbosity that WARN is not printed at all
 #              (it needs GGML_SYCL_MOE_EXEC=ring or the trace), so its absence proves nothing (llama.cpp-bcre).
 #              loan_exercised=yes|no is a "[MOE-EXEC] loan device N: K triplets" line.
+#   Q_pp_ub2048  llama-bench -m $Q -ub 2048 -p 2048 -n 0 -r 3 -fa 1 -o csv -v       B70  pp2048 >= 500 only (no pp512 row),
+#              scored like Q_pp otherwise; the pp2048 floor's natural setting and llama.cpp-dfo0's measurement arm
+#   Q_pp_nocopyq  Q_pp with GGML_SYCL_COPY_ENGINE=0                               B70  scored like Q_pp; the copy-engine A/B
 #   Q_pp_cpu   Q_pp with GGML_SYCL_MOE_EXEC=cpu                       B70  recorded, not gated (FAIL on rc != 0)
 #   Q_staged   llama-bench -p 512 -n 0 -r 1 -fa 1 -o csv -v, GGML_SYCL_MOE_EXEC_TRACE=1   B70
 #              the executor prints "[MOE-EXEC-TRACE] executor device D tensor=T experts=E staged=S arm=A" for EVERY
@@ -71,12 +75,12 @@
 #   resets     journalctl -k --since <gate start> | grep -icE
 #              'GT reset|guc_id|CAT error|Engine reset|exec queue reset' = 0
 #              (journalctl's own rc is kept: a failed journalctl or a missing journal file is a FAIL, never a clean log)
-# Duration: a complete run of all 15 arms takes about 45 minutes on this host with the ring off (run 2: Q_pp 9.5 min,
+# Duration: a complete run of all 17 arms takes about 45 minutes on this host with the ring off (run 2: Q_pp 9.5 min,
 # Q_pp_cpu 9.3, Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the GPT-OSS and Mistral arms
 # about 1 each).
 # Note on the plan table: llama-bench has no -c option (its context is n_prompt + n_gen), so GO_pp carries none.
 # Verdict-bearing arms (11): Q_pp Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets.
-# Arms in all (15): the eleven, Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
+# Arms in all (17): the eleven, Q_pp_ub2048, Q_pp_nocopyq (both verdict-bearing too), Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
 #
 # Every grep has a positive and a negative control (check_controls) that runs before any arm and is exposed as
 # --check-controls. The GPT-OSS echo-line trap (the prompt ends with the answer, so a loose grep scores 2) is the
@@ -197,8 +201,15 @@ MISTRAL="/models/mistral-7b-v0.1.Q4_0.gguf"
 DECODE_PROMPT="$SCRIPT_DIR/qwen4exp-mtp-prompts/code.txt"
 TOK_PROMPT="$SCRIPT_DIR/sycl-moe-exec-prompts/code-2k.txt"
 
-PP512_MIN=500
-PP2048_MIN=800
+# The prefill floors come from the bus, not from the old targets (plan 2026-10-24-prefill-window-ring.md, "Why this plan
+# exists" item 4). Qwen3.8 on the B70 places 44091 of 73728 experts on the host; a 512-token ubatch touches almost every
+# expert of a host layer, about 29 fully-host layers x 1536 matrices x 0.92 MB = ~41 GB per ubatch. At the probed
+# ~25 GB/s that is ~1.6 s per ubatch, a pp512 ceiling near 312 tok/s. PP512_MIN is 200, 64 % of that ceiling. The old
+# 500 is above the ceiling for this placement and is retired. At -ub 2048 the same bytes carry four times the tokens,
+# so pp2048 is no longer bus-bound: PP2048_MIN is 500, the compute-bound floor the 2026-10-19 plan already defended
+# (the old 800 needs -ub 2048 and is llama.cpp-dfo0's measurement, not a gate). --pp512-min / --pp2048-min override.
+PP512_MIN=200
+PP2048_MIN=500
 QTG_MIN="11.0"
 QNOC_MIN="9.5"
 QMD5="25b7738a"
@@ -219,8 +230,8 @@ DECODE_FLIP_PREFIX_MIN=128
 TOK_PREFIX_MIN=64
 
 # The arms whose verdict carries ring_engaged=yes|no; ring_engaged_any in the summary is read from these and only these.
-RING_ARMS=(Q_pp Q_staged)
-ALL_ARMS=(Q_pp Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc
+RING_ARMS=(Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_staged)
+ALL_ARMS=(Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc
           GO_gate GO_pp GO_noc MI_b70 MI_b50 resets)
 declare -a ARMS=()
 S_CSV="" S_OUT="" S_OUT2="" S_ERR="" S_REF="" S_REF2="" S_JOURNAL="" S_RC=0
@@ -230,11 +241,14 @@ S_CSV="" S_OUT="" S_OUT2="" S_ERR="" S_REF="" S_REF2="" S_JOURNAL="" S_RC=0
 RE_LAYER='\[MOE-EXEC\] layer [0-9]+:'
 RE_SUMMARY='\[MOE-EXEC\] summary:'
 RE_SUMMARY_RING='\[MOE-EXEC\] summary: [0-9]+ layer-ubatches ring'
+RE_SUMMARY_WINDOWS='\[MOE-EXEC\] summary: .*, [0-9]+ windows, [0-9]+ exposed, [0-9]+ misses'
+RE_WINDOW_FIELDS=', [0-9]+ windows, [0-9]+ exposed, [0-9]+ misses'
 RE_LOAN_OK='\[MOE-EXEC\] loan device [0-9]+: [0-9]+ triplets'
 RE_REFILL='\[MOE-EXEC\] refill device [0-9]+: [0-9]+/[0-9]+ triplets re-admitted'
 RE_PP_REFUSED='\[PP-MOE\] refused device='
 RE_PP_ARM_F16='\[PP-MOE\] device=[0-9]+ type=[^ ]+ layout=[^ ]+ arm=f16 '
 RE_TRACE_EXEC='\[MOE-EXEC-TRACE\] executor device [0-9]+ tensor=[^ ]+ experts=[0-9]+ staged=[0-9]+ arm=[a-z0-9]+'
+RE_TRACE_MISSES='\[MOE-EXEC-TRACE\] executor device [0-9]+ .* misses=[0-9]+'
 RE_WATCHDOG='SYCL-WATCHDOG\] No GPU progress'
 RE_PLACE='MoE experts: [0-9]+ on device, [0-9]+ on host'
 RE_TPS='[0-9.]+ tokens per second'
@@ -452,6 +466,32 @@ ring_layer_ubatches() {
 # not the signal: under auto at default verbosity the phase prints nothing of its own (it needs ring or the trace).
 ring_engaged() { [ "$(ring_layer_ubatches "$@")" -gt 0 ] && echo yes || echo no; }
 
+# summary_field <file> <windows|exposed|misses>: the sum of that window field over every "[MOE-EXEC] summary:" line, or
+# NA when no summary line carries the window fields or any summary line lacks them (an older binary, or a mixed run).
+# Summed, not read from the last line: a summary prints once per backend teardown (llama-bench makes one context per -p
+# value), so a miss in the first context must not be hidden by a clean last one, as ring_layer_ubatches sums too.
+summary_field() {
+    local n_all n_win
+    n_all="$(count_re "$RE_SUMMARY" "$1")"
+    n_win="$(count_re "$RE_SUMMARY_WINDOWS" "$1")"
+    if [ "$n_win" -eq 0 ] || [ "$n_win" -ne "$n_all" ]; then
+        echo NA
+        return
+    fi
+    cat "$1" 2>/dev/null | grep -aoE -- "$RE_WINDOW_FIELDS" | awk -v f="$2" '
+        { v = (f == "windows") ? $2 : (f == "exposed") ? $4 : $6; n += v } END { print n + 0 }'
+}
+summary_windows() { summary_field "$1" windows; }
+summary_exposed() { summary_field "$1" exposed; }
+summary_misses() { summary_field "$1" misses; }
+
+# trace_misses <file>: the sum of misses=N over the "[MOE-EXEC-TRACE] executor device" lines (0 when the trace is off or
+# a line carries no misses= field).
+trace_misses() {
+    cat "$1" 2>/dev/null | grep -aE -- "$RE_TRACE_MISSES" | grep -aoE ' misses=[0-9]+' | cut -d= -f2 \
+        | awk '{ n += $1 } END { print n + 0 }'
+}
+
 # layers_item <label> <layers> <want>: a failure item when the distinct layer count is not what the arm needs. want
 # is a number (exactly that many, 0 for none), "any" (at least one layer was consulted) or "-" (recorded, not scored).
 layers_item() {
@@ -480,12 +520,18 @@ rc_item() { [ "${1:-0}" = 0 ] || echo "rc=$1"; }
 
 # ---------------------------------------------------------------- arm scorers: each prints one verdict line
 
-score_q_pp() { # <csv> <err> <rc>
-    local csv="$1" err="$2" rc="$3" fails=() r512 r2048 pp512 sd512 ub pp2048 sd2048 _
+# score_q_pp <csv> <err> <rc> [label] [pp512 row: score|skip]: the label is the arm's name (Q_pp, Q_pp_nocopyq, Q_pp_ub2048);
+# skip is for a -p 2048 run, which has no pp512 row and answers to the pp2048 floor alone, with ub read from its row.
+score_q_pp() {
+    local csv="$1" err="$2" rc="$3" label="${4:-Q_pp}" row512="${5:-score}"
+    local fails=() r512 r2048 pp512 sd512 ub pp2048 sd2048 ub2048
     read -r pp512 sd512 ub <<< "$(csv_row "$csv" 512 0)"
-    read -r pp2048 sd2048 _ <<< "$(csv_row "$csv" 2048 0)"
+    read -r pp2048 sd2048 ub2048 <<< "$(csv_row "$csv" 2048 0)"
+    [ "$row512" != skip ] || ub="$ub2048"
     [ -z "$(rc_item "$rc")" ] || fails+=("$(rc_item "$rc")")
-    if [ "$pp512" = NA ]; then
+    if [ "$row512" = skip ]; then
+        :
+    elif [ "$pp512" = NA ]; then
         fails+=("no_pp512_row")
     elif fcmp "$pp512" "<" "$PP512_MIN"; then
         fails+=("$(awk -v v="$pp512" -v m="$PP512_MIN" 'BEGIN { printf "pp512=%.0f<%s", v, m }')")
@@ -503,12 +549,26 @@ score_q_pp() { # <csv> <err> <rc>
     [ -z "$item" ] || fails+=("$item")
     [ "$summary" -ge 1 ] || fails+=("summary=$summary<1")
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
+    # The window ring: it must have engaged, the summary must carry the window fields (an older binary prints none) and
+    # no window may have missed, in the summary or in the executor trace.
+    local windows exposed misses
+    windows="$(summary_windows "$err")"
+    exposed="$(summary_exposed "$err")"
+    misses="$(summary_misses "$err")"
+    [ "$misses" = NA ] || misses=$((misses + $(trace_misses "$err")))
+    [ "$(ring_layer_ubatches "$err")" -gt 0 ] || fails+=("ring_engaged=no")
+    if [ "$windows" = NA ]; then
+        fails+=("summary_windows=missing")
+    elif [ "$misses" -ne 0 ]; then
+        fails+=("misses=$misses")
+    fi
     r512="$(awk -v v="$pp512" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
     r2048="$(awk -v v="$pp2048" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
-    echo "Q_pp=$(verdict_of "${fails[@]}") pp512=$r512 sd512=$sd512 pp2048=$r2048" \
+    echo "$label=$(verdict_of "${fails[@]}") pp512=$r512 sd512=$sd512 pp2048=$r2048" \
         "sd2048=$sd2048 ub=$ub layers=$layers" \
         "summary=$summary pp_moe_refused=$refused ring_engaged=$(ring_engaged "$err")" \
-        "ring_layer_ubatches=$(ring_layer_ubatches "$err") loan_exercised=$(loan_exercised "$err")"
+        "ring_layer_ubatches=$(ring_layer_ubatches "$err") loan_exercised=$(loan_exercised "$err")" \
+        "windows=$windows exposed=$exposed misses=$misses"
 }
 
 score_q_pp_cpu() { # <csv> <err> <rc>
@@ -562,6 +622,9 @@ score_q_staged() { # <err> <rc>
     [ "$nonf16" -eq 0 ] || fails+=("arm_not_f16=$nonf16/$served")
     [ "$arms" -gt 0 ] || fails+=("no_pp_moe_arm_f16_line")
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
+    local tmiss
+    tmiss="$(trace_misses "$err")"
+    [ "$tmiss" -eq 0 ] || fails+=("trace_misses=$tmiss")
     echo "Q_staged=$(verdict_of "${fails[@]}") ring_layers=$nids executor_dispatches=$total" \
         "ring_layer_dispatches=$served pp_moe_arm_f16_lines=$arms pp_moe_refused=$refused ring_engaged=yes" \
         "ring_layer_ubatches=$(ring_layer_ubatches "$err")"
@@ -772,7 +835,8 @@ score_resets() {
 score_arm_raw() {
     local arm="$1" csv="$2" out="$3" err="$4" ref="$5" journal="$6" rc="$7" out2="${8:-}" ref2="${9:-}"
     case "$arm" in
-        Q_pp) score_q_pp "$csv" "$err" "$rc" ;;
+        Q_pp | Q_pp_nocopyq) score_q_pp "$csv" "$err" "$rc" "$arm" ;;
+        Q_pp_ub2048) score_q_pp "$csv" "$err" "$rc" "$arm" skip ;;
         Q_pp_cpu) score_q_pp_cpu "$csv" "$err" "$rc" ;;
         Q_staged) score_q_staged "$err" "$rc" ;;
         Q_tok | Q_tok_2 | Q_tok_cpu_1) score_q_tok "$arm" "$out" "$rc" ;;
@@ -890,6 +954,10 @@ arm_setup() {
     local q_tok=(-m "$QWEN" -f "$TOK_PROMPT" -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4)
     case "$arm" in
         Q_pp) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
+        Q_pp_ub2048) A_KIND=bench A_BIN=llama-bench A_TMO=1500
+            A_ARGV=(-m "$QWEN" -ub 2048 -p 2048 -n 0 -r 3 -fa 1 -o csv -v) ;;
+        Q_pp_nocopyq) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ENV=(GGML_SYCL_COPY_ENGINE=0)
+            A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
         Q_pp_cpu) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ENV=(GGML_SYCL_MOE_EXEC=cpu)
             A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
         Q_staged) A_KIND=bench A_BIN=llama-bench; A_ENV=(GGML_SYCL_MOE_EXEC_TRACE=1)
@@ -917,8 +985,14 @@ arm_doc() {
     case "$1" in
         Q_pp)
             echo "pp512 >= $PP512_MIN, pp2048 >= $PP2048_MIN, $Q_LAYERS distinct '$RE_LAYER' lines," \
-                "at least one '$RE_SUMMARY', zero '$RE_PP_REFUSED'; reports ring_engaged" \
-                "(the '$RE_SUMMARY_RING' lines add up to > 0) and loan_exercised ('$RE_LOAN_OK')" ;;
+                "at least one '$RE_SUMMARY', zero '$RE_PP_REFUSED'; ring_engaged=yes (the '$RE_SUMMARY_RING' lines" \
+                "add up to > 0), the window fields on every summary line and zero misses (summary and" \
+                "'$RE_TRACE_MISSES'); reports loan_exercised ('$RE_LOAN_OK') and windows exposed misses" ;;
+        Q_pp_ub2048)
+            echo "pp2048 >= $PP2048_MIN at -ub 2048 (no pp512 row, no pp512 floor); the same ring, window and miss" \
+                "scoring as Q_pp" ;;
+        Q_pp_nocopyq)
+            echo "Q_pp under GGML_SYCL_COPY_ENGINE=0, scored like Q_pp; the pp numbers are the copy-engine A/B" ;;
         Q_pp_cpu) echo "recorded only: pp512, pp2048, forced cpu layer lines" ;;
         Q_staged)
             echo "every '$RE_TRACE_EXEC' line of a layer with a '[MOE-EXEC] layer N: ring' line has" \
