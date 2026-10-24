@@ -600,9 +600,9 @@ and `GO_pp`). `builders_post` is 0 in every arm, `Shmem` stayed flat at 1.42 GB,
 | resets | count | 0 | 0 | PASS | 0 | |
 
 An earlier run at f14082f2b (2026-10-23 23:0x-23:34 EDT, same gate and head check) read Q_pp 12.9 / 31.4 FAIL,
-Q_tg 12.79, Q_noc 10.84, GO_pp 782.8 / 34.0, with the same md5s and `verdicts_pass=8`. Both runs are slower on Qwen
-or faster than the 8c44f3b3c table by host load alone, since the ring did not engage in either; compare them only
-with each other under a paired arm, never as baselines.
+Q_tg 12.79, Q_noc 10.84, GO_pp 782.8 / 34.0, with the same md5s and `verdicts_pass=8`. The Qwen figures differ
+between the three runs although the ring engaged in none of them, so they move with the host's load and the tree;
+compare them only with each other in a paired arm, never as baselines.
 
 ### How to read the verdict fields
 
