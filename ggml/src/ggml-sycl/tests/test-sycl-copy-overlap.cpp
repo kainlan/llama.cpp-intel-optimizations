@@ -17,13 +17,19 @@
 // this process's per-engine busy deltas from the xe driver's DRM fdinfo
 // (drm-cycles-<class>, GPU timestamp ticks this client kept the engine class
 // busy; ticks= is the drm-total-cycles delta, the elapsed GPU timestamp over
-// the same window). alone_*: around the alone copies, which no kernel shares,
-// so they attribute the copies' engine directly. The unprefixed fields are
-// around the kernel submit and the with-kernel copies, and ccs_cycles there
-// includes the spin kernel's own ticks. Only render-node fds whose drm-pdev is
-// the device under test count, each DRM client once. NA: no drm-cycles key
-// (not the xe driver, or no matching fd). One raw fdinfo is printed first as
-// [COPY-OVERLAP-FDINFO] lines so the keys this kernel prints are on record.
+// the same window). alone_*: from just before the alone copies' first submit
+// to just after their queue wait; no kernel shares that window, so it
+// attributes the copies' engine directly. The unprefixed fields: from just
+// before the spin kernel's submit to just after both the with-kernel copies'
+// queue wait and the kernel's own completion, so ccs_cycles there holds the
+// whole spin kernel on every row plus any copy the compute engine ran. No
+// fdinfo read falls inside a timed window (alone_ms, with_kernel_ms,
+// total_ms). Only render-node fds whose drm-pdev is the device under test
+// count, each DRM client once. NA: no drm-cycles key on a matching fd (not the
+// xe driver, or no matching fd), or the device reports no PCI address, so its
+// DRM clients cannot be told from the other cards'. One raw fdinfo is printed
+// first as [COPY-OVERLAP-FDINFO] lines so the keys this kernel prints are on
+// record.
 //
 // The copy source is the prefill ring's own source shape: a pinned-pool WEIGHT
 // slice of the cache's host zone, which mem_copy_async trusts as host USM and
@@ -121,8 +127,8 @@ static std::vector<std::pair<std::string, std::string>> read_fdinfo(const std::s
     return kv;
 }
 
-// Engine-busy counters summed over this process's DRM clients on the device whose PCI address is `pdev`
-// (every render-node client when `pdev` is empty).
+// Engine-busy counters summed over this process's DRM clients on the device whose PCI address is `pdev`. Empty
+// (every cycle field prints NA) when `pdev` is empty: summing every render client would count the other cards'.
 struct drm_snapshot {
     std::map<std::string, unsigned long long> cycles;     // drm-cycles-<class>, keyed by <class>
     unsigned long long                        ticks = 0;  // max drm-total-cycles-<class> over the clients
@@ -131,6 +137,9 @@ struct drm_snapshot {
 static drm_snapshot read_drm_snapshot(const std::string & pdev) {
     drm_snapshot          snap;
     std::set<std::string> clients;
+    if (pdev.empty()) {
+        return snap;
+    }
     for (const std::string & fd : render_node_fds()) {
         const std::vector<std::pair<std::string, std::string>> kv = read_fdinfo(fd);
         std::string                                            fd_pdev;
@@ -142,7 +151,7 @@ static drm_snapshot read_drm_snapshot(const std::string & pdev) {
                 client = p.second;
             }
         }
-        if ((!pdev.empty() && fd_pdev != pdev) || client.empty() || !clients.insert(client).second) {
+        if (fd_pdev != pdev || client.empty() || !clients.insert(client).second) {
             continue;
         }
         for (const auto & p : kv) {
@@ -318,13 +327,20 @@ int main() {
     }
     uint32_t * counter = static_cast<uint32_t *>(ctr_ptr.ptr);
 
-    // The device's PCI address selects its DRM clients; empty (every render-node client) when not reported.
+    // The device's PCI address selects its DRM clients. Not reported: every cycle field prints NA, and the dump
+    // below shows the first render fd's keys only.
     std::string pdev;
     if (ccs.get_device().has(sycl::aspect::ext_intel_pci_address)) {
         pdev = ccs.get_device().get_info<sycl::ext::intel::info::device::pci_address>();
     }
-    std::printf("[COPY-OVERLAP-FDINFO] pdev=%s render_fds=%zu\n", pdev.empty() ? "unknown" : pdev.c_str(),
-                render_node_fds().size());
+    if (pdev.empty()) {
+        std::printf(
+            "[COPY-OVERLAP-FDINFO] pdev=unknown render_fds=%zu cycles=NA: the device reports no PCI address, so its "
+            "DRM clients cannot be told from the other cards'; the dump below is the first render fd, for its keys\n",
+            render_node_fds().size());
+    } else {
+        std::printf("[COPY-OVERLAP-FDINFO] pdev=%s render_fds=%zu\n", pdev.c_str(), render_node_fds().size());
+    }
     for (const std::string & fd : render_node_fds()) {
         const std::vector<std::pair<std::string, std::string>> kv    = read_fdinfo(fd);
         bool                                                   match = pdev.empty();
@@ -387,10 +403,12 @@ int main() {
             const auto         t0           = std::chrono::steady_clock::now();
             sycl::event        k            = spin_kernel(ccs, counter, sp.groups, sp.iters);
             const double       with         = time_copies(*a.q, dst, src, staged);
-            const drm_snapshot with_after   = read_drm_snapshot(pdev);
             k.wait();
-            const double total   = ms_since(t0);
-            const bool   overlap = with < alone + 0.5 * sp.kernel_ms;
+            const double       total      = ms_since(t0);
+            // After the kernel's completion and after total_ms: the window holds the whole kernel on every row, and
+            // the read is outside every timed window.
+            const drm_snapshot with_after = read_drm_snapshot(pdev);
+            const bool         overlap    = with < alone + 0.5 * sp.kernel_ms;
             std::printf(
                 "[COPY-OVERLAP] queue=%s alone_ms=%.1f with_kernel_ms=%.1f kernel_ms=%.1f total_ms=%.1f overlap=%s "
                 "adapter=%s spin=%s%s%s staged_h2d=%llu\n",
