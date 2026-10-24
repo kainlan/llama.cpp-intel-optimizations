@@ -8,8 +8,8 @@
 // SOA reorder destination; a matrix staged AOS-only spends one, read in place
 // (c-hmey). This header holds two things:
 //
-//   moe_stream_ring_size()  the pure geometry: two regions, each holding the
-//                           heaviest layer's slots, or no ring. It depends on
+//   moe_stream_ring_size()  the pure geometry: two regions, each holding one
+//                           executor window's slots, or no ring. It depends on
 //                           nothing, so the host-only test compiles it without
 //                           SYCL (GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY).
 //   moe_stream_ring         the reservation: one allocation, sliced into slots,

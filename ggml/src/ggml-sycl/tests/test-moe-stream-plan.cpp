@@ -255,6 +255,13 @@ void test_ring_cap_is_loan_invariant() {
     }
     CHECK(ggml_sycl::moe_stream_plan_ring_geometry(short_plan, 0, nullptr, nullptr, claims_all, hints).bytes == 0);
 
+    // A sentinel lent_bytes saturates rather than wraps: R + SIZE_MAX would wrap to R - 1 = 180223, and
+    // 180223 / 11 = 16383 refuses the ring; clamped to SIZE_MAX the cap admits it.
+    ggml_sycl::moe_stream_window_hints sentinel_hints = hints;
+    sentinel_hints.lent_bytes                         = SIZE_MAX;
+    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, sentinel_hints).bytes ==
+          ring_bytes);
+
     // The loan: the lendable triplet moves to the host (target_device -1, as the transaction's
     // update_expert_placement sets it) and its device bytes come back through hints.lent_bytes.
     placement_plan lent_plan = plan;

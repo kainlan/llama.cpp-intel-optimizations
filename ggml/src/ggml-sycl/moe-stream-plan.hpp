@@ -440,7 +440,9 @@ static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const place
     moe_stream_plan_index index =
         moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints);
     // The cap reads the device's expert set with the ring's own loan counted back (llama.cpp-7999): a loan moves
-    // hints.lent_bytes out of index.resident_expert_bytes, so the sum is the same before and after it. Saturating.
+    // hints.lent_bytes out of index.resident_expert_bytes, so the sum is the same before and after it. The add
+    // saturates defensively: a real sum of device bytes cannot approach SIZE_MAX, so the clamp only keeps a corrupt
+    // or sentinel lent_bytes from wrapping into a refusal.
     size_t resident_with_lent = index.resident_expert_bytes + hints.lent_bytes;
     if (resident_with_lent < index.resident_expert_bytes) {
         resident_with_lent = SIZE_MAX;

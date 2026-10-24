@@ -28,7 +28,7 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
         return {};
     }
 
-    // A whole layer's slots per region, two regions.
+    // One executor window's slots per region, two regions.
     const uint64_t n_slots = 2ull * region_slots;
 
     // Round each slot up to the alignment so every slot starts aligned.
