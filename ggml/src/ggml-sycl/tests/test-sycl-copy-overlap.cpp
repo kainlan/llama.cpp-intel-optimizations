@@ -28,7 +28,11 @@
 // The copy source is the prefill ring's own source shape: a pinned-pool WEIGHT
 // slice of the cache's host zone, which mem_copy_async trusts as host USM and
 // copies directly. Any other host source is staged through a synchronous host
-// memcpy, and the row would time that instead of the DMA.
+// memcpy, and the row would time that instead of the DMA. So the source's
+// owner is checked against that trust rule before timing, and every timed call
+// reads this thread's staged-H2D census (counted with the trace off) around its
+// copies: staged_h2d= on the row is the count over the row's three copy rounds,
+// and a non-zero count prints a FAIL line and makes the test exit 1.
 //
 // No host thread waits on a copy-queue event: the copies are drained with a
 // queue wait on the copy queue itself. The only event waited is the spin
@@ -211,14 +215,19 @@ static double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// 16 x 4 MiB pinned H2D on `copy_q`; returns wall ms from the first submit to copy_q.wait().
-static double time_copies(sycl::queue & copy_q, const mem_handle & dst, const mem_handle & src) {
-    const auto t0 = std::chrono::steady_clock::now();
+// 16 x 4 MiB pinned H2D on `copy_q`; returns wall ms from the first submit to copy_q.wait() and adds to `staged`
+// how many of the copies took the staged host-to-device branch. The census is per thread and the copies are
+// submitted on this one, so the difference is exactly these copies; it is read outside the timed window.
+static double time_copies(sycl::queue & copy_q, const mem_handle & dst, const mem_handle & src, uint64_t & staged) {
+    const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
+    const auto     t0            = std::chrono::steady_clock::now();
     for (size_t i = 0; i < kChunks; ++i) {
         ggml_sycl::mem_copy_async(dst, i * kChunkBytes, src, i * kChunkBytes, kChunkBytes, copy_q);
     }
     copy_q.wait();
-    return ms_since(t0);
+    const double ms = ms_since(t0);
+    staged += ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before;
+    return ms;
 }
 
 // A bytes-long device buffer in the RUNTIME zone of cq's device.
@@ -291,12 +300,15 @@ int main() {
                     ctr.valid() ? 1 : 0);
         return 1;
     }
-    // Without a zone-managed pinned WEIGHT owner the copies are staged, and the rows would time a host memcpy.
+    // Without a zone-managed pinned WEIGHT owner on a device (mem-ops.cpp's host_endpoint_owner_in_scope) the copies
+    // are staged, and the rows would time a host memcpy. The census check on every row is the backstop.
     ggml_sycl::alloc_metadata owner{};
     if (!src.owner_metadata(&owner) || owner.tier != ggml_sycl::alloc_tier::HOST_PINNED ||
-        owner.host_zone == ggml_sycl::host_zone_id::COUNT || owner.role != ggml_sycl::alloc_role::WEIGHT) {
-        std::printf("FAIL: the copy source is not a zone-managed pinned-pool WEIGHT owner (tier=%d host_zone=%d)\n",
-                    (int) owner.tier, (int) owner.host_zone);
+        owner.host_zone == ggml_sycl::host_zone_id::COUNT || owner.device < 0 ||
+        owner.role != ggml_sycl::alloc_role::WEIGHT) {
+        std::printf(
+            "FAIL: the copy source is not a zone-managed pinned-pool WEIGHT owner (tier=%d host_zone=%d device=%d)\n",
+            (int) owner.tier, (int) owner.host_zone, owner.device);
         return 1;
     }
     const ggml_sycl::resolved_ptr ctr_ptr = ctr.resolve(device);
@@ -363,30 +375,39 @@ int main() {
         { "compute", &cq                     }
     };
     const char * adapter = adapter_name();
+    int          failed  = 0;
     for (const spin & sp : spins) {
         for (const arm & a : arms) {
-            time_copies(*a.q, dst, src);  // warm-up
+            uint64_t staged = 0;
+            time_copies(*a.q, dst, src, staged);  // warm-up
             const drm_snapshot alone_before = read_drm_snapshot(pdev);
-            const double       alone        = time_copies(*a.q, dst, src);
+            const double       alone        = time_copies(*a.q, dst, src, staged);
             const drm_snapshot alone_after  = read_drm_snapshot(pdev);
             const drm_snapshot with_before  = read_drm_snapshot(pdev);
             const auto         t0           = std::chrono::steady_clock::now();
             sycl::event        k            = spin_kernel(ccs, counter, sp.groups, sp.iters);
-            const double       with         = time_copies(*a.q, dst, src);
+            const double       with         = time_copies(*a.q, dst, src, staged);
             const drm_snapshot with_after   = read_drm_snapshot(pdev);
             k.wait();
             const double total   = ms_since(t0);
             const bool   overlap = with < alone + 0.5 * sp.kernel_ms;
             std::printf(
                 "[COPY-OVERLAP] queue=%s alone_ms=%.1f with_kernel_ms=%.1f kernel_ms=%.1f total_ms=%.1f overlap=%s "
-                "adapter=%s spin=%s%s%s\n",
+                "adapter=%s spin=%s%s%s staged_h2d=%llu\n",
                 a.name, alone, with, sp.kernel_ms, total, overlap ? "yes" : "no", adapter, sp.name,
                 drm_delta_fields("alone_", alone_before, alone_after).c_str(),
-                drm_delta_fields("", with_before, with_after).c_str());
+                drm_delta_fields("", with_before, with_after).c_str(), (unsigned long long) staged);
+            if (staged != 0) {
+                std::printf(
+                    "FAIL: queue=%s spin=%s: %llu of the row's %zu copies took the staged host-to-device branch, so "
+                    "its times are a host memcpy, not the DMA\n",
+                    a.name, sp.name, (unsigned long long) staged, 3 * kChunks);
+                ++failed;
+            }
             std::fflush(stdout);
         }
     }
     ccs.wait();
     cq.wait();
-    return 0;
+    return failed == 0 ? 0 : 1;
 }
