@@ -594,13 +594,13 @@ and `GO_pp`). `builders_post` is 0 in every arm, `Shmem` stayed flat at 1.42 GB,
 | GO_gate | count | 1 | 1 | PASS | 0 | |
 | GO_noc | count | 1 | 1 | PASS | 0 | |
 | GO_pp | pp512 t/s | 814.3 ± 7.9 | 827.4 (95 % of 871) | FAIL | 0 | llama.cpp-zuze: master regression |
-| GO_pp | tg128 t/s | 39.0 ± 0.09 | 31.0 (97 % of 32.0) | PASS | 0 | same run |
+| GO_pp | tg128 t/s | 39.0 ± 0.09 | 31.0-33.0 (32.0 ± 3 %) | FAIL | 0 | above the band; the gate's tg check is two-sided; B50 GPT-OSS decode 22 % above the ~32 reference in both final runs, unexplained, owner flag |
 | MI_b70 | digits | 1 | 1 | PASS | 0 | |
 | MI_b50 | digits | 1 | 1 | PASS | 0 | |
 | resets | count | 0 | 0 | PASS | 0 | |
 
 An earlier run at f14082f2b (2026-10-23 23:0x-23:34 EDT, same gate and head check) read Q_pp 12.9 / 31.4 FAIL,
-Q_tg 12.79, Q_noc 10.84, GO_pp 782.8 / 34.0, with the same md5s and `verdicts_pass=8`. The Qwen figures differ
+Q_tg 12.79, Q_noc 10.84, GO_pp 782.8 / 34.0 (the 34.0 tg128 is also above the 31.0-33.0 band, so it scored FAIL there too), with the same md5s and `verdicts_pass=8`. The Qwen figures differ
 between the three runs although the ring engaged in none of them, so they move with the host's load and the tree;
 compare them only with each other in a paired arm, never as baselines.
 
