@@ -41,9 +41,11 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
         return {};
     }
     const size_t bytes = static_cast<size_t>(n_slots) * slot_bytes;
-    // The cap is 10 % of the resident expert set AFTER the ring's bytes are lent out of it (llama.cpp-8p5x): a
-    // geometry accepted before the loan it requests is accepted after it. bytes <= (resident - bytes) / 10 is
-    // 11 * bytes <= resident; the division form cannot overflow.
+    // The ring may take 10 % of what the device's expert set keeps once the ring's own bytes are lent out of it:
+    // bytes <= (resident - bytes) / 10, which is 11 * bytes <= resident, tested in the division form, which cannot
+    // overflow. The caller passes resident as the device's resident expert bytes plus the bytes lent to the ring now
+    // (moe_stream_plan_ring_geometry, llama.cpp-7999). A loan moves bytes from the first term to the second, so the
+    // figure, and with it the answer, is the same before the loan and after it.
     if (bytes > resident_expert_bytes / 11) {
         return {};
     }

@@ -6,10 +6,12 @@
 // matrix staged as SOA (AOS copy destination, SOA reorder destination), one
 // per matrix staged AOS-only (c-hmey), each slot the largest matrix rounded up
 // to 256 bytes. The caller counts the slots, so every call here passes a
-// region's slot count. If those bytes exceed 10 % of the resident
-// expert set left once the ring is lent out of it (bytes > resident / 11,
-// llama.cpp-8p5x) there is no ring. The model pins re-derive the plan's base
-// figures.
+// region's slot count. If those bytes exceed 10 % of what the resident expert
+// set keeps once the ring's own bytes are lent out of it (bytes > resident /
+// 11) there is no ring. The caller passes the expert set with any loan to the
+// ring counted back, so the figure does not move with a loan; that half is
+// test-moe-stream-plan's (llama.cpp-7999). The model pins re-derive the plan's
+// base figures.
 
 #include "moe-stream-ring.hpp"
 
@@ -100,26 +102,14 @@ int main() {
                    0, 0);
     check_geometry("rounding up overflows size_t", moe_stream_ring_size(1, SIZE_MAX, SIZE_MAX), 0, 0, 0, 0);
 
-    // Task 7 (2026-10-24 plan, llama.cpp-8p5x): the cap is tested against the resident bytes left once the ring is
-    // lent out of them, so a geometry that passes before the loan passes after it (a fixed point).
+    // Task 7 (2026-10-24 plan, llama.cpp-7999): the cap leaves 10 % of what remains once the ring's own bytes are
+    // taken out, b <= (R - b) / 10, which is b <= R / 11.
     {
         const size_t slot = 256;
-        // 2 regions x 4 slots x 256 = 2048 bytes. Old cap: resident >= 20480. New cap: resident >= 22528.
-        check_geometry("fixed point: just inside the post-loan cap", moe_stream_ring_size(4, slot, 22528), slot, 8,
-                       2048, 4);
-        check_geometry("fixed point: inside the old cap, outside the post-loan cap",
-                       moe_stream_ring_size(4, slot, 22527), 0, 0, 0, 0);
-        const moe_stream_ring_geometry before         = moe_stream_ring_size(4, slot, 22528);
-        // The post-loan resident set is resident - bytes; the sizing's cap test is written against THAT set
-        // (11 * bytes <= resident  <=>  bytes <= (resident - bytes) / 10), so a geometry the pre-loan call accepts is
-        // also accepted by a cap test on the post-loan set with the ORIGINAL 10 % rule: the two agree by construction.
-        const size_t                   resident_after = 22528 - before.bytes;
-        if (!(before.bytes <= resident_after / 10)) {
-            std::printf("FAIL: fixed point: the accepted geometry violates the 10 %% rule on the post-loan set\n");
-            ++g_failures;
-        } else {
-            std::printf("PASS: fixed point: the accepted geometry holds the 10 %% rule on the post-loan set\n");
-        }
+        // 2 regions x 4 slots x 256 = 2048 bytes. Under / 10: resident >= 20480. Under / 11: resident >= 22528.
+        check_geometry("eleventh: just inside the cap", moe_stream_ring_size(4, slot, 22528), slot, 8, 2048, 4);
+        check_geometry("eleventh: inside a tenth, outside an eleventh", moe_stream_ring_size(4, slot, 22527), 0, 0, 0,
+                       0);
     }
 
     if (g_failures != 0) {
