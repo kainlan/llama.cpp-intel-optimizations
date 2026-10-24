@@ -217,15 +217,9 @@ moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
     in.window_us         = window_us;
     in.ring_bytes_free   = ring_bytes_free();
     in.triplet_bytes_max = li.expert_bytes_max;  // the largest streamable triplet: a region holds no other kind
-    // The device's resolved H2D rate (llama.cpp-kp1l), read live: the probe may resolve a device after the first
-    // prompt. h2d_probed is false for the seed (GGML_SYCL_H2D_PROBE=0) and while the device is unresolved.
-    double probed_h2d_gbps = 0.0;
-    if (device_ >= 0 && device_ < GGML_SYCL_MAX_DEVICES) {
-        const sycl_device_info & dev = ggml_sycl_info().devices[device_];
-        if (dev.h2d_probed) {
-            probed_h2d_gbps = dev.h2d_pinned_gbps;
-        }
-    }
+    // The device's probed H2D rate (llama.cpp-kp1l), read live and under the probe's mutex: another model's load may
+    // run the probe while this prompt weighs. 0 while the device is unresolved or keeps the seed.
+    const double         probed_h2d_gbps = ggml_sycl_h2d_probed_gbps(device_);
     const moe_exec_rates r =
         moe_stream_rates_assemble(li.host_mix, record_valid_ ? &record_ : nullptr, probed_h2d_gbps, moe_stream_getenv);
     return moe_exec_weigh(in, r, op.policy);

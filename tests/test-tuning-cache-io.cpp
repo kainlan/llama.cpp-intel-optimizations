@@ -1725,14 +1725,18 @@ TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
           // non-finite and zero rates
           << "    {\"device_key\":\"NAN\",\"h2d_gbps\":nan,\"reorder_gbps\":200,\"dev_gflops_by_type\":[]},\n"
           << "    {\"device_key\":\"ZERO\",\"h2d_gbps\":0,\"reorder_gbps\":200,\"dev_gflops_by_type\":[]},\n"
+          // a reorder rate read from the file: negative is refused; "nan" parses as 0, which is unmeasured and valid
+          << "    {\"device_key\":\"NEGR\",\"h2d_gbps\":20,\"reorder_gbps\":-1,\"dev_gflops_by_type\":[]},\n"
+          << "    {\"device_key\":\"NANR\",\"h2d_gbps\":20,\"reorder_gbps\":nan,\"dev_gflops_by_type\":[]},\n"
           // cut off mid-pair: its braces never close, so it is not an entry
           << "    {\"device_key\":\"CUT\",\"h2d_gbps\":20,\"reorder_gbps\":200,\"dev_gflops_by_type\":[[1,5.0],[2,";
     }
     std::vector<MoeExecRatesEntry> loaded;
     ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
-    ASSERT(loaded.size() == 4);
+    ASSERT(loaded.size() == 6);
     ASSERT(loaded[0].device_key == "GOOD" && loaded[1].device_key == "NOH2D" && loaded[2].device_key == "NAN" &&
-           loaded[3].device_key == "ZERO");
+           loaded[3].device_key == "ZERO" && loaded[4].device_key == "NEGR" && loaded[5].device_key == "NANR");
+    ASSERT(loaded[4].reorder_gbps == -1.0 && loaded[5].reorder_gbps == 0.0);
     const std::vector<std::pair<int, double>> good_pairs = {
         { 1, 5.0 },
         { 2, 6.0 },
@@ -1747,6 +1751,8 @@ TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
     ASSERT(!moe_exec_rates_find(loaded, "NOH2D", type_count, got));
     ASSERT(!moe_exec_rates_find(loaded, "NAN", type_count, got));
     ASSERT(!moe_exec_rates_find(loaded, "ZERO", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "NEGR", type_count, got));  // a negative reorder read from a file is a miss
+    ASSERT(moe_exec_rates_find(loaded, "NANR", type_count, got) && got.h2d_gbps == 20.0 && got.reorder_gbps == 0.0);
     ASSERT(!moe_exec_rates_find(loaded, "CUT", type_count, got));
     ASSERT(!moe_exec_rates_find(loaded, "ABSENT", type_count, got));
 
@@ -1836,7 +1842,6 @@ TEST(moe_exec_rates_unmeasured_reorder_is_a_valid_record) {
     ASSERT(got.h2d_gbps == 26.5 && got.reorder_gbps == 0.0);
     ASSERT(moe_exec_rates_find(loaded, "OLD", type_count, got));
     ASSERT(got.h2d_gbps == 24.0 && got.reorder_gbps == 200.0);
-    ASSERT(!moe_exec_rates_find(loaded, "NEG", type_count, got));
 
     std::remove(path.c_str());
     rmdir(cache_dir.c_str());
