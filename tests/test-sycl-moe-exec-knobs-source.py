@@ -84,7 +84,7 @@ def test_ring_layers_knob_is_removed():
 def test_log_formats_appear_once():
     assert count_literal("[MOE-EXEC] layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
     assert count_literal("[MOE-EXEC-TRACE] dev %d layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
-    assert count_literal("[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed") == 1
+    assert count_literal("[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed, %u windows, %u exposed, %u misses") == 1
 
 
 def test_env_settings_rows():

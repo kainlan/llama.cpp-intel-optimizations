@@ -162,13 +162,27 @@ int main() {
         CHECK(log.bytes_streamed == (8ull << 20), "streamed bytes accumulate for RING only, NOT_CONSULTED ignored");
         char buf[160];
         CHECK(log.take_summary(buf, sizeof(buf)), "a consulted log gives a summary");
-        CHECK(std::strcmp(buf, "[MOE-EXEC] summary: 2 layer-ubatches ring, 0 cpu, 2 forced, 8 MiB streamed") == 0,
+        CHECK(std::strcmp(buf,
+                          "[MOE-EXEC] summary: 2 layer-ubatches ring, 0 cpu, 2 forced, 8 MiB streamed, 0 windows, "
+                          "0 exposed, 0 misses") == 0,
               "summary format");
         CHECK(!log.take_summary(buf, sizeof(buf)), "a second take gives nothing");
+        log.note(0, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED), 4ull << 20);
+        log.note_window(/*exposed*/ true, /*misses*/ 5);  // an exposed window's misses are not counted
+        log.note_window(false, 0);
+        log.note_window(false, 2);
+        CHECK(log.take_summary(buf, sizeof(buf)) &&
+                  std::strcmp(buf,
+                              "[MOE-EXEC] summary: 1 layer-ubatches ring, 0 cpu, 1 forced, 4 MiB streamed, "
+                              "3 windows, 1 exposed, 2 misses") == 0,
+              "window counters in the summary");
+        CHECK(!log.take_summary(buf, sizeof(buf)), "a take with nothing consulted prints nothing");
         log.note(0, 4, decision(moe_exec_choice::CPU), 0);
         CHECK(log.take_summary(buf, sizeof(buf)) &&
-                  std::strcmp(buf, "[MOE-EXEC] summary: 0 layer-ubatches ring, 1 cpu, 0 forced, 0 MiB streamed") == 0,
-              "a note after a take counts from zero");
+                  std::strcmp(buf,
+                              "[MOE-EXEC] summary: 0 layer-ubatches ring, 1 cpu, 0 forced, 0 MiB streamed, 0 windows, "
+                              "0 exposed, 0 misses") == 0,
+              "a note after a take counts from zero, window counters included (the reset witness)");
     }
 
     std::printf("%d cases, %d failures\n", g_cases, g_failures);

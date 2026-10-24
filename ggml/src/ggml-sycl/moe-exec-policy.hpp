@@ -103,6 +103,16 @@ struct moe_exec_decision_log {
     uint32_t n_cpu                                   = 0;
     uint32_t n_forced                                = 0;
     size_t   bytes_streamed                          = 0;
+    uint32_t n_windows = 0;  // windows served this prompt, fed once per window by the ring's window_begin
+    uint32_t n_exposed = 0;  // of them, a layer's first UP window: copied with no earlier phase to hide under
+    uint32_t n_misses  = 0;  // experts a window asked for that were not staged ahead, exposed windows excluded
+
+    void note_window(bool exposed, uint32_t misses) {
+        std::lock_guard<std::mutex> lock(mu);
+        ++n_windows;
+        n_exposed += exposed ? 1 : 0;
+        n_misses += exposed ? 0 : misses;
+    }
 
     // bytes is what this layer-ubatch streams through the ring (0 for a CPU choice).
     void note(int device, int layer, const moe_exec_decision & d, size_t bytes) {
@@ -149,10 +159,14 @@ struct moe_exec_decision_log {
         if (n_ring + n_cpu == 0) {
             return false;
         }
-        std::snprintf(buf, cap, "[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed",
-                      n_ring, n_cpu, n_forced, bytes_streamed >> 20);
+        // clang-format off: the knobs gate pins this format as one contiguous literal
+        std::snprintf(buf, cap,
+                      "[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed, %u windows, %u exposed, %u misses",
+                      n_ring, n_cpu, n_forced, bytes_streamed >> 20, n_windows, n_exposed, n_misses);
+        // clang-format on
         n_ring = n_cpu = n_forced = 0;
         bytes_streamed            = 0;
+        n_windows = n_exposed = n_misses = 0;
         return true;
     }
 
