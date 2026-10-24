@@ -1086,7 +1086,8 @@ git commit -m "sycl, tests: a prompt layer's host experts are weighed before its
 **Amendment (2026-10-23, llama.cpp-xod7; epic ruling c-las5 on llama.cpp-36j0):** Task 7b merged with these
 deviations, rulings and carry-forwards. The text above is the plan; this is the build.
 - Deviations #1-#5, #7 and #11 of xod7 c-kkbs were accepted (c-0bw3): `begin_layer` takes a `const moe_stream_op &`;
-  `region_open()` and the staged predicate (`fully_staged()` as xod7 merged it, `executor_staged()` since 3460) are public; there is no `rates_` member and the rates are assembled per layer;
+  `region_open()` and the staged predicate (`fully_staged()` as xod7 merged it, `executor_staged()` since 3460) are
+  public; there is no `rates_` member and the rates are assembled per layer;
   the phase is held as `unique_ptr<moe_stream_phase, moe_stream_phase_deleter>` in common.hpp;
   `ggml_sycl_reorder_weight_gpu` was made non-static instead of refactoring the fill; `layer_done`'s event is a
   compute-queue barrier after the down op; the n_host == 0 skip reads the plan index.
