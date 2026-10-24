@@ -12,7 +12,8 @@ host storage owner-first, and under the inventory mutex has the cache lend each 
 (unified_cache::loan_expert_triplet), then flips the plan copy and publishes it once. It runs at a graph boundary.
 What this gate pins (the retire, the boundary and the ready event are lead ruling c-tdra):
   - the loan code never waits and never asks an event's status (c-3bde and c-fjx1): no .wait(, no wait_and_throw(,
-    no get_info<, no event_complete(, and not finalize_retired_entries_locked(, which asks;
+    no get_info<, no event_complete(, not finalize_retired_entries_locked(, which asks, and no
+    drain_retained_handles(; the one sanctioned wait on the loan's path is the boundary's (below), not the loan's;
   - the device free is gated on the copy event, with no host_task: each D2H copy is submitted on the DMA queue reading
     the entry's own allocation owner; the transaction then re-checks each device entry and mints the lease that holds
     it in place, all three before any entry changes, since minting allocates; then each device entry's last write
@@ -41,6 +42,12 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
   - the loan runs at the graph boundary, never inside a graph: an in-graph caller records a request with a lock-free
     compare-and-swap; ggml_backend_sycl_synchronize() runs the pending loan after it clears the graph's compute flag
     and before the deferred-free pass; the transaction refuses "graph active"; and mul_mat_id names no loan entry;
+  - the boundary that accepted a loan drains the loan's retained records (llama.cpp-6aj4, c-769m): the runner
+    reports an accepted loan that lent, and synchronize then calls ggml_sycl_expert_loan_boundary_drain, after the
+    runner and before the deferred-free pass, so that pass erases the withdrawn device entries and returns their room
+    before the next graph's reserve. It is the one sanctioned wait (synchronize has just waited the whole stream): it
+    runs only for an accepted loan, waits at most 100 ms on drain_retained_handles (the whole store; the call takes no
+    scope), and on a timeout leaves the retention standing, the erase one pass late, with one trace line;
   - a loan is refused "host zones not configured", REFUSED and so never re-posted, before anything is selected,
     leased, allocated or lent, when its device's cache has no host zones (lead ruling, llama.cpp-sif1): an unzoned
     pinned copy sends every later copy from it down the staged branch. The transaction asks the same query the pinned
@@ -54,6 +61,15 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     equal to the last it pushed; the batched CPU dispatch skips one equal to the last job input it pushed;
   - the exact-owner check (c-sepd) and the layout check (c-n4gw) refuse before anything is copied;
   - the registration is the typed register_host_expert_owned, carrying the minted owner, never the untyped overload;
+  - each extra drops every view it holds of a withdrawn device entry before it forgets the entry's record and
+    remembers the host copy (llama.cpp-6aj4): ggml_sycl_drop_lent_expert_views matches each view by the key the loan
+    retired the entry under and never resolves one, since a retired entry refuses a resolve once the cache generation
+    moves; it keeps a lease on every view it takes, and the transaction retains those leases until the device's
+    execution queue passes a barrier, after the loop and before the publication, so no kernel still reading a dropped
+    table sees a freed buffer; and every drop leaves the device table stale (the slot's payload nulled, the storage
+    generation bumped, and the table marked stale through mark_moe_device_table_stale, whose marks are pinned, behind
+    its device guard as its first statement): a dropped pointer-table lease, route table or hybrid record each sets
+    the flag that marks it, so a drop of the table's views alone still does;
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
     epoch;
   - the WARN format strings;
@@ -217,7 +233,7 @@ RESOLVE_SIG = "static bool ggml_sycl_expert_loan_resolve_registered("
 WRAPPER_SIG = "static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction("
 REQUEST_SIG = "static void ggml_sycl_request_expert_loan("
 PENDING_DEVICE_SIG = "static bool ggml_sycl_run_pending_expert_loan_on_device("
-PENDING_SIG = "static void ggml_sycl_run_pending_expert_loan("
+PENDING_SIG = "static bool ggml_sycl_run_pending_expert_loan("
 SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend)"
 MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst)"
 DISPATCH_SIG = "auto dispatch_cpu_entries_now = [&](const std::vector<expert_dispatch_entry> & entries)"
@@ -235,7 +251,11 @@ def loan_bodies(cache: str, sycl: str) -> list[str]:
 
 # --- waits and status queries ---------------------------------------------------------------------------------------
 
-FORBIDDEN_WAITS = (".wait(", "wait_and_throw(", "get_info<", "event_complete(", "finalize_retired_entries_locked(")
+# The loan bodies never wait or ask (c-3bde): they run on inference paths. The one sanctioned wait on the loan's path is
+# ggml_sycl_expert_loan_boundary_drain, which synchronize calls after the runner (claim_loan_boundary_drains_its_room);
+# it is not a loan body, and draining the retained store from one is forbidden here like any other wait.
+EVENT_WAITS = (".wait(", "wait_and_throw(", "get_info<", "event_complete(", "finalize_retired_entries_locked(")
+FORBIDDEN_WAITS = EVENT_WAITS + ("drain_retained_handles(",)
 
 
 def claim_loan_never_waits(cache: str, sycl: str) -> bool:
@@ -491,6 +511,34 @@ def claim_loan_runs_at_the_graph_boundary(sycl: str) -> bool:
             and not any(x in mmid for x in MMID_FORBIDDEN))
 
 
+# The boundary that accepted a loan drains the loan's retained records before the deferred-free pass (llama.cpp-6aj4,
+# c-769m): the copies' owners and the dropped views go, so that pass erases the withdrawn device entries and
+# returns their room before the next graph's reserve. The runner reports only an accepted loan that lent, so a decode
+# boundary pays nothing; the wait is bounded at 100 ms, and a timeout leaves the retention to a later pass with one
+# trace line. The drain asks no event itself.
+LOAN_DRAIN_SIG = "static bool ggml_sycl_expert_loan_boundary_drain(int device, bool loan_accepted)"
+RUN_PENDING_ACCEPTED = "const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);"
+LOAN_DRAIN_CALL = "(void) ggml_sycl_expert_loan_boundary_drain(sycl_ctx->device, loan_accepted);"
+PENDING_LENT = ("return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result) && "
+                "result.accepted && result.n_triplets != 0;")
+LOAN_DRAIN_BOUND = "constexpr uint32_t drain_ms = 100;"
+LOAN_DRAIN_ONLY_ACCEPTED = "if (!loan_accepted || ggml_sycl::drain_retained_handles(true, drain_ms)) { return true; }"
+LOAN_DRAIN_TRACE = ('if (ggml_sycl_moe_exec_config().trace >= 1) { GGML_LOG_INFO("[MOE-EXEC-TRACE] loan device %d: '
+                    'room pending, boundary drain timed out\\n", device); } return false;')
+
+
+def claim_loan_boundary_drains_its_room(sycl: str) -> bool:
+    s = norm(sycl)
+    sync = body(s, SYNC_SIG)
+    drain = body(s, LOAN_DRAIN_SIG)
+    return (s.count(LOAN_DRAIN_CALL) == 1 and sync.count(LOAN_DRAIN_CALL) == 1
+            and ordered(sync, SET_INACTIVE, RUN_PENDING_ACCEPTED, LOAN_DRAIN_CALL, DEFERRED_FREES, RUN_REFILL)
+            and body(s, PENDING_SIG).count(PENDING_LENT) == 1
+            and drain.count("drain_retained_handles(") == 1
+            and ordered(drain, LOAN_DRAIN_BOUND, LOAN_DRAIN_ONLY_ACCEPTED, LOAN_DRAIN_TRACE)
+            and not any(token in drain for token in EVENT_WAITS))
+
+
 # --- a loan without host zones is refused (lead ruling, llama.cpp-sif1) ----------------------------------------------
 
 INVALID_ARGS = 'return refuse(ggml_sycl_txn_result::REFUSED, "invalid arguments"); }'
@@ -575,6 +623,7 @@ PROBE = ('if (probe_mode) { result.accepted = n_selected != 0; result.bytes_free
          'finish(ggml_sycl_txn_result::REFUSED, "nothing lendable"); }')
 LEASE = "registry.acquire_live_update(current_token)"
 FORGET = "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);"
+DROP = "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);"
 REMEMBER = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
             "std::move(record.host_handles[r]), &record.copy_events[r], 0, logical);")
 FLIP = "(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, refill, refill ? device : -1);"
@@ -586,8 +635,79 @@ UNLOCK = "} lock.unlock(); warn_dropped(); if (!swapped) {"
 def claim_probe_changes_nothing_and_a_loan_publishes_once(sycl: str) -> bool:
     b = body(norm(sycl), TXN_SIG)
     return (b.count(PROBE) == 1 and b.count(PUBLISH) == 1 and b.count(FLIP) == 1
-            and ordered(b, PROBE, LEASE, HOST_ALLOC, INVENTORY_LOCK, LEND, FORGET, REMEMBER, FLIP, PUBLISH, EPOCH,
-                        UNLOCK))
+            and ordered(b, PROBE, LEASE, HOST_ALLOC, INVENTORY_LOCK, LEND, DROP, FORGET, REMEMBER, FLIP, PUBLISH,
+                        EPOCH, UNLOCK))
+
+
+# --- a loan drops the extras' views of each withdrawn device entry by its key (llama.cpp-6aj4) -----------------------
+
+DROP_SIG = "static void ggml_sycl_drop_lent_expert_views("
+DROP_MATCH = "return h.is_weight() && h.device() == device && h.key() == withdrawn;"
+
+
+def claim_lent_views_dropped_by_key(sycl: str) -> bool:
+    b = body(norm(sycl), DROP_SIG)
+    return b.count(DROP_MATCH) == 1 and "resolve(" not in b
+
+
+# Each view the helper takes off an extra keeps a lease in `retained` before it goes, and the transaction keeps every
+# such lease until the device's execution queue passes a barrier, after the loop: a kernel still reading a dropped
+# table never sees a freed buffer, wherever the loan runs.
+RETAIN_RECORD = "retained.push_back(record.handle);"
+RETAIN_SLOT = "retained.push_back(std::move(w.moe_expert_handles[device][slot]));"
+RETAIN_LEASE = "if (on_entry(lease)) { retained.push_back(lease); }"
+RETAIN_ROUTES = "if (held.lease.valid()) { retained.push_back(held.lease); }"
+RETAIN_HYBRID = "ggml_sycl_moe_hybrid_decode_record_append_handles(*w.moe_hybrid_decode[device], retained);"
+RETAIN_VIEWS = ("ggml_sycl::retain_handles_until_event(std::move(lent_views), "
+                "queue ? queue->ext_oneapi_submit_barrier() : sycl::event{});")
+
+
+def claim_lent_views_retained_to_a_barrier(sycl: str) -> bool:
+    n = norm(sycl)
+    helper = body(n, DROP_SIG)
+    txn = body(n, TXN_SIG)
+    return (all(helper.count(x) == 1 for x in (RETAIN_RECORD, RETAIN_SLOT, RETAIN_LEASE, RETAIN_ROUTES, RETAIN_HYBRID))
+            and ordered(helper, RETAIN_RECORD, "list.erase(", RETAIN_SLOT, RETAIN_LEASE, "leases.erase(", RETAIN_ROUTES,
+                        "routes.invalidate();", RETAIN_HYBRID, "w.moe_hybrid_decode[device].reset();")
+            and txn.count(RETAIN_VIEWS) == 1
+            and ordered(txn, LEND, DROP, REMEMBER, BREAK_ESCAPED, RETAIN_VIEWS, PUBLISH))
+
+
+# Dropping a view leaves the device table stale, so neither the full-local fast path nor the transient table trusts a
+# raw pointer to the withdrawn entry once the zone hands its room to the ring: the slot's kernel payload is nulled with
+# the slot, a dropped storage record or slot bumps the storage generation, and any drop marks the table stale through
+# the one member that does it for every site (its four marks pinned in common.hpp).
+STALE_SIG = "void mark_moe_device_table_stale(int dev)"
+STALE_MARKS = ("moe_device_table_valid[dev] = false;", "moe_full_local_probe_generation[dev] = 0;",
+               "moe_full_local_probe_layout[dev] = GGML_LAYOUT_AOS;", "moe_full_local_probe_ok[dev] = false;")
+NULL_PAYLOAD = "w.moe_expert_ptr_payload[device][slot] = nullptr;"
+BUMP_GENERATION = "if (stored) { ++w.moe_expert_storage_generation; }"
+MARK_STALE = "if (stored || table_dropped) { w.mark_moe_device_table_stale(device); }"
+# The flag behind a drop of the table's views alone: a pointer-table lease erased (the holder a prompt graph's preload
+# leaves, with no storage record and no slot naming the entry), the route table invalidated, or the hybrid record
+# reset. Without it a table whose only view of the entry was its leases stays valid, its raw pointer into room the
+# ring reuses.
+# The count the lease flag compares against is taken before the erase: taken after it, the flag is always false.
+N_LEASES = "const size_t n_leases = leases.size();"
+LEASE_ERASE = "leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());"
+TABLE_FROM_LEASES = "table_dropped = leases.size() != n_leases;"
+TABLE_FROM_ROUTES = "routes.invalidate(); table_dropped = true; break;"
+TABLE_FROM_HYBRID = "w.moe_hybrid_decode_stamp[device] = {}; table_dropped = true; }"
+# The member's guard is its first statement: inverted, every stale mark is a no-op on a valid device.
+STALE_GUARD = "{ if (!ggml_sycl_valid_device_index(dev)) { return; }"
+
+
+def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
+    helper = body(norm(sycl), DROP_SIG)
+    member = body(norm(common), STALE_SIG)
+    return (member.startswith(STALE_GUARD) and all(member.count(x) == 1 for x in STALE_MARKS)
+            and helper.count(NULL_PAYLOAD) == 1 and ordered(helper, RETAIN_SLOT, NULL_PAYLOAD, "stored = true;")
+            and helper.count(BUMP_GENERATION) == 1 and helper.count(MARK_STALE) == 1
+            and all(helper.count(x) == 1
+                    for x in (N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID))
+            and helper.count("table_dropped = true;") == 2
+            and ordered(helper, RETAIN_LEASE, N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, RETAIN_ROUTES,
+                        TABLE_FROM_ROUTES, RETAIN_HYBRID, TABLE_FROM_HYBRID, BUMP_GENERATION, MARK_STALE))
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -1177,6 +1297,10 @@ def test_loan_runs_at_the_graph_boundary():
     assert claim_loan_runs_at_the_graph_boundary(SYCL)
 
 
+def test_loan_boundary_drains_its_room():
+    assert claim_loan_boundary_drains_its_room(SYCL)
+
+
 def test_busy_reposts_the_request():
     assert claim_busy_reposts_the_request(SYCL)
 
@@ -1199,6 +1323,18 @@ def test_registration_is_typed():
 
 def test_probe_changes_nothing_and_a_loan_publishes_once():
     assert claim_probe_changes_nothing_and_a_loan_publishes_once(SYCL)
+
+
+def test_lent_views_dropped_by_key():
+    assert claim_lent_views_dropped_by_key(SYCL)
+
+
+def test_lent_views_retained_to_a_barrier():
+    assert claim_lent_views_retained_to_a_barrier(SYCL)
+
+
+def test_lent_views_mark_the_table_stale():
+    assert claim_lent_views_mark_the_table_stale(SYCL, COMMON)
 
 
 def test_warn_formats():
@@ -1324,6 +1460,12 @@ def test_mutant_transaction_waits_fails():
 
 def test_mutant_pending_runner_waits_fails():
     assert not claim_loan_never_waits(CACHE, _once(SYCL, PENDING_TAKE, "cache_queue_wait.wait(); " + PENDING_TAKE))
+
+
+def test_mutant_pending_runner_drains_the_store_fails():
+    """The drain belongs to the boundary: the runner draining it would be a wait inside the loan code."""
+    assert not claim_loan_never_waits(
+        CACHE, _once(SYCL, PENDING_TAKE, "(void) ggml_sycl::drain_retained_handles(true, 100); " + PENDING_TAKE))
 
 
 def test_mutant_retire_chained_through_a_host_task_fails():
@@ -1568,6 +1710,39 @@ def test_mutant_loan_runs_after_the_deferred_frees_fails():
     assert not claim_loan_runs_at_the_graph_boundary(n)
 
 
+def test_mutant_loan_boundary_drain_removed_fails():
+    """Without the drain the retention outlives the boundary's pass, so the room comes back after the next reserve."""
+    assert not claim_loan_boundary_drains_its_room(_once_in(SYCL, SYNC_SIG, LOAN_DRAIN_CALL, ""))
+
+
+def test_mutant_loan_boundary_drain_after_the_pass_fails():
+    n = _once_in(SYCL, SYNC_SIG, LOAN_DRAIN_CALL, "")
+    n = _once_in(n, SYNC_SIG, RUN_REFILL, LOAN_DRAIN_CALL + " " + RUN_REFILL)
+    assert not claim_loan_boundary_drains_its_room(n)
+
+
+def test_mutant_loan_boundary_drains_at_every_boundary_fails():
+    """A decode boundary would pay the wait, and another context's work on the queue could hold it 100 ms."""
+    assert not claim_loan_boundary_drains_its_room(
+        _once(SYCL, LOAN_DRAIN_ONLY_ACCEPTED,
+              "if (ggml_sycl::drain_retained_handles(true, drain_ms)) { return true; }"))
+
+
+def test_mutant_loan_boundary_drain_unbounded_fails():
+    assert not claim_loan_boundary_drains_its_room(
+        _once(SYCL, LOAN_DRAIN_BOUND, "constexpr uint32_t drain_ms = 10000;"))
+
+
+def test_mutant_runner_reports_a_refused_loan_fails():
+    """A BUSY or REFUSED loan lent nothing, so its boundary must not wait."""
+    assert not claim_loan_boundary_drains_its_room(
+        _once(SYCL, PENDING_LENT, "return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result);"))
+
+
+def test_mutant_loan_boundary_timeout_is_silent_fails():
+    assert not claim_loan_boundary_drains_its_room(_once(SYCL, LOAN_DRAIN_TRACE, "return false;"))
+
+
 def test_mutant_transaction_runs_inside_a_graph_fails():
     assert not claim_loan_runs_at_the_graph_boundary(_once(SYCL, GRAPH_ACTIVE, ""))
 
@@ -1735,6 +1910,90 @@ def test_mutant_publish_per_triplet_fails():
 def test_mutant_device_lease_kept_fails():
     """The extra keeps its lease on the withdrawn device copy: the retired entry is never reclaimed."""
     assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(SYCL, FORGET, ""))
+
+
+def test_mutant_lent_views_kept_fails():
+    """The extras keep their pointer-table, route-table and hybrid-record views on the withdrawn device entry: it stays
+    leased, and the deferred-free pass never reclaims it (llama.cpp-6aj4)."""
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(SYCL, DROP + " " + FORGET, FORGET))
+
+
+def test_mutant_lent_views_dropped_after_remember_fails():
+    """The views dropped in the remember loop: a remember that throws leaves the later members' views in place."""
+    kept = _once(SYCL, DROP + " " + FORGET, FORGET)
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(kept, REMEMBER, REMEMBER + " " + DROP))
+
+
+def test_mutant_lent_views_matched_by_resolve_fails():
+    """A view matched through a resolve: once the cache generation moves, the retired entry refuses it and the view
+    survives the loan."""
+    assert not claim_lent_views_dropped_by_key(
+        _once_in(SYCL, DROP_SIG, DROP_MATCH,
+                 DROP_MATCH.replace("h.key() == withdrawn", "h.resolve(device).on_device && h.key() == withdrawn")))
+
+
+def test_mutant_lent_views_released_at_once_fails():
+    """The transaction lets the dropped views go when it returns: a kernel another context still has on the queue can
+    read a pointer table whose expert the deferred-free pass just freed."""
+    assert not claim_lent_views_retained_to_a_barrier(_once(SYCL, RETAIN_VIEWS, "lent_views.clear();"))
+
+
+def test_mutant_table_leases_released_at_once_fails():
+    """The helper erases the pointer table's leases on the entry without keeping them: they go at once."""
+    assert not claim_lent_views_retained_to_a_barrier(_once_in(SYCL, DROP_SIG, RETAIN_LEASE, ""))
+
+
+def test_mutant_stale_mark_dropped_fails():
+    """The member loses one of its marks: the table stays valid (moe_ptrs_ptr() hands out the old table), or the
+    full-local probe keeps a verdict taken while the withdrawn entry was in the table."""
+    for mark in STALE_MARKS:
+        assert not claim_lent_views_mark_the_table_stale(SYCL, _once_in(COMMON, STALE_SIG, mark, "")), mark
+
+
+def test_mutant_stale_mark_never_applied_fails():
+    """The helper drops views but never marks the table stale: a MUL_MAT_ID trusts a table naming the withdrawn
+    entry."""
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, "if (stored || table_dropped) {", "if (false) {"), COMMON)
+
+
+def test_mutant_storage_generation_not_bumped_fails():
+    """A dropped storage record or slot leaves the generation alone: whatever is keyed on it reads as current."""
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, "++w.moe_expert_storage_generation;", ""), COMMON)
+
+
+def test_mutant_slot_payload_kept_fails():
+    """The slot's handle goes but its raw kernel payload stays: the next table upload carries the freed pointer."""
+    assert not claim_lent_views_mark_the_table_stale(_once_in(SYCL, DROP_SIG, NULL_PAYLOAD, ""), COMMON)
+
+
+def test_mutant_table_lease_drop_sets_no_flag_fails():
+    """The preload's holder: only the table's leases name the entry, so with no flag the table stays valid."""
+    assert not claim_lent_views_mark_the_table_stale(_once_in(SYCL, DROP_SIG, TABLE_FROM_LEASES, ""), COMMON)
+
+
+def test_mutant_lease_count_taken_after_the_erase_fails():
+    """The same holder in another spelling: counted after the erase, the flag compares equal sizes and stays false."""
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, N_LEASES + " " + LEASE_ERASE, LEASE_ERASE + " " + N_LEASES), COMMON)
+
+
+def test_mutant_route_table_drop_sets_no_flag_fails():
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_ROUTES, "routes.invalidate(); break;"), COMMON)
+
+
+def test_mutant_hybrid_record_drop_sets_no_flag_fails():
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_HYBRID, "w.moe_hybrid_decode_stamp[device] = {}; }"), COMMON)
+
+
+def test_mutant_stale_guard_inverted_fails():
+    """Inverted, the guard returns for every valid device, so no drop ever marks a table stale."""
+    assert not claim_lent_views_mark_the_table_stale(
+        SYCL, _once_in(COMMON, STALE_SIG, "if (!ggml_sycl_valid_device_index(dev)) {",
+                       "if (ggml_sycl_valid_device_index(dev)) {"))
 
 
 def test_mutant_no_epoch_bump_fails():

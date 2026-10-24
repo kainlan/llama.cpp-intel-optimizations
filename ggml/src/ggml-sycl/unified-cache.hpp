@@ -2890,7 +2890,9 @@ struct expert_loan_member {
 // plan's charge by the quantized tail direct staging pads), a lease on each member's host entry (whose bytes are valid
 // once copy_events[i] completes; the entry carries that event as its ready event) and each device entry's retire
 // status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after the entry's
-// leases are gone and behind the copy, which is the entry's last write.
+// leases are gone and behind the copy, which is the entry's last write. device_keys[i] is the key that device entry
+// was retired under: the caller drops every view it holds on the entry by that key, since a retired entry refuses the
+// resolve a view would otherwise be matched by once the cache generation moves (llama.cpp-6aj4).
 struct expert_loan_record {
     bool                 accepted    = false;
     const char *         reason      = "none";
@@ -2899,6 +2901,7 @@ struct expert_loan_record {
     sycl::event          copy_events[3];
     expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
                                               expert_retire_status::INVALID };
+    unified_cache_key    device_keys[3]   = {};
 };
 
 // One member of a lent triplet re-admitted to the device after a prompt phase (llama.cpp-sif1), the loan's member

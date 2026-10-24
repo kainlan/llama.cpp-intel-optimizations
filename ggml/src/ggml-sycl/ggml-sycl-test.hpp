@@ -632,6 +632,14 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry();
 // With no entry to size a copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
 // ledger's back, and either moves and publishes nothing (llama.cpp-pu8v).
 std::string test_expert_loan_and_refill_stop_on_a_missing_entry();
+// A loan leaves no lease on a withdrawn device entry in the pointer tables a prompt graph's preload built, and marks
+// each such table stale, one whose leases are the entry's only view included: the loan's own boundary drains the views
+// it dropped, so the one deferred-free pass after it erases the entry and returns its zone room, and the first decode
+// boundary re-admits it (llama.cpp-6aj4).
+std::string test_expert_loan_reclaims_pointer_table_leases();
+// The same loan with the boundary's drain timed out on a held drain worker: the entry survives that boundary's pass,
+// and the pass after the worker goes erases it and returns its room (llama.cpp-6aj4).
+std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain();
 #endif
 
 }  // namespace ggml_sycl

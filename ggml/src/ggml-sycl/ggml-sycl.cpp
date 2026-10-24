@@ -20963,6 +20963,106 @@ static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t si
     return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
 }
 
+// Defined with the record (llama.cpp-7pvo): appends every handle a hybrid decode record holds, its table among them.
+static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
+                                                              std::vector<ggml_sycl::mem_handle> & out);
+
+// Take every view `extra` holds of the device entry a loan retired under `withdrawn` off the extra, keeping a lease on
+// each in `retained` (llama.cpp-6aj4). The caller keeps `retained` until the device's queue passes a barrier, so no
+// kernel still reading a dropped table sees a freed buffer. The boundary that ran the loan drains that retention
+// (ggml_sycl_expert_loan_boundary_drain), so the deferred-free pass right after it erases the entry; when that bounded
+// drain times out, the retention stands and the erase lags one pass. Views are matched by the entry's key, never by a
+// resolve: once the cache generation moves, a retired entry refuses the resolve forget_moe_storage_handle_on_device()
+// matches by. The views are the expert's storage records, its slot in the pointer table's handles, the table's
+// per-expert leases (ggml_sycl_set_moe_ptr_table_leases), the route table when one of its entries leases the entry
+// (invalidated, with every lease it held retained, since another expert it names may be lent next), and the hybrid
+// decode record, which holds every expert's lease and its table, all retained. Dropping any of them marks the device
+// table stale, so the next MUL_MAT_ID or preload rebuilds it under the plan the loan publishes.
+static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
+                                             int                                  device,
+                                             int                                  expert_id,
+                                             const ggml_sycl::unified_cache_key & withdrawn,
+                                             std::vector<ggml_sycl::mem_handle> & retained) {
+    // Boundary premise: the loan runs after synchronize's stream wait; the retention covers work still on the queue.
+    if (!extra || !extra->weight_ext || expert_id < 0 || !ggml_sycl_valid_device_index(device)) {
+        return;
+    }
+    ggml_tensor_extra_gpu_weight_ext & w        = *extra->weight_ext;
+    auto                               on_entry = [&](const ggml_sycl::mem_handle & h) {
+        return h.is_weight() && h.device() == device && h.key() == withdrawn;
+    };
+    bool stored        = false;
+    bool table_dropped = false;
+
+    const auto records = w.moe_expert_storage_handles.find(
+        ggml_tensor_extra_gpu_weight_ext::moe_storage_handle_key(expert_id, GGML_LAYOUT_AOS));
+    if (records != w.moe_expert_storage_handles.end()) {
+        auto & list = records->second;
+        for (const ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record & record : list) {
+            if (on_entry(record.handle)) {
+                retained.push_back(record.handle);
+            }
+        }
+        const size_t before = list.size();
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record & record) {
+                                      return on_entry(record.handle);
+                                  }),
+                   list.end());
+        stored = list.size() != before;
+        if (list.empty()) {
+            w.moe_expert_storage_handles.erase(records);
+        }
+    }
+
+    const size_t slot = static_cast<size_t>(expert_id);
+    if (slot < w.moe_expert_handles[device].size() && on_entry(w.moe_expert_handles[device][slot])) {
+        retained.push_back(std::move(w.moe_expert_handles[device][slot]));
+        w.moe_expert_handles[device][slot] = ggml_sycl::mem_handle{};
+        if (slot < w.moe_expert_ptr_payload[device].size()) {
+            w.moe_expert_ptr_payload[device][slot] = nullptr;
+        }
+        stored = true;
+    }
+
+    std::vector<ggml_sycl::mem_handle> & leases = w.moe_expert_ptrs_leases[device];
+    for (const ggml_sycl::mem_handle & lease : leases) {
+        if (on_entry(lease)) {
+            retained.push_back(lease);
+        }
+    }
+    const size_t n_leases = leases.size();
+    leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());
+    table_dropped = leases.size() != n_leases;
+
+    ggml_sycl::moe_route_table & routes = w.moe_route_tables[device];
+    for (const ggml_sycl::moe_route_entry & route : routes.experts) {
+        if (on_entry(route.lease)) {
+            for (const ggml_sycl::moe_route_entry & held : routes.experts) {
+                if (held.lease.valid()) {
+                    retained.push_back(held.lease);
+                }
+            }
+            routes.invalidate();
+            table_dropped = true;
+            break;
+        }
+    }
+    if (w.moe_hybrid_decode[device]) {
+        ggml_sycl_moe_hybrid_decode_record_append_handles(*w.moe_hybrid_decode[device], retained);
+        w.moe_hybrid_decode[device].reset();
+        w.moe_hybrid_decode_stamp[device] = {};
+        table_dropped                     = true;
+    }
+
+    if (stored) {
+        ++w.moe_expert_storage_generation;
+    }
+    if (stored || table_dropped) {
+        w.mark_moe_device_table_stale(device);
+    }
+}
+
 // The body, both directions (llama.cpp-sif1). `amount` is the bytes a loan should free, or the most triplets a refill
 // re-admits. `resolver` is null in production (the registry resolver above, bound to the published plan's owner); the
 // private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless the caller re-posts
@@ -21174,6 +21274,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     // An exception while moving a triplet stops the loop; the triplets already moved are still published below, and it
     // is rethrown once the inventory lock is released.
     std::exception_ptr escaped;
+    // A loan's drops keep a lease on every view they take here, retained after the loop (llama.cpp-6aj4).
+    std::vector<ggml_sycl::mem_handle> lent_views;
     for (prepared_triplet & triplet : prepared) {
         ggml_sycl::expert_loan_record   record;
         ggml_sycl::expert_refill_record refilled;
@@ -21221,13 +21323,16 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                     stop = record.reason;
                     break;
                 }
-                // Drop each extra's lease on its withdrawn device copy, so the retired entry can be reclaimed, before
-                // anything that allocates; then remember each host copy the way S1-PRELOAD remembers a host-planned
-                // expert, behind its copy event. A remember that fails leaves the expert to the cache's own host
-                // entries.
+                // Drop each extra's leases on its withdrawn device copy, before anything that allocates, so only the
+                // retention below holds the retired entry until the loan's boundary drains it: every storage-record,
+                // pointer-table, route-table and hybrid-record view of the entry, matched by the key the loan retired
+                // it under (llama.cpp-6aj4), and then any device record left for the expert. Then remember each host
+                // copy the way S1-PRELOAD remembers a host-planned expert, behind its copy event. A remember that
+                // fails leaves the expert to the cache's own host entries.
                 for (int r = 0; r < 3; ++r) {
                     const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
                     ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
+                    ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);
                     (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
                 }
                 for (int r = 0; r < 3; ++r) {
@@ -21271,6 +21376,29 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         }
         if (escaped) {
             break;
+        }
+    }
+    // The views the loan dropped stay leased until the device's execution queue passes a barrier, so no kernel still
+    // reading a pointer table or a hybrid decode record sees a freed buffer. The boundary that ran the loan drains the
+    // retention, so the deferred-free pass that follows erases each withdrawn entry, or the next pass does when that
+    // bounded drain times out (llama.cpp-6aj4). A failure to retain them (the barrier's submit, or
+    // the retention's allocation) joins the loop's exception, so the triplets already lent are still published; only
+    // then do the views go at once.
+    if (!lent_views.empty()) {
+        try {
+            // Null only before the device has a cache or a TP queue, and a loan runs on the cache; a null queue would
+            // retain the views to a default event, already complete, so they would go at once.
+            sycl::queue * queue = ggml_sycl_execution_queue_for_device(device);
+            ggml_sycl::retain_handles_until_event(std::move(lent_views),
+                                                  queue ? queue->ext_oneapi_submit_barrier() : sycl::event{});
+        } catch (const ggml_sycl_fallback_error &) {
+            // G-CATCH requires this clause before catch (...). Neither the barrier nor the retention throws the op
+            // fallback, so it cannot leave the triplets already lent unpublished.
+            throw;
+        } catch (...) {
+            if (!escaped) {
+                escaped = std::current_exception();
+            }
         }
     }
     // The triplet the preparation could not prepare leaves the ledger only from its back: every triplet selected before
@@ -21476,12 +21604,41 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
 }
 
 // The graph boundary's half of a request: ggml_backend_sycl_synchronize() calls this once the graph's work is done
-// and its compute flag is cleared, before the deferred-free pass.
-static void ggml_sycl_run_pending_expert_loan(ggml_backend_t backend) {
+// and its compute flag is cleared, before the deferred-free pass. True when the loan it ran was accepted and lent at
+// least one triplet, the one case the boundary's drain below runs for.
+static bool ggml_sycl_run_pending_expert_loan(ggml_backend_t backend) {
     const auto * ctx = backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (ctx) {
-        (void) ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, nullptr);
+    if (!ctx) {
+        return false;
     }
+    ggml_sycl_expert_loan_result result;
+    return ggml_sycl_run_pending_expert_loan_on_device(ctx->device, nullptr, &result) && result.accepted &&
+           result.n_triplets != 0;
+}
+
+// Defined with the MoE executor's knobs (llama.cpp-36j0); the drain below reads its trace level.
+static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config();
+
+// The one wait on the loan's path (llama.cpp-6aj4): at the boundary that accepted a loan, wait up to 100 ms for the
+// retained store to drain. The loan's records in it are each D2H copy's two owners and the views the loan dropped,
+// retained to a barrier on the device's execution queue; once they drain, the deferred-free pass that follows erases
+// each withdrawn device entry and returns its room to the WEIGHT zone, so an accepted loan's room is back before the
+// next graph's reserve. The loan code never waits or asks an event's status (c-3bde), since it runs on inference paths;
+// ggml_backend_sycl_synchronize() is the designated boundary and has just waited the whole stream, so a bounded wait
+// for the loan's own copies and barrier is the boundary's. A loan is rare (at most one per short micro-batch, and only
+// while lendable triplets remain) and copies for about 20 ms. drain_retained_handles() takes no scope, so this drains
+// the whole store, every device's records. On a timeout (another context's work still on the queue, or copies past the
+// bound) the retention stands, the erase lags one pass, and one trace line says so. False only then; true at once when
+// no loan was accepted, so a decode boundary pays nothing.
+static bool ggml_sycl_expert_loan_boundary_drain(int device, bool loan_accepted) {
+    constexpr uint32_t drain_ms = 100;
+    if (!loan_accepted || ggml_sycl::drain_retained_handles(/*wait_all=*/true, drain_ms)) {
+        return true;
+    }
+    if (ggml_sycl_moe_exec_config().trace >= 1) {
+        GGML_LOG_INFO("[MOE-EXEC-TRACE] loan device %d: room pending, boundary drain timed out\n", device);
+    }
+    return false;
 }
 
 // ---- The refill (llama.cpp-sif1, plan Task 12 of llama.cpp-36j0) --------------------------------------------------
@@ -21787,6 +21944,19 @@ struct test_loan_fixture {
                 (void) extras[t]->forget_moe_storage_handle_on_device(e, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE);
             }
         }
+        // A case that built pointer tables leaves their views on the extras: they go with the records, so no lease on
+        // the case's entries outlives the deferred-free pass below (llama.cpp-6aj4).
+        for (const auto & extra : extras) {
+            if (extra->weight_ext) {
+                ggml_tensor_extra_gpu_weight_ext & w = *extra->weight_ext;
+                w.moe_expert_ptrs_leases[device].clear();
+                w.moe_expert_handles[device].clear();
+                w.moe_expert_ptr_payload[device].clear();
+                w.moe_route_tables[device].invalidate();
+                w.moe_hybrid_decode[device].reset();
+                w.moe_device_table_valid[device] = false;
+            }
+        }
         for (const ggml_sycl_cache_id & key : keys) {
             (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/expert loan cleanup");
         }
@@ -22018,6 +22188,143 @@ struct test_loan_fixture {
         return cache->test_expert_host_entry_state(keys[index(layer, slot, expert)], &in_use, &retired);
     }
 
+    // A ggml tensor for (layer, slot) with the fixture's geometry, bound to its extra, as a model's MUL_MAT_ID reads
+    // its src0: n_experts f32 experts of test_loan_expert_bytes() each. Its data stays null, since every expert a case
+    // reads is direct-staged and remembered by the extra (llama.cpp-6aj4).
+    void bind_tensor(ggml_tensor & tensor, int layer, int slot) const {
+        tensor       = {};
+        tensor.type  = GGML_TYPE_F32;
+        tensor.ne[0] = static_cast<int64_t>(test_loan_expert_bytes() / sizeof(float));
+        tensor.ne[1] = 1;
+        tensor.ne[2] = n_experts;
+        tensor.ne[3] = 1;
+        tensor.nb[0] = sizeof(float);
+        tensor.nb[1] = test_loan_expert_bytes();
+        tensor.nb[2] = test_loan_expert_bytes();
+        tensor.nb[3] = test_loan_expert_bytes() * static_cast<size_t>(n_experts);
+        ggml_set_name(&tensor, names[layer * 3 + slot].c_str());
+        tensor.extra = extras[layer * 3 + slot].get();
+    }
+
+    // Whether h leases (layer, slot, expert)'s device entry: a weight lease on this device under the expert's id whose
+    // key is not its host copy's. Read from the handle's identity alone: resolving a lease on a retired entry drops
+    // the lease, so a census that resolved would erase the holder it looks for.
+    bool leases_device_entry(const mem_handle & h, int layer, int slot, int expert) const {
+        const ggml_sycl_cache_id & id = keys[index(layer, slot, expert)];
+        const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+        return h.is_weight() && h.device() == device && detail::cache_id_equal(h.key().id, id) &&
+               !(h.key() == host_key);
+    }
+
+    // Whether (layer, slot)'s device pointer table is trusted (moe_device_table_valid) and its kernel payload still
+    // names `expert`: what a MUL_MAT_ID reads without rebuilding the table.
+    bool device_table_valid(int layer, int slot) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        return w && w->moe_device_table_valid[device];
+    }
+
+    bool payload_names_expert(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        return w && static_cast<size_t>(expert) < w->moe_expert_ptr_payload[device].size() &&
+               w->moe_expert_ptr_payload[device][static_cast<size_t>(expert)] != nullptr;
+    }
+
+    // The storage records, and the pointer-table slot handles, (layer, slot)'s extra holds on that expert's entry.
+    int records_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const auto & kv : w->moe_expert_storage_handles) {
+                for (const auto & record : kv.second) {
+                    n += leases_device_entry(record.handle, layer, slot, expert) ? 1 : 0;
+                }
+            }
+        }
+        return n;
+    }
+
+    int slot_handles_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const mem_handle & h : w->moe_expert_handles[device]) {
+                n += leases_device_entry(h, layer, slot, expert) ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
+    // Leaves (layer, slot)'s pointer-table leases as the only view its extra holds of `expert`'s device entry, the
+    // shape the RED found holding a withdrawn entry after a loan (records=0 slot_cache=0 table_leases=1): the storage
+    // records and the slot handle on that entry go (the slot's payload with it), and the table, still trusted, keeps
+    // its leases.
+    void keep_only_table_leases(int layer, int slot, int expert) {
+        ggml_tensor_extra_gpu_weight_ext & w = *extras[layer * 3 + slot]->weight_ext;
+        for (auto it = w.moe_expert_storage_handles.begin(); it != w.moe_expert_storage_handles.end();) {
+            auto & list = it->second;
+            list.erase(std::remove_if(list.begin(), list.end(),
+                                      [&](const ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record & record) {
+                                          return leases_device_entry(record.handle, layer, slot, expert);
+                                      }),
+                       list.end());
+            it = list.empty() ? w.moe_expert_storage_handles.erase(it) : std::next(it);
+        }
+        const size_t e = static_cast<size_t>(expert);
+        if (e < w.moe_expert_handles[device].size() &&
+            leases_device_entry(w.moe_expert_handles[device][e], layer, slot, expert)) {
+            w.moe_expert_handles[device][e] = mem_handle{};
+            if (e < w.moe_expert_ptr_payload[device].size()) {
+                w.moe_expert_ptr_payload[device][e] = nullptr;
+            }
+        }
+    }
+
+    // The pointer-table leases (layer, slot)'s extra holds on that expert's device entry.
+    int table_leases_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const mem_handle & h : w->moe_expert_ptrs_leases[device]) {
+                n += leases_device_entry(h, layer, slot, expert) ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
+    // The route-table leases (layer, slot)'s extra holds on that expert's device entry.
+    int route_leases_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const moe_route_entry & entry : w->moe_route_tables[device].experts) {
+                n += leases_device_entry(entry.lease, layer, slot, expert) ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
+    // Whether (layer, slot)'s extra keeps a hybrid decode record on the device.
+    bool has_hybrid_record(int layer, int slot) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        return w && w->moe_hybrid_decode[device] != nullptr;
+    }
+
+    // Who holds (layer, slot, expert)'s device entry: its lease count, and the handles on it in each view the extra
+    // keeps.
+    std::string device_entry_holders(int layer, int slot, int expert) const {
+        uint32_t   in_use     = 0;
+        const bool present    = cache->test_expert_device_entry_in_use(keys[index(layer, slot, expert)], &in_use);
+        const int  records    = records_on_device_entry(layer, slot, expert);
+        const int  slot_cache = slot_handles_on_device_entry(layer, slot, expert);
+        const int  route      = route_leases_on_device_entry(layer, slot, expert);
+        const bool hybrid     = has_hybrid_record(layer, slot);
+        return test_loan_fail(
+            "layer %d slot %d expert %d's device entry %s with %u leases; its extra's handles on it: records=%d "
+            "slot_cache=%d table_leases=%d route_table=%d, hybrid_record=%d",
+            layer, slot, expert, present ? "present" : "gone", in_use, records, slot_cache,
+            table_leases_on_device_entry(layer, slot, expert), route, (int) hybrid);
+    }
+
     // A host entry still in the cache under (layer, slot, expert)'s exact key, retired: a withdrawn host copy the
     // deferred-free pass has not finalized yet.
     bool host_entry_retired(int layer, int slot, int expert) const {
@@ -22070,13 +22377,44 @@ struct test_loan_fixture {
         return lent;
     }
 
+    // How lend() checks that the lent device entries are reclaimed (llama.cpp-6aj4). POLL runs deferred-free passes and
+    // drains for up to 2 s. AT_BOUNDARY checks once, after the loan's own boundary drain and the one pass synchronize
+    // runs after it, with no polling. DRAIN_TIMES_OUT holds the drain worker on the loan's first retained record, so
+    // the boundary's drain times out: the entries must survive that boundary's pass, and the next pass, once the worker
+    // goes, must reclaim them.
+    enum class reclaim_check { POLL, AT_BOUNDARY, DRAIN_TIMES_OUT };
+
     // A loan of bytes_wanted run at the graph boundary, which must lend n_expected triplets; then each lent device
     // entry is reclaimed and its storage handed back, so a refill meets no withdrawn entry under the ids it re-admits.
-    // `freed`, when given, receives the loan's bytes_freed.
-    std::string lend(size_t bytes_wanted, uint32_t n_expected, int host_expert, size_t * freed = nullptr) {
+    // `freed`, when given, receives the loan's bytes_freed; `check` says how the reclaim is checked.
+    std::string lend(size_t        bytes_wanted,
+                     uint32_t      n_expected,
+                     int           host_expert,
+                     size_t *      freed = nullptr,
+                     reclaim_check check = reclaim_check::POLL) {
         const device_bytes                     before   = sample();
         const ::ggml_sycl_expert_loan_resolver resolver = this->resolver();
         ::ggml_sycl_expert_loan_result         result;
+
+        // Released on every return, so a failed case never leaves the worker held for the next.
+        struct drain_hold {
+            bool held = false;
+
+            ~drain_hold() {
+                if (held) {
+                    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+                }
+            }
+        } hold;
+
+        if (check == reclaim_check::DRAIN_TIMES_OUT) {
+            // An empty store first, so the worker is held on the loan's own first record, not an earlier fill's.
+            if (!drain_retained_handles(true, 5000)) {
+                return "the retained store did not drain before the loan";
+            }
+            retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
+            hold.held = true;
+        }
         ::ggml_sycl_request_expert_loan(device, bytes_wanted);
         if (!::ggml_sycl_run_pending_expert_loan_on_device(device, &resolver, &result) || !result.accepted ||
             result.n_triplets != n_expected) {
@@ -22086,6 +22424,8 @@ struct test_loan_fixture {
         if (freed) {
             *freed = result.bytes_freed;
         }
+        // As synchronize runs it: after the loan, before the deferred-free pass.
+        const bool drained = ::ggml_sycl_expert_loan_boundary_drain(device, result.accepted && result.n_triplets != 0);
         const std::vector<std::pair<int, int>> lent     = lent_triplets(host_expert);
         const size_t                           expected = 3 * n_expected * staged_bytes;
         // Each lent copy is a host-pinned slice of a host zone, the one provenance the copy path reads as host USM,
@@ -22103,17 +22443,63 @@ struct test_loan_fixture {
                 }
             }
         }
-        const bool gone = reclaim_until([&] {
+        auto entries_present = [&] {
+            size_t n = 0;
             for (const auto & t : lent) {
                 for (int s = 0; s < 3; ++s) {
-                    if (device_entry_present(t.first, s, t.second)) {
-                        return false;
-                    }
+                    n += device_entry_present(t.first, s, t.second) ? 1 : 0;
                 }
             }
-            return returned_since(before) >= expected;
-        });
-        return gone ? std::string() : "a lent device entry, or its storage, was not reclaimed within 2 s";
+            return n;
+        };
+        auto reclaimed = [&] {
+            return entries_present() == 0 && returned_since(before) >= expected;
+        };
+        // The pass synchronize runs after the loan's drain.
+        auto boundary_pass = [&] {
+            if (cache->has_pending_deferred_frees()) {
+                cache->process_deferred_frees_public();
+            }
+        };
+        auto not_reclaimed = [&](const char * when) {
+            return test_loan_fail(
+                "%s, %zu of the %zu lent device entries remain and the WEIGHT zone got %zu of %zu bytes", when,
+                entries_present(), 3 * lent.size(), returned_since(before), expected);
+        };
+        switch (check) {
+            case reclaim_check::POLL:
+                return reclaim_until(reclaimed) ? std::string() :
+                                                  "a lent device entry, or its storage, was not reclaimed within 2 s";
+            case reclaim_check::AT_BOUNDARY:
+                if (!drained) {
+                    return "the loan's boundary drain timed out with no drain worker held";
+                }
+                boundary_pass();
+                return reclaimed() ? std::string() : not_reclaimed("after the loan's boundary drain and its one pass");
+            case reclaim_check::DRAIN_TIMES_OUT:
+                // The control: the worker is held on the loan's record and the drain gave up, and the boundary's pass
+                // erases nothing the retention still holds, so this is the lag path, not an early drain.
+                if (drained || !retained_drain_test_parked()) {
+                    return test_loan_fail(
+                        "the boundary drain did not time out on the held worker (drained=%d parked=%d)", (int) drained,
+                        (int) retained_drain_test_parked());
+                }
+                boundary_pass();
+                if (entries_present() != 3 * lent.size()) {
+                    return test_loan_fail(
+                        "%zu of the %zu lent device entries survived the pass after a timed-out drain",
+                        entries_present(), 3 * lent.size());
+                }
+                retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+                hold.held = false;
+                // The next graph's work, here nothing: the worker finishes the loan's records on its own.
+                if (!drain_retained_handles(true, 5000)) {
+                    return "the loan's retained records did not drain once the worker went";
+                }
+                boundary_pass();
+                return reclaimed() ? std::string() : not_reclaimed("at the pass after a timed-out boundary drain");
+        }
+        return "unknown reclaim check";
     }
 
     // The device copy the extra remembers for (layer, slot, expert), read back once its copy lands, against the
@@ -23465,6 +23851,115 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
         }
     }
     return {};
+}
+
+// llama.cpp-6aj4: a prompt graph's preload builds each MoE tensor's expert pointer table with
+// ggml_sycl_update_moe_ptr_table, and the tensor's extra keeps a lease on every expert the table names
+// (moe_expert_ptrs_leases) until that table is next built, which for a tensor the loan leaves with experts on both
+// sides may be never. A loan that withdraws one of those experts must leave no such lease: once the loan's views are
+// released, the deferred-free pass erases the retired device entry, the WEIGHT zone gets the entry's room back, and the
+// first decode boundary's refill re-admits the triplet. Every such table must be marked stale, including slot 0's,
+// whose leases are made the entry's only view, so only the lease path can mark it. `check` says when the release must
+// have happened.
+static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check check) {
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x36616a3401ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+
+    // The layer's three tensors, each table built as the preload builds a prompt ubatch's: the ids it routed, the
+    // device experts, in the layout they were staged in.
+    ggml_tensor tensors[3];
+    for (int s = 0; s < 3; ++s) {
+        fx.bind_tensor(tensors[s], 0, s);
+    }
+    ggml_backend_sycl_context  ctx(fx.device);
+    const std::vector<int32_t> routed = { 0, 1, 2 };
+    ggml_tensor                ids{};
+    for (int s = 0; s < 3; ++s) {
+        sycl::event table_event;
+        if (!ggml_sycl_update_moe_ptr_table(ctx, &tensors[s], &ids, GGML_LAYOUT_AOS, &table_event,
+                                            moe_ptr_table_coverage::SELECTED_IDS, &routed,
+                                            /*skip_device_copy=*/false,
+                                            /*force_cache_aos=*/false,
+                                            /*skip_cpu_routed_experts=*/false,
+                                            /*exact_layout_required=*/false)) {
+            return test_loan_fail("slot %d's pointer table was not built", s);
+        }
+        table_event.wait_and_throw();
+    }
+    ctx.stream()->wait();
+    // The control: each table leases expert 2's device entry, the triplet the loan selects from the plan's tail, and
+    // is trusted with a payload naming it, so the check after the loan can fail.
+    for (int s = 0; s < 3; ++s) {
+        if (fx.table_leases_on_device_entry(0, s, 2) == 0) {
+            return "no pointer-table lease before the loan: " + fx.device_entry_holders(0, s, 2);
+        }
+        if (!fx.device_table_valid(0, s) || !fx.payload_names_expert(0, s, 2)) {
+            return test_loan_fail("slot %d's table before the loan: valid=%d, payload names expert 2=%d, not 1 and 1",
+                                  s, (int) fx.device_table_valid(0, s), (int) fx.payload_names_expert(0, s, 2));
+        }
+    }
+    // Slot 0's table leases become the only view its extra holds of expert 2's entry, the shape the RED found
+    // (records=0 slot_cache=0 table_leases=1): only the lease flag can mark that table stale, so the loan's slot path
+    // cannot pass for it. Slots 1 and 2 keep every view, so the slot path is witnessed too. Nor may slot 0's route
+    // table lease the entry or a hybrid record exist, or their own flags could mark it stale without the lease flag.
+    fx.keep_only_table_leases(0, /*slot=*/0, 2);
+    if (fx.records_on_device_entry(0, 0, 2) != 0 || fx.slot_handles_on_device_entry(0, 0, 2) != 0 ||
+        fx.route_leases_on_device_entry(0, 0, 2) != 0 || fx.has_hybrid_record(0, 0) ||
+        fx.table_leases_on_device_entry(0, 0, 2) == 0 || !fx.device_table_valid(0, 0)) {
+        return "slot 0 is not lease-only before the loan: " + fx.device_entry_holders(0, 0, 2);
+    }
+
+    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3, /*freed=*/nullptr, check); !why.empty()) {
+        for (int s = 0; s < 3; ++s) {
+            why += "; " + fx.device_entry_holders(0, s, 2);
+        }
+        return why;
+    }
+    // No table still trusted with a raw pointer into the room the zone got back: each is stale, so the next
+    // MUL_MAT_ID or preload rebuilds it. Lease-only slot 0 is checked by its stale mark alone, since only its device
+    // copy of the table named the entry; the full-view slots' payloads no longer name expert 2 either.
+    if (fx.device_table_valid(0, 0)) {
+        return "lease-only slot 0's table is still trusted after the loan: " + fx.device_entry_holders(0, 0, 2);
+    }
+    for (int s = 1; s < 3; ++s) {
+        if (fx.device_table_valid(0, s) || fx.payload_names_expert(0, s, 2)) {
+            return test_loan_fail("slot %d's table after the loan: valid=%d, payload names expert 2=%d, not 0 and 0", s,
+                                  (int) fx.device_table_valid(0, s), (int) fx.payload_names_expert(0, s, 2));
+        }
+    }
+    // The loan moved expert 2's triplet and no other, so the refill below cannot pass on a triplet that never left.
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (lent.size() != 1 || lent[0] != std::make_pair(0, 2)) {
+        return test_loan_fail("the loan lent %zu triplets (first layer %d expert %d), not layer 0 expert 2 alone",
+                              lent.size(), lent.empty() ? -1 : lent[0].first, lent.empty() ? -1 : lent[0].second);
+    }
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1 || remaining != 0) {
+        return test_loan_fail("the first decode boundary re-admitted %u triplets with %u remaining (%s), not 1 and 0",
+                              result.n_triplets, remaining, result.reason);
+    }
+    return fx.readmitted(0, 2);
+}
+
+// The loan's own boundary drains its retained views, so the one pass after it has erased the three withdrawn device
+// entries and returned their room, with no polling.
+std::string test_expert_loan_reclaims_pointer_table_leases() {
+    return test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check::AT_BOUNDARY);
+}
+
+// The lag path: the boundary's drain times out on a held drain worker, the entries survive that boundary's pass, and
+// the pass after the worker goes erases them and returns their room.
+std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain() {
+    return test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check::DRAIN_TIMES_OUT);
 }
 
 }  // namespace ggml_sycl
@@ -68604,10 +69099,7 @@ static bool ggml_sycl_release_moe_ptr_table_leases_for_layout(const ggml_tensor 
         return false;
     }
 
-    extra->weight().moe_device_table_valid[device]          = false;
-    extra->weight().moe_full_local_probe_generation[device] = 0;
-    extra->weight().moe_full_local_probe_layout[device]     = GGML_LAYOUT_AOS;
-    extra->weight().moe_full_local_probe_ok[device]         = false;
+    extra->weight().mark_moe_device_table_stale(device);
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         static std::atomic<int> lease_release_log{ 0 };
         const int               n = lease_release_log.fetch_add(1, std::memory_order_relaxed);
@@ -81441,6 +81933,14 @@ struct moe_hybrid_decode_record {
     bool                               has_ready = false;
 };
 
+static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
+                                                              std::vector<ggml_sycl::mem_handle> & out) {
+    out.insert(out.end(), record.lease.begin(), record.lease.end());
+    if (record.table.valid()) {
+        out.push_back(record.table);
+    }
+}
+
 // The record's table (llama.cpp-7pvo): host-pinned, n_as device weight pointers by expert id, copied to the planned
 // scratch per op. Owner-first, so the record's handle is the allocation's only owner from the start.
 static bool ggml_sycl_moe_hybrid_decode_table_allocate(sycl::queue &           queue,
@@ -81679,10 +82179,8 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     std::shared_ptr<const moe_hybrid_decode_record> & held = weight.moe_hybrid_decode[device];
     if (held) {
         // The replaced record's table and device leases may back a table copy or kernel still on the queue.
-        std::vector<ggml_sycl::mem_handle> handles = held->lease;
-        if (held->table.valid()) {
-            handles.push_back(held->table);
-        }
+        std::vector<ggml_sycl::mem_handle> handles;
+        ggml_sycl_moe_hybrid_decode_record_append_handles(*held, handles);
         ggml_sycl::retain_handles_until_event(std::move(handles), ctx.stream()->ext_oneapi_submit_barrier());
     }
     if (settled == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) {
@@ -95433,8 +95931,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         sycl_ctx->has_pending_barrier              = false;
         sycl_ctx->barrier_event.reset();
         ggml_sycl::unified_cache_set_graph_compute_active(false);
-        // A loan an in-graph caller requested runs here, at the graph boundary (llama.cpp-mwmr, c-tdra).
-        ggml_sycl_run_pending_expert_loan(backend);
+        // A loan an in-graph caller requested runs here, at the graph boundary (llama.cpp-mwmr, c-tdra). When it
+        // lent, the boundary drains the loan's retained records, so the deferred-free pass below erases the withdrawn
+        // device entries and returns their room before the next graph's reserve (llama.cpp-6aj4).
+        const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);
+        (void) ggml_sycl_expert_loan_boundary_drain(sycl_ctx->device, loan_accepted);
         {
             auto * cache = ggml_sycl::get_unified_cache_for_device(sycl_ctx->device);
             if (cache && cache->has_pending_deferred_frees()) {
