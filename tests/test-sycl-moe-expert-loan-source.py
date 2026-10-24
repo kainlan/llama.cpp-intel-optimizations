@@ -687,6 +687,9 @@ MARK_STALE = "if (stored || table_dropped) { w.mark_moe_device_table_stale(devic
 # leaves, with no storage record and no slot naming the entry), the route table invalidated, or the hybrid record
 # reset. Without it a table whose only view of the entry was its leases stays valid, its raw pointer into room the
 # ring reuses.
+# The count the lease flag compares against is taken before the erase: taken after it, the flag is always false.
+N_LEASES = "const size_t n_leases = leases.size();"
+LEASE_ERASE = "leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());"
 TABLE_FROM_LEASES = "table_dropped = leases.size() != n_leases;"
 TABLE_FROM_ROUTES = "routes.invalidate(); table_dropped = true; break;"
 TABLE_FROM_HYBRID = "w.moe_hybrid_decode_stamp[device] = {}; table_dropped = true; }"
@@ -700,10 +703,11 @@ def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
     return (member.startswith(STALE_GUARD) and all(member.count(x) == 1 for x in STALE_MARKS)
             and helper.count(NULL_PAYLOAD) == 1 and ordered(helper, RETAIN_SLOT, NULL_PAYLOAD, "stored = true;")
             and helper.count(BUMP_GENERATION) == 1 and helper.count(MARK_STALE) == 1
-            and all(helper.count(x) == 1 for x in (TABLE_FROM_LEASES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID))
+            and all(helper.count(x) == 1
+                    for x in (N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID))
             and helper.count("table_dropped = true;") == 2
-            and ordered(helper, RETAIN_LEASE, "leases.erase(", TABLE_FROM_LEASES, RETAIN_ROUTES, TABLE_FROM_ROUTES,
-                        RETAIN_HYBRID, TABLE_FROM_HYBRID, BUMP_GENERATION, MARK_STALE))
+            and ordered(helper, RETAIN_LEASE, N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, RETAIN_ROUTES,
+                        TABLE_FROM_ROUTES, RETAIN_HYBRID, TABLE_FROM_HYBRID, BUMP_GENERATION, MARK_STALE))
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -1967,6 +1971,12 @@ def test_mutant_slot_payload_kept_fails():
 def test_mutant_table_lease_drop_sets_no_flag_fails():
     """The preload's holder: only the table's leases name the entry, so with no flag the table stays valid."""
     assert not claim_lent_views_mark_the_table_stale(_once_in(SYCL, DROP_SIG, TABLE_FROM_LEASES, ""), COMMON)
+
+
+def test_mutant_lease_count_taken_after_the_erase_fails():
+    """The same holder in another spelling: counted after the erase, the flag compares equal sizes and stays false."""
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, N_LEASES + " " + LEASE_ERASE, LEASE_ERASE + " " + N_LEASES), COMMON)
 
 
 def test_mutant_route_table_drop_sets_no_flag_fails():

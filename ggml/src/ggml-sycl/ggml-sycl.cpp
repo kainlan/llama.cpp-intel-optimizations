@@ -22192,6 +22192,55 @@ struct test_loan_fixture {
                w->moe_expert_ptr_payload[device][static_cast<size_t>(expert)] != nullptr;
     }
 
+    // The storage records, and the pointer-table slot handles, (layer, slot)'s extra holds on that expert's entry.
+    int records_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const auto & kv : w->moe_expert_storage_handles) {
+                for (const auto & record : kv.second) {
+                    n += leases_device_entry(record.handle, layer, slot, expert) ? 1 : 0;
+                }
+            }
+        }
+        return n;
+    }
+
+    int slot_handles_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const mem_handle & h : w->moe_expert_handles[device]) {
+                n += leases_device_entry(h, layer, slot, expert) ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
+    // Leaves (layer, slot)'s pointer-table leases as the only view its extra holds of `expert`'s device entry, the
+    // holder a prompt graph's preload leaves once a later table names other experts: the storage records and the slot
+    // handle on that entry go (the slot's payload with it), and the table, still trusted, keeps its leases.
+    void keep_only_table_leases(int layer, int slot, int expert) {
+        ggml_tensor_extra_gpu_weight_ext & w = *extras[layer * 3 + slot]->weight_ext;
+        for (auto it = w.moe_expert_storage_handles.begin(); it != w.moe_expert_storage_handles.end();) {
+            auto & list = it->second;
+            list.erase(std::remove_if(list.begin(), list.end(),
+                                      [&](const ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record & record) {
+                                          return leases_device_entry(record.handle, layer, slot, expert);
+                                      }),
+                       list.end());
+            it = list.empty() ? w.moe_expert_storage_handles.erase(it) : std::next(it);
+        }
+        const size_t e = static_cast<size_t>(expert);
+        if (e < w.moe_expert_handles[device].size() &&
+            leases_device_entry(w.moe_expert_handles[device][e], layer, slot, expert)) {
+            w.moe_expert_handles[device][e] = mem_handle{};
+            if (e < w.moe_expert_ptr_payload[device].size()) {
+                w.moe_expert_ptr_payload[device][e] = nullptr;
+            }
+        }
+    }
+
     // The pointer-table leases (layer, slot)'s extra holds on that expert's device entry.
     int table_leases_on_device_entry(int layer, int slot, int expert) const {
         const auto & w = extras[layer * 3 + slot]->weight_ext;
@@ -22209,20 +22258,12 @@ struct test_loan_fixture {
     std::string device_entry_holders(int layer, int slot, int expert) const {
         uint32_t     in_use     = 0;
         const bool   present    = cache->test_expert_device_entry_in_use(keys[index(layer, slot, expert)], &in_use);
-        int          records    = 0;
-        int          slot_cache = 0;
+        const int    records    = records_on_device_entry(layer, slot, expert);
+        const int    slot_cache = slot_handles_on_device_entry(layer, slot, expert);
         int          route      = 0;
         bool         hybrid     = false;
         const auto & w          = extras[layer * 3 + slot]->weight_ext;
         if (w) {
-            for (const auto & kv : w->moe_expert_storage_handles) {
-                for (const auto & record : kv.second) {
-                    records += leases_device_entry(record.handle, layer, slot, expert) ? 1 : 0;
-                }
-            }
-            for (const mem_handle & h : w->moe_expert_handles[device]) {
-                slot_cache += leases_device_entry(h, layer, slot, expert) ? 1 : 0;
-            }
             for (const moe_route_entry & entry : w->moe_route_tables[device].experts) {
                 route += leases_device_entry(entry.lease, layer, slot, expert) ? 1 : 0;
             }
@@ -23624,7 +23665,9 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
 // (moe_expert_ptrs_leases) until that table is next built, which for a tensor the loan leaves with experts on both
 // sides may be never. A loan that withdraws one of those experts must leave no such lease: once the loan's views are
 // released, the deferred-free pass erases the retired device entry, the WEIGHT zone gets the entry's room back, and the
-// first decode boundary's refill re-admits the triplet. `check` says when the release must have happened.
+// first decode boundary's refill re-admits the triplet. Every such table must be marked stale, including slot 0's,
+// whose leases are made the entry's only view, so only the lease path can mark it. `check` says when the release must
+// have happened.
 static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check check) {
     test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x36616a3401ull);
     if (!fx.cache) {
@@ -23669,6 +23712,14 @@ static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture:
                                   s, (int) fx.device_table_valid(0, s), (int) fx.payload_names_expert(0, s, 2));
         }
     }
+    // Slot 0's table leases become the only view its extra holds of expert 2's entry, the shape the RED found
+    // (records=0 slot_cache=0 table_leases=1): only the lease flag can mark that table stale, so the loan's slot path
+    // cannot pass for it. Slots 1 and 2 keep every view, so the slot path is witnessed too.
+    fx.keep_only_table_leases(0, /*slot=*/0, 2);
+    if (fx.records_on_device_entry(0, 0, 2) != 0 || fx.slot_handles_on_device_entry(0, 0, 2) != 0 ||
+        fx.table_leases_on_device_entry(0, 0, 2) == 0 || !fx.device_table_valid(0, 0)) {
+        return "slot 0 is not lease-only before the loan: " + fx.device_entry_holders(0, 0, 2);
+    }
 
     if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3, check); !why.empty()) {
         for (int s = 0; s < 3; ++s) {
@@ -23676,9 +23727,13 @@ static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture:
         }
         return why;
     }
-    // No table still trusted with a raw pointer into the room the zone got back: each is stale, and its payload no
-    // longer names expert 2, so the next MUL_MAT_ID or preload rebuilds it.
-    for (int s = 0; s < 3; ++s) {
+    // No table still trusted with a raw pointer into the room the zone got back: each is stale, so the next
+    // MUL_MAT_ID or preload rebuilds it. Lease-only slot 0 is checked by its stale mark alone, since only its device
+    // copy of the table named the entry; the full-view slots' payloads no longer name expert 2 either.
+    if (fx.device_table_valid(0, 0)) {
+        return "lease-only slot 0's table is still trusted after the loan: " + fx.device_entry_holders(0, 0, 2);
+    }
+    for (int s = 1; s < 3; ++s) {
         if (fx.device_table_valid(0, s) || fx.payload_names_expert(0, s, 2)) {
             return test_loan_fail("slot %d's table after the loan: valid=%d, payload names expert 2=%d, not 0 and 0", s,
                                   (int) fx.device_table_valid(0, s), (int) fx.payload_names_expert(0, s, 2));
