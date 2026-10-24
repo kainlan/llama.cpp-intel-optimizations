@@ -454,8 +454,7 @@ PENDING_RUN = ("const ggml_sycl_txn_result code = ggml_sycl_expert_loan_transact
 NOT_BUSY_RETURNS = ("if (code != ggml_sycl_txn_result::BUSY) { busy_streak.store(0, std::memory_order_relaxed); "
                     "return true; }")
 REPOST = "ggml_sycl_request_expert_loan(device, bytes_wanted); return true; }"
-MMID_FORBIDDEN = ("ggml_sycl_expert_loan_transaction_run(", "ggml_sycl_run_expert_loan_transaction(",
-                  "ggml_sycl_run_pending_expert_loan", "loan_expert_triplet(")
+MMID_FORBIDDEN = ("ggml_sycl_expert_loan_transaction_run(", "ggml_sycl_run_pending_expert_loan", "loan_expert_triplet(")
 
 
 def claim_request_is_lock_free(sycl: str) -> bool:
@@ -1754,7 +1753,8 @@ def test_mutant_mul_mat_id_runs_the_loan_fails():
     anchor = "auto dispatch_cpu_entries_now = [&]"
     assert not claim_loan_runs_at_the_graph_boundary(
         _once_in(SYCL, MMID_SIG, anchor,
-                 "(void) ggml_sycl_run_expert_loan_transaction(nullptr, 1, false, nullptr); " + anchor))
+                 "(void) ggml_sycl_expert_loan_transaction_run(ctx.device, 1, false, nullptr, nullptr, false); "
+                 + anchor))
 
 
 def test_mutant_busy_drops_the_request_fails():
