@@ -162,12 +162,26 @@ int main() {
         CHECK(log.bytes_streamed == (8ull << 20), "streamed bytes accumulate for RING only, NOT_CONSULTED ignored");
         char buf[160];
         CHECK(log.take_summary(buf, sizeof(buf)), "a consulted log gives a summary");
-        CHECK(std::strcmp(buf, "[MOE-EXEC] summary: 2 layer-ubatches ring, 0 cpu, 2 forced, 8 MiB streamed") == 0,
+        CHECK(std::strcmp(buf,
+                          "[MOE-EXEC] summary: 2 layer-ubatches ring, 0 cpu, 2 forced, 8 MiB streamed, 0 windows, "
+                          "0 exposed, 0 misses") == 0,
               "summary format");
         CHECK(!log.take_summary(buf, sizeof(buf)), "a second take gives nothing");
+        log.note(0, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED), 4ull << 20);
+        log.note_window(/*exposed*/ true, /*misses*/ 0);
+        log.note_window(false, 0);
+        log.note_window(false, 2);
+        CHECK(log.take_summary(buf, sizeof(buf)) &&
+                  std::strcmp(buf,
+                              "[MOE-EXEC] summary: 1 layer-ubatches ring, 0 cpu, 1 forced, 4 MiB streamed, "
+                              "3 windows, 1 exposed, 2 misses") == 0,
+              "window counters in the summary");
+        CHECK(!log.take_summary(buf, sizeof(buf)), "window counters reset with the summary");
         log.note(0, 4, decision(moe_exec_choice::CPU), 0);
         CHECK(log.take_summary(buf, sizeof(buf)) &&
-                  std::strcmp(buf, "[MOE-EXEC] summary: 0 layer-ubatches ring, 1 cpu, 0 forced, 0 MiB streamed") == 0,
+                  std::strcmp(buf,
+                              "[MOE-EXEC] summary: 0 layer-ubatches ring, 1 cpu, 0 forced, 0 MiB streamed, 0 windows, "
+                              "0 exposed, 0 misses") == 0,
               "a note after a take counts from zero");
     }
 
