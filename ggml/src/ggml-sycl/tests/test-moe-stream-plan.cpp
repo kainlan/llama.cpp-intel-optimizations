@@ -191,6 +191,29 @@ int main() {
     wrong_layer[4].layer                     = 2;
     CHECK(!layer_fully_staged(wrong_layer, plan, 1, routed, 4));
 
+    // The reference above is checked against production: moe_stream_plan_index_build lists, for every layer with a host
+    // expert, the same (expert_id, role) sequence as the STREAM_ALL reference, and omits layer 3 (no host experts).
+    // The hand-built entries have a zeroed type and shape, so the production staging is NONE; only the list is compared.
+    const ggml_sycl::moe_stream_plan_index idx =
+        ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr);
+    for (int l = 0; l < kLayers; ++l) {
+        const auto ref = plan_build(plan, l, moe_exec_regime::STREAM_ALL, nullptr, 0);
+        const auto it  = idx.layers.find(l);
+        if (ref.empty()) {
+            CHECK(it == idx.layers.end());
+            continue;
+        }
+        CHECK(it != idx.layers.end());
+        if (it == idx.layers.end()) {
+            continue;
+        }
+        CHECK(it->second.items.size() == ref.size());
+        for (size_t i = 0; i < ref.size() && i < it->second.items.size(); ++i) {
+            CHECK(it->second.items[i].expert_id == ref[i].expert_id);
+            CHECK(it->second.items[i].role == ref[i].role);
+        }
+    }
+
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);
         return 1;
