@@ -574,13 +574,17 @@ and `GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`, gate exit 1.
 #### Record at 660a34602 (2026-10-24 02:03-02:32 EDT)
 
 The same gate, run from the merge tree whose HEAD is 660a34602, under the head check (no `--no-head-check`), by the
-lead. Summary: `verdicts_pass=8` of 15 arms scored, `ring_engaged_any=no`, `loan_exercised_any=no`, 2 FAIL (`Q_pp`
-and `GO_pp`). `builders_post` is 0 in every arm, `Shmem` stayed flat at 1.42 GB, and the per-arm load average read
-8.93-20.32, from the arms' pre lines as defined in the Method section. This is a record, not a baseline: the ring did not engage, so the Qwen numbers are the CPU-executor numbers.
+lead. Summary: `verdicts_pass=8` of 15 arms scored (8 PASS, 4 RECORDED, 1 NOT_EXERCISED, 2 FAIL: `Q_pp` and
+`GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`. The gate's exit code is 1: the log does not record it, and
+the script returns 1 whenever an arm FAILs. The Qwen placement lines were `MoE experts: 42693 on device, 31035 on
+host` (`Q_tg`) and `MoE experts: 29637 on device, 44091 on host` (`Q_noc`). `builders_post` is 0 in every arm,
+`Shmem` stayed flat at 1.42 GB, and the per-arm load average read 8.93-20.32, from the arms' pre lines as the Method
+section defines. This is a record, not a baseline: the ring did not engage, so the Qwen numbers are the CPU-executor
+numbers.
 
 | arm | metric | value | floor | verdict | builders_post | notes |
 |-----|--------|-------|-------|---------|---------------|-------|
-| Q_pp | pp512 t/s | 17.7 ± 0.65 | 500 | FAIL | 0 | ub=512 layers=24 summary=2 ring_engaged=no loan_exercised=no; the 10 % cap refuses the ring (llama.cpp-bcre) |
+| Q_pp | pp512 t/s | 17.7 ± 0.65 | 500 | FAIL | 0 | ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no; the ring stays short and the 10 % cap refuses it (llama.cpp-bcre) |
 | Q_pp | pp2048 t/s | 48.5 ± 0.38 | 800 | FAIL | 0 | same run |
 | Q_pp_cpu | pp512 t/s | 17.70 | - | RECORDED | 0 | forced_cpu_lines=24 |
 | Q_pp_cpu | pp2048 t/s | 48.40 | - | RECORDED | 0 | same run |
@@ -599,10 +603,19 @@ and `GO_pp`). `builders_post` is 0 in every arm, `Shmem` stayed flat at 1.42 GB,
 | MI_b50 | digits | 1 | 1 | PASS | 0 | |
 | resets | count | 0 | 0 | PASS | 0 | |
 
-An earlier run at f14082f2b (2026-10-23 23:0x-23:34 EDT, same gate and head check) read Q_pp 12.9 / 31.4 FAIL,
-Q_tg 12.79, Q_noc 10.84, GO_pp 782.8 / 34.0 (the 34.0 tg128 is also above the 31.0-33.0 band, so it scored FAIL there too), `verdicts_pass=8`, and md5s that partly differ: `Q_tok` and `Q_tok_cpu_1` read 2a6c2cf6 (9577403b and 199c6905 at 660a34602), while `Q_tok_2` 199c6905, `Q_tg` 3ce606c1 and `Q_noc` 25b7738a match. Its `Q_tok_cpu` passed with distinct_cpu=1 pairs_equal=2 min_prefix=105. The Qwen figures differ
-between the three runs although the ring engaged in none of them, so they move with the host's load and the tree;
-compare them only with each other in a paired arm, never as baselines.
+An earlier run at f14082f2b (2026-10-23 22:51:52-23:34:52 EDT, same gate and head check) read:
+
+- `Q_pp` 12.9 ± 0.73 pp512 and 31.4 ± 1.80 pp2048, FAIL.
+- `Q_pp_cpu` 13.57 and 29.97, RECORDED.
+- `Q_tg` 12.79 and `Q_noc` 10.84, both PASS.
+- `GO_pp` pp512 782.8 ± 13.9, FAIL (llama.cpp-zuze), and tg128 33.96 ± 0.65, also above the 31.0-33.0 band, so FAIL.
+- `verdicts_pass=8`.
+
+Its md5s partly differ from the 660a34602 run. `Q_tok` and `Q_tok_cpu_1` read 2a6c2cf6 (9577403b and 199c6905 at
+660a34602), while `Q_tok_2` 199c6905, `Q_tg` 3ce606c1 and `Q_noc` 25b7738a match. Its `Q_tok_cpu` passed with
+distinct_cpu=1 pairs_equal=2 min_prefix=105. The Qwen figures differ between the three runs although the ring engaged
+in none of them, so they move with the host's load and the tree. Compare them only with each other in a paired arm,
+never as baselines.
 
 ### How to read the verdict fields
 
@@ -613,14 +626,13 @@ compare them only with each other in a paired arm, never as baselines.
   `auto` at default verbosity does not print that line. `Q_staged` then reports `NOT_EXERCISED`, which is
   neither a pass nor a fail. The summary line says `ring_engaged_any=no` and the gate's exit code is 3 rather
   than 0, even when `Q_pp` passed its floors and nothing failed. Do not read it as green.
-  A second reason the ring did not engage in the runs this table records, both since fixed. A model that passes
-  the cap (Qwen1.5 at a 33-35 % VRAM budget) finds the ring short and asks for a loan. At `8c44f3b3c` the loan
-  was refused with "host storage too small" (`llama.cpp-pu8v`, the host copy sized from dst_size). At
-  `5d0727255`, the pu8v fix, the loan was accepted (41 triplets, 190 MiB) but the ring still could not engage,
-  because lent room was not returned on reclaim (`llama.cpp-6aj4`). Both tickets are closed. The 660a34602 and
-  f14082f2b records are after both fixes, and the ring still did not engage: only 41 of about 1301 triplets are
-  lendable, since `moe_loan_triplet_is_lendable` refuses bulk-staged tensors (`llama.cpp-bcre` c-aerm), and on Qwen3.8
-  the 10 % cap refuses before any loan. The 8c44f3b3c table predates both fixes.
+  A second reason the ring did not engage is the loan. A model that passes the cap (Qwen1.5 at a 33-35 % VRAM budget)
+  finds the ring short and asks for a loan. At `8c44f3b3c` the loan was refused with "host storage too small"
+  (`llama.cpp-pu8v`, the host copy sized from dst_size). The pu8v fix (`5d0727255`) got the loan accepted (41
+  triplets, 190 MiB), but lent room was not returned on reclaim (`llama.cpp-6aj4`). Both tickets are closed, and the
+  660a34602 and f14082f2b records are the runs after both fixes. The ring still did not engage in them: only 41 of
+  about 1301 triplets are lendable, since `moe_loan_triplet_is_lendable` refuses bulk-staged tensors (`llama.cpp-bcre`
+  c-aerm), and on Qwen3.8 the 10 % cap refuses before any loan. The 8c44f3b3c table predates both fixes.
 - **`Q_staged`.** The executor prints its `[MOE-EXEC-TRACE] executor device` line for every dispatch,
   resident layers included, and `staged=0` is correct for those. The arm scores only the layers the ring
   served: a layer with a `[MOE-EXEC] layer N: ring` line is a host layer, and every `blk.N.*` dispatch of it
