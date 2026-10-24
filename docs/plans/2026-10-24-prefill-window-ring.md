@@ -3,8 +3,8 @@
 > **Execution:** Use `team-driven-development` in Claude Code, `pi-team-driven-development` in pi.dev, or
 > `codex-team-driven-development` in Codex.
 
-**Goal:** A Qwen3.8-Flash-Next prompt on the Arc Pro B70, with 60 % of its routed experts host-resident, runs every
-MoE layer's host experts through the batched oneDNN f16 executor from ring slots the copy engine filled one executor
+**Goal:** A Qwen3.8-Flash-Next prompt on the Arc Pro B70, with 60 % of its routed experts host-resident, runs every MoE
+layer's host experts through the batched oneDNN f16 executor from ring slots the cache's copy queue filled one executor
 phase ahead, so pp512 rises from 12.9 tok/s (the CPU executor today) toward the PCIe ceiling of about 300 tok/s and
 pp2048 from 31 toward 800, with the ring engaged on every host layer (`ring_engaged=yes`, `misses=0`) and the output
 byte-identical to the CPU policy.
@@ -15,14 +15,13 @@ re-sized from "two whole layers" to "two executor windows". A window is one phas
 executor already derives from its planned f16 weight slot (`moe_pp_batched_f16_plan_groups`). The ring's two regions
 hold the current window and the prefetched next one; the executor asks the phase for each window right before it
 dequantizes it and tells the phase when the window's dequants are behind a barrier, so the region can be refilled. The
-copies run on a Level Zero immediate command list on the device's copy-only engine, created through
-`sycl::make_queue`, so they overlap the executor's dequant and GEMM kernels on the compute engine instead of queueing
-behind them. Placement is unchanged: the planner still decides which experts live in VRAM; the ring moves bytes to
-where the executor runs them, which is the amended 2026-10-19 ruling ("stream host-pinned weights to VRAM when the
-cost model says it is faster").
+copies stay on the cache's existing in-order copy queue: the Task 4 spike measured, on both cards, that a 64 MiB pinned
+copy on that queue finishes in 2.5-3.5 ms while a full-EU spin kernel holds the card for 110-130 ms, so the copies
+already overlap the executor's dequant and GEMM kernels and no copy-engine queue is built. Placement is unchanged: the
+planner still decides which experts live in VRAM; the ring moves bytes to where the executor runs them, which is the
+amended 2026-10-19 ruling ("stream host-pinned weights to VRAM when the cost model says it is faster").
 
-**Tech Stack:** C++17, SYCL (oneAPI 2026.1, icpx), Level Zero loader (`/usr/lib/x86_64-linux-gnu/libze_loader.so.1`,
-header `/usr/include/level_zero/ze_api.h`), oneDNN batched GEMM, CMake + Ninja (`scripts/sycl-build.sh`), ctest,
+**Tech Stack:** C++17, SYCL (oneAPI 2026.1, icpx), oneDNN batched GEMM, CMake + Ninja (`scripts/sycl-build.sh`), ctest,
 Python 3 (`pytest`) source-contract gates, bash gate script.
 
 **Test Infrastructure:** Host-only C++ tests in `ggml/src/ggml-sycl/tests/` registered in
@@ -103,23 +102,25 @@ so it never sees a ring layer; admitting it is a follow-up ticket. A layer decli
 world (`enqueue_host_expert_rows`), which is what llama.cpp-8p5x c-0blp expects (read it). A stage failure **after** a
 claim is an invariant violation (the window fits the region by construction) and aborts with a message.
 
-**W5. Copy engine.** `unified_cache::get_stream_copy_queue()`: a `sycl::queue` made with
-`sycl::make_queue<sycl::backend::ext_oneapi_level_zero>` from a Level Zero immediate command list on the first queue
-group with the COPY flag and without the COMPUTE flag (`zeDeviceGetCommandQueueGroupProperties`,
-`zeCommandListCreateImmediate`, resolved through `dlopen("libze_loader.so.1")`, never linked). Knob
-`GGML_SYCL_COPY_ENGINE` (unset or `1`: try; `0`: off); on only for Battlemage
-(`sycl::ext::oneapi::experimental::info::device::architecture` in `{intel_gpu_bmg_g21, intel_gpu_bmg_g31}`), Level
-Zero backend only, off when `SYCL_UR_USE_LEVEL_ZERO_V2=0` (the legacy adapter already uses the copy engine). Used by
-exactly two callers: the ring's `mem_copy_async` and the load-time H2D probe, so the probed rate is the ring's rate.
-Nothing else is submitted on it: no `fill`, no kernel (a copy-only list rejects them), and no host thread waits on its
-events (a v2-adapter hang Strata documents). One WARN-level line names the queue group at creation, so a default
-verbosity run shows which engine the ring uses. A spike (Task 4) measures overlap on both cards before the queue is
-built; its decision rule is in Task 5.
+**W5. Copy queue (amended 2026-10-24 from the Task 4 rows).** The ring copies on the cache's BCS queue
+(`cache.get_bcs_queue()`, a plain in-order queue on the compute queue's context, `unified-cache.cpp:6365`) as it does
+today. The plan first proposed a Level Zero immediate command list on the device's copy-only engine, built through a
+`dlopen`ed ze_loader behind a `GGML_SYCL_COPY_ENGINE` knob, on the Strata premise that an in-order SYCL queue's copies
+queue behind compute under the v2 adapter. The Task 4 spike (lead-run, llama.cpp-efck c-0cu6, read it) refuted the
+premise on this host: on the B70 and the B50, adapter v2, a 64 MiB pinned H2D copy on either cache queue takes 2.5-2.7
+ms alone and 2.5-3.5 ms while a ~100 ms one-work-group spin kernel **or** a 110-130 ms full-EU spin kernel runs on the
+compute queue, every row `overlap=yes`, `staged_h2d=0`. A copy that completes in 3 ms under a kernel occupying every EU
+for 120 ms is not EU work queued behind compute, so a second queue would buy nothing; the plan's own decision rule
+("both `queue=bcs` rows `overlap=yes`: default off") is applied as "not built". The DRM fdinfo engine counters cannot
+name the engine on this stack (a resident exec queue reads 100 % busy whether or not it executes), so the row's timing
+is the evidence, not the counters. What W5 keeps is the kp1l mismatch: the load-time H2D probe
+(`ggml_sycl_measure_h2d_pinned`, `ggml-sycl.cpp:32006`) times the cache's **compute** queue while the ring copies on the
+BCS queue; Task 5 moves the probe to the BCS queue so `h2d_gbps` is the rate of the queue the ring uses. If a later card
+or driver shows `overlap=no`, the 94e1b0666 revision of this plan holds the copy-engine design in full.
 
 **W6. Gate.** The teardown summary line grows `, %u windows, %u exposed, %u misses`; the gate's Q_pp scores
-`ring_engaged=yes` and `misses=0` and carries floors from the bus arithmetic (`PP512_MIN=200`, `PP2048_MIN=500`), a
-`-ub 2048` control arm and a `GGML_SYCL_COPY_ENGINE=0` arm for the A/B. Decode floors, md5 identity and the GPT-OSS
-and Mistral controls are unchanged.
+`ring_engaged=yes` and `misses=0` and carries floors from the bus arithmetic (`PP512_MIN=200`, `PP2048_MIN=500`) and a
+`-ub 2048` control arm. Decode floors, md5 identity and the GPT-OSS and Mistral controls are unchanged.
 
 **Standing rulings that bind this plan** (unchanged from the 2026-10-19 plan): all SYCL memory flows through
 `unified_allocate` / `unified_allocate_owner` and surfaces as a `mem_handle`; raw pointers are never ownership tokens
@@ -144,7 +145,7 @@ the tracker, and the owner-facing status on the epic.
 | Track | Tasks | Description |
 |-------|-------|-------------|
 | A | 1, 2b, 3, 8 | Ring sizing, phase window API, executor windows, forced-decline knob (same files, sequential) |
-| B | 4, 5 | Copy-overlap spike, copy-engine queue (5 also waits for 3: it edits the probe in `ggml-sycl.cpp`) |
+| B | 4, 5 | Copy-overlap spike, H2D probe on the ring's queue (5 also waits for 3: both edit `ggml-sycl.cpp`) |
 | C | 2a, 6, 9 | Decision-log window counters, gate arms, docs |
 | D | 7 | Post-loan geometry fixed point (after 1) |
 | lead | 10 | End-to-end validation |
@@ -159,7 +160,7 @@ digraph dependencies {
     2b [label="Task 2b: phase window API"];
     3  [label="Task 3: executor windows"];
     4  [label="Task 4: copy-overlap spike"];
-    5  [label="Task 5: copy-engine queue"];
+    5  [label="Task 5: probe on the ring's queue"];
     6  [label="Task 6: gate arms"];
     7  [label="Task 7: post-loan fixed point"];
     8  [label="Task 8: forced-decline knob"];
@@ -175,24 +176,22 @@ digraph dependencies {
 
 | File/Directory | Tasks | Conflict Risk |
 |----------------|-------|---------------|
-| `ggml/src/ggml-sycl/moe-stream-plan.hpp`, `moe-stream-plan.cpp` | 1, 2b, 5 (one line), 8 | Sequential (A; 5 after 3) |
+| `ggml/src/ggml-sycl/moe-stream-plan.hpp`, `moe-stream-plan.cpp` | 1, 2b, 8 | Sequential (A) |
 | `ggml/src/ggml-sycl/moe-exec-cost.hpp`, `tests/test-moe-exec-cost.cpp` | 1 | None |
 | `ggml/src/ggml-sycl/moe-exec-policy.hpp`, `tests/test-moe-exec-policy.cpp` | 2a, 8 (reason enum) | Sequential (8 after 2a via 3) |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp` | 1 (`:35997-36020`), 2b (`:36120-36140`), 3 (`:82904-82997`, `:89722-89812`, `:90115-90121`, `:90360-90378`, `:90486-90570`, `:90895-90911`), 5 (`:32068-32080`) | Sequential (A; 5 after 3) |
-| `ggml/src/ggml-sycl/unified-cache.hpp`, `unified-cache.cpp` | 5 | None |
-| `ggml/src/ggml-sycl/common.hpp` | 5 (knob), 8 (knob) | Sequential (8 after 5 is not required: disjoint lines, but the lead merges 5 first) |
+| `ggml/src/ggml-sycl/common.hpp` | 8 (knob) | None |
 | `ggml/src/ggml-sycl/moe-stream-ring.cpp`, `tests/test-moe-stream-ring-sizing.cpp` | 7 | None |
 | `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp` | 1 | None |
 | `ggml/src/ggml-sycl/tests/test-moe-stream-phase.cpp` | 2b, 8 | Sequential (A) |
-| `ggml/src/ggml-sycl/tests/test-sycl-copy-overlap.cpp` (new), `ggml/src/ggml-sycl/CMakeLists.txt` | 4, 5 | Sequential (B) |
+| `ggml/src/ggml-sycl/tests/test-sycl-copy-overlap.cpp` (new), `ggml/src/ggml-sycl/CMakeLists.txt` | 4 | None |
 | `tests/test-sycl-moe-stream-enqueue-source.py` | 1 (ring-size pin), 2b (stage pins) | Sequential (A) |
 | `tests/test-sycl-auto-ubatch-source.py` | 1 (ring-size pin), 7 (fixed-point pin) | Sequential (7 after 1) |
-| `tests/test-sycl-moe-exec-knobs-source.py` | 2a (summary literal), 5 (COPY_ENGINE name), 8 (DECLINE name) | Sequential by merge order (2a, 5, 8) |
+| `tests/test-sycl-moe-exec-knobs-source.py` | 2a (summary literal), 8 (DECLINE name) | Sequential by merge order (2a, 8) |
 | `tests/test-sycl-moe-exec-window-source.py` (new) | 3 | None |
-| `tests/test-sycl-copy-engine-source.py` (new) | 5 | None |
+| `tests/test-sycl-h2d-probe-queue-source.py` (new), `tests/CMakeLists.txt` (its registration) | 5 | None |
 | `scripts/sycl-moe-exec-gate.sh`, `tests/test-sycl-moe-exec-gate-script.sh` | 6, 8 (decline arm) | Sequential (8 after 6) |
 | `docs/backend/sycl-env-vars.md`, `docs/backend/sycl-memory-design.md`, `docs/design/sycl-canonical-memory-architecture.md`, `docs/backend/sycl-perf-baselines.md`, `docs/plans/2026-10-19-moe-executor-cost-model-prefill-ring.md` | 9 | None (single task, last) |
-| `docs/backend/sycl-static-storage-inventory.csv` | 5 (regenerate: new statics) | None |
 
 **Shared-checkout rule:** nothing is edited in `/Apps/llama.cpp` by an implementer. Every task is a worktree. The
 nine owner-dirty paths there (`src/llama-model-loader.cpp`, `.claude/skills/llm-wiki/SKILL.md`, `.llm-wiki/*`) are
@@ -749,8 +748,7 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req, u
      `table_[key] = { mem_handle(), aos, copy, GGML_LAYOUT_AOS, moe_stream_consumer::EXECUTOR }`); the region close
      and table erase at the top stay (`close_region(region_last_)` then erase `region_keys_[cur_region_]`); the reuse
      gate is `region_reads_.read_gate[cur_region_]` or `ccs_->ext_oneapi_submit_barrier()` as today; at the end
-     `region_reads_.refill(cur_region_, wid)`. Task 5 changes `cache.get_bcs_queue()` to the stream copy queue; leave
-     it in this task.
+     `region_reads_.refill(cur_region_, wid)`. The copy stays on `cache.get_bcs_queue()` (W5 as amended).
    - `window_done(layer, role, phase, e)`: `if (layer != cur_layer_) return; region_reads_.window_done(window_id(layer,
      role, phase), e);`. `layer_done` keeps calling `close_region(down_done)` for an open region and additionally
      `region_reads_.window_done` for nothing (a layer id is not a window id): remove its `region_reads_.layer_done` call.
@@ -1042,9 +1040,12 @@ git commit -- ggml/src/ggml-sycl/ggml-sycl.cpp tests/test-sycl-moe-exec-window-s
 
 **Description:** The copy-engine queue (Task 5) rests on a claim this fork has never measured: that the cache's BCS
 queue does not overlap compute on the v2 Level Zero adapter (Strata measured it on its own tree). This device test
-measures it directly and prints one row per queue the lead can read at default verbosity. Task 5's default is
-decided from the row (its decision rule is in Task 5). The implementer builds it; **only the lead runs it**, on both
-cards.
+measures it directly and prints one row per queue the lead can read at default verbosity. Task 5's scope is
+decided from the rows (W5). The implementer builds it; **only the lead runs it**, on both cards.
+
+**Result (lead-run 2026-10-24, binary from 98c496ae7, rows on llama.cpp-efck c-0cu6):** eight rows, two queues x two
+spin shapes x two cards, every one `overlap=yes`, `staged_h2d=0`, `rc=0`; `alone_ms` 2.5-2.7, `with_kernel_ms` 2.5-3.5
+under kernels of 88.9-131.3 ms. The copy-engine queue is not built; Task 5 is the probe alignment below.
 
 **Acceptance Criteria:**
 - [ ] The test times 16 x 4 MiB pinned H2D copies alone, then the same copies submitted while a ~100 ms spin kernel
@@ -1206,242 +1207,101 @@ git commit -- ggml/src/ggml-sycl/tests/test-sycl-copy-overlap.cpp ggml/src/ggml-
 
 ---
 
-### Task 5: The ring copies on a Level Zero copy-engine queue
+### Task 5: The H2D probe rates the queue the ring copies on
 
-**Track:** B **Depends on:** 4 (its rows), 3 (the probe line in `ggml-sycl.cpp`) **Model/effort:** opus, xhigh
+**Track:** B **Depends on:** 4 (its rows), 3 (`ggml-sycl.cpp`) **Model/effort:** sonnet, medium
 **File scope:**
-- Modify: `ggml/src/ggml-sycl/unified-cache.hpp:3461-3468` (declarations), `:5187-5188` (members)
-- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:6365-6380` (after the BCS queue ctor), `:12652-12658` (accessor)
-- Modify: `ggml/src/ggml-sycl/common.hpp:1485-1500` (knob reader, next to `ggml_sycl_moe_pp_f16_group_experts_max`)
-- Modify: `ggml/src/ggml-sycl/moe-stream-plan.cpp` (`stage_window`'s `cache.get_bcs_queue()` → `cache.get_stream_copy_queue()`)
-- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:32073` (`sycl::queue * q = &cache->get_queue();` → `get_stream_copy_queue()`),
-  the `sycl_env_settings[]` row table (find with `cat ... | grep -n 'GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV'`)
-- Modify: `ggml/src/ggml-sycl/tests/test-sycl-copy-overlap.cpp` (a third arm `stream`)
-- Modify: `docs/backend/sycl-static-storage-inventory.csv` (regenerate), `tests/test-sycl-moe-exec-knobs-source.py`
-  (`NAMES` gains `GGML_SYCL_COPY_ENGINE`; the catalog-row test for it is satisfied by Task 9, so add the name to the
-  getenv-once and env-settings tests only, and leave the catalog parametrization at the two MOE_EXEC names)
-- Create: `tests/test-sycl-copy-engine-source.py`
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:32073` (`sycl::queue * q = &cache->get_queue();` →
+  `sycl::queue * q = &cache->get_bcs_queue();`) and the probe's comment above it
+- Create: `tests/test-sycl-h2d-probe-queue-source.py`
+- Modify: `tests/CMakeLists.txt:975` (register it by copying the `test-sycl-moe-exec-knobs-source` block)
 
-**Description:** W5. One new queue in the cache, built from an immediate command list on the copy-only engine, used
-by the ring's copies and the H2D probe and nothing else. The Level Zero loader is `dlopen`ed (never linked, so a host
-without it, or a non-Level-Zero backend, falls back to the BCS queue with one WARN line).
+**Description:** W5 as amended. The Task 4 rows (llama.cpp-efck c-0cu6, read it) show the cache's BCS queue already
+overlaps compute on both cards, so no copy-engine queue is built. What remains is the mismatch the queue survey found:
+the load-time probe (`ggml_sycl_measure_h2d_pinned`, `ggml-sycl.cpp:32006`) times the cache's compute queue
+(`get_queue()`, in-order, profiling) while `stage_window` copies on `get_bcs_queue()` (`moe-stream-plan.cpp:364`). The
+cost model reads the probed rate through `ggml_sycl_h2d_probed_gbps` into `moe_stream_rates_assemble`
+(`moe-stream-plan.cpp:437-441`), so `h2d_gbps` must be the rate of the queue the ring uses. On this host both queues
+measured ~25 GB/s (64 MiB in 2.5 ms), so this corrects the attribution, not the number.
 
-**Decision rule from the Task 4 rows (lead applies before this task starts):** if the B70 **and** B50 rows show
-`queue=bcs ... overlap=yes`, the default is **off** (`GGML_SYCL_COPY_ENGINE=1` opts in) and the knob row says why;
-if either shows `overlap=no`, the default is **on** for Battlemage as W5 says. Either way the queue is built and the
-third spike arm measures it.
+**Descoped, recorded here so nobody rebuilds it by accident:** `unified_cache::get_stream_copy_queue()`, the
+`GGML_SYCL_COPY_ENGINE` knob and its `sycl_env_settings[]` row, the `dlopen`ed ze_loader immediate command list, the
+`stream` spike arm, the `Q_pp_nocopyq` gate arm, the static-storage CSV regeneration and
+`tests/test-sycl-copy-engine-source.py`. The full design is in this plan's 94e1b0666 revision
+(`git show 94e1b0666:docs/plans/2026-10-24-prefill-window-ring.md`, Task 5), to be revived only if a card or driver
+prints `overlap=no`.
 
 **Acceptance Criteria:**
-- [ ] `sycl::queue & unified_cache::get_stream_copy_queue()` returns the copy-engine queue when it exists, else
-      `get_bcs_queue()`.
-- [ ] The queue is created in the constructor after `bcs_queue_` when `ggml_sycl_copy_engine_enabled()` (knob, BMG
-      architecture, Level Zero backend, `SYCL_UR_USE_LEVEL_ZERO_V2 != "0"`), via `dlopen("libze_loader.so.1",
-      RTLD_NOW | RTLD_NOLOAD)` then `RTLD_NOW`, `zeDeviceGetCommandQueueGroupProperties`, the first group with
-      `ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY` set and `..._FLAG_COMPUTE` clear and `numQueues > 0`,
-      `zeCommandListCreateImmediate` with `ZE_COMMAND_QUEUE_FLAG_IN_ORDER`, `ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS`,
-      `ZE_COMMAND_QUEUE_PRIORITY_NORMAL`, index 0; wrapped with
-      `sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(input, ctx)` where `input` is
-      `backend_input_t<ext_oneapi_level_zero, queue>{ list, dev, ownership::keep, property_list{ in_order{} } }`.
-- [ ] One `GGML_LOG_WARN("[UNIFIED-CACHE] stream copy queue: level_zero copy engine ordinal %u (%s)\n", ordinal, reason)`
-      on success, and one WARN naming the reason it was not built (`knob off`, `not battlemage`, `v2 adapter disabled`,
-      `no copy-only group`, `ze_loader missing`, `make_queue failed: ...`), so a default-verbosity run shows which.
-- [ ] Exactly two callers of `get_stream_copy_queue()` outside the cache: `moe-stream-plan.cpp` (`stage_window`) and
-      the H2D probe (`ggml-sycl.cpp:32073`); the source gate pins both and that neither `.fill(` nor `parallel_for`
-      nor `.wait()` on an event of that queue appears in either caller.
-- [ ] The static-storage CSV is regenerated and `--check` passes; the knobs gate passes with the third name; the spike
-      prints a `queue=stream` row.
+- [ ] The probe copies on `cache->get_bcs_queue()`; its comment says why (the probe rates the queue the ring copies
+      on; the two cache queues are both in-order on one context and the driver decides which engine each lands on).
+- [ ] `tests/test-sycl-h2d-probe-queue-source.py` pins `sycl::queue * q = &cache->get_bcs_queue();` inside
+      `ggml_sycl_measure_h2d_pinned` and the single `cache.get_bcs_queue()` call in `moe-stream-plan.cpp`, and is
+      registered as a ctest named `test-sycl-h2d-probe-queue-source`.
+- [ ] Nothing else about the probe changes: 64 MiB per iteration as 4 MiB chunks, one warm-up plus eight timed
+      iterations, the staged-path discard, the tuning-cache record (`ggml-sycl.cpp:32006-32140`).
 
 **Implementation Guide:**
 
-1. **Test (source gate).** Create `tests/test-sycl-copy-engine-source.py`:
+1. **Test.** Create `tests/test-sycl-h2d-probe-queue-source.py`:
 
 ```python
 #!/usr/bin/env python3
-"""The stream copy queue has exactly two consumers and nothing but copies go to it (2026-10-24 plan, Task 5)."""
+"""The load-time H2D probe and the expert stream ring copy on the same cache queue (2026-10-24 plan, W5 / Task 5)."""
 from pathlib import Path
-import re
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml" / "src" / "ggml-sycl"
+GGML_SYCL = (SYCL / "ggml-sycl.cpp").read_text()
 PLAN = (SYCL / "moe-stream-plan.cpp").read_text()
-MAIN = (SYCL / "ggml-sycl.cpp").read_text()
-CACHE = (SYCL / "unified-cache.cpp").read_text()
-ACCESSOR = "get_stream_copy_queue()"
 
 
-def test_two_consumers_only():
-    users = [p for p in SYCL.rglob("*.cpp") if ACCESSOR in p.read_text() and p.name != "unified-cache.cpp"]
-    assert sorted(p.name for p in users) == ["ggml-sycl.cpp", "moe-stream-plan.cpp"]
-    assert PLAN.count(ACCESSOR) == 1 and MAIN.count(ACCESSOR) == 1
+def probe_body() -> str:
+    start = GGML_SYCL.index("ggml_sycl_measure_h2d_pinned(")
+    end = GGML_SYCL.index("\n}\n", start)
+    return GGML_SYCL[start:end]
 
 
-def test_ring_copy_uses_it():
-    assert "mem_copy_async(aos, host, item.src_bytes, cache.get_stream_copy_queue(), deps)" in PLAN
-    assert "cache.get_bcs_queue()" not in PLAN
+def test_probe_times_the_bcs_queue():
+    body = probe_body()
+    assert "sycl::queue * q = &cache->get_bcs_queue();" in body
+    assert "&cache->get_queue();" not in body
 
 
-def test_probe_uses_it():
-    probe = MAIN[MAIN.index("ggml_sycl_measure_h2d_pinned("):]
-    probe = probe[:probe.index("\n}\n")]
-    assert "sycl::queue * q = &cache->get_stream_copy_queue();" in probe
-
-
-def test_nothing_but_copies_on_it():
-    ctor = CACHE[CACHE.index("stream_copy_queue_ ="):]
-    ctor = ctor[:ctor.index("\n    }\n")]
-    for forbidden in (".fill(", "parallel_for", "single_task", "ext_oneapi_submit_barrier"):
-        assert forbidden not in ctor
-
-
-def test_knob_literal_once():
-    outside_tests = "".join(p.read_text() for p in SYCL.rglob("*.*pp") if "tests" not in p.parts)
-    assert outside_tests.count('"GGML_SYCL_COPY_ENGINE"') == 1
+def test_ring_copies_on_the_bcs_queue():
+    assert PLAN.count("cache.get_bcs_queue()") == 1
 ```
 
-   Run: `python3 -I -m pytest -q tests/test-sycl-copy-engine-source.py`. Expected: 5 FAIL.
+   Register it in `tests/CMakeLists.txt` after the `test-sycl-moe-exec-knobs-source` block (`:975`), same form.
+   Run: `python3 -I -m pytest -q tests/test-sycl-h2d-probe-queue-source.py`. Expected: 1 FAIL
+   (`test_probe_times_the_bcs_queue`), 1 PASS.
 
-2. **Implement: the knob** in `common.hpp` after `ggml_sycl_moe_pp_f16_group_experts_max`:
+2. **Implement.** `ggml-sycl.cpp:32073` becomes `sycl::queue * q = &cache->get_bcs_queue();` with this comment
+   above it:
 
 ```cpp
-// GGML_SYCL_COPY_ENGINE: the ring's H2D copies and the load-time H2D probe run on a Level Zero immediate command list
-// on the device's copy-only engine (docs/plans/2026-10-24-prefill-window-ring.md, W5). Unset or 1: try (built only
-// on Battlemage, Level Zero, v2 adapter); 0: off. Spelled once, here, for the reader and the sycl_env_settings row.
-static constexpr const char * GGML_SYCL_COPY_ENGINE_ENV = "GGML_SYCL_COPY_ENGINE";
-
-static inline bool ggml_sycl_copy_engine_knob() {
-    static const bool on = [] {
-        const char * env = std::getenv(GGML_SYCL_COPY_ENGINE_ENV);
-        return env == nullptr || env[0] == '\0' || env[0] != '0';  // Task 4 decision rule may flip this default
-    }();
-    return on;
-}
+    // The expert stream ring copies on the cache's BCS queue (moe-stream-plan.cpp stage_window), so the probe rates
+    // that queue, not the compute queue: h2d_gbps is the rate the ring sees. Both are in-order queues on one context
+    // and the driver picks the engine (the 2026-10-24 copy-overlap spike measured ~25 GB/s on both, overlapping compute).
 ```
 
-   (If the decision rule says default off, the last line becomes `return env != nullptr && env[0] == '1';`.)
+   Run the test (2 PASS), then `python3 -I scripts/check-sycl-alloc-zone-contract.py --root <worktree>`,
+   `python3 -I scripts/audit-sycl-static-storage.py --check-classification --repo <worktree>` and `--check`,
+   `python3 -I tests/test-sycl-lifecycle-source-contract.py`. Build `ggml-sycl llama-bench` detached (the probe is
+   in `ggml-sycl.cpp`: a device link). Expected: `BUILD_DONE rc=0`.
 
-3. **Implement: the queue** in `unified-cache.cpp` after the BCS queue block (`:6380`). Resolve two symbols:
-
-```cpp
-    // Task 5 (2026-10-24 plan): a queue on the copy-only engine. Mirrors /Apps/strata/sycl/src/core/copy_queue.cpp:60-142.
-    stream_copy_queue_.reset();
-    const char * why = nullptr;
-    if (!ggml_sycl_copy_engine_knob()) {
-        why = "knob off";
-    } else if (queue_.get_backend() != sycl::backend::ext_oneapi_level_zero) {
-        why = "not level_zero";
-    } else if (const char * v2 = std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2"); v2 != nullptr && v2[0] == '0') {
-        why = "v2 adapter disabled: the legacy adapter already uses the copy engine";
-    } else {
-        namespace sx = sycl::ext::oneapi::experimental;
-        const auto arch = queue_.get_device().get_info<sx::info::device::architecture>();
-        if (arch != sx::architecture::intel_gpu_bmg_g21 && arch != sx::architecture::intel_gpu_bmg_g31) {
-            why = "not battlemage";
-        }
-    }
-    if (why == nullptr) {
-        void * ze = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
-        if (ze == nullptr) {
-            ze = dlopen("libze_loader.so.1", RTLD_NOW);
-        }
-        using get_groups_fn = ze_result_t (*)(ze_device_handle_t, uint32_t *, ze_command_queue_group_properties_t *);
-        using create_imm_fn = ze_result_t (*)(ze_context_handle_t, ze_device_handle_t, const ze_command_queue_desc_t *,
-                                              ze_command_list_handle_t *);
-        auto get_groups = ze ? reinterpret_cast<get_groups_fn>(dlsym(ze, "zeDeviceGetCommandQueueGroupProperties")) : nullptr;
-        auto create_imm = ze ? reinterpret_cast<create_imm_fn>(dlsym(ze, "zeCommandListCreateImmediate")) : nullptr;
-        if (get_groups == nullptr || create_imm == nullptr) {
-            why = "ze_loader missing";
-        } else {
-            const auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(queue_.get_device());
-            const auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(queue_.get_context());
-            uint32_t   n    = 0;
-            get_groups(zdev, &n, nullptr);
-            std::vector<ze_command_queue_group_properties_t> groups(n);
-            for (auto & g : groups) {
-                g.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
-            }
-            get_groups(zdev, &n, groups.data());
-            uint32_t ordinal = UINT32_MAX;
-            for (uint32_t i = 0; i < n; ++i) {
-                const bool copy    = groups[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY;
-                const bool compute = groups[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE;
-                if (copy && !compute && groups[i].numQueues > 0) {
-                    ordinal = i;
-                    break;
-                }
-            }
-            if (ordinal == UINT32_MAX) {
-                why = "no copy-only group";
-            } else {
-                ze_command_queue_desc_t d{};
-                d.stype    = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
-                d.ordinal  = ordinal;
-                d.index    = 0;
-                d.flags    = ZE_COMMAND_QUEUE_FLAG_IN_ORDER;
-                d.mode     = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
-                d.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
-                ze_command_list_handle_t list = nullptr;
-                if (create_imm(zctx, zdev, &d, &list) != ZE_RESULT_SUCCESS || list == nullptr) {
-                    why = "zeCommandListCreateImmediate failed";
-                } else {
-                    try {
-                        sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero, sycl::queue> in{
-                            list, queue_.get_device(), sycl::ext::oneapi::level_zero::ownership::keep,
-                            sycl::property_list{ sycl::property::queue::in_order{} } };
-                        stream_copy_queue_ = std::make_unique<sycl::queue>(
-                            sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, queue_.get_context()));
-                        GGML_LOG_WARN("[UNIFIED-CACHE] stream copy queue: level_zero copy engine ordinal %u (%s)\n",
-                                      ordinal, "immediate command list, in order");
-                    } catch (const std::exception & e) {
-                        why = e.what();
-                    }
-                }
-            }
-        }
-    }
-    if (!stream_copy_queue_) {
-        GGML_LOG_WARN("[UNIFIED-CACHE] stream copy queue: not built (%s); the ring copies on the BCS queue\n", why);
-    }
-```
-
-   `#include <dlfcn.h>` and `#include <level_zero/ze_api.h>` at the top of `unified-cache.cpp`;
-   `#include <sycl/ext/oneapi/backend/level_zero.hpp>` for `make_queue`/`get_native`. Add the member
-   `std::unique_ptr<sycl::queue> stream_copy_queue_;  // Task 5: copy-only engine, ring copies and the H2D probe only`
-   after `bcs_queue_` (`hpp:5188`) and the accessor declaration after `get_bcs_queue()` (`hpp:3468`) with the W5
-   comment. The accessor: `return stream_copy_queue_ ? *stream_copy_queue_ : get_bcs_queue();`. Ownership `keep`
-   means the cache owns the list: `zeCommandListDestroy` through the same `dlsym` in `~unified_cache()` after the
-   queue member is reset (order: queue first, then list).
-
-4. **Implement: the callers.** `moe-stream-plan.cpp` `stage_window`: `cache.get_stream_copy_queue()`.
-   `ggml-sycl.cpp:32073`: `sycl::queue * q = &cache->get_stream_copy_queue();` (the probe comment says why: the
-   probe rates the queue the ring copies on). Add the `sycl_env_settings[]` row for `GGML_SYCL_COPY_ENGINE_ENV`.
-
-5. **Spike arm.** In `test-sycl-copy-overlap.cpp` add `{ "stream", &cache.get_stream_copy_queue() }` to `arms`.
-
-6. **Regenerate** the static-storage inventory: `python3 -I scripts/audit-sycl-static-storage.py --repo <worktree>`
-   (no flags writes the CSV), then `--check-classification` and `--check`. The new statics are the knob's memoized
-   bool and the queue member (a member is not a static; the classification run tells you what it found).
-
-   Build `ggml-sycl test-sycl-copy-overlap llama-bench` detached. Run the three Python gates. Expected: green,
-   `BUILD_DONE rc=0`. Report to the lead the two spike commands.
-
-**Commit:** two commits: `sycl: the unified cache owns a copy-engine queue for the expert stream ring and the H2D
-probe` (cache, common, plan, ggml-sycl, CSV, spike arm) and `tests: the copy-engine queue has two consumers and
-carries only copies` (the Python gate + its CMake registration).
+**Commit:** `sycl: the H2D probe times the cache queue the expert stream ring copies on` (`ggml-sycl.cpp`, the test,
+`tests/CMakeLists.txt`).
 
 **Gotchas:**
-- `/usr/include/level_zero/ze_api.h` is the system header, not under `/opt/intel/oneapi`; the SYCL compile already
-  has `/usr/include` on its path, so no `target_include_directories` change. Do **not** add `ze_loader` to any
-  `target_link_libraries`: the whole point of `dlopen` is a build that runs on a host without it.
-- A copy-only command list rejects kernels and `fill`. `mem_copy_async` on the staged (non-USM) path may submit a
-  kernel-backed copy on the queue it is given (`mem-ops.cpp:155-193`); confirm the ring's pinned-pool source resolves
-  USM-accessible (memory `an-async-copy-can-be-silently-synchronous`, fixed by e4e36a693) and that the probe's source
-  does; the spike's `alone_ms` makes a staged copy obvious.
-- Never `event.wait()` on an event this queue produced from a host thread (Strata: hangs under the v2 adapter);
-  `q.wait()` on the queue is fine, and the ring never waits at all (events chain into the compute queue's barriers).
-- `test-unified-cache-unpin-event` depends on `dma_queue_` being non-profiling; the new queue is also non-profiling
-  and must stay so (an in-order profiling queue's status query blocks: `unified-cache.hpp:3449-3460`).
-- `sycl_env_settings[]` is the non-default report; `tests/test-sycl-env-report.cpp` gates that WARN lines reach the
-  callback: the new WARN lines above are what a default-verbosity run shows.
+- `get_bcs_queue()` falls back to the DMA queue and then to `queue_` (`unified-cache.cpp:12652`); on this host the BCS
+  queue exists, and the fallback keeps the probe correct where it does not.
+- The probe discards the run if any copy took the staged path. The BCS queue shares the cache queue's context
+  (`unified-cache.cpp:6365`) and the device lookup goes by device (`common.cpp:277`), so the pinned source still copies
+  directly; the spike's `staged_h2d=0` rows on that queue are the proof.
+- codescout is blind inside `ggml-sycl.cpp`: find the probe with
+  `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'ggml_sycl_measure_h2d_pinned'`, never from the index alone.
+- The probe's comment cites the reason, not this task number.
+- Lead gate (not yours): a Qwen3.8 load with the rebuilt `llama-bench -v` still reports a probed rate near 25 GB/s.
 
 ---
 
@@ -1454,26 +1314,28 @@ carries only copies` (the Python gate + its CMake registration).
 - Modify: `tests/test-sycl-moe-exec-gate-script.sh` (fixtures and expected verdicts)
 
 **Description:** W6. The gate reads the three new summary fields and the executor trace's `misses=`, fails Q_pp when
-the ring did not engage or any window missed, carries honest floors with the arithmetic beside them, and gains two
-arms: `Q_pp_ub2048` (`-ub 2048`, the pp2048 floor's natural setting and llama.cpp-dfo0's measurement) and
-`Q_pp_nocopyq` (`GGML_SYCL_COPY_ENGINE=0`, the copy-engine A/B). The script never runs here; its scoring is a pure
+the ring did not engage or any window missed, carries honest floors with the arithmetic beside them, and gains one
+arm: `Q_pp_ub2048` (`-ub 2048`, the pp2048 floor's natural setting and llama.cpp-dfo0's measurement). The script never
+runs here; its scoring is a pure
 function of fixture files, which the GPU-free test drives.
 
 **Acceptance Criteria:**
 - [ ] `RE_SUMMARY_RING` still matches the longer summary; new `RE_SUMMARY_WINDOWS='\[MOE-EXEC\] summary: .*, [0-9]+ windows, [0-9]+ exposed, [0-9]+ misses'`.
-- [ ] `summary_windows`, `summary_exposed`, `summary_misses` helpers read the fields of the **last** summary line of the
-      run's stderr; `trace_misses` sums `misses=` over `RE_TRACE_EXEC` lines.
+- [ ] `summary_windows`, `summary_exposed`, `summary_misses` helpers **sum** the fields over every summary line of the
+      run's stderr (a miss in the first llama-bench context must not be hidden by a clean last one; a summary without
+      the fields makes the result `NA`); `trace_misses` sums `misses=` over `RE_TRACE_EXEC` lines and is reported
+      separately as `trace_misses=N` (the same events as the summary's misses, so never added into `misses=`), failing
+      the arm when N > 0.
 - [ ] `score_q_pp` fails with `ring_engaged=no` when `ring_layer_ubatches == 0`, with `misses=N` when N > 0, and
       prints `windows= exposed= misses=` in its verdict line.
 - [ ] `PP512_MIN=200`, `PP2048_MIN=500`, each with a comment deriving it (41 GB per 512-token ubatch at the probed
       25 GB/s is ~1.6 s, a ~312 tok/s ceiling; 200 is 64 % of it; pp2048 at `-ub 2048` carries four times the tokens
       per copy, 500 is the compute-bound floor the 2026-10-19 plan already defended). `--pp512-min` / `--pp2048-min`
       still override.
-- [ ] `Q_pp_ub2048` runs `llama-bench ... -ub 2048 -p 2048` and is scored by `score_q_pp` with only the pp2048 floor;
-      `Q_pp_nocopyq` runs Q_pp's command under `GGML_SYCL_COPY_ENGINE=0` and is scored like Q_pp (its pp numbers are
-      recorded; the lead compares them by hand in Task 10). Both are in `RING_ARMS`, both pin the selector, neither
-      passes `-ngl`.
-- [ ] `--dry-run` lists sixteen device arms (fourteen today plus two) with the selector pinned; the fixture test
+- [ ] `Q_pp_ub2048` runs `llama-bench ... -ub 2048 -p 2048` and is scored by `score_q_pp` with only the pp2048 floor.
+      It is in `RING_ARMS`, pins the selector, and does not pass `-ngl`.
+- [ ] Every new regex has a positive and a decoy control in `check_controls` (the gate header promises it).
+- [ ] `--dry-run` lists fifteen device arms (fourteen today plus one) with the selector pinned; the fixture test
       asserts the exact verdict strings for: engaged pass, `ring_engaged=no` fail, `misses=3` fail, the old
       short summary line (no window fields) scoring `windows=NA` and failing `summary_windows=missing`.
 
@@ -1534,10 +1396,9 @@ summary_misses()  { summary_field "$1" misses; }
 ```
 
    and append ` windows=$windows exposed=$exposed misses=$misses` to the verdict echo. Floors at `:200-201` with their
-   derivation comments. Arm table rows for `Q_pp_ub2048` and `Q_pp_nocopyq` copied from `Q_pp`'s row with the
-   `-ub 2048 -p 2048` / `GGML_SYCL_COPY_ENGINE=0 env` differences; a `score_q_pp_ub2048` that reuses `score_q_pp`
-   with `PP512_MIN=0` (no pp512 row in a `-p 2048`-only run: pass `PP512_SKIP=1` and make `score_q_pp` skip the row
-   when set). Add both to `RING_ARMS` (`:222`).
+   derivation comments. An arm table row for `Q_pp_ub2048` copied from `Q_pp`'s row with the `-ub 2048 -p 2048`
+   difference; a `score_q_pp_ub2048` that reuses `score_q_pp` with `PP512_MIN=0` (no pp512 row in a `-p 2048`-only
+   run: pass `PP512_SKIP=1` and make `score_q_pp` skip the row when set). Add it to `RING_ARMS` (`:222`).
 
    Run: `bash tests/test-sycl-moe-exec-gate-script.sh`. Expected: all cases pass, including the existing ones (the
    previous passing fixtures must grow the window fields or they now fail with `summary_windows=missing`: update
@@ -1651,7 +1512,7 @@ git commit -- ggml/src/ggml-sycl/moe-stream-ring.cpp ggml/src/ggml-sycl/moe-stre
 
 **Track:** A (after 3) and C (after 6) **Depends on:** 3, 6 **Model/effort:** opus, high
 **File scope:**
-- Modify: `ggml/src/ggml-sycl/common.hpp` (knob reader next to `GGML_SYCL_COPY_ENGINE_ENV`)
+- Modify: `ggml/src/ggml-sycl/common.hpp` (knob reader next to `ggml_sycl_moe_pp_f16_group_experts_max`)
 - Modify: `ggml/src/ggml-sycl/moe-exec-policy.hpp:59-74` (`moe_exec_reason::DECLINED`, name `declined`)
 - Modify: `ggml/src/ggml-sycl/moe-stream-plan.cpp` (`executor_claims`)
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (`sycl_env_settings[]` row)
@@ -1718,24 +1579,23 @@ fallback` (one commit, all paths).
 
 **Track:** C **Depends on:** 5, 7, 8 **Model/effort:** sonnet, low
 **File scope:**
-- Modify: `docs/backend/sycl-env-vars.md:365-372` (MOE_EXEC rows: add `GGML_SYCL_COPY_ENGINE`,
-  `GGML_SYCL_MOE_EXEC_DECLINE_LAYER`), `:422` (the MOE_EXEC_TRACE line catalog: the summary's three fields, the
+- Modify: `docs/backend/sycl-env-vars.md:365-372` (MOE_EXEC rows: add `GGML_SYCL_MOE_EXEC_DECLINE_LAYER`), `:422` (the MOE_EXEC_TRACE line catalog: the summary's three fields, the
   `stage window` line, the executor line's `misses=`), `:423`
-- Modify: `docs/backend/sycl-memory-design.md:136-163` (the ring paragraph: windows, two regions, copy engine, no
-  SOA staging, the 11x cap)
+- Modify: `docs/backend/sycl-memory-design.md:136-163` (the ring paragraph: windows, two regions, the BCS queue the
+  ring and the probe share and why no copy-engine queue was built, no SOA staging, the 11x cap)
 - Modify: `docs/design/sycl-canonical-memory-architecture.md:340` (the §3 ring row: cohort `moe_stream_ring`,
   WEIGHT zone, window-sized)
 - Modify: `docs/backend/sycl-perf-baselines.md:485+` ("MoE executor" section: a dated placeholder table the lead fills
-  from Task 10 with `ring_engaged`, `windows/exposed/misses`, pp512, pp2048 at `-ub 512` and `-ub 2048`, copy-engine
-  on/off; marked *record, not baseline* until a second clean run)
+  from Task 10 with `ring_engaged`, `windows/exposed/misses`, pp512, pp2048 at `-ub 512` and `-ub 2048`, and the
+  eight copy-overlap rows; marked *record, not baseline* until a second clean run)
 - Modify: `docs/plans/2026-10-19-moe-executor-cost-model-prefill-ring.md:1-20` (amendment pointer: "superseded for
   the ring by `2026-10-24-prefill-window-ring.md`; the `>= 500` pp512 target is retired for this placement, see its
   gap section")
 
 **Description:** Every user-visible string, knob and rule the earlier tasks added gets its catalog entry, and the two
 design documents describe the ring as built. Nothing here is asserted by a test except the env-var rows (the knobs
-gate checks a row exists for each `NAMES` entry: `GGML_SYCL_COPY_ENGINE` and `GGML_SYCL_MOE_EXEC_DECLINE_LAYER` rows
-make `test_catalog_has_row` pass once Tasks 5 and 8 add the names).
+gate checks a row exists for each `NAMES` entry: the `GGML_SYCL_MOE_EXEC_DECLINE_LAYER` row makes
+`test_catalog_has_row` pass once Task 8 adds the name).
 
 **Acceptance Criteria:**
 - [ ] Each listed file changed as described; the trace-line catalog lists every `[MOE-EXEC*]` format the code prints
@@ -1743,11 +1603,11 @@ make `test_catalog_has_row` pass once Tasks 5 and 8 add the names).
 - [ ] `python3 -I -m pytest -q tests/test-sycl-moe-exec-knobs-source.py` passes.
 - [ ] Lines wrapped at 120 columns (`awk 'length > 120' <file>` prints nothing for the touched files).
 
-**Implementation Guide:** RED is the knobs gate's `test_catalog_has_row[GGML_SYCL_COPY_ENGINE]` failing before the row
-exists (run it first; it fails once Task 5 is merged). GREEN is the rows and prose. No code.
+**Implementation Guide:** RED is the knobs gate's `test_catalog_has_row[GGML_SYCL_MOE_EXEC_DECLINE_LAYER]` failing
+before the row exists (run it first; it fails once Task 8 is merged). GREEN is the rows and prose. No code.
 
-**Commit:** `docs: the SYCL env-var catalog, memory design and canonical contract describe the window ring and the
-copy-engine queue` (all five files).
+**Commit:** `docs: the SYCL env-var catalog, memory design and canonical contract describe the window ring` (all five
+files).
 
 **Gotchas:**
 - The catalog's literal-search command (`sycl-env-vars.md:11-14`) is the oracle for names; run it and check every
@@ -1780,15 +1640,15 @@ and Arc Pro B50 (`level_zero:1`, 16 GB), Intel GPU stack 26.35, oneAPI 2026.1; m
 1. **Backend present** (never trust a gate before this): `grep -E '^GGML_SYCL:' $M/build/CMakeCache.txt` prints
    `BOOL=ON`; `ldd $M/build/bin/llama-bench | grep -cE 'libggml-sycl|libsycl'` prints >= 2.
 2. **Copy-overlap spike, both cards** (Task 4/5): `ONEAPI_DEVICE_SELECTOR=level_zero:1 $M/build/bin/test-sycl-copy-overlap`
-   then `level_zero:0`. Expected: three `[COPY-OVERLAP]` rows each; `queue=stream ... overlap=yes` on both; `rc=0`.
-   Record all six rows in the baselines placeholder.
-3. **Queue line at default verbosity:** `ONEAPI_DEVICE_SELECTOR=level_zero:0 $M/build/bin/llama-bench -m <qwen3.8> -p 0 -n 1 -r 1 -v 2>&1 | grep -c 'stream copy queue: level_zero copy engine ordinal'`
-   prints 1.
-4. **The gate, ring arms:** `bash scripts/sycl-moe-exec-gate.sh <merge sha> --arms Q_pp,Q_staged,Q_pp_ub2048,Q_pp_nocopyq`
+   then `level_zero:0`. Expected: four `[COPY-OVERLAP]` rows each (`bcs`/`compute` x `spin=1wg`/`spin=full`), every
+   one `overlap=yes` and `staged_h2d=0`; `rc=0`. Record all eight rows in the baselines placeholder (the 2026-10-24
+   rows are on llama.cpp-efck c-0cu6).
+3. **Probe on the ring's queue:** `python3 -I -m pytest -q tests/test-sycl-h2d-probe-queue-source.py` on the merge
+   tree passes (2 passed), and the Qwen3.8 load in step 4 reports a probed H2D rate near 25 GB/s.
+4. **The gate, ring arms:** `bash scripts/sycl-moe-exec-gate.sh <merge sha> --arms Q_pp,Q_staged,Q_pp_ub2048`
    (its own lock helper takes `GPU.lock`; release ours first). Expected: `Q_pp=PASS ... ring_engaged=yes
-   ring_layer_ubatches>=24 misses=0`, `Q_staged=PASS`, `Q_pp_ub2048=PASS` (pp2048 >= 500), `Q_pp_nocopyq` recorded.
-   Read `exposed` (== host layers x ubatches) and the pp512 value; the copy-engine effect is `Q_pp` pp512 vs
-   `Q_pp_nocopyq` pp512 on the same build.
+   ring_layer_ubatches>=24 misses=0 trace_misses=0`, `Q_staged=PASS`, `Q_pp_ub2048=PASS` (pp2048 >= 500).
+   Read `exposed` (== host layers x ubatches) and the pp512 value.
 5. **Correctness:** gate arms `Q_tok,Q_tok_cpu` (two loads each; md5 equality or the documented >= 64-byte common
    prefix) and `Q_decline` (Task 8). Expected: all PASS.
 6. **Decode unchanged:** `Q_tg,Q_noc` (floors, refill balanced). Expected: PASS.
