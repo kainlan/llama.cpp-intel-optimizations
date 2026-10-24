@@ -3049,7 +3049,6 @@ def test_the_shared_ring_geometry_pin_sees_a_duplicated_call(where):
         assert not _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, mutated), "the mutant must make the pin fail"
 
 
-
 # llama.cpp-7999 (Task 7 of llama.cpp-a2xb, first half of llama.cpp-8p5x): the ring's cap is 10 % of the resident expert
 # set left AFTER the ring's own bytes are lent out of it, bytes > (resident - bytes) / 10, tested as resident / 11. A
 # loan sized from the pre-loan geometry then lowers resident by at most the ring's bytes, so the geometry it asked for
@@ -3074,6 +3073,7 @@ def test_the_post_loan_ring_cap_pin_has_a_mutation_witness():
     mutated = MOE_STREAM_RING_CPP.replace(_RING_CAP_LINE, _RING_CAP_LINE.replace("/ 11", "/ 10"))
     assert mutated != MOE_STREAM_RING_CPP
     assert not _ring_cap_is_post_loan(mutated), "the pre-loan cap (/ 10) must make the pin fail"
+
 
 if __name__ == "__main__":
     import sys

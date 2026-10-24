@@ -1,11 +1,12 @@
 // Host-only test of moe_stream_ring_size() (llama.cpp-36j0, Task 6 of
 // docs/plans/2026-10-19-moe-executor-cost-model-prefill-ring.md).
 //
-// The ring has two regions, each holding the heaviest layer's slots: two per
-// host matrix staged as SOA (AOS copy destination, SOA reorder destination),
-// one per matrix staged AOS-only (c-hmey), each slot the largest matrix
-// rounded up to 256 bytes. The caller counts the slots, so every call here
-// passes a region's slot count. If those bytes exceed 10 % of the resident
+// The ring has two regions, each holding one executor window's slots
+// (moe_stream_plan_index::window_slots), not a whole layer's: two per host
+// matrix staged as SOA (AOS copy destination, SOA reorder destination), one
+// per matrix staged AOS-only (c-hmey), each slot the largest matrix rounded up
+// to 256 bytes. The caller counts the slots, so every call here passes a
+// region's slot count. If those bytes exceed 10 % of the resident
 // expert set left once the ring is lent out of it (bytes > resident / 11,
 // llama.cpp-8p5x) there is no ring. The model pins re-derive the plan's base
 // figures.
