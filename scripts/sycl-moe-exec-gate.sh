@@ -37,6 +37,8 @@
 #              are scored: a layer N with a "[MOE-EXEC] layer N: ring" line in the run is a host layer, and every
 #              trace line whose tensor is blk.N.* must have S > 0 and A = f16. At least one such dispatch must exist.
 #              Also at least one "[PP-MOE] device=D type=T layout=L arm=f16" line and zero "[PP-MOE] refused".
+#              A "misses=N" on the trace lines sums to trace_misses=N, a FAIL when above 0; trace_misses=NA
+#              (no trace line carries the field) and 0 are clean, and the verdict always prints the value.
 #              NOT_EXERCISED (neither pass nor fail) when ring_engaged=no: nothing was staged to count.
 #   Q_tok      llama-completion -m $Q -f code-2k.txt -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4
 #              B70  md5 of stdout recorded (load 1 of 2); an rc != 0 or an empty stdout is a FAIL, not a recorded md5
@@ -239,17 +241,21 @@ declare -a ARMS=()
 S_CSV="" S_OUT="" S_OUT2="" S_ERR="" S_REF="" S_REF2="" S_JOURNAL="" S_RC=0
 
 # The exact strings the gate scores, spelled once. Each is the printf format the code prints (moe-exec-policy.hpp,
-# moe-stream-plan.cpp, ggml-sycl.cpp), not a name of the macro that prints it.
+# moe-stream-plan.cpp, ggml-sycl.cpp), not a name of the macro that prints it; the exception is named per regex below.
 RE_LAYER='\[MOE-EXEC\] layer [0-9]+:'
 RE_SUMMARY='\[MOE-EXEC\] summary:'
 RE_SUMMARY_RING='\[MOE-EXEC\] summary: [0-9]+ layer-ubatches ring'
+# A summary line that carries the window fields: the teardown line the window ring's counters extend.
 RE_SUMMARY_WINDOWS='\[MOE-EXEC\] summary: .*, [0-9]+ windows, [0-9]+ exposed, [0-9]+ misses'
+# The window fields alone, applied only to lines RE_SUMMARY_WINDOWS already matched, to read the three counts.
 RE_WINDOW_FIELDS=', [0-9]+ windows, [0-9]+ exposed, [0-9]+ misses'
 RE_LOAN_OK='\[MOE-EXEC\] loan device [0-9]+: [0-9]+ triplets'
 RE_REFILL='\[MOE-EXEC\] refill device [0-9]+: [0-9]+/[0-9]+ triplets re-admitted'
 RE_PP_REFUSED='\[PP-MOE\] refused device='
 RE_PP_ARM_F16='\[PP-MOE\] device=[0-9]+ type=[^ ]+ layout=[^ ]+ arm=f16 '
 RE_TRACE_EXEC='\[MOE-EXEC-TRACE\] executor device [0-9]+ tensor=[^ ]+ experts=[0-9]+ staged=[0-9]+ arm=[a-z0-9]+'
+# The executor's per-layer trace line with a misses=N field. Master's executor trace does not print misses= yet:
+# this matches the line once the window executor adds the field, and counts nothing before that.
 RE_TRACE_MISSES='\[MOE-EXEC-TRACE\] executor device [0-9]+ .* misses=[0-9]+'
 RE_WATCHDOG='SYCL-WATCHDOG\] No GPU progress'
 RE_PLACE='MoE experts: [0-9]+ on device, [0-9]+ on host'
@@ -468,31 +474,33 @@ ring_layer_ubatches() {
 # not the signal: under auto at default verbosity the phase prints nothing of its own (it needs ring or the trace).
 ring_engaged() { [ "$(ring_layer_ubatches "$@")" -gt 0 ] && echo yes || echo no; }
 
-# summary_field <file> <windows|exposed|misses>: the sum of that window field over every "[MOE-EXEC] summary:" line, or
-# NA when no summary line carries the window fields or any summary line lacks them (an older binary, or a mixed run).
-# Summed, not read from the last line: a summary prints once per backend teardown (llama-bench makes one context per -p
-# value), so a miss in the first context must not be hidden by a clean last one, as ring_layer_ubatches sums too.
-summary_field() {
-    local n_all n_win
-    n_all="$(count_re "$RE_SUMMARY" "$1")"
-    n_win="$(count_re "$RE_SUMMARY_WINDOWS" "$1")"
+# summary_fields <file>: "windows exposed misses", each the sum of that window field over every "[MOE-EXEC] summary:"
+# line, or "NA NA NA" when no summary line carries the window fields or any summary line lacks them (an older binary, or
+# a mixed run). Summed, not read from the last line: a summary prints once per backend teardown (llama-bench makes one
+# context per -p value), so a miss in the first context must not be hidden by a clean last one, as ring_layer_ubatches
+# sums too. Only summary lines are read, so another line ending in the same fields counts for nothing.
+summary_fields() {
+    local lines win n_all n_win
+    lines="$(cat "$1" 2>/dev/null | grep -aE -- "$RE_SUMMARY")"
+    win="$(grep -aE -- "$RE_SUMMARY_WINDOWS" <<< "$lines")"
+    n_all="$(grep -c . <<< "$lines")"
+    n_win="$(grep -c . <<< "$win")"
     if [ "$n_win" -eq 0 ] || [ "$n_win" -ne "$n_all" ]; then
-        echo NA
+        echo "NA NA NA"
         return
     fi
-    cat "$1" 2>/dev/null | grep -aE -- "$RE_SUMMARY_WINDOWS" | grep -aoE -- "$RE_WINDOW_FIELDS" | awk -v f="$2" '
-        { v = (f == "windows") ? $2 : (f == "exposed") ? $4 : $6; n += v } END { print n + 0 }'
+    grep -aoE -- "$RE_WINDOW_FIELDS" <<< "$win" | awk '{ w += $2; e += $4; m += $6 } END { print w + 0, e + 0, m + 0 }'
 }
-summary_windows() { summary_field "$1" windows; }
-summary_exposed() { summary_field "$1" exposed; }
-summary_misses() { summary_field "$1" misses; }
 
-# trace_misses <file>: the sum of misses=N over the "[MOE-EXEC-TRACE] executor device" lines (0 when the trace is off or
-# a line carries no misses= field).
+# trace_misses <file>: the sum of misses=N over the executor trace lines that carry the field, or NA when none does
+# (the trace is off, or the executor does not print misses= yet). NA is not a failure; only a sum above 0 is.
 trace_misses() {
     cat "$1" 2>/dev/null | grep -aE -- "$RE_TRACE_MISSES" | grep -aoE ' misses=[0-9]+' | cut -d= -f2 \
-        | awk '{ n += $1 } END { print n + 0 }'
+        | awk '{ n += $1; c++ } END { if (c == 0) print "NA"; else print n + 0 }'
 }
+
+# trace_misses_item <value>: a failure item when the trace counted any miss; NA and 0 are clean.
+trace_misses_item() { case "$1" in NA | 0) ;; *) echo "trace_misses=$1" ;; esac; }
 
 # layers_item <label> <layers> <want>: a failure item when the distinct layer count is not what the arm needs. want
 # is a number (exactly that many, 0 for none), "any" (at least one layer was consulted) or "-" (recorded, not scored).
@@ -543,7 +551,7 @@ score_q_pp() {
     elif fcmp "$pp2048" "<" "$PP2048_MIN"; then
         fails+=("$(awk -v v="$pp2048" -v m="$PP2048_MIN" 'BEGIN { printf "pp2048=%.0f<%s", v, m }')")
     fi
-    local layers summary refused item
+    local layers summary refused item windows exposed misses tmiss ring_ub
     layers="$(distinct_layers "$err")"
     summary="$(count_re "$RE_SUMMARY" "$err")"
     refused="$(count_re "$RE_PP_REFUSED" "$err")"
@@ -552,27 +560,26 @@ score_q_pp() {
     [ "$summary" -ge 1 ] || fails+=("summary=$summary<1")
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
     # The window ring: it must have engaged, the summary must carry the window fields (an older binary prints none) and
-    # no window may have missed, in the summary (misses) or in the executor trace (trace_misses).
-    local windows exposed misses
-    windows="$(summary_windows "$err")"
-    exposed="$(summary_exposed "$err")"
-    misses="$(summary_misses "$err")"
-    local tmiss
+    # no window may have missed, in the summary (misses) or in the executor trace (trace_misses). The trace prints the
+    # same misses the summary counts, so it is its own field and its own failure, never added in. These arms run with
+    # the trace off, so trace_misses=NA is normal and not a failure.
+    read -r windows exposed misses <<< "$(summary_fields "$err")"
     tmiss="$(trace_misses "$err")"
-    [ "$(ring_layer_ubatches "$err")" -gt 0 ] || fails+=("ring_engaged=no")
+    ring_ub="$(ring_layer_ubatches "$err")"
+    [ "$ring_ub" -gt 0 ] || fails+=("ring_engaged=no")
     if [ "$windows" = NA ]; then
         fails+=("summary_windows=missing")
     elif [ "$misses" -ne 0 ]; then
         fails+=("misses=$misses")
     fi
-    # The trace prints the same misses the summary counts, so it is its own field and its own failure, never added in.
-    [ "$tmiss" -eq 0 ] || fails+=("trace_misses=$tmiss")
+    item="$(trace_misses_item "$tmiss")"
+    [ -z "$item" ] || fails+=("$item")
     r512="$(awk -v v="$pp512" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
     r2048="$(awk -v v="$pp2048" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
     echo "$label=$(verdict_of "${fails[@]}") pp512=$r512 sd512=$sd512 pp2048=$r2048" \
         "sd2048=$sd2048 ub=$ub layers=$layers" \
-        "summary=$summary pp_moe_refused=$refused ring_engaged=$(ring_engaged "$err")" \
-        "ring_layer_ubatches=$(ring_layer_ubatches "$err") loan_exercised=$(loan_exercised "$err")" \
+        "summary=$summary pp_moe_refused=$refused ring_engaged=$([ "$ring_ub" -gt 0 ] && echo yes || echo no)" \
+        "ring_layer_ubatches=$ring_ub loan_exercised=$(loan_exercised "$err")" \
         "windows=$windows exposed=$exposed misses=$misses trace_misses=$tmiss"
 }
 
@@ -611,7 +618,7 @@ trace_counts() {
 }
 
 score_q_staged() { # <err> <rc>
-    local err="$1" rc="$2" fails=() ids nids total served unstaged nonf16 refused arms
+    local err="$1" rc="$2" fails=() ids nids total served unstaged nonf16 refused arms tmiss item
     if [ "$(ring_engaged "$err")" = no ]; then
         echo "Q_staged=NOT_EXERCISED(ring_engaged=no) rc=$rc"
         return
@@ -627,12 +634,12 @@ score_q_staged() { # <err> <rc>
     [ "$nonf16" -eq 0 ] || fails+=("arm_not_f16=$nonf16/$served")
     [ "$arms" -gt 0 ] || fails+=("no_pp_moe_arm_f16_line")
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
-    local tmiss
     tmiss="$(trace_misses "$err")"
-    [ "$tmiss" -eq 0 ] || fails+=("trace_misses=$tmiss")
+    item="$(trace_misses_item "$tmiss")"
+    [ -z "$item" ] || fails+=("$item")
     echo "Q_staged=$(verdict_of "${fails[@]}") ring_layers=$nids executor_dispatches=$total" \
         "ring_layer_dispatches=$served pp_moe_arm_f16_lines=$arms pp_moe_refused=$refused ring_engaged=yes" \
-        "ring_layer_ubatches=$(ring_layer_ubatches "$err")"
+        "ring_layer_ubatches=$(ring_layer_ubatches "$err") trace_misses=$tmiss"
 }
 
 # score_q_tok <name> <out> <rc>: a recorded md5 of stdout.
@@ -1007,7 +1014,8 @@ arm_doc() {
         Q_staged)
             echo "every '$RE_TRACE_EXEC' line of a layer with a '[MOE-EXEC] layer N: ring' line has" \
                 "staged > 0 and arm=f16 (resident layers are ignored); at least one '$RE_PP_ARM_F16';" \
-                "zero '$RE_PP_REFUSED'; NOT_EXERCISED when the ring is unavailable" ;;
+                "zero '$RE_PP_REFUSED'; trace_misses (the sum of misses= on the trace lines, NA when none carries it)" \
+                "is 0 or NA; NOT_EXERCISED when the ring is unavailable" ;;
         Q_tok) echo "recorded only: md5 of stdout, load 1 of 2" ;;
         Q_tok_2) echo "recorded only: md5 of stdout, load 2 of 2" ;;
         Q_tok_cpu_1) echo "recorded only: md5 of stdout with GGML_SYCL_MOE_EXEC=cpu, load 1 of 2" ;;

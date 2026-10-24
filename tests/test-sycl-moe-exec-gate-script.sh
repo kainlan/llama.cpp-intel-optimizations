@@ -12,10 +12,11 @@
 #     layer-ubatches: ring_engaged=no), ring_engaged read from the summary and not from the unavailable WARN
 #     (which auto does not print), layer count, missing summary and [PP-MOE] refused each fail by name,
 #     loan_exercised counts a granted loan and not a refused one;
-#     the window ring (plan 2026-10-24, Task 6): the summary's windows/exposed/misses fields and the executor trace's
-#     misses=, so an engaged run passes with windows= exposed= misses= in the verdict, ring_engaged=no and misses=3
-#     fail by name, an older summary without the window fields fails summary_windows=missing, floors are the bus
-#     arithmetic (pp512 200, pp2048 500, overridable), and the new arm Q_pp_ub2048 (pp2048 floor only);
+#     the window ring (plan 2026-10-24, prefill window ring): the summary's windows/exposed/misses fields and the
+#     executor trace's misses=, so an engaged run passes with windows= exposed= misses= in the verdict,
+#     ring_engaged=no and misses=3 fail by name, an older summary without the window fields fails
+#     summary_windows=missing, floors are the bus arithmetic (pp512 200, pp2048 500, overridable), and the new arm
+#     Q_pp_ub2048 (pp2048 floor only); trace_misses is NA, 0 or the sum and fails only above 0;
 #   - Q_staged: only the layers the ring served are scored (the executor also dispatches resident layers, whose
 #     staged=0 lines are correct): a pass with resident staged=0 lines, a ring-served layer at staged=0, a non-f16
 #     ring-served arm, a refused line, a missing arm=f16 line, no ring-served dispatch, and NOT_EXERCISED when no
@@ -142,19 +143,19 @@ out="$(bash "$GATE" --check-controls 2>&1)"; rc=$?
 expect_rc "controls rc" "$rc" 0
 expect "controls print ok" "$out" "controls: ok"
 # Each window-ring control must fail when its regex stops discriminating: mutate one regex in a copy of the gate.
-mutate_control() { # <name> <sed expression>
+mutate_control() { # <name> <sed expression> [what the mutation breaks]
     mkdir -p "$WORK/mut/scripts"
     sed -E "$2" "$GATE" > "$WORK/mut/scripts/gate.sh"
     cmp -s "$GATE" "$WORK/mut/scripts/gate.sh" && { fail "control mutation $1 changed nothing"; return; }
     out="$(bash "$WORK/mut/scripts/gate.sh" --check-controls 2>&1)"; rc=$?
-    expect_rc "control $1 fails when its regex stops discriminating" "$rc" 1
-    expect "control $1 names itself" "$out" "control FAIL: $1"
+    expect_rc "control $1 fails when its regex ${3:-stops discriminating}" "$rc" 1
+    expect "control $1 names itself" "$out" "control FAIL: $1 "
 }
 mutate_control summary_windows "s/^(RE_SUMMARY_WINDOWS=').*/\\1\\\\[MOE-EXEC\\\\] summary:'/"
 mutate_control summary_windows_trace_decoy "s/^(RE_SUMMARY_WINDOWS=').*/\\1, [0-9]+ windows, [0-9]+ exposed, [0-9]+ misses'/"
 mutate_control window_fields "s/^(RE_WINDOW_FIELDS=').*/\\1, [0-9]+ windows, [0-9]+ exposed'/"
 mutate_control trace_misses "s/^(RE_TRACE_MISSES=').*/\\1\\\\[MOE-EXEC-TRACE\\\\].* misses=[0-9]+'/"
-mutate_control summary_ring "s/^(RE_SUMMARY_RING=').*/\\1\\\\[MOE-EXEC\\\\] summary: [0-9]+ layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB'/"
+mutate_control summary_ring "s/^(RE_SUMMARY_RING=').*/\\1\\\\[MOE-EXEC\\\\] summary: [0-9]+ layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB'/" "no longer matches the long summary line"
 
 # ---- Q_pp
 mkcsv "$WORK/pp-pass.csv" 512:0:523.4:3.1:512 2048:0:851.2:5.0:2048
@@ -230,10 +231,10 @@ mkcsv "$WORK/pp-none.csv" 128:0:900:1:128
 out="$(score Q_pp --csv "$WORK/pp-none.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp a csv without the rows fails, never passes" "$out" "Q_pp=FAIL(no_pp512_row"
 
-# ---- Q_pp, the window ring (plan 2026-10-24 Task 6): windows/exposed/misses, bus floors, the new arm Q_pp_ub2048
+# ---- Q_pp, the window ring (plan 2026-10-24): windows/exposed/misses, bus floors, the new arm Q_pp_ub2048
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp engaged pass: the exact verdict line" "$out" \
-    "Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0 trace_misses=0"
+    "Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0 trace_misses=NA"
 # The two summaries of a -p 512,2048 run add up like ring_layer_ubatches does: a miss in the first context counts.
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-sum2.err")"
 expect "Q_pp windows add up over the summaries" "$out" "windows=296 exposed=32 misses=0"
@@ -260,7 +261,7 @@ expect "Q_pp one summary without the window fields is summary_windows=missing" "
 { cat "$WORK/pp-pass.err"
   echo "$TRACE_EXEC_PREFIX tensor=blk.0.ffn_up_exps.weight experts=480 staged=300 arm=f16, 5 windows, 0 exposed, 7 misses"; } > "$WORK/pp-fieldsdecoy.err"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-fieldsdecoy.err")"
-expect "Q_pp a trace line carrying window fields scores 0 in the summary fields" "$out" "windows=216 exposed=24 misses=0 trace_misses=0"
+expect "Q_pp a trace line carrying window fields scores 0 in the summary fields" "$out" "windows=216 exposed=24 misses=0 trace_misses=NA"
 expect "Q_pp that decoy line still passes" "$out" "Q_pp=PASS"
 # the executor trace's misses= is its own field, and a trace line without it counts for nothing
 { cat "$WORK/pp-pass.err"
@@ -270,10 +271,11 @@ expect "Q_pp that decoy line still passes" "$out" "Q_pp=PASS"
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-tracemiss.err")"
 expect "Q_pp the executor trace misses fail by their own name" "$out" "Q_pp=FAIL(trace_misses=3)"
 expect "Q_pp the trace misses are not added to the summary misses" "$out" "misses=0 trace_misses=3"
-out="$(score Q_staged --err "$WORK/pp-tracemiss.err")"
-expect "Q_staged names the executor trace misses" "$out" "trace_misses=3"
-out="$(score Q_staged --err "$WORK/st-pass.err")"
-expect_not "Q_staged without misses= fields names no trace_misses" "$out" "trace_misses"
+{ cat "$WORK/pp-pass.err"
+  echo "$TRACE_EXEC_PREFIX tensor=blk.0.ffn_up_exps.weight experts=480 staged=300 arm=f16 misses=0"; } > "$WORK/pp-miss0.err"
+out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-miss0.err")"
+expect "Q_pp with misses=0 on the trace prints trace_misses=0, a pass" "$out" "Q_pp=PASS"
+expect "Q_pp exact trace_misses=0" "$out" "misses=0 trace_misses=0"
 # floors: the bus arithmetic, overridable
 mkcsv "$WORK/pp-floor.csv" 512:0:199.0:1.0:512 2048:0:499.0:1.0:2048
 out="$(score Q_pp --csv "$WORK/pp-floor.csv" --err "$WORK/pp-pass.err")"
@@ -287,7 +289,7 @@ expect "Q_pp --pp512-min and --pp2048-min override the floors" "$out" "Q_pp=PASS
 mkcsv "$WORK/ub-pass.csv" 2048:0:610.0:4.0:2048
 out="$(score Q_pp_ub2048 --csv "$WORK/ub-pass.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp_ub2048 scores pp2048 alone and names itself" "$out" \
-    "Q_pp_ub2048=PASS pp512=NA sd512=NA pp2048=610.0 sd2048=4.0 ub=2048 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0 trace_misses=0"
+    "Q_pp_ub2048=PASS pp512=NA sd512=NA pp2048=610.0 sd2048=4.0 ub=2048 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0 trace_misses=NA"
 mkcsv "$WORK/ub-slow.csv" 2048:0:450.0:4.0:2048
 out="$(score Q_pp_ub2048 --csv "$WORK/ub-slow.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp_ub2048 below the pp2048 floor fails" "$out" "Q_pp_ub2048=FAIL(pp2048=450<500)"
@@ -320,6 +322,20 @@ mklayers "$WORK/st-pass.err" 3
     echo "$SUMMARY"
 } >> "$WORK/st-pass.err"
 out="$(score Q_staged --err "$WORK/st-pass.err")"
+# trace_misses: always printed (NA when no trace line carries misses=, 0, or the sum); only a sum above 0 fails
+expect "Q_staged without misses= fields prints trace_misses=NA" "$out" "ring_layer_ubatches=96 trace_misses=NA"
+expect "Q_staged without misses= fields still passes" "$out" "Q_staged=PASS"
+{ cat "$WORK/st-pass.err"
+  echo "$TRACE_EXEC_PREFIX tensor=blk.0.ffn_up_exps.weight experts=480 staged=300 arm=f16 misses=0"; } > "$WORK/st-miss0.err"
+out2="$(score Q_staged --err "$WORK/st-miss0.err")"
+expect "Q_staged with misses=0 on the trace prints trace_misses=0 and passes" "$out2" "Q_staged=PASS"
+expect "Q_staged exact trace_misses=0" "$out2" "ring_layer_ubatches=96 trace_misses=0"
+{ cat "$WORK/st-pass.err"
+  echo "$TRACE_EXEC_PREFIX tensor=blk.0.ffn_up_exps.weight experts=480 staged=300 arm=f16 misses=2"
+  echo "$TRACE_EXEC_PREFIX tensor=blk.1.ffn_up_exps.weight experts=480 staged=300 arm=f16 misses=1"; } > "$WORK/st-miss3.err"
+out2="$(score Q_staged --err "$WORK/st-miss3.err")"
+expect "Q_staged names the executor trace misses" "$out2" "Q_staged=FAIL(trace_misses=3)"
+expect "Q_staged the failing verdict prints the sum" "$out2" "ring_layer_ubatches=96 trace_misses=3"
 expect "Q_staged passes with resident staged=0 lines present" "$out" \
     "Q_staged=PASS ring_layers=3 executor_dispatches=6 ring_layer_dispatches=3"
 sed 's/blk.1.ffn_up_exps.weight experts=8 staged=8/blk.1.ffn_up_exps.weight experts=8 staged=0/' \
@@ -673,10 +689,11 @@ expect_rc "an unknown arm is a usage error" "$rc" 2
 
 # ---- the summary: ring_engaged_any and the exit code, scored from real verdict lines
 PASS_RING="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
-# A Q_pp PASS without the ring is unreachable since Task 6, but summarize() is a pure function of verdict lines
+# A Q_pp PASS without the ring is unreachable now that the ring is scored, but summarize() is a pure function of
+# verdict lines
 # and keeps its ring_engaged_any=no / exit 3 rule for any ring arm that prints a PASS with ring_engaged=no: score that
 # literal line.
-PASS_NORING="Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no windows=0 exposed=0 misses=0"
+PASS_NORING="Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no windows=0 exposed=0 misses=0 trace_misses=NA"
 FAIL_LINE="$(score Q_pp --csv "$WORK/pp-fail.csv" --err "$WORK/pp-fail.err")"
 CTRL_PASS="GO_gate=PASS count=1 layer_lines=0"
 summ() { # <name> <verdict line>...: writes them to a file and runs --score-summary
