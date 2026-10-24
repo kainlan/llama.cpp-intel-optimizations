@@ -9,7 +9,7 @@
 #   setsid nohup bash scripts/sycl-moe-exec-gate.sh <sha> > <scratchpad>/gate.log 2>&1 < /dev/null &
 # It loads models onto both discrete cards. Never run it from a subagent, never in a loop.
 #
-# Arms (selector pinned in every arm; no -ngl anywhere; timeouts: the four Q_pp arms 1500 s, the other Qwen arms 900 s,
+# Arms (selector pinned in every arm; no -ngl anywhere; timeouts: the three Q_pp arms 1500 s, the other Qwen arms 900 s,
 # GO_gate and GO_noc 600 s, the Mistral arms 300 s; a run that hits its timeout exits 124 and one that has to be
 # killed exits 137, and every arm scores a non-zero rc as a FAIL naming it):
 #   Q_pp       llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v          B70  pp512 >= 200, pp2048 >= 500 (the bus-derived
@@ -28,7 +28,6 @@
 #              loan_exercised=yes|no is a "[MOE-EXEC] loan device N: K triplets" line.
 #   Q_pp_ub2048  llama-bench -m $Q -ub 2048 -p 2048 -n 0 -r 3 -fa 1 -o csv -v       B70  pp2048 >= 500 only (no pp512 row),
 #              scored like Q_pp otherwise; the pp2048 floor's natural setting and llama.cpp-dfo0's measurement arm
-#   Q_pp_nocopyq  Q_pp with GGML_SYCL_COPY_ENGINE=0                               B70  scored like Q_pp; the copy-engine A/B
 #   Q_pp_cpu   Q_pp with GGML_SYCL_MOE_EXEC=cpu                       B70  recorded, not gated (FAIL on rc != 0)
 #   Q_staged   llama-bench -p 512 -n 0 -r 1 -fa 1 -o csv -v, GGML_SYCL_MOE_EXEC_TRACE=1   B70
 #              the executor prints "[MOE-EXEC-TRACE] executor device D tensor=T experts=E staged=S arm=A" for EVERY
@@ -75,14 +74,14 @@
 #   resets     journalctl -k --since <gate start> | grep -icE
 #              'GT reset|guc_id|CAT error|Engine reset|exec queue reset' = 0
 #              (journalctl's own rc is kept: a failed journalctl or a missing journal file is a FAIL, never a clean log)
-# Duration: a complete run of all 17 arms takes about 65 minutes on this host with the ring off (run 2, of the original 15 arms,
-# 45 minutes; Q_pp_ub2048 and Q_pp_nocopyq each add about a Q_pp: Q_pp 9.5 min,
+# Duration: a complete run of all 16 arms takes about 55 minutes on this host with the ring off (run 2, of the original 15 arms,
+# 45 minutes; Q_pp_ub2048 adds about a Q_pp: Q_pp 9.5 min,
 # Q_pp_cpu 9.3, Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the GPT-OSS and Mistral arms
 # about 1 each).
 # Note on the plan table: llama-bench has no -c option (its context is n_prompt + n_gen), so GO_pp carries none.
-# Verdict-bearing arms (13): Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70
+# Verdict-bearing arms (12): Q_pp Q_pp_ub2048 Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70
 # MI_b50 resets.
-# Arms in all (17): the thirteen, Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
+# Arms in all (16): the twelve, Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
 #
 # Every grep has a positive and a negative control (check_controls) that runs before any arm and is exposed as
 # --check-controls. The GPT-OSS echo-line trap (the prompt ends with the answer, so a loose grep scores 2) is the
@@ -232,8 +231,8 @@ DECODE_FLIP_PREFIX_MIN=128
 TOK_PREFIX_MIN=64
 
 # The arms whose verdict carries ring_engaged=yes|no; ring_engaged_any in the summary is read from these and only these.
-RING_ARMS=(Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_staged)
-ALL_ARMS=(Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc
+RING_ARMS=(Q_pp Q_pp_ub2048 Q_staged)
+ALL_ARMS=(Q_pp Q_pp_ub2048 Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc
           GO_gate GO_pp GO_noc MI_b70 MI_b50 resets)
 declare -a ARMS=()
 S_CSV="" S_OUT="" S_OUT2="" S_ERR="" S_REF="" S_REF2="" S_JOURNAL="" S_RC=0
@@ -522,7 +521,7 @@ rc_item() { [ "${1:-0}" = 0 ] || echo "rc=$1"; }
 
 # ---------------------------------------------------------------- arm scorers: each prints one verdict line
 
-# score_q_pp <csv> <err> <rc> [label] [pp512 row: score|skip]: the label is the arm's name (Q_pp, Q_pp_nocopyq, Q_pp_ub2048);
+# score_q_pp <csv> <err> <rc> [label] [pp512 row: score|skip]: the label is the arm's name (Q_pp, Q_pp_ub2048);
 # skip is for a -p 2048 run, which has no pp512 row and answers to the pp2048 floor alone, with ub read from its row.
 score_q_pp() {
     local csv="$1" err="$2" rc="$3" label="${4:-Q_pp}" row512="${5:-score}"
@@ -840,7 +839,7 @@ score_resets() {
 score_arm_raw() {
     local arm="$1" csv="$2" out="$3" err="$4" ref="$5" journal="$6" rc="$7" out2="${8:-}" ref2="${9:-}"
     case "$arm" in
-        Q_pp | Q_pp_nocopyq) score_q_pp "$csv" "$err" "$rc" "$arm" ;;
+        Q_pp) score_q_pp "$csv" "$err" "$rc" "$arm" ;;
         Q_pp_ub2048) score_q_pp "$csv" "$err" "$rc" "$arm" skip ;;
         Q_pp_cpu) score_q_pp_cpu "$csv" "$err" "$rc" ;;
         Q_staged) score_q_staged "$err" "$rc" ;;
@@ -969,8 +968,6 @@ arm_setup() {
         Q_pp) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
         Q_pp_ub2048) A_KIND=bench A_BIN=llama-bench A_TMO=1500
             A_ARGV=(-m "$QWEN" -ub 2048 -p 2048 -n 0 -r 3 -fa 1 -o csv -v) ;;
-        Q_pp_nocopyq) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ENV=(GGML_SYCL_COPY_ENGINE=0)
-            A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
         Q_pp_cpu) A_KIND=bench A_BIN=llama-bench A_TMO=1500; A_ENV=(GGML_SYCL_MOE_EXEC=cpu)
             A_ARGV=(-m "$QWEN" -p '512,2048' -n 0 -r 3 -fa 1 -o csv -v) ;;
         Q_staged) A_KIND=bench A_BIN=llama-bench; A_ENV=(GGML_SYCL_MOE_EXEC_TRACE=1)
@@ -1004,8 +1001,6 @@ arm_doc() {
         Q_pp_ub2048)
             echo "pp2048 >= $PP2048_MIN at -ub 2048 (no pp512 row, no pp512 floor); the same ring, window and miss" \
                 "scoring as Q_pp" ;;
-        Q_pp_nocopyq)
-            echo "Q_pp under GGML_SYCL_COPY_ENGINE=0, scored like Q_pp; the pp numbers are the copy-engine A/B" ;;
         Q_pp_cpu) echo "recorded only: pp512, pp2048, forced cpu layer lines" ;;
         Q_staged)
             echo "every '$RE_TRACE_EXEC' line of a layer with a '[MOE-EXEC] layer N: ring' line has" \
