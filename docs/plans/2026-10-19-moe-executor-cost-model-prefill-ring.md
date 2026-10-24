@@ -1331,13 +1331,12 @@ Follow-ups folded elsewhere: llama.cpp-v7np into Task 10, the in-graph loan requ
       line, not `->layer_fully_staged(` on the `plan_has_cpu_experts` line.** Source gate: `->layer_fully_staged(`
       appears exactly once in `ggml_sycl_mul_mat_id`, on the line that computes `plan_has_cpu_experts`;
       `moe_hybrid_with_plan` keeps its `ne12 == 1 ||` term (decode untouched).
-- [ ] **The ring-engaged half moved to llama.cpp-bcre (see the Amendment; pu8v and 6aj4 are closed).**
-      Lead-run: Qwen B70
-      `llama-bench -p 512,2048 -n 0 -r 3` with no `-ub` (auto) and `GGML_SYCL_MOE_EXEC=auto`: pp512 >= 500 tok/s,
-      pp2048 >= 800 tok/s, `[MOE-EXEC] trace` (one `-v` run) shows every prompt layer RING and the batched route's own
-      log line (`[PP-MOE]` or the XMX route's, whichever the all-VRAM pair printed in Task 9) per layer; the 2k-prompt
-      `llama-completion` md5 equals the `GGML_SYCL_MOE_EXEC=cpu` arm's; GPT-OSS B50 `-c 4096` pp512/tg128 and the
-      count gate unchanged (no host experts: NOT_CONSULTED, zero `[MOE-EXEC] layer` lines).
+- [ ] **The ring-engaged half moved to llama.cpp-bcre (see the Amendment; pu8v and 6aj4 are closed).** Lead-run:
+      Qwen B70 `llama-bench -p 512,2048 -n 0 -r 3` with no `-ub` (auto) and `GGML_SYCL_MOE_EXEC=auto`: pp512 >= 500
+      tok/s, pp2048 >= 800 tok/s, `[MOE-EXEC] trace` (one `-v` run) shows every prompt layer RING and the batched
+      route's own log line (`[PP-MOE]` or the XMX route's, whichever the all-VRAM pair printed in Task 9) per layer;
+      the 2k-prompt `llama-completion` md5 equals the `GGML_SYCL_MOE_EXEC=cpu` arm's; GPT-OSS B50 `-c 4096`
+      pp512/tg128 and the count gate unchanged (no host experts: NOT_CONSULTED, zero `[MOE-EXEC] layer` lines).
 
 **Implementation Guide:**
 
@@ -1385,9 +1384,9 @@ premise was wrong, and its acceptance could not run.
   on 2026-10-23; with pu8v and llama.cpp-6aj4 (2026-10-24) closed, the loan is accepted for the 41 lendable triplets
   and the ring stays short, llama.cpp-bcre c-aerm). The pp512 >= 500, pp2048 >= 800 and every-layer-RING targets stay
   with bcre. Measured: Qwen3.8 B70 ABBA neutral (pp512 about 14, pp2048 about 31.5 on both trees), the md5 of auto
-  equals cpu equals NAN_CHECK, and the GPT-OSS B50 and Mistral controls are green.
-  The GPT-OSS B50 pp512 reads about 770 against the 871-894 floor on
-  master itself (llama.cpp-zuze), so Task 15's GO_pp window cites zuze until it is bisected.
+  equals cpu equals NAN_CHECK, and the GPT-OSS B50 and Mistral controls are green. The GPT-OSS B50 pp512 reads about
+  770 against the 871-894 floor on master itself (llama.cpp-zuze), so Task 15's GO_pp window cites zuze until it is
+  bisected.
 - Limits: the REFUSED loan latch and `warned_unavailable_` reset only in `end_prompt`, so a prompt-only workload keeps
   one refusal for the process (the c-las5 "per prompt" carry-forward). `route_layout` is re-derived at dispatch
   (llama.cpp-8f7x). The forced-decline arm on a staged layer is owned by llama.cpp-8p5x (its acceptance carries it,
