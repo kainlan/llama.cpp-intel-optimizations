@@ -145,9 +145,13 @@ heaviest layer's slots (`region_slots_max`). It refuses the ring, leaving none,
 when the ring's bytes would exceed `resident_expert_bytes / 10`. The two regions
 are epochs. Layer l+1 streams into one while layer l runs from the other. Reuse
 of a region is ordered after the event that ended its previous use, chained on
-the device through `current_region_gate`, so the host never waits. `STAGED_RING`
-is the only route from a host-resident entry to the device, and
-`moe_staged_route_tally` counts each entry the route refuses, by cause.
+the device through `current_region_gate`, so the host never waits. A staged slot
+has two consumers, and no other path reaches the device from a host-resident
+entry. The first is the `STAGED_RING` resolver route, which serves a hybrid-world
+op. The second is the batched prompt executor, which reads staged slots through
+the phase's `find()` once `moe_stream_executor_staged` (the phase's
+`executor_staged`) answers for the weight. `moe_staged_route_tally` counts each
+entry the route refuses, by cause, and each entry it hands to the executor.
 
 **The loan and the refill.** A loan lends resident expert triplets to the ring.
 `moe_expert_loan_select` picks whole (gate, up, down) triplets from the
@@ -176,8 +180,11 @@ so a rung that needs them is refused with a figure.
 
 **Gates.** Three gates keep the rule enforceable.
 
-- `STAGED_RING` is the only route from a host-resident entry to the device.
-  `tests/test-sycl-staged-ring-route-source.py` pins that route's single writer.
+- A staged slot has two consumers: the `STAGED_RING` resolver route and the
+  batched prompt executor, which reads it through the phase's `find()` once
+  `moe_stream_executor_staged` answers. No other path leads from a host-resident
+  entry to the device.
+  `tests/test-sycl-staged-ring-route-source.py` pins the route's single writer.
   `tests/test-sycl-moe-stream-enqueue-source.py` guards the copy path.
 
 - Nothing allocates outside the unified cache. The ring's slots come only from

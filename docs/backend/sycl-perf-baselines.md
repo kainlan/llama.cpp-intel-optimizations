@@ -580,10 +580,12 @@ and `GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`, gate exit 1.
   `auto` at default verbosity does not print that line. `Q_staged` then reports `NOT_EXERCISED`, which is
   neither a pass nor a fail. The summary line says `ring_engaged_any=no` and the gate's exit code is 3 rather
   than 0, even when `Q_pp` passed its floors and nothing failed. Do not read it as green.
-  `llama.cpp-pu8v` is the second reason the ring does not engage. A model that passes the cap (Qwen1.5 at a
-  33-35 % VRAM budget) finds the ring short and asks for a loan. At `5d0727255` the loan is accepted (41
-  triplets, 190 MiB) but the ring still cannot engage, because of a reclaim defect (`llama.cpp-6aj4`): only
-  190 of the 557 MiB it needs are lendable.
+  A second reason the ring did not engage in the runs this table records, both since fixed. A model that passes
+  the cap (Qwen1.5 at a 33-35 % VRAM budget) finds the ring short and asks for a loan. At `8c44f3b3c` the loan
+  was refused with "host storage too small" (`llama.cpp-pu8v`, the host copy sized from dst_size). At
+  `5d0727255`, the pu8v fix, the loan was accepted (41 triplets, 190 MiB) but the ring still could not engage,
+  because of a reclaim defect (`llama.cpp-6aj4`): only 190 of the 557 MiB it needs were lendable. Both tickets
+  are closed, and no run in this table was taken after the 6aj4 fix.
 - **`Q_staged`.** The executor prints its `[MOE-EXEC-TRACE] executor device` line for every dispatch,
   resident layers included, and `staged=0` is correct for those. The arm scores only the layers the ring
   served: a layer with a `[MOE-EXEC] layer N: ring` line is a host layer, and every `blk.N.*` dispatch of it
@@ -595,7 +597,8 @@ and `GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`, gate exit 1.
   prints two. The table records both; `--q-layers N` makes the layer count exact.
 - **`loan_exercised=no` and `refill=not_exercised`.** Nothing lent experts to the ring in that arm, so the
   "re-admitted equals lent" check had nothing to count. Production only originates a loan at a short
-  reserve under `auto` (`llama.cpp-3460`), and the loan can still be refused (`llama.cpp-pu8v`).
+  reserve under `auto` (`llama.cpp-3460`), and a loan can still be refused (the `8c44f3b3c` runs saw it refused
+  by `llama.cpp-pu8v`, since fixed).
 - **`place=unscored` and `place=unchanged`.** The references `--place-ref-tg` and `--place-ref-noc` default to
   `-`, so the `MoE experts: N on device, M on host` line is recorded and `place=unscored`. The lead passes the
   values of this table; `place=unchanged` then means the line equals them, and a different line is a `FAIL`.

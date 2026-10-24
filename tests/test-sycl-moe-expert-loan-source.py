@@ -2311,7 +2311,8 @@ def test_mutant_pinned_pool_stops_branching_on_the_zones_fails():
 
 
 # --- a lent triplet the refill can never prepare leaves the ledger, each drop WARNed, and one decode graph admits one
-# --- refill (llama.cpp-sif1, quality review) --------------------------------------------------------------------------
+# --- refill (llama.cpp-sif1: left in the ledger, a triplet that can never be prepared stops every later refill at
+# --- itself; the per-graph cap bounds how much one decode graph re-admits) -----------------------------------------
 
 
 def test_an_unpreparable_triplet_leaves_the_ledger():

@@ -1086,7 +1086,7 @@ git commit -m "sycl, tests: a prompt layer's host experts are weighed before its
 **Amendment (2026-10-23, llama.cpp-xod7; epic ruling c-las5 on llama.cpp-36j0):** Task 7b merged with these
 deviations, rulings and carry-forwards. The text above is the plan; this is the build.
 - Deviations #1-#5, #7 and #11 of xod7 c-kkbs were accepted (c-0bw3): `begin_layer` takes a `const moe_stream_op &`;
-  `fully_staged()` and `region_open()` are public; there is no `rates_` member and the rates are assembled per layer;
+  `region_open()` and the staged predicate (`fully_staged()` as xod7 merged it, `executor_staged()` since 3460) are public; there is no `rates_` member and the rates are assembled per layer;
   the phase is held as `unique_ptr<moe_stream_phase, moe_stream_phase_deleter>` in common.hpp;
   `ggml_sycl_reorder_weight_gpu` was made non-static instead of refactoring the fill; `layer_done`'s event is a
   compute-queue barrier after the down op; the n_host == 0 skip reads the plan index.
@@ -1169,7 +1169,7 @@ if (prompt_rows && sctx && sctx->moe_stream) {
         route.planned_device  = submit_device;
         route.layout          = GGML_LAYOUT_SOA;
         route.staged_ring     = true;
-        route.recipe          = ggml_sycl_build_device_recipe(src0, submit_device, GGML_LAYOUT_SOA, /*rows*/ count / slots_per_token);
+        route.recipe          = ggml_sycl_moe_build_device_recipe(src0, submit_device, GGML_LAYOUT_SOA, /*rows*/ count / slots_per_token);
         route.recipe.transfer = moe_recipe_transfer::STAGED_RING;
         route.recipe_reason   = "staged-ring";
         return route;
@@ -1177,7 +1177,7 @@ if (prompt_rows && sctx && sctx->moe_stream) {
 }
 ```
 
-where `ggml_sycl_build_device_recipe` is the existing device-recipe construction at `:32255-32269` hoisted into a static (the capability query `ggml_sycl_moe_query_route_capability`, `:31622`, with the `requires_host_staging ? HOST_BOUNCE : NONE` transfer it sets today, overwritten here).
+where `ggml_sycl_moe_build_device_recipe` is the existing device-recipe construction at `:32255-32269` hoisted into a static (the capability query `ggml_sycl_moe_query_route_capability`, `:31622`, with the `requires_host_staging ? HOST_BOUNCE : NONE` transfer it sets today, overwritten here).
 3. Build, gates, format.
 
 **Commit:**
@@ -1316,7 +1316,7 @@ Follow-ups folded elsewhere: llama.cpp-v7np into Task 10, the in-graph loan requ
       ctx.moe_stream->layer_fully_staged(layer, ids, n_ids))` where `moe_stream_phase::layer_fully_staged` wraps Task
       7a's pure `moe_stream_layer_fully_staged` over the phase's own stage table (every distinct id that is
       host-planned has all three roles staged, ready or pending).
-- [ ] **No longer true as written (3460 c-vrmr, see the Amendment): the gate pins `->fully_staged(` on the bool's own
+- [ ] **No longer true as written (3460 c-vrmr, see the Amendment): the gate pins `->executor_staged(` on the bool's own
       line, not `->layer_fully_staged(` on the `plan_has_cpu_experts` line.** Source gate: `->layer_fully_staged(`
       appears exactly once in `ggml_sycl_mul_mat_id`, on the line that computes `plan_has_cpu_experts`;
       `moe_hybrid_with_plan` keeps its `ne12 == 1 ||` term (decode untouched).
@@ -1354,7 +1354,7 @@ premise was wrong, and its acceptance could not run.
   device or the host, a device layout the executor accepts, an f16 table row at AOS, MXFP4 excluded). The ring's
   library hook answers it. Executor-consumer slots stage AOS_ONLY. The resolver refuses by the entry's consumer, and
   the executor's resolve takes staged entries through `find()`. One bool read after `begin_layer` (the predicate and
-  `fully_staged`) leaves the hybrid world. Its gate pins `->fully_staged(` on the bool's own line, not on the
+  `executor_staged`) leaves the hybrid world. Its gate pins `->executor_staged(` on the bool's own line, not on the
   `plan_has_cpu_experts` line, and not the plan's `->layer_fully_staged(` (3460 c-vrmr: the bool is set after the
   payload release, because the claim-release gate pins the release directly after `begin_layer`).
   llama.cpp-v7np closed with this merge.
