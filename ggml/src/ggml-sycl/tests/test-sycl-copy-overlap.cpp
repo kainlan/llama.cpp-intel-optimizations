@@ -4,9 +4,26 @@
 // Times 16 x 4 MiB pinned host-to-device copies alone, then the same copies
 // submitted while a ~100 ms spin kernel runs on the backend's compute queue,
 // for the cache's BCS queue and for the cache's compute queue. Prints one
-// [COPY-OVERLAP] row per queue at default verbosity. overlap=yes means the
-// copies did not queue behind the kernel. Lead-run only (it takes the device);
-// exits 77 without one.
+// [COPY-OVERLAP] row per queue and spin shape at default verbosity.
+// overlap=yes means the copies did not queue behind the kernel. Lead-run only
+// (it takes the device); exits 77 without one.
+//
+// Two spin shapes: spin=1wg is one work-group and leaves most EUs idle, so a
+// copy the compute engine runs by time-slicing can still finish on time;
+// spin=full launches 4096 work-groups to saturate the EUs, closer to the
+// dequant+GEMM load the ring's copies meet.
+//
+// overlap= does not say which engine ran the copies, so each row also prints
+// this process's per-engine busy deltas from the xe driver's DRM fdinfo
+// (drm-cycles-<class>, GPU timestamp ticks this client kept the engine class
+// busy; ticks= is the drm-total-cycles delta, the elapsed GPU timestamp over
+// the same window). alone_*: around the alone copies, which no kernel shares,
+// so they attribute the copies' engine directly. The unprefixed fields are
+// around the kernel submit and the with-kernel copies, and ccs_cycles there
+// includes the spin kernel's own ticks. Only render-node fds whose drm-pdev is
+// the device under test count, each DRM client once. NA: no drm-cycles key
+// (not the xe driver, or no matching fd). One raw fdinfo is printed first as
+// [COPY-OVERLAP-FDINFO] lines so the keys this kernel prints are on record.
 //
 // The copy source is the prefill ring's own source shape: a pinned-pool WEIGHT
 // slice of the cache's host zone, which mem_copy_async trusts as host USM and
@@ -23,15 +40,22 @@
 #include "../unified-cache.hpp"
 #include "sycl-test-skip.hpp"
 
+#include <dirent.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <utility>
+#include <vector>
 
 using ggml_sycl::mem_handle;
 
@@ -51,15 +75,132 @@ static const char * adapter_name() {
     return v2 ? "v2" : v1 ? "v1" : "unknown";
 }
 
-// Device busy work on `q`: one work-group iterating an LCG `iters` times.
-static sycl::event spin_kernel(sycl::queue & q, uint32_t * counter, uint64_t iters) {
+// The fds of this process open on a DRM render node, with their /proc/self/fd number.
+static std::vector<std::string> render_node_fds() {
+    std::vector<std::string> fds;
+    DIR *                    dir = opendir("/proc/self/fd");
+    if (!dir) {
+        return fds;
+    }
+    for (dirent * e = readdir(dir); e != nullptr; e = readdir(dir)) {
+        if (e->d_name[0] == '.') {
+            continue;
+        }
+        const std::string link = std::string("/proc/self/fd/") + e->d_name;
+        char              target[256];
+        const ssize_t     n = readlink(link.c_str(), target, sizeof(target) - 1);
+        if (n <= 0) {
+            continue;
+        }
+        target[n] = '\0';
+        if (std::string(target).rfind("/dev/dri/renderD", 0) == 0) {
+            fds.push_back(e->d_name);
+        }
+    }
+    closedir(dir);
+    return fds;
+}
+
+// The `key:\tvalue` lines of one fd's fdinfo.
+static std::vector<std::pair<std::string, std::string>> read_fdinfo(const std::string & fd) {
+    std::vector<std::pair<std::string, std::string>> kv;
+    std::ifstream                                    in("/proc/self/fdinfo/" + fd);
+    std::string                                      line;
+    while (std::getline(in, line)) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const size_t at = line.find_first_not_of(" \t", colon + 1);
+        kv.emplace_back(line.substr(0, colon), at == std::string::npos ? std::string() : line.substr(at));
+    }
+    return kv;
+}
+
+// Engine-busy counters summed over this process's DRM clients on the device whose PCI address is `pdev`
+// (every render-node client when `pdev` is empty).
+struct drm_snapshot {
+    std::map<std::string, unsigned long long> cycles;     // drm-cycles-<class>, keyed by <class>
+    unsigned long long                        ticks = 0;  // max drm-total-cycles-<class> over the clients
+};
+
+static drm_snapshot read_drm_snapshot(const std::string & pdev) {
+    drm_snapshot          snap;
+    std::set<std::string> clients;
+    for (const std::string & fd : render_node_fds()) {
+        const std::vector<std::pair<std::string, std::string>> kv = read_fdinfo(fd);
+        std::string                                            fd_pdev;
+        std::string                                            client;
+        for (const auto & p : kv) {
+            if (p.first == "drm-pdev") {
+                fd_pdev = p.second;
+            } else if (p.first == "drm-client-id") {
+                client = p.second;
+            }
+        }
+        if ((!pdev.empty() && fd_pdev != pdev) || client.empty() || !clients.insert(client).second) {
+            continue;
+        }
+        for (const auto & p : kv) {
+            const unsigned long long v = std::strtoull(p.second.c_str(), nullptr, 10);
+            if (p.first.rfind("drm-cycles-", 0) == 0) {
+                snap.cycles[p.first.substr(11)] += v;
+            } else if (p.first.rfind("drm-total-cycles-", 0) == 0 && v > snap.ticks) {
+                snap.ticks = v;
+            }
+        }
+    }
+    return snap;
+}
+
+// " <prefix>bcs_cycles=<d> <prefix>ccs_cycles=<d> [<prefix><class>_cycles=<d> ...] <prefix>ticks=<d>": bcs and ccs
+// always, any other class only when it moved; "<prefix>bcs_cycles=NA <prefix>ccs_cycles=NA" without cycles keys.
+static std::string drm_delta_fields(const char * prefix, const drm_snapshot & before, const drm_snapshot & after) {
+    std::string out;
+    char        buf[128];
+    if (after.cycles.empty()) {
+        std::snprintf(buf, sizeof(buf), " %sbcs_cycles=NA %sccs_cycles=NA", prefix, prefix);
+        return buf;
+    }
+    const char * always[] = { "bcs", "ccs" };
+    for (const char * cls : always) {
+        const auto a = after.cycles.find(cls);
+        const auto b = before.cycles.find(cls);
+        if (a == after.cycles.end()) {
+            std::snprintf(buf, sizeof(buf), " %s%s_cycles=NA", prefix, cls);
+        } else {
+            const unsigned long long d = a->second - (b == before.cycles.end() ? 0ull : b->second);
+            std::snprintf(buf, sizeof(buf), " %s%s_cycles=%llu", prefix, cls, d);
+        }
+        out += buf;
+    }
+    for (const auto & a : after.cycles) {
+        if (a.first == "bcs" || a.first == "ccs") {
+            continue;
+        }
+        const auto               b = before.cycles.find(a.first);
+        const unsigned long long d = a.second - (b == before.cycles.end() ? 0ull : b->second);
+        if (d != 0) {
+            std::snprintf(buf, sizeof(buf), " %s%s_cycles=%llu", prefix, a.first.c_str(), d);
+            out += buf;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), " %sticks=%llu", prefix, after.ticks - before.ticks);
+    out += buf;
+    return out;
+}
+
+// Device busy work on `q`: `groups` work-groups of 256 iterating an LCG `iters` times.
+static sycl::event spin_kernel(sycl::queue & q, uint32_t * counter, size_t groups, uint64_t iters) {
     return q.submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::nd_range<1>(256, 256), [=](sycl::nd_item<1> it) {
+        h.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
             uint32_t acc = static_cast<uint32_t>(it.get_global_id(0));
             for (uint64_t i = 0; i < iters; ++i) {
                 acc = acc * 1664525u + 1013904223u;
             }
-            if (it.get_global_id(0) == 0) {
+            // Every work-item's result is observable (acc == 0 is the rare store), so the compiler cannot sink the
+            // loop into work-item 0's branch and leave the other work-items idle.
+            if (it.get_global_id(0) == 0 || acc == 0u) {
                 *counter = acc;
             }
         });
@@ -165,18 +306,51 @@ int main() {
     }
     uint32_t * counter = static_cast<uint32_t *>(ctr_ptr.ptr);
 
-    // JIT the spin kernel before timing it, then calibrate it to ~100 ms.
-    spin_kernel(ccs, counter, 1).wait();
-    uint64_t iters     = 1ull << 20;
-    double   kernel_ms = 0.0;
-    for (;;) {
-        const auto t0 = std::chrono::steady_clock::now();
-        spin_kernel(ccs, counter, iters).wait();
-        kernel_ms = ms_since(t0);
-        if (kernel_ms >= 80.0 || iters > (1ull << 36)) {
-            break;
+    // The device's PCI address selects its DRM clients; empty (every render-node client) when not reported.
+    std::string pdev;
+    if (ccs.get_device().has(sycl::aspect::ext_intel_pci_address)) {
+        pdev = ccs.get_device().get_info<sycl::ext::intel::info::device::pci_address>();
+    }
+    std::printf("[COPY-OVERLAP-FDINFO] pdev=%s render_fds=%zu\n", pdev.empty() ? "unknown" : pdev.c_str(),
+                render_node_fds().size());
+    for (const std::string & fd : render_node_fds()) {
+        const std::vector<std::pair<std::string, std::string>> kv    = read_fdinfo(fd);
+        bool                                                   match = pdev.empty();
+        for (const auto & p : kv) {
+            match |= p.first == "drm-pdev" && p.second == pdev;
         }
-        iters *= 2;
+        if (!match) {
+            continue;
+        }
+        for (const auto & p : kv) {
+            std::printf("[COPY-OVERLAP-FDINFO] fd=%s %s: %s\n", fd.c_str(), p.first.c_str(), p.second.c_str());
+        }
+        break;
+    }
+
+    struct spin {
+        const char * name;
+        size_t       groups;
+        uint64_t     iters;
+        double       kernel_ms;
+    };
+
+    // JIT the spin kernel before timing it, then calibrate each shape to ~100 ms.
+    spin_kernel(ccs, counter, 1, 1).wait();
+    spin spins[] = {
+        { "1wg",  1,    1ull << 20, 0.0 },
+        { "full", 4096, 1ull << 8,  0.0 },
+    };
+    for (spin & sp : spins) {
+        for (;;) {
+            const auto t0 = std::chrono::steady_clock::now();
+            spin_kernel(ccs, counter, sp.groups, sp.iters).wait();
+            sp.kernel_ms = ms_since(t0);
+            if (sp.kernel_ms >= 80.0 || sp.iters > (1ull << 36)) {
+                break;
+            }
+            sp.iters *= 2;
+        }
     }
 
     struct arm {
@@ -189,20 +363,28 @@ int main() {
         { "compute", &cq                     }
     };
     const char * adapter = adapter_name();
-    for (const arm & a : arms) {
-        time_copies(*a.q, dst, src);  // warm-up
-        const double alone = time_copies(*a.q, dst, src);
-        const auto   t0    = std::chrono::steady_clock::now();
-        sycl::event  k     = spin_kernel(ccs, counter, iters);
-        const double with  = time_copies(*a.q, dst, src);
-        k.wait();
-        const double total   = ms_since(t0);
-        const bool   overlap = with < alone + 0.5 * kernel_ms;
-        std::printf(
-            "[COPY-OVERLAP] queue=%s alone_ms=%.1f with_kernel_ms=%.1f kernel_ms=%.1f total_ms=%.1f overlap=%s "
-            "adapter=%s\n",
-            a.name, alone, with, kernel_ms, total, overlap ? "yes" : "no", adapter);
-        std::fflush(stdout);
+    for (const spin & sp : spins) {
+        for (const arm & a : arms) {
+            time_copies(*a.q, dst, src);  // warm-up
+            const drm_snapshot alone_before = read_drm_snapshot(pdev);
+            const double       alone        = time_copies(*a.q, dst, src);
+            const drm_snapshot alone_after  = read_drm_snapshot(pdev);
+            const drm_snapshot with_before  = read_drm_snapshot(pdev);
+            const auto         t0           = std::chrono::steady_clock::now();
+            sycl::event        k            = spin_kernel(ccs, counter, sp.groups, sp.iters);
+            const double       with         = time_copies(*a.q, dst, src);
+            const drm_snapshot with_after   = read_drm_snapshot(pdev);
+            k.wait();
+            const double total   = ms_since(t0);
+            const bool   overlap = with < alone + 0.5 * sp.kernel_ms;
+            std::printf(
+                "[COPY-OVERLAP] queue=%s alone_ms=%.1f with_kernel_ms=%.1f kernel_ms=%.1f total_ms=%.1f overlap=%s "
+                "adapter=%s spin=%s%s%s\n",
+                a.name, alone, with, sp.kernel_ms, total, overlap ? "yes" : "no", adapter, sp.name,
+                drm_delta_fields("alone_", alone_before, alone_after).c_str(),
+                drm_delta_fields("", with_before, with_after).c_str());
+            std::fflush(stdout);
+        }
     }
     ccs.wait();
     cq.wait();
