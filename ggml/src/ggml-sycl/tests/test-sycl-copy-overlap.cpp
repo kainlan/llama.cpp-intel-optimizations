@@ -42,7 +42,7 @@
 // memcpy, and the row would time that instead of the DMA. So the source's
 // owner is checked against that trust rule before timing, and every timed call
 // reads this thread's staged-H2D census (counted with the trace off) around its
-// copies: staged_h2d= on the row is the count over the row's three copy rounds,
+// copies: staged_h2d= on the row is the count over all the row's copy rounds,
 // and a non-zero count prints a FAIL line and makes the test exit 1.
 //
 // No host thread waits on a copy-queue event: the copies are drained with a
@@ -75,13 +75,11 @@
 using ggml_sycl::mem_handle;
 
 // The copy shape the plan's spike names: 16 copies of 4 MiB, 64 MiB in all, about 2.7 ms at the probed ~25 GB/s.
-static constexpr size_t kChunkBytes       = 4ull * 1024ull * 1024ull;
-static constexpr size_t kChunks           = 16;
-static constexpr size_t kCopyBytes        = kChunkBytes * kChunks;
-// Copy rounds per row (warm-up, alone, with-kernel); staged_h2d= counts the copies of all of them.
-static constexpr size_t kCopyRoundsPerRow = 3;
+static constexpr size_t kChunkBytes   = 4ull * 1024ull * 1024ull;
+static constexpr size_t kChunks       = 16;
+static constexpr size_t kCopyBytes    = kChunkBytes * kChunks;
 // The spin counter: one uint32 the kernel stores, padded to a 64-byte line.
-static constexpr size_t kCounterBytes     = 64;
+static constexpr size_t kCounterBytes = 64;
 
 // Host zones, configured only when the process has none: a WEIGHT zone with room for two copy sources, and the
 // small KV, STAGING and SCRATCH zones test-mem-ops configures (this test allocates nothing from them).
@@ -290,10 +288,16 @@ static double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// 16 x 4 MiB pinned H2D on `copy_q`; returns wall ms from the first submit to copy_q.wait() and adds to `staged`
-// how many of the copies took the staged host-to-device branch. The census is per thread and the copies are
-// submitted on this one, so the difference is exactly these copies; it is read outside the timed window.
-static double time_copies(sycl::queue & copy_q, const mem_handle & dst, const mem_handle & src, uint64_t & staged) {
+// A row's copy tally over all its rounds: copies submitted, and how many of them took the staged branch.
+struct copy_tally {
+    uint64_t copies = 0;
+    uint64_t staged = 0;
+};
+
+// 16 x 4 MiB pinned H2D on `copy_q`; returns wall ms from the first submit to copy_q.wait() and adds to `tally` the
+// copies submitted and how many of them took the staged host-to-device branch. The census is per thread and the
+// copies are submitted on this one, so the difference is exactly these copies; it is read outside the timed window.
+static double time_copies(sycl::queue & copy_q, const mem_handle & dst, const mem_handle & src, copy_tally & tally) {
     const uint64_t staged_before = ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d;
     const auto     t0            = std::chrono::steady_clock::now();
     for (size_t i = 0; i < kChunks; ++i) {
@@ -301,7 +305,8 @@ static double time_copies(sycl::queue & copy_q, const mem_handle & dst, const me
     }
     copy_q.wait();
     const double ms = ms_since(t0);
-    staged += ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before;
+    tally.copies += kChunks;
+    tally.staged += ggml_sycl::mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before;
     return ms;
 }
 
@@ -467,15 +472,15 @@ int main() {
     int          failed  = 0;
     for (const spin & sp : spins) {
         for (const arm & a : arms) {
-            uint64_t staged = 0;
-            time_copies(*a.q, dst, src, staged);  // warm-up
+            copy_tally tally;
+            time_copies(*a.q, dst, src, tally);  // warm-up
             const drm_snapshot alone_before = read_drm_snapshot(pdev, fds);
-            const double       alone        = time_copies(*a.q, dst, src, staged);
+            const double       alone        = time_copies(*a.q, dst, src, tally);
             const drm_snapshot alone_after  = read_drm_snapshot(pdev, fds);
             const drm_snapshot with_before  = read_drm_snapshot(pdev, fds);
             const auto         t0           = std::chrono::steady_clock::now();
             sycl::event        k            = spin_kernel(ccs, counter, sp.groups, sp.iters);
-            const double       with         = time_copies(*a.q, dst, src, staged);
+            const double       with         = time_copies(*a.q, dst, src, tally);
             k.wait();
             const double       total      = ms_since(t0);
             // After the kernel's completion and after total_ms: the window holds the whole kernel on every row, and
@@ -488,12 +493,12 @@ int main() {
                 "adapter=%s spin=%s%s%s staged_h2d=%llu resolved=%s\n",
                 a.name, alone, with, sp.kernel_ms, total, overlap ? "yes" : "no", adapter, sp.name,
                 drm_delta_fields("alone_", alone_before, alone_after).c_str(),
-                drm_delta_fields("", with_before, with_after).c_str(), (unsigned long long) staged, resolved);
-            if (staged != 0) {
+                drm_delta_fields("", with_before, with_after).c_str(), (unsigned long long) tally.staged, resolved);
+            if (tally.staged != 0) {
                 std::printf(
-                    "FAIL: queue=%s spin=%s: %llu of the row's %zu copies took the staged host-to-device branch, so "
+                    "FAIL: queue=%s spin=%s: %llu of the row's %llu copies took the staged host-to-device branch, so "
                     "its times are a host memcpy, not the DMA\n",
-                    a.name, sp.name, (unsigned long long) staged, kCopyRoundsPerRow * kChunks);
+                    a.name, sp.name, (unsigned long long) tally.staged, (unsigned long long) tally.copies);
                 ++failed;
             }
             if (std::string(a.name) == "bcs" && std::string(resolved) == "compute") {
