@@ -1459,8 +1459,15 @@ included; `/ 11` is the 10 % rule on what remains once the ring's own bytes are 
       argument; the cpp and hpp comments say the input is the device expert set with the ring's loan counted back.
 - [ ] `g_sycl_expert_lent_bytes[device]` (atomic `size_t`) is the `dst_size` sum of the triplets currently lent on
       the device: added where the transaction body adds to `g_sycl_expert_lent_total`, subtracted on readmit by the
-      figure stored per triplet in the ledger, reset where the ledger is reset; `ggml_sycl_moe_stream_set_window`
+      figure stored per triplet in the ledger. The ledger follows the publication: a plan publication under another
+      `(model_id, load_txn_id)`, or of no plan, empties it and stores 0 to `lent_count` and `lent_bytes` at the end of
+      `ggml_sycl_publish_prepared_plan_locked`, and `ggml_sycl_expert_lent_ledger_locked` keeps the same check as a
+      belt (spec-7999-2: nothing else resets it, so a freed model's loan inflated the next model's cap).
+      `ggml_sycl_moe_stream_set_window`
       copies it into `op.window.lent_bytes`.
+- [ ] The loan fixture shows the ledger follows the publication: lend, publish another identity, then
+      `lent_bytes_are({})` and `lent_count == 0` before any loan or refill; lend, republish the same identity,
+      and the ledger is kept.
 - [ ] `test-moe-stream-ring-sizing` keeps the two pure boundary cases (22528 accepts, 22527 refuses) and every
       recomputed model-pin case; the inline constants-only "fixed point" check is gone (it could not fail).
 - [ ] `test-moe-stream-plan` has the fixed-point case: the geometry on plan `P` (device triplets totalling `R`,
