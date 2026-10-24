@@ -46,10 +46,11 @@ What this gate pins:
     ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor, the check the staged route refuses a weight on (c-las5), from
     call.plan, the plan the index build holds (lead ruling c-gi44); only the check's two-argument entry point, the
     batched executor's own route, reads the device's plan, by passing no plan;
-  - staging mirrors serving (llama.cpp-o9uw): the prompt-kernel predicate answers through the one helper the staged
-    route refuses on, ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel for a
-    type with no direct-kernel requirement (Q1_0 and NVFP4 run only through their direct kernel, which the recipe
-    validator and the executor choice ask through moe_type_needs_direct_kernel);
+  - the prompt-kernel predicate answers through the one helper the staged route refuses on (llama.cpp-o9uw),
+    ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel for a type with no
+    direct-kernel requirement (Q1_0 and NVFP4 run only through their direct kernel, which the recipe validator and the
+    executor choice ask through moe_type_needs_direct_kernel). Since W2 the ring stages from the library claim alone
+    and never asks the predicate; the pin keeps the still-wired predicate on the resolver's helper;
   - a region closes on the event of its last copy;
   - a refilled region's copies wait for its read gate: the barrier the executor submits behind the dequants of the
     window the region last held and hands to window_done (lead ruling c-o9uw-1), recorded for the region holding that
@@ -279,7 +280,8 @@ ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
 
 def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
     """One consultation site, in ggml_sycl_mul_mat_id's prompt ids-admission branch: after the graph-sink refusal and
-    the ids snapshot, guarded by the prompt-batch predicate, routed on the snapshot, and before moe_hybrid_with_plan."""
+    the ids snapshot, guarded by the prompt-batch predicate, passing the snapshot, which begin_layer no longer reads
+    (a signature pin), and before moe_hybrid_with_plan."""
     n = norm(sycl)
     if n.count(BEGIN_CALL) != 1:
         return False
@@ -317,7 +319,7 @@ def test_begin_layer_mutants():
     late = mutate(SYCL, BEGIN_GUARD + " " + stmt, BEGIN_GUARD)
     late = late.replace(HYBRID_WITH_PLAN, stmt + " " + HYBRID_WITH_PLAN, 1)
     assert not claim_begin_layer_once_in_prompt_branch(late)
-    # routed on something other than the snapshot
+    # the snapshot not passed: begin_layer no longer reads it, so this pins the call's signature
     assert not claim_begin_layer_once_in_prompt_branch(
         mutate(SYCL, "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()", "nullptr, 0"))
 
@@ -891,11 +893,11 @@ DIRECT_USES = (
 
 
 def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
-    """llama.cpp-o9uw: the ring stages only what the staged route can serve. The prompt-kernel predicate and the
-    resolver ask one helper, which admits a supported MMVQ_COMPAT kernel and nothing else, and refuses a type that
-    runs only through its direct kernel. Which types those are is one predicate, the one the recipe validator and the
-    executor choice ask, and neither of those spells the types out, so the staging predicate cannot drift from the
-    served test: Q1_0 and NVFP4, which the capability query answers MMVQ_COMPAT for in a prompt, stage NONE. The
+    """llama.cpp-o9uw: the prompt-kernel predicate and the staged-route resolver ask one helper, which admits a
+    supported MMVQ_COMPAT kernel and nothing else, and refuses a type that runs only through its direct kernel. Which
+    types those are is one predicate, the one the recipe validator and the executor choice ask, and neither of those
+    spells the types out. Since W2 the ring stages from the library claim alone and never asks the prompt-kernel
+    predicate; this pin keeps the still-wired predicate on the resolver's helper, so the two cannot drift apart. The
     predicate's only answer other than the helper's is false for a missing call."""
     n = norm(sycl)
     b = norm(batch_hpp)
@@ -918,7 +920,7 @@ def test_staging_mirrors_serving():
 
 def test_staging_mirrors_serving_mutants():
     c = claim_staging_mirrors_serving
-    # The predicate answering from the capability alone again, so a Q1_0/NVFP4 matrix stages and is never served.
+    # The predicate answering from the capability alone again, so it drifts from the resolver's helper on Q1_0/NVFP4.
     assert not c(mutate(SYCL, PROMPT_KERNEL_RETURN, "return cap.supported;"), BATCH_HPP)
     # The helper admitting a direct-kernel type.
     assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""), BATCH_HPP)
@@ -1253,6 +1255,35 @@ def test_window_decline_mutants():
     assert not c(mutate(PHASE, "const bool exposed =", short))
     # The window's size returned instead of what the table holds.
     assert not c(mutate(PHASE, "return staged; }", "return static_cast<uint32_t>(items.size()); }"))
+
+
+# ---- a micro-batch starts with no window (llama.cpp-9433) ------------------------------------------------------------
+
+UBATCH_RESETS = ("table_.clear();", "prev_window_layer_ = -1;", "next_window_id_ = UINT32_MAX;",
+                 "next_window_whole_ = false;")
+
+
+def claim_ubatch_resets_the_window_state(phase: str) -> bool:
+    """begin_ubatch clears the table, then forgets the last window's layer and the prefetch. A micro-batch can start at
+    the layer the last one ended on (moe_stream_ubatch_starts), so a window prefetched before the boundary has the same
+    id as one asked after it. Kept, the id would take the cleared window as prefetched and skip staging it (the executor
+    then declines it), and the whole flag would abort on the entries the clear dropped."""
+    return ordered(body(norm(phase), BEGIN_UBATCH_SIG), *UBATCH_RESETS)
+
+
+def test_ubatch_resets_the_window_state():
+    assert claim_ubatch_resets_the_window_state(PHASE)
+
+
+def test_ubatch_reset_mutants():
+    c = claim_ubatch_resets_the_window_state
+    # The prefetch id kept across the boundary.
+    assert not c(mutate(PHASE, "next_window_id_ = UINT32_MAX;", ""))
+    # The prefetch id and its whole flag kept.
+    assert not c(mutate(PHASE, "next_window_id_ = UINT32_MAX; next_window_whole_ = false;", ""))
+    # The last window's layer kept, so a micro-batch whose first window is not UP phase 0 (a layer whose UP role has
+    # no host matrix) reads it as prefetched and counts its copies as misses.
+    assert not c(mutate(PHASE, "prev_window_layer_ = -1;", ""))
 
 
 UBATCH_PRED_SIG = "static inline bool moe_stream_ubatch_starts("

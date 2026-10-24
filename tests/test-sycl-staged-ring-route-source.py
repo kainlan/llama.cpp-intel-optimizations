@@ -1436,6 +1436,7 @@ SPECIAL_MEMBERS = (
 RING_ACQUIRE_DECL = "mem_handle acquire_slot(ggml_layout_mode layout);"
 RING_ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout)"
 RING_SLICE = "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);"
+STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage_window("
 PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
 PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
 TAG_AGREES = "if (view.layout != s->layout) { return moe_staged_route_refusal::LAYOUT; }"
@@ -1448,6 +1449,7 @@ def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp:
     AOS for its one slot per matrix and records AOS, and asks no slot for SOA (the SOA staging is retired), and the
     resolver still refuses, as a layout refusal, a slot whose resolved layout is not its entry's."""
     mh, mc, rh, rc, ph = norm(mem_hpp), norm(mem_cpp), norm(ring_hpp), norm(ring_cpp), norm(phase)
+    stage = body(ph, STAGE_SIG)
     tagged = body(mc, TAGGED_SLICE_SIG)
     view = body(mc, VIEW_SIG)
     members_carry = all(all(line in body(mc, sig) for line in lines) for sig, lines in SPECIAL_MEMBERS)
@@ -1455,7 +1457,8 @@ def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp:
             and ordered(view, "if (!view.ptr) { return view; }", VIEW_APPLY, "if (!is_slice_) {")
             and members_carry
             and RING_ACQUIRE_DECL in rh and RING_SLICE in body(rc, RING_ACQUIRE_SIG)
-            and ordered(ph, PHASE_AOS_ACQUIRE, PHASE_AOS_ENTRY) and "acquire_slot(GGML_LAYOUT_SOA)" not in ph
+            and ordered(stage, PHASE_AOS_ACQUIRE, PHASE_AOS_ENTRY) and stage.count("acquire_slot(") == 1
+            and "acquire_slot(GGML_LAYOUT_SOA)" not in ph
             and "GGML_LAYOUT_SOA" not in ph
             and TAG_AGREES in build_body(sycl))
 
@@ -1492,6 +1495,9 @@ def test_tag_is_the_layout_mutants():
     # A SOA slot acquired beside it again.
     assert not claim_tag_is_the_layout(
         *with_(4, PHASE_AOS_ACQUIRE, PHASE_AOS_ACQUIRE + " mem_handle soa = ring_->acquire_slot(GGML_LAYOUT_SOA);"))
+    # A second AOS slot per matrix.
+    assert not claim_tag_is_the_layout(
+        *with_(4, PHASE_AOS_ACQUIRE, PHASE_AOS_ACQUIRE + " mem_handle aos2 = ring_->acquire_slot(GGML_LAYOUT_AOS);"))
     # The resolver trusting the entry without checking the slot agrees.
     assert not claim_tag_is_the_layout(*with_(5, TAG_AGREES, ""))
 
