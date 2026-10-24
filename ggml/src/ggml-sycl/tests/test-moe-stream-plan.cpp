@@ -103,7 +103,6 @@ std::vector<moe_stream_item> plan_build(const placement_plan & plan,
         item.layer     = e.layer_id;
         item.expert_id = e.expert_id;
         item.role      = e.expert_role;
-        item.dst_bytes = e.dst_size;
         item.src_bytes = e.src_size;
         out.push_back(item);
     }
@@ -302,7 +301,6 @@ int main() {
         CHECK(all[i].expert_id == exp_e[i / 3]);
         CHECK(all[i].role == exp_r[i % 3]);
         CHECK(all[i].src_bytes == kSrc);
-        CHECK(all[i].dst_bytes == kDst);
         CHECK(all[i].type == 0 && all[i].ncols == 0 && all[i].nrows == 0);
     }
 
@@ -345,7 +343,7 @@ int main() {
 
     // The reference above is checked against production: moe_stream_plan_index_build lists, for every layer with a
     // host expert, the same (expert_id, role) sequence as the STREAM_ALL reference, and omits layer 3 (no host
-    // experts). The null prompt_kernel makes the production staging NONE for every item, and the hand-built entries'
+    // experts). The null library_claims makes the production staging NONE for every item, and the hand-built entries'
     // zeroed type and shape would force it too; only the list is compared. The comparison fails on a dropped role, a
     // reordered expert, or a fused GATE_UP host entry listed as a triplet (layer 1 would then have 10 items, not 9).
     const ggml_sycl::moe_stream_plan_index idx = ggml_sycl::moe_stream_plan_index_build(

@@ -36187,6 +36187,12 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
            ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*call->plan, w, call->device);
 }
 
+// The auto-ubatch fit's claims hook (llama.cpp-9433): every weight claimed, reading no graph. A claim is the only way a
+// matrix takes a ring slot (W2), so claiming every weight sizes the largest window ring the stream phase can stage.
+static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::expert_tensor_role) {
+    return true;
+}
+
 // The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
 // supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
 // ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
@@ -36194,18 +36200,19 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
 // device's resident expert bytes plus the bytes lent to the ring now, ggml_sycl_moe_stream_set_window). A refused
 // probe (a graph is active) lends nothing, so the whole ring counts.
 //
-// The geometry is the stream phase's own: moe_stream_plan_ring_geometry over the same prompt-kernel predicate, so the
-// fit and the ring cannot disagree about its size. The predicate reads a stream call: the device and the rows. At the
-// PROMPT phase the capability it queries reads the rows only to refuse zero (ggml_sycl_moe_query_route_capability);
-// the decode rows == 1 case of the Q1_0 / NVFP4 AOS candidate is not reached, and the XMX-tiled row limit is for a
-// layout the ring never asks about. So the geometry does not depend on the rung and `n_ubatch` stands in for the
-// micro-batch's rows. The fit passes NO library-claims hook: the backend's hook reads g_moe_gate_up_pairs, a
-// thread-local scan of a graph that is stale outside compute (a previous model's weight tensors can still be in it),
-// so asking it here could read freed tensors. The fit therefore counts no library claim, and its ring is an upper
-// bound of the phase's, never an under-count: a claim makes a matrix one AOS slot, never more than the kernels' answer
-// gives it (moe_stream_plan_ring_geometry). The ring holds one executor window per region, and the window is read
-// from the same helper the phase uses (ggml_sycl_moe_stream_set_window): the device's planned f16 weight slot, which
-// the load publishes before any context transaction, so the fit charges the window-sized ring the phase reserves.
+// The geometry is the stream phase's own, moe_stream_plan_ring_geometry, so the fit and the ring cannot disagree about
+// how a claimed matrix is sized. The prompt-kernel hook and the rows (`n_ubatch` stands in for the micro-batch's) are
+// passed for the shared signature; since the window ring (W2) the index build asks neither. The claims hook is what
+// sizes the ring, and the fit cannot pass the backend's: it reads g_moe_gate_up_pairs, a thread-local scan of a graph
+// that is stale outside compute (a previous model's weight tensors can still be in it), so asking it here could read
+// freed tensors. A null hook claims nothing and so sizes no ring, an under-count. The fit passes
+// ggml_sycl_moe_stream_claims_every_weight instead: a claim is the only way a matrix takes a slot, so claiming every
+// weight stages every host matrix one AOS slot holds, and the fit's ring bounds the phase's from above. Two edges
+// escape the bound: the cap can refuse the whole set's ring where a claimed subset's would pass it (the fit then
+// charges 0), and a claimed subset whose largest f16 expert is smaller than the whole set's gets a wider window. The
+// ring holds one executor window per region, and the window is read from the same helper the phase uses
+// (ggml_sycl_moe_stream_set_window): the device's planned f16 weight slot, which the load publishes before any context
+// transaction, so the fit charges the window-sized ring the phase reserves.
 // The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
 // context transaction, before it publishes, this can see the previous plan or none, and the realized check (run
 // after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
@@ -36216,15 +36223,16 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     if (!current || !current->plan) {
         return 0;
     }
-    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the prompt-kernel hook reads it through graph_ctx
+    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the hooks' graph_ctx, which neither reads
     call.plan        = current->plan;
     call.cache       = ggml_sycl::get_unified_cache_for_device(device);
     call.device      = device;
     call.op.n_tokens = n_ubatch;
     ggml_sycl_moe_stream_set_window(call.op, device);
 
-    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
-        *call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr, call.op.window);
+    const ggml_sycl::moe_stream_ring_geometry geo =
+        ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call,
+                                                 ggml_sycl_moe_stream_claims_every_weight, call.op.window);
     if (geo.bytes == 0) {
         return 0;
     }

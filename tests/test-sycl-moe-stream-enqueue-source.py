@@ -358,7 +358,7 @@ def test_copy_mutants():
     assert not claim_copy_on_bcs_behind_region_gate(
         mutate(PHASE, "cache.get_bcs_queue(), deps)", "cache.get_bcs_queue(), { ring_->current_region_gate() })"))
     assert not claim_copy_on_bcs_behind_region_gate(
-        mutate(PHASE, "aos, host, item.src_bytes, ", "aos, host, item.dst_bytes, "))
+        mutate(PHASE, "aos, host, item.src_bytes, ", "aos, host, host_bytes, "))
 
 
 def claim_window_copy_is_the_only_submission(phase: str) -> bool:
@@ -1590,7 +1590,7 @@ RULE_ORDER = (
     "idx.host_matrices_per_layer_max == 0", '"no host matrices of a streamable type"',
     "idx.matrix_bytes_max == 0", '"no matrix bytes"',
     "idx.window_slots == 0", '"no executor window"',
-    "geo.n_slots == 0", '"ring exceeds 10% of resident expert bytes"',
+    "geo.n_slots == 0", '"ring exceeds an eleventh of resident plus lent expert bytes"',
     "!in_order", '"queue not in order"',
     "reserve_failed", '"reserve refused"',
 )
@@ -1630,7 +1630,7 @@ def test_ring_unavailable_diagnostic_mutants():
     swapped = mutate(PHASE, "index_.region_slots_max, index_.window_slots, index_.matrix_bytes_max,",
                      "index_.window_slots, index_.region_slots_max, index_.matrix_bytes_max,")
     assert not claim_ring_unavailable_diagnostic(swapped, PLAN_HPP, {PHASE_REL: swapped})
-    # The window rule dropped from the helper, or asked after the 10% bound it would otherwise be reported as.
+    # The window rule dropped from the helper, or asked after the cap it would otherwise be reported as.
     assert not claim_ring_unavailable_diagnostic(
         PHASE, mutate(PLAN_HPP, "if (idx.window_slots == 0) { return \"no executor window\"; }", ""), SYCL_TREE)
     tree = dict(SYCL_TREE)
@@ -1639,6 +1639,10 @@ def test_ring_unavailable_diagnostic_mutants():
     assert not claim_ring_unavailable_diagnostic(mutate(PHASE, DIAG_EMIT, "(void) line;"), PLAN_HPP, SYCL_TREE)
     assert not claim_ring_unavailable_diagnostic(
         PHASE, mutate(PLAN_HPP, '"reserve refused"', '"reserve failed"'), SYCL_TREE)
+    # The cap named as the 10 % of resident bytes it was before the ring's lent bytes were counted back.
+    assert not claim_ring_unavailable_diagnostic(
+        PHASE, mutate(PLAN_HPP, '"ring exceeds an eleventh of resident plus lent expert bytes"',
+                      '"ring exceeds 10% of resident expert bytes"'), SYCL_TREE)
     # The claim rule dropped, or asked after the ring's rules that it would otherwise be reported as.
     claim_rule = 'if (!moe_stream_layer_claimed(li)) { return "executor does not claim"; }'
     assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, claim_rule, ""), SYCL_TREE)

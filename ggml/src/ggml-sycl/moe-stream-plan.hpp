@@ -80,7 +80,6 @@ struct moe_stream_item {
     int                 layer;
     int                 expert_id;
     expert_tensor_role  role;
-    size_t              dst_bytes;  // the SOA size the device route wants
     size_t              src_bytes;  // the AOS size of the host copy
     ggml_type           type;       // from the plan entry (moe_stream_plan_index_build)
     int64_t             ncols, nrows;
@@ -145,7 +144,7 @@ static inline size_t moe_stream_item_rows_bytes(const moe_stream_item & item) {
 }  // namespace detail
 
 // True iff one ring slot of `slot_bytes` holds `item` as AOS, to be read in place (c-hmey): its rows are whole blocks,
-// src_bytes is exactly its rows' bytes, and src_bytes fits. No SOA side is written, so dst_bytes plays no part.
+// src_bytes is exactly its rows' bytes, and src_bytes fits. No SOA side is written.
 static inline bool moe_stream_item_aos_fits(const moe_stream_item & item, size_t slot_bytes) {
     return detail::moe_stream_item_rows_bytes(item) != 0 && item.src_bytes <= slot_bytes;
 }
@@ -298,7 +297,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         item.layer     = e.layer_id;
         item.expert_id = e.expert_id;
         item.role      = e.expert_role;
-        item.dst_bytes = e.dst_size;
         item.src_bytes = e.src_size;
         item.type      = e.type;
         item.ncols     = e.ne[0];
@@ -354,7 +352,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
 // (llama.cpp-bcre).
 // A plan with no host expert has no layer and no region slot, so the sizing answers the default geometry. A null
 // `library_claims` claims nothing, so every item stages NONE and the geometry is the default too: no ring. The
-// auto-ubatch fit, a caller with no live graph scan, passes none, so the ring it charges is 0 bytes, below the phase's.
+// auto-ubatch fit, a caller with no live graph scan, passes ggml_sycl_moe_stream_claims_every_weight, claiming every
+// weight, so the ring it charges bounds the phase's from above, but for the two edges ggml_sycl_hold_ring_uncovered
+// names.
 static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const placement_plan &          plan,
                                                                      int                             device,
                                                                      moe_stream_prompt_kernel_fn     prompt_kernel,
@@ -405,12 +405,12 @@ static inline bool moe_stream_executor_claims(const moe_stream_layer_info & li, 
 
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
 // holds, in this order. A layer the executor does not claim comes first, since the ring serves the executor only (W2).
-// geo is what moe_stream_ring_size gave for idx; its all-zero answer past the index's first three rules is the 10%
-// bound (its overflow guards refuse sizes far above any resident expert set too). A window of 0 slots is no planned
-// executor slot (before the load publishes the inventory globals), or a slot that holds no expert. The last name is
-// unreachable while the cost model's stage unit is one streamable matrix (moe_stream_layer_info::matrix_bytes_max),
-// since a region of window_slots >= 1 slots holds the largest streamable matrix in each slot; it is there so that no
-// ring-unavailable line goes unexplained.
+// geo is what moe_stream_ring_size gave for idx; its all-zero answer past the index's first three rules is the cap,
+// an eleventh of the resident plus lent expert bytes (llama.cpp-7999; its overflow guards refuse sizes far above any
+// resident expert set too). A window of 0 slots is no planned executor slot (before the load publishes the inventory
+// globals), or a slot that holds no expert. The last name is unreachable while the cost model's stage unit is one
+// streamable matrix (moe_stream_layer_info::matrix_bytes_max), since a region of window_slots >= 1 slots holds the
+// largest streamable matrix in each slot; it is there so that no ring-unavailable line goes unexplained.
 static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_plan_index &    idx,
                                                             const moe_stream_layer_info &    li,
                                                             const moe_stream_ring_geometry & geo,
@@ -429,7 +429,7 @@ static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_pla
         return "no executor window";
     }
     if (geo.n_slots == 0) {
-        return "ring exceeds 10% of resident expert bytes";
+        return "ring exceeds an eleventh of resident plus lent expert bytes";
     }
     if (!in_order) {
         return "queue not in order";

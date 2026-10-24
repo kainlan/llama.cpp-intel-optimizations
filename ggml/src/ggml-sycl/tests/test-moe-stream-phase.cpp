@@ -306,7 +306,7 @@ int main() {
             const moe_stream_item & it = l0->items[i];
             CHECK(it.layer == 0 && it.expert_id == exp_e[i / 3] && it.role == kRoles[i % 3]);
             CHECK(it.type == GGML_TYPE_Q4_0 && it.ncols == kCols && it.nrows == kRows);
-            CHECK(it.src_bytes == src_bytes() && it.dst_bytes == dst_bytes());
+            CHECK(it.src_bytes == src_bytes());
         }
         // One AOS slot per matrix, read in place by the executor: nothing reorders.
         CHECK(items_all(*l0, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
@@ -525,7 +525,7 @@ int main() {
         moe_stream_plan_index no_window = idx;
         no_window.window_slots          = 0;
         CHECK(rule(no_window, c0, no_ring, true, false) == "no executor window");
-        CHECK(rule(idx, c0, no_ring, true, false) == "ring exceeds 10% of resident expert bytes");
+        CHECK(rule(idx, c0, no_ring, true, false) == "ring exceeds an eleventh of resident plus lent expert bytes");
         CHECK(rule(idx, c0, ring_geo, false, false) == "queue not in order");
         CHECK(rule(idx, c0, ring_geo, true, true) == "reserve refused");
         // None of the seven: named anyway, so no ring-unavailable line goes unexplained.
@@ -613,7 +613,6 @@ int main() {
     q.ncols     = kCols;
     q.nrows     = kRows;
     q.src_bytes = src_bytes();
-    q.dst_bytes = dst_bytes();
     CHECK(ggml_sycl::moe_stream_item_aos_fits(q, src_bytes()));  // the AOS bytes alone: no SOA side to hold
     CHECK(!ggml_sycl::moe_stream_item_aos_fits(q, src_bytes() - 1));
     moe_stream_item bad = q;

@@ -2931,13 +2931,20 @@ def test_the_shared_ring_geometry_pin_has_a_mutation_witness(where):
         assert not _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, mutated), "the mutant must make the pin fail"
 
 
-# What the fit hands the shared function (llama.cpp-kjef). A prompt-kernel hook left null, or a stream call whose rows
-# are 0 (the capability refuses zero rows), sizes NO ring, so the fit would under-count and wave a rung through. The
-# library-claims hook is null on purpose: the backend's hook reads a thread-local graph scan that is stale outside
-# compute (a previous model's weight tensors), so the fit counts no claim and its ring is an upper bound.
+# What the fit hands the shared function (llama.cpp-kjef). Since the window ring (W2) a claim is the only way an item
+# takes a ring slot, so the claims hook sizes the ring: a null hook claims nothing and sizes NO ring, and the fit would
+# under-count and wave a rung through. The backend's hook reads a thread-local graph scan that is stale outside compute
+# (a previous model's weight tensors), so the fit passes a hook that claims every weight (llama.cpp-9433), which IS the
+# upper bound: every host matrix one AOS slot holds takes its slot. The prompt-kernel hook, the call as graph_ctx and
+# the rows are passed for the shared signature; the index build no longer asks the prompt-kernel hook, so those three
+# mutants below pin the call's shape, not a sizing input.
 _RING_GEOMETRY_CALL = (
-    "ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr, "
-    "call.op.window);"
+    "ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, "
+    "ggml_sycl_moe_stream_claims_every_weight, call.op.window);"
+)
+# The fit's claims hook answers true for every weight and reads nothing: answering false would size no ring.
+_CLAIMS_EVERY_WEIGHT_DEF = (
+    "static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::expert_tensor_role) { return true; }"
 )
 _RING_ROWS_FILL = "call.op.n_tokens = n_ubatch;"
 # The ring is sized to the executor's window (docs/plans/2026-10-24-prefill-window-ring.md, W3): the fit fills the
@@ -2951,11 +2958,13 @@ def _fit_ring_geometry_call_pinned(raw_cpp: str) -> bool:
     body = re.sub(r"\s+", "", _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END))
     call = re.sub(r"\s+", "", _RING_GEOMETRY_CALL)
     fill = re.sub(r"\s+", "", _RING_WINDOW_FILL)
+    flat = re.sub(r"\s+", "", strip_comments(raw_cpp))
     return (
         body.count(call) == 1
         and body.count(re.sub(r"\s+", "", _RING_ROWS_FILL)) == 1
         and body.count(fill) == 1
         and -1 < body.find(fill) < body.find(call)
+        and flat.count(re.sub(r"\s+", "", _CLAIMS_EVERY_WEIGHT_DEF)) == 1
     )
 
 
@@ -2972,17 +2981,25 @@ def test_the_fit_hands_the_shared_ring_geometry_its_hooks_and_rows():
 @pytest.mark.parametrize(
     "old,new",
     [
-        ("ggml_sycl_moe_stream_prompt_kernel, &call, nullptr", "nullptr, &call, nullptr"),
-        ("ggml_sycl_moe_stream_prompt_kernel, &call, nullptr", "ggml_sycl_moe_stream_prompt_kernel, nullptr, nullptr"),
-        (
-            "ggml_sycl_moe_stream_prompt_kernel, &call, nullptr",
-            "ggml_sycl_moe_stream_prompt_kernel, &call, ggml_sycl_moe_stream_library_claims",
-        ),
+        ("ggml_sycl_moe_stream_prompt_kernel, &call,", "nullptr, &call,"),
+        ("ggml_sycl_moe_stream_prompt_kernel, &call,", "ggml_sycl_moe_stream_prompt_kernel, nullptr,"),
+        ("&call, ggml_sycl_moe_stream_claims_every_weight,", "&call, ggml_sycl_moe_stream_library_claims,"),
+        ("&call, ggml_sycl_moe_stream_claims_every_weight,", "&call, nullptr,"),
+        (_CLAIMS_EVERY_WEIGHT_DEF, _CLAIMS_EVERY_WEIGHT_DEF.replace("return true;", "return false;")),
         ("call.op.n_tokens = n_ubatch;", ""),
         ("ggml_sycl_moe_stream_set_window(call.op, device);", ""),
         ("call.op.window);", "ggml_sycl::moe_stream_window_hints());"),
     ],
-    ids=["no-prompt-kernel", "no-graph-ctx", "backend-library-claims", "no-rows", "no-window", "default-window"],
+    ids=[
+        "no-prompt-kernel",
+        "no-graph-ctx",
+        "backend-library-claims",
+        "null-claims",
+        "claims-nothing",
+        "no-rows",
+        "no-window",
+        "default-window",
+    ],
 )
 def test_the_fit_ring_geometry_call_has_a_mutation_witness(old, new):
     mutated = _mutate_raw_ws_tolerant(GGML_SYCL_CPP, old, new)
