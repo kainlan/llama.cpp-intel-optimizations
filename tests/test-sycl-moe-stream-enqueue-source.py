@@ -587,7 +587,7 @@ INDEX_BUILD_SIG = "static inline moe_stream_plan_index moe_stream_plan_index_bui
 RING_GEOMETRY_SIG = "static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry("
 # The one place the ring is sized (llama.cpp-kjef): the phase's prepare() and the auto-ubatch fit both call the helper.
 # A region holds one executor window, not a whole layer (docs/plans/2026-10-24-prefill-window-ring.md, W3).
-RING_SIZE_CALL = "moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, index.resident_expert_bytes)"
+RING_SIZE_CALL = "moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, resident_with_lent)"
 
 
 def claim_window_matrix_takes_one_aos_slot(phase: str, hpp: str) -> bool:
@@ -625,7 +625,7 @@ def test_window_slot_mutants():
     assert not c(mutate(PHASE, "ring_->slots_free() == 0", "ring_->slots_free() < 2"), PLAN_HPP)
     # The ring sized from the matrix count, as before c-hmey.
     assert not c(PHASE, mutate(PLAN_HPP, RING_SIZE_CALL, "moe_stream_ring_size(2 * index.host_matrices_per_layer_max, "
-                                                         "index.matrix_bytes_max, index.resident_expert_bytes)"))
+                                                         "index.matrix_bytes_max, resident_with_lent)"))
 
 
 STAGE_CLOSE = "close_region(region_last_);"

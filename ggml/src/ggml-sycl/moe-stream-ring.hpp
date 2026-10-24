@@ -8,8 +8,8 @@
 // SOA reorder destination; a matrix staged AOS-only spends one, read in place
 // (c-hmey). This header holds two things:
 //
-//   moe_stream_ring_size()  the pure geometry: two regions, each holding the
-//                           heaviest layer's slots, or no ring. It depends on
+//   moe_stream_ring_size()  the pure geometry: two regions, each holding one
+//                           executor window's slots, or no ring. It depends on
 //                           nothing, so the host-only test compiles it without
 //                           SYCL (GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY).
 //   moe_stream_ring         the reservation: one allocation, sliced into slots,
@@ -55,9 +55,15 @@ struct moe_stream_ring_geometry {
 
 // Two regions of region_slots slots of matrix_bytes_max (rounded up to
 // MOE_STREAM_RING_SLOT_ALIGN) each, or no ring when those bytes, padding
-// included, exceed resident_expert_bytes / 10. region_slots is one executor
-// window (moe_stream_plan_index::window_slots, min(role_items_max, G_plan)),
-// not a whole layer: the phase stages a layer a window at a time.
+// included, exceed 10 % of what the expert set keeps once the ring's own bytes
+// are lent out of it: bytes > (resident_expert_bytes - bytes) / 10, tested as
+// bytes > resident_expert_bytes / 11, which cannot overflow. The caller passes
+// resident_expert_bytes as the device's resident expert bytes PLUS the bytes
+// lent to the ring now (moe_stream_plan_ring_geometry, llama.cpp-7999): a loan
+// moves bytes from one term to the other, so the answer does not change with
+// it. region_slots is one executor window (moe_stream_plan_index::window_slots,
+// min(role_items_max, G_plan)), not a whole layer: the phase stages a layer a
+// window at a time.
 moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
                                               size_t   matrix_bytes_max,
                                               size_t   resident_expert_bytes);

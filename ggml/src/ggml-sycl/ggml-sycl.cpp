@@ -2780,6 +2780,8 @@ static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_lo
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) noexcept;
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
+static void ggml_sycl_expert_lent_ledger_reconcile_locked(int                                        device,
+                                                          const ggml_sycl::lifecycle_plan_snapshot * current) noexcept;
 
 // The process-global tenant publish generation (g_data_ptr_cache's stamp), defined
 // beside the cache.  Bumped by every plan publication and every teardown release.
@@ -16502,6 +16504,13 @@ static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publi
             publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);
         },
         [&] { std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release); });
+    // The lent ledgers describe the published plan's lent set: a publication under another identity, or of no plan,
+    // empties them here, so the next ring sizing never counts a previous plan's loan back (llama.cpp-7999). Every
+    // device's ledger, not only the cached ones: a device with no cache has an empty ledger, and the loop calls
+    // nothing that can throw.
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        ggml_sycl_expert_lent_ledger_reconcile_locked(d, snapshot.get());
+    }
 }
 
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
@@ -20860,11 +20869,14 @@ enum class ggml_sycl_expert_txn_direction {
 // the new prompt phase's ring reuses their bytes. A decode graph's boundary arms the cursor and a prompt graph's
 // disarms it. A refill re-admits from the back (the last lent, the most popular of them) and only while the cursor is
 // armed. g_sycl_expert_lent_count mirrors each ledger's size, so the boundary asks without the lock whether there is
-// anything to refill.
+// anything to refill. triplet_bytes holds, beside each lent triplet, the device bytes the loan moved out of the plan's
+// resident set (its three entries' dst_size, the figure moe_stream_plan_index_build sums), so whatever removes a
+// triplet removes exactly the bytes the loan added; g_sycl_expert_lent_bytes mirrors their sum (llama.cpp-7999).
 struct ggml_sycl_expert_lent_ledger {
     uint64_t                                                    model_id    = 0;
     uint64_t                                                    load_txn_id = 0;
     std::vector<std::array<ggml_sycl::expert_placement_key, 3>> triplets;
+    std::vector<size_t>                                         triplet_bytes;
     bool                                                        refill_armed = false;
 };
 
@@ -20875,21 +20887,65 @@ static std::atomic<uint32_t>        g_sycl_expert_lent_count[GGML_SYCL_MAX_DEVIC
 static std::atomic<uint32_t> g_sycl_expert_lent_total[GGML_SYCL_MAX_DEVICES];
 static std::atomic<uint32_t> g_sycl_expert_readmitted_total[GGML_SYCL_MAX_DEVICES];
 
-// The device's ledger under the publication `current`. A ledger kept under another publication (another model, or
-// another load of it) names experts of a plan that is gone and cannot be refilled, so it is emptied first. The caller
+// Per device, the device bytes of the triplets lent now: the sum of the ledger's triplet_bytes, stored wherever
+// g_sycl_expert_lent_count is (llama.cpp-7999). The ring's sizing adds it back to the plan's resident expert bytes
+// (moe_stream_window_hints::lent_bytes), so its cap reads the same figure before a loan and after it.
+static std::atomic<size_t> g_sycl_expert_lent_bytes[GGML_SYCL_MAX_DEVICES];
+
+// A lent triplet's device bytes: its three entries' dst_size in `plan`, the bytes moe_stream_plan_index_build stops
+// counting as resident on the device when the loan flips them to the host (the flip leaves dst_size as it is).
+static size_t ggml_sycl_expert_triplet_dst_bytes(const ggml_sycl::placement_plan & plan,
+                                                 const ggml_sycl::expert_placement_key (&placed)[3]) {
+    size_t bytes = 0;
+    for (int r = 0; r < 3; ++r) {
+        const ggml_sycl::placement_entry * e =
+            plan.find_expert_entry(placed[r].layer_id, placed[r].expert_id, placed[r].role);
+        bytes += e ? e->dst_size : 0;
+    }
+    return bytes;
+}
+
+// The sum of a ledger's triplet_bytes. The caller holds g_tensor_inventory_mutex.
+static size_t ggml_sycl_expert_lent_ledger_bytes(const ggml_sycl_expert_lent_ledger & ledger) {
+    GGML_ASSERT(ledger.triplet_bytes.size() == ledger.triplets.size());
+    size_t bytes = 0;
+    for (size_t b : ledger.triplet_bytes) {
+        bytes += b;
+    }
+    return bytes;
+}
+
+// The device's ledger follows the published plan (llama.cpp-7999). The ledger describes the published plan's lent set,
+// so a publication under another identity (another model, or another load of it), or of no plan (`current` null),
+// names experts of a plan that is gone and cannot be refilled: the ledger is emptied, with its count and lent bytes,
+// and takes the new identity (0, 0 for no plan). A publication under the same identity keeps it: the loan's own
+// republish and the KV transactions keep the identity, and their lent triplets stay lent. The publication calls this
+// for every device after it writes the plan; ggml_sycl_expert_lent_ledger_locked calls it too. The caller holds
+// g_tensor_inventory_mutex.
+static void ggml_sycl_expert_lent_ledger_reconcile_locked(int                                        device,
+                                                          const ggml_sycl::lifecycle_plan_snapshot * current) noexcept {
+    ggml_sycl_expert_lent_ledger & ledger      = g_sycl_expert_lent[device];
+    const uint64_t                 model_id    = current ? current->model_id : 0;
+    const uint64_t                 load_txn_id = current ? current->load_txn_id : 0;
+    if (ledger.model_id == model_id && ledger.load_txn_id == load_txn_id) {
+        return;
+    }
+    ledger.triplets.clear();
+    ledger.triplet_bytes.clear();
+    ledger.refill_armed = false;
+    ledger.model_id     = model_id;
+    ledger.load_txn_id  = load_txn_id;
+    g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
+    g_sycl_expert_lent_bytes[device].store(0, std::memory_order_release);
+}
+
+// The device's ledger under the publication `current`, emptied first when it was kept under another one. The caller
 // holds g_tensor_inventory_mutex.
 static ggml_sycl_expert_lent_ledger & ggml_sycl_expert_lent_ledger_locked(
     int                                        device,
     const ggml_sycl::lifecycle_plan_snapshot & current) {
-    ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
-    if (ledger.model_id != current.model_id || ledger.load_txn_id != current.load_txn_id) {
-        ledger.triplets.clear();
-        ledger.refill_armed = false;
-        ledger.model_id     = current.model_id;
-        ledger.load_txn_id  = current.load_txn_id;
-        g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
-    }
-    return ledger;
+    ggml_sycl_expert_lent_ledger_reconcile_locked(device, &current);
+    return g_sycl_expert_lent[device];
 }
 
 static bool ggml_sycl_expert_triplet_is(const std::array<ggml_sycl::expert_placement_key, 3> & lent,
@@ -20925,9 +20981,20 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
         }
         return false;
     };
-    ledger.triplets.erase(std::remove_if(ledger.triplets.begin(), ledger.triplets.end(), not_on_host),
-                          ledger.triplets.end());
+    // Each triplet leaves with its bytes, so the two vectors stay paired.
+    size_t kept = 0;
+    for (size_t t = 0; t < ledger.triplets.size(); ++t) {
+        if (not_on_host(ledger.triplets[t])) {
+            continue;
+        }
+        ledger.triplets[kept]      = ledger.triplets[t];
+        ledger.triplet_bytes[kept] = ledger.triplet_bytes[t];
+        ++kept;
+    }
+    ledger.triplets.erase(ledger.triplets.begin() + kept, ledger.triplets.end());
+    ledger.triplet_bytes.erase(ledger.triplet_bytes.begin() + kept, ledger.triplet_bytes.end());
     g_sycl_expert_lent_count[device].store(static_cast<uint32_t>(ledger.triplets.size()), std::memory_order_release);
+    g_sycl_expert_lent_bytes[device].store(ggml_sycl_expert_lent_ledger_bytes(ledger), std::memory_order_release);
     if (ledger.refill_armed) {
         for (size_t t = ledger.triplets.size(); t > 0 && keys.size() / 3 < max_triplets; --t) {
             keys.insert(keys.end(), ledger.triplets[t - 1].begin(), ledger.triplets[t - 1].end());
@@ -21249,6 +21316,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     ggml_sycl_expert_lent_ledger & ledger    = ggml_sycl_expert_lent_ledger_locked(device, *current);
     if (!refill) {
         ledger.triplets.reserve(ledger.triplets.size() + prepared.size());
+        ledger.triplet_bytes.reserve(ledger.triplet_bytes.size() + prepared.size());
     }
     uint32_t lent  = 0;
     size_t   freed = 0;
@@ -21263,6 +21331,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         GGML_ASSERT(n_dropped < dropped.size());
         dropped[n_dropped++] = { ledger.triplets.back()[0], reason };
         ledger.triplets.pop_back();
+        ledger.triplet_bytes.pop_back();
     };
     auto warn_dropped = [&] {
         for (size_t i = 0; i < n_dropped; ++i) {
@@ -21368,8 +21437,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
             }
             if (refill) {
                 ledger.triplets.pop_back();
+                ledger.triplet_bytes.pop_back();
             } else {
                 ledger.triplets.push_back({ placed[0], placed[1], placed[2] });
+                ledger.triplet_bytes.push_back(ggml_sycl_expert_triplet_dst_bytes(*next_plan, placed));
             }
             ++lent;
             freed += refill ? refilled.bytes_readmitted : record.bytes_freed;
@@ -21415,6 +21486,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     }
     result.n_remaining = ledger.refill_armed ? static_cast<uint32_t>(ledger.triplets.size()) : 0;
     g_sycl_expert_lent_count[device].store(static_cast<uint32_t>(ledger.triplets.size()), std::memory_order_release);
+    g_sycl_expert_lent_bytes[device].store(ggml_sycl_expert_lent_ledger_bytes(ledger), std::memory_order_release);
     if (refill) {
         g_sycl_expert_readmitted_total[device].fetch_add(lent, std::memory_order_relaxed);
     } else {
@@ -21935,6 +22007,7 @@ struct test_loan_fixture {
         g_sycl_expert_loan_requests[device].store(0, std::memory_order_release);
         g_sycl_expert_loan_busy_streak[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
+        g_sycl_expert_lent_bytes[device].store(0, std::memory_order_release);
         g_sycl_expert_lent_total[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_readmitted_total[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_refill_refusal_streak[device].store(0, std::memory_order_relaxed);
@@ -22325,6 +22398,36 @@ struct test_loan_fixture {
         return {};
     }
 
+    // The ledger's lent bytes against `triplets` as the published plan's entries carry them: the sum of their dst_size,
+    // the bytes the plan index stops counting as resident when they are lent (llama.cpp-7999). Computed from the plan,
+    // never from the ledger. A list whose entries carry no bytes would make the check vacuous, so it fails.
+    std::string lent_bytes_are(const std::vector<std::pair<int, int>> & triplets, const char * when) const {
+        const auto published = ::ggml_sycl_global_plan_snapshot();
+        if (!published || !published->plan) {
+            return test_loan_fail("no published plan to read the lent bytes from %s", when);
+        }
+        size_t want = 0;
+        for (const std::pair<int, int> & t : triplets) {
+            for (int s = 0; s < 3; ++s) {
+                const placement_entry * entry = published->plan->find_expert_entry(t.first, t.second, role(s));
+                if (!entry) {
+                    return test_loan_fail("layer %d expert %d slot %d has no plan entry %s", t.first, t.second, s,
+                                          when);
+                }
+                want += entry->dst_size;
+            }
+        }
+        if (!triplets.empty() && want == 0) {
+            return test_loan_fail("the %zu lent triplets carry no dst bytes in the plan %s", triplets.size(), when);
+        }
+        const size_t got = g_sycl_expert_lent_bytes[device].load(std::memory_order_acquire);
+        if (got != want) {
+            return test_loan_fail("the ledger's lent bytes are %zu %s, not the plan's %zu over %zu triplets", got, when,
+                                  want, triplets.size());
+        }
+        return {};
+    }
+
     // The experts other than host_expert the published plan has on the host: the lent ones.
     std::vector<std::pair<int, int>> lent_triplets(int host_expert) const {
         std::vector<std::pair<int, int>> lent;
@@ -22645,6 +22748,11 @@ std::string test_expert_loan_lends_two_triplets() {
         return test_loan_fail("the loan lent %u triplets and %zu bytes, not 2 and %zu", result.n_triplets,
                               result.bytes_freed, 6 * fx.staged_bytes);
     }
+    const std::pair<int, int> lent_first{ 1, 2 };
+    const std::pair<int, int> lent_second{ 1, 1 };
+    if (std::string why = fx.lent_bytes_are({ lent_first, lent_second }, "after the loan"); !why.empty()) {
+        return why;
+    }
 
     // Selection walks the plan from its tail, so it takes layer 1's experts 2 and 1.
     auto lent = [](int layer, int expert) {
@@ -22733,6 +22841,34 @@ std::string test_expert_loan_lends_two_triplets() {
     }
     if (!fx.device_entry_present(1, 0, 0) || !fx.device_entry_present(0, 2, 2)) {
         return "a device entry the loan did not select is gone";
+    }
+
+    // The ledger follows the publication (llama.cpp-7999). A republish under the same identity, the shape of a KV
+    // transaction, keeps the lent triplets and their bytes.
+    ::ggml_sycl_republish_current_plan();
+    if (g_sycl_expert_lent_count[fx.device].load() != 2) {
+        return test_loan_fail("a republish under the same identity left the ledger counting %u lent triplets, not 2",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are({ lent_first, lent_second }, "after a same-identity republish");
+        !why.empty()) {
+        return why;
+    }
+    // A publication under another identity (another model's plan, with no loan run since) empties the ledger at once,
+    // so the next ring sizing does not count this plan's loan back.
+    {
+        const auto other_plan = ::ggml_sycl_make_provisional_plan_snapshot(fx.plan(/*host_expert=*/3));
+        auto       other      = std::make_shared<lifecycle_plan_snapshot>(*other_plan);
+        other->model_id ^= 0x7999ull;
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        ::ggml_sycl_publish_plan_locked(other);
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 0) {
+        return test_loan_fail("a publication under another identity left the ledger counting %u lent triplets",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are({}, "after a publication under another identity"); !why.empty()) {
+        return why;
     }
     return {};
 }
@@ -23006,6 +23142,9 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     if (lent.size() != 2) {
         return test_loan_fail("the published plan has %zu lent triplets, not 2", lent.size());
     }
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
+    }
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
@@ -23039,6 +23178,9 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     const std::pair<int, int> still = lent[1 - back];
     if (test_loan_fixture::triplet_on_device(*first, still.first, still.second) != 0) {
         return "the triplet the first refill left is not on the host in the plan";
+    }
+    if (std::string why = fx.lent_bytes_are({ still }, "after the first refill"); !why.empty()) {
+        return why;
     }
     // Until the deferred-free pass finalizes them, the withdrawn host copies stay in the cache, retired, under the
     // exact keys a resolve looks up first. The re-admitted ids resolve past them to their device entries, with no
@@ -23108,6 +23250,9 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     if (g_sycl_expert_lent_count[fx.device].load() != 0) {
         return test_loan_fail("the ledger still counts %u lent triplets", g_sycl_expert_lent_count[fx.device].load());
     }
+    if (std::string why = fx.lent_bytes_are({}, "after the second refill"); !why.empty()) {
+        return why;
+    }
 
     // Nothing is left to re-admit, and nothing changes.
     const auto published = ::ggml_sycl_global_plan_snapshot();
@@ -23163,6 +23308,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     if (lent.size() != 2) {
         return test_loan_fail("the published plan has %zu lent triplets, not 2", lent.size());
     }
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
+    }
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
@@ -23181,6 +23329,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     const std::vector<std::pair<int, int>> still_lent = fx.lent_triplets(/*host_expert=*/3);
     if (still_lent.size() != 1) {
         return test_loan_fail("%zu triplets are still lent after the first refill, not 1", still_lent.size());
+    }
+    if (std::string why = fx.lent_bytes_are(still_lent, "after the first refill"); !why.empty()) {
+        return why;
     }
     const std::pair<int, int> still = still_lent[0];
     const std::pair<int, int> again = lent[0] == still ? lent[1] : lent[0];
@@ -23201,6 +23352,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     if (lent_now.size() != 2 || std::find(lent_now.begin(), lent_now.end(), still) == lent_now.end()) {
         return test_loan_fail("%zu triplets are lent after the second loan, not the first loan's one and the second's",
                               lent_now.size());
+    }
+    if (std::string why = fx.lent_bytes_are(lent_now, "after the second loan"); !why.empty()) {
+        return why;
     }
     const std::pair<int, int> newest    = lent_now[0] == still ? lent_now[1] : lent_now[0];
     const auto                published = ::ggml_sycl_global_plan_snapshot();
@@ -23254,6 +23408,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     }
     if (std::string why = fx.still_lent(still.first, still.second); !why.empty()) {
         return "the resumed refill took the first loan's triplet, not the back: " + why;
+    }
+    if (std::string why = fx.lent_bytes_are({ still }, "after the resumed refill"); !why.empty()) {
+        return why;
     }
     return {};
 }
@@ -23338,6 +23495,20 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     if (std::string why = fx.lend(12 * charge, 4, /*host_expert=*/3); !why.empty()) {
         return why;
     }
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
+    }
+    // The lent triplets the ledger still holds: all four, less each one a refill moves or drops.
+    auto still_in_ledger = [&](std::initializer_list<std::pair<int, int>> gone) {
+        std::vector<std::pair<int, int>> held;
+        for (const auto & t : lent) {
+            if (std::find(gone.begin(), gone.end(), t) == gone.end()) {
+                held.push_back(t);
+            }
+        }
+        return held;
+    };
 
     // The fixture's resolver, refusing slot 1 of the refused-th triplet a call asks about (0 is the ledger's back,
     // where the refill's preparation starts), as a tensor the registry no longer has is refused. Slot 0 of that
@@ -23373,6 +23544,11 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     if (g_sycl_expert_lent_count[fx.device].load() != 3) {
         return test_loan_fail("the ledger counts %u lent triplets after the drop, not 3",
                               g_sycl_expert_lent_count[fx.device].load());
+    }
+    // The dropped triplet stays on the host in the plan but leaves the ledger, and its bytes with it.
+    if (std::string why = fx.lent_bytes_are(still_in_ledger({ dropped_back }), "after the drop at the back");
+        !why.empty()) {
+        return why;
     }
     // A drop is progress, WARNed by name already, so the boundary runner does not count it as a refusal.
     if (g_sycl_expert_refill_refusal_streak[fx.device].load() != 0) {
@@ -23424,6 +23600,11 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
             "lent) and 1",
             on_host.size(), g_sycl_expert_lent_count[fx.device].load());
     }
+    if (std::string why = fx.lent_bytes_are(still_in_ledger({ dropped_back, moved, dropped_behind }),
+                                            "after the refill that moved one and dropped the one behind it");
+        !why.empty()) {
+        return why;
+    }
 
     // A full WEIGHT zone is transient: the refill answers BUSY, drops nothing, and the triplet stays in the ledger.
     std::vector<mem_handle> fillers;
@@ -23459,6 +23640,9 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     if (std::string why = fx.still_lent(last.first, last.second); !why.empty()) {
         return "the triplet a full WEIGHT zone refused: " + why;
     }
+    if (std::string why = fx.lent_bytes_are({ last }, "after the refill a full WEIGHT zone refused"); !why.empty()) {
+        return why;
+    }
 
     // The room back, the next decode graph's boundary re-admits the triplet the full zone kept.
     fillers.clear();
@@ -23474,6 +23658,10 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     }
     if (std::string why = fx.readmitted(last.first, last.second); !why.empty()) {
         return "the triplet the full zone kept: " + why;
+    }
+    // Two triplets are still on the host for the session, but neither is lent: the ledger is empty.
+    if (std::string why = fx.lent_bytes_are({}, "after the last refill"); !why.empty()) {
+        return why;
     }
     if (std::string why = fx.still_lent(dropped_back.first, dropped_back.second); !why.empty()) {
         return "the first dropped triplet, later: " + why;
@@ -23510,6 +23698,9 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
     if (lent.size() != 3) {
         return test_loan_fail("the published plan has %zu lent triplets, not 3", lent.size());
     }
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
+    }
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
@@ -23532,6 +23723,9 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
         return test_loan_fail(
             "%zu triplets are on the host and the ledger counts %u after the two-triplet call, not 1, 1",
             on_host.size(), g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are(on_host, "after the two-triplet refill"); !why.empty()) {
+        return why;
     }
     const std::pair<int, int>        still = on_host[0];
     std::vector<std::pair<int, int>> moved;
@@ -23574,6 +23768,9 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
     }
     if (std::string why = fx.readmitted(still.first, still.second); !why.empty()) {
         return "the triplet the two-triplet call left, re-admitted next: " + why;
+    }
+    if (std::string why = fx.lent_bytes_are({}, "after the last refill"); !why.empty()) {
+        return why;
     }
     if (g_sycl_expert_lent_total[fx.device].load() != 3 || g_sycl_expert_readmitted_total[fx.device].load() != 3) {
         return test_loan_fail("the teardown counts read %u/%u, not 3/3",
@@ -23735,6 +23932,9 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
             g_sycl_expert_loan_requests[fx.device].load() != 0 || g_sycl_expert_lent_count[fx.device].load() != 0) {
             return "the refused loan published a plan, re-posted its request or recorded a lent triplet";
         }
+        if (std::string why = fx.lent_bytes_are({}, "after the refused loan"); !why.empty()) {
+            return why;
+        }
         for (int s = 0; s < 2; ++s) {
             if (!fx.device_entry_present(1, s, 2) || fx.host_entry_present(1, s, 2)) {
                 return test_loan_fail("the refused loan moved layer 1 expert 2 slot %d", s);
@@ -23785,6 +23985,10 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
         return test_loan_fail("the ledger counts %u lent triplets with expert 2 behind the back, not 1",
                               g_sycl_expert_lent_count[fx.device].load());
     }
+    const std::pair<int, int> behind_back{ 1, 2 };
+    if (std::string why = fx.lent_bytes_are({ behind_back }, "after the refill of the back triplet"); !why.empty()) {
+        return why;
+    }
 
     const auto published = ::ggml_sycl_global_plan_snapshot();
     remaining            = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
@@ -23802,6 +24006,10 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
     if (::ggml_sycl_global_plan_snapshot().get() != published.get() ||
         g_sycl_expert_lent_count[fx.device].load() != 0) {
         return "the refill that dropped a triplet published a plan or kept it in the ledger";
+    }
+    if (std::string why = fx.lent_bytes_are({}, "after the refill that dropped the triplet with no host copy");
+        !why.empty()) {
+        return why;
     }
     const auto now = ::ggml_sycl_global_plan_snapshot();
     if (!now || !now->plan || test_loan_fixture::triplet_on_device(*now, 1, 2) != 0) {
@@ -32801,10 +33009,15 @@ static int ggml_sycl_moe_stream_layer_of(const ggml_tensor * src0) {
 }
 
 // The batched executor's phase on `device`, which the stream ring is sized to (moe_stream_window_hints): its planned
-// f16 weight slot and its group cap. The stream phase and the auto-ubatch fit both read it here, so they size one ring.
+// f16 weight slot and its group cap, and the device bytes lent to the ring now, which the sizing counts back as
+// resident so its cap does not move with a loan. The stream phase and the auto-ubatch fit both read it here, so they
+// size one ring.
 static void ggml_sycl_moe_stream_set_window(ggml_sycl::moe_stream_op & op, int device) {
     op.window.weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
     op.window.group_cap         = ggml_sycl_moe_pp_f16_group_experts_max();
+    op.window.lent_bytes        = device >= 0 && device < GGML_SYCL_MAX_DEVICES ?
+                                      g_sycl_expert_lent_bytes[device].load(std::memory_order_acquire) :
+                                      0;
 }
 
 // Fills `call` for a prompt MUL_MAT_ID of `src0` and makes ctx.moe_stream on first use. False when the op names no
@@ -35977,8 +36190,9 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
 // The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
 // supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
 // ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
-// host. 0 with no published plan, no host expert, or no ring (the sizing refuses one past a tenth of the resident
-// expert bytes). A refused probe (a graph is active) lends nothing, so the whole ring counts.
+// host. 0 with no published plan, no host expert, or no ring (the sizing refuses a ring over an eleventh of the
+// device's resident expert bytes plus the bytes lent to the ring now, ggml_sycl_moe_stream_set_window). A refused
+// probe (a graph is active) lends nothing, so the whole ring counts.
 //
 // The geometry is the stream phase's own: moe_stream_plan_ring_geometry over the same prompt-kernel predicate, so the
 // fit and the ring cannot disagree about its size. The predicate reads a stream call: the device and the rows. At the

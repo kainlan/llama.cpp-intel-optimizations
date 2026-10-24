@@ -2998,6 +2998,12 @@ _WINDOW_SLOT_FILL = (
     "op.window.weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);"
 )
 _WINDOW_CAP_FILL = "op.window.group_cap = ggml_sycl_moe_pp_f16_group_experts_max();"
+# The device bytes lent to the ring now, which the ring's sizing counts back as resident (llama.cpp-7999): without it
+# the cap reads the post-loan resident set and refuses the geometry the loan was sized for.
+_WINDOW_LENT_FILL = (
+    "op.window.lent_bytes = device >= 0 && device < GGML_SYCL_MAX_DEVICES ? "
+    "g_sycl_expert_lent_bytes[device].load(std::memory_order_acquire) : 0;"
+)
 _WINDOW_PREPARE_FILL = "ggml_sycl_moe_stream_set_window(call.op, ctx.device);"
 
 
@@ -3008,6 +3014,7 @@ def _window_helper_pinned(raw_cpp: str) -> bool:
         flat.count(re.sub(r"\s+", "", _WINDOW_HELPER_START)) == 1
         and helper.count(re.sub(r"\s+", "", _WINDOW_SLOT_FILL)) == 1
         and helper.count(re.sub(r"\s+", "", _WINDOW_CAP_FILL)) == 1
+        and helper.count(re.sub(r"\s+", "", _WINDOW_LENT_FILL)) == 1
         and flat.count("ggml_sycl_moe_stream_set_window(") == 3  # the definition, prepare and the fit
         and flat.count(re.sub(r"\s+", "", _WINDOW_PREPARE_FILL)) == 1
         and flat.count(re.sub(r"\s+", "", _RING_WINDOW_FILL)) == 1
@@ -3023,9 +3030,10 @@ def test_both_ring_sizings_read_one_window_helper():
     [
         (_WINDOW_SLOT_FILL, "op.window.weight_slot_bytes = 0;"),
         (_WINDOW_CAP_FILL, "op.window.group_cap = 0;"),
+        (_WINDOW_LENT_FILL, ""),
         (_WINDOW_PREPARE_FILL, ""),
     ],
-    ids=["no-slot", "no-cap", "prepare-skips-window"],
+    ids=["no-slot", "no-cap", "no-lent-bytes", "prepare-skips-window"],
 )
 def test_the_window_helper_pin_has_a_mutation_witness(old, new):
     mutated = _mutate_raw_ws_tolerant(GGML_SYCL_CPP, old, new)
@@ -3047,6 +3055,69 @@ def test_the_shared_ring_geometry_pin_sees_a_duplicated_call(where):
             GGML_SYCL_CPP, _RING_GEOMETRY_CALL, _RING_GEOMETRY_CALL + " (void) " + _RING_GEOMETRY_CALL
         )
         assert not _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, mutated), "the mutant must make the pin fail"
+
+
+# llama.cpp-7999 (Task 7 of llama.cpp-a2xb, first half of llama.cpp-8p5x): the ring may take 10 % of what the device's
+# expert set keeps once the ring's own bytes are lent out of it, bytes > (R - bytes) / 10, tested as R / 11, where R is
+# the device's resident expert bytes PLUS the bytes lent to the ring now. A loan moves bytes from the first term to the
+# second, so R, and the geometry, are the same before the loan and after it. Pinned here: the / 11 cap, and the sum
+# moe_stream_plan_ring_geometry hands it (the window helper's lent_bytes fill is pinned above).
+MOE_STREAM_RING_CPP = (ROOT / "ggml/src/ggml-sycl/moe-stream-ring.cpp").read_text()
+_RING_SIZE_START = "moe_stream_ring_geometry moe_stream_ring_size("
+_RING_SIZE_END = "#if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)"
+_RING_CAP_LINE = "if (bytes > resident_expert_bytes / 11) {"
+
+
+def _ring_cap_is_post_loan(raw_cpp: str) -> bool:
+    body = _body_of(raw_cpp, _RING_SIZE_START, _RING_SIZE_END)  # comment-stripped, whitespace-normalized
+    return body.count(_RING_CAP_LINE) == 1 and len(re.findall(r"\bresident_expert_bytes\b", body)) == 2
+
+
+def test_the_ring_cap_is_tested_against_the_post_loan_resident_set():
+    assert _ring_cap_is_post_loan(MOE_STREAM_RING_CPP)
+
+
+def test_the_post_loan_ring_cap_pin_has_a_mutation_witness():
+    assert MOE_STREAM_RING_CPP.count(_RING_CAP_LINE) == 1
+    mutated = MOE_STREAM_RING_CPP.replace(_RING_CAP_LINE, _RING_CAP_LINE.replace("/ 11", "/ 10"))
+    assert mutated != MOE_STREAM_RING_CPP
+    assert not _ring_cap_is_post_loan(mutated), "the pre-loan cap (/ 10) must make the pin fail"
+
+
+MOE_STREAM_PLAN_HPP = (ROOT / "ggml/src/ggml-sycl/moe-stream-plan.hpp").read_text()
+_RING_GEOMETRY_START = "static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry("
+_RING_GEOMETRY_END = "return geo;"
+_RING_LENT_SUM = "size_t resident_with_lent = index.resident_expert_bytes + hints.lent_bytes;"
+_RING_SIZE_CALL = "moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, resident_with_lent);"
+
+
+def _ring_cap_counts_the_loan_back(raw_hpp: str) -> bool:
+    body = re.sub(r"\s+", "", _body_of(raw_hpp, _RING_GEOMETRY_START, _RING_GEOMETRY_END))
+    return (
+        body.count(re.sub(r"\s+", "", _RING_LENT_SUM)) == 1
+        and body.count("moe_stream_ring_size(") == 1
+        and body.count(re.sub(r"\s+", "", _RING_SIZE_CALL)) == 1
+    )
+
+
+def test_the_ring_geometry_counts_the_rings_loan_back_as_resident():
+    assert _ring_cap_counts_the_loan_back(MOE_STREAM_PLAN_HPP)
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        (
+            _RING_SIZE_CALL,
+            "moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, index.resident_expert_bytes);",
+        ),
+        (_RING_LENT_SUM, "size_t resident_with_lent = index.resident_expert_bytes;"),
+    ],
+    ids=["bare-resident-field", "no-lent-term"],
+)
+def test_the_lent_back_ring_cap_pin_has_a_mutation_witness(old, new):
+    mutated = _mutate_raw_ws_tolerant(MOE_STREAM_PLAN_HPP, old, new)
+    assert not _ring_cap_counts_the_loan_back(mutated), "the mutant must make the pin fail"
 
 
 if __name__ == "__main__":

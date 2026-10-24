@@ -217,6 +217,74 @@ void test_window_sizing() {
     CHECK(idx.window_slots == 3);
 }
 
+// The ring cap is loan-invariant (llama.cpp-7999, first half of llama.cpp-8p5x): a loan flips device triplets to host,
+// so the index's resident bytes fall by the lent bytes L, and the caller hands L back through hints.lent_bytes. The
+// geometry sized before the loan is then the geometry sized after it, even where the cap is tight.
+void test_ring_cap_is_loan_invariant() {
+    placement_plan                     plan = make_typed_plan();
+    // A window of G_plan = 2 (fit = 4): every layer with host experts has 3 host items per role, so window_slots is
+    // G_plan-capped at 2 and lending one more triplet into layer 0 (4 items per role) does not grow it. A loan that
+    // grows window_slots is the second half of llama.cpp-8p5x and out of scope here.
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes     = 4 * kSrc;
+    // The ring: 2 regions x 2 slots x 4096 = 16384 bytes. The cap is tight at R = 11 x 16384 = 180224 resident
+    // bytes: the lendable triplet (layer 0, expert 0) carries 3 x kDst of them and one layer-3 entry the rest.
+    constexpr size_t ring_bytes = 4 * kSrc;
+    constexpr size_t resident   = 11 * ring_bytes;
+    constexpr size_t lent       = 3 * kDst;
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.expert_id < 0 || !e.on_device) {
+            continue;
+        }
+        const bool lendable = e.layer_id == 0 && e.expert_id == 0;
+        const bool anchor   = e.layer_id == 3 && e.expert_id == 0 && e.expert_role == expert_tensor_role::GATE;
+        e.dst_size          = lendable ? kDst : anchor ? resident - lent : 0;
+    }
+    ggml_sycl::moe_stream_plan_index idx;
+    const auto before = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, hints, &idx);
+    CHECK(idx.resident_expert_bytes == resident);
+    CHECK(idx.window_slots == 2);
+    CHECK(before.region_slots == 2 && before.n_slots == 4 && before.bytes == ring_bytes);
+
+    // Tight: one resident byte fewer refuses the ring.
+    placement_plan short_plan = plan;
+    for (ggml_sycl::placement_entry & e : short_plan.entries) {
+        if (e.layer_id == 3 && e.expert_id == 0 && e.expert_role == expert_tensor_role::GATE) {
+            e.dst_size -= 1;
+        }
+    }
+    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(short_plan, 0, nullptr, nullptr, claims_all, hints).bytes == 0);
+
+    // A sentinel lent_bytes saturates rather than wraps: R + SIZE_MAX would wrap to R - 1 = 180223, and
+    // 180223 / 11 = 16383 refuses the ring; clamped to SIZE_MAX the cap admits it.
+    ggml_sycl::moe_stream_window_hints sentinel_hints = hints;
+    sentinel_hints.lent_bytes                         = SIZE_MAX;
+    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, sentinel_hints).bytes ==
+          ring_bytes);
+
+    // The loan: the lendable triplet moves to the host (target_device -1, as the transaction's
+    // update_expert_placement sets it) and its device bytes come back through hints.lent_bytes.
+    placement_plan lent_plan = plan;
+    for (ggml_sycl::placement_entry & e : lent_plan.entries) {
+        if (e.layer_id == 0 && e.expert_id == 0) {
+            e.on_device     = false;
+            e.target_device = -1;
+        }
+    }
+    ggml_sycl::moe_stream_window_hints lent_hints = hints;
+    lent_hints.lent_bytes                         = lent;
+    ggml_sycl::moe_stream_plan_index lidx;
+    const auto                       after =
+        ggml_sycl::moe_stream_plan_ring_geometry(lent_plan, 0, nullptr, nullptr, claims_all, lent_hints, &lidx);
+    CHECK(lidx.resident_expert_bytes == resident - lent);
+    CHECK(lidx.role_items_max == 4);
+    CHECK(lidx.window_slots == 2);
+    CHECK(after.slot_bytes == before.slot_bytes);
+    CHECK(after.region_slots == before.region_slots);
+    CHECK(after.n_slots == before.n_slots);
+    CHECK(after.bytes == before.bytes);
+}
+
 }  // namespace
 
 int main() {
@@ -301,6 +369,7 @@ int main() {
     }
 
     test_window_sizing();
+    test_ring_cap_is_loan_invariant();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);
