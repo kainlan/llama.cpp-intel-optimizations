@@ -584,7 +584,8 @@ REGION_SIZE = "li.region_slots += static_cast<int>(moe_stream_staging_slots(item
 INDEX_BUILD_SIG = "static inline moe_stream_plan_index moe_stream_plan_index_build("
 RING_GEOMETRY_SIG = "static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry("
 # The one place the ring is sized (llama.cpp-kjef): the phase's prepare() and the auto-ubatch fit both call the helper.
-RING_SIZE_CALL = "moe_stream_ring_size(index.region_slots_max, index.matrix_bytes_max, index.resident_expert_bytes)"
+# A region holds one executor window, not a whole layer (docs/plans/2026-10-24-prefill-window-ring.md, W3).
+RING_SIZE_CALL = "moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, index.resident_expert_bytes)"
 
 
 def claim_aos_only_item_takes_one_slot(phase: str, hpp: str) -> bool:
@@ -854,8 +855,8 @@ PROMPT_KERNEL_RETURN = ("return ggml_sycl_moe_staged_capability_refusal(cap, typ
                         "ggml_sycl::moe_staged_route_refusal::NONE;")
 STAGING_SIG = "static inline moe_stream_staging moe_stream_item_staging("
 INDEX_CALL = ("moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, "
-              "&index_);")
-INDEX_BUILD_CALL = "moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims)"
+              "moe_stream_op_window_hints(op), &index_);")
+INDEX_BUILD_CALL = "moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints)"
 PREPARE_SIG = "void moe_stream_phase::prepare("
 
 
@@ -909,14 +910,18 @@ def test_staging_source_mutants():
     assert not claim_staging_from_the_capability_query(
         SYCL, PLAN_HPP,
         mutate(PHASE, INDEX_CALL,
-               "moe_stream_plan_ring_geometry(plan, device, nullptr, nullptr, op.library_claims, &index_);"))
+               "moe_stream_plan_ring_geometry(plan, device, nullptr, nullptr, op.library_claims, "
+               "moe_stream_op_window_hints(op), &index_);"))
+    # The ring sized with no executor window: the geometry would size no ring, whatever the op carries.
+    assert not claim_staging_from_the_capability_query(
+        SYCL, PLAN_HPP, mutate(PHASE, "moe_stream_op_window_hints(op), &index_);", "moe_stream_window_hints(), &index_);"))
     # The shared geometry helper builds the index blind or without the claims hook, whatever prepare() passes.
     assert not claim_staging_from_the_capability_query(
         SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, nullptr, nullptr, "
-                                                 "library_claims)"), PHASE)
+                                                 "library_claims, hints)"), PHASE)
     assert not claim_staging_from_the_capability_query(
         SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, prompt_kernel, "
-                                                 "graph_ctx, nullptr)"), PHASE)
+                                                 "graph_ctx, nullptr, hints)"), PHASE)
     # The predicate asked again at every stage.
     asked_again = AOS_ONLY_FLAG + " (void) op.prompt_kernel(op.graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, " \
                                   "item.nrows);"
@@ -1054,7 +1059,7 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
             and "MXFP4" not in lc and "moe_classify_tensor" not in lc
             and "g_moe_gate_up_pairs.find(layer)" in body(n, LAYER_WEIGHT_SIG)
             and n.count(LIBRARY_CLAIMS_FILL) == 1 and n.count(ROUTE_CONSUMER_REFUSAL) == 1
-            and "moe_stream_library_claims_fn library_claims)" in norm(hpp)
+            and "moe_stream_library_claims_fn library_claims, const moe_stream_window_hints & hints)" in norm(hpp)
             and ordered(build, INDEX_STAGING_ASK, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY,
                         "li.items.push_back(item);", INDEX_SLOT_SKIP, "++li.n_streamable;", REGION_SIZE)
             and norm(hpp).count("library_claims(graph_ctx") == 1

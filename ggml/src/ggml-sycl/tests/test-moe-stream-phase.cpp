@@ -212,8 +212,11 @@ bool kernels_table(void *, ggml_type type, ggml_layout_mode layout, int64_t, int
            (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ3_XXS);
 }
 
+// A planned weight slot that holds every expert: the window is the most streamable items one role of a layer has.
+const ggml_sycl::moe_stream_window_hints kWideWindow = { SIZE_MAX, 0 };
+
 moe_stream_plan_index index_of(const placement_plan & plan, ggml_sycl::moe_stream_prompt_kernel_fn kernels) {
-    return ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels, nullptr, nullptr);
+    return ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels, nullptr, nullptr, kWideWindow);
 }
 
 // The library executor's claims, handed to the index build through graph_ctx as the backend's call is.
@@ -510,7 +513,8 @@ int main() {
         // The predicate is asked once per distinct (type, shape, bytes) per build, not once per entry (c-7soh): the
         // plan has one host matrix shape, which takes a SOA question and then an AOS one.
         int calls = 0;
-        (void) ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_aos_counted, &calls, nullptr);
+        (void) ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_aos_counted, &calls, nullptr,
+                                                      kWideWindow);
         CHECK(calls == 2);
     }
 
@@ -519,8 +523,8 @@ int main() {
     // llama.cpp-v7np) ----
     {
         claims_probe                probe;
-        const moe_stream_plan_index claimed =
-            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2);
+        const moe_stream_plan_index claimed = ggml_sycl::moe_stream_plan_index_build(
+            make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2, kWideWindow);
         const moe_stream_layer_info * c0 = layer_info(claimed, 0);
         const moe_stream_layer_info * c1 = layer_info(claimed, 1);
         const moe_stream_layer_info * c2 = layer_info(claimed, 2);
@@ -549,7 +553,7 @@ int main() {
 
         // Every weight claimed: every matrix takes one slot of its AOS bytes.
         const moe_stream_plan_index all =
-            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all, kWideWindow);
         CHECK(soa_bytes_agree(all));
         CHECK(all.host_matrices_per_layer_max == 9 && all.region_slots_max == 9 && all.matrix_bytes_max == src_bytes());
         // ... and no layer has a byte to reorder.
@@ -559,9 +563,9 @@ int main() {
 
         // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
         // kernels_soa_q4 reads, takes one AOS slot. Unclaimed it takes none.
-        const moe_stream_plan_index iq_free = index_of(make_mixed_plan(true), kernels_soa_q4);
-        const moe_stream_plan_index iq_claimed =
-            ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(true), 0, kernels_soa_q4, nullptr, claims_all);
+        const moe_stream_plan_index iq_free    = index_of(make_mixed_plan(true), kernels_soa_q4);
+        const moe_stream_plan_index iq_claimed = ggml_sycl::moe_stream_plan_index_build(
+            make_mixed_plan(true), 0, kernels_soa_q4, nullptr, claims_all, kWideWindow);
         CHECK(soa_bytes_agree(iq_free) && soa_bytes_agree(iq_claimed));
         const moe_stream_layer_info * i1 = layer_info(iq_claimed, 1);
         const moe_stream_layer_info * f1 = layer_info(iq_free, 1);
@@ -587,7 +591,7 @@ int main() {
         zeroed.build_index();
         claims_probe                zprobe;
         const moe_stream_plan_index z =
-            ggml_sycl::moe_stream_plan_index_build(zeroed, 0, kernels_soa_q4, &zprobe, claims_l0_gate_l2);
+            ggml_sycl::moe_stream_plan_index_build(zeroed, 0, kernels_soa_q4, &zprobe, claims_l0_gate_l2, kWideWindow);
         CHECK(soa_bytes_agree(z));
         const moe_stream_layer_info * z2 = layer_info(z, 2);
         CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0 && z2->region_slots == 0);
@@ -600,7 +604,7 @@ int main() {
 
         // No weight claimed: the index is the one an unset predicate builds.
         const moe_stream_plan_index free_of =
-            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_none);
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_none, kWideWindow);
         // No claim: the kernels' SOA answer stands, so the claims path reorders every host triplet byte.
         CHECK(soa_bytes_agree(free_of));
         const moe_stream_layer_info * f0 = layer_info(free_of, 0);
@@ -631,6 +635,11 @@ int main() {
         moe_stream_plan_index no_bytes = mixed;
         no_bytes.matrix_bytes_max      = 0;
         CHECK(rule(no_bytes, none, true, false) == "no matrix bytes");
+        // No executor window (no planned weight slot, or one that holds no expert) sizes no ring either.
+        CHECK(mixed.window_slots != 0);
+        moe_stream_plan_index no_window = mixed;
+        no_window.window_slots          = 0;
+        CHECK(rule(no_window, none, true, false) == "no executor window");
         CHECK(rule(mixed, none, true, false) == "ring exceeds 10% of resident expert bytes");
         CHECK(rule(mixed, geo, false, false) == "queue not in order");
         CHECK(rule(mixed, geo, true, true) == "reserve refused");
@@ -657,8 +666,8 @@ int main() {
         // claims_l0_gate_l2: layer 0's gate entries and every entry of layer 2 carry consumer EXECUTOR; layer 0's up
         // and down entries carry ROUTE. Host experts are 1, 5 and 6 in layers 0 to 2.
         claims_probe                probe;
-        const moe_stream_plan_index claimed =
-            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2);
+        const moe_stream_plan_index claimed = ggml_sycl::moe_stream_plan_index_build(
+            make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2, kWideWindow);
         CHECK(soa_bytes_agree(claimed));
         const moe_stream_layer_info * c0        = layer_info(claimed, 0);
         const moe_stream_layer_info * c2        = layer_info(claimed, 2);
@@ -698,7 +707,7 @@ int main() {
         // no item, and no info all answer false.
         CHECK(!ggml_sycl::moe_stream_executor_staged(c0, expert_tensor_role::GATE_UP, b15, empty));
         const moe_stream_plan_index every =
-            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all, kWideWindow);
         CHECK(soa_bytes_agree(every));
         CHECK(!ggml_sycl::moe_stream_executor_staged(layer_info(every, 1), gate, b15,
                                                      table_of(1, { 1, 5, 6 }, gate, moe_stream_consumer::EXECUTOR)));

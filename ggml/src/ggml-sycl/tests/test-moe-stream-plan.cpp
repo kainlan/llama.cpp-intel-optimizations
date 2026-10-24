@@ -134,6 +134,77 @@ bool layer_fully_staged(const std::vector<moe_stream_item> & staged,
     return true;
 }
 
+// The make_plan() layout with each gate/up/down entry typed as one F16 matrix of kSrc bytes, so a claim can stage it
+// (moe_stream_plan_index_build gives a matrix a slot only once its rows are whole blocks of src_bytes). F16 makes one
+// expert's f16 bytes, K*N*2, equal to its src bytes, so the window arithmetic below reads in kSrc units.
+constexpr int64_t kTypedCols = 64;
+constexpr int64_t kTypedRows = static_cast<int64_t>(kSrc) / (2 * kTypedCols);
+
+placement_plan make_typed_plan() {
+    placement_plan plan = make_plan();
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.expert_id >= 0 && ggml_sycl::detail::moe_expert_role_is_triplet(e.expert_role)) {
+            e.type  = GGML_TYPE_F16;
+            e.ne[0] = kTypedCols;
+            e.ne[1] = kTypedRows;
+        }
+    }
+    return plan;
+}
+
+// The batched executor claims every weight: each host matrix stages AOS-only, one slot.
+bool claims_all(void *, int, expert_tensor_role) {
+    return true;
+}
+
+// The ring is sized to one executor window, min(role_items_max, G_plan), not to a whole layer's host matrices.
+void test_window_sizing() {
+    const placement_plan               plan = make_typed_plan();
+    // fit = slot / (K*N*2), G_plan = fit >= 2 ? fit / 2 : fit (the executor's two-buffer rule), capped by group_cap.
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes = 10 * kSrc;  // fit = 10 -> G_plan = 5
+    hints.group_cap         = 0;
+    auto idx = ggml_sycl::moe_stream_plan_index_build(plan, /*device*/ 0, nullptr, nullptr, claims_all, hints);
+    CHECK(idx.host_matrices_per_layer_max == 9);  // a layer has 9 host matrices, one role of it 3
+    CHECK(idx.role_items_max == 3);
+    CHECK(idx.window_slots == 3);                 // min(3 host items per role, G_plan 5)
+    hints.weight_slot_bytes = 4 * kSrc;           // fit = 4 -> G_plan = 2
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    CHECK(idx.window_slots == 2);
+    hints.weight_slot_bytes = 1 * kSrc;  // fit = 1 -> G_plan = 1 (one buffer)
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    CHECK(idx.window_slots == 1);
+    hints.weight_slot_bytes = kSrc - 1;  // fit = 0: the slot holds no expert
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    CHECK(idx.window_slots == 0);
+    hints.weight_slot_bytes = 10 * kSrc;
+    hints.group_cap         = 2;  // GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX caps G_plan
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    CHECK(idx.window_slots == 2);
+    hints.group_cap         = 0;
+    hints.weight_slot_bytes = 0;  // no planned slot yet (before the first prompt): no window, no ring
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    CHECK(idx.window_slots == 0);
+    // Nothing staged (no claim, no prompt kernel): no streamable item, so no window whatever the slot holds.
+    hints.weight_slot_bytes = 10 * kSrc;
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr, hints);
+    CHECK(idx.role_items_max == 0);
+    CHECK(idx.window_slots == 0);
+    // The geometry is sized from the window: 2 regions x 3 slots x 4096 (already 256-aligned) = 24576 bytes, against
+    // 2 x 9 slots for the whole-layer ring.
+    ggml_sycl::moe_stream_plan_index gidx;
+    const auto geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, hints, &gidx);
+    CHECK(geo.region_slots == 3);
+    CHECK(geo.n_slots == 6);
+    CHECK(geo.bytes == 6 * kSrc);
+    CHECK(gidx.window_slots == 3);
+    // The per-layer matrix maximum the cost model now reads as its stage unit; layer 3 has no host expert.
+    for (int l = 0; l < 3; ++l) {
+        CHECK(gidx.layers.count(l) == 1 && gidx.layers.at(l).matrix_bytes_max == kSrc);
+    }
+    CHECK(gidx.layers.count(3) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -197,8 +268,8 @@ int main() {
     // experts). The null prompt_kernel makes the production staging NONE for every item, and the hand-built entries'
     // zeroed type and shape would force it too; only the list is compared. The comparison fails on a dropped role, a
     // reordered expert, or a fused GATE_UP host entry listed as a triplet (layer 1 would then have 10 items, not 9).
-    const ggml_sycl::moe_stream_plan_index idx =
-        ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr);
+    const ggml_sycl::moe_stream_plan_index idx = ggml_sycl::moe_stream_plan_index_build(
+        plan, 0, nullptr, nullptr, nullptr, ggml_sycl::moe_stream_window_hints());
     for (int l = 0; l < kLayers; ++l) {
         const auto ref = plan_build(plan, l, moe_exec_regime::STREAM_ALL, nullptr, 0);
         const auto it  = idx.layers.find(l);
@@ -216,6 +287,8 @@ int main() {
             CHECK(it->second.items[i].role == ref[i].role);
         }
     }
+
+    test_window_sizing();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);

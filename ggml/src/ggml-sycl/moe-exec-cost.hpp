@@ -36,17 +36,17 @@ struct moe_exec_rates {
 };
 
 struct moe_exec_layer_inputs {
-    uint32_t n_tokens          = 0;  // rows of this micro-batch reaching the layer
-    int      n_expert          = 0;
-    int      n_expert_used     = 0;
-    size_t   host_expert_bytes = 0;    // this layer's host-resident triplet bytes
-    int      n_host_experts    = 0;
-    int64_t  K                 = 0;    // n_embd for gate/up, n_ff for down (use the larger: an upper bound)
-    int64_t  N                 = 0;    // K and N are n_embd and n_ff in either order: only the product is used
-    double   window_us         = 0.0;  // the previous layer's compute window the copies can hide under
-    size_t   ring_bytes_free   = 0;    // ring bytes the layer may use (0 = no ring)
-    size_t   triplet_bytes_max = 0;    // the largest host triplet of the layer
-    size_t   soa_bytes         = 0;    // the host_expert_bytes share the ring stages SOA: the only bytes it reorders
+    uint32_t n_tokens             = 0;  // rows of this micro-batch reaching the layer
+    int      n_expert             = 0;
+    int      n_expert_used        = 0;
+    size_t   host_expert_bytes    = 0;    // this layer's host-resident triplet bytes
+    int      n_host_experts       = 0;
+    int64_t  K                    = 0;    // n_embd for gate/up, n_ff for down (use the larger: an upper bound)
+    int64_t  N                    = 0;    // K and N are n_embd and n_ff in either order: only the product is used
+    double   window_us            = 0.0;  // the previous layer's compute window the copies can hide under
+    size_t   ring_bytes_free      = 0;    // ring bytes the layer may use (0 = no ring)
+    size_t   stage_unit_bytes_max = 0;    // the largest one matrix the ring stages for the layer (one slot)
+    size_t   soa_bytes            = 0;    // the host_expert_bytes share the ring stages SOA: the only bytes it reorders
 };
 
 struct moe_exec_decision {
@@ -124,7 +124,7 @@ static inline moe_exec_decision moe_exec_weigh(const moe_exec_layer_inputs & in,
         d.reason = moe_exec_reason::FORCED;
         return d;
     }
-    if (in.ring_bytes_free < in.triplet_bytes_max || in.ring_bytes_free == 0) {
+    if (in.ring_bytes_free < in.stage_unit_bytes_max || in.ring_bytes_free == 0) {
         d.choice = moe_exec_choice::CPU;
         d.reason = moe_exec_reason::RING_UNAVAILABLE;
         return d;

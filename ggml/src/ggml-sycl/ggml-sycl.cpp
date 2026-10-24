@@ -32805,6 +32805,13 @@ static int ggml_sycl_moe_stream_layer_of(const ggml_tensor * src0) {
     return layer >= 0 && layer < ggml_sycl::moe_exec_decision_log::MAX_LAYERS ? layer : -1;
 }
 
+// The batched executor's phase on `device`, which the stream ring is sized to (moe_stream_window_hints): its planned
+// f16 weight slot and its group cap. The stream phase and the auto-ubatch fit both read it here, so they size one ring.
+static void ggml_sycl_moe_stream_set_window(ggml_sycl::moe_stream_op & op, int device) {
+    op.planned_weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
+    op.group_cap                 = ggml_sycl_moe_pp_f16_group_experts_max();
+}
+
 // Fills `call` for a prompt MUL_MAT_ID of `src0` and makes ctx.moe_stream on first use. False when the op names no
 // layer the decision log can hold, the device has no cache, or no plan is published.
 static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
@@ -32840,6 +32847,7 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;
     call.op.request_loan   = ggml_sycl_request_expert_loan;
     call.op.loan_refusals  = ggml_sycl_expert_loan_refusals;
+    ggml_sycl_moe_stream_set_window(call.op, ctx.device);
     return true;
 }
 
@@ -35988,7 +35996,9 @@ static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggm
 // thread-local scan of a graph that is stale outside compute (a previous model's weight tensors can still be in it),
 // so asking it here could read freed tensors. The fit therefore counts no library claim, and its ring is an upper
 // bound of the phase's, never an under-count: a claim makes a matrix one AOS slot, never more than the kernels' answer
-// gives it (moe_stream_plan_ring_geometry).
+// gives it (moe_stream_plan_ring_geometry). The ring holds one executor window per region, and the window is read
+// from the same helper the phase uses (ggml_sycl_moe_stream_set_window): the device's planned f16 weight slot, which
+// the load publishes before any context transaction, so the fit charges the window-sized ring the phase reserves.
 // The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
 // context transaction, before it publishes, this can see the previous plan or none, and the realized check (run
 // after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
@@ -36004,9 +36014,11 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     call.cache       = ggml_sycl::get_unified_cache_for_device(device);
     call.device      = device;
     call.op.n_tokens = n_ubatch;
+    ggml_sycl_moe_stream_set_window(call.op, device);
 
-    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
-        *call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr);
+    const ggml_sycl::moe_stream_ring_geometry geo =
+        ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr,
+                                                 ggml_sycl::moe_stream_op_window_hints(call.op));
     if (geo.bytes == 0) {
         return 0;
     }
