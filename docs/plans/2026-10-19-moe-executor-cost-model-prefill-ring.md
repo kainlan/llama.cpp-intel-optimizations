@@ -4,6 +4,16 @@
 
 **Goal:** A Qwen3.8-Flash-Next prompt on the Arc Pro B70, with 41 % of its routed experts host-resident, processes at >= 500 tok/s (from 10.5-14.4 today) because each MoE layer's host-resident experts are streamed into a lent VRAM ring one layer ahead and run on the device, chosen per layer per micro-batch by a cost model that still picks the CPU path wherever it is cheaper, with decode, the GPT-OSS B50 gates and the Mistral gate unchanged.
 
+**Amendment (2026-10-23, llama.cpp-bcre, llama.cpp-348c, llama.cpp-3460, llama.cpp-pu8v):** The goal stands, but two
+premises changed while it was built. The record below is what was built, task by task.
+- The device executor was the larger half of the gap. With every expert in VRAM, Qwen1.5-MoE Q4_0 on the B70 ran
+  prompts through the per-row executor at 0.63 TFLOP/s, so the epic gained Task 10-pre (llama.cpp-348c) before Task
+  10: a batched f16 executor for every expert type.
+- The ring has never engaged on this host. The 10 %-of-resident cap refuses it on both canonical models
+  (llama.cpp-bcre, open, P0). Where a model passes the cap (Qwen1.5 at a 33-35 % VRAM budget) the ring is short and
+  its loan is refused (llama.cpp-pu8v). The >= 500 and >= 800 tok/s targets therefore move to the tasks that make the
+  ring engage, and Task 15's gate reports ring_engaged and loan_exercised instead of scoring a vacuous pass.
+
 **Architecture:** Placement is unchanged: the planner still decides which experts live in VRAM and which live in pinned host memory. What changes is the **executor** of a MUL_MAT_ID whose expert entries are host-resident. A pure cost model (`moe-exec-cost.hpp`, one layer of one micro-batch as its unit, decided before the layer's first MoE op) weighs today's CpuExpertPool path against staging the layer's host experts through a byte-budgeted VRAM ring (slots lent from the tail of the resident expert set for the prompt phase, refilled in the background afterwards) and running them with the same device kernels resident experts use. Streaming is an H2D copy on the cache's BCS queue followed by an AOS-to-SOA reorder on the compute queue, event-chained, the next layer's copies enqueued while this layer computes. The MoE batch resolver (`moe-resolved-batch.hpp`) learns one new transfer kind, `STAGED_RING`, which is the only way a host-resident entry can ever answer `PRIMARY_DEVICE`. Rates (H2D GB/s per device, CPU expert GB/s per type, device expert rate per type) are probed and persisted in the existing tuning cache, env-overridable. The micro-batch comes from the existing auto-ubatch trial with a ring fit term; `-ub` caps it.
 
 **Owner ruling this implements (2026-10-19, amends the 2026-08-16 "placement decides the executor" ruling):** *"Our unified cache is meant to intelligently handle everything automatically, if it's faster to stream host pinned weights to vram it should do that. No idea is too complicated for us to consider."* The brainstorm (llama.cpp-36j0 comments c-rnt5, c-6hvu) fixed: sub-project A first (B = llama.cpp-reba, C = llama.cpp-3kp7 filed); the cache picks the prompt micro-batch and `-ub` caps it; ring slots are lent during prompts and refilled after; rates are probed at load and persisted; layer-ahead ring streaming is the mechanism. The validated design is § 9 of the session brief (scratchpad `research-memarch/brief.md`); the reference engine is Strata at `/Apps/strata` (llama.cpp-tx1s; read-only data, never build or run it).
@@ -47,7 +57,7 @@
 |-------|-------|-------------|
 | L | 0, 9 | Lead: merge `task/7fmt`; measure the batched prompt executor per expert type (the spike Task 10 depends on) |
 | A | 1, 2, 3, 4 | Cost model core: the pure decision function, the rates record (seed + env + tuning-cache persistence), the H2D probe at init, the knobs and the `[MOE-EXEC]` log |
-| B | 5, 6, 7a, 7b, 8, 10 | Ring and streaming: the copy-path spike, ring reservation with epochs, the per-ubatch layer stream plan (host-only) and its enqueue, the `STAGED_RING` resolver route, the fully-staged layer's exit from the hybrid world |
+| B | 5, 6, 7a, 7b, 8, 10-pre, 10 | Ring and streaming: the copy-path spike, ring reservation with epochs, the per-ubatch layer stream plan (host-only) and its enqueue, the `STAGED_RING` resolver route, the batched f16 prompt executor for every expert type (10-pre, inserted 2026-10-22), the fully-staged layer's exit from the hybrid world |
 | C | 11a, 11b, 12, 13 | Loan selection (host-only), the loan and refill transactions on the placement plan, the auto-ubatch ring fit term |
 | D | 14, 15 | Docs (memory design, env vars, canonical contract), the gate script and the baselines section |
 
@@ -63,23 +73,30 @@ digraph dependencies {
     4  [label="Task 4: knobs + [MOE-EXEC] log"];
     5  [label="Task 5: spike: trusted H2D from host expert handles"];
     6  [label="Task 6: ring reservation + epochs"];
-    7a [label="Task 7a: layer stream plan (host-only)"];
-    7b [label="Task 7b: layer-ahead enqueue + wiring"];
+    "7a" [label="Task 7a: layer stream plan (host-only)"];
+    "7b" [label="Task 7b: layer-ahead enqueue + wiring"];
     8  [label="Task 8: STAGED_RING resolver route"];
     9  [label="Task 9: spike: batched prompt executor rates (lead)"];
+    "10pre" [label="Task 10-pre: batched f16 prompt executor, every expert type (llama.cpp-348c)"];
+    bcre [label="llama.cpp-bcre: ring geometry vs the 10% cap (open, P0)", style=dashed];
+    pu8v [label="llama.cpp-pu8v: the loan is refused, host storage too small (open)", style=dashed];
+    xr4i [label="llama.cpp-xr4i: probe rate = max over iterations 2..8"];
     10 [label="Task 10: fully staged layer leaves hybrid"];
-    11a [label="Task 11a: loan selection (host-only)"];
-    11b [label="Task 11b: loan transaction"];
+    "11a" [label="Task 11a: loan selection (host-only)"];
+    "11b" [label="Task 11b: loan transaction"];
     12 [label="Task 12: refill transaction"];
     13 [label="Task 13: auto-ubatch ring fit term"];
     14 [label="Task 14: docs + contract"];
     15 [label="Task 15: gate script + baselines"];
     0 -> 1; 0 -> 2;
     1 -> 2; 2 -> 3; 1 -> 4; 2 -> 4;
-    1 -> 7a; 7a -> 7b; 5 -> 7b; 6 -> 7b; 4 -> 7b; 7b -> 8; 8 -> 10; 9 -> 10;
-    7a -> 11a; 6 -> 11b; 11a -> 11b; 11b -> 12; 6 -> 13; 11b -> 13;
-    1 -> 14; 8 -> 14; 11b -> 14;
-    4 -> 15; 8 -> 15; 12 -> 15;
+    1 -> "7a"; "7a" -> "7b"; 5 -> "7b"; 6 -> "7b"; 4 -> "7b"; "7b" -> 8; 8 -> 10; 9 -> "10pre"; "10pre" -> 10;
+    8 -> bcre; bcre -> 10 [style=dashed, label="ring-engaged acceptance"];
+    12 -> pu8v; pu8v -> 10 [style=dashed, label="loan acceptance"];
+    3 -> xr4i; xr4i -> 12;
+    "7a" -> "11a"; 6 -> "11b"; "11a" -> "11b"; "11b" -> 12; 6 -> 13; "11b" -> 13;
+    1 -> 14; 8 -> 14; "11b" -> 14;
+    4 -> 15; 8 -> 15; 10 -> 15; 12 -> 15;
 }
 ```
 
@@ -87,24 +104,27 @@ digraph dependencies {
 
 | File/Directory | Tasks | Conflict Risk |
 |----------------|-------|---------------|
-| `ggml/src/ggml-sycl/moe-exec-cost.hpp` (new) | 1, 2 | Sequential (same track) |
+| `ggml/src/ggml-sycl/moe-exec-cost.hpp` (new) | 1, 2, 10-pre, 10 | Sequential; Task 10 re-seeded rates |
 | `ggml/src/ggml-sycl/tests/test-moe-exec-cost.cpp` (new) | 1, 2 | Sequential (same track) |
 | `ggml/src/ggml-sycl/tuning-cache-io.hpp`, `tests/test-tuning-cache-io.cpp` | 2 | None (single task) |
 | `ggml/src/ggml-sycl/ubatch-tuning-cache.cpp` | 2 | None (single task) |
-| `ggml/src/ggml-sycl/common.hpp` (`sycl_device_info` field) | 3 | None (single task) |
+| `ggml/src/ggml-sycl/common.hpp` (`sycl_device_info` field) | 3, 10-pre | Sequential |
 | `ggml/src/ggml-sycl/mem-ops.cpp` | 5 | None (single task) |
-| `ggml/src/ggml-sycl/moe-stream-ring.hpp/.cpp` (new) | 6 | None (single task) |
-| `ggml/src/ggml-sycl/moe-stream-plan.hpp` (new) | 7a, 7b, 10, 11a | 7a creates it; 7b and 10 (Track B) and 11a (Track C) append distinct declarations; 11a rebases on 7a |
-| `ggml/src/ggml-sycl/moe-stream-plan.cpp` (new) | 7b | None (single task) |
+| `ggml/src/ggml-sycl/moe-stream-ring.hpp/.cpp` (new) | 6, 10 | Sequential |
+| `ggml/src/ggml-sycl/moe-stream-plan.hpp` (new) | 7a, 7b, 8, 10-pre, 10, 11a | 7a creates it; Track B tasks and 11a (Track C) append; 11a rebases |
+| `ggml/src/ggml-sycl/moe-stream-plan.cpp` (new) | 7b, 8, 10-pre, 10 | Sequential (same track) |
 | `ggml/src/ggml-sycl/tests/test-moe-stream-*.cpp`, `test-moe-expert-loan-select.cpp` (new) | 6, 7a, 11a | One file per task |
 | `ggml/src/ggml-sycl/moe-resolved-batch.hpp` | 8 | None (single task) |
+| `ggml/src/ggml-sycl/moe-mmvq-tables.hpp` (new), `moe-layer-plan.hpp`, `gemm.hpp` | 10-pre, 10 | 10-pre creates the tables; 10 edits |
+| `tests/test-moe-pp-batched-dequant.cpp`, `tests/test-sycl-moe-mmvq-tables.cpp`, `tests/test-sycl-moe-pp-batched-types-source.py` (new) | 10-pre, 10 | 10-pre creates them; 10 edits the types gate |
 | `ggml/src/ggml-sycl/unified-cache.hpp/.cpp` (ring reservation, loan, refill) | 6, 11b, 12 | 6 in Track B, 11b/12 in Track C: distinct regions (ring API next to the PP oneDNN ring at `:7585`, loan/refill next to the retire primitives at `unified-cache.cpp:9927`); Track C rebases on 6 before merge |
-| `ggml/src/ggml-sycl/zone-sizing.hpp/.cpp`, `tests/test-zone-sizing.cpp` | 13 | None (single task) |
+| `ggml/src/ggml-sycl/zone-sizing.hpp/.cpp`, `tests/test-zone-sizing.cpp` | 10-pre, 13 | Sequential; 13 adds the ring term |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp` | 3 (init probe, ~28559), 4 (knob parse + log, ~17069/29258), 7b, 8 and 10 (mul_mat_id region 78077-87255 and the batch resolver 32180-32283), 11b and 12 (plan transaction next to 19682), 13 (hold fit 18554) | HOTSPOT. Distinct regions per track; every implementer rebases on master before building, commits path-scoped, and the lead merges one lane at a time |
 | `ggml/src/ggml-sycl/CMakeLists.txt` | 1, 4, 6, 7a, 11a, 11b | Appended blocks only; rebase |
-| `tests/CMakeLists.txt` | 2, 4, 8, 13, 14 | Appended `llama_test_pytest` blocks only; rebase |
-| `docs/backend/sycl-memory-design.md`, `docs/backend/sycl-env-vars.md`, `docs/design/sycl-canonical-memory-architecture.md` | 14 | None (single task) |
-| `scripts/sycl-moe-exec-gate.sh` (new), `docs/backend/sycl-perf-baselines.md` | 15 | None (single task) |
+| `tests/CMakeLists.txt` | 2, 4, 8, 10-pre, 13, 14, 15 | Appended `llama_test_pytest` blocks only; rebase |
+| `docs/backend/sycl-memory-design.md`, `docs/backend/sycl-env-vars.md`, `docs/design/sycl-canonical-memory-architecture.md` | 10-pre, 10, 14 | Sequential |
+| `scripts/sycl-moe-exec-gate.sh`, `scripts/sycl-moe-exec-prompts/code-2k.txt`, `tests/test-sycl-moe-exec-gate-script.sh` (all new) | 15 | None |
+| `docs/backend/sycl-perf-baselines.md` | 15 | None (single task) |
 
 ---
 
@@ -557,14 +577,25 @@ git commit -m "sycl, tests: the MoE executor's rates seed from the per-type CPU 
 - Create: `tests/test-sycl-h2d-probe-source.py`
 - Modify: `tests/CMakeLists.txt` (one appended `llama_test_pytest` block)
 
-**Description:** The cost model's `h2d_gbps` must be the real link rate of each card, measured from PINNED host memory (pageable DMA is 10.5-19 GB/s against 26.5-27.1 pinned, 8bgi c-nn1q, and the peer-bounce probe at `:28559` uses a pageable `std::vector` staging buffer, so it cannot be reused as is). The probe copies 64 MiB in 4 MiB chunks, 8 iterations, from a pinned-pool host allocation to a device allocation on the device's default queue, times it on the host, writes `info.h2d_pinned_gbps`, and stores it through Task 2's record when the tuning cache is enabled; a later start with a stored record skips the probe (`GGML_SYCL_H2D_PROBE=1` forces a re-probe, `=0` skips it and keeps the seed).
+**Description:** The cost model's `h2d_gbps` must be the real link rate of each card, measured from PINNED host memory
+(pageable DMA is 10.5-19 GB/s against 26.5-27.1 pinned, 8bgi c-nn1q, and the peer-bounce probe at `:28559` uses a
+pageable `std::vector` staging buffer, so it cannot be reused as is). The probe copies 64 MiB in 4 MiB chunks, 8
+iterations, from a pinned-pool host allocation to a device allocation on the device's default queue, times each
+iteration on the host, writes `info.h2d_pinned_gbps` (the maximum over iterations 2..8, llama.cpp-xr4i), and stores it
+through Task 2's record when the tuning cache is enabled; a later start with a stored record skips the probe
+(`GGML_SYCL_H2D_PROBE=1` forces a re-probe, `=0` skips it and keeps the seed).
 
 **Acceptance Criteria:**
 - [ ] Both allocations are `ggml_sycl::unified_allocate(req)` with `req.intent.role = alloc_role::STAGING`, `category = runtime_category::STAGING`, `cohort_id = "h2d_probe_src"` / `"h2d_probe_dst"`, the host one with `constraints.must_host_pinned = true; use_pinned_pool = true;`, the device one with `must_device = true; prefer_vram_zone = vram_zone_id::RUNTIME; forbid_vram_zone_spill = true;` (clauses b and d of `scripts/check-sycl-alloc-zone-contract.py`).
 - [ ] The copy is `ggml_sycl::mem_copy(dst_handle, src_handle, chunk, *q)` per chunk, like the peer probe (`:28608-28611`); the probe takes < 100 ms per device (8 x 64 MiB at >= 20 GB/s = 27 ms plus allocation).
-- [ ] Logged once at WARN as `[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)` with `(probed)` or `(tuning cache)` or `(seed, GGML_SYCL_H2D_PROBE=0)`.
+- [ ] Logged once at WARN as `[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)` with `(probed; iterations <lo>-<hi>)`
+      (llama.cpp-xr4i; it was `(probed)`) or `(tuning cache)` or `(seed, GGML_SYCL_H2D_PROBE=0)`.
 - [ ] The source gate pins: the probe function exists; both requests carry the literal tier flag; `mem_copy(` is the copy; the WARN string; `GGML_SYCL_H2D_PROBE` is read exactly once; `h2d_pinned_gbps` is read by exactly one consumer (Task 7b's rates assembly later changes that count to two and updates the gate).
-- [ ] Lead-run verification (recorded in the task's tracker comment): `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -p 'hi' -n 1 -lv 4 2>&1 | grep -c '\[MOE-EXEC\] h2d probe device 0: 2[4-9]\.[0-9] GB/s (probed)'` = 1 on the first run and `(tuning cache)` on the second; the same on `level_zero:1`; the Mistral gate output unchanged.
+- [ ] Lead-run verification (recorded in the task's tracker comment): `ONEAPI_DEVICE_SELECTOR=level_zero:0
+      ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -p 'hi' -n 1 -lv 4 2>&1 | grep -c
+      '\[MOE-EXEC\] h2d probe device 0: 2[0-9]\.[0-9] GB/s (probed; iterations'` = 1 on the first run (it was `2[4-9]`
+      and `(probed)`; see the Amendment) and `(tuning cache)` on the second; the same on `level_zero:1`; the Mistral
+      gate output unchanged.
 
 **Implementation Guide:**
 
@@ -675,6 +706,22 @@ git commit -m "sycl, tests: each device probes its pinned host-to-device rate on
 - The probe runs on EVERY device the selector exposes, the iGPU included when unpinned: 64 MiB on the iGPU is harmless (host memory to host memory), and the result is not used by any iGPU consumer. Keep the size at 64 MiB; 256 MiB on the iGPU is the TTM shmem story.
 - A `catch (const std::exception &)` here needs the `ggml_sycl_fallback_error` handler first or an allowlist entry (clause g of the contract script); copy the peer probe's arrangement at `:28620-28640`.
 
+**Amendment (2026-10-23, llama.cpp-zujy, llama.cpp-xr4i):** The probe merged as 31865e0b0 (llama.cpp-zujy) and was
+changed by llama.cpp-xr4i after the first GPU census.
+- The census: three of eleven readings sat at 9.x GB/s on both cards and the rest at 23-26, because the probe timed
+  the 8 x 64 MiB block as one mean and persisted that single mean, so one slow window stayed in the tuning cache until
+  `GGML_SYCL_H2D_PROBE=1`. This replaces the plan's "mean over one 8 x 64 MiB block" and the bare `(probed)` word.
+- The probe times each iteration. Iteration 1 is a second warm-up. The persisted rate is the maximum over iterations
+  2..8, and the WARN carries the spread: `[MOE-EXEC] h2d probe device %d: %.1f GB/s (probed; iterations <lo>-<hi>)`.
+  The `(tuning cache)` and `(seed, GGML_SYCL_H2D_PROBE=0)` strings are unchanged.
+- A maximum under MOE_EXEC_H2D_MIN_SEED_FRACTION (0.5) of the seed is RETRY_NO_RATE: the seed stands, the line reads
+  `(seed, probe max %.1f GB/s is under half the seed)`, and the device probes again at the next load instead of
+  freezing the reading. A copy that took the staged path is never stored either (RETRY_STAGED, `(seed, probe copy was
+  staged)`).
+- The plan's lead-run grep for `2[4-9].x GB/s (probed)` was too narrow. The direct rate on this host is 22.8-26.6 GB/s
+  (B70 22.8-25.3, B50 25.8-26.6), and 9y0p measured 20.2-21.0 for a 64 MiB direct DMA. The acceptance is a `(probed;
+  iterations ...)` line at >= 20 GB/s on both cards, then `(tuning cache)` on the second load.
+
 ---
 
 ## Task 4: The knobs, the `[MOE-EXEC]` decision log, the trace, the teardown summary
@@ -687,10 +734,21 @@ git commit -m "sycl, tests: each device probes its pinned host-to-device rate on
 - Create: `ggml/src/ggml-sycl/tests/test-moe-exec-policy.cpp`, `tests/test-sycl-moe-exec-knobs-source.py`
 - Modify: `ggml/src/ggml-sycl/CMakeLists.txt`, `tests/CMakeLists.txt`
 
-**Description:** Three knobs, parsed once: `GGML_SYCL_MOE_EXEC=auto|cpu|ring` (default auto; `cpu` reproduces today's behaviour exactly and is the A/B control arm; `ring` forces the ring wherever one exists), `GGML_SYCL_MOE_EXEC_TRACE=1` (one INFO line per layer per micro-batch with the decision's terms), `GGML_SYCL_MOE_RING_LAYERS=N` (ring bytes = N layers' host expert bytes instead of the default 2, still capped at 10 % of resident expert bytes). One WARN line `[MOE-EXEC] layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)` per DECISION CHANGE (the first decision, and every layer whose choice differs from its own previous micro-batch's), never per op; and a teardown summary `[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed`.
+**Description:** Three knobs, parsed once: `GGML_SYCL_MOE_EXEC=auto|cpu|ring` (default auto; `cpu` reproduces today's
+behaviour exactly and is the A/B control arm; `ring` forces the ring wherever one exists),
+`GGML_SYCL_MOE_EXEC_TRACE=1` (one INFO line per layer per micro-batch with the decision's terms),
+`GGML_SYCL_MOE_RING_LAYERS=N` (NOT BUILT: owner ruling B, c-3bde, removed it; see the Amendment; was: ring bytes = N
+layers' host expert bytes instead of the default 2, still capped at 10 % of resident expert bytes, with an unparsable
+or 0 value read as 2 and a value above 8 read as 8). One WARN line
+`[MOE-EXEC] layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)` per DECISION CHANGE (the first decision, and every
+layer whose choice differs from its own previous micro-batch's), never per op; and a teardown summary `[MOE-EXEC]
+summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed`.
 
 **Acceptance Criteria:**
-- [ ] `moe_exec_config_parse(getenv_fn)` returns `{policy, trace, ring_layers}`: `MOE_EXEC` unset or `auto` -> AUTO, `cpu` -> CPU, `ring` -> RING, anything else -> AUTO plus one WARN naming the value; `RING_LAYERS` unparsable or 0 -> 2, > 8 -> 8.
+- [ ] `moe_exec_config_parse(getenv_fn)` returns `{policy, trace, bad_policy}` (`ring_layers` was removed, c-3bde):
+      `MOE_EXEC` unset or `auto` -> AUTO, `cpu` -> CPU, `ring` -> RING, anything else -> AUTO plus one WARN naming the
+      value; there is no `RING_LAYERS` (was: `{policy, trace, ring_layers}`, with `RING_LAYERS` unparsable or 0 -> 2
+      and > 8 -> 8).
 - [ ] `moe_exec_decision_log` keeps per-(device, layer) the last `moe_exec_choice` and emits the WARN only when it changes; the host-only test drives 48 layers x 3 micro-batches and counts exactly 48 lines when nothing changes after the first, 49 when one layer flips once.
 - [ ] The three knobs appear in `sycl_env_settings[]` so `[SYCL] non-default settings in effect` reports them (`tests/test-sycl-env-report.cpp` already checks that table's mechanism).
 - [ ] Source gate: each `getenv` literal appears exactly once in `ggml/src/ggml-sycl/` (the catalog's literal-search command in `docs/backend/sycl-env-vars.md:7-14` is the oracle), the WARN format string appears once, and `docs/backend/sycl-env-vars.md` has a row for each (Task 14 writes the rows; this gate's doc assertion is marked `xfail` until Task 14 merges, then flipped: state it in the test's docstring).
@@ -732,6 +790,14 @@ git commit -m "sycl, tests: GGML_SYCL_MOE_EXEC, its trace and ring-layers knobs,
 - WARN, not INFO: INFO never reaches a default-verbosity run (CLAUDE.md llama-bench trap 1, `common/log.cpp:444`). The trace line is INFO on purpose (opt-in, `-lv 4` or `-v`).
 - The gate scores `[MOE-EXEC] layer` lines with `grep -c '^\[MOE-EXEC\] layer'`; a per-op emission would turn 48 into thousands and the gate fails. Positive control in the host test: a flip produces exactly one more line.
 - Do not add a `GGML_SYCL_MOE_EXEC_PP_SPLIT`-style sibling "for later"; YAGNI.
+
+**Amendment (2026-10-23, llama.cpp-pa1s, llama.cpp-oj8d):** Two facts about the knobs as built.
+- `GGML_SYCL_MOE_RING_LAYERS` is read by no code and has no catalog row. Owner ruling B (c-3bde, from the Task 6
+  review) fixed the ring at two regions that each hold a whole layer, so there is no ring-size knob and
+  `moe_stream_ring_size` takes the region's slot count, not a layer count. llama.cpp-bcre names a ring-size knob as
+  its option (c); it is not built.
+- `moe_exec_config` is `{policy, trace, bad_policy}` with `trace` an int level: 0 off, 1 one INFO line per layer per
+  micro-batch, 2 also the load-time copy probe; `bad_policy` is a `char[48]` copy of the rejected value.
 
 ---
 
@@ -785,8 +851,14 @@ git commit -m "sycl, tests: a pinned-pool WEIGHT-role host owner is a trusted US
 **Description:** The ring is N equal slots of `slot_bytes` = the largest host triplet's `dst_size` (entries are not equal-sized: `maybe_upgrade_moe_*_to_i8` and the PP alternates change sizes after the pack, `unified-cache.cpp:33082-33090`), carved as ONE allocation from the WEIGHT zone (`unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, bytes)`, `unified-cache.hpp:8047`, falling back to `unified_allocate_owner` with role `EXPERT_STAGING`, category `EXPERT_CACHE`, `must_device`, `prefer_vram_zone WEIGHT`, `forbid_vram_zone_spill`, exactly as the scratch pool does at `unified-cache.cpp:24935-24976`), sliced into slots through `mem_handle::slice` (`mem-handle.hpp:467`) so every slot is a `mem_handle` and no raw pointer leaves the module. Two epoch regions (the scratch pool's shape, `unified-cache.hpp:5995-6001`, `kScratchPoolRegionCount = 2`): a layer's slots are acquired from the current region; `epoch_boundary(down_gemm_event)` flips regions and the previous region is reusable only after that event, which is what gates layer l+2's copies on layer l's down GEMM (depth 2). The pure sizing (budget rule, slot count, depth) is a separate header function with a host-only test.
 
 **Acceptance Criteria:**
-- [ ] `moe_stream_ring_size(size_t host_bytes_per_layer_max, size_t resident_expert_bytes, size_t triplet_bytes_max, int ring_layers) -> moe_stream_ring_geometry {slot_bytes, n_slots, bytes}` with `bytes = min(ring_layers * host_bytes_per_layer_max, resident_expert_bytes / 10)` rounded down to whole slots; `n_slots = 0` when fewer than one layer's slots fit (the caller then answers RING_UNAVAILABLE).
-- [ ] Host test pins Qwen/B70: 2 x 410 MiB vs 10 % of 22 GiB -> 820 MiB -> 482 slots of 1741 KiB; GPT-OSS/B50 default-ctx: 2 x 712 MB vs 10 % of ~12 GB -> 1.2 GB -> 32 slots of 37.5 MB; `ring_layers` 1 -> half.
+- [ ] **Superseded by the Amendment (c-3bde B, c-fjx1 D): the signature, the `ring_layers` term and the slot size
+      changed.** `moe_stream_ring_size(size_t host_bytes_per_layer_max, size_t resident_expert_bytes, size_t
+      triplet_bytes_max, int ring_layers) -> moe_stream_ring_geometry {slot_bytes, n_slots, bytes}` with `bytes =
+      min(ring_layers * host_bytes_per_layer_max, resident_expert_bytes / 10)` rounded down to whole slots; `n_slots =
+      0` when fewer than one layer's slots fit (the caller then answers RING_UNAVAILABLE).
+- [ ] **Superseded by the Amendment (c-3bde B, c-fjx1 D): `ring_layers` does not exist and the pins moved.** Host test
+      pins Qwen/B70: 2 x 410 MiB vs 10 % of 22 GiB -> 820 MiB -> 482 slots of 1741 KiB; GPT-OSS/B50 default-ctx: 2 x
+      712 MB vs 10 % of ~12 GB -> 1.2 GB -> 32 slots of 37.5 MB; `ring_layers` 1 -> half.
 - [ ] `moe_stream_ring::reserve(int device, const moe_stream_ring_geometry &)` returns false (no throw, one WARN) when the zone cannot give `bytes`; `acquire_slot()` returns a `mem_handle` slice or an invalid handle when the current region is exhausted; `epoch_boundary(sycl::event)` flips; `release()` frees the owner only after both regions' events are complete (`retain_handles_until_event`).
 - [ ] Device test (`level_zero:1`, label `"sycl;moe;ring;cache;tdd"`, `SKIP_RETURN_CODE 77`, `RUN_SERIAL`): reserve 8 slots of 1 MiB; acquire 4, fill each with a distinct byte on the queue, boundary with the fill event, acquire 4 more (other region), boundary, acquire again and assert the slot returned is the first region's first slot and its handle resolves on device; release; `unified_cache_raw_device_held_bytes` returns to its pre-reserve value.
 - [ ] Alloc-zone contract passes (the request literals; no raw allocator).
@@ -824,7 +896,13 @@ class moe_stream_ring {
 }  // namespace ggml_sycl
 ```
 
-`reserve` splits `n_slots` across the two regions (`count = n_slots / 2` each); `acquire_slot` is `base_.slice(slot_index * slot_bytes, slot_bytes)`; `epoch_boundary` stores the event on the current region, flips, and before handing out the new current region's first slot waits NOTHING on the host: it asks `region.done.get_info<sycl::info::event::command_execution_status>()` and, if not complete, returns an invalid handle (the caller then falls back to CPU for that layer with the RING_UNAVAILABLE reason; memory `sycl-runtime-facts-from-the-th32-ht-probes`: a status query on an in-flight event busy-waits, so query once per acquire, never loop).
+`reserve` splits `n_slots` across the two regions (`count = n_slots / 2` each); `acquire_slot` is
+`base_.slice(slot_index * slot_bytes, slot_bytes)`; `epoch_boundary` stores the event on the current region, flips,
+and before handing out the new current region's first slot waits NOTHING on the host: it asks
+`region.done.get_info<sycl::info::event::command_execution_status>()` (**superseded by the Amendment, c-3bde A: no
+host status query; the device gates reuse**) and, if not complete, returns an invalid handle (the caller then falls
+back to CPU for that layer with the RING_UNAVAILABLE reason; memory `sycl-runtime-facts-from-the-th32-ht-probes`: a
+status query on an in-flight event busy-waits, so query once per acquire, never loop).
 5. Alloc-zone contract, format dry-run, both tests.
 
 **Commit:**
@@ -839,6 +917,34 @@ git commit -m "sycl, tests: a byte-budgeted ring of expert slots in the WEIGHT z
 - In single-chunk mode the WEIGHT zone allocator is nullptr and delegates to the KV allocator (`unified-cache.hpp:108-109`): the reserve must go through `unified_cache_zone_allocate_owner`, never touch the zone allocator directly.
 - The scratch pool hands out raw pointers (`get_scratch`, `unified-cache.cpp:25035`); do not copy that. The design doc says the epoch_region struct is deliberately not extracted (`sycl-memory-design.md:1132`); copy the POLICY, not the code.
 - No host waits: `epoch_boundary` never calls `.wait()`.
+
+**Amendment (2026-10-23, llama.cpp-mo41; lead rulings c-3bde A, B and c-fjx1 D from the Task 6 quality reviews):**
+These rulings supersede the acceptance text and the geometry above. They bind Tasks 4, 7b, 9, 11b, 12 and 14.
+- A. Slot reuse is gated on the device, not by a host status query. The sketch's `get_info<command_execution_status>`
+  on every acquire busy-waits up to 5 s on an in-flight profiling-queue event (every backend stream is one) and has
+  lied (memory sycl-runtime-facts-from-the-th32-ht-probes, facts 2 and 5). `acquire_slot()` is invalid only when the
+  ring is unreserved or the current region is exhausted. `current_region_gate()` returns the event the region's last
+  use ended with, and the caller chains every copy into that region with `depends_on(gate)`. Task 7b's call is
+  `mem_copy_async(aos, host, bytes, bcs, { ring_.current_region_gate() }, ...)`, and the RING_UNAVAILABLE reason
+  "prior epoch incomplete" no longer exists: the device orders it, and only "ring unreserved/exhausted" remains.
+- B. The slot unit is one matrix and a region holds a whole layer: `moe_stream_ring_size(uint32_t
+  host_matrices_per_layer_max, size_t matrix_bytes_max, size_t resident_expert_bytes)`. `layer_slots` is 2 x the host
+  matrices (an AOS and a SOA slot per matrix, as Task 7b spends them), and `n_slots` is 0 when two regions do not fit
+  under resident / 10 (no partial ring). `ring_layers` and `GGML_SYCL_MOE_RING_LAYERS` are not built: the regions are
+  fixed at two (Task 4's amendment). GPT-OSS on the B50 at the default context is RING_UNAVAILABLE under the 10 % cap
+  until the loan supplies bytes, and the Qwen/B70 case fits on paper (llama.cpp-bcre found it does not under
+  whole-layer host placement).
+- D. Ring slots are aligned. `slot_bytes` = the largest dst_size gave unaligned slots (Qwen's 594262 B is 2 mod 4;
+  IQ3_XXS at 98 B per block and MXFP4 at 17 B per block are not 4-aligned either), which Task 7b's MMVQ and oneDNN
+  consumers would read with wide loads from misaligned USM. `MOE_STREAM_RING_SLOT_ALIGN = 256` (the zone allocator's
+  default) lives in `moe-stream-ring.hpp`. `moe_stream_ring_size` rounds `slot_bytes` up to it and the 10 % cap counts
+  the padding. `reserve()` refuses a `slot_bytes` that is not a multiple of it and refuses every geometry except
+  `n_slots == 2 x region_slots` with `bytes == n_slots x slot_bytes`, with no silent trimming. Re-pinned: Qwen/B70
+  594432 B x 2892 = 1719097344 B (under the 2362232012 B cap), GPT-OSS/B50 12500224 B x 228 = 2850051072 B (no ring
+  under the cap, as before).
+- `release()` and the destructor carry no gate for the current region. The caller calls `epoch_boundary(<event of the
+  last use>)` before `release()`, or holds its slot handles until that device work completes, on every exit including
+  exception unwind (c-fjx1, quality minor 5).
 
 ---
 
@@ -907,12 +1013,20 @@ git commit -m "sycl, tests: a prompt layer's stream list is a pure function of t
 **Description:** At the FIRST MoE op of layer l in a prompt micro-batch (gate; identified as today by `prompt_batch` at `:81654` and the ids refresh at `:78446-78478`), the backend (a) assembles the rates (`moe_exec_rates_seed` over the layer's host mix from the plan's entries + `info.h2d_pinned_gbps` + the tuning-cache record + env), (b) weighs layer l+1 with `moe_exec_weigh` (its `window_us` is the measured wall time between layer l-1's and layer l's first MoE op, a host clock, no device query), (c) if RING: builds layer l+1's stream list (STREAM_ALL: every host-planned expert of layer l+1 in plan.entries order; ROUTED_ONLY: not available layer-ahead since ids are not known, so ROUTED_ONLY stages layer l's OWN touched host experts after its router, with the copy exposed) and enqueues, per expert, `mem_copy_async(slot, host_handle, dst_bytes, bcs_queue)` for the AOS bytes into a ring slot (Task 5 made it a direct DMA) and `ggml_sycl_reorder_weight_gpu(ccs_queue, aos_slot, soa_slot, type, ncols, nrows, src_bytes, {copy_event})` (`ggml-sycl.cpp:30845`; the pair is the body of `ggml_sycl_fill_reordered_gpu` at `:30898`, which this task refactors into a reusable static taking explicit handles), recording `{layer, expert, soa_slot_handle, reorder_event}` in the device's `moe_stream_stage_table`; (d) layer 0 of each micro-batch is staged at its own first op (the one exposed copy); (e) at layer l's down op completion event, `ring.epoch_boundary(down_event)`.
 
 **Acceptance Criteria:**
-- [ ] The ring geometry comes from `moe_stream_ring_size(host_bytes_per_layer_max, resident_expert_bytes, triplet_bytes_max, config.ring_layers)` (Task 4's knob, Task 6's function) at `begin_ubatch`; the loan (Task 11b) supplies the bytes once it exists, until then the reserve draws on free WEIGHT-zone bytes and `RING_UNAVAILABLE` is the expected answer on a full card.
+- [ ] **Superseded by the Amendment (c-3bde B): there is no `config.ring_layers`; the call is
+      `moe_stream_ring_size(host_matrices_per_layer_max, matrix_bytes_max, resident_expert_bytes)` (Task 6's
+      amendment).** The ring geometry comes from `moe_stream_ring_size(host_bytes_per_layer_max,
+      resident_expert_bytes, triplet_bytes_max, config.ring_layers)` (Task 4's knob, Task 6's function) at
+      `begin_ubatch`; the loan (Task 11b) supplies the bytes once it exists, until then the reserve draws on free
+      WEIGHT-zone bytes and `RING_UNAVAILABLE` is the expected answer on a full card.
 - [ ] Each matrix of a triplet uses TWO ring slots, one AOS (the copy's destination) and one SOA (the reorder's destination, the slot the kernel reads); the reorder's event is the entry's ready event; the stage table holds both handles until that event completes (`retain_handles_until_event`). The reorder temp buffer (`cache->get_reorder_temp_buffer()`, `unified-cache.hpp:4622`) is not used.
 - [ ] A failed copy or reorder submission (a throw from `mem_copy_async` / `ggml_sycl_reorder_weight_gpu`) aborts through `GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s")` (design § 9.3: DMA/reorder failure aborts; a ring-ALLOCATION failure is the soft path, RING_UNAVAILABLE).
 - [ ] Source gate: in `ggml_sycl_mul_mat_id` the plan is consulted exactly once per (layer, micro-batch) (`->moe_stream->begin_layer(` appears once, inside the `prompt_batch` branch, before `moe_hybrid_with_plan` is computed); the copy call is `mem_copy_async(` with `get_bcs_queue()`; the reorder call is `ggml_sycl_reorder_weight_gpu(` with a `{ copy }` dependency; the count of `.wait()` / `wait_and_throw()` in `moe-stream-plan.cpp` is 0 and in `ggml_sycl_mul_mat_id` is unchanged from master.
 - [ ] The stage table is cleared at the first decode graph after the prompt and at every new prompt's first layer; cleared entries release their handles only through the ring's epoch events.
-- [ ] Trace (`GGML_SYCL_MOE_EXEC_TRACE=1`) prints per layer: `[MOE-EXEC] trace layer %d ubatch %u: %s regime=%s p=%.2f t_cpu=%.0f t_ring=%.0f window=%.0f staged=%d/%d bytes=%zu`.
+- [ ] Trace (`GGML_SYCL_MOE_EXEC_TRACE=1`) prints per layer: `[MOE-EXEC-TRACE] stage layer %d ubatch %u: %s regime=%s
+      p=%.2f t_cpu=%.0f t_ring=%.0f window=%.0f staged=%d/%d bytes=%zu unowned=%d untyped=%d exhausted=%d` (the prefix
+      and the last three fields are as built; was: `[MOE-EXEC] trace layer %d ubatch %u: %s regime=%s p=%.2f
+      t_cpu=%.0f t_ring=%.0f window=%.0f staged=%d/%d bytes=%zu`; see the Task 7b amendment).
 
 **Implementation Guide:**
 
@@ -969,6 +1083,49 @@ git commit -m "sycl, tests: a prompt layer's host experts are weighed before its
 - `moe_graphs_disabled_once` is already set for hybrid prompt layers; the ring copies must not be recorded into a command graph (Task 5's gotcha).
 - `window_us` is a host clock between two host events; it is a lower bound on the device window and that is the safe direction.
 
+**Amendment (2026-10-23, llama.cpp-xod7; epic ruling c-las5 on llama.cpp-36j0):** Task 7b merged with these
+deviations, rulings and carry-forwards. The text above is the plan; this is the build.
+- Deviations #1-#5, #7 and #11 of xod7 c-kkbs were accepted (c-0bw3): `begin_layer` takes a `const moe_stream_op &`;
+  `fully_staged()` and `region_open()` are public; there is no `rates_` member and the rates are assembled per layer;
+  the phase is held as `unique_ptr<moe_stream_phase, moe_stream_phase_deleter>` in common.hpp;
+  `ggml_sycl_reorder_weight_gpu` was made non-static instead of refactoring the fill; `layer_done`'s event is a
+  compute-queue barrier after the down op; the n_host == 0 skip reads the plan index.
+- Staging gate (c-3skf): as merged, staging happened only when the policy was RING, and AUTO recorded its decision and
+  moved nothing, "until Task 8 lands a consumer". Task 10 (llama.cpp-3460) lifted it: AUTO stages when the cost model
+  chooses the ring. `moe_stream_stage_now` is the one predicate. Task 7b's hardware arms therefore ran under
+  `GGML_SYCL_MOE_EXEC=ring`.
+- `reserve_failed_` lasts one micro-batch: it is cleared with the per-micro-batch table clear (c-i8rz).
+- The per-prompt ring-unavailable WARN (c-kcyf): `[MOE-EXEC] device %d: stream ring unavailable: %s
+  (host_matrices_per_layer_max=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)`, one of five
+  rule names, and Task 10 inserted `region_slots_max=%u` after the first field. It prints under
+  `GGML_SYCL_MOE_EXEC=ring` or the trace and never under auto at default verbosity, so a gate cannot read ring
+  engagement from its absence (Task 15 reads the teardown summary instead).
+- The hardware acceptance was re-scoped (c-kcyf, c-tquu): a forced-ring Qwen3.8 run prints the diagnostic and its
+  tokens equal AUTO's, Mistral is unchanged, and the GPT-OSS B50 AUTO count gate is unchanged with the ring
+  unavailable. The staged=N/N proof moved to the integration arm.
+- The ring is sized over streamable host matrices only: matrices of an untyped expert are listed but not counted
+  (04a7260d1).
+- The phase's trace line carries the prefix `[MOE-EXEC-TRACE] stage layer`, not the plan's `[MOE-EXEC] trace layer`
+  (xod7 c-phbo, c-o68c). The not-in-order WARN was dropped: `warn_ring_unavailable` names "queue not in order" as one
+  of its rules. Task 8 added a separate `[MOE-EXEC-TRACE] stage layouts layer %d ubatch %u: soa=%d aos_only=%d` line.
+- Carry-forwards (c-las5): the look-ahead stops at a graph split. IQ types count as untyped, which Task 10's AOS-only
+  staging supersedes for claimed tensors. SOA write-after-read across a region's reuse is ordered only by the in-order
+  compute queue, so a library consumer of staged SOA slots would need the reader-done event (Task 8 added the read
+  gate for AOS-only slots). "Per prompt" means between decode graphs, so a prompt-only workload (llama-bench -n 0,
+  perplexity, embeddings) never reaches `end_prompt`: the c-kcyf WARN prints once per context and a forced ring stays
+  reserved until a decode graph or teardown.
+- c-las5 item 4: this lane is the first caller of `note()`, so under AUTO the change-only `[MOE-EXEC] layer N: ...`
+  WARN lines and the `[MOE-EXEC] summary:` line print at default verbosity whenever host experts exist.
+- c-3bde A and C, c-fjx1 D (Task 6's rulings, binding this task): every copy into a ring region chains on
+  `depends_on(ring_.current_region_gate())` and nothing asks the event for a host status; every slice inherits the
+  base allocation's `GGML_LAYOUT_AOS` tag (`from_owned_alloc`), so the SOA slot a kernel reads must not be dispatched
+  from the slice's tag (one fact, two sources). Either the reorder's output handle carries its layout or dispatch
+  takes it from the stage-table entry, which Task 8 settled as the entry's layout and `slice(off, size, layout)`
+  (c-o9uw-1). A small rotating AOS staging set instead of a full AOS slot per matrix would halve the ring's demand, as
+  a measured follow-up and not now (c-3bde C). The slots are 256-byte aligned (Task 6's amendment), and teardown calls
+  `epoch_boundary(<last event>)` before `release()` or holds the slot handles until that work completes, on every exit
+  including exception unwind.
+
 ---
 
 ## Task 8: `STAGED_RING`: the resolver route from a host-resident entry to the device
@@ -989,7 +1146,10 @@ git commit -m "sycl, tests: a prompt layer's host experts are weighed before its
 - [ ] The resolver lambda consults the stage table BEFORE calling the route core, and only when `rows > 1` (never on decode); the lookup takes `src0`'s layer id and role from `extra` the way `ggml_sycl_get_moe_expert_cache_key` (`:4496`) derives them.
 - [ ] `test-resolver-host-return-count`: with a `moe_stream_phase` holding one fake staged entry (a device test; the existing file already needs a device), the operand's `residency()` is `PRIMARY_DEVICE` and `recipe().transfer == STAGED_RING`; without it, HOST (unchanged).
 - [ ] Source gate: `moe_recipe_transfer::STAGED_RING` is assigned exactly once in `ggml-sycl.cpp`, inside `ggml_sycl_build_moe_resolved_batch`, guarded by a `moe_stream->find(` call and a `rows > 1` test; the `remember_moe_storage_handle(` call at `:6616` is unreachable for a staged route (the staged branch returns before the route core, so the gate asserts the staged branch contains no `remember_moe_storage_handle`).
-- [ ] Lead-run: Qwen B70 `llama-completion` with `GGML_SYCL_MOE_EXEC=ring` on a 2k-token prompt (Task 15's prompt file) produces the same `-n 32` tokens as `GGML_SYCL_MOE_EXEC=cpu` (md5 of the output equal), and `[MOE-EXEC] trace` shows every prompt layer `RING`. Prompt rate recorded, not yet gated (the hybrid world's per-row matvec is Task 10's subject).
+- [ ] **Not reachable as written, moved to llama.cpp-bcre (see the Amendment).** Lead-run: Qwen B70 `llama-completion`
+      with `GGML_SYCL_MOE_EXEC=ring` on a 2k-token prompt (Task 15's prompt file) produces the same `-n 32` tokens as
+      `GGML_SYCL_MOE_EXEC=cpu` (md5 of the output equal), and `[MOE-EXEC] trace` shows every prompt layer `RING`.
+      Prompt rate recorded, not yet gated (the hybrid world's per-row matvec is Task 10's subject).
 
 **Implementation Guide:**
 
@@ -1033,6 +1193,45 @@ git commit -m "sycl, tests: STAGED_RING is the one route by which a host-residen
 - The route core's own HOST answer is unchanged; `moe_layer_route_residency` (`common.hpp:55397`: MISSING, DEVICE, HOST) and `moe_expert_route_kind` (LOCAL_DEVICE, SECONDARY_DEVICE, HOST, UNAVAILABLE, REFUSED) gain no value: the staged route is built at the batch level, not the expert-route level.
 - One layout per weight (memory `one-layout-per-weight-all-consumers-must-support-it`): the ring slot is SOA; the layer's device route must advertise a kernel for (type, SOA), which MMVQ_COMPAT / XMX_TILED do for Qwen's types in the hybrid world; a type with no SOA kernel stays HOST (the capability query returns it) and the trace says why.
 
+**Amendment (2026-10-23, llama.cpp-o9uw, llama.cpp-bcre, llama.cpp-v7np):** Task 8 merged as a5ef0f347. The sketch
+above differs from the build in these ways.
+- llama.cpp-bcre supersedes "every prompt layer RING". Under whole-layer host placement the ring is 2 regions x 1536
+  matrices x 921600 B = 2.83 GB on Qwen3.8/B70, and `moe-stream-ring.cpp` refuses anything over resident_expert_bytes
+  / 10 = 1.29 GB. GPT-OSS on the B50 at a 90 % budget asks 1.69 GB against 887 MB. So `GGML_SYCL_MOE_EXEC=ring` ran 0
+  layer-ubatches on the ring in every Qwen B70 run and the staged route has executed only in device ctests. bcre is
+  open (P0). The lead recommends sizing the ring per executor group window (two regions of 68 experts x 3 matrices x
+  921600 B = 188 MB, 376 MB in all, under the cap with no cap change); the owner decision is pending as of 2026-10-23.
+  This task's ring-engaged arm and E2E step 4 move to whichever task decides it.
+- No route flag: `moe_batch_route` gains no `staged_ring` field; `STAGED_RING` is a transfer kind only, and its
+  validator clause also requires the submit queue. `test-resolver-host-return-count` is unchanged; the device vehicle
+  is `ggml/src/ggml-sycl/tests/test-moe-staged-ring-route.cpp`. The prompt builds pass `&ctx` and `ctx.stream()` with
+  a null queue capability. The resolver takes `moe_stream` only when rows > 1 and asks for the library claim lazily,
+  at the first stage-table hit.
+- Lifetime: a staged slot never enters `moe_expert_handles[]`, `remember_moe_storage_handle` or the persistent leases.
+  The fused path refuses a bundle that names one. An admission entry that names a staged slot is keyed on the
+  micro-batch, and another epoch is a miss.
+- Slice with layout (ruling c-o9uw-1): `mem_handle::slice(off, size, layout)` is allowed only on an owned allocation
+  (refused on a weight lease, whose layout is a cache-key fact), `moe_stream_ring::acquire_slot` takes the layout with
+  no default, and the phase tags each slot by its layout, so the tag and the stage entry agree by construction.
+- SOA only for MXFP4 (ruling c-o9uw-2): the prompt kernel tables have no SOA kernel for Q4_0, Q8_0, Q4_K or Q6_K. An
+  item is SOA-staged (two slots) iff it is reorderable and (type, SOA) has a prompt kernel, else AOS-only (one slot)
+  iff (type, AOS) has one, else untyped. On Qwen3.8 Q4_K, Q6_K, IQ3_XXS and IQ3_S stage AOS-only, IQ4_XS stays
+  untyped, and only MXFP4 stages SOA (as ruled in c-ned2, before the step 0 census; 3460 c-g7y7 found the e2e model's
+  expert types are Q2_0/IQ4_NL/IQ3_S/IQ2_S/IQ2_XS/IQ2_XXS/IQ3_XXS, all of which take the AOS table row, so every one
+  stages AOS-only and none stages SOA).
+- Read gate (c-o9uw-1): AOS-only slots are read by matmuls, so the phase records each region's occupant layer and
+  `layer_done(L)` records `down_done` as that region's read gate. A copy into a region whose previous occupant held
+  AOS-only slots depends on it, with a stage-time compute-queue barrier as the fallback when no `layer_done` arrived.
+  A SOA-only region relies on queue order alone.
+- Refusals carry a cause: the `moe_staged_route_refusal` enum, tallied per device, reported on `[MOE-EXEC-TRACE]
+  staged route device %d: served=%zu handed_off=%zu refused=%zu` and a refusals line, and printed at WARN under an
+  explicit ring.
+- STAGED_RING was served only to a plain kernel (MMVQ_COMPAT) and refused CLAIMED for any tensor the batched f16
+  executor claims, because a library reader needs ring rewrites ordered after it (c-las5). Task 10 narrowed this
+  (llama.cpp-v7np, c-v31d): a claimed weight's slots are AOS-only and read by the executor's own dequant kernel on the
+  in-order compute queue, a weight staged whole is counted as a handoff and not a refusal, and CLAIMED stays only for
+  a claimed weight the ring stages partly.
+
 ---
 
 ## Task 9: Spike (lead): the batched prompt executor's rate per expert type on an all-VRAM MoE model
@@ -1054,12 +1253,57 @@ git commit -m "sycl, tests: STAGED_RING is the one route by which a host-residen
 - `llama-bench` drops INFO without `-v`; the kernel profiler is runtime-off by default (`sycl-kernel-profiler.cpp:723`); both must be set.
 - Qwen3.6-35B-A3B is a different architecture (no QSA, no hyper-connections); its number is the EXECUTOR's rate per type, not a Qwen3.8 prediction; say so in the table.
 
+**Amendment (2026-10-23, llama.cpp-g4uy):** The spike ran on 2026-10-21; its table and the re-derived target are on
+llama.cpp-36j0.
+- Qwen1.5-MoE-A2.7B Q4_0 on the B70 with every expert in VRAM: pp512 293.7 t/s, pp2048 333.5 t/s. 98 % of kernel time
+  is `mulmat.mmvq.id_aos_q4_0` (1404 calls, 18.8 ms mean; 0.63 TFLOP/s on gate/up, 0.59 on down).
+- The batched mul_mat_id executor existed only for MXFP4 (10 TFLOP/s). Qwen3.8 needs >= 2.36 TFLOP/s effective for 500
+  t/s, and the per-row executor caps it near 133 t/s even with every expert on the device, so the ring alone would
+  reach about 100 t/s. Under the CLAUDE.md corollary that is a support gap to close, which became Task 10-pre.
+
+---
+
+## Task 10-pre: A batched f16 prompt executor for every expert type (inserted 2026-10-22, llama.cpp-348c)
+
+**Track:** B
+**Depends on:** Task 9 (the spike, llama.cpp-g4uy)
+**Status:** merged as d52110c80 (task/348c, 54 first-parent commits). Inserted by owner decision. Spec FAIL r1 then
+PASS r2; quality FAIL r1, FAIL r2, PASS r3.
+**File scope (the main files; the range touched 30):**
+- Create: `ggml/src/ggml-sycl/moe-mmvq-tables.hpp`, `ggml/src/ggml-sycl/tests/test-moe-pp-batched-dequant.cpp` (device),
+  `tests/test-sycl-moe-mmvq-tables.cpp`, `tests/test-sycl-moe-pp-batched-types-source.py`
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`, `common.hpp`, `gemm.hpp`, `moe-layer-plan.hpp`, `moe-exec-cost.hpp`,
+  `moe-stream-plan.hpp/.cpp`, `zone-sizing.hpp/.cpp`, `tests/CMakeLists.txt`
+
+**Description:** Every expert type in the executor's support table runs the prompt through the batched f16 executor at
+the materialized layout: Q4_0, Q8_0, Q4_K and Q6_K at AOS and SOA, and the AOS-only types (IQ3_XXS, IQ3_S, IQ4_XS,
+IQ4_NL, IQ1_M among them). The log line is `[PP-MOE] device=%d type=%s layout=%s arm=f16 experts=%d groups=%d
+planned_weight_slot=%zu`. The executor runs a layer's active experts in event-chained groups that fit the planner's
+EXISTING weight slot, double-buffered across two halves (136 f16 experts per group on Qwen3.8 against the 425 MB slot).
+The design that widened the slot was measured at -6.6 % B70 decode on Qwen3.8 (ABBA) and removed under the room rulings
+(8ecj, w013).
+
+**As built:**
+- `GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX` is a debugging knob that caps the experts per group.
+- A decline after the executor claimed a tensor warns once per (device, cause) at default verbosity, as
+  `[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s staged=%zu`. Precheck causes are trace-only
+  (item 9, "plan amendment, Task 15" in 6721ce088).
+- The planner's per-row device seeds were stale. They were re-measured on d52110c80 (Q4_0 about 9000 GFLOP/s for the
+  whole executor, the f16-arm mix about 5000) and re-seeded in Task 10.
+- Measured: Qwen1.5-MoE Q4_0 on the B70 pp512 1713 and pp2048 1620 against 270-287 and 322-325 on master. Qwen3.8 B70
+  ABBA pp512 +7 % and tg128 6.26 against 6.32-6.44 on master with the same arena sequence. GPT-OSS MXFP4 is untouched.
+  The Mistral gate and the GPT-OSS count gate are unchanged, with zero `[PP-MOE]` refusals and no widening line.
+
+**Decode gaps left open:** q8_0 and q6_K experts materialized SOA have no decode kernel (llama.cpp-wkdi, owner choice
+a or b). IQ4_XS, IQ1_S and IQ1_M lack decode kernels (llama.cpp-w4qk). Decode launches per expert (llama.cpp-cl5q).
+Follow-ups folded elsewhere: llama.cpp-v7np into Task 10, the in-graph loan request (c-0tmn) into Task 10.
+
 ---
 
 ## Task 10: A fully staged prompt layer leaves the hybrid world and takes the batched prompt executor
 
 **Track:** B
-**Depends on:** Tasks 8, 9
+**Depends on:** Tasks 8, 10-pre (and 9 through it)
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (`plan_has_cpu_experts` at `:81200`, `selected_hybrid_route` at `:81668-81672`, `moe_hybrid_with_plan` at `:81689`; the retained prompt batch build at `:79518-79551`)
 - Modify: `tests/test-sycl-staged-ring-route-source.py` (extend), `tests/test-sycl-moe-exec-gate.sh` is Task 15's
@@ -1067,9 +1311,21 @@ git commit -m "sycl, tests: STAGED_RING is the one route by which a host-residen
 **Description:** When Task 7b's decision for layer l is RING and every host-planned expert of layer l that this micro-batch routes to is in the stage table (STREAM_ALL guarantees it; ROUTED_ONLY by construction), `plan_has_cpu_experts` is false FOR THIS OP: the layer is all-device for this micro-batch, `selected_hybrid_route` is false, and the op takes the same prompt route a fully resident layer takes (`pp_onednn_batched_route_claims_prompt`, `:81666`, or the XMX retained prompt executor), whose resolver already accepts `PRIMARY_DEVICE` operands with ready events (Task 8's validator branch covers them). A layer with any un-staged host expert (ring exhausted, a type with no SOA kernel) stays hybrid, exactly as today.
 
 **Acceptance Criteria:**
-- [ ] `const bool plan_has_cpu_experts = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && !(ctx.moe_stream && ctx.moe_stream->layer_fully_staged(layer, ids, n_ids))` where `moe_stream_phase::layer_fully_staged` wraps Task 7a's pure `moe_stream_layer_fully_staged` over the phase's own stage table (every distinct id that is host-planned has all three roles staged, ready or pending).
-- [ ] Source gate: `->layer_fully_staged(` appears exactly once in `ggml_sycl_mul_mat_id`, on the line that computes `plan_has_cpu_experts`; `moe_hybrid_with_plan` keeps its `ne12 == 1 ||` term (decode untouched).
-- [ ] Lead-run: Qwen B70 `llama-bench -p 512,2048 -n 0 -r 3` with no `-ub` (auto) and `GGML_SYCL_MOE_EXEC=auto`: pp512 >= 500 tok/s, pp2048 >= 800 tok/s, `[MOE-EXEC] trace` (one `-v` run) shows every prompt layer RING and the batched route's own log line (`[PP-MOE]` or the XMX route's, whichever the all-VRAM pair printed in Task 9) per layer; the 2k-prompt `llama-completion` md5 equals the `GGML_SYCL_MOE_EXEC=cpu` arm's; GPT-OSS B50 `-c 4096` pp512/tg128 and the count gate unchanged (no host experts: NOT_CONSULTED, zero `[MOE-EXEC] layer` lines).
+- [ ] **As built differently, see the Amendment.** `const bool plan_has_cpu_experts =
+      plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && !(ctx.moe_stream &&
+      ctx.moe_stream->layer_fully_staged(layer, ids, n_ids))` where `moe_stream_phase::layer_fully_staged` wraps Task
+      7a's pure `moe_stream_layer_fully_staged` over the phase's own stage table (every distinct id that is
+      host-planned has all three roles staged, ready or pending).
+- [ ] **No longer true as written (3460 c-vrmr, see the Amendment): the gate pins `->fully_staged(` on the bool's own
+      line, not `->layer_fully_staged(` on the `plan_has_cpu_experts` line.** Source gate: `->layer_fully_staged(`
+      appears exactly once in `ggml_sycl_mul_mat_id`, on the line that computes `plan_has_cpu_experts`;
+      `moe_hybrid_with_plan` keeps its `ne12 == 1 ||` term (decode untouched).
+- [ ] **The ring-engaged half moved to llama.cpp-bcre and llama.cpp-pu8v (see the Amendment).** Lead-run: Qwen B70
+      `llama-bench -p 512,2048 -n 0 -r 3` with no `-ub` (auto) and `GGML_SYCL_MOE_EXEC=auto`: pp512 >= 500 tok/s,
+      pp2048 >= 800 tok/s, `[MOE-EXEC] trace` (one `-v` run) shows every prompt layer RING and the batched route's own
+      log line (`[PP-MOE]` or the XMX route's, whichever the all-VRAM pair printed in Task 9) per layer; the 2k-prompt
+      `llama-completion` md5 equals the `GGML_SYCL_MOE_EXEC=cpu` arm's; GPT-OSS B50 `-c 4096` pp512/tg128 and the
+      count gate unchanged (no host experts: NOT_CONSULTED, zero `[MOE-EXEC] layer` lines).
 
 **Implementation Guide:**
 
@@ -1087,6 +1343,40 @@ git commit -m "sycl, tests: a prompt layer whose host experts are all staged in 
 **Gotchas:**
 - The batched prompt executors group rows by expert; they read `src0`'s per-expert pointers through the same ptr table / route table (`moe_route_table`, `moe-route-table.hpp:55`), which Task 8 feeds. Confirm with `GGML_SYCL_NAN_CHECK=1` once on the lead's first run.
 - This is the task where the e2e number is made or missed. If Task 9's measured batched rate puts the target out of reach at `-ub 512` but in reach at 2048, the auto-ubatch trial (Task 13's fit term) is what gets there, not a bigger ring.
+
+**Amendment (2026-10-23, llama.cpp-3460, llama.cpp-v7np; lead ruling c-mvqc):** Task 10 merged as 8c44f3b3c. Its
+premise was wrong, and its acceptance could not run.
+- Premise correction (c-mvqc): the sketch above assumed the executor claims hybrid tensors. It does not.
+  `primary_layout` returns false unless all_experts_on_device and the claim reads it, so llama.cpp-v7np's CLAIMED
+  refusal was unreachable for a real staged slot, and under `GGML_SYCL_MOE_EXEC=ring` the staged experts were served
+  by MMVQ in the hybrid world (o9uw).
+- As built: a predicate "the executor claims this weight once its host experts are staged" (experts planned on the
+  device or the host, a device layout the executor accepts, an f16 table row at AOS, MXFP4 excluded). The ring's
+  library hook answers it. Executor-consumer slots stage AOS_ONLY. The resolver refuses by the entry's consumer, and
+  the executor's resolve takes staged entries through `find()`. One bool read after `begin_layer` (the predicate and
+  `fully_staged`) leaves the hybrid world. Its gate pins `->fully_staged(` on the bool's own line, not on the
+  `plan_has_cpu_experts` line, and not the plan's `->layer_fully_staged(` (3460 c-vrmr: the bool is set after the
+  payload release, because the claim-release gate pins the release directly after `begin_layer`).
+  llama.cpp-v7np closed with this merge.
+- Auto stages: `GGML_SYCL_MOE_EXEC=auto` stages a layer's host experts when the cost model chooses the ring, which
+  lifts c-3skf (Task 7b's amendment). The per-type device seeds were re-seeded from the re-measured executor rates
+  (Task 10-pre).
+- A short reserve asks for an expert loan (c-0tmn): when the WEIGHT zone cannot give the ring's bytes, the phase asks
+  for a loan of the shortfall once per micro-batch, until a loan this prompt asked for is refused. Before this nothing
+  in production originated a loan. Strings: `[MOE-EXEC-TRACE] executor device %d tensor=%s experts=%zu staged=%zu
+  arm=%s` (trace), `[PP-MOE] refused device=%d cause=%s detail=%s tensor=%s type=%s layout=%s staged=%zu` (default
+  verbosity), `[MOE-EXEC] loan device %d refused: %s` (once per prompt under auto), `[MOE-STREAM-RING] reserve: the
+  WEIGHT zone cannot give %.1f MB` (per micro-batch), and `[MOE-EXEC] device %d: stream ring %.1f MiB short and its
+  expert loan refused: no further loan this prompt` (ring or trace only).
+- The acceptance arms: the ring never engaged on this host (the bcre cap on Qwen3.8; Qwen1.5 at a 33-35 % VRAM budget
+  passes the cap, is short, and its loan fires and is refused "host storage too small", llama.cpp-pu8v). The pp512 >=
+  500, pp2048 >= 800 and every-layer-RING targets move to bcre and pu8v's re-probe. Measured: Qwen3.8 B70 ABBA neutral
+  (pp512 about 14, pp2048 about 31.5 on both trees), the md5 of auto equals cpu equals NAN_CHECK, and the GPT-OSS B50
+  and Mistral controls are green. The GPT-OSS B50 pp512 reads about 770 against the 871-894 floor on master itself
+  (llama.cpp-zuze), so Task 15's GO_pp window cites zuze until it is bisected.
+- Limits: the REFUSED loan latch and `warned_unavailable_` reset only in `end_prompt`, so a prompt-only workload keeps
+  one refusal for the process (the c-las5 "per prompt" carry-forward). `route_layout` is re-derived at dispatch
+  (llama.cpp-8f7x). A forced-decline arm on a staged layer is owed to pu8v's re-probe (c-58j8).
 
 ---
 
@@ -1157,6 +1447,14 @@ git commit -m "sycl, tests: the selected triplets are lent to the ring for a pro
 - The loan runs at the first prompt graph of a phase, under the process-global `g_sycl_graph_compute_mutex` already held by graph compute; the transaction must not take it again. The KV transaction is called from `llama_context` outside compute; this one is called from inside `mul_mat_id`'s first prompt op, so it takes only `g_tensor_inventory_mutex` and the cache's own locks (lock order: inventory mutex first, then `rw_mutex_`; this is the order `direct_stage_expert` establishes at `:8683` and `:8852`).
 - `retire_expert_entry_exact` returns DEFERRED while `last_write_event` or a lease is live (`unified-cache.hpp:2783-2791`): the D2H copy's event IS a write event on the source; chain the retire after it, never spin.
 
+**Amendment (2026-10-23, llama.cpp-mwmr):** Task 11b merged with one accepted deviation (ruling c-mwmr-2).
+- The transaction holds a lease on each device entry from just before its retire until the host registration finishes,
+  where the brief's c-tdra ruling 1 said to drop the leases before the retire. The retire is deferred under a live
+  lease either way, the held lease never outlives the transaction, and it makes a late registration failure (an
+  allocation) restorable through `restore_expert_entry_at_locked`, which the "no partial state" requirement needs.
+- The test fixture defect behind c-uv67 (case 1's teardown published an empty plan, so every later direct stage was
+  refused) was a fixture bug, and the fixture now restores the publication it found.
+
 ---
 
 ## Task 12: The refill transaction: re-admit lent experts after the prompt, in the background, cancellable
@@ -1189,6 +1487,20 @@ git commit -m "sycl, tests: lent experts are re-admitted one triplet per decode 
 - The lent triplet's pinned copy is the SOURCE of the refill AND of any ring copy during the next prompt; never free it before both are done (the owner is released only on the refill's ready event).
 - Never promote through `promote_to_device`: it is a stub returning nullptr (`:13126-13133`).
 
+**Amendment (2026-10-23, llama.cpp-sif1; llama.cpp-xr4i blocks this task):** Task 12 merged as 40ab270d2.
+- The probe answer (sif1 c-qxjr): `acquire_bound_load_effect` does not refuse outside a load, but
+  `direct_stage_expert`'s built-in copy goes through staging, so the refill supplies its own owner-to-owner copy on
+  the BCS queue.
+- The loan and the refill are plan-republishing transactions, one body with a direction (`ggml_sycl_expert_txn_run`
+  with LOAN and REFILL). The refill runs at the decode boundary and re-admits at most `GGML_SYCL_MOE_REFILL_PER_GRAPH`
+  triplets per decode graph. A loan refuses by name when the host zones are not configured (`[MOE-EXEC] loan device 0
+  refused: host zones not configured`). The teardown line is `[MOE-EXEC] refill device %d: %u/%u triplets
+  re-admitted`.
+- Nothing in production originated a loan until Task 10 wired the in-graph request at a short reserve (c-0tmn), and
+  pu8v refuses that loan on the models tried. So Task 15's gate must say whether the loan and the refill ran
+  (`loan_exercised`, `refill=not_exercised`) rather than score a vacuous pass.
+- The task depends on llama.cpp-xr4i (the probe's rate is bimodal until it lands), as the graph above now shows.
+
 ---
 
 ## Task 13: The auto-ubatch trial's ring fit term
@@ -1202,7 +1514,8 @@ git commit -m "sycl, tests: lent experts are re-admitted one triplet per decode 
 **Description:** The trial judges a rung by `zone_hold_fit` over `free_before`, the KV room, the planned dense scratch and the rung's compute-buffer request against the 256 MiB headroom (`:18575-18598`). The ring is lent bytes, so it costs the card nothing extra EXCEPT the part the loan cannot supply (no lendable triplets, or the resident set is smaller than the ring): that remainder is a demand on free memory and enters `zone_hold_fit_demand`. With Qwen on the B70 the loan covers the ring and the term is 0; the term exists so a model with few lendable experts (GPT-OSS at a context where only bulk-staged tensors remain) refuses honestly rather than spilling the ring to host.
 
 **Acceptance Criteria:**
-- [ ] `zone_hold_fit_demand(in, n_ubatch)` = today's value + `in.ring_bytes`; `test-zone-sizing` new case: the `:1613` inputs plus `ring_bytes = 200 MiB` turn "512 fits" into "512 does not fit, largest_ub names 256".
+- [ ] `zone_hold_fit_demand(in, n_ubatch)` = today's value + `in.ring_bytes`; `test-zone-sizing` new case: the `:1613`
+      inputs plus `ring_bytes = 400 MiB` turn "512 fits" into "512 does not fit, largest_ub names 256".
 - [ ] `ggml_sycl_hold_spill_fit` computes `in.ring_bytes = max(0, ring_geometry.bytes - loan_probe.bytes_freed)` using Task 11b's probe mode, only when the plan has host experts (`has_host_experts`), else 0.
 - [ ] `tests/test-sycl-auto-ubatch-source.py` extended: the fit query mentions `ring_bytes` exactly once.
 
@@ -1218,6 +1531,18 @@ git commit -m "sycl, tests: the hold-spill fit charges the ring bytes a loan can
 **Gotchas:**
 - `zone_hold_fit` is a pure function three callers share so they cannot disagree (`zone-sizing.hpp:505-511`); add the term in `zone_hold_fit_demand` only, never in a caller.
 - Never lower `-ub`: the term can only make a rung refuse with `largest_ub`, which is the existing contract.
+
+**Amendment (2026-10-23, llama.cpp-kjef):** Task 13 merged as cd4e334f4.
+- Acceptance arithmetic (ruling c-qc5y): 200 MiB does not flip 512 on the Case 24 inputs. A 512 rung demands 471 MiB,
+  200 MiB more leaves 426 MiB of 1097 against the 256 MiB headroom, and it still fits. 400 MiB leaves 226 MiB, so 512
+  is refused and `largest_ub` names 256 (test-zone-sizing Case 24b).
+- The fit charges only the ring bytes no loan would cover, `ggml_sycl_hold_ring_uncovered`, through the shared
+  `moe_stream_plan_ring_geometry` that `moe_stream_phase::prepare` also calls. The fit passes nullptr
+  `library_claims`, an upper bound by construction, because the thread-local claims scan outlives graphs and models
+  and a fit after a model switch would read freed tensors.
+- Knife edge (c-ani9): one Qwen3.8 load picked `n_ubatch` 256 for a 9.9 MB shortfall under the 256 MB driver headroom,
+  from a transient stale-low driver free-memory reading, and the same tree picked 512 on eight further loads. The ring
+  fit term must not be sized to the last MB, and per-ubatch counts compare only at the same auto `-ub`.
 
 ---
 
@@ -1249,12 +1574,21 @@ git commit -m "docs: the executor cost model and the prefill expert ring amend t
 - The contract's existing line numbers for the allocator entry points are stale (`unified-cache.hpp:4330` for a function now at `:7073`); do not add line numbers to that table.
 - Do not touch `.llm-wiki/` (owner-dirty).
 
+**Amendment (2026-10-23, llama.cpp-oj8d, llama.cpp-3460):** Task 14 merged as 5d5abe057.
+- The docs were written with "auto only records" and a forward pointer to Task 10; Task 10 (llama.cpp-3460) then
+  rewrote those sentences in `sycl-memory-design.md` and the `GGML_SYCL_MOE_EXEC` catalog row, so the docs describe
+  the final behaviour.
+- `GGML_SYCL_MOE_RING_LAYERS`, named in this task's file scope, is read by no code and has no catalog row (Task 4's
+  amendment). `GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY` is a compile-time define for test builds and its row says so.
+  The catalog literal-search finds eight in-scope literals, each with a row.
+- The memory design states that nothing in production originates a loan (c-0tmn), which Task 10 changed.
+
 ---
 
 ## Task 15: The gate script and the baselines section
 
 **Track:** D
-**Depends on:** Tasks 4, 8, 12
+**Depends on:** Tasks 4, 8, 10, 12
 **File scope:**
 - Create: `scripts/sycl-moe-exec-gate.sh`, `scripts/sycl-moe-exec-prompts/code-2k.txt`
 - Modify: `docs/backend/sycl-perf-baselines.md` (new section `## MoE executor: Qwen3.8 B70 prefill and the GPT-OSS B50 control (2026-10, llama.cpp-36j0)` before "Correctness gates" at line 458)
@@ -1264,15 +1598,15 @@ git commit -m "docs: the executor cost model and the prefill expert ring amend t
 
 | arm | command | score |
 |---|---|---|
-| Q_pp | `ONEAPI_DEVICE_SELECTOR=level_zero:0 llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v` (no `-ub`, no `-ngl`) | pp512 >= 500, pp2048 >= 800; `[MOE-EXEC] layer` lines = 48 at the first ubatch; `[MOE-EXEC] summary` once |
+| Q_pp | `ONEAPI_DEVICE_SELECTOR=level_zero:0 llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v` (no `-ub`, no `-ngl`) | pp512 >= 500, pp2048 >= 800; at least one `[MOE-EXEC] layer` line and at least one `[MOE-EXEC] summary` (was: = 48 layer lines at the first ubatch and one summary: only layers with host experts print, 24 on this tree, and `llama-bench` prints one summary per context, two for `-p 512,2048`; see the amendment) |
 | Q_pp_cpu | same with `GGML_SYCL_MOE_EXEC=cpu` | the before-number (13.5-14.4 at `-ub 256`); recorded, not gated |
 | Q_tok | `llama-completion -m $Q -f scripts/sycl-moe-exec-prompts/code-2k.txt -n 32 --seed 42 --temp 0 -no-cnv --no-display-prompt -lv 4 -t 4` | md5 of the output |
-| Q_tok_cpu | same with `GGML_SYCL_MOE_EXEC=cpu` | md5 equal to Q_tok |
-| Q_tg | `llama-completion -m $Q -f $P -n 60 -c 4096 ... -ub 256` (the q0xu Q_c4096 arm verbatim) | tg >= 11.0, md5 25b7738a, `[MOE-EXEC] refill` re-admitted = lent |
-| Q_noc | the q0xu Q_noc arm | tg >= 9.5, place line unchanged |
+| Q_tok_cpu | same with `GGML_SYCL_MOE_EXEC=cpu`, two loads per arm | some auto md5 equals some cpu md5 and every auto output shares >= 64 bytes with its best cpu match (was: md5 equal to Q_tok; the greedy near-tie flips in both policies, see the amendment) |
+| Q_tg | `llama-completion -m $Q -f $P -n 60 -c 4096 ... -ub 256` (the q0xu Q_c4096 arm verbatim) | tg >= 11.0, md5 25b7738a or a flip (>= 128 bytes shared with the reference text), `[MOE-EXEC] refill` re-admitted = lent |
+| Q_noc | the q0xu Q_noc arm | tg >= 9.5, md5 as Q_tg; the place line is recorded, and scored only against a reference the lead passes |
 | GO_gate | the CLAUDE.md GPT-OSS B50 count gate | `grep -cx '1, 2, 3, 4, 5'` = 1; `[MOE-EXEC] layer` lines = 0 |
-| GO_pp | `level_zero:1 llama-bench -m $GO -p 512 -n 128 -r 3 -c 4096` | pp512 within 5 % of 871, tg128 within 2 % of 33.7 |
-| GO_noc | `llama-cli` GPT-OSS gate without `-c` | count gate = 1; `[MOE-EXEC] layer` lines = 12 (the demoted layers) at the prompt |
+| GO_pp | `level_zero:1 llama-bench -m $GO -p 512 -n 128 -r 3` | pp512 within 5 % of 871, tg128 within 3 % of 32.0 (was: within 2 % of 33.7, and `-c 4096`, which `llama-bench` does not have) |
+| GO_noc | `llama-cli` GPT-OSS gate without `-c` | count gate = 1; `[MOE-EXEC] layer` line count recorded, not gated (was: = 12, "the demoted layers"; run 2 measured 0, see the amendment) |
 | MI | the Mistral gate on both cards | `grep -c '1, 2, 3, 4, 5, 6, 7, 8, 9, 10'` = 1 |
 | resets | `journalctl -k --since $T0 \| grep -icE 'GT reset\|guc_id\|CAT error\|Engine reset\|exec queue reset'` | 0 |
 
@@ -1297,6 +1631,56 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
 - The Qwen load is ~70 GB from `/models` (bcachefs over NVMe + SATA + USB): a cold load is minutes; the script's timeouts are 900 s per Qwen arm as q0xu's were.
 - The decode arms are the q0xu arms verbatim so their floors and md5 carry over; a changed md5 there is a regression, not a new baseline.
 
+**Amendment (2026-10-23, llama.cpp-x6zo):** The gate as built (`scripts/sycl-moe-exec-gate.sh`,
+`tests/test-sycl-moe-exec-gate-script.sh`, 150 GPU-free cases). It differs from the table above here.
+- Fifteen arms, eleven of them verdict-bearing: the table's arms plus `Q_staged`, `Q_tok_2` and `Q_tok_cpu_1`. The
+  final line is `verdicts_pass=N GATE_DONE`, where N counts PASS verdicts, and a refusal prints the same line with N =
+  0. Exit codes: 0 all PASS, 1 a FAIL, 2 refused or usage, 3 nothing failed but an arm was NOT_EXERCISED or
+  NOT_SCORED, or a ring-scoring arm ran and no arm engaged the ring (the summary line says `ring_engaged_any=no`; a
+  `Q_pp` that passes its floors without the ring is still not the ring working), 143 the gate was stopped by a
+  signal. The summary line carries `ring_engaged_any=yes|no|na` beside `loan_exercised_any`. `<sha>` must be 7 to 40
+  lowercase hex characters.
+- `llama-bench` has no `-c` option (its context is n_prompt + n_gen), so `GO_pp` carries none and runs at 640. Its csv
+  is parsed by header name and the verdict carries the auto `ub=`.
+- The `staged_experts=K` field of the Task 10 brief does not exist. The strings are the executor's trace line
+  (`staged=%zu`, trace only) and `[PP-MOE] refused ... staged=%zu`. A separate arm, `Q_staged`, runs with
+  `GGML_SYCL_MOE_EXEC_TRACE=1`. The executor prints that trace line for every dispatch, resident layers included
+  (576 `staged=0 arm=f16` lines on Qwen3.8 in llama.cpp-3460 c-7kr6, from resident layers), so the arm scores only
+  the layers the ring served: a layer with a `[MOE-EXEC] layer N: ring` line in the run is a host layer, and every
+  `blk.N.*` dispatch of it must have staged > 0 and arm=f16, with at least one such dispatch. The arm also needs at
+  least one `[PP-MOE] ... arm=f16` line and zero `[PP-MOE] refused`. It reports NOT_EXERCISED, neither pass nor fail,
+  with exit 3, when the ring did not engage.
+- `ring_engaged` is yes only when the `[MOE-EXEC] summary: K layer-ubatches ring` lines add up to K > 0, and the
+  verdict carries `ring_layer_ubatches=K`. It is not read from the `stream ring unavailable` WARN, which auto does not
+  print at default verbosity. `loan_exercised` is a `[MOE-EXEC] loan device N: K triplets` line. `refill` is balanced,
+  unbalanced or not_exercised from the teardown `R/L` lines.
+- Layer and summary counts: `[MOE-EXEC] layer N:` lines exist only for layers with host experts (24 on the Task 10
+  run, not 48) and `llama-bench` prints one summary per context (two for `-p 512,2048`). `Q_pp` needs at least one of
+  each, and `--q-layers N` makes the layer count exact. `GO_noc` records its layer count and does not gate it (the
+  plan's 12 was wrong: run 2 measured 0, because GPT-OSS without `-c` keeps every expert on the device and what
+  overflows at the default context is KV, which the planner demotes to host tiers per llama.cpp-uize, so no executor
+  decision prints; `--go-noc-layers N` makes it an exact check).
+- Qwen3.8 on the B70 flips under greedy decoding about one load in five to eight (c-ani9). The md5 row scores two
+  loads per arm on stdout only. Run 2 showed two loads per arm cannot enumerate the flip (four loads, three distinct
+  32-token outputs, every divergence at byte 106-116 after an identical prefix, in both policies). `Q_tok_cpu`
+  therefore passes when at least one auto md5 equals at least one cpu md5 and every auto output is identical to a cpu
+  output or shares a prefix of at least 64 bytes with its best-matching cpu output, and prints `distinct_auto`,
+  `distinct_cpu`, `pairs_equal` and `min_prefix`: a defect is `pairs_equal=0` with an early `min_prefix`, a flip is
+  `pairs_equal` of 1 or more with a late one. `Q_tg` and `Q_noc` follow the same idea: an md5 equal to the reference is
+  a PASS, a different md5 is a PASS with `flip=yes` when the output shares at least 128 bytes with the reference text
+  (`scripts/sycl-moe-exec-prompts/code-ref-25b7738a.txt`), and a FAIL with `flip=no` below that. The placement
+  references default to `-` (recorded): Qwen3.8's `Q_noc` places 25950 on device and 47778 on host on this tree, not
+  the q0xu reference 38163/35565, because the cost-based KV room (llama.cpp-w013) demotes more experts at the default
+  context.
+- Placement: the baselines section sits after the Correctness gates subsection and before the MMVQ section, because
+  inserting it before would re-parent that subsection. Its table is run 2 at 8c44f3b3c, a record and not a baseline (the ring did not engage; see the section's Status).
+- `GO_pp` compares against 871 (5 %) and 32.0 (3 %; the plan's 33.7 contradicted the baselines document's B50 TG128
+  of about 32), and master reads pp512 about 770 on the B50 (llama.cpp-zuze), so a pp512 within 15 % below 871 is that
+  open regression, expected to FAIL until zuze lands, and the verdict names it.
+- A complete run of all 15 arms takes about 45 minutes with the ring off (run 2: Q_pp 9.5 min, Q_pp_cpu 9.3,
+  Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the GPT-OSS and Mistral arms about 1 each);
+  Q_pp and Q_pp_cpu carry a 1500 s timeout.
+
 ---
 
 ## End-to-End Validation (on the user's machine) — MANDATORY
@@ -1310,7 +1694,7 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
 1. Host family on the merged build: `ctest --test-dir build -R 'moe-exec|moe-stream|expert-loan|zone-sizing|tuning-cache-io|h2d-probe|staged-ring|moe-exec-knobs|kv-room-cost' --output-on-failure -j 1` -> all pass; `python3.13 -I scripts/check-sycl-alloc-zone-contract.py --root /Apps/llama.cpp` -> pass; `bash scripts/check-ctest-safety-net.sh --build-dir build` -> "safety net intact".
 2. Device tests, lead-run, one at a time: `ctest --test-dir build -R '^(mem-ops|moe-stream-ring|moe-expert-loan)$' --output-on-failure -j 1` on `level_zero:1`, then the same with `ONEAPI_DEVICE_SELECTOR=level_zero:0` -> pass on both cards, no 77.
 3. The probe: first start of `llama-completion` on each card logs `[MOE-EXEC] h2d probe device N: 2x.x GB/s (probed)`; the second logs `(tuning cache)`; `ls ~/.cache/llama.cpp/sycl-tuning/*-moe-exec-rates.json` lists one file per device.
-4. The gate: `nohup bash scripts/sycl-moe-exec-gate.sh <merge sha> > <scratchpad>/gate.log 2>&1 &` (detached, marker `GATE_DONE`, waiter armed on that word; memory `a-waiter-armed-on-the-wrong-marker-word...`) -> `verdicts_pass=11 GATE_DONE`; the Q_pp arm's table shows pp512 >= 500 and pp2048 >= 800 with the auto-chosen `n_ubatch` in the CSV; Q_tok md5 == Q_tok_cpu md5; Q_tg >= 11.0 with `refill ... 100/100`-style equal counts; GO_gate, GO_pp, GO_noc, MI all green; resets = 0.
+4. The gate: `nohup bash scripts/sycl-moe-exec-gate.sh <merge sha> > <scratchpad>/gate.log 2>&1 &` (detached, marker `GATE_DONE`, waiter armed on that word; memory `a-waiter-armed-on-the-wrong-marker-word...`) -> `verdicts_pass=11 GATE_DONE` (11 = every arm that can PASS; run 2 reached 8); the Q_pp arm's table shows pp512 >= 500 and pp2048 >= 800 with the auto-chosen `n_ubatch` in the CSV; Q_tok md5 == Q_tok_cpu md5; Q_tg >= 11.0 with `refill ... 100/100`-style equal counts; GO_gate, GO_pp, GO_noc, MI all green; resets = 0.
 5. The decision is a decision: `GGML_SYCL_MOE_EXEC=cpu` on Q_pp reproduces the before-number (13.5-14.4 at `-ub 256`, higher at auto `-ub`) and prints 48 `[MOE-EXEC] layer ... CPU (forced)` lines; `GGML_SYCL_MOE_EXEC_TRACE=1` on one Q_pp run shows `regime=STREAM_ALL p=0.99` for every layer at `-ub >= 256`, and a `-p 16` run shows `ROUTED_ONLY` with `CPU` chosen.
 6. Loan and refill are visible and balanced: the Q_pp `-v` log has one `[MOE-EXEC] loan device 0: N triplets, M MiB` line per prompt phase and the teardown summary's `re-admitted` count equals the lent count; `MoE experts: X on device, Y on host` (the place line) at the next load is unchanged from the pre-plan run.
 7. Memory: `Shmem` after each Qwen arm settles under 30 GB within 10 s; `RssAnon` of the bench pid at pp2048 sampled and within the pre-plan envelope (memory `multi-ubatch-prefill-leaks-host-memory-per-decode`).
@@ -1319,3 +1703,23 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
 **Steps requiring the user (minimize — ideally none):** none.
 
 **Observed success:** the Qwen3.8 B70 prompt at auto micro-batch processes at >= 500 tok/s pp512 and >= 800 tok/s pp2048 (from 13.5-14.4 at `-ub 256`) with tokens identical to the CPU arm; decode (Q_tg, Q_noc) within its floors and the place line unchanged; every GPT-OSS B50 arm and the Mistral gate unchanged with zero `[MOE-EXEC] layer` lines where no host expert exists; loan and refill counts equal; no kernel resets; the baselines section carries the first green table.
+
+**Amendment (2026-10-23, llama.cpp-bcre, llama.cpp-pu8v, llama.cpp-x6zo):** The ring-engaged targets above move; the
+steps otherwise stand.
+- Step 3: the probe line reads `(probed; iterations <lo>-<hi>)` at >= 20 GB/s on both cards (Task 3's amendment).
+- Step 4: `verdicts_pass=11` needs the pp512 >= 500 and pp2048 >= 800 floors, which need the ring. On a tree where the
+  ring does not engage, `Q_pp` fails its floors and says `ring_engaged=no`, so the failure names its cause. The floors
+  are not lowered, and `Q_staged` reports NOT_EXERCISED. The gate exits 3, not 0, when no arm engaged the ring, even
+  if nothing failed. The original "Q_tok md5 == Q_tok_cpu md5" is replaced: `Q_tok_cpu` is scored across two loads per
+  arm by common prefix (some auto md5 equals some cpu md5, and every auto output shares >= 64 bytes with its best
+  cpu match), because the greedy near-tie flips in both policies. `Q_tg` and `Q_noc` pass on the reference md5 or on
+  a flip that shares >= 128 bytes with the committed reference text.
+- Step 5: the number of `[MOE-EXEC] layer ... CPU (forced)` lines is the number of layers with host experts, not 48.
+- Step 6: the loan and the refill appear only when a reserve falls short and the loan is granted. The gate reports
+  `loan_exercised` and `refill`, and `no` and `not_exercised` are the honest answer until llama.cpp-pu8v lands.
+- Observed success: the Qwen3.8 B70 targets (pp512 >= 500, pp2048 >= 800, tokens identical to the CPU arm or a
+  flip by the common-prefix rule) and the loan and refill counts are owned by llama.cpp-bcre and llama.cpp-pu8v.
+  Until they land, success is the gate reporting `ring_engaged=no` with the neutral numbers, the decode arms inside
+  their floors with the md5 as the reference or a flip and the place line recorded (not "unchanged"), every GPT-OSS
+  B50 arm (with zuze's pp512 caveat) and the Mistral gate unchanged, and no kernel resets. The baselines section
+  carries run 2 as a record, not as the first green table.

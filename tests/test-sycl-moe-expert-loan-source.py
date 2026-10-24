@@ -2454,6 +2454,35 @@ def test_mutant_refill_storage_sized_from_dst_size_fails():
     assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
 
 
+def test_mutant_missing_entry_does_not_stop_fails():
+    """No entry to size from must stop the preparation with the cache's refusal, not mint a zero-byte copy."""
+    mutant = _once_in(SYCL, TXN_SIG, COPY_SIZE_MISSING, "")
+    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+
+
+def test_mutant_loan_query_sizes_a_retired_entry_fails():
+    mutant = _once_in(CACHE, LOAN_BYTES_SIG, BYTES_RETURN, "return it != entries_.end() ? it->second.size : 0;")
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+
+
+def test_mutant_refill_query_sizes_a_retired_entry_fails():
+    mutant = _once_in(CACHE, REFILL_BYTES_SIG, BYTES_RETURN, "return it != entries_.end() ? it->second.size : 0;")
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+
+
+def test_mutant_refill_query_reads_the_device_entry_fails():
+    mutant = _once_in(CACHE, REFILL_BYTES_SIG, REFILL_BYTES_FIND, LOAN_BYTES_FIND)
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+
+
+def test_mutant_copy_minted_before_the_size_query_fails():
+    """The copies minted first and the size asked after: the order the claim pins, witnessed."""
+    query = COPY_SIZE + " " + COPY_SIZE_MISSING
+    mutant = _once_in(SYCL, TXN_SIG, query, "")
+    mutant = _once_in(mutant, TXN_SIG, HOST_ALLOC, HOST_ALLOC + " " + query)
+    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+
+
 def test_mutant_loan_query_reads_the_host_entry_fails():
     mutant = _once_in(CACHE, LOAN_BYTES_SIG, LOAN_BYTES_FIND, REFILL_BYTES_FIND)
     assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)

@@ -1355,6 +1355,21 @@ if (NOT WIN32)
         LABELS "sycl;source"
         SKIP_RETURN_CODE 77
     )
+
+    # MoE executor gate script (llama.cpp-x6zo, plan Task 15 of llama.cpp-36j0): the scoring of
+    # scripts/sycl-moe-exec-gate.sh against fixture logs and csv (Q_pp pass / fail / ring-refused, the staged-ring
+    # trace, the decode arms, the GPT-OSS echo-line control), --dry-run, --help and the refusals. Pure bash: it
+    # loads no model, touches no device and takes no GPU.lock, so it is safe at any parallelism.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-moe-exec-gate-script
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-gate-script.sh
+    )
+    set_tests_properties(test-sycl-moe-exec-gate-script PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT WIN32)

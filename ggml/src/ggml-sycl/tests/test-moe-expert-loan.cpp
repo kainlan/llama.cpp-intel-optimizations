@@ -16,8 +16,9 @@
 //   lends_two_triplets      2 layers x 4 experts, expert 3 on the host: three requests leave the largest pending,
 //                           the graph-boundary runner lends two triplets and clears it, the plan shows them on the
 //                           host, resolve_expert finds host-pinned copies equal to the originals, the device entries
-//                           are gone within 2 s and the device gets their storage back: the entries' sizes, which
-//                           equal the reported charge only because a 1 MiB expert is 256-byte aligned.
+//                           are gone within 2 s and the device gets their storage back: the entries' sizes, which the
+//                           loan reports, and which equal the requested charge only because a 1 MiB expert is
+//                           256-byte aligned.
 //   probe_changes_nothing   c-tdra first: inside a graph the transaction refuses "graph active" and a request waits.
 //                           Then the same plan probed: the selection is reported and nothing is copied or published.
 //   refuses_replacing_a_host_entry
@@ -61,15 +62,22 @@
 //                           once the room is back. The teardown counts read 2/4.
 //   refill_moves_two_triplets_per_call
 //                           A three-triplet loan, then one decode boundary at two per call: both move (2 triplets,
-//                           6 charges of bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
+//                           six entries' bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
 //                           to a device entry IN_PROGRESS behind its copy, and the third stays lent until the next
 //                           decode boundary re-admits it. The teardown counts read 3/3.
 //   loan_sizes_its_copies_from_the_entry
 //                           llama.cpp-pu8v: each device entry 72 bytes past the plan's dst_size, as S1-PRELOAD pads a
 //                           Q4_0 expert whose rows are not a multiple of MATRIX_ROW_PADDING. A host copy minted at the
 //                           plan's size is refused "host storage too small" and moves nothing; then the loan lends two
-//                           triplets, each host copy the entry's size with its zero tail, and one decode boundary
-//                           re-admits both at that size.
+//                           triplets, each host copy the entry's size with its zero tail, reporting exactly the six
+//                           entries' sizes freed, and one decode boundary re-admits both, reporting the same bytes.
+//   loan_and_refill_stop_on_a_missing_entry
+//                           llama.cpp-pu8v: a one-triplet loan whose down member has no device entry stops "not
+//                           resident" (its refusal WARNed once): nothing lent, published or re-posted. After a
+//                           two-triplet loan, the triplet behind the ledger's back loses its gate host copy: one
+//                           decode boundary re-admits the back and keeps it, WARNing no drop, and the next stops "not
+//                           lent" and drops it, WARNing "stays on the host: not lent" once, publishing nothing. Both
+//                           WARNs are captured and asserted.
 //   loan_reclaims_pointer_table_leases
 //                           llama.cpp-6aj4: one layer's three tensors each get the pointer table a prompt graph's
 //                           preload builds (ggml_sycl_update_moe_ptr_table over the routed device experts), and each
@@ -150,6 +158,8 @@ int main() {
     ok &= run_case("refill_drops_an_unpreparable_triplet", ggml_sycl::test_expert_refill_drops_an_unpreparable_triplet);
     ok &= run_case("refill_moves_two_triplets_per_call", ggml_sycl::test_expert_refill_moves_two_triplets_per_call);
     ok &= run_case("loan_sizes_its_copies_from_the_entry", ggml_sycl::test_expert_loan_sizes_its_copies_from_the_entry);
+    ok &= run_case("loan_and_refill_stop_on_a_missing_entry",
+                   ggml_sycl::test_expert_loan_and_refill_stop_on_a_missing_entry);
     ok &= run_case("loan_reclaims_pointer_table_leases", ggml_sycl::test_expert_loan_reclaims_pointer_table_leases);
     ok &= run_case("loan_reclaims_after_a_timed_out_boundary_drain",
                    ggml_sycl::test_expert_loan_reclaims_after_a_timed_out_boundary_drain);

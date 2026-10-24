@@ -1,0 +1,10 @@
+```python
+def merge_intervals(intervals):
+    """
+    Merge overlapping closed intervals.
+
+    Given a list of (start, end) tuples representing closed intervals,
+    merge all overlapping intervals and return a sorted list of merged intervals.
+
+    >>> merge_intervals([(1, 3
+

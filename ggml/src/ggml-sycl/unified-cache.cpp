@@ -10327,7 +10327,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_freed += members[i].vram_charge_size;
+        out.bytes_freed += bytes[i];
     }
     return true;
 }
@@ -10613,7 +10613,7 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_readmitted += members[i].vram_charge_size;
+        out.bytes_readmitted += bytes[i];
     }
     return true;
 }
@@ -29755,6 +29755,9 @@ static size_t planner_layout_bytes_for_dims(ggml_type        type,
         case GGML_LAYOUT_AOS:
         case GGML_LAYOUT_SOA:
         default:
+            // Unpadded: a direct-staged AOS expert's entry can exceed this by the MATRIX_ROW_PADDING tail
+            // (ggml_sycl_get_padded_weight_bytes), so expert loans and refills size copies from the entry
+            // (llama.cpp-pu8v).
             return ggml_row_size(type, ncols) * static_cast<size_t>(nrows);
     }
 }
