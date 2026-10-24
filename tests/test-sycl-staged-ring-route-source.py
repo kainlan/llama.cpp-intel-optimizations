@@ -26,7 +26,7 @@ What this gate pins:
     NVFP4 matrix, a slice whose resolved layout is not the entry's, or a route either validator refuses falls through
     to the route core. Every lookup is counted served or refused, and every refusal with its cause, in the order
     asked, and with the capability's reason or the validator's reject reason (plan Task 8: the trace says why); the
-    capability part is one helper the ring's staging asks too;
+    capability part is one helper, the one the prompt-kernel predicate answers through;
   - the batched executor consumes a staged slot whose entry names it as the consumer, for an expert it would otherwise
     decline (llama.cpp-3460): one stage-table lookup in its expert loop, only for a non-device expert, keyed as the
     staged route keys it, the slot and layout from the entry, the entry's ready event on the executor's barrier, and

@@ -22,17 +22,6 @@
 #include <utility>
 #include <vector>
 
-// The AOS -> SOA reorder of one matrix on `queue` (ggml-sycl.cpp), which the load-time fill runs over the types of
-// ggml_sycl_soa_reorder_supported_type. The prompt ring never calls it: every ring slot holds AOS (moe_stream_staging).
-sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue &                    queue,
-                                         const uint8_t *                  aos_device,
-                                         uint8_t *                        soa_device,
-                                         ggml_type                        type,
-                                         int64_t                          ncols,
-                                         int64_t                          nrows,
-                                         size_t                           src_bytes,
-                                         const std::vector<sycl::event> & deps);
-
 namespace ggml_sycl {
 
 // How the ring stages one matrix (W2 of docs/plans/2026-10-24-prefill-window-ring.md). AOS_ONLY: one slot the copy
@@ -398,7 +387,7 @@ static inline bool moe_stream_layer_claimed(const moe_stream_layer_info & li) {
 
 // True iff the batched executor takes the layer's weights whole from the ring: the layer is claimed
 // (moe_stream_layer_claimed) and a ring of `geo` can exist. Anything less keeps the whole layer hybrid: the ring never
-// stages part of a layer.
+// serves some of a layer's host matrices while the rest stay on the hybrid path.
 static inline bool moe_stream_executor_claims(const moe_stream_layer_info & li, const moe_stream_ring_geometry & geo) {
     return geo.n_slots != 0 && moe_stream_layer_claimed(li);
 }
@@ -919,8 +908,9 @@ class moe_stream_phase {
 
 namespace detail {
 
-// True iff a SOA-to-AOS inverse of ggml_sycl_reorder_weight_gpu exists for `type`. None exists yet: that function only
-// runs AOS to SOA, so v1 lends AOS-layout entries only. Add a case here when an inverse kernel lands.
+// True iff a SOA-to-AOS inverse of ggml_sycl_reorder_weight_gpu (the load fill's reorder, ggml-sycl.cpp) exists for
+// `type`. None exists yet: that function only runs AOS to SOA, so v1 lends AOS-layout entries only. Add a case here
+// when an inverse kernel lands.
 static inline bool moe_loan_soa_inverse_exists(ggml_type type) {
     (void) type;
     return false;

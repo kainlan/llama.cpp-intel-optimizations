@@ -20,6 +20,9 @@ What this gate pins:
     by begin_ubatch, which every new micro-batch runs, and by end_prompt. An expert loan (ruling c-tdra, llama.cpp-mwmr)
     can make room before the next micro-batch, so a per-prompt latch would waste the loan its own prompt asked for (lead
     ruling c-i8rz);
+  - begin_ubatch clears the stage table and then forgets the last window's layer, the prefetch id and its whole flag
+    (llama.cpp-9433): a micro-batch can start at the layer the last one ended on, so a kept id would take a cleared
+    window as prefetched and skip staging it, and a kept flag would abort on the entries the clear dropped;
   - a refused reserve asks for that loan (llama.cpp-3460, closing c-0tmn): the request is made once, in ring_ready()'s
     reserve-failed branch after the latch, with the shortfall the reserve reports (the ring's bytes past the WEIGHT
     zone's largest free block), through op hooks the backend wires to ggml_sycl_request_expert_loan and to the boundary
@@ -66,6 +69,11 @@ What this gate pins:
   - only a host lease whose retained owner is a host-pinned WEIGHT allocation of this device's host zones is copied
     (llama.cpp-9y0p: any other lease would take the staged path), only a matrix one AOS slot holds is staged, and a
     window lists only matrices not staged NONE (moe_stream_window_items);
+  - a matrix the ring cannot take (no lease, a short lease, or an owner it cannot copy from) reaches the executor as a
+    decline, not an abort (llama.cpp-9433): stage_window skips it before the free-slot check, and window_begin re-stages
+    only a window no prefetch took, aborts on a prefetched one only after a whole prefetch, has three aborts (the claim
+    guard, a window larger than its region, entries lost after a whole prefetch) and returns what the table holds. No
+    host test reaches window_begin, so this pin is the interim decline path's only witness;
   - teardown gates the open region and holds one slot handle until the last use before the ring is released
     (ruling D, c-fjx1), and the ring is offered only on an in-order compute queue;
   - the backend context owns the phase, resets it after draining its queues and before the retained handles drain,
@@ -1869,27 +1877,34 @@ REORDER_DEF = "sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
 LOAD_FILL = "ggml_sycl_reorder_weight_gpu(queue, static_cast<const uint8_t *>(temp_vram),"
 
 
-def claim_reorder_is_shared_not_copied(sycl: str, hpp: str) -> bool:
-    """The load path's reorder dispatch is defined once in ggml-sycl.cpp without `static` and declared in
-    moe-stream-plan.hpp, which ggml-sycl.cpp includes before the definition (-Wmissing-declarations), and the load-time
-    fill still calls it. The ring no longer does (test_window_copy_is_the_only_submission)."""
+REORDER_DECL = ("sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue, const uint8_t * aos_device, "
+                "uint8_t * soa_device, ggml_type type, int64_t ncols, int64_t nrows, size_t src_bytes, "
+                "const std::vector<sycl::event> & deps);")
+
+
+def claim_reorder_is_the_load_fills_own(sycl: str, hpp: str) -> bool:
+    """The load path's reorder dispatch is a static function of ggml-sycl.cpp, defined once and called once, by the
+    load-time fill, and moe-stream-plan.hpp names it nowhere outside comments: the SOA staging that shared it is
+    retired, and the ring copies AOS and reorders nothing (test_window_copy_is_the_only_submission)."""
     n = norm(sycl)
-    return (n.count(REORDER_DEF) == 1 and "static " + REORDER_DEF not in n
-            and "sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue," in norm(hpp)
-            and n.count(LOAD_FILL) == 1)
+    return (n.count("static " + REORDER_DEF) == 1 and n.count(REORDER_DEF) == 1
+            and n.count(REORDER_CALL) == 2 and n.count(LOAD_FILL) == 1 and REORDER_CALL not in norm(hpp))
 
 
-def test_reorder_is_shared_not_copied():
-    assert claim_reorder_is_shared_not_copied(SYCL, PLAN_HPP)
+def test_reorder_is_the_load_fills_own():
+    assert claim_reorder_is_the_load_fills_own(SYCL, PLAN_HPP)
 
 
-def test_reorder_shared_mutants():
-    assert not claim_reorder_is_shared_not_copied(mutate(SYCL, REORDER_DEF, "static " + REORDER_DEF), PLAN_HPP)
-    assert not claim_reorder_is_shared_not_copied(
-        SYCL, mutate(PLAN_HPP, REORDER_DEF, "sycl::event other_reorder(sycl::queue & queue,"))
-    # The load-time fill moved off the shared dispatch.
-    assert not claim_reorder_is_shared_not_copied(
-        mutate(SYCL, LOAD_FILL, "other_reorder(queue, static_cast<const uint8_t *>(temp_vram),"), PLAN_HPP)
+def test_reorder_load_fill_mutants():
+    c = claim_reorder_is_the_load_fills_own
+    # The stream header declares it again.
+    assert not c(SYCL, mutate(PLAN_HPP, "namespace ggml_sycl {", REORDER_DECL + " namespace ggml_sycl {"))
+    # The definition is external again.
+    assert not c(mutate(SYCL, "static " + REORDER_DEF, REORDER_DEF), PLAN_HPP)
+    # A second caller.
+    assert not c(mutate(SYCL, LOAD_FILL, REORDER_CALL + "q2, a, s, t, c, r, b, d); " + LOAD_FILL), PLAN_HPP)
+    # The load-time fill moved off the dispatch.
+    assert not c(mutate(SYCL, LOAD_FILL, "other_reorder(queue, static_cast<const uint8_t *>(temp_vram),"), PLAN_HPP)
 
 
 # ---- the trace -------------------------------------------------------------------------------------------------------
