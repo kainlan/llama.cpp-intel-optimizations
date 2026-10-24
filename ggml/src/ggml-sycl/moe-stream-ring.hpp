@@ -55,7 +55,11 @@ struct moe_stream_ring_geometry {
 
 // Two regions of region_slots slots of matrix_bytes_max (rounded up to
 // MOE_STREAM_RING_SLOT_ALIGN) each, or no ring when those bytes, padding
-// included, exceed resident_expert_bytes / 10. region_slots is one executor
+// included, exceed 10 % of the resident expert set left once the ring's own
+// bytes are lent out of it: bytes > (resident_expert_bytes - bytes) / 10,
+// tested as bytes > resident_expert_bytes / 11 (the post-loan form, which
+// cannot overflow). A geometry accepted before the loan it requests is
+// therefore accepted after it (llama.cpp-8p5x). region_slots is one executor
 // window (moe_stream_plan_index::window_slots, min(role_items_max, G_plan)),
 // not a whole layer: the phase stages a layer a window at a time.
 moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,

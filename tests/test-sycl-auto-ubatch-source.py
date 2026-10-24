@@ -3049,6 +3049,32 @@ def test_the_shared_ring_geometry_pin_sees_a_duplicated_call(where):
         assert not _ring_geometry_is_shared(MOE_STREAM_PLAN_CPP, mutated), "the mutant must make the pin fail"
 
 
+
+# llama.cpp-7999 (Task 7 of llama.cpp-a2xb, first half of llama.cpp-8p5x): the ring's cap is 10 % of the resident expert
+# set left AFTER the ring's own bytes are lent out of it, bytes > (resident - bytes) / 10, tested as resident / 11. A
+# loan sized from the pre-loan geometry then lowers resident by at most the ring's bytes, so the geometry it asked for
+# is still accepted. The pre-loan form (/ 10) refuses after the loan the geometry it accepted before it.
+MOE_STREAM_RING_CPP = (ROOT / "ggml/src/ggml-sycl/moe-stream-ring.cpp").read_text()
+_RING_SIZE_START = "moe_stream_ring_geometry moe_stream_ring_size("
+_RING_SIZE_END = "#if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)"
+_RING_CAP_LINE = "if (bytes > resident_expert_bytes / 11) {"
+
+
+def _ring_cap_is_post_loan(raw_cpp: str) -> bool:
+    body = _body_of(raw_cpp, _RING_SIZE_START, _RING_SIZE_END)  # comment-stripped, whitespace-normalized
+    return body.count(_RING_CAP_LINE) == 1 and len(re.findall(r"\bresident_expert_bytes\b", body)) == 2
+
+
+def test_the_ring_cap_is_tested_against_the_post_loan_resident_set():
+    assert _ring_cap_is_post_loan(MOE_STREAM_RING_CPP)
+
+
+def test_the_post_loan_ring_cap_pin_has_a_mutation_witness():
+    assert MOE_STREAM_RING_CPP.count(_RING_CAP_LINE) == 1
+    mutated = MOE_STREAM_RING_CPP.replace(_RING_CAP_LINE, _RING_CAP_LINE.replace("/ 11", "/ 10"))
+    assert mutated != MOE_STREAM_RING_CPP
+    assert not _ring_cap_is_post_loan(mutated), "the pre-loan cap (/ 10) must make the pin fail"
+
 if __name__ == "__main__":
     import sys
 
