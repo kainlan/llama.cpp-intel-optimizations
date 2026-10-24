@@ -31965,8 +31965,12 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
 // The H2D probe's results (h2d_pinned_gbps, h2d_probed, h2d_retry_logged) are written at a model load's outermost
 // exit on the loading thread, which holds no lock a computing thread takes: a second model may load while another
 // model's prompt is in moe_stream_phase::weigh (llama.cpp-kp1l). They are therefore written and read under this one
-// leaf mutex, which is never held across a call: the probe's once-guard (ggml_sycl_h2d_pinned_resolved), its store,
-// and the one reader the cost model uses (ggml_sycl_h2d_probed_gbps).
+// leaf mutex, which only brackets plain field accesses (no call is made while it is held): the probe's once-guard
+// (ggml_sycl_h2d_pinned_resolved), its store, and the one reader the cost model uses (ggml_sycl_h2d_probed_gbps).
+// The mutex orders a writer against weigh. It does not serialise two probes: the guard's check-then-act is safe
+// because the probe runs only inside load_end's body (g_sycl_abort_load_exit makes every other exit return before
+// it), and the L0 LOAD token serialises those bodies (g_load_end_bodies_running, a witness, checks it). No further
+// witness is added at the probe's entry: the preload that precedes it in the same exit already carries one.
 static std::mutex g_sycl_h2d_pinned_mutex;
 
 static bool ggml_sycl_h2d_pinned_resolved(const ggml_sycl_device_info & info, int dev) {
@@ -31980,8 +31984,8 @@ double ggml_sycl_h2d_probed_gbps(int device) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return 0.0;
     }
-    std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);
     const sycl_device_info &    d = ggml_sycl_info().devices[device];
+    std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);
     return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;
 }
 
