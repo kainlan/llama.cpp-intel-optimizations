@@ -1086,7 +1086,8 @@ git commit -m "sycl, tests: a prompt layer's host experts are weighed before its
 **Amendment (2026-10-23, llama.cpp-xod7; epic ruling c-las5 on llama.cpp-36j0):** Task 7b merged with these
 deviations, rulings and carry-forwards. The text above is the plan; this is the build.
 - Deviations #1-#5, #7 and #11 of xod7 c-kkbs were accepted (c-0bw3): `begin_layer` takes a `const moe_stream_op &`;
-  `fully_staged()` and `region_open()` are public; there is no `rates_` member and the rates are assembled per layer;
+  `region_open()` and the staged predicate (`fully_staged()` as xod7 merged it, `executor_staged()` since 3460) are
+  public; there is no `rates_` member and the rates are assembled per layer;
   the phase is held as `unique_ptr<moe_stream_phase, moe_stream_phase_deleter>` in common.hpp;
   `ggml_sycl_reorder_weight_gpu` was made non-static instead of refactoring the fill; `layer_done`'s event is a
   compute-queue barrier after the down op; the n_host == 0 skip reads the plan index.
@@ -1169,7 +1170,7 @@ if (prompt_rows && sctx && sctx->moe_stream) {
         route.planned_device  = submit_device;
         route.layout          = GGML_LAYOUT_SOA;
         route.staged_ring     = true;
-        route.recipe          = ggml_sycl_build_device_recipe(src0, submit_device, GGML_LAYOUT_SOA, /*rows*/ count / slots_per_token);
+        route.recipe          = ggml_sycl_moe_build_device_recipe(src0, submit_device, GGML_LAYOUT_SOA, /*rows*/ count / slots_per_token);
         route.recipe.transfer = moe_recipe_transfer::STAGED_RING;
         route.recipe_reason   = "staged-ring";
         return route;
@@ -1177,7 +1178,7 @@ if (prompt_rows && sctx && sctx->moe_stream) {
 }
 ```
 
-where `ggml_sycl_build_device_recipe` is the existing device-recipe construction at `:32255-32269` hoisted into a static (the capability query `ggml_sycl_moe_query_route_capability`, `:31622`, with the `requires_host_staging ? HOST_BOUNCE : NONE` transfer it sets today, overwritten here).
+where `ggml_sycl_moe_build_device_recipe` is the existing device-recipe construction at `:32255-32269` hoisted into a static (the capability query `ggml_sycl_moe_query_route_capability`, `:31622`, with the `requires_host_staging ? HOST_BOUNCE : NONE` transfer it sets today, overwritten here).
 3. Build, gates, format.
 
 **Commit:**
@@ -1316,7 +1317,7 @@ Follow-ups folded elsewhere: llama.cpp-v7np into Task 10, the in-graph loan requ
       ctx.moe_stream->layer_fully_staged(layer, ids, n_ids))` where `moe_stream_phase::layer_fully_staged` wraps Task
       7a's pure `moe_stream_layer_fully_staged` over the phase's own stage table (every distinct id that is
       host-planned has all three roles staged, ready or pending).
-- [ ] **No longer true as written (3460 c-vrmr, see the Amendment): the gate pins `->fully_staged(` on the bool's own
+- [ ] **No longer true as written (3460 c-vrmr, see the Amendment): the gate pins `->executor_staged(` on the bool's own
       line, not `->layer_fully_staged(` on the `plan_has_cpu_experts` line.** Source gate: `->layer_fully_staged(`
       appears exactly once in `ggml_sycl_mul_mat_id`, on the line that computes `plan_has_cpu_experts`;
       `moe_hybrid_with_plan` keeps its `ne12 == 1 ||` term (decode untouched).
@@ -1354,7 +1355,7 @@ premise was wrong, and its acceptance could not run.
   device or the host, a device layout the executor accepts, an f16 table row at AOS, MXFP4 excluded). The ring's
   library hook answers it. Executor-consumer slots stage AOS_ONLY. The resolver refuses by the entry's consumer, and
   the executor's resolve takes staged entries through `find()`. One bool read after `begin_layer` (the predicate and
-  `fully_staged`) leaves the hybrid world. Its gate pins `->fully_staged(` on the bool's own line, not on the
+  `executor_staged`) leaves the hybrid world. Its gate pins `->executor_staged(` on the bool's own line, not on the
   `plan_has_cpu_experts` line, and not the plan's `->layer_fully_staged(` (3460 c-vrmr: the bool is set after the
   payload release, because the claim-release gate pins the release directly after `begin_layer`).
   llama.cpp-v7np closed with this merge.
@@ -1692,7 +1693,16 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
 **Steps the coding agent runs itself:**
 
 1. Host family on the merged build: `ctest --test-dir build -R 'moe-exec|moe-stream|expert-loan|zone-sizing|tuning-cache-io|h2d-probe|staged-ring|moe-exec-knobs|kv-room-cost' --output-on-failure -j 1` -> all pass; `python3.13 -I scripts/check-sycl-alloc-zone-contract.py --root /Apps/llama.cpp` -> pass; `bash scripts/check-ctest-safety-net.sh --build-dir build` -> "safety net intact".
-2. Device tests, lead-run, one at a time: `ctest --test-dir build -R '^(mem-ops|moe-stream-ring|moe-expert-loan)$' --output-on-failure -j 1` on `level_zero:1`, then the same with `ONEAPI_DEVICE_SELECTOR=level_zero:0` -> pass on both cards, no 77.
+2. Device tests, lead-run, one at a time. The three ctest registrations pin `ONEAPI_DEVICE_SELECTOR=level_zero:1`, and a
+   selector set in the shell is silently overridden, so the B70 arm cannot run through ctest.
+   - B50 arm: `ctest --test-dir build -R '^(mem-ops|sycl-moe-stream-ring|sycl-moe-expert-loan)$' --output-on-failure -j 1`
+     (the registered names; `moe-stream-ring|moe-expert-loan` select nothing) -> pass, no 77.
+   - B70 arm: run the binaries directly after sourcing `setvars.sh`: `ONEAPI_DEVICE_SELECTOR=level_zero:0
+     build/bin/test-mem-ops`, `ONEAPI_DEVICE_SELECTOR=level_zero:0 build/bin/test-moe-stream-ring` and
+     `ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_STRICT_LEASES=1 build/bin/test-moe-expert-loan`. Score each by its
+     exit code (77 is a skip, not a pass) and by its "Device 0 (...)" line. On the B70 the loan test's
+     `refill_drops_an_unpreparable_triplet` case fails with "the WEIGHT zone took 16 GiB of 1 MiB fillers and still had
+     room" (llama.cpp-m0t7, a fixture limitation) and the other 14 cases pass (measured at f14082f2b on 2026-10-23).
 3. The probe: first start of `llama-completion` on each card logs `[MOE-EXEC] h2d probe device N: 2x.x GB/s (probed)`; the second logs `(tuning cache)`; `ls ~/.cache/llama.cpp/sycl-tuning/*-moe-exec-rates.json` lists one file per device.
 4. The gate: `nohup bash scripts/sycl-moe-exec-gate.sh <merge sha> > <scratchpad>/gate.log 2>&1 &` (detached, marker `GATE_DONE`, waiter armed on that word; memory `a-waiter-armed-on-the-wrong-marker-word...`) -> `verdicts_pass=11 GATE_DONE` (11 = every arm that can PASS; run 2 reached 8); the Q_pp arm's table shows pp512 >= 500 and pp2048 >= 800 with the auto-chosen `n_ubatch` in the CSV; Q_tok md5 == Q_tok_cpu md5; Q_tg >= 11.0 with `refill ... 100/100`-style equal counts; GO_gate, GO_pp, GO_noc, MI all green; resets = 0.
 5. The decision is a decision: `GGML_SYCL_MOE_EXEC=cpu` on Q_pp reproduces the before-number (13.5-14.4 at `-ub 256`, higher at auto `-ub`) and prints 48 `[MOE-EXEC] layer ... CPU (forced)` lines; `GGML_SYCL_MOE_EXEC_TRACE=1` on one Q_pp run shows `regime=STREAM_ALL p=0.99` for every layer at `-ub >= 256`, and a `-p 16` run shows `ROUTED_ONLY` with `CPU` chosen.

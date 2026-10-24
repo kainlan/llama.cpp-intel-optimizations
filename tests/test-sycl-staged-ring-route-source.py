@@ -991,8 +991,11 @@ RELEASE_PAYLOAD = "std::vector<void *> & payload = extra->weight().moe_expert_pt
 RELEASE_HANDLES = "const std::vector<ggml_sycl::mem_handle> & handles = extra->weight().moe_expert_handles[device];"
 RELEASE_NULL = ("if (staged[slot] != 0 && payload[slot] != nullptr && (slot >= handles.size() || "
                 "!handles[slot].valid())) { payload[slot] = nullptr; nulled = true; }")
-RELEASE_INVALIDATE = ("if (nulled) { extra->weight().moe_device_table_valid[device] = false; "
-                      "ggml_sycl_invalidate_moe_full_local_probe(extra, device); }")
+# The one member that marks the table stale and forgets the probe, with the device-index guard (llama.cpp-8xdz M3);
+# the release path used to repeat its body inline.
+RELEASE_INVALIDATE = "if (nulled) { extra->weight().mark_moe_device_table_stale(device); }"
+RELEASE_INVALIDATE_INLINE = ("if (nulled) { extra->weight().moe_device_table_valid[device] = false; "
+                             "ggml_sycl_invalidate_moe_full_local_probe(extra, device); }")
 RELEASE_UNCOUNT = "extra->weight().moe_stream_payload_records.fetch_sub(1, std::memory_order_release);"
 RELEASE_CLEAR = "ctx.moe_stream_payload.clear();"
 RECORD_SIG = ("static void ggml_sycl_moe_stream_record_payload(ggml_backend_sycl_context & ctx, "
@@ -1072,11 +1075,11 @@ def test_staged_pointer_release_mutants():
     assert not c(sycl=mutate(SYCL, "{ payload[slot] = nullptr; nulled = true; }", "{ nulled = true; }"))
     # A slot a later upload gave a resident expert is nulled under it.
     assert not c(sycl=mutate(SYCL, " && (slot >= handles.size() || !handles[slot].valid())", ""))
-    # The device table kept valid, so moe_ptrs_ptr hands a kernel the stale device copy.
-    assert not c(sycl=mutate(SYCL, RELEASE_INVALIDATE,
-                             "if (nulled) { ggml_sycl_invalidate_moe_full_local_probe(extra, device); }"))
-    # The full-local probe kept.
-    assert not c(sycl=mutate(SYCL, " ggml_sycl_invalidate_moe_full_local_probe(extra, device); }", " }"))
+    # The device table kept valid and the full-local probe kept, so moe_ptrs_ptr hands a kernel the stale device copy.
+    assert not c(sycl=mutate(SYCL, RELEASE_INVALIDATE, "if (nulled) { }"))
+    # The body repeated inline instead of calling the one member (the pre-8xdz form): the table is marked, but through
+    # a second copy of the member's body that can drift from it.
+    assert not c(sycl=mutate(SYCL, RELEASE_INVALIDATE, RELEASE_INVALIDATE_INLINE))
     # Nulled while the ring that holds the pointers is still held.
     assert not c(sycl=mutate(SYCL, "if (ctx.moe_stream && ctx.moe_stream->ring_releases() == "
                                    "ctx.moe_stream_payload_releases) { return; }", ""))

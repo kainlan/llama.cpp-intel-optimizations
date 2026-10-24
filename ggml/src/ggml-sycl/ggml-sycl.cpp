@@ -20751,11 +20751,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // A prompt phase borrows VRAM for the prefill ring from the device's least popular resident expert triplets.
 // moe_expert_loan_select() picks whole (gate, up, down) triplets from the published plan; the cache copies each to
 // pinned host storage and withdraws the device copy (unified_cache::loan_expert_triplet); the plan flips those entries
-// to the host and is published once, so each lent expert executes where it now lives. File-static. Today its one
-// production caller is the boundary runner ggml_backend_sycl_synchronize() calls, which finds no request until a
-// requester lands.
-// The auto-ubatch fit's ring term calls it in probe mode (ggml_sycl_expert_loan_probe_bytes), and once plan Task 12
-// lands the ring's admission in mul_mat_id (the ring phase, Task 7b) will call only ggml_sycl_request_expert_loan().
+// to the host and is published once, so each lent expert executes where it now lives. File-static. Its one production
+// caller is the boundary runner ggml_backend_sycl_synchronize() calls, which runs the request the prompt phase posted:
+// the ring phase's moe_stream_phase::ring_ready() (moe-stream-plan.cpp, llama.cpp-3460) asks through its request_loan
+// hook, which the backend wires to ggml_sycl_request_expert_loan(), when the WEIGHT zone cannot give it the ring.
+// The auto-ubatch fit's ring term calls it in probe mode (ggml_sycl_expert_loan_probe_bytes) and lends nothing.
 //
 // Where it runs (c-tdra): at a graph boundary, never inside a graph. The ring's admission runs inside one, holding
 // g_sycl_graph_compute_mutex (L2), and the inventory mutex (L1) ranks below it (canonical contract section 12.5), so it
@@ -21077,7 +21077,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                                                      bool                                   warn_busy) {
     const bool                   refill = direction == ggml_sycl_expert_txn_direction::REFILL;
     ggml_sycl_expert_loan_result result{};
-    auto finish = [&](ggml_sycl_txn_result code, const char * reason) {
+    auto                         finish = [&](ggml_sycl_txn_result code, const char * reason) {
         result.reason = reason;
         if (out) {
             *out = result;
@@ -21273,7 +21273,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
 
     // An exception while moving a triplet stops the loop; the triplets already moved are still published below, and it
     // is rethrown once the inventory lock is released.
-    std::exception_ptr escaped;
+    std::exception_ptr                 escaped;
     // A loan's drops keep a lease on every view they take here, retained after the loop (llama.cpp-6aj4).
     std::vector<ggml_sycl::mem_handle> lent_views;
     for (prepared_triplet & triplet : prepared) {
@@ -21493,25 +21493,6 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
                                     out, warn_busy);
 }
 
-// Lend resident expert triplets worth at least bytes_wanted of VRAM on the backend's device to the prefill ring, or,
-// in probe mode, say what a loan would lend while copying and publishing nothing. The direct entry, for a caller
-// outside any graph; refused "graph active" inside one. Unused until its caller lands (plan Task 12); the fit term asks
-// ggml_sycl_expert_loan_probe_bytes, which takes a device because the fit has no backend.
-[[maybe_unused]] static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction(ggml_backend_t backend,
-                                                                                   size_t         bytes_wanted,
-                                                                                   bool           probe_mode,
-                                                                                   ggml_sycl_expert_loan_result * out) {
-    const auto * ctx = backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (!ctx) {
-        if (out) {
-            *out        = ggml_sycl_expert_loan_result{};
-            out->reason = "backend has no SYCL context";
-        }
-        return ggml_sycl_txn_result::REFUSED;
-    }
-    return ggml_sycl_expert_loan_transaction_run(ctx->device, bytes_wanted, probe_mode, nullptr, out);
-}
-
 // What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused
 // (a graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks it
 // (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
@@ -21586,7 +21567,7 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     if (code == ggml_sycl_txn_result::REFUSED) {
         g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release);
     }
-    std::atomic<uint32_t> &    busy_streak = g_sycl_expert_loan_busy_streak[device];
+    std::atomic<uint32_t> & busy_streak = g_sycl_expert_loan_busy_streak[device];
     if (code != ggml_sycl_txn_result::BUSY) {
         busy_streak.store(0, std::memory_order_relaxed);
         return true;
@@ -21685,25 +21666,6 @@ static uint32_t ggml_sycl_expert_refill_transaction_run(int                     
         *code = answer;
     }
     return result->n_remaining;
-}
-
-// Re-admit up to max_triplets_per_call of the triplets the backend's device has lent, flipping each back on the device
-// in the plan and publishing once, and return how many lent triplets the refill cursor still holds. 0 is also what an
-// accepted loan since the last decode boundary leaves: it disarms the cursor, so this re-admits nothing until a decode
-// boundary arms it again. The direct entry, for a caller outside any graph; refused "graph active" inside one. The
-// decode boundary runs ggml_sycl_run_expert_refill_at_boundary() instead, which also arms the cursor.
-[[maybe_unused]] static uint32_t ggml_sycl_run_expert_refill_transaction(ggml_backend_t backend,
-                                                                         uint32_t       max_triplets_per_call,
-                                                                         ggml_sycl_expert_loan_result * out = nullptr) {
-    const auto * ctx = backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (!ctx) {
-        if (out) {
-            *out        = ggml_sycl_expert_loan_result{};
-            out->reason = "backend has no SYCL context";
-        }
-        return 0;
-    }
-    return ggml_sycl_expert_refill_transaction_run(ctx->device, max_triplets_per_call, nullptr, out);
 }
 
 // Arm or disarm the device's refill cursor. Armed only while the ledger holds a lent triplet.
@@ -32834,15 +32796,15 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     if (!ctx.moe_stream) {
         ctx.moe_stream.reset(new ggml_sycl::moe_stream_phase());
     }
-    call.op.n_tokens      = static_cast<uint32_t>(ids->ne[1]);
-    call.op.n_expert      = static_cast<int>(src0->ne[2]);
-    call.op.n_expert_used = static_cast<int>(ids->ne[0]);
-    call.op.graph_seq     = ctx.graph_compute_seq;
-    call.op.policy        = ggml_sycl_moe_exec_config().policy;
-    call.op.log           = &ggml_sycl_moe_exec_log();
-    call.op.graph_ctx     = &call;
-    call.op.layer_present = ggml_sycl_moe_stream_layer_present;
-    call.op.host_lease    = ggml_sycl_moe_stream_host_lease;
+    call.op.n_tokens       = static_cast<uint32_t>(ids->ne[1]);
+    call.op.n_expert       = static_cast<int>(src0->ne[2]);
+    call.op.n_expert_used  = static_cast<int>(ids->ne[0]);
+    call.op.graph_seq      = ctx.graph_compute_seq;
+    call.op.policy         = ggml_sycl_moe_exec_config().policy;
+    call.op.log            = &ggml_sycl_moe_exec_log();
+    call.op.graph_ctx      = &call;
+    call.op.layer_present  = ggml_sycl_moe_stream_layer_present;
+    call.op.host_lease     = ggml_sycl_moe_stream_host_lease;
     call.op.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;
     call.op.request_loan   = ggml_sycl_request_expert_loan;
@@ -32931,8 +32893,7 @@ static void ggml_sycl_moe_stream_release_payload(ggml_backend_sycl_context & ctx
             }
         }
         if (nulled) {
-            extra->weight().moe_device_table_valid[device] = false;
-            ggml_sycl_invalidate_moe_full_local_probe(extra, device);
+            extra->weight().mark_moe_device_table_stale(device);
         }
         extra->weight().moe_stream_payload_records.fetch_sub(1, std::memory_order_release);
     }
@@ -95521,7 +95482,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // `[SYCL-MOE-SEQUENCE-GRAPHLET] summary phase=final` line may print here too.
     ggml_sycl_graph_diag_report("final", sycl_ctx && sycl_ctx->exec_graph, sycl_ctx);
 #endif
-    ggml_sycl_moe_exec_log_report();  // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
+    ggml_sycl_moe_exec_log_report();       // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
     ggml_sycl_expert_refill_log_report();  // the [MOE-EXEC] refill line, if any triplet was lent (llama.cpp-sif1)
     // Stop adaptive prestage background thread before tearing down SYCL resources.
     g_adaptive_prestage.stop();
