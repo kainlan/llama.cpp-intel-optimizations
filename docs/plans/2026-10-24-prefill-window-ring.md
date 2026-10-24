@@ -1811,7 +1811,7 @@ not sufficient; the gate run on this host is the evidence, recorded with the mer
 
 ## Tracker
 
-Epic: created by the lead when this plan is committed (`llama.cpp-<epic>`), parent of Tasks 1-10. Linked (not owned):
+Epic: `llama.cpp-a2xb`, parent of Tasks 1-10 (`eeim`, `2399`, `9433`, `8epx`, `efck`, `a64a`, `fthf`, `7999`, `ny6i`, `477m`, `qov5`). Linked (not owned):
 - llama.cpp-bcre — the ring never engages; this plan is the owner's decision (a), the window ring. Closed by Task 10.
 - llama.cpp-8p5x — loan sized by pre-loan geometry (Task 7) and the forced-decline arm (Task 8).
 - llama.cpp-xkcx — `test-moe-expert-loan` 1-in-7 segfault; the loan path is exercised by `Q_pp` only when the ring is
