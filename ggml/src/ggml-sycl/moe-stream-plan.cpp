@@ -1,9 +1,9 @@
 // moe_stream_phase: the prompt phase's VRAM ring, stage table and per-layer decisions (llama.cpp-xod7, plan Task 7b of
 // llama.cpp-36j0). The pure parts it consults are in moe-stream-plan.hpp; test-moe-stream-phase pins them.
 //
-// Nothing here waits on the host or asks an event for its status (ruling A, c-3bde): a copy waits for its region's
-// gate on the device (and, around an AOS-only slot, for a compute-queue barrier), a reorder for its copy, and a region
-// closes on an event after its last use.
+// Nothing here waits on the host or asks an event for its status (ruling A, c-3bde): a copy waits on the device for its
+// region's gate and its region's read gate (the executor's barrier behind the dequants of the window the region last
+// held, or a compute-queue barrier), and a region closes on an event after its last copy.
 
 #include "moe-stream-plan.hpp"
 
@@ -46,10 +46,12 @@ void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {
     region_keys_[0].clear();
     region_keys_[1].clear();
     layers_.clear();
-    cur_layer_   = -1;
-    ubatch_seq_  = ubatch_live_ ? ubatch_seq_ + 1 : 0;
-    ubatch_live_ = true;
-    n_tokens_    = n_tokens;
+    cur_layer_         = -1;
+    ubatch_live_       = true;
+    n_tokens_          = n_tokens;
+    prev_window_layer_ = -1;
+    next_window_id_    = UINT32_MAX;
+    next_window_whole_ = false;
 }
 
 moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
@@ -60,55 +62,45 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
                                                 const int32_t *        ids,
                                                 size_t                 n_ids,
                                                 const moe_stream_op &  op) {
+    GGML_UNUSED(cache);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(n_ids);
     const bool new_ubatch = moe_stream_ubatch_starts(ubatch_live_, layer, cur_layer_, op.graph_seq, cur_graph_seq_);
     if (!new_ubatch && layer == cur_layer_) {
         return decision_of(layer);  // the layer's later ops: the first one decided
     }
-    const std::chrono::steady_clock::time_point now       = std::chrono::steady_clock::now();
-    double                                      window_us = 0.0;
     if (new_ubatch) {
         begin_ubatch(op.n_tokens);
         prepare(plan, device, ccs, op);
-    } else {
-        window_us = std::chrono::duration<double, std::micro>(now - last_layer_tp_).count();
     }
-    last_layer_tp_ = now;
     cur_layer_     = layer;
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
     policy_        = op.policy;
     request_loan_  = op.request_loan;
     loan_refusals_ = op.loan_refusals;
-    bitmap_        = moe_stream_ids_bitmap(ids, n_ids, op.n_expert);
 
-    // The layer itself: weighed here only when the previous layer did not weigh it (the micro-batch's first host
-    // layer: its copy is exposed), staged here when it was not staged a layer ahead.
+    // The layer is weighed at its own first op, never a layer ahead: the executor stages its own windows, and no copy
+    // of a layer hides under the previous layer's (there is no cross-layer prefetch), so the cost model gets no window.
     const auto cur = index_.layers.find(layer);
     if (cur != index_.layers.end()) {
         layer_state & st = layers_[layer];
         if (!st.decided) {
             st.decision = weigh(cur->second, op, 0.0);
             st.decided  = true;
-        }
-        if (!st.resolved) {
-            resolve(layer, cur->second, st, cache, op);
-        }
-    }
-
-    // The next layer, under this layer's window. A STREAM_ALL ring knows its experts now and stages now; a
-    // ROUTED_ONLY ring needs its own ids and stages at its own first op; a CPU decision is only logged. The decision log
-    // holds layers below MAX_LAYERS, and ggml_sycl_moe_stream_prepare bounds only the current layer.
-    const int  next = layer + 1;
-    const auto nxt  = next < moe_exec_decision_log::MAX_LAYERS ? index_.layers.find(next) : index_.layers.end();
-    if (nxt != index_.layers.end() && op.layer_present != nullptr && op.layer_present(op.graph_ctx, next)) {
-        layer_state & ns = layers_[next];
-        if (!ns.decided) {
-            ns.decision  = weigh(nxt->second, op, window_us);
-            ns.window_us = window_us;
-            ns.decided   = true;
-            if (moe_stream_resolve_ahead(ns.decision)) {
-                resolve(next, nxt->second, ns, cache, op);
+            // A RING decision moves bytes under any policy but cpu (moe_stream_stage_now): AUTO when the cost model
+            // chose the ring, ring always (llama.cpp-3460). It stands only on a layer the executor claims whole, once
+            // the ring reserves at the first such layer: the ring serves the executor only (W2). Every decision is
+            // reported.
+            if (moe_stream_stage_now(st.decision, op.policy) &&
+                !(moe_stream_executor_claims(cur->second, geo_) && ring_ready())) {
+                st.decision.choice = moe_exec_choice::CPU;
+                st.decision.reason = moe_exec_reason::RING_UNAVAILABLE;
             }
+            if (st.decision.reason == moe_exec_reason::RING_UNAVAILABLE) {
+                warn_ring_unavailable(op, cur->second);
+            }
+            report(layer, st);
         }
     }
     return decision_of(layer);
@@ -119,31 +111,102 @@ const moe_stream_staged * moe_stream_phase::find(int layer, int expert_id, exper
     return it == table_.end() ? nullptr : &it->second;
 }
 
-// The index lookup comes first: a layer with no host entry answers without marking the ids.
-bool moe_stream_phase::executor_staged(int                layer,
-                                       expert_tensor_role role,
-                                       const int32_t *    ids,
-                                       size_t             n_ids,
-                                       int                n_expert) const {
+// The index lookup comes first: a layer with no host entry answers without touching the ring.
+bool moe_stream_phase::executor_claims(int layer) {
     const auto it = index_.layers.find(layer);
-    if (it == index_.layers.end()) {
-        return false;
+    return it != index_.layers.end() && decision_of(layer).choice == moe_exec_choice::RING &&
+           moe_stream_executor_claims(it->second, geo_) && ring_ready();
+}
+
+// A window the last call prefetched is staged already; any other is staged now, whole, into a region of its own. Then
+// the next window goes into the other region, where its copies overlap this window's dequants.
+uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
+                                        unified_cache &                   cache,
+                                        const moe_stream_op &             op,
+                                        uint32_t *                        misses) {
+    // The ring stages for the executor only: a layer whose RING decision stands and whose every host matrix it claims.
+    if (req.layer != cur_layer_ || !executor_claims(req.layer)) {
+        GGML_ABORT("[MOE-EXEC] window_begin on layer %d, which executor_claims did not answer true for", req.layer);
     }
-    return moe_stream_executor_staged(&it->second, role, moe_stream_ids_bitmap(ids, n_ids, n_expert), table_);
+    const auto li = index_.layers.find(req.layer);  // executor_claims found it
+
+    // A window larger than its region breaks the ring's sizing: a region holds one executor window.
+    const auto stage_or_abort = [&](const std::vector<moe_stream_item> & window, expert_tensor_role role, size_t p) {
+        const stage_counts n = stage_window(window, moe_stream_window_id(req.layer, role, p), cache, op);
+        report_window(req.layer, role, p, n);
+        if (n.exhausted != 0) {
+            GGML_ABORT("[MOE-EXEC] window layer %d role %s phase %zu exceeds its region: %d of %zu without a slot",
+                       req.layer, expert_tensor_role_name(role), p, n.exhausted, window.size());
+        }
+        return n;
+    };
+    const uint32_t                     wid     = moe_stream_window_id(req.layer, req.role, req.phase);
+    const std::vector<moe_stream_item> items   = moe_stream_window_items(li->second, req.role, req.experts, req.n);
+    uint32_t                           missing = 0;
+    for (const moe_stream_item & item : items) {
+        missing += find(item.layer, item.expert_id, item.role) == nullptr ? 1u : 0u;
+    }
+    if (wid == next_window_id_) {
+        // Prefetched. A matrix its prefetch could not take (no streamable lease) would meet the same lease again, so it
+        // is not asked again: the executor reads that expert another way. A prefetch that took its whole window lost
+        // nothing since, because nothing stages between two windows.
+        if (next_window_whole_ && missing != 0) {
+            GGML_ABORT("[MOE-EXEC] window layer %d role %s phase %zu lost %u prefetched entries", req.layer,
+                       expert_tensor_role_name(req.role), req.phase, missing);
+        }
+    } else if (missing != 0) {
+        stage_or_abort(items, req.role, req.phase);  // whole, into the region the last prefetch did not take
+    }
+    const bool exposed = moe_stream_window_exposed(req.layer, req.role, req.phase, prev_window_layer_);
+    if (log_ != nullptr) {
+        log_->note_window(exposed, missing);
+    }
+    if (misses != nullptr) {
+        *misses = exposed ? 0 : missing;
+    }
+    prev_window_layer_ = req.layer;
+
+    // The next phase of this role, or phase 0 of next_role at this role's last phase.
+    next_window_id_    = UINT32_MAX;
+    next_window_whole_ = false;
+    if (req.next != nullptr && req.n_next != 0) {
+        const bool                         same_role = req.next_role == expert_tensor_role::UNKNOWN;
+        const expert_tensor_role           nrole     = same_role ? req.role : req.next_role;
+        const size_t                       nphase    = same_role ? req.phase + 1 : 0;
+        const std::vector<moe_stream_item> nitems    = moe_stream_window_items(li->second, nrole, req.next, req.n_next);
+        if (!nitems.empty()) {
+            const stage_counts n = stage_or_abort(nitems, nrole, nphase);
+            next_window_id_      = moe_stream_window_id(req.layer, nrole, nphase);
+            next_window_whole_   = n.staged == static_cast<int>(nitems.size());
+        }
+    }
+    uint32_t staged = 0;
+    for (const moe_stream_item & item : items) {
+        staged += find(item.layer, item.expert_id, item.role) != nullptr ? 1u : 0u;
+    }
+    return staged;
+}
+
+// The window's readers ran on the compute queue (c-las5) before `readers_done`, so it is the read gate of the region
+// holding the window. A layer other than the current one has nothing in the ring this micro-batch.
+void moe_stream_phase::window_done(int layer, expert_tensor_role role, size_t phase, sycl::event readers_done) {
+    if (layer != cur_layer_) {
+        return;
+    }
+    region_reads_.window_done(moe_stream_window_id(layer, role, phase), readers_done);
 }
 
 bool moe_stream_phase::region_open() const {
     return ring_ && ring_->slots_free() < ring_->geometry().region_slots;
 }
 
-// `down_done` follows every kernel that read the slots of `layer`: they ran on this queue (c-las5) before its down op
-// ended. So it becomes the read gate of the region holding `layer` (lead ruling c-o9uw-1), and an open region closes on
-// it.
+// `down_done` follows the layer's down op: an open region closes on it. The region's read gate is its window's
+// (window_done): a region turns over several times per layer, so a layer's event says nothing about which of its
+// windows a region holds.
 void moe_stream_phase::layer_done(int layer, sycl::event down_done) {
     if (layer != cur_layer_) {
         return;  // the down op of a layer this micro-batch has not begun: nothing of it is in the ring
     }
-    region_reads_.layer_done(layer, down_done);
     close_region(down_done);
 }
 
@@ -160,17 +223,16 @@ void moe_stream_phase::end_prompt() {
     index_            = moe_stream_plan_index();
     ubatch_live_      = false;
     cur_layer_        = -1;
-    ubatch_seq_       = 0;
     reserve_failed_   = false;
     record_valid_     = false;
     record_looked_up_ = false;
     prepared_         = false;
 }
 
-// One scan of the plan per micro-batch (c-7soh), at its first op, which carries the device's prompt-kernel predicate
-// (c-hmey) that decides each matrix's staging and so the ring's geometry. A new geometry, device or compute queue gives
-// the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache record is read once
-// per prompt.
+// One scan of the plan per micro-batch (c-7soh), at its first op, which carries the library executor's claim
+// (llama.cpp-3460) that decides each matrix's staging and so the ring's geometry (W2). A new geometry, device or
+// compute queue gives the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache
+// record is read once per prompt.
 void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
     const moe_stream_ring_geometry geo = moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx,
                                                                        op.library_claims, op.window, &index_);
@@ -182,8 +244,8 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     }
     if (!same_queue) {
         ccs_.emplace(ccs);
-        // The SOA slots of a reused region are overwritten after its readers only because both run in order on this
-        // queue; on any other queue the ring is not offered, and the ring-unavailable diagnostic says so.
+        // A region's readers, the executor's dequants, run in order on this queue, and its read gates are barriers on
+        // it; on any other queue the ring is not offered, and the ring-unavailable diagnostic says so.
         in_order_ = ccs.is_in_order();
     }
     device_   = device;
@@ -195,7 +257,7 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     }
 }
 
-// The ring bytes one layer may use: one region, when a ring of this geometry can exist here.
+// The ring bytes one window may use: one region, when a ring of this geometry can exist here.
 size_t moe_stream_phase::ring_bytes_free() const {
     if (geo_.n_slots == 0 || !in_order_ || reserve_failed_) {
         return 0;
@@ -217,7 +279,7 @@ moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
     in.window_us            = window_us;
     in.ring_bytes_free      = ring_bytes_free();
     in.stage_unit_bytes_max = li.matrix_bytes_max;  // one slot: a window is staged a matrix at a time
-    in.soa_bytes            = li.soa_bytes;         // the reorder prices only these: AOS_ONLY items are read in place
+    in.soa_bytes            = li.soa_bytes;         // 0: every slot is AOS, read in place, so no reorder is priced
     // The device's probed H2D rate (llama.cpp-kp1l), read live and under the probe's mutex: another model's load may
     // run the probe while this prompt weighs. 0 while the device is unresolved or keeps the seed.
     const double         probed_h2d_gbps = ggml_sycl_h2d_probed_gbps(device_);
@@ -236,92 +298,45 @@ moe_exec_decision moe_stream_phase::decision_of(int layer) const {
     return d;
 }
 
-void moe_stream_phase::resolve(int                           layer,
-                               const moe_stream_layer_info & li,
-                               layer_state &                 st,
-                               unified_cache &               cache,
-                               const moe_stream_op &         op) {
+// Copies each window matrix's AOS host bytes into a slot of a fresh region on the copy queue, after the region's gate
+// and its read gate. Every slot holds AOS, read in place by the executor's dequant kernel (W2): one slot per matrix and
+// no reorder. A matrix the ring cannot take directly is skipped, never copied another way: the executor reads it from
+// where it lives.
+moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<moe_stream_item> & items,
+                                                              uint32_t                             window_id,
+                                                              unified_cache &                      cache,
+                                                              const moe_stream_op &                op) {
     stage_counts n;
-    // A RING decision moves bytes and reserves the ring under any policy but cpu (moe_stream_stage_now): AUTO when the
-    // cost model chose the ring, ring always (llama.cpp-3460). Every decision is reported, staged or not.
-    if (moe_stream_stage_now(st.decision, op.policy)) {
-        n = stage(li, st.decision.regime, cache, op);
-        if (n.ring_unavailable) {
-            st.decision.choice = moe_exec_choice::CPU;
-            st.decision.reason = moe_exec_reason::RING_UNAVAILABLE;
-        }
-    }
-    if (st.decision.reason == moe_exec_reason::RING_UNAVAILABLE) {
-        warn_ring_unavailable(op);
-    }
-    st.resolved = true;
-    report(layer, st, n, op);
-}
-
-// Copies each selected matrix's AOS host bytes into a slot of the current region on the copy queue, after the
-// region's gate. A matrix staged as SOA is then reordered into a second slot on the compute queue, after the copy; an
-// AOS-only one (c-hmey) is read in place. Each item the ring cannot take directly is counted, never copied another way.
-moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_info & li,
-                                                       moe_exec_regime               regime,
-                                                       unified_cache &               cache,
-                                                       const moe_stream_op &         op) {
-    stage_counts                 n;
-    std::vector<moe_stream_item> items = moe_stream_select(li, regime, bitmap_);
     if (items.empty()) {
         return n;
     }
-    if (!ring_ready()) {
-        n.ring_unavailable = true;
-        return n;
-    }
-    // A region holds one layer: close the one in use, then drop the table entries of the layer this region last
-    // held. Their slots are rewritten below, after that layer's reorders (the gate) and its readers (the in-order
-    // compute queue, and the barrier below).
+    GGML_ASSERT(ring_ != nullptr);  // window_begin runs only where executor_claims reserved the ring
+    // A region holds one window: close the one in use, then drop the table entries of the window this region last
+    // held. Their slots are rewritten below, after that window's copies (the gate) and its dequants (the read gate).
     close_region(region_last_);
     for (uint64_t key : region_keys_[cur_region_]) {
         table_.erase(key);
     }
     region_keys_[cur_region_].clear();
 
-    // AOS-only items first. The region's last submission is then a reorder when it holds a SOA item, and that reorder
-    // follows its own copy, which the in-order copy queue runs after every copy before it: the event the region closes
-    // on follows every copy and every reorder into it. With no SOA item it is the last copy, which follows the rest.
-    const auto aos_only_item = [](const moe_stream_item & it) {
-        return it.staging == moe_stream_staging::AOS_ONLY;
-    };
-    std::stable_partition(items.begin(), items.end(), aos_only_item);
-    // With an AOS-only item in the region's last use or in this one, a copy below may rewrite a slot that a kernel read
-    // in the last use: an AOS-only slot is read in place, and a pair's SOA slot no longer sits at a fixed odd index.
-    // Those readers ran on the compute queue (c-las5), and the gate does not follow them: under STREAM_ALL, layer_done
-    // closes the region that holds the NEXT layer, so a region's gate precedes its own layer's readers. So the copies
-    // also wait for the region's read gate (lead ruling c-o9uw-1), a barrier that follows every kernel that read the
-    // region: the backend's ggml_sycl_moe_stream_layer_done submits it behind the down op of the layer the region last
-    // held and hands it to layer_done().
-    // The backend skips layer_done while no region is open. With no read gate recorded, the copies wait for a
-    // compute-queue barrier submitted at the first of them. It follows every reader of the last use as well, because
-    // no reader is submitted after it:
-    // - each reader is a kernel of its own layer's MUL_MAT_ID, dispatched on this queue in node order (a prompt
-    //   MUL_MAT_ID is never recorded into a command graph, and the backend reorders no nodes);
-    // - the last use held a layer below the one whose first op runs this stage, or a layer of an earlier micro-batch.
-    // The read gate is preferred: that barrier also waits for the work queued after the last use's down op, the next
-    // layer's attention among it, so the copies would start later.
-    const bool reuse_after_readers =
-        region_reads_.aos_only[cur_region_] || std::any_of(items.begin(), items.end(), aos_only_item);
+    // A copy below may rewrite a slot that a dequant read in the region's last fill: the slot is read in place, and the
+    // gate does not follow its readers, which ran on the compute queue (c-las5). So the copies also wait for the
+    // region's read gate (lead ruling c-o9uw-1), the barrier the executor submits behind the dequants of the window the
+    // region last held and hands to window_done(). With none recorded (that window never ran, or its window_done is
+    // still to come), the copies wait for a compute-queue barrier submitted at the first of them. It follows every
+    // reader of the last fill too, because no reader of it is submitted after it: the executor asks for a window
+    // (window_begin) only after it has submitted every dequant of the window before, and the region refilled here holds
+    // that window or an older one. The read gate is preferred: the barrier also waits for the work queued after the
+    // last fill's dequants, so the copies would start later. A region no copy has gone into since the ring was reserved
+    // has no reader to wait for.
+    const bool                 refill_after_readers = region_reads_.window[cur_region_] != UINT32_MAX;
     std::optional<sycl::event> reuse_gate;
-    bool                       aos_only_staged = false;
-    bool                       copied_in       = false;
 
-    const int                                    device = device_;
-    std::unordered_map<int, std::pair<int, int>> per_expert;  // expert -> (matrices selected, matrices staged)
+    const int               device     = device_;
+    std::vector<uint64_t> & other_keys = region_keys_[1 - cur_region_];
     for (const moe_stream_item & item : items) {
-        std::pair<int, int> & pe = per_expert[item.expert_id];
-        ++pe.first;
-        const bool aos_only = item.staging == moe_stream_staging::AOS_ONLY;
-        if (item.staging == moe_stream_staging::NONE ||
-            !(aos_only ? moe_stream_item_aos_fits(item, geo_.slot_bytes) :
-                         moe_stream_item_reorderable(item, geo_.slot_bytes))) {
-            ++n.untyped;
-            continue;
+        if (!moe_stream_item_aos_fits(item, geo_.slot_bytes)) {
+            continue;  // a shape one slot does not hold
         }
         size_t         host_bytes = 0;
         mem_handle     host       = op.host_lease != nullptr ?
@@ -330,20 +345,15 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
         alloc_metadata owner{};
         if (!host.valid() || host_bytes < item.src_bytes ||
             !(host.owner_metadata(&owner) && moe_stream_owner_streamable(owner, device))) {
-            ++n.unowned;
-            continue;
+            continue;  // no lease, or a lease the ring cannot copy directly
         }
-        // A SOA item takes two slots, AOS then SOA, an AOS-only item one. An item is taken whole or not at all, so an
-        // exhausted region never leaves an AOS slot without its SOA partner.
-        if (ring_->slots_free() < moe_stream_staging_slots(item.staging)) {
+        if (ring_->slots_free() == 0) {
             ++n.exhausted;
             continue;
         }
-        // Each slot is acquired with the layout written there, so its tag is the entry's layout (lead ruling c-o9uw-1).
+        // The slot is acquired with the layout written there, so its tag is the entry's layout (lead ruling c-o9uw-1).
         mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);
-        mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_SOA);
-        GGML_ASSERT(aos.valid() && soa.valid() != aos_only);
-        sycl::event reorder;
+        GGML_ASSERT(aos.valid());
         sycl::event copied;
         try {
             // The lease admits a host entry still being filled (require_ready=false), so the copy waits on the device
@@ -353,70 +363,50 @@ moe_stream_phase::stage_counts moe_stream_phase::stage(const moe_stream_layer_in
             if (hr.has_ready_event) {
                 deps.push_back(hr.ready_event);
             }
-            if (reuse_after_readers && !reuse_gate) {
+            if (refill_after_readers && !reuse_gate) {
                 reuse_gate = region_reads_.read_gate[cur_region_] ? *region_reads_.read_gate[cur_region_] :
                                                                     ccs_->ext_oneapi_submit_barrier();
             }
             if (reuse_gate) {
                 deps.push_back(*reuse_gate);
             }
-
-            const sycl::event copy = mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), deps);
-            if (aos_only) {
-                // Read in place: the copy is this submission's last use of the lease and of the slot, and the table's
-                // hold on the slot is not this submission's ownership.
-                retain_handles_until_event({ aos, host }, copy);
-                copied = copy;
-            } else {
-                const uint8_t * aos_ptr = static_cast<const uint8_t *>(aos.resolve(device).ptr);
-                uint8_t *       soa_ptr = static_cast<uint8_t *>(soa.resolve(device).ptr);
-                reorder = ggml_sycl_reorder_weight_gpu(*ccs_, aos_ptr, soa_ptr, item.type, item.ncols, item.nrows,
-                                                       item.src_bytes, { copy });
-                // Every handle the two submissions touch lives until the reorder: the table's hold on the SOA slot is
-                // not this submission's ownership.
-                retain_handles_until_event({ aos, host, soa }, reorder);
-            }
+            copied = mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), deps);
+            // Read in place: the copy is this submission's last use of the lease and of the slot, and the table's hold
+            // on the slot is not this submission's ownership.
+            retain_handles_until_event({ aos, host }, copied);
         } catch (const ggml_sycl_fallback_error &) {
             throw;
         } catch (const std::exception & e) {
             GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());
         }
         const uint64_t key = moe_stream_table_key(item.layer, item.expert_id, item.role);
-        region_submitted_  = true;
-        copied_in          = true;
-        anchor_            = aos;  // any slice holds the whole reservation
-        if (aos_only) {
-            // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader
-            // the index build named for the item (llama.cpp-3460).
-            region_last_    = copied;
-            aos_only_staged = true;
-            table_[key]     = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };
-            ++n.aos_only;
-        } else {
-            region_last_ = reorder;
-            table_[key]  = { soa, aos, reorder, GGML_LAYOUT_SOA };
-            ++n.soa;
+        if (table_.find(key) != table_.end()) {
+            // The other region holds this matrix too, for a window the executor split another way: the entry moves
+            // here, so that region's next refill does not drop it.
+            other_keys.erase(std::remove(other_keys.begin(), other_keys.end(), key), other_keys.end());
         }
+        region_submitted_ = true;
+        region_last_      = copied;
+        anchor_           = aos;  // any slice holds the whole reservation
+        // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader the
+        // index build named for the item, the executor (llama.cpp-3460).
+        table_[key]       = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };
         region_keys_[cur_region_].push_back(key);
         n.bytes += item.src_bytes;
-        ++pe.second;
+        ++n.staged;
     }
-    // A copy went in, so the region's last use is now this one: its layer, whether it left an AOS-only slot, and no
-    // read gate until layer_done records one behind this layer's readers.
-    if (copied_in) {
-        region_reads_.refill(cur_region_, items.front().layer, aos_only_staged);
-    }
-    for (const auto & kv : per_expert) {
-        ++n.wanted;
-        n.staged += kv.second.second == kv.second.first ? 1 : 0;
+    // A copy went in, so the region's last fill is now this window, with no read gate until its window_done.
+    if (n.staged != 0) {
+        region_reads_.refill(cur_region_, window_id);
     }
     return n;
 }
 
-// The ring is reserved at the first layer that stages, so a prompt whose every layer runs on the CPU reserves
-// nothing. A failed reserve stays failed for the rest of the micro-batch: one attempt per micro-batch. A reserve the
-// WEIGHT zone was short of asks the backend for an expert loan of the shortfall at the next graph boundary, so the next
-// micro-batch's attempt may succeed, until a loan this prompt asked for comes back refused (llama.cpp-3460, c-0tmn).
+// The ring is reserved at the first layer whose RING decision stands (begin_layer, executor_claims), so a prompt whose
+// every layer runs on the CPU reserves nothing. A failed reserve stays failed for the rest of the micro-batch: one
+// attempt per micro-batch. A reserve the WEIGHT zone was short of asks the backend for an expert loan of the shortfall
+// at the next graph boundary, so the next micro-batch's attempt may succeed, until a loan this prompt asked for comes
+// back refused (llama.cpp-3460, c-0tmn).
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;
@@ -439,9 +429,9 @@ bool moe_stream_phase::ring_ready() {
     return true;
 }
 
-// Both regions start over: the first one current, nothing submitted into either and no slot held, and no last use, so
-// no AOS-only slot, no layer and no read gate. A new ring and a torn-down one both start here, so a read gate recorded
-// for one ring is never taken by the next one's copies (stage()).
+// Both regions start over: the first one current, nothing submitted into either and no slot held, and no last fill, so
+// no window and no read gate. A new ring and a torn-down one both start here, so a read gate recorded for one ring is
+// never taken by the next one's copies (stage_window()).
 void moe_stream_phase::reset_regions() {
     region_keys_[0].clear();
     region_keys_[1].clear();
@@ -474,7 +464,7 @@ sycl::event moe_stream_phase::compute_barrier() {
 
 // Gives the ring back after the device's last use of it (ruling D, c-fjx1): the current region closes on last_use,
 // and one slot, which retains the whole reservation, is held until last_use too, because a region closed earlier
-// carries a gate that precedes its SOA readers. The table's handles then go.
+// carries a gate that precedes its readers, the executor's dequants. The table's handles then go.
 void moe_stream_phase::teardown(sycl::event last_use) {
     if (ring_) {
         close_region(last_use);
@@ -491,34 +481,24 @@ void moe_stream_phase::teardown(sycl::event last_use) {
     geo_ = moe_stream_ring_geometry();
 }
 
-void moe_stream_phase::report(int                   layer,
-                              const layer_state &   st,
-                              const stage_counts &  n,
-                              const moe_stream_op & op) const {
-    if (st.decision.choice == moe_exec_choice::NOT_CONSULTED || op.log == nullptr) {
+// The layer's decision goes to the decision log, its change line and its trace line (moe_exec_decision_log::note). The
+// layer stages nothing itself: its bytes are its windows' (report_window).
+void moe_stream_phase::report(int layer, const layer_state & st) const {
+    if (log_ != nullptr) {
+        log_->note(device_, layer, st.decision, 0);
+    }
+}
+
+// One trace line per window stage, apart from note()'s "[MOE-EXEC-TRACE] dev" line (lead ruling c-xod7-q1): the
+// window, and the matrices it copied and their bytes.
+void moe_stream_phase::report_window(int layer, expert_tensor_role role, size_t phase, const stage_counts & n) const {
+    if (log_ == nullptr || log_->trace < 1 || log_->trace_sink == nullptr) {
         return;
     }
-    // The stage line: the plan's fields under a prefix of its own, apart from note()'s "[MOE-EXEC-TRACE] dev" line
-    // (plan amendment for Task 15, lead ruling c-xod7-q1).
-    if (op.log->trace >= 1 && op.log->trace_sink != nullptr) {
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "[MOE-EXEC-TRACE] stage layer %d ubatch %u: %s regime=%s p=%.2f t_cpu=%.0f t_ring=%.0f "
-                      "window=%.0f staged=%d/%d bytes=%zu"
-                      " unowned=%d untyped=%d exhausted=%d",
-                      layer, ubatch_seq_, moe_exec_choice_name(st.decision.choice),
-                      moe_stream_regime_name(st.decision.regime), st.decision.p_touch, st.decision.t_cpu_us,
-                      st.decision.t_ring_us, st.window_us, n.staged, n.wanted, n.bytes, n.unowned, n.untyped,
-                      n.exhausted);
-        op.log->trace_sink(op.log->sink_ctx, line);
-        // The staged matrices split by the layout their slot holds, so a census can tell which path each layer took
-        // (lead ruling c-o9uw-1, c-9wgo). A line of its own: the stage line keeps its bytes.
-        char split[128];
-        std::snprintf(split, sizeof(split), "[MOE-EXEC-TRACE] stage layouts layer %d ubatch %u: soa=%d aos_only=%d",
-                      layer, ubatch_seq_, n.soa, n.aos_only);
-        op.log->trace_sink(op.log->sink_ctx, split);
-    }
-    op.log->note(device_, layer, st.decision, n.bytes);
+    char line[160];
+    std::snprintf(line, sizeof(line), "[MOE-EXEC-TRACE] stage window layer %d role %s phase %zu: %d items %zu bytes",
+                  layer, expert_tensor_role_name(role), phase, n.staged, n.bytes);
+    log_->trace_sink(log_->sink_ctx, line);
 }
 
 void moe_staged_route_tally::count(moe_staged_route_refusal refusal, const char * detail) {
@@ -623,18 +603,19 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
     }
     mem_handle slot = ring_->acquire_slot(layout);
     if (slot.valid()) {
-        anchor_ = slot;  // as stage() keeps one: any slice holds the whole reservation
+        anchor_ = slot;  // as stage_window() keeps one: any slice holds the whole reservation
     }
     return slot;
 }
 #endif
 
 // One WARN per prompt saying why the ring is unavailable, at the first layer that answers RING_UNAVAILABLE, under an
-// explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log.
-// region_slots_max is the most slots one layer's streamable matrices take; the ring holds one executor window
-// (window_slots) per region instead, so n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked
-// for, so when the 10% bound refused it they are the uncapped request.
-void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
+// explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log. The
+// rule is asked of that layer `li`, since whether the executor claims it is the layer's. region_slots_max is the most
+// slots one layer's streamable matrices take; the ring holds one executor window (window_slots) per region instead, so
+// n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked for, so when the cap refused it
+// they are the uncapped request.
+void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li) {
     if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr ||
         (op.policy != moe_exec_policy::RING && op.log->trace < 1)) {
         return;
@@ -647,7 +628,7 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
                   "[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
                   "region_slots_max=%u window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u "
                   "bytes=%zu)",
-                  device_, moe_stream_ring_unavailable_rule(index_, geo_, in_order_, reserve_failed_),
+                  device_, moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, reserve_failed_),
                   index_.host_matrices_per_layer_max, index_.region_slots_max, index_.window_slots,
                   index_.matrix_bytes_max, index_.resident_expert_bytes, asked.n_slots, asked.bytes);
     op.log->sink(op.log->sink_ctx, line);
