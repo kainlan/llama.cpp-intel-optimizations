@@ -207,7 +207,6 @@ struct moe_stream_layer_info {
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
     int     n_streamable     = 0;  // items the ring gives slots: staging SOA or AOS_ONLY
     int     region_slots     = 0;  // the slots its streamable items take: 2 per SOA item, 1 per AOS-only item
-    size_t  expert_bytes_max = 0;  // the largest one expert's streamable AOS bytes, summed over its roles
     size_t  soa_bytes        = 0;  // src bytes of the items staged SOA (the bytes the ring reorders)
     size_t  matrix_bytes_max = 0;  // the largest one streamable matrix's slot bytes: the unit the ring stages
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
@@ -220,7 +219,9 @@ struct moe_stream_layer_info {
 // The plan as the phase reads it for one micro-batch, and the inputs of the ring's geometry (ruling B, c-3bde).
 struct moe_stream_plan_index {
     uint32_t host_matrices_per_layer_max = 0;  // the most streamable items one layer has
-    uint32_t region_slots_max            = 0;  // the most slots one layer's streamable items take: a region's size
+    // The most slots one layer's streamable items take (2 per SOA item, 1 per AOS-only item). The ring is sized from
+    // window_slots, not from this; the ring-unavailable WARN prints both.
+    uint32_t region_slots_max            = 0;
     // Over every streamable item, the bytes a slot holds: max(src, dst) staged as SOA (a slot holds either side), src
     // staged AOS-only.
     size_t   matrix_bytes_max            = 0;
@@ -305,9 +306,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
                                                                 void *                          graph_ctx,
                                                                 moe_stream_library_claims_fn    library_claims,
                                                                 const moe_stream_window_hints & hints) {
-    moe_stream_plan_index                idx;
-    // Streamable AOS bytes per (layer, expert), keyed with role UNKNOWN; an expert's key exists once it has any host entry.
-    std::unordered_map<uint64_t, size_t> expert_bytes;
+    moe_stream_plan_index        idx;
+    // The (layer, expert) keys with a host entry, keyed with role UNKNOWN: counts each layer's distinct host experts.
+    std::unordered_set<uint64_t> host_experts;
 
     struct staging_answer {
         ggml_type          type;
@@ -337,8 +338,7 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         li.K = std::max(li.K, e.ne[0]);
         li.N = std::max(li.N, e.ne[1]);
         detail::moe_stream_mix_add(li.host_mix, e.type, e.src_size);
-        auto ins = expert_bytes.emplace(moe_stream_table_key(e.layer_id, e.expert_id, expert_tensor_role::UNKNOWN), 0);
-        if (ins.second) {
+        if (host_experts.insert(moe_stream_table_key(e.layer_id, e.expert_id, expert_tensor_role::UNKNOWN)).second) {
             ++li.n_host_experts;
         }
         if (!detail::moe_expert_role_is_triplet(e.expert_role)) {
@@ -395,8 +395,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         if (item.staging == moe_stream_staging::SOA) {
             li.soa_bytes += item.src_bytes;
         }
-        ins.first->second += e.src_size;
-        li.expert_bytes_max = std::max(li.expert_bytes_max, ins.first->second);
         const size_t matrix_bytes =
             item.staging == moe_stream_staging::SOA ? std::max(e.src_size, e.dst_size) : e.src_size;
         li.matrix_bytes_max  = std::max(li.matrix_bytes_max, matrix_bytes);
@@ -475,7 +473,7 @@ static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_pla
     if (reserve_failed) {
         return "reserve refused";
     }
-    return "region smaller than the largest streamable triplet";
+    return "region smaller than the largest streamable matrix";
 }
 
 // The items a decision stages: every item for STREAM_ALL, the experts the micro-batch routes to for ROUTED_ONLY, none
@@ -691,19 +689,10 @@ struct moe_stream_op {
     // Unset, a requested loan is never seen refused, so every short micro-batch asks again.
     moe_stream_loan_refusals_fn  loan_refusals  = nullptr;
 
-    // The executor's phase the ring is sized to (moe_stream_window_hints): the device's planned f16 weight slot and the
-    // group cap. Unset (0 slot bytes), there is no window and no ring.
-    size_t planned_weight_slot_bytes = 0;
-    size_t group_cap                 = 0;
+    // The executor's phase the ring is sized to: the device's planned f16 weight slot and the group cap, handed as is
+    // to moe_stream_plan_ring_geometry. Unset (0 slot bytes), there is no window and no ring.
+    moe_stream_window_hints window;
 };
-
-// The window hints `op` carries, for moe_stream_plan_ring_geometry.
-static inline moe_stream_window_hints moe_stream_op_window_hints(const moe_stream_op & op) {
-    moe_stream_window_hints hints;
-    hints.weight_slot_bytes = op.planned_weight_slot_bytes;
-    hints.group_cap         = op.group_cap;
-    return hints;
-}
 
 // Why the resolver refused a staged ring slot (llama.cpp-o9uw). The enumerators name the causes; the staged branch's
 // lambda in ggml_sycl_build_moe_resolved_batch fixes the order they are asked in. RECIPE covers both the missing

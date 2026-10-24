@@ -384,7 +384,6 @@ int main() {
         CHECK(l0->region_slots == 18);  // an AOS slot and a SOA slot per matrix
         CHECK(l0->host_bytes == 9 * src_bytes());
         CHECK(l0->soa_bytes == l0->host_bytes);  // the kernels answer SOA for every item: every host byte reorders
-        CHECK(l0->expert_bytes_max == 3 * src_bytes());
         CHECK(l0->K == kCols && l0->N == kRows);
         CHECK(l0->host_mix.size() == 1 && l0->host_mix[0].first == GGML_TYPE_Q4_0 &&
               l0->host_mix[0].second == 9 * src_bytes());
@@ -397,7 +396,6 @@ int main() {
         CHECK(l1->host_bytes == 9 * src_bytes() + kFused);
         CHECK(l1->soa_bytes == 9 * src_bytes());  // the fused entry is never staged, so never reordered
         // The fused entry takes no slot.
-        CHECK(l1->expert_bytes_max == 3 * src_bytes());
     }
     const moe_stream_layer_info * l4 = layer_info(idx, 4);
     CHECK(l4 != nullptr);
@@ -429,8 +427,6 @@ int main() {
             for (const moe_stream_item & it : m1->items) {
                 CHECK(it.staging == moe_stream_staging::NONE);
             }
-            CHECK(m0->expert_bytes_max == 3 * src_bytes());
-            CHECK(m1->expert_bytes_max == 0);
             // The cost model still sees every host byte, and reorders none of an unstaged layer's.
             CHECK(m1->n_host_experts == 4 && m1->host_bytes > 0);
             CHECK(m0->soa_bytes == 6 * src_bytes() && m1->soa_bytes == 0);
@@ -460,7 +456,6 @@ int main() {
             for (const moe_stream_item & it : q1->items) {
                 CHECK(it.staging == moe_stream_staging::AOS_ONLY);
             }
-            CHECK(q1->expert_bytes_max == 3 * iq_src_bytes());
             CHECK(q1->soa_bytes == 0);  // read in place: nothing reorders
         }
         CHECK(iq.host_matrices_per_layer_max == 12 && iq.region_slots_max == 12);
@@ -540,9 +535,9 @@ int main() {
                 CHECK(it.staging == moe_stream_staging::AOS_ONLY && it.consumer == moe_stream_consumer::EXECUTOR);
             }
             // Layer 0: three claimed gates of one slot, six unclaimed SOA matrices of two.
-            CHECK(c0->n_streamable == 9 && c0->region_slots == 15 && c0->expert_bytes_max == 3 * src_bytes());
+            CHECK(c0->n_streamable == 9 && c0->region_slots == 15);
             CHECK(c1->n_streamable == 9 && c1->region_slots == 18);  // layer 1's weights are not claimed
-            CHECK(c2->n_streamable == 9 && c2->region_slots == 9 && c2->expert_bytes_max == 3 * src_bytes());
+            CHECK(c2->n_streamable == 9 && c2->region_slots == 9);
             // The cost model reorders what the ring reorders: layer 0's six unclaimed matrices, none of layer 2's.
             CHECK(c0->soa_bytes == 6 * src_bytes() && c1->soa_bytes == 9 * src_bytes() && c2->soa_bytes == 0);
         }
@@ -644,7 +639,7 @@ int main() {
         CHECK(rule(mixed, geo, false, false) == "queue not in order");
         CHECK(rule(mixed, geo, true, true) == "reserve refused");
         // None of the six: named anyway, so no ring-unavailable line goes unexplained.
-        CHECK(rule(mixed, geo, true, false) == "region smaller than the largest streamable triplet");
+        CHECK(rule(mixed, geo, true, false) == "region smaller than the largest streamable matrix");
     }
 
     // ---- what a decision stages ----

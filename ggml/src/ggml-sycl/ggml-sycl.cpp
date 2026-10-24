@@ -32808,8 +32808,8 @@ static int ggml_sycl_moe_stream_layer_of(const ggml_tensor * src0) {
 // The batched executor's phase on `device`, which the stream ring is sized to (moe_stream_window_hints): its planned
 // f16 weight slot and its group cap. The stream phase and the auto-ubatch fit both read it here, so they size one ring.
 static void ggml_sycl_moe_stream_set_window(ggml_sycl::moe_stream_op & op, int device) {
-    op.planned_weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
-    op.group_cap                 = ggml_sycl_moe_pp_f16_group_experts_max();
+    op.window.weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
+    op.window.group_cap         = ggml_sycl_moe_pp_f16_group_experts_max();
 }
 
 // Fills `call` for a prompt MUL_MAT_ID of `src0` and makes ctx.moe_stream on first use. False when the op names no
@@ -36016,9 +36016,8 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     call.op.n_tokens = n_ubatch;
     ggml_sycl_moe_stream_set_window(call.op, device);
 
-    const ggml_sycl::moe_stream_ring_geometry geo =
-        ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr,
-                                                 ggml_sycl::moe_stream_op_window_hints(call.op));
+    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
+        *call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr, call.op.window);
     if (geo.bytes == 0) {
         return 0;
     }
