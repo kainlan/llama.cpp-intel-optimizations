@@ -20,6 +20,11 @@ static int g_cases = 0, g_failures = 0;
         }                                                                      \
     } while (0)
 
+// a and b agree to 1e-6 relative (absolute below 1).
+static bool near_rel(double a, double b) {
+    return std::fabs(a - b) <= 1e-6 * std::fmax(1.0, std::fabs(b));
+}
+
 static moe_exec_rates b70_rates() {
     moe_exec_rates r;
     r.h2d_gbps     = 26.5;     // measured, 8bgi c-nn1q
@@ -52,6 +57,9 @@ static moe_exec_layer_inputs qwen_layer(uint32_t T) {
     in.window_us         = 3000.0;
     in.ring_bytes_free   = 820ull << 20;
     in.triplet_bytes_max = 2048 * 1024;  // largest host triplet, rounded up from the 410 MiB / 212 mean
+    // The hybrid world, every host byte staged SOA and reordered on the device: the shape these expectations were
+    // written in. A layer the library executor claims stages AOS_ONLY and has soa_bytes 0 (llama.cpp-b5hm).
+    in.soa_bytes         = in.host_expert_bytes;
     return in;
 }
 
@@ -68,6 +76,7 @@ static moe_exec_layer_inputs gptoss_layer(uint32_t T, bool host) {
     in.window_us         = 2000.0;
     in.ring_bytes_free   = 1500ull << 20;
     in.triplet_bytes_max = 13200000ull;
+    in.soa_bytes         = in.host_expert_bytes;  // the hybrid world, as qwen_layer
     return in;
 }
 
@@ -167,6 +176,59 @@ int main() {
         d = moe_exec_weigh(gptoss_layer(512, false), b50_rates(), moe_exec_policy::AUTO);
         CHECK(d.choice == moe_exec_choice::NOT_CONSULTED && d.reason == moe_exec_reason::NO_HOST_EXPERTS,
               "all-VRAM -c 4096 layer is not consulted");
+    }
+    // The reorder prices only the SOA-staged bytes (llama.cpp-b5hm): the ring reorders only items staged SOA, and an
+    // AOS_ONLY item (every one the library executor claims) is copied and read in place.
+    {
+        const moe_exec_rates        r   = b70_rates();
+        const moe_exec_layer_inputs hyb = qwen_layer(256);
+        moe_exec_layer_inputs       aos = hyb;
+        aos.soa_bytes                   = 0;
+        moe_exec_layer_inputs half      = hyb;
+        half.soa_bytes                  = hyb.host_expert_bytes / 2;
+        const moe_exec_decision d_hyb   = moe_exec_weigh(hyb, r, moe_exec_policy::AUTO);
+        const moe_exec_decision d_aos   = moe_exec_weigh(aos, r, moe_exec_policy::AUTO);
+        const moe_exec_decision d_half  = moe_exec_weigh(half, r, moe_exec_policy::AUTO);
+        CHECK(d_aos.regime == moe_exec_regime::STREAM_ALL, "the all-AOS T=256 layer streams every host expert");
+        const double gflop  = moe_exec_layer_gflop(aos) * (static_cast<double>(aos.n_host_experts) / aos.n_expert);
+        const double expect = std::max(0.0, aos.host_expert_bytes / (r.h2d_gbps * 1e3) - aos.window_us) +
+                              gflop / r.dev_gflops * 1e6 + r.dev_fixed_us;
+        CHECK(near_rel(d_aos.t_ring_us, expect),
+              "an all-AOS layer's ring cost is the copy, the GEMM and the fixed cost");
+        const double reord_all = hyb.host_expert_bytes / (r.reorder_gbps * 1e3);
+        CHECK(near_rel(d_hyb.t_ring_us - d_aos.t_ring_us, reord_all),
+              "STREAM_ALL: the hybrid layer pays exactly the reorder of every host byte more");
+        CHECK(near_rel(d_half.t_ring_us - d_aos.t_ring_us, reord_all / 2.0),
+              "half the bytes staged SOA: half the reorder");
+        CHECK(d_aos.t_cpu_us == d_hyb.t_cpu_us, "the staging does not move the CPU cost");
+    }
+    {
+        // ROUTED_ONLY reorders the touched share of the SOA bytes, as it copies the touched share.
+        const moe_exec_rates        r   = b70_rates();
+        const moe_exec_layer_inputs hyb = qwen_layer(4);
+        moe_exec_layer_inputs       aos = hyb;
+        aos.soa_bytes                   = 0;
+        const moe_exec_decision d_hyb   = moe_exec_weigh(hyb, r, moe_exec_policy::AUTO);
+        const moe_exec_decision d_aos   = moe_exec_weigh(aos, r, moe_exec_policy::AUTO);
+        CHECK(d_hyb.regime == moe_exec_regime::ROUTED_ONLY && d_hyb.p_touch < 0.9, "T=4 is routed-only");
+        CHECK(near_rel(d_hyb.t_ring_us - d_aos.t_ring_us, d_hyb.p_touch * hyb.soa_bytes / (r.reorder_gbps * 1e3)),
+              "ROUTED_ONLY: the reorder covers the touched share of the SOA bytes");
+    }
+    {
+        // The term decides the choice: at a 50 GB/s reorder the hybrid layer is CPU and the same layer staged AOS is
+        // RING.
+        moe_exec_rates r                = b70_rates();
+        r.reorder_gbps                  = 50.0;
+        const moe_exec_layer_inputs hyb = qwen_layer(256);
+        moe_exec_layer_inputs       aos = hyb;
+        aos.soa_bytes                   = 0;
+        const moe_exec_decision d_hyb   = moe_exec_weigh(hyb, r, moe_exec_policy::AUTO);
+        const moe_exec_decision d_aos   = moe_exec_weigh(aos, r, moe_exec_policy::AUTO);
+        CHECK(d_hyb.t_ring_us > d_hyb.t_cpu_us && d_hyb.choice == moe_exec_choice::CPU,
+              "premise: the hybrid layer's reorder makes the ring dearer than the CPU");
+        CHECK(d_aos.t_ring_us < d_aos.t_cpu_us && d_aos.choice == moe_exec_choice::RING,
+              "the all-AOS layer has no reorder term and answers RING");
+        CHECK(d_aos.reason == moe_exec_reason::CHEAPER && d_hyb.reason == moe_exec_reason::CHEAPER, "both on cost");
     }
     // seed: the Qwen GSQ-RCO mix (seven measured types at 22 GB/s) gives 22; a mix with an unmeasured type keeps
     // the measured bytes' mean (the room refuses unmeasured types; the executor just prices them at the default)

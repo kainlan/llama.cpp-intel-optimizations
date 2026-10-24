@@ -217,6 +217,7 @@ moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
     in.window_us         = window_us;
     in.ring_bytes_free   = ring_bytes_free();
     in.triplet_bytes_max = li.expert_bytes_max;  // the largest streamable triplet: a region holds no other kind
+    in.soa_bytes         = li.soa_bytes;         // the reorder prices only these: AOS_ONLY items are read in place
     // The device's probed H2D rate (llama.cpp-kp1l), read live and under the probe's mutex: another model's load may
     // run the probe while this prompt weighs. 0 while the device is unresolved or keeps the seed.
     const double         probed_h2d_gbps = ggml_sycl_h2d_probed_gbps(device_);

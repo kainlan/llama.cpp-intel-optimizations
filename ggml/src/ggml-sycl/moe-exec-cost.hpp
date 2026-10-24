@@ -46,6 +46,7 @@ struct moe_exec_layer_inputs {
     double   window_us         = 0.0;  // the previous layer's compute window the copies can hide under
     size_t   ring_bytes_free   = 0;    // ring bytes the layer may use (0 = no ring)
     size_t   triplet_bytes_max = 0;    // the largest host triplet of the layer
+    size_t   soa_bytes         = 0;    // the host_expert_bytes share the ring stages SOA: the only bytes it reorders
 };
 
 struct moe_exec_decision {
@@ -96,6 +97,7 @@ static inline moe_exec_decision moe_exec_weigh(const moe_exec_layer_inputs & in,
         return d;
     }
     GGML_ASSERT(moe_exec_rates_valid(r));
+    GGML_ASSERT(in.soa_bytes <= in.host_expert_bytes);  // one scan of the plan counts both: more is a caller bug
     d.p_touch           = moe_exec_p_touch(in.n_expert_used, in.n_expert, in.n_tokens);
     d.regime            = d.p_touch >= r.stream_all_p_min ? moe_exec_regime::STREAM_ALL : moe_exec_regime::ROUTED_ONLY;
     // Bytes moved: every host expert under STREAM_ALL, the touched share otherwise (GB/s is 1e3 bytes per us).
@@ -109,7 +111,12 @@ static inline moe_exec_decision moe_exec_weigh(const moe_exec_layer_inputs & in,
     // layer's window; a ROUTED_ONLY layer's ids exist after its own router, so its copy is exposed.
     const double copy_raw = bytes / (r.h2d_gbps * 1e3);
     const double copy     = d.regime == moe_exec_regime::STREAM_ALL ? std::max(0.0, copy_raw - in.window_us) : copy_raw;
-    const double reord    = bytes / (r.reorder_gbps * 1e3);
+    // The ring reorders only the items it stages SOA; an AOS_ONLY item (every one the library executor claims) is
+    // copied and read in place. So the reorder covers the SOA share, under the same regime rule as the copy. Unlike
+    // the copy it is not discounted by the window: it runs on the compute queue, where the window's own kernels run.
+    const double soa =
+        d.regime == moe_exec_regime::STREAM_ALL ? static_cast<double>(in.soa_bytes) : d.p_touch * in.soa_bytes;
+    const double reord    = soa / (r.reorder_gbps * 1e3);
     const double dev_fl   = gflop / r.dev_gflops * 1e6;
     d.t_ring_us           = copy + reord + dev_fl + r.dev_fixed_us;
     if (policy == moe_exec_policy::CPU) {

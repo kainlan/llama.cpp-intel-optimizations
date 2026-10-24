@@ -240,6 +240,26 @@ const moe_stream_layer_info * layer_info(const moe_stream_plan_index & idx, int 
     return it == idx.layers.end() ? nullptr : &it->second;
 }
 
+// The src bytes of `li`'s items staged SOA: what the ring reorders, and so what soa_bytes must say (llama.cpp-b5hm).
+size_t soa_src_sum(const moe_stream_layer_info & li) {
+    size_t bytes = 0;
+    for (const moe_stream_item & it : li.items) {
+        bytes += it.staging == moe_stream_staging::SOA ? it.src_bytes : 0;
+    }
+    return bytes;
+}
+
+// Every layer of `idx` carries soa_bytes as the sum over its SOA items, never more than its host bytes. An index with
+// no layers answers false: agreement over nothing would pass vacuously, and every index this test builds has layers.
+bool soa_bytes_agree(const moe_stream_plan_index & idx) {
+    for (const auto & kv : idx.layers) {
+        if (kv.second.soa_bytes != soa_src_sum(kv.second) || kv.second.soa_bytes > kv.second.host_bytes) {
+            return false;
+        }
+    }
+    return !idx.layers.empty();
+}
+
 // A stage table's view as moe_stream_executor_staged reads it: the key and the entry's consumer.
 struct consumer_entry {
     moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
@@ -360,6 +380,7 @@ int main() {
         CHECK(l0->n_host_experts == 3 && l0->n_untriplet == 0 && l0->n_streamable == 9);
         CHECK(l0->region_slots == 18);  // an AOS slot and a SOA slot per matrix
         CHECK(l0->host_bytes == 9 * src_bytes());
+        CHECK(l0->soa_bytes == l0->host_bytes);  // the kernels answer SOA for every item: every host byte reorders
         CHECK(l0->expert_bytes_max == 3 * src_bytes());
         CHECK(l0->K == kCols && l0->N == kRows);
         CHECK(l0->host_mix.size() == 1 && l0->host_mix[0].first == GGML_TYPE_Q4_0 &&
@@ -371,6 +392,7 @@ int main() {
         CHECK(l1->items.size() == 9 && l1->n_untriplet == 1);
         CHECK(l1->n_host_experts == 3);  // expert 1's fused entry is the same expert
         CHECK(l1->host_bytes == 9 * src_bytes() + kFused);
+        CHECK(l1->soa_bytes == 9 * src_bytes());  // the fused entry is never staged, so never reordered
         // The fused entry takes no slot.
         CHECK(l1->expert_bytes_max == 3 * src_bytes());
     }
@@ -378,7 +400,9 @@ int main() {
     CHECK(l4 != nullptr);
     if (l4) {
         CHECK(l4->items.empty() && l4->n_host_experts == 1 && l4->n_untriplet == 1);
+        CHECK(l4->soa_bytes == 0);
     }
+    CHECK(soa_bytes_agree(idx));
     CHECK(idx.host_matrices_per_layer_max == 9);
     CHECK(idx.region_slots_max == 18);
     CHECK(idx.matrix_bytes_max == dst_bytes());
@@ -390,6 +414,7 @@ int main() {
     // given no slot ----
     {
         const moe_stream_plan_index   mixed = index_of(make_mixed_plan(true), kernels_soa_q4);
+        CHECK(soa_bytes_agree(mixed));
         const moe_stream_layer_info * m0    = layer_info(mixed, 0);
         const moe_stream_layer_info * m1    = layer_info(mixed, 1);
         CHECK(m0 != nullptr && m1 != nullptr);
@@ -403,14 +428,16 @@ int main() {
             }
             CHECK(m0->expert_bytes_max == 3 * src_bytes());
             CHECK(m1->expert_bytes_max == 0);
-            // The cost model still sees every host byte.
+            // The cost model still sees every host byte, and reorders none of an unstaged layer's.
             CHECK(m1->n_host_experts == 4 && m1->host_bytes > 0);
+            CHECK(m0->soa_bytes == 6 * src_bytes() && m1->soa_bytes == 0);
         }
         // Layer 0's six, not layer 1's twelve, and a Q4_0 slot, not the IQ3_XXS device size.
         CHECK(mixed.host_matrices_per_layer_max == 6);
         CHECK(mixed.region_slots_max == 12);
         CHECK(mixed.matrix_bytes_max == dst_bytes());
         const moe_stream_plan_index iq_only = index_of(make_mixed_plan(false), kernels_soa_q4);
+        CHECK(soa_bytes_agree(iq_only));
         CHECK(iq_only.host_matrices_per_layer_max == 0 && iq_only.matrix_bytes_max == 0);
         CHECK(iq_only.region_slots_max == 0);
         const moe_stream_layer_info * q1 = layer_info(iq_only, 1);
@@ -422,6 +449,7 @@ int main() {
         // IQ3_XXS, no reorder, read as AOS: every matrix streamable, one slot each, and the slot sized from the AOS
         // bytes it holds, not from the device size the plan entry carries (4 x a Q4_0 matrix here).
         const moe_stream_plan_index   iq = index_of(make_mixed_plan(false), kernels_aos);
+        CHECK(soa_bytes_agree(iq));
         const moe_stream_layer_info * q1 = layer_info(iq, 1);
         CHECK(q1 != nullptr);
         if (q1) {
@@ -430,6 +458,7 @@ int main() {
                 CHECK(it.staging == moe_stream_staging::AOS_ONLY);
             }
             CHECK(q1->expert_bytes_max == 3 * iq_src_bytes());
+            CHECK(q1->soa_bytes == 0);  // read in place: nothing reorders
         }
         CHECK(iq.host_matrices_per_layer_max == 12 && iq.region_slots_max == 12);
         CHECK(iq.matrix_bytes_max == iq_src_bytes());
@@ -443,7 +472,9 @@ int main() {
             for (const moe_stream_item & it : a0->items) {
                 CHECK(it.staging == moe_stream_staging::AOS_ONLY);
             }
+            CHECK(a0->soa_bytes == 0);
         }
+        CHECK(soa_bytes_agree(q4));
         CHECK(q4.host_matrices_per_layer_max == 9 && q4.region_slots_max == 9);
         CHECK(q4.matrix_bytes_max == src_bytes());
 
@@ -463,15 +494,18 @@ int main() {
                       (it.type == GGML_TYPE_Q4_0 ? moe_stream_staging::SOA : moe_stream_staging::AOS_ONLY));
             }
             CHECK(n_soa == 6 && n_aos == 6);
+            CHECK(x0->soa_bytes == 6 * src_bytes());  // the Q4_0 half: the IQ3_XXS half is read in place
         }
+        CHECK(soa_bytes_agree(mix));
         CHECK(mix.host_matrices_per_layer_max == 12 && mix.region_slots_max == 18);
         CHECK(mix.matrix_bytes_max == std::max(dst_bytes(), iq_src_bytes()));
 
         // No predicate: the ring cannot tell what the device reads, so nothing is streamable (fail closed).
         const moe_stream_plan_index blind = index_of(make_plan(), nullptr);
+        CHECK(soa_bytes_agree(blind));
         CHECK(blind.host_matrices_per_layer_max == 0 && blind.region_slots_max == 0 && blind.matrix_bytes_max == 0);
         const moe_stream_layer_info * b0 = layer_info(blind, 0);
-        CHECK(b0 != nullptr && b0->items.size() == 9 && b0->n_streamable == 0);
+        CHECK(b0 != nullptr && b0->items.size() == 9 && b0->n_streamable == 0 && b0->soa_bytes == 0);
 
         // The predicate is asked once per distinct (type, shape, bytes) per build, not once per entry (c-7soh): the
         // plan has one host matrix shape, which takes a SOA question and then an AOS one.
@@ -505,7 +539,10 @@ int main() {
             CHECK(c0->n_streamable == 9 && c0->region_slots == 15 && c0->expert_bytes_max == 3 * src_bytes());
             CHECK(c1->n_streamable == 9 && c1->region_slots == 18);  // layer 1's weights are not claimed
             CHECK(c2->n_streamable == 9 && c2->region_slots == 9 && c2->expert_bytes_max == 3 * src_bytes());
+            // The cost model reorders what the ring reorders: layer 0's six unclaimed matrices, none of layer 2's.
+            CHECK(c0->soa_bytes == 6 * src_bytes() && c1->soa_bytes == 9 * src_bytes() && c2->soa_bytes == 0);
         }
+        CHECK(soa_bytes_agree(claimed));
         CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.region_slots_max == 18);
         // Asked once per (layer, role) with a matrix one AOS slot holds, not once per expert: layers 0-2, three roles.
         CHECK(probe.calls == 9);
@@ -513,13 +550,19 @@ int main() {
         // Every weight claimed: every matrix takes one slot of its AOS bytes.
         const moe_stream_plan_index all =
             ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
+        CHECK(soa_bytes_agree(all));
         CHECK(all.host_matrices_per_layer_max == 9 && all.region_slots_max == 9 && all.matrix_bytes_max == src_bytes());
+        // ... and no layer has a byte to reorder.
+        for (const auto & kv : all.layers) {
+            CHECK(kv.second.soa_bytes == 0);
+        }
 
         // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
         // kernels_soa_q4 reads, takes one AOS slot. Unclaimed it takes none.
         const moe_stream_plan_index iq_free = index_of(make_mixed_plan(true), kernels_soa_q4);
         const moe_stream_plan_index iq_claimed =
             ggml_sycl::moe_stream_plan_index_build(make_mixed_plan(true), 0, kernels_soa_q4, nullptr, claims_all);
+        CHECK(soa_bytes_agree(iq_free) && soa_bytes_agree(iq_claimed));
         const moe_stream_layer_info * i1 = layer_info(iq_claimed, 1);
         const moe_stream_layer_info * f1 = layer_info(iq_free, 1);
         CHECK(i1 != nullptr && f1 != nullptr);
@@ -529,6 +572,7 @@ int main() {
             for (const moe_stream_item & it : i1->items) {
                 CHECK(it.staging == moe_stream_staging::AOS_ONLY && it.consumer == moe_stream_consumer::EXECUTOR);
             }
+            CHECK(i1->soa_bytes == 0);
         }
         CHECK(iq_claimed.matrix_bytes_max == std::max(src_bytes(), iq_src_bytes()));
 
@@ -544,6 +588,7 @@ int main() {
         claims_probe                zprobe;
         const moe_stream_plan_index z =
             ggml_sycl::moe_stream_plan_index_build(zeroed, 0, kernels_soa_q4, &zprobe, claims_l0_gate_l2);
+        CHECK(soa_bytes_agree(z));
         const moe_stream_layer_info * z2 = layer_info(z, 2);
         CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0 && z2->region_slots == 0);
         if (z2) {
@@ -556,16 +601,20 @@ int main() {
         // No weight claimed: the index is the one an unset predicate builds.
         const moe_stream_plan_index free_of =
             ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_none);
+        // No claim: the kernels' SOA answer stands, so the claims path reorders every host triplet byte.
+        CHECK(soa_bytes_agree(free_of));
         const moe_stream_layer_info * f0 = layer_info(free_of, 0);
         CHECK(free_of.host_matrices_per_layer_max == idx.host_matrices_per_layer_max &&
               free_of.region_slots_max == idx.region_slots_max && free_of.matrix_bytes_max == idx.matrix_bytes_max);
         CHECK(f0 != nullptr && f0->n_streamable == 9 && f0->region_slots == 18);
+        CHECK(f0 != nullptr && f0->soa_bytes == f0->host_bytes);
     }
 
     // ---- why a layer answered RING_UNAVAILABLE: the first rule that holds, in a fixed order ----
     {
         const moe_stream_plan_index iq_only = index_of(make_mixed_plan(false), kernels_soa_q4);
         const moe_stream_plan_index mixed   = index_of(make_mixed_plan(true), kernels_soa_q4);
+        CHECK(soa_bytes_agree(iq_only) && soa_bytes_agree(mixed));
 
         ggml_sycl::moe_stream_ring_geometry none;
         ggml_sycl::moe_stream_ring_geometry geo;
@@ -610,6 +659,7 @@ int main() {
         claims_probe                probe;
         const moe_stream_plan_index claimed =
             ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2);
+        CHECK(soa_bytes_agree(claimed));
         const moe_stream_layer_info * c0        = layer_info(claimed, 0);
         const moe_stream_layer_info * c2        = layer_info(claimed, 2);
         const int32_t                 ids_15[2] = { 1, 5 };
@@ -649,6 +699,7 @@ int main() {
         CHECK(!ggml_sycl::moe_stream_executor_staged(c0, expert_tensor_role::GATE_UP, b15, empty));
         const moe_stream_plan_index every =
             ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, kernels_soa_q4, nullptr, claims_all);
+        CHECK(soa_bytes_agree(every));
         CHECK(!ggml_sycl::moe_stream_executor_staged(layer_info(every, 1), gate, b15,
                                                      table_of(1, { 1, 5, 6 }, gate, moe_stream_consumer::EXECUTOR)));
         const int32_t ids_2[1] = { 2 };
