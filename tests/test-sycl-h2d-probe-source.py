@@ -575,73 +575,109 @@ ACCESSOR_SIG = "double ggml_sycl_h2d_probed_gbps(int device)"
 LOCK_STMT = "std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);"
 
 
-def locked_span(text: str, lock: str = LOCK_STMT) -> str:
-    """The text a lock statement guards: from the end of the first `lock` to the close of the brace block that encloses
-    it (string literals are skipped while balancing, as in body()). Empty when there is no such statement or block, so
-    a lock in a block of its own, closed before the access, guards nothing."""
+@functools.lru_cache(maxsize=None)
+def literal_mask(text: str) -> bytes:
+    """1 for every character inside a string or char literal (quotes included): one skipper for both brace scans."""
+    mask = bytearray(len(text))
+    for m in _LEXEME_RE.finditer(text):
+        if m.group(0)[0] in "\"'":
+            mask[m.start():m.end()] = b"\x01" * (m.end() - m.start())
+    return bytes(mask)
+
+
+def locked_bounds(text: str, lock: str = LOCK_STMT):
+    """(start, end) offsets of the text a lock statement guards: the end of the first `lock` to the close of the brace
+    block that encloses it, braces inside literals ignored in both directions. None when there is no such statement or
+    block, so a lock in a block of its own, closed before the access, guards nothing."""
     at = text.find(lock)
     if at < 0:
-        return ""
+        return None
+    mask = literal_mask(text)
     depth = 0
     i = at - 1
     open_at = -1
     while i >= 0:
-        ch = text[i]
-        if ch == "}":
-            depth += 1
-        elif ch == "{":
-            if depth == 0:
-                open_at = i
-                break
-            depth -= 1
+        if not mask[i]:
+            if text[i] == "}":
+                depth += 1
+            elif text[i] == "{":
+                if depth == 0:
+                    open_at = i
+                    break
+                depth -= 1
         i -= 1
     if open_at < 0:
-        return ""
+        return None
     depth = 0
-    j = open_at
-    n = len(text)
-    while j < n:
-        ch = text[j]
-        if ch in "\"'":
-            k = j + 1
-            while k < n and text[k] != ch:
-                k += 2 if text[k] == "\\" else 1
-            j = k + 1
+    for j in range(open_at, len(text)):
+        if mask[j]:
             continue
-        if ch == "{":
+        if text[j] == "{":
             depth += 1
-        elif ch == "}":
+        elif text[j] == "}":
             depth -= 1
             if depth == 0:
-                return text[at + len(lock):j]
-        j += 1
-    return ""
+                return (at + len(lock), j)
+    return None
+
+
+def locked_span(text: str, lock: str = LOCK_STMT) -> str:
+    bounds = locked_bounds(text, lock)
+    return text[bounds[0]:bounds[1]] if bounds else ""
+
+
+ACCESS_RE = re.compile(r"(?:\.|->)\s*(h2d_pinned_gbps|h2d_probed(?!_)|h2d_retry_logged)\b")
+
+
+def h2d_accesses(overrides: dict) -> list:
+    """Every member access to the three probe fields across the backend's sources, as (path, offset) in the
+    comment-stripped normalized text of that file. `overrides` maps a relative path to replacement text. The
+    declarations in common.hpp are not accesses (no `.` or `->` before the name)."""
+    found = []
+    for p in sorted((ROOT / SYCL_TREE_DIR).rglob("*")):
+        if not p.is_file() or p.suffix not in (".c", ".cpp", ".h", ".hpp"):
+            continue
+        rel = p.relative_to(ROOT).as_posix()
+        text = norm(overrides[rel] if rel in overrides else p.read_text(errors="replace"))
+        found.extend((rel, m.start()) for m in ACCESS_RE.finditer(text))
+    return found
 
 
 def claim_probed_rate_is_published_under_one_mutex(sycl: str, common: str, cpp: str) -> bool:
     """A load's outermost exit runs the probe on the loading thread with no lock a computing thread takes, and
     moe_stream_phase::weigh runs on any thread that computes, so the rate and its flag are written and read under one
-    leaf mutex. Each access must sit INSIDE the block the lock statement guards, not merely after it: the probe's
-    guard read, its stores and its retry-bit test and set (the report lambda), and the accessor weigh calls. weigh
-    itself touches neither field, and the accessor is declared where weigh sees it."""
+    leaf mutex. Two directions: each expected access sits INSIDE the block its lock statement guards, not merely
+    after it; and NO OTHER access to the three fields exists anywhere in the backend's sources (a census of every
+    `.h2d_pinned_gbps`, `.h2d_probed` and `.h2d_retry_logged`: once-guard 1, accessor 2, probe's report lambda 4).
+    weigh itself touches neither field, and the accessor is declared where weigh sees it."""
     n = norm(sycl)
     probe = probe_body(sycl)
     resolved = body(n, RESOLVED_SIG)
     accessor = body(n, ACCESSOR_SIG)
     weigh = body(norm(cpp), WEIGH_SIG)
-    return bool(probe) and bool(resolved) and bool(accessor) and bool(weigh) and all([
+    if not (probe and resolved and accessor and weigh):
+        return False
+    spans = []
+    for fn in (resolved, accessor, probe):
+        bounds = locked_bounds(fn)
+        if bounds is None:
+            return False
+        base = n.find(fn)
+        spans.append((base + bounds[0], base + bounds[1]))
+    accesses = h2d_accesses({SYCL_REL: sycl, COMMON_REL: common, PLAN_CPP_REL: cpp})
+    per_span = [sum(1 for rel, at in accesses if rel == SYCL_REL and lo <= at < hi) for lo, hi in spans]
+    return all([
         n.count(PINNED_MUTEX) == 1,
+        n.count("g_sycl_h2d_pinned_mutex") == 4,  # the definition and the three lock statements, no unlock
         probe.count(LOCK_STMT) == 1,
         "return info.devices[dev].h2d_pinned_gbps > 0.0;" in locked_span(resolved),
         "return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;" in locked_span(accessor),
         "if (ggml_sycl_h2d_pinned_resolved(info, dev)) { continue; }" in probe,
-        # the store and the retry bit: every access to the three fields inside the one locked block
         all(piece in locked_span(probe) for piece in (
             "(d.h2d_retry_logged & bit) != 0", "d.h2d_retry_logged |= bit;", "d.h2d_pinned_gbps = gbps;",
             "d.h2d_probed = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;")),
-        # and no access to them anywhere else in the probe body
-        probe.count("d.h2d_pinned_gbps") == 1 and probe.count("d.h2d_probed") == 1
-        and probe.count("d.h2d_retry_logged") == 2,
+        per_span == [1, 2, 4],
+        len(accesses) == 7,
         "double ggml_sycl_h2d_probed_gbps(int device);" in norm(common),
         "ggml_sycl_h2d_probed_gbps(device_)" in weigh,
         "h2d_pinned_gbps" not in weigh and not re.search(r"h2d_probed(?!_gbps)", weigh),
@@ -967,9 +1003,6 @@ def test_mutant_third_reader_fails():
     assert not claim_two_consumers_read_the_rate({SYCL_REL: no_accessor_read})
 
 
-LOCK = "std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);"
-
-
 def test_mutant_lock_taken_but_access_outside_its_block_fails():
     """The lock statement preceding an access is not the access being inside the lock's block: each of the three
     sites is mutated so the lock still precedes the field access textually but its block has closed."""
@@ -980,35 +1013,75 @@ def test_mutant_lock_taken_but_access_outside_its_block_fails():
                        "} } if (outcome < H2D_PROBE_OUTCOME_RETRY_ZONES) { " + stores + " }")
     assert not claim_probed_rate_is_published_under_one_mutex(writes_out, COMMON, PLAN_CPP)
     # (b) the accessor's lock sits in its own block ahead of the reads
-    acc_out = _once(SYCL, LOCK + " return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;",
-                    "{ " + LOCK + " } return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;")
+    acc_out = _once(SYCL, LOCK_STMT + " return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;",
+                    "{ " + LOCK_STMT + " } return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;")
     assert not claim_probed_rate_is_published_under_one_mutex(acc_out, COMMON, PLAN_CPP)
     # (c) the same in the once-guard helper
-    res_out = _once(SYCL, LOCK + " return info.devices[dev].h2d_pinned_gbps > 0.0;",
-                    "{ " + LOCK + " } return info.devices[dev].h2d_pinned_gbps > 0.0;")
+    res_out = _once(SYCL, LOCK_STMT + " return info.devices[dev].h2d_pinned_gbps > 0.0;",
+                    "{ " + LOCK_STMT + " } return info.devices[dev].h2d_pinned_gbps > 0.0;")
     assert not claim_probed_rate_is_published_under_one_mutex(res_out, COMMON, PLAN_CPP)
     # (d) the retry bit's test and set leave the locked block
-    retry_out = _once(SYCL, LOCK + " if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {",
-                      "{ " + LOCK + " } if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {")
+    retry_out = _once(SYCL, LOCK_STMT + " if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {",
+                      "{ " + LOCK_STMT + " } if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {")
     assert not claim_probed_rate_is_published_under_one_mutex(retry_out, COMMON, PLAN_CPP)
+
+
+def test_mutant_a_second_access_outside_every_locked_span_fails():
+    """The claim must also see accesses it does not expect: an unlocked fast-path read in the accessor or the
+    once-guard helper, an unlocked write elsewhere in the translation unit, an alias write in the probe body, an
+    explicit unlock, and a `}` string literal ahead of the lock that must not widen its block."""
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
+    info_d = "const sycl_device_info & d = ggml_sycl_info().devices[device];"
+    fast_acc = _once(SYCL, info_d, info_d + " if (!d.h2d_probed) { return 0.0; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(fast_acc, COMMON, PLAN_CPP)
+    fast_res = _once(SYCL, RESOLVED_SIG + " {",
+                     RESOLVED_SIG + " { if (info.devices[dev].h2d_pinned_gbps > 0.0) { return true; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(fast_res, COMMON, PLAN_CPP)
+    other_fn = _once(SYCL, PINNED_MUTEX,
+                     PINNED_MUTEX + " static void h2d_reset(ggml_sycl_device_info & info) { "
+                     "info.devices[0].h2d_probed = false; info.devices[0].h2d_retry_logged = 0; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(other_fn, COMMON, PLAN_CPP)
+    alias = _once(SYCL, 'report(dev, rec.h2d_gbps, H2D_PROBE_OUTCOME_FROM_CACHE, "tuning cache");',
+                  'report(dev, rec.h2d_gbps, H2D_PROBE_OUTCOME_FROM_CACHE, "tuning cache"); '
+                  "info.devices[dev].h2d_probed = true;")
+    assert not claim_probed_rate_is_published_under_one_mutex(alias, COMMON, PLAN_CPP)
+    unlocked = _once(SYCL, LOCK_STMT + " return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;",
+                     LOCK_STMT + " g_sycl_h2d_pinned_mutex.unlock(); return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;")
+    assert not claim_probed_rate_is_published_under_one_mutex(unlocked, COMMON, PLAN_CPP)
+    # the same access written in another backend source
+    stray = PLAN_CPP + "\nstatic void stray(sycl_device_info & d) { d.h2d_probed = true; }\n"
+    assert not claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, stray)
+
+
+def test_mutant_brace_literal_before_the_lock_does_not_widen_its_block():
+    stores = "d.h2d_pinned_gbps = gbps; d.h2d_probed = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;"
+    anchor = LOCK_STMT + " if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {"
+    tagged = _once(SYCL, anchor, 'const char * tag = "}"; (void) tag; ' + anchor)
+    assert claim_probed_rate_is_published_under_one_mutex(tagged, COMMON, PLAN_CPP)
+    widened = _once(tagged, "} else { " + stores + " } }",
+                    "} } if (outcome < H2D_PROBE_OUTCOME_RETRY_ZONES) { " + stores + " }")
+    assert not claim_probed_rate_is_published_under_one_mutex(widened, COMMON, PLAN_CPP)
+    # and a `{` char literal ahead of the lock, in a block of its own, does not make a closed block look open
+    char_open = _once(SYCL, LOCK_STMT + " return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;",
+                      "{ char c = '{'; (void) c; " + LOCK_STMT + " } return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;")
+    assert not claim_probed_rate_is_published_under_one_mutex(char_open, COMMON, PLAN_CPP)
 
 
 def test_mutant_probed_rate_published_without_the_mutex_fails():
     assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
-    lock = "std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);"
     # the accessor, the once-guard helper and the store each lose their lock
     for sig in (ACCESSOR_SIG, RESOLVED_SIG):
         at = strip_comments(SYCL).find(sig)
         assert at >= 0
-        cut = strip_comments(SYCL)[at:].find(lock)
+        cut = strip_comments(SYCL)[at:].find(LOCK_STMT)
         assert cut >= 0
-        mutant = strip_comments(SYCL)[:at + cut] + strip_comments(SYCL)[at + cut + len(lock):]
+        mutant = strip_comments(SYCL)[:at + cut] + strip_comments(SYCL)[at + cut + len(LOCK_STMT):]
         assert not claim_probed_rate_is_published_under_one_mutex(mutant, COMMON, PLAN_CPP)
     store = _once(SYCL, "d.h2d_pinned_gbps = gbps;", "d.h2d_pinned_gbps = gbps;")
     probe_at = strip_comments(store).find("auto report = [&info]")
-    store_lock = strip_comments(store)[probe_at:].find(lock)
+    store_lock = strip_comments(store)[probe_at:].find(LOCK_STMT)
     unlocked_store = (strip_comments(store)[:probe_at + store_lock]
-                      + strip_comments(store)[probe_at + store_lock + len(lock):])
+                      + strip_comments(store)[probe_at + store_lock + len(LOCK_STMT):])
     assert not claim_probed_rate_is_published_under_one_mutex(unlocked_store, COMMON, PLAN_CPP)
     # weigh reading a field directly, and the accessor going undeclared
     direct = _once(PLAN_CPP, "ggml_sycl_h2d_probed_gbps(device_)", "ggml_sycl_info().devices[device_].h2d_pinned_gbps")
