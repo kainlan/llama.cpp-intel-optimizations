@@ -22218,8 +22218,9 @@ struct test_loan_fixture {
     }
 
     // Leaves (layer, slot)'s pointer-table leases as the only view its extra holds of `expert`'s device entry, the
-    // holder a prompt graph's preload leaves once a later table names other experts: the storage records and the slot
-    // handle on that entry go (the slot's payload with it), and the table, still trusted, keeps its leases.
+    // shape the RED found holding a withdrawn entry after a loan (records=0 slot_cache=0 table_leases=1): the storage
+    // records and the slot handle on that entry go (the slot's payload with it), and the table, still trusted, keeps
+    // its leases.
     void keep_only_table_leases(int layer, int slot, int expert) {
         ggml_tensor_extra_gpu_weight_ext & w = *extras[layer * 3 + slot]->weight_ext;
         for (auto it = w.moe_expert_storage_handles.begin(); it != w.moe_expert_storage_handles.end();) {
@@ -22253,22 +22254,33 @@ struct test_loan_fixture {
         return n;
     }
 
+    // The route-table leases (layer, slot)'s extra holds on that expert's device entry.
+    int route_leases_on_device_entry(int layer, int slot, int expert) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        int          n = 0;
+        if (w) {
+            for (const moe_route_entry & entry : w->moe_route_tables[device].experts) {
+                n += leases_device_entry(entry.lease, layer, slot, expert) ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
+    // Whether (layer, slot)'s extra keeps a hybrid decode record on the device.
+    bool has_hybrid_record(int layer, int slot) const {
+        const auto & w = extras[layer * 3 + slot]->weight_ext;
+        return w && w->moe_hybrid_decode[device] != nullptr;
+    }
+
     // Who holds (layer, slot, expert)'s device entry: its lease count, and the handles on it in each view the extra
     // keeps.
     std::string device_entry_holders(int layer, int slot, int expert) const {
-        uint32_t     in_use     = 0;
-        const bool   present    = cache->test_expert_device_entry_in_use(keys[index(layer, slot, expert)], &in_use);
-        const int    records    = records_on_device_entry(layer, slot, expert);
-        const int    slot_cache = slot_handles_on_device_entry(layer, slot, expert);
-        int          route      = 0;
-        bool         hybrid     = false;
-        const auto & w          = extras[layer * 3 + slot]->weight_ext;
-        if (w) {
-            for (const moe_route_entry & entry : w->moe_route_tables[device].experts) {
-                route += leases_device_entry(entry.lease, layer, slot, expert) ? 1 : 0;
-            }
-            hybrid = w->moe_hybrid_decode[device] != nullptr;
-        }
+        uint32_t   in_use     = 0;
+        const bool present    = cache->test_expert_device_entry_in_use(keys[index(layer, slot, expert)], &in_use);
+        const int  records    = records_on_device_entry(layer, slot, expert);
+        const int  slot_cache = slot_handles_on_device_entry(layer, slot, expert);
+        const int  route      = route_leases_on_device_entry(layer, slot, expert);
+        const bool hybrid     = has_hybrid_record(layer, slot);
         return test_loan_fail(
             "layer %d slot %d expert %d's device entry %s with %u leases; its extra's handles on it: records=%d "
             "slot_cache=%d table_leases=%d route_table=%d, hybrid_record=%d",
@@ -23714,9 +23726,11 @@ static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture:
     }
     // Slot 0's table leases become the only view its extra holds of expert 2's entry, the shape the RED found
     // (records=0 slot_cache=0 table_leases=1): only the lease flag can mark that table stale, so the loan's slot path
-    // cannot pass for it. Slots 1 and 2 keep every view, so the slot path is witnessed too.
+    // cannot pass for it. Slots 1 and 2 keep every view, so the slot path is witnessed too. Nor may slot 0's route
+    // table lease the entry or a hybrid record exist, or their own flags could mark it stale without the lease flag.
     fx.keep_only_table_leases(0, /*slot=*/0, 2);
     if (fx.records_on_device_entry(0, 0, 2) != 0 || fx.slot_handles_on_device_entry(0, 0, 2) != 0 ||
+        fx.route_leases_on_device_entry(0, 0, 2) != 0 || fx.has_hybrid_record(0, 0) ||
         fx.table_leases_on_device_entry(0, 0, 2) == 0 || !fx.device_table_valid(0, 0)) {
         return "slot 0 is not lease-only before the loan: " + fx.device_entry_holders(0, 0, 2);
     }

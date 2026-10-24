@@ -75,14 +75,14 @@
 //                           preload builds (ggml_sycl_update_moe_ptr_table over the routed device experts), and each
 //                           table leases expert 2's device entry (checked first). Slot 0's table leases are then made
 //                           the only view its extra holds of that entry, its storage records and slot handle dropped
-//                           (checked), so only the loan's lease path can mark that table stale; slots 1 and 2 keep
-//                           every view. After the loan each table is stale, slot 0's checked by its stale mark alone
-//                           and the others' also by a payload that no longer names expert 2. The one-triplet loan takes
-//                           expert 2 and no other triplet; after the loan's own boundary drain and the one
-//                           deferred-free pass synchronize runs after it, with no polling, its three device entries are
-//                           gone and the WEIGHT zone has their room back, and the first decode boundary re-admits the
-//                           triplet. A failure names each entry's lease count and the extra's handles on it per view,
-//                           counted without resolving any.
+//                           (checked, with no route-table lease and no hybrid record), so only the loan's lease path
+//                           can mark that table stale; slots 1 and 2 keep every view. After the loan each table is
+//                           stale, slot 0's checked by its stale mark alone and the others' also by a payload that no
+//                           longer names expert 2. The one-triplet loan takes expert 2 and no other triplet; after the
+//                           loan's own boundary drain and the one deferred-free pass synchronize runs after it, with no
+//                           polling, its three device entries are gone and the WEIGHT zone has their room back, and the
+//                           first decode boundary re-admits the triplet. A failure names each entry's lease count and
+//                           the extra's handles on it per view, counted without resolving any.
 //   loan_reclaims_after_a_timed_out_boundary_drain
 //                           llama.cpp-6aj4: the same loan, slot 0 lease-only as above, with the drain worker held on
 //                           the loan's first retained record, so the boundary's 100 ms drain times out (checked, with
