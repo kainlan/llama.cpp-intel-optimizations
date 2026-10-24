@@ -32733,11 +32733,6 @@ struct ggml_sycl_moe_stream_call {
     ggml_sycl_moe_stream_call & operator=(ggml_sycl_moe_stream_call &&)      = delete;
 };
 
-// True iff `layer`'s MUL_MAT_ID ops are in the graph being computed.
-static bool ggml_sycl_moe_stream_layer_present(void *, int layer) {
-    return g_moe_gate_up_pairs.find(layer) != g_moe_gate_up_pairs.end();
-}
-
 // `layer`'s `role` weight tensor in the graph being computed, or null.
 static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, ggml_sycl::expert_tensor_role role) {
     const auto it = g_moe_gate_up_pairs.find(layer);
@@ -32841,7 +32836,6 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.policy         = ggml_sycl_moe_exec_config().policy;
     call.op.log            = &ggml_sycl_moe_exec_log();
     call.op.graph_ctx      = &call;
-    call.op.layer_present  = ggml_sycl_moe_stream_layer_present;
     call.op.host_lease     = ggml_sycl_moe_stream_host_lease;
     call.op.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;

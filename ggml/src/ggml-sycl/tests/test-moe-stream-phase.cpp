@@ -130,13 +130,12 @@ placement_plan make_plan() {
 
 // Layer 0: experts 0 and 1 on the host as Q4_0 (streamable). Layer 1: experts 0-3 on the host as IQ3_XXS, which has no
 // reorder, with a larger device size than any Q4_0 matrix. Experts 4-7 of both layers are resident Q4_0 on device 0.
-// with_q4 = false drops layer 0's host experts, leaving only the IQ3_XXS ones.
-placement_plan make_mixed_plan(bool with_q4) {
+placement_plan make_mixed_plan() {
     const size_t   iq_src = ggml_row_size(GGML_TYPE_IQ3_XXS, kCols) * static_cast<size_t>(kRows);
     placement_plan plan{};
     for (int e = 0; e < kExperts; ++e) {
         for (int r = 0; r < 3; ++r) {
-            const bool q4_host = with_q4 && e < 2;
+            const bool q4_host = e < 2;
             plan.entries.push_back(entry(0, e, kRoles[r], kNames[r], q4_host, 0, src_bytes(), dst_bytes()));
             if (e < 4) {
                 placement_entry iq = entry(1, e, kRoles[r], kNames[r], true, 0, iq_src, 4 * dst_bytes());
@@ -381,8 +380,8 @@ int main() {
 
         // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
         // kernels_soa_q4 reads, takes one AOS slot of its own bytes. Unclaimed it takes none.
-        const moe_stream_plan_index   iq_free    = index_of(make_mixed_plan(true), nullptr);
-        const moe_stream_plan_index   iq_claimed = index_of(make_mixed_plan(true), claims_all);
+        const moe_stream_plan_index   iq_free    = index_of(make_mixed_plan(), nullptr);
+        const moe_stream_plan_index   iq_claimed = index_of(make_mixed_plan(), claims_all);
         const moe_stream_layer_info * i1         = layer_info(iq_claimed, 1);
         const moe_stream_layer_info * f1         = layer_info(iq_free, 1);
         CHECK(no_layer_reorders(iq_free) && no_layer_reorders(iq_claimed));

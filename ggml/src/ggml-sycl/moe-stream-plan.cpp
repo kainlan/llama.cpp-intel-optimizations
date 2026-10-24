@@ -47,7 +47,6 @@ void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {
     region_keys_[1].clear();
     layers_.clear();
     cur_layer_         = -1;
-    ubatch_seq_        = ubatch_live_ ? ubatch_seq_ + 1 : 0;
     ubatch_live_       = true;
     n_tokens_          = n_tokens;
     prev_window_layer_ = -1;
@@ -224,7 +223,6 @@ void moe_stream_phase::end_prompt() {
     index_            = moe_stream_plan_index();
     ubatch_live_      = false;
     cur_layer_        = -1;
-    ubatch_seq_       = 0;
     reserve_failed_   = false;
     record_valid_     = false;
     record_looked_up_ = false;
@@ -492,7 +490,7 @@ void moe_stream_phase::report(int layer, const layer_state & st) const {
 }
 
 // One trace line per window stage, apart from note()'s "[MOE-EXEC-TRACE] dev" line (lead ruling c-xod7-q1): the
-// window, the matrices it copied and their bytes, and the ones it could not take.
+// window, and the matrices it copied and their bytes.
 void moe_stream_phase::report_window(int layer, expert_tensor_role role, size_t phase, const stage_counts & n) const {
     if (log_ == nullptr || log_->trace < 1 || log_->trace_sink == nullptr) {
         return;

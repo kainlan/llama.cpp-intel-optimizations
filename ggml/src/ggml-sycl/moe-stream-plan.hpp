@@ -125,8 +125,9 @@ static inline uint64_t moe_stream_table_key(int layer, int expert_id, expert_ten
 namespace detail {
 
 // The bytes of `item`'s rows when its type is a known one with a block size, its rows are whole blocks and src_bytes is
-// exactly those bytes; 0 otherwise (a zeroed inventory shape, a retired type). Both ways of staging copy src_bytes and
-// a kernel then reads ncols x nrows of the type from the slot, so a mismatch is never staged.
+// exactly those bytes; 0 otherwise (a zeroed inventory shape, a retired type). The one way of staging (AOS_ONLY) copies
+// src_bytes and the executor's dequant then reads ncols x nrows of the type from the slot, so a mismatch is never
+// staged.
 static inline size_t moe_stream_item_rows_bytes(const moe_stream_item & item) {
     if (static_cast<int>(item.type) < 0 || static_cast<int>(item.type) >= GGML_TYPE_COUNT ||
         ggml_blck_size(item.type) <= 0 || item.ncols <= 0 || item.nrows <= 0 ||
@@ -585,20 +586,18 @@ static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_l
 }
 
 // What begin_layer and window_begin need beyond their plan, cache and queue: the op's shape for the cost model, the
-// backend's one policy and decision log (ggml_sycl_moe_exec_config(), ggml_sycl_moe_exec_log()), two answers only the
-// graph has, from the backend's MUL_MAT_ID scan: whether a layer's ops are in the graph being computed, and the host
-// AOS lease of one of its experts (keyed from that layer's weight tensor, as the hybrid path's host route keys it), and
-// whether the library executor claims a layer's weight (llama.cpp-3460), which decides what the ring stages (W2).
+// backend's one policy and decision log (ggml_sycl_moe_exec_config(), ggml_sycl_moe_exec_log()), and two answers only
+// the graph has, from the backend's MUL_MAT_ID scan: the host AOS lease of one of a layer's experts (keyed from that
+// layer's weight tensor, as the hybrid path's host route keys it), and whether the library executor claims a layer's
+// weight (llama.cpp-3460), which decides what the ring stages (W2).
 struct moe_stream_op {
-    uint32_t                n_tokens                   = 0;  // ids->ne[1]
-    int                     n_expert                   = 0;  // src0->ne[2]
-    int                     n_expert_used              = 0;  // ids->ne[0]
-    uint64_t                graph_seq                  = 0;  // the context's graph_compute_seq
-    moe_exec_policy         policy                     = moe_exec_policy::AUTO;
-    moe_exec_decision_log * log                        = nullptr;
-    void *                  graph_ctx                  = nullptr;
-    // Not asked since the phase weighs each layer at its own first op (W1): no layer is weighed ahead.
-    bool (*layer_present)(void * graph_ctx, int layer) = nullptr;
+    uint32_t                n_tokens      = 0;  // ids->ne[1]
+    int                     n_expert      = 0;  // src0->ne[2]
+    int                     n_expert_used = 0;  // ids->ne[0]
+    uint64_t                graph_seq     = 0;  // the context's graph_compute_seq
+    moe_exec_policy         policy        = moe_exec_policy::AUTO;
+    moe_exec_decision_log * log           = nullptr;
+    void *                  graph_ctx     = nullptr;
     // The host lease of (layer, expert, role) and its bytes, or an invalid handle.
     mem_handle (*host_lease)(void * graph_ctx, int layer, int expert_id, expert_tensor_role role, size_t * bytes) =
         nullptr;
@@ -880,7 +879,6 @@ class moe_stream_phase {
     int                                             cur_layer_          = -1;
     uint64_t                                        cur_graph_seq_      = 0;
     uint32_t                                        n_tokens_           = 0;
-    uint32_t                                        ubatch_seq_         = 0;
     bool                                            ubatch_live_        = false;
     bool                                            prepared_           = false;
     bool                                            in_order_           = false;
