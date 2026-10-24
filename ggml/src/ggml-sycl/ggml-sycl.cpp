@@ -31924,13 +31924,44 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
                   H2D_PROBE_OUTCOME_RETRY_ZONES < H2D_PROBE_OUTCOME_RETRY_FAILED && H2D_PROBE_OUTCOME_RETRY_FAILED < 32,
               "h2d_probe_outcome: resolved outcomes first, then RETRY_ZONES and the other RETRY values");
 
+// The H2D probe's results (h2d_pinned_gbps, h2d_probed, h2d_retry_logged) are written at a model load's outermost
+// exit on the loading thread, which holds no lock a computing thread takes: a second model may load while another
+// model's prompt is in moe_stream_phase::weigh (llama.cpp-kp1l). They are therefore written and read under this one
+// leaf mutex, which only brackets plain field accesses (no call is made while it is held): the probe's once-guard
+// (ggml_sycl_h2d_pinned_resolved), its store, and the one reader the cost model uses (ggml_sycl_h2d_probed_gbps).
+// The mutex orders a writer against weigh. It does not serialise two probes: the guard's check-then-act is safe
+// because load_end's body is the only exit that reaches the probe (the two abort paths set g_sycl_abort_load_exit,
+// which makes the exit return before it), and that body's witness, g_load_end_bodies_running, is unconditional and
+// checks that no two bodies overlap. For that reason no witness is added at the probe's entry. The LOAD-token witness
+// in the preload that precedes the probe is conditional (early returns, global_plan != nullptr) and is not relied on.
+static std::mutex g_sycl_h2d_pinned_mutex;
+
+static bool ggml_sycl_h2d_pinned_resolved(const ggml_sycl_device_info & info, int dev) {
+    std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);
+    return info.devices[dev].h2d_pinned_gbps > 0.0;
+}
+
+// The device's probed pinned H2D rate for the cost model: the measured or stored rate, 0 while the device is
+// unresolved, left in a RETRY outcome, or keeping the seed (GGML_SYCL_H2D_PROBE=0 with no stored record).
+double ggml_sycl_h2d_probed_gbps(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0.0;
+    }
+    const sycl_device_info &    d = ggml_sycl_info().devices[device];
+    std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);
+    return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;
+}
+
 // llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device's host-to-device rate from PINNED host memory, which the
 // MoE executor's cost model divides by (26.5-27.1 GB/s pinned against 10.5-19 GB/s pageable, llama.cpp-8bgi). The peer
 // probe above stages through a pageable std::vector, so it cannot stand in.
 //
-// Consumers: h2d_pinned_gbps is 0 until a device resolves, and stays 0 for a device left in a RETRY outcome, so a
-// consumer (Task 7b's rates assembly) must fall back to the seed rate on 0. h2d_probed is true for a measured or stored
-// rate and false for the seed.
+// Consumers: h2d_pinned_gbps is 0 until a device resolves, and stays 0 for a device left in a RETRY outcome. h2d_probed
+// is true for a measured or stored rate and false for the seed. moe_stream_phase::weigh reads the rate through
+// ggml_sycl_h2d_probed_gbps (0 unless h2d_probed, under g_sycl_h2d_pinned_mutex) and passes it to
+// moe_stream_rates_assemble, which prices the ring's copy term with: the environment override, else the tuning-cache
+// record, else this probed rate, else the seed (llama.cpp-kp1l). The measured rate therefore reaches the cost model
+// whether or not the store accepted it.
 //
 // What it times: 64 MiB in 4 MiB chunks, 8 iterations after one untimed copy, on the cache's queue (cache->get_queue():
 // mem_copy_submit's direct branch needs the copy queue to share a context with it, and the dpct default queue does
@@ -31963,10 +31994,10 @@ static_assert(H2D_PROBE_OUTCOME_MEASURED < H2D_PROBE_OUTCOME_RETRY_ZONES &&
 // exception included (its text rides in the source word), so a device logs one WARN line per outcome. A stored record
 // is read back instead of probing. A probe that cannot allocate keeps the seed and says so: never an abort. A refused
 // store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the measured rate resolved for
-// the process and is logged "probed, not stored". The store accepts only a record with a positive reorder rate, so the
-// record carries Task 2's seed value for it (by reference to the seed, not a literal). That only satisfies the store's
-// validity rule: the executor's rates assembly takes the reorder rate from its own measurement. The tuning cache is
-// keyed by the visible devices, so a device hidden from the scheduler probes again on every start.
+// the process and is logged "probed, not stored", and the cost model still prices with it (see Consumers). The probe
+// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0
+// (unmeasured) when there was none, and the rates assembly takes the seed for it. The tuning cache is keyed by the
+// visible devices, so a device hidden from the scheduler probes again on every start.
 //
 // Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE, RETRY_ALLOC or RETRY_FAILED allocates 64 MiB and times
 // 8 x 64 MiB again at every outermost load, silently after its reason's first line. That is bounded and load-time
@@ -31988,15 +32019,18 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
     auto report = [&info](int dev, double gbps, h2d_probe_outcome outcome, const char * source,
                           const double * spread = nullptr) {
         auto & d = info.devices[dev];
-        if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {
-            const uint32_t bit = 1u << outcome;
-            if ((d.h2d_retry_logged & bit) != 0) {
-                return;
+        {
+            std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);
+            if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {
+                const uint32_t bit = 1u << outcome;
+                if ((d.h2d_retry_logged & bit) != 0) {
+                    return;
+                }
+                d.h2d_retry_logged |= bit;
+            } else {
+                d.h2d_pinned_gbps = gbps;
+                d.h2d_probed      = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;
             }
-            d.h2d_retry_logged |= bit;
-        } else {
-            d.h2d_pinned_gbps = gbps;
-            d.h2d_probed      = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;
         }
         // The probed outcome alone passes the min and max of the iterations behind its rate, so a bimodal link shows in
         // any log ("probed; iterations 24.1-26.2"); every other outcome keeps its exact source word.
@@ -32009,7 +32043,7 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
     };
 
     for (int dev = 0; dev < info.total_gpu_count && dev < GGML_SYCL_MAX_DEVICES; ++dev) {
-        if (info.devices[dev].h2d_pinned_gbps > 0.0) {
+        if (ggml_sycl_h2d_pinned_resolved(info, dev)) {
             continue;
         }
         ggml_sycl_moe_exec_rates_record rec  = {};
@@ -32082,10 +32116,7 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
                 report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_RETRY_NO_RATE, why);
                 continue;
             }
-            rec.h2d_gbps = gbps;
-            if (!(rec.reorder_gbps > 0.0)) {
-                rec.reorder_gbps = seed.reorder_gbps;
-            }
+            rec.h2d_gbps           = gbps;
             // A refused store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the rate
             // resolved for this process, but the line must not claim it persisted.
             const bool   stored    = ggml_backend_sycl_moe_exec_rates_store(dev, &rec);

@@ -1115,8 +1115,8 @@ inline bool read_entry_objects(const std::string & path, std::vector<std::string
 struct MoeExecRatesEntry {
     std::string                         device_key;  // device_identity_key(name, driver)
     double                              h2d_gbps     = 0.0;
-    double                              reorder_gbps = 0.0;
-    std::vector<std::pair<int, double>> dev_gflops_by_type;  // (ggml_type, GFLOP/s)
+    double                              reorder_gbps = 0.0;  // 0 = unmeasured (the executor uses its seed)
+    std::vector<std::pair<int, double>> dev_gflops_by_type;  // (ggml_type, GFLOP/s); no probe writes it yet
     std::string                         created;             // ISO 8601, UTC
 };
 
@@ -1187,10 +1187,13 @@ inline MoeExecRatesEntry moe_exec_rates_entry_from_json(const std::string & json
     return e;
 }
 
-// A rate the executor divides by: finite and positive. Absent keys and non-finite values parse or write as 0, so
-// this is also what rejects a hand-edited, truncated, or probe-failed entry.
+// A record the executor may read. The H2D rate is one it divides by: finite and positive. Absent keys and non-finite
+// values parse or write as 0, so that is also what rejects a hand-edited, truncated, or probe-failed entry. The reorder
+// rate is finite and not negative, and 0 means "unmeasured" (llama.cpp-kp1l): the H2D probe measures nothing else, and
+// the executor's rates assembly prices an unmeasured reorder at its seed. An entry stored before this change, with a
+// positive reorder, is unchanged and still read as measured (same file version).
 inline bool moe_exec_rates_scalars_valid(double h2d_gbps, double reorder_gbps) {
-    return std::isfinite(h2d_gbps) && h2d_gbps > 0.0 && std::isfinite(reorder_gbps) && reorder_gbps > 0.0;
+    return std::isfinite(h2d_gbps) && h2d_gbps > 0.0 && std::isfinite(reorder_gbps) && reorder_gbps >= 0.0;
 }
 
 // The (type, GFLOP/s) pairs of `e` a record with one slot per ggml type can hold: a type in [0, type_count) with a

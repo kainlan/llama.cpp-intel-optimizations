@@ -24,9 +24,11 @@ reused. The probe this gate pins:
   - GGML_SYCL_H2D_PROBE is read once (1 forces a re-probe, 0 skips it and keeps the seed); a stored record skips the
     probe; a probe that cannot allocate keeps the seed and never aborts;
   - a handler that can swallow ggml_sycl_fallback_error is preceded by the sanctioned rethrow (clause (g));
-  - sycl_device_info carries h2d_pinned_gbps and h2d_probed, and exactly one place reads h2d_pinned_gbps: the probe's
-    own once-guard (a device that holds a rate is not probed again). Task 7b's rates assembly makes it two and updates
-    this count;
+  - sycl_device_info carries h2d_pinned_gbps and h2d_probed, and exactly two places read h2d_pinned_gbps: the probe's
+    own once-guard (a device that holds a rate is not probed again) and moe_stream_phase::weigh, which hands it to
+    moe_stream_rates_assemble when h2d_probed (llama.cpp-kp1l). The assembly prices h2d from the tuning-cache record,
+    else that probed rate, else the seed, with the environment override applied last, so a run with the tuning cache
+    disabled still prices with the measured rate;
   - the probe is called at the end of ggml_sycl_model_loading_effects' outermost exit, right after
     ggml_sycl_preload_model_weights() (the host zones are configured and the experts placed), never from
     ggml_sycl_init (it must not create caches) nor from model_load_begin (the zones are not configured yet), and
@@ -40,8 +42,9 @@ reused. The probe this gate pins:
   - a device whose cache has no configured host zones is not probed (the host source would not be a trusted direct-copy
     source), and a copy the staged-copy census records as staged is never stored or kept: the seed stands, h2d_probed
     stays false, and both outcomes leave the device unresolved so the next load retries;
-  - the stored record's reorder rate is the Task 2 seed's value (seed = moe_exec_rates_seed({}), seed.reorder_gbps),
-    never a numeric literal: it only satisfies the store's validity rule, and the rates assembly measures its own.
+  - the probe never writes a reorder rate into the record (llama.cpp-kp1l): the record keeps the looked-up rate, 0 when
+    there was none, and a reorder rate of 0 is a valid record that means unmeasured, so the seed is not persisted as a
+    measurement.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -95,6 +98,17 @@ SYCL_TREE_DIR = "ggml/src/ggml-sycl"
 SYCL = read(SYCL_REL)
 COMMON = read(COMMON_REL)
 COST = read(COST_REL)
+
+PLAN_HPP_REL = "ggml/src/ggml-sycl/moe-stream-plan.hpp"
+PLAN_CPP_REL = "ggml/src/ggml-sycl/moe-stream-plan.cpp"
+IO_REL = "ggml/src/ggml-sycl/tuning-cache-io.hpp"
+ENV_DOC_REL = "docs/backend/sycl-env-vars.md"
+PLAN_HPP = read(PLAN_HPP_REL)
+PLAN_CPP = read(PLAN_CPP_REL)
+IO_HPP = read(IO_REL)
+ENV_DOC = read(ENV_DOC_REL)
+ASSEMBLE_SIG = "static inline moe_exec_rates moe_stream_rates_assemble("
+WEIGH_SIG = "moe_exec_decision moe_stream_phase::weigh("
 
 PROBE_SIG = "static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info)"
 LOG_FORMAT = '"[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)\\n"'
@@ -211,7 +225,7 @@ def claim_reads_its_switch_once(src: str) -> bool:
     return norm(src).count('getenv("GGML_SYCL_H2D_PROBE")') == 1
 
 
-GUARD = "if (info.devices[dev].h2d_pinned_gbps > 0.0) { continue; }"
+GUARD = "if (ggml_sycl_h2d_pinned_resolved(info, dev)) { continue; }"
 LOOKUP = "ggml_backend_sycl_moe_exec_rates_lookup("
 CACHE_HIT = 'if (have && !force) { report(dev, rec.h2d_gbps, H2D_PROBE_OUTCOME_FROM_CACHE, "tuning cache"); continue; }'
 SKIP = 'if (skip) { report(dev, seed.h2d_gbps, H2D_PROBE_OUTCOME_SEED_KEPT, "seed, GGML_SYCL_H2D_PROBE=0"); continue; }'
@@ -221,7 +235,9 @@ def claim_a_device_holding_a_rate_is_not_probed_again(src: str) -> bool:
     """The once-guard is the loop's first statement, ahead of the tuning-cache lookup: a device that holds a rate is
     skipped whole, which is what lets every outermost load call the probe."""
     fn = probe_body(src)
-    return bool(fn) and fn.count(GUARD) == 1 and ordered(fn, "for (int dev = 0;", GUARD, LOOKUP)
+    helper = body(norm(src), RESOLVED_SIG)
+    return bool(fn) and fn.count(GUARD) == 1 and ordered(fn, "for (int dev = 0;", GUARD, LOOKUP) and \
+        "return info.devices[dev].h2d_pinned_gbps > 0.0;" in helper
 
 
 def claim_switch_semantics(src: str) -> bool:
@@ -255,17 +271,6 @@ def claim_rethrows_fallback_error_first(src: str) -> bool:
     guard = "catch (const ggml_sycl_fallback_error &) { throw; }"
     handler = "catch (const std::exception & e)"
     return bool(fn) and guard in fn and handler in fn and fn.index(guard) < fn.index(handler)
-
-
-def claim_store_carries_a_valid_reorder_rate(src: str) -> bool:
-    """The store refuses a record whose reorder rate is not finite and positive, so a record holding only the H2D rate
-    would never persist and the second start would probe again. The value is the seed's, by reference."""
-    fn = probe_body(src)
-    return bool(fn) and all([
-        "rec.reorder_gbps = seed.reorder_gbps;" in fn,
-        "seed = ggml_sycl::moe_exec_rates_seed({})" in fn,
-        not re.search(r"reorder_gbps\s*=\s*[0-9]", fn),
-    ])
 
 
 EFFECTS_SIG = "static void ggml_sycl_model_loading_effects(bool loading, bool outer)"
@@ -468,10 +473,11 @@ def count_reads_in(text: str) -> int:
     return len(read_offsets(text))
 
 
-def claim_one_consumer_reads_the_rate(overrides: dict = None) -> bool:
-    """h2d_pinned_gbps is read in exactly one place across the backend's sources, and that place is the probe's own
-    once-guard. A write is an occurrence followed by `=` (the field's default, the report lambda's store). `overrides`
-    maps a relative path to replacement text, which is how a mutant tree is checked."""
+def claim_two_consumers_read_the_rate(overrides: dict = None) -> bool:
+    """h2d_pinned_gbps is read in exactly two places across the backend's sources, both in ggml-sycl.cpp and both under
+    g_sycl_h2d_pinned_mutex: the probe's once-guard helper and the accessor the cost model's phase calls
+    (llama.cpp-kp1l). A write is an occurrence followed by `=` (the field's default, the report lambda's store).
+    `overrides` maps a relative path to replacement text, which is how a mutant tree is checked."""
     reads = []
     for p in sorted((ROOT / SYCL_TREE_DIR).rglob("*")):
         if not p.is_file() or p.suffix not in (".c", ".cpp", ".h", ".hpp"):
@@ -480,11 +486,213 @@ def claim_one_consumer_reads_the_rate(overrides: dict = None) -> bool:
         text = norm(overrides[rel] if overrides and rel in overrides else p.read_text(errors="replace"))
         for at in read_offsets(text):
             reads.append((rel, at, text))
-    if len(reads) != 1 or reads[0][0] != SYCL_REL:
+    if len(reads) != 2 or any(r[0] != SYCL_REL for r in reads):
         return False
-    _, at, text = reads[0]
-    fn = body(text, PROBE_SIG)
-    return bool(fn) and text.find(fn) <= at < text.find(fn) + len(fn)
+    text = reads[0][2]
+    spans = []
+    for sig in (RESOLVED_SIG, ACCESSOR_SIG):
+        fn = body(text, sig)
+        if not fn:
+            return False
+        spans.append((text.find(fn), text.find(fn) + len(fn)))
+    return all(any(lo <= at < hi for lo, hi in spans) for _, at, _ in reads) and \
+        len({next(i for i, (lo, hi) in enumerate(spans) if lo <= at < hi) for _, at, _ in reads}) == 2
+
+
+# ---- the probed H2D rate: the cost model's source order, the unmeasured reorder rate, the mutex (llama.cpp-kp1l) ----
+
+def claim_assembly_takes_h2d_from_record_then_probe_then_seed(hpp: str) -> bool:
+    """moe_stream_rates_assemble prices the h2d term from, in order: the device's tuning-cache record, the device's
+    probed rate (a parameter, so the function stays device-free), the seed it starts from; the environment override
+    is applied after all of them. A cache-disabled run therefore still prices with the measured rate."""
+    fn = body(norm(hpp), ASSEMBLE_SIG)
+    sig_at = norm(hpp).find(ASSEMBLE_SIG)
+    sig = norm(hpp)[sig_at:sig_at + 400] if sig_at >= 0 else ""
+    return bool(fn) and all([
+        "double probed_h2d_gbps" in sig,
+        # the chain is one statement straight after the seed: the record, else the probed rate, else the seed stands
+        "moe_exec_rates r = moe_exec_rates_seed(host_mix); "
+        "if (record != nullptr && detail::moe_stream_rate_measured(record->h2d_gbps)) { "
+        "r.h2d_gbps = record->h2d_gbps; } "
+        "else if (detail::moe_stream_rate_measured(probed_h2d_gbps)) { "
+        "r.h2d_gbps = probed_h2d_gbps; } if (record != nullptr) {"
+        in fn,
+        ordered(fn, "probed_h2d_gbps", "moe_exec_rates_apply_env(r, getenv_fn);"),
+    ])
+
+
+def claim_weigh_passes_the_devices_probed_rate(cpp: str) -> bool:
+    """The phase reads the device's probed rate where it weighs (live: the probe may resolve after the first prompt)
+    through the mutex-guarded accessor, and hands it to the assembly."""
+    fn = body(norm(cpp), WEIGH_SIG)
+    return bool(fn) and ordered(
+        fn, "const double probed_h2d_gbps = ggml_sycl_h2d_probed_gbps(device_);",
+        "moe_stream_rates_assemble(li.host_mix, record_valid_ ? &record_ : nullptr, probed_h2d_gbps, "
+        "moe_stream_getenv)")
+
+
+def claim_probe_does_not_store_the_reorder_seed(src: str) -> bool:
+    """The probe measures the H2D rate only. It never writes a reorder rate into the record: it stores what the
+    looked-up record held (0 = unmeasured), so the assembly's seed is not frozen into the file as a measurement."""
+    fn = probe_body(src)
+    return bool(fn) and all([
+        not re.search(r"reorder_gbps\s*=(?!=)", fn),
+        "seed.reorder_gbps" not in fn,
+        "moe_exec_rates_store(dev, &rec)" in fn,
+    ])
+
+
+def claim_record_accepts_an_unmeasured_reorder_rate(io: str) -> bool:
+    """A record's reorder rate of 0 means unmeasured and is valid; a negative or non-finite one is still refused."""
+    n = norm(io)
+    return ("return std::isfinite(h2d_gbps) && h2d_gbps > 0.0 && std::isfinite(reorder_gbps) && reorder_gbps >= 0.0;"
+            in n)
+
+
+def _doc_row(doc: str, name: str) -> str:
+    for line in doc.splitlines():
+        if line.startswith("| `" + name + "="):
+            return line
+    return ""
+
+
+def claim_catalog_rows_state_the_source_order(doc: str) -> bool:
+    row = _doc_row(doc, "GGML_SYCL_MOE_EXEC_H2D_GBPS")
+    probe = _doc_row(doc, "GGML_SYCL_H2D_PROBE")
+    return bool(row) and bool(probe) and ordered(
+        row, "this environment override", "the device's tuning-cache record", "the device's probed rate",
+        "the 20 GB/s seed") and "even when the tuning cache" \
+        in row and "not stored" in probe and \
+        "With no stored record, `GGML_SYCL_H2D_PROBE=0` skips the probe and the seed stands" in row and \
+        "leaves no probed rate" not in row
+
+
+PINNED_MUTEX = "static std::mutex g_sycl_h2d_pinned_mutex;"
+RESOLVED_SIG = "static bool ggml_sycl_h2d_pinned_resolved(const ggml_sycl_device_info & info, int dev)"
+ACCESSOR_SIG = "double ggml_sycl_h2d_probed_gbps(int device)"
+
+
+LOCK_STMT = "std::lock_guard<std::mutex> lock(g_sycl_h2d_pinned_mutex);"
+
+
+@functools.lru_cache(maxsize=None)
+def literal_mask(text: str) -> bytes:
+    """1 for every character inside a string or char literal (quotes included): one skipper for both brace scans."""
+    mask = bytearray(len(text))
+    for m in _LEXEME_RE.finditer(text):
+        if m.group(0)[0] in "\"'":
+            mask[m.start():m.end()] = b"\x01" * (m.end() - m.start())
+    return bytes(mask)
+
+
+def locked_bounds(text: str, lock: str = LOCK_STMT):
+    """(start, end) offsets of the text a lock statement guards: the end of the first `lock` to the close of the brace
+    block that encloses it, braces inside literals ignored in both directions. None when there is no such statement or
+    block, so a lock in a block of its own, closed before the access, guards nothing."""
+    at = text.find(lock)
+    if at < 0:
+        return None
+    mask = literal_mask(text)
+    depth = 0
+    i = at - 1
+    open_at = -1
+    while i >= 0:
+        if not mask[i]:
+            if text[i] == "}":
+                depth += 1
+            elif text[i] == "{":
+                if depth == 0:
+                    open_at = i
+                    break
+                depth -= 1
+        i -= 1
+    if open_at < 0:
+        return None
+    depth = 0
+    for j in range(open_at, len(text)):
+        if mask[j]:
+            continue
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return (at + len(lock), j)
+    return None
+
+
+def locked_span(text: str, lock: str = LOCK_STMT) -> str:
+    bounds = locked_bounds(text, lock)
+    return text[bounds[0]:bounds[1]] if bounds else ""
+
+
+ACCESS_RE = re.compile(r"(?:\.|->)\s*(h2d_pinned_gbps|h2d_probed(?!_)|h2d_retry_logged)\b")
+
+
+BARE_RE = re.compile(r"\b(h2d_pinned_gbps|h2d_probed|h2d_retry_logged)\b")
+
+
+def h2d_accesses(overrides: dict, pattern=ACCESS_RE) -> list:
+    """Every member access to the three probe fields across the backend's sources, as (path, offset) in the
+    comment-stripped normalized text of that file. `overrides` maps a relative path to replacement text. The
+    declarations in common.hpp are not accesses (no `.` or `->` before the name). With `pattern=BARE_RE` it lists every
+    occurrence of the bare names instead, which also covers a member function's implicit-this access, a field-name
+    macro and an offsetof or pointer-to-member spelling: none of them can name a field without one of these tokens."""
+    found = []
+    for p in sorted((ROOT / SYCL_TREE_DIR).rglob("*")):
+        if not p.is_file() or p.suffix not in (".c", ".cpp", ".h", ".hpp"):
+            continue
+        rel = p.relative_to(ROOT).as_posix()
+        text = norm(overrides[rel] if rel in overrides else p.read_text(errors="replace"))
+        found.extend((rel, m.start()) for m in pattern.finditer(text))
+    return found
+
+
+def claim_probed_rate_is_published_under_one_mutex(sycl: str, common: str, cpp: str) -> bool:
+    """A load's outermost exit runs the probe on the loading thread with no lock a computing thread takes, and
+    moe_stream_phase::weigh runs on any thread that computes, so the rate and its flag are written and read under one
+    leaf mutex. Two directions: each expected access sits INSIDE the block its lock statement guards, not merely
+    after it; and NO OTHER access to the three fields exists anywhere in the backend's sources (a census of every
+    `.h2d_pinned_gbps`, `.h2d_probed` and `.h2d_retry_logged`: once-guard 1, accessor 2, probe's report lambda 4), and
+    of every bare mention of the three names, which must total the 3 declarations plus those 7 accesses.
+    weigh itself touches neither field, and the accessor is declared where weigh sees it."""
+    n = norm(sycl)
+    probe = probe_body(sycl)
+    resolved = body(n, RESOLVED_SIG)
+    accessor = body(n, ACCESSOR_SIG)
+    weigh = body(norm(cpp), WEIGH_SIG)
+    if not (probe and resolved and accessor and weigh):
+        return False
+    spans = []
+    for fn in (resolved, accessor, probe):
+        bounds = locked_bounds(fn)
+        if bounds is None:
+            return False
+        base = n.find(fn)
+        spans.append((base + bounds[0], base + bounds[1]))
+    sources = {SYCL_REL: sycl, COMMON_REL: common, PLAN_CPP_REL: cpp}
+    accesses = h2d_accesses(sources)
+    bare = h2d_accesses(sources, BARE_RE)
+    per_span = [sum(1 for rel, at in accesses if rel == SYCL_REL and lo <= at < hi) for lo, hi in spans]
+    return all([
+        n.count(PINNED_MUTEX) == 1,
+        n.count("g_sycl_h2d_pinned_mutex") == 4,  # the definition and the three lock statements, no unlock
+        probe.count(LOCK_STMT) == 1,
+        "return info.devices[dev].h2d_pinned_gbps > 0.0;" in locked_span(resolved),
+        "return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;" in locked_span(accessor),
+        "if (ggml_sycl_h2d_pinned_resolved(info, dev)) { continue; }" in probe,
+        all(piece in locked_span(probe) for piece in (
+            "(d.h2d_retry_logged & bit) != 0", "d.h2d_retry_logged |= bit;", "d.h2d_pinned_gbps = gbps;",
+            "d.h2d_probed = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;")),
+        per_span == [1, 2, 4],
+        len(accesses) == 7,
+        # every bare mention: the 3 declarations in common.hpp and the 7 locked accesses, nothing else (10)
+        len(bare) == 10 and sum(1 for rel, _ in bare if rel == COMMON_REL) == 3
+        and sum(1 for rel, _ in bare if rel == SYCL_REL) == 7,
+        "double ggml_sycl_h2d_probed_gbps(int device);" in norm(common),
+        "ggml_sycl_h2d_probed_gbps(device_)" in weigh,
+        "h2d_pinned_gbps" not in weigh and not re.search(r"h2d_probed(?!_gbps)", weigh),
+    ])
 
 
 # ---- tests ----
@@ -507,10 +715,6 @@ def test_probe_logs_once_at_warn_and_reads_its_switch_once():
 def test_probe_failure_keeps_the_seed_and_never_aborts():
     assert claim_failed_alloc_keeps_the_seed_and_never_aborts(SYCL)
     assert claim_rethrows_fallback_error_first(SYCL)
-
-
-def test_probe_stores_a_record_the_cache_will_accept():
-    assert claim_store_carries_a_valid_reorder_rate(SYCL)
 
 
 def test_probe_runs_after_preload_through_the_mutable_accessor():
@@ -537,9 +741,9 @@ def test_copies_run_on_the_cache_queue():
     assert claim_copies_run_on_the_cache_queue(SYCL)
 
 
-def test_device_info_carries_the_rate_and_one_consumer_reads_it():
+def test_device_info_carries_the_rate_and_two_consumers_read_it():
     assert claim_device_info_fields(COMMON)
-    assert claim_one_consumer_reads_the_rate()
+    assert claim_two_consumers_read_the_rate()
 
 
 def test_each_iteration_is_timed_on_its_own():
@@ -556,6 +760,24 @@ def test_the_spread_rides_in_the_probed_line_only():
 
 def test_a_max_under_half_the_seed_is_retried_not_stored():
     assert claim_a_max_under_half_the_seed_is_retried_not_stored(SYCL, COST)
+
+
+def test_assembly_takes_h2d_from_record_then_probe_then_seed():
+    assert claim_assembly_takes_h2d_from_record_then_probe_then_seed(PLAN_HPP)
+    assert claim_weigh_passes_the_devices_probed_rate(PLAN_CPP)
+
+
+def test_probe_does_not_store_the_reorder_seed_and_the_record_may_say_unmeasured():
+    assert claim_probe_does_not_store_the_reorder_seed(SYCL)
+    assert claim_record_accepts_an_unmeasured_reorder_rate(IO_HPP)
+
+
+def test_catalog_rows_state_the_source_order():
+    assert claim_catalog_rows_state_the_source_order(ENV_DOC)
+
+
+def test_probed_rate_is_published_under_one_mutex():
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
 
 
 # ---- mutants: each claim must go red when its text is broken ----
@@ -620,10 +842,6 @@ def test_mutant_unguarded_catch_fails():
               "catch (const std::exception & e) { char what[192];"))
 
 
-def test_mutant_reorder_rate_missing_fails():
-    assert not claim_store_carries_a_valid_reorder_rate(SYCL.replace("rec.reorder_gbps", "rec.unused_gbps"))
-
-
 def test_mutant_probe_called_from_init_fails():
     assert not claim_probe_runs_after_preload_through_the_mutable_accessor(
         _once(SYCL, "ggml_sycl_init_peer_link_defaults(info);",
@@ -668,13 +886,14 @@ def test_mutant_call_outside_the_outer_exit_block_fails():
 
 def test_mutant_once_guard_inverted_fails():
     assert not claim_a_device_holding_a_rate_is_not_probed_again(
-        _once(SYCL, "h2d_pinned_gbps > 0.0) {", "h2d_pinned_gbps < 0.0) {"))
+        _once(SYCL, "return info.devices[dev].h2d_pinned_gbps > 0.0;",
+              "return info.devices[dev].h2d_pinned_gbps < 0.0;"))
 
 
 def test_mutant_once_guard_without_continue_fails():
     assert not claim_a_device_holding_a_rate_is_not_probed_again(
-        _once(SYCL, "if (info.devices[dev].h2d_pinned_gbps > 0.0) { continue; }",
-              "if (info.devices[dev].h2d_pinned_gbps > 0.0) { }"))
+        _once(SYCL, "if (ggml_sycl_h2d_pinned_resolved(info, dev)) { continue; }",
+              "if (ggml_sycl_h2d_pinned_resolved(info, dev)) { }"))
 
 
 def test_mutant_env_skip_disabled_fails():
@@ -781,20 +1000,160 @@ def test_mutant_zone_check_removed_fails():
         _once(SYCL, "if (cache == nullptr || !cache->host_zones_configured()) {", "if (false) {"))
 
 
-def test_mutant_reorder_literal_fails():
-    assert not claim_store_carries_a_valid_reorder_rate(
-        _once(SYCL, "rec.reorder_gbps = seed.reorder_gbps;", "rec.reorder_gbps = 200.0;"))
-
-
-def test_mutant_second_reader_fails():
-    """A second read of the rate inside the probe, and one outside it, each break the one-consumer claim."""
-    assert claim_one_consumer_reads_the_rate()
-    inside = _once(SYCL, "if (info.devices[dev].h2d_pinned_gbps > 0.0) {",
-                   "double extra = info.devices[dev].h2d_pinned_gbps; if (info.devices[dev].h2d_pinned_gbps > 0.0) {")
-    assert not claim_one_consumer_reads_the_rate({SYCL_REL: inside})
+def test_mutant_third_reader_fails():
+    """A second read inside the probe, one outside both readers, and a dropped accessor read each break the claim."""
+    assert claim_two_consumers_read_the_rate()
+    inside = _once(SYCL, "if (ggml_sycl_h2d_pinned_resolved(info, dev)) { continue; }",
+                   "double extra = info.devices[dev].h2d_pinned_gbps; "
+                   "if (ggml_sycl_h2d_pinned_resolved(info, dev)) { continue; }")
+    assert not claim_two_consumers_read_the_rate({SYCL_REL: inside})
     outside = SYCL + ("\nstatic double h2d_extra_reader(const ggml_sycl_device_info & i) "
                       "{ return i.devices[0].h2d_pinned_gbps; }\n")
-    assert not claim_one_consumer_reads_the_rate({SYCL_REL: outside})
+    assert not claim_two_consumers_read_the_rate({SYCL_REL: outside})
+    no_accessor_read = _once(SYCL, "return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;", "return 0.0;")
+    assert not claim_two_consumers_read_the_rate({SYCL_REL: no_accessor_read})
+
+
+def test_mutant_lock_taken_but_access_outside_its_block_fails():
+    """The lock statement preceding an access is not the access being inside the lock's block: each of the three
+    sites is mutated so the lock still precedes the field access textually but its block has closed."""
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
+    # (a) the report lambda's two writes move after the locked block's closing brace
+    stores = "d.h2d_pinned_gbps = gbps; d.h2d_probed = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;"
+    writes_out = _once(SYCL, "} else { " + stores + " } }",
+                       "} } if (outcome < H2D_PROBE_OUTCOME_RETRY_ZONES) { " + stores + " }")
+    assert not claim_probed_rate_is_published_under_one_mutex(writes_out, COMMON, PLAN_CPP)
+    # (b) the accessor's lock sits in its own block ahead of the reads
+    acc_out = _once(SYCL, LOCK_STMT + " return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;",
+                    "{ " + LOCK_STMT + " } return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;")
+    assert not claim_probed_rate_is_published_under_one_mutex(acc_out, COMMON, PLAN_CPP)
+    # (c) the same in the once-guard helper
+    res_out = _once(SYCL, LOCK_STMT + " return info.devices[dev].h2d_pinned_gbps > 0.0;",
+                    "{ " + LOCK_STMT + " } return info.devices[dev].h2d_pinned_gbps > 0.0;")
+    assert not claim_probed_rate_is_published_under_one_mutex(res_out, COMMON, PLAN_CPP)
+    # (d) the retry bit's test and set leave the locked block
+    retry_out = _once(SYCL, LOCK_STMT + " if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {",
+                      "{ " + LOCK_STMT + " } if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {")
+    assert not claim_probed_rate_is_published_under_one_mutex(retry_out, COMMON, PLAN_CPP)
+
+
+def test_mutant_a_second_access_outside_every_locked_span_fails():
+    """The claim must also see accesses it does not expect: an unlocked fast-path read in the accessor or the
+    once-guard helper, an unlocked write elsewhere in the translation unit, an alias write in the probe body, an
+    explicit unlock, and a `}` string literal ahead of the lock that must not widen its block."""
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
+    info_d = "const sycl_device_info & d = ggml_sycl_info().devices[device];"
+    fast_acc = _once(SYCL, info_d, info_d + " if (!d.h2d_probed) { return 0.0; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(fast_acc, COMMON, PLAN_CPP)
+    fast_res = _once(SYCL, RESOLVED_SIG + " {",
+                     RESOLVED_SIG + " { if (info.devices[dev].h2d_pinned_gbps > 0.0) { return true; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(fast_res, COMMON, PLAN_CPP)
+    other_fn = _once(SYCL, PINNED_MUTEX,
+                     PINNED_MUTEX + " static void h2d_reset(ggml_sycl_device_info & info) { "
+                     "info.devices[0].h2d_probed = false; info.devices[0].h2d_retry_logged = 0; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(other_fn, COMMON, PLAN_CPP)
+    alias = _once(SYCL, 'report(dev, rec.h2d_gbps, H2D_PROBE_OUTCOME_FROM_CACHE, "tuning cache");',
+                  'report(dev, rec.h2d_gbps, H2D_PROBE_OUTCOME_FROM_CACHE, "tuning cache"); '
+                  "info.devices[dev].h2d_probed = true;")
+    assert not claim_probed_rate_is_published_under_one_mutex(alias, COMMON, PLAN_CPP)
+    unlocked = _once(SYCL, LOCK_STMT + " return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;",
+                     LOCK_STMT + " g_sycl_h2d_pinned_mutex.unlock(); return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;")
+    assert not claim_probed_rate_is_published_under_one_mutex(unlocked, COMMON, PLAN_CPP)
+    # the same access written in another backend source
+    stray = PLAN_CPP + "\nstatic void stray(sycl_device_info & d) { d.h2d_probed = true; }\n"
+    assert not claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, stray)
+
+
+def test_mutant_implicit_this_access_in_a_member_function_fails():
+    """A member function of sycl_device_info reaches the fields by their bare names, which the `.name` and `->name`
+    census cannot see: a getter called unlocked, a setter in the header, and an out-of-line setter in the TU."""
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
+    tail = "uint32_t h2d_retry_logged = 0;"
+    getter = _once(COMMON, tail, tail + " double h2d_rate() const { return h2d_probed ? h2d_pinned_gbps : 0.0; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(SYCL, getter, PLAN_CPP)
+    setter = _once(COMMON, tail, tail + " void h2d_mark() { h2d_probed = true; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(SYCL, setter, PLAN_CPP)
+    out_of_line = SYCL + "\nvoid sycl_device_info::h2d_mark() { h2d_probed = true; }\n"
+    assert not claim_probed_rate_is_published_under_one_mutex(out_of_line, COMMON, PLAN_CPP)
+    in_plan = PLAN_CPP + "\nstatic double h2d_peek(const sycl_device_info & d) { return d.h2d_rate(); }\n"
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, in_plan)  # a call names no field
+
+
+def test_mutant_brace_literal_before_the_lock_does_not_widen_its_block():
+    stores = "d.h2d_pinned_gbps = gbps; d.h2d_probed = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;"
+    anchor = LOCK_STMT + " if (outcome >= H2D_PROBE_OUTCOME_RETRY_ZONES) {"
+    tagged = _once(SYCL, anchor, 'const char * tag = "}"; (void) tag; ' + anchor)
+    assert claim_probed_rate_is_published_under_one_mutex(tagged, COMMON, PLAN_CPP)
+    widened = _once(tagged, "} else { " + stores + " } }",
+                    "} } if (outcome < H2D_PROBE_OUTCOME_RETRY_ZONES) { " + stores + " }")
+    assert not claim_probed_rate_is_published_under_one_mutex(widened, COMMON, PLAN_CPP)
+    # and a `{` char literal ahead of the lock, in a block of its own, does not make a closed block look open
+    char_open = _once(SYCL, LOCK_STMT + " return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;",
+                      "{ char c = '{'; (void) c; " + LOCK_STMT + " } return d.h2d_probed ? d.h2d_pinned_gbps : 0.0;")
+    assert not claim_probed_rate_is_published_under_one_mutex(char_open, COMMON, PLAN_CPP)
+
+
+def test_mutant_probed_rate_published_without_the_mutex_fails():
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
+    # the accessor, the once-guard helper and the store each lose their lock
+    for sig in (ACCESSOR_SIG, RESOLVED_SIG):
+        at = strip_comments(SYCL).find(sig)
+        assert at >= 0
+        cut = strip_comments(SYCL)[at:].find(LOCK_STMT)
+        assert cut >= 0
+        mutant = strip_comments(SYCL)[:at + cut] + strip_comments(SYCL)[at + cut + len(LOCK_STMT):]
+        assert not claim_probed_rate_is_published_under_one_mutex(mutant, COMMON, PLAN_CPP)
+    store = _once(SYCL, "d.h2d_pinned_gbps = gbps;", "d.h2d_pinned_gbps = gbps;")
+    probe_at = strip_comments(store).find("auto report = [&info]")
+    store_lock = strip_comments(store)[probe_at:].find(LOCK_STMT)
+    unlocked_store = (strip_comments(store)[:probe_at + store_lock]
+                      + strip_comments(store)[probe_at + store_lock + len(LOCK_STMT):])
+    assert not claim_probed_rate_is_published_under_one_mutex(unlocked_store, COMMON, PLAN_CPP)
+    # weigh reading a field directly, and the accessor going undeclared
+    direct = _once(PLAN_CPP, "ggml_sycl_h2d_probed_gbps(device_)", "ggml_sycl_info().devices[device_].h2d_pinned_gbps")
+    assert not claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, direct)
+    assert not claim_probed_rate_is_published_under_one_mutex(
+        SYCL, _once(COMMON, "double ggml_sycl_h2d_probed_gbps(int device);", ""), PLAN_CPP)
+
+
+def test_mutant_assembly_without_the_probed_fallback_fails():
+    assert claim_assembly_takes_h2d_from_record_then_probe_then_seed(PLAN_HPP)
+    dropped = _once(PLAN_HPP, "} else if (detail::moe_stream_rate_measured(probed_h2d_gbps)) {\n"
+                    "        r.h2d_gbps = probed_h2d_gbps;\n    }", "}")
+    assert not claim_assembly_takes_h2d_from_record_then_probe_then_seed(dropped)
+    swapped = _once(PLAN_HPP, "if (record != nullptr && detail::moe_stream_rate_measured(record->h2d_gbps)) {",
+                    "if (detail::moe_stream_rate_measured(probed_h2d_gbps)) {\n        r.h2d_gbps = probed_h2d_gbps;\n"
+                    "    } else if (record != nullptr && detail::moe_stream_rate_measured(record->h2d_gbps)) {")
+    assert not claim_assembly_takes_h2d_from_record_then_probe_then_seed(swapped)
+    env_first = _once(PLAN_HPP, "moe_exec_rates_apply_env(r, getenv_fn);", "")
+    assert not claim_assembly_takes_h2d_from_record_then_probe_then_seed(env_first)
+
+
+def test_mutant_weigh_not_passing_the_probed_rate_fails():
+    assert claim_weigh_passes_the_devices_probed_rate(PLAN_CPP)
+    assert not claim_weigh_passes_the_devices_probed_rate(
+        _once(PLAN_CPP, "probed_h2d_gbps, moe_stream_getenv", "0.0, moe_stream_getenv"))
+    assert not claim_weigh_passes_the_devices_probed_rate(
+        _once(PLAN_CPP, "ggml_sycl_h2d_probed_gbps(device_)", "0.0"))
+
+
+def test_mutant_probe_stores_the_reorder_seed_fails():
+    assert claim_probe_does_not_store_the_reorder_seed(SYCL)
+    assert not claim_probe_does_not_store_the_reorder_seed(
+        _once(SYCL, "rec.h2d_gbps = gbps;", "rec.h2d_gbps = gbps; rec.reorder_gbps = seed.reorder_gbps;"))
+    assert not claim_probe_does_not_store_the_reorder_seed(
+        _once(SYCL, "rec.h2d_gbps = gbps;", "rec.h2d_gbps = gbps; rec.reorder_gbps = 200.0;"))
+
+
+def test_mutant_unmeasured_reorder_refused_fails():
+    assert claim_record_accepts_an_unmeasured_reorder_rate(IO_HPP)
+    refused = IO_HPP.replace("reorder_gbps >= 0.0", "reorder_gbps > 0.0")
+    assert not claim_record_accepts_an_unmeasured_reorder_rate(refused)
+
+
+def test_mutant_catalog_row_without_the_probed_rate_fails():
+    assert claim_catalog_rows_state_the_source_order(ENV_DOC)
+    assert not claim_catalog_rows_state_the_source_order(ENV_DOC.replace("the device's probed rate (", "(", 1))
 
 
 def test_mutant_iterations_timed_as_one_block_fails():
