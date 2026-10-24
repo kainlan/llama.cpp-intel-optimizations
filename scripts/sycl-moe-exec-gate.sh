@@ -75,12 +75,14 @@
 #   resets     journalctl -k --since <gate start> | grep -icE
 #              'GT reset|guc_id|CAT error|Engine reset|exec queue reset' = 0
 #              (journalctl's own rc is kept: a failed journalctl or a missing journal file is a FAIL, never a clean log)
-# Duration: a complete run of all 17 arms takes about 45 minutes on this host with the ring off (run 2: Q_pp 9.5 min,
+# Duration: a complete run of all 17 arms takes about 65 minutes on this host with the ring off (run 2, of the original 15 arms,
+# 45 minutes; Q_pp_ub2048 and Q_pp_nocopyq each add about a Q_pp: Q_pp 9.5 min,
 # Q_pp_cpu 9.3, Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the GPT-OSS and Mistral arms
 # about 1 each).
 # Note on the plan table: llama-bench has no -c option (its context is n_prompt + n_gen), so GO_pp carries none.
-# Verdict-bearing arms (11): Q_pp Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70 MI_b50 resets.
-# Arms in all (17): the eleven, Q_pp_ub2048, Q_pp_nocopyq (both verdict-bearing too), Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
+# Verdict-bearing arms (13): Q_pp Q_pp_ub2048 Q_pp_nocopyq Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70
+# MI_b50 resets.
+# Arms in all (17): the thirteen, Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
 #
 # Every grep has a positive and a negative control (check_controls) that runs before any arm and is exposed as
 # --check-controls. The GPT-OSS echo-line trap (the prompt ends with the answer, so a loose grep scores 2) is the
@@ -478,7 +480,7 @@ summary_field() {
         echo NA
         return
     fi
-    cat "$1" 2>/dev/null | grep -aoE -- "$RE_WINDOW_FIELDS" | awk -v f="$2" '
+    cat "$1" 2>/dev/null | grep -aE -- "$RE_SUMMARY_WINDOWS" | grep -aoE -- "$RE_WINDOW_FIELDS" | awk -v f="$2" '
         { v = (f == "windows") ? $2 : (f == "exposed") ? $4 : $6; n += v } END { print n + 0 }'
 }
 summary_windows() { summary_field "$1" windows; }
@@ -550,25 +552,28 @@ score_q_pp() {
     [ "$summary" -ge 1 ] || fails+=("summary=$summary<1")
     [ "$refused" -eq 0 ] || fails+=("pp_moe_refused=$refused")
     # The window ring: it must have engaged, the summary must carry the window fields (an older binary prints none) and
-    # no window may have missed, in the summary or in the executor trace.
+    # no window may have missed, in the summary (misses) or in the executor trace (trace_misses).
     local windows exposed misses
     windows="$(summary_windows "$err")"
     exposed="$(summary_exposed "$err")"
     misses="$(summary_misses "$err")"
-    [ "$misses" = NA ] || misses=$((misses + $(trace_misses "$err")))
+    local tmiss
+    tmiss="$(trace_misses "$err")"
     [ "$(ring_layer_ubatches "$err")" -gt 0 ] || fails+=("ring_engaged=no")
     if [ "$windows" = NA ]; then
         fails+=("summary_windows=missing")
     elif [ "$misses" -ne 0 ]; then
         fails+=("misses=$misses")
     fi
+    # The trace prints the same misses the summary counts, so it is its own field and its own failure, never added in.
+    [ "$tmiss" -eq 0 ] || fails+=("trace_misses=$tmiss")
     r512="$(awk -v v="$pp512" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
     r2048="$(awk -v v="$pp2048" 'BEGIN { if (v == "NA") print "NA"; else printf "%.1f", v }')"
     echo "$label=$(verdict_of "${fails[@]}") pp512=$r512 sd512=$sd512 pp2048=$r2048" \
         "sd2048=$sd2048 ub=$ub layers=$layers" \
         "summary=$summary pp_moe_refused=$refused ring_engaged=$(ring_engaged "$err")" \
         "ring_layer_ubatches=$(ring_layer_ubatches "$err") loan_exercised=$(loan_exercised "$err")" \
-        "windows=$windows exposed=$exposed misses=$misses"
+        "windows=$windows exposed=$exposed misses=$misses trace_misses=$tmiss"
 }
 
 score_q_pp_cpu() { # <csv> <err> <rc>
@@ -904,9 +909,17 @@ check_controls() {
         '[MOE-EXEC-TRACE] dev 0 layer 7: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
     ctl summary "$RE_SUMMARY" '[MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed' \
         '[MOE-EXEC] layer 7: ring (p=0.99)'
-    ctl summary_ring "$RE_SUMMARY_RING" \
-        '[MOE-EXEC] summary: 96 layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB streamed' \
+    local sum_long='[MOE-EXEC] summary: 24 layer-ubatches ring, 0 cpu, 0 forced, 41000 MiB streamed, 216 windows, 24 exposed, 0 misses'
+    local sum_short='[MOE-EXEC] summary: 24 layer-ubatches ring, 0 cpu, 0 forced, 41000 MiB streamed'
+    ctl summary_ring "$RE_SUMMARY_RING" "$sum_long" \
         '[MOE-EXEC] layer 7: ring (p=0.99 t_cpu=900 us t_ring=300 us cheaper)'
+    ctl summary_windows "$RE_SUMMARY_WINDOWS" "$sum_long" "$sum_short"
+    ctl summary_windows_trace_decoy "$RE_SUMMARY_WINDOWS" "$sum_long" \
+        '[MOE-EXEC-TRACE] executor device 0 tensor=blk.0.x experts=8 staged=8 arm=f16, 5 windows, 0 exposed, 7 misses'
+    ctl window_fields "$RE_WINDOW_FIELDS" ', 216 windows, 24 exposed, 0 misses' ', 216 windows, 24 exposed'
+    ctl trace_misses "$RE_TRACE_MISSES" \
+        '[MOE-EXEC-TRACE] executor device 0 tensor=blk.0.ffn_up_exps.weight experts=480 staged=300 arm=f16 misses=0' \
+        '[MOE-EXEC-TRACE] stage layer 3 ubatch 512: regime=STREAM_ALL misses=2'
     ctl loan_ok "$RE_LOAN_OK" '[MOE-EXEC] loan device 0: 24 triplets, 300 MiB lent to the ring (ok)' \
         '[MOE-EXEC] loan device 0 refused: host storage too small'
     ctl refill "$RE_REFILL" '[MOE-EXEC] refill device 0: 24/24 triplets re-admitted' \
