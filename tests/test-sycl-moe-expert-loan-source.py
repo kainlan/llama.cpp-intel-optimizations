@@ -230,7 +230,6 @@ RESTORE_SIG = "void unified_cache::restore_expert_entry_at_locked("
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_txn_run("
 LOAN_TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run("
 RESOLVE_SIG = "static bool ggml_sycl_expert_loan_resolve_registered("
-WRAPPER_SIG = "static ggml_sycl_txn_result ggml_sycl_run_expert_loan_transaction("
 REQUEST_SIG = "static void ggml_sycl_request_expert_loan("
 PENDING_DEVICE_SIG = "static bool ggml_sycl_run_pending_expert_loan_on_device("
 PENDING_SIG = "static bool ggml_sycl_run_pending_expert_loan("
@@ -245,8 +244,7 @@ def loan_bodies(cache: str, sycl: str) -> list[str]:
     c = norm(cache)
     s = norm(sycl)
     return [body(c, LOAN_SIG), body(c, EXACT_SIG), body(c, RESTORE_SIG), body(s, TXN_SIG), body(s, LOAN_TXN_SIG),
-            body(s, RESOLVE_SIG), body(s, WRAPPER_SIG), body(s, REQUEST_SIG), body(s, PENDING_DEVICE_SIG),
-            body(s, PENDING_SIG)]
+            body(s, RESOLVE_SIG), body(s, REQUEST_SIG), body(s, PENDING_DEVICE_SIG), body(s, PENDING_SIG)]
 
 
 # --- waits and status queries ---------------------------------------------------------------------------------------
@@ -773,7 +771,6 @@ SELECT_SIG = "static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expe
 FINAL_SIG = "static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason)"
 DEVICE_ALLOC_SIG = "static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t size)"
 REFILL_RUN_SIG = "static uint32_t ggml_sycl_expert_refill_transaction_run("
-REFILL_API_SIG = "static uint32_t ggml_sycl_run_expert_refill_transaction("
 ARM_SIG = "static void ggml_sycl_expert_refill_set_armed(int device, bool armed)"
 BOUNDARY_DEVICE_SIG = "static uint32_t ggml_sycl_run_expert_refill_at_boundary_on_device("
 BOUNDARY_SIG = "static void ggml_sycl_run_expert_refill_at_boundary(ggml_backend_t backend)"
@@ -788,8 +785,8 @@ def refill_bodies(cache: str, sycl: str) -> list[str]:
     c = norm(cache)
     s = norm(sycl)
     return [body(c, REFILL_SIG), body(s, SELECT_SIG), body(s, FINAL_SIG), body(s, DEVICE_ALLOC_SIG),
-            body(s, REFILL_RUN_SIG), body(s, REFILL_API_SIG), body(s, ARM_SIG), body(s, BOUNDARY_DEVICE_SIG),
-            body(s, BOUNDARY_SIG), body(s, LEDGER_SIG)]
+            body(s, REFILL_RUN_SIG), body(s, ARM_SIG), body(s, BOUNDARY_DEVICE_SIG), body(s, BOUNDARY_SIG),
+            body(s, LEDGER_SIG)]
 
 
 DIRECTION_ENUM = "enum class ggml_sycl_expert_txn_direction { LOAN, REFILL, };"
@@ -2308,6 +2305,18 @@ def test_mutant_pinned_pool_stops_branching_on_the_zones_fails():
     mutant = _once_in(CACHE, UNIFIED_ALLOC_SIG, PINNED_ZONE_BRANCH,
                       PINNED_ZONE_BRANCH.replace("!ucache->host_zones_configured()", "!ucache->arena_active()"))
     assert not claim_a_loan_without_host_zones_is_refused(mutant, SYCL)
+
+
+# --- the direct backend-taking entries had no production caller (llama.cpp-8xdz M2) ---------------------------------
+# The runtime reaches the loan through ggml_sycl_request_expert_loan and the boundary runner, and the refill through the
+# decode boundary's ggml_sycl_run_expert_refill_at_boundary. The two [[maybe_unused]] wrappers that took a backend were
+# never called, and the device test reaches neither, so they stay deleted rather than carried as dead API.
+DEAD_DIRECT_ENTRIES = ("ggml_sycl_run_expert_loan_transaction", "ggml_sycl_run_expert_refill_transaction")
+
+
+def test_the_unused_direct_loan_and_refill_entries_are_gone():
+    for name in DEAD_DIRECT_ENTRIES:
+        assert name not in SYCL, name
 
 
 # --- a lent triplet the refill can never prepare leaves the ledger, each drop WARNed, and one decode graph admits one
