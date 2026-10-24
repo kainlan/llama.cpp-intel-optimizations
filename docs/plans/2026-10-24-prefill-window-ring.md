@@ -287,7 +287,9 @@ static void test_window_sizing() {
     hints.group_cap         = 2;  // GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX caps G_plan
     idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr, hints);
     CHECK(idx.window_slots == 2);
-    hints.weight_slot_bytes = 0;  // no planned slot yet (before the first prompt): no window, no ring
+    // A down matrix transposed relative to gate/up must not inflate the unit: with the same slot the window is 3
+    // when the per-matrix unit is used, 2 when the layer-wide K*N is (the defect spec-eeim-1 found).
+    hints.weight_slot_bytes = 0;  // no planned slot (inventory globals not yet published at load): no window, no ring
     idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr, hints);
     CHECK(idx.window_slots == 0);
     // The geometry is sized from the window: 2 regions x 3 slots x 4096 (already 256-aligned) = 24576 bytes.
@@ -354,10 +356,11 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
         for (int r = 0; r < 3; ++r) {
             idx.role_items_max = std::max(idx.role_items_max, static_cast<uint32_t>(kv.second.role_items[r]));
         }
-        // One expert's f16 bytes, the executor's dequant unit: K*N*2 over the layer's host entries. A plan whose
-        // entries carry no shape (ne 0, the host tests' fixtures) falls back to the largest matrix's src bytes.
-        const size_t kn = static_cast<size_t>(kv.second.K) * static_cast<size_t>(kv.second.N) * 2;
-        expert_f16_bytes = std::max(expert_f16_bytes, kn != 0 ? kn : kv.second.matrix_bytes_max);
+        // One matrix's f16 bytes, the executor's dequant unit (ggml-sycl.cpp:90019 feeds ne00*ne01*2 to
+        // plan_groups): the max over the layer's streamable items of item.ncols * item.nrows * 2. NOT the layer's
+        // K*N: li.K/li.N are the maxima over all entries, and gate/up [2560,640] with down [640,2560] would give
+        // 2560^2, a unit four times too large and a window a quarter of the executor's phase (spec-eeim-1 finding 1).
+        expert_f16_bytes = std::max(expert_f16_bytes, kv.second.matrix_f16_bytes_max);
     }
     idx.window_slots = std::min(idx.role_items_max, moe_stream_window_experts(hints, expert_f16_bytes));
 ```
