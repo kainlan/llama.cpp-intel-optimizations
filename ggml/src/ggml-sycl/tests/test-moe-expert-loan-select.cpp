@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -153,6 +154,18 @@ bool has_expert(const std::vector<expert_placement_key> & keys, int expert) {
     return false;
 }
 
+// Test-only (llama.cpp-8xdz M4): the runtime selects through moe_expert_loan_select, which asks the same detail
+// predicate; this one-triplet form is for the cases below that probe a single (layer, expert).
+// True iff the gate/up/down triplet of (layer, expert) can be lent: all three entries exist and are on a device, none
+// is bulk-staged, and each is AOS or has a SOA-to-AOS inverse (v1: AOS only, see moe_loan_soa_inverse_exists).
+// Precondition: plan.build_index() has run; find_expert_entry returns nullptr on an un-indexed plan, so the answer is
+// then false (fail-safe, no signal).
+bool triplet_lendable(const placement_plan & plan, int layer, int expert) {
+    std::unordered_map<uint64_t, bool> memo;
+    return ggml_sycl::detail::moe_loan_triplet_is_lendable(ggml_sycl::detail::moe_loan_triplet_of(plan, layer, expert),
+                                                           plan, memo);
+}
+
 }  // namespace
 
 int main() {
@@ -161,13 +174,13 @@ int main() {
     const size_t         huge = ~static_cast<size_t>(0);
 
     // Lendable predicate: a plain device triplet, then each skip.
-    CHECK(ggml_sycl::moe_expert_triplet_lendable(plan, 2, 3));
-    CHECK(ggml_sycl::moe_expert_triplet_lendable(plan, 0, 2));
-    CHECK(!ggml_sycl::moe_expert_triplet_lendable(plan, 1, 0));   // bulk: every expert of the tensor on device 0
-    CHECK(!ggml_sycl::moe_expert_triplet_lendable(plan, 1, 5));   // bulk, also for the high expert ids
-    CHECK(!ggml_sycl::moe_expert_triplet_lendable(plan, 0, 3));   // SOA layout, Q4_0 has no inverse
-    CHECK(!ggml_sycl::moe_expert_triplet_lendable(plan, 2, 4));   // host
-    CHECK(!ggml_sycl::moe_expert_triplet_lendable(plan, 2, 99));  // not in the plan
+    CHECK(triplet_lendable(plan, 2, 3));
+    CHECK(triplet_lendable(plan, 0, 2));
+    CHECK(!triplet_lendable(plan, 1, 0));   // bulk: every expert of the tensor on device 0
+    CHECK(!triplet_lendable(plan, 1, 5));   // bulk, also for the high expert ids
+    CHECK(!triplet_lendable(plan, 0, 3));   // SOA layout, Q4_0 has no inverse
+    CHECK(!triplet_lendable(plan, 2, 4));   // host
+    CHECK(!triplet_lendable(plan, 2, 99));  // not in the plan
 
     // Everything lendable: layer 2 experts 3,2,1,0 then layer 0 experts 2,1,0, last entries first.
     size_t     sel       = 0;
@@ -214,9 +227,9 @@ int main() {
     // One role differs: every role is checked, not just the gate. Device 0 holds expert 0 whole; device 1 holds
     // experts 2 and 3 whole. Expert 1 is split across devices, expert 4 has a SOA up, expert 5 has a host down.
     const placement_plan split = make_split_plan();
-    CHECK(ggml_sycl::moe_expert_triplet_lendable(split, 0, 0));
-    CHECK(!ggml_sycl::moe_expert_triplet_lendable(split, 0, 4));
-    CHECK(!ggml_sycl::moe_expert_triplet_lendable(split, 0, 5));
+    CHECK(triplet_lendable(split, 0, 0));
+    CHECK(!triplet_lendable(split, 0, 4));
+    CHECK(!triplet_lendable(split, 0, 5));
     const auto split0 = ggml_sycl::moe_expert_loan_select(split, 0, huge, &sel);
     CHECK(split0.size() == 3 && sel == tc);
     CHECK(!split0.empty() && split0[0].expert_id == 0);
@@ -233,17 +246,17 @@ int main() {
     // allocation there and the primary experts 0-3 are views into it.
     const placement_plan alt = make_alt_plan();
     for (int e = 0; e < 4; ++e) {
-        CHECK(!ggml_sycl::moe_expert_triplet_lendable(alt, 0, e));
+        CHECK(!triplet_lendable(alt, 0, e));
     }
     // A same-device alternate on one expert makes the tensor non-bulk: its experts are lendable.
     for (int e = 0; e < 4; ++e) {
-        CHECK(ggml_sycl::moe_expert_triplet_lendable(alt, 1, e));
+        CHECK(triplet_lendable(alt, 1, e));
     }
     // One expert only: n_experts > 1 fails, so not bulk.
-    CHECK(ggml_sycl::moe_expert_triplet_lendable(alt, 2, 0));
+    CHECK(triplet_lendable(alt, 2, 0));
     // Two alternates resolving to device 0 on one non-primary expert: not bulk either.
     for (int e = 0; e < 4; ++e) {
-        CHECK(ggml_sycl::moe_expert_triplet_lendable(alt, 3, e));
+        CHECK(triplet_lendable(alt, 3, e));
     }
     // Select on device 0: layer 3 experts 3..0, layer 2 expert 0, layer 1 experts 3..0; layer 0 is bulk and skipped.
     const auto alt_sel = ggml_sycl::moe_expert_loan_select(alt, 0, huge, &sel);

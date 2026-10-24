@@ -82,12 +82,11 @@ struct moe_stream_item {
     int                 layer;
     int                 expert_id;
     expert_tensor_role  role;
-    ggml_sycl_cache_id  key;  // left default by moe_stream_plan_build: the entry carries no tensor to derive it from
     size_t              dst_bytes;  // the SOA size the device route wants
     size_t              src_bytes;  // the AOS size of the host copy
-    ggml_type           type;       // from the plan entry (moe_stream_plan_index_build); moe_stream_plan_build leaves 0
+    ggml_type           type;       // from the plan entry (moe_stream_plan_index_build)
     int64_t             ncols, nrows;
-    // From moe_stream_plan_index_build (moe_stream_item_staging); moe_stream_plan_build leaves NONE.
+    // From moe_stream_plan_index_build (moe_stream_item_staging).
     moe_stream_staging  staging  = moe_stream_staging::NONE;
     // From moe_stream_plan_index_build: EXECUTOR for a weight the library executor claims once staged.
     moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
@@ -99,86 +98,7 @@ static inline bool moe_expert_role_is_triplet(expert_tensor_role r) {
     return r == expert_tensor_role::GATE || r == expert_tensor_role::UP || r == expert_tensor_role::DOWN;
 }
 
-// Fused GATE_UP and CHUNK_* host entries are deliberately NOT listed: the stream list is gate/up/down triplets, the only
-// shape the ring stages. An empty list therefore does not mean "staged" for a fused-gate_up or chunked model.
-// A gate/up/down entry of `layer` that is planned for the host. Host entries carry target_device -1 (the planner sets
-// it at placement time), so they serve any device and the device argument of the callers is not a filter.
-static inline bool moe_stream_host_triplet_entry(const placement_entry & e, int layer) {
-    if (e.expert_id < 0 || e.layer_id != layer || e.on_device) {
-        return false;
-    }
-    return moe_expert_role_is_triplet(e.expert_role);
-}
-
-static inline bool moe_stream_id_listed(const int32_t * ids, size_t n_ids, int expert) {
-    for (size_t i = 0; i < n_ids; ++i) {
-        if (ids[i] == expert) {
-            return true;
-        }
-    }
-    return false;
-}
-
 }  // namespace detail
-
-// STREAM_ALL: every host-planned gate/up/down entry of `layer`, in plan.entries order, ids ignored.
-// ROUTED_ONLY: the same entries restricted to the experts named in ids, still in plan.entries order.
-// Any other regime lists nothing. `device` is accepted for symmetry with the enqueue; see the detail helper.
-static inline std::vector<moe_stream_item> moe_stream_plan_build(const placement_plan & plan,
-                                                                 int                    device,
-                                                                 int                    layer,
-                                                                 moe_exec_regime        regime,
-                                                                 const int32_t *        ids,
-                                                                 size_t                 n_ids) {
-    (void) device;
-    std::vector<moe_stream_item> out;
-    if (regime != moe_exec_regime::STREAM_ALL && regime != moe_exec_regime::ROUTED_ONLY) {
-        return out;
-    }
-    for (const placement_entry & e : plan.entries) {
-        if (!detail::moe_stream_host_triplet_entry(e, layer)) {
-            continue;
-        }
-        if (regime == moe_exec_regime::ROUTED_ONLY && !detail::moe_stream_id_listed(ids, n_ids, e.expert_id)) {
-            continue;
-        }
-        moe_stream_item item{};
-        item.layer     = e.layer_id;
-        item.expert_id = e.expert_id;
-        item.role      = e.expert_role;
-        item.dst_bytes = e.dst_size;
-        item.src_bytes = e.src_size;
-        out.push_back(item);
-    }
-    return out;
-}
-
-// Only gate/up/down triplets are considered (see moe_stream_host_triplet_entry): a layer whose host experts are fused
-// GATE_UP or CHUNK_* entries has an empty want list and so answers true without anything staged. Callers must not use
-// this predicate to skip the CPU path for a fused-gate_up or chunked model.
-// True iff every distinct id in ids that is host-planned in `layer` has gate, up and down in `staged`.
-static inline bool moe_stream_layer_fully_staged(const std::vector<moe_stream_item> & staged,
-                                                 const placement_plan &               plan,
-                                                 int                                  device,
-                                                 int                                  layer,
-                                                 const int32_t *                      ids,
-                                                 size_t                               n_ids) {
-    const std::vector<moe_stream_item> want =
-        moe_stream_plan_build(plan, device, layer, moe_exec_regime::ROUTED_ONLY, ids, n_ids);
-    for (const moe_stream_item & w : want) {
-        bool found = false;
-        for (const moe_stream_item & s : staged) {
-            if (s.layer == layer && s.expert_id == w.expert_id && s.role == w.role) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return false;
-        }
-    }
-    return true;
-}
 
 // One staged matrix: the SOA slot the device route reads, the AOS slot the copy landed in, and the reorder's event,
 // after which `soa` holds the matrix. `layout` is the layout the slot the device route reads really holds (ruling C,
@@ -327,7 +247,7 @@ static inline bool moe_stream_rate_measured(double rate) {
 
 }  // namespace detail
 
-// One scan of plan.entries. Host entries carry target_device -1 and serve any device (moe_stream_host_triplet_entry);
+// One scan of plan.entries. Host entries carry target_device -1 and serve any device;
 // `device` selects only the resident bytes that bound the ring's size. The items take type and shape from the entry,
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE), and their staging from
 // moe_stream_item_staging over the device's prompt kernels. The predicate is asked once per distinct (type, shape,
@@ -1059,15 +979,6 @@ static inline bool moe_loan_triplet_is_lendable(const moe_loan_triplet &        
 }
 
 }  // namespace detail
-
-// True iff the gate/up/down triplet of (layer, expert) can be lent: all three entries exist and are on a device, none is
-// bulk-staged, and each is AOS or has a SOA-to-AOS inverse (v1: AOS only, see moe_loan_soa_inverse_exists).
-// Precondition: plan.build_index() has run; find_expert_entry returns nullptr on an un-indexed plan, so selection then
-// returns nothing (fail-safe, no signal).
-static inline bool moe_expert_triplet_lendable(const placement_plan & plan, int layer, int expert) {
-    std::unordered_map<uint64_t, bool> memo;
-    return detail::moe_loan_triplet_is_lendable(detail::moe_loan_triplet_of(plan, layer, expert), plan, memo);
-}
 
 // The lendable tail of the resident set on `device`: whole (gate, up, down) triplets, walking plan.entries in REVERSE
 // (pack-group order, popularity rank when ranks exist, so the tail is the least popular), until the summed
