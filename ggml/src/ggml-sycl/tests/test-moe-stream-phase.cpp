@@ -643,7 +643,7 @@ int main() {
         CHECK(rule(mixed, none, true, false) == "ring exceeds 10% of resident expert bytes");
         CHECK(rule(mixed, geo, false, false) == "queue not in order");
         CHECK(rule(mixed, geo, true, true) == "reserve refused");
-        // None of the five: named anyway, so no ring-unavailable line goes unexplained.
+        // None of the six: named anyway, so no ring-unavailable line goes unexplained.
         CHECK(rule(mixed, geo, true, false) == "region smaller than the largest streamable triplet");
     }
 

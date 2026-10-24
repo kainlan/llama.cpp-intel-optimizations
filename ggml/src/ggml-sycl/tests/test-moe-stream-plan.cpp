@@ -140,13 +140,16 @@ bool layer_fully_staged(const std::vector<moe_stream_item> & staged,
 constexpr int64_t kTypedCols = 64;
 constexpr int64_t kTypedRows = static_cast<int64_t>(kSrc) / (2 * kTypedCols);
 
-placement_plan make_typed_plan() {
+// down_transposed gives the down entries the transposed shape, kTypedRows x kTypedCols, as a model's down matrix is
+// [n_ff, n_embd] against gate/up's [n_embd, n_ff]: the same bytes, each dimension's maximum over the layer larger.
+placement_plan make_typed_plan(bool down_transposed = false) {
     placement_plan plan = make_plan();
     for (ggml_sycl::placement_entry & e : plan.entries) {
         if (e.expert_id >= 0 && ggml_sycl::detail::moe_expert_role_is_triplet(e.expert_role)) {
-            e.type  = GGML_TYPE_F16;
-            e.ne[0] = kTypedCols;
-            e.ne[1] = kTypedRows;
+            const bool t = down_transposed && e.expert_role == expert_tensor_role::DOWN;
+            e.type       = GGML_TYPE_F16;
+            e.ne[0]      = t ? kTypedRows : kTypedCols;
+            e.ne[1]      = t ? kTypedCols : kTypedRows;
         }
     }
     return plan;
@@ -182,7 +185,7 @@ void test_window_sizing() {
     idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
     CHECK(idx.window_slots == 2);
     hints.group_cap         = 0;
-    hints.weight_slot_bytes = 0;  // no planned slot yet (before the first prompt): no window, no ring
+    hints.weight_slot_bytes = 0;  // no planned slot (before the load publishes the inventory): no window, no ring
     idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
     CHECK(idx.window_slots == 0);
     // Nothing staged (no claim, no prompt kernel): no streamable item, so no window whatever the slot holds.
@@ -203,6 +206,13 @@ void test_window_sizing() {
         CHECK(gidx.layers.count(l) == 1 && gidx.layers.at(l).matrix_bytes_max == kSrc);
     }
     CHECK(gidx.layers.count(3) == 0);
+    // The executor's unit is one matrix, ne0 x ne1 x 2 (moe_pp_batched_f16_plan_groups): a down matrix transposed
+    // against gate/up is the same 4096 bytes, so fit stays 10 and the window 3. The product of the layer's per-dimension
+    // maxima, 64 x 64 x 2, would make fit 5, G_plan 2 and the window 2.
+    const placement_plan transposed = make_typed_plan(/*down_transposed*/ true);
+    idx = ggml_sycl::moe_stream_plan_index_build(transposed, 0, nullptr, nullptr, claims_all, hints);
+    CHECK(idx.role_items_max == 3);
+    CHECK(idx.window_slots == 3);
 }
 
 }  // namespace

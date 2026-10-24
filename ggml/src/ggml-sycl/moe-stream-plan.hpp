@@ -271,7 +271,8 @@ static inline int moe_stream_role_slot(expert_tensor_role role) {
 // What the ring's sizing needs from the batched executor (W3 of docs/plans/2026-10-24-prefill-window-ring.md): the
 // planned f16 weight slot it dequantizes a phase into, and the group cap it honours. A phase holds
 // G_plan = fit >= 2 ? fit / 2 : fit experts (fit = slot / one expert's f16 bytes), the executor's own two-buffer rule
-// (moe_pp_batched_f16_plan_groups), capped. 0 slot bytes (no prompt planned yet) means no window and no ring.
+// (moe_pp_batched_f16_plan_groups), capped. 0 slot bytes (a dense model, or before the load publishes the inventory
+// globals) means no window and no ring.
 struct moe_stream_window_hints {
     size_t weight_slot_bytes = 0;  // unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device)
     size_t group_cap         = 0;  // ggml_sycl_moe_pp_f16_group_experts_max(); 0 = none
@@ -317,6 +318,10 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
 
     std::vector<staging_answer>        answers;
     std::unordered_map<uint64_t, bool> claims;  // (layer, role) keyed with expert 0 -> the executor claims it staged
+    // One expert's f16 bytes, the executor's dequant unit: one matrix, ne0 x ne1 x 2 (the executor's f16_expert_bytes,
+    // fed to moe_pp_batched_f16_plan_groups), the largest over the streamable items. Never the product of a layer's
+    // per-dimension maxima: gate/up and down are transposed shapes, and that product is not one matrix.
+    size_t                             expert_f16_bytes = 0;
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.layer_id < 0) {
             continue;
@@ -396,10 +401,10 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
             item.staging == moe_stream_staging::SOA ? std::max(e.src_size, e.dst_size) : e.src_size;
         li.matrix_bytes_max  = std::max(li.matrix_bytes_max, matrix_bytes);
         idx.matrix_bytes_max = std::max(idx.matrix_bytes_max, matrix_bytes);
+        // A streamable item has a non-zero shape (a zeroed one stages NONE), so this is never 0 where a window exists.
+        expert_f16_bytes =
+            std::max(expert_f16_bytes, static_cast<size_t>(item.ncols) * static_cast<size_t>(item.nrows) * 2);
     }
-    // One expert's f16 bytes, the executor's dequant unit: K*N*2 over the layers' host entries. A layer with a
-    // streamable item has a non-zero shape (a zeroed one stages NONE), so the product is never 0 where a window exists.
-    size_t expert_f16_bytes = 0;
     for (const auto & kv : idx.layers) {
         idx.host_matrices_per_layer_max =
             std::max(idx.host_matrices_per_layer_max, static_cast<uint32_t>(kv.second.n_streamable));
@@ -407,8 +412,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         for (int r = 0; r < 3; ++r) {
             idx.role_items_max = std::max(idx.role_items_max, static_cast<uint32_t>(kv.second.role_items[r]));
         }
-        expert_f16_bytes =
-            std::max(expert_f16_bytes, static_cast<size_t>(kv.second.K) * static_cast<size_t>(kv.second.N) * 2);
     }
     idx.window_slots = std::min(idx.role_items_max, moe_stream_window_experts(hints, expert_f16_bytes));
     return idx;
@@ -446,7 +449,7 @@ static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const place
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
 // holds, in this order. geo is what moe_stream_ring_size gave for idx; its all-zero answer past the first three rules is
 // the 10% bound (its overflow guards refuse sizes far above any resident expert set too). A window of 0 slots is no
-// planned executor slot yet, or a slot that holds no expert. The last name is unreachable while the cost model's stage
+// planned executor slot (before the load publishes the inventory globals), or a slot that holds no expert. The last name is unreachable while the cost model's stage
 // unit is one streamable matrix (moe_stream_layer_info::matrix_bytes_max), since a region of window_slots >= 1 slots
 // holds the largest streamable matrix in each slot; it is there so that no ring-unavailable line goes unexplained.
 static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_plan_index &    idx,
