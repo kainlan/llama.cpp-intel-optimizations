@@ -172,9 +172,9 @@ void moe_stream_phase::end_prompt() {
 // the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache record is read once
 // per prompt.
 void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
-    const moe_stream_ring_geometry geo =
-        moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, &index_);
-    const bool same_queue = ccs_.has_value() && *ccs_ == ccs;
+    const moe_stream_ring_geometry geo = moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx,
+                                                                       op.library_claims, op.window, &index_);
+    const bool                     same_queue = ccs_.has_value() && *ccs_ == ccs;
     const bool same_geo = geo.slot_bytes == geo_.slot_bytes && geo.n_slots == geo_.n_slots && geo.bytes == geo_.bytes &&
                           geo.region_slots == geo_.region_slots;
     if (prepared_ && (device != device_ || !same_queue || !same_geo)) {
@@ -207,17 +207,17 @@ moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
                                           const moe_stream_op &         op,
                                           double                        window_us) const {
     moe_exec_layer_inputs in;
-    in.n_tokens          = n_tokens_;  // the micro-batch's, from begin_ubatch
-    in.n_expert          = op.n_expert;
-    in.n_expert_used     = op.n_expert_used;
-    in.host_expert_bytes = li.host_bytes;
-    in.n_host_experts    = li.n_host_experts;
-    in.K                 = li.K;
-    in.N                 = li.N;
-    in.window_us         = window_us;
-    in.ring_bytes_free   = ring_bytes_free();
-    in.triplet_bytes_max = li.expert_bytes_max;  // the largest streamable triplet: a region holds no other kind
-    in.soa_bytes         = li.soa_bytes;         // the reorder prices only these: AOS_ONLY items are read in place
+    in.n_tokens             = n_tokens_;  // the micro-batch's, from begin_ubatch
+    in.n_expert             = op.n_expert;
+    in.n_expert_used        = op.n_expert_used;
+    in.host_expert_bytes    = li.host_bytes;
+    in.n_host_experts       = li.n_host_experts;
+    in.K                    = li.K;
+    in.N                    = li.N;
+    in.window_us            = window_us;
+    in.ring_bytes_free      = ring_bytes_free();
+    in.stage_unit_bytes_max = li.matrix_bytes_max;  // one slot: a window is staged a matrix at a time
+    in.soa_bytes            = li.soa_bytes;         // the reorder prices only these: AOS_ONLY items are read in place
     // The device's probed H2D rate (llama.cpp-kp1l), read live and under the probe's mutex: another model's load may
     // run the probe while this prompt weighs. 0 while the device is unresolved or keeps the seed.
     const double         probed_h2d_gbps = ggml_sycl_h2d_probed_gbps(device_);
@@ -631,8 +631,9 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
 
 // One WARN per prompt saying why the ring is unavailable, at the first layer that answers RING_UNAVAILABLE, under an
 // explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log.
-// region_slots_max is the most slots one layer's region needs. The slots and bytes are the ring the layer asked for, so
-// when the 10% bound refused it they are the uncapped request.
+// region_slots_max is the most slots one layer's streamable matrices take; the ring holds one executor window
+// (window_slots) per region instead, so n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked
+// for, so when the 10% bound refused it they are the uncapped request.
 void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
     if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr ||
         (op.policy != moe_exec_policy::RING && op.log->trace < 1)) {
@@ -640,14 +641,15 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op) {
     }
     warned_unavailable_ = true;
     const moe_stream_ring_geometry asked =
-        geo_.n_slots != 0 ? geo_ : moe_stream_ring_size(index_.region_slots_max, index_.matrix_bytes_max, SIZE_MAX);
-    char line[320];
+        geo_.n_slots != 0 ? geo_ : moe_stream_ring_size(index_.window_slots, index_.matrix_bytes_max, SIZE_MAX);
+    char line[384];
     std::snprintf(line, sizeof(line),
                   "[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
-                  "region_slots_max=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)",
+                  "region_slots_max=%u window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u "
+                  "bytes=%zu)",
                   device_, moe_stream_ring_unavailable_rule(index_, geo_, in_order_, reserve_failed_),
-                  index_.host_matrices_per_layer_max, index_.region_slots_max, index_.matrix_bytes_max,
-                  index_.resident_expert_bytes, asked.n_slots, asked.bytes);
+                  index_.host_matrices_per_layer_max, index_.region_slots_max, index_.window_slots,
+                  index_.matrix_bytes_max, index_.resident_expert_bytes, asked.n_slots, asked.bytes);
     op.log->sink(op.log->sink_ctx, line);
 }
 

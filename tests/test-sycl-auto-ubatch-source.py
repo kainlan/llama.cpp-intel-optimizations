@@ -2916,7 +2916,7 @@ def test_the_fit_and_the_stream_phase_size_the_ring_with_one_function():
 
 @pytest.mark.parametrize("where", ["phase", "fit"])
 def test_the_shared_ring_geometry_pin_has_a_mutation_witness(where):
-    direct = "moe_stream_ring_size(index.region_slots_max, index.matrix_bytes_max, index.resident_expert_bytes)"
+    direct = "moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, index.resident_expert_bytes)"
     if where == "phase":
         old = "moe_stream_plan_ring_geometry("
         at = MOE_STREAM_PLAN_CPP.find(old, MOE_STREAM_PLAN_CPP.find(_PHASE_PREPARE_START))
@@ -2936,17 +2936,26 @@ def test_the_shared_ring_geometry_pin_has_a_mutation_witness(where):
 # library-claims hook is null on purpose: the backend's hook reads a thread-local graph scan that is stale outside
 # compute (a previous model's weight tensors), so the fit counts no claim and its ring is an upper bound.
 _RING_GEOMETRY_CALL = (
-    "ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr);"
+    "ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, nullptr, "
+    "call.op.window);"
 )
 _RING_ROWS_FILL = "call.op.n_tokens = n_ubatch;"
+# The ring is sized to the executor's window (docs/plans/2026-10-24-prefill-window-ring.md, W3): the fit fills the
+# call's window from the same helper the stream phase's prepare does, before it sizes the ring. With no window the
+# geometry sizes no ring, and the fit would charge none.
+_RING_WINDOW_FILL = "ggml_sycl_moe_stream_set_window(call.op, device);"
 
 
 def _fit_ring_geometry_call_pinned(raw_cpp: str) -> bool:
     # Whitespace-free on both sides: a wrapped argument list leaves a space after "(" that a plain match would miss.
     body = re.sub(r"\s+", "", _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END))
+    call = re.sub(r"\s+", "", _RING_GEOMETRY_CALL)
+    fill = re.sub(r"\s+", "", _RING_WINDOW_FILL)
     return (
-        body.count(re.sub(r"\s+", "", _RING_GEOMETRY_CALL)) == 1
+        body.count(call) == 1
         and body.count(re.sub(r"\s+", "", _RING_ROWS_FILL)) == 1
+        and body.count(fill) == 1
+        and -1 < body.find(fill) < body.find(call)
     )
 
 
@@ -2970,12 +2979,57 @@ def test_the_fit_hands_the_shared_ring_geometry_its_hooks_and_rows():
             "ggml_sycl_moe_stream_prompt_kernel, &call, ggml_sycl_moe_stream_library_claims",
         ),
         ("call.op.n_tokens = n_ubatch;", ""),
+        ("ggml_sycl_moe_stream_set_window(call.op, device);", ""),
+        ("call.op.window);", "ggml_sycl::moe_stream_window_hints());"),
     ],
-    ids=["no-prompt-kernel", "no-graph-ctx", "backend-library-claims", "no-rows"],
+    ids=["no-prompt-kernel", "no-graph-ctx", "backend-library-claims", "no-rows", "no-window", "default-window"],
 )
 def test_the_fit_ring_geometry_call_has_a_mutation_witness(old, new):
     mutated = _mutate_raw_ws_tolerant(GGML_SYCL_CPP, old, new)
     assert not _fit_ring_geometry_call_pinned(mutated), "the mutant must make the pin fail"
+
+
+# The one helper that fills the window both ring sizings read: the device's planned f16 weight slot (the batched
+# executor's own slot) and the executor's group cap, and nothing else. The stream phase's prepare and the fit each call
+# it once, so the two rings are sized from one window.
+_WINDOW_HELPER_START = "static void ggml_sycl_moe_stream_set_window(ggml_sycl::moe_stream_op & op, int device) {"
+_WINDOW_HELPER_END = "static bool ggml_sycl_moe_stream_prepare("
+_WINDOW_SLOT_FILL = (
+    "op.window.weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);"
+)
+_WINDOW_CAP_FILL = "op.window.group_cap = ggml_sycl_moe_pp_f16_group_experts_max();"
+_WINDOW_PREPARE_FILL = "ggml_sycl_moe_stream_set_window(call.op, ctx.device);"
+
+
+def _window_helper_pinned(raw_cpp: str) -> bool:
+    flat = re.sub(r"\s+", "", strip_comments(raw_cpp))
+    helper = re.sub(r"\s+", "", _body_of(raw_cpp, _WINDOW_HELPER_START, _WINDOW_HELPER_END))
+    return (
+        flat.count(re.sub(r"\s+", "", _WINDOW_HELPER_START)) == 1
+        and helper.count(re.sub(r"\s+", "", _WINDOW_SLOT_FILL)) == 1
+        and helper.count(re.sub(r"\s+", "", _WINDOW_CAP_FILL)) == 1
+        and flat.count("ggml_sycl_moe_stream_set_window(") == 3  # the definition, prepare and the fit
+        and flat.count(re.sub(r"\s+", "", _WINDOW_PREPARE_FILL)) == 1
+        and flat.count(re.sub(r"\s+", "", _RING_WINDOW_FILL)) == 1
+    )
+
+
+def test_both_ring_sizings_read_one_window_helper():
+    assert _window_helper_pinned(GGML_SYCL_CPP)
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        (_WINDOW_SLOT_FILL, "op.window.weight_slot_bytes = 0;"),
+        (_WINDOW_CAP_FILL, "op.window.group_cap = 0;"),
+        (_WINDOW_PREPARE_FILL, ""),
+    ],
+    ids=["no-slot", "no-cap", "prepare-skips-window"],
+)
+def test_the_window_helper_pin_has_a_mutation_witness(old, new):
+    mutated = _mutate_raw_ws_tolerant(GGML_SYCL_CPP, old, new)
+    assert not _window_helper_pinned(mutated), "the mutant must make the pin fail"
 
 
 @pytest.mark.parametrize("where", ["phase", "fit"])
@@ -2983,7 +3037,8 @@ def test_the_shared_ring_geometry_pin_sees_a_duplicated_call(where):
     """The single-call clause: a second call beside the shared one (a second sizing in the same function)."""
     if where == "phase":
         call = (
-            "moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, &index_);"
+            "moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, op.window, "
+            "&index_);"
         )
         mutated = _mutate_raw_ws_tolerant(MOE_STREAM_PLAN_CPP, call, call + " (void) " + call)
         assert not _ring_geometry_is_shared(mutated, GGML_SYCL_CPP), "the mutant must make the pin fail"

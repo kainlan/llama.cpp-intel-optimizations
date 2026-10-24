@@ -47,19 +47,19 @@ static moe_exec_rates b50_rates() {
 
 static moe_exec_layer_inputs qwen_layer(uint32_t T) {
     moe_exec_layer_inputs in;
-    in.n_tokens          = T;
-    in.n_expert          = 512;
-    in.n_expert_used     = 10;
-    in.host_expert_bytes = 410ull << 20;
-    in.n_host_experts    = 212;
-    in.K                 = 2560;
-    in.N                 = 640;
-    in.window_us         = 3000.0;
-    in.ring_bytes_free   = 820ull << 20;
-    in.triplet_bytes_max = 2048 * 1024;  // largest host triplet, rounded up from the 410 MiB / 212 mean
+    in.n_tokens             = T;
+    in.n_expert             = 512;
+    in.n_expert_used        = 10;
+    in.host_expert_bytes    = 410ull << 20;
+    in.n_host_experts       = 212;
+    in.K                    = 2560;
+    in.N                    = 640;
+    in.window_us            = 3000.0;
+    in.ring_bytes_free      = 820ull << 20;
+    in.stage_unit_bytes_max = 2048 * 1024 / 3;  // one matrix of the largest host triplet, from the 410 MiB / 212 mean
     // The hybrid world, every host byte staged SOA and reordered on the device: the shape these expectations were
     // written in. A layer the library executor claims stages AOS_ONLY and has soa_bytes 0 (llama.cpp-b5hm).
-    in.soa_bytes         = in.host_expert_bytes;
+    in.soa_bytes            = in.host_expert_bytes;
     return in;
 }
 
@@ -70,13 +70,13 @@ static moe_exec_layer_inputs gptoss_layer(uint32_t T, bool host) {
     in.n_expert_used = 4;
     in.host_expert_bytes =
         host ? 19ull * 13200000ull : 0;  // 13.2 MB per expert triplet: 10152345600 B / (24 x 32), test-kv-room-cost
-    in.n_host_experts    = host ? 19 : 0;
-    in.K                 = 2880;
-    in.N                 = 2880;
-    in.window_us         = 2000.0;
-    in.ring_bytes_free   = 1500ull << 20;
-    in.triplet_bytes_max = 13200000ull;
-    in.soa_bytes         = in.host_expert_bytes;  // the hybrid world, as qwen_layer
+    in.n_host_experts       = host ? 19 : 0;
+    in.K                    = 2880;
+    in.N                    = 2880;
+    in.window_us            = 2000.0;
+    in.ring_bytes_free      = 1500ull << 20;
+    in.stage_unit_bytes_max = 13200000ull / 3;       // one matrix of the 13.2 MB triplet
+    in.soa_bytes            = in.host_expert_bytes;  // the hybrid world, as qwen_layer
     return in;
 }
 
@@ -128,12 +128,12 @@ int main() {
         // RING policy forces the ring even where the CPU is cheaper.
         moe_exec_decision d = moe_exec_weigh(qwen_layer(4), b70_rates(), moe_exec_policy::RING);
         CHECK(d.choice == moe_exec_choice::RING && d.reason == moe_exec_reason::FORCED, "RING policy forces RING");
-        // A ring smaller than the largest triplet cannot stage it.
+        // A ring smaller than the largest matrix cannot stage it.
         moe_exec_layer_inputs in = qwen_layer(256);
         in.ring_bytes_free       = 1024;
         d                        = moe_exec_weigh(in, b70_rates(), moe_exec_policy::AUTO);
         CHECK(d.choice == moe_exec_choice::CPU && d.reason == moe_exec_reason::RING_UNAVAILABLE,
-              "ring smaller than the largest triplet is unavailable");
+              "ring smaller than the largest matrix is unavailable");
     }
     {
         // Compute-bound CPU: a slow CPU GEMM rate dominates its bandwidth term.
