@@ -447,11 +447,12 @@ static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const place
 }
 
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
-// holds, in this order. geo is what moe_stream_ring_size gave for idx; its all-zero answer past the first three rules is
-// the 10% bound (its overflow guards refuse sizes far above any resident expert set too). A window of 0 slots is no
-// planned executor slot (before the load publishes the inventory globals), or a slot that holds no expert. The last name is unreachable while the cost model's stage
-// unit is one streamable matrix (moe_stream_layer_info::matrix_bytes_max), since a region of window_slots >= 1 slots
-// holds the largest streamable matrix in each slot; it is there so that no ring-unavailable line goes unexplained.
+// holds, in this order. geo is what moe_stream_ring_size gave for idx; its all-zero answer past the first three rules
+// is the 10% bound (its overflow guards refuse sizes far above any resident expert set too). A window of 0 slots is no
+// planned executor slot (before the load publishes the inventory globals), or a slot that holds no expert. The last
+// name is unreachable while the cost model's stage unit is one streamable matrix (moe_stream_layer_info::
+// matrix_bytes_max), since a region of window_slots >= 1 slots holds the largest streamable matrix in each slot; it is
+// there so that no ring-unavailable line goes unexplained.
 static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_plan_index &    idx,
                                                             const moe_stream_ring_geometry & geo,
                                                             bool                             in_order,

@@ -136,7 +136,8 @@ bool layer_fully_staged(const std::vector<moe_stream_item> & staged,
 
 // The make_plan() layout with each gate/up/down entry typed as one F16 matrix of kSrc bytes, so a claim can stage it
 // (moe_stream_plan_index_build gives a matrix a slot only once its rows are whole blocks of src_bytes). F16 makes one
-// expert's f16 bytes, K*N*2, equal to its src bytes, so the window arithmetic below reads in kSrc units.
+// expert's f16 bytes, ncols x nrows x 2 (one matrix), equal to its src bytes, so the window arithmetic below reads in
+// kSrc units.
 constexpr int64_t kTypedCols = 64;
 constexpr int64_t kTypedRows = static_cast<int64_t>(kSrc) / (2 * kTypedCols);
 
@@ -163,7 +164,8 @@ bool claims_all(void *, int, expert_tensor_role) {
 // The ring is sized to one executor window, min(role_items_max, G_plan), not to a whole layer's host matrices.
 void test_window_sizing() {
     const placement_plan               plan = make_typed_plan();
-    // fit = slot / (K*N*2), G_plan = fit >= 2 ? fit / 2 : fit (the executor's two-buffer rule), capped by group_cap.
+    // fit = slot / (ncols x nrows x 2, one matrix), G_plan = fit >= 2 ? fit / 2 : fit (the executor's two-buffer
+    // rule), capped by group_cap.
     ggml_sycl::moe_stream_window_hints hints;
     hints.weight_slot_bytes = 10 * kSrc;  // fit = 10 -> G_plan = 5
     hints.group_cap         = 0;
@@ -207,8 +209,8 @@ void test_window_sizing() {
     }
     CHECK(gidx.layers.count(3) == 0);
     // The executor's unit is one matrix, ne0 x ne1 x 2 (moe_pp_batched_f16_plan_groups): a down matrix transposed
-    // against gate/up is the same 4096 bytes, so fit stays 10 and the window 3. The product of the layer's per-dimension
-    // maxima, 64 x 64 x 2, would make fit 5, G_plan 2 and the window 2.
+    // against gate/up is the same 4096 bytes, so fit stays 10 and the window 3. The product of the layer's
+    // per-dimension maxima, 64 x 64 x 2, would make fit 5, G_plan 2 and the window 2.
     const placement_plan transposed = make_typed_plan(/*down_transposed*/ true);
     idx = ggml_sycl::moe_stream_plan_index_build(transposed, 0, nullptr, nullptr, claims_all, hints);
     CHECK(idx.role_items_max == 3);
