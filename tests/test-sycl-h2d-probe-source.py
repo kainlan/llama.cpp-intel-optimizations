@@ -629,17 +629,22 @@ def locked_span(text: str, lock: str = LOCK_STMT) -> str:
 ACCESS_RE = re.compile(r"(?:\.|->)\s*(h2d_pinned_gbps|h2d_probed(?!_)|h2d_retry_logged)\b")
 
 
-def h2d_accesses(overrides: dict) -> list:
+BARE_RE = re.compile(r"\b(h2d_pinned_gbps|h2d_probed|h2d_retry_logged)\b")
+
+
+def h2d_accesses(overrides: dict, pattern=ACCESS_RE) -> list:
     """Every member access to the three probe fields across the backend's sources, as (path, offset) in the
     comment-stripped normalized text of that file. `overrides` maps a relative path to replacement text. The
-    declarations in common.hpp are not accesses (no `.` or `->` before the name)."""
+    declarations in common.hpp are not accesses (no `.` or `->` before the name). With `pattern=BARE_RE` it lists every
+    occurrence of the bare names instead, which also covers a member function's implicit-this access, a field-name
+    macro and an offsetof or pointer-to-member spelling: none of them can name a field without one of these tokens."""
     found = []
     for p in sorted((ROOT / SYCL_TREE_DIR).rglob("*")):
         if not p.is_file() or p.suffix not in (".c", ".cpp", ".h", ".hpp"):
             continue
         rel = p.relative_to(ROOT).as_posix()
         text = norm(overrides[rel] if rel in overrides else p.read_text(errors="replace"))
-        found.extend((rel, m.start()) for m in ACCESS_RE.finditer(text))
+        found.extend((rel, m.start()) for m in pattern.finditer(text))
     return found
 
 
@@ -648,7 +653,8 @@ def claim_probed_rate_is_published_under_one_mutex(sycl: str, common: str, cpp: 
     moe_stream_phase::weigh runs on any thread that computes, so the rate and its flag are written and read under one
     leaf mutex. Two directions: each expected access sits INSIDE the block its lock statement guards, not merely
     after it; and NO OTHER access to the three fields exists anywhere in the backend's sources (a census of every
-    `.h2d_pinned_gbps`, `.h2d_probed` and `.h2d_retry_logged`: once-guard 1, accessor 2, probe's report lambda 4).
+    `.h2d_pinned_gbps`, `.h2d_probed` and `.h2d_retry_logged`: once-guard 1, accessor 2, probe's report lambda 4), and
+    of every bare mention of the three names, which must total the 3 declarations plus those 7 accesses.
     weigh itself touches neither field, and the accessor is declared where weigh sees it."""
     n = norm(sycl)
     probe = probe_body(sycl)
@@ -664,7 +670,9 @@ def claim_probed_rate_is_published_under_one_mutex(sycl: str, common: str, cpp: 
             return False
         base = n.find(fn)
         spans.append((base + bounds[0], base + bounds[1]))
-    accesses = h2d_accesses({SYCL_REL: sycl, COMMON_REL: common, PLAN_CPP_REL: cpp})
+    sources = {SYCL_REL: sycl, COMMON_REL: common, PLAN_CPP_REL: cpp}
+    accesses = h2d_accesses(sources)
+    bare = h2d_accesses(sources, BARE_RE)
     per_span = [sum(1 for rel, at in accesses if rel == SYCL_REL and lo <= at < hi) for lo, hi in spans]
     return all([
         n.count(PINNED_MUTEX) == 1,
@@ -678,6 +686,9 @@ def claim_probed_rate_is_published_under_one_mutex(sycl: str, common: str, cpp: 
             "d.h2d_probed = outcome != H2D_PROBE_OUTCOME_SEED_KEPT;")),
         per_span == [1, 2, 4],
         len(accesses) == 7,
+        # every bare mention: the 3 declarations in common.hpp and the 7 locked accesses, nothing else (10)
+        len(bare) == 10 and sum(1 for rel, _ in bare if rel == COMMON_REL) == 3
+        and sum(1 for rel, _ in bare if rel == SYCL_REL) == 7,
         "double ggml_sycl_h2d_probed_gbps(int device);" in norm(common),
         "ggml_sycl_h2d_probed_gbps(device_)" in weigh,
         "h2d_pinned_gbps" not in weigh and not re.search(r"h2d_probed(?!_gbps)", weigh),
@@ -1051,6 +1062,21 @@ def test_mutant_a_second_access_outside_every_locked_span_fails():
     # the same access written in another backend source
     stray = PLAN_CPP + "\nstatic void stray(sycl_device_info & d) { d.h2d_probed = true; }\n"
     assert not claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, stray)
+
+
+def test_mutant_implicit_this_access_in_a_member_function_fails():
+    """A member function of sycl_device_info reaches the fields by their bare names, which the `.name` and `->name`
+    census cannot see: a getter called unlocked, a setter in the header, and an out-of-line setter in the TU."""
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, PLAN_CPP)
+    tail = "uint32_t h2d_retry_logged = 0;"
+    getter = _once(COMMON, tail, tail + " double h2d_rate() const { return h2d_probed ? h2d_pinned_gbps : 0.0; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(SYCL, getter, PLAN_CPP)
+    setter = _once(COMMON, tail, tail + " void h2d_mark() { h2d_probed = true; }")
+    assert not claim_probed_rate_is_published_under_one_mutex(SYCL, setter, PLAN_CPP)
+    out_of_line = SYCL + "\nvoid sycl_device_info::h2d_mark() { h2d_probed = true; }\n"
+    assert not claim_probed_rate_is_published_under_one_mutex(out_of_line, COMMON, PLAN_CPP)
+    in_plan = PLAN_CPP + "\nstatic double h2d_peek(const sycl_device_info & d) { return d.h2d_rate(); }\n"
+    assert claim_probed_rate_is_published_under_one_mutex(SYCL, COMMON, in_plan)  # a call names no field
 
 
 def test_mutant_brace_literal_before_the_lock_does_not_widen_its_block():
