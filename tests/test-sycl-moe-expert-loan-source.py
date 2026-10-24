@@ -938,8 +938,10 @@ FORGET_HOST = ("(void) extra->forget_moe_storage_handle_on_device(k.expert_id, G
                "ggml_sycl::mem_handle::HOST_DEVICE);")
 REMEMBER_DEVICE = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
                    "std::move(refilled.device_handles[r]), &refilled.copy_events[r], 0, logical);")
-POP_READMITTED = ("if (refill) { ledger.triplets.pop_back(); } "
-                  "else { ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); }")
+# Each lent triplet's device bytes sit beside it in the ledger and move with it (llama.cpp-7999).
+POP_READMITTED = ("if (refill) { ledger.triplets.pop_back(); ledger.triplet_bytes.pop_back(); } "
+                  "else { ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); "
+                  "ledger.triplet_bytes.push_back(ggml_sycl_expert_triplet_dst_bytes(*next_plan, placed)); }")
 
 
 def claim_refill_flips_back_and_forgets_the_host_copy(sycl: str) -> bool:
@@ -957,7 +959,8 @@ CANCELLED = '"cancelled by a loan";'
 SELECT_ARMED = "if (ledger.refill_armed) {"
 SELECT_REMAINING = "*remaining = ledger.refill_armed ? static_cast<uint32_t>(ledger.triplets.size()) : 0;"
 TXN_REMAINING = "result.n_remaining = ledger.refill_armed ? static_cast<uint32_t>(ledger.triplets.size()) : 0;"
-RESERVE = "if (!refill) { ledger.triplets.reserve(ledger.triplets.size() + prepared.size()); }"
+RESERVE = ("if (!refill) { ledger.triplets.reserve(ledger.triplets.size() + prepared.size()); "
+           "ledger.triplet_bytes.reserve(ledger.triplet_bytes.size() + prepared.size()); }")
 
 
 def claim_a_loan_cancels_the_refills(sycl: str) -> bool:
@@ -1134,7 +1137,8 @@ def claim_an_unpreparable_triplet_leaves_the_ledger(sycl: str) -> bool:
 
 
 DROP_BACK = ("auto drop_back = [&](const char * reason) { GGML_ASSERT(n_dropped < dropped.size()); "
-             "dropped[n_dropped++] = { ledger.triplets.back()[0], reason }; ledger.triplets.pop_back(); };")
+             "dropped[n_dropped++] = { ledger.triplets.back()[0], reason }; ledger.triplets.pop_back(); "
+             "ledger.triplet_bytes.pop_back(); };")
 WARN_DROPPED_SIG = "auto warn_dropped = [&]"
 WARN_EACH = "for (size_t i = 0; i < n_dropped; ++i) {"
 WARN_AFTER_UNLOCK = "lock.unlock(); warn_dropped();"
@@ -2161,8 +2165,13 @@ def test_mutant_refill_leaves_the_plan_on_the_host_fails():
 
 
 def test_mutant_refill_keeps_the_triplet_in_the_ledger_fails():
-    mutant = _once(SYCL, POP_READMITTED, POP_READMITTED.replace("if (refill) { ledger.triplets.pop_back(); } else ",
-                                                                "if (!refill) "))
+    readmit = "if (refill) { ledger.triplets.pop_back(); ledger.triplet_bytes.pop_back(); } else "
+    mutant = _once(SYCL, POP_READMITTED, POP_READMITTED.replace(readmit, "if (!refill) "))
+    assert not claim_refill_flips_back_and_forgets_the_host_copy(mutant)
+
+
+def test_mutant_refill_keeps_the_triplets_bytes_in_the_ledger_fails():
+    mutant = _once(SYCL, POP_READMITTED, POP_READMITTED.replace("ledger.triplet_bytes.pop_back(); } else", "} else"))
     assert not claim_refill_flips_back_and_forgets_the_host_copy(mutant)
 
 
@@ -2383,8 +2392,8 @@ def test_mutant_drop_unwarned_when_something_moved_fails():
 
 
 def test_mutant_drop_warned_under_the_lock_fails():
-    mutant = _once(SYCL, DROP_BACK, DROP_BACK.replace("ledger.triplets.pop_back(); };",
-                                                      "ledger.triplets.pop_back(); " + DROP_WARN + " };"))
+    mutant = _once(SYCL, DROP_BACK, DROP_BACK.replace("ledger.triplet_bytes.pop_back(); };",
+                                                      "ledger.triplet_bytes.pop_back(); " + DROP_WARN + " };"))
     assert not claim_each_dropped_triplet_is_warned(mutant)
 
 

@@ -20883,6 +20883,19 @@ static std::atomic<uint32_t> g_sycl_expert_readmitted_total[GGML_SYCL_MAX_DEVICE
 // (moe_stream_window_hints::lent_bytes), so its cap reads the same figure before a loan and after it.
 static std::atomic<size_t> g_sycl_expert_lent_bytes[GGML_SYCL_MAX_DEVICES];
 
+// A lent triplet's device bytes: its three entries' dst_size in `plan`, the bytes moe_stream_plan_index_build stops
+// counting as resident on the device when the loan flips them to the host (the flip leaves dst_size as it is).
+static size_t ggml_sycl_expert_triplet_dst_bytes(const ggml_sycl::placement_plan & plan,
+                                                 const ggml_sycl::expert_placement_key (&placed)[3]) {
+    size_t bytes = 0;
+    for (int r = 0; r < 3; ++r) {
+        const ggml_sycl::placement_entry * e =
+            plan.find_expert_entry(placed[r].layer_id, placed[r].expert_id, placed[r].role);
+        bytes += e ? e->dst_size : 0;
+    }
+    return bytes;
+}
+
 // The sum of a ledger's triplet_bytes. The caller holds g_tensor_inventory_mutex.
 static size_t ggml_sycl_expert_lent_ledger_bytes(const ggml_sycl_expert_lent_ledger & ledger) {
     GGML_ASSERT(ledger.triplet_bytes.size() == ledger.triplets.size());
@@ -21403,17 +21416,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 ledger.triplets.pop_back();
                 ledger.triplet_bytes.pop_back();
             } else {
-                // A lent triplet's device bytes are its entries' dst_size (the flip leaves it), the bytes the plan
-                // index stops counting as resident on this device.
-                size_t placed_bytes = 0;
-                for (int r = 0; r < 3; ++r) {
-                    const ggml_sycl::expert_placement_key & k = placed[r];
-                    const ggml_sycl::placement_entry *      e =
-                        next_plan->find_expert_entry(k.layer_id, k.expert_id, k.role);
-                    placed_bytes += e ? e->dst_size : 0;
-                }
                 ledger.triplets.push_back({ placed[0], placed[1], placed[2] });
-                ledger.triplet_bytes.push_back(placed_bytes);
+                ledger.triplet_bytes.push_back(ggml_sycl_expert_triplet_dst_bytes(*next_plan, placed));
             }
             ++lent;
             freed += refill ? refilled.bytes_readmitted : record.bytes_freed;
@@ -22371,6 +22375,36 @@ struct test_loan_fixture {
         return {};
     }
 
+    // The ledger's lent bytes against `triplets` as the published plan's entries carry them: the sum of their dst_size,
+    // the bytes the plan index stops counting as resident when they are lent (llama.cpp-7999). Computed from the plan,
+    // never from the ledger. A list whose entries carry no bytes would make the check vacuous, so it fails.
+    std::string lent_bytes_are(const std::vector<std::pair<int, int>> & triplets, const char * when) const {
+        const auto published = ::ggml_sycl_global_plan_snapshot();
+        if (!published || !published->plan) {
+            return test_loan_fail("no published plan to read the lent bytes from %s", when);
+        }
+        size_t want = 0;
+        for (const std::pair<int, int> & t : triplets) {
+            for (int s = 0; s < 3; ++s) {
+                const placement_entry * entry = published->plan->find_expert_entry(t.first, t.second, role(s));
+                if (!entry) {
+                    return test_loan_fail("layer %d expert %d slot %d has no plan entry %s", t.first, t.second, s,
+                                          when);
+                }
+                want += entry->dst_size;
+            }
+        }
+        if (!triplets.empty() && want == 0) {
+            return test_loan_fail("the %zu lent triplets carry no dst bytes in the plan %s", triplets.size(), when);
+        }
+        const size_t got = g_sycl_expert_lent_bytes[device].load(std::memory_order_acquire);
+        if (got != want) {
+            return test_loan_fail("the ledger's lent bytes are %zu %s, not the plan's %zu over %zu triplets", got, when,
+                                  want, triplets.size());
+        }
+        return {};
+    }
+
     // The experts other than host_expert the published plan has on the host: the lent ones.
     std::vector<std::pair<int, int>> lent_triplets(int host_expert) const {
         std::vector<std::pair<int, int>> lent;
@@ -22690,6 +22724,11 @@ std::string test_expert_loan_lends_two_triplets() {
     if (result.n_triplets != 2 || result.bytes_freed != 6 * fx.staged_bytes) {
         return test_loan_fail("the loan lent %u triplets and %zu bytes, not 2 and %zu", result.n_triplets,
                               result.bytes_freed, 6 * fx.staged_bytes);
+    }
+    const std::pair<int, int> lent_first{ 1, 2 };
+    const std::pair<int, int> lent_second{ 1, 1 };
+    if (std::string why = fx.lent_bytes_are({ lent_first, lent_second }, "after the loan"); !why.empty()) {
+        return why;
     }
 
     // Selection walks the plan from its tail, so it takes layer 1's experts 2 and 1.
@@ -23052,6 +23091,9 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     if (lent.size() != 2) {
         return test_loan_fail("the published plan has %zu lent triplets, not 2", lent.size());
     }
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
+    }
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
@@ -23085,6 +23127,9 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     const std::pair<int, int> still = lent[1 - back];
     if (test_loan_fixture::triplet_on_device(*first, still.first, still.second) != 0) {
         return "the triplet the first refill left is not on the host in the plan";
+    }
+    if (std::string why = fx.lent_bytes_are({ still }, "after the first refill"); !why.empty()) {
+        return why;
     }
     // Until the deferred-free pass finalizes them, the withdrawn host copies stay in the cache, retired, under the
     // exact keys a resolve looks up first. The re-admitted ids resolve past them to their device entries, with no
@@ -23153,6 +23198,9 @@ std::string test_expert_refill_readmits_one_triplet_per_call() {
     }
     if (g_sycl_expert_lent_count[fx.device].load() != 0) {
         return test_loan_fail("the ledger still counts %u lent triplets", g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are({}, "after the second refill"); !why.empty()) {
+        return why;
     }
 
     // Nothing is left to re-admit, and nothing changes.
@@ -23228,6 +23276,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     if (still_lent.size() != 1) {
         return test_loan_fail("%zu triplets are still lent after the first refill, not 1", still_lent.size());
     }
+    if (std::string why = fx.lent_bytes_are(still_lent, "after the first refill"); !why.empty()) {
+        return why;
+    }
     const std::pair<int, int> still = still_lent[0];
     const std::pair<int, int> again = lent[0] == still ? lent[1] : lent[0];
     // The refill's copies land, its host copies are reclaimed and the copies' retained owners go, so the new loan may
@@ -23247,6 +23298,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     if (lent_now.size() != 2 || std::find(lent_now.begin(), lent_now.end(), still) == lent_now.end()) {
         return test_loan_fail("%zu triplets are lent after the second loan, not the first loan's one and the second's",
                               lent_now.size());
+    }
+    if (std::string why = fx.lent_bytes_are(lent_now, "after the second loan"); !why.empty()) {
+        return why;
     }
     const std::pair<int, int> newest    = lent_now[0] == still ? lent_now[1] : lent_now[0];
     const auto                published = ::ggml_sycl_global_plan_snapshot();
@@ -23300,6 +23354,9 @@ std::string test_expert_refill_cancelled_by_a_loan() {
     }
     if (std::string why = fx.still_lent(still.first, still.second); !why.empty()) {
         return "the resumed refill took the first loan's triplet, not the back: " + why;
+    }
+    if (std::string why = fx.lent_bytes_are({ still }, "after the resumed refill"); !why.empty()) {
+        return why;
     }
     return {};
 }
@@ -23384,6 +23441,20 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     if (std::string why = fx.lend(12 * charge, 4, /*host_expert=*/3); !why.empty()) {
         return why;
     }
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
+    }
+    // The lent triplets the ledger still holds: all four, less each one a refill moves or drops.
+    auto still_in_ledger = [&](std::initializer_list<std::pair<int, int>> gone) {
+        std::vector<std::pair<int, int>> held;
+        for (const auto & t : lent) {
+            if (std::find(gone.begin(), gone.end(), t) == gone.end()) {
+                held.push_back(t);
+            }
+        }
+        return held;
+    };
 
     // The fixture's resolver, refusing slot 1 of the refused-th triplet a call asks about (0 is the ledger's back,
     // where the refill's preparation starts), as a tensor the registry no longer has is refused. Slot 0 of that
@@ -23419,6 +23490,11 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     if (g_sycl_expert_lent_count[fx.device].load() != 3) {
         return test_loan_fail("the ledger counts %u lent triplets after the drop, not 3",
                               g_sycl_expert_lent_count[fx.device].load());
+    }
+    // The dropped triplet stays on the host in the plan but leaves the ledger, and its bytes with it.
+    if (std::string why = fx.lent_bytes_are(still_in_ledger({ dropped_back }), "after the drop at the back");
+        !why.empty()) {
+        return why;
     }
     // A drop is progress, WARNed by name already, so the boundary runner does not count it as a refusal.
     if (g_sycl_expert_refill_refusal_streak[fx.device].load() != 0) {
@@ -23470,6 +23546,11 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
             "lent) and 1",
             on_host.size(), g_sycl_expert_lent_count[fx.device].load());
     }
+    if (std::string why = fx.lent_bytes_are(still_in_ledger({ dropped_back, moved, dropped_behind }),
+                                            "after the refill that moved one and dropped the one behind it");
+        !why.empty()) {
+        return why;
+    }
 
     // A full WEIGHT zone is transient: the refill answers BUSY, drops nothing, and the triplet stays in the ledger.
     std::vector<mem_handle> fillers;
@@ -23505,6 +23586,9 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     if (std::string why = fx.still_lent(last.first, last.second); !why.empty()) {
         return "the triplet a full WEIGHT zone refused: " + why;
     }
+    if (std::string why = fx.lent_bytes_are({ last }, "after the refill a full WEIGHT zone refused"); !why.empty()) {
+        return why;
+    }
 
     // The room back, the next decode graph's boundary re-admits the triplet the full zone kept.
     fillers.clear();
@@ -23520,6 +23604,10 @@ std::string test_expert_refill_drops_an_unpreparable_triplet() {
     }
     if (std::string why = fx.readmitted(last.first, last.second); !why.empty()) {
         return "the triplet the full zone kept: " + why;
+    }
+    // Two triplets are still on the host for the session, but neither is lent: the ledger is empty.
+    if (std::string why = fx.lent_bytes_are({}, "after the last refill"); !why.empty()) {
+        return why;
     }
     if (std::string why = fx.still_lent(dropped_back.first, dropped_back.second); !why.empty()) {
         return "the first dropped triplet, later: " + why;
@@ -23556,6 +23644,9 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
     if (lent.size() != 3) {
         return test_loan_fail("the published plan has %zu lent triplets, not 3", lent.size());
     }
+    if (std::string why = fx.lent_bytes_are(lent, "after the loan"); !why.empty()) {
+        return why;
+    }
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
@@ -23578,6 +23669,9 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
         return test_loan_fail(
             "%zu triplets are on the host and the ledger counts %u after the two-triplet call, not 1, 1",
             on_host.size(), g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are(on_host, "after the two-triplet refill"); !why.empty()) {
+        return why;
     }
     const std::pair<int, int>        still = on_host[0];
     std::vector<std::pair<int, int>> moved;
@@ -23620,6 +23714,9 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
     }
     if (std::string why = fx.readmitted(still.first, still.second); !why.empty()) {
         return "the triplet the two-triplet call left, re-admitted next: " + why;
+    }
+    if (std::string why = fx.lent_bytes_are({}, "after the last refill"); !why.empty()) {
+        return why;
     }
     if (g_sycl_expert_lent_total[fx.device].load() != 3 || g_sycl_expert_readmitted_total[fx.device].load() != 3) {
         return test_loan_fail("the teardown counts read %u/%u, not 3/3",
@@ -23781,6 +23878,9 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
             g_sycl_expert_loan_requests[fx.device].load() != 0 || g_sycl_expert_lent_count[fx.device].load() != 0) {
             return "the refused loan published a plan, re-posted its request or recorded a lent triplet";
         }
+        if (std::string why = fx.lent_bytes_are({}, "after the refused loan"); !why.empty()) {
+            return why;
+        }
         for (int s = 0; s < 2; ++s) {
             if (!fx.device_entry_present(1, s, 2) || fx.host_entry_present(1, s, 2)) {
                 return test_loan_fail("the refused loan moved layer 1 expert 2 slot %d", s);
@@ -23831,6 +23931,10 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
         return test_loan_fail("the ledger counts %u lent triplets with expert 2 behind the back, not 1",
                               g_sycl_expert_lent_count[fx.device].load());
     }
+    const std::pair<int, int> behind_back{ 1, 2 };
+    if (std::string why = fx.lent_bytes_are({ behind_back }, "after the refill of the back triplet"); !why.empty()) {
+        return why;
+    }
 
     const auto published = ::ggml_sycl_global_plan_snapshot();
     remaining            = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
@@ -23848,6 +23952,10 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
     if (::ggml_sycl_global_plan_snapshot().get() != published.get() ||
         g_sycl_expert_lent_count[fx.device].load() != 0) {
         return "the refill that dropped a triplet published a plan or kept it in the ledger";
+    }
+    if (std::string why = fx.lent_bytes_are({}, "after the refill that dropped the triplet with no host copy");
+        !why.empty()) {
+        return why;
     }
     const auto now = ::ggml_sycl_global_plan_snapshot();
     if (!now || !now->plan || test_loan_fixture::triplet_on_device(*now, 1, 2) != 0) {
