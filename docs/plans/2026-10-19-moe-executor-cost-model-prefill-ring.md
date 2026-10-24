@@ -13,8 +13,10 @@ llama.cpp-6aj4):** The goal stands, but two premises changed while it was built.
   (llama.cpp-bcre, open, P0, owner decision pending). Where a model passes the cap (Qwen1.5 at a 33-35 % VRAM budget)
   the ring was short and its loan was refused for host storage (llama.cpp-pu8v, now closed: the loan's host copy is
   sized from the source bytes, and the loan was accepted, 41 triplets 190 MiB at 5d0727255). llama.cpp-6aj4 is also
-  closed: it fixed the reclaim defect that made only 190 of 557 MiB lendable. The loan is now refused only by bcre's
-  10 % cap. The >= 500 and >= 800 tok/s targets stay with bcre, and Task 15's gate reports ring_engaged and
+  closed: room lent to the ring now returns on reclaim (the Qwen1.5 shortfall fell from 555.3 to 366.6 MiB). The loan
+  is still limited to the lendable triplets, 41 of about 1301, because `moe_loan_triplet_is_lendable` refuses
+  bulk-staged tensors (llama.cpp-bcre c-aerm), so the ring stays short. The >= 500 and >= 800 tok/s targets stay with
+  bcre, and Task 15's gate reports ring_engaged and
   loan_exercised instead of scoring a vacuous pass.
 
 **Architecture:** Placement is unchanged: the planner still decides which experts live in VRAM and which live in pinned host memory. What changes is the **executor** of a MUL_MAT_ID whose expert entries are host-resident. A pure cost model (`moe-exec-cost.hpp`, one layer of one micro-batch as its unit, decided before the layer's first MoE op) weighs today's CpuExpertPool path against staging the layer's host experts through a byte-budgeted VRAM ring (slots lent from the tail of the resident expert set for the prompt phase, refilled in the background afterwards) and running them with the same device kernels resident experts use. Streaming is an H2D copy on the cache's BCS queue followed by an AOS-to-SOA reorder on the compute queue, event-chained, the next layer's copies enqueued while this layer computes. The MoE batch resolver (`moe-resolved-batch.hpp`) learns one new transfer kind, `STAGED_RING`, which is the only way a host-resident entry can ever answer `PRIMARY_DEVICE`. Rates (H2D GB/s per device, CPU expert GB/s per type, device expert rate per type) are probed and persisted in the existing tuning cache, env-overridable. The micro-batch comes from the existing auto-ubatch trial with a ring fit term; `-ub` caps it.
@@ -1322,8 +1324,8 @@ Follow-ups folded elsewhere: llama.cpp-v7np into Task 10, the in-graph loan requ
 - [ ] **As built differently, see the Amendment.** `const bool plan_has_cpu_experts =
       plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && !(ctx.moe_stream &&
       ctx.moe_stream->layer_fully_staged(layer, ids, n_ids))` where `moe_stream_phase::layer_fully_staged` wraps Task
-      7a's pure `moe_stream_layer_fully_staged` over the phase's own stage table (every distinct id that is
-      host-planned has all three roles staged, ready or pending).
+      7a's pure `moe_stream_layer_fully_staged` (test-only since llama.cpp-8xdz, see the Task 7a amendment) over the
+      phase's own stage table (every distinct id that is host-planned has all three roles staged, ready or pending).
 - [ ] **No longer true as written (3460 c-vrmr, see the Amendment): the gate pins `->executor_staged(` on the bool's own
       line, not `->layer_fully_staged(` on the `plan_has_cpu_experts` line.** Source gate: `->layer_fully_staged(`
       appears exactly once in `ggml_sycl_mul_mat_id`, on the line that computes `plan_has_cpu_experts`;
@@ -1377,8 +1379,9 @@ premise was wrong, and its acceptance could not run.
   WEIGHT zone cannot give %.1f MB` (per micro-batch), and `[MOE-EXEC] device %d: stream ring %.1f MiB short and its
   expert loan refused: no further loan this prompt` (ring or trace only).
 - The acceptance arms: the ring never engaged on this host (the bcre cap on Qwen3.8; Qwen1.5 at a 33-35 % VRAM budget
-  passes the cap, is short, and its loan fired and was refused "host storage too small" until llama.cpp-pu8v and
-  llama.cpp-6aj4 closed, 2026-10-24). The pp512 >= 500, pp2048 >= 800 and every-layer-RING targets stay with bcre. Measured: Qwen3.8 B70 ABBA neutral
+  passes the cap, is short, and its loan fired and was refused "host storage too small" until llama.cpp-pu8v closed;
+  with pu8v and llama.cpp-6aj4 closed, 2026-10-24, the loan is accepted for the 41 lendable triplets and the ring
+  stays short, llama.cpp-bcre c-aerm). The pp512 >= 500, pp2048 >= 800 and every-layer-RING targets stay with bcre. Measured: Qwen3.8 B70 ABBA neutral
   (pp512 about 14, pp2048 about 31.5 on both trees), the md5 of auto equals cpu equals NAN_CHECK, and the GPT-OSS B50
   and Mistral controls are green. The GPT-OSS B50 pp512 reads about 770 against the 871-894 floor on master itself
   (llama.cpp-zuze), so Task 15's GO_pp window cites zuze until it is bisected.
@@ -1512,7 +1515,7 @@ git commit -m "sycl, tests: lent experts are re-admitted one triplet per decode 
   refused: host zones not configured`). The teardown line is `[MOE-EXEC] refill device %d: %u/%u triplets
   re-admitted`.
 - Nothing in production originated a loan until Task 10 wired the in-graph request at a short reserve (c-0tmn), and
-  pu8v refused that loan on the models tried (closed 2026-10-24; bcre's cap now refuses it). So Task 15's gate must say whether the loan and the refill ran
+  pu8v refused that loan on the models tried (closed 2026-10-24; it is now accepted for the lendable triplets only, bcre c-aerm). So Task 15's gate must say whether the loan and the refill ran
   (`loan_exercised`, `refill=not_exercised`) rather than score a vacuous pass.
 - The task depends on llama.cpp-xr4i (the probe's rate is bimodal until it lands), as the graph above now shows.
 
@@ -1741,7 +1744,7 @@ steps otherwise stand.
   a flip that shares >= 128 bytes with the committed reference text.
 - Step 5: the number of `[MOE-EXEC] layer ... CPU (forced)` lines is the number of layers with host experts, not 48.
 - Step 6: the loan and the refill appear only when a reserve falls short and the loan is granted. The gate reports
-  `loan_exercised` and `refill`, and `no` and `not_exercised` are the honest answer until llama.cpp-bcre lets the ring engage (pu8v and 6aj4 are closed).
+  `loan_exercised` and `refill`, and `no` and `not_exercised` are the honest answer until llama.cpp-bcre lets the ring engage (pu8v and 6aj4 are closed; the loan covers the lendable triplets only).
 - Observed success: the Qwen3.8 B70 targets (pp512 >= 500, pp2048 >= 800, tokens identical to the CPU arm or a
   flip by the common-prefix rule) and the loan and refill counts are owned by llama.cpp-bcre.
   Until they land, success is the gate reporting `ring_engaged=no` with the neutral numbers, the decode arms inside
