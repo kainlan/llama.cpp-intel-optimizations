@@ -147,7 +147,7 @@ the tracker, and the owner-facing status on the epic.
 | A | 1, 2b, 3, 8 | Ring sizing, phase window API, executor windows, forced-decline knob (same files, sequential) |
 | B | 4, 5 | Copy-overlap spike, H2D probe on the ring's queue (5 also waits for 3: both edit `ggml-sycl.cpp`) |
 | C | 2a, 6, 9 | Decision-log window counters, gate arms, docs |
-| D | 7 | Post-loan geometry fixed point (after 1) |
+| D | 7 | Post-loan geometry fixed point: the loan counted back as resident (after 1) |
 | lead | 10 | End-to-end validation |
 
 ### Dependency Graph
@@ -176,13 +176,13 @@ digraph dependencies {
 
 | File/Directory | Tasks | Conflict Risk |
 |----------------|-------|---------------|
-| `ggml/src/ggml-sycl/moe-stream-plan.hpp`, `moe-stream-plan.cpp` | 1, 2b, 8 | Sequential (A) |
+| `ggml/src/ggml-sycl/moe-stream-plan.hpp`, `moe-stream-plan.cpp` | 1, 2b, 8; 7 (hpp: one hints field, one call) | Sequential (A); 7 concurrent with 2b on disjoint hunks, 2b merges master |
 | `ggml/src/ggml-sycl/moe-exec-cost.hpp`, `tests/test-moe-exec-cost.cpp` | 1 | None |
 | `ggml/src/ggml-sycl/moe-exec-policy.hpp`, `tests/test-moe-exec-policy.cpp` | 2a, 8 (reason enum) | Sequential (8 after 2a via 3) |
-| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 1 (`:35997-36020`), 2b (`:36120-36140`), 3 (`:82904-82997`, `:89722-89812`, `:90115-90121`, `:90360-90378`, `:90486-90570`, `:90895-90911`), 5 (`:32068-32080`) | Sequential (A; 5 after 3) |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 1 (`:35997-36020`), 2b (`:36120-36140`), 3 (`:82904-82997`, `:89722-89812`, `:90115-90121`, `:90360-90378`, `:90486-90570`, `:90895-90911`), 5 (`:32068-32080`), 7 (lent-bytes atomic, `set_window`, `hold_ring_uncovered` comment) | Sequential (A; 5 after 3); 7 concurrent with 2b on disjoint hunks |
 | `ggml/src/ggml-sycl/common.hpp` | 8 (knob) | None |
 | `ggml/src/ggml-sycl/moe-stream-ring.cpp`, `tests/test-moe-stream-ring-sizing.cpp` | 7 | None |
-| `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp` | 1 | None |
+| `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp` | 1, 7 (fixed-point case) | Sequential (7 after 1) |
 | `ggml/src/ggml-sycl/tests/test-moe-stream-phase.cpp` | 2b, 8 | Sequential (A) |
 | `ggml/src/ggml-sycl/tests/test-sycl-copy-overlap.cpp` (new), `ggml/src/ggml-sycl/CMakeLists.txt` | 4 | None |
 | `tests/test-sycl-moe-stream-enqueue-source.py` | 1 (ring-size pin), 2b (stage pins) | Sequential (A) |
@@ -1429,85 +1429,108 @@ git commit -- scripts/sycl-moe-exec-gate.sh tests/test-sycl-moe-exec-gate-script
 
 **Track:** D **Depends on:** 1 **Model/effort:** opus, medium
 **File scope:**
-- Modify: `ggml/src/ggml-sycl/moe-stream-ring.cpp:44` (the cap test), `ggml/src/ggml-sycl/moe-stream-ring.hpp:48-53`
-  (doc comment)
-- Modify: `tests/test-sycl-auto-ubatch-source.py` (a pin on the cap expression)
-- Test: `ggml/src/ggml-sycl/tests/test-moe-stream-ring-sizing.cpp`
+- Modify: `ggml/src/ggml-sycl/moe-stream-ring.cpp` (the cap test and its comment),
+  `ggml/src/ggml-sycl/moe-stream-ring.hpp` (doc comment)
+- Modify: `ggml/src/ggml-sycl/moe-stream-plan.hpp` (`moe_stream_window_hints::lent_bytes`; the one
+  `moe_stream_ring_size` call in `moe_stream_plan_ring_geometry`)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (a per-device lent-bytes atomic beside `g_sycl_expert_lent_total`, the
+  lend, readmit and reset sites of the lent ledger, `ggml_sycl_moe_stream_set_window`,
+  `ggml_sycl_hold_ring_uncovered`'s comment)
+- Modify: `tests/test-sycl-auto-ubatch-source.py` (pins on the cap expression, the `set_window` field and the
+  geometry call), `docs/backend/sycl-static-storage-inventory.csv` (regenerated for the new static)
+- Test: `ggml/src/ggml-sycl/tests/test-moe-stream-ring-sizing.cpp` (the pure cases),
+  `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp` (the fixed point)
 
-**Description:** llama.cpp-8p5x (read c-0blp and the ticket body): the loan a short reserve requests is sized from
-the geometry computed before the loan, and the loan evicts resident experts, which lowers the 10 % cap, which can
-refuse the same geometry after the loan it asked for. The fix is to test the cap against the resident bytes that
-remain once the ring itself is carved out: `bytes > (resident - bytes) / 10`, equivalently `11 * bytes > resident`.
-With the window ring (~125 MB against ~12.9 GB resident) the cap is far away, but the fixed point must hold in the
-tight case (Qwen1.5-MoE at a 33-35 % budget) or the loan is wasted exactly where it is needed.
+**Description:** llama.cpp-8p5x (read c-0blp, c-7g7b and the ticket body): the loan a short reserve requests is sized
+from the geometry computed before the loan, and the loan flips the lent triplets to host in the published plan, which
+lowers `resident_expert_bytes` at the next `prepare()` and so the 10 % cap, which can refuse the same geometry after
+the loan it asked for. **Amended 2026-10-24 (quality-7999-1 I1):** this task first prescribed `bytes > resident / 11`
+on both calls; that is not a fixed point, because the post-loan call already passes `R - L`, so `/ 11` only moves the
+pre-accepted/post-refused window from `[10b, 10b + L)` to `[11b, 11b + L)`, and the loan can overshoot `b` by one
+whole triplet. The fix is to count the ring's own loan back into the figure the cap is tested against: the device's
+lent bytes (the sum of the lent entries' `dst_size`, exactly what the index counts for a resident entry) reach the
+index as `moe_stream_window_hints::lent_bytes`, and the geometry tests `bytes > (resident_expert_bytes + lent_bytes)
+/ 11`. That input is identical before and after the loan, so the test is loan-invariant by construction, overshoot
+included; `/ 11` is the 10 % rule on what remains once the ring's own bytes are lent (`bytes <= (R - bytes) / 10`).
 
 **Acceptance Criteria:**
-- [ ] `moe_stream_ring_size` refuses iff `bytes > resident_expert_bytes / 11` (overflow-guarded: compare
-      `bytes > resident / 11` with integer division, documented as the post-loan form).
-- [ ] `test-moe-stream-ring-sizing` has the three cases below and passes.
-- [ ] The auto-ubatch source gate pins the new expression with a mutation witness.
+- [ ] `moe_stream_ring_size` refuses iff `bytes > resident_expert_bytes / 11` (integer division), and
+      `moe_stream_plan_ring_geometry` passes `index.resident_expert_bytes + hints.lent_bytes` (saturating) as that
+      argument; the cpp and hpp comments say the input is the device expert set with the ring's loan counted back.
+- [ ] `g_sycl_expert_lent_bytes[device]` (atomic `size_t`) is the `dst_size` sum of the triplets currently lent on
+      the device: added where the transaction body adds to `g_sycl_expert_lent_total`, subtracted on readmit by the
+      figure stored per triplet in the ledger, reset where the ledger is reset; `ggml_sycl_moe_stream_set_window`
+      copies it into `op.window.lent_bytes`.
+- [ ] `test-moe-stream-ring-sizing` keeps the two pure boundary cases (22528 accepts, 22527 refuses) and every
+      recomputed model-pin case; the inline constants-only "fixed point" check is gone (it could not fail).
+- [ ] `test-moe-stream-plan` has the fixed-point case: the geometry on plan `P` (device triplets totalling `R`,
+      `lent_bytes` 0) equals the geometry on `P'` (one device triplet flipped to host, its `dst_size` `L` passed as
+      `lent_bytes`), with `R == 11 * bytes` so the case is tight and fails under the pre-amendment code.
+- [ ] `hold_ring_uncovered`'s comment no longer says "a tenth"; the ring-unavailable WARN format is unchanged (its
+      `resident_expert_bytes` is the post-loan figure; Task 2b owns the DIAG pins).
+- [ ] The auto-ubatch source gate pins the cap expression, the three `set_window` assignments and the
+      `resident_expert_bytes + hints.lent_bytes` call, each with a mutation witness; the flake8 count equals base.
 
 **Implementation Guide:**
 
-1. **Test.** Append to `test-moe-stream-ring-sizing.cpp` before the summary print in `main`:
+1. **Test (pure).** In `test-moe-stream-ring-sizing.cpp`, next to the existing cases:
+   `moe_stream_ring_size(4, 256, 22528)` is `{256, 8, 2048, 4}` and `moe_stream_ring_size(4, 256, 22527)` is `{}`.
+   Run the sizing ctest. Expected: the second FAILS under the `/ 10` rule (22527 / 10 = 2252 >= 2048 accepts).
+
+2. **Test (fixed point).** In `test-moe-stream-plan.cpp`, with the file's `make_plan`/`kSrc` helpers: build `P` so the
+   device entries sum to exactly `11 * geo.bytes` for the geometry that `window_slots` x `matrix_bytes_max` yields
+   (pick `weight_slot_bytes` so `window_slots` is `G_plan`-capped: lending must not grow it in this case);
+   `hints.lent_bytes = 0`; `CHECK(geo.n_slots != 0)`. Copy `P` to `P'`, flip one device triplet to host
+   (`on_device = false`, `target_device = -1`), set `hints.lent_bytes` to the sum of its three `dst_size`, and `CHECK`
+   the geometry is identical field for field.
+   Run: `ctest --test-dir build -R '^sycl-moe-stream-plan$' --output-on-failure -j 1`. Expected: FAIL (`P'` is
+   refused: `(R - L) / 11 < bytes`).
+
+3. **Implement.** `moe-stream-ring.cpp`: `if (bytes > resident_expert_bytes / 11) { return {}; }` with a comment that
+   the caller supplies the device expert set with the ring's loan counted back, so the test reads the same before and
+   after the loan. `moe-stream-plan.hpp`: `size_t lent_bytes = 0;` on `moe_stream_window_hints`, and in
+   `moe_stream_plan_ring_geometry`:
 
 ```cpp
-    // Task 7 (2026-10-24 plan, llama.cpp-8p5x): the cap is tested against the resident bytes left once the ring is
-    // lent out of them, so a geometry that passes before the loan passes after it (a fixed point).
-    {
-        const size_t slot = 256;
-        // 2 regions x 4 slots x 256 = 2048 bytes. Old cap: resident >= 20480. New cap: resident >= 22528.
-        check_geometry("fixed point: just inside the post-loan cap", moe_stream_ring_size(4, slot, 22528), slot, 8,
-                       2048, 4);
-        check_geometry("fixed point: inside the old cap, outside the post-loan cap", moe_stream_ring_size(4, slot, 22527),
-                       0, 0, 0, 0);
-        const moe_stream_ring_geometry before = moe_stream_ring_size(4, slot, 22528);
-        // The post-loan resident set is resident - bytes; the sizing's cap test is written against THAT set
-        // (11 * bytes <= resident  <=>  bytes <= (resident - bytes) / 10), so a geometry the pre-loan call accepts is
-        // also accepted by a cap test on the post-loan set with the ORIGINAL 10 % rule: the two agree by construction.
-        const size_t resident_after = 22528 - before.bytes;
-        if (!(before.bytes <= resident_after / 10)) {
-            std::printf("FAIL: fixed point: the accepted geometry violates the 10 %% rule on the post-loan set\n");
-            ++g_failures;
-        }
+    const size_t resident = index.resident_expert_bytes > SIZE_MAX - hints.lent_bytes
+                                ? SIZE_MAX
+                                : index.resident_expert_bytes + hints.lent_bytes;
+    const moe_stream_ring_geometry geo = moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, resident);
 ```
 
-   Run: `cmake --build build --target test-moe-stream-ring-sizing && ctest --test-dir build -R '^test-moe-stream-ring-sizing$' --output-on-failure -j 1`
-   Expected: FAIL on "inside the old cap, outside the post-loan cap": today's rule computes 22527 / 10 = 2252 >= 2048
-   and accepts the geometry; the first case passes under both rules.
+   `ggml-sycl.cpp`: `static std::atomic<size_t> g_sycl_expert_lent_bytes[GGML_SYCL_MAX_DEVICES];` beside
+   `g_sycl_expert_lent_total`; the ledger's triplet record carries the triplet's device bytes (the three entries'
+   `dst_size` at the moment of lending); the transaction body adds that on lend and subtracts it on readmit where it
+   updates `g_sycl_expert_lent_total` / `g_sycl_expert_readmitted_total`; the ledger reset stores 0;
+   `ggml_sycl_moe_stream_set_window` adds
+   `op.window.lent_bytes = g_sycl_expert_lent_bytes[device].load(std::memory_order_acquire);`.
+   Run both ctests. Expected: PASS.
 
-2. **Implement.** `moe-stream-ring.cpp:44`:
-
-```cpp
-    // The cap is 10 % of the resident expert set AFTER the ring's bytes are lent out of it (llama.cpp-8p5x): a
-    // geometry accepted before the loan it requests is accepted after it. bytes <= (resident - bytes) / 10 is
-    // 11 * bytes <= resident; the division form cannot overflow.
-    if (bytes > resident_expert_bytes / 11) {
-        return {};
-    }
-```
-
-   Update the header comment at `moe-stream-ring.hpp:48-53` and the file comment at the top of the sizing test (it
-   says "10 %"). Existing model-pin cases in the test whose resident bytes sit between 10x and 11x the ring bytes
-   flip: recompute each with the new rule and fix its expectation (the file's figures re-derive the plan's base
-   numbers; keep the derivations and change only the 10 to 11).
-
-3. **Pin.** `tests/test-sycl-auto-ubatch-source.py` next to the ring-size pin: `assert "if (bytes > resident_expert_bytes / 11)" in RING_CPP`
-   with a witness replacing `/ 11` by `/ 10`.
+4. **Pins.** `tests/test-sycl-auto-ubatch-source.py`: `"if (bytes > resident_expert_bytes / 11)"` exactly once in
+   the comment-stripped sizing body (witness: `/ 10`); the `set_window` body assigns `weight_slot_bytes`, `group_cap`
+   and `lent_bytes` (witness: drop `lent_bytes`); `moe_stream_plan_ring_geometry` passes `+ hints.lent_bytes`
+   (witness: the bare field). Regenerate `docs/backend/sycl-static-storage-inventory.csv` for the new static and
+   commit it with the change.
 
 **Commit:**
 ```bash
 git commit -- ggml/src/ggml-sycl/moe-stream-ring.cpp ggml/src/ggml-sycl/moe-stream-ring.hpp \
-              ggml/src/ggml-sycl/tests/test-moe-stream-ring-sizing.cpp tests/test-sycl-auto-ubatch-source.py \
-  -m "sycl: the stream ring cap is tested against the resident set left after its own loan"
+              ggml/src/ggml-sycl/moe-stream-plan.hpp ggml/src/ggml-sycl/ggml-sycl.cpp \
+              ggml/src/ggml-sycl/tests/test-moe-stream-ring-sizing.cpp \
+              ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp \
+              tests/test-sycl-auto-ubatch-source.py docs/backend/sycl-static-storage-inventory.csv \
+  -m "sycl: the ring cap counts the ring's own loan back as resident, so the test is loan-invariant"
 ```
 
 **Gotchas:**
-- The file compiles `moe-stream-ring.cpp` with `GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY` and no `-fsycl`
-  (`CMakeLists.txt:6971-6985`): keep the change inside the sizing function.
-- The ticket's second half (the *backend* sizing the loan request from the pre-loan geometry,
-  `ggml_sycl_hold_ring_uncovered` at `ggml-sycl.cpp:35997`) is unchanged by this task: with the cap in the post-loan
-  form, the request computed before the loan is the one the sizing will accept after it. Say so in the commit body.
+- `moe-stream-ring.cpp` compiles with `GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY` and no `-fsycl`: keep the sizing
+  change inside the sizing function; the lent bytes are the caller's business.
+- Task 2b edits other regions of `moe-stream-plan.hpp` and `ggml-sycl.cpp` concurrently; keep the hunks minimal and
+  local, do not reformat around them, and Task 2b merges master after this task lands.
+- The ticket's second half is NOT closed by this task: lent triplets become host items, so `role_items_max` and,
+  when it was below `G_plan`, `window_slots` can grow; `prepare()` then tears the ring down and `ring_ready()` needs a
+  second reserve the one-shot loan latch does not request. It is recorded on llama.cpp-8p5x (c-7g7b); do not close
+  8p5x on Tasks 7 and 8 alone.
 
 ---
 
