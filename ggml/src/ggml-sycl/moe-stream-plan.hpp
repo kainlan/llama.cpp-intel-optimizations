@@ -258,7 +258,7 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
                                                                 void *                          graph_ctx,
                                                                 moe_stream_library_claims_fn    library_claims,
                                                                 const moe_stream_window_hints & hints) {
-    GGML_UNUSED(prompt_kernel);
+    GGML_UNUSED(prompt_kernel);  // kept for the signature; unused since the window ring (W2)
     moe_stream_plan_index        idx;
     // The (layer, expert) keys with a host entry, keyed with role UNKNOWN: counts each layer's distinct host experts.
     std::unordered_set<uint64_t> host_experts;
