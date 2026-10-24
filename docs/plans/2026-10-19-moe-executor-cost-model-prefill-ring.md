@@ -1385,7 +1385,8 @@ premise was wrong, and its acceptance could not run.
   on 2026-10-23; with pu8v and llama.cpp-6aj4 (2026-10-24) closed, the loan is accepted for the 41 lendable triplets
   and the ring stays short, llama.cpp-bcre c-aerm). The pp512 >= 500, pp2048 >= 800 and every-layer-RING targets stay
   with bcre. Measured: Qwen3.8 B70 ABBA neutral (pp512 about 14, pp2048 about 31.5 on both trees), the md5 of auto
-  equals cpu equals NAN_CHECK, and the GPT-OSS B50 and Mistral controls are green. The GPT-OSS B50 pp512 reads about 770 against the 871-894 floor on
+  equals cpu equals NAN_CHECK, and the GPT-OSS B50 and Mistral controls are green.
+  The GPT-OSS B50 pp512 reads about 770 against the 871-894 floor on
   master itself (llama.cpp-zuze), so Task 15's GO_pp window cites zuze until it is bisected.
 - Limits: the REFUSED loan latch and `warned_unavailable_` reset only in `end_prompt`, so a prompt-only workload keeps
   one refusal for the process (the c-las5 "per prompt" carry-forward). `route_layout` is re-derived at dispatch
