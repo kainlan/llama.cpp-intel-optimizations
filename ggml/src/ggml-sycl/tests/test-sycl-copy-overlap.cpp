@@ -2,11 +2,16 @@
 // (docs/plans/2026-10-24-prefill-window-ring.md, Task 4 spike; llama.cpp-efck)
 //
 // Times 16 x 4 MiB pinned host-to-device copies alone, then the same copies
-// submitted while a ~100 ms spin kernel runs on the backend's compute queue,
-// for the cache's BCS queue and for the cache's compute queue. Prints one
-// [COPY-OVERLAP] row per queue and spin shape at default verbosity.
-// overlap=yes means the copies did not queue behind the kernel. Lead-run only
-// (it takes the device); exits 77 without one.
+// submitted while a spin kernel calibrated to 80-160 ms runs on the backend's
+// compute queue, for the cache's BCS queue and for the cache's compute queue.
+// Prints one [COPY-OVERLAP] row per queue and spin shape at default
+// verbosity. overlap=yes means the copies did not queue behind the kernel.
+// resolved= names the queue object the arm's accessor returned: the BCS
+// accessor falls back to the DMA queue and then to the compute queue, and a
+// bcs arm that resolved to the compute queue fails. A spin that cannot reach
+// the calibration floor fails too, since every row would then read
+// overlap=yes having measured nothing. Lead-run only (it takes the device);
+// exits 77 without one.
 //
 // Two spin shapes: spin=1wg is one work-group and leaves most EUs idle, so a
 // copy the compute engine runs by time-slicing can still finish on time;
@@ -69,9 +74,39 @@
 
 using ggml_sycl::mem_handle;
 
-static constexpr size_t kChunkBytes = 4ull * 1024ull * 1024ull;
-static constexpr size_t kChunks     = 16;
-static constexpr size_t kCopyBytes  = kChunkBytes * kChunks;
+// The copy shape the plan's spike names: 16 copies of 4 MiB, 64 MiB in all, about 2.7 ms at the probed ~25 GB/s.
+static constexpr size_t kChunkBytes       = 4ull * 1024ull * 1024ull;
+static constexpr size_t kChunks           = 16;
+static constexpr size_t kCopyBytes        = kChunkBytes * kChunks;
+// Copy rounds per row (warm-up, alone, with-kernel); staged_h2d= counts the copies of all of them.
+static constexpr size_t kCopyRoundsPerRow = 3;
+// The spin counter: one uint32 the kernel stores, padded to a 64-byte line.
+static constexpr size_t kCounterBytes     = 64;
+
+// Host zones, configured only when the process has none: a WEIGHT zone with room for two copy sources, and the
+// small KV, STAGING and SCRATCH zones test-mem-ops configures (this test allocates nothing from them).
+static constexpr size_t kHostWeightZoneBytes  = 2 * kCopyBytes;
+static constexpr size_t kHostKvZoneBytes      = 2ull << 20;
+static constexpr size_t kHostStagingZoneBytes = 4ull << 20;
+static constexpr size_t kHostScratchZoneBytes = 2ull << 20;
+
+// The spin kernel's work-group size: the plan's shape, a multiple of every Battlemage sub-group width.
+static constexpr size_t   kSpinGroupSize         = 256;
+// spin=full's work-group count: many times the work-groups the 256-CU B70 can hold at once, so every EU stays busy.
+static constexpr size_t   kSpinFullGroups        = 4096;
+// Calibration doubles a shape's iteration count until one launch takes at least this long, so it lands in
+// [floor, 2 x floor) = 80-160 ms: long enough that queueing behind the kernel dwarfs a ~2.7 ms copy round.
+static constexpr double   kSpinFloorMs           = 80.0;
+// Starting iteration counts, far below the floor for each shape on both cards so calibration climbs to it. spin=full
+// starts lower because each of its iterations runs 4096 times as many work-items.
+static constexpr uint64_t kSpin1wgStartIters     = 1ull << 20;
+static constexpr uint64_t kSpinFullStartIters    = 1ull << 8;
+// Calibration stops here: a spin that still misses the floor after 2^36 iterations is not running as written (the
+// loop was compiled away, or the device is not executing it), and the test fails rather than time against it.
+static constexpr uint64_t kSpinMaxIters          = 1ull << 36;
+// overlap=yes when the with-kernel copies took less than alone + this fraction of kernel_ms. Copies queued behind the
+// kernel take at least alone + kernel_ms, overlapping ones about alone; half the kernel splits the two.
+static constexpr double   kOverlapKernelFraction = 0.5;
 
 static const char * adapter_name() {
     std::ifstream maps("/proc/self/maps");
@@ -127,86 +162,117 @@ static std::vector<std::pair<std::string, std::string>> read_fdinfo(const std::s
     return kv;
 }
 
-// Engine-busy counters summed over this process's DRM clients on the device whose PCI address is `pdev`. Empty
-// (every cycle field prints NA) when `pdev` is empty: summing every render client would count the other cards'.
+// The value of `key` in one fdinfo, or "" when it has none.
+static std::string fdinfo_value(const std::vector<std::pair<std::string, std::string>> & kv, const char * key) {
+    for (const auto & p : kv) {
+        if (p.first == key) {
+            return p.second;
+        }
+    }
+    return std::string();
+}
+
+// Engine-busy counters summed over this process's DRM clients on one device.
 struct drm_snapshot {
-    std::map<std::string, unsigned long long> cycles;     // drm-cycles-<class>, keyed by <class>
-    unsigned long long                        ticks = 0;  // max drm-total-cycles-<class> over the clients
+    std::map<std::string, unsigned long long> cycles;             // drm-cycles-<class>, keyed by <class>
+    bool                                      has_ticks = false;  // any drm-total-cycles-<class> was read
+    unsigned long long                        ticks     = 0;      // max drm-total-cycles-<class> over the clients
 };
 
-static drm_snapshot read_drm_snapshot(const std::string & pdev) {
+// The counters of this process's DRM clients on the device whose PCI address is `pdev`: render-node fds whose
+// drm-pdev matches, each drm-client-id once (dup'd fds share a client). Empty, so every cycle field prints NA, when
+// `pdev` is empty: summing every render client would count the other cards'.
+static drm_snapshot read_drm_snapshot(const std::string & pdev, const std::vector<std::string> & fds) {
     drm_snapshot          snap;
     std::set<std::string> clients;
     if (pdev.empty()) {
         return snap;
     }
-    for (const std::string & fd : render_node_fds()) {
-        const std::vector<std::pair<std::string, std::string>> kv = read_fdinfo(fd);
-        std::string                                            fd_pdev;
-        std::string                                            client;
-        for (const auto & p : kv) {
-            if (p.first == "drm-pdev") {
-                fd_pdev = p.second;
-            } else if (p.first == "drm-client-id") {
-                client = p.second;
-            }
-        }
-        if (fd_pdev != pdev || client.empty() || !clients.insert(client).second) {
+    for (const std::string & fd : fds) {
+        const std::vector<std::pair<std::string, std::string>> kv     = read_fdinfo(fd);
+        const std::string                                      client = fdinfo_value(kv, "drm-client-id");
+        if (fdinfo_value(kv, "drm-pdev") != pdev || client.empty() || !clients.insert(client).second) {
             continue;
         }
         for (const auto & p : kv) {
             const unsigned long long v = std::strtoull(p.second.c_str(), nullptr, 10);
             if (p.first.rfind("drm-cycles-", 0) == 0) {
                 snap.cycles[p.first.substr(11)] += v;
-            } else if (p.first.rfind("drm-total-cycles-", 0) == 0 && v > snap.ticks) {
-                snap.ticks = v;
+            } else if (p.first.rfind("drm-total-cycles-", 0) == 0) {
+                snap.ticks     = snap.has_ticks && snap.ticks > v ? snap.ticks : v;
+                snap.has_ticks = true;
             }
         }
     }
     return snap;
 }
 
-// " <prefix>bcs_cycles=<d> <prefix>ccs_cycles=<d> [<prefix><class>_cycles=<d> ...] <prefix>ticks=<d>": bcs and ccs
-// always, any other class only when it moved; "<prefix>bcs_cycles=NA <prefix>ccs_cycles=NA" without cycles keys.
-static std::string drm_delta_fields(const char * prefix, const drm_snapshot & before, const drm_snapshot & after) {
-    std::string out;
-    char        buf[128];
-    if (after.cycles.empty()) {
-        std::snprintf(buf, sizeof(buf), " %sbcs_cycles=NA %sccs_cycles=NA", prefix, prefix);
-        return buf;
+// after - before of one counter as text, or "NA" when either side lacks it or it went backwards (a client that
+// closed between the snapshots), never a wrapped unsigned difference. `moved` reports a non-zero delta.
+static std::string counter_delta_text(bool               has_before,
+                                      unsigned long long before,
+                                      bool               has_after,
+                                      unsigned long long after,
+                                      bool *             moved = nullptr) {
+    const bool ok = has_before && has_after && after >= before;
+    if (moved) {
+        *moved = !ok || after != before;
     }
+    return ok ? std::to_string(after - before) : std::string("NA");
+}
+
+static std::string cycles_delta_text(const drm_snapshot & before,
+                                     const drm_snapshot & after,
+                                     const std::string &  cls,
+                                     bool *               moved = nullptr) {
+    const auto b = before.cycles.find(cls);
+    const auto a = after.cycles.find(cls);
+    return counter_delta_text(b != before.cycles.end(), b == before.cycles.end() ? 0ull : b->second,
+                              a != after.cycles.end(), a == after.cycles.end() ? 0ull : a->second, moved);
+}
+
+// " <prefix>bcs_cycles=<d> <prefix>ccs_cycles=<d> [<prefix><class>_cycles=<d> ...] <prefix>ticks=<d>": bcs and ccs
+// always, any other class only when it moved (or cannot be compared); "<prefix>bcs_cycles=NA <prefix>ccs_cycles=NA"
+// without cycles keys.
+static std::string drm_delta_fields(const char * prefix, const drm_snapshot & before, const drm_snapshot & after) {
+    if (after.cycles.empty()) {
+        return std::string(" ") + prefix + "bcs_cycles=NA " + prefix + "ccs_cycles=NA";
+    }
+    std::string  out;
     const char * always[] = { "bcs", "ccs" };
     for (const char * cls : always) {
-        const auto a = after.cycles.find(cls);
-        const auto b = before.cycles.find(cls);
-        if (a == after.cycles.end()) {
-            std::snprintf(buf, sizeof(buf), " %s%s_cycles=NA", prefix, cls);
-        } else {
-            const unsigned long long d = a->second - (b == before.cycles.end() ? 0ull : b->second);
-            std::snprintf(buf, sizeof(buf), " %s%s_cycles=%llu", prefix, cls, d);
-        }
-        out += buf;
+        out += std::string(" ") + prefix + cls + "_cycles=" + cycles_delta_text(before, after, cls);
     }
     for (const auto & a : after.cycles) {
         if (a.first == "bcs" || a.first == "ccs") {
             continue;
         }
-        const auto               b = before.cycles.find(a.first);
-        const unsigned long long d = a.second - (b == before.cycles.end() ? 0ull : b->second);
-        if (d != 0) {
-            std::snprintf(buf, sizeof(buf), " %s%s_cycles=%llu", prefix, a.first.c_str(), d);
-            out += buf;
+        bool              moved = false;
+        const std::string d     = cycles_delta_text(before, after, a.first, &moved);
+        if (moved) {
+            out += std::string(" ") + prefix + a.first + "_cycles=" + d;
         }
     }
-    std::snprintf(buf, sizeof(buf), " %sticks=%llu", prefix, after.ticks - before.ticks);
-    out += buf;
+    out += std::string(" ") + prefix +
+           "ticks=" + counter_delta_text(before.has_ticks, before.ticks, after.has_ticks, after.ticks);
     return out;
 }
 
-// Device busy work on `q`: `groups` work-groups of 256 iterating an LCG `iters` times.
+// Which of the cache's queue objects `q` is. Compute first: the DMA accessor itself falls back to the compute queue.
+static const char * queue_identity(const sycl::queue * q, ggml_sycl::unified_cache & cache) {
+    if (q == &cache.get_queue()) {
+        return "compute";
+    }
+    if (q == &cache.get_dma_queue()) {
+        return "dma";
+    }
+    return "bcs";
+}
+
+// Device busy work on `q`: `groups` work-groups of kSpinGroupSize iterating an LCG `iters` times.
 static sycl::event spin_kernel(sycl::queue & q, uint32_t * counter, size_t groups, uint64_t iters) {
     return q.submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        h.parallel_for(sycl::nd_range<1>(groups * kSpinGroupSize, kSpinGroupSize), [=](sycl::nd_item<1> it) {
             uint32_t acc = static_cast<uint32_t>(it.get_global_id(0));
             for (uint64_t i = 0; i < iters; ++i) {
                 acc = acc * 1664525u + 1013904223u;
@@ -293,7 +359,8 @@ int main() {
         return 1;
     }
     if (!cache->host_zones_configured()) {
-        cache->configure_host_zones(2 * kCopyBytes, 2ull << 20, 4ull << 20, 2ull << 20);
+        cache->configure_host_zones(kHostWeightZoneBytes, kHostKvZoneBytes, kHostStagingZoneBytes,
+                                    kHostScratchZoneBytes);
     }
     if (!cache->host_zones_configured()) {
         std::printf("FAIL: the cache's host zones could not be configured\n");
@@ -303,7 +370,7 @@ int main() {
 
     const mem_handle src = alloc_pinned_weight(cq, device, kCopyBytes);
     const mem_handle dst = alloc_runtime_device(cq, device, kCopyBytes);
-    const mem_handle ctr = alloc_runtime_device(cq, device, 64);
+    const mem_handle ctr = alloc_runtime_device(cq, device, kCounterBytes);
     if (!src.valid() || !dst.valid() || !ctr.valid()) {
         std::printf("FAIL: allocation refused (src=%d dst=%d ctr=%d)\n", src.valid() ? 1 : 0, dst.valid() ? 1 : 0,
                     ctr.valid() ? 1 : 0);
@@ -333,21 +400,20 @@ int main() {
     if (ccs.get_device().has(sycl::aspect::ext_intel_pci_address)) {
         pdev = ccs.get_device().get_info<sycl::ext::intel::info::device::pci_address>();
     }
+    // The render-node fds are opened during backend and cache initialisation, all done by now: one scan serves the
+    // dump and every snapshot.
+    const std::vector<std::string> fds = render_node_fds();
     if (pdev.empty()) {
         std::printf(
             "[COPY-OVERLAP-FDINFO] pdev=unknown render_fds=%zu cycles=NA: the device reports no PCI address, so its "
             "DRM clients cannot be told from the other cards'; the dump below is the first render fd, for its keys\n",
-            render_node_fds().size());
+            fds.size());
     } else {
-        std::printf("[COPY-OVERLAP-FDINFO] pdev=%s render_fds=%zu\n", pdev.c_str(), render_node_fds().size());
+        std::printf("[COPY-OVERLAP-FDINFO] pdev=%s render_fds=%zu\n", pdev.c_str(), fds.size());
     }
-    for (const std::string & fd : render_node_fds()) {
-        const std::vector<std::pair<std::string, std::string>> kv    = read_fdinfo(fd);
-        bool                                                   match = pdev.empty();
-        for (const auto & p : kv) {
-            match |= p.first == "drm-pdev" && p.second == pdev;
-        }
-        if (!match) {
+    for (const std::string & fd : fds) {
+        const std::vector<std::pair<std::string, std::string>> kv = read_fdinfo(fd);
+        if (!pdev.empty() && fdinfo_value(kv, "drm-pdev") != pdev) {
             continue;
         }
         for (const auto & p : kv) {
@@ -363,21 +429,28 @@ int main() {
         double       kernel_ms;
     };
 
-    // JIT the spin kernel before timing it, then calibrate each shape to ~100 ms.
+    // JIT the spin kernel before timing it, then calibrate each shape to [kSpinFloorMs, 2 x kSpinFloorMs).
     spin_kernel(ccs, counter, 1, 1).wait();
     spin spins[] = {
-        { "1wg",  1,    1ull << 20, 0.0 },
-        { "full", 4096, 1ull << 8,  0.0 },
+        { "1wg",  1,               kSpin1wgStartIters,  0.0 },
+        { "full", kSpinFullGroups, kSpinFullStartIters, 0.0 },
     };
     for (spin & sp : spins) {
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
             spin_kernel(ccs, counter, sp.groups, sp.iters).wait();
             sp.kernel_ms = ms_since(t0);
-            if (sp.kernel_ms >= 80.0 || sp.iters > (1ull << 36)) {
+            if (sp.kernel_ms >= kSpinFloorMs || sp.iters >= kSpinMaxIters) {
                 break;
             }
             sp.iters *= 2;
+        }
+        if (sp.kernel_ms < kSpinFloorMs) {
+            std::printf(
+                "FAIL: spin=%s reached only kernel_ms=%.1f at %llu iterations, under the %.0f ms calibration floor; "
+                "every row would read overlap=yes having measured nothing\n",
+                sp.name, sp.kernel_ms, (unsigned long long) sp.iters, kSpinFloorMs);
+            return 1;
         }
     }
 
@@ -396,10 +469,10 @@ int main() {
         for (const arm & a : arms) {
             uint64_t staged = 0;
             time_copies(*a.q, dst, src, staged);  // warm-up
-            const drm_snapshot alone_before = read_drm_snapshot(pdev);
+            const drm_snapshot alone_before = read_drm_snapshot(pdev, fds);
             const double       alone        = time_copies(*a.q, dst, src, staged);
-            const drm_snapshot alone_after  = read_drm_snapshot(pdev);
-            const drm_snapshot with_before  = read_drm_snapshot(pdev);
+            const drm_snapshot alone_after  = read_drm_snapshot(pdev, fds);
+            const drm_snapshot with_before  = read_drm_snapshot(pdev, fds);
             const auto         t0           = std::chrono::steady_clock::now();
             sycl::event        k            = spin_kernel(ccs, counter, sp.groups, sp.iters);
             const double       with         = time_copies(*a.q, dst, src, staged);
@@ -407,19 +480,27 @@ int main() {
             const double       total      = ms_since(t0);
             // After the kernel's completion and after total_ms: the window holds the whole kernel on every row, and
             // the read is outside every timed window.
-            const drm_snapshot with_after = read_drm_snapshot(pdev);
-            const bool         overlap    = with < alone + 0.5 * sp.kernel_ms;
+            const drm_snapshot with_after = read_drm_snapshot(pdev, fds);
+            const bool         overlap    = with < alone + kOverlapKernelFraction * sp.kernel_ms;
+            const char *       resolved   = queue_identity(a.q, *cache);
             std::printf(
                 "[COPY-OVERLAP] queue=%s alone_ms=%.1f with_kernel_ms=%.1f kernel_ms=%.1f total_ms=%.1f overlap=%s "
-                "adapter=%s spin=%s%s%s staged_h2d=%llu\n",
+                "adapter=%s spin=%s%s%s staged_h2d=%llu resolved=%s\n",
                 a.name, alone, with, sp.kernel_ms, total, overlap ? "yes" : "no", adapter, sp.name,
                 drm_delta_fields("alone_", alone_before, alone_after).c_str(),
-                drm_delta_fields("", with_before, with_after).c_str(), (unsigned long long) staged);
+                drm_delta_fields("", with_before, with_after).c_str(), (unsigned long long) staged, resolved);
             if (staged != 0) {
                 std::printf(
                     "FAIL: queue=%s spin=%s: %llu of the row's %zu copies took the staged host-to-device branch, so "
                     "its times are a host memcpy, not the DMA\n",
-                    a.name, sp.name, (unsigned long long) staged, 3 * kChunks);
+                    a.name, sp.name, (unsigned long long) staged, kCopyRoundsPerRow * kChunks);
+                ++failed;
+            }
+            if (std::string(a.name) == "bcs" && std::string(resolved) == "compute") {
+                std::printf(
+                    "FAIL: queue=bcs spin=%s: the cache built neither a BCS nor a DMA queue, so the bcs arm timed the "
+                    "compute queue\n",
+                    sp.name);
                 ++failed;
             }
             std::fflush(stdout);
