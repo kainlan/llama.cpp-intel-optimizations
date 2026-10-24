@@ -107,15 +107,18 @@ struct moe_exec_decision_log {
     uint32_t n_exposed = 0;  // of them, a layer's first UP window: copied with no earlier phase to hide under
     uint32_t n_misses  = 0;  // experts a window asked for that were not staged ahead, exposed windows excluded
 
-    void note_window(bool exposed, uint32_t misses) {
+    // bytes is what the window's call staged: the window itself when no prefetch had, plus the prefetch it issued
+    // for the next one. Each copied byte is counted once, on the call that copied it; MiB streamed is their sum.
+    void note_window(bool exposed, uint32_t misses, size_t bytes) {
         std::lock_guard<std::mutex> lock(mu);
         ++n_windows;
+        bytes_streamed += bytes;
         n_exposed += exposed ? 1 : 0;
         n_misses += exposed ? 0 : misses;
     }
 
-    // bytes is what this layer-ubatch streams through the ring (0 for a CPU choice).
-    void note(int device, int layer, const moe_exec_decision & d, size_t bytes) {
+    // A layer stages nothing at decide time: its bytes are its windows' (note_window).
+    void note(int device, int layer, const moe_exec_decision & d) {
         if (d.choice == moe_exec_choice::NOT_CONSULTED) {
             return;
         }
@@ -125,7 +128,6 @@ struct moe_exec_decision_log {
         const bool                  ring = d.choice == moe_exec_choice::RING;
         if (ring) {
             ++n_ring;
-            bytes_streamed += bytes;
         } else {
             ++n_cpu;
         }
