@@ -24,7 +24,9 @@ static constexpr const char * MOE_EXEC_ENV_TRACE  = "GGML_SYCL_MOE_EXEC_TRACE";
 
 struct moe_exec_config {
     moe_exec_policy policy = moe_exec_policy::AUTO;
-    int             trace  = 0;  // 0 off, 1 one INFO line per layer per micro-batch, 2 also the load-time copy probe
+    // 0 off; 1 the three stage lines per consulted layer-ubatch plus one executor line per MUL_MAT_ID dispatch;
+    // 2 also the load-time copy probe
+    int             trace  = 0;
     char            bad_policy[48] = {};  // the rejected GGML_SYCL_MOE_EXEC value, copied, for one WARN; empty if none
 };
 
