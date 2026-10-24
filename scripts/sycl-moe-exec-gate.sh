@@ -13,7 +13,8 @@
 # GO_gate and GO_noc 600 s, the Mistral arms 300 s; a run that hits its timeout exits 124 and one that has to be
 # killed exits 137, and every arm scores a non-zero rc as a FAIL naming it):
 #   Q_pp       llama-bench -m $Q -p 512,2048 -n 0 -r 3 -fa 1 -o csv -v          B70  pp512 >= 200, pp2048 >= 500
-#              (the bus-derived floors, see PP512_MIN), ring_engaged=yes, zero window misses, the window fields on every summary line,
+#              (the bus-derived floors, see PP512_MIN), ring_engaged=yes, zero window misses, the window fields on
+#              every summary line,
 #              at least one distinct "[MOE-EXEC] layer N:" line (exactly --q-layers N when given), at least one
 #              "[MOE-EXEC] summary:" (llama-bench makes one context per -p value, so -p 512,2048 prints two),
 #              zero "[PP-MOE] refused".
@@ -27,7 +28,8 @@
 #              (it needs GGML_SYCL_MOE_EXEC=ring or the trace), so its absence proves nothing (llama.cpp-bcre).
 #              loan_exercised=yes|no is a "[MOE-EXEC] loan device N: K triplets" line.
 #   Q_pp_ub2048  llama-bench -m $Q -ub 2048 -p 2048 -n 0 -r 3 -fa 1 -o csv -v    B70
-#              pp2048 >= 500 only (no pp512 row), scored like Q_pp otherwise; the pp2048 floor's natural setting and llama.cpp-dfo0's measurement arm
+#              pp2048 >= 500 only (no pp512 row), scored like Q_pp otherwise; the pp2048 floor's natural setting
+#              and llama.cpp-dfo0's measurement arm
 #   Q_pp_cpu   Q_pp with GGML_SYCL_MOE_EXEC=cpu                       B70  recorded, not gated (FAIL on rc != 0)
 #   Q_staged   llama-bench -p 512 -n 0 -r 1 -fa 1 -o csv -v, GGML_SYCL_MOE_EXEC_TRACE=1   B70
 #              the executor prints "[MOE-EXEC-TRACE] executor device D tensor=T experts=E staged=S arm=A" for EVERY

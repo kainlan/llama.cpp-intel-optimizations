@@ -230,7 +230,7 @@ mkcsv "$WORK/pp-none.csv" 128:0:900:1:128
 out="$(score Q_pp --csv "$WORK/pp-none.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp a csv without the rows fails, never passes" "$out" "Q_pp=FAIL(no_pp512_row"
 
-# ---- Q_pp, the window ring (plan 2026-10-24 Task 6): windows/exposed/misses, bus-derived floors, the new arm Q_pp_ub2048
+# ---- Q_pp, the window ring (plan 2026-10-24 Task 6): windows/exposed/misses, bus floors, the new arm Q_pp_ub2048
 out="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")"
 expect "Q_pp engaged pass: the exact verdict line" "$out" \
     "Q_pp=PASS pp512=523.4 sd512=3.1 pp2048=851.2 sd2048=5.0 ub=512 layers=48 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=96 loan_exercised=no windows=216 exposed=24 misses=0 trace_misses=0"
