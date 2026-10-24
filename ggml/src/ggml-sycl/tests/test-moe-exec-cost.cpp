@@ -58,7 +58,7 @@ static moe_exec_layer_inputs qwen_layer(uint32_t T) {
     in.ring_bytes_free   = 820ull << 20;
     in.triplet_bytes_max = 2048 * 1024;  // largest host triplet, rounded up from the 410 MiB / 212 mean
     // The hybrid world, every host byte staged SOA and reordered on the device: the shape these expectations were
-    // measured in. A layer the library executor claims stages AOS_ONLY and has soa_bytes 0 (llama.cpp-b5hm).
+    // written in. A layer the library executor claims stages AOS_ONLY and has soa_bytes 0 (llama.cpp-b5hm).
     in.soa_bytes         = in.host_expert_bytes;
     return in;
 }

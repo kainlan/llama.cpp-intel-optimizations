@@ -151,7 +151,8 @@ digraph dependencies {
 
 ## Task 1: The cost function and its two model fixtures (host-only)
 
-**Amendment (llama.cpp-b5hm):** the reorder term prices only the SOA-staged bytes (`soa_bytes`, from the index build); AOS_ONLY and executor-claimed items are copied and read in place, never reordered.
+**Amendment (2026-10-24, llama.cpp-b5hm):** the reorder term prices only the SOA-staged bytes (`soa_bytes`, from the
+index build); AOS_ONLY and executor-claimed items are copied and read in place, never reordered.
 
 **Track:** A
 **Depends on:** Task 0
