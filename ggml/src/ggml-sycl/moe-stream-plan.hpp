@@ -208,6 +208,7 @@ struct moe_stream_layer_info {
     int     n_streamable     = 0;  // items the ring gives slots: staging SOA or AOS_ONLY
     int     region_slots     = 0;  // the slots its streamable items take: 2 per SOA item, 1 per AOS-only item
     size_t  expert_bytes_max = 0;  // the largest one expert's streamable AOS bytes, summed over its roles
+    size_t  soa_bytes        = 0;  // src bytes of the items staged SOA (the bytes the ring reorders)
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
     int64_t N                = 0;  // the largest ne[1] over the host expert entries
 };
@@ -341,6 +342,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         }
         ++li.n_streamable;
         li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));
+        if (item.staging == moe_stream_staging::SOA) {
+            li.soa_bytes += item.src_bytes;
+        }
         ins.first->second += e.src_size;
         li.expert_bytes_max = std::max(li.expert_bytes_max, ins.first->second);
         idx.matrix_bytes_max =
