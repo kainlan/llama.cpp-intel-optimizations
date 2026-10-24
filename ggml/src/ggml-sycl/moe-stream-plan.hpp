@@ -478,7 +478,10 @@ static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int
 //            run with the tuning cache disabled, or a record the store refused, still prices with the probed rate.
 //   reorder: the record's rate where it measured, else the seed. A record rate that is not positive means
 //            "unmeasured": the probe measures the H2D rate only and stores reorder as 0, so a later change of the seed
-//            is not masked by a copy of the old seed in the file.
+//            is not masked by a copy of the old seed in the file. A record written before llama.cpp-kp1l (the
+//            CACHE_VERSION did not change) holds the old 200 GB/s seed as `reorder_gbps` and is read as measured, and
+//            GGML_SYCL_H2D_PROBE=1 over such a record carries it forward (the GGML_SYCL_MOE_EXEC_REORDER_GBPS catalog
+//            row). Deleting the device's `*-moe-exec-rates.json` clears it.
 //   dev:     each type's recorded rate (the record's per-type slot, which has no writer yet), else its seed, as a
 //            byte-weighted harmonic mean over the mix.
 // A value is taken only when finite and positive. The environment overrides apply last and win over all of them.

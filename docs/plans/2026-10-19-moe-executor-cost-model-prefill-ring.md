@@ -4,15 +4,21 @@
 
 **Goal:** A Qwen3.8-Flash-Next prompt on the Arc Pro B70, with 41 % of its routed experts host-resident, processes at >= 500 tok/s (from 10.5-14.4 today) because each MoE layer's host-resident experts are streamed into a lent VRAM ring one layer ahead and run on the device, chosen per layer per micro-batch by a cost model that still picks the CPU path wherever it is cheaper, with decode, the GPT-OSS B50 gates and the Mistral gate unchanged.
 
-**Amendment (2026-10-23, llama.cpp-bcre, llama.cpp-348c, llama.cpp-3460, llama.cpp-pu8v):** The goal stands, but two
-premises changed while it was built. The record below is what was built, task by task.
+**Amendment (2026-10-23, llama.cpp-bcre, llama.cpp-348c, llama.cpp-3460, llama.cpp-pu8v; updated 2026-10-24,
+llama.cpp-6aj4):** The goal stands, but two premises changed while it was built. The record below is what was built,
+task by task.
 - The device executor was the larger half of the gap. With every expert in VRAM, Qwen1.5-MoE Q4_0 on the B70 ran
   prompts through the per-row executor at 0.63 TFLOP/s, so the epic gained Task 10-pre (llama.cpp-348c) before Task
   10: a batched f16 executor for every expert type.
 - The ring has never engaged on this host. The 10 %-of-resident cap refuses it on both canonical models
-  (llama.cpp-bcre, open, P0). Where a model passes the cap (Qwen1.5 at a 33-35 % VRAM budget) the ring is short and
-  its loan is refused (llama.cpp-pu8v). The >= 500 and >= 800 tok/s targets therefore move to the tasks that make the
-  ring engage, and Task 15's gate reports ring_engaged and loan_exercised instead of scoring a vacuous pass.
+  (llama.cpp-bcre, open, P0, owner decision pending). Where a model passes the cap (Qwen1.5 at a 33-35 % VRAM budget)
+  the ring was short and its loan was refused for host storage. llama.cpp-pu8v closed on 2026-10-23: the loan's host
+  copy is sized from the source bytes, and the loan was accepted, 41 triplets 190 MiB at 5d0727255 (pu8v c-kgye).
+  llama.cpp-6aj4 closed on 2026-10-24: room lent to the ring now returns on reclaim, and the Qwen1.5 shortfall fell
+  from 555.3 to 366.6 MiB (6aj4 c-sil1). The loan is still limited to the lendable triplets, 41 of about 1301,
+  because `moe_loan_triplet_is_lendable` refuses bulk-staged tensors (bcre c-aerm), so the ring stays short. The
+  >= 500 and >= 800 tok/s targets stay with bcre, and Task 15's gate reports ring_engaged and loan_exercised instead
+  of scoring a vacuous pass.
 
 **Architecture:** Placement is unchanged: the planner still decides which experts live in VRAM and which live in pinned host memory. What changes is the **executor** of a MUL_MAT_ID whose expert entries are host-resident. A pure cost model (`moe-exec-cost.hpp`, one layer of one micro-batch as its unit, decided before the layer's first MoE op) weighs today's CpuExpertPool path against staging the layer's host experts through a byte-budgeted VRAM ring (slots lent from the tail of the resident expert set for the prompt phase, refilled in the background afterwards) and running them with the same device kernels resident experts use. Streaming is an H2D copy on the cache's BCS queue followed by an AOS-to-SOA reorder on the compute queue, event-chained, the next layer's copies enqueued while this layer computes. The MoE batch resolver (`moe-resolved-batch.hpp`) learns one new transfer kind, `STAGED_RING`, which is the only way a host-resident entry can ever answer `PRIMARY_DEVICE`. Rates (H2D GB/s per device, CPU expert GB/s per type, device expert rate per type) are probed and persisted in the existing tuning cache, env-overridable. The micro-batch comes from the existing auto-ubatch trial with a ring fit term; `-ub` caps it.
 
@@ -79,7 +85,7 @@ digraph dependencies {
     9  [label="Task 9: spike: batched prompt executor rates (lead)"];
     "10pre" [label="Task 10-pre: batched f16 prompt executor, every expert type (llama.cpp-348c)"];
     bcre [label="llama.cpp-bcre: ring geometry vs the 10% cap (open, P0)", style=dashed];
-    pu8v [label="llama.cpp-pu8v: the loan is refused, host storage too small (open)", style=dashed];
+    pu8v [label="llama.cpp-pu8v: the loan host copy sized from src bytes (closed)"];
     xr4i [label="llama.cpp-xr4i: probe rate = max over iterations 2..8"];
     10 [label="Task 10: fully staged layer leaves hybrid"];
     "11a" [label="Task 11a: loan selection (host-only)"];
@@ -92,7 +98,7 @@ digraph dependencies {
     1 -> 2; 2 -> 3; 1 -> 4; 2 -> 4;
     1 -> "7a"; "7a" -> "7b"; 5 -> "7b"; 6 -> "7b"; 4 -> "7b"; "7b" -> 8; 8 -> 10; 9 -> "10pre"; "10pre" -> 10;
     8 -> bcre; bcre -> 10 [style=dashed, label="ring-engaged acceptance"];
-    12 -> pu8v; pu8v -> 10 [style=dashed, label="loan acceptance"];
+    12 -> pu8v; pu8v -> 10 [style=dashed, label="closed: loan accepted, ring still short (c-sil1)"];
     3 -> xr4i; xr4i -> 12;
     "7a" -> "11a"; 6 -> "11b"; "11a" -> "11b"; "11b" -> 12; 6 -> 13; "11b" -> 13;
     1 -> 14; 8 -> 14; "11b" -> 14;
@@ -953,6 +959,10 @@ These rulings supersede the acceptance text and the geometry above. They bind Ta
 
 ## Task 7a: The per-ubatch layer stream plan (host-only)
 
+**Amendment (2026-10-24, llama.cpp-8xdz, d0ac95d6d):** `moe_stream_layer_fully_staged` is no longer production code. It
+moved into `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp` as a test-only reference, and the runtime equivalent
+lives in `moe_stream_plan_index_build` and the phase's stage table.
+
 **Track:** B
 **Depends on:** Task 1
 **File scope:**
@@ -1318,18 +1328,18 @@ Follow-ups folded elsewhere: llama.cpp-v7np into Task 10, the in-graph loan requ
 - [ ] **As built differently, see the Amendment.** `const bool plan_has_cpu_experts =
       plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && !(ctx.moe_stream &&
       ctx.moe_stream->layer_fully_staged(layer, ids, n_ids))` where `moe_stream_phase::layer_fully_staged` wraps Task
-      7a's pure `moe_stream_layer_fully_staged` over the phase's own stage table (every distinct id that is
-      host-planned has all three roles staged, ready or pending).
+      7a's pure `moe_stream_layer_fully_staged` (test-only since llama.cpp-8xdz, see the Task 7a amendment) over the
+      phase's own stage table (every distinct id that is host-planned has all three roles staged, ready or pending).
 - [ ] **No longer true as written (3460 c-vrmr, see the Amendment): the gate pins `->executor_staged(` on the bool's own
       line, not `->layer_fully_staged(` on the `plan_has_cpu_experts` line.** Source gate: `->layer_fully_staged(`
       appears exactly once in `ggml_sycl_mul_mat_id`, on the line that computes `plan_has_cpu_experts`;
       `moe_hybrid_with_plan` keeps its `ne12 == 1 ||` term (decode untouched).
-- [ ] **The ring-engaged half moved to llama.cpp-bcre and llama.cpp-pu8v (see the Amendment).** Lead-run: Qwen B70
-      `llama-bench -p 512,2048 -n 0 -r 3` with no `-ub` (auto) and `GGML_SYCL_MOE_EXEC=auto`: pp512 >= 500 tok/s,
-      pp2048 >= 800 tok/s, `[MOE-EXEC] trace` (one `-v` run) shows every prompt layer RING and the batched route's own
-      log line (`[PP-MOE]` or the XMX route's, whichever the all-VRAM pair printed in Task 9) per layer; the 2k-prompt
-      `llama-completion` md5 equals the `GGML_SYCL_MOE_EXEC=cpu` arm's; GPT-OSS B50 `-c 4096` pp512/tg128 and the
-      count gate unchanged (no host experts: NOT_CONSULTED, zero `[MOE-EXEC] layer` lines).
+- [ ] **The ring-engaged half moved to llama.cpp-bcre (see the Amendment; pu8v and 6aj4 are closed).** Lead-run:
+      Qwen B70 `llama-bench -p 512,2048 -n 0 -r 3` with no `-ub` (auto) and `GGML_SYCL_MOE_EXEC=auto`: pp512 >= 500
+      tok/s, pp2048 >= 800 tok/s, `[MOE-EXEC] trace` (one `-v` run) shows every prompt layer RING and the batched
+      route's own log line (`[PP-MOE]` or the XMX route's, whichever the all-VRAM pair printed in Task 9) per layer;
+      the 2k-prompt `llama-completion` md5 equals the `GGML_SYCL_MOE_EXEC=cpu` arm's; GPT-OSS B50 `-c 4096`
+      pp512/tg128 and the count gate unchanged (no host experts: NOT_CONSULTED, zero `[MOE-EXEC] layer` lines).
 
 **Implementation Guide:**
 
@@ -1373,14 +1383,17 @@ premise was wrong, and its acceptance could not run.
   WEIGHT zone cannot give %.1f MB` (per micro-batch), and `[MOE-EXEC] device %d: stream ring %.1f MiB short and its
   expert loan refused: no further loan this prompt` (ring or trace only).
 - The acceptance arms: the ring never engaged on this host (the bcre cap on Qwen3.8; Qwen1.5 at a 33-35 % VRAM budget
-  passes the cap, is short, and its loan fires and is refused "host storage too small", llama.cpp-pu8v). The pp512 >=
-  500, pp2048 >= 800 and every-layer-RING targets move to bcre and pu8v's re-probe. Measured: Qwen3.8 B70 ABBA neutral
-  (pp512 about 14, pp2048 about 31.5 on both trees), the md5 of auto equals cpu equals NAN_CHECK, and the GPT-OSS B50
-  and Mistral controls are green. The GPT-OSS B50 pp512 reads about 770 against the 871-894 floor on master itself
-  (llama.cpp-zuze), so Task 15's GO_pp window cites zuze until it is bisected.
+  passes the cap, is short, and its loan fired and was refused "host storage too small" until llama.cpp-pu8v closed
+  on 2026-10-23; with pu8v and llama.cpp-6aj4 (2026-10-24) closed, the loan is accepted for the 41 lendable triplets
+  and the ring stays short, llama.cpp-bcre c-aerm). The pp512 >= 500, pp2048 >= 800 and every-layer-RING targets stay
+  with bcre. Measured: Qwen3.8 B70 ABBA neutral (pp512 about 14, pp2048 about 31.5 on both trees), the md5 of auto
+  equals cpu equals NAN_CHECK, and the GPT-OSS B50 and Mistral controls are green. The GPT-OSS B50 pp512 reads about
+  770 against the 871-894 floor on master itself (llama.cpp-zuze), so Task 15's GO_pp window cites zuze
+  until it is bisected.
 - Limits: the REFUSED loan latch and `warned_unavailable_` reset only in `end_prompt`, so a prompt-only workload keeps
   one refusal for the process (the c-las5 "per prompt" carry-forward). `route_layout` is re-derived at dispatch
-  (llama.cpp-8f7x). A forced-decline arm on a staged layer is owed to pu8v's re-probe (c-58j8).
+  (llama.cpp-8f7x). The forced-decline arm on a staged layer is owned by llama.cpp-8p5x (its acceptance carries it,
+  comment c-0blp).
 
 ---
 
@@ -1415,6 +1428,10 @@ git commit -m "sycl, tests: the loan takes the lendable tail of the resident exp
 ---
 
 ## Task 11b: The loan transaction: lend the selected triplets to the ring for a prompt phase
+
+**Amendment (2026-10-24, llama.cpp-8xdz):** the direct wrappers `ggml_sycl_run_expert_loan_transaction` and
+`ggml_sycl_run_expert_refill_transaction` named below were deleted. The live entry points are
+`ggml_sycl_expert_loan_transaction_run` and `ggml_sycl_expert_refill_transaction_run` in `ggml-sycl.cpp`.
 
 **Track:** C
 **Depends on:** Tasks 6, 11a
@@ -1463,6 +1480,9 @@ git commit -m "sycl, tests: the selected triplets are lent to the ring for a pro
 
 ## Task 12: The refill transaction: re-admit lent experts after the prompt, in the background, cancellable
 
+**Amendment (2026-10-24, llama.cpp-8xdz):** `ggml_sycl_run_expert_refill_transaction` below is now
+`ggml_sycl_expert_refill_transaction_run` (see the Task 11b amendment).
+
 **Track:** C
 **Depends on:** Task 11b
 **File scope:**
@@ -1501,8 +1521,9 @@ git commit -m "sycl, tests: lent experts are re-admitted one triplet per decode 
   refused: host zones not configured`). The teardown line is `[MOE-EXEC] refill device %d: %u/%u triplets
   re-admitted`.
 - Nothing in production originated a loan until Task 10 wired the in-graph request at a short reserve (c-0tmn), and
-  pu8v refuses that loan on the models tried. So Task 15's gate must say whether the loan and the refill ran
-  (`loan_exercised`, `refill=not_exercised`) rather than score a vacuous pass.
+  pu8v refused that loan on the models tried (closed 2026-10-23; it is now accepted for the lendable triplets only,
+  bcre c-aerm). So Task 15's gate must say whether the loan and the refill ran (`loan_exercised`,
+  `refill=not_exercised`) rather than score a vacuous pass.
 - The task depends on llama.cpp-xr4i (the probe's rate is bimodal until it lands), as the graph above now shows.
 
 ---
@@ -1717,8 +1738,8 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
 
 **Observed success:** the Qwen3.8 B70 prompt at auto micro-batch processes at >= 500 tok/s pp512 and >= 800 tok/s pp2048 (from 13.5-14.4 at `-ub 256`) with tokens identical to the CPU arm; decode (Q_tg, Q_noc) within its floors and the place line unchanged; every GPT-OSS B50 arm and the Mistral gate unchanged with zero `[MOE-EXEC] layer` lines where no host expert exists; loan and refill counts equal; no kernel resets; the baselines section carries the first green table.
 
-**Amendment (2026-10-23, llama.cpp-bcre, llama.cpp-pu8v, llama.cpp-x6zo):** The ring-engaged targets above move; the
-steps otherwise stand.
+**Amendment (2026-10-23, llama.cpp-bcre, llama.cpp-pu8v, llama.cpp-x6zo; 2026-10-24: pu8v and 6aj4 are closed):** The
+ring-engaged targets above move; the steps otherwise stand.
 - Step 3: the probe line reads `(probed; iterations <lo>-<hi>)` at >= 20 GB/s on both cards (Task 3's amendment).
 - Step 4: `verdicts_pass=11` needs the pp512 >= 500 and pp2048 >= 800 floors, which need the ring. On a tree where the
   ring does not engage, `Q_pp` fails its floors and says `ring_engaged=no`, so the failure names its cause. The floors
@@ -1729,10 +1750,11 @@ steps otherwise stand.
   a flip that shares >= 128 bytes with the committed reference text.
 - Step 5: the number of `[MOE-EXEC] layer ... CPU (forced)` lines is the number of layers with host experts, not 48.
 - Step 6: the loan and the refill appear only when a reserve falls short and the loan is granted. The gate reports
-  `loan_exercised` and `refill`, and `no` and `not_exercised` are the honest answer until llama.cpp-pu8v lands.
+  `loan_exercised` and `refill`, and `no` and `not_exercised` are the honest answer until llama.cpp-bcre lets the
+  ring engage (pu8v and 6aj4 are closed; the loan covers the lendable triplets only).
 - Observed success: the Qwen3.8 B70 targets (pp512 >= 500, pp2048 >= 800, tokens identical to the CPU arm or a
-  flip by the common-prefix rule) and the loan and refill counts are owned by llama.cpp-bcre and llama.cpp-pu8v.
-  Until they land, success is the gate reporting `ring_engaged=no` with the neutral numbers, the decode arms inside
+  flip by the common-prefix rule) and the loan and refill counts are owned by llama.cpp-bcre.
+  Until it lands, success is the gate reporting `ring_engaged=no` with the neutral numbers, the decode arms inside
   their floors with the md5 as the reference or a flip and the place line recorded (not "unchanged"), every GPT-OSS
   B50 arm (with zuze's pp512 caveat) and the Mistral gate unchanged, and no kernel resets. The baselines section
   carries run 2 as a record, not as the first green table.

@@ -1113,7 +1113,7 @@ inline bool read_entry_objects(const std::string & path, std::vector<std::string
 // =============================================================================
 
 struct MoeExecRatesEntry {
-    std::string                         device_key;  // device_identity_key(name, driver)
+    std::string                         device_key;          // device_identity_key(name, driver)
     double                              h2d_gbps     = 0.0;
     double                              reorder_gbps = 0.0;  // 0 = unmeasured (the executor uses its seed)
     std::vector<std::pair<int, double>> dev_gflops_by_type;  // (ggml_type, GFLOP/s); no probe writes it yet

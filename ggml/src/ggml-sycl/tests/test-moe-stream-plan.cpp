@@ -1,5 +1,6 @@
 // llama.cpp-36j0 Task 7a: the layer stream list is a pure function of the plan, the regime and the ids.
 // Host-only: a hand-built 4-layer, 8-expert plan with 3 host experts per layer (1, 5, 6), no queue, no device.
+// A test-only reference list is also compared with the production moe_stream_plan_index_build at the end of main.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
@@ -190,6 +191,31 @@ int main() {
     std::vector<moe_stream_item> wrong_layer = all;
     wrong_layer[4].layer                     = 2;
     CHECK(!layer_fully_staged(wrong_layer, plan, 1, routed, 4));
+
+    // The reference above is checked against production: moe_stream_plan_index_build lists, for every layer with a
+    // host expert, the same (expert_id, role) sequence as the STREAM_ALL reference, and omits layer 3 (no host
+    // experts). The null prompt_kernel makes the production staging NONE for every item, and the hand-built entries'
+    // zeroed type and shape would force it too; only the list is compared. The comparison fails on a dropped role, a
+    // reordered expert, or a fused GATE_UP host entry listed as a triplet (layer 1 would then have 10 items, not 9).
+    const ggml_sycl::moe_stream_plan_index idx =
+        ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr);
+    for (int l = 0; l < kLayers; ++l) {
+        const auto ref = plan_build(plan, l, moe_exec_regime::STREAM_ALL, nullptr, 0);
+        const auto it  = idx.layers.find(l);
+        if (ref.empty()) {
+            CHECK(it == idx.layers.end());
+            continue;
+        }
+        CHECK(it != idx.layers.end());
+        if (it == idx.layers.end()) {
+            continue;
+        }
+        CHECK(it->second.items.size() == ref.size());
+        for (size_t i = 0; i < ref.size() && i < it->second.items.size(); ++i) {
+            CHECK(it->second.items[i].expert_id == ref[i].expert_id);
+            CHECK(it->second.items[i].role == ref[i].role);
+        }
+    }
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);
