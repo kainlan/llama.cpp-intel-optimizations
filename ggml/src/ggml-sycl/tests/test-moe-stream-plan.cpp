@@ -191,9 +191,11 @@ int main() {
     wrong_layer[4].layer                     = 2;
     CHECK(!layer_fully_staged(wrong_layer, plan, 1, routed, 4));
 
-    // The reference above is checked against production: moe_stream_plan_index_build lists, for every layer with a host
-    // expert, the same (expert_id, role) sequence as the STREAM_ALL reference, and omits layer 3 (no host experts).
-    // The hand-built entries have a zeroed type and shape, so the production staging is NONE; only the list is compared.
+    // The reference above is checked against production: moe_stream_plan_index_build lists, for every layer with a
+    // host expert, the same (expert_id, role) sequence as the STREAM_ALL reference, and omits layer 3 (no host
+    // experts). The hand-built entries have a zeroed type and shape, so the production staging is NONE; only the list
+    // is compared. The comparison fails on a dropped role, a reordered expert, or a fused GATE_UP host entry listed
+    // as a triplet (layer 1 would then have 10 items, not 9).
     const ggml_sycl::moe_stream_plan_index idx =
         ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr);
     for (int l = 0; l < kLayers; ++l) {
