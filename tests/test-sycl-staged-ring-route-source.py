@@ -19,8 +19,8 @@ What this gate pins:
   - lead ruling c-o9uw-1: the slice's tag agrees with the entry by construction. mem_handle::slice(offset, size,
     layout) names the layout only on an owned allocation (it refuses before anything else otherwise), the view applies
     it on every resolve and all four special members carry it; the ring slices each slot with the layout it is
-    acquired for, the phase acquires the AOS slot as AOS and the SOA slot as SOA, and the resolver still refuses a slot
-    whose resolved layout is not the entry's;
+    acquired for, the phase acquires its one slot per matrix as AOS and records AOS (the SOA staging is retired,
+    llama.cpp-9433), and the resolver still refuses a slot whose resolved layout is not the entry's;
   - c-las5 (1): a staged expert is served only as a plain MMVQ_COMPAT kernel on the submit queue, for a type that
     does not need its direct kernel. A weight the oneDNN batched prompt executor claims, any other kernel, a Q1_0 or
     NVFP4 matrix, a slice whose resolved layout is not the entry's, or a route either validator refuses falls through
@@ -31,11 +31,11 @@ What this gate pins:
     decline (llama.cpp-3460): one stage-table lookup in its expert loop, only for a non-device expert, keyed as the
     staged route keys it, the slot and layout from the entry, the entry's ready event on the executor's barrier, and
     the slot's lease held until the done marker;
-  - a prompt layer whose routed host experts are all staged, for a weight the batched executor claims once its host
-    experts are staged, leaves the hybrid world (plan Task 10, llama.cpp-3460): ggml_sycl_mul_mat_id asks the stage
-    table once, after begin_layer, on the ids begin_layer was given, together with the staged claim, and the one bool
-    clears plan_has_cpu_experts and joins the resident claim at the MMVQ-probe skip and the prompt route; decode keeps
-    `ne12 == 1 ||` and the retained prompt batch keeps allow_materialize=false;
+  - a prompt layer the executor claims leaves the hybrid world (plan Task 10, llama.cpp-3460; W2 of llama.cpp-a2xb):
+    ggml_sycl_mul_mat_id asks moe_stream_phase::executor_claims once, after begin_layer decided the layer, for the
+    layer begin_layer was given, and the one bool clears plan_has_cpu_experts and joins the resident claim at the
+    MMVQ-probe skip and the prompt route; decode keeps `ne12 == 1 ||` and the retained prompt batch keeps
+    allow_materialize=false. The resolver asks the same question, once per build, for the executor's handoff;
   - the device recipe is one function shared by a resident expert and a staged slot (one fact, one source);
   - the staged branch keeps no persistent handle: no moe_expert_handles[] write, no remember_moe_storage_handle, no
     handle retention; the transient pointer-table upload clears a staged slot's handle entry and keeps it out of the
@@ -242,12 +242,11 @@ FIND = "if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_
 HANDOFF = ("if (refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()) { "
            "moe_stream->count_executor_handoff(); } else { moe_stream->count_staged_route(refusal, refusal_detail); } ")
 SERVE_RETURN = HANDOFF + "if (refusal == moe_staged_route_refusal::NONE) { return staged; }"
-# Asked once per build, at the first executor entry, on the build's own ids: the answer the prompt path takes after
+# Asked once per build, at the first executor entry, for the build's layer: the answer the prompt path takes after
 # begin_layer (STAGED_LAYER_SET).
 EXECUTOR_TAKES = ("bool executor_asked = false; bool executor_takes = false; "
                   "const auto executor_takes_weight = [&]() { if (!executor_asked) { executor_asked = true; "
-                  "executor_takes = moe_stream->executor_staged(stream_layer, stream_role, ids, count, "
-                  "static_cast<int>(src0->ne[2])); } return executor_takes; };")
+                  "executor_takes = moe_stream->executor_claims(stream_layer); } return executor_takes; };")
 ROUTE_CORE = "::ggml_sycl_resolve_moe_expert_route_for_dispatch("
 LAMBDA_OPEN = ("auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, "
                "[&](int32_t expert_id) {")
@@ -683,15 +682,16 @@ def test_executor_entry_refused_by_its_consumer_mutants():
 
 def claim_executor_handoff_counted_apart(sycl: str, phase: str, hpp: str) -> bool:
     """An executor entry is a refusal only when the executor will not read it (llama.cpp-3460). On a weight the
-    executor takes whole, every host expert the build's ids route to staged for it (moe_stream_phase::executor_staged,
-    the answer the prompt path takes after begin_layer), the entry is the executor's handoff: counted apart from the
-    refusals, in the tally's own field, so the report's WARN stays for real refusals. The build asks executor_staged
-    once, lazily, at its first executor entry, before the lambda, on its own ids. Either way the expert falls through
-    to the route core, whose HOST answer the executor's expert loop takes to the stage table."""
+    executor takes (moe_stream_phase::executor_claims: the layer's RING decision stands, the executor claims every host
+    matrix of it and the ring is reserved, the answer the prompt path takes after begin_layer), the entry is the
+    executor's handoff: counted apart from the refusals, in the tally's own field, so the report's WARN stays for real
+    refusals. The build asks executor_claims once, lazily, at its first executor entry, before the lambda, for its own
+    layer. Either way the expert falls through to the route core, whose HOST answer the executor's expert loop takes
+    to the stage table."""
     b = build_body(sycl)
     br = staged_branch(sycl)
     n = norm(phase)
-    return (b.count("->executor_staged(") == 1 and b.count(EXECUTOR_TAKES) == 1
+    return (b.count("->executor_claims(") == 1 and "->executor_staged(" not in b and b.count(EXECUTOR_TAKES) == 1
             and ordered(b, EXECUTOR_TAKES, LAMBDA_OPEN) and br.count("executor_takes_weight()") == 1
             and ordered(br, REFUSAL_OPEN, EXECUTOR_REFUSAL, SERVE_RETURN)
             and body(n, HANDOFF_SIG) == HANDOFF_BODY and body(n, TALLY_HANDOFF_SIG) == TALLY_HANDOFF_BODY
@@ -711,12 +711,13 @@ def test_executor_handoff_counted_apart_mutants():
     # Every executor entry counted as a refusal again (the shape before the handoff field).
     assert not c(mutate(SYCL, HANDOFF, "moe_stream->count_staged_route(refusal, refusal_detail); "))
     # The phase asked per expert instead of once per build.
-    assert not c(mutate(SYCL, "&& executor_takes_weight()",
-                        "&& moe_stream->executor_staged(stream_layer, stream_role, ids, count, "
-                        "static_cast<int>(src0->ne[2]))"))
-    # The phase asked on another weight's role, so the gate's handoff reads the up weight's staging.
-    assert not c(mutate(SYCL, "executor_staged(stream_layer, stream_role, ids,",
-                        "executor_staged(stream_layer, expert_tensor_role::UP, ids,"))
+    assert not c(mutate(SYCL, "&& executor_takes_weight()", "&& moe_stream->executor_claims(stream_layer)"))
+    # The phase asked about another layer than the build's.
+    assert not c(mutate(SYCL, "executor_claims(stream_layer);", "executor_claims(stream_layer + 1);"))
+    # The retired per-ids stage-table question back in its place.
+    assert not c(mutate(SYCL, "executor_takes = moe_stream->executor_claims(stream_layer);",
+                        "executor_takes = moe_stream->executor_staged(stream_layer, stream_role, ids, count, "
+                        "static_cast<int>(src0->ne[2]));"))
     # A handoff counted as a refusal by the phase.
     assert not c(phase=mutate(PHASE, HANDOFF_BODY,
                               "{ staged_routes_.count(moe_staged_route_refusal::CLAIMED, nullptr); }"))
@@ -792,17 +793,15 @@ def test_executor_reads_staged_slots_mutants():
 
 # ---- a fully staged prompt layer leaves the hybrid world -------------------------------------------------------------
 
-# plan Task 10 (llama.cpp-3460): one bool, set once after begin_layer staged the layer, from the phase's
-# executor_staged: the consumer the index build recorded from the staged claim, and the stage table, on the ids
-# begin_layer was given. The claim is not asked again on that line (one fact, one source). The bool clears
-# plan_has_cpu_experts and joins the resident claim at the MMVQ-probe skip and at the prompt route, so the op reaches
-# the batched executor in the non-hybrid world.
+# plan Task 10 (llama.cpp-3460), W2 of llama.cpp-a2xb: one bool, set once after begin_layer decided the layer, from the
+# phase's executor_claims: the consumer the index build recorded from the staged claim, the layer's decision and the
+# ring. The claim is not asked again on that line (one fact, one source). The bool clears plan_has_cpu_experts and joins
+# the resident claim at the MMVQ-probe skip and at the prompt route, so the op reaches the batched executor in the
+# non-hybrid world.
 STAGED_LAYER_DECL = "bool pp_onednn_batched_claims_staged_layer = false;"
 STAGED_LAYER_BEGIN = ("if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) { "
                       "ctx.moe_stream->begin_layer(")
-STAGED_LAYER_SET = ("pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_staged(stream_call.layer, "
-                    "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name), prompt_ids_snapshot.data(), "
-                    "prompt_ids_snapshot.size(), stream_call.op.n_expert);")
+STAGED_LAYER_SET = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_claims(stream_call.layer);"
 STAGED_LAYER_ASSIGN = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->"
 # The release site stays directly after begin_layer (claim_staged_pointer_released_with_ring); the bool follows it,
 # inside the same block.
@@ -822,19 +821,19 @@ HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybr
 
 
 def claim_fully_staged_layer_leaves_hybrid(sycl: str) -> bool:
-    """A prompt op whose weight the batched executor takes with its routed host experts read from the ring leaves the
-    hybrid world (plan Task 10, llama.cpp-3460). ggml_sycl_mul_mat_id asks the phase exactly once
-    (`->executor_staged(`), after begin_layer staged the layer, keyed by the layer the phase stages under and the
-    plan's role classifier, on the ids begin_layer was given (no second copy of them). The phase answers from the
-    consumer its index build recorded from the staged claim and from the stage table, so the bool's line asks no claim:
-    a staged weight the executor does not claim stays hybrid because its entries carry the route's consumer. The one
-    bool clears plan_has_cpu_experts and joins the resident claim at the MMVQ-probe skip and at the prompt route;
-    decode keeps its unconditional `ne12 == 1 ||` term, and the retained prompt batch still builds with
-    allow_materialize=false."""
+    """A prompt op whose layer the batched executor claims, its host experts to be read from ring windows it stages,
+    leaves the hybrid world (plan Task 10, llama.cpp-3460; W2 of llama.cpp-a2xb). ggml_sycl_mul_mat_id asks the phase
+    exactly once (`->executor_claims(`), after begin_layer decided the layer, keyed by the layer the phase decides
+    under. The phase answers from the consumer its index build recorded from the staged claim, the layer's decision and
+    the ring, so the bool's line asks no claim: a layer with a matrix the executor does not claim stays hybrid because
+    that matrix stages NONE. The one bool clears plan_has_cpu_experts and joins the resident claim at the MMVQ-probe
+    skip and at the prompt route; decode keeps its unconditional `ne12 == 1 ||` term, and the retained prompt batch
+    still builds with allow_materialize=false."""
     m = body(norm(sycl), MMID_SIG)
     at = m.find(STAGED_LAYER_ASSIGN)
     assign = m[at:m.find(";", at) + 1] if at >= 0 else ""
-    return (m != "" and m.count("->executor_staged(") == 1 and "->fully_staged(" not in m
+    return (m != "" and m.count("->executor_claims(") == 1 and "->executor_staged(" not in m
+            and "->fully_staged(" not in m
             and "claims_staged_tensor(" not in assign and "claims_tensor(" not in assign
             and m.count(STAGED_LAYER_DECL) == 1
             and m.count(STAGED_LAYER_SET) == 1 and m.count(STAGED_LAYER_SITE) == 1
@@ -850,25 +849,25 @@ def test_fully_staged_layer_leaves_hybrid():
 def test_fully_staged_layer_leaves_hybrid_mutants():
     c = claim_fully_staged_layer_leaves_hybrid
     # The claim asked again on the bool's line: a second source for the consumer the index build recorded.
-    assert not c(mutate(SYCL, STAGED_LAYER_ASSIGN + "executor_staged(",
+    assert not c(mutate(SYCL, STAGED_LAYER_ASSIGN + "executor_claims(",
                         "pp_onednn_batched_claims_staged_layer = ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor("
-                        "*stream_call.plan, src0, ctx.device) && ctx.moe_stream->executor_staged("))
-    # The layer-wide question back in its place: it never reads the recorded consumer.
-    assert not c(mutate(SYCL, "ctx.moe_stream->executor_staged(stream_call.layer, "
-                              "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name), ",
-                        "ctx.moe_stream->fully_staged(stream_call.layer, "))
-    # Keyed by another role than the staged route's classifier.
-    assert not c(mutate(SYCL, "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name), prompt_ids_snapshot.data()",
-                        "ggml_sycl::expert_tensor_role::GATE, prompt_ids_snapshot.data()"))
+                        "*stream_call.plan, src0, ctx.device) && ctx.moe_stream->executor_claims("))
+    # The layer-wide stage-table question back in its place: it never reads the recorded consumer.
+    assert not c(mutate(SYCL, "ctx.moe_stream->executor_claims(stream_call.layer)",
+                        "ctx.moe_stream->fully_staged(stream_call.layer)"))
+    # The retired per-ids question back: it asks whether begin_layer staged the ids, which it no longer does.
+    assert not c(mutate(SYCL, "ctx.moe_stream->executor_claims(stream_call.layer)",
+                        "ctx.moe_stream->executor_staged(stream_call.layer, "
+                        "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name), prompt_ids_snapshot.data(), "
+                        "prompt_ids_snapshot.size(), stream_call.op.n_expert)"))
     # The stage table asked a second time, on the plan_has_cpu_experts line, as the brief's one-liner wrote it.
     assert not c(mutate(SYCL, PLAN_HAS_CPU,
                         "plan_has_cpu_experts = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && "
                         "!pp_onednn_batched_claims_staged_layer && !(ctx.moe_stream && "
-                        "ctx.moe_stream->executor_staged(stream_call_layer, role, ids_host.data(), ids_host.size(), "
-                        "n_exp));"))
+                        "ctx.moe_stream->executor_claims(stream_call_layer));"))
     # Keyed by another layer than the one the phase stages under.
-    assert not c(mutate(SYCL, "executor_staged(stream_call.layer,", "executor_staged(moe_cache_layer_id(src0->name),"))
-    # The table asked before begin_layer staged the layer, so the first op of a layer always stays hybrid.
+    assert not c(mutate(SYCL, "executor_claims(stream_call.layer)", "executor_claims(moe_cache_layer_id(src0->name))"))
+    # The phase asked before begin_layer decided the layer, so the first op of a layer always stays hybrid.
     m = mutate(SYCL, " " + STAGED_LAYER_SET + " } }", " } }")
     early = STAGED_LAYER_BEGIN.replace("ctx.moe_stream->begin_layer(",
                                        STAGED_LAYER_SET + " ctx.moe_stream->begin_layer(")
@@ -1323,7 +1322,12 @@ def test_trace():
 def test_trace_mutants():
     m = mutate(PHASE, END_PROMPT_HEAD, "{ if (!ubatch_live_ && !ring_ && table_.empty()) { report_staged_routes();")
     assert not claim_trace(m, {PHASE_REL: m})
-    m = mutate(PHASE, TRACE_EMIT, "(void) line;")
+    # The served/refused line formatted but never emitted. The window trace emits through the same sink call, so the
+    # mutant is made inside the report.
+    n = norm(PHASE)
+    rep = body(n, REPORT_SIG)
+    assert TRACE_EMIT in rep, "mutant precondition: the report emits its line"
+    m = n.replace(rep, rep.replace(TRACE_EMIT, "(void) line;", 1), 1)
     assert not claim_trace(m, {PHASE_REL: m})
     tree = dict(SYCL_TREE)
     tree["extra.cpp"] = '"' + TRACE_FMT + '"'
@@ -1433,9 +1437,7 @@ RING_ACQUIRE_DECL = "mem_handle acquire_slot(ggml_layout_mode layout);"
 RING_ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout)"
 RING_SLICE = "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);"
 PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
-PHASE_SOA_ACQUIRE = "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_SOA);"
 PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
-PHASE_SOA_ENTRY = "table_[key] = { soa, aos, reorder, GGML_LAYOUT_SOA };"
 TAG_AGREES = "if (view.layout != s->layout) { return moe_staged_route_refusal::LAYOUT; }"
 
 
@@ -1443,8 +1445,8 @@ def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp:
     """A ring slot's resolved layout is the layout the phase acquired it for, which is the layout its stage-table entry
     records: an owned allocation's slice may name its layout (any other handle refuses before deriving anything), the
     view applies the name on every resolve, every copy and move carries it, the ring slices with it, the phase asks
-    AOS for the AOS slot and SOA for the SOA slot and records those layouts, and the resolver still refuses, as a
-    layout refusal, a slot whose resolved layout is not its entry's."""
+    AOS for its one slot per matrix and records AOS, and asks no slot for SOA (the SOA staging is retired), and the
+    resolver still refuses, as a layout refusal, a slot whose resolved layout is not its entry's."""
     mh, mc, rh, rc, ph = norm(mem_hpp), norm(mem_cpp), norm(ring_hpp), norm(ring_cpp), norm(phase)
     tagged = body(mc, TAGGED_SLICE_SIG)
     view = body(mc, VIEW_SIG)
@@ -1453,7 +1455,8 @@ def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp:
             and ordered(view, "if (!view.ptr) { return view; }", VIEW_APPLY, "if (!is_slice_) {")
             and members_carry
             and RING_ACQUIRE_DECL in rh and RING_SLICE in body(rc, RING_ACQUIRE_SIG)
-            and ordered(ph, PHASE_AOS_ACQUIRE, PHASE_SOA_ACQUIRE) and PHASE_AOS_ENTRY in ph and PHASE_SOA_ENTRY in ph
+            and ordered(ph, PHASE_AOS_ACQUIRE, PHASE_AOS_ENTRY) and "acquire_slot(GGML_LAYOUT_SOA)" not in ph
+            and "GGML_LAYOUT_SOA" not in ph
             and TAG_AGREES in build_body(sycl))
 
 
@@ -1480,10 +1483,15 @@ def test_tag_is_the_layout_mutants():
     # The ring slicing every slot with its root's AOS tag again.
     assert not claim_tag_is_the_layout(
         *with_(3, RING_SLICE, "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes);"))
-    # The SOA slot acquired as AOS.
+    # The AOS slot acquired as SOA: its tag would disagree with the entry's layout.
     assert not claim_tag_is_the_layout(
-        *with_(4, PHASE_SOA_ACQUIRE,
-               "mem_handle soa = aos_only ? mem_handle() : ring_->acquire_slot(GGML_LAYOUT_AOS);"))
+        *with_(4, PHASE_AOS_ACQUIRE, "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_SOA);"))
+    # The entry recorded as SOA for an AOS slot.
+    assert not claim_tag_is_the_layout(
+        *with_(4, PHASE_AOS_ENTRY, PHASE_AOS_ENTRY.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")))
+    # A SOA slot acquired beside it again.
+    assert not claim_tag_is_the_layout(
+        *with_(4, PHASE_AOS_ACQUIRE, PHASE_AOS_ACQUIRE + " mem_handle soa = ring_->acquire_slot(GGML_LAYOUT_SOA);"))
     # The resolver trusting the entry without checking the slot agrees.
     assert not claim_tag_is_the_layout(*with_(5, TAG_AGREES, ""))
 
