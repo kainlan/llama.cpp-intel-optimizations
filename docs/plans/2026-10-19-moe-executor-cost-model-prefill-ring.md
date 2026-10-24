@@ -1693,7 +1693,16 @@ git commit -m "scripts, tests, docs: the MoE executor gate runs the Qwen B70 pre
 **Steps the coding agent runs itself:**
 
 1. Host family on the merged build: `ctest --test-dir build -R 'moe-exec|moe-stream|expert-loan|zone-sizing|tuning-cache-io|h2d-probe|staged-ring|moe-exec-knobs|kv-room-cost' --output-on-failure -j 1` -> all pass; `python3.13 -I scripts/check-sycl-alloc-zone-contract.py --root /Apps/llama.cpp` -> pass; `bash scripts/check-ctest-safety-net.sh --build-dir build` -> "safety net intact".
-2. Device tests, lead-run, one at a time: `ctest --test-dir build -R '^(mem-ops|moe-stream-ring|moe-expert-loan)$' --output-on-failure -j 1` on `level_zero:1`, then the same with `ONEAPI_DEVICE_SELECTOR=level_zero:0` -> pass on both cards, no 77.
+2. Device tests, lead-run, one at a time. The three ctest registrations pin `ONEAPI_DEVICE_SELECTOR=level_zero:1`, and a
+   selector set in the shell is silently overridden, so the B70 arm cannot run through ctest.
+   - B50 arm: `ctest --test-dir build -R '^(mem-ops|sycl-moe-stream-ring|sycl-moe-expert-loan)$' --output-on-failure -j 1`
+     (the registered names; `moe-stream-ring|moe-expert-loan` select nothing) -> pass, no 77.
+   - B70 arm: run the binaries directly after sourcing `setvars.sh`: `ONEAPI_DEVICE_SELECTOR=level_zero:0
+     build/bin/test-mem-ops`, `ONEAPI_DEVICE_SELECTOR=level_zero:0 build/bin/test-moe-stream-ring` and
+     `ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_STRICT_LEASES=1 build/bin/test-moe-expert-loan`. Score each by its
+     exit code (77 is a skip, not a pass) and by its "Device 0 (...)" line. On the B70 the loan test's
+     `refill_drops_an_unpreparable_triplet` case fails with "the WEIGHT zone took 16 GiB of 1 MiB fillers and still had
+     room" (llama.cpp-m0t7, a fixture limitation) and the other 14 cases pass (measured at f14082f2b on 2026-10-23).
 3. The probe: first start of `llama-completion` on each card logs `[MOE-EXEC] h2d probe device N: 2x.x GB/s (probed)`; the second logs `(tuning cache)`; `ls ~/.cache/llama.cpp/sycl-tuning/*-moe-exec-rates.json` lists one file per device.
 4. The gate: `nohup bash scripts/sycl-moe-exec-gate.sh <merge sha> > <scratchpad>/gate.log 2>&1 &` (detached, marker `GATE_DONE`, waiter armed on that word; memory `a-waiter-armed-on-the-wrong-marker-word...`) -> `verdicts_pass=11 GATE_DONE` (11 = every arm that can PASS; run 2 reached 8); the Q_pp arm's table shows pp512 >= 500 and pp2048 >= 800 with the auto-chosen `n_ubatch` in the CSV; Q_tok md5 == Q_tok_cpu md5; Q_tg >= 11.0 with `refill ... 100/100`-style equal counts; GO_gate, GO_pp, GO_noc, MI all green; resets = 0.
 5. The decision is a decision: `GGML_SYCL_MOE_EXEC=cpu` on Q_pp reproduces the before-number (13.5-14.4 at `-ub 256`, higher at auto `-ub`) and prints 48 `[MOE-EXEC] layer ... CPU (forced)` lines; `GGML_SYCL_MOE_EXEC_TRACE=1` on one Q_pp run shows `regime=STREAM_ALL p=0.99` for every layer at `-ub >= 256`, and a `-p 16` run shows `ROUTED_ONLY` with `CPU` chosen.
