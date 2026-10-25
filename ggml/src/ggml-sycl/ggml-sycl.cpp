@@ -90762,9 +90762,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // (src/llama-graph.cpp), but the gated activation takes the gate output as src[0]
                 // (ggml_swiglu_split(gate, up)), ggml's graph walk visits src[0] first, and SYCL reorders no graph. A
                 // model with no gate runs UP, DOWN, which the same mapping serves; a wrong order would cost misses=,
-                // not output. No window prefetches across layers: DOWN's last phase names none. The three roles of a
-                // layer share the ids, so their phases are the same. The window's deferred experts are read after it,
-                // and their copies ordered by one barrier before the window's dequants.
+                // not output. No window prefetches across layers: DOWN's last phase names none. The three roles'
+                // phases are the same because their inputs are: one ids tensor (one active set, one sort input), the
+                // role-invariant f16_expert_bytes and one planned slot, so one phase_experts. Were they to differ,
+                // the next role's prefetched phase 0 would hold another set, and window_begin aborts on it ("lost
+                // prefetched entries") instead of declining. The window's deferred experts are read after it, and
+                // their copies ordered by one barrier before the window's dequants.
                 if (pp_onednn_batched_claims_staged_layer) {
                     ggml_sycl::moe_stream_window_request window_req;
                     window_req.layer   = pp_stream_layer;
