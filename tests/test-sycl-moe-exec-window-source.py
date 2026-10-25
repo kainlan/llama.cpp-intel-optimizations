@@ -4,16 +4,19 @@ docs/plans/2026-10-24-prefill-window-ring.md, W1 and W4).
 Host-only: reads sources, builds nothing, loads no model and touches no device.
 
 On a layer the executor claims (pp_onednn_batched_claims_staged_layer, from moe_stream_phase::executor_claims), the
-batched executor is the ring's consumer one window at a time. What this gate pins, each claim with mutants that must
-turn it red (its positive controls):
+batched executor is the ring's consumer one window at a time, for each op that reads windows. What this gate pins,
+each claim with mutants that must turn it red (its positive controls):
   - the stream call lives at ggml_sycl_mul_mat_id's function scope, ahead of the prompt branch, so the op window_begin
     hands the ring (whose host_lease reads the call through op.graph_ctx) outlives the claim block; the claim is
     executor_claims(stream_call.layer);
-  - the expert loop defers a claimed layer's HOST experts (expert.deferred, AOS, the ring's only layout) and asks the
-    stage table nothing: their windows are not staged yet;
-  - on a claimed layer a phase is one window: phase_experts is capped at window_experts(), the region's slots, and the
-    phases and the f16 halves are built from the capped count; the WOQ arm never sees a claimed layer (asserted);
-  - each phase of a claimed layer asks window_begin exactly once with the phase's experts and the window after it (the
+  - whether an op reads windows is decided per op before the expert loop (pp_stream_windowed): its layer is claimed,
+    its role is GATE, UP or DOWN, and it runs the f16 arm. Every window block keys on it, never on the layer's claim,
+    and nothing asserts the WOQ arm away: a windowless op of a claimed layer runs as on an unclaimed one;
+  - the expert loop defers a windowed op's HOST experts (expert.deferred, AOS, the ring's only layout) and asks the
+    stage table nothing: their slots are read in their phase, after window_begin;
+  - for a windowed op a phase is one window: phase_experts is capped at window_experts(), the region's slots, and the
+    phases and the f16 halves are built from the capped count;
+  - each phase of a windowed op asks window_begin exactly once with the phase's experts and the window after it (the
     next phase of the role, or phase 0 of the next role in the order the graph dispatches them, GATE, UP, DOWN; none
     after DOWN), sums its return into pp_staged_experts and its misses, counted per window, into pp_window_misses; then
     reads each deferred expert's slot (resolve_deferred_expert: the entry's consumer, AOS, view and tag checks, the
@@ -188,19 +191,81 @@ def test_stream_call_at_function_scope_mutants():
     assert not c(mutate(SYCL, CLAIM, CLAIM.replace("stream_call.layer", "moe_cache_layer_id(src0->name)")))
 
 
-# ---- the expert loop defers a claimed layer's host experts -----------------------------------------------------------
+# ---- the window path is decided per op -------------------------------------------------------------------------------
+
+ROLE_DECL = ("const ggml_sycl::expert_tensor_role pp_stream_role = ctx.moe_stream ? "
+             "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) : ggml_sycl::expert_tensor_role::UNKNOWN;")
+WOQ_ARM = "const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);"
+WINDOWED = ("const bool pp_stream_windowed = pp_onednn_batched_claims_staged_layer && "
+            "ggml_sycl::detail::moe_expert_role_is_triplet(pp_stream_role) && !pp_woq_arm;")
+LAYER_FLAG = "pp_onednn_batched_claims_staged_layer"
+WOQ_ASSERT = "GGML_ASSERT(!pp_woq_arm || !pp_onednn_batched_claims_staged_layer);"
+SORT = "std::sort(active_experts.begin(), active_experts.end(),"
+# Each block that reads windows, as it opens: the deferral, the phase cap, the phase ids, the window request and the
+# readers_done barrier.
+WINDOWED_USES = (
+    "} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {",
+    "if (pp_stream_windowed) { phase_experts = std::min(",
+    "if (pp_stream_windowed) { phase_ids.reserve(active_count);",
+    "if (pp_stream_windowed) { ggml_sycl::moe_stream_window_request window_req;",
+    "if (pp_stream_windowed) { const sycl::event readers_done =",
+)
+
+
+def claim_window_path_is_per_op(sycl: str) -> bool:
+    """Whether an op reads ring windows is decided once per op, before the expert loop: its layer is claimed, its role
+    is one a window holds (GATE, UP or DOWN, the roles moe_stream_window_id takes, by the predicate the ring's index
+    uses), and it runs the f16 arm (the WOQ arm reads no window). A claimed layer can carry an op that is none of these,
+    a fused GATE_UP or CHUNK_* weight or a WOQ-arm MXFP4 role, because the claim counts only host matrices and such an
+    op's are all resident. Every block after the decision keys on pp_stream_windowed, never on the layer's claim, and
+    nothing asserts the WOQ arm away: the cache can evict a planned-device expert at runtime, so a windowless op's HOST
+    route is reachable, and it declines EXPERT_NOT_LOCAL as on an unclaimed layer (the deferral's else branch)."""
+    lam = body(norm(sycl), EXEC_SIG)
+    at = lam.find(WINDOWED)
+    return (at >= 0 and lam.count(WINDOWED) == 1 and lam.count(WOQ_ARM) == 1
+            and ordered(lam, ROLE_DECL, WOQ_ARM, WINDOWED, EARLY_LOOP)
+            and all(lam.count(use) == 1 for use in WINDOWED_USES)
+            and LAYER_FLAG not in lam[at + len(WINDOWED):] and "GGML_ASSERT(!pp_woq_arm" not in lam)
+
+
+def test_window_path_is_per_op():
+    assert claim_window_path_is_per_op(SYCL)
+
+
+def test_window_path_is_per_op_mutants():
+    c = claim_window_path_is_per_op
+    # The role test dropped: a claimed layer's fused GATE_UP or CHUNK_* op would ask window_begin, whose window id
+    # aborts on any role but GATE, UP or DOWN.
+    assert not c(mutate(SYCL, WINDOWED,
+                        WINDOWED.replace("ggml_sycl::detail::moe_expert_role_is_triplet(pp_stream_role) && ", "")))
+    # The WOQ term dropped: a claimed layer's resident MXFP4 op would stage windows its arm never reads.
+    assert not c(mutate(SYCL, WINDOWED, WINDOWED.replace(" && !pp_woq_arm", "")))
+    # The WOQ arm asserted away again instead of reading no window.
+    assert not c(mutate(SYCL, WOQ_ARM, WOQ_ARM + " " + WOQ_ASSERT))
+    # Decided after the expert loop, which defers on it.
+    m = mutate(SYCL, WINDOWED, "")
+    assert not c(m.replace(SORT, WINDOWED + " " + SORT, 1))
+
+
+@pytest.mark.parametrize("use", WINDOWED_USES)
+def test_window_path_is_per_op_layer_flag_mutants(use):
+    # The block keyed on the layer's claim again: the op's role and arm no longer decide it.
+    assert not claim_window_path_is_per_op(mutate(SYCL, use, use.replace("pp_stream_windowed", LAYER_FLAG)))
+
+
+# ---- the expert loop defers a windowed op's host experts -------------------------------------------------------------
 
 DEFERRED_FIELD = "bool deferred = false;"
-DEFERRED = ("} else if (pp_onednn_batched_claims_staged_layer && route.kind == moe_expert_route_kind::HOST) { "
+DEFERRED = ("} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) { "
             "expert.deferred = true; expert.layout = GGML_LAYOUT_AOS; } else { "
             "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "
             "ggml_sycl_expert_resolve_reason_name(route.reason), i02); }")
 
 
 def claim_early_loop_defers(sycl: str) -> bool:
-    """The expert loop marks a claimed layer's HOST expert deferred, with the AOS reader the ring's slots take (the
-    ring stages AOS only), and asks the stage table nothing: the window is not staged until its phase. Any other
-    non-device expert is declined EXPERT_NOT_LOCAL as before."""
+    """The expert loop marks a windowed op's HOST expert deferred, with the AOS reader the ring's slots take (the ring
+    stages AOS only), and asks the stage table nothing: the slot is read in its phase, after window_begin. Any other
+    non-device expert, a windowless op's included, is declined EXPERT_NOT_LOCAL as before."""
     lam = body(norm(sycl), EXEC_SIG)
     early = body(lam, EARLY_LOOP)
     return (early != "" and lam.count(EARLY_LOOP) == 1 and early.count(DEFERRED) == 1
@@ -218,14 +283,13 @@ def test_early_loop_defers_mutants():
     assert not c(mutate(SYCL, "expert.deferred = true;",
                         "(void) ctx.moe_stream->find(pp_stream_layer, static_cast<int>(i02), pp_stream_role); "
                         "expert.deferred = true;"))
-    # A host expert of a claimed layer declined instead of deferred (the interim inert ring).
+    # A host expert of a windowed op declined instead of deferred (the interim inert ring).
     assert not c(mutate(SYCL, "expert.deferred = true; ", ""))
     # Any route deferred, not only HOST.
-    assert not c(mutate(SYCL, "pp_onednn_batched_claims_staged_layer && route.kind == moe_expert_route_kind::HOST) {",
-                        "pp_onednn_batched_claims_staged_layer) {"))
-    # An unclaimed layer's host expert deferred: no window would ever stage it.
-    assert not c(mutate(SYCL, "} else if (pp_onednn_batched_claims_staged_layer && route.kind",
-                        "} else if (route.kind"))
+    assert not c(mutate(SYCL, "pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {",
+                        "pp_stream_windowed) {"))
+    # A windowless op's host expert deferred: no window would ever stage it.
+    assert not c(mutate(SYCL, "} else if (pp_stream_windowed && route.kind", "} else if (route.kind"))
     # The struct without the flag.
     assert not c(mutate(SYCL, DEFERRED_FIELD, ""))
 
@@ -233,28 +297,24 @@ def test_early_loop_defers_mutants():
 # ---- a phase is one window -------------------------------------------------------------------------------------------
 
 PHASE_CAP = ("size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group; "
-             "if (pp_onednn_batched_claims_staged_layer) { "
+             "if (pp_stream_windowed) { "
              "phase_experts = std::min(f16_groups.experts_per_group, "
              "static_cast<size_t>(ctx.moe_stream->window_experts())); "
              "GGML_ASSERT(phase_experts > 0); }")
 HALF_ELEMS = "const size_t half_elems = phase_experts * weight_elems;"
 PHASES_BUILD = "for (size_t begin = 0; begin < active_count; begin += phase_experts) {"
-WOQ_ARM = "const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);"
-WOQ_ASSERT = "GGML_ASSERT(!pp_woq_arm || !pp_onednn_batched_claims_staged_layer);"
-SORT = "std::sort(active_experts.begin(), active_experts.end(),"
-PHASE_IDS = ("std::vector<int32_t> phase_ids; if (pp_onednn_batched_claims_staged_layer) { "
+PHASE_IDS = ("std::vector<int32_t> phase_ids; if (pp_stream_windowed) { "
              "phase_ids.reserve(active_count); for (const pp_onednn_batched_expert & expert : active_experts) { "
              "phase_ids.push_back(expert.expert_id); } }")
 
 
 def claim_phase_is_a_window(sycl: str) -> bool:
-    """On a claimed layer the phase is capped at window_experts(), the region's slots, so a window never exceeds its
+    """For a windowed op the phase is capped at window_experts(), the region's slots, so a window never exceeds its
     region (window_begin aborts on one that does), and the f16 halves and the phases follow the capped count. The
-    phase ids are read after the experts are sorted, since a phase indexes the sorted list. The WOQ arm, which the
-    claim never admits (MXFP4), asserts it never meets a claimed layer."""
+    phase ids are read after the experts are sorted, since a phase indexes the sorted list."""
     lam = body(norm(sycl), EXEC_SIG)
     return (lam.count(PHASE_CAP) == 1 and "const size_t phase_experts" not in lam
-            and ordered(lam, WOQ_ARM, WOQ_ASSERT, PHASE_CAP, HALF_ELEMS, PHASES_BUILD)
+            and ordered(lam, WINDOWED, PHASE_CAP, HALF_ELEMS, PHASES_BUILD)
             and lam.count(PHASE_IDS) == 1 and ordered(lam, SORT, PHASE_IDS, PHASE_LOOP))
 
 
@@ -270,8 +330,6 @@ def test_phase_is_a_window_mutants():
     # The halves sized before the cap.
     m = mutate(SYCL, HALF_ELEMS, "")
     assert not c(m.replace(PHASE_CAP, HALF_ELEMS + " " + PHASE_CAP, 1))
-    # The WOQ arm's assert dropped.
-    assert not c(mutate(SYCL, WOQ_ASSERT, ""))
     # The phase ids read before the sort: a phase's window names the wrong experts.
     m = mutate(SYCL, PHASE_IDS, "")
     assert not c(m.replace(SORT, PHASE_IDS + " " + SORT, 1))
@@ -281,7 +339,7 @@ def test_phase_is_a_window_mutants():
 
 WINDOW_MISSES_DECL = "uint32_t window_misses = 0;"
 WINDOW_REQ = (
-    "if (pp_onednn_batched_claims_staged_layer) { ggml_sycl::moe_stream_window_request window_req; "
+    "if (pp_stream_windowed) { ggml_sycl::moe_stream_window_request window_req; "
     "window_req.layer = pp_stream_layer; window_req.role = pp_stream_role; window_req.phase = p; "
     "window_req.experts = phase_ids.data() + phase.begin; window_req.n = phase.end - phase.begin;"
 )
@@ -302,7 +360,7 @@ DEFERRED_LOOP = ("for (size_t i = phase.begin; i < phase.end; ++i) { if (active_
                  "!resolve_deferred_expert(active_experts[i], window_ready)) { return false; } }")
 WINDOW_BARRIER = "if (!window_ready.empty()) { stream->ext_oneapi_submit_barrier(window_ready); } }"
 DEQUANT = "dequant_expert_f16(active_experts[i], phase_weights + (i - phase.begin) * weight_elems);"
-READERS_DONE = ("if (pp_onednn_batched_claims_staged_layer) { "
+READERS_DONE = ("if (pp_stream_windowed) { "
                 "const sycl::event readers_done = stream->ext_oneapi_submit_barrier(); "
                 "ctx.moe_stream->window_done(pp_stream_layer, pp_stream_role, p, readers_done); }")
 GEMM_TRY = "try { const sycl::event deps_in = stream->ext_oneapi_submit_barrier();"
@@ -313,7 +371,7 @@ PHASE_STEPS = (WINDOW_REQ, NEXT_FILL, WINDOW_MISSES_DECL + " " + WINDOW_BEGIN, M
 
 
 def claim_phase_brackets_its_window(sycl: str) -> bool:
-    """Each phase of a claimed layer asks window_begin exactly once, with the phase's experts and the window after it
+    """Each phase of a windowed op asks window_begin exactly once, with the phase's experts and the window after it
     (W1: the next phase of the role, else phase 0 of the next role in the order the graph dispatches them, GATE, UP,
     DOWN, and nothing after DOWN, since no window prefetches across layers). The order is the graph's, not the FFN
     builder's: the builder creates the up matmul first, but the gated activation takes the gate output as src[0]

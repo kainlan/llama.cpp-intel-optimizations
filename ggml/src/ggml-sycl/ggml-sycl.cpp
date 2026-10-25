@@ -89924,7 +89924,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 layout_mode           layout    = GGML_LAYOUT_AOS;  // the layout the expert is materialized in
                 to_fp16_sycl_t        to_fp16   = nullptr;  // the f16 arm's converter for `layout` (see pp_q8_0_soa)
                 ggml_sycl::mem_handle lease;
-                bool deferred = false;  // a claimed layer's host expert: its slot is read after its window_begin
+                bool deferred = false;  // a host expert of an op that reads ring windows: read after its window_begin
             };
 
             // host-stall attribution cycle, phase 3/6: everything from
@@ -89952,6 +89952,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const ggml_sycl::expert_tensor_role pp_stream_role =
                 ctx.moe_stream ? ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) :
                                  ggml_sycl::expert_tensor_role::UNKNOWN;
+
+            // llama.cpp-sr83 (C3): default ON -- the batched executor repacks
+            // straight to the {nibbles,e8m0-scales} WOQ shape and hands
+            // oneDNN's WOQ matmul the quantized weights directly, deleting
+            // the f16 dequant. =0 keeps the pre-C3 f16-dequant arm (also the
+            // fallback path if the WOQ oneDNN primitive ever regresses).
+            // Reads through the shared helper (fix cycle, defect 1) so this
+            // stays in lockstep with the claims predicate and the candidate
+            // gate above -- a local copy here previously let WOQ=0 keep
+            // reaching this lambda for tiled ops even after the predicate
+            // was taught the same restriction, which is exactly the
+            // divergence that produced the original bug.
+            const bool pp_woq_enabled = ggml_sycl_moe_pp_woq_enabled();
+            // llama.cpp-348c: the WOQ arm is MXFP4's alone (moe_pp_batched_woq_supports_layout); every other type the
+            // tables take, and MXFP4 under GGML_SYCL_MOE_PP_WOQ=0, runs the f16 arm.
+            const bool pp_woq_arm     = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);
+
+            // llama.cpp-8epx: whether this op reads ring windows, decided once for the op. Windows hold only a claimed
+            // layer's GATE, UP and DOWN host matrices, which the f16 arm dequantizes. Such a layer's other ops have no
+            // host expert, or the layer would not be claimed: a fused GATE_UP or CHUNK_* weight, or an MXFP4 role (the
+            // WOQ arm's type, which the ring refuses), is all resident. Any other op runs uncapped and windowless, and
+            // a HOST route there (the cache can evict a planned-device expert at runtime) declines EXPERT_NOT_LOCAL in
+            // the expert loop, as on a layer the executor does not claim.
+            const bool pp_stream_windowed = pp_onednn_batched_claims_staged_layer &&
+                                            ggml_sycl::detail::moe_expert_role_is_triplet(pp_stream_role) &&
+                                            !pp_woq_arm;
 
             for (int64_t i02 = 0; i02 < n_as; ++i02) {
                 const size_t row_begin = row_map_offsets[static_cast<size_t>(i02)];
@@ -89991,13 +90017,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     expert.ptr    = route.ptr;
                     expert.layout = route.actual_layout;
                     expert.lease  = std::move(route.lease);
-                } else if (pp_onednn_batched_claims_staged_layer && route.kind == moe_expert_route_kind::HOST) {
-                    // llama.cpp-8epx: a host expert of a layer the executor takes whole from the ring
-                    // (pp_onednn_batched_claims_staged_layer). The staged route handed its entry off to this executor
-                    // (llama.cpp-3460), so the expert's route is the host one. Its window is not staged yet: the phase
-                    // loop below asks window_begin for each phase's window, then reads the slot
-                    // (resolve_deferred_expert), so nothing asks the stage table here. The ring stages AOS only (W2),
-                    // so the reader is picked for AOS below, and resolve_deferred_expert asserts the entry holds it.
+                } else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {
+                    // llama.cpp-8epx: a host expert of an op that reads ring windows (pp_stream_windowed). The route is
+                    // HOST because the plan put the expert on the host. Any entry the ring already staged for it (a
+                    // window the previous role prefetched) was handed to this executor by the staged route
+                    // (llama.cpp-3460). Its slot is read in its phase (resolve_deferred_expert), after window_begin,
+                    // which stages it if no prefetch did, so nothing asks the stage table here. The ring stages AOS
+                    // only (W2), so the reader is picked for AOS below, and resolve_deferred_expert asserts the entry
+                    // holds it.
                     expert.deferred = true;
                     expert.layout   = GGML_LAYOUT_AOS;
                 } else {
@@ -90073,18 +90100,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 out = a * b;
                 return true;
             };
-            // llama.cpp-sr83 (C3): default ON -- the batched executor repacks
-            // straight to the {nibbles,e8m0-scales} WOQ shape and hands
-            // oneDNN's WOQ matmul the quantized weights directly, deleting
-            // the f16 dequant. =0 keeps the pre-C3 f16-dequant arm (also the
-            // fallback path if the WOQ oneDNN primitive ever regresses).
-            // Reads through the shared helper (fix cycle, defect 1) so this
-            // stays in lockstep with the claims predicate and the candidate
-            // gate above -- a local copy here previously let WOQ=0 keep
-            // reaching this lambda for tiled ops even after the predicate
-            // was taught the same restriction, which is exactly the
-            // divergence that produced the original bug.
-            const bool    pp_woq_enabled    = ggml_sycl_moe_pp_woq_enabled();
             const bool    experts_are_tiled = route_layout == GGML_LAYOUT_XMX_TILED;
             const int     blocks_per_row    = static_cast<int>(ne00 / QK_MXFP4);
             const auto &  xmx_caps_for_tile = ggml_sycl_info().devices[ctx.device].xmx_caps;
@@ -90093,13 +90108,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (experts_are_tiled && tile_n_total <= 0) {
                 return reject_batched(moe_pp_batched_refusal::XMX_TILE_CAPS, nullptr);
             }
-            // llama.cpp-348c: the WOQ arm is MXFP4's alone (moe_pp_batched_woq_supports_layout); every other type the
-            // tables take, and MXFP4 under GGML_SYCL_MOE_PP_WOQ=0, runs the f16 arm.
-            const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);
-            // llama.cpp-8epx: the ring's claim never admits MXFP4 (moe_pp_batched_takes_staged_type), so the WOQ arm
-            // never reads a ring window. A claim that admits it must teach the WOQ arm windows first; this fails
-            // loudly instead of staging windows the arm never reads.
-            GGML_ASSERT(!pp_woq_arm || !pp_onednn_batched_claims_staged_layer);
             // llama.cpp-sr83 (fix cycle, defect 1 -- team-lead COMPARE evidence
             // 2026-08-22): dequantize_row_mxfp4_soa_to_fp16_rowmajor (the f16
             // arm's only dequant kernel) reads its SOA-shaped index math
@@ -90568,14 +90576,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 size_t end    = 0;
                 size_t buffer = 0;  // the f16 slot buffer its experts are dequantized into
             };
-            // llama.cpp-8epx: on a layer the executor claims, a phase is one ring window (W1, W4 of
+            // llama.cpp-8epx: for an op that reads ring windows, a phase is one ring window (W1, W4 of
             // docs/plans/2026-10-24-prefill-window-ring.md), so it holds at most window_experts() experts, a ring
             // region's slots. A group the slot would take whole then splits into more phases. With two buffers they
             // alternate halves as above. With one (every active expert fits the slot) every phase lands in buffer 0,
             // so each phase's dequant waits for the previous phase's GEMMs (the half_readers barrier below) although
             // the slot could hold every expert: those phases run one after another.
             size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group;
-            if (pp_onednn_batched_claims_staged_layer) {
+            if (pp_stream_windowed) {
                 phase_experts =
                     std::min(f16_groups.experts_per_group, static_cast<size_t>(ctx.moe_stream->window_experts()));
                 GGML_ASSERT(phase_experts > 0);
@@ -90592,9 +90600,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 phases.push_back(phase);
             }
             // The active experts' ids in phase order (active_experts is sorted by rows above), so phase p's window
-            // is phase_ids[phases[p].begin, phases[p].end). Only a claimed layer asks for windows.
+            // is phase_ids[phases[p].begin, phases[p].end). Only an op that reads windows asks for them.
             std::vector<int32_t> phase_ids;
-            if (pp_onednn_batched_claims_staged_layer) {
+            if (pp_stream_windowed) {
                 phase_ids.reserve(active_count);
                 for (const pp_onednn_batched_expert & expert : active_experts) {
                     phase_ids.push_back(expert.expert_id);
@@ -90756,7 +90764,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {
                 const pp_batched_phase & phase         = phases[p];
                 sycl::half *             phase_weights = batched_weights + phase.buffer * half_elems;
-                // llama.cpp-8epx: on a claimed layer this phase is one ring window (W1). window_begin is asked exactly
+                // llama.cpp-8epx: for a windowed op this phase is one ring window (W1). window_begin is asked exactly
                 // once per window: it copies the window's host matrices no prefetch staged into a region, and the
                 // window after it into the other region, under this window's dequants and GEMMs. That window is the
                 // next phase of this role, else phase 0 of the next role in the order the graph dispatches a layer's
@@ -90770,7 +90778,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // the next role's prefetched phase 0 would hold another set, and window_begin aborts on it ("lost
                 // prefetched entries") instead of declining. The window's deferred experts are read after it, and
                 // their copies ordered by one barrier before the window's dequants.
-                if (pp_onednn_batched_claims_staged_layer) {
+                if (pp_stream_windowed) {
                     ggml_sycl::moe_stream_window_request window_req;
                     window_req.layer   = pp_stream_layer;
                     window_req.role    = pp_stream_role;
@@ -90819,7 +90827,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // in-order queue (c-las5), so a barrier behind them is the window's read gate: the ring's next refill
                 // of the region holding this window waits for it (moe_stream_phase::window_done). oneDNN reads only
                 // the f16 slot, never the ring's.
-                if (pp_onednn_batched_claims_staged_layer) {
+                if (pp_stream_windowed) {
                     const sycl::event readers_done = stream->ext_oneapi_submit_barrier();
                     ctx.moe_stream->window_done(pp_stream_layer, pp_stream_role, p, readers_done);
                 }

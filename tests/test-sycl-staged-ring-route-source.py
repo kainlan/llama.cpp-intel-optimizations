@@ -335,21 +335,22 @@ EXEC_SRCS_USES = (
 ONEDNN_CALLS = ("DnnlGemmWrapper::gemm_batch_strided(", "DnnlGemmWrapper::woq_gemm_batch_mxfp4(")
 EXPERT_NAMES = ("expert.ptr", "expert_src", "repack_srcs", "active_experts", "route.ptr", "moe_stream")
 # The executor's read of a staged slot (llama.cpp-3460): the stage-table key, built as the staged route builds it.
-# Since the window ring (llama.cpp-8epx) the expert loop only defers a claimed layer's HOST expert, and the phase loop
-# reads its slot after that phase's window_begin staged it, through resolve_deferred_expert, onto the window's barrier.
+# Since the window ring (llama.cpp-8epx) the expert loop only defers the HOST expert of an op that reads windows
+# (pp_stream_windowed: a claimed layer's GATE, UP or DOWN op on the f16 arm), and the phase loop reads its slot after
+# that phase's window_begin staged it, through resolve_deferred_expert, onto the window's barrier.
 EXEC_STREAM_KEY = (
     "const int pp_stream_layer = ctx.moe_stream ? ggml_sycl_moe_stream_layer_of(src0) : -1;",
     "const ggml_sycl::expert_tensor_role pp_stream_role = ctx.moe_stream ? "
     "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) : ggml_sycl::expert_tensor_role::UNKNOWN;",
 )
 EXEC_FIND = "ctx.moe_stream->find(pp_stream_layer, expert.expert_id, pp_stream_role)"
-# The deferred branch is a HOST route's only, and only on a layer the executor claims: a device route takes the device
+# The deferred branch is a HOST route's only, and only for an op that reads windows: a device route takes the device
 # branch, and any other route the core can answer (UNAVAILABLE, REFUSED) is recoverable and is declined like an expert
 # the executor cannot read (lead ruling, quality r2). An executor entry is AOS-only, and its view is checked as the
 # staged route checks a slot's: on this device, and tagged with the entry's layout (lead ruling c-o9uw-1). A deferred
 # expert the window did not stage is declined, never aborted (the 9433 contract), and every decline in the phase loop
 # first drains the phases it already submitted.
-EXEC_DEFER = ("} else if (pp_onednn_batched_claims_staged_layer && route.kind == moe_expert_route_kind::HOST) { "
+EXEC_DEFER = ("} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) { "
               "expert.deferred = true; expert.layout = GGML_LAYOUT_AOS; } else { ")
 EXEC_HOST_ONLY = ("return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "
                   "ggml_sycl_expert_resolve_reason_name(route.reason), i02); }")
@@ -788,11 +789,15 @@ def test_executor_reads_staged_slots_mutants():
     assert not c(mutate(SYCL, "expert.lease = staged->aos;", ""))
     # An expert deferred under a route other than HOST (UNAVAILABLE, REFUSED), so the executor reads a slot whose
     # expert the route core could not place.
-    assert not c(mutate(SYCL, "pp_onednn_batched_claims_staged_layer && route.kind == moe_expert_route_kind::HOST) {",
-                        "pp_onednn_batched_claims_staged_layer) {"))
-    # A host expert deferred on a layer the executor does not claim, where no window is staged for it.
-    assert not c(mutate(SYCL, "pp_onednn_batched_claims_staged_layer && route.kind == moe_expert_route_kind::HOST) {",
+    assert not c(mutate(SYCL, "pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {",
+                        "pp_stream_windowed) {"))
+    # A host expert deferred for an op that reads no window, where no window is staged for it.
+    assert not c(mutate(SYCL, "pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {",
                         "route.kind == moe_expert_route_kind::HOST) {"))
+    # Deferred on the layer's claim instead: a claimed layer's fused or WOQ-arm op would defer a host expert no window
+    # stages.
+    assert not c(mutate(SYCL, "pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {",
+                        "pp_onednn_batched_claims_staged_layer && route.kind == moe_expert_route_kind::HOST) {"))
     # A device expert deferred as well.
     assert not c(mutate(SYCL, "expert.lease = std::move(route.lease); } else if",
                         "expert.lease = std::move(route.lease); expert.deferred = true; } else if"))
