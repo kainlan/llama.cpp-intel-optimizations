@@ -579,9 +579,12 @@ static void test_reserve_completes_across_two_calls_from_scattered_room(sycl::qu
     // Sub-case 3: the partial slots of one geometry go back before a reserve() of another takes its own.
     {
         std::vector<mem_handle> refill;
+        bool                    refilled = true;
         for (uint32_t i = 0; i < kSlots - kLeft; ++i) {
             refill.push_back(hold_weight_bytes(device, kHole));
+            refilled = refilled && refill.back().valid();
         }
+        CHECK(refilled, "%u fillers take all but %u holes back again, for the other geometry", kSlots - kLeft, kLeft);
         moe_stream_ring ring;
         CHECK(!ring.reserve(device, geo), "with room for %u slots the %u-slot ring is refused again", kLeft, kSlots);
         const auto small = make_geometry(kSlot, 2, 2 * kSlot);
