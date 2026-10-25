@@ -1938,6 +1938,64 @@ def test_teardown_mutants():
         in_body(PHASE, END_PROMPT_SIG, "teardown(ring_ ? compute_barrier() : sycl::event());", ""))
 
 
+PENDING_DECL = "std::unique_ptr<moe_stream_ring> pending_ring_;"
+PENDING_TAKE = ("std::unique_ptr<moe_stream_ring> ring = pending_ring_ ? std::move(pending_ring_) : "
+                "std::make_unique<moe_stream_ring>();")
+PENDING_KEEP = "pending_ring_ = std::move(ring);"
+PENDING_DROP = "pending_ring_.reset();"
+END_PROMPT_EARLY = "if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) { return; }"
+TEARDOWN_RING_IF = "if (ring_)"
+
+
+def claim_partial_reservation_survives_the_ubatch(phase: str, hpp: str) -> bool:
+    """A refused reserve keeps the slots it got (llama.cpp-am87), and the phase keeps the refused ring for the next
+    micro-batch's attempt, which continues from those slots instead of asking the zone for the whole ring again.
+    ring_ready() takes the pending ring when there is one, stores a refused ring back before the latch, and moves a
+    reserved ring into ring_. The pending ring is nobody's ring: no other member function reads it, so neither the
+    executor's claim nor the release count can take it for a reserved one. teardown() drops it outside its ring_
+    branch (a pending ring exists only while ring_ does not, and it handed nothing out, so its slots go back at once),
+    and end_prompt() does not skip the teardown while one is held. A new geometry or device is the ring's own business:
+    reserve() gives the partial slots back and starts over."""
+    n = norm(phase)
+    ready = body(n, RING_READY_SIG)
+    at = ready.find(RESERVE_SHORT_IF + " {")
+    branch = body(ready[at:], RESERVE_SHORT_IF) if at >= 0 else ""
+    td = body(n, TEARDOWN_SIG)
+    return (norm(hpp).count(PENDING_DECL) == 1 and n.count("pending_ring_") == 5
+            and ordered(ready, LATCH_GUARD, PENDING_TAKE, RESERVE_SHORT_IF, RING_READY_RESET)
+            and branch.startswith("{ " + PENDING_KEEP + " " + LATCH_SET)
+            and td.count(PENDING_DROP) == 1 and PENDING_DROP not in body(td, TEARDOWN_RING_IF)
+            and END_PROMPT_EARLY in body(n, END_PROMPT_SIG))
+
+
+def test_partial_reservation_survives_the_ubatch():
+    assert claim_partial_reservation_survives_the_ubatch(PHASE, PLAN_HPP)
+
+
+def test_partial_reservation_mutants():
+    def c(phase=PHASE, hpp=PLAN_HPP):
+        return claim_partial_reservation_survives_the_ubatch(phase, hpp)
+
+    # The refused ring dropped: its slots go back, and the next attempt asks the zone for the whole ring again.
+    assert not c(phase=mutate(PHASE, PENDING_KEEP + " " + LATCH_SET, LATCH_SET))
+    # Every attempt starts from an empty ring.
+    assert not c(phase=mutate(PHASE, PENDING_TAKE,
+                              "std::unique_ptr<moe_stream_ring> ring = std::make_unique<moe_stream_ring>();"))
+    # A reserved ring kept pending: nobody would stage into it.
+    assert not c(phase=mutate(PHASE, RING_READY_RESET, PENDING_KEEP + " reset_regions(); return true;"))
+    # The pending ring taken for a reserved one.
+    assert not c(phase=in_body(PHASE, RING_READY_SIG, "if (ring_) { return true; }",
+                               "if (ring_ || pending_ring_) { return true; }"))
+    # teardown keeps it, or drops it only where a reserved ring is, which a pending ring never is.
+    assert not c(phase=in_body(PHASE, TEARDOWN_SIG, " " + PENDING_DROP, ""))
+    inside = in_body(PHASE, TEARDOWN_SIG, " " + PENDING_DROP, "")
+    assert not c(phase=in_body(inside, TEARDOWN_SIG, "++ring_releases_;", "++ring_releases_; " + PENDING_DROP))
+    # end_prompt skips the teardown while only a pending ring is held: its slots would stay out through decode.
+    assert not c(phase=mutate(PHASE, "!ring_ && !pending_ring_ &&", "!ring_ &&"))
+    # The member gone from the phase's declaration.
+    assert not c(hpp=mutate(PLAN_HPP, PENDING_DECL, ""))
+
+
 # ---- the context's wiring --------------------------------------------------------------------------------------------
 
 MEMBER = "std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;"

@@ -471,7 +471,7 @@ HANDOFF_BODY = "{ staged_routes_.count_handoff(); }"
 TALLY_HANDED_OFF = "size_t handed_off = 0;"
 TALLY_HANDOFF_SIG = "void moe_staged_route_tally::count_handoff()"
 TALLY_HANDOFF_BODY = "{ ++handed_off; }"
-END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && table_.empty()) {"
+END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) {"
 DTOR_SIG = "moe_stream_phase::~moe_stream_phase()"
 DTOR_HEAD = "{ report_staged_routes(); teardown("
 REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.handed_off != 0 || "
@@ -1370,7 +1370,8 @@ def test_trace():
 
 
 def test_trace_mutants():
-    m = mutate(PHASE, END_PROMPT_HEAD, "{ if (!ubatch_live_ && !ring_ && table_.empty()) { report_staged_routes();")
+    m = mutate(PHASE, END_PROMPT_HEAD,
+               "{ if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) { report_staged_routes();")
     assert not claim_trace(m, {PHASE_REL: m})
     # The served/refused line formatted but never emitted. The window trace emits through the same sink call, so the
     # mutant is made inside the report.

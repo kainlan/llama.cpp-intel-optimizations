@@ -215,7 +215,7 @@ void moe_stream_phase::layer_done(int layer, sycl::event down_done) {
 
 void moe_stream_phase::end_prompt() {
     report_staged_routes();
-    if (!ubatch_live_ && !ring_ && table_.empty()) {
+    if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) {
         return;  // every decode graph after the first: nothing to drop
     }
     // The next prompt explains its own unavailable ring, and asks for its own loans (a refusal held only this one).
@@ -409,7 +409,9 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
 // every layer runs on the CPU reserves nothing. A failed reserve stays failed for the rest of the micro-batch: one
 // attempt per micro-batch. A reserve the WEIGHT zone was short of asks the backend for an expert loan of the shortfall
 // at the next graph boundary, so the next micro-batch's attempt may succeed, until a loan this prompt asked for comes
-// back refused (llama.cpp-3460, c-0tmn).
+// back refused (llama.cpp-3460, c-0tmn). A refused reserve keeps the slots it got, and its ring waits in pending_ring_
+// for the next micro-batch's attempt, which continues from those slots, so the room a loan freed in holes a slot wide
+// adds up across attempts instead of being asked for again as one block (llama.cpp-am87).
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;
@@ -417,9 +419,11 @@ bool moe_stream_phase::ring_ready() {
     if (reserve_failed_ || geo_.n_slots == 0 || !in_order_) {
         return false;
     }
-    std::unique_ptr<moe_stream_ring> ring        = std::make_unique<moe_stream_ring>();
-    size_t                           bytes_short = 0;
+    std::unique_ptr<moe_stream_ring> ring =
+        pending_ring_ ? std::move(pending_ring_) : std::make_unique<moe_stream_ring>();
+    size_t bytes_short = 0;
     if (!ring->reserve(device_, geo_, &bytes_short)) {
+        pending_ring_   = std::move(ring);
         reserve_failed_ = true;
         if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_) ==
             moe_stream_loan_step::REFUSED) {
@@ -467,7 +471,8 @@ sycl::event moe_stream_phase::compute_barrier() {
 
 // Gives the ring back after the device's last use of it (ruling D, c-fjx1): the current region closes on last_use,
 // and one slot, which retains the whole reservation, is held until last_use too, because a region closed earlier
-// carries a gate that precedes its readers, the executor's dequants. The table's handles then go.
+// carries a gate that precedes its readers, the executor's dequants. The table's handles then go. A partial
+// reservation kept for the next attempt (ring_ready()) handed nothing out, so its slots go back at once.
 void moe_stream_phase::teardown(sycl::event last_use) {
     if (ring_) {
         close_region(last_use);
@@ -478,6 +483,7 @@ void moe_stream_phase::teardown(sycl::event last_use) {
         ring_.reset();
         ++ring_releases_;
     }
+    pending_ring_.reset();
     anchor_ = mem_handle();
     table_.clear();
     reset_regions();

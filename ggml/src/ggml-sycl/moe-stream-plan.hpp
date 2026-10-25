@@ -867,6 +867,9 @@ class moe_stream_phase {
     void              warn_loan_refused(size_t bytes_short) const;
 
     std::unique_ptr<moe_stream_ring>                ring_;
+    // A refused reserve's ring and the slots it got, for the next micro-batch's ring_ready() to continue from. No other
+    // member reads it: it is not a ring the phase can stage into.
+    std::unique_ptr<moe_stream_ring>                pending_ring_;
     std::unordered_map<uint64_t, moe_stream_staged> table_;           // key = moe_stream_table_key(layer, expert, role)
     std::vector<uint64_t>                           region_keys_[2];  // the table keys whose slots each region holds
     int                                             cur_region_       = 0;      // flips with every epoch_boundary
