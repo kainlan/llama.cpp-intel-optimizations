@@ -23,9 +23,8 @@ each claim with mutants that must turn it red (its positive controls):
     entry's ready event onto a per-window barrier, the slot's lease held), dequantizes, submits the readers_done barrier
     and hands it to window_done, all before the phase's GEMMs;
   - window_begin itself (moe-stream-plan.cpp, read here, not edited) feeds both counts from the same two facts: its
-    *misses is the window's missing matrices unless the window is exposed, and note_window is fed (exposed, missing)
-    after both are known (c-qz9m item 2: `*misses = missing` survived every gate). The pin accepts the Task 2c form,
-    which moves the note after the prefetch and adds a byte count;
+    *misses is the window's missing matrices unless the window is exposed, and note_window is fed (exposed, missing,
+    the window's staged bytes) after both are known (c-qz9m item 2: `*misses = missing` survived every gate);
   - a window is exposed (its copies counted apart from misses=) only when it is its layer's first in the micro-batch:
     every later window, UP phase 0 included, was prefetched under the one before it, so moe_stream_window_exposed
     names no role (an earlier clause named UP phase 0, the builder's source order, and hid a prefetched window);
@@ -454,17 +453,16 @@ WB_SIG = "uint32_t moe_stream_phase::window_begin(const moe_stream_window_reques
 WB_MISSING = "missing += find(item.layer, item.expert_id, item.role) == nullptr ? 1u : 0u;"
 WB_EXPOSED = "const bool exposed = moe_stream_window_exposed(req.layer, req.role, req.phase, prev_window_layer_);"
 WB_MISSES = "if (misses != nullptr) { *misses = exposed ? 0 : missing; }"
-# (exposed, missing) first; the Task 2c form (llama.cpp-4huq) adds one more argument, the window's staged bytes.
-WB_NOTE_RE = re.compile(r"if \(log_ != nullptr\) \{ log_->note_window\(exposed, missing(?:, [A-Za-z_]\w*)?\); \}")
-WB_STAGED = "uint32_t staged = 0;"
+# (exposed, missing, the window's staged bytes): the three-argument form Task 2c (llama.cpp-4huq) landed.
+WB_NOTE_RE = re.compile(r"if \(log_ != nullptr\) \{ log_->note_window\(exposed, missing, [A-Za-z_]\w*\); \}")
 
 
 def claim_window_begin_feeds_misses_and_note(plan_cpp: str) -> bool:
     """window_begin answers the executor's *misses and feeds the decision log's note_window from the same two facts:
     the window's matrices no entry holds after any staging (missing), and whether the window's copies were exposed.
     *misses is the missing count unless the window was exposed (an exposed window's copies are the trace's other
-    count, so the executor's misses= reads only hidden-copy misses), and note_window gets (exposed, missing). Both
-    follow the exposed decision, and each is fed once."""
+    count, so the executor's misses= reads only hidden-copy misses), and note_window gets (exposed, missing) and the
+    window's staged bytes. Both follow the exposed decision, and each is fed once."""
     wb = body(norm(plan_cpp), WB_SIG)
     notes = WB_NOTE_RE.findall(wb)
     if wb == "" or len(notes) != 1 or wb.count("note_window(") != 1 or wb.count("*misses") != 1:
@@ -475,15 +473,6 @@ def claim_window_begin_feeds_misses_and_note(plan_cpp: str) -> bool:
 
 def test_window_begin_feeds_misses_and_note():
     assert claim_window_begin_feeds_misses_and_note(PLAN_CPP)
-
-
-def test_window_begin_feeds_misses_and_note_accepts_the_task_2c_form():
-    # Task 2c moves the note after the prefetch and adds the window's staged bytes; that is the same feed.
-    note = WB_NOTE_RE.search(norm(PLAN_CPP)).group(0)
-    m = mutate(PLAN_CPP, note, "")
-    m = m.replace(WB_STAGED, "if (log_ != nullptr) { log_->note_window(exposed, missing, bytes_staged); } "
-                  + WB_STAGED, 1)
-    assert claim_window_begin_feeds_misses_and_note(m)
 
 
 def test_window_begin_feeds_misses_and_note_mutants():
@@ -501,6 +490,8 @@ def test_window_begin_feeds_misses_and_note_mutants():
     # The note fed the opposite exposure, or no missing count.
     assert not c(mutate(PLAN_CPP, "note_window(exposed, missing", "note_window(!exposed, missing"))
     assert not c(mutate(PLAN_CPP, "note_window(exposed, missing", "note_window(exposed, 0u"))
+    # The note fed without the window's staged bytes, the two-argument form before Task 2c.
+    assert not c(mutate(PLAN_CPP, note, re.sub(r", [A-Za-z_]\w*\); \}$", "); }", note)))
     # The note fed twice.
     assert not c(mutate(PLAN_CPP, note, note + " " + note))
     # The note fed before the window's exposure is known.
