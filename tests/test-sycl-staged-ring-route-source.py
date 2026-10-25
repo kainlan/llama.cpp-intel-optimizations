@@ -1485,7 +1485,8 @@ SPECIAL_MEMBERS = (
 )
 RING_ACQUIRE_DECL = "mem_handle acquire_slot(ggml_layout_mode layout);"
 RING_ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout)"
-RING_SLICE = "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);"
+# The slot's own allocation, re-tagged with the caller's layout (llama.cpp-am87: one allocation per slot).
+RING_SLICE = "return slots_[index].slice(0, geo_.slot_bytes, layout);"
 STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage_window("
 PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
 PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
@@ -1495,9 +1496,10 @@ TAG_AGREES = "if (view.layout != s->layout) { return moe_staged_route_refusal::L
 def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp: str, phase: str, sycl: str) -> bool:
     """A ring slot's resolved layout is the layout the phase acquired it for, which is the layout its stage-table entry
     records: an owned allocation's slice may name its layout (any other handle refuses before deriving anything), the
-    view applies the name on every resolve, every copy and move carries it, the ring slices with it, the phase asks
-    AOS for its one slot per matrix and records AOS, and asks no slot for SOA (the SOA staging is retired), and the
-    resolver still refuses, as a layout refusal, a slot whose resolved layout is not its entry's."""
+    view applies the name on every resolve, every copy and move carries it, the ring slices each slot's own allocation
+    with it, the phase asks AOS for its one slot per matrix and records AOS, and asks no slot for SOA (the SOA staging
+    is retired), and the resolver still refuses, as a layout refusal, a slot whose resolved layout is not its
+    entry's."""
     mh, mc, rh, rc, ph = norm(mem_hpp), norm(mem_cpp), norm(ring_hpp), norm(ring_cpp), norm(phase)
     stage = body(ph, STAGE_SIG)
     tagged = body(mc, TAGGED_SLICE_SIG)
@@ -1534,8 +1536,10 @@ def test_tag_is_the_layout_mutants():
     assert not claim_tag_is_the_layout(*with_(1, "view_layout_ = other.view_layout_;", ""))
     assert not claim_tag_is_the_layout(*with_(1, "view_layout_ = new_view_layout;", ""))
     # The ring slicing every slot with its root's AOS tag again.
+    assert not claim_tag_is_the_layout(*with_(3, RING_SLICE, "return slots_[index].slice(0, geo_.slot_bytes);"))
+    # The single-allocation ring's slice of one base, even with the caller's tag.
     assert not claim_tag_is_the_layout(
-        *with_(3, RING_SLICE, "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes);"))
+        *with_(3, RING_SLICE, "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);"))
     # The AOS slot acquired as SOA: its tag would disagree with the entry's layout.
     assert not claim_tag_is_the_layout(
         *with_(4, PHASE_AOS_ACQUIRE, "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_SOA);"))
