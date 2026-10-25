@@ -90020,12 +90020,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     expert.lease  = std::move(route.lease);
                 } else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {
                     // llama.cpp-8epx: a host expert of an op that reads ring windows (pp_stream_windowed). The route is
-                    // HOST because the plan put the expert on the host. Any entry the ring already staged for it (a
-                    // window the previous role prefetched) was handed to this executor by the staged route
-                    // (llama.cpp-3460). Its slot is read in its phase (resolve_deferred_expert), after window_begin,
-                    // which stages it if no prefetch did, so nothing asks the stage table here. The ring stages AOS
-                    // only (W2), so the reader is picked for AOS below, and resolve_deferred_expert asserts the entry
-                    // holds it.
+                    // HOST because the plan put the expert on the host, or because the cache evicted a planned-device
+                    // expert at runtime. The latter is in no window, so resolve_deferred_expert finds no entry for it
+                    // and declines it. Any entry the ring already staged for a planned host expert (a window the
+                    // previous role prefetched) was handed to this executor by the staged route (llama.cpp-3460). Its
+                    // slot is read in its phase (resolve_deferred_expert), after window_begin, which stages it if no
+                    // prefetch did, so nothing asks the stage table here. The ring stages AOS only (W2), so the reader
+                    // is picked for AOS below, and resolve_deferred_expert asserts the entry holds it.
                     expert.deferred = true;
                     expert.layout   = GGML_LAYOUT_AOS;
                 } else {

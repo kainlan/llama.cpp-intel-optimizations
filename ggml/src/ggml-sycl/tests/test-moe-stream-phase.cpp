@@ -572,8 +572,9 @@ int main() {
         // A layer's first window, GATE phase 0 in the dispatched order GATE, UP, DOWN: no window prefetches across
         // layers.
         CHECK(moe_stream_window_exposed(3, expert_tensor_role::GATE, 0, 2));
-        // Every later window was prefetched under the window before it: the next phase of the role, or phase 0 of the
-        // next role at the last phase. UP phase 0 is prefetched under GATE's last phase, so it is not exposed.
+        // In a gated layer whose three roles read windows, every later window is prefetched under the one before it:
+        // the next phase of the role, or phase 0 of the next role at the last phase. UP phase 0 is prefetched under
+        // GATE's last phase, so it is not exposed.
         CHECK(!moe_stream_window_exposed(3, expert_tensor_role::GATE, 1, 3));
         CHECK(!moe_stream_window_exposed(3, expert_tensor_role::UP, 0, 3));
         CHECK(!moe_stream_window_exposed(3, expert_tensor_role::UP, 1, 3));
