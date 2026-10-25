@@ -453,12 +453,15 @@ static inline std::vector<moe_stream_item> moe_stream_window_items(const moe_str
     return out;
 }
 
-// True iff a window is exposed: staged with no earlier window of its layer to hide under. A layer's first window is,
-// whatever its role, and so is any first UP phase: the window before a phase prefetches the next phase of its role, or
-// phase 0 of the next role in the order UP, GATE, DOWN, so never a first UP phase, and no window prefetches across
-// layers. `prev_layer` is the layer of the window before this one, -1 for none.
+// True iff a window is exposed: staged with no earlier window of its layer to hide under, which is only the layer's
+// first window in the micro-batch. Every later window has the window before it to hide under, which prefetches the
+// next one (see moe_stream_window_request), and no window prefetches across layers. begin_ubatch resets the last
+// window's layer, so a micro-batch's first window is exposed even when it is the layer the last micro-batch ended at.
+// `prev_layer` is the layer of the window before this one, -1 for none.
 static inline bool moe_stream_window_exposed(int layer, expert_tensor_role role, size_t phase_index, int prev_layer) {
-    return layer != prev_layer || (role == expert_tensor_role::UP && phase_index == 0);
+    GGML_UNUSED(role);  // kept for the signature: window_begin passes the window's (layer, role, phase)
+    GGML_UNUSED(phase_index);
+    return layer != prev_layer;
 }
 
 // The id moe_stream_region_reads keys a region's window by: one per (layer, role, phase), never UINT32_MAX. A role has
@@ -691,9 +694,9 @@ template <typename event_t> struct moe_stream_region_reads {
 };
 
 // What the batched prompt executor asks of the ring for one window (W1): one phase of one (layer, role), and the window
-// to prefetch under it. The executor's phases split a role's active experts, and it reads a layer's roles in the order
-// UP, GATE, DOWN, so the window after a phase is the next phase of its role, or phase 0 of the next role at the role's
-// last phase. There is no cross-layer prefetch.
+// to prefetch under it. The executor's phases split a role's active experts, and the graph dispatches a layer's roles
+// in the order GATE, UP, DOWN (the gated activation takes the gate output as src[0]), so the window after a phase is
+// the next phase of its role, or phase 0 of the next role at the role's last phase. There is no cross-layer prefetch.
 struct moe_stream_window_request {
     int                layer     = -1;
     expert_tensor_role role      = expert_tensor_role::UNKNOWN;

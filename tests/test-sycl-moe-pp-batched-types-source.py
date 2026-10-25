@@ -76,7 +76,8 @@ dequant. These claims pin that shape:
       and only then finishes or releases its scratch claim, whose release marker follows the barrier in queue order.
       The oneDNN primitive is not ordered with the queue (llama.cpp-dboi), so without the barrier a GEMM still
       running could write the slot after the next dispatch claims it. One helper holds the leases, for this path
-      and for both success branches.
+      and for both success branches, and one helper drains (drain_submitted_phases), for this path and for a
+      deferred expert the phase loop declines (llama.cpp-8epx).
   (s) one type question for a host-staged weight (llama.cpp-3460): moe_pp_batched_takes_staged_type in
       moe-mmvq-tables.hpp is exactly an MMVQ-ID kernel (moe_mmvq_admission_supports_type) and an f16 row at AOS. The
       staged claim asks it, beside the runtime knobs (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost
@@ -165,6 +166,8 @@ GROUP_EXACT = "groups != want_groups || group_experts != size_t(group_cap) || bu
 # The GEMM stage's failure path: its head, the barrier on the GEMMs already submitted, the leases held to it, and the
 # scratch claim's release.
 FAIL_HEAD = "auto gemm_stage_failed = [&](const char * what) -> bool {"
+DRAIN_HEAD = "auto drain_submitted_phases = [&]() {"
+DRAIN_CALL = "drain_submitted_phases(); if (tiled_claimed_op) {"
 FAIL_BARRIER = ("const sycl::event drained = gemm_events.empty() ? stream->ext_oneapi_submit_barrier() : "
                 "stream->ext_oneapi_submit_barrier(gemm_events);")
 FAIL_RETAIN = "retain_expert_leases_until(drained);"
@@ -1025,7 +1028,16 @@ def claim_r_failure_drain(s):
     at = lam.find(FAIL_HEAD)
     if at < 0:
         return ["the lambda has no gemm_stage_failed helper"]
-    body = lam[at:match_close(lam, at + len(FAIL_HEAD) - 1)]
+    fail_body = lam[at:match_close(lam, at + len(FAIL_HEAD) - 1)]
+    # The drain is one helper (llama.cpp-8epx), which the failure path calls once, before its XMX_TILED throw.
+    drain_at = lam.find(DRAIN_HEAD)
+    if drain_at < 0 or drain_at > at:
+        return ["the lambda has no drain_submitted_phases helper defined ahead of gemm_stage_failed"]
+    if fail_body.count("drain_submitted_phases();") != 1 or DRAIN_CALL not in fail_body:
+        fails.append("a failed GEMM stage does not drain exactly once, before its XMX_TILED throw")
+    if "ext_oneapi_submit_barrier" in fail_body:
+        fails.append("a failed GEMM stage keeps a barrier of its own beside the shared drain")
+    body = lam[drain_at:match_close(lam, drain_at + len(DRAIN_HEAD) - 1)]
     barrier, retain, release = body.find(FAIL_BARRIER), body.find(FAIL_RETAIN), body.find(CLAIM_RELEASE)
     if barrier < 0:
         fails.append("a failed GEMM stage does not barrier on the GEMMs it already submitted")
@@ -1044,8 +1056,8 @@ def claim_r_failure_drain(s):
                    "ggml_sycl::retain_handles_until_event(std::move(leases), until);"):
         if needle not in helper:
             fails.append(f"retain_expert_leases_until does not hold every expert's lease until its event (`{needle}`)")
-    if helper_at > at:
-        fails.append("retain_expert_leases_until is defined after the failure path that calls it")
+    if helper_at > drain_at:
+        fails.append("retain_expert_leases_until is defined after the drain that calls it")
     if lam.count("retain_expert_leases_until(done);") != 2:
         fails.append("the two success branches do not hold the leases through retain_expert_leases_until(done)")
     if lam.count("retain_handles_until_event(") != 1:
@@ -1275,6 +1287,9 @@ MUTANTS = [
     ("r", "sycl", FAIL_BARRIER + " " + FAIL_RETAIN + " " + CLAIM_RELEASE,
      CLAIM_RELEASE + " " + FAIL_BARRIER + " " + FAIL_RETAIN),
     ("r", "sycl", FAIL_RETAIN, ""),
+    # The failure path no longer drains, or keeps its own copy of the drain beside the helper.
+    ("r", "sycl", DRAIN_CALL, "if (tiled_claimed_op) {"),
+    ("r", "sycl", DRAIN_CALL, FAIL_BARRIER + " " + DRAIN_CALL),
     ("r", "sycl", "ggml_sycl::retain_handles_until_event(std::move(leases), until);", ""),
     ("s", "tables", "return moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(",
      "return moe_pp_batched_f16_supports_layout("),

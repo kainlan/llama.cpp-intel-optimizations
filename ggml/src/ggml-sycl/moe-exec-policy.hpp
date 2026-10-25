@@ -104,7 +104,9 @@ struct moe_exec_decision_log {
     uint32_t n_forced                                = 0;
     size_t   bytes_streamed                          = 0;
     uint32_t n_windows = 0;  // windows served this prompt, fed once per window by the ring's window_begin
-    uint32_t n_exposed = 0;  // of them, a layer's first UP window: copied with no earlier phase to hide under
+    uint32_t n_exposed = 0;  // of them, a layer's first window (GATE phase 0 if gated): copied with no earlier
+                             // window to hide under. Every later window has the one before it; what that
+                             // window's prefetch did not stage counts in n_misses.
     uint32_t n_misses  = 0;  // experts a window asked for that were not staged ahead, exposed windows excluded
 
     // bytes is what the window's call staged: the window itself when no earlier prefetch staged it, plus the

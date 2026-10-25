@@ -87,10 +87,11 @@ bool                      test_moe_admission_entry_reusable(bool     valid,
                                                             uint64_t entry_graph_seq,
                                                             uint64_t graph_seq);
 // A staged slot's lifetime (llama.cpp-o9uw). reserve_ring gives the backend's phase (making it when it has none) a ring
-// of n_slots slots of slot_bytes, in two regions, its reorders on the backend's queue, as the phase's first staging
-// layer reserves one; acquire_slot takes a slot of it as stage() does; staged_ring_upload uploads `batch`'s pointer
-// table for src0 as a prompt MUL_MAT_ID does, recording each payload slot it gives a staged pointer; payload_records
-// is the number of weights the backend holds a record for. test_moe_stream_end_prompt gives the ring back.
+// of n_slots slots of slot_bytes, in two regions, its barriers on the backend's queue, as the first claimed layer's
+// ring_ready() reserves one; acquire_slot takes a slot of it as stage_window() does; staged_ring_upload uploads
+// `batch`'s pointer table for src0 as a prompt MUL_MAT_ID does, recording each payload slot it gives a staged pointer;
+// payload_records is the number of weights the backend holds a record for. test_moe_stream_end_prompt gives the ring
+// back.
 bool                      test_moe_stream_reserve_ring(ggml_backend_t backend, size_t slot_bytes, uint32_t n_slots);
 mem_handle                test_moe_stream_acquire_slot(ggml_backend_t backend, ggml_layout_mode layout);
 const void * const *      test_moe_staged_ring_upload(ggml_backend_t             backend,
