@@ -32270,7 +32270,12 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
             continue;
         }
         try {
-            sycl::queue *            q = &cache->get_queue();
+            // The expert stream ring copies on the cache's BCS queue (moe-stream-plan.cpp stage_window), so the probe
+            // rates that queue, not the compute queue: h2d_gbps is the rate the ring sees. Both are in-order queues on
+            // one context and the driver picks the engine (measured ~25 GB/s on both queues). get_bcs_queue() falls
+            // back to the DMA queue and then to the compute queue, and the ring and the probe fall back together, so
+            // the claim survives the fallback.
+            sycl::queue *            q = &cache->get_bcs_queue();
             ggml_sycl::alloc_request dst_req{};
             dst_req.queue                                     = q;
             dst_req.device                                    = dev;
