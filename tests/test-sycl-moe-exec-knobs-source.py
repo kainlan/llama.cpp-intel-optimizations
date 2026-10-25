@@ -166,8 +166,9 @@ DECLINE_HELPER = ("static inline bool moe_stream_layer_declined(int layer, int k
                   "return knob >= 0 && knob == layer; }")
 DECLINE_FIELD = "int decline_layer = -1;"
 DECLINE_FILL = "call.op.decline_layer = ggml_sycl_moe_exec_decline_layer();"
-DECLINE_OVERRIDE = ("if (moe_stream_layer_declined(layer, op.decline_layer)) { "
-                    "st.decision.choice = moe_exec_choice::CPU; st.decision.reason = moe_exec_reason::DECLINED; }")
+DECLINE_GUARD = "if (moe_stream_layer_declined(layer, op.decline_layer)) {"
+DECLINE_CHOICE = "st.decision.choice = moe_exec_choice::CPU;"
+DECLINE_REASON = "st.decision.reason = moe_exec_reason::DECLINED;"
 WEIGH_CALL = "st.decision = weigh(cur->second, op, 0.0);"
 RING_GATE = "if (moe_stream_stage_now(st.decision, op.policy) &&"
 REPORT_CALL = "report(layer, st);"
@@ -214,14 +215,24 @@ def claim_decline_fill(sycl):
     return n.count(DECLINE_FILL) == 1 and prep.count(DECLINE_FILL) == 1
 
 
+def override_block(text):
+    """The declined-layer block of begin_layer as the claims read it: the guard through its closing brace, "" when the
+    guard is not there."""
+    n = norm(text)
+    body = between(n, DECLINE_GUARD, "}")
+    return DECLINE_GUARD + body + "}" if DECLINE_GUARD in n else ""
+
+
 def claim_decline_override(plan_cpp):
     """begin_layer turns the declined layer's weighed decision to CPU, DECLINED: after weigh() and before the ring is
     asked (moe_stream_stage_now then answers false, so the ring is neither reserved nor claimed for it), and before the
-    decision is reported."""
+    decision is reported. The block under the knob's guard sets both fields, in either order."""
     n = norm(plan_cpp)
     bl = between(n, "moe_exec_decision moe_stream_phase::begin_layer(", "moe_stream_phase::find(")
-    marks = [bl.find(m) for m in (WEIGH_CALL, DECLINE_OVERRIDE, RING_GATE, REPORT_CALL)]
-    return n.count(DECLINE_OVERRIDE) == 1 and min(marks) >= 0 and marks == sorted(marks)
+    body = between(bl, DECLINE_GUARD, "}")
+    marks = [bl.find(m) for m in (WEIGH_CALL, DECLINE_GUARD, RING_GATE, REPORT_CALL)]
+    return (n.count(DECLINE_GUARD) == 1 and body.count(DECLINE_CHOICE) == 1 and body.count(DECLINE_REASON) == 1
+            and min(marks) >= 0 and marks == sorted(marks))
 
 
 def claim_decline_reason(policy_hpp, cost_hpp):
@@ -286,20 +297,30 @@ def test_decline_override():
     assert claim_decline_override(src("moe-stream-plan.cpp"))
 
 
+def test_decline_override_either_order():
+    cpp = src("moe-stream-plan.cpp")
+    block = override_block(cpp)
+    swapped = DECLINE_GUARD + " " + DECLINE_REASON + " " + DECLINE_CHOICE + " }"
+    assert block != swapped and claim_decline_override(mutate(cpp, block, swapped))
+
+
 def test_decline_override_mutants():
     cpp = src("moe-stream-plan.cpp")
+    block = override_block(cpp)
     # no override
-    assert not claim_decline_override(mutate(cpp, DECLINE_OVERRIDE, ""))
+    assert not claim_decline_override(mutate(cpp, block, ""))
     # the override after the ring gate, where a RING decision has already reserved and claimed the ring
-    moved = mutate(cpp, DECLINE_OVERRIDE, "").replace(REPORT_CALL, DECLINE_OVERRIDE + " " + REPORT_CALL, 1)
-    assert moved.count(DECLINE_OVERRIDE) == 1 and not claim_decline_override(moved)
+    moved = mutate(cpp, block, "").replace(REPORT_CALL, block + " " + REPORT_CALL, 1)
+    assert moved.count(DECLINE_GUARD) == 1 and not claim_decline_override(moved)
     # the wrong reason, or the choice left alone
-    assert not claim_decline_override(mutate(cpp, DECLINE_OVERRIDE, DECLINE_OVERRIDE.replace("::DECLINED", "::FORCED")))
-    assert not claim_decline_override(mutate(cpp, DECLINE_OVERRIDE,
-                                             DECLINE_OVERRIDE.replace("moe_exec_choice::CPU", "moe_exec_choice::RING")))
+    assert not claim_decline_override(mutate(cpp, block, block.replace("::DECLINED", "::FORCED")))
+    ring = block.replace("moe_exec_choice::CPU", "moe_exec_choice::RING")
+    assert not claim_decline_override(mutate(cpp, block, ring))
+    assert not claim_decline_override(mutate(cpp, block, block.replace(DECLINE_CHOICE, "")))
+    # an assignment outside the guarded block, which would apply to every layer
+    assert not claim_decline_override(mutate(cpp, block, block.replace(DECLINE_REASON, "") + " " + DECLINE_REASON))
     # a fixed layer instead of the knob
-    assert not claim_decline_override(mutate(cpp, DECLINE_OVERRIDE,
-                                             DECLINE_OVERRIDE.replace("op.decline_layer", "3")))
+    assert not claim_decline_override(mutate(cpp, block, block.replace("op.decline_layer", "3")))
 
 
 def test_decline_reason():
