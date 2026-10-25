@@ -385,6 +385,13 @@ static inline bool moe_stream_layer_claimed(const moe_stream_layer_info & li) {
     return true;
 }
 
+// True iff GGML_SYCL_MOE_EXEC_DECLINE_LAYER (`knob`, -1 unset) names `layer`: begin_layer then turns the layer's
+// decision to CPU with reason DECLINED, so executor_claims answers false and the layer stays hybrid (llama.cpp-ny6i).
+// The claim itself (moe_stream_executor_claims) does not read the knob.
+static inline bool moe_stream_layer_declined(int layer, int knob) {
+    return knob >= 0 && knob == layer;
+}
+
 // True iff the batched executor takes the layer's weights whole from the ring: the layer is claimed
 // (moe_stream_layer_claimed) and a ring of `geo` can exist. Anything less keeps the whole layer hybrid: the ring never
 // serves some of a layer's host matrices while the rest stay on the hybrid path.
@@ -612,6 +619,8 @@ struct moe_stream_op {
     moe_stream_request_loan_fn   request_loan   = nullptr;
     // Unset, a requested loan is never seen refused, so every short micro-batch asks again.
     moe_stream_loan_refusals_fn  loan_refusals  = nullptr;
+    // The layer GGML_SYCL_MOE_EXEC_DECLINE_LAYER forces off the executor (moe_stream_layer_declined); -1 is none.
+    int                          decline_layer  = -1;
 
     // The executor's phase the ring is sized to: the device's planned f16 weight slot and the group cap, handed as is
     // to moe_stream_plan_ring_geometry. Unset (0 slot bytes), there is no window and no ring.
@@ -761,7 +770,8 @@ class moe_stream_phase {
     void                      begin_ubatch(uint32_t n_tokens);
     // Called at every prompt MUL_MAT_ID of `layer`; the first one per micro-batch decides. The cost model weighs the
     // layer, and a RING decision stands only on a layer the executor claims whole (moe_stream_executor_claims) once the
-    // ring reserves, at the first such layer; anything else is RING_UNAVAILABLE. Nothing is staged here, and no layer
+    // ring reserves, at the first such layer; anything else is RING_UNAVAILABLE. The layer the op's decline_layer names
+    // is CPU, DECLINED, whatever the cost model chose (moe_stream_layer_declined). Nothing is staged here, and no layer
     // is weighed ahead: the executor stages its windows (window_begin), whose experts and cache are their own, so
     // `cache` and the ids are not read. A layer below the last one, or the same layer in a new graph, starts a
     // micro-batch (moe_stream_ubatch_starts). Returns the layer's decision.

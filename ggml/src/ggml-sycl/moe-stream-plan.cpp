@@ -54,6 +54,11 @@ void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {
     next_window_whole_ = false;
 }
 
+// The decline knob's range (common.hpp) is the decision log's layers: a larger knob names a layer the log cannot
+// record.
+static_assert(GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX == moe_exec_decision_log::MAX_LAYERS - 1,
+              "GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX must be the decision log's last layer");
+
 moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
                                                 const placement_plan & plan,
                                                 int                    device,
@@ -88,6 +93,12 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
         if (!st.decided) {
             st.decision = weigh(cur->second, op, 0.0);
             st.decided  = true;
+            // GGML_SYCL_MOE_EXEC_DECLINE_LAYER forces this layer off the executor (llama.cpp-ny6i): a CPU decision is
+            // never staged, so the ring is neither reserved nor claimed for it and the layer runs the hybrid path.
+            if (moe_stream_layer_declined(layer, op.decline_layer)) {
+                st.decision.choice = moe_exec_choice::CPU;
+                st.decision.reason = moe_exec_reason::DECLINED;
+            }
             // A RING decision moves bytes under any policy but cpu (moe_stream_stage_now): AUTO when the cost model
             // chose the ring, ring always (llama.cpp-3460). It stands only on a layer the executor claims whole, once
             // the ring reserves at the first such layer: the ring serves the executor only (W2). Every decision is

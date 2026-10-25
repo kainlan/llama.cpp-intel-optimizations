@@ -62,6 +62,22 @@
 #              figure on the last " eval time = " line, never the prompt-eval rate: a nan eval line is no_tg.
 #   Q_noc      the q0xu Q_noc arm (the same without -c)                          B70  tg >= 9.5, md5 25b7738a,
 #              watchdog 0, place line as --place-ref-noc, and the same md5/flip and refill rules as Q_tg
+#   Q_decline  Q_tok with GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20                    B70  the knob turns layer 20's
+#              decision to cpu with reason "declined", so the executor does not claim it and it runs the hybrid path
+#              (llama.cpp-ny6i, the forced-decline proof of llama.cpp-8p5x c-0blp). Its references are the two auto
+#              loads that run before it, Q_tok and Q_tok_2: Qwen3.8 greedy decoding on the B70 flips between two texts
+#              from load to load (see Q_tok_cpu), so one md5 cannot be the reference. PASS needs at least one
+#              "[MOE-EXEC] layer 20: cpu (... declined)" line and no "[MOE-EXEC] layer 20: ring" line, the
+#              "[MOE-EXEC] summary:" cpu counts adding up to >= 1, stdout identical to Q_tok's or Q_tok_2's (md5; a
+#              mismatch with both prints the shared prefix against each), zero "runtime KV update rejected", zero
+#              "mem_handle::resolve(device_id=N): wrong-device access", rc 0 and a non-empty stdout. NOT_SCORED when
+#              Q_tok's or Q_tok_2's output is missing or empty or its load failed (that arm's own verdict carries the
+#              failure). NOT_EXERCISED when it would pass but Q_tok never ran layer 20 on the ring (its log has no
+#              "[MOE-EXEC] layer 20: ring" line): then the decline changed nothing, and identical text proves nothing.
+#              The verdict prints ref_layer20=ring|cpu|none and declined_layers=N, how many distinct layers carry a
+#              declined line (0 or 1 for the one-layer knob). begin_layer applies the knob only to a layer with host
+#              experts, so a layer the placement keeps whole on the device prints no decline line: that reads as
+#              FAIL(no_decline_line) with ref_layer20=none. Not a ring arm: it does not move ring_engaged_any.
 #   GO_gate    llama-cli GPT-OSS count gate at -c 4096 (all in VRAM)            B50  grep -cx '1, 2, 3, 4, 5' = 1,
 #              zero "[MOE-EXEC] layer" lines
 #   GO_pp      llama-bench -m $GO -p 512 -n 128 -r 3 -o csv                     B50  pp512 within 5 % of 871,
@@ -78,13 +94,14 @@
 #   resets     journalctl -k --since <gate start> | grep -icE
 #              'GT reset|guc_id|CAT error|Engine reset|exec queue reset' = 0
 #              (journalctl's own rc is kept: a failed journalctl or a missing journal file is a FAIL, never a clean log)
-# Duration: a complete run of all 16 arms takes about 55 minutes on this host with the ring off (Q_pp 9.5 min,
+# Duration: a complete run of the first 16 arms takes about 55 minutes on this host with the ring off (Q_pp 9.5 min,
 # Q_pp_cpu 9.3, Q_pp_ub2048 about the same, Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the
-# GPT-OSS and Mistral arms about 1 each; the 15 arms of run 2 took 45).
+# GPT-OSS and Mistral arms about 1 each; the 15 arms of run 2 took 45). Q_decline is one more Q_tok load on the B70 and
+# takes about 2 minutes including the load, the same as each Q_tok arm (2026-10-25 B70 run).
 # Note on the plan table: llama-bench has no -c option (its context is n_prompt + n_gen), so GO_pp carries none.
-# Verdict-bearing arms (12): Q_pp Q_pp_ub2048 Q_staged Q_tok_cpu Q_tg Q_noc GO_gate GO_pp GO_noc MI_b70
+# Verdict-bearing arms (13): Q_pp Q_pp_ub2048 Q_staged Q_tok_cpu Q_tg Q_noc Q_decline GO_gate GO_pp GO_noc MI_b70
 # MI_b50 resets.
-# Arms in all (16): the twelve, Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
+# Arms in all (17): the thirteen, Q_pp_cpu, Q_tok, Q_tok_2 and Q_tok_cpu_1 (recorded, not gated).
 #
 # Every grep has a positive and a negative control (check_controls) that runs before any arm and is exposed as
 # --check-controls. The GPT-OSS echo-line trap (the prompt ends with the answer, so a loose grep scores 2) is the
@@ -135,11 +152,13 @@
 # Options:
 #   --help | --dry-run (print each arm's command and scoring, run nothing) | --arm NAME (repeatable)
 #   --make-prompt [--prompt-out FILE]   regenerate scripts/sycl-moe-exec-prompts/code-2k.txt from docs/
-#   --score-arm NAME [--csv F] [--out F] [--out2 F] [--err F] [--ref-out F] [--ref-out2 F] [--journal F] [--rc N]
-#                                       [--rc-out2 N --rc-ref N --rc-ref2 N: the rcs of Q_tok_cpu_1, Q_tok, Q_tok_2]
-#                                       [--builders-pre N --builders-post N]
+#   --score-arm NAME [--csv F] [--out F] [--out2 F] [--err F] [--ref-out F] [--ref-out2 F] [--ref-err F] [--journal F]
+#                                       [--rc N] [--rc-out2 N --rc-ref N --rc-ref2 N: the rcs of Q_tok_cpu_1, Q_tok,
+#                                       Q_tok_2] [--builders-pre N --builders-post N]
 #                                       score existing files, GPU-free; for Q_tok_cpu: --out cpu load 2, --out2 cpu
-#                                       load 1, --ref-out auto load 1, --ref-out2 auto load 2
+#                                       load 1, --ref-out auto load 1, --ref-out2 auto load 2; for Q_decline: --ref-out
+#                                       and --ref-out2 Q_tok's and Q_tok_2's stdout, --ref-err Q_tok's log, --rc-ref
+#                                       and --rc-ref2 their rcs
 #   --score-summary FILE                print the summary line and exit with the code a gate over those verdict lines
 #                                       (one per line) would, GPU-free
 #   --ring-arms                         print the arms whose verdict carries ring_engaged (RING_ARMS), which is what
@@ -194,7 +213,7 @@ BUILDERS_POLL=10
 RUN_STARTED=0
 declare -a VERDICTS=()
 SAMPLER=""
-S_BPRE=na S_BPOST=na S_RC_OUT2=0 S_RC_REF=0 S_RC_REF2=0
+S_BPRE=na S_BPOST=na S_RC_OUT2=0 S_RC_REF=0 S_RC_REF2=0 S_REF_ERR=""
 TUNING_DIR=""
 SINCE=""
 LOCK_SELFTEST=0
@@ -232,11 +251,16 @@ PLACE_REF_NOC="-"
 DECODE_REF="$SCRIPT_DIR/sycl-moe-exec-prompts/code-ref-25b7738a.txt"
 DECODE_FLIP_PREFIX_MIN=128
 TOK_PREFIX_MIN=64
+# The forced-decline arm (llama.cpp-8p5x c-0blp): Q_tok's load, where Qwen3.8 on the B70 runs layers 16..46 on the ring
+# for the prompt (llama.cpp-ny6i c-nnce), and GGML_SYCL_MOE_EXEC_DECLINE_LAYER takes layer 20 off the executor. A layer
+# the placement keeps whole on the device is never consulted, so if layer 20 stops being a host layer the arm reads
+# FAIL(no_decline_line) with ref_layer20=none, and this value moves, not the code.
+DECLINE_LAYER=20
 
 # The arms whose verdict carries ring_engaged=yes|no; ring_engaged_any in the summary is read from these and only these.
 RING_ARMS=(Q_pp Q_pp_ub2048 Q_staged)
-ALL_ARMS=(Q_pp Q_pp_ub2048 Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc
-          GO_gate GO_pp GO_noc MI_b70 MI_b50 resets)
+ALL_ARMS=(Q_pp Q_pp_ub2048 Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc Q_decline GO_gate GO_pp
+          GO_noc MI_b70 MI_b50 resets)
 declare -a ARMS=()
 S_CSV="" S_OUT="" S_OUT2="" S_ERR="" S_REF="" S_REF2="" S_JOURNAL="" S_RC=0
 
@@ -262,6 +286,19 @@ RE_PLACE='MoE experts: [0-9]+ on device, [0-9]+ on host'
 RE_TPS='[0-9.]+ tokens per second'
 RE_RESETS='GT reset|guc_id|CAT error|Engine reset|exec queue reset'
 RE_MI='1, 2, 3, 4, 5, 6, 7, 8, 9, 10'
+# The forced decline: the change line's fixed format with reason "declined" (moe_exec_reason_name) for the declined
+# layer, the same layer's ring and cpu change lines (the reference's decision), the summary's cpu count, the backend's
+# KV refusal (ggml-sycl.cpp prints it after "[SYCL-PLAN] "), and mem_handle::resolve(int)'s wrong-device refusal
+# (mem-handle.cpp, the only wrong-device warning in ggml-sycl; matched up to the text before its em dash).
+RE_DECLINE="\\[MOE-EXEC\\] layer $DECLINE_LAYER: cpu \\(.* declined\\)"
+# Any layer's decline line: the verdict prints how many distinct layers carry one (declined_layers, 0 or 1 for the
+# one-layer knob).
+RE_DECLINE_ANY='\[MOE-EXEC\] layer [0-9]+: cpu \(.* declined\)'
+RE_DECLINE_RING="\\[MOE-EXEC\\] layer $DECLINE_LAYER: ring "
+RE_DECLINE_CPU="\\[MOE-EXEC\\] layer $DECLINE_LAYER: cpu "
+RE_SUMMARY_CPU='\[MOE-EXEC\] summary: [0-9]+ layer-ubatches ring, [0-9]+ cpu'
+RE_KV_REJECTED='runtime KV update rejected'
+RE_WRONG_DEVICE='mem_handle::resolve\(device_id=-?[0-9]+\): wrong-device access'
 
 usage() {
     sed -n '2,/^set -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -309,6 +346,7 @@ while [ $# -gt 0 ]; do
         --err) need_value "$#" "$1"; S_ERR="$2"; shift 2 ;;
         --ref-out) need_value "$#" "$1"; S_REF="$2"; shift 2 ;;
         --ref-out2) need_value "$#" "$1"; S_REF2="$2"; shift 2 ;;
+        --ref-err) need_value "$#" "$1"; S_REF_ERR="$2"; shift 2 ;;
         --journal) need_value "$#" "$1"; S_JOURNAL="$2"; shift 2 ;;
         --rc) need_value "$#" "$1"; S_RC="$2"; shift 2 ;;
         --rc-out2) need_value "$#" "$1"; S_RC_OUT2="$2"; shift 2 ;;
@@ -655,6 +693,77 @@ score_q_tok() {
     fi
 }
 
+# summary_cpu <file>: the sum of C over every "[MOE-EXEC] summary: K layer-ubatches ring, C cpu" line, 0 when none.
+summary_cpu() {
+    cat "$1" 2>/dev/null | grep -aoE -- "$RE_SUMMARY_CPU" | awk '{ n += $6 } END { print n + 0 }'
+}
+
+# ref_layer_decision <err>: ring when the reference ran the declined layer on the ring in any micro-batch, else cpu when
+# it printed a cpu line for it, else none (the layer had no host expert, or the phase never consulted it).
+ref_layer_decision() {
+    if [ "$(count_re "$RE_DECLINE_RING" "$1")" -gt 0 ]; then
+        echo ring
+    elif [ "$(count_re "$RE_DECLINE_CPU" "$1")" -gt 0 ]; then
+        echo cpu
+    else
+        echo none
+    fi
+}
+
+# declined_layers <file>: how many different layer ids carry a "[MOE-EXEC] layer N: cpu (... declined)" line.
+declined_layers() {
+    cat "$1" 2>/dev/null | grep -aoE -- "$RE_DECLINE_ANY" | grep -oE 'layer [0-9]+:' | sort -u | wc -l | tr -d ' '
+}
+
+# score_q_decline <out> <err> <rc> <Q_tok out> <Q_tok_2 out> <Q_tok err> <Q_tok rc> <Q_tok_2 rc>: the forced-decline
+# proof (llama.cpp-ny6i, c-0blp). A missing, empty or failed auto load leaves nothing to compare: NOT_SCORED (that
+# arm's own verdict carries the failure). The declined load must print the declined line and no ring line for the
+# layer, count a cpu layer-ubatch in its summary, print the text of one of the two auto loads (the B70 greedy flip
+# gives them two), and print no KV refusal and no wrong-device resolve. A real failure is a FAIL whatever Q_tok
+# decided; a run that would pass is NOT_EXERCISED unless Q_tok ran the layer on the ring, since only then did the
+# decline change the path.
+score_q_decline() {
+    local out="$1" err="$2" rc="$3" refs=("$4" "$5") referr="$6" refrcs=("$7" "$8") names=(Q_tok Q_tok_2)
+    local fails=() i n ring cpu kv wdev md5 rmd5a rmd5b refl st prefix=""
+    for i in 0 1; do
+        if [ ! -e "${refs[$i]}" ]; then
+            echo "Q_decline=NOT_SCORED(no_${names[$i]}_output) rc=$rc"
+            return
+        elif [ "${refrcs[$i]:-0}" != 0 ]; then
+            echo "Q_decline=NOT_SCORED(rc_${names[$i]}=${refrcs[$i]}) rc=$rc"
+            return
+        elif [ ! -s "${refs[$i]}" ]; then
+            echo "Q_decline=NOT_SCORED(empty_${names[$i]}_output) rc=$rc"
+            return
+        fi
+    done
+    [ -z "$(rc_item "$rc")" ] || fails+=("$(rc_item "$rc")")
+    [ -s "$out" ] || fails+=("empty_output")
+    n="$(count_re "$RE_DECLINE" "$err")"
+    [ "$n" -ge 1 ] || fails+=("no_decline_line")
+    ring="$(count_re "$RE_DECLINE_RING" "$err")"
+    [ "$ring" -eq 0 ] || fails+=("declined_layer_ring=$ring")
+    cpu="$(summary_cpu "$err")"
+    [ "$cpu" -ge 1 ] || fails+=("summary_cpu=$cpu<1")
+    md5="$(md5_8 "$out")"
+    rmd5a="$(md5_8 "${refs[0]}")"
+    rmd5b="$(md5_8 "${refs[1]}")"
+    if [ "$md5" != "$rmd5a" ] && [ "$md5" != "$rmd5b" ]; then
+        fails+=("md5=$md5!=$rmd5a,$rmd5b")
+        prefix=" prefix_Q_tok=$(common_prefix "$out" "${refs[0]}") prefix_Q_tok_2=$(common_prefix "$out" "${refs[1]}")"
+    fi
+    kv="$(count_re "$RE_KV_REJECTED" "$err")"
+    [ "$kv" -eq 0 ] || fails+=("kv_rejected=$kv")
+    wdev="$(count_re "$RE_WRONG_DEVICE" "$err")"
+    [ "$wdev" -eq 0 ] || fails+=("wrong_device=$wdev")
+    refl="$(ref_layer_decision "$referr")"
+    st="$(verdict_of "${fails[@]}")"
+    [ "$st" != PASS ] || [ "$refl" = ring ] || st="NOT_EXERCISED(ref_layer$DECLINE_LAYER=$refl)"
+    echo "Q_decline=$st decline_lines=$n declined_layers=$(declined_layers "$err") summary_cpu=$cpu md5=$md5" \
+        "ref_md5=$rmd5a,$rmd5b ref_layer$DECLINE_LAYER=$refl$prefix" \
+        "layers=$(distinct_layers "$err") kv_rejected=$kv wrong_device=$wdev rc=$rc"
+}
+
 # first_diff_byte <a> <b>: the 1-based byte where two files first differ, "eof" when one is a prefix of the other.
 first_diff_byte() {
     local r
@@ -843,7 +952,8 @@ score_resets() {
 }
 
 # score_arm_raw <arm> <csv> <out> <err> <ref-out> <journal> <rc> <out2> <ref-out2>; the rcs of the recorded Q_tok arms
-# come from S_RC_OUT2 (Q_tok_cpu_1), S_RC_REF (Q_tok) and S_RC_REF2 (Q_tok_2).
+# come from S_RC_OUT2 (Q_tok_cpu_1), S_RC_REF (Q_tok) and S_RC_REF2 (Q_tok_2). Q_decline reads the same <ref-out>,
+# <ref-out2> and rcs, plus S_REF_ERR, Q_tok's log.
 score_arm_raw() {
     local arm="$1" csv="$2" out="$3" err="$4" ref="$5" journal="$6" rc="$7" out2="${8:-}" ref2="${9:-}"
     case "$arm" in
@@ -852,6 +962,7 @@ score_arm_raw() {
         Q_pp_cpu) score_q_pp_cpu "$csv" "$err" "$rc" ;;
         Q_staged) score_q_staged "$err" "$rc" ;;
         Q_tok | Q_tok_2 | Q_tok_cpu_1) score_q_tok "$arm" "$out" "$rc" ;;
+        Q_decline) score_q_decline "$out" "$err" "$rc" "$ref" "$ref2" "$S_REF_ERR" "$S_RC_REF" "$S_RC_REF2" ;;
         Q_tok_cpu) score_q_tok_cpu "$out" "$out2" "$ref" "$ref2" "$rc" "$S_RC_OUT2" "$S_RC_REF" "$S_RC_REF2" ;;
         Q_tg) score_decode Q_tg "$out" "$err" "$rc" "$QTG_MIN" "$PLACE_REF_TG" ;;
         Q_noc) score_decode Q_noc "$out" "$err" "$rc" "$QNOC_MIN" "$PLACE_REF_NOC" ;;
@@ -948,6 +1059,34 @@ check_controls() {
     ctl tps "$RE_TPS" "$tps_head   (   83.97 ms per token,    11.91 tokens per second)" "$tps_head"
     ctl resets "$RE_RESETS" 'xe 0000:03:00.0: [drm] GT reset started' 'xe 0000:03:00.0: [drm] GT0: suspended'
     ctl mi "$RE_MI" '1, 2, 3, 4, 5, 6, 7, 8, 9, 10' '1, 2, 3, 4, 5,'
+    local dec_tail='(p=0.98 t_cpu=52000 us t_ring=9000 us declined)'
+    ctl decline "$RE_DECLINE" "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail" \
+        "[MOE-EXEC-TRACE] dev 0 layer $DECLINE_LAYER: cpu $dec_tail"
+    ctl decline_other_layer "$RE_DECLINE" "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail" \
+        "[MOE-EXEC] layer 1$DECLINE_LAYER: cpu $dec_tail"
+    ctl decline_reason "$RE_DECLINE" "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail" \
+        "[MOE-EXEC] layer $DECLINE_LAYER: cpu (p=0.98 t_cpu=52000 us t_ring=9000 us ring-unavailable)"
+    ctl decline_any "$RE_DECLINE_ANY" "[MOE-EXEC] layer 1$DECLINE_LAYER: cpu $dec_tail" \
+        "[MOE-EXEC-TRACE] dev 0 layer 1$DECLINE_LAYER: cpu $dec_tail"
+    # The ring and cpu lines decide ref_layer (a ring line turns NOT_EXERCISED into PASS), so each also refuses
+    # another layer's line and the trace line.
+    local ring_tail='(p=0.98 t_cpu=52000 us t_ring=9000 us cheaper)'
+    ctl decline_ring "$RE_DECLINE_RING" "[MOE-EXEC] layer $DECLINE_LAYER: ring $ring_tail" \
+        "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail"
+    ctl decline_ring_other_layer "$RE_DECLINE_RING" "[MOE-EXEC] layer $DECLINE_LAYER: ring $ring_tail" \
+        "[MOE-EXEC] layer 1$DECLINE_LAYER: ring $ring_tail"
+    ctl decline_ring_trace "$RE_DECLINE_RING" "[MOE-EXEC] layer $DECLINE_LAYER: ring $ring_tail" \
+        "[MOE-EXEC-TRACE] dev 0 layer $DECLINE_LAYER: ring $ring_tail"
+    ctl decline_cpu "$RE_DECLINE_CPU" "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail" \
+        "[MOE-EXEC-TRACE] dev 0 layer $DECLINE_LAYER: cpu $dec_tail"
+    ctl decline_cpu_other_layer "$RE_DECLINE_CPU" "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail" \
+        "[MOE-EXEC] layer 1$DECLINE_LAYER: cpu $dec_tail"
+    ctl summary_cpu "$RE_SUMMARY_CPU" "$sum_long" '[MOE-EXEC] summary: 24 layer-ubatches ring'
+    ctl kv_rejected "$RE_KV_REJECTED" '[SYCL-PLAN] runtime KV update rejected: per-device budget exceeded --' \
+        'W [SYCL-PLAN] KV overflow re-placed to host tier: 9 layer(s) demoted'
+    ctl wrong_device "$RE_WRONG_DEVICE" \
+        'mem_handle::resolve(device_id=0): wrong-device access — handle owns device 1 (kind=2). Returning null.' \
+        '[SYCL-STORAGE]   blk.3.ffn_up_exps.weight: data_handle[0] valid handle_device=1 resolve=0 on_device=1'
     # The count scorer is grep -cx, not grep -c: the echo line ends with the answer (CLAUDE.md, GPT-OSS gate).
     local echo_line='> Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5'
     [ "$(printf '%s\n' "$echo_line" | grep -cx '1, 2, 3, 4, 5')" = 0 ] ||
@@ -985,6 +1124,8 @@ arm_setup() {
         Q_tok_cpu_1 | Q_tok_cpu) A_BIN=llama-completion; A_ENV=(GGML_SYCL_MOE_EXEC=cpu); A_ARGV=("${q_tok[@]}") ;;
         Q_tg) A_BIN=llama-completion; A_ARGV=("${q_decode[@]}" -c 4096) ;;
         Q_noc) A_BIN=llama-completion; A_ARGV=("${q_decode[@]}") ;;
+        Q_decline) A_BIN=llama-completion; A_ENV=("GGML_SYCL_MOE_EXEC_DECLINE_LAYER=$DECLINE_LAYER")
+            A_ARGV=("${q_tok[@]}") ;;
         GO_gate)
             A_KIND=cli A_BIN=llama-cli A_SEL=level_zero:1 A_TMO=600
             A_ARGV=(-m "$GPTOSS" -c 4096 "${gpt_cli[@]}") ;;
@@ -1032,6 +1173,11 @@ arm_doc() {
             echo "tg >= $QNOC_MIN, md5 $QMD5 (or flip=yes, as Q_tg), zero '$RE_WATCHDOG'," \
                 "place line == '$PLACE_REF_NOC' (- = unscored)," \
                 "every '$RE_REFILL' has R == L (per line, the same rule as Q_tg)" ;;
+        Q_decline)
+            echo ">= 1 '$RE_DECLINE' and zero '$RE_DECLINE_RING', the '$RE_SUMMARY_CPU' counts >= 1, md5 of stdout" \
+                "== Q_tok's or Q_tok_2's, zero '$RE_KV_REJECTED', zero '$RE_WRONG_DEVICE'; NOT_EXERCISED when" \
+                "Q_tok's log has no '$RE_DECLINE_RING' line; NOT_SCORED when Q_tok's or Q_tok_2's output is missing" \
+                "or empty or its load failed; prints declined_layers (distinct '$RE_DECLINE_ANY' layers)" ;;
         GO_gate)
             echo "grep -cx '1, 2, 3, 4, 5' == 1 (control: the echo line scores 0)," \
                 "zero distinct '$RE_LAYER' lines" ;;
@@ -1382,7 +1528,8 @@ for arm in "${ARMS[@]}"; do
         MI_*) [ -f "$MISTRAL" ] || refuse "no model $MISTRAL" ;;
     esac
     case "$arm" in
-        Q_tok | Q_tok_2 | Q_tok_cpu_1 | Q_tok_cpu) [ -f "$TOK_PROMPT" ] || refuse "no prompt $TOK_PROMPT" ;;
+        Q_tok | Q_tok_2 | Q_tok_cpu_1 | Q_tok_cpu | Q_decline)
+            [ -f "$TOK_PROMPT" ] || refuse "no prompt $TOK_PROMPT" ;;
         Q_tg | Q_noc)
             [ -f "$DECODE_PROMPT" ] || refuse "no prompt $DECODE_PROMPT"
             [ -f "$DECODE_REF" ] || refuse "no reference text $DECODE_REF" ;;
@@ -1456,6 +1603,7 @@ score_arm_in_outdir() { # <arm>
     S_RC_OUT2="$(cat "$OUT_DIR/Q_tok_cpu_1.rc" 2>/dev/null || echo 0)"
     S_RC_REF="$(cat "$OUT_DIR/Q_tok.rc" 2>/dev/null || echo 0)"
     S_RC_REF2="$(cat "$OUT_DIR/Q_tok_2.rc" 2>/dev/null || echo 0)"
+    S_REF_ERR="$OUT_DIR/Q_tok.err" # Q_decline reads Q_tok's layer decision; no other arm reads it
     S_BPRE="$(cat "$OUT_DIR/$arm.builders_pre" 2>/dev/null || echo na)"
     S_BPOST="$(cat "$OUT_DIR/$arm.builders_post" 2>/dev/null || echo na)"
     line="$(score_arm_files "$arm" "$csv" "$out" "$err" "$ref" "$out" "$rc" \
