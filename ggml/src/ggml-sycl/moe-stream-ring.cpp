@@ -60,29 +60,11 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
 
 #if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)
 
-namespace {
-
-// What the WEIGHT zone of `device` is short of for one reservation of `bytes`: the bytes past its largest free block,
-// the most one allocation there can take. 0 when the zone's figures are not available (no cache, or no arena).
-size_t moe_stream_ring_weight_shortfall(int device, size_t bytes) {
-    unified_cache * cache        = get_unified_cache_for_device(device);
-    size_t          capacity     = 0;
-    size_t          used         = 0;
-    size_t          available    = 0;
-    size_t          largest_free = 0;
-    if (cache == nullptr || !cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest_free)) {
-        return 0;
-    }
-    return bytes > largest_free ? bytes - largest_free : 0;
-}
-
-}  // namespace
-
 bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short) {
     if (bytes_short != nullptr) {
         *bytes_short = 0;
     }
-    if (base_.valid()) {
+    if (valid()) {
         GGML_LOG_WARN("[MOE-STREAM-RING] reserve: device %d already holds a ring of %.1f MB; release it first\n",
                       device_, geo_.bytes / (1024.0 * 1024.0));
         return false;
@@ -102,50 +84,75 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, 
     }
     const uint32_t region_slots = geo.region_slots;
 
-    // The WEIGHT zone first. In single-chunk mode its allocator delegates to the
-    // KV zone, which unified_cache_zone_allocate_owner() handles; the zone
-    // allocator is never touched directly here.
-    allocation_result allocation =
-        unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, geo.bytes, MOE_STREAM_RING_SLOT_ALIGN);
-    if (!allocation) {
-        // The scratch pool's arrangement: the same zone through the general
-        // entry point, refusing rather than spilling into raw device memory
-        // outside the arena when the arena is active.
-        alloc_request req{};
-        req.device                                    = device;
-        req.size                                      = geo.bytes;
-        req.alignment                                 = MOE_STREAM_RING_SLOT_ALIGN;
-        req.intent.role                               = alloc_role::EXPERT_STAGING;
-        req.intent.category                           = runtime_category::EXPERT_CACHE;
-        req.intent.cohort_id                          = "moe_stream_ring";
-        req.intent.constraints.must_device            = true;
-        req.intent.constraints.prefer_vram_zone       = vram_zone_id::WEIGHT;
-        req.intent.constraints.forbid_vram_zone_spill = true;
-        allocation                                    = unified_allocate_owner(req);
+    // A partial reservation continues only as the ring it was started for: the
+    // slots of another geometry or device go back first.
+    const bool same_ring = device == device_ && geo.slot_bytes == geo_.slot_bytes && geo.n_slots == geo_.n_slots &&
+                           geo.bytes == geo_.bytes && geo.region_slots == geo_.region_slots;
+    if (!slots_.empty() && !same_ring) {
+        GGML_LOG_WARN(
+            "[MOE-STREAM-RING] reserve: device %d gives back the %zu of %u slots held for a %.1f MB ring to reserve "
+            "%.1f MB on device %d\n",
+            device_, slots_.size(), geo_.n_slots, geo_.bytes / (1024.0 * 1024.0), geo.bytes / (1024.0 * 1024.0),
+            device);
+        release();
     }
-    if (!allocation) {
-        // The shortfall the phase asks an expert loan for (llama.cpp-3460, c-0tmn), read after the refusal.
+    geo_    = geo;
+    device_ = device;
+
+    // One allocation per slot (llama.cpp-am87): nothing in the ring needs the
+    // slots side by side, so room an expert loan frees in holes a slot wide
+    // gives the ring. A refused slot stops the loop, and the slots already held
+    // stay held for the next reserve() to continue from.
+    slots_.reserve(geo.n_slots);
+    while (slots_.size() < geo.n_slots) {
+        // The WEIGHT zone first. In single-chunk mode its allocator delegates to
+        // the KV zone, which unified_cache_zone_allocate_owner() handles; the
+        // zone allocator is never touched directly here.
+        allocation_result allocation =
+            unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, geo.slot_bytes, MOE_STREAM_RING_SLOT_ALIGN);
+        if (!allocation) {
+            // The scratch pool's arrangement: the same zone through the general
+            // entry point, refusing rather than spilling into raw device memory
+            // outside the arena when the arena is active.
+            alloc_request req{};
+            req.device                                    = device;
+            req.size                                      = geo.slot_bytes;
+            req.alignment                                 = MOE_STREAM_RING_SLOT_ALIGN;
+            req.intent.role                               = alloc_role::EXPERT_STAGING;
+            req.intent.category                           = runtime_category::EXPERT_CACHE;
+            req.intent.cohort_id                          = "moe_stream_ring";
+            req.intent.constraints.must_device            = true;
+            req.intent.constraints.prefer_vram_zone       = vram_zone_id::WEIGHT;
+            req.intent.constraints.forbid_vram_zone_spill = true;
+            allocation                                    = unified_allocate_owner(req);
+        }
+        if (!allocation) {
+            break;
+        }
+        mem_handle slot     = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = slot.resolve(device);
+        if (!resolved.ptr || !resolved.on_device) {
+            // No loan makes a slot resolve: no shortfall is reported.
+            GGML_LOG_WARN("[MOE-STREAM-RING] reserve: slot %zu of %.2f MB did not resolve on device %d\n",
+                          slots_.size(), geo.slot_bytes / (1024.0 * 1024.0), device);
+            return false;
+        }
+        slots_.push_back(std::move(slot));
+    }
+    const uint32_t held = static_cast<uint32_t>(slots_.size());
+    if (held < geo.n_slots) {
+        // The slots still to allocate: the expert loan the phase asks for (llama.cpp-3460, c-0tmn). Each needs only a
+        // hole of its own, so a loan of that many bytes covers it however the zone is fragmented.
         if (bytes_short != nullptr) {
-            *bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes);
+            *bytes_short = static_cast<size_t>(geo.n_slots - held) * geo.slot_bytes;
         }
         GGML_LOG_WARN(
-            "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give %.1f MB (%u slots x %.2f MB) on device "
-            "%d\n",
-            geo.bytes / (1024.0 * 1024.0), geo.n_slots, geo.slot_bytes / (1024.0 * 1024.0), device);
+            "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give %.1f MB (%u slots x %.2f MB) on device %d "
+            "(holding %u of %u slots)\n",
+            geo.bytes / (1024.0 * 1024.0), geo.n_slots, geo.slot_bytes / (1024.0 * 1024.0), device, held, geo.n_slots);
         return false;
     }
 
-    mem_handle base     = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-    const auto resolved = base.resolve(device);
-    if (!resolved.ptr || !resolved.on_device) {
-        GGML_LOG_WARN("[MOE-STREAM-RING] reserve: the %.1f MB reservation did not resolve on device %d\n",
-                      geo.bytes / (1024.0 * 1024.0), device);
-        return false;
-    }
-
-    geo_              = geo;
-    device_           = device;
-    base_             = std::move(base);
     regions_[0]       = region{};
     regions_[1]       = region{};
     regions_[0].first = 0;
@@ -157,7 +164,7 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, 
 }
 
 mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout) {
-    if (!base_.valid()) {
+    if (!valid()) {
         return {};
     }
     region & r = regions_[current_];
@@ -168,7 +175,7 @@ mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout) {
     // current_region_gate().
     const size_t index = static_cast<size_t>(r.first) + r.next;
     ++r.next;
-    return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);
+    return slots_[index].slice(0, geo_.slot_bytes, layout);
 }
 
 sycl::event moe_stream_ring::current_region_gate() const {
@@ -177,7 +184,7 @@ sycl::event moe_stream_ring::current_region_gate() const {
 }
 
 void moe_stream_ring::epoch_boundary(sycl::event region_done) {
-    if (!base_.valid()) {
+    if (!valid()) {
         return;
     }
     region & finished = regions_[current_];
@@ -193,19 +200,17 @@ void moe_stream_ring::epoch_boundary(sycl::event region_done) {
 }
 
 void moe_stream_ring::release() {
-    if (!base_.valid()) {
-        return;
-    }
-    // Each gated region keeps its own copy of the base handle until its gate
-    // completes, so the bytes return only after both; slots still held by a
-    // caller retain the same owner on their own.
+    // Each gated region hands its own slots to the drain until its gate
+    // completes; slots still held by a caller retain their allocations on their
+    // own. A partial reservation has no gated region: its slots just drop.
     for (region & r : regions_) {
         if (r.has_gate) {
-            retain_handles_until_event(std::vector<mem_handle>{ base_ }, r.gate);
+            const auto first = slots_.begin() + r.first;
+            retain_handles_until_event(std::vector<mem_handle>(first, first + r.count), r.gate);
         }
         r = region{};
     }
-    base_    = mem_handle();
+    slots_.clear();
     geo_     = moe_stream_ring_geometry{};
     device_  = -1;
     current_ = 0;

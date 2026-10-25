@@ -4,8 +4,10 @@
 // 1. Reserve 8 slots of 1 MiB, use the first region's 4 slots, flip, use the
 //    second region's 4 slots, flip, and check that the next slot handed out is
 //    the first region's first slot again, gated on the first boundary's event,
-//    resolving on the device with the bytes the first fill wrote. Release and
-//    check the allocation's registry row and the raw device bytes are gone.
+//    resolving on the device with the bytes the first fill wrote. Each slot is
+//    its own allocation (llama.cpp-am87): no two overlap, and each has its own
+//    registry row while held. Release and check every slot's registry row and
+//    the raw device bytes are gone.
 //    The first region's slots are acquired as AOS and SOA in turn, and each
 //    resolves with the layout it was acquired for (lead ruling c-o9uw-1).
 // 2. Geometries that are not two equal aligned regions (one slot, an odd slot
@@ -88,7 +90,7 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
     constexpr uint32_t kRegion = kSlots / 2;
     const auto         geo     = make_geometry(kSlot, kSlots, kSlots * kSlot);
 
-    void * base_ptr = nullptr;
+    std::vector<void *> slot_ptrs;
     {
         moe_stream_ring ring;
         const bool      reserved = ring.reserve(device, geo);
@@ -120,11 +122,8 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
             first_ptrs.push_back(resolved.ptr);
             first_region.push_back(slot);
         }
-        base_ptr = first_ptrs[0];
+        slot_ptrs = first_ptrs;
 
-        // Positive control for the release checks below, on either path: the
-        // reservation's registry row exists while the ring holds it.
-        CHECK(allocation_registry_test_contains(base_ptr), "the reservation's registry row exists while held");
         alloc_metadata md{};
         const bool     zone_managed = first_region.front().owner_metadata(&md) && md.zone_managed;
         g_zone_managed              = zone_managed;
@@ -139,25 +138,38 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         CHECK(ring.slots_free() == 0, "an exhausted region has no free slots (got %u)", ring.slots_free());
         ring.epoch_boundary(first_fill);
 
-        // Region 1: the other four slots.
+        // Region 1: the other four slots, each its own allocation, so each
+        // overlaps no slot handed out before it.
         std::vector<mem_handle> second_region;
         sycl::event             second_fill;
         for (uint32_t i = 0; i < kRegion; ++i) {
-            mem_handle           slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
-            const auto           resolved = slot.resolve(device);
-            const std::ptrdiff_t offset   = resolved.ptr != nullptr ? static_cast<const char *>(resolved.ptr) -
-                                                                        static_cast<const char *>(first_ptrs[0]) :
-                                                                      -1;
+            mem_handle      slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
+            const auto      resolved = slot.resolve(device);
+            const uintptr_t begin    = reinterpret_cast<uintptr_t>(resolved.ptr);
+            bool            apart    = resolved.ptr != nullptr;
+            for (void * other : slot_ptrs) {
+                const uintptr_t o = reinterpret_cast<uintptr_t>(other);
+                apart             = apart && (begin + kSlot <= o || o + kSlot <= begin);
+            }
             CHECK(is_slot_aligned(resolved.ptr), "region 1 slot %u starts at a multiple of %zu (got %p)", i,
                   MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
-            CHECK(resolved.ptr != nullptr && resolved.on_device &&
-                      offset == static_cast<std::ptrdiff_t>((kRegion + i) * kSlot),
-                  "region 1 slot %u resolves on device at slot offset %u (got byte offset %td)", i, kRegion + i,
-                  offset);
+            CHECK(resolved.ptr != nullptr && resolved.on_device && apart,
+                  "region 1 slot %u resolves on device and overlaps none of the %zu slots before it (got %p)", i,
+                  slot_ptrs.size(), resolved.ptr);
             second_fill = mem_fill_async(slot, 0x20 + static_cast<int>(i), kSlot, q, { ring.current_region_gate() });
+            slot_ptrs.push_back(resolved.ptr);
             second_region.push_back(slot);
         }
         ring.epoch_boundary(second_fill);
+
+        // Positive control for the release checks below, on either path: each
+        // slot's registry row exists while the ring holds it.
+        size_t rows_held = 0;
+        for (void * ptr : slot_ptrs) {
+            rows_held += allocation_registry_test_contains(ptr) ? 1 : 0;
+        }
+        CHECK(rows_held == kSlots, "each of the %u slots has its own registry row while held (%zu found)", kSlots,
+              rows_held);
 
         // Region 0 again: its gate is the first boundary's event, and the slot
         // comes back without the ring asking whether that event completed.
@@ -187,9 +199,13 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         CHECK(!ring.acquire_slot(GGML_LAYOUT_AOS).valid(), "a released ring hands out an invalid handle");
     }
 
-    // release() handed the backing to the retained-handle drain; let it run.
+    // release() handed the slots to the retained-handle drain; let it run.
     CHECK(drain_retained_handles(true), "the retained-handle drain completes");
-    CHECK(!allocation_registry_test_contains(base_ptr), "the reservation's registry row is gone after release");
+    size_t rows_left = 0;
+    for (void * ptr : slot_ptrs) {
+        rows_left += allocation_registry_test_contains(ptr) ? 1 : 0;
+    }
+    CHECK(rows_left == 0, "every slot's registry row is gone after release (%zu left)", rows_left);
     if (g_zone_managed) {
         std::printf("INFO: held-bytes check skipped: a zone sub-allocation is outside that ledger\n");
     } else {
@@ -263,9 +279,9 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     std::atomic<bool> copy_done{ false };
 
     mem_handle first_use = ring.acquire_slot(GGML_LAYOUT_AOS);
-    void *     base_ptr  = first_use.resolve(device).ptr;
-    CHECK(base_ptr != nullptr && allocation_registry_test_contains(base_ptr),
-          "the gate case's reservation has a registry row while held");
+    void *     slot_ptr  = first_use.resolve(device).ptr;
+    CHECK(slot_ptr != nullptr && allocation_registry_test_contains(slot_ptr),
+          "the gate case's first slot has a registry row while held");
     sycl::event blocker = blocker_queue.submit([&](sycl::handler & h) {
         h.host_task([&]() {
             while (!release_blocker.load()) {
@@ -340,7 +356,7 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     // Region 1 was never gated: its release is the has_gate == false branch.
     CHECK(drain_retained_handles(true), "the gate case's retained-handle drain completes");
     stamp("retained-handle drain completed");
-    CHECK(!allocation_registry_test_contains(base_ptr), "the gate case's registry row is gone after release");
+    CHECK(!allocation_registry_test_contains(slot_ptr), "the gate case's first slot has no registry row after release");
 }
 
 // Holds `bytes` of the WEIGHT zone as an owned allocation, or an invalid handle when the zone refuses.
