@@ -107,7 +107,7 @@ struct moe_exec_decision_log {
     uint32_t n_exposed = 0;  // of them, a layer's first UP window: copied with no earlier phase to hide under
     uint32_t n_misses  = 0;  // experts a window asked for that were not staged ahead, exposed windows excluded
 
-    // bytes is what the window's call staged: the window itself when no prefetch had, plus the prefetch it issued
+    // bytes is what the window's call staged: the window itself when no earlier prefetch staged it, plus the prefetch it issued
     // for the next one. Each copied byte is counted once, on the call that copied it; MiB streamed is their sum.
     void note_window(bool exposed, uint32_t misses, size_t bytes) {
         std::lock_guard<std::mutex> lock(mu);

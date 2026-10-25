@@ -150,7 +150,7 @@ int main() {
         log.note(0, 0, decision(moe_exec_choice::RING));
         CHECK(lines.size() == 1, "trace level without a trace sink prints only the change line");
     }
-    // log: devices keep separate state; forced and streamed bytes are counted; NOT_CONSULTED is ignored
+    // log: devices keep separate state; forced is counted, a layer note carries no bytes; NOT_CONSULTED is ignored
     {
         std::vector<std::string> lines;
         moe_exec_decision_log    log(capture, &lines);
@@ -191,7 +191,7 @@ int main() {
         std::vector<std::string> lines;
         moe_exec_decision_log    log(capture, &lines);
         log.note(0, 3, decision(moe_exec_choice::RING));
-        log.note_window(/*exposed*/ true, 4, (7ull << 20) / 2);
+        log.note_window(/*exposed*/ true, /*misses*/ 4, /*bytes*/ (7ull << 20) / 2);
         log.note_window(false, 1, (9ull << 20) / 2);
         log.note_window(false, 0, 0);  // a window the last call prefetched stages nothing of its own
         char buf[160];
