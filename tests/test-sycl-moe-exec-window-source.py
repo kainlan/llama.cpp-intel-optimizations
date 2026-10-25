@@ -13,14 +13,12 @@ turn it red (its positive controls):
     stage table nothing: their windows are not staged yet;
   - on a claimed layer a phase is one window: phase_experts is capped at window_experts(), the region's slots, and the
     phases and the f16 halves are built from the capped count; the WOQ arm never sees a claimed layer (asserted);
-  - each phase of a claimed layer asks window_begin exactly once with the phase's experts and the window after it
-    (the next phase of the role, or phase 0 of the next role in the order the graph dispatches them, GATE, UP, DOWN;
-    none after DOWN), sums its
-    return into pp_staged_experts and its misses, counted per window, into pp_window_misses; then reads each deferred
-    expert's slot
-    (resolve_deferred_expert: the entry's consumer, AOS, view and tag checks, the entry's ready event onto a per-window
-    barrier, the slot's lease held), dequantizes, submits the readers_done barrier and hands it to window_done, all
-    before the phase's GEMMs;
+  - each phase of a claimed layer asks window_begin exactly once with the phase's experts and the window after it (the
+    next phase of the role, or phase 0 of the next role in the order the graph dispatches them, GATE, UP, DOWN; none
+    after DOWN), sums its return into pp_staged_experts and its misses, counted per window, into pp_window_misses; then
+    reads each deferred expert's slot (resolve_deferred_expert: the entry's consumer, AOS, view and tag checks, the
+    entry's ready event onto a per-window barrier, the slot's lease held), dequantizes, submits the readers_done barrier
+    and hands it to window_done, all before the phase's GEMMs;
   - window_begin itself (moe-stream-plan.cpp, read here, not edited) feeds both counts from the same two facts: its
     *misses is the window's missing matrices unless the window is exposed, and note_window is fed (exposed, missing)
     after both are known (c-qz9m item 2: `*misses = missing` survived every gate). The pin accepts the Task 2c form,
@@ -466,7 +464,10 @@ def claim_exposed_is_a_layers_first_window(plan_hpp: str, plan_cpp: str) -> bool
     could hide it: its layer's first window in the micro-batch. Every later window was prefetched under the one before
     it (the next phase of its role, or phase 0 of the next role in the dispatched order GATE, UP, DOWN), UP phase 0
     included, so the predicate names no role and no phase. begin_ubatch resets the last window's layer to -1, which is
-    what makes a micro-batch's first window exposed even when it is the layer the last micro-batch ended at."""
+    what makes a micro-batch's first window exposed even when it is the layer the last micro-batch ended at. This is an
+    exact-expression pin: it requires the body to return `layer != prev_layer` and name no role or phase, and
+    begin_ubatch to keep its reset; it never evaluates the predicate. The exposure block of test-moe-stream-phase.cpp
+    (the sycl-moe-stream-phase ctest) pins the behaviour, both polarities."""
     b = body(norm(plan_hpp), EXPOSED_SIG)
     ub = body(norm(plan_cpp), BEGIN_UBATCH_SIG)
     return (b != "" and b.endswith(EXPOSED_RETURN) and b.count("return ") == 1 and "expert_tensor_role::" not in b
@@ -479,21 +480,18 @@ def test_exposed_is_a_layers_first_window():
 
 def test_exposed_is_a_layers_first_window_mutants():
     c = claim_exposed_is_a_layers_first_window
-    # The builder's first role back: a prefetched UP phase 0 counted as exposed, its misses forced to 0.
+    # The UP-phase-0 clause back: the predicate names a role again.
     assert not c(mutate(PLAN_HPP, EXPOSED_RETURN,
                         "return layer != prev_layer || (role == expert_tensor_role::UP && phase_index == 0); }"),
                  PLAN_CPP)
-    # The dispatched first role named as well: a second source for the dispatch order, and a GATE phase 0 is already
-    # its layer's first window.
+    # A GATE-phase-0 clause: the predicate names a role, a second source for the dispatch order.
     assert not c(mutate(PLAN_HPP, EXPOSED_RETURN,
                         "return layer != prev_layer || (role == expert_tensor_role::GATE && phase_index == 0); }"),
                  PLAN_CPP)
-    # Every window exposed, so misses= is always 0.
+    # Any other return expression. The exact-text check does not tell these two apart; the phase test does.
     assert not c(mutate(PLAN_HPP, EXPOSED_RETURN, "return true; }"), PLAN_CPP)
-    # No window exposed, so a layer's first window counts as misses.
     assert not c(mutate(PLAN_HPP, EXPOSED_RETURN, "return false; }"), PLAN_CPP)
-    # The micro-batch's reset dropped, so a micro-batch that starts at the layer the last one ended at reads its first
-    # window as prefetched.
+    # begin_ubatch's reset of the last window's layer dropped.
     assert not c(PLAN_HPP, mutate(PLAN_CPP, UBATCH_RESET, ""))
 
 
