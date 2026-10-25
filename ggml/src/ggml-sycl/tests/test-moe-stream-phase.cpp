@@ -282,15 +282,16 @@ ggml_sycl::moe_stream_loan_step run_short_ubatch(ggml_sycl::moe_stream_loan_latc
 
 // GGML_SYCL_MOE_EXEC_DECLINE_LAYER (llama.cpp-ny6i): begin_layer turns the knob's layer to CPU with reason DECLINED, so
 // executor_claims answers false and the layer stays hybrid. The helper is true for that layer only, and never with the
-// knob unset (-1). The decline lives in the layer's decision, not in the claim: moe_stream_executor_claims takes no
-// knob, so a claimed layer still answers true from it while the knob names that layer.
+// knob unset (-1).
 void test_declined_layer(const moe_stream_layer_info & claimed, const ggml_sycl::moe_stream_ring_geometry & geo) {
     CHECK(ggml_sycl::moe_stream_layer_declined(3, 3));
     CHECK(!ggml_sycl::moe_stream_layer_declined(4, 3));
     CHECK(!ggml_sycl::moe_stream_layer_declined(3, -1));
     CHECK(ggml_sycl::moe_stream_layer_declined(0, 0));
     CHECK(!ggml_sycl::moe_stream_layer_declined(-1, -1));
-    CHECK(ggml_sycl::moe_stream_layer_declined(0, 0) && ggml_sycl::moe_stream_executor_claims(claimed, geo));
+    // The decline lives in the layer's decision (begin_layer), not in the geometry check: the claim test takes no
+    // knob, so a layer it accepts stays accepted whatever the knob names.
+    CHECK(ggml_sycl::moe_stream_executor_claims(claimed, geo));
 }
 
 // The decision log prints a declined layer through the change line's fixed format, with the reason "declined", which is
