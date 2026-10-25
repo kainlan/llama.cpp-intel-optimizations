@@ -69,10 +69,15 @@ record.
 
 **W1. Window.** One executor phase of one (layer, role): the host experts among `active_experts[p*G, (p+1)*G)`, in
 ascending expert id (`i02`), `G` from the executor's group plan capped by the ring's `window_experts()`. The two ring
-regions hold two windows. The role order inside a layer is the graph builder's UP, GATE, DOWN
-(`src/llama-graph.cpp:2202`, `:2215`, `:2316`). At the last phase of a role, the next window is phase 0 of the next role
-(UP to GATE, GATE to DOWN). There is **no cross-layer prefetch** in this plan: the first UP window of each layer is an
-exposed copy, counted as `exposed`, never as a `miss`. Cross-layer look-ahead is a follow-up ticket this plan creates
+regions hold two windows. The role order inside a layer is the order the executor DISPATCHES, which is the graph's
+visit order, not the builder's source order: GATE, UP, DOWN. `src/llama-graph.cpp:2258` builds
+`ggml_swiglu_split(ctx0, cur, up)` with the gate output as `src[0]`, and `ggml_visit_parents_graph` (LEFT_TO_RIGHT)
+adds `src[0]` first; the SYCL backend has no `graph_optimize`, and the executor traces show `gate_exps`, `up_exps`,
+`down_exps` on every layer. (Corrected 2026-10-25 by Task 3's spec review; this paragraph said UP, GATE, DOWN from the
+builder's source lines, which cost two wasted and two on-demand window copies per layer.) At the last phase of a role,
+the next window is phase 0 of the next role (GATE to UP, UP to DOWN; DOWN prefetches nothing). There is **no cross-layer
+prefetch** in this plan: the first GATE window of each layer is an exposed copy, counted as `exposed`, never as a
+`miss`. Cross-layer look-ahead is a follow-up ticket this plan creates
 but does not implement.
 
 **W2. Phase API.** `moe_stream_phase` gains `window_begin(req, cache, op, &misses)` (stages the window's missing host
@@ -436,7 +441,7 @@ git commit -- <the same paths> -m "sycl: size the expert stream ring to one exec
 - Test: `ggml/src/ggml-sycl/tests/test-moe-exec-policy.cpp:160-170`
 
 **Description:** The teardown summary gains the three window counters the gate scores (W6): windows served, exposed
-windows (the first UP window of a layer, copied with nothing to hide under) and misses (a window the executor asked
+windows (the first GATE window of a layer, copied with nothing to hide under) and misses (a window the executor asked
 for that was not already staged, other than an exposed one). The phase (Task 2b) feeds them through one new method.
 
 **Acceptance Criteria:**
@@ -472,7 +477,7 @@ for that was not already staged, other than an exposed one). The phase (Task 2b)
 
 ```cpp
     uint32_t n_windows = 0;  // executor windows the ring served this prompt (Task 2b window_begin)
-    uint32_t n_exposed = 0;  // of them, a layer's first UP window: copied with no earlier phase to hide under
+    uint32_t n_exposed = 0;  // of them, a layer's first GATE window: copied with no earlier phase to hide under
     uint32_t n_misses  = 0;  // experts a window asked for that were not staged ahead, exposed windows excluded
 
     void note_window(bool exposed, uint32_t misses) {
@@ -593,7 +598,7 @@ static void test_window_items() {
 4. **Test: exposed vs miss accounting.** The phase itself needs a queue, so the accounting lives in a pure helper:
 
 ```cpp
-// moe_stream_window_exposed(layer, role, phase_index, prev_layer): a layer's first UP window is exposed; every other
+// moe_stream_window_exposed(layer, role, phase_index, prev_layer): a layer's first GATE window is exposed; every other
 // window had a predecessor to prefetch under.
 static void test_window_exposed() {
     using ggml_sycl::moe_stream_window_exposed;
@@ -968,8 +973,9 @@ def test_mutation_witness(pin, mutant):
                         window_req.next   = phase_ids.data() + phases[p + 1].begin;
                         window_req.n_next = phases[p + 1].end - phases[p + 1].begin;
                     } else if (pp_stream_role != ggml_sycl::expert_tensor_role::DOWN) {
-                        window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::UP ?
-                                                   ggml_sycl::expert_tensor_role::GATE :
+                        // dispatched order is GATE, UP, DOWN (W1): GATE prefetches UP, UP prefetches DOWN
+                        window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::GATE ?
+                                                   ggml_sycl::expert_tensor_role::UP :
                                                    ggml_sycl::expert_tensor_role::DOWN;
                         window_req.next      = phase_ids.data() + phases[0].begin;
                         window_req.n_next    = phases[0].end - phases[0].begin;
@@ -1711,5 +1717,5 @@ Epic: `llama.cpp-a2xb`, parent of Tasks 1-10 (`eeim`, `2399`, `9433`, `8epx`, `e
   short, which the window ring makes rare; fix before relying on `loan_exercised=yes` as evidence.
 - llama.cpp-dfo0 — multi-ubatch prefill; `Q_pp_ub2048` is its measurement arm.
 - llama.cpp-zuze — GPT-OSS B50 pp512 bisect; the control arm here must not be read as its gate.
-Follow-ups this plan creates and does not implement: cross-layer window prefetch (the exposed first UP window);
+Follow-ups this plan creates and does not implement: cross-layer window prefetch (the exposed first GATE window);
 admitting MXFP4 to the executor claim so the WOQ arm gets a window (GPT-OSS ring).

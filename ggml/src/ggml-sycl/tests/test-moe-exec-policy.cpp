@@ -101,7 +101,7 @@ int main() {
         moe_exec_decision_log    log(capture, &lines);
         for (int ub = 0; ub < 3; ++ub) {
             for (int layer = 0; layer < 48; ++layer) {
-                log.note(0, layer, decision(moe_exec_choice::RING), 1u << 20);
+                log.note(0, layer, decision(moe_exec_choice::RING));
             }
         }
         CHECK(count_layer_lines(lines) == 48, "48 layers x 3 ubatches, no change: 48 lines");
@@ -116,7 +116,7 @@ int main() {
         for (int ub = 0; ub < 3; ++ub) {
             for (int layer = 0; layer < 48; ++layer) {
                 const bool flip = layer == 7 && ub == 2;
-                log.note(0, layer, decision(flip ? moe_exec_choice::CPU : moe_exec_choice::RING), 0);
+                log.note(0, layer, decision(flip ? moe_exec_choice::CPU : moe_exec_choice::RING));
             }
         }
         CHECK(count_layer_lines(lines) == 49, "one flip: 49 lines");
@@ -129,10 +129,10 @@ int main() {
         moe_exec_decision_log    log(capture, &lines, level, capture);
         for (int ub = 0; ub < 3; ++ub) {
             for (int layer = 0; layer < 48; ++layer) {
-                log.note(0, layer, decision(moe_exec_choice::RING), 0);
+                log.note(0, layer, decision(moe_exec_choice::RING));
             }
         }
-        log.note(0, 0, moe_exec_decision(), 0);  // NOT_CONSULTED: no line of either kind
+        log.note(0, 0, moe_exec_decision());  // NOT_CONSULTED: no line of either kind
         size_t n_trace = 0;
         for (const std::string & l : lines) {
             n_trace += l.rfind("[MOE-EXEC-TRACE] dev 0 layer ", 0) == 0 ? 1 : 0;
@@ -147,42 +147,65 @@ int main() {
     {
         std::vector<std::string> lines;
         moe_exec_decision_log    log(capture, &lines, 1, nullptr);
-        log.note(0, 0, decision(moe_exec_choice::RING), 0);
+        log.note(0, 0, decision(moe_exec_choice::RING));
         CHECK(lines.size() == 1, "trace level without a trace sink prints only the change line");
     }
-    // log: devices keep separate state; forced and streamed bytes are counted; NOT_CONSULTED is ignored
+    // log: devices keep separate state; forced is counted, a layer note carries no bytes; NOT_CONSULTED is ignored
     {
         std::vector<std::string> lines;
         moe_exec_decision_log    log(capture, &lines);
-        log.note(0, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED), 3ull << 20);
-        log.note(1, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED), 5ull << 20);
-        log.note(1, 3, moe_exec_decision(), 99);
+        log.note(0, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED));
+        log.note(1, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED));
+        log.note(1, 3, moe_exec_decision());
         CHECK(count_layer_lines(lines) == 2, "same layer on two devices logs once each");
         CHECK(log.n_forced == 2, "forced counted");
-        CHECK(log.bytes_streamed == (8ull << 20), "streamed bytes accumulate for RING only, NOT_CONSULTED ignored");
+        CHECK(log.bytes_streamed == 0, "a layer note carries no bytes: the windows' bytes are the streamed total");
         char buf[160];
         CHECK(log.take_summary(buf, sizeof(buf)), "a consulted log gives a summary");
         CHECK(std::strcmp(buf,
-                          "[MOE-EXEC] summary: 2 layer-ubatches ring, 0 cpu, 2 forced, 8 MiB streamed, 0 windows, "
+                          "[MOE-EXEC] summary: 2 layer-ubatches ring, 0 cpu, 2 forced, 0 MiB streamed, 0 windows, "
                           "0 exposed, 0 misses") == 0,
               "summary format");
         CHECK(!log.take_summary(buf, sizeof(buf)), "a second take gives nothing");
-        log.note(0, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED), 4ull << 20);
-        log.note_window(/*exposed*/ true, /*misses*/ 5);  // an exposed window's misses are not counted
-        log.note_window(false, 0);
-        log.note_window(false, 2);
+        log.note(0, 3, decision(moe_exec_choice::RING, moe_exec_reason::FORCED));
+        log.note_window(/*exposed*/ true, /*misses*/ 5, 0);  // an exposed window's misses are not counted
+        log.note_window(false, 0, 0);
+        log.note_window(false, 2, 0);
         CHECK(log.take_summary(buf, sizeof(buf)) &&
                   std::strcmp(buf,
-                              "[MOE-EXEC] summary: 1 layer-ubatches ring, 0 cpu, 1 forced, 4 MiB streamed, "
+                              "[MOE-EXEC] summary: 1 layer-ubatches ring, 0 cpu, 1 forced, 0 MiB streamed, "
                               "3 windows, 1 exposed, 2 misses") == 0,
               "window counters in the summary");
         CHECK(!log.take_summary(buf, sizeof(buf)), "a take with nothing consulted prints nothing");
-        log.note(0, 4, decision(moe_exec_choice::CPU), 0);
+        log.note(0, 4, decision(moe_exec_choice::CPU));
         CHECK(log.take_summary(buf, sizeof(buf)) &&
                   std::strcmp(buf,
                               "[MOE-EXEC] summary: 0 layer-ubatches ring, 1 cpu, 0 forced, 0 MiB streamed, 0 windows, "
                               "0 exposed, 0 misses") == 0,
               "a note after a take counts from zero, window counters included (the reset witness)");
+    }
+
+    // log: MiB streamed is the sum of the bytes each window staged (its own and its prefetch's), summed before the
+    // shift: two windows of 3.5 and 4.5 MiB are 8 MiB, where shifting each would read 7
+    {
+        std::vector<std::string> lines;
+        moe_exec_decision_log    log(capture, &lines);
+        log.note(0, 3, decision(moe_exec_choice::RING));
+        log.note_window(/*exposed*/ true, /*misses*/ 4, /*bytes*/ (7ull << 20) / 2);
+        log.note_window(false, 1, (9ull << 20) / 2);
+        log.note_window(false, 0, 0);  // a window the last call prefetched stages nothing of its own
+        char buf[160];
+        CHECK(log.take_summary(buf, sizeof(buf)) &&
+                  std::strcmp(buf,
+                              "[MOE-EXEC] summary: 1 layer-ubatches ring, 0 cpu, 0 forced, 8 MiB streamed, "
+                              "3 windows, 1 exposed, 1 misses") == 0,
+              "MiB streamed is the sum of the windows' staged bytes, two windows of different byte counts");
+        log.note(0, 3, decision(moe_exec_choice::RING));
+        CHECK(log.take_summary(buf, sizeof(buf)) &&
+                  std::strcmp(buf,
+                              "[MOE-EXEC] summary: 1 layer-ubatches ring, 0 cpu, 0 forced, 0 MiB streamed, "
+                              "0 windows, 0 exposed, 0 misses") == 0,
+              "the streamed bytes and the window counters reset with the summary");
     }
 
     std::printf("%d cases, %d failures\n", g_cases, g_failures);
