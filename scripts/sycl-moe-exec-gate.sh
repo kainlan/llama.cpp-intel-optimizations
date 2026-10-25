@@ -95,7 +95,7 @@
 # Duration: a complete run of the first 16 arms takes about 55 minutes on this host with the ring off (Q_pp 9.5 min,
 # Q_pp_cpu 9.3, Q_pp_ub2048 about the same, Q_staged 3.5, each Q_tok load about 2, Q_tg and Q_noc about 2.5 each, the
 # GPT-OSS and Mistral arms about 1 each; the 15 arms of run 2 took 45). Q_decline is one more Q_tok load on the B70 and
-# is not timed yet.
+# takes about 2 minutes including the load, the same as each Q_tok arm (2026-10-25 B70 run).
 # Note on the plan table: llama-bench has no -c option (its context is n_prompt + n_gen), so GO_pp carries none.
 # Verdict-bearing arms (13): Q_pp Q_pp_ub2048 Q_staged Q_tok_cpu Q_tg Q_noc Q_decline GO_gate GO_pp GO_noc MI_b70
 # MI_b50 resets.
