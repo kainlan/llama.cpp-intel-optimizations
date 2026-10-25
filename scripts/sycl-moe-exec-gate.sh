@@ -1068,10 +1068,19 @@ check_controls() {
         "[MOE-EXEC] layer $DECLINE_LAYER: cpu (p=0.98 t_cpu=52000 us t_ring=9000 us ring-unavailable)"
     ctl decline_any "$RE_DECLINE_ANY" "[MOE-EXEC] layer 1$DECLINE_LAYER: cpu $dec_tail" \
         "[MOE-EXEC-TRACE] dev 0 layer 1$DECLINE_LAYER: cpu $dec_tail"
-    ctl decline_ring "$RE_DECLINE_RING" "[MOE-EXEC] layer $DECLINE_LAYER: ring (p=0.98 cheaper)" \
+    # The ring and cpu lines decide ref_layer (a ring line turns NOT_EXERCISED into PASS), so each also refuses
+    # another layer's line and the trace line.
+    local ring_tail='(p=0.98 t_cpu=52000 us t_ring=9000 us cheaper)'
+    ctl decline_ring "$RE_DECLINE_RING" "[MOE-EXEC] layer $DECLINE_LAYER: ring $ring_tail" \
         "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail"
+    ctl decline_ring_other_layer "$RE_DECLINE_RING" "[MOE-EXEC] layer $DECLINE_LAYER: ring $ring_tail" \
+        "[MOE-EXEC] layer 1$DECLINE_LAYER: ring $ring_tail"
+    ctl decline_ring_trace "$RE_DECLINE_RING" "[MOE-EXEC] layer $DECLINE_LAYER: ring $ring_tail" \
+        "[MOE-EXEC-TRACE] dev 0 layer $DECLINE_LAYER: ring $ring_tail"
     ctl decline_cpu "$RE_DECLINE_CPU" "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail" \
         "[MOE-EXEC-TRACE] dev 0 layer $DECLINE_LAYER: cpu $dec_tail"
+    ctl decline_cpu_other_layer "$RE_DECLINE_CPU" "[MOE-EXEC] layer $DECLINE_LAYER: cpu $dec_tail" \
+        "[MOE-EXEC] layer 1$DECLINE_LAYER: cpu $dec_tail"
     ctl summary_cpu "$RE_SUMMARY_CPU" "$sum_long" '[MOE-EXEC] summary: 24 layer-ubatches ring'
     ctl kv_rejected "$RE_KV_REJECTED" '[SYCL-PLAN] runtime KV update rejected: per-device budget exceeded --' \
         'W [SYCL-PLAN] KV overflow re-placed to host tier: 9 layer(s) demoted'

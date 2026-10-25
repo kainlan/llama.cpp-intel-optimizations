@@ -676,6 +676,11 @@ REF_CPU='0.05.100.000 W [MOE-EXEC] layer 20: cpu (p=0.99 t_cpu=101163 us t_ring=
 printf '%s\n' "$REF_WARM" "$REF_RING" "$DECLINE_SUMMARY0" > "$WORK/dec-ref.err"
 printf '%s\n' "$REF_CPU" "$DECLINE_SUMMARY" > "$WORK/dec-refcpu.err"
 printf '%s\n' "$DECLINE_LINE" "$REF_RING" "$DECLINE_SUMMARY" > "$WORK/dec-ring.err"
+# Ring lines that are not layer 20's change line: another layer's, and the trace line.
+REF_RING_DECOYS='0.05.100.000 W [MOE-EXEC] layer 120: ring (p=0.99 t_cpu=101163 us t_ring=58334 us cheaper)'
+REF_RING_DECOYS="$REF_RING_DECOYS
+0.05.100.000 I [MOE-EXEC-TRACE] dev 0 layer 20: ring (p=0.99 t_cpu=101163 us t_ring=58334 us cheaper)"
+printf '%s\n' "$REF_RING_DECOYS" "$DECLINE_SUMMARY0" > "$WORK/dec-refdecoys.err"
 md5a="$(md5sum < "$WORK/dec-ref.out" | cut -c1-8)"
 md5b="$(md5sum < "$WORK/dec-ref2.out" | cut -c1-8)"
 md5d="$(md5sum < "$WORK/dec-diff.out" | cut -c1-8)"
@@ -705,6 +710,10 @@ expect_rc "Q_decline not exercised rc" "$rc" 3
 out="$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err" --ref-err "$WORK/dec-none.err")"
 expect "Q_decline a Q_tok log with no layer 20 line is not exercised" "$out" \
     "Q_decline=NOT_EXERCISED(ref_layer20=none)"
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err" --ref-err "$WORK/dec-refdecoys.err")"; rc=$?
+expect "Q_decline layer 120's ring line or a trace ring line is not Q_tok running layer 20 on the ring" "$out" \
+    "Q_decline=NOT_EXERCISED(ref_layer20=none)"
+expect_rc "Q_decline ring decoys in Q_tok's log rc" "$rc" 3
 out="$(decl "$WORK/dec-diff.out" "$WORK/dec-pass.err" --ref-err "$WORK/dec-refcpu.err")"
 expect "Q_decline a real failure beats not exercised" "$out" "Q_decline=FAIL(md5="
 out="$(decl "$WORK/dec-same.out" "$WORK/dec-noline.err")"; rc=$?
