@@ -569,18 +569,20 @@ int main() {
     // ---- which windows are exposed: copied with no earlier phase of the layer to hide under ----
     {
         using ggml_sycl::moe_stream_window_exposed;
-        // A layer's first UP window: there is no cross-layer prefetch.
-        CHECK(moe_stream_window_exposed(3, expert_tensor_role::UP, 0, 2));
+        // A layer's first window, GATE phase 0 in the dispatched order GATE, UP, DOWN: no window prefetches across
+        // layers.
+        CHECK(moe_stream_window_exposed(3, expert_tensor_role::GATE, 0, 2));
         // Every later window was prefetched under the window before it: the next phase of the role, or phase 0 of the
-        // next role at the last phase.
+        // next role at the last phase. UP phase 0 is prefetched under GATE's last phase, so it is not exposed.
+        CHECK(!moe_stream_window_exposed(3, expert_tensor_role::GATE, 1, 3));
+        CHECK(!moe_stream_window_exposed(3, expert_tensor_role::UP, 0, 3));
         CHECK(!moe_stream_window_exposed(3, expert_tensor_role::UP, 1, 3));
-        CHECK(!moe_stream_window_exposed(3, expert_tensor_role::GATE, 0, 3));
         CHECK(!moe_stream_window_exposed(3, expert_tensor_role::DOWN, 0, 3));
         CHECK(!moe_stream_window_exposed(3, expert_tensor_role::DOWN, 2, 3));
-        // The first window of a new layer is exposed whatever its role, and so is a layer's first UP window when the
-        // window before it was the same layer's (a new micro-batch that starts at the layer the last one ended at).
-        CHECK(moe_stream_window_exposed(3, expert_tensor_role::GATE, 0, 2));
-        CHECK(moe_stream_window_exposed(3, expert_tensor_role::UP, 0, 3));
+        // The first window of a new layer is exposed whatever its role (a model with no gate starts at UP), and so is a
+        // micro-batch's first window: begin_ubatch resets the last window's layer to -1.
+        CHECK(moe_stream_window_exposed(3, expert_tensor_role::UP, 0, 2));
+        CHECK(moe_stream_window_exposed(0, expert_tensor_role::GATE, 0, -1));
         CHECK(moe_stream_window_exposed(0, expert_tensor_role::UP, 0, -1));
     }
 

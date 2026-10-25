@@ -90757,10 +90757,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // llama.cpp-8epx: on a claimed layer this phase is one ring window (W1). window_begin is asked exactly
                 // once per window: it copies the window's host matrices no prefetch staged into a region, and the
                 // window after it into the other region, under this window's dequants and GEMMs. That window is the
-                // next phase of this role, else phase 0 of the next role in the graph's order UP, GATE, DOWN
-                // (src/llama-graph.cpp); the three roles of a layer share the ids, so their phases are the same. No
-                // window prefetches across layers: DOWN's last phase names none. The window's deferred experts are
-                // read after it, and their copies ordered by one barrier before the window's dequants.
+                // next phase of this role, else phase 0 of the next role in the order the graph dispatches a layer's
+                // roles: GATE, UP, DOWN. The FFN builder creates the up matmul before the gate one
+                // (src/llama-graph.cpp), but the gated activation takes the gate output as src[0]
+                // (ggml_swiglu_split(gate, up)), ggml's graph walk visits src[0] first, and SYCL reorders no graph. A
+                // model with no gate runs UP, DOWN, which the same mapping serves; a wrong order would cost misses=,
+                // not output. No window prefetches across layers: DOWN's last phase names none. The three roles of a
+                // layer share the ids, so their phases are the same. The window's deferred experts are read after it,
+                // and their copies ordered by one barrier before the window's dequants.
                 if (pp_onednn_batched_claims_staged_layer) {
                     ggml_sycl::moe_stream_window_request window_req;
                     window_req.layer   = pp_stream_layer;
@@ -90772,8 +90776,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         window_req.next   = phase_ids.data() + phases[p + 1].begin;
                         window_req.n_next = phases[p + 1].end - phases[p + 1].begin;
                     } else if (pp_stream_role != ggml_sycl::expert_tensor_role::DOWN) {
-                        window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::UP ?
-                                                   ggml_sycl::expert_tensor_role::GATE :
+                        window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::GATE ?
+                                                   ggml_sycl::expert_tensor_role::UP :
                                                    ggml_sycl::expert_tensor_role::DOWN;
                         window_req.next      = phase_ids.data() + phases[0].begin;
                         window_req.n_next    = phases[0].end - phases[0].begin;

@@ -1289,8 +1289,8 @@ def test_ubatch_reset_mutants():
     assert not c(mutate(PHASE, "next_window_id_ = UINT32_MAX;", ""))
     # The prefetch id and its whole flag kept.
     assert not c(mutate(PHASE, "next_window_id_ = UINT32_MAX; next_window_whole_ = false;", ""))
-    # The last window's layer kept, so a micro-batch whose first window is not UP phase 0 (a layer whose UP role has
-    # no host matrix) reads it as prefetched and counts its copies as misses.
+    # The last window's layer kept, so a micro-batch that starts at the layer the last one ended at reads its first
+    # window as prefetched and counts its copies as misses (moe_stream_window_exposed names no role).
     assert not c(mutate(PHASE, "prev_window_layer_ = -1;", ""))
 
 

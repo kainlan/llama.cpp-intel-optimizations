@@ -14,7 +14,8 @@ turn it red (its positive controls):
   - on a claimed layer a phase is one window: phase_experts is capped at window_experts(), the region's slots, and the
     phases and the f16 halves are built from the capped count; the WOQ arm never sees a claimed layer (asserted);
   - each phase of a claimed layer asks window_begin exactly once with the phase's experts and the window after it
-    (the next phase of the role, or phase 0 of the next role in the order UP, GATE, DOWN; none after DOWN), sums its
+    (the next phase of the role, or phase 0 of the next role in the order the graph dispatches them, GATE, UP, DOWN;
+    none after DOWN), sums its
     return into pp_staged_experts and its misses, counted per window, into pp_window_misses; then reads each deferred
     expert's slot
     (resolve_deferred_expert: the entry's consumer, AOS, view and tag checks, the entry's ready event onto a per-window
@@ -24,6 +25,9 @@ turn it red (its positive controls):
     *misses is the window's missing matrices unless the window is exposed, and note_window is fed (exposed, missing)
     after both are known (c-qz9m item 2: `*misses = missing` survived every gate). The pin accepts the Task 2c form,
     which moves the note after the prefetch and adds a byte count;
+  - a window is exposed (its copies counted apart from misses=) only when it is its layer's first in the micro-batch:
+    every later window, UP phase 0 included, was prefetched under the one before it, so moe_stream_window_exposed
+    names no role (an earlier clause named UP phase 0, the builder's source order, and hid a prefetched window);
   - a deferred expert the window did not stage (the ring could not take the matrix) is declined, never aborted
     (llama.cpp-9433), and every decline in the phase loop first drains the phases already submitted;
   - the [PP-MOE] first-run line counts the windows the dispatch began, and the executor trace line its misses
@@ -74,6 +78,7 @@ def read(rel: str) -> str:
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 TEST_HPP = read("ggml/src/ggml-sycl/ggml-sycl-test.hpp")
 PLAN_CPP = read("ggml/src/ggml-sycl/moe-stream-plan.cpp")
+PLAN_HPP = read("ggml/src/ggml-sycl/moe-stream-plan.hpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -286,8 +291,8 @@ NEXT_FILL = (
     "if (p + 1 < phases.size()) { window_req.next = phase_ids.data() + phases[p + 1].begin; "
     "window_req.n_next = phases[p + 1].end - phases[p + 1].begin; } "
     "else if (pp_stream_role != ggml_sycl::expert_tensor_role::DOWN) { "
-    "window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::UP ? "
-    "ggml_sycl::expert_tensor_role::GATE : ggml_sycl::expert_tensor_role::DOWN; "
+    "window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::GATE ? "
+    "ggml_sycl::expert_tensor_role::UP : ggml_sycl::expert_tensor_role::DOWN; "
     "window_req.next = phase_ids.data() + phases[0].begin; window_req.n_next = phases[0].end - phases[0].begin; }"
 )
 WINDOW_BEGIN = ("pp_staged_experts += ctx.moe_stream->window_begin(window_req, *stream_call.cache, stream_call.op, "
@@ -311,8 +316,10 @@ PHASE_STEPS = (WINDOW_REQ, NEXT_FILL, WINDOW_MISSES_DECL + " " + WINDOW_BEGIN, M
 
 def claim_phase_brackets_its_window(sycl: str) -> bool:
     """Each phase of a claimed layer asks window_begin exactly once, with the phase's experts and the window after it
-    (W1: the next phase of the role, else phase 0 of the next role in the order UP, GATE, DOWN, and nothing after
-    DOWN, since no window prefetches across layers). window_begin's not-prefetched branch stages only what is
+    (W1: the next phase of the role, else phase 0 of the next role in the order the graph dispatches them, GATE, UP,
+    DOWN, and nothing after DOWN, since no window prefetches across layers). The order is the graph's, not the FFN
+    builder's: the builder creates the up matmul first, but the gated activation takes the gate output as src[0]
+    and ggml's graph walk visits src[0] first. window_begin's not-prefetched branch stages only what is
     missing, so a second call would decline experts its own prefetch evicted (c-qz9m). Its return is the window's
     staged host experts (pp_staged_experts) and its *misses the window's unhidden copies (pp_window_misses, the trace's
     misses=). The deferred experts are read after it, their copies ordered by a per-window barrier, then the dequants
@@ -362,11 +369,17 @@ def test_phase_brackets_its_window_mutants():
     assert not c(mutate(SYCL, NEXT_FILL, ""))
     # The next role's fill removed: the last phase of UP and GATE prefetch nothing.
     assert not c(mutate(SYCL, NEXT_FILL, NEXT_FILL[:NEXT_FILL.index(" else if")]))
-    # The role order swapped: UP's last phase prefetches DOWN.
-    assert not c(mutate(SYCL, "expert_tensor_role::UP ? ggml_sycl::expert_tensor_role::GATE : "
+    # The FFN builder's source order (UP, GATE, DOWN) instead of the dispatched one: GATE's last phase would prefetch
+    # DOWN, which UP's staging then evicts, UP phase 0 would copy on demand, and UP's last phase would prefetch GATE.
+    assert not c(mutate(SYCL, "expert_tensor_role::GATE ? ggml_sycl::expert_tensor_role::UP : "
+                              "ggml_sycl::expert_tensor_role::DOWN;",
+                        "expert_tensor_role::UP ? ggml_sycl::expert_tensor_role::GATE : "
+                        "ggml_sycl::expert_tensor_role::DOWN;"))
+    # UP's last phase prefetching GATE, which already ran.
+    assert not c(mutate(SYCL, "expert_tensor_role::GATE ? ggml_sycl::expert_tensor_role::UP : "
                               "ggml_sycl::expert_tensor_role::DOWN;",
                         "expert_tensor_role::GATE ? ggml_sycl::expert_tensor_role::UP : "
-                        "ggml_sycl::expert_tensor_role::DOWN;"))
+                        "ggml_sycl::expert_tensor_role::GATE;"))
     # DOWN prefetching across the layer boundary.
     assert not c(mutate(SYCL, "else if (pp_stream_role != ggml_sycl::expert_tensor_role::DOWN) {", "else {"))
     # The next phase's experts taken from this phase.
@@ -437,6 +450,51 @@ def test_window_begin_feeds_misses_and_note_mutants():
     # The note fed before the window's exposure is known.
     m = mutate(PLAN_CPP, note, "")
     assert not c(m.replace(WB_EXPOSED, note + " " + WB_EXPOSED, 1))
+
+
+# ---- a window is exposed only as its layer's first in the micro-batch ------------------------------------------------
+
+EXPOSED_SIG = ("static inline bool moe_stream_window_exposed(int layer, expert_tensor_role role, size_t phase_index, "
+               "int prev_layer) {")
+EXPOSED_RETURN = "return layer != prev_layer; }"
+BEGIN_UBATCH_SIG = "void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {"
+UBATCH_RESET = "prev_window_layer_ = -1;"
+
+
+def claim_exposed_is_a_layers_first_window(plan_hpp: str, plan_cpp: str) -> bool:
+    """A window is exposed, its copies counted apart from the trace's misses=, only when no earlier window of its layer
+    could hide it: its layer's first window in the micro-batch. Every later window was prefetched under the one before
+    it (the next phase of its role, or phase 0 of the next role in the dispatched order GATE, UP, DOWN), UP phase 0
+    included, so the predicate names no role and no phase. begin_ubatch resets the last window's layer to -1, which is
+    what makes a micro-batch's first window exposed even when it is the layer the last micro-batch ended at."""
+    b = body(norm(plan_hpp), EXPOSED_SIG)
+    ub = body(norm(plan_cpp), BEGIN_UBATCH_SIG)
+    return (b != "" and b.endswith(EXPOSED_RETURN) and b.count("return ") == 1 and "expert_tensor_role::" not in b
+            and "role ==" not in b and "phase_index ==" not in b and ub.count(UBATCH_RESET) == 1)
+
+
+def test_exposed_is_a_layers_first_window():
+    assert claim_exposed_is_a_layers_first_window(PLAN_HPP, PLAN_CPP)
+
+
+def test_exposed_is_a_layers_first_window_mutants():
+    c = claim_exposed_is_a_layers_first_window
+    # The builder's first role back: a prefetched UP phase 0 counted as exposed, its misses forced to 0.
+    assert not c(mutate(PLAN_HPP, EXPOSED_RETURN,
+                        "return layer != prev_layer || (role == expert_tensor_role::UP && phase_index == 0); }"),
+                 PLAN_CPP)
+    # The dispatched first role named as well: a second source for the dispatch order, and a GATE phase 0 is already
+    # its layer's first window.
+    assert not c(mutate(PLAN_HPP, EXPOSED_RETURN,
+                        "return layer != prev_layer || (role == expert_tensor_role::GATE && phase_index == 0); }"),
+                 PLAN_CPP)
+    # Every window exposed, so misses= is always 0.
+    assert not c(mutate(PLAN_HPP, EXPOSED_RETURN, "return true; }"), PLAN_CPP)
+    # No window exposed, so a layer's first window counts as misses.
+    assert not c(mutate(PLAN_HPP, EXPOSED_RETURN, "return false; }"), PLAN_CPP)
+    # The micro-batch's reset dropped, so a micro-batch that starts at the layer the last one ended at reads its first
+    # window as prefetched.
+    assert not c(PLAN_HPP, mutate(PLAN_CPP, UBATCH_RESET, ""))
 
 
 # ---- a deferred expert's slot, and the declines that drain -----------------------------------------------------------
