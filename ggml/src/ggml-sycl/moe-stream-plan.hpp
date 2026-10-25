@@ -868,8 +868,9 @@ class moe_stream_phase {
     void              warn_partial_released(uint32_t held) const;
 
     std::unique_ptr<moe_stream_ring>                ring_;
-    // A refused reserve's ring and the slots it got, for the next micro-batch's ring_ready() to continue from. No other
-    // member reads it: it is not a ring the phase can stage into.
+    // A refused reserve's ring and the slots it got, for the next micro-batch's ring_ready() to continue from while a
+    // loan can still fund it. Only ring_ready() takes or stores it, end_prompt() checks it, teardown() drops it, and
+    // nothing stages into it.
     std::unique_ptr<moe_stream_ring>                pending_ring_;
     std::unordered_map<uint64_t, moe_stream_staged> table_;           // key = moe_stream_table_key(layer, expert, role)
     std::vector<uint64_t>                           region_keys_[2];  // the table keys whose slots each region holds
