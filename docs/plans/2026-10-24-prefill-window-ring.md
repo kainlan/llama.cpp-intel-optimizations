@@ -69,10 +69,15 @@ record.
 
 **W1. Window.** One executor phase of one (layer, role): the host experts among `active_experts[p*G, (p+1)*G)`, in
 ascending expert id (`i02`), `G` from the executor's group plan capped by the ring's `window_experts()`. The two ring
-regions hold two windows. The role order inside a layer is the graph builder's UP, GATE, DOWN
-(`src/llama-graph.cpp:2202`, `:2215`, `:2316`). At the last phase of a role, the next window is phase 0 of the next role
-(UP to GATE, GATE to DOWN). There is **no cross-layer prefetch** in this plan: the first UP window of each layer is an
-exposed copy, counted as `exposed`, never as a `miss`. Cross-layer look-ahead is a follow-up ticket this plan creates
+regions hold two windows. The role order inside a layer is the order the executor DISPATCHES, which is the graph's
+visit order, not the builder's source order: GATE, UP, DOWN. `src/llama-graph.cpp:2258` builds
+`ggml_swiglu_split(ctx0, cur, up)` with the gate output as `src[0]`, and `ggml_visit_parents_graph` (LEFT_TO_RIGHT)
+adds `src[0]` first; the SYCL backend has no `graph_optimize`, and the executor traces show `gate_exps`, `up_exps`,
+`down_exps` on every layer. (Corrected 2026-10-25 by Task 3's spec review; this paragraph said UP, GATE, DOWN from the
+builder's source lines, which cost two wasted and two on-demand window copies per layer.) At the last phase of a role,
+the next window is phase 0 of the next role (GATE to UP, UP to DOWN; DOWN prefetches nothing). There is **no cross-layer
+prefetch** in this plan: the first GATE window of each layer is an exposed copy, counted as `exposed`, never as a
+`miss`. Cross-layer look-ahead is a follow-up ticket this plan creates
 but does not implement.
 
 **W2. Phase API.** `moe_stream_phase` gains `window_begin(req, cache, op, &misses)` (stages the window's missing host
@@ -968,8 +973,9 @@ def test_mutation_witness(pin, mutant):
                         window_req.next   = phase_ids.data() + phases[p + 1].begin;
                         window_req.n_next = phases[p + 1].end - phases[p + 1].begin;
                     } else if (pp_stream_role != ggml_sycl::expert_tensor_role::DOWN) {
-                        window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::UP ?
-                                                   ggml_sycl::expert_tensor_role::GATE :
+                        // dispatched order is GATE, UP, DOWN (W1): GATE prefetches UP, UP prefetches DOWN
+                        window_req.next_role = pp_stream_role == ggml_sycl::expert_tensor_role::GATE ?
+                                                   ggml_sycl::expert_tensor_role::UP :
                                                    ggml_sycl::expert_tensor_role::DOWN;
                         window_req.next      = phase_ids.data() + phases[0].begin;
                         window_req.n_next    = phases[0].end - phases[0].begin;
