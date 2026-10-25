@@ -201,8 +201,11 @@ int main() {
                               "3 windows, 1 exposed, 1 misses") == 0,
               "MiB streamed is the sum of the windows' staged bytes, two windows of different byte counts");
         log.note(0, 3, decision(moe_exec_choice::RING));
-        CHECK(log.take_summary(buf, sizeof(buf)) && std::strstr(buf, "0 MiB streamed") != nullptr,
-              "the streamed bytes reset with the summary");
+        CHECK(log.take_summary(buf, sizeof(buf)) &&
+                  std::strcmp(buf,
+                              "[MOE-EXEC] summary: 1 layer-ubatches ring, 0 cpu, 0 forced, 0 MiB streamed, "
+                              "0 windows, 0 exposed, 0 misses") == 0,
+              "the streamed bytes and the window counters reset with the summary");
     }
 
     std::printf("%d cases, %d failures\n", g_cases, g_failures);

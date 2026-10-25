@@ -485,7 +485,7 @@ void moe_stream_phase::teardown(sycl::event last_use) {
 }
 
 // The layer's decision goes to the decision log, its change line and its trace line (moe_exec_decision_log::note). The
-// layer stages nothing itself: its bytes are its windows' (report_window).
+// layer stages nothing itself: its bytes are its windows' (note_window).
 void moe_stream_phase::report(int layer, const layer_state & st) const {
     if (log_ != nullptr) {
         log_->note(device_, layer, st.decision);

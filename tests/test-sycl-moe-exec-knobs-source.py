@@ -106,6 +106,15 @@ def test_streamed_bytes_come_from_the_windows():
     assert "bytes_streamed" not in note
     plan = squash(code_of("moe-stream-plan.cpp"))
     assert plan.count("log_->note_window(exposed, missing, bytes_staged);") == 1
+    wb = plan.split("moe_stream_phase::window_begin(")[1].split("void moe_stream_phase::window_done(")[0]
+    assert wb.count("size_t bytes_staged = 0;") == 1
+    assert wb.count("bytes_staged +=") == 1 and wb.count("bytes_staged") == 3, "one total, one accumulation, one use"
+    lam = wb.split("const auto stage_or_abort = [&]")[1].split("return n; };")[0]
+    assert lam.count("bytes_staged += n.bytes;") == 1, "accumulated in the lambda every stage goes through"
+    # The call follows the prefetch, so the prefetch's bytes are in the total, and precedes the staged count.
+    call = wb.index("log_->note_window(exposed, missing, bytes_staged);")
+    assert wb.count("stage_or_abort(nitems, nrole, nphase)") == 1
+    assert wb.index("stage_or_abort(nitems, nrole, nphase)") < call < wb.index("uint32_t staged = 0;")
     assert plan.count("log_->note(device_, layer, st.decision);") == 1
 
 
