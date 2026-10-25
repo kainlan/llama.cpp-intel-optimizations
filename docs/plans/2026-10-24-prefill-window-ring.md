@@ -441,7 +441,7 @@ git commit -- <the same paths> -m "sycl: size the expert stream ring to one exec
 - Test: `ggml/src/ggml-sycl/tests/test-moe-exec-policy.cpp:160-170`
 
 **Description:** The teardown summary gains the three window counters the gate scores (W6): windows served, exposed
-windows (the first UP window of a layer, copied with nothing to hide under) and misses (a window the executor asked
+windows (the first GATE window of a layer, copied with nothing to hide under) and misses (a window the executor asked
 for that was not already staged, other than an exposed one). The phase (Task 2b) feeds them through one new method.
 
 **Acceptance Criteria:**
@@ -477,7 +477,7 @@ for that was not already staged, other than an exposed one). The phase (Task 2b)
 
 ```cpp
     uint32_t n_windows = 0;  // executor windows the ring served this prompt (Task 2b window_begin)
-    uint32_t n_exposed = 0;  // of them, a layer's first UP window: copied with no earlier phase to hide under
+    uint32_t n_exposed = 0;  // of them, a layer's first GATE window: copied with no earlier phase to hide under
     uint32_t n_misses  = 0;  // experts a window asked for that were not staged ahead, exposed windows excluded
 
     void note_window(bool exposed, uint32_t misses) {
@@ -598,7 +598,7 @@ static void test_window_items() {
 4. **Test: exposed vs miss accounting.** The phase itself needs a queue, so the accounting lives in a pure helper:
 
 ```cpp
-// moe_stream_window_exposed(layer, role, phase_index, prev_layer): a layer's first UP window is exposed; every other
+// moe_stream_window_exposed(layer, role, phase_index, prev_layer): a layer's first GATE window is exposed; every other
 // window had a predecessor to prefetch under.
 static void test_window_exposed() {
     using ggml_sycl::moe_stream_window_exposed;
@@ -1717,5 +1717,5 @@ Epic: `llama.cpp-a2xb`, parent of Tasks 1-10 (`eeim`, `2399`, `9433`, `8epx`, `e
   short, which the window ring makes rare; fix before relying on `loan_exercised=yes` as evidence.
 - llama.cpp-dfo0 — multi-ubatch prefill; `Q_pp_ub2048` is its measurement arm.
 - llama.cpp-zuze — GPT-OSS B50 pp512 bisect; the control arm here must not be read as its gate.
-Follow-ups this plan creates and does not implement: cross-layer window prefetch (the exposed first UP window);
+Follow-ups this plan creates and does not implement: cross-layer window prefetch (the exposed first GATE window);
 admitting MXFP4 to the executor claim so the WOQ arm gets a window (GPT-OSS ring).
