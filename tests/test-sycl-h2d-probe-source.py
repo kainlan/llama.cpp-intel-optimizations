@@ -33,9 +33,11 @@ reused. The probe this gate pins:
     ggml_sycl_preload_model_weights() (the host zones are configured and the experts placed), never from
     ggml_sycl_init (it must not create caches) nor from model_load_begin (the zones are not configured yet), and
     through ggml_sycl_info_mutable(), defined once, rather than a const_cast of the const accessor;
-  - the copies and the device buffer use cache->get_queue(), never the dpct device's default_queue(): the direct branch
-    needs the copy queue to share a context with the cache's own queue (measured: the default queue read 4-10 GB/s,
-    staged, against 20-21 GB/s direct), and the staged baseline is read after the untimed warm-up;
+  - the copies and the device buffer use cache->get_bcs_queue(), the queue the expert stream ring copies on, never the
+    compute queue (get_queue()) and never the dpct device's default_queue(): the BCS queue shares the cache's context
+    (unified-cache.cpp builds it on queue_.get_context()), so the direct branch still applies (queues_share_context in
+    mem-ops.cpp), where the default queue read 4-10 GB/s, staged, against 20-21 GB/s direct; the staged baseline is
+    read after the untimed warm-up;
   - the call sits inside the outermost-exit `if (outer)` block after the preload; a device that holds a rate is skipped
     by the loop's first statement; a stored record (unless forced) and then the env skip come before the cache and
     zone check; and a refused tuning-cache store is logged "probed, not stored", never "probed";
@@ -378,12 +380,15 @@ def claim_zones_and_staged_copies_never_reach_the_store(src: str) -> bool:
 
 
 def claim_copies_run_on_the_cache_queue(src: str) -> bool:
-    """mem_copy_submit takes its direct branch only when the copy queue shares a context with the cache's own queue
-    (queue_for_device_or_fallback returns cache->get_queue()), so the probe copies, and allocates its device buffer,
-    on that queue: never the dpct device's default queue, which is a different context and is always refused."""
+    """The probe rates the queue the expert stream ring copies on: the cache's BCS queue, so h2d_gbps is the rate the
+    ring sees. That queue shares the cache's context (unified-cache.cpp builds it on queue_.get_context()), so
+    mem_copy_submit still takes its direct branch (queues_share_context, mem-ops.cpp). The probe copies, and allocates
+    its device buffer, on it: never the compute queue, and never the dpct device's default queue, which is a different
+    context and is always refused."""
     fn = probe_body(src)
     return bool(fn) and all([
-        fn.count("sycl::queue * q = &cache->get_queue();") == 1,
+        fn.count("sycl::queue * q = &cache->get_bcs_queue();") == 1,
+        "&cache->get_queue()" not in fn,
         "default_queue" not in fn,
         "dpct::dev_mgr" not in fn,
         "dst_req.queue = q;" in fn,
@@ -965,8 +970,15 @@ def test_mutant_device_info_field_dropped_fails():
 
 def test_mutant_default_queue_fails():
     assert not claim_copies_run_on_the_cache_queue(
-        _once(SYCL, "sycl::queue * q = &cache->get_queue();",
-              "sycl::queue * q = &dpct::dev_mgr::instance().get_device(info.gpu_dpct_ids[dev]).default_queue();"))
+        _once(SYCL, "sycl::queue * q = &cache->get_bcs_queue(); ggml_sycl::alloc_request dst_req{};",
+              "sycl::queue * q = &dpct::dev_mgr::instance().get_device(info.gpu_dpct_ids[dev]).default_queue();"
+              " ggml_sycl::alloc_request dst_req{};"))
+
+
+def test_mutant_compute_queue_fails():
+    assert not claim_copies_run_on_the_cache_queue(
+        _once(SYCL, "sycl::queue * q = &cache->get_bcs_queue(); ggml_sycl::alloc_request dst_req{};",
+              "sycl::queue * q = &cache->get_queue(); ggml_sycl::alloc_request dst_req{};"))
 
 
 def test_mutant_dst_on_another_queue_fails():
