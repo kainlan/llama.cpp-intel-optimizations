@@ -518,6 +518,35 @@ def test_deferred_slot_and_draining_declines_mutants():
                         "batched_scratch_claim.finish_or_release(); retain_expert_leases_until(drained); };"))
     # The GEMM stage's failure keeping its own copy of the drain instead of the one helper.
     assert not c(mutate(SYCL, GEMM_FAIL_SIG + " ", GEMM_FAIL_SIG + " const sycl::event drained = sycl::event(); "))
+    # A matrix the ring could not take asserted instead of declined.
+    assert not c(mutate(SYCL, RESOLVE_STEPS[2], "GGML_ASSERT(executor_entry);"))
+
+
+# The three declines in resolve_deferred_expert. Each drains the phases already submitted before it refuses (lead
+# decision on llama.cpp-8epx): a refusal that returns first, or never drains, leaves earlier phases' GEMMs reading
+# expert slots whose leases and scratch claim the op then gives back.
+DECLINE_HEADS = ("if (!executor_entry) { ", "if (view.ptr == nullptr || !view.on_device) { ",
+                 "if (view.layout != staged->layout) { ")
+
+
+def decline_text(head: str) -> str:
+    """The whole decline that opens with `head`, from the normalized source."""
+    res = body(body(norm(SYCL), EXEC_SIG), RESOLVE_SIG)
+    at = res.find(head + DRAINED_DECLINE)
+    assert at >= 0, f"no drained decline opens with {head!r}"
+    return res[at:res.find("); }", at) + len("); }")]
+
+
+@pytest.mark.parametrize("head", DECLINE_HEADS)
+def test_each_decline_drains_before_it_refuses(head):
+    c = claim_deferred_slot_and_draining_declines
+    whole = decline_text(head)
+    refusal = whole[len(head + "drain_submitted_phases(); "):-len(" }")]
+    assert refusal.startswith("return reject_batched(") and refusal.endswith(");")
+    # The refusal returned before the drain, which then never runs.
+    assert not c(mutate(SYCL, whole, head + refusal + " drain_submitted_phases(); }"))
+    # The refusal with no drain at all.
+    assert not c(mutate(SYCL, whole, head + refusal + " }"))
 
 
 # ---- the trace lines -------------------------------------------------------------------------------------------------
