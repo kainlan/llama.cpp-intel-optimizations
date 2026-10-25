@@ -11,7 +11,8 @@ eleventh-of-resident cap, slot-by-slot reservation, and copies on the BCS queue 
 that plan and `docs/backend/sycl-memory-design.md` for the ring as built; the ring text below is the record of what was
 first built. The `>= 500` pp512 target in the Goal is retired for this placement: the bus carries about 41 GB per
 512-token ubatch at the probed 25 GB/s, a pp512 ceiling near 312 tok/s (the new plan's "Why this plan exists", item 4).
-Its gate floors are pp512 >= 200 and pp2048 >= 500 at `-ub 2048`, and the `>= 800` pp2048 target moves to the
+Its gate floors are pp512 >= 200 and pp2048 >= 500 (Q_pp, and Q_pp_ub2048 at `-ub 2048`), and the `>= 800`
+pp2048 target moves to the
 `-ub 2048` measurement arm. The amendment below that leaves the `>= 500` and `>= 800` targets "with bcre" is
 superseded by this paragraph.
 

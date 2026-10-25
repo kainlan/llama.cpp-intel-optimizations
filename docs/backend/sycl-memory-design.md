@@ -177,8 +177,10 @@ that prices the ring's copy term is the rate the ring sees. No Level Zero
 copy-engine queue was built. The Task 4 spike (llama.cpp-efck, c-0cu6) timed a
 64 MiB pinned copy on either cache queue at 2.5 to 3.5 ms while a one-work-group
 or full-EU spin kernel held the compute queue for 90 to 130 ms, on both cards:
-every row `overlap=yes` and `staged_h2d=0`. Under the v2 Level Zero adapter the
-copies from either queue already run on the blitter and overlap compute, so the
+every row `overlap=yes` and `staged_h2d=0`. The corrected engine counters of a
+later run (c-2oac) show the BCS class busy and the CCS class at 0 on five of eight
+rows, for either queue: under the v2 Level Zero adapter the copies from either
+queue already run on the blitter and overlap compute, so the
 `GGML_SYCL_COPY_ENGINE` knob was descoped (llama.cpp-a64a).
 
 **The loan and the refill.** A loan lends resident expert triplets to the ring.

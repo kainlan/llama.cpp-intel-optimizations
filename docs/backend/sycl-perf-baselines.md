@@ -622,7 +622,7 @@ never as baselines.
 The first run with the window ring (`llama.cpp-qov5`, comments c-bg4s, c-2w7h, c-vu9s and c-xkq4), by the lead, from a
 snapshot of `scripts/sycl-moe-exec-gate.sh` taken from the merge tree, `--pp512-min 200 --pp2048-min 500`. Host load
 31-38, `builders_post` 0 in every arm, `Shmem` flat at 1.44-1.49 GB, no GT-reset events. **This is a record, not a
-baseline**: the ring arms FAIL at this build, and the ring was re-run on master 4229a205d (row at the end of the
+baseline**: the ring arms FAIL at this build, and the ring is being re-run on master 4229a205d (row at the end of the
 table, `llama.cpp-8ucb` owns the attribution). The Qwen3.8 placement is the B70's, 23 host layers.
 
 | arm | metric | value | floor | verdict | notes |
@@ -655,8 +655,10 @@ queue, on the cache's BCS queue and on its compute queue. Lead run, binary from 
 Level Zero v2 adapter, under `GPU.lock`, builders 7, load about 32, `Shmem` 1.45 GB before and after, rc=0 and
 `staged_h2d=0` on every row. **A record, not a baseline.** Every row reads `overlap=yes`: a copy that ends in 2.5-3.5 ms
 under a spin kernel of 89-131 ms is not queued behind it. Later runs on 4d1362427 (c-2oac) and 483449621 (c-os3q, whose
-`resolved=` field confirms each arm timed the queue it names) read the same. The fdinfo engine counters read both engine
-classes busy on this stack, so no row names an engine. This is why the ring and the probe share the BCS queue and no
+`resolved=` field confirms each arm timed the queue it names) read the same timing. The engine counters of the first run
+(c-0cu6) were uninformative: both classes read busy for the whole window. After the window fix, c-2oac shows the BCS
+class busy for the whole copy window with the CCS class at 0 on five of eight rows, for either cache queue, so the
+copies are blitter work. This is why the ring and the probe share the BCS queue and no
 copy-engine queue was built (`llama.cpp-a64a`).
 
 | card | queue | spin | alone_ms | with_kernel_ms | kernel_ms | overlap |

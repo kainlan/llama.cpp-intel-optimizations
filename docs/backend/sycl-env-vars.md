@@ -519,7 +519,8 @@ third under `ring` only, the aborts always)
 **Probes** (load time)
 
 - WARN `[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)`: one per device and outcome. `%s` is `probed; iterations
-  lo-hi`, `probed, not stored`, `tuning cache`, `seed, GGML_SYCL_H2D_PROBE=0`, or a `seed, ...` retry reason (host
+  lo-hi`, `probed, not stored; iterations lo-hi`, `tuning cache`, `seed, GGML_SYCL_H2D_PROBE=0`, or a
+  `seed, ...` retry reason (host
   zones not configured, probe allocation refused, probe copy was staged, no usable rate) or an exception text. The
   probe times the cache's BCS queue, the queue `stage_window` copies on, and falls back with it to the DMA queue and
   then the compute queue. `GGML_SYCL_H2D_PROBE=0` skips it and `=1` forces it.
@@ -530,10 +531,10 @@ third under `ring` only, the aborts always)
 
 **Trace** (`GGML_SYCL_MOE_EXEC_TRACE>=1`, all INFO, in the order a layer-ubatch prints them)
 
-- `[MOE-EXEC-TRACE] stage window layer %d role %s phase %zu: %d items %zu bytes`: one per window `stage_window` ran,
-  the matrices it copied and their bytes, for the window itself and for the prefetch it issued.
 - `[MOE-EXEC-TRACE] dev %d layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)`: the decision, every consult. It
   carries the fields of the WARN decision line.
+- `[MOE-EXEC-TRACE] stage window layer %d role %s phase %zu: %d items %zu bytes`: one per window `stage_window` ran,
+  the matrices it copied and their bytes, for the window itself and for the prefetch it issued.
 - `[MOE-EXEC-TRACE] executor device %d tensor=%s experts=%zu staged=%zu arm=%s misses=%u`: one per MUL_MAT_ID dispatch
   of the batched prompt executor. `experts` are the active ones, `staged` how many it read from ring slots, `arm` is
   `woq` or `f16`, and `misses` how many of its window's experts were not staged ahead (0 for an exposed window).
