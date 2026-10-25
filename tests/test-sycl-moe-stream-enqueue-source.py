@@ -1995,25 +1995,43 @@ PENDING_KEEP = "pending_ring_ = std::move(ring);"
 PENDING_DROP = "pending_ring_.reset();"
 END_PROMPT_EARLY = "if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) { return; }"
 TEARDOWN_RING_IF = "if (ring_)"
+# The refused branch keeps the ring only while a loan can still fund it, decided after the loan step (which may latch
+# a REFUSED loan in this very call); otherwise the ring gives its slots back as it leaves scope (lead ruling, c-zgrd).
+LOAN_CAN_FOLLOW = "const bool loan_can_follow = !loan_latch_.refused && request_loan_ != nullptr;"
+KEEP_WHILE_LOAN = "if (loan_can_follow) { " + PENDING_KEEP + " } else { warn_partial_released(ring->slots_held()); }"
+RELEASED_WARN_SIG = "void moe_stream_phase::warn_partial_released(uint32_t held) const"
+RELEASED_WARN_GUARD = ("if (held == 0 || log_ == nullptr || log_->sink == nullptr || "
+                       "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+RELEASED_WARN_FMT = ("[MOE-STREAM-RING] partial reservation released on device %d: no loan can follow "
+                     "(held %u of %u slots)")
+SLOTS_HELD_DECL = "uint32_t slots_held() const { return static_cast<uint32_t>(slots_.size()); }"
 
 
-def claim_partial_reservation_survives_the_ubatch(phase: str, hpp: str) -> bool:
+def claim_partial_reservation_survives_the_ubatch(phase: str, hpp: str, ring_hpp: str = RING_HPP) -> bool:
     """A refused reserve keeps the slots it got (llama.cpp-am87), and the phase keeps the refused ring for the next
-    micro-batch's attempt, which continues from those slots instead of asking the zone for the whole ring again.
-    ring_ready() takes the pending ring when there is one, stores a refused ring back before the latch, and moves a
-    reserved ring into ring_. The pending ring is nobody's ring: no other member function reads it, so neither the
-    executor's claim nor the release count can take it for a reserved one. teardown() drops it outside its ring_
-    branch (a pending ring exists only while ring_ does not, and it handed nothing out, so its slots go back at once),
-    and end_prompt() does not skip the teardown while one is held. A new geometry or device is the ring's own business:
-    reserve() gives the partial slots back and starts over."""
+    micro-batch's attempt, which continues from those slots instead of asking the zone for the whole ring again. The
+    hold is for the loan path only (lead ruling, c-zgrd): after the loan step, the refused ring is kept only while a
+    loan can still fund it, and otherwise gives its slots back to the WEIGHT zone, which mid-prompt runtime
+    allocations prefer, with one WARN under the ring-unavailable line's gate naming how many it held (none for an
+    empty ring). ring_ready() takes the pending ring when there is one and moves a reserved ring into ring_. The
+    pending ring is nobody's ring: only ring_ready() takes or stores it, so neither the executor's claim nor the
+    release count can take it for a reserved one. teardown() drops it outside its ring_ branch (a pending ring exists
+    only while ring_ does not, and it handed nothing out, so its slots go back at once), and end_prompt() does not
+    skip the teardown while one is held. A new geometry or device is the ring's own business: reserve() gives the
+    partial slots back and starts over."""
     n = norm(phase)
     ready = body(n, RING_READY_SIG)
     at = ready.find(RESERVE_SHORT_IF + " {")
     branch = body(ready[at:], RESERVE_SHORT_IF) if at >= 0 else ""
     td = body(n, TEARDOWN_SIG)
+    warn = body(n, RELEASED_WARN_SIG)
     return (norm(hpp).count(PENDING_DECL) == 1 and n.count("pending_ring_") == 5
             and ordered(ready, LATCH_GUARD, PENDING_TAKE, RESERVE_SHORT_IF, RING_READY_RESET)
-            and branch.startswith("{ " + PENDING_KEEP + " " + LATCH_SET)
+            and ordered(branch, LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN, LOAN_CAN_FOLLOW, KEEP_WHILE_LOAN,
+                        "return false;")
+            and n.count(PENDING_KEEP) == 1 and n.count("warn_partial_released(") == 2
+            and warn.startswith("{ " + RELEASED_WARN_GUARD)
+            and ordered(warn, RELEASED_WARN_FMT, LOAN_WARN_EMIT) and SLOTS_HELD_DECL in norm(ring_hpp)
             and td.count(PENDING_DROP) == 1 and PENDING_DROP not in body(td, TEARDOWN_RING_IF)
             and END_PROMPT_EARLY in body(n, END_PROMPT_SIG))
 
@@ -2023,11 +2041,28 @@ def test_partial_reservation_survives_the_ubatch():
 
 
 def test_partial_reservation_mutants():
-    def c(phase=PHASE, hpp=PLAN_HPP):
-        return claim_partial_reservation_survives_the_ubatch(phase, hpp)
+    def c(phase=PHASE, hpp=PLAN_HPP, ring_hpp=RING_HPP):
+        return claim_partial_reservation_survives_the_ubatch(phase, hpp, ring_hpp)
 
-    # The refused ring dropped: its slots go back, and the next attempt asks the zone for the whole ring again.
-    assert not c(phase=mutate(PHASE, PENDING_KEEP + " " + LATCH_SET, LATCH_SET))
+    # The refused ring dropped while a loan can still fund it: the next attempt asks the zone for the whole ring again.
+    assert not c(phase=mutate(PHASE, KEEP_WHILE_LOAN, "warn_partial_released(ring->slots_held());"))
+    # Kept after a REFUSED loan, or with no loan hook: the hold would outlive any loan, holding WEIGHT room the
+    # runtime allocations prefer until end_prompt.
+    assert not c(phase=mutate(PHASE, LOAN_CAN_FOLLOW, "const bool loan_can_follow = request_loan_ != nullptr;"))
+    assert not c(phase=mutate(PHASE, LOAN_CAN_FOLLOW, "const bool loan_can_follow = !loan_latch_.refused;"))
+    assert not c(phase=mutate(PHASE, LOAN_CAN_FOLLOW, "const bool loan_can_follow = true;"))
+    # Decided before the loan step: a loan this call latched REFUSED would leave the ring held.
+    early = in_body(PHASE, RING_READY_SIG, LOAN_CAN_FOLLOW + " ", "")
+    assert not c(phase=in_body(early, RING_READY_SIG, LATCH_SET, LOAN_CAN_FOLLOW + " " + LATCH_SET))
+    # Released silently: the ring's "(holding K of N slots)" line would go unexplained.
+    assert not c(phase=mutate(PHASE, KEEP_WHILE_LOAN, "if (loan_can_follow) { " + PENDING_KEEP + " }"))
+    # The release WARN ungated (AUTO would print it at default verbosity), printed for an empty ring, or never emitted.
+    assert not c(phase=in_body(PHASE, RELEASED_WARN_SIG, " || (policy_ != moe_exec_policy::RING && log_->trace < 1)",
+                               ""))
+    assert not c(phase=in_body(PHASE, RELEASED_WARN_SIG, "held == 0 || ", ""))
+    assert not c(phase=in_body(PHASE, RELEASED_WARN_SIG, LOAN_WARN_EMIT, "(void) line;"))
+    # The held count is not the slots the ring holds.
+    assert not c(ring_hpp=mutate(RING_HPP, SLOTS_HELD_DECL, "uint32_t slots_held() const { return geo_.n_slots; }"))
     # Every attempt starts from an empty ring.
     assert not c(phase=mutate(PHASE, PENDING_TAKE,
                               "std::unique_ptr<moe_stream_ring> ring = std::make_unique<moe_stream_ring>();"))

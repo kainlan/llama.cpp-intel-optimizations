@@ -124,6 +124,9 @@ class moe_stream_ring {
     // hands out slots; a partial reservation hands out none.
     bool valid() const { return geo_.n_slots != 0 && slots_.size() == geo_.n_slots; }
 
+    // The slots held: n_slots once valid(), fewer in a partial reservation.
+    uint32_t slots_held() const { return static_cast<uint32_t>(slots_.size()); }
+
     // The next slot of the current region: the slot's own allocation, as a
     // handle that resolves with `layout`, the layout the caller will write
     // there (lead ruling c-o9uw-1: the slice's tag is the slot's layout), or an

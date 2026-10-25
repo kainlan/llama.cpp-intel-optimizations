@@ -865,6 +865,7 @@ class moe_stream_phase {
     void              report_staged_routes();
     void              warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li);
     void              warn_loan_refused(size_t bytes_short) const;
+    void              warn_partial_released(uint32_t held) const;
 
     std::unique_ptr<moe_stream_ring>                ring_;
     // A refused reserve's ring and the slots it got, for the next micro-batch's ring_ready() to continue from. No other

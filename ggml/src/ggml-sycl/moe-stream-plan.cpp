@@ -410,7 +410,10 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
 // at the next graph boundary, so the next micro-batch's attempt may succeed, until a loan this prompt asked for comes
 // back refused (llama.cpp-3460, c-0tmn). A refused reserve keeps the slots it got, and its ring waits in pending_ring_
 // for the next micro-batch's attempt, which continues from those slots, so the room a loan freed in holes a slot wide
-// adds up across attempts instead of being asked for again as one block (llama.cpp-am87).
+// adds up across attempts instead of being asked for again as one block (llama.cpp-am87). The hold lives only while a
+// loan can still fund it: once a loan this prompt asked for comes back refused, or the op wires no loan hook, the
+// refused ring gives its slots back at once, because mid-prompt runtime allocations prefer the WEIGHT zone too (lead
+// ruling, c-zgrd).
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;
@@ -422,11 +425,18 @@ bool moe_stream_phase::ring_ready() {
         pending_ring_ ? std::move(pending_ring_) : std::make_unique<moe_stream_ring>();
     size_t bytes_short = 0;
     if (!ring->reserve(device_, geo_, &bytes_short)) {
-        pending_ring_   = std::move(ring);
         reserve_failed_ = true;
         if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_) ==
             moe_stream_loan_step::REFUSED) {
             warn_loan_refused(bytes_short);
+        }
+        // Decided after the loan step, which may latch a REFUSED loan in this very call. A ring not kept gives its
+        // slots back as it leaves scope.
+        const bool loan_can_follow = !loan_latch_.refused && request_loan_ != nullptr;
+        if (loan_can_follow) {
+            pending_ring_ = std::move(ring);
+        } else {
+            warn_partial_released(ring->slots_held());
         }
         return false;
     }
@@ -648,6 +658,22 @@ void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
                   "[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
                   "prompt",
                   device_, bytes_short / (1024.0 * 1024.0));
+    log_->sink(log_->sink_ctx, line);
+}
+
+// A WARN when a refused ring gives its slots back because no loan can fund it any more (lead ruling, c-zgrd), so the
+// ring's own "(holding K of N slots)" line before it is explained. It goes out under the same gate as the
+// ring-unavailable line (lead ruling c-kcyf), and not for a ring that held no slot.
+void moe_stream_phase::warn_partial_released(uint32_t held) const {
+    if (held == 0 || log_ == nullptr || log_->sink == nullptr ||
+        (policy_ != moe_exec_policy::RING && log_->trace < 1)) {
+        return;
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-STREAM-RING] partial reservation released on device %d: no loan can follow (held %u of %u "
+                  "slots)",
+                  device_, held, geo_.n_slots);
     log_->sink(log_->sink_ctx, line);
 }
 
