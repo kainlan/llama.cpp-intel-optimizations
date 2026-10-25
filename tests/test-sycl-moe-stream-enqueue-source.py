@@ -1547,12 +1547,24 @@ def test_short_reserve_loan_mutants():
 # ---- the ring reserves slot by slot (llama.cpp-am87) -----------------------------------------------------------------
 
 SLOT_LOOP = "while (slots_.size() < geo.n_slots)"
-# The loop body's steps, in order: the WEIGHT zone, then the general entry point with the ring's intent, a refusal
-# stopping the loop, and a slot accepted only once it resolves on the device.
+FALLBACK_CALL = "allocation = unified_allocate_owner(req);"
+FALLBACK_IF = "if (!allocation)"
+# The loop body's steps, in order: the WEIGHT zone, then the general entry point (inside the zone refusal's branch),
+# a refusal stopping the loop, the slot wrapped, and a slot accepted only once it resolves on the device.
 SLOT_LOOP_ORDER = (
     "allocation_result allocation = unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, geo.slot_bytes, "
     "MOE_STREAM_RING_SLOT_ALIGN);",
-    "if (!allocation) { alloc_request req{};",
+    FALLBACK_IF + " {",
+    FALLBACK_CALL,
+    "if (!allocation) { break; }",
+    "mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);",
+    "const auto resolved = slot.resolve(device);",
+    "if (!resolved.ptr || !resolved.on_device) {",
+    "slots_.push_back(std::move(slot));",
+)
+# The fallback request's fields, each set once before the fallback call, in any order and wherever reserve() builds the
+# request: the ring's intent is the rule, not the order the fields are written in.
+FALLBACK_REQ = (
     "req.device = device;",
     "req.size = geo.slot_bytes;",
     "req.alignment = MOE_STREAM_RING_SLOT_ALIGN;",
@@ -1562,12 +1574,6 @@ SLOT_LOOP_ORDER = (
     "req.intent.constraints.must_device = true;",
     "req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;",
     "req.intent.constraints.forbid_vram_zone_spill = true;",
-    "allocation = unified_allocate_owner(req); }",
-    "if (!allocation) { break; }",
-    "mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);",
-    "const auto resolved = slot.resolve(device);",
-    "if (!resolved.ptr || !resolved.on_device) {",
-    "slots_.push_back(std::move(slot));",
 )
 SAME_RING = ("const bool same_ring = device == device_ && geo.slot_bytes == geo_.slot_bytes && "
              "geo.n_slots == geo_.n_slots && geo.bytes == geo_.bytes && geo.region_slots == geo_.region_slots;")
@@ -1607,7 +1613,9 @@ def claim_ring_reserves_slot_by_slot(ring_cpp: str, ring_hpp: str) -> bool:
     loop = body(rsv, SLOT_LOOP)
     give_back = body(rsv, GIVE_BACK_IF)
     refused = body(rsv, REFUSED_IF)
-    return (bool(loop) and ordered(loop, *SLOT_LOOP_ORDER)
+    call_at = rsv.find(FALLBACK_CALL)
+    return (bool(loop) and ordered(loop, *SLOT_LOOP_ORDER) and FALLBACK_CALL in body(loop, FALLBACK_IF)
+            and all(rsv.count(f) == 1 and -1 < rsv.find(f) < call_at for f in FALLBACK_REQ)
             and rc.count("unified_cache_zone_allocate_owner(") == 1 and rc.count("unified_allocate_owner(") == 1
             and all(rsv.count(use) == 1 for use in SLOT_USES) and rsv.count("slots_") == len(SLOT_USES)
             and ordered(rsv, SAME_RING, GIVE_BACK_IF, "geo_ = geo;", "device_ = device;", SLOT_LOOP, HELD, REFUSED_IF)
@@ -1634,6 +1642,12 @@ def test_ring_slot_by_slot_mutants():
     assert not c(ring_cpp=mutate(RING_CPP, SLOT_LOOP, "if (slots_.empty())"))
     # The fallback without the ring's intent: it could spill outside the arena.
     assert not c(ring_cpp=mutate(RING_CPP, "req.intent.constraints.forbid_vram_zone_spill = true;", ""))
+    # A field set after the call, so the request goes out without it.
+    assert not c(ring_cpp=mutate(RING_CPP, "req.intent.constraints.must_device = true; ", "").replace(
+        FALLBACK_CALL, FALLBACK_CALL + " req.intent.constraints.must_device = true;", 1))
+    # The fallback called whether or not the zone refused: the zone's slot would be overwritten.
+    unguarded = mutate(RING_CPP, FALLBACK_IF + " { alloc_request req{};", "{ alloc_request req{};")
+    assert not c(ring_cpp=unguarded)
     # A second allocation site beside the loop.
     assert not c(ring_cpp=mutate(RING_CPP, HELD, "(void) unified_allocate_owner(alloc_request{}); " + HELD))
     # The partial slots released on refusal: in the loop's break, in the refused branch, or before its return.
@@ -1670,6 +1684,16 @@ def test_ring_slot_by_slot_mutants():
     # A partial reservation counted valid, or acquire_slot handing out a partial reservation's slots.
     assert not c(ring_hpp=mutate(RING_HPP, VALID_DECL, "bool valid() const { return !slots_.empty(); }"))
     assert not c(ring_cpp=mutate(RING_CPP, "{ if (!valid()) { return {}; }", "{ if (slots_.empty()) { return {}; }"))
+
+
+def test_ring_slot_by_slot_allows_any_request_field_order():
+    """Positive controls: the fallback request's fields in another order, or the request built once before the loop,
+    break no rule, so the claim must still hold."""
+    req_block = "alloc_request req{}; " + " ".join(FALLBACK_REQ) + " "
+    shuffled = mutate(RING_CPP, req_block, "alloc_request req{}; " + " ".join(reversed(FALLBACK_REQ)) + " ")
+    assert claim_ring_reserves_slot_by_slot(shuffled, RING_HPP)
+    hoisted = mutate(RING_CPP, req_block, "").replace(SLOT_LOOP, req_block + SLOT_LOOP, 1)
+    assert claim_ring_reserves_slot_by_slot(hoisted, RING_HPP)
 
 
 def test_ring_slot_by_slot_fails_on_the_single_allocation_ring():
