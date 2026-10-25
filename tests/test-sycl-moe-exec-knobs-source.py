@@ -161,7 +161,9 @@ DECLINE_CONST = ('static constexpr const char * GGML_SYCL_MOE_EXEC_DECLINE_LAYER
 DECLINE_ACCESSOR_SIG = "static inline int ggml_sycl_moe_exec_decline_layer() {"
 DECLINE_GETENV = "std::getenv(GGML_SYCL_MOE_EXEC_DECLINE_LAYER_ENV)"
 DECLINE_UNSET = "if (env == nullptr || env[0] == '\\0') { return -1; }"
-DECLINE_RANGE = "if (end == env || *end != '\\0' || value < 0 || value > 511) {"
+DECLINE_RANGE = "if (end == env || *end != '\\0' || value < 0 || value > GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX) {"
+DECLINE_MAX = "static constexpr int GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX = "
+DECLINE_MAX_ASSERT = "static_assert(GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX == moe_exec_decision_log::MAX_LAYERS - 1,"
 DECLINE_HELPER = ("static inline bool moe_stream_layer_declined(int layer, int knob) { "
                   "return knob >= 0 && knob == layer; }")
 DECLINE_FIELD = "int decline_layer = -1;"
@@ -191,13 +193,19 @@ def between(text, start, end):
 
 
 def claim_decline_accessor(common):
-    """The accessor reads the knob through the one spelling, answers -1 unset and refuses anything outside 0..511 (the
-    decision log's MAX_LAYERS is 512: a larger knob names no layer the log can record)."""
+    """The accessor reads the knob through the one spelling, answers -1 unset and refuses anything outside
+    0..GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX, the named bound (claim_decline_bound ties it to the decision log)."""
     n = norm(common)
     acc = between(n, DECLINE_ACCESSOR_SIG, "return decline_layer; }")
     return (n.count(DECLINE_CONST) == 1 and n.count(DECLINE_ACCESSOR_SIG) == 1 and acc.count(DECLINE_GETENV) == 1
             and DECLINE_UNSET in acc and DECLINE_RANGE in acc and acc.count("return -1;") == 2
             and acc.index(DECLINE_UNSET) < acc.index(DECLINE_RANGE))
+
+
+def claim_decline_bound(common, plan_cpp):
+    """The bound is defined once, in common.hpp, and moe-stream-plan.cpp (which sees both) static_asserts it equals the
+    decision log's last layer, MAX_LAYERS - 1: a larger knob would name a layer the log cannot record."""
+    return norm(common).count(DECLINE_MAX) == 1 and norm(plan_cpp).count(DECLINE_MAX_ASSERT) == 1
 
 
 def claim_decline_helper(plan_hpp):
@@ -263,11 +271,24 @@ def test_decline_accessor_mutants():
     common = src("common.hpp")
     # a second spelling of the name
     assert not claim_decline_accessor(mutate(common, DECLINE_GETENV, 'std::getenv("GGML_SYCL_MOE_EXEC_DECLINE_LAYER")'))
-    # the range check widened past the decision log's layers, or the negative check dropped
-    assert not claim_decline_accessor(mutate(common, "value > 511", "value > 1023"))
+    # the range check widened past the decision log's layers, back to a literal, or the negative check dropped
+    assert not claim_decline_accessor(mutate(common, "value > GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX", "value > 1023"))
+    assert not claim_decline_accessor(mutate(common, "value > GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX", "value > 511"))
     assert not claim_decline_accessor(mutate(common, "value < 0 || ", ""))
     # unset answers layer 0 instead of -1
     assert not claim_decline_accessor(mutate(common, DECLINE_UNSET, DECLINE_UNSET.replace("return -1;", "return 0;")))
+
+
+def test_decline_bound():
+    assert claim_decline_bound(src("common.hpp"), src("moe-stream-plan.cpp"))
+
+
+def test_decline_bound_mutants():
+    common, cpp = src("common.hpp"), src("moe-stream-plan.cpp")
+    # no named bound, or no assert tying it to the decision log, or an assert against the log's size
+    assert not claim_decline_bound(mutate(common, DECLINE_MAX, "static constexpr int DECLINE_LAYER_LAST = "), cpp)
+    assert not claim_decline_bound(common, mutate(cpp, DECLINE_MAX_ASSERT, "static_assert(true,"))
+    assert not claim_decline_bound(common, mutate(cpp, DECLINE_MAX_ASSERT, DECLINE_MAX_ASSERT.replace(" - 1,", ",")))
 
 
 def test_decline_helper():

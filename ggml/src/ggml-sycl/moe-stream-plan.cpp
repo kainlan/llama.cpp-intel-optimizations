@@ -54,6 +54,11 @@ void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {
     next_window_whole_ = false;
 }
 
+// The decline knob's range (common.hpp) is the decision log's layers: a larger knob names a layer the log cannot
+// record.
+static_assert(GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX == moe_exec_decision_log::MAX_LAYERS - 1,
+              "GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX must be the decision log's last layer");
+
 moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
                                                 const placement_plan & plan,
                                                 int                    device,

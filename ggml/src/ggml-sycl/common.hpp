@@ -1512,10 +1512,13 @@ static inline size_t ggml_sycl_moe_pp_f16_group_experts_max() {
 // llama.cpp-ny6i: a debugging knob that forces one prompt layer off the batched executor, so a gate can prove the
 // hybrid fallback on a layer the executor would claim. The stream phase's begin_layer turns that layer's decision to
 // CPU with reason "declined" (moe_stream_layer_declined, moe-stream-plan.hpp); executor_claims then answers false and
-// the layer runs the hybrid path. Unset or empty is -1, no layer. A layer from 0 to 511 (the decision log's MAX_LAYERS)
-// is that layer. Anything else warns once and is ignored. Read once; spelled once, here, for the accessor and its
-// sycl_env_settings[] row.
+// the layer runs the hybrid path. Unset or empty is -1, no layer. A layer from 0 to
+// GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX is that layer. Anything else warns once and is ignored. Read once; spelled
+// once, here, for the accessor and its sycl_env_settings[] row.
 static constexpr const char * GGML_SYCL_MOE_EXEC_DECLINE_LAYER_ENV = "GGML_SYCL_MOE_EXEC_DECLINE_LAYER";
+// The highest layer the decision log can record: moe_exec_decision_log::MAX_LAYERS - 1 (moe-exec-policy.hpp), which
+// moe-stream-plan.cpp, a TU that sees both, static_asserts.
+static constexpr int          GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX = 511;
 
 static inline int ggml_sycl_moe_exec_decline_layer() {
     static const int decline_layer = [] {
@@ -1525,9 +1528,9 @@ static inline int ggml_sycl_moe_exec_decline_layer() {
         }
         char *     end   = nullptr;
         const long value = std::strtol(env, &end, 10);
-        if (end == env || *end != '\0' || value < 0 || value > 511) {
-            GGML_LOG_WARN("[MOE-EXEC] %s=%s is not a layer from 0 to 511; ignoring it\n",
-                          GGML_SYCL_MOE_EXEC_DECLINE_LAYER_ENV, env);
+        if (end == env || *end != '\0' || value < 0 || value > GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX) {
+            GGML_LOG_WARN("[MOE-EXEC] %s=%s is not a layer from 0 to %d; ignoring it\n",
+                          GGML_SYCL_MOE_EXEC_DECLINE_LAYER_ENV, env, GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX);
             return -1;
         }
         return static_cast<int>(value);
