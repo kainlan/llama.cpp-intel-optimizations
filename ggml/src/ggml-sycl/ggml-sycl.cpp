@@ -89924,7 +89924,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 layout_mode           layout    = GGML_LAYOUT_AOS;  // the layout the expert is materialized in
                 to_fp16_sycl_t        to_fp16   = nullptr;  // the f16 arm's converter for `layout` (see pp_q8_0_soa)
                 ggml_sycl::mem_handle lease;
-                bool deferred = false;  // a host expert of an op that reads ring windows: read after its window_begin
+                // a host expert of an op that reads ring windows: its slot is read after its window_begin
+                bool                  deferred = false;
             };
 
             // host-stall attribution cycle, phase 3/6: everything from
