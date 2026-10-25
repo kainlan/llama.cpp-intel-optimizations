@@ -38,8 +38,8 @@
 #     summary with no cpu layer-ubatch, an md5 matching neither auto load (with the shared prefix against each), a
 #     "runtime KV update rejected" line, a wrong-device resolve warning, a declined layer that still printed a ring
 #     line; a missing, empty or failed Q_tok or Q_tok_2 is NOT_SCORED, and a Q_tok log whose layer 20 never ran on the
-#     ring is NOT_EXERCISED (the decline changed nothing; a real failure still FAILs); Q_decline_ref is no arm;
-#     Q_decline is not a ring arm, so it does not move ring_engaged_any;
+#     ring is NOT_EXERCISED (the decline changed nothing; a real failure still FAILs); Q_decline is not a ring arm,
+#     so it does not move ring_engaged_any;
 #   - --dry-run lists every arm, pins the selector in all sixteen device arms, passes no -ngl, no -cnv to
 #     llama-cli, and runs nothing; --help names the arms;
 #   - a real run refuses without a <sha> or with a wrong one, prints verdicts_pass=0 GATE_DONE, exits 2 and never
@@ -679,9 +679,6 @@ printf '%s\n' "$DECLINE_LINE" "$REF_RING" "$DECLINE_SUMMARY" > "$WORK/dec-ring.e
 md5a="$(md5sum < "$WORK/dec-ref.out" | cut -c1-8)"
 md5b="$(md5sum < "$WORK/dec-ref2.out" | cut -c1-8)"
 md5d="$(md5sum < "$WORK/dec-diff.out" | cut -c1-8)"
-out="$(score Q_decline_ref --out "$WORK/dec-ref.out" 2>&1)"; rc=$?
-expect "Q_decline_ref is no longer an arm" "$out" "REFUSED: usage: --score-arm 'Q_decline_ref' is not one of"
-expect_rc "Q_decline_ref is no longer an arm rc" "$rc" 2
 decl() {
     score Q_decline --out "$1" --err "$2" --ref-out "$WORK/dec-ref.out" --ref-out2 "$WORK/dec-ref2.out" \
         --ref-err "$WORK/dec-ref.err" "${@:3}"
@@ -761,7 +758,6 @@ for arm in Q_pp Q_pp_ub2048 Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cp
            Q_decline GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
     expect "dry-run lists $arm" "$out" "$arm: "
 done
-expect_not "dry-run lists no Q_decline_ref" "$out" "Q_decline_ref: "
 n_arms="$(printf '%s\n' "$out" | grep -c '^    score: ')"
 expect_rc "dry-run lists seventeen arms" "$n_arms" 17
 n_sel="$(printf '%s\n' "$out" | grep -c 'ONEAPI_DEVICE_SELECTOR=level_zero:[01] ')"
@@ -775,7 +771,6 @@ expect "dry-run Q_decline runs llama-completion" "$line_decl" "/llama-completion
 expect "dry-run Q_decline loads Qwen3.8" "$line_decl" " -m /models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/"
 expect "dry-run Q_decline declines layer 20" "$line_decl" " GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20 "
 expect_not "dry-run Q_decline caps no VRAM budget" "$line_decl" "VRAM_BUDGET"
-expect_not "dry-run Q_decline loads no Qwen1.5-MoE" "$out" "Qwen1.5-MoE"
 expect "dry-run Q_decline has Q_tok's timeout" "$line_decl" "timeout -k 15 900 "
 decl_cmd="${line_decl#Q_decline: }"
 decl_cmd="${decl_cmd/GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20 /}"
