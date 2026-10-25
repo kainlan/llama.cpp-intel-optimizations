@@ -65884,11 +65884,11 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
                                 expert_handles[slot].stable_identity_equal(handle) && ptr_payload[slot] == resolved.ptr;
         // A staged ring slot (STAGED_RING, llama.cpp-o9uw) is this micro-batch's copy of a host expert, not the
         // expert's storage. It stays out of the persistent handle table and the table's active leases: both outlive
-        // the micro-batch, and a held slice keeps the ring's whole reservation. Its handle entry is cleared, so no
-        // later upload takes it for the same entry and the full-local probe refuses the table. The ring's anchor keeps
-        // the bytes until the prompt's last use (moe_stream_phase::teardown), and the region gates keep a later copy
-        // off the slot until its readers are done. The payload slot is recorded, and nulled once the ring is given
-        // back (ggml_sycl_moe_stream_release_payload), so the pointer does not outlive the reservation.
+        // the micro-batch, and a held slot handle keeps that slot's bytes. Its handle entry is cleared, so no later
+        // upload takes it for the same entry and the full-local probe refuses the table. Every ring slot lives until
+        // the prompt's last use (moe_stream_phase::teardown), and the region gates keep a later copy off the slot
+        // until its readers are done. The payload slot is recorded, and nulled once the ring is given back
+        // (ggml_sycl_moe_stream_release_payload), so the pointer does not outlive the reservation.
         const bool staged = staged_experts != nullptr &&
                             std::find(staged_experts->begin(), staged_experts->end(), eid) != staged_experts->end();
         if (staged) {
