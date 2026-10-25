@@ -62,7 +62,7 @@
 #              figure on the last " eval time = " line, never the prompt-eval rate: a nan eval line is no_tg.
 #   Q_noc      the q0xu Q_noc arm (the same without -c)                          B70  tg >= 9.5, md5 25b7738a,
 #              watchdog 0, place line as --place-ref-noc, and the same md5/flip and refill rules as Q_tg
-#   Q_decline  Q_tok with GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20                         B70  the knob turns layer 20's
+#   Q_decline  Q_tok with GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20                    B70  the knob turns layer 20's
 #              decision to cpu with reason "declined", so the executor does not claim it and it runs the hybrid path
 #              (llama.cpp-ny6i, the forced-decline proof of llama.cpp-8p5x c-0blp). Its references are the two auto
 #              loads that run before it, Q_tok and Q_tok_2: Qwen3.8 greedy decoding on the B70 flips between two texts
@@ -74,8 +74,10 @@
 #              Q_tok's or Q_tok_2's output is missing or empty or its load failed (that arm's own verdict carries the
 #              failure). NOT_EXERCISED when it would pass but Q_tok never ran layer 20 on the ring (its log has no
 #              "[MOE-EXEC] layer 20: ring" line): then the decline changed nothing, and identical text proves nothing.
-#              The verdict prints ref_layer20=ring|cpu|none and declined_layers=N, the distinct layers with a
-#              declined line (which layer the knob reached). Not a ring arm: it does not move ring_engaged_any.
+#              The verdict prints ref_layer20=ring|cpu|none and declined_layers=N, how many distinct layers carry a
+#              declined line (0 or 1 for the one-layer knob). begin_layer applies the knob only to a layer with host
+#              experts, so a layer the placement keeps whole on the device prints no decline line: that reads as
+#              FAIL(no_decline_line) with ref_layer20=none. Not a ring arm: it does not move ring_engaged_any.
 #   GO_gate    llama-cli GPT-OSS count gate at -c 4096 (all in VRAM)            B50  grep -cx '1, 2, 3, 4, 5' = 1,
 #              zero "[MOE-EXEC] layer" lines
 #   GO_pp      llama-bench -m $GO -p 512 -n 128 -r 3 -o csv                     B50  pp512 within 5 % of 871,
@@ -250,9 +252,9 @@ DECODE_REF="$SCRIPT_DIR/sycl-moe-exec-prompts/code-ref-25b7738a.txt"
 DECODE_FLIP_PREFIX_MIN=128
 TOK_PREFIX_MIN=64
 # The forced-decline arm (llama.cpp-8p5x c-0blp): Q_tok's load, where Qwen3.8 on the B70 runs layers 16..46 on the ring
-# for the prompt (gate-out-t10-tok), and GGML_SYCL_MOE_EXEC_DECLINE_LAYER takes layer 20 off the executor. A layer the
-# placement keeps on the device is never consulted; if layer 20 stops being a host layer, declined_layers says so and
-# this value moves, not the code.
+# for the prompt (llama.cpp-ny6i c-nnce), and GGML_SYCL_MOE_EXEC_DECLINE_LAYER takes layer 20 off the executor. A layer
+# the placement keeps whole on the device is never consulted, so if layer 20 stops being a host layer the arm reads
+# FAIL(no_decline_line) with ref_layer20=none, and this value moves, not the code.
 DECLINE_LAYER=20
 
 # The arms whose verdict carries ring_engaged=yes|no; ring_engaged_any in the summary is read from these and only these.
@@ -289,8 +291,8 @@ RE_MI='1, 2, 3, 4, 5, 6, 7, 8, 9, 10'
 # KV refusal (ggml-sycl.cpp prints it after "[SYCL-PLAN] "), and mem_handle::resolve(int)'s wrong-device refusal
 # (mem-handle.cpp, the only wrong-device warning in ggml-sycl; matched up to the text before its em dash).
 RE_DECLINE="\\[MOE-EXEC\\] layer $DECLINE_LAYER: cpu \\(.* declined\\)"
-# Any layer's decline line: the distinct layers it names are printed, so a run on a layer with no host expert shows
-# which layer the knob reached instead.
+# Any layer's decline line: the verdict prints how many distinct layers carry one (declined_layers, 0 or 1 for the
+# one-layer knob).
 RE_DECLINE_ANY='\[MOE-EXEC\] layer [0-9]+: cpu \(.* declined\)'
 RE_DECLINE_RING="\\[MOE-EXEC\\] layer $DECLINE_LAYER: ring "
 RE_DECLINE_CPU="\\[MOE-EXEC\\] layer $DECLINE_LAYER: cpu "

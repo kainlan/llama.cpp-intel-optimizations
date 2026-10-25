@@ -669,7 +669,7 @@ printf '%s\n' "$DECLINE_LINE" "$DECLINE_SUMMARY0" > "$WORK/dec-nocpu.err"
 printf '%s\n' "$DECLINE_LINE" > "$WORK/dec-nosummary.err"
 printf '%s\n' "$KV_REJECTED" "$DECLINE_LINE" "$DECLINE_SUMMARY" > "$WORK/dec-kv.err"
 printf '%s\n' "$DECLINE_LINE" "$WRONG_DEVICE" "$DECLINE_SUMMARY" > "$WORK/dec-wrongdev.err"
-# Q_tok's own log: warmup puts layer 20 on the cpu (p=0.04), the prompt ubatches on the ring (gate-out-t10-tok).
+# Q_tok's own log: warmup puts layer 20 on the cpu (p=0.04), the prompt ubatches on the ring (llama.cpp-ny6i c-nnce).
 REF_WARM='0.05.000.000 W [MOE-EXEC] layer 20: cpu (p=0.04 t_cpu=2182 us t_ring=2404 us cheaper)'
 REF_RING='0.05.100.000 W [MOE-EXEC] layer 20: ring (p=0.99 t_cpu=101163 us t_ring=58334 us cheaper)'
 REF_CPU='0.05.100.000 W [MOE-EXEC] layer 20: cpu (p=0.99 t_cpu=101163 us t_ring=58334 us ring-unavailable)'
