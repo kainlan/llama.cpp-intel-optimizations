@@ -1575,9 +1575,18 @@ GIVE_BACK_IF = "if (!slots_.empty() && !same_ring)"
 HELD = "const uint32_t held = static_cast<uint32_t>(slots_.size());"
 REFUSED_IF = "if (held < geo.n_slots)"
 HOLDING_SUFFIX = "(holding %u of %u slots)"
-# Anything that would drop a held slot.
-SLOT_DROPS = ("release(", "slots_.clear()", "slots_ =", "slots_.pop_back", "slots_.erase", "slots_.resize",
-              "slots_.swap")
+# Every use of slots_ in reserve(), each exactly once: the give-back test and its WARN, the capacity, the loop test,
+# the unresolved-slot WARN, the append and the held count. A census rather than a list of drops: a drop of a held slot
+# spelled any way (clear, assign, swap(slots_), std::exchange, an assignment) adds a use or replaces one of these.
+SLOT_USES = (
+    GIVE_BACK_IF,
+    "device_, slots_.size(), geo_.n_slots,",
+    "slots_.reserve(geo.n_slots);",
+    SLOT_LOOP,
+    "slots_.size(), geo.slot_bytes",
+    "slots_.push_back(std::move(slot));",
+    HELD,
+)
 VALID_DECL = "bool valid() const { return geo_.n_slots != 0 && slots_.size() == geo_.n_slots; }"
 ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout)"
 # What the single-allocation ring read to size its loan: the zone's largest free block.
@@ -1587,10 +1596,11 @@ SHORTFALL_NAMES = ("moe_stream_ring_weight_shortfall", "zone_free_figures", "lar
 def claim_ring_reserves_slot_by_slot(ring_cpp: str, ring_hpp: str) -> bool:
     """llama.cpp-am87: reserve() allocates the ring one slot at a time, each slot through
     unified_cache_zone_allocate_owner and then unified_allocate_owner with the ring's intent, so an expert loan's
-    scattered room gives it. The two allocation calls exist once each, inside the loop. A refused slot breaks the loop
-    and nothing drops a held slot there or in the refused branch, which reports the slots still to allocate and WARNs
-    how many it holds; the one release() in reserve() gives back a partial reservation of another geometry or device,
-    so the next reserve() of the same ring continues from the slots held. A partial reservation is not valid, and
+    scattered room gives it. The two allocation calls exist once each, inside the loop. A refused slot breaks the loop,
+    and the refused branch reports the slots still to allocate and WARNs how many it holds. reserve() names slots_ only
+    in the uses SLOT_USES lists, so neither the loop nor the refused branch drops a held slot, and the refused branch
+    names none; the one release() in reserve() gives back a partial reservation of another geometry or device, so the
+    next reserve() of the same ring continues from the slots held. A partial reservation is not valid, and
     acquire_slot hands out nothing until it is. The ring reads no zone figure: the largest free block is gone."""
     rc = norm(ring_cpp)
     rsv = body(rc, RESERVE_DEF_SIG)
@@ -1599,11 +1609,11 @@ def claim_ring_reserves_slot_by_slot(ring_cpp: str, ring_hpp: str) -> bool:
     refused = body(rsv, REFUSED_IF)
     return (bool(loop) and ordered(loop, *SLOT_LOOP_ORDER)
             and rc.count("unified_cache_zone_allocate_owner(") == 1 and rc.count("unified_allocate_owner(") == 1
-            and not any(d in loop for d in SLOT_DROPS)
+            and all(rsv.count(use) == 1 for use in SLOT_USES) and rsv.count("slots_") == len(SLOT_USES)
             and ordered(rsv, SAME_RING, GIVE_BACK_IF, "geo_ = geo;", "device_ = device;", SLOT_LOOP, HELD, REFUSED_IF)
             and rsv.count("release(") == 1 and "release();" in give_back
             and ordered(refused, RESERVE_SHORT_SET, WEIGHT_REFUSAL_WARN, HOLDING_SUFFIX, "return false;")
-            and not any(d in refused for d in SLOT_DROPS)
+            and "slots_" not in refused
             and VALID_DECL in norm(ring_hpp)
             and body(rc, ACQUIRE_SIG).startswith("{ if (!valid()) { return {}; }")
             and not any(name in rc for name in SHORTFALL_NAMES))
@@ -1631,6 +1641,19 @@ def test_ring_slot_by_slot_mutants():
                                  "if (!allocation) { slots_.clear(); break; }"))
     assert not c(ring_cpp=mutate(RING_CPP, REFUSED_IF + " {", REFUSED_IF + " { release();"))
     assert not c(ring_cpp=mutate(RING_CPP, REFUSED_IF + " {", REFUSED_IF + " { slots_.clear();"))
+    # The same drops spelled so that no list of drop names would match them, before the return of the refused branch
+    # and of the loop's unresolved-slot branch: neither return's text is pinned on its own.
+    rsv = body(norm(RING_CPP), RESERVE_DEF_SIG)
+    refused = body(rsv[rsv.find(REFUSED_IF + " {"):], REFUSED_IF)
+    unresolved = body(body(rsv, SLOT_LOOP), "if (!resolved.ptr || !resolved.on_device)")
+    for drop in ("std::vector<mem_handle>().swap(slots_);", "slots_.assign(0, mem_handle());",
+                 "(void) std::exchange(slots_, {});"):
+        for branch in (refused, unresolved):
+            assert not c(ring_cpp=mutate(RING_CPP, branch, branch.replace("return false;", drop + " return false;")))
+    # A listed use traded for a drop keeps the count: the census names each use, not only how many there are.
+    traded = mutate(RING_CPP, "slots_.reserve(geo.n_slots);", "")
+    swapped = unresolved.replace("return false;", "std::vector<mem_handle>().swap(slots_); return false;")
+    assert not c(ring_cpp=mutate(traded, unresolved, swapped))
     # Every partial reservation given back, whatever ring the next call asks for: nothing would continue.
     assert not c(ring_cpp=mutate(RING_CPP, GIVE_BACK_IF, "if (!slots_.empty())"))
     assert not c(ring_cpp=mutate(RING_CPP, " && geo.region_slots == geo_.region_slots;", ";"))
