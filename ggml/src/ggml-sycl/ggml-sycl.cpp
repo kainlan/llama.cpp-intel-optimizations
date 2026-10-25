@@ -90570,8 +90570,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             };
             // llama.cpp-8epx: on a layer the executor claims, a phase is one ring window (W1, W4 of
             // docs/plans/2026-10-24-prefill-window-ring.md), so it holds at most window_experts() experts, a ring
-            // region's slots. A group the slot would take whole then splits into more phases, which the halves
-            // handle at any count.
+            // region's slots. A group the slot would take whole then splits into more phases. With two buffers they
+            // alternate halves as above. With one (every active expert fits the slot) every phase lands in buffer 0,
+            // so each phase's dequant waits for the previous phase's GEMMs (the half_readers barrier below) although
+            // the slot could hold every expert: those phases run one after another.
             size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group;
             if (pp_onednn_batched_claims_staged_layer) {
                 phase_experts =
