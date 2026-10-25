@@ -168,11 +168,11 @@ for a loan of that many bytes through the op's `request_loan` hook, which the
 backend wires to `ggml_sycl_request_expert_loan`. It asks once per micro-batch,
 since the reserve latch stops later layers before the reserve. The loan runs at
 the next graph boundary, and the next micro-batch's reserve continues from the
-slots the refused one kept. A loan
-the boundary runner refuses stops the asking for the rest of the prompt. A BUSY
-refusal does not, because the runner re-posts that request itself. The
-auto-ubatch fit only probes the loan bytes (`ggml_sycl_expert_loan_probe_bytes`)
-for its ring term, `ggml_sycl_hold_ring_uncovered`, and lends nothing. When a loan
+slots the refused one kept. A loan the boundary runner refuses stops the asking
+for the rest of the prompt. A BUSY refusal does not, because the runner re-posts
+that request itself. The auto-ubatch fit only probes the loan bytes
+(`ggml_sycl_expert_loan_probe_bytes`) for its ring term,
+`ggml_sycl_hold_ring_uncovered`, and lends nothing. When a loan
 runs, the refill runs at the decode boundary through
 `ggml_sycl_expert_refill_transaction_run`. It re-admits
 lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying
