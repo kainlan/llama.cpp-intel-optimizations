@@ -13,7 +13,9 @@ satisfy one by accident, and each count is read against a positive control in th
   3. the per-change WARN format, the level-1 trace format and the teardown summary format each appear exactly once;
   4. sycl_env_settings[] carries a row for both names, so the non-default report names them;
   5. ggml_sycl_moe_exec_config() is defined once in ggml-sycl.cpp and the backend free path prints the summary;
-  6. docs/backend/sycl-env-vars.md has a row for each name.
+  6. docs/backend/sycl-env-vars.md has a row for each name;
+  7. the summary's "MiB streamed" is the windows' bytes (llama.cpp-4huq): note_window() takes the bytes a window staged,
+     the layer's note() takes none, and the stream phase feeds note_window() the bytes stage_window() copied.
 """
 import re
 from pathlib import Path
@@ -85,6 +87,35 @@ def test_log_formats_appear_once():
     assert count_literal("[MOE-EXEC] layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
     assert count_literal("[MOE-EXEC-TRACE] dev %d layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
     assert count_literal("[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed, %u windows, %u exposed, %u misses") == 1
+
+
+def code_of(name):
+    return strip_comments((SYCL / name).read_text(errors="replace"))
+
+
+def squash(text):
+    return re.sub(r"\s+", " ", text)
+
+
+def test_streamed_bytes_come_from_the_windows():
+    policy = squash(code_of("moe-exec-policy.hpp"))
+    assert policy.count("void note_window(bool exposed, uint32_t misses, size_t bytes) {") == 1
+    assert "bytes_streamed += bytes;" in policy.split("void note_window(")[1].split("void note(")[0]
+    note = policy.split("void note(")[1].split("bool take_summary(")[0]
+    assert re.match(r"int device, int layer, const moe_exec_decision & d\) \{", note), "note() takes no bytes"
+    assert "bytes_streamed" not in note
+    plan = squash(code_of("moe-stream-plan.cpp"))
+    assert plan.count("log_->note_window(exposed, missing, bytes_staged);") == 1
+    wb = plan.split("moe_stream_phase::window_begin(")[1].split("void moe_stream_phase::window_done(")[0]
+    assert wb.count("size_t bytes_staged = 0;") == 1
+    assert wb.count("bytes_staged +=") == 1 and wb.count("bytes_staged") == 3, "one total, one accumulation, one use"
+    lam = wb.split("const auto stage_or_abort = [&]")[1].split("return n; };")[0]
+    assert lam.count("bytes_staged += n.bytes;") == 1, "accumulated in the lambda every stage goes through"
+    # The call follows the prefetch, so the prefetch's bytes are in the total, and precedes the staged count.
+    call = wb.index("log_->note_window(exposed, missing, bytes_staged);")
+    assert wb.count("stage_or_abort(nitems, nrole, nphase)") == 1
+    assert wb.index("stage_or_abort(nitems, nrole, nphase)") < call < wb.index("uint32_t staged = 0;")
+    assert plan.count("log_->note(device_, layer, st.decision);") == 1
 
 
 def test_env_settings_rows():

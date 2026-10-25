@@ -130,10 +130,13 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     }
     const auto li = index_.layers.find(req.layer);  // executor_claims found it
 
+    // The bytes this call copies, the window's own and its prefetch's: note_window() counts them once, here.
+    size_t     bytes_staged   = 0;
     // A window larger than its region breaks the ring's sizing: a region holds one executor window.
     const auto stage_or_abort = [&](const std::vector<moe_stream_item> & window, expert_tensor_role role, size_t p) {
         const stage_counts n = stage_window(window, moe_stream_window_id(req.layer, role, p), cache, op);
         report_window(req.layer, role, p, n);
+        bytes_staged += n.bytes;
         if (n.exhausted != 0) {
             GGML_ABORT("[MOE-EXEC] window layer %d role %s phase %zu exceeds its region: %d of %zu without a slot",
                        req.layer, expert_tensor_role_name(role), p, n.exhausted, window.size());
@@ -158,9 +161,6 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
         stage_or_abort(items, req.role, req.phase);  // whole, into the region the last prefetch did not take
     }
     const bool exposed = moe_stream_window_exposed(req.layer, req.role, req.phase, prev_window_layer_);
-    if (log_ != nullptr) {
-        log_->note_window(exposed, missing);
-    }
     if (misses != nullptr) {
         *misses = exposed ? 0 : missing;
     }
@@ -179,6 +179,9 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
             next_window_id_      = moe_stream_window_id(req.layer, nrole, nphase);
             next_window_whole_   = n.staged == static_cast<int>(nitems.size());
         }
+    }
+    if (log_ != nullptr) {
+        log_->note_window(exposed, missing, bytes_staged);
     }
     uint32_t staged = 0;
     for (const moe_stream_item & item : items) {
@@ -482,10 +485,10 @@ void moe_stream_phase::teardown(sycl::event last_use) {
 }
 
 // The layer's decision goes to the decision log, its change line and its trace line (moe_exec_decision_log::note). The
-// layer stages nothing itself: its bytes are its windows' (report_window).
+// layer stages nothing itself: its bytes are its windows' (note_window).
 void moe_stream_phase::report(int layer, const layer_state & st) const {
     if (log_ != nullptr) {
-        log_->note(device_, layer, st.decision, 0);
+        log_->note(device_, layer, st.decision);
     }
 }
 
