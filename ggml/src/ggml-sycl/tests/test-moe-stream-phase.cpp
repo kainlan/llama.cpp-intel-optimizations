@@ -280,6 +280,42 @@ ggml_sycl::moe_stream_loan_step run_short_ubatch(ggml_sycl::moe_stream_loan_latc
     return step;
 }
 
+// GGML_SYCL_MOE_EXEC_DECLINE_LAYER (llama.cpp-ny6i): begin_layer turns the knob's layer to CPU with reason DECLINED, so
+// executor_claims answers false and the layer stays hybrid. The helper is true for that layer only, and never with the
+// knob unset (-1). The decline lives in the layer's decision, not in the claim: moe_stream_executor_claims takes no
+// knob, so a claimed layer still answers true from it while the knob names that layer.
+void test_declined_layer(const moe_stream_layer_info & claimed, const ggml_sycl::moe_stream_ring_geometry & geo) {
+    CHECK(ggml_sycl::moe_stream_layer_declined(3, 3));
+    CHECK(!ggml_sycl::moe_stream_layer_declined(4, 3));
+    CHECK(!ggml_sycl::moe_stream_layer_declined(3, -1));
+    CHECK(ggml_sycl::moe_stream_layer_declined(0, 0));
+    CHECK(!ggml_sycl::moe_stream_layer_declined(-1, -1));
+    CHECK(ggml_sycl::moe_stream_layer_declined(0, 0) && ggml_sycl::moe_stream_executor_claims(claimed, geo));
+}
+
+// The decision log prints a declined layer through the change line's fixed format, with the reason "declined", which is
+// the line the gate's Q_decline arm scores; the summary counts it as a cpu layer-ubatch and not as a forced one.
+void capture_line(void * ctx, const char * line) {
+    *static_cast<std::string *>(ctx) = line;
+}
+
+void test_declined_line() {
+    CHECK(std::string(ggml_sycl::moe_exec_reason_name(ggml_sycl::moe_exec_reason::DECLINED)) == "declined");
+    std::string                      line;
+    ggml_sycl::moe_exec_decision_log log(capture_line, &line);
+    moe_exec_decision                d;
+    d.choice    = moe_exec_choice::CPU;
+    d.reason    = ggml_sycl::moe_exec_reason::DECLINED;
+    d.p_touch   = 0.98;
+    d.t_cpu_us  = 52000.0;
+    d.t_ring_us = 9000.0;
+    log.note(0, 3, d);
+    CHECK(line == "[MOE-EXEC] layer 3: cpu (p=0.98 t_cpu=52000 us t_ring=9000 us declined)");
+    char summary[256] = {};
+    CHECK(log.take_summary(summary, sizeof(summary)));
+    CHECK(std::strstr(summary, "summary: 0 layer-ubatches ring, 1 cpu, 0 forced,") != nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -496,6 +532,16 @@ int main() {
             routed.items.back().consumer = moe_stream_consumer::ROUTE;
             CHECK(!ggml_sycl::moe_stream_layer_claimed(routed));
         }
+    }
+
+    // ---- GGML_SYCL_MOE_EXEC_DECLINE_LAYER: one layer forced off the executor (llama.cpp-ny6i) ----
+    {
+        const moe_stream_layer_info * c0 = layer_info(idx, 0);
+        CHECK(c0 != nullptr);
+        if (c0 != nullptr) {
+            test_declined_layer(*c0, ring_geo);
+        }
+        test_declined_line();
     }
 
     // ---- why a layer answered RING_UNAVAILABLE: the first rule that holds, in a fixed order ----

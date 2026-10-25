@@ -418,6 +418,9 @@ int g_ggml_sycl_moe_pp_f16_batched_aos       = 1;
 // GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX as the report's integer (llama.cpp-348c), SET from
 // ggml_sycl_moe_pp_f16_group_experts_max() after the table parse: 0 is no cap.
 int g_ggml_sycl_moe_pp_f16_group_experts_max = 0;
+// GGML_SYCL_MOE_EXEC_DECLINE_LAYER as the report's integer (llama.cpp-ny6i), SET from
+// ggml_sycl_moe_exec_decline_layer() after the table parse: -1 is no layer.
+int g_ggml_sycl_moe_exec_decline_layer       = -1;
 
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
@@ -33054,6 +33057,7 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;
     call.op.request_loan   = ggml_sycl_request_expert_loan;
     call.op.loan_refusals  = ggml_sycl_expert_loan_refusals;
+    call.op.decline_layer  = ggml_sycl_moe_exec_decline_layer();
     ggml_sycl_moe_stream_set_window(call.op, ctx.device);
     return true;
 }
@@ -33254,6 +33258,9 @@ static void ggml_check_sycl() try {
             { GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV, &g_ggml_sycl_moe_pp_f16_batched_aos, 1 },
             // The f16 arm's debugging group cap (llama.cpp-348c), likewise overwritten from its accessor.
             { GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV, &g_ggml_sycl_moe_pp_f16_group_experts_max, 0 },
+            // The forced-decline debugging knob (llama.cpp-ny6i), likewise overwritten from its accessor, which refuses
+            // a layer this integer parse would take.
+            { GGML_SYCL_MOE_EXEC_DECLINE_LAYER_ENV, &g_ggml_sycl_moe_exec_decline_layer, -1 },
             // clang-format on
         };
 
@@ -33265,6 +33272,7 @@ static void ggml_check_sycl() try {
 
         g_ggml_sycl_moe_pp_f16_batched_aos       = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;
         g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
+        g_ggml_sycl_moe_exec_decline_layer       = ggml_sycl_moe_exec_decline_layer();
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a

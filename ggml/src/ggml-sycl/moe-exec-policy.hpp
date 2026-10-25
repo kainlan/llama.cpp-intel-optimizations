@@ -72,6 +72,8 @@ static inline const char * moe_exec_reason_name(moe_exec_reason r) {
             return "decode";
         case moe_exec_reason::NO_HOST_EXPERTS:
             return "no-host-experts";
+        case moe_exec_reason::DECLINED:
+            return "declined";
         default:
             return "none";
     }

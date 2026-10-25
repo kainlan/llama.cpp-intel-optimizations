@@ -32,8 +32,15 @@
 #     by default, unchanged, changed); refill balanced / unbalanced / not_exercised; watchdog;
 #   - GO_gate / GO_noc count and layer lines (the echo line alone must not score), GO_pp window, MI digits,
 #     resets;
-#   - --dry-run lists every arm, pins the selector in all fifteen device arms, passes no -ngl, no -cnv to llama-cli,
-#     and runs nothing; --help names the arms;
+#   - Q_decline_ref / Q_decline (llama.cpp-ny6i, c-0blp): the reference load is recorded; the declined load passes on
+#     a "[MOE-EXEC] layer 3: cpu (... declined)" line, a summary with cpu >= 1 and stdout identical to the reference,
+#     and fails by name on a missing decline line (a trace line or another layer's decline is not one), a summary
+#     with no cpu layer-ubatch, an md5 mismatch, a "runtime KV update rejected" line, a declined layer that still
+#     printed a ring line; a missing, empty or failed reference is NOT_SCORED, and a reference whose layer 3
+#     never ran on the ring is NOT_EXERCISED (the decline changed nothing; a real failure still FAILs); neither arm is
+#     a ring arm, so neither moves ring_engaged_any;
+#   - --dry-run lists every arm, pins the selector in all seventeen device arms, passes no -ngl, no -cnv to
+#     llama-cli, and runs nothing; --help names the arms;
 #   - a real run refuses without a <sha> or with a wrong one, prints verdicts_pass=0 GATE_DONE, exits 2 and never
 #     creates GPU.lock; the lock helper takes, refuses a second take, and releases;
 #   - --make-prompt is deterministic and the committed prompt exists;
@@ -635,17 +642,119 @@ expect "resets clean journal" "$out" "resets=PASS count=0"
 out="$(score resets --journal "$WORK/j-reset.txt")"
 expect "resets a GT reset fails" "$out" "resets=FAIL(count=1)"
 
+# ---- Q_decline_ref / Q_decline: one layer forced off the executor (llama.cpp-ny6i, c-0blp)
+DECLINE_LINE='0.05.100.000 W [MOE-EXEC] layer 3: cpu (p=0.98 t_cpu=52000 us t_ring=9000 us declined)'
+DECLINE_TRACE='0.05.100.000 I [MOE-EXEC-TRACE] dev 0 layer 3: cpu (p=0.98 t_cpu=52000 us t_ring=9000 us declined)'
+DECLINE_OTHER='0.05.100.000 W [MOE-EXEC] layer 13: cpu (p=0.98 t_cpu=52000 us t_ring=9000 us declined)'
+DECLINE_SUMMARY='0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 12 cpu, 0 forced, 0 MiB streamed,'
+DECLINE_SUMMARY="$DECLINE_SUMMARY 0 windows, 0 exposed, 0 misses"
+DECLINE_SUMMARY0='0.09.000.000 W [MOE-EXEC] summary: 12 layer-ubatches ring, 0 cpu, 0 forced, 9 MiB streamed,'
+DECLINE_SUMMARY0="$DECLINE_SUMMARY0 4 windows, 1 exposed, 0 misses"
+KV_REJECTED='0.01.000.000 E [SYCL-PLAN] runtime KV update rejected: per-device budget exceeded -- n_ctx=4096'
+printf 'a declined layer computes the same text\n' > "$WORK/dec-ref.out"
+printf 'a declined layer computes the same text\n' > "$WORK/dec-same.out"
+printf 'a declined layer computes another text\n' > "$WORK/dec-diff.out"
+: > "$WORK/dec-empty.out"
+printf '%s\n' "$DECLINE_LINE" "$DECLINE_SUMMARY" > "$WORK/dec-pass.err"
+printf '%s\n' "$DECLINE_SUMMARY" > "$WORK/dec-noline.err"
+printf '%s\n' "$DECLINE_TRACE" "$DECLINE_OTHER" "$DECLINE_SUMMARY" > "$WORK/dec-decoys.err"
+printf '%s\n' "$DECLINE_LINE" "$DECLINE_SUMMARY0" > "$WORK/dec-nocpu.err"
+printf '%s\n' "$DECLINE_LINE" > "$WORK/dec-nosummary.err"
+printf '%s\n' "$KV_REJECTED" "$DECLINE_LINE" "$DECLINE_SUMMARY" > "$WORK/dec-kv.err"
+REF_RING='0.05.100.000 W [MOE-EXEC] layer 3: ring (p=0.98 t_cpu=52000 us t_ring=9000 us cheaper)'
+REF_CPU='0.05.100.000 W [MOE-EXEC] layer 3: cpu (p=0.98 t_cpu=52000 us t_ring=9000 us ring-unavailable)'
+printf '%s\n' "$REF_RING" "$DECLINE_SUMMARY0" > "$WORK/dec-ref.err"
+printf '%s\n' "$REF_CPU" "$DECLINE_SUMMARY" > "$WORK/dec-refcpu.err"
+printf '%s\n' "$DECLINE_LINE" "$REF_RING" "$DECLINE_SUMMARY" > "$WORK/dec-ring.err"
+out="$(score Q_decline_ref --out "$WORK/dec-ref.out")"
+expect "Q_decline_ref is recorded" "$out" "Q_decline_ref=RECORDED md5="
+decl() { score Q_decline --out "$1" --err "$2" --ref-out "$WORK/dec-ref.out" --ref-err "$WORK/dec-ref.err" "${@:3}"; }
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err")"; rc=$?
+expect "Q_decline passes on the decline line, a cpu summary and the reference's text" "$out" \
+    "Q_decline=PASS decline_lines=1 declined_layers=1 summary_cpu=12 md5=$(md5sum < "$WORK/dec-ref.out" | cut -c1-8)"
+expect "Q_decline prints the reference md5" "$out" "ref_md5=$(md5sum < "$WORK/dec-ref.out" | cut -c1-8)"
+expect_rc "Q_decline pass rc" "$rc" 0
+expect_not "Q_decline is not a ring arm: no ring_engaged field" "$out" "ring_engaged="
+expect "Q_decline reports the reference's layer 3 decision" "$out" "ref_layer3=ring"
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-ring.err")"
+expect "Q_decline a declined layer that still printed a ring line fails" "$out" \
+    "Q_decline=FAIL(declined_layer_ring=1)"
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err" --ref-err "$WORK/dec-refcpu.err")"; rc=$?
+expect "Q_decline a reference that ran layer 3 on the cpu is not exercised" "$out" \
+    "Q_decline=NOT_EXERCISED(ref_layer3=cpu)"
+expect_rc "Q_decline not exercised rc" "$rc" 3
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err" --ref-err "$WORK/dec-none.err")"
+expect "Q_decline a reference with no layer 3 line is not exercised" "$out" \
+    "Q_decline=NOT_EXERCISED(ref_layer3=none)"
+out="$(decl "$WORK/dec-diff.out" "$WORK/dec-pass.err" --ref-err "$WORK/dec-refcpu.err")"
+expect "Q_decline a real failure beats not exercised" "$out" "Q_decline=FAIL(md5="
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-noline.err")"; rc=$?
+expect "Q_decline without the decline line fails by name" "$out" "Q_decline=FAIL(no_decline_line)"
+expect_rc "Q_decline without the decline line rc" "$rc" 1
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-decoys.err")"
+expect "Q_decline a trace line or layer 13 is not layer 3's decline line" "$out" "Q_decline=FAIL(no_decline_line)"
+expect "Q_decline counts the distinct declined layers, layer 13 included" "$out" "decline_lines=0 declined_layers=1 "
+out="$(decl "$WORK/dec-diff.out" "$WORK/dec-pass.err")"; rc=$?
+expect "Q_decline an md5 mismatch fails by name" "$out" \
+    "Q_decline=FAIL(md5=$(md5sum < "$WORK/dec-diff.out" | cut -c1-8)!=$(md5sum < "$WORK/dec-ref.out" | cut -c1-8))"
+expect "Q_decline a mismatch prints the shared prefix" "$out" "prefix=26"
+expect_rc "Q_decline md5 mismatch rc" "$rc" 1
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-nocpu.err")"
+expect "Q_decline a summary with no cpu layer-ubatch fails" "$out" "Q_decline=FAIL(summary_cpu=0<1)"
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-nosummary.err")"
+expect "Q_decline no summary fails" "$out" "Q_decline=FAIL(summary_cpu=0<1)"
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-kv.err")"
+expect "Q_decline a runtime KV rejection fails" "$out" "Q_decline=FAIL(kv_rejected=1)"
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err" --rc 134)"
+expect "Q_decline a crashed load fails" "$out" "Q_decline=FAIL(rc=134"
+out="$(decl "$WORK/dec-empty.out" "$WORK/dec-pass.err")"
+expect "Q_decline an empty output fails" "$out" "Q_decline=FAIL(empty_output"
+out="$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err" --rc-ref 137)"; rc=$?
+expect "Q_decline a killed reference load is not scored" "$out" "Q_decline=NOT_SCORED(rc_Q_decline_ref=137)"
+expect_rc "Q_decline a killed reference rc" "$rc" 3
+out="$(score Q_decline --out "$WORK/dec-same.out" --err "$WORK/dec-pass.err" --ref-out "$WORK/dec-empty.out")"
+expect "Q_decline an empty reference is not scored" "$out" "Q_decline=NOT_SCORED(empty_Q_decline_ref_output)"
+out="$(score Q_decline --out "$WORK/dec-same.out" --err "$WORK/dec-pass.err" --ref-out "$WORK/dec-none.out")"; rc=$?
+expect "Q_decline without the reference is not scored" "$out" "Q_decline=NOT_SCORED(no_Q_decline_ref_output)"
+expect_rc "Q_decline not scored rc" "$rc" 3
+
 # ---- dry run and help
 out="$(bash "$GATE" --dry-run 2>&1)"; rc=$?
 expect_rc "dry-run rc" "$rc" 0
 for arm in Q_pp Q_pp_ub2048 Q_pp_cpu Q_staged Q_tok Q_tok_2 Q_tok_cpu_1 Q_tok_cpu Q_tg Q_noc \
-           GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
+           Q_decline_ref Q_decline GO_gate GO_pp GO_noc MI_b70 MI_b50 resets; do
     expect "dry-run lists $arm" "$out" "$arm: "
 done
+n_arms="$(printf '%s\n' "$out" | grep -c '^    score: ')"
+expect_rc "dry-run lists eighteen arms" "$n_arms" 18
 n_sel="$(printf '%s\n' "$out" | grep -c 'ONEAPI_DEVICE_SELECTOR=level_zero:[01] ')"
-expect_rc "dry-run pins the selector in all fifteen device arms" "$n_sel" 15
+expect_rc "dry-run pins the selector in all seventeen device arms" "$n_sel" 17
 n_q900="$(printf '%s\n' "$out" | grep -E '^Q_[A-Za-z0-9_]+: ' | grep -c 'timeout -k 15 900 ')"
-expect_rc "dry-run gives the seven short Qwen arms timeout 900" "$n_q900" 7
+expect_rc "dry-run gives the nine short Qwen arms timeout 900" "$n_q900" 9
+line_dref="$(printf '%s\n' "$out" | grep -E '^Q_decline_ref: ')"
+line_decl="$(printf '%s\n' "$out" | grep -E '^Q_decline: ')"
+for l in "$line_dref" "$line_decl"; do
+    expect "dry-run ${l%%:*} pins the B50" "$l" "ONEAPI_DEVICE_SELECTOR=level_zero:1 "
+    expect "dry-run ${l%%:*} runs llama-completion" "$l" "/llama-completion "
+    expect "dry-run ${l%%:*} loads Qwen1.5-MoE Q4_0" "$l" " -m /models/Qwen1.5-MoE-A2.7B-Wikihow.Q4_0.gguf "
+    expect "dry-run ${l%%:*} caps the VRAM budget at 34 %" "$l" " GGML_SYCL_VRAM_BUDGET_PCT=34 "
+done
+expect "dry-run Q_decline declines layer 3" "$line_decl" " GGML_SYCL_MOE_EXEC_DECLINE_LAYER=3 "
+expect_not "dry-run Q_decline_ref declines nothing" "$line_dref" "DECLINE_LAYER"
+decl_cmd="${line_decl#*GGML_SYCL_VRAM_BUDGET_PCT=34 }"
+dref_cmd="${line_dref#*GGML_SYCL_VRAM_BUDGET_PCT=34 }"
+if [ -n "$decl_cmd" ] && [ "${decl_cmd%% > <out-dir>*}" = "${dref_cmd%% > <out-dir>*}" ]; then
+    pass "dry-run Q_decline and Q_decline_ref run the same command after the budget"
+else
+    fail "dry-run Q_decline and Q_decline_ref differ beyond the decline" "$line_decl"
+fi
+dref_at="$(printf '%s\n' "$out" | grep -nE '^Q_decline_ref: ' | cut -d: -f1)"
+decl_at="$(printf '%s\n' "$out" | grep -nE '^Q_decline: ' | cut -d: -f1)"
+if [ -n "$dref_at" ] && [ -n "$decl_at" ] && [ "$dref_at" -lt "$decl_at" ]; then
+    pass "dry-run runs the reference before the declined load"
+else
+    fail "dry-run must run Q_decline_ref before Q_decline" "$dref_at $decl_at"
+fi
 n_q1500="$(printf '%s\n' "$out" | grep -E '^Q_pp(_[a-z0-9]+)?: ' | grep -c 'timeout -k 15 1500 ')"
 expect_rc "dry-run gives the three Q_pp arms timeout 1500 (run 1 took 11.5 min of 15 with the ring off)" "$n_q1500" 3
 expect_not "dry-run passes no -ngl" "$out" " -ngl"
@@ -813,6 +922,7 @@ else
     fail "--ring-arms printed nothing"
 fi
 expect "the ring arms include the window-ring arms" "${RARMS[*]}" "Q_pp Q_pp_ub2048 Q_staged"
+expect_not "the ring arms leave out the decline arms" "${RARMS[*]}" "Q_decline"
 for arm in "${RARMS[@]}"; do
     case "$arm" in
         Q_pp) line="$(score Q_pp --csv "$WORK/pp-pass.csv" --err "$WORK/pp-pass.err")" ;;
@@ -831,6 +941,9 @@ expect "an arm outside RING_ARMS cannot move ring_engaged_any to no" "$out" "rin
 out="$(summ outside2 "$CTRL_PASS" "Q_tg=PASS tg=11.9 ring_engaged=no")"; rc=$?
 expect "an arm outside RING_ARMS does not make ring_engaged_any=no" "$out" "ring_engaged_any=na"
 expect_rc "an arm outside RING_ARMS leaves the exit code 0" "$rc" 0
+out="$(summ outside3 "$PASS_RING" "$(decl "$WORK/dec-same.out" "$WORK/dec-pass.err")")"; rc=$?
+expect "a Q_decline PASS leaves ring_engaged_any to the ring arms" "$out" "ring_engaged_any=yes"
+expect_rc "a Q_decline PASS beside a ring PASS exits 0" "$rc" 0
 
 # ---- the arms fail closed ---------------------------------------------------------------------
 
@@ -895,9 +1008,10 @@ out="$(timeout 10 bash "$GATE" --since 2>&1)"; rc=$?
 expect_rc "a trailing --since exits 2, not 124" "$rc" 2
 n_opts=0
 bad_opts=""
-VALUE_OPTS="--prompt-out --csv --out --out2 --err --ref-out --ref-out2 --journal --rc --rc-out2 --rc-ref --rc-ref2
+VALUE_OPTS="--prompt-out --csv --out --out2 --err --ref-out --ref-out2 --ref-err --journal --rc --rc-out2 --rc-ref
+--rc-ref2
 --builders-pre --builders-post --src-dir --seed-verdicts --builders-file --builders-wait-max --builders-poll
---score-summary --build-dir --out-dir --lock-dir --since --qwen --gptoss --mistral --tuning-dir --decode-ref
+--score-summary --build-dir --out-dir --lock-dir --since --qwen --qwen-moe --gptoss --mistral --tuning-dir --decode-ref
 --place-ref-tg --place-ref-noc --qmd5 --q-layers --go-noc-layers --pp512-min --pp2048-min --go-pp-ref --go-tg-ref
 --arm --score-arm --builders-post-selftest"
 for opt in $VALUE_OPTS; do
@@ -910,15 +1024,15 @@ for opt in $VALUE_OPTS; do
     [ "$rc" = 2 ] && printf '%s\n' "$out" | grep -qF -- "$want" || bad_opts="$bad_opts $opt(rc=$rc)"
 done
 expect_rc "no guarded option is left without a refusal when it is the last word:$bad_opts" "${bad_opts:+bad}" ""
-expect_rc "the loop above covered all 41 value-taking options" "$n_opts" 41
+expect_rc "the loop above covered all 43 value-taking options" "$n_opts" 43
 # every `shift 2` arm in the script carries the guard, except the three whose is_arm check refuses an empty value
 # itself, so a guard removed from an option is caught even if the list above forgot the option
 unguarded="$(cat "$GATE" | grep -n 'shift 2 ;;' | grep -v 'need_value' | cut -d: -f2- \
     | grep -c -v -E 'ARMS\+=|SCORE_ARM=|BUILDERS_POST_SELFTEST=')"
 expect_rc "every shift 2 arm in the option loop has a need_value guard" "$unguarded" 0
 n_shift2="$(cat "$GATE" | grep -c 'shift 2 ;;')"
-expect_rc "the option loop has 41 shift 2 arms (a new one must join the list above)" \
-    "$n_shift2" 41
+expect_rc "the option loop has 43 shift 2 arms (a new one must join the list above)" \
+    "$n_shift2" 43
 out="$(bash "$GATE" --arm Q_nope 2>&1)"
 expect "an unknown arm prints the final line" "$out" "verdicts_pass=0 GATE_DONE"
 out="$(bash "$GATE" abcdef0 1234567 2>&1)"; rc=$?
@@ -1054,7 +1168,7 @@ expect "summary a tainted PASS is not counted as a pass" "$out" "verdicts_pass=1
 printf '%s\n' "$PASS_RING" "$CTRL_PASS" > "$WORK/seed.txt"
 out="$(bash "$GATE" --refuse-selftest --seed-verdicts "$WORK/seed.txt" --lock-dir "$WORK/ref.lock" 2>&1)"; rc=$?
 expect_rc "a refusal after arms ran exits 2" "$rc" 2
-expect "a refusal after arms ran prints STOPPED with the reason" "$out" "STOPPED: synthetic stop (2 of 16 arms scored)"
+expect "a refusal after arms ran prints STOPPED with the reason" "$out" "STOPPED: synthetic stop (2 of 18 arms scored)"
 expect "a refusal after arms ran prints the summary over the scored verdicts" "$out" "summary: ring_engaged_any=yes"
 expect "a refusal after arms ran keeps the scored passes in the final line" "$out" "verdicts_pass=2 GATE_DONE"
 expect_not "a refusal after arms ran is not a bare REFUSED" "$out" "REFUSED"
@@ -1077,7 +1191,7 @@ kill -TERM "$gpid" 2>/dev/null
 wait "$gpid"; rc=$?
 out="$(cat "$WORK/sig2.out")"
 expect_rc "a TERM after arms ran exits 143" "$rc" 143
-expect "a TERM after arms ran prints STOPPED: signal" "$out" "STOPPED: signal (2 of 16 arms scored)"
+expect "a TERM after arms ran prints STOPPED: signal" "$out" "STOPPED: signal (2 of 18 arms scored)"
 expect "a TERM after arms ran prints the summary over the scored verdicts" "$out" "summary: ring_engaged_any=yes"
 expect "a TERM after arms ran keeps the scored passes" "$out" "verdicts_pass=2 GATE_DONE"
 if [ -e "$LOCKS" ]; then

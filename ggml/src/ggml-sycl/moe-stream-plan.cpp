@@ -88,6 +88,12 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
         if (!st.decided) {
             st.decision = weigh(cur->second, op, 0.0);
             st.decided  = true;
+            // GGML_SYCL_MOE_EXEC_DECLINE_LAYER forces this layer off the executor (llama.cpp-ny6i): a CPU decision is
+            // never staged, so the ring is neither reserved nor claimed for it and the layer runs the hybrid path.
+            if (moe_stream_layer_declined(layer, op.decline_layer)) {
+                st.decision.choice = moe_exec_choice::CPU;
+                st.decision.reason = moe_exec_reason::DECLINED;
+            }
             // A RING decision moves bytes under any policy but cpu (moe_stream_stage_now): AUTO when the cost model
             // chose the ring, ring always (llama.cpp-3460). It stands only on a layer the executor claims whole, once
             // the ring reserves at the first such layer: the ring serves the executor only (W2). Every decision is

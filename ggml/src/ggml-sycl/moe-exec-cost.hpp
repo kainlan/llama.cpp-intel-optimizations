@@ -21,7 +21,7 @@ namespace ggml_sycl {
 enum class moe_exec_policy : uint8_t { AUTO, CPU, RING };
 enum class moe_exec_choice : uint8_t { NOT_CONSULTED, CPU, RING };
 enum class moe_exec_regime : uint8_t { NONE, STREAM_ALL, ROUTED_ONLY };
-enum class moe_exec_reason : uint8_t { NONE, FORCED, CHEAPER, RING_UNAVAILABLE, DECODE, NO_HOST_EXPERTS };
+enum class moe_exec_reason : uint8_t { NONE, FORCED, CHEAPER, RING_UNAVAILABLE, DECODE, NO_HOST_EXPERTS, DECLINED };
 
 // The measured rates the decision divides by. Zero means "not measured": the caller substitutes the seed.
 struct moe_exec_rates {
