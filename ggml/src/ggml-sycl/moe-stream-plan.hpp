@@ -454,13 +454,10 @@ static inline std::vector<moe_stream_item> moe_stream_window_items(const moe_str
 }
 
 // True iff a window is exposed: staged with no earlier window of its layer to hide under, which is only the layer's
-// first window in the micro-batch. Every later window was prefetched under the window before it: the next phase of its
-// role, or phase 0 of the next role in the order the graph dispatches a layer's roles, GATE, UP, DOWN (the gated
-// activation takes the gate output as src[0], and ggml's graph walk visits src[0] first), and no window prefetches
-// across layers. So the role and phase do not decide it; naming a first role here would restate the dispatch order a
-// second time (an earlier clause named UP phase 0, the FFN builder's source order, and counted that prefetched window
-// as exposed). begin_ubatch resets the last window's layer, so a micro-batch's first window is exposed even when it is
-// the layer the last micro-batch ended at. `prev_layer` is the layer of the window before this one, -1 for none.
+// first window in the micro-batch. Every later window has the window before it to hide under, which prefetches the
+// next one (see moe_stream_window_request), and no window prefetches across layers. begin_ubatch resets the last
+// window's layer, so a micro-batch's first window is exposed even when it is the layer the last micro-batch ended at.
+// `prev_layer` is the layer of the window before this one, -1 for none.
 static inline bool moe_stream_window_exposed(int layer, expert_tensor_role role, size_t phase_index, int prev_layer) {
     GGML_UNUSED(role);  // kept for the signature: window_begin passes the window's (layer, role, phase)
     GGML_UNUSED(phase_index);

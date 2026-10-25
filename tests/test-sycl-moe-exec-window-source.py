@@ -26,8 +26,8 @@ each claim with mutants that must turn it red (its positive controls):
     *misses is the window's missing matrices unless the window is exposed, and note_window is fed (exposed, missing,
     the window's staged bytes) after both are known (c-qz9m item 2: `*misses = missing` survived every gate);
   - a window is exposed (its copies counted apart from misses=) only when it is its layer's first in the micro-batch:
-    every later window, UP phase 0 included, was prefetched under the one before it, so moe_stream_window_exposed
-    names no role (an earlier clause named UP phase 0, the builder's source order, and hid a prefetched window);
+    every later window, UP phase 0 included, has the one before it to hide under, so moe_stream_window_exposed names
+    no role;
   - a deferred expert the window did not stage (the ring could not take the matrix) is declined, never aborted
     (llama.cpp-9433), and every decline in the phase loop first drains the phases already submitted;
   - the [PP-MOE] first-run line counts the windows the dispatch began, and the executor trace line its misses
@@ -510,8 +510,8 @@ UBATCH_RESET = "prev_window_layer_ = -1;"
 
 def claim_exposed_is_a_layers_first_window(plan_hpp: str, plan_cpp: str) -> bool:
     """A window is exposed, its copies counted apart from the trace's misses=, only when no earlier window of its layer
-    could hide it: its layer's first window in the micro-batch. Every later window was prefetched under the one before
-    it (the next phase of its role, or phase 0 of the next role in the dispatched order GATE, UP, DOWN), UP phase 0
+    could hide it: its layer's first window in the micro-batch. Every later window has the one before it to hide
+    under, which prefetches the next window (the next phase of its role, or phase 0 of the next role), UP phase 0
     included, so the predicate names no role and no phase. begin_ubatch resets the last window's layer to -1, which is
     what makes a micro-batch's first window exposed even when it is the layer the last micro-batch ended at. This is an
     exact-expression pin: it requires the body to return `layer != prev_layer` and name no role or phase, and
