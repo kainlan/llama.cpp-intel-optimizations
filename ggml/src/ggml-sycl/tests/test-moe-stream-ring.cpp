@@ -74,6 +74,18 @@ static bool is_slot_aligned(const void * ptr) {
     return ptr != nullptr && reinterpret_cast<uintptr_t>(ptr) % MOE_STREAM_RING_SLOT_ALIGN == 0;
 }
 
+// Whether the `bytes` at `ptr` overlap none of the slots of `bytes` each at `others`. A null pointer is never apart.
+static bool apart_from(const void * ptr, const std::vector<void *> & others, size_t bytes) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    for (const void * other : others) {
+        const uintptr_t o = reinterpret_cast<uintptr_t>(other);
+        if (begin < o + bytes && o < begin + bytes) {
+            return false;
+        }
+    }
+    return ptr != nullptr;
+}
+
 static moe_stream_ring_geometry make_geometry(size_t slot_bytes, uint32_t n_slots, size_t bytes) {
     moe_stream_ring_geometry geo;
     geo.slot_bytes   = slot_bytes;
@@ -118,6 +130,9 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
                   static_cast<int>(resolved.layout), static_cast<int>(want));
             CHECK(is_slot_aligned(resolved.ptr), "region 0 slot %u starts at a multiple of %zu (got %p)", i,
                   MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
+            CHECK(apart_from(resolved.ptr, first_ptrs, kSlot),
+                  "region 0 slot %u overlaps none of the %zu region 0 slots before it (got %p)", i, first_ptrs.size(),
+                  resolved.ptr);
             first_fill = mem_fill_async(slot, 0x10 + static_cast<int>(i), kSlot, q, { ring.current_region_gate() });
             first_ptrs.push_back(resolved.ptr);
             first_region.push_back(slot);
@@ -143,14 +158,9 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         std::vector<mem_handle> second_region;
         sycl::event             second_fill;
         for (uint32_t i = 0; i < kRegion; ++i) {
-            mem_handle      slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
-            const auto      resolved = slot.resolve(device);
-            const uintptr_t begin    = reinterpret_cast<uintptr_t>(resolved.ptr);
-            bool            apart    = resolved.ptr != nullptr;
-            for (void * other : slot_ptrs) {
-                const uintptr_t o = reinterpret_cast<uintptr_t>(other);
-                apart             = apart && (begin + kSlot <= o || o + kSlot <= begin);
-            }
+            mem_handle slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
+            const auto resolved = slot.resolve(device);
+            const bool apart    = apart_from(resolved.ptr, slot_ptrs, kSlot);
             CHECK(is_slot_aligned(resolved.ptr), "region 1 slot %u starts at a multiple of %zu (got %p)", i,
                   MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
             CHECK(resolved.ptr != nullptr && resolved.on_device && apart,
