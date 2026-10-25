@@ -146,12 +146,18 @@ class moe_stream_ring {
     // Drops the ring's slots. A gated region's slots go back to the unified
     // cache once that region's gate completes and every handle to them is
     // dropped; nothing waits here. Gates exist only for regions closed by
-    // epoch_boundary(): the caller must call epoch_boundary(<event of the last
-    // use>) before release() and before destruction, or hold its slot handles
-    // until that device work completes. Otherwise the current region's bytes
-    // return to the cache under live device work. A partial reservation has no
-    // gate and handed nothing out: its slots go back at once.
+    // epoch_boundary(), and a region's gate can be its last copy, which
+    // precedes the region's readers: a ring the device used goes back through
+    // release(last_use), or its caller holds its slot handles until that device
+    // work completes. Otherwise slots return to the cache under live device
+    // work. A partial reservation has no gate and handed nothing out: its slots
+    // go back at once.
     void release();
+
+    // release() for a ring the device used up to `last_use`: every slot, gated
+    // region or not, is also held until `last_use`. Each slot is its own
+    // allocation, so no one slot held by the caller keeps the others.
+    void release(sycl::event last_use);
 
     const moe_stream_ring_geometry & geometry() const { return geo_; }
 

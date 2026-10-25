@@ -79,8 +79,9 @@ What this gate pins:
     only a window no prefetch took, aborts on a prefetched one only after a whole prefetch, has three aborts (the claim
     guard, a window larger than its region, entries lost after a whole prefetch) and returns what the table holds. No
     host test reaches window_begin, so this pin is the interim decline path's only witness;
-  - teardown gates the open region and holds one slot handle until the last use before the ring is released
-    (ruling D, c-fjx1), and the ring is offered only on an in-order compute queue;
+  - teardown gates the open region and hands every slot of the ring to the drain until the last use as it releases the
+    ring (ruling D, c-fjx1; every slot since llama.cpp-am87, because a region's gate can be its last copy, which
+    precedes the region's readers), and the ring is offered only on an in-order compute queue;
   - the backend context owns the phase, resets it after draining its queues and before the retained handles drain,
     ends the prompt at the first decode graph, and closes a layer's region after its down MUL_MAT_ID;
   - begin_layer and window_begin decide through the header's pure predicates (a micro-batch's start, staging now, the
@@ -1895,13 +1896,27 @@ def test_begin_layer_weigh_mutants():
 TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
 
 
-def claim_teardown_gates_before_release(phase: str) -> bool:
-    """Ruling D: the open region is gated on the last use, one slot handle is held until it, then the ring releases;
-    the destructor and end_prompt both tear down through it, and the ring is offered only on an in-order queue."""
+TEARDOWN_RELEASE = "ring_->release(last_use);"
+RING_RELEASE_AFTER_DECL = "void release(sycl::event last_use);"
+RING_RELEASE_AFTER_SIG = "void moe_stream_ring::release(sycl::event last_use)"
+RING_RETAIN_EVERY_SLOT = "retain_handles_until_event(slots_, std::move(last_use));"
+RING_RELEASE_AFTER_BODY = "{ if (!slots_.empty()) { " + RING_RETAIN_EVERY_SLOT + " } release(); }"
+
+
+def claim_teardown_gates_before_release(phase: str, hpp: str = PLAN_HPP, ring_cpp: str = RING_CPP,
+                                        ring_hpp: str = RING_HPP) -> bool:
+    """Ruling D: the open region is gated on the last use and the ring is released after it; the destructor and
+    end_prompt both tear down through it, and the ring is offered only on an in-order queue. Every slot waits for the
+    last use, not only the slots of the regions a gate covers (llama.cpp-am87): a region's gate can be its last copy,
+    which precedes the region's readers, the executor's dequants, and the slots are separate allocations, so no one
+    slot keeps the others. The ring's release(last_use) hands every slot to the drain on the last use before release()
+    applies the region gates; the phase's one release is teardown's, through it, and no anchor slot remains."""
     n = norm(phase)
     td = body(n, TEARDOWN_SIG)
-    return (ordered(td, "close_region(last_use);", "retain_handles_until_event({ anchor_ }, last_use);",
-                    "ring_->release();")
+    return (ordered(td, "close_region(last_use);", TEARDOWN_RELEASE) and n.count("->release(") == 1
+            and RING_RELEASE_AFTER_DECL in norm(ring_hpp)
+            and body(norm(ring_cpp), RING_RELEASE_AFTER_SIG) == RING_RELEASE_AFTER_BODY
+            and "anchor_" not in n and "anchor_" not in norm(hpp)
             and "teardown(" in body(n, "moe_stream_phase::~moe_stream_phase()")
             and "teardown(" in body(n, "void moe_stream_phase::end_prompt()")
             and "in_order_ = ccs.is_in_order();" in n)
@@ -1919,23 +1934,35 @@ def in_body(text: str, signature: str, old: str, new: str) -> str:
     return n.replace(b, b.replace(old, new, 1), 1)
 
 
-TEARDOWN_RETAIN = "if (anchor_.valid()) { retain_handles_until_event({ anchor_ }, last_use); }"
-
-
 def test_teardown_mutants():
-    assert not claim_teardown_gates_before_release(mutate(PHASE, "close_region(last_use);", ""))
-    assert not claim_teardown_gates_before_release(
-        mutate(PHASE, "retain_handles_until_event({ anchor_ }, last_use);", ""))
-    assert not claim_teardown_gates_before_release(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = true;"))
-    # The ring released before the slot handle is retained on the last use.
-    assert not claim_teardown_gates_before_release(
-        in_body(PHASE, TEARDOWN_SIG, TEARDOWN_RETAIN + " ring_->release();", "ring_->release(); " + TEARDOWN_RETAIN))
+    def c(phase=PHASE, hpp=PLAN_HPP, ring_cpp=RING_CPP, ring_hpp=RING_HPP):
+        return claim_teardown_gates_before_release(phase, hpp, ring_cpp, ring_hpp)
+
+    assert not c(phase=mutate(PHASE, "close_region(last_use);", ""))
+    assert not c(phase=mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = true;"))
+    # The ring released on its region gates alone: the current region's slots would wait for nothing past last_use,
+    # and an earlier region's for a copy its readers follow.
+    assert not c(phase=mutate(PHASE, TEARDOWN_RELEASE, "ring_->release();"))
+    # Only the gated regions' slots held until the last use.
+    assert not c(ring_cpp=mutate(RING_CPP, RING_RETAIN_EVERY_SLOT,
+                                 "for (const region & r : regions_) { if (r.has_gate) { "
+                                 "const auto first = slots_.begin() + r.first; "
+                                 "retain_handles_until_event(std::vector<mem_handle>(first, first + r.count), "
+                                 "last_use); } }"))
+    # One slot held until the last use, the single allocation's anchor: the other slots are their own allocations.
+    assert not c(ring_cpp=mutate(RING_CPP, RING_RETAIN_EVERY_SLOT,
+                                 "retain_handles_until_event({ slots_.front() }, std::move(last_use));"))
+    # The slots dropped before they are handed to the drain: release() clears them, so nothing would be retained.
+    assert not c(ring_cpp=mutate(RING_CPP, RING_RELEASE_AFTER_BODY,
+                                 "{ release(); if (!slots_.empty()) { " + RING_RETAIN_EVERY_SLOT + " } }"))
+    # A second release site in the phase, which would skip the last use.
+    assert not c(phase=in_body(PHASE, END_PROMPT_SIG, "teardown(", "if (ring_) { ring_->release(); } teardown("))
+    # The anchor slot back in the phase.
+    assert not c(hpp=mutate(PLAN_HPP, PENDING_DECL, PENDING_DECL + " mem_handle anchor_;"))
     # The destructor gives the ring back without teardown().
-    assert not claim_teardown_gates_before_release(
-        in_body(PHASE, "moe_stream_phase::~moe_stream_phase()", "teardown(", "(void) ("))
+    assert not c(phase=in_body(PHASE, "moe_stream_phase::~moe_stream_phase()", "teardown(", "(void) ("))
     # end_prompt keeps the ring.
-    assert not claim_teardown_gates_before_release(
-        in_body(PHASE, END_PROMPT_SIG, "teardown(ring_ ? compute_barrier() : sycl::event());", ""))
+    assert not c(phase=in_body(PHASE, END_PROMPT_SIG, "teardown(ring_ ? compute_barrier() : sycl::event());", ""))
 
 
 PENDING_DECL = "std::unique_ptr<moe_stream_ring> pending_ring_;"

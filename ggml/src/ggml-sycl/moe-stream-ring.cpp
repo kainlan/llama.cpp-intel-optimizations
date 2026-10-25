@@ -216,6 +216,15 @@ void moe_stream_ring::release() {
     current_ = 0;
 }
 
+void moe_stream_ring::release(sycl::event last_use) {
+    // Every slot waits for last_use, and release() adds each gated region's
+    // own gate: a slot goes back once both have completed.
+    if (!slots_.empty()) {
+        retain_handles_until_event(slots_, std::move(last_use));
+    }
+    release();
+}
+
 uint32_t moe_stream_ring::slots_free() const {
     const region & r = regions_[current_];
     return r.count - r.next;

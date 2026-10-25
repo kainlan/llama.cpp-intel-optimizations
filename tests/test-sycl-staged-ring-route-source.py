@@ -1071,7 +1071,7 @@ RELEASE_SITES = (
 )
 PAYLOAD_MEMBERS = ("std::unordered_map<uint64_t, moe_stream_payload_record> moe_stream_payload; "
                    "uint64_t moe_stream_payload_releases = 0;")
-RELEASE_COUNT = "ring_->release(); ring_.reset(); ++ring_releases_;"
+RELEASE_COUNT = "ring_->release(last_use); ring_.reset(); ++ring_releases_;"
 RELEASES_ACCESSOR = "uint64_t ring_releases() const { return ring_releases_; }"
 TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
 
@@ -1159,10 +1159,9 @@ def test_staged_pointer_release_mutants():
         head = site[:site.index(" ggml_sycl_moe_stream_release_payload(")]
         assert not c(sycl=mutate(SYCL, site, head))
     # Teardown releases the ring without counting it.
-    assert not c(phase=mutate(PHASE, RELEASE_COUNT, "ring_->release(); ring_.reset();"))
+    assert not c(phase=mutate(PHASE, RELEASE_COUNT, "ring_->release(last_use); ring_.reset();"))
     # One release counted twice.
-    assert not c(phase=mutate(PHASE, "ring_->release(); ring_.reset(); ++ring_releases_;",
-                              "ring_->release(); ring_.reset(); ++ring_releases_; ++ring_releases_;"))
+    assert not c(phase=mutate(PHASE, RELEASE_COUNT, RELEASE_COUNT + " ++ring_releases_;"))
     # The context forgets the records.
     assert not c(common=mutate(COMMON, "uint64_t moe_stream_payload_releases = 0;", ""))
 

@@ -390,7 +390,6 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
         }
         region_submitted_ = true;
         region_last_      = copied;
-        anchor_           = aos;  // any slice holds the whole reservation
         // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader the
         // index build named for the item, the executor (llama.cpp-3460).
         table_[key]       = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };
@@ -469,22 +468,19 @@ sycl::event moe_stream_phase::compute_barrier() {
     }
 }
 
-// Gives the ring back after the device's last use of it (ruling D, c-fjx1): the current region closes on last_use,
-// and one slot, which retains the whole reservation, is held until last_use too, because a region closed earlier
-// carries a gate that precedes its readers, the executor's dequants. The table's handles then go. A partial
-// reservation kept for the next attempt (ring_ready()) handed nothing out, so its slots go back at once.
+// Gives the ring back after the device's last use of it (ruling D, c-fjx1): the current region closes on last_use, and
+// the ring's release(last_use) holds every slot until last_use too. A region stage_window() closed is gated on its last
+// copy, which precedes the region's readers, the executor's dequants, and each slot is its own allocation, so no one
+// slot keeps the others (llama.cpp-am87). The table's handles then go. A partial reservation kept for the next attempt
+// (ring_ready()) handed nothing out, so its slots go back at once.
 void moe_stream_phase::teardown(sycl::event last_use) {
     if (ring_) {
         close_region(last_use);
-        if (anchor_.valid()) {
-            retain_handles_until_event({ anchor_ }, last_use);
-        }
-        ring_->release();
+        ring_->release(last_use);
         ring_.reset();
         ++ring_releases_;
     }
     pending_ring_.reset();
-    anchor_ = mem_handle();
     table_.clear();
     reset_regions();
     geo_ = moe_stream_ring_geometry();
@@ -610,11 +606,7 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
     if (!ring_) {
         return mem_handle();
     }
-    mem_handle slot = ring_->acquire_slot(layout);
-    if (slot.valid()) {
-        anchor_ = slot;  // as stage_window() keeps one: any slice holds the whole reservation
-    }
-    return slot;
+    return ring_->acquire_slot(layout);
 }
 #endif
 

@@ -875,7 +875,6 @@ class moe_stream_phase {
     int                                             cur_region_       = 0;      // flips with every epoch_boundary
     bool                                            region_submitted_ = false;  // a copy went into it since
     sycl::event                                     region_last_;  // its last copy's event (see stage_window())
-    mem_handle                                      anchor_;       // one slot: any slice holds the whole reservation
     moe_stream_plan_index                           index_;
     std::unordered_map<int, layer_state>            layers_;
     std::optional<sycl::queue>                      ccs_;  // the compute queue the readers and the barriers run on
