@@ -622,7 +622,7 @@ never as baselines.
 The first run with the window ring (`llama.cpp-qov5`, comments c-bg4s, c-2w7h, c-vu9s and c-xkq4), by the lead, from a
 snapshot of `scripts/sycl-moe-exec-gate.sh` taken from the merge tree, `--pp512-min 200 --pp2048-min 500`. Host load
 31-38, `builders_post` 0 in every arm, `Shmem` flat at 1.44-1.49 GB, no GT-reset events. **This is a record, not a
-baseline**: the ring arms FAIL at this build, and the ring is being re-run on master 4229a205d (row at the end of the
+baseline**: the ring arms FAIL at this build, and the ring was re-run on master 4229a205d (rows at the end of the
 table, `llama.cpp-8ucb` owns the attribution). The Qwen3.8 placement is the B70's, 23 host layers.
 
 | arm | metric | value | floor | verdict | notes |
@@ -646,7 +646,17 @@ table, `llama.cpp-8ucb` owns the attribution). The Qwen3.8 placement is the B70'
 | MI_b50 | digits | 1 | 1 | PASS | |
 | resets | count | 0 | 0 | PASS | |
 | Q_decline | md5 | 9577403b | md5 equals Q_tok or Q_tok_2 | PASS | taken apart from the run above, at 4229a205d on the B70 (`llama.cpp-ny6i` c-pvhl, `GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20`): decline_lines=1 declined_layers=1 summary_cpu=35 ref_layer20=ring, with the two auto loads reading 2a6c2cf6 and 9577403b |
-| ring arms | re-run on master 4229a205d | pending | | pending | **re-run pending (2026-10-25): the lead fills Q_pp, Q_staged, Q_pp_ub2048, Q_tg and Q_noc from the re-run here** |
+| Q_pp (4229a205d) | pp512 t/s | 30.9 ± 29.39 | 200 | FAIL | ub=512 layers=23 summary=2 ring_engaged=yes ring_layer_ubatches=391 loan_exercised=yes windows=2880 exposed=391 misses=0. The ring engaged at the fourth ubatch (reserve held 11, 135, 135, then 136 of 136 slots; loans of 62, 1, 1 triplets), so the two pp512 repetitions straddle the engagement, hence the spread |
+| Q_pp (4229a205d) | pp2048 t/s | 66.5 ± 1.03 | 500 | FAIL | same run; the pp2048 phase ran all-ring: 368 layer-ubatches ring, 0 cpu, 86576 MiB streamed, 2706 windows, 368 exposed, 0 misses. Q_pp_cpu on the same tree is 32.5, so the ring is 2.0x the CPU executor (`llama.cpp-8ucb` c-t791 has the attribution data) |
+| Q_staged (4229a205d) | ring_layers | - | - | NOT_EXERCISED | ring_engaged=no: two ubatches, reserve held 11 then 135 of 136 slots (loans 62 then 1 triplets), the context ended one slot short. The loan is sized in bytes, not slots: `llama.cpp-9x8t` |
+| Q_pp_ub2048 (4229a205d) | pp2048 t/s | - | 500 | FAIL | rc=1, the same planner refusal as at 0f1d9172c ("PP MoE oneDNN scratch ring for n_ubatch=2048 needs 15785.0 MB ... RUNTIME zone has 4237.5 MB", `llama.cpp-86bl`) |
+| Q_tg (4229a205d) | tg t/s | 4.10 | 11.0 | FAIL | md5 3ce606c1 flip=yes prefix=173 refill=balanced(9/9) loan_exercised=yes ring_engaged=no; reserve held 119 of 136 slots at the pp-to-tg boundary, 9 triplets / 15 MiB lent, returned only at exit (`llama.cpp-i4ny` c-789n) |
+| Q_noc (4229a205d) | tg t/s | 11.63 | 9.5 | PASS | md5 25b7738a flip=no prefix=277 refill=not_exercised loan_exercised=no ring_engaged=yes (7 ring layer-ubatches, no loan) |
+
+Re-run on master 4229a205d (2026-10-25 06:35-07:3x EDT, merge-tree build, B70 `level_zero:0`, load 31-33, builders 0 in
+every arm, `Shmem` flat at 1.45 GB; `llama.cpp-qov5` c-c774). A record, not a baseline. The 0f1d9172c and 4229a205d rows
+differ by Tasks 5, 11 and 8 (`llama.cpp-a64a`, `llama.cpp-am87`, `llama.cpp-ny6i`): the per-slot reserve moved the
+ring's engagement from the twelfth boundary to the fourth and pp2048 from 56.4 to 66.5; the floors remain unmet.
 
 #### Copy overlap: does a cache-queue H2D copy overlap a compute kernel? (`llama.cpp-efck`, 2026-10-24)
 
