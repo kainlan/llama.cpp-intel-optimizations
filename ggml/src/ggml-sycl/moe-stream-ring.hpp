@@ -114,10 +114,12 @@ class moe_stream_ring {
     // on the same device continues from the slots held; one of another
     // geometry or device gives them back first, with one WARN. `bytes_short`,
     // when given, is set to the bytes of the slots still to allocate,
-    // (n_slots - held) * slot_bytes, which an expert loan of that much covers
-    // whatever the zone's fragmentation, since each slot needs only a hole of
-    // its own (llama.cpp-3460, c-0tmn; llama.cpp-am87). It is 0 on success and
-    // on every other refusal.
+    // (n_slots - held) * slot_bytes: the least an expert loan must free
+    // (llama.cpp-3460, c-0tmn; llama.cpp-am87). A loan of that much funds every
+    // remaining slot only where each entry it frees is a slot wide or borders
+    // free room; a freed matrix smaller than a slot funds none on its own, and
+    // the next attempt asks for what is still short. It is 0 on success and on
+    // every other refusal.
     bool reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short = nullptr);
 
     // Whether every slot of the reserved geometry is held. Only a valid ring

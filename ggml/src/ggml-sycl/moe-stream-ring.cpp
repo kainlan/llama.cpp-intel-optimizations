@@ -141,8 +141,9 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, 
     }
     const uint32_t held = static_cast<uint32_t>(slots_.size());
     if (held < geo.n_slots) {
-        // The slots still to allocate: the expert loan the phase asks for (llama.cpp-3460, c-0tmn). Each needs only a
-        // hole of its own, so a loan of that many bytes covers it however the zone is fragmented.
+        // The slots still to allocate: the least the expert loan the phase asks for must free (llama.cpp-3460,
+        // c-0tmn). It funds every remaining slot only where each entry it frees is a slot wide or borders free room;
+        // a freed matrix smaller than a slot funds none on its own, and the next attempt asks for what is still short.
         if (bytes_short != nullptr) {
             *bytes_short = static_cast<size_t>(geo.n_slots - held) * geo.slot_bytes;
         }
