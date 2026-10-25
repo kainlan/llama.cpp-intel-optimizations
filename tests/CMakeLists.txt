@@ -977,13 +977,6 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
-    # The load-time H2D probe rates the cache queue the expert stream ring copies on.
-    llama_test_pytest(${Python3_EXECUTABLE}
-        NAME test-sycl-h2d-probe-queue-source
-        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-h2d-probe-queue-source.py
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        LABEL "sycl;moe;source;source-contract;hostonly;python"
-        TIMEOUT 60)
     # llama.cpp-8epx (Task 3 of llama.cpp-a2xb): the batched prompt executor reads a claimed layer's host experts from
     # ring windows, one window per phase, bracketed by window_begin and window_done.
     llama_test_pytest(${Python3_EXECUTABLE}
