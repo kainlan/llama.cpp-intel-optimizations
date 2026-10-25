@@ -4,8 +4,10 @@
 // 1. Reserve 8 slots of 1 MiB, use the first region's 4 slots, flip, use the
 //    second region's 4 slots, flip, and check that the next slot handed out is
 //    the first region's first slot again, gated on the first boundary's event,
-//    resolving on the device with the bytes the first fill wrote. Release and
-//    check the allocation's registry row and the raw device bytes are gone.
+//    resolving on the device with the bytes the first fill wrote. Each slot is
+//    its own allocation (llama.cpp-am87): no two overlap, and each has its own
+//    registry row while held. Release and check every slot's registry row and
+//    the raw device bytes are gone.
 //    The first region's slots are acquired as AOS and SOA in turn, and each
 //    resolves with the layout it was acquired for (lead ruling c-o9uw-1).
 // 2. Geometries that are not two equal aligned regions (one slot, an odd slot
@@ -15,6 +17,16 @@
 //    while the event that ended the region's previous use is incomplete, and
 //    acquire_slot(layout) hands the slot out regardless (it never consults an
 //    event).
+// 4. A WEIGHT zone whose free room is scattered holes gives the ring
+//    (llama.cpp-am87). The zone is filled, then every other one of its first
+//    fillers is freed: eight holes, each one slot wide, none holding two, and
+//    one allocation of the whole ring refused. One reserve() call takes the
+//    ring, every slot inside a hole. With room for only three slots reserve()
+//    refuses, short by the five slots still to allocate, and keeps the three
+//    (no slot of room is left); once the other holes are free the next call
+//    completes the ring. A partial reservation of one geometry is given back
+//    before a reserve() of another. Each release() gives the holes back. This
+//    case reserves a small arena when the cache has none, so it runs last.
 //
 // A test may wait on events; the ring itself never does, and nothing here
 // status-queries an event.
@@ -26,6 +38,7 @@
 #include "../unified-cache.hpp"
 #include "sycl-test-skip.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -34,6 +47,7 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace ggml_sycl;
@@ -60,6 +74,18 @@ static bool is_slot_aligned(const void * ptr) {
     return ptr != nullptr && reinterpret_cast<uintptr_t>(ptr) % MOE_STREAM_RING_SLOT_ALIGN == 0;
 }
 
+// Whether the `bytes` at `ptr` overlap none of the slots of `bytes` each at `others`. A null pointer is never apart.
+static bool apart_from(const void * ptr, const std::vector<void *> & others, size_t bytes) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    for (const void * other : others) {
+        const uintptr_t o = reinterpret_cast<uintptr_t>(other);
+        if (begin < o + bytes && o < begin + bytes) {
+            return false;
+        }
+    }
+    return ptr != nullptr;
+}
+
 static moe_stream_ring_geometry make_geometry(size_t slot_bytes, uint32_t n_slots, size_t bytes) {
     moe_stream_ring_geometry geo;
     geo.slot_bytes   = slot_bytes;
@@ -76,7 +102,7 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
     constexpr uint32_t kRegion = kSlots / 2;
     const auto         geo     = make_geometry(kSlot, kSlots, kSlots * kSlot);
 
-    void * base_ptr = nullptr;
+    std::vector<void *> slot_ptrs;
     {
         moe_stream_ring ring;
         const bool      reserved = ring.reserve(device, geo);
@@ -104,15 +130,15 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
                   static_cast<int>(resolved.layout), static_cast<int>(want));
             CHECK(is_slot_aligned(resolved.ptr), "region 0 slot %u starts at a multiple of %zu (got %p)", i,
                   MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
+            CHECK(apart_from(resolved.ptr, first_ptrs, kSlot),
+                  "region 0 slot %u overlaps none of the %zu region 0 slots before it (got %p)", i, first_ptrs.size(),
+                  resolved.ptr);
             first_fill = mem_fill_async(slot, 0x10 + static_cast<int>(i), kSlot, q, { ring.current_region_gate() });
             first_ptrs.push_back(resolved.ptr);
             first_region.push_back(slot);
         }
-        base_ptr = first_ptrs[0];
+        slot_ptrs = first_ptrs;
 
-        // Positive control for the release checks below, on either path: the
-        // reservation's registry row exists while the ring holds it.
-        CHECK(allocation_registry_test_contains(base_ptr), "the reservation's registry row exists while held");
         alloc_metadata md{};
         const bool     zone_managed = first_region.front().owner_metadata(&md) && md.zone_managed;
         g_zone_managed              = zone_managed;
@@ -127,25 +153,33 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         CHECK(ring.slots_free() == 0, "an exhausted region has no free slots (got %u)", ring.slots_free());
         ring.epoch_boundary(first_fill);
 
-        // Region 1: the other four slots.
+        // Region 1: the other four slots, each its own allocation, so each
+        // overlaps no slot handed out before it.
         std::vector<mem_handle> second_region;
         sycl::event             second_fill;
         for (uint32_t i = 0; i < kRegion; ++i) {
-            mem_handle           slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
-            const auto           resolved = slot.resolve(device);
-            const std::ptrdiff_t offset   = resolved.ptr != nullptr ? static_cast<const char *>(resolved.ptr) -
-                                                                        static_cast<const char *>(first_ptrs[0]) :
-                                                                      -1;
+            mem_handle slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
+            const auto resolved = slot.resolve(device);
+            const bool apart    = apart_from(resolved.ptr, slot_ptrs, kSlot);
             CHECK(is_slot_aligned(resolved.ptr), "region 1 slot %u starts at a multiple of %zu (got %p)", i,
                   MOE_STREAM_RING_SLOT_ALIGN, resolved.ptr);
-            CHECK(resolved.ptr != nullptr && resolved.on_device &&
-                      offset == static_cast<std::ptrdiff_t>((kRegion + i) * kSlot),
-                  "region 1 slot %u resolves on device at slot offset %u (got byte offset %td)", i, kRegion + i,
-                  offset);
+            CHECK(resolved.ptr != nullptr && resolved.on_device && apart,
+                  "region 1 slot %u resolves on device and overlaps none of the %zu slots before it (got %p)", i,
+                  slot_ptrs.size(), resolved.ptr);
             second_fill = mem_fill_async(slot, 0x20 + static_cast<int>(i), kSlot, q, { ring.current_region_gate() });
+            slot_ptrs.push_back(resolved.ptr);
             second_region.push_back(slot);
         }
         ring.epoch_boundary(second_fill);
+
+        // Positive control for the release checks below, on either path: each
+        // slot's registry row exists while the ring holds it.
+        size_t rows_held = 0;
+        for (void * ptr : slot_ptrs) {
+            rows_held += allocation_registry_test_contains(ptr) ? 1 : 0;
+        }
+        CHECK(rows_held == kSlots, "each of the %u slots has its own registry row while held (%zu found)", kSlots,
+              rows_held);
 
         // Region 0 again: its gate is the first boundary's event, and the slot
         // comes back without the ring asking whether that event completed.
@@ -175,9 +209,13 @@ static void test_regions_and_release(sycl::queue & q, int device, size_t held_be
         CHECK(!ring.acquire_slot(GGML_LAYOUT_AOS).valid(), "a released ring hands out an invalid handle");
     }
 
-    // release() handed the backing to the retained-handle drain; let it run.
+    // release() handed the slots to the retained-handle drain; let it run.
     CHECK(drain_retained_handles(true), "the retained-handle drain completes");
-    CHECK(!allocation_registry_test_contains(base_ptr), "the reservation's registry row is gone after release");
+    size_t rows_left = 0;
+    for (void * ptr : slot_ptrs) {
+        rows_left += allocation_registry_test_contains(ptr) ? 1 : 0;
+    }
+    CHECK(rows_left == 0, "every slot's registry row is gone after release (%zu left)", rows_left);
     if (g_zone_managed) {
         std::printf("INFO: held-bytes check skipped: a zone sub-allocation is outside that ledger\n");
     } else {
@@ -251,9 +289,9 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     std::atomic<bool> copy_done{ false };
 
     mem_handle first_use = ring.acquire_slot(GGML_LAYOUT_AOS);
-    void *     base_ptr  = first_use.resolve(device).ptr;
-    CHECK(base_ptr != nullptr && allocation_registry_test_contains(base_ptr),
-          "the gate case's reservation has a registry row while held");
+    void *     slot_ptr  = first_use.resolve(device).ptr;
+    CHECK(slot_ptr != nullptr && allocation_registry_test_contains(slot_ptr),
+          "the gate case's first slot has a registry row while held");
     sycl::event blocker = blocker_queue.submit([&](sycl::handler & h) {
         h.host_task([&]() {
             while (!release_blocker.load()) {
@@ -328,7 +366,256 @@ static void test_gate_orders_reuse_on_device(sycl::queue & q, int device) {
     // Region 1 was never gated: its release is the has_gate == false branch.
     CHECK(drain_retained_handles(true), "the gate case's retained-handle drain completes");
     stamp("retained-handle drain completed");
-    CHECK(!allocation_registry_test_contains(base_ptr), "the gate case's registry row is gone after release");
+    CHECK(!allocation_registry_test_contains(slot_ptr), "the gate case's first slot has no registry row after release");
+}
+
+// Holds `bytes` of the WEIGHT zone as an owned allocation, or an invalid handle when the zone refuses.
+static mem_handle hold_weight_bytes(int device, size_t bytes) {
+    allocation_result allocation =
+        unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, bytes, MOE_STREAM_RING_SLOT_ALIGN);
+    return allocation ? mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS) : mem_handle();
+}
+
+// The WEIGHT zone's free bytes, or SIZE_MAX when its figures are not available (no arena).
+static size_t weight_zone_available(unified_cache * cache) {
+    size_t capacity  = 0;
+    size_t used      = 0;
+    size_t available = 0;
+    size_t largest   = 0;
+    return cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest) ? available : SIZE_MAX;
+}
+
+// `bytes` rounded down to the slot alignment, and at least one alignment unit.
+static size_t align_down_one_unit(size_t bytes) {
+    return std::max(MOE_STREAM_RING_SLOT_ALIGN, bytes / MOE_STREAM_RING_SLOT_ALIGN * MOE_STREAM_RING_SLOT_ALIGN);
+}
+
+// Takes the rest of the WEIGHT zone: each filler is the largest free block the zone reports, rounded down to the
+// alignment and halved while the zone refuses it, until not even one alignment unit is given.
+static void fill_weight_zone(unified_cache * cache, int device, std::vector<mem_handle> & fillers) {
+    for (int guard = 0; guard < 4096; ++guard) {
+        size_t capacity = 0;
+        size_t used     = 0;
+        size_t avail    = 0;
+        size_t largest  = 0;
+        if (!cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, avail, largest)) {
+            return;
+        }
+        size_t     want   = align_down_one_unit(largest);
+        mem_handle filler = hold_weight_bytes(device, want);
+        while (!filler.valid() && want > MOE_STREAM_RING_SLOT_ALIGN) {
+            want   = align_down_one_unit(want / 2);
+            filler = hold_weight_bytes(device, want);
+        }
+        if (!filler.valid()) {
+            return;
+        }
+        fillers.push_back(std::move(filler));
+    }
+}
+
+struct byte_range {
+    uintptr_t begin = 0;
+    uintptr_t end   = 0;
+};
+
+// Sorted, with touching ranges merged: two freed fillers that sat side by side are one free block.
+static std::vector<byte_range> merge_ranges(std::vector<byte_range> ranges) {
+    std::sort(ranges.begin(), ranges.end(),
+              [](const byte_range & a, const byte_range & b) { return a.begin < b.begin; });
+    std::vector<byte_range> merged;
+    for (const byte_range & r : ranges) {
+        if (!merged.empty() && r.begin <= merged.back().end) {
+            merged.back().end = std::max(merged.back().end, r.end);
+        } else {
+            merged.push_back(r);
+        }
+    }
+    return merged;
+}
+
+static bool inside_one(const std::vector<byte_range> & holes, const void * ptr, size_t bytes) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    for (const byte_range & h : holes) {
+        if (begin >= h.begin && begin + bytes <= h.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool disjoint(const std::vector<byte_range> & ranges) {
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        for (size_t j = i + 1; j < ranges.size(); ++j) {
+            if (ranges[i].begin < ranges[j].end && ranges[j].begin < ranges[i].end) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Acquires both regions' slots of a reserved ring and checks each is on the device inside one of `holes`, and that no
+// two overlap; then releases the ring.
+static void use_and_release(moe_stream_ring &               ring,
+                            int                             device,
+                            const std::vector<byte_range> & holes,
+                            const char *                    what) {
+    const moe_stream_ring_geometry geo = ring.geometry();
+    std::vector<mem_handle>        held;
+    std::vector<byte_range>        slots;
+    bool                           fits = true;
+    for (int region = 0; region < 2; ++region) {
+        for (uint32_t i = 0; i < geo.region_slots; ++i) {
+            mem_handle      slot     = ring.acquire_slot(GGML_LAYOUT_AOS);
+            const auto      resolved = slot.resolve(device);
+            const uintptr_t begin    = reinterpret_cast<uintptr_t>(resolved.ptr);
+            fits                     = fits && resolved.ptr != nullptr && resolved.on_device &&
+                   inside_one(holes, resolved.ptr, geo.slot_bytes);
+            slots.push_back({ begin, begin + geo.slot_bytes });
+            held.push_back(std::move(slot));
+        }
+        ring.epoch_boundary(sycl::event());
+    }
+    CHECK(fits, "%s: each of the %u slots is on the device inside one hole", what, geo.n_slots);
+    CHECK(disjoint(slots), "%s: no two slots overlap", what);
+    held.clear();
+    ring.release();
+}
+
+// Case 4: one reserve() takes the ring from scattered holes; a partial reservation holds its slots, reports the slots
+// still to allocate and completes at the next call; another geometry gives the partial slots back first.
+static void test_reserve_completes_across_two_calls_from_scattered_room(sycl::queue & q, int device) {
+    constexpr size_t   kSlot  = 1024 * 1024;
+    constexpr uint32_t kSlots = 8;
+    constexpr uint32_t kLeft  = 3;  // the holes the partial sub-cases leave free
+    // A hole is a slot plus one alignment unit: it holds one slot, never two.
+    constexpr size_t   kHole  = kSlot + MOE_STREAM_RING_SLOT_ALIGN;
+    const auto         geo    = make_geometry(kSlot, kSlots, kSlots * kSlot);
+
+    unified_cache * cache = get_unified_cache_for_device(device);
+    if (cache != nullptr && !cache->arena_active()) {
+        constexpr size_t kArena = 64ull * 1024 * 1024;
+        (void) cache->arena_reserve(q, kArena, kArena, kArena, 0, 0, 0, 0);
+    }
+    const bool zoned = cache != nullptr && weight_zone_available(cache) != SIZE_MAX;
+    CHECK(zoned, "device %d has a WEIGHT zone for the scattered-room case", device);
+    if (!zoned) {
+        return;
+    }
+    const size_t available_empty = weight_zone_available(cache);
+
+    // The hole fillers first, so they sit side by side in the zone's free room, then the rest of the zone. The last
+    // hole filler is never freed: it keeps the last hole apart from whatever follows.
+    std::vector<mem_handle> hole_fillers;
+    bool                    all_given = true;
+    for (uint32_t i = 0; i < 2 * kSlots + 1; ++i) {
+        hole_fillers.push_back(hold_weight_bytes(device, kHole));
+        all_given = all_given && hole_fillers.back().valid();
+    }
+    CHECK(all_given, "the WEIGHT zone gives %u fillers of %zu bytes", 2 * kSlots + 1, kHole);
+    if (!all_given) {
+        return;
+    }
+    std::vector<mem_handle> rest;
+    fill_weight_zone(cache, device, rest);
+    CHECK(!hold_weight_bytes(device, MOE_STREAM_RING_SLOT_ALIGN).valid(),
+          "the WEIGHT zone is full after the fill (%zu more fillers)", rest.size());
+
+    std::vector<byte_range> holes;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+        mem_handle &    filler = hole_fillers[2 * i];
+        const uintptr_t begin  = reinterpret_cast<uintptr_t>(filler.resolve(device).ptr);
+        holes.push_back({ begin, begin + kHole });
+        filler = mem_handle();
+    }
+    CHECK(drain_retained_handles(true), "the scattered-room case's hole drain completes");
+    holes                        = merge_ranges(holes);
+    const size_t available_holes = weight_zone_available(cache);
+    std::printf("INFO: %u holes of %zu bytes in %zu free blocks; WEIGHT zone available %zu (empty %zu)\n", kSlots,
+                kHole, holes.size(), available_holes, available_empty);
+    CHECK(available_holes >= geo.bytes, "the holes together hold the ring (%zu >= %zu)", available_holes, geo.bytes);
+    CHECK(!hold_weight_bytes(device, geo.bytes).valid(), "one allocation of the ring's %zu bytes is refused",
+          geo.bytes);
+
+    // Sub-case 1: one call, every slot in a hole.
+    {
+        moe_stream_ring ring;
+        size_t          short_by = SIZE_MAX;
+        const bool      reserved = ring.reserve(device, geo, &short_by);
+        CHECK(reserved && short_by == 0, "one reserve() takes the %u-slot ring from %zu scattered holes (short %zu)",
+              kSlots, holes.size(), short_by);
+        if (reserved) {
+            use_and_release(ring, device, holes, "one call");
+        }
+    }
+    CHECK(drain_retained_handles(true), "the one-call ring's drain completes");
+    CHECK(weight_zone_available(cache) == available_holes, "the one-call ring gives the holes back (%zu, want %zu)",
+          weight_zone_available(cache), available_holes);
+
+    // Sub-case 2: room for kLeft slots, then for the rest.
+    {
+        std::vector<mem_handle> refill;
+        bool                    refilled = true;
+        for (uint32_t i = 0; i < kSlots - kLeft; ++i) {
+            refill.push_back(hold_weight_bytes(device, kHole));
+            refilled = refilled && refill.back().valid();
+        }
+        CHECK(refilled, "%u fillers take all but %u holes back", kSlots - kLeft, kLeft);
+        moe_stream_ring ring;
+        size_t          short_by = 0;
+        const bool      first    = ring.reserve(device, geo, &short_by);
+        const size_t    want     = static_cast<size_t>(kSlots - kLeft) * kSlot;
+        CHECK(!first && short_by == want,
+              "with room for %u slots reserve() refuses, short by the %u slots left to allocate (%zu, want %zu)", kLeft,
+              kSlots - kLeft, short_by, want);
+        CHECK(ring.slots_free() == 0 && !ring.acquire_slot(GGML_LAYOUT_AOS).valid(),
+              "a partial reservation hands out no slot (%u free)", ring.slots_free());
+        CHECK(!hold_weight_bytes(device, kSlot).valid(),
+              "the refused reserve() keeps its %u slots: the zone has no slot of room left", kLeft);
+        refill.clear();
+        CHECK(drain_retained_handles(true), "the refill's drain completes");
+        const bool second = ring.reserve(device, geo, &short_by);
+        CHECK(second && short_by == 0, "with the other holes free the next reserve() completes the ring (short %zu)",
+              short_by);
+        if (second) {
+            use_and_release(ring, device, holes, "two calls");
+        }
+    }
+    CHECK(drain_retained_handles(true), "the two-call ring's drain completes");
+    CHECK(weight_zone_available(cache) == available_holes, "the two-call ring gives the holes back (%zu, want %zu)",
+          weight_zone_available(cache), available_holes);
+
+    // Sub-case 3: the partial slots of one geometry go back before a reserve() of another takes its own.
+    {
+        std::vector<mem_handle> refill;
+        bool                    refilled = true;
+        for (uint32_t i = 0; i < kSlots - kLeft; ++i) {
+            refill.push_back(hold_weight_bytes(device, kHole));
+            refilled = refilled && refill.back().valid();
+        }
+        CHECK(refilled, "%u fillers take all but %u holes back again, for the other geometry", kSlots - kLeft, kLeft);
+        moe_stream_ring ring;
+        CHECK(!ring.reserve(device, geo), "with room for %u slots the %u-slot ring is refused again", kLeft, kSlots);
+        const auto small = make_geometry(kSlot, 2, 2 * kSlot);
+        const bool other = ring.reserve(device, small);
+        CHECK(other && ring.geometry().n_slots == 2,
+              "a reserve() of 2 slots gives the %u partial slots back first and takes two of their holes", kLeft);
+        if (other) {
+            use_and_release(ring, device, holes, "another geometry");
+        }
+        refill.clear();
+    }
+    CHECK(drain_retained_handles(true), "the other geometry's drain completes");
+    CHECK(weight_zone_available(cache) == available_holes, "the other geometry gives the holes back (%zu, want %zu)",
+          weight_zone_available(cache), available_holes);
+
+    hole_fillers.clear();
+    rest.clear();
+    CHECK(drain_retained_handles(true), "the scattered-room case's final drain completes");
+    CHECK(weight_zone_available(cache) == available_empty,
+          "the WEIGHT zone's room is what it was before the case (%zu, want %zu)", weight_zone_available(cache),
+          available_empty);
 }
 
 int main() {
@@ -370,6 +657,9 @@ int main() {
         CHECK(held_end == held_before, "raw device held bytes end at their starting value (before %zu, end %zu)",
               held_before, held_end);
     }
+
+    // Last: it may reserve an arena, which the held-bytes checks above do not expect.
+    test_reserve_completes_across_two_calls_from_scattered_room(q, device);
 
     if (g_failures != 0) {
         std::printf("FAILED: %d case(s)\n", g_failures);

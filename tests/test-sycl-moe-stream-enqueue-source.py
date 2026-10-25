@@ -24,10 +24,10 @@ What this gate pins:
     (llama.cpp-9433): a micro-batch can start at the layer the last one ended on, so a kept id would take a cleared
     window as prefetched and skip staging it, and a kept flag would abort on the entries the clear dropped;
   - a refused reserve asks for that loan (llama.cpp-3460, closing c-0tmn): the request is made once, in ring_ready()'s
-    reserve-failed branch after the latch, with the shortfall the reserve reports (the ring's bytes past the WEIGHT
-    zone's largest free block), through op hooks the backend wires to ggml_sycl_request_expert_loan and to the boundary
-    runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner re-posts)
-    latches until end_prompt, with one WARN under an explicit ring or a trace;
+    reserve-failed branch after the latch, with the shortfall the reserve reports (the bytes of the slots it still has
+    to allocate, llama.cpp-am87), through op hooks the backend wires to ggml_sycl_request_expert_loan and to the
+    boundary runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner
+    re-posts) latches until end_prompt, with one WARN under an explicit ring or a trace;
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
     (the first is the executor's claim, "executor does not claim") and the ring's inputs, in a fixed format, through the
     decision log's WARN sink; the flag is cleared by end_prompt and never per micro-batch (lead ruling c-kcyf), and the
@@ -64,7 +64,12 @@ What this gate pins:
     and both a new ring and teardown run it;
   - a throw from the copy aborts with "[MOE-EXEC] stream enqueue failed: %s" (design 9.3);
   - moe-stream-plan.cpp waits on nothing (.wait(), wait_and_throw()), queries no event status (get_info<), has no
-    const_cast (ruling E) and calls no allocator: its slots come from the ring's one reservation;
+    const_cast (ruling E) and calls no allocator: its slots come from the ring's reservation;
+  - the ring reserves slot by slot (llama.cpp-am87): each slot is its own allocation, the WEIGHT zone first and then
+    the general entry point with the ring's intent, so room scattered in holes a slot wide gives the ring. A refused
+    slot stops the loop and the slots already held stay held, reported short by the slots still to allocate; the next
+    reserve() of the same ring continues from them, and only another geometry or device gives them back first. A
+    partial reservation hands out no slot, and the ring no longer reads the zone's largest free block;
   - the number of waits in ggml_sycl_mul_mat_id is the one master had at 84fb449da;
   - only a host lease whose retained owner is a host-pinned WEIGHT allocation of this device's host zones is copied
     (llama.cpp-9y0p: any other lease would take the staged path), only a matrix one AOS slot holds is staged, and a
@@ -74,8 +79,9 @@ What this gate pins:
     only a window no prefetch took, aborts on a prefetched one only after a whole prefetch, has three aborts (the claim
     guard, a window larger than its region, entries lost after a whole prefetch) and returns what the table holds. No
     host test reaches window_begin, so this pin is the interim decline path's only witness;
-  - teardown gates the open region and holds one slot handle until the last use before the ring is released
-    (ruling D, c-fjx1), and the ring is offered only on an in-order compute queue;
+  - teardown gates the open region and hands every slot of the ring to the drain until the last use as it releases the
+    ring (ruling D, c-fjx1; every slot since llama.cpp-am87, because a region's gate can be its last copy, which
+    precedes the region's readers), and the ring is offered only on an in-order compute queue;
   - the backend context owns the phase, resets it after draining its queues and before the retained handles drain,
     ends the prompt at the first decode graph, and closes a layer's region after its down MUL_MAT_ID;
   - begin_layer and window_begin decide through the header's pure predicates (a micro-batch's start, staging now, the
@@ -518,7 +524,7 @@ ALLOCATOR_NAMES = ("malloc", "unified_alloc", "unified_allocate", "zone_allocate
 
 
 def claim_phase_allocates_only_ring_slots(phase: str) -> bool:
-    """No allocator: the one slot each window matrix takes is ring_->acquire_slot(GGML_LAYOUT_AOS), from the ring's one
+    """No allocator: the one slot each window matrix takes is ring_->acquire_slot(GGML_LAYOUT_AOS), from the ring's
     reservation."""
     n = norm(phase)
     return bool(n) and not any(a in n for a in ALLOCATOR_NAMES) and n.count("ring_->acquire_slot(") == 1
@@ -1442,13 +1448,8 @@ RESERVE_DECL = "bool reserve(int device, const moe_stream_ring_geometry & geo, s
 RESERVE_DEF_SIG = ("bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, "
                    "size_t * bytes_short)")
 RESERVE_SHORT_SET = ("if (bytes_short != nullptr) { "
-                     "*bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes); }")
+                     "*bytes_short = static_cast<size_t>(geo.n_slots - held) * geo.slot_bytes; }")
 WEIGHT_REFUSAL_WARN = "[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give"
-SHORTFALL_SIG = "size_t moe_stream_ring_weight_shortfall(int device, size_t bytes)"
-SHORTFALL_PARTS = (
-    "cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest_free)",
-    "return bytes > largest_free ? bytes - largest_free : 0;",
-)
 REFUSALS_DECL = "static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_SYCL_MAX_DEVICES];"
 REFUSALS_BUMP = ("if (code == ggml_sycl_txn_result::REFUSED) { "
                  "g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release); }")
@@ -1469,8 +1470,8 @@ def claim_short_reserve_requests_a_loan(phase: str, hpp: str, sycl: str, ring_cp
     hooks it calls are the op's, stored at begin_layer before the layer's reserve, and the backend wires them to
     ggml_sycl_request_expert_loan and to the boundary runner's REFUSED count. The pure helper asks only while no loan
     this prompt came back REFUSED: the runner counts a REFUSED outcome (never BUSY, which it re-posts itself), a count
-    that moved since the last ask latches, and only end_prompt clears the latch. The reserve's shortfall is the ring's
-    bytes past the WEIGHT zone's largest free block, set where the zone refuses the ring."""
+    that moved since the last ask latches, and only end_prompt clears the latch. The reserve's shortfall is the bytes
+    of the slots it still has to allocate (llama.cpp-am87), set after the slot allocation the zone refused."""
     n = norm(phase)
     ready = body(n, RING_READY_SIG)
     at = ready.find(RESERVE_SHORT_IF + " {")
@@ -1487,7 +1488,6 @@ def claim_short_reserve_requests_a_loan(phase: str, hpp: str, sycl: str, ring_cp
             and RESERVE_DECL in norm(ring_hpp)
             and ordered(body(rc, RESERVE_DEF_SIG), "allocation = unified_allocate_owner(req);", RESERVE_SHORT_SET,
                         WEIGHT_REFUSAL_WARN)
-            and all(part in body(rc, SHORTFALL_SIG) for part in SHORTFALL_PARTS)
             and s.count(REFUSALS_DECL) == 1
             and s.count("g_sycl_expert_loan_refusals[device].fetch_add(") == 1
             and ordered(body(s, RUN_PENDING_SIG), RUN_PENDING_TXN, REFUSALS_BUMP, RUN_PENDING_BUSY)
@@ -1533,8 +1533,8 @@ def test_short_reserve_loan_mutants():
     assert not c(ring_hpp=mutate(RING_HPP, RESERVE_DECL,
                                  "bool reserve(int device, const moe_stream_ring_geometry & geo);"))
     assert not c(ring_cpp=mutate(RING_CPP, RESERVE_SHORT_SET, ""))
-    assert not c(ring_cpp=mutate(RING_CPP, "return bytes > largest_free ? bytes - largest_free : 0;",
-                                 "return bytes;"))
+    assert not c(ring_cpp=mutate(RING_CPP, "*bytes_short = static_cast<size_t>(geo.n_slots - held) * geo.slot_bytes;",
+                                 "*bytes_short = geo.bytes;"))
     # The refusal counted on BUSY too (the runner re-posts BUSY itself), or never counted.
     assert not c(sycl=mutate(SYCL, "if (code == ggml_sycl_txn_result::REFUSED) {",
                              "if (code != ggml_sycl_txn_result::ACCEPTED) {"))
@@ -1542,6 +1542,169 @@ def test_short_reserve_loan_mutants():
     # The hooks not wired by the backend.
     assert not c(sycl=mutate(SYCL, WIRE_REQUEST, ""))
     assert not c(sycl=mutate(SYCL, WIRE_REFUSALS, ""))
+
+
+# ---- the ring reserves slot by slot (llama.cpp-am87) -----------------------------------------------------------------
+
+SLOT_LOOP = "while (slots_.size() < geo.n_slots)"
+FALLBACK_CALL = "allocation = unified_allocate_owner(req);"
+FALLBACK_IF = "if (!allocation)"
+# The loop body's steps, in order: the WEIGHT zone, then the general entry point (inside the zone refusal's branch),
+# a refusal stopping the loop, the slot wrapped, and a slot accepted only once it resolves on the device.
+SLOT_LOOP_ORDER = (
+    "allocation_result allocation = unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, geo.slot_bytes, "
+    "MOE_STREAM_RING_SLOT_ALIGN);",
+    FALLBACK_IF + " {",
+    FALLBACK_CALL,
+    "if (!allocation) { break; }",
+    "mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);",
+    "const auto resolved = slot.resolve(device);",
+    "if (!resolved.ptr || !resolved.on_device) {",
+    "slots_.push_back(std::move(slot));",
+)
+# The fallback request's fields, each set once before the fallback call, in any order and wherever reserve() builds the
+# request: the ring's intent is the rule, not the order the fields are written in.
+FALLBACK_REQ = (
+    "req.device = device;",
+    "req.size = geo.slot_bytes;",
+    "req.alignment = MOE_STREAM_RING_SLOT_ALIGN;",
+    "req.intent.role = alloc_role::EXPERT_STAGING;",
+    "req.intent.category = runtime_category::EXPERT_CACHE;",
+    'req.intent.cohort_id = "moe_stream_ring";',
+    "req.intent.constraints.must_device = true;",
+    "req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;",
+    "req.intent.constraints.forbid_vram_zone_spill = true;",
+)
+SAME_RING = ("const bool same_ring = device == device_ && geo.slot_bytes == geo_.slot_bytes && "
+             "geo.n_slots == geo_.n_slots && geo.bytes == geo_.bytes && geo.region_slots == geo_.region_slots;")
+GIVE_BACK_IF = "if (!slots_.empty() && !same_ring)"
+HELD = "const uint32_t held = static_cast<uint32_t>(slots_.size());"
+REFUSED_IF = "if (held < geo.n_slots)"
+HOLDING_SUFFIX = "(holding %u of %u slots)"
+# Every use of slots_ in reserve(), each exactly once: the give-back test and its WARN, the capacity, the loop test,
+# the unresolved-slot WARN, the append and the held count. A census rather than a list of drops: a drop of a held slot
+# spelled any way (clear, assign, swap(slots_), std::exchange, an assignment) adds a use or replaces one of these.
+SLOT_USES = (
+    GIVE_BACK_IF,
+    "device_, slots_.size(), geo_.n_slots,",
+    "slots_.reserve(geo.n_slots);",
+    SLOT_LOOP,
+    "slots_.size(), geo.slot_bytes",
+    "slots_.push_back(std::move(slot));",
+    HELD,
+)
+VALID_DECL = "bool valid() const { return geo_.n_slots != 0 && slots_.size() == geo_.n_slots; }"
+ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout)"
+# What the single-allocation ring read to size its loan: the zone's largest free block.
+SHORTFALL_NAMES = ("moe_stream_ring_weight_shortfall", "zone_free_figures", "largest_free")
+
+
+def claim_ring_reserves_slot_by_slot(ring_cpp: str, ring_hpp: str) -> bool:
+    """llama.cpp-am87: reserve() allocates the ring one slot at a time, each slot through
+    unified_cache_zone_allocate_owner and then unified_allocate_owner with the ring's intent, so an expert loan's
+    scattered room gives it. The two allocation calls exist once each, inside the loop. A refused slot breaks the loop,
+    and the refused branch reports the slots still to allocate and WARNs how many it holds. reserve() names slots_ only
+    in the uses SLOT_USES lists, so neither the loop nor the refused branch drops a held slot, and the refused branch
+    names none; the one release() in reserve() gives back a partial reservation of another geometry or device, so the
+    next reserve() of the same ring continues from the slots held. A partial reservation is not valid, and
+    acquire_slot hands out nothing until it is. The ring reads no zone figure: the largest free block is gone."""
+    rc = norm(ring_cpp)
+    rsv = body(rc, RESERVE_DEF_SIG)
+    loop = body(rsv, SLOT_LOOP)
+    give_back = body(rsv, GIVE_BACK_IF)
+    refused = body(rsv, REFUSED_IF)
+    call_at = rsv.find(FALLBACK_CALL)
+    return (bool(loop) and ordered(loop, *SLOT_LOOP_ORDER) and FALLBACK_CALL in body(loop, FALLBACK_IF)
+            and all(rsv.count(f) == 1 and -1 < rsv.find(f) < call_at for f in FALLBACK_REQ)
+            and rc.count("unified_cache_zone_allocate_owner(") == 1 and rc.count("unified_allocate_owner(") == 1
+            and all(rsv.count(use) == 1 for use in SLOT_USES) and rsv.count("slots_") == len(SLOT_USES)
+            and ordered(rsv, SAME_RING, GIVE_BACK_IF, "geo_ = geo;", "device_ = device;", SLOT_LOOP, HELD, REFUSED_IF)
+            and rsv.count("release(") == 1 and "release();" in give_back
+            and ordered(refused, RESERVE_SHORT_SET, WEIGHT_REFUSAL_WARN, HOLDING_SUFFIX, "return false;")
+            and "slots_" not in refused
+            and VALID_DECL in norm(ring_hpp)
+            and body(rc, ACQUIRE_SIG).startswith("{ if (!valid()) { return {}; }")
+            and not any(name in rc for name in SHORTFALL_NAMES))
+
+
+def test_ring_reserves_slot_by_slot():
+    assert claim_ring_reserves_slot_by_slot(RING_CPP, RING_HPP)
+
+
+def test_ring_slot_by_slot_mutants():
+    def c(ring_cpp=RING_CPP, ring_hpp=RING_HPP):
+        return claim_ring_reserves_slot_by_slot(ring_cpp, ring_hpp)
+
+    # The single allocation restored: the whole ring asked of the zone at once, or the loop run once.
+    assert not c(ring_cpp=mutate(RING_CPP, "vram_zone_id::WEIGHT, geo.slot_bytes, MOE_STREAM_RING_SLOT_ALIGN);",
+                                 "vram_zone_id::WEIGHT, geo.bytes, MOE_STREAM_RING_SLOT_ALIGN);"))
+    assert not c(ring_cpp=mutate(RING_CPP, "req.size = geo.slot_bytes;", "req.size = geo.bytes;"))
+    assert not c(ring_cpp=mutate(RING_CPP, SLOT_LOOP, "if (slots_.empty())"))
+    # The fallback without the ring's intent: it could spill outside the arena.
+    assert not c(ring_cpp=mutate(RING_CPP, "req.intent.constraints.forbid_vram_zone_spill = true;", ""))
+    # A field set after the call, so the request goes out without it.
+    assert not c(ring_cpp=mutate(RING_CPP, "req.intent.constraints.must_device = true; ", "").replace(
+        FALLBACK_CALL, FALLBACK_CALL + " req.intent.constraints.must_device = true;", 1))
+    # The fallback called whether or not the zone refused: the zone's slot would be overwritten.
+    unguarded = mutate(RING_CPP, FALLBACK_IF + " { alloc_request req{};", "{ alloc_request req{};")
+    assert not c(ring_cpp=unguarded)
+    # A second allocation site beside the loop.
+    assert not c(ring_cpp=mutate(RING_CPP, HELD, "(void) unified_allocate_owner(alloc_request{}); " + HELD))
+    # The partial slots released on refusal: in the loop's break, in the refused branch, or before its return.
+    assert not c(ring_cpp=mutate(RING_CPP, "if (!allocation) { break; }",
+                                 "if (!allocation) { slots_.clear(); break; }"))
+    assert not c(ring_cpp=mutate(RING_CPP, REFUSED_IF + " {", REFUSED_IF + " { release();"))
+    assert not c(ring_cpp=mutate(RING_CPP, REFUSED_IF + " {", REFUSED_IF + " { slots_.clear();"))
+    # The same drops spelled so that no list of drop names would match them, before the return of the refused branch
+    # and of the loop's unresolved-slot branch: neither return's text is pinned on its own.
+    rsv = body(norm(RING_CPP), RESERVE_DEF_SIG)
+    refused = body(rsv[rsv.find(REFUSED_IF + " {"):], REFUSED_IF)
+    unresolved = body(body(rsv, SLOT_LOOP), "if (!resolved.ptr || !resolved.on_device)")
+    for drop in ("std::vector<mem_handle>().swap(slots_);", "slots_.assign(0, mem_handle());",
+                 "(void) std::exchange(slots_, {});"):
+        for branch in (refused, unresolved):
+            assert not c(ring_cpp=mutate(RING_CPP, branch, branch.replace("return false;", drop + " return false;")))
+    # A listed use traded for a drop keeps the count: the census names each use, not only how many there are.
+    traded = mutate(RING_CPP, "slots_.reserve(geo.n_slots);", "")
+    swapped = unresolved.replace("return false;", "std::vector<mem_handle>().swap(slots_); return false;")
+    assert not c(ring_cpp=mutate(traded, unresolved, swapped))
+    # Every partial reservation given back, whatever ring the next call asks for: nothing would continue.
+    assert not c(ring_cpp=mutate(RING_CPP, GIVE_BACK_IF, "if (!slots_.empty())"))
+    assert not c(ring_cpp=mutate(RING_CPP, " && geo.region_slots == geo_.region_slots;", ";"))
+    # bytes_short computed from the largest free block again, or as the whole ring.
+    assert not c(ring_cpp=mutate(RING_CPP, "*bytes_short = static_cast<size_t>(geo.n_slots - held) * geo.slot_bytes;",
+                                 "*bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes);"))
+    assert not c(ring_cpp=mutate(RING_CPP, "static_cast<size_t>(geo.n_slots - held)",
+                                 "static_cast<size_t>(geo.n_slots)"))
+    assert not c(ring_cpp=mutate(RING_CPP, "namespace ggml_sycl {",
+                                 "namespace ggml_sycl { size_t largest_free_of(unified_cache & c) { size_t a, b, d, e; "
+                                 "c.zone_free_figures(vram_zone_id::WEIGHT, a, b, d, e); return e; }"))
+    # The refusal WARN without how many slots it holds.
+    assert not c(ring_cpp=mutate(RING_CPP, " " + HOLDING_SUFFIX, ""))
+    # A partial reservation counted valid, or acquire_slot handing out a partial reservation's slots.
+    assert not c(ring_hpp=mutate(RING_HPP, VALID_DECL, "bool valid() const { return !slots_.empty(); }"))
+    assert not c(ring_cpp=mutate(RING_CPP, "{ if (!valid()) { return {}; }", "{ if (slots_.empty()) { return {}; }"))
+
+
+def test_ring_slot_by_slot_allows_any_request_field_order():
+    """Positive controls: the fallback request's fields in another order, or the request built once before the loop,
+    break no rule, so the claim must still hold."""
+    req_block = "alloc_request req{}; " + " ".join(FALLBACK_REQ) + " "
+    shuffled = mutate(RING_CPP, req_block, "alloc_request req{}; " + " ".join(reversed(FALLBACK_REQ)) + " ")
+    assert claim_ring_reserves_slot_by_slot(shuffled, RING_HPP)
+    hoisted = mutate(RING_CPP, req_block, "").replace(SLOT_LOOP, req_block + SLOT_LOOP, 1)
+    assert claim_ring_reserves_slot_by_slot(hoisted, RING_HPP)
+
+
+def test_ring_slot_by_slot_fails_on_the_single_allocation_ring():
+    """The single-allocation ring (master before llama.cpp-am87), rebuilt from its parts on a copy: one allocation of
+    geo.bytes and a shortfall read off the largest free block. The claim must refuse it."""
+    single = mutate(RING_CPP, "vram_zone_id::WEIGHT, geo.slot_bytes, MOE_STREAM_RING_SLOT_ALIGN);",
+                    "vram_zone_id::WEIGHT, geo.bytes, MOE_STREAM_RING_SLOT_ALIGN);")
+    single = mutate(single, SLOT_LOOP, "if (slots_.empty())")
+    single = mutate(single, "*bytes_short = static_cast<size_t>(geo.n_slots - held) * geo.slot_bytes;",
+                    "*bytes_short = moe_stream_ring_weight_shortfall(device, geo.bytes);")
+    assert not claim_ring_reserves_slot_by_slot(single, RING_HPP)
 
 
 LOAN_WARN_SIG = "void moe_stream_phase::warn_loan_refused(size_t bytes_short) const"
@@ -1780,13 +1943,27 @@ def test_begin_layer_weigh_mutants():
 TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
 
 
-def claim_teardown_gates_before_release(phase: str) -> bool:
-    """Ruling D: the open region is gated on the last use, one slot handle is held until it, then the ring releases;
-    the destructor and end_prompt both tear down through it, and the ring is offered only on an in-order queue."""
+TEARDOWN_RELEASE = "ring_->release(last_use);"
+RING_RELEASE_AFTER_DECL = "void release(sycl::event last_use);"
+RING_RELEASE_AFTER_SIG = "void moe_stream_ring::release(sycl::event last_use)"
+RING_RETAIN_EVERY_SLOT = "retain_handles_until_event(slots_, std::move(last_use));"
+RING_RELEASE_AFTER_BODY = "{ if (!slots_.empty()) { " + RING_RETAIN_EVERY_SLOT + " } release(); }"
+
+
+def claim_teardown_gates_before_release(phase: str, hpp: str = PLAN_HPP, ring_cpp: str = RING_CPP,
+                                        ring_hpp: str = RING_HPP) -> bool:
+    """Ruling D: the open region is gated on the last use and the ring is released after it; the destructor and
+    end_prompt both tear down through it, and the ring is offered only on an in-order queue. Every slot waits for the
+    last use, not only the slots of the regions a gate covers (llama.cpp-am87): a region's gate can be its last copy,
+    which precedes the region's readers, the executor's dequants, and the slots are separate allocations, so no one
+    slot keeps the others. The ring's release(last_use) hands every slot to the drain on the last use before release()
+    applies the region gates; the phase's one release is teardown's, through it, and no anchor slot remains."""
     n = norm(phase)
     td = body(n, TEARDOWN_SIG)
-    return (ordered(td, "close_region(last_use);", "retain_handles_until_event({ anchor_ }, last_use);",
-                    "ring_->release();")
+    return (ordered(td, "close_region(last_use);", TEARDOWN_RELEASE) and n.count("->release(") == 1
+            and RING_RELEASE_AFTER_DECL in norm(ring_hpp)
+            and body(norm(ring_cpp), RING_RELEASE_AFTER_SIG) == RING_RELEASE_AFTER_BODY
+            and "anchor_" not in n and "anchor_" not in norm(hpp)
             and "teardown(" in body(n, "moe_stream_phase::~moe_stream_phase()")
             and "teardown(" in body(n, "void moe_stream_phase::end_prompt()")
             and "in_order_ = ccs.is_in_order();" in n)
@@ -1804,23 +1981,128 @@ def in_body(text: str, signature: str, old: str, new: str) -> str:
     return n.replace(b, b.replace(old, new, 1), 1)
 
 
-TEARDOWN_RETAIN = "if (anchor_.valid()) { retain_handles_until_event({ anchor_ }, last_use); }"
-
-
 def test_teardown_mutants():
-    assert not claim_teardown_gates_before_release(mutate(PHASE, "close_region(last_use);", ""))
-    assert not claim_teardown_gates_before_release(
-        mutate(PHASE, "retain_handles_until_event({ anchor_ }, last_use);", ""))
-    assert not claim_teardown_gates_before_release(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = true;"))
-    # The ring released before the slot handle is retained on the last use.
-    assert not claim_teardown_gates_before_release(
-        in_body(PHASE, TEARDOWN_SIG, TEARDOWN_RETAIN + " ring_->release();", "ring_->release(); " + TEARDOWN_RETAIN))
+    def c(phase=PHASE, hpp=PLAN_HPP, ring_cpp=RING_CPP, ring_hpp=RING_HPP):
+        return claim_teardown_gates_before_release(phase, hpp, ring_cpp, ring_hpp)
+
+    assert not c(phase=mutate(PHASE, "close_region(last_use);", ""))
+    assert not c(phase=mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = true;"))
+    # The ring released on its region gates alone: the current region's slots would wait for nothing past last_use,
+    # and an earlier region's for a copy its readers follow.
+    assert not c(phase=mutate(PHASE, TEARDOWN_RELEASE, "ring_->release();"))
+    # Only the gated regions' slots held until the last use.
+    assert not c(ring_cpp=mutate(RING_CPP, RING_RETAIN_EVERY_SLOT,
+                                 "for (const region & r : regions_) { if (r.has_gate) { "
+                                 "const auto first = slots_.begin() + r.first; "
+                                 "retain_handles_until_event(std::vector<mem_handle>(first, first + r.count), "
+                                 "last_use); } }"))
+    # One slot held until the last use, the single allocation's anchor: the other slots are their own allocations.
+    assert not c(ring_cpp=mutate(RING_CPP, RING_RETAIN_EVERY_SLOT,
+                                 "retain_handles_until_event({ slots_.front() }, std::move(last_use));"))
+    # The slots dropped before they are handed to the drain: release() clears them, so nothing would be retained.
+    assert not c(ring_cpp=mutate(RING_CPP, RING_RELEASE_AFTER_BODY,
+                                 "{ release(); if (!slots_.empty()) { " + RING_RETAIN_EVERY_SLOT + " } }"))
+    # A second release site in the phase, which would skip the last use.
+    assert not c(phase=in_body(PHASE, END_PROMPT_SIG, "teardown(", "if (ring_) { ring_->release(); } teardown("))
+    # The anchor slot back in the phase.
+    assert not c(hpp=mutate(PLAN_HPP, PENDING_DECL, PENDING_DECL + " mem_handle anchor_;"))
     # The destructor gives the ring back without teardown().
-    assert not claim_teardown_gates_before_release(
-        in_body(PHASE, "moe_stream_phase::~moe_stream_phase()", "teardown(", "(void) ("))
+    assert not c(phase=in_body(PHASE, "moe_stream_phase::~moe_stream_phase()", "teardown(", "(void) ("))
     # end_prompt keeps the ring.
-    assert not claim_teardown_gates_before_release(
-        in_body(PHASE, END_PROMPT_SIG, "teardown(ring_ ? compute_barrier() : sycl::event());", ""))
+    assert not c(phase=in_body(PHASE, END_PROMPT_SIG, "teardown(ring_ ? compute_barrier() : sycl::event());", ""))
+
+
+PENDING_DECL = "std::unique_ptr<moe_stream_ring> pending_ring_;"
+PENDING_TAKE = ("std::unique_ptr<moe_stream_ring> ring = pending_ring_ ? std::move(pending_ring_) : "
+                "std::make_unique<moe_stream_ring>();")
+PENDING_KEEP = "pending_ring_ = std::move(ring);"
+PENDING_DROP = "pending_ring_.reset();"
+END_PROMPT_EARLY = "if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) { return; }"
+TEARDOWN_RING_IF = "if (ring_)"
+# The refused branch keeps the ring only while a loan can still fund it, decided after the loan step (which may latch
+# a REFUSED loan in this very call); otherwise the ring gives its slots back as it leaves scope (lead ruling, c-zgrd).
+LOAN_CAN_FOLLOW = "const bool loan_can_follow = !loan_latch_.refused && request_loan_ != nullptr;"
+KEEP_WHILE_LOAN = "if (loan_can_follow) { " + PENDING_KEEP + " } else { warn_partial_released(ring->slots_held()); }"
+RELEASED_WARN_SIG = "void moe_stream_phase::warn_partial_released(uint32_t held) const"
+RELEASED_WARN_GUARD = ("if (held == 0 || log_ == nullptr || log_->sink == nullptr || "
+                       "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+RELEASED_WARN_FMT = ("[MOE-STREAM-RING] partial reservation released on device %d: no loan can follow "
+                     "(held %u of %u slots)")
+SLOTS_HELD_DECL = "uint32_t slots_held() const { return static_cast<uint32_t>(slots_.size()); }"
+
+
+def claim_partial_reservation_survives_the_ubatch(phase: str, hpp: str, ring_hpp: str = RING_HPP) -> bool:
+    """A refused reserve keeps the slots it got (llama.cpp-am87), and the phase keeps the refused ring for the next
+    micro-batch's attempt, which continues from those slots instead of asking the zone for the whole ring again. The
+    hold is for the loan path only (lead ruling, c-zgrd): after the loan step, the refused ring is kept only while a
+    loan can still fund it, and otherwise gives its slots back to the WEIGHT zone, which mid-prompt runtime
+    allocations prefer, with one WARN under the ring-unavailable line's gate naming how many it held (none for an
+    empty ring). ring_ready() takes the pending ring when there is one and moves a reserved ring into ring_. The
+    pending ring is nobody's ring: only ring_ready() takes or stores it, so neither the executor's claim nor the
+    release count can take it for a reserved one. teardown() drops it outside its ring_ branch (a pending ring exists
+    only while ring_ does not, and it handed nothing out, so its slots go back at once), and end_prompt() does not
+    skip the teardown while one is held. A new geometry or device is the ring's own business: reserve() gives the
+    partial slots back and starts over."""
+    n = norm(phase)
+    ready = body(n, RING_READY_SIG)
+    at = ready.find(RESERVE_SHORT_IF + " {")
+    branch = body(ready[at:], RESERVE_SHORT_IF) if at >= 0 else ""
+    td = body(n, TEARDOWN_SIG)
+    warn = body(n, RELEASED_WARN_SIG)
+    return (norm(hpp).count(PENDING_DECL) == 1 and n.count("pending_ring_") == 5
+            and ordered(ready, LATCH_GUARD, PENDING_TAKE, RESERVE_SHORT_IF, RING_READY_RESET)
+            and ordered(branch, LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN, LOAN_CAN_FOLLOW, KEEP_WHILE_LOAN,
+                        "return false;")
+            and n.count(PENDING_KEEP) == 1 and n.count("warn_partial_released(") == 2
+            and warn.startswith("{ " + RELEASED_WARN_GUARD)
+            and ordered(warn, RELEASED_WARN_FMT, LOAN_WARN_EMIT) and SLOTS_HELD_DECL in norm(ring_hpp)
+            and td.count(PENDING_DROP) == 1 and PENDING_DROP not in body(td, TEARDOWN_RING_IF)
+            and END_PROMPT_EARLY in body(n, END_PROMPT_SIG))
+
+
+def test_partial_reservation_survives_the_ubatch():
+    assert claim_partial_reservation_survives_the_ubatch(PHASE, PLAN_HPP)
+
+
+def test_partial_reservation_mutants():
+    def c(phase=PHASE, hpp=PLAN_HPP, ring_hpp=RING_HPP):
+        return claim_partial_reservation_survives_the_ubatch(phase, hpp, ring_hpp)
+
+    # The refused ring dropped while a loan can still fund it: the next attempt asks the zone for the whole ring again.
+    assert not c(phase=mutate(PHASE, KEEP_WHILE_LOAN, "warn_partial_released(ring->slots_held());"))
+    # Kept after a REFUSED loan, or with no loan hook: the hold would outlive any loan, holding WEIGHT room the
+    # runtime allocations prefer until end_prompt.
+    assert not c(phase=mutate(PHASE, LOAN_CAN_FOLLOW, "const bool loan_can_follow = request_loan_ != nullptr;"))
+    assert not c(phase=mutate(PHASE, LOAN_CAN_FOLLOW, "const bool loan_can_follow = !loan_latch_.refused;"))
+    assert not c(phase=mutate(PHASE, LOAN_CAN_FOLLOW, "const bool loan_can_follow = true;"))
+    # Decided before the loan step: a loan this call latched REFUSED would leave the ring held.
+    early = in_body(PHASE, RING_READY_SIG, LOAN_CAN_FOLLOW + " ", "")
+    assert not c(phase=in_body(early, RING_READY_SIG, LATCH_SET, LOAN_CAN_FOLLOW + " " + LATCH_SET))
+    # Released silently: the ring's "(holding K of N slots)" line would go unexplained.
+    assert not c(phase=mutate(PHASE, KEEP_WHILE_LOAN, "if (loan_can_follow) { " + PENDING_KEEP + " }"))
+    # The release WARN ungated (AUTO would print it at default verbosity), printed for an empty ring, or never emitted.
+    assert not c(phase=in_body(PHASE, RELEASED_WARN_SIG, " || (policy_ != moe_exec_policy::RING && log_->trace < 1)",
+                               ""))
+    assert not c(phase=in_body(PHASE, RELEASED_WARN_SIG, "held == 0 || ", ""))
+    assert not c(phase=in_body(PHASE, RELEASED_WARN_SIG, LOAN_WARN_EMIT, "(void) line;"))
+    # The held count is not the slots the ring holds.
+    assert not c(ring_hpp=mutate(RING_HPP, SLOTS_HELD_DECL, "uint32_t slots_held() const { return geo_.n_slots; }"))
+    # Every attempt starts from an empty ring.
+    assert not c(phase=mutate(PHASE, PENDING_TAKE,
+                              "std::unique_ptr<moe_stream_ring> ring = std::make_unique<moe_stream_ring>();"))
+    # A reserved ring kept pending: nobody would stage into it.
+    assert not c(phase=mutate(PHASE, RING_READY_RESET, PENDING_KEEP + " reset_regions(); return true;"))
+    # The pending ring taken for a reserved one.
+    assert not c(phase=in_body(PHASE, RING_READY_SIG, "if (ring_) { return true; }",
+                               "if (ring_ || pending_ring_) { return true; }"))
+    # teardown keeps it, or drops it only where a reserved ring is, which a pending ring never is.
+    assert not c(phase=in_body(PHASE, TEARDOWN_SIG, " " + PENDING_DROP, ""))
+    inside = in_body(PHASE, TEARDOWN_SIG, " " + PENDING_DROP, "")
+    assert not c(phase=in_body(inside, TEARDOWN_SIG, "++ring_releases_;", "++ring_releases_; " + PENDING_DROP))
+    # end_prompt skips the teardown while only a pending ring is held: its slots would stay out through decode.
+    assert not c(phase=mutate(PHASE, "!ring_ && !pending_ring_ &&", "!ring_ &&"))
+    # The member gone from the phase's declaration.
+    assert not c(hpp=mutate(PLAN_HPP, PENDING_DECL, ""))
 
 
 # ---- the context's wiring --------------------------------------------------------------------------------------------

@@ -471,7 +471,7 @@ HANDOFF_BODY = "{ staged_routes_.count_handoff(); }"
 TALLY_HANDED_OFF = "size_t handed_off = 0;"
 TALLY_HANDOFF_SIG = "void moe_staged_route_tally::count_handoff()"
 TALLY_HANDOFF_BODY = "{ ++handed_off; }"
-END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && table_.empty()) {"
+END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) {"
 DTOR_SIG = "moe_stream_phase::~moe_stream_phase()"
 DTOR_HEAD = "{ report_staged_routes(); teardown("
 REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.handed_off != 0 || "
@@ -1071,7 +1071,7 @@ RELEASE_SITES = (
 )
 PAYLOAD_MEMBERS = ("std::unordered_map<uint64_t, moe_stream_payload_record> moe_stream_payload; "
                    "uint64_t moe_stream_payload_releases = 0;")
-RELEASE_COUNT = "ring_->release(); ring_.reset(); ++ring_releases_;"
+RELEASE_COUNT = "ring_->release(last_use); ring_.reset(); ++ring_releases_;"
 RELEASES_ACCESSOR = "uint64_t ring_releases() const { return ring_releases_; }"
 TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use)"
 
@@ -1159,10 +1159,9 @@ def test_staged_pointer_release_mutants():
         head = site[:site.index(" ggml_sycl_moe_stream_release_payload(")]
         assert not c(sycl=mutate(SYCL, site, head))
     # Teardown releases the ring without counting it.
-    assert not c(phase=mutate(PHASE, RELEASE_COUNT, "ring_->release(); ring_.reset();"))
+    assert not c(phase=mutate(PHASE, RELEASE_COUNT, "ring_->release(last_use); ring_.reset();"))
     # One release counted twice.
-    assert not c(phase=mutate(PHASE, "ring_->release(); ring_.reset(); ++ring_releases_;",
-                              "ring_->release(); ring_.reset(); ++ring_releases_; ++ring_releases_;"))
+    assert not c(phase=mutate(PHASE, RELEASE_COUNT, RELEASE_COUNT + " ++ring_releases_;"))
     # The context forgets the records.
     assert not c(common=mutate(COMMON, "uint64_t moe_stream_payload_releases = 0;", ""))
 
@@ -1370,7 +1369,8 @@ def test_trace():
 
 
 def test_trace_mutants():
-    m = mutate(PHASE, END_PROMPT_HEAD, "{ if (!ubatch_live_ && !ring_ && table_.empty()) { report_staged_routes();")
+    m = mutate(PHASE, END_PROMPT_HEAD,
+               "{ if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) { report_staged_routes();")
     assert not claim_trace(m, {PHASE_REL: m})
     # The served/refused line formatted but never emitted. The window trace emits through the same sink call, so the
     # mutant is made inside the report.
@@ -1485,7 +1485,8 @@ SPECIAL_MEMBERS = (
 )
 RING_ACQUIRE_DECL = "mem_handle acquire_slot(ggml_layout_mode layout);"
 RING_ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode layout)"
-RING_SLICE = "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);"
+# The slot's own allocation, re-tagged with the caller's layout (llama.cpp-am87: one allocation per slot).
+RING_SLICE = "return slots_[index].slice(0, geo_.slot_bytes, layout);"
 STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage_window("
 PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
 PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
@@ -1495,9 +1496,10 @@ TAG_AGREES = "if (view.layout != s->layout) { return moe_staged_route_refusal::L
 def claim_tag_is_the_layout(mem_hpp: str, mem_cpp: str, ring_hpp: str, ring_cpp: str, phase: str, sycl: str) -> bool:
     """A ring slot's resolved layout is the layout the phase acquired it for, which is the layout its stage-table entry
     records: an owned allocation's slice may name its layout (any other handle refuses before deriving anything), the
-    view applies the name on every resolve, every copy and move carries it, the ring slices with it, the phase asks
-    AOS for its one slot per matrix and records AOS, and asks no slot for SOA (the SOA staging is retired), and the
-    resolver still refuses, as a layout refusal, a slot whose resolved layout is not its entry's."""
+    view applies the name on every resolve, every copy and move carries it, the ring slices each slot's own allocation
+    with it, the phase asks AOS for its one slot per matrix and records AOS, and asks no slot for SOA (the SOA staging
+    is retired), and the resolver still refuses, as a layout refusal, a slot whose resolved layout is not its
+    entry's."""
     mh, mc, rh, rc, ph = norm(mem_hpp), norm(mem_cpp), norm(ring_hpp), norm(ring_cpp), norm(phase)
     stage = body(ph, STAGE_SIG)
     tagged = body(mc, TAGGED_SLICE_SIG)
@@ -1534,8 +1536,10 @@ def test_tag_is_the_layout_mutants():
     assert not claim_tag_is_the_layout(*with_(1, "view_layout_ = other.view_layout_;", ""))
     assert not claim_tag_is_the_layout(*with_(1, "view_layout_ = new_view_layout;", ""))
     # The ring slicing every slot with its root's AOS tag again.
+    assert not claim_tag_is_the_layout(*with_(3, RING_SLICE, "return slots_[index].slice(0, geo_.slot_bytes);"))
+    # The single-allocation ring's slice of one base, even with the caller's tag.
     assert not claim_tag_is_the_layout(
-        *with_(3, RING_SLICE, "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes);"))
+        *with_(3, RING_SLICE, "return base_.slice(index * geo_.slot_bytes, geo_.slot_bytes, layout);"))
     # The AOS slot acquired as SOA: its tag would disagree with the entry's layout.
     assert not claim_tag_is_the_layout(
         *with_(4, PHASE_AOS_ACQUIRE, "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_SOA);"))

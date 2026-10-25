@@ -215,7 +215,7 @@ void moe_stream_phase::layer_done(int layer, sycl::event down_done) {
 
 void moe_stream_phase::end_prompt() {
     report_staged_routes();
-    if (!ubatch_live_ && !ring_ && table_.empty()) {
+    if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) {
         return;  // every decode graph after the first: nothing to drop
     }
     // The next prompt explains its own unavailable ring, and asks for its own loans (a refusal held only this one).
@@ -390,7 +390,6 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
         }
         region_submitted_ = true;
         region_last_      = copied;
-        anchor_           = aos;  // any slice holds the whole reservation
         // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader the
         // index build named for the item, the executor (llama.cpp-3460).
         table_[key]       = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };
@@ -409,7 +408,12 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
 // every layer runs on the CPU reserves nothing. A failed reserve stays failed for the rest of the micro-batch: one
 // attempt per micro-batch. A reserve the WEIGHT zone was short of asks the backend for an expert loan of the shortfall
 // at the next graph boundary, so the next micro-batch's attempt may succeed, until a loan this prompt asked for comes
-// back refused (llama.cpp-3460, c-0tmn).
+// back refused (llama.cpp-3460, c-0tmn). A refused reserve keeps the slots it got, and its ring waits in pending_ring_
+// for the next micro-batch's attempt, which continues from those slots, so the room a loan freed in holes a slot wide
+// adds up across attempts instead of being asked for again as one block (llama.cpp-am87). The hold lives only while a
+// loan can still fund it: once a loan this prompt asked for comes back refused, or the op wires no loan hook, the
+// refused ring gives its slots back at once, because mid-prompt runtime allocations prefer the WEIGHT zone too (lead
+// ruling, c-zgrd).
 bool moe_stream_phase::ring_ready() {
     if (ring_) {
         return true;
@@ -417,13 +421,22 @@ bool moe_stream_phase::ring_ready() {
     if (reserve_failed_ || geo_.n_slots == 0 || !in_order_) {
         return false;
     }
-    std::unique_ptr<moe_stream_ring> ring        = std::make_unique<moe_stream_ring>();
-    size_t                           bytes_short = 0;
+    std::unique_ptr<moe_stream_ring> ring =
+        pending_ring_ ? std::move(pending_ring_) : std::make_unique<moe_stream_ring>();
+    size_t bytes_short = 0;
     if (!ring->reserve(device_, geo_, &bytes_short)) {
         reserve_failed_ = true;
         if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_) ==
             moe_stream_loan_step::REFUSED) {
             warn_loan_refused(bytes_short);
+        }
+        // Decided after the loan step, which may latch a REFUSED loan in this very call. A ring not kept gives its
+        // slots back as it leaves scope.
+        const bool loan_can_follow = !loan_latch_.refused && request_loan_ != nullptr;
+        if (loan_can_follow) {
+            pending_ring_ = std::move(ring);
+        } else {
+            warn_partial_released(ring->slots_held());
         }
         return false;
     }
@@ -465,20 +478,19 @@ sycl::event moe_stream_phase::compute_barrier() {
     }
 }
 
-// Gives the ring back after the device's last use of it (ruling D, c-fjx1): the current region closes on last_use,
-// and one slot, which retains the whole reservation, is held until last_use too, because a region closed earlier
-// carries a gate that precedes its readers, the executor's dequants. The table's handles then go.
+// Gives the ring back after the device's last use of it (ruling D, c-fjx1): the current region closes on last_use, and
+// the ring's release(last_use) holds every slot until last_use too. A region stage_window() closed is gated on its last
+// copy, which precedes the region's readers, the executor's dequants, and each slot is its own allocation, so no one
+// slot keeps the others (llama.cpp-am87). The table's handles then go. A partial reservation kept for the next attempt
+// (ring_ready()) handed nothing out, so its slots go back at once.
 void moe_stream_phase::teardown(sycl::event last_use) {
     if (ring_) {
         close_region(last_use);
-        if (anchor_.valid()) {
-            retain_handles_until_event({ anchor_ }, last_use);
-        }
-        ring_->release();
+        ring_->release(last_use);
         ring_.reset();
         ++ring_releases_;
     }
-    anchor_ = mem_handle();
+    pending_ring_.reset();
     table_.clear();
     reset_regions();
     geo_ = moe_stream_ring_geometry();
@@ -604,11 +616,7 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
     if (!ring_) {
         return mem_handle();
     }
-    mem_handle slot = ring_->acquire_slot(layout);
-    if (slot.valid()) {
-        anchor_ = slot;  // as stage_window() keeps one: any slice holds the whole reservation
-    }
-    return slot;
+    return ring_->acquire_slot(layout);
 }
 #endif
 
@@ -650,6 +658,22 @@ void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
                   "[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
                   "prompt",
                   device_, bytes_short / (1024.0 * 1024.0));
+    log_->sink(log_->sink_ctx, line);
+}
+
+// A WARN when a refused ring gives its slots back because no loan can fund it any more (lead ruling, c-zgrd), so the
+// ring's own "(holding K of N slots)" line before it is explained. It goes out under the same gate as the
+// ring-unavailable line (lead ruling c-kcyf), and not for a ring that held no slot.
+void moe_stream_phase::warn_partial_released(uint32_t held) const {
+    if (held == 0 || log_ == nullptr || log_->sink == nullptr ||
+        (policy_ != moe_exec_policy::RING && log_->trace < 1)) {
+        return;
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-STREAM-RING] partial reservation released on device %d: no loan can follow (held %u of %u "
+                  "slots)",
+                  device_, held, geo_.n_slots);
     log_->sink(log_->sink_ctx, line);
 }
 

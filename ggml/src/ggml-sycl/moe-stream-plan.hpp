@@ -865,14 +865,18 @@ class moe_stream_phase {
     void              report_staged_routes();
     void              warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li);
     void              warn_loan_refused(size_t bytes_short) const;
+    void              warn_partial_released(uint32_t held) const;
 
     std::unique_ptr<moe_stream_ring>                ring_;
+    // A refused reserve's ring and the slots it got, for the next micro-batch's ring_ready() to continue from while a
+    // loan can still fund it. Only ring_ready() takes or stores it, end_prompt() checks it, teardown() drops it, and
+    // nothing stages into it.
+    std::unique_ptr<moe_stream_ring>                pending_ring_;
     std::unordered_map<uint64_t, moe_stream_staged> table_;           // key = moe_stream_table_key(layer, expert, role)
     std::vector<uint64_t>                           region_keys_[2];  // the table keys whose slots each region holds
     int                                             cur_region_       = 0;      // flips with every epoch_boundary
     bool                                            region_submitted_ = false;  // a copy went into it since
     sycl::event                                     region_last_;  // its last copy's event (see stage_window())
-    mem_handle                                      anchor_;       // one slot: any slice holds the whole reservation
     moe_stream_plan_index                           index_;
     std::unordered_map<int, layer_state>            layers_;
     std::optional<sycl::queue>                      ccs_;  // the compute queue the readers and the barriers run on
