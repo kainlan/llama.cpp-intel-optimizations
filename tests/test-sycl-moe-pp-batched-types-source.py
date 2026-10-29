@@ -59,7 +59,8 @@ dequant. These claims pin that shape:
       region and wait for no earlier phase: one pure predicate in moe-mmvq-tables.hpp
       (moe_pp_batched_phases_reuse_buffers, true unless there is exactly one group) decides both the phase's offset
       (moe_pp_batched_phase_weight_offset) and whether the wait is submitted, the executor asks it and never
-      re-derives it, and the phase's region is asserted to lie in the claimed slot;
+      re-derives it, and the phase's region is asserted to lie in the claimed slot; the route log's weight figure
+      asks the same predicate, so it reports the regions the phases really used;
   (n) the dequant profiler label's name comes from a table built once per type, never from a string the dispatch
       builds;
   (o) every type the f16 table takes runs in the device test (test-moe-pp-batched-dequant.cpp's k_types), or is named
@@ -166,6 +167,10 @@ PHASE_OFFSET = ("sycl::half * phase_weights = batched_weights + "
                 "moe_pp_batched_phase_weight_offset(f16_groups, phase.begin, phase.buffer, half_elems, weight_elems);")
 PHASE_BOUND = ("GGML_ASSERT(pp_woq_arm || (static_cast<size_t>(phase_weights - batched_weights) + "
                "(phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <= reserved.weight_size);")
+# The route log's weight figure: the f16 arm's buffers when its phases reuse them, else every active expert's region.
+WEIGHT_USED = ("const size_t f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ? "
+               "phase_buffers * half_elems : active_count * weight_elems; "
+               "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : f16_used_elems * sizeof(sycl::half);")
 PHASE_WAIT = ("if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_readers[phase.buffer].empty()) { "
               "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]); half_readers[phase.buffer].clear(); }")
 # The debugging compare arm (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE), the one block in the lambda that may wait on
@@ -916,6 +921,8 @@ def claim_m_chain(s):
         fails.append("moe_pp_batched_f16_plan_groups is not defined exactly once in moe-mmvq-tables.hpp")
     elif "plan.buffers = fit >= 2 ? 2 : 1;" not in helper:
         fails.append("the group plan does not split a slot that holds two experts into two halves")
+    if WEIGHT_USED not in lam:
+        fails.append("the route log's weight figure does not ask the reuse predicate for the slot the phases used")
     for name, want in ((REUSE_FN, REUSE_BODY), (OFFSET_FN, OFFSET_BODY)):
         body = one_definition(s["tables"], name)
         if body is None or definitions(s["sycl"], name):
@@ -1269,6 +1276,13 @@ MUTANTS = [
      "if (!half_readers[phase.buffer].empty())"),
     ("m", "sycl", PHASE_OFFSET, "sycl::half * phase_weights = batched_weights + phase.buffer * half_elems;"),
     ("m", "sycl", PHASE_BOUND, ""),
+    # The route log's weight figure: one window's buffers whatever the predicate says, the plan re-derived there.
+    ("m", "sycl", WEIGHT_USED, "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : "
+     "phase_buffers * half_elems * sizeof(sycl::half);"),
+    ("m", "sycl", "f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ?",
+     "f16_used_elems = f16_groups.groups != 1 ?"),
+    ("m", "sycl", "phase_buffers * half_elems : active_count * weight_elems;",
+     "phase_buffers * half_elems : phase_buffers * half_elems;"),
     # A second definition of either function, beside the first or in the executor's file.
     ("m", "tables", "inline bool moe_pp_batched_phases_reuse_buffers(",
      "inline bool moe_pp_batched_phases_reuse_buffers(const moe_pp_batched_f16_groups & groups, int) { "

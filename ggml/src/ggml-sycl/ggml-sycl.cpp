@@ -91815,10 +91815,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                // The weight figure is what this dispatch used of the slot: the WOQ planes of every active expert,
-                // or the f16 arm's buffers.
-                const size_t weight_used_bytes =
-                    pp_woq_arm ? weight_bytes : phase_buffers * half_elems * sizeof(sycl::half);
+                // The weight figure is what this dispatch used of the slot: the WOQ planes of every active expert;
+                // the f16 arm's buffers when its phases reuse them; otherwise every active expert's own region, which
+                // the last phase's region ends at.
+                const size_t f16_used_elems    = moe_pp_batched_phases_reuse_buffers(f16_groups) ?
+                                                     phase_buffers * half_elems :
+                                                     active_count * weight_elems;
+                const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : f16_used_elems * sizeof(sycl::half);
                 static std::atomic<int> batched_log{ 0 };
                 if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96) {
                     GGML_LOG_INFO(
