@@ -20883,7 +20883,7 @@ struct ggml_sycl_expert_lent_ledger {
     bool                                                        refill_armed = false;
     // The decode graph, in its context's count, at whose boundary a bulk refill of the whole ledger is owed: the
     // first one after a prompt whose ring did not engage (llama.cpp-i4ny). 0 when none is.
-    uint64_t                                                    bulk_refill_owed_at = 0;
+    uint64_t                                                    bulk_refill_owed_at      = 0;
     // Set by the backend free of a context that ends with triplets lent: the next context's first graph entry
     // returns the whole ledger (llama.cpp-i4ny).
     bool                                                        bulk_refill_next_context = false;
@@ -20941,10 +20941,10 @@ static void ggml_sycl_expert_lent_ledger_reconcile_locked(int                   
     }
     ledger.triplets.clear();
     ledger.triplet_bytes.clear();
-    ledger.refill_armed        = false;
-    ledger.bulk_refill_owed_at = 0;
+    ledger.refill_armed             = false;
+    ledger.bulk_refill_owed_at      = 0;
     ledger.bulk_refill_next_context = false;
-    ledger.model_id            = model_id;
+    ledger.model_id                 = model_id;
     ledger.load_txn_id  = load_txn_id;
     g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
     g_sycl_expert_lent_bytes[device].store(0, std::memory_order_release);
