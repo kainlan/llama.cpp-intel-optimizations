@@ -6,15 +6,14 @@
 
 **Superseded for the ring (2026-10-25, llama.cpp-477m):** the ring this plan built, two regions of the heaviest
 layer's slots with a 10 % cap and a copy one layer ahead, is replaced by the window ring of
-`docs/plans/2026-10-24-prefill-window-ring.md` (the resolution of llama.cpp-bcre): one executor window per region, an
-eleventh-of-resident cap, slot-by-slot reservation, and copies on the BCS queue that the H2D probe now times too. Read
-that plan and `docs/backend/sycl-memory-design.md` for the ring as built; the ring text below is the record of what was
-first built. The `>= 500` pp512 target in the Goal is retired for this placement: the bus carries about 41 GB per
-512-token ubatch at the probed 25 GB/s, a pp512 ceiling near 312 tok/s (the new plan's "Why this plan exists", item 4).
-Its gate floors are pp512 >= 200 and pp2048 >= 500 (Q_pp, and Q_pp_ub2048 at `-ub 2048`), and the `>= 800`
-pp2048 target moves to the
-`-ub 2048` measurement arm. The amendment below that leaves the `>= 500` and `>= 800` targets "with bcre" is
-superseded by this paragraph.
+`docs/plans/2026-10-24-prefill-window-ring.md` (the resolution of llama.cpp-bcre): one executor window per region, a
+cap of (resident + lent) / 11, slot-by-slot reservation, and copies on the BCS queue that the H2D probe now times too.
+Read that plan and `docs/backend/sycl-memory-design.md` for the ring as built; the ring text below is the record of
+what was first built. The `>= 500` pp512 target in the Goal is retired for this placement: the bus carries about 41 GB
+per 512-token ubatch at the probed 25 GB/s, a pp512 ceiling near 312 tok/s (the new plan's "Why this plan exists",
+item 4). Its gate floors are pp512 >= 200 and pp2048 >= 500 (Q_pp, and Q_pp_ub2048 at `-ub 2048`), and the `>= 800`
+pp2048 target moves to the `-ub 2048` measurement arm. The amendment below that leaves the `>= 500` and `>= 800`
+targets "with bcre" is superseded by this paragraph.
 
 **Amendment (2026-10-23, llama.cpp-bcre, llama.cpp-348c, llama.cpp-3460, llama.cpp-pu8v; updated 2026-10-24,
 llama.cpp-6aj4):** The goal stands, but two premises changed while it was built. The record below is what was built,
