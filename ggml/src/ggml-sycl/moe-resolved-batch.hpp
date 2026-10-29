@@ -249,8 +249,8 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
 // Q1_0 and NVFP4 run on a device only through their direct kernel (DEVICE_MMVQ_Q1_NVFP4_AOS) and its admitted
 // workspace bundle, which validate_moe_execution_recipe checks and choose_moe_batch_executor keeps closed; any other
 // device recipe for them is refused. One answer for the validator, the executor choice and the staged route's
-// capability refusal (ggml_sycl_moe_staged_capability_refusal). The stream ring does not ask it: it stages only what
-// the library executor claims, whole layers of it (window ring, plan Task 2b).
+// capability refusal (ggml_sycl_moe_staged_capability_refusal). The stream ring does not ask it: it stages windows
+// only for layers the library executor claims whole (W2 of docs/plans/2026-10-24-prefill-window-ring.md).
 inline bool moe_type_needs_direct_kernel(ggml_type type) {
     return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
 }

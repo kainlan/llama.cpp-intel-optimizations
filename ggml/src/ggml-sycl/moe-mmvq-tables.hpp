@@ -351,8 +351,9 @@ inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
 // GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0, GGML_SYCL_MOE_PP_ONEDNN_F16=0 or the route not selected, in a build without
 // oneDNN, and for a weight with no per-expert entries (moe_pp_batched_has_expert_entries). Two terms:
 //   - an f16 row at AOS: the ring stages a claimed weight's host experts as AOS slots, which the f16 arm dequantizes;
-//   - an MMVQ-ID kernel (moe_mmvq_admission_supports_type): a layer the executor declines at dispatch runs the hybrid
-//     path, and supports_op admits no other type on a hybrid layer (ggml_sycl_moe_pp_batched_admits_op).
+//   - an MMVQ-ID kernel (moe_mmvq_admission_supports_type): a layer the executor does not take at dispatch (a CPU
+//     decision, no ring, the decline knob) runs the hybrid path, and supports_op, which decides before that, admits no
+//     other type on a hybrid layer (ggml_sycl_moe_pp_batched_admits_op).
 // IQ1_S, IQ1_M and IQ4_XS have the f16 row but no MMVQ-ID kernel, so they are left out until one exists
 // (llama.cpp-w4qk). MXFP4 has no f16 row at AOS: the ring stages nothing of it, so its layer stays hybrid.
 inline bool moe_pp_batched_takes_staged_type(enum ggml_type type) {
