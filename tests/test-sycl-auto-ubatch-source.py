@@ -2890,7 +2890,7 @@ def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
     assert not _ring_helper_remainder_pinned(mutated), "the mutant must make the pin fail"
 
 
-# llama.cpp-xug5: the fit's ring term counts ring SLOTS, as the loan it stands in for does (llama.cpp-9x8t). The helper
+# The fit's ring term counts ring SLOTS, as the loan it stands in for does. The helper
 # hands the probe the ring's slot size; the probe forwards it to the selector's walk and answers in the currency of
 # geo.bytes, whole slots times the slot size, because the byte sum of the selected triplets includes each matrix's
 # remainder below a slot, which funds no slot. With no slot size (the byte-semantics fixtures) it answers the bytes.

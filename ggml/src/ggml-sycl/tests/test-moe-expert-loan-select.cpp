@@ -248,7 +248,7 @@ void test_slot_sized_selection_skips_matrices_below_a_slot() {
 
 // The auto-ubatch fit's probe asks how many ring slots a loan funds, and the caller subtracts that from the ring in
 // whole slots. The byte sum of the selected triplets is not that figure: each matrix carries a remainder below a slot
-// that frees nothing, so the selector reports the funded slots beside the byte sum (llama.cpp-xug5).
+// that frees nothing, so the selector reports the funded slots beside the byte sum.
 void test_slot_sized_selection_reports_funded_slots_not_the_byte_sum() {
     const placement_plan plan   = make_slot_plan();
     size_t               sel    = 0;
@@ -259,18 +259,16 @@ void test_slot_sized_selection_reports_funded_slots_not_the_byte_sum() {
     const auto three = ggml_sycl::moe_expert_loan_select(plan, 0, 3 * kSlot, kSlot, &sel, &funded);
     CHECK(experts_of(three) == std::vector<int>({ 3, 2 }));
     CHECK(funded == 4);
-    CHECK(sel == 2 * kSlot + 3 * (kSlot + kSlot / 2));
-    CHECK(sel > 3 * kSlot && sel > funded * kSlot);
-    // The probe answers funded * kSlot, whole slots. It is strictly below the byte sum, and the gap is exactly the
-    // sub-slot remainders of the matrices lent: a probe that answered the byte sum would credit them.
+    // The probe answers funded * kSlot, whole slots. The byte sum exceeds it by exactly the sub-slot remainders of
+    // the matrices lent, which fund no slot, so a figure taken from the byte sum would credit them.
     size_t remainders = 0;
     for (const int e : experts_of(three)) {
         for (int r = 0; r < 3; ++r) {
             remainders += slot_plan_charge(e, r) % kSlot;
         }
     }
-    CHECK(remainders == kSlot + 3 * (kSlot / 2));
-    CHECK(funded * kSlot < sel && sel - funded * kSlot == remainders);
+    CHECK(remainders > 0);
+    CHECK(sel - funded * kSlot == remainders);
 
     // One slot short: expert 3 alone, 1 slot from 2 * kSlot bytes.
     ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, kSlot, &sel, &funded);

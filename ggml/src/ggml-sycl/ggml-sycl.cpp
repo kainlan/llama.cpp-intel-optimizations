@@ -21588,7 +21588,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 // What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused (a
 // graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks it
 // (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
-// With a ring slot of `slot_bytes` the probe counts slots, as the loan the ring asks for does (llama.cpp-9x8t), and
+// With a ring slot of `slot_bytes` the probe counts slots, as the loan the ring asks for does, and
 // answers the slots it funds times slot_bytes: whole slots, the currency of the ring's byte count. The byte sum of the
 // triplets it selects is not that answer, since each matrix's remainder below a slot is in the sum and funds no slot.
 // With slot_bytes 0 it counts bytes and answers the selection's byte sum.

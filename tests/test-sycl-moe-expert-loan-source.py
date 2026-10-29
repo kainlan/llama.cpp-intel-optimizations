@@ -2917,7 +2917,7 @@ def claim_the_selector_counts_whole_slots_per_matrix(hpp: str) -> bool:
     """With a slot size, the walk stops on slots, not bytes: it wants the shortfall's slots rounded up, each matrix
     frees vram_charge_size / slot_bytes of them (the floor per hole, never the floor of the triplet's sum), and a
     triplet that frees none is skipped after the lendable checks and before any key is taken. *bytes_selected stays
-    the byte sum, *slots_selected is the funded slot count the probe multiplies by the slot size (llama.cpp-xug5),
+    the byte sum, *slots_selected is the funded slot count the probe multiplies by the slot size,
     and with slot_bytes 0 the walk counts bytes as before and the count stays 0."""
     sel = body(norm(hpp), SELECT_DEF)
     return (sel.count(SLOT_PER_MATRIX) == 1 and sel.count(SLOT_SKIP) == 1 and sel.count(BYTES_ADD) == 1
