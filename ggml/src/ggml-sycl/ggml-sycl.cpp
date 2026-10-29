@@ -20884,8 +20884,9 @@ struct ggml_sycl_expert_lent_ledger {
     // The decode graph, in its context's count, at whose boundary a bulk refill of the whole ledger is owed: the
     // first one after a prompt whose ring did not engage (llama.cpp-i4ny). 0 when none is.
     uint64_t                                                    bulk_refill_owed_at      = 0;
-    // Set by the backend free of a context that ends with triplets lent: the next context's first graph entry
-    // returns the whole ledger (llama.cpp-i4ny).
+    // Set by a backend free while the device has triplets lent: the next graph entry on the device returns the whole
+    // ledger (llama.cpp-i4ny). The ledger is per device, so the free owes whatever is lent there; that is the ending
+    // context's loan because contexts on one device run one after another (canonical contract section 5).
     bool                                                        bulk_refill_next_context = false;
 };
 
@@ -21899,10 +21900,12 @@ static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device(ggml_sycl::mo
     return remaining;
 }
 
-// The backend free's half of a loan its context leaves lent (llama.cpp-i4ny). No later graph of that context will
-// return it: the context ran no decode graph after its loan, or its refills had not finished. The free owes the whole
-// ledger to the next context and copies nothing, so a process that exits after its last context pays nothing.
-// Returns how many triplets are owed.
+// The backend free's half of a loan left lent (llama.cpp-i4ny). No later graph of the ending context will return it:
+// it ran no decode graph after its loan, or its refills had not finished. The ledger is per device, not per context,
+// so the free owes the next context on the device whatever is lent there, and copies nothing, so a process that exits
+// after its last context pays nothing. That is the ending context's loan only because contexts on one device run one
+// after another (same-device concurrent inference is unsupported, canonical contract section 5). Returns how many
+// triplets are owed.
 static uint32_t ggml_sycl_expert_bulk_refill_owe_next_context(int device) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return 0;
@@ -96317,8 +96320,10 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // `[SYCL-MOE-SEQUENCE-GRAPHLET] summary phase=final` line may print here too.
     ggml_sycl_graph_diag_report("final", sycl_ctx && sycl_ctx->exec_graph, sycl_ctx);
 #endif
-    // A loan this context leaves lent is owed to the next context, before the report says so (llama.cpp-i4ny). A
-    // temporary backend that computed no graph lent nothing, and owes nothing for a live context's loan.
+    // What the device has lent is owed to the next context on it, before the report says so (llama.cpp-i4ny). The
+    // ledger is per device, so this owes whatever is lent there: this context's loan, since contexts on one device run
+    // one after another (canonical contract section 5). A temporary backend that computed no graph lent nothing, and
+    // owes nothing for a live context's loan.
     if (sycl_ctx && sycl_ctx->graph_compute_seq != 0) {
         (void) ggml_sycl_expert_bulk_refill_owe_next_context(sycl_ctx->device);
     }
