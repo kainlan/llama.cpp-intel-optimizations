@@ -653,7 +653,7 @@ table, `llama.cpp-8ucb` owns the attribution). The Qwen3.8 placement is the B70'
 | Q_tg (4229a205d) | tg t/s | 4.10 | 11.0 | FAIL | md5 3ce606c1 flip=yes prefix=173 refill=balanced(9/9) loan_exercised=yes ring_engaged=no; reserve held 119 of 136 slots at the pp-to-tg boundary, 9 triplets / 15 MiB lent, returned only at exit (`llama.cpp-i4ny` c-789n) |
 | Q_noc (4229a205d) | tg t/s | 11.63 | 9.5 | PASS | md5 25b7738a flip=no prefix=277 refill=not_exercised loan_exercised=no ring_engaged=yes (7 ring layer-ubatches, no loan) |
 
-Re-run on master 4229a205d (2026-10-25 06:35-07:3x EDT, merge-tree build, B70 `level_zero:0`, load 31-33, builders 0 in
+Re-run on master 4229a205d (2026-10-25 06:35-07:15 EDT, merge-tree build, B70 `level_zero:0`, load 31-33, builders 0 in
 every arm, `Shmem` flat at 1.45 GB; `llama.cpp-qov5` c-c774). A record, not a baseline. The 0f1d9172c and 4229a205d rows
 differ by Tasks 5, 11 and 8 (`llama.cpp-a64a`, `llama.cpp-am87`, `llama.cpp-ny6i`): the per-slot reserve moved the
 ring's engagement from the twelfth boundary to the fourth and pp2048 from 56.4 to 66.5; the floors remain unmet.
