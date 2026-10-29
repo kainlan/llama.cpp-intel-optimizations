@@ -1039,7 +1039,9 @@ static inline bool moe_loan_triplet_is_lendable(const moe_loan_triplet &        
 static inline std::vector<expert_placement_key> moe_expert_loan_select(const placement_plan & plan,
                                                                        int                    device,
                                                                        size_t                 bytes_wanted,
+                                                                       size_t                 slot_bytes,
                                                                        size_t *               bytes_selected) {
+    (void) slot_bytes;
     std::vector<expert_placement_key>  out;
     size_t                             sum = 0;
     std::unordered_map<uint64_t, bool> bulk_memo;

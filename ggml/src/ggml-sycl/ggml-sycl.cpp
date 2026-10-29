@@ -21190,7 +21190,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     size_t                                       selected = 0;
     std::vector<ggml_sycl::expert_placement_key> keys =
         refill ? ggml_sycl_expert_refill_select(device, *current, amount, &result.n_remaining) :
-                 ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, &selected);
+                 ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, /*slot_bytes=*/0, &selected);
     const uint32_t n_selected = static_cast<uint32_t>(keys.size() / 3);
     if (probe_mode) {
         result.accepted    = n_selected != 0;
