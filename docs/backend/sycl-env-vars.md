@@ -538,19 +538,24 @@ third under `ring` only, the aborts always)
   last word is `direct` or `staged`.
 - WARN `[MOE-EXEC] host-expert copy probe device %d: no %zu-byte RUNTIME buffer` and
   `[MOE-EXEC] host-expert copy probe device %d failed: %s`: the same probe, when it could not run.
-- WARN `[MOE-EXEC-TRACE] window device %d layer %d role %s phase %zu bytes=%zu exposed=%d submit_us=%.0f
-  copy_us=%.0f readers_wait_us=%.0f launches=%u`: `GGML_SYCL_MOE_EXEC_TRACE=2`, one per ring window of the batched
+- WARN `[MOE-EXEC-TRACE] window device %d layer %d role %s phase %zu bytes=%zu exposed=%d submit_us=%.0f copy_us=%.0f
+  readers_wait_us=%.0f start_lag_us=%.0f launches=%u`: `GGML_SYCL_MOE_EXEC_TRACE=2`, one per ring window of the batched
   prompt executor (llama.cpp-8ucb), printed at the next synchronize after the window ran, where the host has already
   waited for the queue, so reading the device times never waits on compute work. It is WARN although its prefix is the
-  trace's, so `llama-bench` shows it without `-v`. `bytes` are the window's own copies, staged by its own
-  `window_begin` or prefetched by the one before. `exposed` is 1 for the layer's first window. `submit_us` is the host
-  steady-clock time inside `window_begin`, the next window's prefetch included. `copy_us` is the device time from the
-  window's first copy's `command_start` to its last copy's `command_end` on the in-order copy queue. `readers_wait_us`
-  is the first copy's `command_start` minus the `command_end` of the read gate the copies waited on: the barrier behind
-  the dequants of the window the region last held, on the compute queue. It is clamped at 0. `launches` counts the
-  dequant kernels and the GEMM groups the executor submitted for the window. `-1` means unmeasured: no device times on
-  an event, no copies of the window's own, or no read gate (a region's first fill). A prefetched window that never
-  began prints nothing.
+  trace's, so `llama-bench` shows it without `-v`. `bytes` are the window's own copies, staged by its own `window_begin`
+  or prefetched by the one before. `exposed` is 1 for the layer's first window. `submit_us` is the host steady-clock
+  time inside `window_begin`, the next window's prefetch included. `copy_us` is the device time from the window's first
+  copy's `command_start` to its last copy's `command_end` on the in-order copy queue. The read gate is the barrier, on
+  the compute queue, behind the dequants of the window the region last held; the copies depend on it. `readers_wait_us`
+  is how long the first copy waited for that gate: the gate's `command_end` minus the moment the copy could otherwise
+  have started, which is the later of the copy's `command_submit` and the `command_end` of the copy queued before it on
+  the copy queue. It is clamped at 0, and a large value means the copy queue sat waiting for the compute queue to
+  release the region. `start_lag_us` is the first copy's `command_start` minus the gate's `command_end`, clamped at 0:
+  how late the copy began after the gate released it. The dependency keeps it from starting earlier, so a large lag
+  means the copy queue was busy or the copy was submitted late, not that the gate held it. `launches` counts the dequant
+  kernels and the GEMM groups the executor submitted for the window. `-1` means unmeasured: no device times on an event
+  (for `readers_wait_us`, also on the copy queued before), no copies of the window's own, or no read gate (a region's
+  first fill). A prefetched window that never began prints nothing.
 
 **Trace** (`GGML_SYCL_MOE_EXEC_TRACE>=1`, all INFO, in the order a layer-ubatch prints them)
 

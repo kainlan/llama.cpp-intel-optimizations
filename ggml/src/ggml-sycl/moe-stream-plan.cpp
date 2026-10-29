@@ -26,12 +26,14 @@ const char * moe_stream_getenv(const char * name) {
     return std::getenv(name);
 }
 
-// An event's device command_start and command_end in ns, for the window timing line; false when the event has none
-// (its queue was built without profiling, or the runtime refuses the query). Read only at the synchronize boundary.
-bool moe_stream_event_times(const sycl::event & ev, uint64_t * start_ns, uint64_t * end_ns) {
+// An event's device command_submit, command_start and command_end in ns, for the window timing line; false when the
+// event has none (its queue was built without profiling, or the runtime refuses the query). Read only at the
+// synchronize boundary.
+bool moe_stream_event_times(const sycl::event & ev, uint64_t * submit_ns, uint64_t * start_ns, uint64_t * end_ns) {
     try {
-        *start_ns = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
-        *end_ns   = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        *submit_ns = ev.get_profiling_info<sycl::info::event_profiling::command_submit>();
+        *start_ns  = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        *end_ns    = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
     } catch (const sycl::exception &) {
         return false;
     }
@@ -252,7 +254,7 @@ void moe_stream_phase::flush_window_timing() {
         return;
     }
     if (log_ == nullptr || log_->trace < 2 || log_->sink == nullptr) {
-        window_timing_.records.clear();
+        window_timing_.clear();
         return;
     }
     moe_exec_decision_log * log = log_;

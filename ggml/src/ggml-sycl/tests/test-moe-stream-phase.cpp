@@ -328,29 +328,34 @@ void test_declined_line() {
 // has no fake cache or ring to drive window_begin with, so the test drives the timeline the phase holds over
 // sycl::event, in the order the phase feeds it: stage_window() reports each copy (window_begin of phase 0 copies its
 // own exposed window, then prefetches phase 1), window_begin reports the window, the executor reports its launches,
-// and the synchronize boundary flushes one line per window. The fake profiler answers device times in ns; event 4 has
-// none, as a copy on a queue without profiling.
-bool fake_event_times(int ev, uint64_t * start_ns, uint64_t * end_ns) {
+// and the synchronize boundary flushes one line per window. The fake profiler answers device submit, start and end
+// times in ns; event 4 has none, as a copy on a queue without profiling.
+bool fake_event_times(int ev, uint64_t * submit_ns, uint64_t * start_ns, uint64_t * end_ns) {
     switch (ev) {
-        case 1:  // window 0's first copy
-            *start_ns = 1000000;
-            *end_ns   = 1400000;
+        case 1:  // window 0's first copy: submitted at 0.5 ms, held by its gate until 0.9 ms, started at 1.0 ms
+            *submit_ns = 500000;
+            *start_ns  = 1000000;
+            *end_ns    = 1400000;
             return true;
         case 2:  // window 0's last copy
-            *start_ns = 1400000;
-            *end_ns   = 2000000;
+            *submit_ns = 500000;
+            *start_ns  = 1400000;
+            *end_ns    = 2000000;
             return true;
-        case 3:  // window 1's first copy
-            *start_ns = 2100000;
-            *end_ns   = 2300000;
+        case 3:  // window 1's first copy: submitted at 1.5 ms, but the copy ahead of it on the queue ran to 2.0 ms
+            *submit_ns = 1500000;
+            *start_ns  = 2100000;
+            *end_ns    = 2300000;
             return true;
         case 10:  // window 0's read gate: the dequants of the window its region last held were done at 0.9 ms
-            *start_ns = 800000;
-            *end_ns   = 900000;
+            *submit_ns = 100000;
+            *start_ns  = 800000;
+            *end_ns    = 900000;
             return true;
         case 11:  // window 1's read gate
-            *start_ns = 1900000;
-            *end_ns   = 2050000;
+            *submit_ns = 1000000;
+            *start_ns  = 1900000;
+            *end_ns    = 2080000;
             return true;
         default:
             return false;
@@ -400,18 +405,20 @@ void test_window_timing_records_one_record_per_window_only_under_trace() {
 
     CHECK((*on_at).flush(0, fake_event_times, sink) == 2);
     CHECK(lines.size() == 2);
-    // copy_us spans the first copy's start to the last copy's end (1.0 ms); readers_wait_us is the first copy's start
-    // after the read gate's end (0.1 ms).
+    // copy_us spans the first copy's start to the last copy's end (1.0 ms). No copy was queued ahead of window 0, so
+    // the first copy could have started at its submit (0.5 ms): readers_wait_us is the gate's end after that (0.4 ms),
+    // and start_lag_us is the copy's start after the gate's end (0.1 ms).
     CHECK(lines.size() > 0 &&
           lines[0] ==
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 0 bytes=2000 exposed=1 submit_us=12 "
-              "copy_us=1000 readers_wait_us=100 launches=3");
-    // The last copy has no device times, so the copy span is unmeasured; the read gate and the first copy still give
-    // the wait (0.05 ms).
+              "copy_us=1000 readers_wait_us=400 start_lag_us=100 launches=3");
+    // The last copy has no device times, so the copy span is unmeasured. Window 0's last copy held the queue until
+    // 2.0 ms, after window 1's submit (1.5 ms), so the gate's end (2.08 ms) cost 0.08 ms of waiting, not 0.58 ms; the
+    // copy started 0.02 ms after the gate.
     CHECK(lines.size() > 1 &&
           lines[1] ==
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=1000 exposed=0 submit_us=4 "
-              "copy_us=-1 readers_wait_us=50 launches=2");
+              "copy_us=-1 readers_wait_us=80 start_lag_us=20 launches=2");
     // The flush empties the timeline: the next boundary prints only what came after it.
     CHECK((*on_at).records.empty());
     CHECK((*on_at).flush(0, fake_event_times, sink) == 0);
@@ -427,15 +434,31 @@ void test_window_timing_records_one_record_per_window_only_under_trace() {
     (*on_at).begun(ggml_sycl::moe_stream_window_timing_key(8, w1), 4, expert_tensor_role::UP, 1, false, 1.0);
     lines.clear();
     CHECK((*on_at).flush(1, fake_event_times, sink) == 2);
-    // No read gate (a region's first fill since the ring was reserved): the wait is unmeasured.
+    // No read gate (a region's first fill since the ring was reserved): neither the wait nor the lag is measured.
     CHECK(lines.size() > 0 &&
           lines[0] ==
               "[MOE-EXEC-TRACE] window device 1 layer 4 role up phase 0 bytes=700 exposed=1 submit_us=1 "
-              "copy_us=600 readers_wait_us=-1 launches=0");
+              "copy_us=600 readers_wait_us=-1 start_lag_us=-1 launches=0");
     CHECK(lines.size() > 1 &&
           lines[1] ==
               "[MOE-EXEC-TRACE] window device 1 layer 4 role up phase 1 bytes=0 exposed=0 submit_us=1 "
-              "copy_us=-1 readers_wait_us=-1 launches=0");
+              "copy_us=-1 readers_wait_us=-1 start_lag_us=-1 launches=0");
+
+    // The copy queued ahead has no device times, so when the window's copy could have started is unknown: the wait
+    // is unmeasured, while the lag after the gate still is (0.02 ms).
+    const uint64_t k_a = ggml_sycl::moe_stream_window_timing_key(9, w0);
+    const uint64_t k_b = ggml_sycl::moe_stream_window_timing_key(9, w1);
+    (*on_at).copied(k_a, 4, 100, std::optional<int>());
+    (*on_at).copied(k_b, 3, 200, std::optional<int>(11));
+    (*on_at).begun(k_b, 4, expert_tensor_role::UP, 1, false, 2.0);
+    lines.clear();
+    CHECK((*on_at).flush(0, fake_event_times, sink) == 1);
+    CHECK(lines.size() > 0 &&
+          lines[0] ==
+              "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=200 exposed=0 submit_us=2 "
+              "copy_us=200 readers_wait_us=-1 start_lag_us=20 launches=0");
+    // The flush also forgets the queue's last copy: a window after the boundary measures from its submit alone.
+    CHECK(!(*on_at).queue_tail.has_value());
 }
 
 }  // namespace

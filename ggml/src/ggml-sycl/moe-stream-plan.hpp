@@ -726,10 +726,18 @@ static inline uint64_t moe_stream_window_timing_key(uint64_t ubatch_seq, uint32_
 //                    command_end. The copy queue is in order, so the span covers every copy of the window (and any
 //                    other submitter's work interleaved on that queue). -1 when a copy has no device times (the copy
 //                    queue is built with profiling only under trace level 2) or the window copied nothing itself
-//   readers_wait_us  the first copy's command_start minus the command_end of the read gate its copies waited on (the
-//                    barrier behind the dequants of the window the region last held, or the compute-queue barrier
-//                    that stands in for it): the copy queue waiting for the compute queue before reusing the region.
-//                    Clamped at 0; -1 when the copies waited on no read gate or an event has no device times
+//   readers_wait_us  how long the window's first copy waited FOR its read gate (the barrier behind the dequants of
+//                    the window the region last held, or the compute-queue barrier that stands in for it): the gate's
+//                    command_end minus the moment the copy could otherwise have started, the later of the copy's
+//                    command_submit and the command_end of the copy queued before it on the copy queue (the last copy
+//                    this timeline saw since the previous flush; none: the submit alone). Clamped at 0. A large value
+//                    means the copy queue sat waiting for the compute queue to release the region. -1 when the copies
+//                    waited on no read gate or an event has no device times. Other submitters' work on the copy queue
+//                    and the copy's other dependencies are not seen
+//   start_lag_us     the first copy's command_start minus the read gate's command_end, clamped at 0: how late the copy
+//                    began after the gate released it. The copy depends on the gate, so it never starts before the
+//                    gate's end; a large value means the copy queue was busy or the copy was submitted late, i.e. the
+//                    gate was NOT what held it. -1 as readers_wait_us
 //   launches         the dequant kernels and the GEMM groups the executor submitted for the window
 template <typename event_t> struct moe_stream_window_timeline {
     struct record {
@@ -746,10 +754,17 @@ template <typename event_t> struct moe_stream_window_timeline {
         event_t                first_copy{};
         event_t                last_copy{};
         std::optional<event_t> reuse_gate;  // the read gate the window's copies waited on
+        std::optional<event_t> prev_copy;   // the copy queued just before the first copy, if this timeline saw one
     };
 
-    bool                enabled = false;  // trace level 2
-    std::vector<record> records;
+    bool                   enabled = false;  // trace level 2
+    std::vector<record>    records;
+    std::optional<event_t> queue_tail;       // the latest copy recorded since the previous flush
+
+    void clear() {
+        records.clear();
+        queue_tail.reset();
+    }
 
     // The latest record under `key`: a window's records are recent, so the search runs from the back.
     record * find(uint64_t key) {
@@ -780,7 +795,9 @@ template <typename event_t> struct moe_stream_window_timeline {
         if (r.n_copies == 0) {
             r.first_copy = copy;
             r.reuse_gate = gate;
+            r.prev_copy  = queue_tail;
         }
+        queue_tail  = copy;
         r.last_copy = copy;
         ++r.n_copies;
         r.bytes += bytes;
@@ -811,8 +828,9 @@ template <typename event_t> struct moe_stream_window_timeline {
         }
     }
 
-    // One line per begun window to `sink`, then the records go. `times(ev, &start_ns, &end_ns)` answers an event's
-    // device command_start and command_end, false when it has none. Returns the lines printed.
+    // One line per begun window to `sink`, then the records go. `times(ev, &submit_ns, &start_ns, &end_ns)` answers
+    // an event's device command_submit, command_start and command_end, false when it has none. Returns the lines
+    // printed.
     template <typename times_fn, typename sink_fn> size_t flush(int device, times_fn times, sink_fn sink) {
         size_t printed = 0;
         for (const record & r : records) {
@@ -821,26 +839,37 @@ template <typename event_t> struct moe_stream_window_timeline {
             }
             double     copy_us         = -1.0;
             double     readers_wait_us = -1.0;
-            uint64_t   first_start = 0, first_end = 0;
-            const bool first_timed = r.n_copies != 0 && times(r.first_copy, &first_start, &first_end);
-            uint64_t   last_start = 0, last_end = 0;
-            if (first_timed && times(r.last_copy, &last_start, &last_end) && last_end >= first_start) {
+            double     start_lag_us    = -1.0;
+            uint64_t   first_submit = 0, first_start = 0, first_end = 0;
+            const bool first_timed = r.n_copies != 0 && times(r.first_copy, &first_submit, &first_start, &first_end);
+            uint64_t   last_submit = 0, last_start = 0, last_end = 0;
+            if (first_timed && times(r.last_copy, &last_submit, &last_start, &last_end) && last_end >= first_start) {
                 copy_us = static_cast<double>(last_end - first_start) / 1e3;
             }
-            uint64_t gate_start = 0, gate_end = 0;
-            if (first_timed && r.reuse_gate && times(*r.reuse_gate, &gate_start, &gate_end)) {
-                readers_wait_us = first_start > gate_end ? static_cast<double>(first_start - gate_end) / 1e3 : 0.0;
+            uint64_t   gate_submit = 0, gate_start = 0, gate_end = 0;
+            const bool gate_timed =
+                first_timed && r.reuse_gate && times(*r.reuse_gate, &gate_submit, &gate_start, &gate_end);
+            // The moment the first copy could have started without its gate: its submit, or the end of the copy
+            // ahead of it on the in-order copy queue when that is later.
+            uint64_t       prev_submit = 0, prev_start = 0, prev_end = 0;
+            const bool     prev_known = !r.prev_copy || times(*r.prev_copy, &prev_submit, &prev_start, &prev_end);
+            const uint64_t ready      = std::max(first_submit, prev_end);
+            if (gate_timed && prev_known) {
+                readers_wait_us = gate_end > ready ? static_cast<double>(gate_end - ready) / 1e3 : 0.0;
             }
-            char line[256];
+            if (gate_timed) {
+                start_lag_us = first_start > gate_end ? static_cast<double>(first_start - gate_end) / 1e3 : 0.0;
+            }
+            char line[288];
             std::snprintf(line, sizeof(line),
                           "[MOE-EXEC-TRACE] window device %d layer %d role %s phase %zu bytes=%zu exposed=%d "
-                          "submit_us=%.0f copy_us=%.0f readers_wait_us=%.0f launches=%u",
+                          "submit_us=%.0f copy_us=%.0f readers_wait_us=%.0f start_lag_us=%.0f launches=%u",
                           device, r.layer, expert_tensor_role_name(r.role), r.phase, r.bytes, r.exposed ? 1 : 0,
-                          r.submit_us, copy_us, readers_wait_us, r.launches);
+                          r.submit_us, copy_us, readers_wait_us, start_lag_us, r.launches);
             sink(line);
             ++printed;
         }
-        records.clear();
+        clear();
         return printed;
     }
 };

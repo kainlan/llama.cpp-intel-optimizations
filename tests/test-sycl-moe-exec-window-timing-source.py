@@ -18,6 +18,10 @@ in-memory copy of the normalized source, never a file:
     to window_launched after the phase's GEMM stage, on a windowed op only;
   - stage_window records each copy with its bytes and its read gate, window_begin records the window with the host
     time it took, and begin_ubatch moves the micro-batch key on;
+  - readers_wait_us is the time the first copy waited FOR its read gate: the gate's command_end minus the later of the
+    copy's command_submit and the command_end of the copy queued before it (clamped at 0), and start_lag_us, the
+    copy's command_start after the gate's command_end, is a separate field. The event reader asks for command_submit,
+    each window remembers the copy queued before its first, and a flush forgets the queue's last copy;
   - the synchronize boundary flushes the lines after the queue wait and before the expert-loan runner, its only
     caller in ggml-sycl.cpp, with no lock taken in synchronize ahead of the flush nor in flush_window_timing;
   - docs/backend/sycl-env-vars.md catalogs the literal and says the trace row's level 2 profiles the copy queue.
@@ -109,7 +113,7 @@ def mutate(text: str, old: str, new: str, count: int = 1) -> str:
 # ---- the literal --------------------------------------------------------------------------------------------------
 
 LINE = ('"[MOE-EXEC-TRACE] window device %d layer %d role %s phase %zu bytes=%zu exposed=%d submit_us=%.0f '
-        'copy_us=%.0f readers_wait_us=%.0f launches=%u"')
+        'copy_us=%.0f readers_wait_us=%.0f start_lag_us=%.0f launches=%u"')
 TIMELINE_SIG = "template <typename event_t> struct moe_stream_window_timeline {"
 FLUSH_SIG = "template <typename times_fn, typename sink_fn> size_t flush(int device, times_fn times, sink_fn sink) {"
 
@@ -146,6 +150,10 @@ def test_literal_mutants():
     renamed = dict(texts)
     renamed["moe-stream-plan.hpp"] = mutate(texts["moe-stream-plan.hpp"], "readers_wait_us=%.0f", "wait_us=%.0f")
     assert not claim_literal(renamed)
+    # the lag field dropped, folding the two figures back into one
+    dropped = dict(texts)
+    dropped["moe-stream-plan.hpp"] = mutate(texts["moe-stream-plan.hpp"], " start_lag_us=%.0f", "")
+    assert not claim_literal(dropped)
 
 
 # ---- the trace-level gate -----------------------------------------------------------------------------------------
@@ -157,8 +165,7 @@ RECORDERS = (
     "void begun(uint64_t key, int layer, expert_tensor_role role, size_t phase, bool exposed, double submit_us) {",
     "void launched(uint64_t key, uint32_t n) {",
 )
-FLUSH_GATE = ("if (log_ == nullptr || log_->trace < 2 || log_->sink == nullptr) { window_timing_.records.clear(); "
-              "return; }")
+FLUSH_GATE = "if (log_ == nullptr || log_->trace < 2 || log_->sink == nullptr) { window_timing_.clear(); return; }"
 FLUSH_SINK = "[log](const char * line) { log->sink(log->sink_ctx, line); }"
 
 
@@ -299,6 +306,50 @@ def test_records_mutants():
     assert not claim_records(mutate(PLAN_CPP, COPIED, ""))
     assert not claim_records(mutate(PLAN_CPP, BEGUN, BEGUN.replace("exposed, submit_us", "false, submit_us")))
     assert not claim_records(mutate(PLAN_CPP, "++ubatch_seq_;", ""))
+
+
+# ---- the wait and the lag -----------------------------------------------------------------------------------------
+
+READY = "const uint64_t ready = std::max(first_submit, prev_end);"
+WAIT_EXPR = "readers_wait_us = gate_end > ready ? static_cast<double>(gate_end - ready) / 1e3 : 0.0;"
+LAG_EXPR = "start_lag_us = first_start > gate_end ? static_cast<double>(first_start - gate_end) / 1e3 : 0.0;"
+PREV = "r.first_copy = copy; r.reuse_gate = gate; r.prev_copy = queue_tail; } queue_tail = copy;"
+CLEAR = "void clear() { records.clear(); queue_tail.reset(); }"
+SUBMIT = "*submit_ns = ev.get_profiling_info<sycl::info::event_profiling::command_submit>();"
+
+
+def claim_wait(plan_hpp: str, plan_cpp: str) -> bool:
+    """readers_wait_us measures the wait FOR the gate (the gate's end after the moment the copy could otherwise have
+    started), start_lag_us the copy's start after the gate, each assigned once in the flush; the moment comes from the
+    copy's submit and the copy queued ahead of it; the flush forgets that copy."""
+    timeline = body(norm(plan_hpp), TIMELINE_SIG)
+    flush = body(timeline, FLUSH_SIG)
+    copied = body(timeline, RECORDERS[0])
+    reader = body(norm(plan_cpp), "bool moe_stream_event_times(")
+    return (flush.count(READY) == 1 and flush.count(WAIT_EXPR) == 1 and flush.count(LAG_EXPR) == 1
+            and flush.count("readers_wait_us =") == 2 and flush.count("start_lag_us =") == 2
+            and flush.find(READY) < flush.find(WAIT_EXPR) and copied.count(PREV) == 1
+            and timeline.count(CLEAR) == 1 and flush.count("clear();") == 1 and reader.count(SUBMIT) == 1)
+
+
+def test_wait():
+    assert claim_wait(PLAN_HPP, PLAN_CPP)
+
+
+def test_wait_mutants():
+    # the operands swapped: the copy's readiness after the gate, which the dependency makes 0
+    swapped = WAIT_EXPR.replace("gate_end > ready", "ready > gate_end").replace("gate_end - ready", "ready - gate_end")
+    assert not claim_wait(mutate(PLAN_HPP, WAIT_EXPR, swapped), PLAN_CPP)
+    # the max dropped: a copy held by the copy ahead of it reads as waiting for the gate
+    assert not claim_wait(mutate(PLAN_HPP, READY, "const uint64_t ready = first_submit;"), PLAN_CPP)
+    # readers_wait_us measured as the lag again (the defect this claim exists for)
+    lag_as_wait = LAG_EXPR.replace("start_lag_us =", "readers_wait_us =")
+    assert not claim_wait(mutate(PLAN_HPP, WAIT_EXPR, lag_as_wait), PLAN_CPP)
+    # the copy ahead never remembered, or never forgotten at the flush
+    assert not claim_wait(mutate(PLAN_HPP, " r.prev_copy = queue_tail;", ""), PLAN_CPP)
+    assert not claim_wait(mutate(PLAN_HPP, CLEAR, "void clear() { records.clear(); }"), PLAN_CPP)
+    # the submit read as the start
+    assert not claim_wait(PLAN_HPP, mutate(PLAN_CPP, SUBMIT, SUBMIT.replace("command_submit", "command_start")))
 
 
 # ---- the flush site -----------------------------------------------------------------------------------------------

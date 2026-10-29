@@ -106,7 +106,7 @@ def test_log_formats_appear_once():
     assert count_literal("[MOE-EXEC-TRACE] dev %d layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
     assert count_literal("[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed, %u windows, %u exposed, %u misses") == 1
     assert count_joined_literal('"[MOE-EXEC-TRACE] window device %d layer %d role %s phase %zu bytes=%zu exposed=%d '
-                                'submit_us=%.0f copy_us=%.0f readers_wait_us=%.0f launches=%u"') == 1
+                                'submit_us=%.0f copy_us=%.0f readers_wait_us=%.0f start_lag_us=%.0f launches=%u"') == 1
 
 
 def code_of(name):
