@@ -84,6 +84,10 @@ What this gate pins:
     precedes the region's readers), and the ring is offered only on an in-order compute queue;
   - the backend context owns the phase, resets it after draining its queues and before the retained handles drain,
     ends the prompt at the first decode graph, and closes a layer's region after its down MUL_MAT_ID;
+  - the phase says whether the prompt it ended kept a whole ring (llama.cpp-i4ny): the flag is set only where
+    ring_ready() keeps a whole reservation, never for a refused one kept pending; end_prompt copies it and clears it
+    only past its early return, so the decode graphs after the first leave the answer standing, and marks the prompt
+    ended for take_prompt_ended(), which answers true once per ended prompt;
   - begin_layer and window_begin decide through the header's pure predicates (a micro-batch's start, staging now, the
     executor's claim, a window's id, items and exposure), which test-moe-stream-phase pins, and never restate them;
   - the window trace line "[MOE-EXEC-TRACE] stage window layer %d role %s phase %zu: %d items %zu bytes" (plan Task 2b)
@@ -2259,6 +2263,70 @@ def test_trace_mutants():
     tree = dict(SYCL_TREE)
     tree["extra.cpp"] = '"[MOE-EXEC-TRACE] stage layouts layer %d ubatch %u: soa=%d aos_only=%d"'
     assert not claim_trace_line(PHASE, tree)
+
+
+# ---- whether the prompt's ring engaged (llama.cpp-i4ny) --------------------------------------------------------------
+
+ENGAGED_DECL = "bool last_prompt_ring_engaged() const;"
+ENGAGED_SIG = "bool moe_stream_phase::last_prompt_ring_engaged() const"
+ENGAGED_BODY = "{ return last_prompt_ring_engaged_; }"
+TAKE_ENDED_DECL = "bool take_prompt_ended();"
+TAKE_ENDED_SIG = "bool moe_stream_phase::take_prompt_ended()"
+TAKE_ENDED_BODY = "{ const bool ended = prompt_ended_; prompt_ended_ = false; return ended; }"
+ENGAGED_DECLS = ("bool ring_engaged_ = false;", "bool last_prompt_ring_engaged_ = false;",
+                 "bool prompt_ended_ = false;")
+ENGAGED_SET = "ring_engaged_ = true; ring_ = std::move(ring);"
+ENGAGED_COPY = "last_prompt_ring_engaged_ = ring_engaged_; ring_engaged_ = false; prompt_ended_ = true;"
+
+
+def claim_end_prompt_reports_ring_engagement(phase: str, hpp: str) -> bool:
+    """A loan exists to fund the prompt's ring, so whether that ring engaged decides how the backend returns the loan:
+    at once when it never engaged, a triplet per decode graph when it did (llama.cpp-i4ny). The flag is set at the one
+    place ring_ready() keeps a whole reservation, after the refused branch (a refused ring kept pending funds nothing),
+    and nowhere else; a ring a new geometry tore down mid-prompt still counts. end_prompt copies the flag and clears it
+    for the next prompt only past its early return, so every decode graph after the first leaves the answer standing,
+    and it marks the prompt ended; take_prompt_ended() answers true once per ended prompt. The accessor reads the copy,
+    not the live flag."""
+    n = norm(phase)
+    h = norm(hpp)
+    ready = body(n, RING_READY_SIG)
+    end = body(n, END_PROMPT_SIG)
+    return (h.count(ENGAGED_DECL) == 1 and h.count(TAKE_ENDED_DECL) == 1 and body(n, ENGAGED_SIG) == ENGAGED_BODY
+            and all(h.count(d) == 1 for d in ENGAGED_DECLS)
+            and n.count("ring_engaged_ = true;") == 1 and ready.count(ENGAGED_SET) == 1
+            and ordered(ready, LATCH_GUARD, RESERVE_SHORT_IF, "return false;",
+                        ENGAGED_SET + " reset_regions(); return true;")
+            and n.count("prompt_ended_ = true;") == 1 and n.count("last_prompt_ring_engaged_ =") == 1
+            and end.count(ENGAGED_COPY) == 1 and ordered(end, END_PROMPT_EARLY, ENGAGED_COPY, "teardown(")
+            and body(n, TAKE_ENDED_SIG) == TAKE_ENDED_BODY)
+
+
+def test_end_prompt_reports_ring_engagement():
+    assert claim_end_prompt_reports_ring_engagement(PHASE, PLAN_HPP)
+
+
+def test_end_prompt_reports_ring_engagement_mutants():
+    def c(phase=PHASE, hpp=PLAN_HPP):
+        return claim_end_prompt_reports_ring_engagement(phase, hpp)
+
+    # Never set: every prompt would read as unengaged and lose a loan its ring used.
+    assert not c(phase=mutate(PHASE, "ring_engaged_ = true; ", ""))
+    # Set where a refused ring is kept pending instead: a ring that never reserved would read as engaged.
+    m = mutate(PHASE, "ring_engaged_ = true; ", "")
+    assert not c(phase=mutate(m, PENDING_KEEP, PENDING_KEEP + " ring_engaged_ = true;"))
+    # Copied before the early return: the second decode graph would overwrite the answer with an empty prompt's.
+    m = in_body(PHASE, END_PROMPT_SIG, " " + ENGAGED_COPY, "")
+    assert not c(phase=in_body(m, END_PROMPT_SIG, END_PROMPT_EARLY, ENGAGED_COPY + " " + END_PROMPT_EARLY))
+    # Read from ring_ alone: a ring a new geometry tore down mid-prompt would read as unengaged.
+    assert not c(phase=mutate(PHASE, "last_prompt_ring_engaged_ = ring_engaged_;",
+                              "last_prompt_ring_engaged_ = ring_ != nullptr;"))
+    # Not cleared per prompt: an unengaged prompt after an engaged one would read as engaged.
+    assert not c(phase=mutate(PHASE, ENGAGED_COPY, "last_prompt_ring_engaged_ = ring_engaged_; prompt_ended_ = true;"))
+    # Not marked ended, or marked ended for good: the backend would read the flag never, or at every decode graph.
+    assert not c(phase=mutate(PHASE, " prompt_ended_ = true;", ""))
+    assert not c(phase=mutate(PHASE, TAKE_ENDED_BODY, "{ return prompt_ended_; }"))
+    # The accessor reads the live flag, which end_prompt has just cleared.
+    assert not c(phase=mutate(PHASE, ENGAGED_BODY, "{ return ring_engaged_; }"))
 
 
 if __name__ == "__main__":

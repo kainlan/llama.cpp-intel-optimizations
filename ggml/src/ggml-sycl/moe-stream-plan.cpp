@@ -230,8 +230,12 @@ void moe_stream_phase::end_prompt() {
         return;  // every decode graph after the first: nothing to drop
     }
     // The next prompt explains its own unavailable ring, and asks for its own loans (a refusal held only this one).
-    warned_unavailable_ = false;
-    loan_latch_         = moe_stream_loan_latch();
+    warned_unavailable_       = false;
+    loan_latch_               = moe_stream_loan_latch();
+    // Whether this prompt's ring engaged decides how the backend returns its loan (llama.cpp-i4ny).
+    last_prompt_ring_engaged_ = ring_engaged_;
+    ring_engaged_             = false;
+    prompt_ended_             = true;
     teardown(ring_ ? compute_barrier() : sycl::event());
     layers_.clear();
     index_            = moe_stream_plan_index();
@@ -241,6 +245,16 @@ void moe_stream_phase::end_prompt() {
     record_valid_     = false;
     record_looked_up_ = false;
     prepared_         = false;
+}
+
+bool moe_stream_phase::last_prompt_ring_engaged() const {
+    return last_prompt_ring_engaged_;
+}
+
+bool moe_stream_phase::take_prompt_ended() {
+    const bool ended = prompt_ended_;
+    prompt_ended_    = false;
+    return ended;
 }
 
 // One scan of the plan per micro-batch (c-7soh), at its first op, which carries the library executor's claim
@@ -451,7 +465,8 @@ bool moe_stream_phase::ring_ready() {
         }
         return false;
     }
-    ring_ = std::move(ring);
+    ring_engaged_ = true;
+    ring_         = std::move(ring);
     reset_regions();
     return true;
 }

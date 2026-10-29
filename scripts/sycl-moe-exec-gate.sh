@@ -60,8 +60,12 @@
 #              (default "-": recorded, not scored), every "[MOE-EXEC] refill device D: R/L" has R = L (checked per
 #              line, so 24/23 on one device and 23/24 on another is unbalanced although the sums agree). tg is the
 #              figure on the last " eval time = " line, never the prompt-eval rate: a nan eval line is no_tg.
+#              A loan whose prompt ring never engaged (loan_exercised=yes, ring_engaged=no) must come back in one
+#              transaction at the first decode graph (llama.cpp-i4ny): a "[MOE-EXEC] bulk refill device D: R of L lent
+#              triplets re-admitted in one transaction at decode graph 1 after the prompt" line, else FAIL(refill_late).
+#              The verdict prints bulk_refill=first|late|not_owed. The bulk line never matches the refill regex above.
 #   Q_noc      the q0xu Q_noc arm (the same without -c)                          B70  tg >= 9.5, md5 25b7738a,
-#              watchdog 0, place line as --place-ref-noc, and the same md5/flip and refill rules as Q_tg
+#              watchdog 0, place line as --place-ref-noc, and the same md5/flip, refill and bulk refill rules as Q_tg
 #   Q_decline  Q_tok with GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20                    B70  the knob turns layer 20's
 #              decision to cpu with reason "declined", so the executor does not claim it and it runs the hybrid path
 #              (llama.cpp-ny6i, the forced-decline proof of llama.cpp-8p5x c-0blp). Its references are the two auto
@@ -275,6 +279,10 @@ RE_SUMMARY_WINDOWS='\[MOE-EXEC\] summary: .*, [0-9]+ windows, [0-9]+ exposed, [0
 RE_WINDOW_FIELDS=', [0-9]+ windows, [0-9]+ exposed, [0-9]+ misses'
 RE_LOAN_OK='\[MOE-EXEC\] loan device [0-9]+: [0-9]+ triplets'
 RE_REFILL='\[MOE-EXEC\] refill device [0-9]+: [0-9]+/[0-9]+ triplets re-admitted'
+# The bulk refill a prompt whose ring never engaged owes its loan (llama.cpp-i4ny), and its position: the first decode
+# graph after the prompt. Its "R of L" never matches RE_REFILL's "R/L", so the teardown sums count no bulk line.
+RE_BULK_REFILL='\[MOE-EXEC\] bulk refill device [0-9]+: [0-9]+ of [0-9]+ lent triplets re-admitted in one transaction'
+RE_BULK_REFILL_FIRST="$RE_BULK_REFILL at decode graph 1 after the prompt"
 RE_PP_REFUSED='\[PP-MOE\] refused device='
 RE_PP_ARM_F16='\[PP-MOE\] device=[0-9]+ type=[^ ]+ layout=[^ ]+ arm=f16 '
 RE_TRACE_EXEC='\[MOE-EXEC-TRACE\] executor device [0-9]+ tensor=[^ ]+ experts=[0-9]+ staged=[0-9]+ arm=[a-z0-9]+'
@@ -886,9 +894,19 @@ score_decode() {
         fi
     fi
     case "$refill" in unbalanced*) fails+=("refill=$refill") ;; esac
+    # A loan the prompt's ring never used is returned at the first decode graph, in one transaction (llama.cpp-i4ny).
+    local loan ring bulk=not_owed
+    loan="$(loan_exercised "$err")"
+    ring="$(ring_engaged "$err")"
+    if [ "$(count_re "$RE_BULK_REFILL_FIRST" "$err")" -gt 0 ]; then
+        bulk=first
+    elif [ "$loan" = yes ] && [ "$ring" = no ]; then
+        bulk=late
+        fails+=("refill_late")
+    fi
     echo "${name}=$(verdict_of "${fails[@]}") tg=${tg:-NA} md5=$md5 flip=$flip prefix=${prefix:-0}" \
         "place=$place_state refill=$refill" \
-        "loan_exercised=$(loan_exercised "$err") ring_engaged=$(ring_engaged "$err")"
+        "loan_exercised=$loan ring_engaged=$ring bulk_refill=$bulk"
 }
 
 # score_go <name> <out> <err> <rc> <expected-layer-lines>: the GPT-OSS count gate.
@@ -1043,6 +1061,13 @@ check_controls() {
         '[MOE-EXEC] loan device 0 refused: host storage too small'
     ctl refill "$RE_REFILL" '[MOE-EXEC] refill device 0: 24/24 triplets re-admitted' \
         '[MOE-EXEC] refill device 0: layer 3 expert 5 stays on the host: busy'
+    local bulk='[MOE-EXEC] bulk refill device 0: 9 of 9 lent triplets re-admitted in one transaction'
+    bulk+=' at decode graph 1 after the prompt (its ring did not engage)'
+    ctl refill_not_bulk "$RE_REFILL" '[MOE-EXEC] refill device 0: 9/9 triplets re-admitted' "$bulk"
+    ctl bulk_refill_first "$RE_BULK_REFILL_FIRST" "$bulk" "${bulk/decode graph 1 after/decode graph 12 after}"
+    ctl bulk_refill "$RE_BULK_REFILL" \
+        '[MOE-EXEC] bulk refill device 0: 3 of 3 lent triplets re-admitted in one transaction between contexts' \
+        '[MOE-EXEC] refill device 0: 3/3 triplets re-admitted'
     ctl pp_refused "$RE_PP_REFUSED" \
         '[PP-MOE] refused device=0 cause=x detail=- tensor=blk.0.ffn_up_exps.weight type=q4_0 layout=aos staged=4' \
         '[PP-MOE] device=0 type=q4_0 layout=aos arm=f16 experts=8 groups=1 planned_weight_slot=100'
@@ -1168,11 +1193,12 @@ arm_doc() {
             echo "tg ('$RE_TPS' on the last eval line) >= $QTG_MIN, md5 $QMD5" \
                 "(or flip=yes: >= $DECODE_FLIP_PREFIX_MIN bytes shared with $DECODE_REF)," \
                 "zero '$RE_WATCHDOG', place line == '$PLACE_REF_TG'" \
-                "(- = unscored), every '$RE_REFILL' has R == L (per line)" ;;
+                "(- = unscored), every '$RE_REFILL' has R == L (per line), and with a loan and no ring a" \
+                "'$RE_BULK_REFILL_FIRST' line (else refill_late)" ;;
         Q_noc)
             echo "tg >= $QNOC_MIN, md5 $QMD5 (or flip=yes, as Q_tg), zero '$RE_WATCHDOG'," \
                 "place line == '$PLACE_REF_NOC' (- = unscored)," \
-                "every '$RE_REFILL' has R == L (per line, the same rule as Q_tg)" ;;
+                "every '$RE_REFILL' has R == L (per line, the same rule as Q_tg), and the same refill_late rule" ;;
         Q_decline)
             echo ">= 1 '$RE_DECLINE' and zero '$RE_DECLINE_RING', the '$RE_SUMMARY_CPU' counts >= 1, md5 of stdout" \
                 "== Q_tok's or Q_tok_2's, zero '$RE_KV_REJECTED', zero '$RE_WRONG_DEVICE'; NOT_EXERCISED when" \

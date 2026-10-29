@@ -641,6 +641,19 @@ std::string test_expert_loan_reclaims_pointer_table_leases();
 // The same loan with the boundary's drain timed out on a held drain worker: the entry survives that boundary's pass,
 // and the pass after the worker goes erases it and returns its room (llama.cpp-6aj4).
 std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain();
+// A prompt whose ring did not engage returns its whole loan at the first decode graph's boundary, in one transaction,
+// with one WARN that names the position (llama.cpp-i4ny).
+std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once();
+// A prompt whose ring engaged owes no bulk refill: the first decode boundary is the per-graph refill alone.
+std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt();
+// A context that ends with its loan lent owes it to the next context: its free copies nothing and its report says
+// how many it owes, and the next context's first graph entry returns it in one transaction (llama.cpp-i4ny).
+std::string test_expert_refill_returns_a_loan_an_ended_context_owes();
+// The bulk refill with WEIGHT zone room for one of three lent triplets re-admits that one with one "1 of 3" line; with
+// room for none it is refused with no line. Either way the debt is spent, and once the room is back the per-graph
+// refill re-admits the rest, one per decode graph, with no second bulk line (llama.cpp-i4ny).
+std::string test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph();
+std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph();
 #endif
 
 }  // namespace ggml_sycl

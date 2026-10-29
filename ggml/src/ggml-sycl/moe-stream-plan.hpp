@@ -794,6 +794,12 @@ class moe_stream_phase {
     void                      layer_done(int layer, sycl::event down_done);
     // The first decode graph after a prompt: the table, the decisions and the ring go.
     void                      end_prompt();
+    // Whether the last prompt end_prompt ended kept a whole ring reservation at any point (ring_ready()): a prompt
+    // whose ring never engaged used none of the expert loan its short reserves asked for, so the backend returns that
+    // loan at once instead of a triplet per decode graph (llama.cpp-i4ny). take_prompt_ended() answers true once after
+    // each end_prompt that ended a prompt, so the backend reads the flag once per prompt.
+    bool                      last_prompt_ring_engaged() const;
+    bool                      take_prompt_ended();
     // The resolver's STAGED_RING lookups this prompt (llama.cpp-o9uw): NONE for an entry it served, else why it
     // refused the entry and left it to the route core, with the detail (moe_staged_route_tally). end_prompt reports and
     // clears them, or the destructor for a prompt no end_prompt ended: on the trace, and at WARN under an explicit ring
@@ -920,7 +926,12 @@ class moe_stream_phase {
     moe_stream_loan_refusals_fn loan_refusals_ = nullptr;
     moe_stream_loan_latch       loan_latch_;
     moe_staged_route_tally      staged_routes_;
-    uint64_t                    ring_releases_ = 0;
+    uint64_t                    ring_releases_            = 0;
+    // This prompt kept a whole reservation (ring_ready()); end_prompt copies it into last_prompt_ring_engaged_ and
+    // marks the prompt ended for take_prompt_ended() (llama.cpp-i4ny).
+    bool                        ring_engaged_             = false;
+    bool                        last_prompt_ring_engaged_ = false;
+    bool                        prompt_ended_             = false;
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

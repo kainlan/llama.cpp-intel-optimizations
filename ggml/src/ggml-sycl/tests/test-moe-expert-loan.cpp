@@ -97,6 +97,33 @@
 //                           the worker parked). The three device entries survive that boundary's pass; once the worker
 //                           goes and drains, the next pass erases them and returns their room, and the refill re-admits
 //                           the triplet.
+//   refill_returns_an_unengaged_prompts_loan_at_once
+//                           llama.cpp-i4ny: a three-triplet loan, then a prompt whose ring never engaged ends. The
+//                           first decode graph's boundary reads that from the phase, once, and at one triplet per
+//                           call takes the whole loan back in one transaction: the ledger is empty, the three
+//                           triplets are on the device with no staged copy, and exactly one "bulk refill" WARN names
+//                           decode graph 1. The next decode boundary has nothing to refill and prints no second
+//                           line. The teardown counts read 3/3.
+//   refill_keeps_the_per_graph_refill_after_an_engaged_prompt
+//                           llama.cpp-i4ny, the control: the same loan, then a prompt whose ring reserved two slots
+//                           ends engaged. The first decode boundary is the per-graph refill alone: one triplet, two
+//                           left, no bulk line.
+//   refill_returns_a_loan_an_ended_context_owes
+//                           llama.cpp-i4ny: a three-triplet loan, and a graph entry with nothing owed returns nothing.
+//                           The lending context's free owes all three to the next context, moves nothing, and its
+//                           report reads "0/3 triplets re-admitted (3 owed to the next context)". The next context's
+//                           first graph entry returns the three in one transaction, with no staged copy and one
+//                           "bulk refill ... between contexts" WARN; a second entry has nothing to return, and the
+//                           next report reads "3/0" with no debt.
+//   refill_returns_a_partial_bulk_refills_leftovers_per_graph
+//                           llama.cpp-i4ny: a three-triplet loan, a prompt whose ring never engaged, and a WEIGHT
+//                           zone with room for one triplet. The first decode boundary's bulk refill re-admits that
+//                           one, accepted, with exactly one "1 of 3" bulk line; two stay lent and the debt is spent.
+//                           With the room back, the next decode boundary re-admits one per graph, no second line.
+//   refill_returns_a_refused_bulk_refills_loan_per_graph
+//                           llama.cpp-i4ny: the same with no room. The bulk refill is refused (WEIGHT zone full)
+//                           with no bulk line, all three stay lent and the debt is spent; with the room back, the
+//                           next decode boundary re-admits one per graph, with no bulk line.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -163,6 +190,16 @@ int main() {
     ok &= run_case("loan_reclaims_pointer_table_leases", ggml_sycl::test_expert_loan_reclaims_pointer_table_leases);
     ok &= run_case("loan_reclaims_after_a_timed_out_boundary_drain",
                    ggml_sycl::test_expert_loan_reclaims_after_a_timed_out_boundary_drain);
+    ok &= run_case("refill_returns_an_unengaged_prompts_loan_at_once",
+                   ggml_sycl::test_expert_refill_returns_an_unengaged_prompts_loan_at_once);
+    ok &= run_case("refill_keeps_the_per_graph_refill_after_an_engaged_prompt",
+                   ggml_sycl::test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt);
+    ok &= run_case("refill_returns_a_loan_an_ended_context_owes",
+                   ggml_sycl::test_expert_refill_returns_a_loan_an_ended_context_owes);
+    ok &= run_case("refill_returns_a_partial_bulk_refills_leftovers_per_graph",
+                   ggml_sycl::test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph);
+    ok &= run_case("refill_returns_a_refused_bulk_refills_loan_per_graph",
+                   ggml_sycl::test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
