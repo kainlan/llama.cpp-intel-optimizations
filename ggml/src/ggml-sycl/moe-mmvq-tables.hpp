@@ -422,6 +422,25 @@ inline moe_pp_batched_f16_groups moe_pp_batched_f16_plan_groups(size_t slot_byte
     return plan;
 }
 
+// Whether the f16 arm's phases write one region in turn (two halves alternating, or the one buffer a slot that holds a
+// single expert has) and so must each wait for the GEMMs that last read their buffer. When the slot holds every active
+// expert (one group) each phase has its own region and waits for nothing: a windowed op splits such a layer into
+// phases by the ring window, and those phases overlap instead of running one after another.
+inline bool moe_pp_batched_phases_reuse_buffers(const moe_pp_batched_f16_groups & groups) {
+    return groups.groups != 1;
+}
+
+// Where the phase whose first active expert is `phase_begin` dequantizes, in half-elements from the claimed slot's
+// start: its buffer's start when phases reuse buffers, otherwise its own region at phase_begin experts, which the slot
+// holds because it holds every active expert.
+inline size_t moe_pp_batched_phase_weight_offset(const moe_pp_batched_f16_groups & groups,
+                                                 size_t                            phase_begin,
+                                                 size_t                            phase_buffer,
+                                                 size_t                            half_elems,
+                                                 size_t                            weight_elems) {
+    return moe_pp_batched_phases_reuse_buffers(groups) ? phase_buffer * half_elems : phase_begin * weight_elems;
+}
+
 // Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is reported
 // once per (device, cause) by its name. The latch is a 32-bit mask per device: COUNT, last, is the number of
 // causes, and the latch static_asserts that it fits.
