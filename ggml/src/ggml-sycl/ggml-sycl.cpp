@@ -21603,7 +21603,8 @@ static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_SYCL_MAX_DEVICES];
 // llama.cpp-3460, c-0tmn); the boundary runner below also calls it to re-post a request a transient refusal sent back.
 // The request counts its bytes in ring slots of `slot_bytes`, 0 counting bytes (llama.cpp-9x8t). The slot size is
 // stored before the bytes, whose release publishes it to the runner that acquires them. It is stored whether or not
-// these bytes win: a ring's geometry does not change within a prompt, so two requests in flight agree on it.
+// these bytes win: the ring's geometry is constant between two graph boundaries (prepare() rebuilds it per micro-batch;
+// a loan can grow it, llama.cpp-8p5x), and one micro-batch posts every request in that interval, so they agree on it.
 static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted, size_t slot_bytes) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes_wanted == 0) {
         return;
@@ -21645,7 +21646,11 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     if (bytes_wanted == 0) {
         return false;
     }
-    // Read after the bytes were taken, which the request stored it before.
+    // Loaded after the acquire that took the bytes, so it is the size their request stored before them, or a newer one:
+    // a request posted between the exchange and this load can overwrite it. That is harmless. The newer size is the
+    // geometry the next micro-batch's reserve asks for (constant between two graph boundaries; prepare() rebuilds it
+    // per micro-batch, and a loan can grow it, llama.cpp-8p5x), and that request's own bytes stay for the next
+    // boundary.
     const size_t slot_bytes = g_sycl_expert_loan_slot_bytes[device].load(std::memory_order_acquire);
 
     ggml_sycl_expert_loan_result   local;

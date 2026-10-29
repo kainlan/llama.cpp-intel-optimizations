@@ -2602,10 +2602,12 @@ REQUEST_RESET = "g_sycl_expert_loan_requests[device].store(0, std::memory_order_
 
 def claim_the_request_carries_the_slot_size(sycl: str) -> bool:
     """The request stores its slot size before its bytes, whose release publishes it; the runner reads it after it
-    has taken the bytes with acquire, so it reads the size those bytes were asked in. The runner hands it to the loan
-    transaction, which hands it to the selector, and a BUSY re-post carries it through. The plan reset that clears
-    the request clears it too. A request that does not win the bytes still stores its size: a ring's geometry does not
-    change within a prompt, so the requests in flight agree on it."""
+    has taken the bytes with acquire, so it reads a size at least as new as the one those bytes were asked in (a
+    request posted after the take can overwrite it, harmlessly). The runner hands it to the loan transaction, which
+    hands it to the selector, and a BUSY re-post carries it through. The plan reset that clears the request clears it
+    too. A request that does not win the bytes still stores its size: the ring's geometry is constant between two graph
+    boundaries (prepare() rebuilds it per micro-batch; a loan can grow it, llama.cpp-8p5x), and one micro-batch posts
+    the requests in that interval, so they agree on it."""
     s = norm(sycl)
     request = body(s, REQUEST_SIG)
     pending = body(s, PENDING_DEVICE_SIG)
