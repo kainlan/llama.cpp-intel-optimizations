@@ -36406,7 +36406,7 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
 // DEVICE_MMVQ_Q1_NVFP4_AOS, so validate_moe_execution_recipe refuses an MMVQ_COMPAT recipe for them). NONE when the
 // capability `cap` of `type` can be served, else the cause. The resolver's staged route asks it, and so does the
 // ring's prompt-kernel predicate below, which the index build no longer calls: the ring stages by the library claim
-// alone, and a slot the route cannot serve is a counted refusal that runs on the CPU (llama.cpp-o9uw).
+// alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
 static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap,
                                                                                    ggml_type                    type) {
     if (!cap.supported) {
