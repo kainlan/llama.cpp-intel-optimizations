@@ -21924,8 +21924,13 @@ static uint32_t ggml_sycl_expert_bulk_refill_owed_next_context(int device) {
 // process-global graph lock, as the synchronize boundary's refill runs without it. Nothing is lent, or nothing owed,
 // and it returns. Otherwise it takes the debt under the lock, runs the deferred-free pass that returns the room the
 // ended context's ring held, and refills the whole ledger in one transaction through the per-graph refill, on a cursor
-// of its own, so the arming and the refusal WARN are the per-graph refill's. An accepted one WARNs once. What it
-// leaves stays lent, for the next prompt phase's loans. `resolver` is null in production. Returns what is still lent.
+// of its own, so the arming and the refusal WARN are the per-graph refill's. An accepted one WARNs once.
+// The debt is cleared before the transaction runs, so a BUSY or refused transaction drops it and this path never
+// retries: what is still lent comes back through the per-graph refill, or the next backend free owes it again.
+// What it leaves stays lent only until the next decode graph's boundary, which re-arms the per-graph refill; a prompt
+// graph's boundary disarms it and leaves them lent. The debt is per device, so this assumes one submitting thread per
+// device: two graph entries on one device at once would race for it, and same-device concurrent inference is
+// unsupported (canonical contract section 5). `resolver` is null in production. Returns what is still lent.
 static uint32_t ggml_sycl_run_expert_bulk_refill_between_contexts(int                                    device,
                                                                   const ggml_sycl_expert_loan_resolver * resolver,
                                                                   ggml_sycl_expert_loan_result *         out) {
