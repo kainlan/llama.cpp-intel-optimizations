@@ -267,7 +267,8 @@ def test_launches_mutants():
 
 # ---- what the phase records ---------------------------------------------------------------------------------------
 
-COPIED = "window_timing_.copied(moe_stream_window_timing_key(ubatch_seq_, window_id), copied, item.src_bytes, reuse_gate);"
+COPIED = ("window_timing_.copied(moe_stream_window_timing_key(ubatch_seq_, window_id), copied, item.src_bytes, "
+          "reuse_gate);")
 BEGUN = ("if (timed) { const double submit_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::"
          "now() - t_begin).count(); window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, "
          "req.role, req.phase, exposed, submit_us); }")
