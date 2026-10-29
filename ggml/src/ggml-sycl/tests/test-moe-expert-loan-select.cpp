@@ -166,7 +166,6 @@ bool triplet_lendable(const placement_plan & plan, int layer, int expert) {
                                                            plan, memo);
 }
 
-
 // Queried for device 0 with a ring slot of kSlot bytes, one layer of 8 experts whose charges are set by hand (the
 // ring's slot is the largest host matrix, so a model that mixes expert quants holds matrices below a slot). The reverse
 // walk meets: experts 7 and 6 on the host (not lendable, and they keep the tensor non-bulk); experts 5 and 4, every
