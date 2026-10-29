@@ -114,11 +114,12 @@ recorded choice changes. The regimes below say what each choice does.
 **Two regimes.** In decode, host-resident experts compute on the CPU. In prompt
 processing, the path depends on `GGML_SYCL_MOE_EXEC`. Under `auto`, the default,
 a layer's host-resident experts are staged through the ring when the cost model
-chooses the ring. Under `ring`, they are staged wherever a ring fits. Under
-`cpu`, nothing is staged. `moe_stream_stage_now` is the one predicate. Task 10
+chooses the ring. Under `ring`, they are staged on every layer the batched
+executor claims whole, whatever the cost model prices. Under `cpu`, nothing is
+staged. `moe_stream_stage_now` is the one predicate. Task 10
 (llama.cpp-3460) lifted ruling c-3skf (llama.cpp-xod7), under which `auto` only
-recorded the choice. The ring serves one consumer, the batched prompt executor (llama.cpp-348c), and
-only a layer that executor claims whole. The ring's index build asks the library
+recorded the choice. The ring serves one consumer, the batched prompt executor
+(llama.cpp-348c), and only a layer that executor claims whole. The ring's index build asks the library
 claim once per (layer, role) and records the answer on each host item: it stages
 as one AOS slot, and its consumer is the executor. `moe_stream_executor_claims`
 holds for a layer when every host matrix of it is such an item and a ring can
@@ -176,7 +177,7 @@ the compute queue), and the load-time H2D probe times the same queue, so the rat
 that prices the ring's copy term is the rate the ring sees. No Level Zero
 copy-engine queue was built. The Task 4 spike (llama.cpp-efck, c-0cu6) timed a
 64 MiB pinned copy on either cache queue at 2.5 to 3.5 ms while a one-work-group
-or full-EU spin kernel held the compute queue for 90 to 130 ms, on both cards:
+or full-EU spin kernel held the compute queue for 89 to 131 ms, on both cards:
 every row `overlap=yes` and `staged_h2d=0`. The corrected engine counters of a
 later run (c-2oac) show the BCS class busy and the CCS class at 0 on five of eight
 rows, for either queue: under the v2 Level Zero adapter the copies from either
@@ -217,7 +218,8 @@ so a rung that needs them is refused with a figure.
 
 - A staged slot has one consumer, the batched prompt executor, which reads it
   through the phase's `find()` after `window_begin` staged its window. The
-  `STAGED_RING` resolver route refuses every staged entry as CLAIMED. No other
+  `STAGED_RING` resolver route returns CLAIMED for every staged entry, which the
+  tally counts as a handoff when the executor takes the weight. No other
   path leads from a host-resident entry to the device.
   `tests/test-sycl-staged-ring-route-source.py` pins the route's single writer.
   `tests/test-sycl-moe-stream-enqueue-source.py` guards the copy path.
