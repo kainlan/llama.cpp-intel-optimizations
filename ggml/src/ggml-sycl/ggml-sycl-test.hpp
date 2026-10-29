@@ -649,6 +649,11 @@ std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_promp
 // A context that ends with its loan lent owes it to the next context: its free copies nothing and its report says
 // how many it owes, and the next context's first graph entry returns it in one transaction (llama.cpp-i4ny).
 std::string test_expert_refill_returns_a_loan_an_ended_context_owes();
+// The bulk refill with WEIGHT zone room for one of three lent triplets re-admits that one with one "1 of 3" line; with
+// room for none it is refused with no line. Either way the debt is spent, and once the room is back the per-graph
+// refill re-admits the rest, one per decode graph, with no second bulk line (llama.cpp-i4ny).
+std::string test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph();
+std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph();
 #endif
 
 }  // namespace ggml_sycl

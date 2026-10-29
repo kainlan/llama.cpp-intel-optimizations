@@ -24332,13 +24332,14 @@ std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain() {
     return test_expert_loan_pointer_table_leases_case(test_loan_fixture::reclaim_check::DRAIN_TIMES_OUT);
 }
 
-// The bulk refill's WARN for `n` of `n` triplets at decode graph 1 after the prompt, as the boundary prints it.
-static std::string test_bulk_refill_after_prompt_line(int device, uint32_t n) {
+// The bulk refill's WARN for `readmitted` of `lent` triplets at decode graph 1 after the prompt, as the boundary
+// prints it.
+static std::string test_bulk_refill_after_prompt_line(int device, uint32_t readmitted, uint32_t lent) {
     char line[256];
     snprintf(line, sizeof(line),
              "[MOE-EXEC] bulk refill device %d: %u of %u lent triplets re-admitted in one transaction at decode graph "
              "1 after the prompt (its ring did not engage)\n",
-             device, n, n);
+             device, readmitted, lent);
     return line;
 }
 
@@ -24398,7 +24399,7 @@ std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once() {
                               result.n_triplets, result.bytes_readmitted, result.n_dropped, result.reason,
                               9 * fx.staged_bytes);
     }
-    const std::string bulk_line = test_bulk_refill_after_prompt_line(fx.device, 3);
+    const std::string bulk_line = test_bulk_refill_after_prompt_line(fx.device, 3, 3);
     if (warns.count(bulk_line) != 1 || warns.count_prefix("[MOE-EXEC] bulk refill") != 1) {
         return test_loan_fail("%zu exact bulk refill lines and %zu in all, not 1 and 1 (want: %s)",
                               warns.count(bulk_line), warns.count_prefix("[MOE-EXEC] bulk refill"), bulk_line.c_str());
@@ -24590,6 +24591,121 @@ std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_promp
         return "the boundary left the phase's prompt end for another boundary to take";
     }
     return {};
+}
+
+// The bulk refill of three lent triplets with WEIGHT zone room for one, or for none (llama.cpp-i4ny). It re-admits
+// the one that fits, accepted, with one "1 of 3" line, or is refused, with no line. Either way the debt is spent at
+// that boundary: the triplets it leaves stay lent, and once the room is back the next decode graph's boundary
+// re-admits them through the per-graph refill, one per call, with no second bulk line.
+static std::string test_expert_bulk_refill_short_room_case(uint64_t model_id, bool room_for_one) {
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, model_id);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    if (std::string why = fx.lend(9 * charge, 3, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 3) {
+        return test_loan_fail("the loan left %u triplets in the ledger, not 3",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+
+    // The prompt the loan was for, ended with its ring never reserved.
+    moe_stream_phase phase;
+    phase.begin_ubatch(4);
+    phase.end_prompt();
+
+    // The WEIGHT zone full of 1 MiB fillers, each a lent matrix's size; for room for one triplet, the last three of
+    // them handed back.
+    std::vector<mem_handle> fillers;
+    constexpr size_t        max_fillers = 16384;
+    while (fillers.size() < max_fillers) {
+        mem_handle filler = ::ggml_sycl_device_expert_alloc(fx.device, test_loan_expert_bytes());
+        if (!filler.valid()) {
+            break;
+        }
+        fillers.push_back(std::move(filler));
+    }
+    if (fillers.size() == max_fillers || fillers.size() < 3) {
+        return test_loan_fail("the WEIGHT zone took %zu 1 MiB fillers, not between 3 and 16383", fillers.size());
+    }
+    if (room_for_one) {
+        for (int i = 0; i < 3; ++i) {
+            fillers.pop_back();
+        }
+        if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= 3 * charge; })) {
+            return "three fillers' WEIGHT zone room did not come back within 2 s";
+        }
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    test_loan_warn_capture                 warns;
+    uint32_t       remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result, &phase);
+    const uint32_t want_left = room_for_one ? 2 : 3;
+    if (result.accepted != room_for_one || result.n_triplets != 3 - want_left || result.n_dropped != 0 ||
+        remaining != want_left || g_sycl_expert_lent_count[fx.device].load() != want_left) {
+        return test_loan_fail(
+            "the bulk refill with room for %s answered accepted=%d triplets=%u dropped=%u remaining=%u (%s) with %u in "
+            "the ledger, not accepted=%d triplets=%u dropped=0 remaining=%u",
+            room_for_one ? "one triplet" : "none", (int) result.accepted, result.n_triplets, result.n_dropped,
+            remaining, result.reason, g_sycl_expert_lent_count[fx.device].load(), (int) room_for_one, 3 - want_left,
+            want_left);
+    }
+    if (room_for_one && result.bytes_readmitted != 3 * fx.staged_bytes) {
+        return test_loan_fail("the partial bulk refill re-admitted %zu bytes, not %zu", result.bytes_readmitted,
+                              3 * fx.staged_bytes);
+    }
+    if (!room_for_one && std::strcmp(result.reason, "WEIGHT zone full") != 0) {
+        return test_loan_fail("the refused bulk refill answered %s, not WEIGHT zone full", result.reason);
+    }
+    const std::string bulk_line = test_bulk_refill_after_prompt_line(fx.device, 1, 3);
+    const size_t      want_bulk = room_for_one ? 1 : 0;
+    if (warns.count(bulk_line) != want_bulk || warns.count_prefix("[MOE-EXEC] bulk refill") != want_bulk) {
+        return test_loan_fail("%zu exact bulk refill lines and %zu in all, not %zu and %zu (want: %s)",
+                              warns.count(bulk_line), warns.count_prefix("[MOE-EXEC] bulk refill"), want_bulk,
+                              want_bulk, bulk_line.c_str());
+    }
+    if (phase.take_prompt_ended() || ::ggml_sycl_expert_bulk_refill_take(fx.device) != 0) {
+        return "the bulk refill left its prompt end or its debt for a later boundary";
+    }
+
+    // The room back, the next decode graph's boundary is the per-graph refill: one triplet, and no bulk line.
+    fillers.clear();
+    if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= 3 * charge; })) {
+        return "the fillers' WEIGHT zone room did not come back within 2 s";
+    }
+    phase.end_prompt();
+    remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result, &phase);
+    if (!result.accepted || result.n_triplets != 1 || remaining != want_left - 1 ||
+        g_sycl_expert_lent_count[fx.device].load() != want_left - 1) {
+        return test_loan_fail(
+            "the next decode boundary re-admitted %u triplets with %u remaining and %u in the ledger (%s), not 1, %u, "
+            "%u",
+            result.n_triplets, remaining, g_sycl_expert_lent_count[fx.device].load(), result.reason, want_left - 1,
+            want_left - 1);
+    }
+    if (warns.count_prefix("[MOE-EXEC] bulk refill") != want_bulk) {
+        return test_loan_fail("the next decode boundary left %zu bulk refill lines, not %zu",
+                              warns.count_prefix("[MOE-EXEC] bulk refill"), want_bulk);
+    }
+    return {};
+}
+
+std::string test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph() {
+    return test_expert_bulk_refill_short_room_case(/*model_id=*/0x69346e7904ull, /*room_for_one=*/true);
+}
+
+std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph() {
+    return test_expert_bulk_refill_short_room_case(/*model_id=*/0x69346e7905ull, /*room_for_one=*/false);
 }
 
 }  // namespace ggml_sycl
