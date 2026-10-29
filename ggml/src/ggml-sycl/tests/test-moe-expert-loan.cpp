@@ -98,12 +98,12 @@
 //                           goes and drains, the next pass erases them and returns their room, and the refill re-admits
 //                           the triplet.
 //   refill_returns_an_unengaged_prompts_loan_at_once
-//                           llama.cpp-i4ny: a three-triplet loan, then a prompt whose ring never engaged ends (the
-//                           phase says so, once). The first decode graph's boundary, at one triplet per call, takes
-//                           the whole loan back in one transaction: the ledger is empty, the three triplets are on
-//                           the device with no staged copy, and exactly one "bulk refill" WARN names decode graph 1.
-//                           The next decode boundary has nothing to refill and prints no second line. The teardown
-//                           counts read 3/3.
+//                           llama.cpp-i4ny: a three-triplet loan, then a prompt whose ring never engaged ends. The
+//                           first decode graph's boundary reads that from the phase, once, and at one triplet per
+//                           call takes the whole loan back in one transaction: the ledger is empty, the three
+//                           triplets are on the device with no staged copy, and exactly one "bulk refill" WARN names
+//                           decode graph 1. The next decode boundary has nothing to refill and prints no second
+//                           line. The teardown counts read 3/3.
 //   refill_keeps_the_per_graph_refill_after_an_engaged_prompt
 //                           llama.cpp-i4ny, the control: the same loan, then a prompt whose ring reserved two slots
 //                           ends engaged. The first decode boundary is the per-graph refill alone: one triplet, two

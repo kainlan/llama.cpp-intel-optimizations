@@ -21834,11 +21834,13 @@ static uint32_t ggml_sycl_run_expert_refill_at_boundary_on_device(int           
     return remaining;
 }
 
-// At the entry of the first decode graph after a prompt whose ring did not engage, graph compute owes the device a
-// bulk refill (llama.cpp-i4ny). That prompt used none of the loan its short reserves asked for, and the lent triplets
-// are the most popular of the lendable ones, so that graph's boundary returns all of them in one transaction rather
-// than one per decode graph, each a plan republish that forces a re-record. `first_graph` is that graph's number in
-// its context's decode count. Nothing is owed while nothing is lent.
+// At the boundary of the first decode graph after a prompt whose ring did not engage, the device is owed a bulk refill
+// (llama.cpp-i4ny). That prompt used none of the loan its short reserves asked for, and the lent triplets are the most
+// popular of the lendable ones, so that boundary returns all of them in one transaction rather than one per decode
+// graph, each a plan republish that forces a re-record. `first_graph` is that graph's number in its context's decode
+// count. Nothing is owed while nothing is lent. The synchronize boundary owes it, not graph compute's entry: this
+// takes g_tensor_inventory_mutex (rank L1), and graph compute holds g_sycl_graph_compute_mutex (rank L2) there, which
+// canonical contract section 12.5 forbids (never a lower rank under a higher one).
 static void ggml_sycl_expert_bulk_refill_owe(int device, uint64_t first_graph) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES ||
         g_sycl_expert_lent_count[device].load(std::memory_order_acquire) == 0) {
@@ -21858,18 +21860,24 @@ static uint64_t ggml_sycl_expert_bulk_refill_take(int device) {
     return owed_at;
 }
 
-// The graph boundary's refills. Every boundary with lent triplets takes the bulk refill owed, asking without the lock
-// first, as the per-graph refill does. A prompt graph's boundary drops it, since a new prompt phase stops the refills.
-// A decode graph's boundary runs it as the per-graph refill with max_triplets the ledger's count, so the cursor, the
-// once-per-decode-graph rule and the refusal WARN are the per-graph refill's. An accepted bulk refill WARNs once, with
-// where it ran; what it leaves, or a refused one, the per-graph refill meets at the next decode graphs.
-static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device(int                                    device,
+// The graph boundary's refills. A boundary whose phase says a prompt just ended with its ring never engaged owes the
+// bulk refill at this decode graph, which graph compute has already counted, so the WARN reads decode graph 1. Every
+// boundary with lent triplets takes the bulk refill owed, asking without the lock first, as the per-graph refill
+// does. A prompt graph's boundary drops it, since a new prompt phase stops the refills. A decode graph's boundary
+// runs it as the per-graph refill with max_triplets the ledger's count, so the cursor, the once-per-decode-graph rule
+// and the refusal WARN are the per-graph refill's. An accepted bulk refill WARNs once, with where it ran; what it
+// leaves, or a refused one, the per-graph refill meets at the next decode graphs.
+static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device(ggml_sycl::moe_stream_phase *          phase,
+                                                                   int                                    device,
                                                                    bool                                   decode,
                                                                    uint64_t                               decode_graphs,
                                                                    std::atomic<uint64_t> *                refilled_at,
                                                                    uint32_t                               max_triplets,
                                                                    const ggml_sycl_expert_loan_resolver * resolver,
                                                                    ggml_sycl_expert_loan_result *         out) {
+    if (phase != nullptr && phase->take_prompt_ended() && !phase->last_prompt_ring_engaged()) {
+        ggml_sycl_expert_bulk_refill_owe(device, decode_graphs);
+    }
     const bool lent_any = device >= 0 && device < GGML_SYCL_MAX_DEVICES &&
                           g_sycl_expert_lent_count[device].load(std::memory_order_acquire) != 0;
     const uint64_t owed_at = lent_any ? ggml_sycl_expert_bulk_refill_take(device) : 0;
@@ -21961,7 +21969,7 @@ static void ggml_sycl_run_expert_refill_at_boundary(ggml_backend_t backend) {
     auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
     if (ctx) {
         (void) ggml_sycl_run_expert_refills_at_boundary_on_device(
-            ctx->device, ctx->graph_phase_is_decode.load(std::memory_order_relaxed),
+            ctx->moe_stream.get(), ctx->device, ctx->graph_phase_is_decode.load(std::memory_order_relaxed),
             ctx->decode_graph_count.load(std::memory_order_relaxed), &ctx->refill_decode_graph,
             ggml_sycl_moe_refill_per_graph(), nullptr, nullptr);
     }
@@ -22333,14 +22341,15 @@ struct test_loan_fixture {
     }
 
     // The graph boundary's refills as synchronize runs them since llama.cpp-i4ny, right after a graph: the bulk refill
-    // a prompt whose ring did not engage owes, then the per-graph one. A decode graph counts one, as graph_compute
-    // counts it.
+    // a prompt whose ring did not engage owes, which `phase` tells it, then the per-graph one. A decode graph counts
+    // one, as graph_compute counts it.
     uint32_t refills_after_graph(bool                                     decode,
                                  uint32_t                                 max_triplets,
                                  const ::ggml_sycl_expert_loan_resolver * refill_resolver,
-                                 ::ggml_sycl_expert_loan_result *         result) {
+                                 ::ggml_sycl_expert_loan_result *         result,
+                                 moe_stream_phase *                       phase = nullptr) {
         decode_graphs += decode ? 1 : 0;
-        return ::ggml_sycl_run_expert_refills_at_boundary_on_device(device, decode, decode_graphs, &refilled_at,
+        return ::ggml_sycl_run_expert_refills_at_boundary_on_device(phase, device, decode, decode_graphs, &refilled_at,
                                                                     max_triplets, refill_resolver, result);
     }
 
@@ -24351,26 +24360,20 @@ std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once() {
                               g_sycl_expert_lent_count[fx.device].load());
     }
 
-    // The prompt the loan was for: a micro-batch began and its ring never reserved. The decode graphs after the first
-    // end nothing.
+    // The prompt the loan was for: a micro-batch began and its ring never reserved. The first decode graph's entry
+    // ends it, and its boundary reads that from the phase.
     moe_stream_phase phase;
     phase.begin_ubatch(4);
     phase.end_prompt();
-    if (!phase.take_prompt_ended() || phase.last_prompt_ring_engaged()) {
-        return "the phase did not report an ended prompt whose ring did not engage";
+    if (phase.last_prompt_ring_engaged()) {
+        return "the phase reported a ring engaged that never reserved";
     }
-    phase.end_prompt();
-    if (phase.take_prompt_ended()) {
-        return "a second end_prompt reported a prompt ended again";
-    }
-    // As graph compute owes it at the first decode graph's entry, before it counts that graph.
-    ::ggml_sycl_expert_bulk_refill_owe(fx.device, fx.decode_graphs + 1);
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
     test_loan_warn_capture                 warns;
     const uint64_t                         staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
-    uint32_t remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    uint32_t remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result, &phase);
     if (g_sycl_expert_lent_count[fx.device].load() != 0 || remaining != 0) {
         return test_loan_fail(
             "after the first decode graph's boundary the ledger counts %u lent triplets (%u remaining, %u re-admitted, "
@@ -24401,8 +24404,13 @@ std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once() {
         return why;
     }
 
-    // Owed once: the next decode graph's boundary has nothing to refill and prints no second line.
-    remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    // Owed once: the boundary took the phase's prompt end, the next decode graph's entry ends nothing, and its
+    // boundary has nothing to refill and prints no second line.
+    if (phase.take_prompt_ended()) {
+        return "the boundary left the phase's prompt end for another boundary to take";
+    }
+    phase.end_prompt();
+    remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result, &phase);
     if (remaining != 0 || warns.count_prefix("[MOE-EXEC] bulk refill") != 1) {
         return test_loan_fail("the second decode boundary left %u remaining and %zu bulk refill lines, not 0, 1",
                               remaining, warns.count_prefix("[MOE-EXEC] bulk refill"));
@@ -24517,8 +24525,8 @@ std::string test_expert_refill_returns_a_loan_an_ended_context_owes() {
 }
 
 std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt() {
-    // llama.cpp-i4ny, the control: a prompt whose ring reserved used its loan, so the phase reports it engaged, graph
-    // compute owes no bulk refill, and the first decode graph's boundary is the per-graph refill alone, one triplet.
+    // llama.cpp-i4ny, the control: a prompt whose ring reserved used its loan, so the phase reports it engaged, the
+    // boundary owes no bulk refill, and the first decode graph's boundary is the per-graph refill alone, one triplet.
     test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x69346e7902ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -24548,8 +24556,8 @@ std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_promp
         return "the prompt's ring did not reserve two slots";
     }
     phase.end_prompt();
-    if (!phase.take_prompt_ended() || !phase.last_prompt_ring_engaged()) {
-        return "the phase did not report an ended prompt whose ring engaged";
+    if (!phase.last_prompt_ring_engaged()) {
+        return "the phase did not report the prompt's ring engaged";
     }
     ccs.wait();
     if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= 3 * fx.staged_bytes; })) {
@@ -24559,7 +24567,7 @@ std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_promp
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
     test_loan_warn_capture                 warns;
-    const uint32_t remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    const uint32_t remaining = fx.refills_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result, &phase);
     if (!result.accepted || result.n_triplets != 1 || remaining != 2 ||
         g_sycl_expert_lent_count[fx.device].load() != 2) {
         return test_loan_fail(
@@ -24569,6 +24577,9 @@ std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_promp
     }
     if (warns.count_prefix("[MOE-EXEC] bulk refill") != 0) {
         return "a bulk refill line printed after a prompt whose ring engaged";
+    }
+    if (phase.take_prompt_ended()) {
+        return "the boundary left the phase's prompt end for another boundary to take";
     }
     return {};
 }
@@ -119462,12 +119473,6 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     if (cached_is_decode && sycl_ctx->moe_stream) {
         sycl_ctx->moe_stream->end_prompt();  // the prompt's ring and stage table go at its first decode graph
         ggml_sycl_moe_stream_release_payload(*sycl_ctx);
-        // A prompt whose ring never engaged used none of its loan: this graph's boundary returns all of it at once
-        // (llama.cpp-i4ny). The count is this graph's number, which the fetch_add below gives it.
-        if (sycl_ctx->moe_stream->take_prompt_ended() && !sycl_ctx->moe_stream->last_prompt_ring_engaged()) {
-            ggml_sycl_expert_bulk_refill_owe(sycl_ctx->device,
-                                             sycl_ctx->decode_graph_count.load(std::memory_order_relaxed) + 1);
-        }
     }
     if (cached_is_decode) {
         // Counted for the graph boundary's refill, which re-admits once per decode graph (llama.cpp-sif1).
