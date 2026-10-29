@@ -21930,10 +21930,11 @@ static uint32_t ggml_sycl_expert_bulk_refill_owed_next_context(int device) {
 // of its own, so the arming and the refusal WARN are the per-graph refill's. An accepted one WARNs once.
 // The debt is cleared before the transaction runs, so a BUSY or refused transaction drops it and this path never
 // retries: what is still lent comes back through the per-graph refill, or the next backend free owes it again.
-// What it leaves stays lent only until the next decode graph's boundary, which re-arms the per-graph refill; a prompt
-// graph's boundary disarms it and leaves them lent. The debt is per device, so this assumes one submitting thread per
-// device: two graph entries on one device at once would race for it, and same-device concurrent inference is
-// unsupported (canonical contract section 5). `resolver` is null in production. Returns what is still lent.
+// What it leaves comes back through the per-graph refill from the next decode graph's boundary on, one batch per
+// decode graph; a prompt graph's boundary disarms it and leaves them lent until a decode boundary re-arms it. The
+// debt is per device, so this assumes one submitting thread per device: two graph entries on one device at once would
+// race for it, and same-device concurrent inference is unsupported (canonical contract section 5). `resolver` is null
+// in production. Returns what is still lent.
 static uint32_t ggml_sycl_run_expert_bulk_refill_between_contexts(int                                    device,
                                                                   const ggml_sycl_expert_loan_resolver * resolver,
                                                                   ggml_sycl_expert_loan_result *         out) {
