@@ -97,6 +97,17 @@
 //                           the worker parked). The three device entries survive that boundary's pass; once the worker
 //                           goes and drains, the next pass erases them and returns their room, and the refill re-admits
 //                           the triplet.
+//   refill_returns_an_unengaged_prompts_loan_at_once
+//                           llama.cpp-i4ny: a three-triplet loan, then a prompt whose ring never engaged ends (the
+//                           phase says so, once). The first decode graph's boundary, at one triplet per call, takes
+//                           the whole loan back in one transaction: the ledger is empty, the three triplets are on
+//                           the device with no staged copy, and exactly one "bulk refill" WARN names decode graph 1.
+//                           The next decode boundary has nothing to refill and prints no second line. The teardown
+//                           counts read 3/3.
+//   refill_keeps_the_per_graph_refill_after_an_engaged_prompt
+//                           llama.cpp-i4ny, the control: the same loan, then a prompt whose ring reserved two slots
+//                           ends engaged. The first decode boundary is the per-graph refill alone: one triplet, two
+//                           left, no bulk line.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -121,6 +132,17 @@
 #include <optional>
 #include <string>
 #include <sycl/sycl.hpp>
+
+// llama.cpp-i4ny's cases, declared here rather than in ggml-sycl-test.hpp: only this test calls them.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+namespace ggml_sycl {
+// A prompt whose ring did not engage returns its whole loan at the first decode graph's boundary, in one transaction,
+// with one WARN that names the position.
+std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once();
+// A prompt whose ring engaged owes no bulk refill: the first decode boundary is the per-graph refill alone.
+std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt();
+}  // namespace ggml_sycl
+#endif
 
 static bool run_case(const char * name, std::string (*body)()) {
     fprintf(stderr, "[TEST] %s ... ", name);
@@ -163,6 +185,10 @@ int main() {
     ok &= run_case("loan_reclaims_pointer_table_leases", ggml_sycl::test_expert_loan_reclaims_pointer_table_leases);
     ok &= run_case("loan_reclaims_after_a_timed_out_boundary_drain",
                    ggml_sycl::test_expert_loan_reclaims_after_a_timed_out_boundary_drain);
+    ok &= run_case("refill_returns_an_unengaged_prompts_loan_at_once",
+                   ggml_sycl::test_expert_refill_returns_an_unengaged_prompts_loan_at_once);
+    ok &= run_case("refill_keeps_the_per_graph_refill_after_an_engaged_prompt",
+                   ggml_sycl::test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
