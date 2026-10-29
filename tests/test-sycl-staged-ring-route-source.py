@@ -1567,6 +1567,8 @@ def test_tag_is_the_layout_mutants():
 
 SLOT_LAYOUT_NAME = "MOE_STREAM_RING_SLOT_LAYOUT"
 SLOT_LAYOUT_DEF = "static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;"
+SLOT_LAYOUT_DEFINITION_RE = re.compile(
+    r"\bggml_layout_mode\s+MOE_STREAM_RING_SLOT_LAYOUT\b|#\s*define\s+MOE_STREAM_RING_SLOT_LAYOUT\b")
 EXEC_DEFER_OPEN = "} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {"
 EXEC_DEFER_CLOSE = "} else { return reject_batched("
 
@@ -1583,10 +1585,10 @@ def claim_executor_reads_the_ring_slot_layout(sycl: str, ring_hpp: str) -> bool:
     end = lam.find(EXEC_DEFER_CLOSE, at)
     defer = lam[at:end] if at >= 0 and end > at else ""
     resolve = body(lam, EXEC_RESOLVE_SIG)
-    elsewhere = sum(norm(text).count(" " + SLOT_LAYOUT_NAME + " =") for rel, text in SYCL_TREE.items()
+    elsewhere = sum(len(SLOT_LAYOUT_DEFINITION_RE.findall(norm(text))) for rel, text in SYCL_TREE.items()
                     if rel not in (RING_HPP_REL, SYCL_REL))
-    elsewhere += norm(sycl).count(" " + SLOT_LAYOUT_NAME + " =")
-    return (h.count(SLOT_LAYOUT_DEF) == 1 and h.count(" " + SLOT_LAYOUT_NAME + " =") + elsewhere == 1
+    elsewhere += len(SLOT_LAYOUT_DEFINITION_RE.findall(norm(sycl)))
+    return (h.count(SLOT_LAYOUT_DEF) == 1 and len(SLOT_LAYOUT_DEFINITION_RE.findall(h)) + elsewhere == 1
             and "expert.layout = ggml_sycl::" + SLOT_LAYOUT_NAME + ";" in defer and "GGML_LAYOUT_AOS" not in defer
             and EXEC_AOS_ONLY in resolve and "GGML_LAYOUT_AOS" not in resolve)
 
@@ -1609,6 +1611,12 @@ def test_executor_ring_slot_layout_mutants():
     # A second definition, in the header or in the executor's own file.
     assert not c(ring_hpp=norm(RING_HPP) + " " + SLOT_LAYOUT_DEF)
     assert not claim_executor_reads_the_ring_slot_layout(norm(SYCL) + " " + SLOT_LAYOUT_DEF, RING_HPP)
+    # Other spellings of a second definition: brace-initialized, or a macro.
+    brace_def = " static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT{GGML_LAYOUT_AOS};"
+    assert not c(ring_hpp=norm(RING_HPP) + brace_def)
+    assert not c(sycl=norm(SYCL) + " #define MOE_STREAM_RING_SLOT_LAYOUT GGML_LAYOUT_AOS")
+    # Control: a comparison is a use, not a definition.
+    assert c(sycl=norm(SYCL) + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);")
 
 
 if __name__ == "__main__":

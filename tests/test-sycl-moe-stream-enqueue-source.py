@@ -2335,6 +2335,8 @@ def test_end_prompt_reports_ring_engagement_mutants():
 
 SLOT_LAYOUT_NAME = "MOE_STREAM_RING_SLOT_LAYOUT"
 SLOT_LAYOUT_DEF = "static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;"
+SLOT_LAYOUT_DEFINITION_RE = re.compile(
+    r"\bggml_layout_mode\s+MOE_STREAM_RING_SLOT_LAYOUT\b|#\s*define\s+MOE_STREAM_RING_SLOT_LAYOUT\b")
 RING_RESERVE_SIG = "bool moe_stream_ring::reserve("
 SLOT_WRAP = ("mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), "
              "MOE_STREAM_RING_SLOT_LAYOUT);")
@@ -2347,11 +2349,12 @@ def claim_ring_slot_layout_is_one_constant(ring_hpp: str, ring_cpp: str, phase: 
     in reserve(), and stage_window's slot acquire and stage-table entry."""
     h, c, p = norm(ring_hpp), norm(ring_cpp), norm(phase)
     own = (RING_HPP_REL, RING_CPP_REL, PHASE_REL)
-    elsewhere = sum(norm(text).count(" " + SLOT_LAYOUT_NAME + " =") for rel, text in SYCL_TREE.items()
-                    if rel not in own) + c.count(" " + SLOT_LAYOUT_NAME + " =") + p.count(" " + SLOT_LAYOUT_NAME + " =")
+    elsewhere = (sum(len(SLOT_LAYOUT_DEFINITION_RE.findall(norm(text))) for rel, text in SYCL_TREE.items()
+                     if rel not in own)
+                 + len(SLOT_LAYOUT_DEFINITION_RE.findall(c)) + len(SLOT_LAYOUT_DEFINITION_RE.findall(p)))
     reserve = body(c, RING_RESERVE_SIG)
     stage = body(p, STAGE_SIG)
-    return (h.count(SLOT_LAYOUT_DEF) == 1 and h.count(" " + SLOT_LAYOUT_NAME + " =") + elsewhere == 1
+    return (h.count(SLOT_LAYOUT_DEF) == 1 and len(SLOT_LAYOUT_DEFINITION_RE.findall(h)) + elsewhere == 1
             and SLOT_WRAP in reserve and "GGML_LAYOUT_AOS" not in reserve
             and AOS_ACQUIRE in stage and TABLE_WRITE in stage and "GGML_LAYOUT_AOS" not in stage)
 
@@ -2377,6 +2380,12 @@ def test_ring_slot_layout_constant_mutants():
     # A second definition, in the header or in a source that includes it.
     assert not c(ring_hpp=norm(RING_HPP) + " " + SLOT_LAYOUT_DEF)
     assert not c(phase=norm(PHASE) + " " + SLOT_LAYOUT_DEF)
+    # Other spellings of a second definition: brace-initialized, or a macro.
+    brace_def = " static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT{GGML_LAYOUT_AOS};"
+    assert not c(ring_hpp=norm(RING_HPP) + brace_def)
+    assert not c(phase=norm(PHASE) + " #define MOE_STREAM_RING_SLOT_LAYOUT GGML_LAYOUT_AOS")
+    # Control: a comparison is a use, not a definition.
+    assert c(phase=mutate(PHASE, RETAIN, RETAIN + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);"))
 
 
 if __name__ == "__main__":
