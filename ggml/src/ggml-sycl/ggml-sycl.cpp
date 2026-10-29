@@ -32749,12 +32749,15 @@ double ggml_sycl_h2d_probed_gbps(int device) {
 // record, else this probed rate, else the seed (llama.cpp-kp1l). The measured rate therefore reaches the cost model
 // whether or not the store accepted it.
 //
-// What it times: 64 MiB in 4 MiB chunks, 8 iterations after one untimed copy, on the cache's queue (cache->get_queue():
-// mem_copy_submit's direct branch needs the copy queue to share a context with it, and the dpct default queue does
-// not), timed on the host. The 4 MiB chunk is the order of one matrix's copy in the prefill ring, which is the transfer
-// the rate prices; 8 iterations repeat the 64 MiB enough to amortise the one queue wait each iteration ends with. The
-// chunks go out with mem_copy_async and that one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy
-// per chunk would time the submit-and-wait latency of each chunk and read low.
+// What it times: 64 MiB in 4 MiB chunks, 8 iterations after one untimed copy, on the cache's BCS (copy-only) queue
+// (cache->get_bcs_queue(); it falls back to the DMA queue, then to the compute queue), timed on the host. The probe
+// times the queue the prefill ring's copies go out on, so the bandwidth term of the cost model measures the engine the
+// ring uses and not another one. The queue is the cache's and not the dpct default queue because mem_copy_submit's
+// direct branch needs the copy queue to share a context with it, and the dpct default queue does not. The 4 MiB chunk
+// is the order of one matrix's copy in the prefill ring, which is the transfer the rate prices; 8 iterations repeat
+// the 64 MiB enough to amortise the one queue wait each iteration ends with. The chunks go out with mem_copy_async and
+// that one wait per iteration: ggml_sycl::mem_copy is synchronous, so a mem_copy per chunk would time the
+// submit-and-wait latency of each chunk and read low.
 //
 // The rate persisted is the max over iterations 2..8, each timed on its own (llama.cpp-xr4i, c-vbf4): one block timed
 // as a mean let a link that had not ramped inside the first window freeze 9.x GB/s into the tuning cache on three of
@@ -36401,8 +36404,9 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
 // What a staged ring slot is served with (c-las5): a plain MMVQ_COMPAT kernel on the submit queue, for a type that
 // does not need its own direct kernel (moe_type_needs_direct_kernel: Q1_0 and NVFP4 run on a device only through
 // DEVICE_MMVQ_Q1_NVFP4_AOS, so validate_moe_execution_recipe refuses an MMVQ_COMPAT recipe for them). NONE when the
-// capability `cap` of `type` can be served, else the cause. The ring's prompt-kernel predicate and the resolver's
-// staged route both ask it, so the ring stages nothing the route cannot serve (llama.cpp-o9uw).
+// capability `cap` of `type` can be served, else the cause. The resolver's staged route asks it, and so does the
+// ring's prompt-kernel predicate below, which the index build no longer calls: the ring stages by the library claim
+// alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
 static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap,
                                                                                    ggml_type                    type) {
     if (!cap.supported) {
@@ -37003,8 +37007,9 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 // its phase loop takes to the stage table (resolve_deferred_expert), and a batch the executor declines
                 // reaches the per-expert path's CPU route for it instead of a staged slot that path cannot read. On a
                 // weight the executor takes whole (executor_takes_weight) the entry is the executor's handoff, counted
-                // apart from the refusals; on a weight the ring staged only partly the executor does not run, so
-                // CLAIMED is a refusal: the expert runs on the CPU, its copy wasted.
+                // apart from the refusals. The window ring stages windows only for layers the executor claims whole,
+                // so an EXECUTOR entry on a layer it does not claim is not expected; if one appears, CLAIMED is a
+                // refusal: the expert runs on the CPU, its copy wasted.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
                     if (s->consumer == moe_stream_consumer::EXECUTOR) {
