@@ -10,7 +10,8 @@ satisfy one by accident, and each count is read against a positive control in th
      excluded because the host test spells the names as literals to drive its fake getenv, which deliberately pins
      the real names;
   2. the removed ring_layers knob has no literal and no config field;
-  3. the per-change WARN format, the level-1 trace format and the teardown summary format each appear exactly once;
+  3. the per-change WARN format, the level-1 trace format, the teardown summary format and the level-2 window timing
+     format (llama.cpp-8ucb; written as two adjacent literals, read joined) each appear exactly once;
   4. sycl_env_settings[] carries a row for both names, so the non-default report names them;
   5. ggml_sycl_moe_exec_config() is defined once in ggml-sycl.cpp and the backend free path prints the summary;
   6. docs/backend/sycl-env-vars.md has a row for each name;
@@ -89,10 +90,23 @@ def test_ring_layers_knob_is_removed():
     assert "ring_layers" not in (SYCL / "moe-exec-policy.hpp").read_text()
 
 
+def count_joined_literal(text):
+    """count_literal over the sources with adjacent string literals joined, for a format written across two lines."""
+    return sum(re.sub(r'"\s+"', "", strip_comments(p.read_text(errors="replace"))).count(text) for p in sources())
+
+
+def test_count_joined_literal_joins_adjacent_literals():
+    lit = '"[MOE-EXEC-TRACE] window x=%d y=%d"'
+    src = 'f("[MOE-EXEC-TRACE] window x=%d "\n  "y=%d"); // ' + lit
+    assert re.sub(r'"\s+"', "", strip_comments(src)).count(lit) == 1
+
+
 def test_log_formats_appear_once():
     assert count_literal("[MOE-EXEC] layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
     assert count_literal("[MOE-EXEC-TRACE] dev %d layer %d: %s (p=%.2f t_cpu=%.0f us t_ring=%.0f us %s)") == 1
     assert count_literal("[MOE-EXEC] summary: %u layer-ubatches ring, %u cpu, %u forced, %zu MiB streamed, %u windows, %u exposed, %u misses") == 1
+    assert count_joined_literal('"[MOE-EXEC-TRACE] window device %d layer %d role %s phase %zu bytes=%zu exposed=%d '
+                                'submit_us=%.0f copy_us=%.0f readers_wait_us=%.0f start_lag_us=%.0f launches=%u"') == 1
 
 
 def code_of(name):

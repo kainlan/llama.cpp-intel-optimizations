@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <optional>
 #include <string>
@@ -705,6 +706,179 @@ template <typename event_t> struct moe_stream_region_reads {
     }
 };
 
+// The key a window's timing record is kept under (moe_stream_window_timeline): the micro-batch's sequence number and
+// the window's id, since a window id names the same (layer, role, phase) again in every micro-batch.
+static inline uint64_t moe_stream_window_timing_key(uint64_t ubatch_seq, uint32_t window) {
+    return (ubatch_seq << 32) | window;
+}
+
+// The per-window timing GGML_SYCL_MOE_EXEC_TRACE=2 prints, one record per window, kept by the phase over sycl::event
+// and flushed at the synchronize boundary, where the host has already waited for the queue, so reading an event's
+// device times never waits on the compute path. Disabled (below trace level 2) it records nothing. Enabled, at() grows
+// `records` on the submitting thread inside graph compute, a trace-only allocation path, and clear() keeps the
+// vector's capacity, so later prompts of the same shape reuse it. The submitting thread is the only writer, so the
+// records take no lock. Templated on the event so test-moe-stream-phase drives it without a SYCL object. Each figure
+// and where it comes from:
+//   bytes            the window's own copies' bytes: those staged for it, whichever window_begin call staged them
+//                    (a prefetched window's copies go in during the window before it)
+//   exposed          moe_stream_window_exposed: the layer's first window, which nothing staged ahead
+//   submit_us        host steady_clock time inside window_begin for this window, its own copies and the prefetch of
+//                    the next window included: the host-side submit overhead
+//   copy_us          device time of the window's copies: the first copy's command_start to the last copy's
+//                    command_end. The copy queue is in order, so the span covers every copy of the window (and any
+//                    other submitter's work interleaved on that queue). -1 when a copy has no device times (the copy
+//                    queue is built with profiling only under trace level 2) or the window copied nothing itself
+//   readers_wait_us  how long the window's first copy waited FOR its read gate (the barrier behind the dequants of
+//                    the window the region last held, or the compute-queue barrier that stands in for it): the gate's
+//                    command_end minus the moment the copy could otherwise have started, the later of the copy's
+//                    command_submit and the command_end of the copy queued before it on the copy queue (the last copy
+//                    this timeline saw since the previous flush; none: the submit alone). Clamped at 0. A large value
+//                    means the copy queue sat waiting for the compute queue to release the region. -1 when the copies
+//                    waited on no read gate, an event has no device times, or the first copy's command_submit is 0
+//                    (the runtime gave no submit time). Other submitters' work on the copy queue and the copy's other
+//                    dependencies are not seen
+//   start_lag_us     the first copy's command_start minus the read gate's command_end, clamped at 0: how late the copy
+//                    began after the gate released it. The copy depends on the gate, so it never starts before the
+//                    gate's end; a large value means the copy queue was busy or the copy was submitted late, i.e. the
+//                    gate was NOT what held it. -1 when the copies waited on no read gate, or the first copy or the
+//                    gate has no device times
+//   launches         the dequant kernels and the GEMM groups the executor submitted for the window
+template <typename event_t> struct moe_stream_window_timeline {
+    struct record {
+        uint64_t               key       = 0;
+        bool                   begun     = false;  // window_begin named it; a prefetch never begun prints nothing
+        int                    layer     = -1;
+        expert_tensor_role     role      = expert_tensor_role::UNKNOWN;
+        size_t                 phase     = 0;
+        bool                   exposed   = false;
+        double                 submit_us = 0.0;
+        size_t                 bytes     = 0;
+        uint32_t               launches  = 0;
+        uint32_t               n_copies  = 0;
+        event_t                first_copy{};
+        event_t                last_copy{};
+        std::optional<event_t> reuse_gate;  // the read gate the window's copies waited on
+        std::optional<event_t> prev_copy;   // the copy queued just before the first copy, if this timeline saw one
+    };
+
+    bool                   enabled = false;  // trace level 2
+    std::vector<record>    records;
+    std::optional<event_t> queue_tail;       // the latest copy recorded since the previous flush
+
+    void clear() {
+        records.clear();
+        queue_tail.reset();
+    }
+
+    // The latest record under `key`: a window's records are recent, so the search runs from the back.
+    record * find(uint64_t key) {
+        for (size_t i = records.size(); i-- > 0;) {
+            if (records[i].key == key) {
+                return &records[i];
+            }
+        }
+        return nullptr;
+    }
+
+    record & at(uint64_t key) {
+        record * r = find(key);
+        if (r != nullptr) {
+            return *r;
+        }
+        records.emplace_back();
+        records.back().key = key;
+        return records.back();
+    }
+
+    // stage_window() copied `bytes` for the window under `key`, as `copy`, after `gate`.
+    void copied(uint64_t key, const event_t & copy, size_t bytes, const std::optional<event_t> & gate) {
+        if (!enabled) {
+            return;
+        }
+        record & r = at(key);
+        if (r.n_copies == 0) {
+            r.first_copy = copy;
+            r.reuse_gate = gate;
+            r.prev_copy  = queue_tail;
+        }
+        queue_tail  = copy;
+        r.last_copy = copy;
+        ++r.n_copies;
+        r.bytes += bytes;
+    }
+
+    // window_begin() ran for the window under `key`.
+    void begun(uint64_t key, int layer, expert_tensor_role role, size_t phase, bool exposed, double submit_us) {
+        if (!enabled) {
+            return;
+        }
+        record & r  = at(key);
+        r.begun     = true;
+        r.layer     = layer;
+        r.role      = role;
+        r.phase     = phase;
+        r.exposed   = exposed;
+        r.submit_us = submit_us;
+    }
+
+    // The executor submitted `n` more dequants or GEMM groups for the window under `key`.
+    void launched(uint64_t key, uint32_t n) {
+        if (!enabled) {
+            return;
+        }
+        record * r = find(key);
+        if (r != nullptr) {
+            r->launches += n;
+        }
+    }
+
+    // One line per begun window to `sink`, then the records go. `times(ev, &submit_ns, &start_ns, &end_ns)` answers
+    // an event's device command_submit, command_start and command_end, false when it has none. Returns the lines
+    // printed.
+    template <typename times_fn, typename sink_fn> size_t flush(int device, times_fn times, sink_fn sink) {
+        size_t printed = 0;
+        for (const record & r : records) {
+            if (!r.begun) {
+                continue;
+            }
+            double     copy_us         = -1.0;
+            double     readers_wait_us = -1.0;
+            double     start_lag_us    = -1.0;
+            uint64_t   first_submit = 0, first_start = 0, first_end = 0;
+            const bool first_timed = r.n_copies != 0 && times(r.first_copy, &first_submit, &first_start, &first_end);
+            uint64_t   last_submit = 0, last_start = 0, last_end = 0;
+            if (first_timed && times(r.last_copy, &last_submit, &last_start, &last_end) && last_end >= first_start) {
+                copy_us = static_cast<double>(last_end - first_start) / 1e3;
+            }
+            uint64_t   gate_submit = 0, gate_start = 0, gate_end = 0;
+            const bool gate_timed =
+                first_timed && r.reuse_gate && times(*r.reuse_gate, &gate_submit, &gate_start, &gate_end);
+            // The moment the first copy could have started without its gate: its submit, or the end of the copy
+            // ahead of it on the in-order copy queue when that is later.
+            uint64_t       prev_submit = 0, prev_start = 0, prev_end = 0;
+            const bool     prev_known = !r.prev_copy || times(*r.prev_copy, &prev_submit, &prev_start, &prev_end);
+            const uint64_t ready      = std::max(first_submit, prev_end);
+            // A zero submit is no time at all, not the device clock's origin: the wait would read as the gate's end.
+            if (gate_timed && prev_known && first_submit != 0) {
+                readers_wait_us = gate_end > ready ? static_cast<double>(gate_end - ready) / 1e3 : 0.0;
+            }
+            if (gate_timed) {
+                start_lag_us = first_start > gate_end ? static_cast<double>(first_start - gate_end) / 1e3 : 0.0;
+            }
+            char line[288];
+            std::snprintf(line, sizeof(line),
+                          "[MOE-EXEC-TRACE] window device %d layer %d role %s phase %zu bytes=%zu exposed=%d "
+                          "submit_us=%.0f copy_us=%.0f readers_wait_us=%.0f start_lag_us=%.0f launches=%u",
+                          device, r.layer, expert_tensor_role_name(r.role), r.phase, r.bytes, r.exposed ? 1 : 0,
+                          r.submit_us, copy_us, readers_wait_us, start_lag_us, r.launches);
+            sink(line);
+            ++printed;
+        }
+        clear();
+        return printed;
+    }
+};
+
 // What the batched prompt executor asks of the ring for one window (W1): one phase of one (layer, role), and the window
 // to prefetch under it. The executor's phases split a role's active experts, and the graph dispatches a layer's roles
 // in the order GATE, UP, DOWN (the gated activation takes the gate output as src[0]), so the window after a phase is
@@ -826,6 +1000,13 @@ class moe_stream_phase {
     // `readers_done` follows every dequant that read the window (layer, role, phase): it becomes the read gate of the
     // region holding that window. It frees nothing: the region's next refill waits for it.
     void     window_done(int layer, expert_tensor_role role, size_t phase, sycl::event readers_done);
+    // The executor submitted `n` dequant kernels and GEMM groups for the window (layer, role, phase), for the window's
+    // timing line (moe_stream_window_timeline). Records nothing below GGML_SYCL_MOE_EXEC_TRACE=2.
+    void     window_launched(int layer, expert_tensor_role role, size_t phase, uint32_t n);
+    // At the synchronize boundary, after the queue wait: one WARN line per window since the last flush, under
+    // GGML_SYCL_MOE_EXEC_TRACE=2 (moe_stream_window_timeline), then the records go. Reading the events' device times
+    // there never waits on the compute path. Prints nothing below trace level 2.
+    void     flush_window_timing();
 
     // The host experts one window stages at most: a region's slots, one executor phase (W3). 0 with no ring geometry.
     uint32_t window_experts() const { return geo_.region_slots; }
@@ -917,6 +1098,11 @@ class moe_stream_phase {
     int      prev_window_layer_      = -1;          // the layer of this micro-batch's last window_begin, -1 for none
     uint32_t next_window_id_         = UINT32_MAX;  // the window the last window_begin prefetched, UINT32_MAX for none
     bool     next_window_whole_      = false;       // that prefetch staged every matrix of its window
+    // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
+    // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
+    // and flush_window_timing() prints and clears it. Written by the submitting thread only, so it takes no lock.
+    moe_stream_window_timeline<sycl::event> window_timing_;
+    uint64_t                                ubatch_seq_    = 0;  // begin_ubatch counts micro-batches for the timing key
     // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor, and
     // window_begin feeds the log's window counters.
     moe_exec_decision_log *     log_ = nullptr;
