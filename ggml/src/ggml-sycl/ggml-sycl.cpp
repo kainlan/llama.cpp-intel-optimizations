@@ -21572,9 +21572,12 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
                                     resolver, out, warn_busy);
 }
 
-// What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused
-// (a graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks it
-// (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
+// What a loan of `bytes_wanted` would lend on `device` if it counted bytes, copying and publishing nothing; 0 when the
+// probe is refused (a graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks
+// it (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
+// The probe counts bytes (slot_bytes 0), while the loan the ring asks for counts ring slots (llama.cpp-9x8t), so the
+// fit can credit freed bytes in holes below a slot that fund no slot. llama.cpp-xug5 closes that gap: the probe must
+// count slots and report the slots it funds times slot_bytes, not the bytes it frees.
 static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted) {
     ggml_sycl_expert_loan_result probe;
     const ggml_sycl_txn_result   code = ggml_sycl_expert_loan_transaction_run(
