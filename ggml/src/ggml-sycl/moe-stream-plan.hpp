@@ -57,9 +57,11 @@ using moe_stream_prompt_kernel_fn =
 using moe_stream_library_claims_fn = bool (*)(void * graph_ctx, int layer, expert_tensor_role role);
 
 // Records a request to borrow `bytes` of resident expert VRAM on `device` at its next graph boundary (llama.cpp-3460,
-// c-0tmn). The backend answers with ggml_sycl_request_expert_loan: lock-free, so the phase may call it while
-// g_sycl_graph_compute_mutex is held, and the largest request since the last boundary wins.
-using moe_stream_request_loan_fn = void (*)(int device, size_t bytes);
+// c-0tmn), counted in ring slots of `slot_bytes` (llama.cpp-9x8t): the loan must free that many whole slots, not that
+// many bytes, since a matrix smaller than a slot frees a hole no slot fits in. 0 counts bytes. The backend answers with
+// ggml_sycl_request_expert_loan: lock-free, so the phase may call it while g_sycl_graph_compute_mutex is held, and the
+// largest request since the last boundary wins.
+using moe_stream_request_loan_fn = void (*)(int device, size_t bytes, size_t slot_bytes);
 
 // How many loans the boundary runner has refused on `device` (REFUSED, never BUSY, which it re-posts itself); it only
 // grows. The backend answers with ggml_sycl_expert_loan_refusals.
@@ -570,15 +572,16 @@ enum class moe_stream_loan_step : uint8_t {
 
 // What a short ring reserve does about its shortfall (llama.cpp-3460, closing c-0tmn for production). ring_ready()
 // calls this from its reserve-failed branch, so once per micro-batch (the reserve latch stops the later layers before
-// the reserve, c-i8rz), with the bytes the WEIGHT zone was short of as moe_stream_ring::reserve reported them. It asks
-// for a loan of that much at the next graph boundary (ggml_backend_sycl_synchronize runs it, c-tdra), and the next
-// micro-batch's reserve tries again. A REFUSED count that moved since the last ask means that loan was refused:
-// retrying would refuse again, so the latch holds until end_prompt. An ACCEPTED loan that still left the ring short, or
-// a BUSY one, leaves the count alone, so the next short micro-batch asks again; a repeated request is harmless, since
-// the largest since the last boundary wins.
+// the reserve, c-i8rz), with the bytes the WEIGHT zone was short of as moe_stream_ring::reserve reported them and the
+// ring's slot size, which the loan counts them in (llama.cpp-9x8t). It asks for a loan of that much at the next graph
+// boundary (ggml_backend_sycl_synchronize runs it, c-tdra), and the next micro-batch's reserve tries again. A REFUSED
+// count that moved since the last ask means that loan was refused: retrying would refuse again, so the latch holds
+// until end_prompt. An ACCEPTED loan that still left the ring short, or a BUSY one, leaves the count alone, so the next
+// short micro-batch asks again; a repeated request is harmless, since the largest since the last boundary wins.
 static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_loan_latch &     latch,
                                                                     int                         device,
                                                                     size_t                      bytes_short,
+                                                                    size_t                      slot_bytes,
                                                                     moe_stream_request_loan_fn  request_loan,
                                                                     moe_stream_loan_refusals_fn loan_refusals) {
     if (request_loan == nullptr || latch.refused || bytes_short == 0) {
@@ -591,7 +594,7 @@ static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_l
     }
     latch.asked         = true;
     latch.refusals_seen = refusals_now;
-    request_loan(device, bytes_short);
+    request_loan(device, bytes_short, slot_bytes);
     return moe_stream_loan_step::REQUEST;
 }
 
@@ -1031,20 +1034,31 @@ static inline bool moe_loan_triplet_is_lendable(const moe_loan_triplet &        
 }  // namespace detail
 
 // The lendable tail of the resident set on `device`: whole (gate, up, down) triplets, walking plan.entries in REVERSE
-// (pack-group order, popularity rank when ranks exist, so the tail is the least popular), until the summed
-// vram_charge_size reaches bytes_wanted or nothing lendable is left. A triplet is never split. Keys come out in the
-// order the triplets are met, gate/up/down within each. *bytes_selected (when non-null) receives the sum.
+// (pack-group order, popularity rank when ranks exist, so the tail is the least popular), until what they free covers
+// bytes_wanted or nothing lendable is left. A triplet is never split. Keys come out in the order the triplets are met,
+// gate/up/down within each. *bytes_selected (when non-null) receives the summed vram_charge_size.
+// With slot_bytes 0, what they free is the summed vram_charge_size. With a ring slot of slot_bytes, it is ring slots
+// (llama.cpp-9x8t): the walk wants bytes_wanted / slot_bytes slots, rounded up, and each matrix frees
+// vram_charge_size / slot_bytes of them. A lent matrix leaves one hole in the WEIGHT zone, and the floors of three
+// holes can sum to less than the floor of their sum, so a byte count would over-count and send the ring back for
+// another loan at another boundary. Adjacent holes may coalesce, so the floor is an under-count, the safe direction. A
+// triplet that frees no slot is skipped, not lent: it would cost the model three resident matrices for nothing. One
+// whose per-matrix floors sum to one is lent whole and counts one.
 // Precondition: plan.build_index() has run; find_expert_entry returns nullptr on an un-indexed plan, so selection then
 // returns nothing (fail-safe, no signal).
 static inline std::vector<expert_placement_key> moe_expert_loan_select(const placement_plan & plan,
                                                                        int                    device,
                                                                        size_t                 bytes_wanted,
+                                                                       size_t                 slot_bytes,
                                                                        size_t *               bytes_selected) {
     std::vector<expert_placement_key>  out;
     size_t                             sum = 0;
+    size_t                             slots = 0;
+    const size_t                       slots_wanted =
+        slot_bytes != 0 ? bytes_wanted / slot_bytes + (bytes_wanted % slot_bytes != 0 ? 1 : 0) : 0;
     std::unordered_map<uint64_t, bool> bulk_memo;
     std::unordered_set<uint64_t>       visited;
-    for (size_t i = plan.entries.size(); i-- > 0 && sum < bytes_wanted;) {
+    for (size_t i = plan.entries.size(); i-- > 0 && (slot_bytes != 0 ? slots < slots_wanted : sum < bytes_wanted);) {
         const placement_entry & e = plan.entries[i];
         if (e.expert_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role) || !e.on_device ||
             e.target_device != device) {
@@ -1057,6 +1071,16 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
         if (!t.complete() || t.e[0]->target_device != device || t.e[1]->target_device != device ||
             t.e[2]->target_device != device || !detail::moe_loan_triplet_is_lendable(t, plan, bulk_memo)) {
             continue;
+        }
+        if (slot_bytes != 0) {
+            size_t triplet_slots = 0;
+            for (int r = 0; r < 3; ++r) {
+                triplet_slots += t.e[r]->vram_charge_size / slot_bytes;
+            }
+            if (triplet_slots == 0) {
+                continue;
+            }
+            slots += triplet_slots;
         }
         for (int r = 0; r < 3; ++r) {
             out.push_back({ e.layer_id, e.expert_id, static_cast<expert_tensor_role>(r + 1) });

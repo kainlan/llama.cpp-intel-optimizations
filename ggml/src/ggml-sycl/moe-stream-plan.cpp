@@ -437,8 +437,8 @@ bool moe_stream_phase::ring_ready() {
     size_t bytes_short = 0;
     if (!ring->reserve(device_, geo_, &bytes_short)) {
         reserve_failed_ = true;
-        if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_) ==
-            moe_stream_loan_step::REFUSED) {
+        if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, geo_.slot_bytes, request_loan_,
+                                             loan_refusals_) == moe_stream_loan_step::REFUSED) {
             warn_loan_refused(bytes_short);
         }
         // Decided after the loan step, which may latch a REFUSED loan in this very call. A ring not kept gives its

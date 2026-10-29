@@ -166,6 +166,86 @@ bool triplet_lendable(const placement_plan & plan, int layer, int expert) {
                                                            plan, memo);
 }
 
+// Queried for device 0 with a ring slot of kSlot bytes, one layer of 8 experts whose charges are set by hand (the
+// ring's slot is the largest host matrix, so a model that mixes expert quants holds matrices below a slot). The reverse
+// walk meets: experts 7 and 6 on the host (not lendable, and they keep the tensor non-bulk); experts 5 and 4, every
+// matrix kSlot / 2, so 0 slots each; expert 3, gate kSlot and up and down kSlot / 2, so 1 slot from 2 * kSlot bytes;
+// expert 2, every matrix 1.5 * kSlot, so 3 slots; expert 1, every matrix 2 * kSlot, so 6 slots; expert 0, every matrix
+// one byte short of kSlot, so 0 slots.
+constexpr size_t kSlot = 65536;
+
+size_t slot_plan_charge(int expert, int role_idx) {
+    switch (expert) {
+        case 5:
+        case 4:
+            return kSlot / 2;
+        case 3:
+            return role_idx == 0 ? kSlot : kSlot / 2;
+        case 2:
+            return kSlot + kSlot / 2;
+        case 1:
+            return 2 * kSlot;
+        default:
+            return kSlot - 1;
+    }
+}
+
+placement_plan make_slot_plan() {
+    placement_plan plan{};
+    for (int e = 0; e < 8; ++e) {
+        for (int r = 0; r < 3; ++r) {
+            const bool      dev = e < 6;
+            placement_entry pe  = make_entry(0, e, r, dev, dev ? 0 : -1);
+            pe.vram_charge_size = slot_plan_charge(e, r);
+            plan.entries.push_back(pe);
+        }
+    }
+    plan.build_index();
+    return plan;
+}
+
+std::vector<int> experts_of(const std::vector<expert_placement_key> & keys) {
+    std::vector<int> out;
+    for (size_t i = 0; i + 2 < keys.size(); i += 3) {
+        out.push_back(keys[i].expert_id);
+    }
+    return out;
+}
+
+// Asked with a ring slot, the selector counts what a loan frees in whole slots per matrix and skips a triplet that
+// frees none: freed bytes reaching the shortfall do not mean freed slots reach it, since the floors of the holes sum to
+// less than the floor of their sum (llama.cpp-9x8t). Asked with slot_bytes 0, it counts bytes, as before.
+void test_slot_sized_selection_skips_matrices_below_a_slot() {
+    const placement_plan plan = make_slot_plan();
+    size_t               sel  = 0;
+
+    // One slot short: the small tail frees no slot, so the first lendable triplet is expert 3, which frees one.
+    const auto one = ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, kSlot, &sel);
+    CHECK(experts_of(one) == std::vector<int>({ 3 }));
+    CHECK(one.size() == 3 && sel == 2 * kSlot);  // *bytes_selected stays the byte sum
+
+    // Two slots short: expert 3's 2 * kSlot bytes would cover them, but it frees one slot, so expert 2 follows.
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, 2 * kSlot, kSlot, &sel)) == std::vector<int>({ 3, 2 }));
+    // Three slots short: 1 + 3 slots reach it.
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, 3 * kSlot, kSlot, &sel)) == std::vector<int>({ 3, 2 }));
+    CHECK(sel == 2 * kSlot + 3 * (kSlot + kSlot / 2));
+    // A shortfall one byte past a slot rounds up to two slots.
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, kSlot + 1, kSlot, &sel)) == std::vector<int>({ 3, 2 }));
+    // Five slots short: 1 + 3 is not enough, expert 1's 6 slots are.
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, 5 * kSlot, kSlot, &sel)) ==
+          std::vector<int>({ 3, 2, 1 }));
+    // Everything: experts 5, 4 and 0 each free no slot, so none is lent, however many slots are short.
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, ~static_cast<size_t>(0), kSlot, &sel)) ==
+          std::vector<int>({ 3, 2, 1 }));
+
+    // slot_bytes 0 counts bytes: the small tail comes first, today's path.
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, 0, &sel)) == std::vector<int>({ 5 }));
+    CHECK(sel == 3 * (kSlot / 2));
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, 3 * kSlot, 0, &sel)) == std::vector<int>({ 5, 4 }));
+    CHECK(experts_of(ggml_sycl::moe_expert_loan_select(plan, 0, ~static_cast<size_t>(0), 0, &sel)) ==
+          std::vector<int>({ 5, 4, 3, 2, 1, 0 }));
+}
+
 }  // namespace
 
 int main() {
@@ -184,7 +264,7 @@ int main() {
 
     // Everything lendable: layer 2 experts 3,2,1,0 then layer 0 experts 2,1,0, last entries first.
     size_t     sel       = 0;
-    const auto all       = ggml_sycl::moe_expert_loan_select(plan, 0, huge, &sel);
+    const auto all       = ggml_sycl::moe_expert_loan_select(plan, 0, huge, 0, &sel);
     const int  want_l[7] = { 2, 2, 2, 2, 0, 0, 0 };
     const int  want_e[7] = { 3, 2, 1, 0, 2, 1, 0 };
     CHECK(all.size() == 21);
@@ -195,7 +275,7 @@ int main() {
 
     // Whole-triplet granularity: the gate alone reaches 1 byte and also its own charge, yet all three keys come back.
     for (size_t wanted : { size_t(1), placement_vram_charge_bytes(kDst[0]), tc }) {
-        const auto one = ggml_sycl::moe_expert_loan_select(plan, 0, wanted, &sel);
+        const auto one = ggml_sycl::moe_expert_loan_select(plan, 0, wanted, 0, &sel);
         CHECK(one.size() == 3);
         CHECK(sel == tc);
         if (one.size() == 3) {
@@ -206,23 +286,23 @@ int main() {
     }
 
     // One byte past a triplet takes the next whole triplet.
-    const auto two = ggml_sycl::moe_expert_loan_select(plan, 0, tc + 1, &sel);
+    const auto two = ggml_sycl::moe_expert_loan_select(plan, 0, tc + 1, 0, &sel);
     CHECK(two.size() == 6 && sel == 2 * tc);
     if (two.size() == 6) {
         CHECK(key_is(two[3], 2, 2, expert_tensor_role::GATE));
     }
 
     // Reaching the target stops the walk: 5 triplets cover 5 * tc exactly, 6 are not taken.
-    const auto five = ggml_sycl::moe_expert_loan_select(plan, 0, 5 * tc, &sel);
+    const auto five = ggml_sycl::moe_expert_loan_select(plan, 0, 5 * tc, 0, &sel);
     CHECK(five.size() == 15 && sel == 5 * tc);
     if (five.size() == 15) {
         CHECK(key_is(five[12], 0, 2, expert_tensor_role::GATE));  // fifth triplet: layer 0 expert 2; expert 3 skipped
     }
 
     // Nothing wanted, nothing on that device.
-    CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, 0, &sel).empty() && sel == 0);
-    CHECK(ggml_sycl::moe_expert_loan_select(plan, 1, huge, &sel).empty() && sel == 0);
-    CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, 1, nullptr).size() == 3);  // bytes_selected is optional
+    CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, 0, 0, &sel).empty() && sel == 0);
+    CHECK(ggml_sycl::moe_expert_loan_select(plan, 1, huge, 0, &sel).empty() && sel == 0);
+    CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, 1, 0, nullptr).size() == 3);  // bytes_selected is optional
 
     // One role differs: every role is checked, not just the gate. Device 0 holds expert 0 whole; device 1 holds
     // experts 2 and 3 whole. Expert 1 is split across devices, expert 4 has a SOA up, expert 5 has a host down.
@@ -230,11 +310,11 @@ int main() {
     CHECK(triplet_lendable(split, 0, 0));
     CHECK(!triplet_lendable(split, 0, 4));
     CHECK(!triplet_lendable(split, 0, 5));
-    const auto split0 = ggml_sycl::moe_expert_loan_select(split, 0, huge, &sel);
+    const auto split0 = ggml_sycl::moe_expert_loan_select(split, 0, huge, 0, &sel);
     CHECK(split0.size() == 3 && sel == tc);
     CHECK(!split0.empty() && split0[0].expert_id == 0);
     CHECK(!has_expert(split0, 1) && !has_expert(split0, 4) && !has_expert(split0, 5));
-    const auto split1 = ggml_sycl::moe_expert_loan_select(split, 1, huge, &sel);
+    const auto split1 = ggml_sycl::moe_expert_loan_select(split, 1, huge, 0, &sel);
     CHECK(split1.size() == 6 && sel == 2 * tc);
     if (split1.size() == 6) {
         CHECK(key_is(split1[0], 0, 3, expert_tensor_role::GATE));
@@ -259,7 +339,7 @@ int main() {
         CHECK(triplet_lendable(alt, 3, e));
     }
     // Select on device 0: layer 3 experts 3..0, layer 2 expert 0, layer 1 experts 3..0; layer 0 is bulk and skipped.
-    const auto alt_sel = ggml_sycl::moe_expert_loan_select(alt, 0, huge, &sel);
+    const auto alt_sel = ggml_sycl::moe_expert_loan_select(alt, 0, huge, 0, &sel);
     CHECK(alt_sel.size() == 27 && sel == 9 * tc);
     if (alt_sel.size() == 27) {
         CHECK(key_is(alt_sel[0], 3, 3, expert_tensor_role::GATE));
@@ -267,6 +347,8 @@ int main() {
         CHECK(key_is(alt_sel[15], 1, 3, expert_tensor_role::GATE));
         CHECK(key_is(alt_sel[24], 1, 0, expert_tensor_role::GATE));
     }
+
+    test_slot_sized_selection_skips_matrices_below_a_slot();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-expert-loan-select: %d failure(s)\n", failures);

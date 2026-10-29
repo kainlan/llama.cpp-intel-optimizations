@@ -181,6 +181,7 @@ CACHE = read("ggml/src/ggml-sycl/unified-cache.cpp")
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 SYCL_CMAKE = read("ggml/src/ggml-sycl/CMakeLists.txt")
 COMMON = read("ggml/src/ggml-sycl/common.hpp")
+PLAN_HPP = read("ggml/src/ggml-sycl/moe-stream-plan.hpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -449,11 +450,11 @@ GRAPH_ACTIVE = ('if (ggml_sycl::unified_cache_is_graph_compute_active()) { '
 PENDING_SKIP = ("if (request.load(std::memory_order_acquire) == 0 || "
                 "ggml_sycl::unified_cache_is_graph_compute_active()) { return false; }")
 PENDING_TAKE = "const size_t bytes_wanted = request.exchange(0, std::memory_order_acq_rel);"
-PENDING_RUN = ("const ggml_sycl_txn_result code = ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, false, "
-               "resolver, result, false);")
+PENDING_RUN = ("const ggml_sycl_txn_result code = ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, "
+               "slot_bytes, false, resolver, result, false);")
 NOT_BUSY_RETURNS = ("if (code != ggml_sycl_txn_result::BUSY) { busy_streak.store(0, std::memory_order_relaxed); "
                     "return true; }")
-REPOST = "ggml_sycl_request_expert_loan(device, bytes_wanted); return true; }"
+REPOST = "ggml_sycl_request_expert_loan(device, bytes_wanted, slot_bytes); return true; }"
 MMID_FORBIDDEN = ("ggml_sycl_expert_loan_transaction_run(", "ggml_sycl_run_pending_expert_loan", "loan_expert_triplet(")
 
 
@@ -541,7 +542,7 @@ def claim_loan_boundary_drains_its_room(sycl: str) -> bool:
 INVALID_ARGS = 'return refuse(ggml_sycl_txn_result::REFUSED, "invalid arguments"); }'
 ZONES_REFUSAL = ('if (!refill && !cache->host_zones_configured()) { '
                  'return refuse(ggml_sycl_txn_result::REFUSED, "host zones not configured"); }')
-LOAN_SELECT = "ggml_sycl::moe_expert_loan_select("
+LOAN_SELECT = "ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected);"
 UNIFIED_ALLOC_SIG = "bool unified_alloc(const alloc_request & req_in, alloc_handle * out)"
 PINNED_ZONE_BRANCH = ("if (req.intent.constraints.use_pinned_pool) { if (!ucache->host_zones_configured()) { "
                       "ptr = ucache->host_pool_alloc(")
@@ -791,10 +792,10 @@ def refill_bodies(cache: str, sycl: str) -> list[str]:
 
 
 DIRECTION_ENUM = "enum class ggml_sycl_expert_txn_direction { LOAN, REFILL, };"
-LOAN_ENTRY = ("return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, probe_mode, "
-              "resolver, out, warn_busy);")
+LOAN_ENTRY = ("return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, slot_bytes, "
+              "probe_mode, resolver, out, warn_busy);")
 REFILL_ENTRY = ("const ggml_sycl_txn_result answer = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::REFILL, "
-                "device, max_triplets, false, resolver, result, false);")
+                "device, max_triplets, 0, false, resolver, result, false);")
 REFILL_FLAG = "const bool refill = direction == ggml_sycl_expert_txn_direction::REFILL;"
 REFILL_CALL = "loaned = cache->refill_lent_triplet(triplet.refill_members, refilled);"
 
@@ -1765,7 +1766,7 @@ def test_mutant_mul_mat_id_runs_the_loan_fails():
     anchor = "auto dispatch_cpu_entries_now = [&]"
     assert not claim_loan_runs_at_the_graph_boundary(
         _once_in(SYCL, MMID_SIG, anchor,
-                 "(void) ggml_sycl_expert_loan_transaction_run(ctx.device, 1, false, nullptr, nullptr, false); "
+                 "(void) ggml_sycl_expert_loan_transaction_run(ctx.device, 1, 0, false, nullptr, nullptr, false); "
                  + anchor))
 
 
@@ -2583,6 +2584,146 @@ def test_mutant_ledger_reconciled_before_the_publication_write_fails():
 
 def test_mutant_ledger_accessor_skips_the_reconcile_fails():
     assert not claim_the_ledger_follows_the_publication(_once(SYCL, LEDGER_ACCESSOR_RECONCILE, ""))
+
+
+# --- the loan is counted in ring slots (llama.cpp-9x8t) -------------------------------------------------------------
+
+# The ring's slot is its largest host matrix, so on a model that mixes expert quants a lent small-quant triplet frees
+# three holes each below a slot: it funds no slot, and the ring comes back for another loan at another boundary. The
+# request carries the ring's slot size beside its bytes, the boundary runner hands both to the transaction, and the
+# selector counts what each matrix frees in whole slots.
+SLOT_SIZES = "static std::atomic<size_t> g_sycl_expert_loan_slot_bytes[GGML_SYCL_MAX_DEVICES];"
+REQUEST_DEF = "static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted, size_t slot_bytes) {"
+SLOT_STORE = "g_sycl_expert_loan_slot_bytes[device].store(slot_bytes, std::memory_order_release);"
+SLOT_LOAD = "const size_t slot_bytes = g_sycl_expert_loan_slot_bytes[device].load(std::memory_order_acquire);"
+SLOT_RESET = "g_sycl_expert_loan_slot_bytes[device].store(0, std::memory_order_release);"
+REQUEST_RESET = "g_sycl_expert_loan_requests[device].store(0, std::memory_order_release);"
+
+
+def claim_the_request_carries_the_slot_size(sycl: str) -> bool:
+    """The request stores its slot size before its bytes, whose release publishes it; the runner reads it after it
+    has taken the bytes with acquire, so it reads a size at least as new as the one those bytes were asked in (a
+    request posted after the take can overwrite it, harmlessly). The runner hands it to the loan transaction, which
+    hands it to the selector, and a BUSY re-post carries it through. The plan reset that clears the request clears it
+    too. A request that does not win the bytes still stores its size: the ring's geometry is constant between two graph
+    boundaries (prepare() rebuilds it per micro-batch; a loan can grow it, llama.cpp-8p5x), and one micro-batch posts
+    the requests in that interval, so they agree on it."""
+    s = norm(sycl)
+    request = body(s, REQUEST_SIG)
+    pending = body(s, PENDING_DEVICE_SIG)
+    return (s.count(SLOT_SIZES) == 1 and s.count(REQUEST_DEF) == 1
+            and request.count(SLOT_STORE) == 1 and ordered(request, SLOT_STORE, REQUEST_CAS)
+            and s.count("g_sycl_expert_loan_slot_bytes[device].store(") == 2
+            and s.count(SLOT_RESET) == 1 and ordered(s, REQUEST_RESET, SLOT_RESET)
+            and pending.count(SLOT_LOAD) == 1 and ordered(pending, PENDING_TAKE, SLOT_LOAD, PENDING_RUN, REPOST)
+            and body(s, LOAN_TXN_SIG).count(LOAN_ENTRY) == 1 and body(s, TXN_SIG).count(LOAN_SELECT) == 1)
+
+
+def test_the_request_carries_the_slot_size():
+    assert claim_the_request_carries_the_slot_size(SYCL)
+
+
+def test_mutant_slot_size_stored_after_the_bytes_fails():
+    """Stored after the bytes publish, the size can reach the runner after it took them: it would count the loan in
+    the previous request's slots, or in bytes."""
+    n = _once_in(SYCL, REQUEST_SIG, SLOT_STORE + " ", "")
+    request = body(n, REQUEST_SIG)
+    n = n.replace(request, request[:-1] + SLOT_STORE + " }", 1)
+    assert n.count(SLOT_STORE) == 1, "the mutant must move the store, not drop it"
+    assert not claim_the_request_carries_the_slot_size(n)
+
+
+def test_mutant_slot_size_stored_relaxed_fails():
+    assert not claim_the_request_carries_the_slot_size(
+        _once(SYCL, SLOT_STORE, SLOT_STORE.replace("memory_order_release", "memory_order_relaxed")))
+
+
+def test_mutant_slot_size_read_before_the_bytes_are_taken_fails():
+    n = _once(SYCL, SLOT_LOAD + " ", "")
+    n = n.replace(PENDING_TAKE, SLOT_LOAD + " " + PENDING_TAKE, 1)
+    assert n.count(SLOT_LOAD) == 1, "the mutant must move the load, not drop it"
+    assert not claim_the_request_carries_the_slot_size(n)
+
+
+def test_mutant_runner_drops_the_slot_size_fails():
+    """The runner asks in bytes: a lent small-quant triplet funds no slot again."""
+    assert not claim_the_request_carries_the_slot_size(
+        _once(SYCL, PENDING_RUN, PENDING_RUN.replace("bytes_wanted, slot_bytes, false", "bytes_wanted, 0, false")))
+
+
+def test_mutant_busy_repost_drops_the_slot_size_fails():
+    """A BUSY loan re-posted without its slot size runs in bytes at the next boundary."""
+    mutant = _once(SYCL, REPOST, REPOST.replace("bytes_wanted, slot_bytes)", "bytes_wanted, 0)"))
+    assert not claim_the_request_carries_the_slot_size(mutant)
+    assert not claim_busy_reposts_the_request(mutant)
+
+
+def test_mutant_loan_entry_drops_the_slot_size_fails():
+    assert not claim_the_request_carries_the_slot_size(
+        _once(SYCL, LOAN_ENTRY, LOAN_ENTRY.replace("bytes_wanted, slot_bytes, probe_mode",
+                                                   "bytes_wanted, 0, probe_mode")))
+
+
+def test_mutant_transaction_selects_in_bytes_fails():
+    assert not claim_the_request_carries_the_slot_size(
+        _once(SYCL, LOAN_SELECT, LOAN_SELECT.replace("amount, slot_bytes, &selected", "amount, 0, &selected")))
+
+
+def test_mutant_plan_reset_keeps_the_slot_size_fails():
+    assert not claim_the_request_carries_the_slot_size(_once(SYCL, SLOT_RESET, ""))
+
+
+SELECT_DEF = ("static inline std::vector<expert_placement_key> moe_expert_loan_select(const placement_plan & plan, "
+              "int device, size_t bytes_wanted, size_t slot_bytes, size_t * bytes_selected)")
+SLOTS_WANTED = ("const size_t slots_wanted = slot_bytes != 0 ? bytes_wanted / slot_bytes + "
+                "(bytes_wanted % slot_bytes != 0 ? 1 : 0) : 0;")
+SLOT_WALK = ("for (size_t i = plan.entries.size(); i-- > 0 && "
+             "(slot_bytes != 0 ? slots < slots_wanted : sum < bytes_wanted);) {")
+SELECT_LENDABLE = "!detail::moe_loan_triplet_is_lendable(t, plan, bulk_memo)) { continue; }"
+SLOT_BRANCH = "if (slot_bytes != 0) { size_t triplet_slots = 0; for (int r = 0; r < 3; ++r) {"
+SLOT_PER_MATRIX = "triplet_slots += t.e[r]->vram_charge_size / slot_bytes; }"
+SLOT_SKIP = "if (triplet_slots == 0) { continue; }"
+SLOT_ADD = "slots += triplet_slots; }"
+BYTES_ADD = "sum += t.e[r]->vram_charge_size;"
+BYTES_OUT = "if (bytes_selected) { *bytes_selected = sum; }"
+
+
+def claim_the_selector_counts_whole_slots_per_matrix(hpp: str) -> bool:
+    """With a slot size, the walk stops on slots, not bytes: it wants the shortfall's slots rounded up, each matrix
+    frees vram_charge_size / slot_bytes of them (the floor per hole, never the floor of the triplet's sum), and a
+    triplet that frees none is skipped after the lendable checks and before any key is taken. *bytes_selected stays
+    the byte sum, and with slot_bytes 0 the walk counts bytes as before."""
+    sel = body(norm(hpp), SELECT_DEF)
+    return (sel.count(SLOT_PER_MATRIX) == 1 and sel.count(SLOT_SKIP) == 1 and sel.count(BYTES_ADD) == 1
+            and ordered(sel, SLOTS_WANTED, SLOT_WALK, SELECT_LENDABLE, SLOT_BRANCH, SLOT_PER_MATRIX, SLOT_SKIP,
+                        SLOT_ADD, "out.push_back(", BYTES_ADD, BYTES_OUT))
+
+
+def test_the_selector_counts_whole_slots_per_matrix():
+    assert claim_the_selector_counts_whole_slots_per_matrix(PLAN_HPP)
+
+
+def test_mutant_selector_walks_until_the_bytes_fails():
+    """The walk stopped on the byte sum: freed bytes reach the shortfall before freed slots do."""
+    assert not claim_the_selector_counts_whole_slots_per_matrix(
+        _once(PLAN_HPP, SLOT_WALK, "for (size_t i = plan.entries.size(); i-- > 0 && sum < bytes_wanted;) {"))
+
+
+def test_mutant_selector_lends_a_triplet_that_frees_no_slot_fails():
+    assert not claim_the_selector_counts_whole_slots_per_matrix(_once(PLAN_HPP, SLOT_SKIP, ""))
+
+
+def test_mutant_selector_floors_the_triplet_sum_fails():
+    """The floor of the summed bytes over-counts: three holes of half a slot read as one slot and fund none."""
+    n = _once(PLAN_HPP, SLOT_PER_MATRIX, "triplet_slots += t.e[r]->vram_charge_size; }")
+    n = n.replace(SLOT_SKIP, "triplet_slots /= slot_bytes; " + SLOT_SKIP, 1)
+    assert not claim_the_selector_counts_whole_slots_per_matrix(n)
+
+
+def test_mutant_selector_rounds_the_shortfall_down_fails():
+    """A shortfall one byte past a slot would be asked as one slot, and the ring would come back for the other."""
+    assert not claim_the_selector_counts_whole_slots_per_matrix(
+        _once(PLAN_HPP, SLOTS_WANTED, "const size_t slots_wanted = slot_bytes != 0 ? bytes_wanted / slot_bytes : 0;"))
 
 
 if __name__ == "__main__":

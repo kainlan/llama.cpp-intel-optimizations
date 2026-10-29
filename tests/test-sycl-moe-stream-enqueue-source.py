@@ -1430,7 +1430,8 @@ RING_HPP = read(RING_HPP_REL)
 
 # The reserve-failed branch's condition, without its brace: body() opens at the first brace after it.
 RESERVE_SHORT_IF = "if (!ring->reserve(device_, geo_, &bytes_short))"
-LOAN_CALL = "moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, request_loan_, loan_refusals_)"
+LOAN_CALL = ("moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, geo_.slot_bytes, request_loan_, "
+             "loan_refusals_)")
 LOAN_REFUSED_WARN = "== moe_stream_loan_step::REFUSED) { warn_loan_refused(bytes_short); }"
 LOAN_LATCH_CLEAR = "loan_latch_ = moe_stream_loan_latch();"
 LOAN_HOOKS_STORED = ("request_loan_ = op.request_loan;", "loan_refusals_ = op.loan_refusals;")
@@ -1441,9 +1442,11 @@ LOAN_HELPER_ORDER = (
     "const uint64_t refusals_now = loan_refusals != nullptr ? loan_refusals(device) : 0;",
     "if (latch.asked && refusals_now != latch.refusals_seen) { latch.refused = true; "
     "return moe_stream_loan_step::REFUSED; }",
-    "latch.asked = true; latch.refusals_seen = refusals_now; request_loan(device, bytes_short); "
+    "latch.asked = true; latch.refusals_seen = refusals_now; request_loan(device, bytes_short, slot_bytes); "
     "return moe_stream_loan_step::REQUEST;",
 )
+# The hook's type carries the ring's slot size beside the bytes, so the loan is counted in slots (llama.cpp-9x8t).
+LOAN_FN_TYPE = "using moe_stream_request_loan_fn = void (*)(int device, size_t bytes, size_t slot_bytes);"
 RESERVE_DECL = "bool reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short = nullptr);"
 RESERVE_DEF_SIG = ("bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, "
                    "size_t * bytes_short)")
@@ -1454,7 +1457,8 @@ REFUSALS_DECL = "static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_S
 REFUSALS_BUMP = ("if (code == ggml_sycl_txn_result::REFUSED) { "
                  "g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release); }")
 RUN_PENDING_SIG = "static bool ggml_sycl_run_pending_expert_loan_on_device("
-RUN_PENDING_TXN = "ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, false, resolver, result, false);"
+RUN_PENDING_TXN = ("ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, slot_bytes, false, resolver, result, "
+                   "false);")
 RUN_PENDING_BUSY = "if (code != ggml_sycl_txn_result::BUSY) {"
 REFUSALS_ACCESSOR_SIG = "static uint64_t ggml_sycl_expert_loan_refusals(int device)"
 REFUSALS_LOAD = "return g_sycl_expert_loan_refusals[device].load(std::memory_order_acquire);"
@@ -1483,7 +1487,7 @@ def claim_short_reserve_requests_a_loan(phase: str, hpp: str, sycl: str, ring_cp
             and ordered(branch, LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN)
             and ordered(body(n, BEGIN_LAYER_SIG), *LOAN_HOOKS_STORED, "ring_ready()")
             and n.count(LOAN_LATCH_CLEAR) == 1 and LOAN_LATCH_CLEAR in body(n, END_PROMPT_SIG)
-            and h.count("request_loan(device, ") == 1
+            and h.count("request_loan(device, ") == 1 and h.count(LOAN_FN_TYPE) == 1
             and ordered(body(h, LOAN_HELPER_SIG), *LOAN_HELPER_ORDER)
             and RESERVE_DECL in norm(ring_hpp)
             and ordered(body(rc, RESERVE_DEF_SIG), "allocation = unified_allocate_owner(req);", RESERVE_SHORT_SET,
@@ -1511,7 +1515,18 @@ def test_short_reserve_loan_mutants():
     moved = mutate(PHASE, stmt, "").replace(RING_READY_RESET, stmt + " " + RING_READY_RESET, 1)
     assert not c(phase=moved)
     # The request with the whole ring's bytes instead of the shortfall.
-    assert not c(phase=mutate(PHASE, "device_, bytes_short, request_loan_", "device_, geo_.bytes, request_loan_"))
+    assert not c(phase=mutate(PHASE, "device_, bytes_short, geo_.slot_bytes, request_loan_",
+                              "device_, geo_.bytes, geo_.slot_bytes, request_loan_"))
+    # The request without the ring's slot: the loan would be counted in bytes, and a lent triplet whose matrices are
+    # each below a slot would fund none (llama.cpp-9x8t).
+    assert not c(phase=mutate(PHASE, "bytes_short, geo_.slot_bytes, request_loan_", "bytes_short, 0, request_loan_"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short, slot_bytes);",
+                            "request_loan(device, bytes_short, 0);"))
+    assert not c(hpp=mutate(PLAN_HPP, LOAN_FN_TYPE,
+                            "using moe_stream_request_loan_fn = void (*)(int device, size_t bytes);"))
+    # The boundary runner asks the transaction in bytes.
+    assert not c(sycl=mutate(SYCL, RUN_PENDING_TXN,
+                             RUN_PENDING_TXN.replace("bytes_wanted, slot_bytes,", "bytes_wanted, 0,")))
     # The reserve's shortfall not taken: the phase would have to recompute it.
     assert not c(phase=mutate(PHASE, RESERVE_SHORT_IF, "if (!ring->reserve(device_, geo_))"))
     # The hooks never stored: the request would go nowhere.
@@ -1526,9 +1541,11 @@ def test_short_reserve_loan_mutants():
     assert not c(hpp=mutate(PLAN_HPP, "latch.refused = true; return moe_stream_loan_step::REFUSED;",
                             "return moe_stream_loan_step::REFUSED;"))
     # The helper asks for the whole ring, or asks a second time.
-    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short);", "request_loan(device, SIZE_MAX);"))
-    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short);",
-                            "request_loan(device, bytes_short); request_loan(device, bytes_short);"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short, slot_bytes);",
+                            "request_loan(device, SIZE_MAX, slot_bytes);"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short, slot_bytes);",
+                            "request_loan(device, bytes_short, slot_bytes); "
+                            "request_loan(device, bytes_short, slot_bytes);"))
     # The reserve exposes no shortfall, or exposes the whole ring.
     assert not c(ring_hpp=mutate(RING_HPP, RESERVE_DECL,
                                  "bool reserve(int device, const moe_stream_ring_geometry & geo);"))
