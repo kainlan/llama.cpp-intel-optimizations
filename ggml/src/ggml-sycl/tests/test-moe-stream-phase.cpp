@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -321,6 +322,120 @@ void test_declined_line() {
     char summary[256] = {};
     CHECK(log.take_summary(summary, sizeof(summary)));
     CHECK(std::strstr(summary, "summary: 0 layer-ubatches ring, 1 cpu, 0 forced,") != nullptr);
+}
+
+// llama.cpp-8ucb: the per-window timing the phase keeps under GGML_SYCL_MOE_EXEC_TRACE=2, over int events. The file
+// has no fake cache or ring to drive window_begin with, so the test drives the timeline the phase holds over
+// sycl::event, in the order the phase feeds it: stage_window() reports each copy (window_begin of phase 0 copies its
+// own exposed window, then prefetches phase 1), window_begin reports the window, the executor reports its launches,
+// and the synchronize boundary flushes one line per window. The fake profiler answers device times in ns; event 4 has
+// none, as a copy on a queue without profiling.
+bool fake_event_times(int ev, uint64_t * start_ns, uint64_t * end_ns) {
+    switch (ev) {
+        case 1:  // window 0's first copy
+            *start_ns = 1000000;
+            *end_ns   = 1400000;
+            return true;
+        case 2:  // window 0's last copy
+            *start_ns = 1400000;
+            *end_ns   = 2000000;
+            return true;
+        case 3:  // window 1's first copy
+            *start_ns = 2100000;
+            *end_ns   = 2300000;
+            return true;
+        case 10:  // window 0's read gate: the dequants of the window its region last held were done at 0.9 ms
+            *start_ns = 800000;
+            *end_ns   = 900000;
+            return true;
+        case 11:  // window 1's read gate
+            *start_ns = 1900000;
+            *end_ns   = 2050000;
+            return true;
+        default:
+            return false;
+    }
+}
+
+void test_window_timing_records_one_record_per_window_only_under_trace() {
+    using timeline_t = ggml_sycl::moe_stream_window_timeline<int>;
+    std::vector<std::string> lines;
+    const auto               sink = [&](const char * line) {
+        lines.push_back(line);
+    };
+    const uint32_t w0 = ggml_sycl::moe_stream_window_id(4, expert_tensor_role::UP, 0);
+    const uint32_t w1 = ggml_sycl::moe_stream_window_id(4, expert_tensor_role::UP, 1);
+    const uint64_t k0 = ggml_sycl::moe_stream_window_timing_key(7, w0);
+    const uint64_t k1 = ggml_sycl::moe_stream_window_timing_key(7, w1);
+
+    // Below trace level 2 the phase leaves the timeline disabled: nothing is recorded and the flush prints nothing.
+    // As in the region-reads case, every use goes through a volatile pointer so -O3 cannot fold the checks away.
+    timeline_t off;
+    timeline_t * volatile off_at = &off;
+    const std::optional<int> gate10(10);
+    (*off_at).copied(k0, 1, 1000, gate10);
+    (*off_at).begun(k0, 4, expert_tensor_role::UP, 0, true, 12.4);
+    (*off_at).launched(k0, 3);
+    CHECK((*off_at).records.empty());
+    CHECK((*off_at).flush(0, fake_event_times, sink) == 0);
+    CHECK(lines.empty());
+
+    timeline_t on;
+    timeline_t * volatile on_at = &on;
+    (*on_at).enabled            = true;
+    // window_begin of phase 0: window 0 is not prefetched, so it is staged whole (exposed), then window 1 is prefetched
+    // into the other region, behind its own read gate.
+    (*on_at).copied(k0, 1, 1000, gate10);
+    (*on_at).copied(k0, 2, 1000, gate10);
+    (*on_at).copied(k1, 3, 500, std::optional<int>(11));
+    (*on_at).copied(k1, 4, 500, std::optional<int>(11));
+    (*on_at).begun(k0, 4, expert_tensor_role::UP, 0, true, 12.4);
+    (*on_at).launched(k0, 3);  // two dequants and one GEMM group
+    // window_begin of phase 1: prefetched, so it copies nothing of its own.
+    (*on_at).begun(k1, 4, expert_tensor_role::UP, 1, false, 3.6);
+    (*on_at).launched(k1, 2);
+    // A prefetch whose window never began (the op fell back first) is recorded but prints no line.
+    (*on_at).copied(ggml_sycl::moe_stream_window_timing_key(7, w1 + 1), 9, 500, std::optional<int>());
+    CHECK((*on_at).records.size() == 3);
+
+    CHECK((*on_at).flush(0, fake_event_times, sink) == 2);
+    CHECK(lines.size() == 2);
+    // copy_us spans the first copy's start to the last copy's end (1.0 ms); readers_wait_us is the first copy's start
+    // after the read gate's end (0.1 ms).
+    CHECK(lines.size() > 0 &&
+          lines[0] ==
+              "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 0 bytes=2000 exposed=1 submit_us=12 "
+              "copy_us=1000 readers_wait_us=100 launches=3");
+    // The last copy has no device times, so the copy span is unmeasured; the read gate and the first copy still give
+    // the wait (0.05 ms).
+    CHECK(lines.size() > 1 &&
+          lines[1] ==
+              "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=1000 exposed=0 submit_us=4 "
+              "copy_us=-1 readers_wait_us=50 launches=2");
+    // The flush empties the timeline: the next boundary prints only what came after it.
+    CHECK((*on_at).records.empty());
+    CHECK((*on_at).flush(0, fake_event_times, sink) == 0);
+
+    // The same window in the next micro-batch is a record of its own: micro-batch 7's window 0, copied again after the
+    // flush and never begun, prints nothing, and micro-batch 8's window 0 prints only its own bytes. A window that
+    // copied nothing of its own measures neither span.
+    const uint64_t k0_next = ggml_sycl::moe_stream_window_timing_key(8, w0);
+    (*on_at).copied(k0, 1, 1000, gate10);
+    (*on_at).copied(k0_next, 2, 700, std::optional<int>());
+    CHECK((*on_at).records.size() == 2);
+    (*on_at).begun(k0_next, 4, expert_tensor_role::UP, 0, true, 1.0);
+    (*on_at).begun(ggml_sycl::moe_stream_window_timing_key(8, w1), 4, expert_tensor_role::UP, 1, false, 1.0);
+    lines.clear();
+    CHECK((*on_at).flush(1, fake_event_times, sink) == 2);
+    // No read gate (a region's first fill since the ring was reserved): the wait is unmeasured.
+    CHECK(lines.size() > 0 &&
+          lines[0] ==
+              "[MOE-EXEC-TRACE] window device 1 layer 4 role up phase 0 bytes=700 exposed=1 submit_us=1 "
+              "copy_us=600 readers_wait_us=-1 launches=0");
+    CHECK(lines.size() > 1 &&
+          lines[1] ==
+              "[MOE-EXEC-TRACE] window device 1 layer 4 role up phase 1 bytes=0 exposed=0 submit_us=1 "
+              "copy_us=-1 readers_wait_us=-1 launches=0");
 }
 
 }  // namespace
@@ -882,6 +997,9 @@ int main() {
         rr().window_done(9, 45);
         CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
     }
+
+    // ---- the per-window timing under GGML_SYCL_MOE_EXEC_TRACE=2 (llama.cpp-8ucb) ----
+    test_window_timing_records_one_record_per_window_only_under_trace();
 
     // ---- a short reserve asks for a loan of its shortfall, once per micro-batch, until one comes back REFUSED ----
     {

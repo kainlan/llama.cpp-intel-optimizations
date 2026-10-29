@@ -12,6 +12,7 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,18 @@ const char * moe_stream_getenv(const char * name) {
     return std::getenv(name);
 }
 
+// An event's device command_start and command_end in ns, for the window timing line; false when the event has none
+// (its queue was built without profiling, or the runtime refuses the query). Read only at the synchronize boundary.
+bool moe_stream_event_times(const sycl::event & ev, uint64_t * start_ns, uint64_t * end_ns) {
+    try {
+        *start_ns = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        *end_ns   = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+    } catch (const sycl::exception &) {
+        return false;
+    }
+    return *start_ns != 0 && *end_ns >= *start_ns;
+}
+
 }  // namespace
 
 moe_stream_phase::moe_stream_phase() = default;
@@ -32,9 +45,11 @@ moe_stream_phase::moe_stream_phase() = default;
 // The context destructor resets this after draining its queues, so the barrier is already complete; it still orders the
 // ring's return after every use for any other owner. As in moe_stream_ring's destructor, a throw from the barrier or
 // from retain_handles_until_event() terminates: there is deliberately no catch. A prompt no end_prompt ended (the
-// context freed mid-prompt) is reported first; after an end_prompt the tally is empty and nothing prints again.
+// context freed mid-prompt) is reported first; after an end_prompt the tally is empty and nothing prints again. The
+// windows no synchronize flushed print too, their queues drained.
 moe_stream_phase::~moe_stream_phase() {
     report_staged_routes();
+    flush_window_timing();
     teardown(ring_ && ccs_ ? ccs_->ext_oneapi_submit_barrier() : sycl::event());
 }
 
@@ -52,6 +67,7 @@ void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {
     prev_window_layer_ = -1;
     next_window_id_    = UINT32_MAX;
     next_window_whole_ = false;
+    ++ubatch_seq_;  // the window timing's key: a window id repeats in every micro-batch
 }
 
 // The decline knob's range (common.hpp) is the decision log's layers: a larger knob names a layer the log cannot
@@ -82,6 +98,8 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
     policy_        = op.policy;
+    // The window timing is trace level 2's, like the copy queue's profiling that copy_us reads.
+    window_timing_.enabled = op.log != nullptr && op.log->trace >= 2;
     request_loan_  = op.request_loan;
     loan_refusals_ = op.loan_refusals;
 
@@ -139,6 +157,9 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     if (req.layer != cur_layer_ || !executor_claims(req.layer)) {
         GGML_ABORT("[MOE-EXEC] window_begin on layer %d, which executor_claims did not answer true for", req.layer);
     }
+    // The host time this call takes, for the window's timing line (trace level 2 only).
+    const bool timed   = window_timing_.enabled;
+    const auto t_begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     const auto li = index_.layers.find(req.layer);  // executor_claims found it
 
     // The bytes this call copies, the window's own and its prefetch's: note_window() counts them once, here.
@@ -198,6 +219,12 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     for (const moe_stream_item & item : items) {
         staged += find(item.layer, item.expert_id, item.role) != nullptr ? 1u : 0u;
     }
+    if (timed) {
+        const double submit_us =
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_begin).count();
+        window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, req.role, req.phase, exposed,
+                             submit_us);
+    }
     return staged;
 }
 
@@ -208,6 +235,28 @@ void moe_stream_phase::window_done(int layer, expert_tensor_role role, size_t ph
         return;
     }
     region_reads_.window_done(moe_stream_window_id(layer, role, phase), readers_done);
+}
+
+// As window_done: a layer other than the current one has no window this micro-batch.
+void moe_stream_phase::window_launched(int layer, expert_tensor_role role, size_t phase, uint32_t n) {
+    if (!window_timing_.enabled || layer != cur_layer_) {
+        return;
+    }
+    window_timing_.launched(moe_stream_window_timing_key(ubatch_seq_, moe_stream_window_id(layer, role, phase)), n);
+}
+
+// The windows' lines go out at WARN through the decision log's sink: llama-bench drops INFO without -v, and the
+// trace sink is INFO. The caller has waited for the queue, so reading the device times does not wait on compute work.
+void moe_stream_phase::flush_window_timing() {
+    if (window_timing_.records.empty()) {
+        return;
+    }
+    if (log_ == nullptr || log_->trace < 2 || log_->sink == nullptr) {
+        window_timing_.records.clear();
+        return;
+    }
+    moe_exec_decision_log * log = log_;
+    window_timing_.flush(device_, moe_stream_event_times, [log](const char * line) { log->sink(log->sink_ctx, line); });
 }
 
 bool moe_stream_phase::region_open() const {
@@ -413,6 +462,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
             // here, so that region's next refill does not drop it.
             other_keys.erase(std::remove(other_keys.begin(), other_keys.end(), key), other_keys.end());
         }
+        window_timing_.copied(moe_stream_window_timing_key(ubatch_seq_, window_id), copied, item.src_bytes, reuse_gate);
         region_submitted_ = true;
         region_last_      = copied;
         // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader the

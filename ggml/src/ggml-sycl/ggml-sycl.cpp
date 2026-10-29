@@ -33467,8 +33467,10 @@ void ggml_backend_sycl_print_sycl_devices() {
     print_device_opt_feature(device_count);
 }
 
-// The MoE executor's knobs (llama.cpp-36j0), parsed once. This is the only reader of GGML_SYCL_MOE_EXEC and
-// GGML_SYCL_MOE_EXEC_TRACE: the trace level (2 runs the load-time host-expert copy probe) comes from here too.
+// The MoE executor's knobs (llama.cpp-36j0), parsed once. The backend reads GGML_SYCL_MOE_EXEC and
+// GGML_SYCL_MOE_EXEC_TRACE only here: the trace level (2 runs the load-time host-expert copy probe and prints the
+// per-window timing lines) comes from here too. The unified cache, built before any backend op, parses the level
+// through the same moe_exec_config_parse to decide whether its copy queue records device times (llama.cpp-8ucb).
 static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {
     static const ggml_sycl::moe_exec_config config = [] {
         ggml_sycl::moe_exec_config c =
@@ -91354,6 +91356,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {
                 const pp_batched_phase & phase         = phases[p];
                 sycl::half *             phase_weights = batched_weights + phase.buffer * half_elems;
+                // The dequant kernels and GEMM groups this phase submits, for a window's timing line (llama.cpp-8ucb).
+                uint32_t                 phase_launches = 0;
                 // llama.cpp-8epx: for a windowed op this phase is one ring window (W1). window_begin is asked exactly
                 // once per window: it copies the window's host matrices no prefetch staged into a region, and the
                 // window after it into the other region, under this window's dequants and GEMMs. That window is the
@@ -91411,6 +91415,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                     for (size_t i = phase.begin; i < phase.end; ++i) {
                         dequant_expert_f16(active_experts[i], phase_weights + (i - phase.begin) * weight_elems);
+                        ++phase_launches;
                     }
                 }
                 // llama.cpp-8epx: the window's slots are read only by the dequants above, plain kernels on this
@@ -91478,9 +91483,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                         gemm_events.push_back(*group_event);
                         half_readers[phase.buffer].push_back(*group_event);
+                        ++phase_launches;
                     }
                 } catch (const std::exception & e) {
                     return gemm_stage_failed(e.what());
+                }
+                if (pp_stream_windowed) {
+                    ctx.moe_stream->window_launched(pp_stream_layer, pp_stream_role, p, phase_launches);
                 }
             }
             if (gemm_declined) {
@@ -96823,6 +96832,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         auto err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
                                                CHECK_TRY_ERROR(stream->wait_and_throw());
         ggml_sycl_cpu_job_gates_clear(gate_sleep);
+        // GGML_SYCL_MOE_EXEC_TRACE=2's per-window timing lines (llama.cpp-8ucb): read here, after the wait, so reading
+        // the windows' device times never waits on the compute path. Nothing below trace level 2.
+        if (err == 0 && sycl_ctx->moe_stream) {
+            sycl_ctx->moe_stream->flush_window_timing();
+        }
         if (err != 0) {
             // The throwing drain is the outer async-failure boundary. Exact
             // recovery observes terminal success/quiescence and leaves failed
