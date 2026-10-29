@@ -90629,9 +90629,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // previous role prefetched) was handed to this executor by the staged route (llama.cpp-3460). Its
                     // slot is read in its phase (resolve_deferred_expert), after window_begin, which stages it if no
                     // prefetch did, so nothing asks the stage table here. The ring stages AOS only (W2), so the reader
-                    // is picked for AOS below, and resolve_deferred_expert asserts the entry holds it.
+                    // is picked for MOE_STREAM_RING_SLOT_LAYOUT below, and resolve_deferred_expert asserts the entry
+                    // holds it.
                     expert.deferred = true;
-                    expert.layout   = GGML_LAYOUT_AOS;
+                    expert.layout   = ggml_sycl::MOE_STREAM_RING_SLOT_LAYOUT;
                 } else {
                     // Any other expert that is not on this device: the executor cannot read it, and the op falls back.
                     return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
@@ -91347,7 +91348,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "window-not-staged",
                                           expert.expert_id);
                 }
-                GGML_ASSERT(staged->layout == GGML_LAYOUT_AOS);
+                GGML_ASSERT(staged->layout == ggml_sycl::MOE_STREAM_RING_SLOT_LAYOUT);
                 const ggml_sycl::resolved_ptr view = staged->aos.resolve(ctx.device);
                 if (view.ptr == nullptr || !view.on_device) {
                     drain_submitted_phases();

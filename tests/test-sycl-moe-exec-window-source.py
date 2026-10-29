@@ -256,7 +256,7 @@ def test_window_path_is_per_op_layer_flag_mutants(use):
 
 DEFERRED_FIELD = "bool deferred = false;"
 DEFERRED = ("} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) { "
-            "expert.deferred = true; expert.layout = GGML_LAYOUT_AOS; } else { "
+            "expert.deferred = true; expert.layout = ggml_sycl::MOE_STREAM_RING_SLOT_LAYOUT; } else { "
             "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "
             "ggml_sycl_expert_resolve_reason_name(route.reason), i02); }")
 
@@ -558,7 +558,7 @@ RESOLVE_STEPS = (
     "const bool executor_entry = staged != nullptr && staged->consumer == ggml_sycl::moe_stream_consumer::EXECUTOR;",
     "if (!executor_entry) { " + DRAINED_DECLINE + "moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "
     "\"window-not-staged\", expert.expert_id); }",
-    "GGML_ASSERT(staged->layout == GGML_LAYOUT_AOS);",
+    "GGML_ASSERT(staged->layout == ggml_sycl::MOE_STREAM_RING_SLOT_LAYOUT);",
     "const ggml_sycl::resolved_ptr view = staged->aos.resolve(ctx.device);",
     "if (view.ptr == nullptr || !view.on_device) { " + DRAINED_DECLINE + "moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "
     "\"staged-slot-view\", expert.expert_id); }",

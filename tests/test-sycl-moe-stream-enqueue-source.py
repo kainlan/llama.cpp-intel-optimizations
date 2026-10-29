@@ -280,7 +280,7 @@ HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan ="
 COPY_DECL = "copied = mem_copy_async("
 REORDER_CALL = "ggml_sycl_reorder_weight_gpu("
 RETAIN = "retain_handles_until_event({ aos, host }, copied);"
-TABLE_WRITE = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
+TABLE_WRITE = "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
 ABORT = 'GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());'
 RETHROW = "catch (const ggml_sycl_fallback_error &) { throw; }"
 TRACE_FMT = "[MOE-EXEC-TRACE] stage window layer %d role %s phase %zu: %d items %zu bytes"
@@ -430,15 +430,17 @@ def test_window_entry_mutants():
     # Retained until the region's gate, which precedes the copy.
     assert not c(mutate(PHASE, RETAIN, "retain_handles_until_event({ aos, host }, ring_->current_region_gate());"))
     # Tagged SOA: a reader would read the slot as a layout it does not hold.
-    assert not c(mutate(PHASE, TABLE_WRITE, TABLE_WRITE.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")))
+    assert not c(mutate(PHASE, TABLE_WRITE, TABLE_WRITE.replace("MOE_STREAM_RING_SLOT_LAYOUT", "GGML_LAYOUT_SOA")))
     # A SOA slot named that no reorder wrote.
-    assert not c(mutate(PHASE, TABLE_WRITE, "table_[key] = { aos, aos, copied, GGML_LAYOUT_AOS, item.consumer };"))
+    assert not c(mutate(PHASE, TABLE_WRITE,
+                        "table_[key] = { aos, aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"))
     # The entry's event the region's gate instead of the copy.
     assert not c(mutate(PHASE, TABLE_WRITE,
-                        "table_[key] = { mem_handle(), aos, ring_->current_region_gate(), GGML_LAYOUT_AOS, "
+                        "table_[key] = { mem_handle(), aos, ring_->current_region_gate(), MOE_STREAM_RING_SLOT_LAYOUT, "
                         "item.consumer };"))
     # The consumer dropped: the entry would read as the staged route's.
-    assert not c(mutate(PHASE, TABLE_WRITE, "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS };"))
+    assert not c(mutate(PHASE, TABLE_WRITE,
+                        "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT };"))
 
 
 def claim_submission_failure_aborts(phase: str) -> bool:
@@ -528,8 +530,8 @@ ALLOCATOR_NAMES = ("malloc", "unified_alloc", "unified_allocate", "zone_allocate
 
 
 def claim_phase_allocates_only_ring_slots(phase: str) -> bool:
-    """No allocator: the one slot each window matrix takes is ring_->acquire_slot(GGML_LAYOUT_AOS), from the ring's
-    reservation."""
+    """No allocator: the one slot each window matrix takes is ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT), from
+    the ring's reservation."""
     n = norm(phase)
     return bool(n) and not any(a in n for a in ALLOCATOR_NAMES) and n.count("ring_->acquire_slot(") == 1
 
@@ -542,7 +544,7 @@ def test_allocator_mutants():
     assert not claim_phase_allocates_only_ring_slots(
         mutate(PHASE, RETAIN, RETAIN + " (void) sycl::malloc_device(16, *ccs_);"))
     assert not claim_phase_allocates_only_ring_slots(
-        mutate(PHASE, "ring_->acquire_slot(GGML_LAYOUT_AOS)", "mem_handle()"))
+        mutate(PHASE, "ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT)", "mem_handle()"))
 
 
 # ---- what is streamed ------------------------------------------------------------------------------------------------
@@ -596,7 +598,7 @@ def test_streamed_item_mutants():
 # ---- one AOS slot per window matrix (W2) -----------------------------------------------------------------------------
 
 SLOTS_CHECK = "if (ring_->slots_free() == 0) { ++n.exhausted; continue; }"
-AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
+AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT);"
 STAGING_ENUM = "enum class moe_stream_staging : uint8_t { NONE, AOS_ONLY, };"
 STAGING_SLOTS_SIG = "static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging)"
 STAGING_SLOTS_BODY = "{ return staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }"
@@ -1578,7 +1580,7 @@ SLOT_LOOP_ORDER = (
     FALLBACK_IF + " {",
     FALLBACK_CALL,
     "if (!allocation) { break; }",
-    "mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);",
+    "mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), MOE_STREAM_RING_SLOT_LAYOUT);",
     "const auto resolved = slot.resolve(device);",
     "if (!resolved.ptr || !resolved.on_device) {",
     "slots_.push_back(std::move(slot));",
@@ -2327,6 +2329,54 @@ def test_end_prompt_reports_ring_engagement_mutants():
     assert not c(phase=mutate(PHASE, TAKE_ENDED_BODY, "{ return prompt_ended_; }"))
     # The accessor reads the live flag, which end_prompt has just cleared.
     assert not c(phase=mutate(PHASE, ENGAGED_BODY, "{ return ring_engaged_; }"))
+
+
+# ---- the ring slot's layout is one named constant ------------------------------------------------------------------
+
+SLOT_LAYOUT_NAME = "MOE_STREAM_RING_SLOT_LAYOUT"
+SLOT_LAYOUT_DEF = "static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;"
+RING_RESERVE_SIG = "bool moe_stream_ring::reserve("
+SLOT_WRAP = ("mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), "
+             "MOE_STREAM_RING_SLOT_LAYOUT);")
+
+
+def claim_ring_slot_layout_is_one_constant(ring_hpp: str, ring_cpp: str, phase: str) -> bool:
+    """The layout every ring slot holds is read from one constant, MOE_STREAM_RING_SLOT_LAYOUT, defined once in
+    moe-stream-ring.hpp as GGML_LAYOUT_AOS (W2 of docs/plans/2026-10-24-prefill-window-ring.md: the ring stages AOS
+    only). The three sites of this pin's files name it and spell no GGML_LAYOUT_AOS of their own: the ring's slot wrap
+    in reserve(), and stage_window's slot acquire and stage-table entry."""
+    h, c, p = norm(ring_hpp), norm(ring_cpp), norm(phase)
+    own = (RING_HPP_REL, RING_CPP_REL, PHASE_REL)
+    elsewhere = sum(norm(text).count(" " + SLOT_LAYOUT_NAME + " =") for rel, text in SYCL_TREE.items()
+                    if rel not in own) + c.count(" " + SLOT_LAYOUT_NAME + " =") + p.count(" " + SLOT_LAYOUT_NAME + " =")
+    reserve = body(c, RING_RESERVE_SIG)
+    stage = body(p, STAGE_SIG)
+    return (h.count(SLOT_LAYOUT_DEF) == 1 and h.count(" " + SLOT_LAYOUT_NAME + " =") + elsewhere == 1
+            and SLOT_WRAP in reserve and "GGML_LAYOUT_AOS" not in reserve
+            and AOS_ACQUIRE in stage and TABLE_WRITE in stage and "GGML_LAYOUT_AOS" not in stage)
+
+
+def test_ring_slot_layout_is_one_constant():
+    assert claim_ring_slot_layout_is_one_constant(RING_HPP, RING_CPP, PHASE)
+
+
+def test_ring_slot_layout_constant_mutants():
+    def c(ring_hpp=RING_HPP, ring_cpp=RING_CPP, phase=PHASE):
+        return claim_ring_slot_layout_is_one_constant(ring_hpp, ring_cpp, phase)
+
+    # Each site restored to the literal.
+    assert not c(ring_cpp=mutate(RING_CPP, SLOT_WRAP, SLOT_WRAP.replace(SLOT_LAYOUT_NAME, "GGML_LAYOUT_AOS")))
+    assert not c(phase=mutate(PHASE, AOS_ACQUIRE, AOS_ACQUIRE.replace(SLOT_LAYOUT_NAME, "GGML_LAYOUT_AOS")))
+    assert not c(phase=mutate(PHASE, TABLE_WRITE, TABLE_WRITE.replace(SLOT_LAYOUT_NAME, "GGML_LAYOUT_AOS")))
+    # A literal beside the constant, in either body.
+    assert not c(ring_cpp=mutate(RING_CPP, SLOT_WRAP, SLOT_WRAP + " (void) GGML_LAYOUT_AOS;"))
+    assert not c(phase=mutate(PHASE, RETAIN, RETAIN + " (void) GGML_LAYOUT_AOS;"))
+    # The constant naming another layout: every site would stage a layout the ring does not hold.
+    soa_def = SLOT_LAYOUT_DEF.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")
+    assert not c(ring_hpp=mutate(RING_HPP, SLOT_LAYOUT_DEF, soa_def))
+    # A second definition, in the header or in a source that includes it.
+    assert not c(ring_hpp=norm(RING_HPP) + " " + SLOT_LAYOUT_DEF)
+    assert not c(phase=norm(PHASE) + " " + SLOT_LAYOUT_DEF)
 
 
 if __name__ == "__main__":
