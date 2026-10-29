@@ -195,9 +195,12 @@ loan originates in the prompt phase (llama.cpp-3460). The ring reserves its
 slots one by one, so room a loan frees in holes a slot wide still funds it.
 When the WEIGHT zone cannot give every slot, `moe_stream_ring::reserve` keeps
 the slots it got and reports the shortfall: the bytes of the slots it still has
-to allocate (llama.cpp-am87). `ring_ready()` asks for a loan of that many bytes
-through the op's `request_loan` hook, which the backend wires to
-`ggml_sycl_request_expert_loan`. It asks once per micro-batch, since the reserve
+to allocate (llama.cpp-am87). `ring_ready()` asks for a loan through the op's
+`request_loan` hook, which the backend wires to
+`ggml_sycl_request_expert_loan`. The request carries the shortfall in bytes and
+the ring's slot size, and the selector counts the whole slots each lent matrix
+frees, so a triplet whose matrices are each below a slot is not lent
+(llama.cpp-9x8t). It asks once per micro-batch, since the reserve
 latch stops later layers before the reserve. The loan runs at the next graph
 boundary, and the next micro-batch's reserve continues from the slots the
 refused one kept. The phase keeps that partial ring only while a loan can still
