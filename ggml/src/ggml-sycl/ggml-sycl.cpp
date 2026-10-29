@@ -21887,6 +21887,23 @@ static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device(int          
     return remaining;
 }
 
+// RED seams for the loan a context leaves lent when it ends (llama.cpp-i4ny); the next commit gives them bodies. The
+// backend free owes the loan to the next context, and that context's first graph entry returns it.
+static uint32_t ggml_sycl_expert_bulk_refill_owe_next_context(int device) {
+    (void) device;
+    return 0;
+}
+
+static uint32_t ggml_sycl_run_expert_bulk_refill_between_contexts(int                                    device,
+                                                                  const ggml_sycl_expert_loan_resolver * resolver,
+                                                                  ggml_sycl_expert_loan_result *         out) {
+    (void) resolver;
+    (void) out;
+    return device >= 0 && device < GGML_SYCL_MAX_DEVICES ?
+               g_sycl_expert_lent_count[device].load(std::memory_order_acquire) :
+               0;
+}
+
 // ggml_backend_sycl_synchronize() calls this once the graph's work is done, its compute flag is cleared and the
 // deferred-free pass has run: that pass reclaims a loan's withdrawn device entries and returns the zone room the ring
 // released, which the refill re-admits into.
@@ -24336,6 +24353,107 @@ std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once() {
         return test_loan_fail("the teardown counts read %u/%u, not 3/3",
                               g_sycl_expert_readmitted_total[fx.device].load(),
                               g_sycl_expert_lent_total[fx.device].load());
+    }
+    return {};
+}
+
+std::string test_expert_refill_returns_a_loan_an_ended_context_owes() {
+    // llama.cpp-i4ny: a context that ends with its loan still lent (a prompt and no decode graph after it) owes that
+    // loan to the next context. Its free records the debt and copies nothing, so a process that exits after its last
+    // context pays nothing, and its refill report says how many triplets it owes. The next context's first graph
+    // entry, before any MUL_MAT_ID, returns the whole loan in one transaction, with one WARN that says so.
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x69346e7903ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    if (std::string why = fx.lend(9 * charge, 3, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (lent.size() != 3 || g_sycl_expert_lent_count[fx.device].load() != 3) {
+        return test_loan_fail("the loan left %zu triplets on the host and %u in the ledger, not 3, 3", lent.size(),
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    test_loan_warn_capture                 warns;
+    // Nothing owed yet: a graph entry returns nothing.
+    uint32_t left = ::ggml_sycl_run_expert_bulk_refill_between_contexts(fx.device, &resolver, &result);
+    if (left != 3 || g_sycl_expert_lent_count[fx.device].load() != 3 ||
+        warns.count_prefix("[MOE-EXEC] bulk refill") != 0) {
+        return test_loan_fail("a graph entry with nothing owed left %u lent (%u in the ledger, %zu bulk lines), not 3",
+                              left, g_sycl_expert_lent_count[fx.device].load(),
+                              warns.count_prefix("[MOE-EXEC] bulk refill"));
+    }
+
+    // The lending context's free: it owes all three, and its report says so after the counts.
+    if (const uint32_t owed = ::ggml_sycl_expert_bulk_refill_owe_next_context(fx.device); owed != 3) {
+        return test_loan_fail("the ending context owes %u triplets to the next one, not 3", owed);
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 3) {
+        return "the ending context's free moved a triplet: it owes the loan and copies nothing";
+    }
+    ::ggml_sycl_expert_refill_log_report();
+    char owed_line[160];
+    snprintf(owed_line, sizeof(owed_line),
+             "[MOE-EXEC] refill device %d: 0/3 triplets re-admitted (3 owed to the next context)\n", fx.device);
+    if (warns.count(owed_line) != 1) {
+        return test_loan_fail("the ending context's report printed %zu lines of: %s", warns.count(owed_line),
+                              owed_line);
+    }
+
+    // The next context's first graph entry returns the loan, in one transaction.
+    const uint64_t staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
+    left                         = ::ggml_sycl_run_expert_bulk_refill_between_contexts(fx.device, &resolver, &result);
+    if (left != 0 || g_sycl_expert_lent_count[fx.device].load() != 0) {
+        return test_loan_fail(
+            "the next context's first graph entry left %u lent (%u in the ledger, %u re-admitted, %s), not 0", left,
+            g_sycl_expert_lent_count[fx.device].load(), result.n_triplets, result.reason);
+    }
+    if (const uint64_t staged = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; staged != 0) {
+        return test_loan_fail("the refill between contexts took %llu staged host-to-device copies, not the direct DMA",
+                              (unsigned long long) staged);
+    }
+    if (!result.accepted || result.n_triplets != 3 || result.bytes_readmitted != 9 * fx.staged_bytes) {
+        return test_loan_fail("the refill between contexts re-admitted %u triplets and %zu bytes (%s), not 3, %zu",
+                              result.n_triplets, result.bytes_readmitted, result.reason, 9 * fx.staged_bytes);
+    }
+    char bulk_line[200];
+    snprintf(bulk_line, sizeof(bulk_line),
+             "[MOE-EXEC] bulk refill device %d: 3 of 3 lent triplets re-admitted in one transaction between contexts "
+             "(the context that lent them ended)\n",
+             fx.device);
+    if (warns.count(bulk_line) != 1 || warns.count_prefix("[MOE-EXEC] bulk refill") != 1) {
+        return test_loan_fail("%zu exact bulk refill lines and %zu in all, not 1 and 1 (want: %s)",
+                              warns.count(bulk_line), warns.count_prefix("[MOE-EXEC] bulk refill"), bulk_line);
+    }
+    for (const auto & t : lent) {
+        if (std::string why = fx.readmitted(t.first, t.second); !why.empty()) {
+            return "a triplet of the refill between contexts: " + why;
+        }
+    }
+
+    // Owed once: the next graph entry has nothing to return, and the next report owes nothing.
+    left = ::ggml_sycl_run_expert_bulk_refill_between_contexts(fx.device, &resolver, &result);
+    if (left != 0 || warns.count_prefix("[MOE-EXEC] bulk refill") != 1) {
+        return test_loan_fail("a second graph entry left %u lent and %zu bulk lines, not 0, 1", left,
+                              warns.count_prefix("[MOE-EXEC] bulk refill"));
+    }
+    ::ggml_sycl_expert_refill_log_report();
+    char paid_line[120];
+    snprintf(paid_line, sizeof(paid_line), "[MOE-EXEC] refill device %d: 3/0 triplets re-admitted\n", fx.device);
+    if (warns.count(paid_line) != 1 || warns.count_prefix("[MOE-EXEC] refill device") != 2) {
+        return test_loan_fail("the next context's report printed %zu lines of %s and %zu refill lines in all, not 1, 2",
+                              warns.count(paid_line), paid_line, warns.count_prefix("[MOE-EXEC] refill device"));
     }
     return {};
 }

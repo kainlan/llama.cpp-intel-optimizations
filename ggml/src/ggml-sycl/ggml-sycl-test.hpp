@@ -646,6 +646,9 @@ std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain();
 std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once();
 // A prompt whose ring engaged owes no bulk refill: the first decode boundary is the per-graph refill alone.
 std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt();
+// A context that ends with its loan lent owes it to the next context: its free copies nothing and its report says
+// how many it owes, and the next context's first graph entry returns it in one transaction (llama.cpp-i4ny).
+std::string test_expert_refill_returns_a_loan_an_ended_context_owes();
 #endif
 
 }  // namespace ggml_sycl

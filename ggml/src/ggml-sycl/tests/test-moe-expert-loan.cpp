@@ -108,6 +108,13 @@
 //                           llama.cpp-i4ny, the control: the same loan, then a prompt whose ring reserved two slots
 //                           ends engaged. The first decode boundary is the per-graph refill alone: one triplet, two
 //                           left, no bulk line.
+//   refill_returns_a_loan_an_ended_context_owes
+//                           llama.cpp-i4ny: a three-triplet loan, and a graph entry with nothing owed returns nothing.
+//                           The lending context's free owes all three to the next context, moves nothing, and its
+//                           report reads "0/3 triplets re-admitted (3 owed to the next context)". The next context's
+//                           first graph entry returns the three in one transaction, with no staged copy and one
+//                           "bulk refill ... between contexts" WARN; a second entry has nothing to return, and the
+//                           next report reads "3/0" with no debt.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -178,6 +185,8 @@ int main() {
                    ggml_sycl::test_expert_refill_returns_an_unengaged_prompts_loan_at_once);
     ok &= run_case("refill_keeps_the_per_graph_refill_after_an_engaged_prompt",
                    ggml_sycl::test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt);
+    ok &= run_case("refill_returns_a_loan_an_ended_context_owes",
+                   ggml_sycl::test_expert_refill_returns_a_loan_an_ended_context_owes);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
