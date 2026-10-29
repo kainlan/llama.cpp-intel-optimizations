@@ -542,7 +542,8 @@ def claim_loan_boundary_drains_its_room(sycl: str) -> bool:
 INVALID_ARGS = 'return refuse(ggml_sycl_txn_result::REFUSED, "invalid arguments"); }'
 ZONES_REFUSAL = ('if (!refill && !cache->host_zones_configured()) { '
                  'return refuse(ggml_sycl_txn_result::REFUSED, "host zones not configured"); }')
-LOAN_SELECT = "ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected);"
+LOAN_SELECT = ("ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected, "
+               "&slots_funded);")
 UNIFIED_ALLOC_SIG = "bool unified_alloc(const alloc_request & req_in, alloc_handle * out)"
 PINNED_ZONE_BRANCH = ("if (req.intent.constraints.use_pinned_pool) { if (!ucache->host_zones_configured()) { "
                       "ptr = ucache->host_pool_alloc(")
@@ -617,7 +618,8 @@ def claim_registration_is_typed(cache: str) -> bool:
 # --- probe, publish once, epoch -------------------------------------------------------------------------------------
 
 PROBE = ('if (probe_mode) { result.accepted = n_selected != 0; result.bytes_freed = selected; '
-         'result.n_triplets = n_selected; return n_selected != 0 ? finish(ggml_sycl_txn_result::ACCEPTED, "OK") : '
+         'result.slots_funded = slots_funded; result.n_triplets = n_selected; '
+         'return n_selected != 0 ? finish(ggml_sycl_txn_result::ACCEPTED, "OK") : '
          'finish(ggml_sycl_txn_result::REFUSED, "nothing lendable"); }')
 LEASE = "registry.acquire_live_update(current_token)"
 FORGET = "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);"
@@ -2895,7 +2897,8 @@ def test_mutant_plan_reset_keeps_the_slot_size_fails():
 
 
 SELECT_DEF = ("static inline std::vector<expert_placement_key> moe_expert_loan_select(const placement_plan & plan, "
-              "int device, size_t bytes_wanted, size_t slot_bytes, size_t * bytes_selected)")
+              "int device, size_t bytes_wanted, size_t slot_bytes, size_t * bytes_selected, "
+              "size_t * slots_selected = nullptr)")
 SLOTS_WANTED = ("const size_t slots_wanted = slot_bytes != 0 ? bytes_wanted / slot_bytes + "
                 "(bytes_wanted % slot_bytes != 0 ? 1 : 0) : 0;")
 SLOT_WALK = ("for (size_t i = plan.entries.size(); i-- > 0 && "
@@ -2907,17 +2910,19 @@ SLOT_SKIP = "if (triplet_slots == 0) { continue; }"
 SLOT_ADD = "slots += triplet_slots; }"
 BYTES_ADD = "sum += t.e[r]->vram_charge_size;"
 BYTES_OUT = "if (bytes_selected) { *bytes_selected = sum; }"
+SLOTS_OUT = "if (slots_selected) { *slots_selected = slots; }"
 
 
 def claim_the_selector_counts_whole_slots_per_matrix(hpp: str) -> bool:
     """With a slot size, the walk stops on slots, not bytes: it wants the shortfall's slots rounded up, each matrix
     frees vram_charge_size / slot_bytes of them (the floor per hole, never the floor of the triplet's sum), and a
     triplet that frees none is skipped after the lendable checks and before any key is taken. *bytes_selected stays
-    the byte sum, and with slot_bytes 0 the walk counts bytes as before."""
+    the byte sum, *slots_selected is the funded slot count the probe multiplies by the slot size (llama.cpp-xug5),
+    and with slot_bytes 0 the walk counts bytes as before and the count stays 0."""
     sel = body(norm(hpp), SELECT_DEF)
     return (sel.count(SLOT_PER_MATRIX) == 1 and sel.count(SLOT_SKIP) == 1 and sel.count(BYTES_ADD) == 1
             and ordered(sel, SLOTS_WANTED, SLOT_WALK, SELECT_LENDABLE, SLOT_BRANCH, SLOT_PER_MATRIX, SLOT_SKIP,
-                        SLOT_ADD, "out.push_back(", BYTES_ADD, BYTES_OUT))
+                        SLOT_ADD, "out.push_back(", BYTES_ADD, BYTES_OUT, SLOTS_OUT))
 
 
 def test_the_selector_counts_whole_slots_per_matrix():
@@ -2939,6 +2944,21 @@ def test_mutant_selector_floors_the_triplet_sum_fails():
     n = _once(PLAN_HPP, SLOT_PER_MATRIX, "triplet_slots += t.e[r]->vram_charge_size; }")
     n = n.replace(SLOT_SKIP, "triplet_slots /= slot_bytes; " + SLOT_SKIP, 1)
     assert not claim_the_selector_counts_whole_slots_per_matrix(n)
+
+
+def test_mutant_selector_reports_the_byte_sum_as_the_slot_count_fails():
+    """The probe multiplies the count by the slot size, so a byte sum reported there would credit the remainders."""
+    assert not claim_the_selector_counts_whole_slots_per_matrix(
+        _once(PLAN_HPP, SLOTS_OUT, "if (slots_selected) { *slots_selected = sum; }"))
+
+
+def test_mutant_selector_drops_the_slot_count_fails():
+    assert not claim_the_selector_counts_whole_slots_per_matrix(_once(PLAN_HPP, SLOTS_OUT, ""))
+
+
+def test_mutant_transaction_drops_the_slot_count_from_the_probe_fails():
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(
+        _once(SYCL, "result.slots_funded = slots_funded;", "result.n_slots = 0;"))
 
 
 def test_mutant_selector_rounds_the_shortfall_down_fails():

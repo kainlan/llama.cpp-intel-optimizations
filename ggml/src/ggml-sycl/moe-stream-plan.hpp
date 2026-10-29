@@ -1048,6 +1048,9 @@ static inline bool moe_loan_triplet_is_lendable(const moe_loan_triplet &        
 // (pack-group order, popularity rank when ranks exist, so the tail is the least popular), until what they free covers
 // bytes_wanted or nothing lendable is left. A triplet is never split. Keys come out in the order the triplets are met,
 // gate/up/down within each. *bytes_selected (when non-null) receives the summed vram_charge_size.
+// *slots_selected (when non-null) receives the ring slots the selected triplets fund, the figure the walk counted:
+// 0 when slot_bytes is 0. It is not bytes_selected / slot_bytes: each matrix's remainder below a slot is in the byte
+// sum and funds nothing, so a caller that answers in slots (the auto-ubatch fit's probe) reads this count.
 // With slot_bytes 0, what they free is the summed vram_charge_size. With a ring slot of slot_bytes, it is ring slots
 // (llama.cpp-9x8t): the walk wants bytes_wanted / slot_bytes slots, rounded up, and each matrix frees
 // vram_charge_size / slot_bytes of them. A lent matrix leaves one hole in the WEIGHT zone, and the floors of three
@@ -1061,7 +1064,8 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
                                                                        int                    device,
                                                                        size_t                 bytes_wanted,
                                                                        size_t                 slot_bytes,
-                                                                       size_t *               bytes_selected) {
+                                                                       size_t *               bytes_selected,
+                                                                       size_t * slots_selected = nullptr) {
     std::vector<expert_placement_key>  out;
     size_t                             sum = 0;
     size_t                             slots = 0;
@@ -1100,6 +1104,9 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
     }
     if (bytes_selected) {
         *bytes_selected = sum;
+    }
+    if (slots_selected) {
+        *slots_selected = slots;
     }
     return out;
 }

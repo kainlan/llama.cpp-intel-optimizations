@@ -2830,7 +2830,7 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
 _RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {"
 _RING_HELPER_END = "const char * moe_batch_reject_reason_name("
 _RING_REMAINDER_LINE = "return geo.bytes > lent ? geo.bytes - lent : 0;"
-_RING_PROBE_LINE = "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);"
+_RING_PROBE_LINE = "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, geo.slot_bytes);"
 _RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
 
 
@@ -2884,10 +2884,55 @@ def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
         mutated = GGML_SYCL_CPP.replace("return geo.bytes > lent ? geo.bytes - lent : 0;", "return lent;")
     else:
         mutated = GGML_SYCL_CPP.replace(
-            "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);", "const size_t lent = 0;"
+            _RING_PROBE_LINE, "const size_t lent = 0;"
         )
     assert mutated != GGML_SYCL_CPP
     assert not _ring_helper_remainder_pinned(mutated), "the mutant must make the pin fail"
+
+
+# llama.cpp-xug5: the fit's ring term counts ring SLOTS, as the loan it stands in for does (llama.cpp-9x8t). The helper
+# hands the probe the ring's slot size; the probe forwards it to the selector's walk and answers in the currency of
+# geo.bytes, whole slots times the slot size, because the byte sum of the selected triplets includes each matrix's
+# remainder below a slot, which funds no slot. With no slot size (the byte-semantics fixtures) it answers the bytes.
+_PROBE_START = "static size_t ggml_sycl_expert_loan_probe_bytes("
+_PROBE_END = "static std::atomic<size_t> g_sycl_expert_loan_requests["
+_PROBE_SIG = "static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted, size_t slot_bytes) {"
+_PROBE_FORWARD = ("ggml_sycl_expert_loan_transaction_run( device, bytes_wanted, slot_bytes, true, nullptr, &probe, "
+                  "false);")
+_PROBE_ANSWER = "return slot_bytes != 0 ? probe.slots_funded * slot_bytes : probe.bytes_freed;"
+
+
+def _ring_probe_counts_slots(raw_cpp: str) -> bool:
+    """The helper passes geo.slot_bytes (the _RING_PROBE_LINE pin), and the probe forwards its slot_bytes into the
+    transaction and answers slots * slot_bytes when it has a slot size, bytes_freed when it has none, each once, with
+    the refused probe's 0 ahead of both."""
+    body = _body_of(raw_cpp, _PROBE_START, _PROBE_END)
+    helper = _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END)
+    return (body.startswith(_PROBE_SIG) and body.count(_PROBE_FORWARD) == 1 and body.count(_PROBE_ANSWER) == 1
+            and body.count("bytes_freed") == 1 and helper.count(_RING_PROBE_LINE) == 1
+            and body.find("ACCEPTED") != -1 and body.find("ACCEPTED") < body.find(_PROBE_ANSWER))
+
+
+def test_the_ring_probe_counts_slots_and_answers_in_whole_slots():
+    assert _ring_probe_counts_slots(GGML_SYCL_CPP)
+
+
+_PROBE_MUTANTS = {
+    "call-passes-zero": (_RING_PROBE_LINE, _RING_PROBE_LINE.replace("geo.bytes, geo.slot_bytes)", "geo.bytes, 0)")),
+    "probe-forwards-zero": ("device, bytes_wanted, slot_bytes, /*probe_mode=*/true, nullptr, &probe",
+                            "device, bytes_wanted, 0, /*probe_mode=*/true, nullptr, &probe"),
+    "answers-the-byte-sum": ("return slot_bytes != 0 ? probe.slots_funded * slot_bytes : probe.bytes_freed;",
+                             "return probe.bytes_freed;"),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(_PROBE_MUTANTS))
+def test_the_ring_probe_slot_count_has_a_mutation_witness(mutation):
+    real, broken = _PROBE_MUTANTS[mutation]
+    assert GGML_SYCL_CPP.count(real) == 1, "the mutation target must exist exactly once"
+    mutated = GGML_SYCL_CPP.replace(real, broken)
+    assert mutated != GGML_SYCL_CPP
+    assert not _ring_probe_counts_slots(mutated), "the mutant must make the pin fail"
 
 
 # llama.cpp-kjef: the fit's ring and the stream phase's ring are ONE geometry function. Task 8 (llama.cpp-o9uw)
