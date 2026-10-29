@@ -2915,14 +2915,6 @@ def test_mutant_selector_rounds_the_shortfall_down_fails():
         _once(PLAN_HPP, SLOTS_WANTED, "const size_t slots_wanted = slot_bytes != 0 ? bytes_wanted / slot_bytes : 0;"))
 
 
-if __name__ == "__main__":
-    import sys
-
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-q"]))
-
-
 # --- an unengaged prompt's loan comes back at once: mutants (llama.cpp-i4ny) -----------------------------------------
 
 def test_mutant_owe_marks_the_ledger_unlocked_fails():
@@ -3112,3 +3104,11 @@ def test_mutant_between_contexts_line_reads_as_the_exit_report_fails():
     mutant = _once_in(SYCL, BETWEEN_SIG, "(the context that lent them ended)",
                       "(the context that lent them ended) [MOE-EXEC] refill device 0: 0/0 triplets re-admitted")
     assert not claim_debt_lines_score_as_the_gate_reads_them(mutant, GATE)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
