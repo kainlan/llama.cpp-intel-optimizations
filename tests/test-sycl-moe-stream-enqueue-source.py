@@ -2130,9 +2130,15 @@ def test_partial_reservation_mutants():
 
 MEMBER = "std::unique_ptr<ggml_sycl::moe_stream_phase, ggml_sycl::moe_stream_phase_deleter> moe_stream;"
 DTOR_SIG = "ggml_backend_sycl_context::~ggml_backend_sycl_context()"
+# At the first decode graph, a prompt whose ring did not engage owes its loan back at that graph's boundary, in one
+# refill (llama.cpp-i4ny): the phase reports the prompt ended once, and the graph's number is the count plus one.
+OWE_BULK_REFILL = ("if (sycl_ctx->moe_stream->take_prompt_ended() && "
+                   "!sycl_ctx->moe_stream->last_prompt_ring_engaged()) { "
+                   "ggml_sycl_expert_bulk_refill_owe(sycl_ctx->device, "
+                   "sycl_ctx->decode_graph_count.load(std::memory_order_relaxed) + 1); }")
 END_PROMPT = ("sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed); "
               "if (cached_is_decode && sycl_ctx->moe_stream) { sycl_ctx->moe_stream->end_prompt(); "
-              "ggml_sycl_moe_stream_release_payload(*sycl_ctx); }")
+              "ggml_sycl_moe_stream_release_payload(*sycl_ctx); " + OWE_BULK_REFILL + " }")
 DISPATCH = ("ggml_sycl_mul_mat_id(ctx, dst); ggml_sycl_moe_down_shadow_compare(ctx, dst); "
             "ggml_sycl_moe_stream_layer_done(ctx, dst); break;")
 LAYER_DONE_SIG = "static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst)"
@@ -2161,6 +2167,14 @@ def test_context_mutants():
         COMMON, mutate(SYCL, "if (cached_is_decode && sycl_ctx->moe_stream) {", "if (sycl_ctx->moe_stream) {"))
     assert not claim_context_owns_and_ends_the_phase(
         COMMON, mutate(SYCL, " ggml_sycl_moe_stream_layer_done(ctx, dst); break;", " break;"))
+    # The bulk refill owed after an engaged prompt too, owed with no prompt ended, or owed at the previous graph.
+    assert not claim_context_owns_and_ends_the_phase(
+        COMMON, mutate(SYCL, "&& !sycl_ctx->moe_stream->last_prompt_ring_engaged()", ""))
+    assert not claim_context_owns_and_ends_the_phase(
+        COMMON, mutate(SYCL, "sycl_ctx->moe_stream->take_prompt_ended() &&", ""))
+    assert not claim_context_owns_and_ends_the_phase(
+        COMMON, mutate(SYCL, "decode_graph_count.load(std::memory_order_relaxed) + 1);",
+                       "decode_graph_count.load(std::memory_order_relaxed));"))
     assert not claim_context_owns_and_ends_the_phase(
         COMMON, mutate(SYCL, "it->second.down_weight != dst->src[0]", "false"))
     # The phase reset before the queues drain: its teardown barrier would not follow the last ring use.

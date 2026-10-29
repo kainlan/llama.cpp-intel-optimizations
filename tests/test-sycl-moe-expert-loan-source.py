@@ -980,6 +980,8 @@ def claim_a_loan_cancels_the_refills(sycl: str) -> bool:
 
 
 LEDGER_LOCK = "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);"
+OWE_SIG = "static void ggml_sycl_expert_bulk_refill_owe(int device, uint64_t first_graph)"
+TAKE_SIG = "static uint64_t ggml_sycl_expert_bulk_refill_take(int device)"
 LEDGER_IN_TXN = "ggml_sycl_expert_lent_ledger & ledger = ggml_sycl_expert_lent_ledger_locked(device, *current);"
 
 
@@ -988,13 +990,14 @@ def claim_ledger_is_guarded_by_the_inventory_mutex(sycl: str) -> bool:
     the body reaches the ledger only after its own lock, and the one direct reader besides those is the private
     fixture's teardown, under the same lock. The reconcile helper subscripts it too; its only callers are the
     accessor and the publication, whose caller holds the lock, so the helper's name appears exactly four times: the
-    forward declaration, the definition and those two calls. The five subscripts are the declaration, the helper, the
-    accessor's return, the arming and the teardown."""
+    forward declaration, the definition and those two calls. The bulk refill's owe and take (llama.cpp-i4ny) take the
+    lock before they reach it. The seven subscripts are the declaration, the helper, the accessor's return, the arming,
+    the owe, the take and the teardown."""
     s = norm(sycl)
     select = body(s, SELECT_SIG)
     arm = body(s, ARM_SIG)
     txn = body(s, TXN_SIG)
-    return (s.count("g_sycl_expert_lent[") == 5
+    return (s.count("g_sycl_expert_lent[") == 7
             and s.count("static ggml_sycl_expert_lent_ledger g_sycl_expert_lent[GGML_SYCL_MAX_DEVICES];") == 1
             and body(s, LEDGER_SIG).count("g_sycl_expert_lent[device]") == 1
             and s.count(RECONCILE_DEF) == 1
@@ -1002,6 +1005,8 @@ def claim_ledger_is_guarded_by_the_inventory_mutex(sycl: str) -> bool:
             and s.count("ggml_sycl_expert_lent_ledger_reconcile_locked(") == 4
             and ordered(select, LEDGER_LOCK, "ggml_sycl_expert_lent_ledger_locked(device, current)")
             and ordered(arm, LEDGER_LOCK, "g_sycl_expert_lent[device]")
+            and ordered(body(s, OWE_SIG), LEDGER_LOCK, "g_sycl_expert_lent[device]")
+            and ordered(body(s, TAKE_SIG), LEDGER_LOCK, "g_sycl_expert_lent[device]")
             and txn.count(LEDGER_IN_TXN) == 1 and ordered(txn, INVENTORY_LOCK, LEDGER_IN_TXN)
             and "::ggml_sycl_publish_plan_locked(found); g_sycl_expert_lent[device] = ggml_sycl_expert_lent_ledger{};"
             in s)
@@ -1213,6 +1218,88 @@ def claim_one_decode_graph_admits_one_refill(sycl: str, common: str, sources: li
             and body(s, BOUNDARY_SIG).count(BOUNDARY_PHASE) == 1)
 
 
+# --- an unengaged prompt's loan comes back at once (llama.cpp-i4ny) -------------------------------------------------
+
+GATE = read("scripts/sycl-moe-exec-gate.sh")
+REFILLS_SIG = "static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device("
+OWED_FIELD = "uint64_t bulk_refill_owed_at = 0; };"
+RECONCILE_CLEAR = "ledger.refill_armed = false; ledger.bulk_refill_owed_at = 0;"
+OWE_SKIP = ("if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || "
+            "g_sycl_expert_lent_count[device].load(std::memory_order_acquire) == 0) { return; }")
+OWE_SET = "ledger.bulk_refill_owed_at = ledger.triplets.empty() ? 0 : first_graph;"
+TAKE_CLEAR = "const uint64_t owed_at = ledger.bulk_refill_owed_at; ledger.bulk_refill_owed_at = 0; return owed_at;"
+BULK_TAKE = ("const bool lent_any = device >= 0 && device < GGML_SYCL_MAX_DEVICES && "
+             "g_sycl_expert_lent_count[device].load(std::memory_order_acquire) != 0; "
+             "const uint64_t owed_at = lent_any ? ggml_sycl_expert_bulk_refill_take(device) : 0;")
+BULK_ELSE = ("if (!decode || owed_at == 0 || decode_graphs < owed_at) { "
+             "return ggml_sycl_run_expert_refill_at_boundary_on_device(device, decode, decode_graphs, refilled_at, "
+             "max_triplets, resolver, out); }")
+BULK_LENT = "const uint32_t lent = g_sycl_expert_lent_count[device].load(std::memory_order_acquire);"
+BULK_RUN = ("const uint32_t remaining = ggml_sycl_run_expert_refill_at_boundary_on_device(device, decode, "
+            "decode_graphs, refilled_at, lent, resolver, result);")
+BULK_GUARD = "if (result->accepted) {"
+BULK_WARN = ('GGML_LOG_WARN("[MOE-EXEC] bulk refill device %d: %u of %u lent triplets re-admitted in one transaction '
+             'at decode graph %llu after the prompt (its ring did not engage)\\n", device, result->n_triplets, lent, '
+             "(unsigned long long) (decode_graphs - owed_at + 1));")
+BOUNDARY_CALLS_REFILLS = "(void) ggml_sycl_run_expert_refills_at_boundary_on_device(" + BOUNDARY_PHASE
+
+
+def claim_an_unengaged_prompts_loan_comes_back_at_once(sycl: str) -> bool:
+    """Graph compute owes the device a bulk refill at the first decode graph after a prompt whose ring did not engage
+    (test-sycl-moe-stream-enqueue-source.py pins that wiring). The owe asks without the lock whether anything is lent,
+    then marks the ledger under the lock, and only a ledger with triplets; a publication under another identity clears
+    the mark with the ledger. The synchronize boundary reaches the bulk refill through one runner, which asks without
+    the lock and then takes the mark under it at every boundary with lent triplets: a prompt graph's boundary drops
+    it, and so does a mark for a later decode graph than this one. A decode graph's boundary runs the per-graph
+    refill with max_triplets the ledger's count, one transaction, and WARNs one line, only when it was accepted, that
+    names the decode graph since the prompt. Its WARN is the runner's only one."""
+    s = norm(sycl)
+    owe = body(s, OWE_SIG)
+    take = body(s, TAKE_SIG)
+    refills = body(s, REFILLS_SIG)
+    reconcile = body(s[s.find(RECONCILE_DEF):], RECONCILE_SIG) if RECONCILE_DEF in s else ""
+    return (s.count(OWED_FIELD) == 1 and s.count(RECONCILE_CLEAR) == 1 and reconcile.count(RECONCILE_CLEAR) == 1
+            and owe.count(OWE_SET) == 1 and ordered(owe, OWE_SKIP, LEDGER_LOCK, OWE_SET)
+            and take.count(TAKE_CLEAR) == 1 and ordered(take, LEDGER_LOCK, TAKE_CLEAR)
+            and s.count("ggml_sycl_expert_bulk_refill_take(") == 2
+            and ordered(refills, BULK_TAKE, BULK_ELSE, BULK_LENT, BULK_RUN, BULK_GUARD, BULK_WARN)
+            and refills.count("GGML_LOG_WARN(") == 1
+            and body(s, BOUNDARY_SIG).count(BOUNDARY_CALLS_REFILLS) == 1)
+
+
+def gate_regex(gate: str, name: str) -> str:
+    """The value the gate script assigns to `name`, with a `$RE_...` reference to an earlier one expanded. Empty
+    when the gate has no such assignment."""
+    m = re.search(r"^%s=(['\"])(.*)\1$" % re.escape(name), gate, re.M)
+    if not m:
+        return ""
+    return re.sub(r"\$(RE_[A-Z_]+)", lambda r: gate_regex(gate, r.group(1)), m.group(2))
+
+
+def bulk_refill_line(sycl: str) -> str:
+    """The runner's bulk refill WARN as it prints for nine of nine triplets on device 0 at decode graph 1: its
+    format string with the printf conversions filled in. Empty when the runner has no such WARN."""
+    m = re.search(r'GGML_LOG_WARN\("(\[MOE-EXEC\] bulk refill[^"]*)\\n"', body(norm(sycl), REFILLS_SIG))
+    if not m:
+        return ""
+    fmt = re.sub(r"%(?:llu|u)", "%d", m.group(1))
+    try:
+        return fmt % (0, 9, 9, 1)
+    except (TypeError, ValueError):
+        return ""
+
+
+def claim_bulk_refill_line_scores_as_the_gate_reads_it(sycl: str, gate: str) -> bool:
+    """The gate's FAIL(refill_late) needs the bulk refill line at decode graph 1 (RE_BULK_REFILL_FIRST), and its
+    refill_not_bulk control keeps that line out of RE_REFILL, which reads the exit report. The line the runner prints
+    at decode graph 1 matches the first and not the second, under the gate's own regexes."""
+    line = bulk_refill_line(sycl)
+    first = gate_regex(gate, "RE_BULK_REFILL_FIRST")
+    exit_report = gate_regex(gate, "RE_REFILL")
+    return (bool(line) and bool(first) and bool(exit_report)
+            and re.search(first, line) is not None and re.search(exit_report, line) is None)
+
+
 # --- positive tests -------------------------------------------------------------------------------------------------
 
 # --- copies are sized from the cache entry they will hold (llama.cpp-pu8v) ------------------------------------------
@@ -1412,6 +1499,14 @@ def test_refill_env_read_once():
 
 def test_refill_warn_formats():
     assert claim_refill_warn_formats(SYCL)
+
+
+def test_an_unengaged_prompts_loan_comes_back_at_once():
+    assert claim_an_unengaged_prompts_loan_comes_back_at_once(SYCL)
+
+
+def test_bulk_refill_line_scores_as_the_gate_reads_it():
+    assert claim_bulk_refill_line_scores_as_the_gate_reads_it(SYCL, GATE)
 
 
 def test_final_refusals_name_the_cache_refusals():
@@ -2732,3 +2827,98 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --- an unengaged prompt's loan comes back at once: mutants (llama.cpp-i4ny) -----------------------------------------
+
+def test_mutant_owe_marks_the_ledger_unlocked_fails():
+    mutant = _once_in(SYCL, OWE_SIG, LEDGER_LOCK, ";")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+    assert not claim_ledger_is_guarded_by_the_inventory_mutex(mutant)
+
+
+def test_mutant_take_reads_the_ledger_unlocked_fails():
+    mutant = _once_in(SYCL, TAKE_SIG, LEDGER_LOCK, ";")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+    assert not claim_ledger_is_guarded_by_the_inventory_mutex(mutant)
+
+
+def test_mutant_owe_marks_an_empty_ledger_fails():
+    mutant = _once(SYCL, OWE_SET, "ledger.bulk_refill_owed_at = first_graph;")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_take_leaves_the_mark_fails():
+    mutant = _once_in(SYCL, TAKE_SIG, "ledger.bulk_refill_owed_at = 0;", "")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_reconcile_keeps_the_mark_fails():
+    mutant = _once(SYCL, RECONCILE_CLEAR, "ledger.refill_armed = false;")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_runner_never_takes_the_mark_fails():
+    mutant = _once(SYCL, "const uint64_t owed_at = lent_any ? ggml_sycl_expert_bulk_refill_take(device) : 0;",
+                   "const uint64_t owed_at = 0;")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_runner_takes_the_mark_with_nothing_lent_asked_fails():
+    mutant = _once(SYCL, "lent_any ? ggml_sycl_expert_bulk_refill_take(device) : 0;",
+                   "ggml_sycl_expert_bulk_refill_take(device);")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_prompt_graph_runs_the_bulk_refill_fails():
+    mutant = _once(SYCL, "if (!decode || owed_at == 0 ||", "if (owed_at == 0 ||")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_bulk_refill_at_the_per_graph_count_fails():
+    mutant = _once(SYCL, "refilled_at, lent, resolver, result);", "refilled_at, max_triplets, resolver, result);")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_bulk_refill_warns_when_refused_fails():
+    mutant = _once(SYCL, BULK_GUARD, "if (true) {")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_bulk_refill_line_drops_the_position_fails():
+    mutant = _once(SYCL, "(unsigned long long) (decode_graphs - owed_at + 1)", "(unsigned long long) decode_graphs")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_boundary_skips_the_bulk_refill_fails():
+    mutant = _once_in(SYCL, BOUNDARY_SIG, "ggml_sycl_run_expert_refills_at_boundary_on_device(",
+                      "ggml_sycl_run_expert_refill_at_boundary_on_device(")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_bulk_refill_line_reads_as_the_exit_report_fails():
+    """A bulk line that also reads in the exit report's shape satisfies RE_REFILL, which would count it as the report:
+    the line keeps its decode graph 1 match, so only the negative control can fail it."""
+    mutant = _once_in(SYCL, REFILLS_SIG, "(its ring did not engage)",
+                      "(its ring did not engage) [MOE-EXEC] refill device 0: 0/0 triplets re-admitted")
+    assert re.search(gate_regex(GATE, "RE_BULK_REFILL_FIRST"), bulk_refill_line(mutant))
+    assert not claim_bulk_refill_line_scores_as_the_gate_reads_it(mutant, GATE)
+
+
+def test_mutant_bulk_refill_line_at_another_position_fails():
+    mutant = _once_in(SYCL, REFILLS_SIG, "at decode graph %llu after the prompt", "at decode graph %llu since the prompt")
+    assert not claim_bulk_refill_line_scores_as_the_gate_reads_it(mutant, GATE)
+
+
+def test_mutant_gate_exit_report_regex_reads_the_bulk_line_fails():
+    exit_report = "RE_REFILL='\\[MOE-EXEC\\] refill device [0-9]+: [0-9]+/[0-9]+ triplets re-admitted'"
+    assert GATE.count(exit_report) == 1
+    mutant = GATE.replace(exit_report, "RE_REFILL='\\[MOE-EXEC\\] (bulk )?refill device [0-9]+: '")
+    assert not claim_bulk_refill_line_scores_as_the_gate_reads_it(SYCL, mutant)
+
+
+def test_mutant_gate_wants_another_position_fails():
+    first = 'RE_BULK_REFILL_FIRST="$RE_BULK_REFILL at decode graph 1 after the prompt"'
+    assert GATE.count(first) == 1
+    mutant = GATE.replace(first, first.replace("graph 1 ", "graph 2 "))
+    assert not claim_bulk_refill_line_scores_as_the_gate_reads_it(SYCL, mutant)
