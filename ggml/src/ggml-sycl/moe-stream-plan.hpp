@@ -467,10 +467,9 @@ static inline std::vector<moe_stream_item> moe_stream_window_items(const moe_str
 // first window in the micro-batch. Every later window has the window before it to hide under, which prefetches the
 // next one (see moe_stream_window_request), and no window prefetches across layers. begin_ubatch resets the last
 // window's layer, so a micro-batch's first window is exposed even when it is the layer the last micro-batch ended at.
-// `prev_layer` is the layer of the window before this one, -1 for none.
-static inline bool moe_stream_window_exposed(int layer, expert_tensor_role role, size_t phase_index, int prev_layer) {
-    GGML_UNUSED(role);  // kept for the signature: window_begin passes the window's (layer, role, phase)
-    GGML_UNUSED(phase_index);
+// `prev_layer` is the layer of the window before this one, -1 for none. The window's role and phase play no part, so
+// the predicate takes neither.
+static inline bool moe_stream_window_exposed(int layer, int prev_layer) {
     return layer != prev_layer;
 }
 

@@ -194,7 +194,7 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     } else if (missing != 0) {
         stage_or_abort(items, req.role, req.phase);  // whole, into the region the last prefetch did not take
     }
-    const bool exposed = moe_stream_window_exposed(req.layer, req.role, req.phase, prev_window_layer_);
+    const bool exposed = moe_stream_window_exposed(req.layer, prev_window_layer_);
     if (misses != nullptr) {
         *misses = exposed ? 0 : missing;
     }

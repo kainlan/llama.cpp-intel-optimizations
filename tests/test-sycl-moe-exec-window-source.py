@@ -26,8 +26,8 @@ each claim with mutants that must turn it red (its positive controls):
     *misses is the window's missing matrices unless the window is exposed, and note_window is fed (exposed, missing,
     the window's staged bytes) after both are known (c-qz9m item 2: `*misses = missing` survived every gate);
   - a window is exposed (its copies counted apart from misses=) only when it is its layer's first in the micro-batch:
-    every later window, UP phase 0 included, has the one before it to hide under, so moe_stream_window_exposed names
-    no role;
+    every later window, UP phase 0 included, has the one before it to hide under, so moe_stream_window_exposed takes
+    no role and no phase, only the layer and the previous window's layer;
   - a deferred expert the window did not stage (the ring could not take the matrix) is declined, never aborted
     (llama.cpp-9433), and every decline in the phase loop first drains the phases already submitted;
   - the [PP-MOE] first-run line counts the windows the dispatch began, and the executor trace line its misses
@@ -451,7 +451,7 @@ def test_phase_brackets_its_window_mutants():
 
 WB_SIG = "uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,"
 WB_MISSING = "missing += find(item.layer, item.expert_id, item.role) == nullptr ? 1u : 0u;"
-WB_EXPOSED = "const bool exposed = moe_stream_window_exposed(req.layer, req.role, req.phase, prev_window_layer_);"
+WB_EXPOSED = "const bool exposed = moe_stream_window_exposed(req.layer, prev_window_layer_);"
 WB_MISSES = "if (misses != nullptr) { *misses = exposed ? 0 : missing; }"
 # (exposed, missing, the window's staged bytes): the three-argument form Task 2c (llama.cpp-4huq) landed.
 WB_NOTE_RE = re.compile(r"if \(log_ != nullptr\) \{ log_->note_window\(exposed, missing, [A-Za-z_]\w*\); \}")
@@ -501,8 +501,7 @@ def test_window_begin_feeds_misses_and_note_mutants():
 
 # ---- a window is exposed only as its layer's first in the micro-batch ------------------------------------------------
 
-EXPOSED_SIG = ("static inline bool moe_stream_window_exposed(int layer, expert_tensor_role role, size_t phase_index, "
-               "int prev_layer) {")
+EXPOSED_SIG = "static inline bool moe_stream_window_exposed(int layer, int prev_layer) {"
 EXPOSED_RETURN = "return layer != prev_layer; }"
 BEGIN_UBATCH_SIG = "void moe_stream_phase::begin_ubatch(uint32_t n_tokens) {"
 UBATCH_RESET = "prev_window_layer_ = -1;"
@@ -540,6 +539,13 @@ def test_exposed_is_a_layers_first_window_mutants():
     # Any other return expression. The exact-text check does not tell these two apart; the phase test does.
     assert not c(mutate(PLAN_HPP, EXPOSED_RETURN, "return true; }"), PLAN_CPP)
     assert not c(mutate(PLAN_HPP, EXPOSED_RETURN, "return false; }"), PLAN_CPP)
+    # A restored parameter: the signature takes the layer and the previous layer and nothing else.
+    assert not c(mutate(PLAN_HPP, EXPOSED_SIG,
+                        "static inline bool moe_stream_window_exposed(int layer, expert_tensor_role role, "
+                        "int prev_layer) {"), PLAN_CPP)
+    assert not c(mutate(PLAN_HPP, EXPOSED_SIG,
+                        "static inline bool moe_stream_window_exposed(int layer, size_t phase_index, "
+                        "int prev_layer) {"), PLAN_CPP)
     # begin_ubatch's reset of the last window's layer dropped.
     assert not c(PLAN_HPP, mutate(PLAN_CPP, UBATCH_RESET, ""))
 
