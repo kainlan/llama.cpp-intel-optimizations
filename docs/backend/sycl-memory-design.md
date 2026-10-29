@@ -114,44 +114,76 @@ recorded choice changes. The regimes below say what each choice does.
 **Two regimes.** In decode, host-resident experts compute on the CPU. In prompt
 processing, the path depends on `GGML_SYCL_MOE_EXEC`. Under `auto`, the default,
 a layer's host-resident experts are staged through the ring when the cost model
-chooses the ring. Under `ring`, they are staged wherever a ring fits. Under
-`cpu`, nothing is staged. `moe_stream_stage_now` is the one predicate. Task 10
+chooses the ring. Under `ring`, they are staged on every layer the batched
+executor claims whole, whatever the cost model prices. Under `cpu`, nothing is
+staged. `moe_stream_stage_now` is the one predicate. Task 10
 (llama.cpp-3460) lifted ruling c-3skf (llama.cpp-xod7), under which `auto` only
-recorded the choice. A weight the batched prompt executor claims once its host
-experts are staged is staged as AOS slots that the executor's dequant reads.
-The ring's index build records that claim as each host entry's consumer, and
-`moe_stream_phase::executor_staged` reads it back. A prompt op whose weight's
-routed host experts are all staged that way leaves the hybrid world and runs on
-the device. Any other staged weight is served by the staged ring route
-(llama.cpp-o9uw) in the hybrid world. The resolver still looks up the executor
-entries of a weight staged whole, and counts each one as a handoff
-(`handed_off` on the trace line), not as a refusal: the executor reads those
-slots. Under `ring`, a claimed weight that the ring stages only partly stays
-hybrid: the resolver refuses its executor entries as CLAIMED, so those experts
-run on the CPU from their host leases. Those copies are the waste, and
-`report_staged_routes` lists the refusals at WARN. Under `auto` this happens
-only on a layer the cost model sends to the ring, and the refusals then show
-only on the trace.
+recorded the choice. The ring serves one consumer, the batched prompt executor
+(llama.cpp-348c), and only a layer that executor claims whole. The ring's index
+build asks the library claim once per (layer, role) and records the answer on
+each host item: it stages as one AOS slot, and its consumer is the executor.
+`moe_stream_executor_claims` holds for a layer when every host matrix of it is
+such an item and a ring can exist. `begin_layer` gives a RING decision only to
+such a layer, and `executor_claims` asks again once the ring is reserved. A
+layer that the executor does not claim, or whose ring cannot exist, stays whole
+in the hybrid world and runs its host experts on the CPU from their host leases.
+The ring never serves some of a layer's host matrices while the rest stay
+hybrid, so no staged copy is wasted on a layer that does not run on the device.
+The `STAGED_RING` resolver route is kept, but the ring stages nothing for it:
+every staged entry's consumer is the executor, so the resolver counts a lookup
+as a handoff (`handed_off` on the trace line) when the executor takes the
+weight, and as a CLAIMED refusal otherwise. Under `ring`, a prompt that refused
+any entry logs one WARN (`report_staged_routes`).
+`GGML_SYCL_MOE_EXEC_DECLINE_LAYER` (llama.cpp-ny6i) forces one layer off the
+executor, with the reason `declined`, so a gate can prove that hybrid fallback
+on a layer the executor would claim.
 
-**The ring.** `moe_stream_ring::reserve` takes the ring's slots from the WEIGHT
-zone. It first calls `unified_cache_zone_allocate_owner`. If the zone refuses,
-it makes a second attempt through `unified_allocate_owner`, as an
-`EXPERT_STAGING` allocation in the `moe_stream_ring` cohort that prefers the
-WEIGHT zone and forbids a spill. Either way the resulting `alloc_owner` is
-wrapped with `mem_handle::from_owned_alloc`, and `moe_stream_ring::acquire_slot`
-hands out each slot as its own `mem_handle`, so no raw pointer is kept.
-`moe_stream_ring_size` gives the geometry: two regions, each holding the
-heaviest layer's slots (`region_slots_max`). It refuses the ring, leaving none,
-when the ring's bytes would exceed `resident_expert_bytes / 10`. The two regions
-are epochs. Layer l+1 streams into one while layer l runs from the other. Reuse
-of a region is ordered after the event that ended its previous use, chained on
-the device through `current_region_gate`, so the host never waits. A staged slot
-has two consumers, and no other path reaches the device from a host-resident
-entry. The first is the `STAGED_RING` resolver route, which serves a hybrid-world
-op. The second is the batched prompt executor, which reads staged slots through
-the phase's `find()` once `moe_stream_executor_staged` (the phase's
-`executor_staged`) answers for the weight. `moe_staged_route_tally` counts each
-entry the route refuses, by cause, and each entry it hands to the executor.
+**The ring.** The ring holds one executor window per region, not a layer. The
+executor dequantizes a phase of one role (gate, up or down) at a time, and a
+phase holds `G_plan` experts: the planned f16 weight slot over one expert's f16
+bytes, halved when two fit (the executor's own two-buffer rule, capped by
+`GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX`). `moe_stream_ring_size` is given
+`window_slots`, the smaller of `G_plan` and the most host matrices one role of
+one layer has (`role_items_max`), and sizes two regions of that many slots, each
+slot one matrix of the largest streamable size. `region_slots_max`, the slot
+need of the heaviest whole layer, no longer sizes anything and only appears in
+the ring-unavailable WARN beside `window_slots`. The sizing refuses the ring,
+leaving none, when its bytes exceed an eleventh of the device's expert bytes
+counted with the bytes lent to the ring (`bytes > (resident_expert_bytes +
+lent_bytes) / 11`). That is a tenth of what the device's expert set keeps once the
+ring's own loan has left it, and it is the same before the loan and after it.
+Every slot is AOS: the ring does no SOA staging and no reorder.
+
+The windows are the epochs. `moe_stream_phase::window_begin` stages the window the
+executor is about to dequantize, unless the previous call prefetched it, into the
+current region, and then prefetches the next window into the other region, so
+that copy overlaps this window's dequants. A layer's first window of a
+micro-batch is *exposed*: no earlier window hides its copy, and no window
+prefetches across layers. Reuse of a region is ordered on the device behind the
+dequants of the window it last held (`window_done`, the region's read gate) and
+behind the event that ended its previous use, chained through
+`current_region_gate`, so the host never waits.
+
+`moe_stream_ring::reserve` takes the ring's slots from the WEIGHT zone, one
+allocation per slot. Each slot first calls `unified_cache_zone_allocate_owner`.
+If the zone refuses, a second attempt goes through `unified_allocate_owner`, as
+an `EXPERT_STAGING` allocation in the `moe_stream_ring` cohort that prefers the
+WEIGHT zone and forbids a spill. Each resulting `alloc_owner` is wrapped with
+`mem_handle::from_owned_alloc`, and `moe_stream_ring::acquire_slot` hands out
+each slot as its own `mem_handle`, so no raw pointer is kept.
+
+**The copy queue.** The ring copies on the cache's BCS queue
+(`unified_cache::get_bcs_queue`, which falls back to the DMA queue and then to
+the compute queue), and the load-time H2D probe times the same queue, so the rate
+that prices the ring's copy term is the rate the ring sees. No Level Zero
+copy-engine queue was built. The Task 4 spike (llama.cpp-efck, c-0cu6) timed a
+64 MiB pinned copy on either cache queue at 2.5 to 3.5 ms while a one-work-group
+or full-EU spin kernel held the compute queue for 89 to 131 ms, on both cards:
+every row `overlap=yes` and `staged_h2d=0`. The corrected engine counters of a
+later run (c-2oac) show the BCS class busy and the CCS class at 0 on five of eight
+rows, for either queue: under the v2 Level Zero adapter the copies from either
+queue already run on the blitter and overlap compute, so the
+`GGML_SYCL_COPY_ENGINE` knob was descoped (llama.cpp-a64a).
 
 **The loan and the refill.** A loan lends resident expert triplets to the ring.
 `moe_expert_loan_select` picks whole (gate, up, down) triplets from the
@@ -185,10 +217,11 @@ so a rung that needs them is refused with a figure.
 
 **Gates.** Three gates keep the rule enforceable.
 
-- A staged slot has two consumers: the `STAGED_RING` resolver route and the
-  batched prompt executor, which reads it through the phase's `find()` once
-  `moe_stream_executor_staged` answers. No other path leads from a host-resident
-  entry to the device.
+- A staged slot has one consumer, the batched prompt executor, which reads it
+  through the phase's `find()` after `window_begin` staged its window. The
+  `STAGED_RING` resolver route returns CLAIMED for every staged entry, which the
+  tally counts as a handoff when the executor takes the weight. No other
+  path leads from a host-resident entry to the device.
   `tests/test-sycl-staged-ring-route-source.py` pins the route's single writer.
   `tests/test-sycl-moe-stream-enqueue-source.py` guards the copy path.
 

@@ -617,11 +617,78 @@ distinct_cpu=1 pairs_equal=2 min_prefix=105. The Qwen figures differ between the
 in none of them, so they move with the host's load and the tree. Compare them only with each other in a paired arm,
 never as baselines.
 
+#### Record at 0f1d9172c, the window ring (2026-10-25 00:59-02:31 EDT, Task 10 of `llama.cpp-a2xb`)
+
+The first run with the window ring (`llama.cpp-qov5`, comments c-bg4s, c-2w7h, c-vu9s and c-xkq4), by the lead, from a
+snapshot of `scripts/sycl-moe-exec-gate.sh` taken from the merge tree, `--pp512-min 200 --pp2048-min 500`. Host load
+31-38, `builders_post` 0 in every arm, `Shmem` flat at 1.44-1.49 GB, no GT-reset events. **This is a record, not a
+baseline**: the ring arms FAIL at this build, and the ring was re-run on master 4229a205d (rows at the end of the
+table, `llama.cpp-8ucb` owns the attribution). The Qwen3.8 placement is the B70's, 23 host layers.
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
+| Q_pp | pp512 t/s | 14.3 ± 1.12 | 200 | FAIL | 0 | ub=512 layers=23 summary=2 ring_engaged=yes ring_layer_ubatches=207 loan_exercised=yes windows=1554 exposed=207 misses=0. Context 1 (n_ctx 512) never got a ring (92 layer-ubatches "cpu (ring-unavailable)"), so this is the CPU path: `moe_stream_ring::reserve` needed one contiguous block and the loans lent scattered triplets (`llama.cpp-am87`, merged after this run) |
+| Q_pp | pp2048 t/s | 56.4 ± 18.30 | 500 | FAIL | 0 | same run. Context 2 had the ring for 9 of 12 ubatches; 50223 MiB streamed, 0 declines, 0 PP-MOE refusals. The decision log priced a ring layer-ubatch at 40-88 ms, the measured wall is about 0.4 s per host layer-ubatch (attribution pending, Task 12) |
+| Q_staged | ring_layers | - | - | NOT_EXERCISED | 0 | ring_engaged=no (one context, 107 triplets lent, the ring never reserved) |
+| Q_pp_ub2048 | pp2048 t/s | - | - | FAIL | 0 | rc=1: a planner refusal at context creation, unrelated to the ring (the PP MoE oneDNN scratch ring for n_ubatch=2048 needs 15785 MB RUNTIME, 4237 available, result=19) |
+| Q_pp_cpu | pp512 t/s | 15.77 | - | RECORDED | 0 | forced_cpu_lines=23 rc=0 |
+| Q_pp_cpu | pp2048 t/s | 32.52 | - | RECORDED | 0 | same run; the ring-engaged pp2048 above is +73 % over this |
+| Q_tok | md5 | 2a6c2cf6 | - | RECORDED | 0 | auto load 1: the ring served 217 of 248 layer-ubatches with no loan, 2670 windows, 217 exposed, 0 misses |
+| Q_tok_2 | md5 | 199c6905 | - | RECORDED | 0 | auto load 2 |
+| Q_tok_cpu_1 | md5 | 199c6905 | - | RECORDED | 0 | cpu load 1 |
+| Q_tok_cpu | md5 | - | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=2 min_prefix=153 auto_flip=yes cpu_flip=yes: the window path's text equals the CPU path's, pairwise |
+| Q_tg | tg t/s | 4.91 | 11.0 | FAIL | 0 | md5=3ce606c1 flip=yes prefix=173 refill=balanced(9/9) loan_exercised=yes ring_engaged=no; a second run read 4.32. The 9 most popular triplets were lent at the prompt-to-decode boundary and not returned (`llama.cpp-i4ny`) |
+| Q_noc | tg t/s | 11.91 | 9.5 | PASS | 0 | md5=25b7738a flip=no prefix=277 loan_exercised=no ring_engaged=yes; a second run read 11.95 |
+| GO_gate | count | 1 | 1 | PASS | 0 | |
+| GO_noc | count | 1 | 1 | PASS | 0 | |
+| GO_pp | pp512 t/s | 792.0 | 827.4 | FAIL | 0 | `llama.cpp-zuze`, the known master regression; tg128 36.3 passes |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | |
+| Q_decline | md5 | 9577403b | md5 equals Q_tok or Q_tok_2 | PASS | 0 | taken apart from the run above, at 4229a205d on the B70 (`llama.cpp-ny6i` c-pvhl, `GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20`): decline_lines=1 declined_layers=1 summary_cpu=35 ref_layer20=ring, with the two auto loads reading 2a6c2cf6 and 9577403b |
+| Q_pp (4229a205d) | pp512 t/s | 30.9 ± 29.39 | 200 | FAIL | 0 | ub=512 layers=23 summary=2 ring_engaged=yes ring_layer_ubatches=391 loan_exercised=yes windows=2880 exposed=391 misses=0. The ring engaged at the fourth ubatch (reserve held 11, 135, 135, then 136 of 136 slots; loans of 62, 1, 1 triplets), so the two pp512 repetitions straddle the engagement, hence the spread |
+| Q_pp (4229a205d) | pp2048 t/s | 66.5 ± 1.03 | 500 | FAIL | 0 | same run; the pp2048 phase ran all-ring: 368 layer-ubatches ring, 0 cpu, 86576 MiB streamed, 2706 windows, 368 exposed, 0 misses. Q_pp_cpu on the same tree is 32.5, so the ring is 2.0x the CPU executor (`llama.cpp-8ucb` c-t791 has the attribution data) |
+| Q_staged (4229a205d) | ring_layers | - | - | NOT_EXERCISED | 0 | ring_engaged=no: two ubatches, reserve held 11 then 135 of 136 slots (loans 62 then 1 triplets), the context ended one slot short. The loan is sized in bytes, not slots: `llama.cpp-9x8t` |
+| Q_pp_ub2048 (4229a205d) | pp2048 t/s | - | 500 | FAIL | 0 | rc=1, the same planner refusal as at 0f1d9172c ("PP MoE oneDNN scratch ring for n_ubatch=2048 needs 15785.0 MB ... RUNTIME zone has 4237.5 MB", `llama.cpp-86bl`) |
+| Q_tg (4229a205d) | tg t/s | 4.10 | 11.0 | FAIL | 0 | md5 3ce606c1 flip=yes prefix=173 refill=balanced(9/9) loan_exercised=yes ring_engaged=no; reserve held 119 of 136 slots at the pp-to-tg boundary, 9 triplets / 15 MiB lent, returned only at exit (`llama.cpp-i4ny` c-789n) |
+| Q_noc (4229a205d) | tg t/s | 11.63 | 9.5 | PASS | 0 | md5 25b7738a flip=no prefix=277 refill=not_exercised loan_exercised=no ring_engaged=yes (7 ring layer-ubatches, no loan) |
+
+Re-run on master 4229a205d (2026-10-25 06:35-07:15 EDT, merge-tree build, B70 `level_zero:0`, load 31-33, builders 0 in
+every arm, `Shmem` flat at 1.45 GB; `llama.cpp-qov5` c-c774). A record, not a baseline. The 0f1d9172c and 4229a205d rows
+differ by Tasks 5, 11 and 8 (`llama.cpp-a64a`, `llama.cpp-am87`, `llama.cpp-ny6i`): the per-slot reserve moved the
+ring's engagement from the twelfth boundary to the fourth and pp2048 from 56.4 to 66.5; the floors remain unmet.
+
+#### Copy overlap: does a cache-queue H2D copy overlap a compute kernel? (`llama.cpp-efck`, 2026-10-24)
+
+`test-sycl-copy-overlap` times 16 x 4 MiB pinned H2D copies alone and then concurrent with a spin kernel on the compute
+queue, on the cache's BCS queue and on its compute queue. Lead run, binary from 98c496ae7 (`llama.cpp-efck` c-0cu6),
+Level Zero v2 adapter, under `GPU.lock`, builders 7, load about 32, `Shmem` 1.45 GB before and after, rc=0 and
+`staged_h2d=0` on every row. **A record, not a baseline.** Every row reads `overlap=yes`: a copy that ends in 2.5-3.5 ms
+under a spin kernel of 89-131 ms is not queued behind it. Later runs on 4d1362427 (c-2oac) and 483449621 (c-os3q, whose
+`resolved=` field confirms each arm timed the queue it names) read the same timing. The engine counters of the first run
+(c-0cu6) were uninformative: both classes read busy for the whole window. After the window fix, c-2oac shows the BCS
+class busy for the whole copy window with the CCS class at 0 on five of eight rows, for either cache queue, so the
+copies are blitter work. This is why the ring and the probe share the BCS queue and
+no copy-engine queue was built (`llama.cpp-a64a`).
+
+| card | queue | spin | alone_ms | with_kernel_ms | kernel_ms | overlap |
+|------|-------|------|---------:|---------------:|----------:|---------|
+| B50 (`level_zero:1`) | bcs | 1wg | 2.6 | 2.5 | 95.8 | yes |
+| B50 (`level_zero:1`) | compute | 1wg | 2.5 | 3.3 | 95.8 | yes |
+| B50 (`level_zero:1`) | bcs | full | 2.5 | 3.5 | 131.3 | yes |
+| B50 (`level_zero:1`) | compute | full | 2.6 | 2.6 | 131.3 | yes |
+| B70 (`level_zero:0`) | bcs | 1wg | 2.6 | 2.6 | 88.9 | yes |
+| B70 (`level_zero:0`) | compute | 1wg | 2.7 | 2.6 | 88.9 | yes |
+| B70 (`level_zero:0`) | bcs | full | 2.6 | 2.6 | 109.4 | yes |
+| B70 (`level_zero:0`) | compute | full | 2.7 | 2.6 | 109.4 | yes |
+
 ### How to read the verdict fields
 
-- **`ring_engaged=no`.** No layer-ubatch used the ring: the `[MOE-EXEC] summary: K layer-ubatches ring`
-  lines add up to 0 (`ring_layer_ubatches=0`). On this host that is the expected answer until
-  `llama.cpp-bcre` is decided, because the 10 % cap refuses the ring on both canonical models under
+- **`ring_engaged=no`.** (Written before the window ring. The ring now holds one executor window per region, not a
+  whole layer, so the whole-layer 10 % cap refusal described here is history; why a run may still not engage is in
+  the 0f1d9172c record above.) No layer-ubatch used the ring: the `[MOE-EXEC] summary: K layer-ubatches ring`
+  lines add up to 0 (`ring_layer_ubatches=0`). In the 8c44f3b3c era that was the expected answer until
+  `llama.cpp-bcre` was decided, because the 10 % cap refused the ring on both canonical models under
   whole-layer host placement. The gate does not read it from the `stream ring unavailable` WARN, because
   `auto` at default verbosity does not print that line. `Q_staged` then reports `NOT_EXERCISED`, which is
   neither a pass nor a fail. The summary line says `ring_engaged_any=no` and the gate's exit code is 3 rather
@@ -632,7 +699,7 @@ never as baselines.
   triplets, 190 MiB), but lent room was not returned on reclaim (`llama.cpp-6aj4`). Both tickets are closed, and the
   660a34602 and f14082f2b records are the runs after both fixes. The ring still did not engage in them: only 41 of
   about 1301 triplets are lendable, since `moe_loan_triplet_is_lendable` refuses bulk-staged tensors (`llama.cpp-bcre`
-  c-aerm), and on Qwen3.8 the 10 % cap refuses before any loan. The 8c44f3b3c table predates both fixes.
+  c-aerm), and on Qwen3.8 the 10 % cap refused before any loan. The 8c44f3b3c table predates both fixes.
 - **`Q_staged`.** The executor prints its `[MOE-EXEC-TRACE] executor device` line for every dispatch,
   resident layers included, and `staged=0` is correct for those. The arm scores only the layers the ring
   served: a layer with a `[MOE-EXEC] layer N: ring` line is a host layer, and every `blk.N.*` dispatch of it
