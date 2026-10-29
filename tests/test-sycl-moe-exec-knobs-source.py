@@ -150,7 +150,9 @@ def test_config_accessor_and_teardown_summary():
 
 @pytest.mark.parametrize("name", CATALOGED)
 def test_catalog_has_row(name):
-    assert re.search(r"`%s`" % name, (ROOT / "docs" / "backend" / "sycl-env-vars.md").read_text())
+    # A table row of its own, not a mention in another row's prose: `| `NAME` |` or `| `NAME=<value>` |`.
+    row = r"(?m)^\| `%s(=[^`]*)?` \|" % re.escape(name)
+    assert re.search(row, (ROOT / "docs" / "backend" / "sycl-env-vars.md").read_text())
 
 
 # ---- the forced-decline knob (llama.cpp-ny6i) ----------------------------------------------------------------
