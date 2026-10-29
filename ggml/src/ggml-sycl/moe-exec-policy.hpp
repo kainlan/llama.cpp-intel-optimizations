@@ -26,7 +26,9 @@ struct moe_exec_config {
     moe_exec_policy policy = moe_exec_policy::AUTO;
     // 0 off; 1 the decision line per consulted layer-ubatch, one stage-window line per window staged, one executor
     // line per MUL_MAT_ID dispatch, one staged-route line per prompt (plus a refusals line when one was refused), and
-    // one loan line when a boundary drain times out; 2 also the load-time copy probe
+    // one loan line when a boundary drain times out; 2 also the load-time copy probe and one WARN timing line per ring
+    // window ("[MOE-EXEC-TRACE] window ...", printed at the next synchronize), for which the unified cache builds its
+    // copy queue with profiling when it is constructed
     int             trace          = 0;
     char            bad_policy[48] = {};  // the rejected GGML_SYCL_MOE_EXEC value, copied, for one WARN; empty if none
 };

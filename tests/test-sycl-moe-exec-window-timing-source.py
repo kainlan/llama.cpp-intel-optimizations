@@ -24,7 +24,8 @@ in-memory copy of the normalized source, never a file:
     each window remembers the copy queued before its first, and a flush forgets the queue's last copy;
   - the synchronize boundary flushes the lines after the queue wait and before the expert-loan runner, its only
     caller in ggml-sycl.cpp, with no lock taken in synchronize ahead of the flush nor in flush_window_timing;
-  - docs/backend/sycl-env-vars.md catalogs the literal and says the trace row's level 2 profiles the copy queue.
+  - docs/backend/sycl-env-vars.md catalogs the literal and says the trace row's level 2 profiles the copy queue;
+  - the trace knob's own comment in moe-exec-policy.hpp names the window line among level 2's output.
 """
 import re
 from pathlib import Path
@@ -71,6 +72,7 @@ PLAN_CPP = read("ggml/src/ggml-sycl/moe-stream-plan.cpp")
 PLAN_HPP = read("ggml/src/ggml-sycl/moe-stream-plan.hpp")
 UC_CPP = read("ggml/src/ggml-sycl/unified-cache.cpp")
 ENV_DOC = read("docs/backend/sycl-env-vars.md")
+POLICY_HPP = read("ggml/src/ggml-sycl/moe-exec-policy.hpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -422,6 +424,33 @@ def test_catalog_mutants():
     row = re.search(r"(?m)^\| `GGML_SYCL_MOE_EXEC_TRACE=[^`]*` \|[^\n]*$", ENV_DOC)
     assert row is not None, "mutant precondition: the trace row exists"
     assert not claim_catalog(ENV_DOC.replace(row.group(0), row.group(0).replace("enable_profiling", "profiling")))
+
+
+# ---- the knob's own comment ---------------------------------------------------------------------------------------
+
+def claim_knob_comment(policy_hpp: str) -> bool:
+    """The comment above `int trace` (the lines from "// 0 off;" to the member) says level 2 also prints the window
+    timing line, so the comment, the catalog and the code name the same output."""
+    m = re.search(r"((?:[ \t]*//[^\n]*\n)+)[ \t]*int\s+trace\b", policy_hpp)
+    if m is None:
+        return False
+    comment = " ".join(line.strip().lstrip("/").strip() for line in m.group(1).splitlines())
+    level2 = comment.split("; 2 also", 1)
+    return comment.startswith("0 off;") and len(level2) == 2 and "[MOE-EXEC-TRACE] window" in level2[1]
+
+
+def test_knob_comment():
+    assert claim_knob_comment(POLICY_HPP)
+
+
+def test_knob_comment_mutants():
+    assert "[MOE-EXEC-TRACE] window" in POLICY_HPP, "mutant precondition: the comment names the line"
+    # the window line dropped from the comment
+    assert not claim_knob_comment(POLICY_HPP.replace("[MOE-EXEC-TRACE] window", "a window line"))
+    # the window line attributed to level 1 instead (level 2 lists only the probe)
+    moved = POLICY_HPP.replace("; 2 also the load-time copy probe and", "; and")
+    assert moved != POLICY_HPP, "mutant precondition: the level-2 clause exists"
+    assert not claim_knob_comment(moved)
 
 
 if __name__ == "__main__":
