@@ -641,6 +641,11 @@ std::string test_expert_loan_reclaims_pointer_table_leases();
 // The same loan with the boundary's drain timed out on a held drain worker: the entry survives that boundary's pass,
 // and the pass after the worker goes erases it and returns its room (llama.cpp-6aj4).
 std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain();
+// A prompt whose ring did not engage returns its whole loan at the first decode graph's boundary, in one transaction,
+// with one WARN that names the position (llama.cpp-i4ny).
+std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once();
+// A prompt whose ring engaged owes no bulk refill: the first decode boundary is the per-graph refill alone.
+std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt();
 #endif
 
 }  // namespace ggml_sycl

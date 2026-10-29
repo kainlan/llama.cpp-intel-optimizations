@@ -133,17 +133,6 @@
 #include <string>
 #include <sycl/sycl.hpp>
 
-// llama.cpp-i4ny's cases, declared here rather than in ggml-sycl-test.hpp: only this test calls them.
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-namespace ggml_sycl {
-// A prompt whose ring did not engage returns its whole loan at the first decode graph's boundary, in one transaction,
-// with one WARN that names the position.
-std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once();
-// A prompt whose ring engaged owes no bulk refill: the first decode boundary is the per-graph refill alone.
-std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt();
-}  // namespace ggml_sycl
-#endif
-
 static bool run_case(const char * name, std::string (*body)()) {
     fprintf(stderr, "[TEST] %s ... ", name);
     const std::string failure = body();
