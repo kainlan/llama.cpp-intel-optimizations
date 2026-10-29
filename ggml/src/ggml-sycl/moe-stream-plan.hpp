@@ -732,12 +732,14 @@ static inline uint64_t moe_stream_window_timing_key(uint64_t ubatch_seq, uint32_
 //                    command_submit and the command_end of the copy queued before it on the copy queue (the last copy
 //                    this timeline saw since the previous flush; none: the submit alone). Clamped at 0. A large value
 //                    means the copy queue sat waiting for the compute queue to release the region. -1 when the copies
-//                    waited on no read gate or an event has no device times. Other submitters' work on the copy queue
-//                    and the copy's other dependencies are not seen
+//                    waited on no read gate, an event has no device times, or the first copy's command_submit is 0
+//                    (the runtime gave no submit time). Other submitters' work on the copy queue and the copy's other
+//                    dependencies are not seen
 //   start_lag_us     the first copy's command_start minus the read gate's command_end, clamped at 0: how late the copy
 //                    began after the gate released it. The copy depends on the gate, so it never starts before the
 //                    gate's end; a large value means the copy queue was busy or the copy was submitted late, i.e. the
-//                    gate was NOT what held it. -1 as readers_wait_us
+//                    gate was NOT what held it. -1 when the copies waited on no read gate, or the first copy or the
+//                    gate has no device times
 //   launches         the dequant kernels and the GEMM groups the executor submitted for the window
 template <typename event_t> struct moe_stream_window_timeline {
     struct record {
@@ -854,7 +856,8 @@ template <typename event_t> struct moe_stream_window_timeline {
             uint64_t       prev_submit = 0, prev_start = 0, prev_end = 0;
             const bool     prev_known = !r.prev_copy || times(*r.prev_copy, &prev_submit, &prev_start, &prev_end);
             const uint64_t ready      = std::max(first_submit, prev_end);
-            if (gate_timed && prev_known) {
+            // A zero submit is no time at all, not the device clock's origin: the wait would read as the gate's end.
+            if (gate_timed && prev_known && first_submit != 0) {
                 readers_wait_us = gate_end > ready ? static_cast<double>(gate_end - ready) / 1e3 : 0.0;
             }
             if (gate_timed) {

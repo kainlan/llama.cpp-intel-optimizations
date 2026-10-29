@@ -317,21 +317,26 @@ WAIT_EXPR = "readers_wait_us = gate_end > ready ? static_cast<double>(gate_end -
 LAG_EXPR = "start_lag_us = first_start > gate_end ? static_cast<double>(first_start - gate_end) / 1e3 : 0.0;"
 PREV = "r.first_copy = copy; r.reuse_gate = gate; r.prev_copy = queue_tail; } queue_tail = copy;"
 CLEAR = "void clear() { records.clear(); queue_tail.reset(); }"
+FLUSH_END = "} clear(); return printed; }"
+WAIT_GUARD = "if (gate_timed && prev_known && first_submit != 0) {"
 SUBMIT = "*submit_ns = ev.get_profiling_info<sycl::info::event_profiling::command_submit>();"
 
 
 def claim_wait(plan_hpp: str, plan_cpp: str) -> bool:
     """readers_wait_us measures the wait FOR the gate (the gate's end after the moment the copy could otherwise have
     started), start_lag_us the copy's start after the gate, each assigned once in the flush; the moment comes from the
-    copy's submit and the copy queued ahead of it; the flush forgets that copy."""
+    copy's submit and the copy queued ahead of it, and a zero submit (no time at all) leaves the wait unmeasured; the
+    flush ends with the timeline's own clear(), which forgets that copy, not records.clear(), which would not."""
     timeline = body(norm(plan_hpp), TIMELINE_SIG)
     flush = body(timeline, FLUSH_SIG)
     copied = body(timeline, RECORDERS[0])
     reader = body(norm(plan_cpp), "bool moe_stream_event_times(")
     return (flush.count(READY) == 1 and flush.count(WAIT_EXPR) == 1 and flush.count(LAG_EXPR) == 1
+            and flush.count(WAIT_GUARD) == 1 and flush.find(WAIT_GUARD) < flush.find(WAIT_EXPR)
             and flush.count("readers_wait_us =") == 2 and flush.count("start_lag_us =") == 2
             and flush.find(READY) < flush.find(WAIT_EXPR) and copied.count(PREV) == 1
-            and timeline.count(CLEAR) == 1 and flush.count("clear();") == 1 and reader.count(SUBMIT) == 1)
+            and timeline.count(CLEAR) == 1 and flush.endswith(FLUSH_END) and flush.count("clear();") == 1
+            and reader.count(SUBMIT) == 1)
 
 
 def test_wait():
@@ -350,6 +355,10 @@ def test_wait_mutants():
     # the copy ahead never remembered, or never forgotten at the flush
     assert not claim_wait(mutate(PLAN_HPP, " r.prev_copy = queue_tail;", ""), PLAN_CPP)
     assert not claim_wait(mutate(PLAN_HPP, CLEAR, "void clear() { records.clear(); }"), PLAN_CPP)
+    # the flush clearing only the records, so the queue's last copy outlives the boundary
+    assert not claim_wait(mutate(PLAN_HPP, FLUSH_END, "} records.clear(); return printed; }"), PLAN_CPP)
+    # a zero submit taken as a time: the wait would read as the gate's end
+    assert not claim_wait(mutate(PLAN_HPP, WAIT_GUARD, "if (gate_timed && prev_known) {"), PLAN_CPP)
     # the submit read as the start
     assert not claim_wait(PLAN_HPP, mutate(PLAN_CPP, SUBMIT, SUBMIT.replace("command_submit", "command_start")))
 

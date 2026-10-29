@@ -347,6 +347,11 @@ bool fake_event_times(int ev, uint64_t * submit_ns, uint64_t * start_ns, uint64_
             *start_ns  = 2100000;
             *end_ns    = 2300000;
             return true;
+        case 5:  // a copy the runtime gave device start and end but no submit time
+            *submit_ns = 0;
+            *start_ns  = 3000000;
+            *end_ns    = 3100000;
+            return true;
         case 10:  // window 0's read gate: the dequants of the window its region last held were done at 0.9 ms
             *submit_ns = 100000;
             *start_ns  = 800000;
@@ -459,6 +464,18 @@ void test_window_timing_records_one_record_per_window_only_under_trace() {
               "copy_us=200 readers_wait_us=-1 start_lag_us=20 launches=0");
     // The flush also forgets the queue's last copy: a window after the boundary measures from its submit alone.
     CHECK(!(*on_at).queue_tail.has_value());
+
+    // A copy with no submit time (0) leaves the wait unmeasured instead of reading as the gate's end (2080 us); the
+    // copy span and the lag (0.92 ms) do not use the submit and are still measured.
+    const uint64_t k_c = ggml_sycl::moe_stream_window_timing_key(10, w1);
+    (*on_at).copied(k_c, 5, 300, std::optional<int>(11));
+    (*on_at).begun(k_c, 4, expert_tensor_role::UP, 1, false, 2.0);
+    lines.clear();
+    CHECK((*on_at).flush(0, fake_event_times, sink) == 1);
+    CHECK(lines.size() > 0 &&
+          lines[0] ==
+              "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=300 exposed=0 submit_us=2 "
+              "copy_us=100 readers_wait_us=-1 start_lag_us=920 launches=0");
 }
 
 }  // namespace

@@ -6364,9 +6364,10 @@ unified_cache::unified_cache(sycl::queue & queue,
     // instead of serializing on a single command list.
     //
     // Under GGML_SYCL_MOE_EXEC_TRACE=2 the queue also records device times: the stream ring's per-window timing line
-    // reads its copies' command_start/command_end (llama.cpp-8ucb, moe_stream_window_timeline). Profiling changes the
-    // queue's event kind and its timing, so a traced run compares only with a traced run. The level is parsed here
-    // through the same parser and named constant the backend's knob accessor uses, not a second spelling.
+    // reads its copies' command_submit/command_start/command_end (llama.cpp-8ucb, moe_stream_window_timeline).
+    // Profiling changes the queue's event kind and its timing, so a traced run compares only with a traced run. The
+    // level is parsed here through the same parser and named constant the backend's knob accessor uses, not a second
+    // spelling.
     const bool bcs_profiling =
         moe_exec_config_parse([](const char * name) -> const char * { return std::getenv(name); }).trace >= 2;
     try {
