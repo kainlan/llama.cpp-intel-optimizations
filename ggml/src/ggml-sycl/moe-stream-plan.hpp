@@ -1043,7 +1043,7 @@ static inline bool moe_loan_triplet_is_lendable(const moe_loan_triplet &        
 // holes can sum to less than the floor of their sum, so a byte count would over-count and send the ring back for
 // another loan at another boundary. Adjacent holes may coalesce, so the floor is an under-count, the safe direction. A
 // triplet that frees no slot is skipped, not lent: it would cost the model three resident matrices for nothing. One
-// whose matrices free one slot between them is lent whole and counts one.
+// whose per-matrix floors sum to one is lent whole and counts one.
 // Precondition: plan.build_index() has run; find_expert_entry returns nullptr on an un-indexed plan, so selection then
 // returns nothing (fail-safe, no signal).
 static inline std::vector<expert_placement_key> moe_expert_loan_select(const placement_plan & plan,
