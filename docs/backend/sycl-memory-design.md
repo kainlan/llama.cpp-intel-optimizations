@@ -119,23 +119,24 @@ executor claims whole, whatever the cost model prices. Under `cpu`, nothing is
 staged. `moe_stream_stage_now` is the one predicate. Task 10
 (llama.cpp-3460) lifted ruling c-3skf (llama.cpp-xod7), under which `auto` only
 recorded the choice. The ring serves one consumer, the batched prompt executor
-(llama.cpp-348c), and only a layer that executor claims whole. The ring's index build asks the library
-claim once per (layer, role) and records the answer on each host item: it stages
-as one AOS slot, and its consumer is the executor. `moe_stream_executor_claims`
-holds for a layer when every host matrix of it is such an item and a ring can
-exist. `begin_layer` gives a RING decision only to such a layer, and
-`executor_claims` asks again once the ring is reserved. A layer that the
-executor does not claim, or whose ring cannot exist, stays whole in the hybrid
-world and runs its host experts on the CPU from their host leases. The ring never
-serves some of a layer's host matrices while the rest stay hybrid, so no staged
-copy is wasted on a layer that does not run on the device. The `STAGED_RING`
-resolver route is kept, but the ring stages nothing for it: every staged entry's
-consumer is the executor, so the resolver counts a lookup as a handoff
-(`handed_off` on the trace line) when the executor takes the weight, and as a
-CLAIMED refusal otherwise. Under `ring`, a prompt that refused any entry logs one
-WARN (`report_staged_routes`). `GGML_SYCL_MOE_EXEC_DECLINE_LAYER`
-(llama.cpp-ny6i) forces one layer off the executor, with the reason `declined`,
-so a gate can prove that hybrid fallback on a layer the executor would claim.
+(llama.cpp-348c), and only a layer that executor claims whole. The ring's index
+build asks the library claim once per (layer, role) and records the answer on
+each host item: it stages as one AOS slot, and its consumer is the executor.
+`moe_stream_executor_claims` holds for a layer when every host matrix of it is
+such an item and a ring can exist. `begin_layer` gives a RING decision only to
+such a layer, and `executor_claims` asks again once the ring is reserved. A
+layer that the executor does not claim, or whose ring cannot exist, stays whole
+in the hybrid world and runs its host experts on the CPU from their host leases.
+The ring never serves some of a layer's host matrices while the rest stay
+hybrid, so no staged copy is wasted on a layer that does not run on the device.
+The `STAGED_RING` resolver route is kept, but the ring stages nothing for it:
+every staged entry's consumer is the executor, so the resolver counts a lookup
+as a handoff (`handed_off` on the trace line) when the executor takes the
+weight, and as a CLAIMED refusal otherwise. Under `ring`, a prompt that refused
+any entry logs one WARN (`report_staged_routes`).
+`GGML_SYCL_MOE_EXEC_DECLINE_LAYER` (llama.cpp-ny6i) forces one layer off the
+executor, with the reason `declined`, so a gate can prove that hybrid fallback
+on a layer the executor would claim.
 
 **The ring.** The ring holds one executor window per region, not a layer. The
 executor dequantizes a phase of one role (gate, up or down) at a time, and a
