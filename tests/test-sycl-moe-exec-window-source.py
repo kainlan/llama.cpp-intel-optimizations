@@ -513,8 +513,8 @@ def claim_exposed_is_a_layers_first_window(plan_hpp: str, plan_cpp: str) -> bool
     under, which prefetches the next window (the next phase of its role, or phase 0 of the next role), UP phase 0
     included, so the predicate names no role and no phase. begin_ubatch resets the last window's layer to -1, which is
     what makes a micro-batch's first window exposed even when it is the layer the last micro-batch ended at. This is an
-    exact-expression pin: it requires the body to return `layer != prev_layer` and name no role or phase, and
-    begin_ubatch to keep its reset; it never evaluates the predicate. The exposure block of test-moe-stream-phase.cpp
+    exact-expression pin: it requires the signature to be exactly `(int layer, int prev_layer)`, so a restored parameter
+    fails it, the body to return `layer != prev_layer` and name no role or phase, and begin_ubatch to keep its reset; it never evaluates the predicate. The exposure block of test-moe-stream-phase.cpp
     (the sycl-moe-stream-phase ctest) pins the behaviour, both polarities."""
     b = body(norm(plan_hpp), EXPOSED_SIG)
     ub = body(norm(plan_cpp), BEGIN_UBATCH_SIG)
