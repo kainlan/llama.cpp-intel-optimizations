@@ -20799,6 +20799,7 @@ static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size
 struct ggml_sycl_expert_loan_result {
     bool         accepted         = false;
     size_t       bytes_freed      = 0;  // device storage the lent triplets returned (a probe: the selection's charge)
+    size_t       slots_funded     = 0;  // a probe's: the ring slots the selection funds; 0 when it counted bytes
     size_t       bytes_readmitted = 0;  // a refill's: device storage the re-admitted triplets took
     uint32_t     n_triplets       = 0;  // the triplets lent, or re-admitted
     uint32_t     n_remaining      = 0;  // a refill's: the lent triplets its armed cursor still holds after it ran
@@ -21199,15 +21200,18 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
 
     // A loan selects the least popular resident triplets that free `amount` bytes, in slots of `slot_bytes`; a refill
     // takes up to `amount` lent ones from the back of the ledger, and none when its cursor is disarmed.
-    size_t                                       selected = 0;
+    size_t                                       selected     = 0;
+    size_t                                       slots_funded = 0;
     std::vector<ggml_sycl::expert_placement_key> keys =
-        refill ? ggml_sycl_expert_refill_select(device, *current, amount, &result.n_remaining) :
-                 ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected);
+        refill ?
+            ggml_sycl_expert_refill_select(device, *current, amount, &result.n_remaining) :
+            ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected, &slots_funded);
     const uint32_t n_selected = static_cast<uint32_t>(keys.size() / 3);
     if (probe_mode) {
-        result.accepted    = n_selected != 0;
-        result.bytes_freed = selected;
-        result.n_triplets  = n_selected;
+        result.accepted     = n_selected != 0;
+        result.bytes_freed  = selected;
+        result.slots_funded = slots_funded;
+        result.n_triplets   = n_selected;
         return n_selected != 0 ? finish(ggml_sycl_txn_result::ACCEPTED, "OK") :
                                  finish(ggml_sycl_txn_result::REFUSED, "nothing lendable");
     }
@@ -21581,17 +21585,21 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
                                     resolver, out, warn_busy);
 }
 
-// What a loan of `bytes_wanted` would lend on `device` if it counted bytes, copying and publishing nothing; 0 when the
-// probe is refused (a graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks
-// it (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
-// The probe counts bytes (slot_bytes 0), while the loan the ring asks for counts ring slots (llama.cpp-9x8t), so the
-// fit can credit freed bytes in holes below a slot that fund no slot. llama.cpp-xug5 closes that gap: the probe must
-// count slots and report the slots it funds times slot_bytes, not the bytes it frees.
-static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted) {
+// What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused (a
+// graph is active, no plan is published, nothing is lendable). The auto-ubatch fit's ring term asks it
+// (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
+// With a ring slot of `slot_bytes` the probe counts slots, as the loan the ring asks for does, and
+// answers the slots it funds times slot_bytes: whole slots, the currency of the ring's byte count. The byte sum of the
+// triplets it selects is not that answer, since each matrix's remainder below a slot is in the sum and funds no slot.
+// With slot_bytes 0 it counts bytes and answers the selection's byte sum.
+static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted, size_t slot_bytes) {
     ggml_sycl_expert_loan_result probe;
     const ggml_sycl_txn_result   code = ggml_sycl_expert_loan_transaction_run(
-        device, bytes_wanted, /*slot_bytes=*/0, /*probe_mode=*/true, nullptr, &probe, /*warn_busy=*/false);
-    return code == ggml_sycl_txn_result::ACCEPTED ? probe.bytes_freed : 0;
+        device, bytes_wanted, slot_bytes, /*probe_mode=*/true, nullptr, &probe, /*warn_busy=*/false);
+    if (code != ggml_sycl_txn_result::ACCEPTED) {
+        return 0;
+    }
+    return slot_bytes != 0 ? probe.slots_funded * slot_bytes : probe.bytes_freed;
 }
 
 // Per device, the most bytes any in-graph caller asked to borrow since the last graph boundary; 0 when none did.
@@ -36825,7 +36833,7 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     if (geo.bytes == 0) {
         return 0;
     }
-    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes);
+    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, geo.slot_bytes);
     return geo.bytes > lent ? geo.bytes - lent : 0;
 }
 

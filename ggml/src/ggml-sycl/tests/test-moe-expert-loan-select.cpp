@@ -246,6 +246,51 @@ void test_slot_sized_selection_skips_matrices_below_a_slot() {
           std::vector<int>({ 5, 4, 3, 2, 1, 0 }));
 }
 
+// The auto-ubatch fit's probe asks how many ring slots a loan funds, and the caller subtracts that from the ring in
+// whole slots. The byte sum of the selected triplets is not that figure: each matrix carries a remainder below a slot
+// that frees nothing, so the selector reports the funded slots beside the byte sum.
+void test_slot_sized_selection_reports_funded_slots_not_the_byte_sum() {
+    const placement_plan plan   = make_slot_plan();
+    size_t               sel    = 0;
+    size_t               funded = 99;  // overwritten on every call, so a stale value cannot pass
+
+    // Three slots short: expert 3 funds 1 slot from 2 * kSlot bytes, expert 2 funds 3 from 4.5 * kSlot bytes. The walk
+    // overshoots to 4 slots, and the 6.5 * kSlot byte sum is 2.5 slots more than the slots it funds.
+    const auto three = ggml_sycl::moe_expert_loan_select(plan, 0, 3 * kSlot, kSlot, &sel, &funded);
+    CHECK(experts_of(three) == std::vector<int>({ 3, 2 }));
+    CHECK(funded == 4);
+    // The probe answers funded * kSlot, whole slots. The byte sum exceeds it by exactly the sub-slot remainders of
+    // the matrices lent, which fund no slot, so a figure taken from the byte sum would credit them.
+    size_t remainders = 0;
+    for (const int e : experts_of(three)) {
+        for (int r = 0; r < 3; ++r) {
+            remainders += slot_plan_charge(e, r) % kSlot;
+        }
+    }
+    CHECK(remainders > 0);
+    CHECK(sel - funded * kSlot == remainders);
+
+    // One slot short: expert 3 alone, 1 slot from 2 * kSlot bytes.
+    ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, kSlot, &sel, &funded);
+    CHECK(funded == 1 && sel == 2 * kSlot);
+
+    // Everything: experts 3, 2 and 1 fund 1 + 3 + 6; experts 5, 4 and 0 fund none and are not lent.
+    ggml_sycl::moe_expert_loan_select(plan, 0, ~static_cast<size_t>(0), kSlot, &sel, &funded);
+    CHECK(funded == 10);
+
+    // Nothing to lend on another device: no slots.
+    ggml_sycl::moe_expert_loan_select(plan, 1, ~static_cast<size_t>(0), kSlot, &sel, &funded);
+    CHECK(funded == 0 && sel == 0);
+
+    // slot_bytes 0 counts bytes: the funded count is 0 and the byte sum is the answer.
+    funded = 99;
+    ggml_sycl::moe_expert_loan_select(plan, 0, 3 * kSlot, 0, &sel, &funded);
+    CHECK(funded == 0 && sel == 6 * (kSlot / 2));
+
+    // The count is optional, as the byte sum is.
+    CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, kSlot, nullptr, nullptr).size() == 3);
+}
+
 }  // namespace
 
 int main() {
@@ -349,6 +394,7 @@ int main() {
     }
 
     test_slot_sized_selection_skips_matrices_below_a_slot();
+    test_slot_sized_selection_reports_funded_slots_not_the_byte_sum();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-expert-loan-select: %d failure(s)\n", failures);
