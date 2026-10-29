@@ -18,7 +18,8 @@ in-memory copy of the normalized source, never a file:
     to window_launched after the phase's GEMM stage, on a windowed op only;
   - stage_window records each copy with its bytes and its read gate, window_begin records the window with the host
     time it took, and begin_ubatch moves the micro-batch key on;
-  - the synchronize boundary flushes the lines after the queue wait, its only caller in ggml-sycl.cpp;
+  - the synchronize boundary flushes the lines after the queue wait and before the expert-loan runner, its only
+    caller in ggml-sycl.cpp, with no lock taken in synchronize ahead of the flush nor in flush_window_timing;
   - docs/backend/sycl-env-vars.md catalogs the literal and says the trace row's level 2 profiles the copy queue.
 """
 import re
@@ -304,30 +305,51 @@ def test_records_mutants():
 
 FLUSH_CALL = "if (err == 0 && sycl_ctx->moe_stream) { sycl_ctx->moe_stream->flush_window_timing(); }"
 WAIT = "CHECK_TRY_ERROR(stream->wait_and_throw());"
+RUNNER = "const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);"
+SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {"
+FLUSH_FN_SIG = "void moe_stream_phase::flush_window_timing() {"
+LOCKS = ("lock_guard", "unique_lock", "scoped_lock", ".lock()")
 
 
-def claim_flush_site(sycl: str) -> bool:
-    """The synchronize boundary flushes after its queue wait, and nothing else in the file flushes."""
+def claim_flush_site(sycl: str, plan_cpp: str) -> bool:
+    """The synchronize boundary flushes after its queue wait (every event it reads is complete, so reading device times
+    never waits) and before the expert-loan runner, nothing else in the file flushes, and no lock is taken on the way
+    to the flush (in synchronize ahead of it) or inside it."""
     n = norm(sycl)
-    sync = body(n, "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {")
-    return (sync.count(FLUSH_CALL) == 1 and 0 <= sync.find(WAIT) < sync.find(FLUSH_CALL)
-            and n.count("flush_window_timing()") == 1)
+    sync = body(n, SYNC_SIG)
+    at = sync.find(FLUSH_CALL)
+    ahead = sync[:at]
+    flush_fn = body(norm(plan_cpp), FLUSH_FN_SIG)
+    return (sync.count(FLUSH_CALL) == 1 and 0 <= sync.find(WAIT) < at < sync.find(RUNNER)
+            and n.count("flush_window_timing()") == 1
+            and not any(k in ahead for k in LOCKS) and flush_fn != "" and not any(k in flush_fn for k in LOCKS))
 
 
 def test_flush_site():
-    assert claim_flush_site(SYCL)
+    assert claim_flush_site(SYCL, PLAN_CPP)
 
 
 def test_flush_site_mutants():
     n = norm(SYCL)
-    sync = body(n, "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {")
+    sync = body(n, SYNC_SIG)
     head = "const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);"
     assert sync.count(" " + FLUSH_CALL) == 1 and sync.count(head) == 1, "mutant precondition: one flush, one stream"
+    assert sync.count(RUNNER) == 1, "mutant precondition: one loan runner"
     # before the wait, where reading an event's device times would wait on the compute work
     moved = sync.replace(" " + FLUSH_CALL, "").replace(head, head + " " + FLUSH_CALL)
-    assert not claim_flush_site(n.replace(sync, moved))
+    assert not claim_flush_site(n.replace(sync, moved), PLAN_CPP)
+    # after the loan runner
+    after = sync.replace(" " + FLUSH_CALL, "").replace(RUNNER, RUNNER + " " + FLUSH_CALL)
+    assert not claim_flush_site(n.replace(sync, after), PLAN_CPP)
+    # a lock taken in synchronize ahead of the flush
+    locked = sync.replace(head, head + " std::lock_guard<std::mutex> guard(g_sycl_graph_compute_mutex);")
+    assert not claim_flush_site(n.replace(sync, locked), PLAN_CPP)
+    # a lock taken inside the flush
+    in_flush = mutate(PLAN_CPP, FLUSH_FN_SIG, FLUSH_FN_SIG + " std::lock_guard<std::mutex> g(m);")
+    assert not claim_flush_site(SYCL, in_flush)
     # a second flush elsewhere, e.g. in the graph's compute path
-    assert not claim_flush_site(norm(SYCL) + " void g(x * sycl_ctx) { sycl_ctx->moe_stream->flush_window_timing(); }")
+    assert not claim_flush_site(norm(SYCL) + " void g(x * sycl_ctx) { sycl_ctx->moe_stream->flush_window_timing(); }",
+                                PLAN_CPP)
 
 
 # ---- the catalog --------------------------------------------------------------------------------------------------
