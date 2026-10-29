@@ -164,6 +164,11 @@ mutate_control summary_windows_trace_decoy "s/^(RE_SUMMARY_WINDOWS=').*/\\1, [0-
 mutate_control window_fields "s/^(RE_WINDOW_FIELDS=').*/\\1, [0-9]+ windows, [0-9]+ exposed'/"
 mutate_control trace_misses "s/^(RE_TRACE_MISSES=').*/\\1\\\\[MOE-EXEC-TRACE\\\\].* misses=[0-9]+'/"
 mutate_control summary_ring "s/^(RE_SUMMARY_RING=').*/\\1\\\\[MOE-EXEC\\\\] summary: [0-9]+ layer-ubatches ring, 0 cpu, 0 forced, 1500 MiB'/" "no longer matches the long summary line"
+# The bulk refill line (llama.cpp-i4ny) is not a teardown refill line, and only decode graph 1 is its first position.
+mut_refill="s/^(RE_REFILL=').*/\\1refill device [0-9]+: [0-9]+.* triplets re-admitted'/"
+mutate_control refill_not_bulk "$mut_refill" "matches the bulk refill line"
+mut_bulk='s/^(RE_BULK_REFILL_FIRST=).*/\1"$RE_BULK_REFILL at decode graph [0-9]+ after the prompt"/'
+mutate_control bulk_refill_first "$mut_bulk"
 
 # ---- Q_pp
 mkcsv "$WORK/pp-pass.csv" 512:0:523.4:3.1:512 2048:0:851.2:5.0:2048
@@ -511,6 +516,38 @@ expect "Q_tg place ref - is reported as unscored" "$out" "place=unscored"
 dec_err "$WORK/tg-wd.err" 11.91 "$PLACE_TG" '0.09.000.000 W [SYCL-WATCHDOG] No GPU progress for 30 s'
 out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-wd.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
 expect "Q_tg watchdog fails by name" "$out" "Q_tg=FAIL(watchdog=1)"
+# A loan the prompt's ring never used must come back in one transaction at the first decode graph (llama.cpp-i4ny).
+BULK_FIRST='0.08.000.000 W [MOE-EXEC] bulk refill device 0: 9 of 9 lent triplets re-admitted in one transaction'
+BULK_FIRST="$BULK_FIRST at decode graph 1 after the prompt (its ring did not engage)"
+BULK_LATE="${BULK_FIRST/decode graph 1 after/decode graph 2 after}"
+TG_REPORT='0.09.000.000 W [MOE-EXEC] refill device 0: 9/9 triplets re-admitted'
+TG_LOAN='0.07.000.000 W [MOE-EXEC] loan device 0: 9 triplets, 15 MiB lent to the ring (OK)'
+TG_NORING='0.09.000.000 W [MOE-EXEC] summary: 0 layer-ubatches ring, 46 cpu, 0 forced, 0 MiB streamed'
+TG_RING='0.09.000.000 W [MOE-EXEC] summary: 24 layer-ubatches ring, 22 cpu, 0 forced, 300 MiB streamed'
+bulk_err() { # <file> <summary line> [bulk line]
+    dec_err "$1" 11.91 "$PLACE_TG" "$TG_LOAN"
+    { echo "$2"; [ -z "${3:-}" ] || echo "$3"; echo "$TG_REPORT"; } >> "$1"
+}
+bulk_err "$WORK/tg-held.err" "$TG_NORING"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-held.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg a loan with no ring and no bulk refill fails refill_late" "$out" "Q_tg=FAIL(refill_late)"
+expect "Q_tg a held loan prints bulk_refill=late" "$out" "loan_exercised=yes ring_engaged=no bulk_refill=late"
+bulk_err "$WORK/tg-bulk.err" "$TG_NORING" "$BULK_FIRST"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-bulk.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg a bulk refill at decode graph 1 passes" "$out" "Q_tg=PASS tg=11.91"
+expect "Q_tg a bulk refill at decode graph 1 prints bulk_refill=first" "$out" "bulk_refill=first"
+expect "Q_tg the bulk line is not counted as a teardown refill line" "$out" "refill=balanced(9/9)"
+bulk_err "$WORK/tg-bulk-late.err" "$TG_NORING" "$BULK_LATE"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-bulk-late.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg a bulk refill at decode graph 2 fails refill_late" "$out" "Q_tg=FAIL(refill_late)"
+bulk_err "$WORK/tg-ring.err" "$TG_RING"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg-ring.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg a loan its ring engaged owes no bulk refill" "$out" "Q_tg=PASS tg=11.91"
+expect "Q_tg a ring-funded loan prints bulk_refill=not_owed" "$out" "ring_engaged=yes bulk_refill=not_owed"
+out="$(score Q_tg --out "$WORK/dec.out" --err "$WORK/tg.err" --qmd5 "$MD5" --place-ref-tg "$PLACE_TG")"
+expect "Q_tg no loan owes no bulk refill" "$out" "loan_exercised=no ring_engaged=no bulk_refill=not_owed"
+out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/tg-held.err" --qmd5 "$MD5" --place-ref-noc -)"
+expect "Q_noc takes the same refill_late rule" "$out" "Q_noc=FAIL(refill_late)"
 dec_err "$WORK/noc.err" 9.80 'MoE experts: 38163 on device, 35565 on host'
 out="$(score Q_noc --out "$WORK/dec.out" --err "$WORK/noc.err" --qmd5 "$MD5" \
     --place-ref-noc 'MoE experts: 38163 on device, 35565 on host')"
