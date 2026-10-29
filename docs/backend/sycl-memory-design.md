@@ -219,7 +219,11 @@ whose ring never engaged used none of its loan, so the first decode graph's
 boundary returns all of it in one refill transaction, whatever
 `GGML_SYCL_MOE_REFILL_PER_GRAPH` says, and one WARN names that decode graph
 (llama.cpp-i4ny). Each refill republishes the plan and forces a re-record, so
-one per triplet was the cost. The fit's
+one per triplet was the cost. A context that ends with triplets still lent
+owes them to the next context: its backend free marks the ledger and copies
+nothing, and its refill report adds how many it owes. The next context's
+first graph entry, before any MUL_MAT_ID, returns them in one transaction. A
+process that exits after its last context pays nothing. The fit's
 ring term charges the ring bytes that no loan would cover to the rung's demand,
 so a rung that needs them is refused with a figure.
 
