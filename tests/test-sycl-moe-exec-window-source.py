@@ -514,8 +514,8 @@ def claim_exposed_is_a_layers_first_window(plan_hpp: str, plan_cpp: str) -> bool
     included, so the predicate names no role and no phase. begin_ubatch resets the last window's layer to -1, which is
     what makes a micro-batch's first window exposed even when it is the layer the last micro-batch ended at. This is an
     exact-expression pin: it requires the signature to be exactly `(int layer, int prev_layer)`, so a restored parameter
-    fails it, the body to return `layer != prev_layer` and name no role or phase, and begin_ubatch to keep its reset; it never evaluates the predicate. The exposure block of test-moe-stream-phase.cpp
-    (the sycl-moe-stream-phase ctest) pins the behaviour, both polarities."""
+    fails it, the body to return `layer != prev_layer` and name no role or phase, and begin_ubatch to keep its reset; it never evaluates the predicate. The exposure block of
+    test-moe-stream-phase.cpp (the sycl-moe-stream-phase ctest) pins the behaviour, both polarities."""
     b = body(norm(plan_hpp), EXPOSED_SIG)
     ub = body(norm(plan_cpp), BEGIN_UBATCH_SIG)
     return (b != "" and b.endswith(EXPOSED_RETURN) and b.count("return ") == 1 and "expert_tensor_role::" not in b
