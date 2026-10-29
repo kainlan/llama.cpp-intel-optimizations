@@ -21134,13 +21134,16 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
 }
 
 // The body, both directions (llama.cpp-sif1). `amount` is the bytes a loan should free, or the most triplets a refill
-// re-admits. `resolver` is null in production (the registry resolver above, bound to the published plan's owner); the
-// private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless the caller re-posts
-// BUSY ones (warn_busy false). A refill runs at every decode graph's boundary, so it WARNs only the lent triplets it
-// drops from the ledger, once each (a triplet is dropped once); its boundary runner WARNs refusals, rate-limited.
+// re-admits. A loan counts `amount` in ring slots of `slot_bytes` (moe_expert_loan_select, llama.cpp-9x8t); 0 counts
+// bytes, and a refill passes 0. `resolver` is null in production (the registry resolver above, bound to the published
+// plan's owner); the private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless
+// the caller re-posts BUSY ones (warn_busy false). A refill runs at every decode graph's boundary, so it WARNs only the
+// lent triplets it drops from the ledger, once each (a triplet is dropped once); its boundary runner WARNs refusals,
+// rate-limited.
 static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction         direction,
                                                      int                                    device,
                                                      size_t                                 amount,
+                                                     size_t                                 slot_bytes,
                                                      bool                                   probe_mode,
                                                      const ggml_sycl_expert_loan_resolver * resolver,
                                                      ggml_sycl_expert_loan_result *         out,
@@ -21185,12 +21188,12 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         return refuse(ggml_sycl_txn_result::REFUSED, "no plan published");
     }
 
-    // A loan selects the least popular resident triplets worth `amount` bytes; a refill takes up to `amount` lent ones
-    // from the back of the ledger, and none when its cursor is disarmed.
+    // A loan selects the least popular resident triplets that free `amount` bytes, in slots of `slot_bytes`; a refill
+    // takes up to `amount` lent ones from the back of the ledger, and none when its cursor is disarmed.
     size_t                                       selected = 0;
     std::vector<ggml_sycl::expert_placement_key> keys =
         refill ? ggml_sycl_expert_refill_select(device, *current, amount, &result.n_remaining) :
-                 ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, /*slot_bytes=*/0, &selected);
+                 ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected);
     const uint32_t n_selected = static_cast<uint32_t>(keys.size() / 3);
     if (probe_mode) {
         result.accepted    = n_selected != 0;
@@ -21557,15 +21560,16 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     return finish(ggml_sycl_txn_result::ACCEPTED, reason);
 }
 
-// The loan direction, as the loan's callers and its device cases name it.
+// The loan direction, as the loan's callers and its device cases name it. `slot_bytes` 0 counts bytes.
 static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int                                    device,
                                                                   size_t                                 bytes_wanted,
+                                                                  size_t                                 slot_bytes,
                                                                   bool                                   probe_mode,
                                                                   const ggml_sycl_expert_loan_resolver * resolver,
                                                                   ggml_sycl_expert_loan_result *         out,
                                                                   bool warn_busy = true) {
-    return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, probe_mode, resolver,
-                                    out, warn_busy);
+    return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, slot_bytes, probe_mode,
+                                    resolver, out, warn_busy);
 }
 
 // What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused
@@ -21573,14 +21577,17 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
 // (ggml_sycl_hold_ring_uncovered). A probe logs nothing, so it never warns from the fit.
 static size_t ggml_sycl_expert_loan_probe_bytes(int device, size_t bytes_wanted) {
     ggml_sycl_expert_loan_result probe;
-    const ggml_sycl_txn_result   code =
-        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/true, nullptr, &probe,
-                                              /*warn_busy=*/false);
+    const ggml_sycl_txn_result   code = ggml_sycl_expert_loan_transaction_run(
+        device, bytes_wanted, /*slot_bytes=*/0, /*probe_mode=*/true, nullptr, &probe, /*warn_busy=*/false);
     return code == ggml_sycl_txn_result::ACCEPTED ? probe.bytes_freed : 0;
 }
 
 // Per device, the most bytes any in-graph caller asked to borrow since the last graph boundary; 0 when none did.
 static std::atomic<size_t> g_sycl_expert_loan_requests[GGML_SYCL_MAX_DEVICES];
+
+// Per device, the ring slot size the pending request is counted in (llama.cpp-9x8t); 0 counts bytes. Stored before the
+// request's bytes, which publish it.
+static std::atomic<size_t> g_sycl_expert_loan_slot_bytes[GGML_SYCL_MAX_DEVICES];
 
 // Per device, the BUSY refusals in a row the boundary runner has re-posted; any other outcome resets it.
 static std::atomic<uint32_t> g_sycl_expert_loan_busy_streak[GGML_SYCL_MAX_DEVICES];
@@ -21594,10 +21601,14 @@ static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_SYCL_MAX_DEVICES];
 // caller may hold g_sycl_graph_compute_mutex; the largest request since the last boundary wins. Its in-graph caller is
 // the prompt phase's ring, when the WEIGHT zone cannot give its reserve (through the op's request_loan hook,
 // llama.cpp-3460, c-0tmn); the boundary runner below also calls it to re-post a request a transient refusal sent back.
-static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted) {
+// The request counts its bytes in ring slots of `slot_bytes`, 0 counting bytes (llama.cpp-9x8t). The slot size is
+// stored before the bytes, whose release publishes it to the runner that acquires them. It is stored whether or not
+// these bytes win: a ring's geometry does not change within a prompt, so two requests in flight agree on it.
+static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted, size_t slot_bytes) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes_wanted == 0) {
         return;
     }
+    g_sycl_expert_loan_slot_bytes[device].store(slot_bytes, std::memory_order_release);
     std::atomic<size_t> & request = g_sycl_expert_loan_requests[device];
     size_t                seen    = request.load(std::memory_order_relaxed);
     while (seen < bytes_wanted &&
@@ -21634,10 +21645,14 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     if (bytes_wanted == 0) {
         return false;
     }
+    // Read after the bytes were taken, which the request stored it before.
+    const size_t slot_bytes = g_sycl_expert_loan_slot_bytes[device].load(std::memory_order_acquire);
+
     ggml_sycl_expert_loan_result   local;
     ggml_sycl_expert_loan_result * result = out ? out : &local;
-    const ggml_sycl_txn_result code = ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, /*probe_mode=*/false,
-                                                                            resolver, result, /*warn_busy=*/false);
+    const ggml_sycl_txn_result     code =
+        ggml_sycl_expert_loan_transaction_run(device, bytes_wanted, slot_bytes, /*probe_mode=*/false, resolver, result,
+                                              /*warn_busy=*/false);
     // A REFUSED loan is counted, so the phase that asked stops asking for the rest of its prompt (llama.cpp-3460).
     if (code == ggml_sycl_txn_result::REFUSED) {
         g_sycl_expert_loan_refusals[device].fetch_add(1, std::memory_order_release);
@@ -21655,7 +21670,7 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
         GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s (%u in a row, re-posted; logged once per %u)\n", device,
                       result->reason, n, warn_every);
     }
-    ggml_sycl_request_expert_loan(device, bytes_wanted);
+    ggml_sycl_request_expert_loan(device, bytes_wanted, slot_bytes);
     return true;
 }
 
@@ -21735,8 +21750,8 @@ static uint32_t ggml_sycl_expert_refill_transaction_run(int                     
     ggml_sycl_expert_loan_result   local;
     ggml_sycl_expert_loan_result * result = out ? out : &local;
     const ggml_sycl_txn_result     answer =
-        ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::REFILL, device, max_triplets, /*probe_mode=*/false,
-                                 resolver, result, /*warn_busy=*/false);
+        ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::REFILL, device, max_triplets, /*slot_bytes=*/0,
+                                 /*probe_mode=*/false, resolver, result, /*warn_busy=*/false);
     if (code) {
         *code = answer;
     }
@@ -22008,6 +22023,7 @@ struct test_loan_fixture {
             g_sycl_expert_lent[device] = ggml_sycl_expert_lent_ledger{};
         }
         g_sycl_expert_loan_requests[device].store(0, std::memory_order_release);
+        g_sycl_expert_loan_slot_bytes[device].store(0, std::memory_order_release);
         g_sycl_expert_loan_busy_streak[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
         g_sycl_expert_lent_bytes[device].store(0, std::memory_order_release);
@@ -22483,7 +22499,7 @@ struct test_loan_fixture {
             retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
             hold.held = true;
         }
-        ::ggml_sycl_request_expert_loan(device, bytes_wanted);
+        ::ggml_sycl_request_expert_loan(device, bytes_wanted, /*slot_bytes=*/0);
         if (!::ggml_sycl_run_pending_expert_loan_on_device(device, &resolver, &result) || !result.accepted ||
             result.n_triplets != n_expected) {
             return test_loan_fail("the loan of %zu bytes lent %u triplets (%s), not %u", bytes_wanted,
@@ -22665,8 +22681,8 @@ std::string test_expert_loan_refuses_without_host_zones() {
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
-    const ::ggml_sycl_txn_result           probe =
-        ::ggml_sycl_expert_loan_transaction_run(fx.device, 3 * charge, /*probe_mode=*/true, &resolver, &result);
+    const ::ggml_sycl_txn_result           probe = ::ggml_sycl_expert_loan_transaction_run(
+        fx.device, 3 * charge, /*slot_bytes=*/0, /*probe_mode=*/true, &resolver, &result);
     if (probe != ::ggml_sycl_txn_result::REFUSED || result.accepted ||
         std::strcmp(result.reason, "host zones not configured") != 0) {
         return test_loan_fail("the probe answered code=%d accepted=%d (%s), not a host-zones refusal", (int) probe,
@@ -22674,7 +22690,7 @@ std::string test_expert_loan_refuses_without_host_zones() {
     }
 
     // Through the graph boundary's runner, as the ring's request reaches the transaction.
-    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
+    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge, /*slot_bytes=*/0);
     result = {};
     if (!::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, &result)) {
         return "the boundary runner did not run the pending loan";
@@ -22728,9 +22744,9 @@ std::string test_expert_loan_lends_two_triplets() {
     const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
 
     // c-tdra: an in-graph caller records a request and the graph boundary runs it. The largest request wins.
-    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
-    ::ggml_sycl_request_expert_loan(fx.device, 6 * charge);
-    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
+    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge, /*slot_bytes=*/0);
+    ::ggml_sycl_request_expert_loan(fx.device, 6 * charge, /*slot_bytes=*/0);
+    ::ggml_sycl_request_expert_loan(fx.device, 3 * charge, /*slot_bytes=*/0);
     const size_t pending = g_sycl_expert_loan_requests[fx.device].load();
     if (pending != 6 * charge) {
         return test_loan_fail("the pending request is %zu bytes, not the largest asked, %zu", pending, 6 * charge);
@@ -22900,14 +22916,14 @@ std::string test_expert_loan_probe_changes_nothing() {
 
         for (const bool probe : { true, false }) {
             ::ggml_sycl_expert_loan_result inside;
-            const ::ggml_sycl_txn_result   code =
-                ::ggml_sycl_expert_loan_transaction_run(fx.device, 6 * charge, probe, &resolver, &inside);
+            const ::ggml_sycl_txn_result   code = ::ggml_sycl_expert_loan_transaction_run(
+                fx.device, 6 * charge, /*slot_bytes=*/0, probe, &resolver, &inside);
             if (code != ::ggml_sycl_txn_result::BUSY || inside.accepted || std::strcmp(inside.reason, "graph active")) {
                 return test_loan_fail("inside a graph the %s answered code=%d accepted=%d (%s), not \"graph active\"",
                                       probe ? "probe" : "loan", (int) code, (int) inside.accepted, inside.reason);
             }
         }
-        ::ggml_sycl_request_expert_loan(fx.device, 6 * charge);
+        ::ggml_sycl_request_expert_loan(fx.device, 6 * charge, /*slot_bytes=*/0);
         if (::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, nullptr) ||
             g_sycl_expert_loan_requests[fx.device].load() != 6 * charge) {
             return "inside a graph the boundary runner ran the request or dropped it";
@@ -22919,8 +22935,8 @@ std::string test_expert_loan_probe_changes_nothing() {
     }
 
     ::ggml_sycl_expert_loan_result result;
-    const ::ggml_sycl_txn_result   code =
-        ::ggml_sycl_expert_loan_transaction_run(fx.device, 6 * charge, /*probe_mode=*/true, &resolver, &result);
+    const ::ggml_sycl_txn_result   code = ::ggml_sycl_expert_loan_transaction_run(
+        fx.device, 6 * charge, /*slot_bytes=*/0, /*probe_mode=*/true, &resolver, &result);
     if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_triplets != 2 ||
         result.bytes_freed != 6 * charge) {
         return test_loan_fail("the probe answered accepted=%d triplets=%u bytes=%zu (%s), not 1, 2, %zu",
@@ -22991,8 +23007,8 @@ std::string test_expert_loan_refuses_replacing_a_host_entry() {
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
-    const ::ggml_sycl_txn_result           code =
-        ::ggml_sycl_expert_loan_transaction_run(fx.device, 3 * charge, /*probe_mode=*/false, &resolver, &result);
+    const ::ggml_sycl_txn_result           code = ::ggml_sycl_expert_loan_transaction_run(
+        fx.device, 3 * charge, /*slot_bytes=*/0, /*probe_mode=*/false, &resolver, &result);
     if (code != ::ggml_sycl_txn_result::REFUSED || result.accepted || result.n_triplets != 0 ||
         result.bytes_freed != 0 || std::strcmp(result.reason, "host entry exists") != 0) {
         return test_loan_fail("the loan answered code=%d accepted=%d triplets=%u (%s), not a host-entry-exists refusal",
@@ -23030,8 +23046,8 @@ std::string test_expert_loan_refuses_shared_storage() {
 
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
-    const ::ggml_sycl_txn_result           code =
-        ::ggml_sycl_expert_loan_transaction_run(fx.device, 3 * charge, /*probe_mode=*/false, &resolver, &result);
+    const ::ggml_sycl_txn_result           code = ::ggml_sycl_expert_loan_transaction_run(
+        fx.device, 3 * charge, /*slot_bytes=*/0, /*probe_mode=*/false, &resolver, &result);
     if (code != ::ggml_sycl_txn_result::REFUSED || result.accepted || result.n_triplets != 0 ||
         result.bytes_freed != 0 || std::strcmp(result.reason, "shared storage") != 0) {
         return test_loan_fail("the loan answered code=%d accepted=%d triplets=%u (%s), not a shared-storage refusal",
@@ -23912,7 +23928,7 @@ std::string test_expert_loan_and_refill_stop_on_a_missing_entry() {
         const ::ggml_sycl_expert_loan_resolver resolver  = fx.resolver();
         ::ggml_sycl_expert_loan_result         result;
         test_loan_warn_capture                 warns;
-        ::ggml_sycl_request_expert_loan(fx.device, 3 * charge);
+        ::ggml_sycl_request_expert_loan(fx.device, 3 * charge, /*slot_bytes=*/0);
         if (!::ggml_sycl_run_pending_expert_loan_on_device(fx.device, &resolver, &result)) {
             return "the graph boundary ran no loan for the pending request";
         }
