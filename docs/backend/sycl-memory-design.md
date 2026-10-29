@@ -214,7 +214,12 @@ runs, the refill runs at the decode boundary through
 `ggml_sycl_expert_refill_transaction_run`. It re-admits
 lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying
 each lent host copy back owner to owner on the copy queue, behind its writes. A
-triplet that can never be prepared stays on the host, with one WARN. The fit's
+triplet that can never be prepared stays on the host, with one WARN. A prompt
+whose ring never engaged used none of its loan, so the first decode graph's
+boundary returns all of it in one refill transaction, whatever
+`GGML_SYCL_MOE_REFILL_PER_GRAPH` says, and one WARN names that decode graph
+(llama.cpp-i4ny). Each refill republishes the plan and forces a re-record, so
+one per triplet was the cost. The fit's
 ring term charges the ring bytes that no loan would cover to the rung's demand,
 so a rung that needs them is refused with a figure.
 
