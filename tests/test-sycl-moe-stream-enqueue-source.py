@@ -1309,7 +1309,7 @@ EXPOSED_PRED_SIG = "static inline bool moe_stream_window_exposed("
 WINDOW_ID_SIG = "static inline uint32_t moe_stream_window_id("
 UBATCH_PRED_CALL = ("const bool new_ubatch = moe_stream_ubatch_starts(ubatch_live_, layer, cur_layer_, op.graph_seq, "
                     "cur_graph_seq_);")
-EXPOSED_CALL = ("const bool exposed = moe_stream_window_exposed(req.layer, req.role, req.phase, prev_window_layer_);")
+EXPOSED_CALL = "const bool exposed = moe_stream_window_exposed(req.layer, prev_window_layer_);"
 WINDOW_ID_CALL = "const uint32_t wid = moe_stream_window_id(req.layer, req.role, req.phase);"
 
 
