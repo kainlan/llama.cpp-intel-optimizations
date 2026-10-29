@@ -574,11 +574,10 @@ enum class moe_stream_loan_step : uint8_t {
 // calls this from its reserve-failed branch, so once per micro-batch (the reserve latch stops the later layers before
 // the reserve, c-i8rz), with the bytes the WEIGHT zone was short of as moe_stream_ring::reserve reported them and the
 // ring's slot size, which the loan counts them in (llama.cpp-9x8t). It asks for a loan of that much at the next graph
-// boundary (ggml_backend_sycl_synchronize runs it, c-tdra), and the next
-// micro-batch's reserve tries again. A REFUSED count that moved since the last ask means that loan was refused:
-// retrying would refuse again, so the latch holds until end_prompt. An ACCEPTED loan that still left the ring short, or
-// a BUSY one, leaves the count alone, so the next short micro-batch asks again; a repeated request is harmless, since
-// the largest since the last boundary wins.
+// boundary (ggml_backend_sycl_synchronize runs it, c-tdra), and the next micro-batch's reserve tries again. A REFUSED
+// count that moved since the last ask means that loan was refused: retrying would refuse again, so the latch holds
+// until end_prompt. An ACCEPTED loan that still left the ring short, or a BUSY one, leaves the count alone, so the next
+// short micro-batch asks again; a repeated request is harmless, since the largest since the last boundary wins.
 static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_loan_latch &     latch,
                                                                     int                         device,
                                                                     size_t                      bytes_short,
