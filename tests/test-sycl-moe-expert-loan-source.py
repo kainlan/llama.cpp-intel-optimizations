@@ -1278,7 +1278,6 @@ def claim_an_unengaged_prompts_loan_comes_back_at_once(sycl: str) -> bool:
             and body(s, BOUNDARY_SIG).count(BOUNDARY_CALLS_REFILLS) == 1)
 
 
-GRAPH_UNLOCK = "global_graph_lock.unlock();"
 LEDGER_CALLS = ("ggml_sycl_expert_bulk_refill_owe(", "ggml_sycl_expert_bulk_refill_take(",
                 "ggml_sycl_expert_bulk_refill_owe_next_context(", "ggml_sycl_expert_bulk_refill_owed_next_context(",
                 "ggml_sycl_run_expert_bulk_refill_between_contexts(",
@@ -1286,12 +1285,11 @@ LEDGER_CALLS = ("ggml_sycl_expert_bulk_refill_owe(", "ggml_sycl_expert_bulk_refi
 
 
 def graph_lock_segment(sycl: str) -> str:
-    """Graph compute's text from taking the process-global graph lock to its first release. Empty when either is
-    missing."""
+    """Graph compute's text from taking the process-global graph lock to its end. Not to the first unlock: that one
+    sits in the compute lambda, and the replay path still holds the lock past it. Empty when the lock is missing."""
     g = body(norm(sycl), GRAPH_COMPUTE_SIG)
     at = g.find(GRAPH_LOCK)
-    end = g.find(GRAPH_UNLOCK, at) if at >= 0 else -1
-    return g[at:end] if end > at else ""
+    return g[at:] if at >= 0 else ""
 
 
 def claim_the_debt_is_never_marked_under_the_graph_lock(sycl: str) -> bool:
