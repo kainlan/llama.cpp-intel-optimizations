@@ -2906,7 +2906,8 @@ def test_mutant_bulk_refill_line_reads_as_the_exit_report_fails():
 
 
 def test_mutant_bulk_refill_line_at_another_position_fails():
-    mutant = _once_in(SYCL, REFILLS_SIG, "at decode graph %llu after the prompt", "at decode graph %llu since the prompt")
+    mutant = _once_in(SYCL, REFILLS_SIG, "at decode graph %llu after the prompt",
+                      "at decode graph %llu since the prompt")
     assert not claim_bulk_refill_line_scores_as_the_gate_reads_it(mutant, GATE)
 
 

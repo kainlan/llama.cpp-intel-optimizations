@@ -21855,10 +21855,10 @@ static uint64_t ggml_sycl_expert_bulk_refill_take(int device) {
 }
 
 // The graph boundary's refills. Every boundary with lent triplets takes the bulk refill owed, asking without the lock
-// first, as the per-graph refill does. A prompt graph's boundary drops it, since a new prompt phase stops the refills. A decode graph's runs it as the per-graph refill with max_triplets
-// the ledger's count, so the cursor, the once-per-decode-graph rule and the refusal WARN are the per-graph refill's.
-// An accepted bulk refill WARNs once, with where it ran; what it leaves, or a refused one, the per-graph refill meets
-// at the next decode graphs.
+// first, as the per-graph refill does. A prompt graph's boundary drops it, since a new prompt phase stops the refills.
+// A decode graph's boundary runs it as the per-graph refill with max_triplets the ledger's count, so the cursor, the
+// once-per-decode-graph rule and the refusal WARN are the per-graph refill's. An accepted bulk refill WARNs once, with
+// where it ran; what it leaves, or a refused one, the per-graph refill meets at the next decode graphs.
 static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device(int                                    device,
                                                                    bool                                   decode,
                                                                    uint64_t                               decode_graphs,

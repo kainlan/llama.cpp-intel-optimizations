@@ -2287,7 +2287,8 @@ ENGAGED_BODY = "{ return last_prompt_ring_engaged_; }"
 TAKE_ENDED_DECL = "bool take_prompt_ended();"
 TAKE_ENDED_SIG = "bool moe_stream_phase::take_prompt_ended()"
 TAKE_ENDED_BODY = "{ const bool ended = prompt_ended_; prompt_ended_ = false; return ended; }"
-ENGAGED_DECLS = ("bool ring_engaged_ = false;", "bool last_prompt_ring_engaged_ = false;", "bool prompt_ended_ = false;")
+ENGAGED_DECLS = ("bool ring_engaged_ = false;", "bool last_prompt_ring_engaged_ = false;",
+                 "bool prompt_ended_ = false;")
 ENGAGED_SET = "ring_engaged_ = true; ring_ = std::move(ring);"
 ENGAGED_COPY = "last_prompt_ring_engaged_ = ring_engaged_; ring_engaged_ = false; prompt_ended_ = true;"
 
@@ -2307,7 +2308,8 @@ def claim_end_prompt_reports_ring_engagement(phase: str, hpp: str) -> bool:
     return (h.count(ENGAGED_DECL) == 1 and h.count(TAKE_ENDED_DECL) == 1 and body(n, ENGAGED_SIG) == ENGAGED_BODY
             and all(h.count(d) == 1 for d in ENGAGED_DECLS)
             and n.count("ring_engaged_ = true;") == 1 and ready.count(ENGAGED_SET) == 1
-            and ordered(ready, LATCH_GUARD, RESERVE_SHORT_IF, "return false;", ENGAGED_SET + " reset_regions(); return true;")
+            and ordered(ready, LATCH_GUARD, RESERVE_SHORT_IF, "return false;",
+                        ENGAGED_SET + " reset_regions(); return true;")
             and n.count("prompt_ended_ = true;") == 1 and n.count("last_prompt_ring_engaged_ =") == 1
             and end.count(ENGAGED_COPY) == 1 and ordered(end, END_PROMPT_EARLY, ENGAGED_COPY, "teardown(")
             and body(n, TAKE_ENDED_SIG) == TAKE_ENDED_BODY)
