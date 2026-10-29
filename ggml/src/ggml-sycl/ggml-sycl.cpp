@@ -24674,11 +24674,12 @@ static std::string test_expert_bulk_refill_short_room_case(uint64_t model_id, bo
                               warns.count(bulk_line), warns.count_prefix("[MOE-EXEC] bulk refill"), want_bulk,
                               want_bulk, bulk_line.c_str());
     }
-    if (phase.take_prompt_ended() || ::ggml_sycl_expert_bulk_refill_take(fx.device) != 0) {
-        return "the bulk refill left its prompt end or its debt for a later boundary";
+    if (phase.take_prompt_ended()) {
+        return "the bulk refill left the phase's prompt end for a later boundary";
     }
 
-    // The room back, the next decode graph's boundary is the per-graph refill: one triplet, and no bulk line.
+    // The room back, the next decode graph's boundary is the per-graph refill: one triplet, and no bulk line. A debt
+    // left for it would show here as a second bulk refill of everything still lent.
     fillers.clear();
     if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= 3 * charge; })) {
         return "the fillers' WEIGHT zone room did not come back within 2 s";
