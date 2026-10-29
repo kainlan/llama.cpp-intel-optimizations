@@ -982,6 +982,9 @@ def claim_a_loan_cancels_the_refills(sycl: str) -> bool:
 LEDGER_LOCK = "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);"
 OWE_SIG = "static void ggml_sycl_expert_bulk_refill_owe(int device, uint64_t first_graph)"
 TAKE_SIG = "static uint64_t ggml_sycl_expert_bulk_refill_take(int device)"
+OWE_NEXT_SIG = "static uint32_t ggml_sycl_expert_bulk_refill_owe_next_context(int device)"
+OWED_NEXT_SIG = "static uint32_t ggml_sycl_expert_bulk_refill_owed_next_context(int device)"
+BETWEEN_SIG = "static uint32_t ggml_sycl_run_expert_bulk_refill_between_contexts("
 LEDGER_IN_TXN = "ggml_sycl_expert_lent_ledger & ledger = ggml_sycl_expert_lent_ledger_locked(device, *current);"
 
 
@@ -990,14 +993,15 @@ def claim_ledger_is_guarded_by_the_inventory_mutex(sycl: str) -> bool:
     the body reaches the ledger only after its own lock, and the one direct reader besides those is the private
     fixture's teardown, under the same lock. The reconcile helper subscripts it too; its only callers are the
     accessor and the publication, whose caller holds the lock, so the helper's name appears exactly four times: the
-    forward declaration, the definition and those two calls. The bulk refill's owe and take (llama.cpp-i4ny) take the
-    lock before they reach it. The seven subscripts are the declaration, the helper, the accessor's return, the arming,
-    the owe, the take and the teardown."""
+    forward declaration, the definition and those two calls. The bulk refill's owe and take, and the debt an ended
+    context leaves (its owe, the report's read of it and the next context's refill), take the lock before they reach
+    it (llama.cpp-i4ny). The ten subscripts are the declaration, the helper, the accessor's return, the arming, those
+    six and the teardown."""
     s = norm(sycl)
     select = body(s, SELECT_SIG)
     arm = body(s, ARM_SIG)
     txn = body(s, TXN_SIG)
-    return (s.count("g_sycl_expert_lent[") == 7
+    return (s.count("g_sycl_expert_lent[") == 10
             and s.count("static ggml_sycl_expert_lent_ledger g_sycl_expert_lent[GGML_SYCL_MAX_DEVICES];") == 1
             and body(s, LEDGER_SIG).count("g_sycl_expert_lent[device]") == 1
             and s.count(RECONCILE_DEF) == 1
@@ -1007,6 +1011,8 @@ def claim_ledger_is_guarded_by_the_inventory_mutex(sycl: str) -> bool:
             and ordered(arm, LEDGER_LOCK, "g_sycl_expert_lent[device]")
             and ordered(body(s, OWE_SIG), LEDGER_LOCK, "g_sycl_expert_lent[device]")
             and ordered(body(s, TAKE_SIG), LEDGER_LOCK, "g_sycl_expert_lent[device]")
+            and all(ordered(body(s, sig), LEDGER_LOCK, "g_sycl_expert_lent[device]")
+                    for sig in (OWE_NEXT_SIG, OWED_NEXT_SIG, BETWEEN_SIG))
             and txn.count(LEDGER_IN_TXN) == 1 and ordered(txn, INVENTORY_LOCK, LEDGER_IN_TXN)
             and "::ggml_sycl_publish_plan_locked(found); g_sycl_expert_lent[device] = ggml_sycl_expert_lent_ledger{};"
             in s)
@@ -1222,7 +1228,7 @@ def claim_one_decode_graph_admits_one_refill(sycl: str, common: str, sources: li
 
 GATE = read("scripts/sycl-moe-exec-gate.sh")
 REFILLS_SIG = "static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device("
-OWED_FIELD = "uint64_t bulk_refill_owed_at = 0; };"
+OWED_FIELD = "uint64_t bulk_refill_owed_at = 0;"
 RECONCILE_CLEAR = "ledger.refill_armed = false; ledger.bulk_refill_owed_at = 0;"
 OWE_SKIP = ("if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || "
             "g_sycl_expert_lent_count[device].load(std::memory_order_acquire) == 0) { return; }")
@@ -1298,6 +1304,86 @@ def claim_bulk_refill_line_scores_as_the_gate_reads_it(sycl: str, gate: str) -> 
     exit_report = gate_regex(gate, "RE_REFILL")
     return (bool(line) and bool(first) and bool(exit_report)
             and re.search(first, line) is not None and re.search(exit_report, line) is None)
+
+
+# --- a loan an ended context leaves lent comes back at the next context (llama.cpp-i4ny) ---------------------------
+
+NEXT_FIELD = "bool bulk_refill_next_context = false; };"
+RECONCILE_NEXT = "ledger.bulk_refill_owed_at = 0; ledger.bulk_refill_next_context = false;"
+OWE_NEXT_SET = ("ledger.bulk_refill_next_context = !ledger.triplets.empty(); "
+                "return static_cast<uint32_t>(ledger.triplets.size());")
+OWED_NEXT_READ = "return ledger.bulk_refill_next_context ? static_cast<uint32_t>(ledger.triplets.size()) : 0;"
+BETWEEN_SKIP = "if (g_sycl_expert_lent_count[device].load(std::memory_order_acquire) == 0) { return 0; }"
+BETWEEN_TAKE = ("const bool owed = ledger.bulk_refill_next_context; ledger.bulk_refill_next_context = false; "
+                "if (!owed) { return static_cast<uint32_t>(ledger.triplets.size()); }")
+BETWEEN_CURSOR = "std::atomic<uint64_t> refilled_at{ 0 };"
+BETWEEN_RUN = ("const uint32_t remaining = ggml_sycl_run_expert_refill_at_boundary_on_device(device, true, 1, "
+               "&refilled_at, lent, resolver, result);")
+BETWEEN_WARN = ('GGML_LOG_WARN("[MOE-EXEC] bulk refill device %d: %u of %u lent triplets re-admitted in one '
+                'transaction between contexts (the context that lent them ended)\\n", device, result->n_triplets, '
+                "lent);")
+FREE_OWE = ("if (sycl_ctx && sycl_ctx->graph_compute_seq != 0) { "
+            "(void) ggml_sycl_expert_bulk_refill_owe_next_context(sycl_ctx->device); }")
+ENTRY_CALL = ("(void) ggml_sycl_run_expert_bulk_refill_between_contexts("
+              "static_cast<ggml_backend_sycl_context *>(backend->context)->device, nullptr, nullptr);")
+GRAPH_LOCK = "std::unique_lock<std::mutex> global_graph_lock(g_sycl_graph_compute_mutex);"
+OWED_REPORT_READ = "const uint32_t owed = ggml_sycl_expert_bulk_refill_owed_next_context(device);"
+OWED_WARN = ('GGML_LOG_WARN("[MOE-EXEC] refill device %d: %u/%u triplets re-admitted (%u owed to the next '
+             'context)\\n", device, readmitted, lent, owed);')
+
+
+def claim_an_ended_contexts_loan_comes_back_at_the_next_context(sycl: str) -> bool:
+    """A context that computed a graph and ends with triplets lent owes them to the next context. Its backend free
+    marks the ledger under the lock before the refill report, copying nothing, so a process that exits after its last
+    context pays nothing. The report reads the debt under the lock and prints it after the counts. Every graph entry,
+    before the process-global graph lock and so before any MUL_MAT_ID, reaches the next context's half. It asks
+    without the lock whether anything is lent, then takes the debt under it, clearing it whether or not it acts. With
+    a debt it runs the deferred-free pass, which returns the room the ended context's ring held, and then the per-graph
+    refill once, on a cursor of its own, with max_triplets the ledger's count. It WARNs one line, only when that was
+    accepted, and no other. A publication under another identity clears the debt with the ledger."""
+    s = norm(sycl)
+    reconcile = body(s[s.find(RECONCILE_DEF):], RECONCILE_SIG) if RECONCILE_DEF in s else ""
+    between = body(s, BETWEEN_SIG)
+    return (s.count(NEXT_FIELD) == 1 and reconcile.count(RECONCILE_NEXT) == 1
+            and ordered(body(s, OWE_NEXT_SIG), LEDGER_LOCK, OWE_NEXT_SET)
+            and ordered(body(s, OWED_NEXT_SIG), LEDGER_LOCK, OWED_NEXT_READ)
+            and ordered(between, BETWEEN_SKIP, LEDGER_LOCK, BETWEEN_TAKE, DEFERRED_FREES, BULK_LENT, BETWEEN_CURSOR,
+                        BETWEEN_RUN, BULK_GUARD, BETWEEN_WARN)
+            and between.count("GGML_LOG_WARN(") == 1
+            and body(s, FREE_SIG).count(FREE_OWE) == 1 and ordered(body(s, FREE_SIG), FREE_OWE, FREE_REPORTS)
+            and body(s, GRAPH_COMPUTE_SIG).count(ENTRY_CALL) == 1
+            and ordered(body(s, GRAPH_COMPUTE_SIG), ENTRY_CALL, GRAPH_LOCK)
+            and ordered(body(s, REPORT_SIG), TAKE_LENT, TAKE_READMITTED, OWED_REPORT_READ, OWED_WARN, TEARDOWN_WARN))
+
+
+def warn_line(text: str, signature: str, prefix: str, values: tuple) -> str:
+    """The first WARN in the body of `signature` whose format starts with `prefix`, its printf conversions filled
+    with `values`. Empty when there is none."""
+    m = re.search(r'GGML_LOG_WARN\("(%s[^"]*)\\n"' % re.escape(prefix), body(norm(text), signature))
+    if not m:
+        return ""
+    try:
+        return re.sub(r"%(?:llu|u)", "%d", m.group(1)) % values
+    except (TypeError, ValueError):
+        return ""
+
+
+def claim_debt_lines_score_as_the_gate_reads_them(sycl: str, gate: str) -> bool:
+    """The free's report with a debt keeps the prefix the gate's RE_REFILL reads, so the gate still counts it as the
+    exit report (the positive control). The next context's bulk line is a bulk refill line (RE_BULK_REFILL) that is
+    neither the exit report (RE_REFILL) nor the decode-graph-1 line refill_late wants (RE_BULK_REFILL_FIRST). Only
+    Q_tg and Q_noc score refill balance, and both are single-context llama-completion runs whose ledger the
+    decode-graph-1 bulk refill has emptied by their free, so the debt form never reaches a scored line."""
+    owed = warn_line(sycl, REPORT_SIG, "[MOE-EXEC] refill device", (0, 6, 9, 3))
+    between = warn_line(sycl, BETWEEN_SIG, "[MOE-EXEC]", (0, 9, 9))
+    exit_report = gate_regex(gate, "RE_REFILL")
+    bulk = gate_regex(gate, "RE_BULK_REFILL")
+    first = gate_regex(gate, "RE_BULK_REFILL_FIRST")
+    return (bool(owed) and "owed to the next context" in owed and bool(between)
+            and bool(exit_report) and bool(bulk) and bool(first)
+            and re.search(exit_report, owed) is not None
+            and re.search(bulk, between) is not None
+            and re.search(exit_report, between) is None and re.search(first, between) is None)
 
 
 # --- positive tests -------------------------------------------------------------------------------------------------
@@ -1507,6 +1593,14 @@ def test_an_unengaged_prompts_loan_comes_back_at_once():
 
 def test_bulk_refill_line_scores_as_the_gate_reads_it():
     assert claim_bulk_refill_line_scores_as_the_gate_reads_it(SYCL, GATE)
+
+
+def test_an_ended_contexts_loan_comes_back_at_the_next_context():
+    assert claim_an_ended_contexts_loan_comes_back_at_the_next_context(SYCL)
+
+
+def test_debt_lines_score_as_the_gate_reads_them():
+    assert claim_debt_lines_score_as_the_gate_reads_them(SYCL, GATE)
 
 
 def test_final_refusals_name_the_cache_refusals():
@@ -2876,12 +2970,13 @@ def test_mutant_prompt_graph_runs_the_bulk_refill_fails():
 
 
 def test_mutant_bulk_refill_at_the_per_graph_count_fails():
-    mutant = _once(SYCL, "refilled_at, lent, resolver, result);", "refilled_at, max_triplets, resolver, result);")
+    mutant = _once_in(SYCL, REFILLS_SIG, "refilled_at, lent, resolver, result);",
+                      "refilled_at, max_triplets, resolver, result);")
     assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
 
 
 def test_mutant_bulk_refill_warns_when_refused_fails():
-    mutant = _once(SYCL, BULK_GUARD, "if (true) {")
+    mutant = _once_in(SYCL, REFILLS_SIG, BULK_GUARD, "if (true) {")
     assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
 
 
@@ -2923,3 +3018,97 @@ def test_mutant_gate_wants_another_position_fails():
     assert GATE.count(first) == 1
     mutant = GATE.replace(first, first.replace("graph 1 ", "graph 2 "))
     assert not claim_bulk_refill_line_scores_as_the_gate_reads_it(SYCL, mutant)
+
+
+# --- a loan an ended context leaves lent comes back at the next context: mutants (llama.cpp-i4ny) ------------------
+
+def _ended(mutant: str) -> bool:
+    return claim_an_ended_contexts_loan_comes_back_at_the_next_context(mutant)
+
+
+def test_mutant_free_owes_unlocked_fails():
+    mutant = _once_in(SYCL, OWE_NEXT_SIG, LEDGER_LOCK, ";")
+    assert not _ended(mutant)
+    assert not claim_ledger_is_guarded_by_the_inventory_mutex(mutant)
+
+
+def test_mutant_report_reads_the_debt_unlocked_fails():
+    mutant = _once_in(SYCL, OWED_NEXT_SIG, LEDGER_LOCK, ";")
+    assert not _ended(mutant)
+    assert not claim_ledger_is_guarded_by_the_inventory_mutex(mutant)
+
+
+def test_mutant_next_context_takes_the_debt_unlocked_fails():
+    mutant = _once_in(SYCL, BETWEEN_SIG, LEDGER_LOCK, ";")
+    assert not _ended(mutant)
+    assert not claim_ledger_is_guarded_by_the_inventory_mutex(mutant)
+
+
+def test_mutant_free_owes_an_empty_ledger_fails():
+    assert not _ended(_once(SYCL, "ledger.bulk_refill_next_context = !ledger.triplets.empty();",
+                            "ledger.bulk_refill_next_context = true;"))
+
+
+def test_mutant_next_context_keeps_the_debt_fails():
+    assert not _ended(_once_in(SYCL, BETWEEN_SIG, "ledger.bulk_refill_next_context = false;", ""))
+
+
+def test_mutant_reconcile_keeps_the_debt_fails():
+    assert not _ended(_once(SYCL, RECONCILE_NEXT, "ledger.bulk_refill_owed_at = 0;"))
+
+
+def test_mutant_every_graph_entry_takes_the_lock_fails():
+    assert not _ended(_once(SYCL, BETWEEN_SKIP, ""))
+
+
+def test_mutant_next_context_skips_the_deferred_frees_fails():
+    assert not _ended(_once_in(SYCL, BETWEEN_SIG, DEFERRED_FREES, ";"))
+
+
+def test_mutant_next_context_refills_one_triplet_fails():
+    assert not _ended(_once_in(SYCL, BETWEEN_SIG, "&refilled_at, lent, resolver, result);",
+                               "&refilled_at, 1, resolver, result);"))
+
+
+def test_mutant_next_context_warns_when_refused_fails():
+    assert not _ended(_once_in(SYCL, BETWEEN_SIG, BULK_GUARD, "if (true) {"))
+
+
+def test_mutant_free_owes_after_the_report_fails():
+    moved = _once(SYCL, FREE_OWE, "")
+    assert not _ended(_once(moved, FREE_REPORTS, FREE_REPORTS + " " + FREE_OWE))
+
+
+def test_mutant_temporary_backend_owes_a_live_contexts_loan_fails():
+    assert not _ended(_once(SYCL, "if (sycl_ctx && sycl_ctx->graph_compute_seq != 0) {", "if (sycl_ctx) {"))
+
+
+def test_mutant_next_context_refills_under_the_graph_lock_fails():
+    moved = _once(SYCL, ENTRY_CALL, "")
+    assert not _ended(_once(moved, GRAPH_LOCK, GRAPH_LOCK + " " + ENTRY_CALL))
+
+
+def test_mutant_graph_entry_never_refills_fails():
+    assert not _ended(_once(SYCL, ENTRY_CALL, ""))
+
+
+def test_mutant_report_hides_the_debt_fails():
+    assert not _ended(_once(SYCL, OWED_WARN, TEARDOWN_WARN))
+
+
+def test_mutant_debt_report_loses_the_exit_report_prefix_fails():
+    """The positive control: a debt line the gate's RE_REFILL no longer reads would drop out of refill_state."""
+    mutant = _once(SYCL, "triplets re-admitted (%u owed", "triplets readmitted (%u owed")
+    assert not claim_debt_lines_score_as_the_gate_reads_them(mutant, GATE)
+
+
+def test_mutant_between_contexts_line_reads_as_decode_graph_1_fails():
+    mutant = _once_in(SYCL, BETWEEN_SIG, "in one transaction between contexts (the context that lent them ended)",
+                      "in one transaction at decode graph 1 after the prompt")
+    assert not claim_debt_lines_score_as_the_gate_reads_them(mutant, GATE)
+
+
+def test_mutant_between_contexts_line_reads_as_the_exit_report_fails():
+    mutant = _once_in(SYCL, BETWEEN_SIG, "(the context that lent them ended)",
+                      "(the context that lent them ended) [MOE-EXEC] refill device 0: 0/0 triplets re-admitted")
+    assert not claim_debt_lines_score_as_the_gate_reads_them(mutant, GATE)

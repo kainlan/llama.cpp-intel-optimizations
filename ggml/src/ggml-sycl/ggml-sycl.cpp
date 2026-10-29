@@ -20884,6 +20884,9 @@ struct ggml_sycl_expert_lent_ledger {
     // The decode graph, in its context's count, at whose boundary a bulk refill of the whole ledger is owed: the
     // first one after a prompt whose ring did not engage (llama.cpp-i4ny). 0 when none is.
     uint64_t                                                    bulk_refill_owed_at = 0;
+    // Set by the backend free of a context that ends with triplets lent: the next context's first graph entry
+    // returns the whole ledger (llama.cpp-i4ny).
+    bool                                                        bulk_refill_next_context = false;
 };
 
 static ggml_sycl_expert_lent_ledger g_sycl_expert_lent[GGML_SYCL_MAX_DEVICES];
@@ -20940,6 +20943,7 @@ static void ggml_sycl_expert_lent_ledger_reconcile_locked(int                   
     ledger.triplet_bytes.clear();
     ledger.refill_armed        = false;
     ledger.bulk_refill_owed_at = 0;
+    ledger.bulk_refill_next_context = false;
     ledger.model_id            = model_id;
     ledger.load_txn_id  = load_txn_id;
     g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
@@ -21887,21 +21891,67 @@ static uint32_t ggml_sycl_run_expert_refills_at_boundary_on_device(int          
     return remaining;
 }
 
-// RED seams for the loan a context leaves lent when it ends (llama.cpp-i4ny); the next commit gives them bodies. The
-// backend free owes the loan to the next context, and that context's first graph entry returns it.
+// The backend free's half of a loan its context leaves lent (llama.cpp-i4ny). No later graph of that context will
+// return it: the context ran no decode graph after its loan, or its refills had not finished. The free owes the whole
+// ledger to the next context and copies nothing, so a process that exits after its last context pays nothing.
+// Returns how many triplets are owed.
 static uint32_t ggml_sycl_expert_bulk_refill_owe_next_context(int device) {
-    (void) device;
-    return 0;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+    ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
+    ledger.bulk_refill_next_context       = !ledger.triplets.empty();
+    return static_cast<uint32_t>(ledger.triplets.size());
 }
 
+// The triplets `device` owes the next context: 0 when it owes none.
+static uint32_t ggml_sycl_expert_bulk_refill_owed_next_context(int device) {
+    std::lock_guard<std::mutex>          lock(g_tensor_inventory_mutex);
+    const ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
+    return ledger.bulk_refill_next_context ? static_cast<uint32_t>(ledger.triplets.size()) : 0;
+}
+
+// The next context's half (llama.cpp-i4ny). Graph compute calls this at every graph's entry, before it takes the
+// process-global graph lock, as the synchronize boundary's refill runs without it. Nothing is lent, or nothing owed,
+// and it returns. Otherwise it takes the debt under the lock, runs the deferred-free pass that returns the room the
+// ended context's ring held, and refills the whole ledger in one transaction through the per-graph refill, on a cursor
+// of its own, so the arming and the refusal WARN are the per-graph refill's. An accepted one WARNs once. What it
+// leaves stays lent, for the next prompt phase's loans. `resolver` is null in production. Returns what is still lent.
 static uint32_t ggml_sycl_run_expert_bulk_refill_between_contexts(int                                    device,
                                                                   const ggml_sycl_expert_loan_resolver * resolver,
                                                                   ggml_sycl_expert_loan_result *         out) {
-    (void) resolver;
-    (void) out;
-    return device >= 0 && device < GGML_SYCL_MAX_DEVICES ?
-               g_sycl_expert_lent_count[device].load(std::memory_order_acquire) :
-               0;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    if (g_sycl_expert_lent_count[device].load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+        ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
+        const bool                     owed   = ledger.bulk_refill_next_context;
+        ledger.bulk_refill_next_context       = false;
+        if (!owed) {
+            return static_cast<uint32_t>(ledger.triplets.size());
+        }
+    }
+    if (auto * cache = ggml_sycl::get_unified_cache_for_device(device); cache && cache->has_pending_deferred_frees()) {
+        cache->process_deferred_frees_public();
+    }
+    const uint32_t                 lent = g_sycl_expert_lent_count[device].load(std::memory_order_acquire);
+    ggml_sycl_expert_loan_result   local;
+    ggml_sycl_expert_loan_result * result = out ? out : &local;
+    std::atomic<uint64_t>          refilled_at{ 0 };
+    const uint32_t                 remaining = ggml_sycl_run_expert_refill_at_boundary_on_device(
+        device, /*decode=*/true, /*decode_graphs=*/1, &refilled_at, lent, resolver, result);
+    if (result->accepted) {
+        GGML_LOG_WARN(
+            "[MOE-EXEC] bulk refill device %d: %u of %u lent triplets re-admitted in one transaction between contexts "
+            "(the context that lent them ended)\n",
+            device, result->n_triplets, lent);
+    }
+    return remaining;
 }
 
 // ggml_backend_sycl_synchronize() calls this once the graph's work is done, its compute flag is cleared and the
@@ -21924,7 +21974,15 @@ static void ggml_sycl_expert_refill_log_report() {
     for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
         const uint32_t lent       = g_sycl_expert_lent_total[device].exchange(0, std::memory_order_acq_rel);
         const uint32_t readmitted = g_sycl_expert_readmitted_total[device].exchange(0, std::memory_order_acq_rel);
-        if (lent != 0 || readmitted != 0) {
+        if (lent == 0 && readmitted == 0) {
+            continue;
+        }
+        // The prefix the gate's RE_REFILL reads stays the same with a debt after it (llama.cpp-i4ny).
+        const uint32_t owed = ggml_sycl_expert_bulk_refill_owed_next_context(device);
+        if (owed != 0) {
+            GGML_LOG_WARN("[MOE-EXEC] refill device %d: %u/%u triplets re-admitted (%u owed to the next context)\n",
+                          device, readmitted, lent, owed);
+        } else {
             GGML_LOG_WARN("[MOE-EXEC] refill device %d: %u/%u triplets re-admitted\n", device, readmitted, lent);
         }
     }
@@ -96243,6 +96301,11 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // `[SYCL-MOE-SEQUENCE-GRAPHLET] summary phase=final` line may print here too.
     ggml_sycl_graph_diag_report("final", sycl_ctx && sycl_ctx->exec_graph, sycl_ctx);
 #endif
+    // A loan this context leaves lent is owed to the next context, before the report says so (llama.cpp-i4ny). A
+    // temporary backend that computed no graph lent nothing, and owes nothing for a live context's loan.
+    if (sycl_ctx && sycl_ctx->graph_compute_seq != 0) {
+        (void) ggml_sycl_expert_bulk_refill_owe_next_context(sycl_ctx->device);
+    }
     ggml_sycl_moe_exec_log_report();       // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
     ggml_sycl_expert_refill_log_report();  // the [MOE-EXEC] refill line, if any triplet was lent (llama.cpp-sif1)
     // Stop adaptive prestage background thread before tearing down SYCL resources.
@@ -119346,6 +119409,9 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
         g_sycl_graph_multithreaded.store(true, std::memory_order_relaxed);
     }
     GGML_SYCL_DEBUG("[DEBUG-GRAPH-COMPUTE] ENTER: backend=%p cgraph=%p\n", (void *) backend, (void *) cgraph);
+    // A loan the last context left lent comes back before this graph's first MUL_MAT_ID (llama.cpp-i4ny).
+    (void) ggml_sycl_run_expert_bulk_refill_between_contexts(
+        static_cast<ggml_backend_sycl_context *>(backend->context)->device, nullptr, nullptr);
     std::unique_lock<std::mutex> global_graph_lock(g_sycl_graph_compute_mutex);
 
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
