@@ -3032,6 +3032,19 @@ def test_mutant_next_contexts_half_under_the_graph_lock_fails():
     assert not claim_the_debt_is_never_marked_under_the_graph_lock(mutant)
 
 
+REPLAY_LOCK_HELD = "GGML_ASSERT(global_graph_lock.owns_lock());"
+
+
+def test_mutant_ledger_call_on_the_replay_path_under_the_graph_lock_fails():
+    """Past the compute lambda's unlock, the replay path still holds the graph lock (it asserts so): a ledger call there
+    is L1 under L2 too, whichever of the debt's calls it is."""
+    for call in ("(void) ggml_sycl_expert_bulk_refill_owe_next_context(sycl_ctx->device);",
+                 "(void) ggml_sycl_expert_bulk_refill_owed_next_context(sycl_ctx->device);",
+                 "ggml_sycl_expert_bulk_refill_owe(sycl_ctx->device, 1);"):
+        mutant = _once_in(SYCL, GRAPH_COMPUTE_SIG, REPLAY_LOCK_HELD, REPLAY_LOCK_HELD + " " + call)
+        assert not claim_the_debt_is_never_marked_under_the_graph_lock(mutant), call
+
+
 def test_mutant_owe_at_the_next_decode_graph_fails():
     """Graph compute has already counted the graph whose boundary this is: one more would owe the next one."""
     mutant = _once(SYCL, "ggml_sycl_expert_bulk_refill_owe(device, decode_graphs);",
