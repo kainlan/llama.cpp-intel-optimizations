@@ -1247,15 +1247,19 @@ BULK_GUARD = "if (result->accepted) {"
 BULK_WARN = ('GGML_LOG_WARN("[MOE-EXEC] bulk refill device %d: %u of %u lent triplets re-admitted in one transaction '
              'at decode graph %llu after the prompt (its ring did not engage)\\n", device, result->n_triplets, lent, '
              "(unsigned long long) (decode_graphs - owed_at + 1));")
-BOUNDARY_CALLS_REFILLS = "(void) ggml_sycl_run_expert_refills_at_boundary_on_device(" + BOUNDARY_PHASE
+BOUNDARY_CALLS_REFILLS = ("(void) ggml_sycl_run_expert_refills_at_boundary_on_device(ctx->moe_stream.get(), "
+                          + BOUNDARY_PHASE)
+OWE_FROM_PHASE = ("if (phase != nullptr && phase->take_prompt_ended() && !phase->last_prompt_ring_engaged()) { "
+                  "ggml_sycl_expert_bulk_refill_owe(device, decode_graphs); }")
 
 
 def claim_an_unengaged_prompts_loan_comes_back_at_once(sycl: str) -> bool:
-    """Graph compute owes the device a bulk refill at the first decode graph after a prompt whose ring did not engage
-    (test-sycl-moe-stream-enqueue-source.py pins that wiring). The owe asks without the lock whether anything is lent,
-    then marks the ledger under the lock, and only a ledger with triplets; a publication under another identity clears
-    the mark with the ledger. The synchronize boundary reaches the bulk refill through one runner, which asks without
-    the lock and then takes the mark under it at every boundary with lent triplets: a prompt graph's boundary drops
+    """The synchronize boundary reaches the bulk refill through one runner, which the boundary hands the context's
+    expert stream phase. First it owes the device a bulk refill when the phase says a prompt ended whose ring did not
+    engage, at the decode graph graph compute has just counted, so the line reads decode graph 1; it is the owe's only
+    call. The owe asks without the lock whether anything is lent, then marks the ledger under the lock, and only a
+    ledger with triplets; a publication under another identity clears the mark with the ledger. The runner then asks
+    without the lock and takes the mark under it at every boundary with lent triplets: a prompt graph's boundary drops
     it, and so does a mark for a later decode graph than this one. A decode graph's boundary runs the per-graph
     refill with max_triplets the ledger's count, one transaction, and WARNs one line, only when it was accepted, that
     names the decode graph since the prompt. Its WARN is the runner's only one."""
@@ -1268,9 +1272,35 @@ def claim_an_unengaged_prompts_loan_comes_back_at_once(sycl: str) -> bool:
             and owe.count(OWE_SET) == 1 and ordered(owe, OWE_SKIP, LEDGER_LOCK, OWE_SET)
             and take.count(TAKE_CLEAR) == 1 and ordered(take, LEDGER_LOCK, TAKE_CLEAR)
             and s.count("ggml_sycl_expert_bulk_refill_take(") == 2
-            and ordered(refills, BULK_TAKE, BULK_ELSE, BULK_LENT, BULK_RUN, BULK_GUARD, BULK_WARN)
+            and s.count("ggml_sycl_expert_bulk_refill_owe(") == 2 and refills.count(OWE_FROM_PHASE) == 1
+            and ordered(refills, OWE_FROM_PHASE, BULK_TAKE, BULK_ELSE, BULK_LENT, BULK_RUN, BULK_GUARD, BULK_WARN)
             and refills.count("GGML_LOG_WARN(") == 1
             and body(s, BOUNDARY_SIG).count(BOUNDARY_CALLS_REFILLS) == 1)
+
+
+GRAPH_UNLOCK = "global_graph_lock.unlock();"
+LEDGER_CALLS = ("ggml_sycl_expert_bulk_refill_owe(", "ggml_sycl_expert_bulk_refill_take(",
+                "ggml_sycl_expert_bulk_refill_owe_next_context(", "ggml_sycl_expert_bulk_refill_owed_next_context(",
+                "ggml_sycl_run_expert_bulk_refill_between_contexts(",
+                "ggml_sycl_run_expert_refills_at_boundary_on_device(")
+
+
+def graph_lock_segment(sycl: str) -> str:
+    """Graph compute's text from taking the process-global graph lock to its first release. Empty when either is
+    missing."""
+    g = body(norm(sycl), GRAPH_COMPUTE_SIG)
+    at = g.find(GRAPH_LOCK)
+    end = g.find(GRAPH_UNLOCK, at) if at >= 0 else -1
+    return g[at:end] if end > at else ""
+
+
+def claim_the_debt_is_never_marked_under_the_graph_lock(sycl: str) -> bool:
+    """The ledger's lock, g_tensor_inventory_mutex, is rank L1 and the graph lock, g_sycl_graph_compute_mutex, rank L2;
+    canonical contract section 12.5 forbids taking a lower rank while holding a higher one. So no call that takes the
+    ledger's lock for the bulk refill debt sits in graph compute while it holds the graph lock: the owe runs at the
+    synchronize boundary, and the next context's half before the lock is taken."""
+    seg = graph_lock_segment(sycl)
+    return seg != "" and not any(call in seg for call in LEDGER_CALLS)
 
 
 def gate_regex(gate: str, name: str) -> str:
@@ -1589,6 +1619,10 @@ def test_refill_warn_formats():
 
 def test_an_unengaged_prompts_loan_comes_back_at_once():
     assert claim_an_unengaged_prompts_loan_comes_back_at_once(SYCL)
+
+
+def test_the_debt_is_never_marked_under_the_graph_lock():
+    assert claim_the_debt_is_never_marked_under_the_graph_lock(SYCL)
 
 
 def test_bulk_refill_line_scores_as_the_gate_reads_it():
@@ -2980,6 +3014,40 @@ def test_mutant_bulk_refill_line_drops_the_position_fails():
 def test_mutant_boundary_skips_the_bulk_refill_fails():
     mutant = _once_in(SYCL, BOUNDARY_SIG, "ggml_sycl_run_expert_refills_at_boundary_on_device(",
                       "ggml_sycl_run_expert_refill_at_boundary_on_device(")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_owe_back_under_the_graph_lock_fails():
+    """The owe at graph compute's entry, under the graph lock, as it was: L1 under L2."""
+    moved = _once_in(SYCL, REFILLS_SIG, OWE_FROM_PHASE, "")
+    mutant = _once(moved, GRAPH_LOCK, GRAPH_LOCK + " ggml_sycl_expert_bulk_refill_owe(sycl_ctx->device, "
+                   "sycl_ctx->decode_graph_count.load(std::memory_order_relaxed) + 1);")
+    assert not claim_the_debt_is_never_marked_under_the_graph_lock(mutant)
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_next_contexts_half_under_the_graph_lock_fails():
+    moved = _once(SYCL, ENTRY_CALL, "")
+    mutant = _once(moved, GRAPH_LOCK, GRAPH_LOCK + " " + ENTRY_CALL)
+    assert not claim_the_debt_is_never_marked_under_the_graph_lock(mutant)
+
+
+def test_mutant_owe_at_the_next_decode_graph_fails():
+    """Graph compute has already counted the graph whose boundary this is: one more would owe the next one."""
+    mutant = _once(SYCL, "ggml_sycl_expert_bulk_refill_owe(device, decode_graphs);",
+                   "ggml_sycl_expert_bulk_refill_owe(device, decode_graphs + 1);")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_owe_after_an_engaged_prompt_fails():
+    mutant = _once(SYCL, "&& !phase->last_prompt_ring_engaged()", "&& phase->last_prompt_ring_engaged()")
+    assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
+
+
+def test_mutant_owe_after_the_take_fails():
+    moved = _once_in(SYCL, REFILLS_SIG, OWE_FROM_PHASE, "")
+    mutant = _once(moved, "lent_any ? ggml_sycl_expert_bulk_refill_take(device) : 0;",
+                   "lent_any ? ggml_sycl_expert_bulk_refill_take(device) : 0; " + OWE_FROM_PHASE)
     assert not claim_an_unengaged_prompts_loan_comes_back_at_once(mutant)
 
 
