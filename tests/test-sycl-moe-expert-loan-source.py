@@ -2958,7 +2958,7 @@ def test_mutant_selector_drops_the_slot_count_fails():
 
 def test_mutant_transaction_drops_the_slot_count_from_the_probe_fails():
     assert not claim_probe_changes_nothing_and_a_loan_publishes_once(
-        _once(SYCL, "result.slots_funded = slots_funded;", "result.n_slots = 0;"))
+        _once(SYCL, "result.slots_funded = slots_funded;", ""))
 
 
 def test_mutant_selector_rounds_the_shortfall_down_fails():

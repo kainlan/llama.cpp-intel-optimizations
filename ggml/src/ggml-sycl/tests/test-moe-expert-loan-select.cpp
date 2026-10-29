@@ -261,7 +261,16 @@ void test_slot_sized_selection_reports_funded_slots_not_the_byte_sum() {
     CHECK(funded == 4);
     CHECK(sel == 2 * kSlot + 3 * (kSlot + kSlot / 2));
     CHECK(sel > 3 * kSlot && sel > funded * kSlot);
-    CHECK(funded * kSlot == 4 * kSlot);  // the whole-slot figure the probe returns
+    // The probe answers funded * kSlot, whole slots. It is strictly below the byte sum, and the gap is exactly the
+    // sub-slot remainders of the matrices lent: a probe that answered the byte sum would credit them.
+    size_t remainders = 0;
+    for (const int e : experts_of(three)) {
+        for (int r = 0; r < 3; ++r) {
+            remainders += slot_plan_charge(e, r) % kSlot;
+        }
+    }
+    CHECK(remainders == kSlot + 3 * (kSlot / 2));
+    CHECK(funded * kSlot < sel && sel - funded * kSlot == remainders);
 
     // One slot short: expert 3 alone, 1 slot from 2 * kSlot bytes.
     ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, kSlot, &sel, &funded);
