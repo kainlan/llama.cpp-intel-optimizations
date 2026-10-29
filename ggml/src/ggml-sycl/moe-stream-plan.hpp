@@ -926,7 +926,7 @@ class moe_stream_phase {
     moe_stream_loan_refusals_fn loan_refusals_ = nullptr;
     moe_stream_loan_latch       loan_latch_;
     moe_staged_route_tally      staged_routes_;
-    uint64_t                    ring_releases_ = 0;
+    uint64_t                    ring_releases_            = 0;
     // This prompt kept a whole reservation (ring_ready()); end_prompt copies it into last_prompt_ring_engaged_ and
     // marks the prompt ended for take_prompt_ended() (llama.cpp-i4ny).
     bool                        ring_engaged_             = false;

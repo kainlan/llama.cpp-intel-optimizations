@@ -230,8 +230,8 @@ void moe_stream_phase::end_prompt() {
         return;  // every decode graph after the first: nothing to drop
     }
     // The next prompt explains its own unavailable ring, and asks for its own loans (a refusal held only this one).
-    warned_unavailable_ = false;
-    loan_latch_         = moe_stream_loan_latch();
+    warned_unavailable_       = false;
+    loan_latch_               = moe_stream_loan_latch();
     // Whether this prompt's ring engaged decides how the backend returns its loan (llama.cpp-i4ny).
     last_prompt_ring_engaged_ = ring_engaged_;
     ring_engaged_             = false;

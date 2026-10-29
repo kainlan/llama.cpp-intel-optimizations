@@ -20880,7 +20880,7 @@ struct ggml_sycl_expert_lent_ledger {
     uint64_t                                                    load_txn_id = 0;
     std::vector<std::array<ggml_sycl::expert_placement_key, 3>> triplets;
     std::vector<size_t>                                         triplet_bytes;
-    bool                                                        refill_armed = false;
+    bool                                                        refill_armed             = false;
     // The decode graph, in its context's count, at whose boundary a bulk refill of the whole ledger is owed: the
     // first one after a prompt whose ring did not engage (llama.cpp-i4ny). 0 when none is.
     uint64_t                                                    bulk_refill_owed_at      = 0;
@@ -20945,7 +20945,7 @@ static void ggml_sycl_expert_lent_ledger_reconcile_locked(int                   
     ledger.bulk_refill_owed_at      = 0;
     ledger.bulk_refill_next_context = false;
     ledger.model_id                 = model_id;
-    ledger.load_txn_id  = load_txn_id;
+    ledger.load_txn_id              = load_txn_id;
     g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
     g_sycl_expert_lent_bytes[device].store(0, std::memory_order_release);
 }
