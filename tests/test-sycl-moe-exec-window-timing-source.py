@@ -25,7 +25,10 @@ in-memory copy of the normalized source, never a file:
   - the synchronize boundary flushes the lines after the queue wait and before the expert-loan runner, its only
     caller in ggml-sycl.cpp, with no lock taken in synchronize ahead of the flush nor in flush_window_timing;
   - docs/backend/sycl-env-vars.md catalogs the literal and says the trace row's level 2 profiles the copy queue;
-  - the trace knob's own comment in moe-exec-policy.hpp names the window line among level 2's output.
+  - the trace knob's own comment in moe-exec-policy.hpp names the window line among level 2's output;
+  - the cost below level 2 stays one branch per site: window_begin reads the clock only when the timeline is enabled,
+    flush_window_timing returns below level 2 before it prints, and the phase's destructor flushes what no
+    synchronize did.
 """
 import re
 from pathlib import Path
@@ -433,6 +436,43 @@ def test_catalog_mutants():
     row = re.search(r"(?m)^\| `GGML_SYCL_MOE_EXEC_TRACE=[^`]*` \|[^\n]*$", ENV_DOC)
     assert row is not None, "mutant precondition: the trace row exists"
     assert not claim_catalog(ENV_DOC.replace(row.group(0), row.group(0).replace("enable_profiling", "profiling")))
+
+
+# ---- the cost below level 2 ---------------------------------------------------------------------------------------
+
+TIMED = "const bool timed = window_timing_.enabled;"
+FLUSH_PRINT = "window_timing_.flush(device_, moe_stream_event_times, "
+DTOR_SIG = "moe_stream_phase::~moe_stream_phase() {"
+
+
+def claim_off_cost(plan_cpp: str) -> bool:
+    """window_begin times a window only when the timeline is enabled; flush_window_timing's level gate comes before its
+    print; the phase's destructor flushes the windows no synchronize flushed."""
+    cpp = norm(plan_cpp)
+    begin = body(cpp, "uint32_t moe_stream_phase::window_begin(")
+    flush = body(cpp, FLUSH_FN_SIG)
+    dtor = body(cpp, DTOR_SIG)
+    return (begin.count(TIMED) == 1 and cpp.count("const bool timed =") == 1
+            and 0 <= flush.find(FLUSH_GATE) < flush.find(FLUSH_PRINT) and dtor.count("flush_window_timing();") == 1)
+
+
+def test_off_cost():
+    assert claim_off_cost(PLAN_CPP)
+
+
+def test_off_cost_mutants():
+    # the clock read on every window, traced or not
+    assert not claim_off_cost(mutate(PLAN_CPP, TIMED, "const bool timed = true;"))
+    # the level gate after the print: lines below level 2
+    cpp = norm(PLAN_CPP)
+    flush = body(cpp, FLUSH_FN_SIG)
+    assert flush.count(" " + FLUSH_GATE) == 1 and flush.endswith("); }"), "mutant precondition: one gate, one print"
+    gate_after = flush.replace(" " + FLUSH_GATE, "")[:-1] + FLUSH_GATE + " }"
+    assert not claim_off_cost(cpp.replace(flush, gate_after))
+    # the destructor no longer flushing: the last prompt's windows would never print
+    dtor = body(cpp, DTOR_SIG)
+    assert dtor.count(" flush_window_timing();") == 1, "mutant precondition: the destructor flushes"
+    assert not claim_off_cost(cpp.replace(dtor, dtor.replace(" flush_window_timing();", "")))
 
 
 # ---- the knob's own comment ---------------------------------------------------------------------------------------

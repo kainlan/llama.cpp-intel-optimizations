@@ -712,11 +712,13 @@ static inline uint64_t moe_stream_window_timing_key(uint64_t ubatch_seq, uint32_
     return (ubatch_seq << 32) | window;
 }
 
-// The per-window timing GGML_SYCL_MOE_EXEC_TRACE=2 prints (llama.cpp-8ucb), one record per window, kept by the phase
-// over sycl::event and flushed at the synchronize boundary, where the host has already waited for the queue, so
-// reading an event's device times never waits on the compute path. Disabled (below trace level 2) it records nothing.
-// The submitting thread is the only writer, so the records take no lock. Templated on the event so
-// test-moe-stream-phase drives it without a SYCL object. Each figure and where it comes from:
+// The per-window timing GGML_SYCL_MOE_EXEC_TRACE=2 prints, one record per window, kept by the phase over sycl::event
+// and flushed at the synchronize boundary, where the host has already waited for the queue, so reading an event's
+// device times never waits on the compute path. Disabled (below trace level 2) it records nothing. Enabled, at() grows
+// `records` on the submitting thread inside graph compute, a trace-only allocation path, and clear() keeps the
+// vector's capacity, so later prompts of the same shape reuse it. The submitting thread is the only writer, so the
+// records take no lock. Templated on the event so test-moe-stream-phase drives it without a SYCL object. Each figure
+// and where it comes from:
 //   bytes            the window's own copies' bytes: those staged for it, whichever window_begin call staged them
 //                    (a prefetched window's copies go in during the window before it)
 //   exposed          moe_stream_window_exposed: the layer's first window, which nothing staged ahead
@@ -1096,7 +1098,7 @@ class moe_stream_phase {
     int      prev_window_layer_      = -1;          // the layer of this micro-batch's last window_begin, -1 for none
     uint32_t next_window_id_         = UINT32_MAX;  // the window the last window_begin prefetched, UINT32_MAX for none
     bool     next_window_whole_      = false;       // that prefetch staged every matrix of its window
-    // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2 (llama.cpp-8ucb), keyed by micro-batch and window:
+    // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
     // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
     // and flush_window_timing() prints and clears it. Written by the submitting thread only, so it takes no lock.
     moe_stream_window_timeline<sycl::event> window_timing_;

@@ -324,7 +324,7 @@ void test_declined_line() {
     CHECK(std::strstr(summary, "summary: 0 layer-ubatches ring, 1 cpu, 0 forced,") != nullptr);
 }
 
-// llama.cpp-8ucb: the per-window timing the phase keeps under GGML_SYCL_MOE_EXEC_TRACE=2, over int events. The file
+// The per-window timing the phase keeps under GGML_SYCL_MOE_EXEC_TRACE=2, over int events. The file
 // has no fake cache or ring to drive window_begin with, so the test drives the timeline the phase holds over
 // sycl::event, in the order the phase feeds it: stage_window() reports each copy (window_begin of phase 0 copies its
 // own exposed window, then prefetches phase 1), window_begin reports the window, the executor reports its launches,
@@ -1038,7 +1038,7 @@ int main() {
         CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
     }
 
-    // ---- the per-window timing under GGML_SYCL_MOE_EXEC_TRACE=2 (llama.cpp-8ucb) ----
+    // ---- the per-window timing under GGML_SYCL_MOE_EXEC_TRACE=2 ----
     test_window_timing_records_one_record_per_window_only_under_trace();
 
     // ---- a short reserve asks for a loan of its shortfall, once per micro-batch, until one comes back REFUSED ----

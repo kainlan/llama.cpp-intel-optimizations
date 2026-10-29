@@ -33473,7 +33473,7 @@ void ggml_backend_sycl_print_sycl_devices() {
 // The MoE executor's knobs (llama.cpp-36j0), parsed once. The backend reads GGML_SYCL_MOE_EXEC and
 // GGML_SYCL_MOE_EXEC_TRACE only here: the trace level (2 runs the load-time host-expert copy probe and prints the
 // per-window timing lines) comes from here too. The unified cache, built before any backend op, parses the level
-// through the same moe_exec_config_parse to decide whether its copy queue records device times (llama.cpp-8ucb).
+// through the same moe_exec_config_parse to decide whether its copy queue records device times.
 static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {
     static const ggml_sycl::moe_exec_config config = [] {
         ggml_sycl::moe_exec_config c =
@@ -91361,7 +91361,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {
                 const pp_batched_phase & phase         = phases[p];
                 sycl::half *             phase_weights = batched_weights + phase.buffer * half_elems;
-                // The dequant kernels and GEMM groups this phase submits, for a window's timing line (llama.cpp-8ucb).
+                // The dequant kernels and GEMM groups this phase submits, for a window's timing line.
                 uint32_t                 phase_launches = 0;
                 // llama.cpp-8epx: for a windowed op this phase is one ring window (W1). window_begin is asked exactly
                 // once per window: it copies the window's host matrices no prefetch staged into a region, and the
@@ -96837,8 +96837,8 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         auto err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
                                                CHECK_TRY_ERROR(stream->wait_and_throw());
         ggml_sycl_cpu_job_gates_clear(gate_sleep);
-        // GGML_SYCL_MOE_EXEC_TRACE=2's per-window timing lines (llama.cpp-8ucb): read here, after the wait, so reading
-        // the windows' device times never waits on the compute path. Nothing below trace level 2.
+        // GGML_SYCL_MOE_EXEC_TRACE=2's per-window timing lines: read here, after the wait, so reading the windows'
+        // device times never waits on the compute path. Nothing below trace level 2.
         if (err == 0 && sycl_ctx->moe_stream) {
             sycl_ctx->moe_stream->flush_window_timing();
         }
