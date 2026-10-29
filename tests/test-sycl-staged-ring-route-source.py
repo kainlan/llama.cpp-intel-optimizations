@@ -473,7 +473,9 @@ TALLY_HANDOFF_SIG = "void moe_staged_route_tally::count_handoff()"
 TALLY_HANDOFF_BODY = "{ ++handed_off; }"
 END_PROMPT_HEAD = "{ report_staged_routes(); if (!ubatch_live_ && !ring_ && !pending_ring_ && table_.empty()) {"
 DTOR_SIG = "moe_stream_phase::~moe_stream_phase()"
-DTOR_HEAD = "{ report_staged_routes(); teardown("
+# The destructor's prologue: the prompt's lookups are reported first, then the windows' timing lines no synchronize
+# flushed (GGML_SYCL_MOE_EXEC_TRACE=2, a no-op below it), then the ring is torn down.
+DTOR_HEAD = "{ report_staged_routes(); flush_window_timing(); teardown("
 REPORT_HEAD = ("{ if ((staged_routes_.served != 0 || staged_routes_.handed_off != 0 || "
                "staged_routes_.refused != 0) && log_ != nullptr && "
                "log_->trace >= 1 && log_->trace_sink != nullptr) {")
@@ -1395,8 +1397,9 @@ def test_trace_mutants():
 
 def claim_reported_once_on_every_exit(phase: str) -> bool:
     """A prompt's lookups are reported when it ends and, for a prompt the context outlives no end_prompt of, when the
-    phase is destroyed. report_staged_routes prints only a non-empty tally and clears it as its last statement, so the
-    destructor after an end_prompt prints nothing again; nothing else reports, so a prompt is never split."""
+    phase is destroyed, as the destructor's first statement (before the window timing flush and the teardown).
+    report_staged_routes prints only a non-empty tally and clears it as its last statement, so the destructor after an
+    end_prompt prints nothing again; nothing else reports, so a prompt is never split."""
     n = norm(phase)
     r = body(n, REPORT_SIG)
     return (body(n, DTOR_SIG).startswith(DTOR_HEAD) and body(n, END_PROMPT_SIG).startswith(END_PROMPT_HEAD)
@@ -1410,7 +1413,10 @@ def test_reported_once_on_every_exit():
 
 def test_reported_once_on_every_exit_mutants():
     # The destructor drops a prompt no end_prompt reported.
-    assert not claim_reported_once_on_every_exit(mutate(PHASE, DTOR_HEAD, "{ teardown("))
+    assert not claim_reported_once_on_every_exit(mutate(PHASE, DTOR_HEAD, "{ flush_window_timing(); teardown("))
+    # The destructor reports after the timing flush instead of first.
+    assert not claim_reported_once_on_every_exit(
+        mutate(PHASE, DTOR_HEAD, "{ flush_window_timing(); report_staged_routes(); teardown("))
     # The tally survives a report, so the destructor prints the prompt end_prompt already printed.
     assert not claim_reported_once_on_every_exit(mutate(PHASE, REPORT_RESET + " }", "}"))
     # Cleared before anything reads it: nothing is ever printed.
