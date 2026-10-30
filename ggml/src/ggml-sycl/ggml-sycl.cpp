@@ -36842,7 +36842,8 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // window. So the fit sizes the loan as the stream phase sizes it, from the post-loan plan with the ring short of what
 // the planned room holds (moe_stream_loan_size_post_loan), and charges that geometry's bytes less the room's slots it
 // keeps and what the probe of that loan lends. When no loan converges the phase asks for none, so the part of the
-// pre-loan ring the room does not hold is a demand on free memory, all of it, as a refused probe charges.
+// pre-loan ring the room does not hold is a demand on free memory, all of it, and not the post-loan ring a refused
+// probe charges.
 // The planned room is the bytes the single-device planner held free in the WEIGHT zone for this ring
 // (placement_plan::moe_stream_ring_reserve_bytes). They sit inside the arena, outside the free memory the fit charges
 // against, and a prompt's first reserve takes them before any loan, so the fit credits them first, in whole slots of
