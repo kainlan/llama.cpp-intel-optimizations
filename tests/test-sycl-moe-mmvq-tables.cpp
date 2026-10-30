@@ -734,9 +734,10 @@ int main() {
         for (size_t fit = 1; fit <= 12; ++fit) {
             for (size_t active = 1; active <= 20; ++active) {
                 for (size_t cap = 0; cap <= 3; ++cap) {
-                    const size_t                    slot_elems = fit * weight_elems;
+                    const size_t slot_elems = fit * weight_elems;
+                    const size_t slot_bytes = fit * f16_expert + 1;  // a claimed slot need not be whole experts
                     const moe_pp_batched_f16_groups g =
-                        moe_pp_batched_f16_plan_groups(fit * f16_expert + 1, f16_expert, active, cap);
+                        moe_pp_batched_f16_plan_groups(slot_bytes, f16_expert, active, cap);
                     for (size_t window = 1; window <= fit; ++window) {
                         const size_t per    = window < g.experts_per_group ? window : g.experts_per_group;
                         const size_t halfs  = per * weight_elems;
