@@ -1616,8 +1616,8 @@ def test_executor_ring_slot_layout_mutants():
     assert not c(ring_hpp=norm(RING_HPP) + brace_def)
     assert not c(sycl=norm(SYCL) + " #define MOE_STREAM_RING_SLOT_LAYOUT GGML_LAYOUT_AOS")
     # A shadow in another scope, spelled constexpr auto, inside the deferral block.
-    shadow = EXEC_DEFER.replace("expert.deferred = true; ",
-                                "expert.deferred = true; constexpr auto MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_SOA; ")
+    shadow_def = "constexpr auto MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_SOA; "
+    shadow = EXEC_DEFER.replace("expert.deferred = true; ", "expert.deferred = true; " + shadow_def)
     assert not c(sycl=mutate(SYCL, EXEC_DEFER, shadow))
     # Control: a comparison is a use, not a definition.
     assert c(sycl=norm(SYCL) + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);")
