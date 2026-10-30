@@ -230,10 +230,9 @@ refused one kept. The phase keeps that partial ring only while a loan can still
 fund it. A loan the boundary runner refuses stops the asking for the rest of the
 prompt, and from then on a refused reserve gives its slots back at once, because
 mid-prompt runtime allocations prefer the WEIGHT zone too. A BUSY refusal does
-not, because the runner re-posts that request itself. The auto-ubatch fit's ring
-term, `ggml_sycl_hold_ring_uncovered`, first takes the whole slots the plan's
-room covers, then only probes the loan bytes
-(`ggml_sycl_expert_loan_probe_bytes`) for the rest, and lends nothing. When a loan
+not, because the runner re-posts that request itself. The auto-ubatch fit only
+probes the loan bytes (`ggml_sycl_expert_loan_probe_bytes`) for its ring term,
+`ggml_sycl_hold_ring_uncovered`, and lends nothing. When a loan
 runs, the refill runs at the decode boundary through
 `ggml_sycl_expert_refill_transaction_run`. It re-admits
 lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying
@@ -248,8 +247,7 @@ owes them to the next context: its backend free marks the ledger and copies
 nothing, and its refill report adds how many it owes. The next context's
 first graph entry, before any MUL_MAT_ID, returns them in one transaction. A
 process that exits after its last context pays nothing. The fit's
-ring term charges the ring bytes that neither the planned room nor a loan would
-cover to the rung's demand,
+ring term charges the ring bytes that no loan would cover to the rung's demand,
 so a rung that needs them is refused with a figure.
 
 **Gates.** Three gates keep the rule enforceable.

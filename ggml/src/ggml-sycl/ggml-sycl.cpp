@@ -36814,8 +36814,8 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
     return true;
 }
 
-// The prefill ring's bytes neither the plan's room nor a loan covers on `device` (llama.cpp-kjef). Both are bytes the
-// plan holds, at no cost to the card; the remainder (no room, no lendable triplets, or fewer resident bytes than the
+// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
+// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
 // ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
 // host. 0 with no published plan, no host expert, or no ring (the sizing refuses a ring over an eleventh of the
 // device's resident expert bytes plus the bytes lent to the ring now, ggml_sycl_moe_stream_set_window). A refused
@@ -36855,18 +36855,8 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     if (geo.bytes == 0) {
         return 0;
     }
-    // The room the plan held for the ring in the WEIGHT zone covers that much of it, in whole slots, with no loan and
-    // no free memory (hold_moe_stream_ring_room). Only the rest is asked of the loan, and what the loan does not cover
-    // is the demand. A multi-device plan holds no room.
-    const ggml_sycl::placement_plan & plan = *call.plan;
-    const size_t room    = !plan.multi_device && plan.device_id == device ? plan.moe_stream_ring_reserve_bytes : 0;
-    const size_t planned = std::min(geo.bytes, room / geo.slot_bytes * geo.slot_bytes);
-    const size_t wanted  = geo.bytes - planned;
-    if (wanted == 0) {
-        return 0;
-    }
-    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, wanted, geo.slot_bytes);
-    return wanted > lent ? wanted - lent : 0;
+    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, geo.slot_bytes);
+    return geo.bytes > lent ? geo.bytes - lent : 0;
 }
 
 namespace ggml_sycl {
