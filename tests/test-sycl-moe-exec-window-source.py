@@ -755,3 +755,11 @@ def test_no_stale_prose_sycl_mutants(stale):
 @pytest.mark.parametrize("stale", STALE_TEST_HPP)
 def test_no_stale_prose_test_hpp_mutants(stale):
     assert not claim_no_stale_prose(SYCL, TEST_HPP + "\n// " + stale + "\n")
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
