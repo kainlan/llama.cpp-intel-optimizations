@@ -18730,9 +18730,9 @@ static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query &
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
         "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
-        "net of the KV-zone room a compute buffer can use, plus the prefill-ring bytes no loan covers) would leave "
-        "device %d %.1f MB free (of %.1f MB free before it), under the %.1f MB driver headroom the arena expects; "
-        "%s; or free VRAM on this card (another process) before loading\n",
+        "net of the KV-zone room a compute buffer can use, plus the prefill-ring bytes neither the planned room nor "
+        "a loan covers) would leave device %d %.1f MB free (of %.1f MB free before it), under the %.1f MB driver "
+        "headroom the arena expects; %s; or free VRAM on this card (another process) before loading\n",
         a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
         ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
     return false;
@@ -18769,10 +18769,10 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: at n_ubatch=%u the compute buffers the planned dense scratch "
-        "keeps out of the RUNTIME zone (worst case %.1f MB, with any prefill-ring bytes no loan covers; %llu "
-        "request(s) totalling %.1f MB were held out and now live outside the arena) leave device %d %.1f MB free "
-        "(of %.1f MB free before them), under the %.1f MB driver headroom the arena expects; a smaller -ub keeps "
-        "those buffers in the zone\n",
+        "keeps out of the RUNTIME zone (worst case %.1f MB, with any prefill-ring bytes neither the planned room nor "
+        "a loan covers; %llu request(s) totalling %.1f MB were held out and now live outside the arena) leave device "
+        "%d %.1f MB free (of %.1f MB free before them), under the %.1f MB driver headroom the arena expects; "
+        "a smaller -ub keeps those buffers in the zone\n",
         n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
         free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
