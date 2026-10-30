@@ -380,7 +380,7 @@ def test_self_test() -> None:
     assert self_test(read_sources()) == 0
 
 
-# self_test (run by test_self_test) ---------------------------------------------------------------------------------------
+# self_test (run by test_self_test) ---------------------------------------------------------------------
 
 
 def self_test(s: dict[str, str | None]) -> int:
