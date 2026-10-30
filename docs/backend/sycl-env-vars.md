@@ -450,11 +450,19 @@ the catalog gives each one's condition.
 
 ### MoE executor log lines (`[MOE-EXEC*]` catalog)
 
-Every format literal that ggml/src/ggml-sycl prints with the prefix `[MOE-EXEC]` or `[MOE-EXEC-TRACE]`, listed once
-(35 distinct literals; the loan-refused literal prints at two sites). Two more matches in `ggml-sycl.cpp` are the
-loan/refill tests building the text they expect, not prints. A literal shown here is one printed line: the lines
-below wrap at 120 columns, the output does not. `WARN` lines show at default verbosity. `INFO` lines (the trace) show
-with `-lv 4` or `-v`. `llama-bench` needs `-v` for either level (its null log callback otherwise drops all of it).
+Every format literal that ggml/src/ggml-sycl prints with the prefix `[MOE-EXEC]` or `[MOE-EXEC-TRACE]`, listed once (35
+distinct literals; the loan-refused literal prints at two sites). The two staged-route refusal lines are assembled from
+a literal prefix and one piece per cause, so they are shown with `<cause>` placeholders and are not in the count. The
+loan and refill tests in `ggml-sycl.cpp` also build the text they expect; those are not prints. The count is the
+distinct code spans in this section that start with the prefix, contain a space and hold no placeholder:
+
+```bash
+awk '/^### MoE executor log lines/{f=1;next} f&&/^### /{f=0} f' docs/backend/sycl-env-vars.md | python3 -c 'import sys,re; print(len({" ".join(s.split()) for s in re.findall(r"`(\[MOE-EXEC[^`<]* [^`<]*)`", sys.stdin.read())}))'
+```
+
+A literal shown here is one printed line: the lines below wrap at 120 columns, the output does not. `WARN` lines show at
+default verbosity. `INFO` lines (the trace) show with `-lv 4` or `-v`. `llama-bench` needs `-v` for either level (its
+null log callback otherwise drops all of it).
 
 **Decision log** (always on; `GGML_SYCL_MOE_EXEC` picks the policy, `GGML_SYCL_MOE_EXEC_DECLINE_LAYER` one reason)
 
@@ -487,13 +495,15 @@ third at every policy and verbosity, the fourth under `ring` only, the aborts al
   once per prompt, when a loan asked for the short ring comes back refused. At default verbosity under `auto` the
   loan transaction's own `[MOE-EXEC] loan device %d refused: %s` line is the WARN for it.
 - WARN `[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would leave after %u sizing steps
-  (post-loan ring %u slots, %zu bytes; 0 slots = over the cap): no loan this prompt`: once per prompt, at every
-  policy and verbosity, when the stream phase cannot size a loan for its short ring. The phase sizes the loan from
-  the ring the loan would leave (`moe_stream_loan_size_post_loan`), because lent triplets become host matrices that
-  can widen the window. It asks for no loan, so no transaction line follows, and this line is the only one that says
-  why the prompt runs without its ring. The steps are the post-loan rings the sizing computed. A post-loan ring of 0
-  slots exceeded the cap; otherwise the ring was in another slot size and did not grow, or the sizing spent its bound
-  of G_plan + 1 steps, where G_plan is the experts one executor phase holds.
+  (post-loan ring %u slots, %zu bytes: %s): no loan this prompt`: once per prompt, at every policy and verbosity,
+  when the stream phase cannot size a loan for its short ring. The phase sizes the loan from the ring the loan would
+  leave (`moe_stream_loan_size_post_loan`), because lent triplets become host matrices that can widen the window. It
+  asks for no loan, so no transaction line follows, and this line is the only one that says why the prompt runs
+  without its ring. The steps are the post-loan rings the sizing computed, and the slots and bytes are the last one.
+  `%s` says why it did not settle: `over the cap` (0 slots after a step), `it did not grow, or the sizing spent its
+  bound` (a ring in another slot size that did not grow, or G_plan + 1 steps spent, where G_plan is the experts one
+  executor phase holds), or `no sizing step ran, no plan or no ring` (0 steps, so the 0 slots and 0 bytes are not a
+  ring at all).
 - WARN `[MOE-EXEC] staged route refusals device %d: served=%zu handed_off=%zu refused=%zu <cause>(<detail>)=<n> ...`:
   only under `GGML_SYCL_MOE_EXEC=ring`, once per prompt that refused a staged route, whatever the trace level.
 - ABORT `[MOE-EXEC] window_begin on layer %d, which executor_claims did not answer true for`: the executor asked for

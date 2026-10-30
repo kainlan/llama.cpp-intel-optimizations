@@ -586,7 +586,8 @@ struct moe_stream_loan_latch {
     bool     unconverged   = false;  // the refusal was the sizing's: no ring of the plan a loan would leave fits
     uint64_t refusals_seen = 0;      // the device's REFUSED count at the last ask
     // When the sizing refused, why, for the once-per-prompt WARN: the post-loan geometries it computed and the last
-    // post-loan ring, whose 0 slots mean it exceeded the cap (otherwise it did not grow, or the bound was spent).
+    // post-loan ring. No step means no plan or no ring; after a step, 0 slots mean the ring exceeded the cap, and
+    // otherwise it did not grow, or the bound was spent.
     uint32_t sizing_steps  = 0;
     uint32_t post_slots    = 0;
     size_t   post_bytes    = 0;

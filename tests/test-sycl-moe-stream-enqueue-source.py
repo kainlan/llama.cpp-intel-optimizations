@@ -1940,11 +1940,15 @@ def test_ring_slot_by_slot_fails_on_the_single_allocation_ring():
 LOAN_WARN_SIG = "void moe_stream_phase::warn_loan_refused(size_t bytes_short) const"
 LOAN_WARN_NULL = "if (log_ == nullptr || log_->sink == nullptr) { return; }"
 LOAN_WARN_UNCONVERGED_IF = "if (loan_latch_.unconverged) {"
+# The reason clause, asked steps first: a sizer with no plan or no ring takes no step and leaves 0 slots, and that
+# state is not over the cap.
+LOAN_WARN_WHY = ('const char * why = loan_latch_.sizing_steps == 0 ? "no sizing step ran, no plan or no ring" : '
+                 'loan_latch_.post_slots == 0 ? "over the cap" : "it did not grow, or the sizing spent its bound";')
 LOAN_WARN_UNCONVERGED_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would "
-                             "leave after %u sizing steps (post-loan ring %u slots, %zu bytes; 0 slots = over the "
-                             "cap): no loan this prompt")
+                             "leave after %u sizing steps (post-loan ring %u slots, %zu bytes: %s): no loan this "
+                             "prompt")
 LOAN_WARN_UNCONVERGED_ARGS = ("device_, bytes_short / (1024.0 * 1024.0), loan_latch_.sizing_steps, "
-                              "loan_latch_.post_slots, loan_latch_.post_bytes);")
+                              "loan_latch_.post_slots, loan_latch_.post_bytes, why);")
 LOAN_WARN_GATE = "if (policy_ != moe_exec_policy::RING && log_->trace < 1) { return; }"
 LOAN_WARN_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
                  "prompt")
@@ -1962,7 +1966,7 @@ def claim_refused_loan_warns_once(phase: str, tree: dict) -> bool:
     count = sum(norm(text).count(LOAN_WARN_FMT) for text in tree.values())
     unconverged = sum(norm(text).count(LOAN_WARN_UNCONVERGED_FMT) for text in tree.values())
     return (count == 1 and unconverged == 1 and w.startswith("{ " + LOAN_WARN_NULL)
-            and ordered(w, LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_FMT,
+            and ordered(w, LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_WHY, LOAN_WARN_UNCONVERGED_FMT,
                         LOAN_WARN_UNCONVERGED_ARGS, "} else {",
                         LOAN_WARN_GATE, LOAN_WARN_FMT, LOAN_WARN_EMIT)
             and w.count("policy_") == 1 and w.count("log_->trace") == 1 and w.count(LOAN_WARN_EMIT) == 1)
@@ -1973,8 +1977,8 @@ def test_refused_loan_warns_once():
         "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_loan_refused (the warn formats "
         "are counted across the sycl tree)",
         body(norm(PHASE), LOAN_WARN_SIG),
-        LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_FMT, LOAN_WARN_GATE, LOAN_WARN_FMT,
-        LOAN_WARN_EMIT, signature=LOAN_WARN_SIG)
+        LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_WHY, LOAN_WARN_UNCONVERGED_FMT, LOAN_WARN_GATE,
+        LOAN_WARN_FMT, LOAN_WARN_EMIT, signature=LOAN_WARN_SIG)
 
 
 def test_refused_loan_warn_mutants():
@@ -1992,6 +1996,18 @@ def test_refused_loan_warn_mutants():
     # The unconverged line without its reason: the reader cannot tell an over-cap ring from one that did not grow.
     reasonless = mutate(PHASE, LOAN_WARN_UNCONVERGED_ARGS, "device_, bytes_short / (1024.0 * 1024.0));")
     assert not c(reasonless, {PHASE_REL: reasonless})
+    # The reason clause dropped from the arguments, its step test removed, or the slot count asked first: each prints
+    # "over the cap" for a sizer that took no step, where no cap was met.
+    whyless = mutate(PHASE, LOAN_WARN_UNCONVERGED_ARGS, LOAN_WARN_UNCONVERGED_ARGS.replace(", why);", ");"))
+    assert not c(whyless, {PHASE_REL: whyless})
+    stepless = mutate(PHASE, LOAN_WARN_WHY, LOAN_WARN_WHY.replace(
+        'loan_latch_.sizing_steps == 0 ? "no sizing step ran, no plan or no ring" : ', ""))
+    assert not c(stepless, {PHASE_REL: stepless})
+    cap_first = mutate(PHASE, LOAN_WARN_WHY,
+                       'const char * why = loan_latch_.post_slots == 0 ? "over the cap" : loan_latch_.sizing_steps == '
+                       '0 ? "no sizing step ran, no plan or no ring" : "it did not grow, or the sizing spent its '
+                       'bound";')
+    assert not c(cap_first, {PHASE_REL: cap_first})
     # Never emitted.
     silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
     assert not c(silent, {PHASE_REL: silent})

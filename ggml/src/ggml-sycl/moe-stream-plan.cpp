@@ -746,14 +746,18 @@ void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
     if (log_ == nullptr || log_->sink == nullptr) {
         return;
     }
-    char line[256];
+    char line[320];
     if (loan_latch_.unconverged) {
+        // The reason must hold in every state the latch can carry: a sizer with no plan or no ring takes no step and
+        // leaves 0 slots without any cap having been met, so the step count is asked before the slot count.
+        const char * why = loan_latch_.sizing_steps == 0 ? "no sizing step ran, no plan or no ring" :
+                           loan_latch_.post_slots == 0   ? "over the cap" :
+                                                           "it did not grow, or the sizing spent its bound";
         std::snprintf(line, sizeof(line),
                       "[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would leave after "
-                      "%u sizing steps (post-loan ring %u slots, %zu bytes; 0 slots = over the cap): no loan this "
-                      "prompt",
+                      "%u sizing steps (post-loan ring %u slots, %zu bytes: %s): no loan this prompt",
                       device_, bytes_short / (1024.0 * 1024.0), loan_latch_.sizing_steps, loan_latch_.post_slots,
-                      loan_latch_.post_bytes);
+                      loan_latch_.post_bytes, why);
     } else {
         if (policy_ != moe_exec_policy::RING && log_->trace < 1) {
             return;
