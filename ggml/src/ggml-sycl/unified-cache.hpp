@@ -1239,6 +1239,8 @@ struct placement_plan {
         kv_context_reserve_bytes = 0;
         vram_bytes               = weight_vram_bytes + kv_vram_bytes;
         host_bytes               = weight_host_bytes + kv_host_bytes;
+        // The window ring's room is not KV: it stays held, since the ring is reserved again at every prompt.
+        vram_bytes += moe_stream_ring_reserve_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
         }

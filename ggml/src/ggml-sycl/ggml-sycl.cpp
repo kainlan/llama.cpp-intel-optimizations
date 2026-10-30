@@ -17130,6 +17130,22 @@ static double ggml_sycl_plan_cost_param(const char * name, double def, double ma
 // executor's claim predicate; declared here for the capability query's prompt route.
 static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout);
 
+// The types whose host-staged experts the batched prompt executor claims, one bit per ggml_type: the two type terms of
+// its staged claim (ggml_sycl_moe_pp_onednn_batched_claims_tensor with host_staged), under the runtime knobs. The
+// planner sizes the window ring's room from it (placement_kv_info::moe_stream_staged_types), since only a claimed
+// matrix takes a ring slot. The claim's other terms read a weight's planned layout, which the plan decides after this.
+static uint64_t ggml_sycl_moe_stream_staged_types() {
+    static_assert(GGML_TYPE_COUNT <= 64, "the staged-type mask holds one bit per ggml_type");
+    uint64_t mask = 0;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = static_cast<ggml_type>(t);
+        if (moe_pp_batched_takes_staged_type(type) && ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS)) {
+            mask |= uint64_t(1) << t;
+        }
+    }
+    return mask;
+}
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17361,6 +17377,10 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                                   std::numeric_limits<double>::max(), &g_placement_kv_info.cpu_expert_gbps_set);
     g_placement_kv_info.host_split_us = ggml_sycl_plan_cost_param(
         "GGML_SYCL_PLAN_HOST_SPLIT_US", ggml_sycl::PLACEMENT_HOST_SPLIT_US_DEFAULT, std::numeric_limits<double>::max());
+    // What the planner sizes the prompt phase's window ring with, so it holds the ring's room before the routed experts:
+    // the executor's staged types and its group cap, the inputs the phase's own sizing reads when it runs.
+    g_placement_kv_info.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();
+    g_placement_kv_info.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
             "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB "
@@ -36794,8 +36814,8 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
     return true;
 }
 
-// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
-// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
+// The prefill ring's bytes neither the plan's room nor a loan covers on `device` (llama.cpp-kjef). Both are bytes the
+// plan holds, at no cost to the card; the remainder (no room, no lendable triplets, or fewer resident bytes than the
 // ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
 // host. 0 with no published plan, no host expert, or no ring (the sizing refuses a ring over an eleventh of the
 // device's resident expert bytes plus the bytes lent to the ring now, ggml_sycl_moe_stream_set_window). A refused
@@ -36835,8 +36855,18 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     if (geo.bytes == 0) {
         return 0;
     }
-    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, geo.slot_bytes);
-    return geo.bytes > lent ? geo.bytes - lent : 0;
+    // The room the plan held for the ring in the WEIGHT zone covers that much of it, in whole slots, with no loan and
+    // no free memory (hold_moe_stream_ring_room). Only the rest is asked of the loan, and what the loan does not cover
+    // is the demand. A multi-device plan holds no room.
+    const ggml_sycl::placement_plan & plan = *call.plan;
+    const size_t room    = !plan.multi_device && plan.device_id == device ? plan.moe_stream_ring_reserve_bytes : 0;
+    const size_t planned = std::min(geo.bytes, room / geo.slot_bytes * geo.slot_bytes);
+    const size_t wanted  = geo.bytes - planned;
+    if (wanted == 0) {
+        return 0;
+    }
+    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, wanted, geo.slot_bytes);
+    return wanted > lent ? wanted - lent : 0;
 }
 
 namespace ggml_sycl {

@@ -2829,8 +2829,16 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
 
 _RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {"
 _RING_HELPER_END = "const char * moe_batch_reject_reason_name("
-_RING_REMAINDER_LINE = "return geo.bytes > lent ? geo.bytes - lent : 0;"
-_RING_PROBE_LINE = "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, geo.slot_bytes);"
+# The room the plan held for the ring in the WEIGHT zone (hold_moe_stream_ring_room, unified-cache.cpp) covers that much
+# of it in whole slots, with no loan and no free memory; the probe is asked only for the rest, and the helper returns
+# what the loan does not cover of that rest. Only a single-device plan on the asking device holds room.
+_RING_ROOM_LINE = ("const size_t room = !plan.multi_device && plan.device_id == device ? "
+                   "plan.moe_stream_ring_reserve_bytes : 0;")
+_RING_PLANNED_LINE = "const size_t planned = std::min(geo.bytes, room / geo.slot_bytes * geo.slot_bytes);"
+_RING_WANTED_LINE = "const size_t wanted = geo.bytes - planned;"
+_RING_REMAINDER_LINE = "return wanted > lent ? wanted - lent : 0;"
+_RING_PROBE_LINE = "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, wanted, geo.slot_bytes);"
+_RING_UNCOVERED_LINES = (_RING_ROOM_LINE, _RING_PLANNED_LINE, _RING_WANTED_LINE, _RING_PROBE_LINE, _RING_REMAINDER_LINE)
 _RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
 
 
@@ -2845,10 +2853,14 @@ def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:
 
 
 def _ring_helper_remainder_pinned(raw_cpp: str) -> bool:
-    """The helper returns what the loan did NOT cover: the clamped difference of the ring and the probe's lent bytes,
-    each exactly once."""
+    """The helper returns what neither the plan's room nor the loan covers: the room in whole slots comes off the ring
+    first, the probe is asked for the rest, and the clamped difference of that rest and the probe's lent bytes is the
+    demand. Each line exactly once, in that order."""
     body = _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END)
-    return body.count(_RING_REMAINDER_LINE) == 1 and body.count(_RING_PROBE_LINE) == 1
+    if any(body.count(line) != 1 for line in _RING_UNCOVERED_LINES):
+        return False
+    at = [body.find(line) for line in _RING_UNCOVERED_LINES]
+    return at == sorted(at)
 
 
 def test_the_ring_term_is_set_before_the_fit_reads_the_demand():
@@ -2873,19 +2885,25 @@ def test_the_ring_helper_returns_the_clamped_uncovered_remainder():
     assert _ring_helper_remainder_pinned(GGML_SYCL_CPP)
 
 
-@pytest.mark.parametrize("mutation", ["no-clamp", "returns-lent", "drops-probe"])
+_RING_REMAINDER_MUTANTS = {
+    "no-clamp": (_RING_REMAINDER_LINE, "return wanted - lent;"),
+    "returns-lent": (_RING_REMAINDER_LINE, "return lent;"),
+    "drops-probe": (_RING_PROBE_LINE, "const size_t lent = 0;"),
+    "drops-room": (_RING_PLANNED_LINE, "const size_t planned = 0;"),
+    "room-in-bytes-not-slots": (_RING_PLANNED_LINE, "const size_t planned = std::min(geo.bytes, room);"),
+    "room-of-any-plan": (_RING_ROOM_LINE, "const size_t room = plan.moe_stream_ring_reserve_bytes;"),
+    "probe-asks-the-whole-ring": (_RING_PROBE_LINE, _RING_PROBE_LINE.replace("(device, wanted,", "(device, geo.bytes,")),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(_RING_REMAINDER_MUTANTS))
 def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
-    assert GGML_SYCL_CPP.count("return geo.bytes > lent ? geo.bytes - lent : 0;") == 1
-    if mutation == "no-clamp":
-        mutated = GGML_SYCL_CPP.replace(
-            "return geo.bytes > lent ? geo.bytes - lent : 0;", "return geo.bytes - lent;"
-        )
-    elif mutation == "returns-lent":
-        mutated = GGML_SYCL_CPP.replace("return geo.bytes > lent ? geo.bytes - lent : 0;", "return lent;")
-    else:
-        mutated = GGML_SYCL_CPP.replace(
-            _RING_PROBE_LINE, "const size_t lent = 0;"
-        )
+    real, broken = _RING_REMAINDER_MUTANTS[mutation]
+    # The literals are whitespace-normalized, as _body_of reads the helper; the raw source aligns its columns, so the
+    # target is matched with any run of whitespace between its tokens.
+    target = r"\s+".join(re.escape(token) for token in real.split())
+    mutated, n = re.subn(target, lambda _m: broken, GGML_SYCL_CPP)
+    assert n == 1, "the mutation target must exist exactly once"
     assert mutated != GGML_SYCL_CPP
     assert not _ring_helper_remainder_pinned(mutated), "the mutant must make the pin fail"
 
@@ -2918,7 +2936,7 @@ def test_the_ring_probe_counts_slots_and_answers_in_whole_slots():
 
 
 _PROBE_MUTANTS = {
-    "call-passes-zero": (_RING_PROBE_LINE, _RING_PROBE_LINE.replace("geo.bytes, geo.slot_bytes)", "geo.bytes, 0)")),
+    "call-passes-zero": (_RING_PROBE_LINE, _RING_PROBE_LINE.replace("wanted, geo.slot_bytes)", "wanted, 0)")),
     "probe-forwards-zero": ("device, bytes_wanted, slot_bytes, /*probe_mode=*/true, nullptr, &probe",
                             "device, bytes_wanted, 0, /*probe_mode=*/true, nullptr, &probe"),
     "answers-the-byte-sum": ("return slot_bytes != 0 ? probe.slots_funded * slot_bytes : probe.bytes_freed;",

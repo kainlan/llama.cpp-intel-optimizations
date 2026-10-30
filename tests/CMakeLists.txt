@@ -4631,6 +4631,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# The window ring's room is held in the WEIGHT zone before the routed experts: the ring reserves its slots from that
+# zone at every prompt, and an expert loan cannot fund a slot larger than every lendable matrix, so a room the planner
+# left is what lets the ring engage at default placement. The room is the shared ring geometry over the pack the
+# planner predicts, counted in vram_bytes and kept through the runtime KV re-derivation; the auto-ubatch fit charges
+# only what the room does not cover. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-stream-ring-room-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-stream-ring-room-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-w013: the KV context room is cost-based (owner ruling 2026-10-10). Each device layer's room is weighed in
 # the runtime's demotion order and held only when its host attention cost outweighs the routed experts it displaces;
 # the three cost parameters are read once at the inventory fill site and catalogued. A mutant per claim. Text only: no
