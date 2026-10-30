@@ -1555,7 +1555,7 @@ LOAN_LATCH_CLEAR = "loan_latch_ = moe_stream_loan_latch();"
 LOAN_HOOKS_STORED = ("request_loan_ = op.request_loan;", "loan_refusals_ = op.loan_refusals;")
 LOAN_HELPER_SIG = "static inline moe_stream_loan_step moe_stream_loan_on_short_reserve("
 # The helper's steps, in order: nothing to ask, a refusal since the last ask latches, else size the loan from the plan
-# it leaves (llama.cpp-8p5x) and ask with what converged, or latch when nothing converges. A null sizer asks with the
+# it leaves and ask with what converged, or latch when nothing converges. A null sizer asks with the
 # shortfall as reported.
 LOAN_HELPER_ORDER = (
     "if (request_loan == nullptr || latch.refused || bytes_short == 0) { return moe_stream_loan_step::NONE; }",
@@ -1570,7 +1570,7 @@ LOAN_HELPER_ORDER = (
     "return moe_stream_loan_step::REQUEST;",
 )
 # begin_layer's short reserve sizes its loan from begin_layer's own plan, with the geometry, hooks and executor window
-# prepare() sized the ring with (llama.cpp-8p5x).
+# prepare() sized the ring with.
 LOAN_SIZER_FILL = ("moe_stream_loan_sizer sizer; sizer.plan = &plan; sizer.device = device_; sizer.geo = geo_; "
                    "sizer.prompt_kernel = op.prompt_kernel; sizer.graph_ctx = op.graph_ctx; "
                    "sizer.library_claims = op.library_claims; sizer.hints = window_;")
@@ -1680,8 +1680,9 @@ def test_short_reserve_loan_mutants():
     assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes, slot);", "request_loan(device, SIZE_MAX, slot);"))
     assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes, slot);",
                             "request_loan(device, bytes, slot); request_loan(device, bytes, slot);"))
-    # The loan sized from the pre-loan geometry: the converged request dropped, or its slot size (llama.cpp-8p5x).
-    assert not c(hpp=mutate(PLAN_HPP, "bytes = sized.bytes; slot = sized.geo.slot_bytes;", "slot = sized.geo.slot_bytes;"))
+    # The loan sized from the pre-loan geometry: the converged request dropped, or its slot size.
+    assert not c(hpp=mutate(PLAN_HPP, "bytes = sized.bytes; slot = sized.geo.slot_bytes;",
+                            "slot = sized.geo.slot_bytes;"))
     assert not c(hpp=mutate(PLAN_HPP, "bytes = sized.bytes; slot = sized.geo.slot_bytes;", "bytes = sized.bytes;"))
     # A loan that does not converge asked anyway, or refused without the latch.
     assert not c(hpp=mutate(PLAN_HPP, "if (!sized.converged) { latch.refused = true; latch.unconverged = true; "

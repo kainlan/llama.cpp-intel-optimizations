@@ -304,7 +304,7 @@ uint64_t stub_loan_refusals(int) {
     return 0;
 }
 
-// The make_typed_plan() layout for the loan sizing (llama.cpp-8p5x). G_plan is 5 (a planned slot of 10 matrices), and
+// The make_typed_plan() layout for the loan sizing. G_plan is 5 (a planned slot of 10 matrices), and
 // each host layer has 3 host matrices per role, so the window is 3 and the ring 2 x 3 slots of kSrc = 24576 bytes.
 // Every resident matrix charges kDst = 4352 bytes, one slot. The loan walk meets layer 3 first, which is whole on the
 // device (bulk-staged, not lendable), then layer 2's resident experts 7, 4, 3, 2, 0: every triplet it lends lands in
@@ -361,7 +361,7 @@ ggml_sycl::moe_stream_ring_geometry geometry_after_loan(const placement_plan & p
     return ggml_sycl::moe_stream_plan_ring_geometry(lent_plan, 0, nullptr, nullptr, claims_all, hints);
 }
 
-// The loan is sized from the plan it leaves (llama.cpp-8p5x, owner ruling c-ifgn): lending widens the window, so the
+// The loan is sized from the plan it leaves: lending widens the window, so the
 // request sized for the reserve's geometry would leave the next micro-batch's ring short again. The request iterates
 // to the geometry its own loan leaves.
 void test_loan_converges_on_the_post_loan_ring() {

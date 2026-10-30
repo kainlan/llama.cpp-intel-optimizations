@@ -291,8 +291,8 @@ void test_slot_sized_selection_reports_funded_slots_not_the_byte_sum() {
     CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, kSlot, nullptr, nullptr).size() == 3);
 }
 
-// The stream phase sizes its loan by selecting triplets for each candidate request (moe_stream_loan_size_post_loan,
-// llama.cpp-8p5x), and the boundary's loan then selects again from the same plan with the request it was posted. Two
+// The stream phase sizes its loan by selecting triplets for each candidate request (moe_stream_loan_size_post_loan),
+// and the boundary's loan then selects again from the same plan with the request it was posted. Two
 // facts make the boundary take exactly the triplets the sizing flipped: the same request selects the same keys, and a
 // larger request in the same slot size selects a superset whose head is the smaller request's keys (the walk has one
 // order and only stops later), so a request that grew across the sizing's steps reselects every triplet it counted.

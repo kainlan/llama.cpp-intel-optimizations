@@ -281,7 +281,7 @@ ggml_sycl::moe_stream_loan_step run_short_ubatch(ggml_sycl::moe_stream_loan_latc
         if (!stub_reserve_refuses(short_by, &bytes_short)) {
             reserve_failed = true;
             // No loan sizer: these cases drive the latch alone, so the request is the shortfall as reported. The
-            // sizing from the plan a loan leaves is test-moe-stream-plan's (llama.cpp-8p5x).
+            // sizing from the plan a loan leaves is test-moe-stream-plan's.
             step           = ggml_sycl::moe_stream_loan_on_short_reserve(latch, device, bytes_short, kLoanSlotBytes,
                                                                          stub_request_loan, stub_loan_refusals, nullptr);
         }

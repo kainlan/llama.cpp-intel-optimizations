@@ -587,7 +587,7 @@ struct moe_stream_loan_latch {
     uint64_t refusals_seen = 0;      // the device's REFUSED count at the last ask
 };
 
-// What sizes a short ring's loan from the plan the loan would leave (llama.cpp-8p5x): the plan and the device the ring
+// What sizes a short ring's loan from the plan the loan would leave: the plan and the device the ring
 // was sized for, the geometry its reserve was short of, and the same hooks and executor window that sized it
 // (moe_stream_plan_ring_geometry). Plain data, read during one call: `plan` is the caller's for that call only.
 struct moe_stream_loan_sizer {
@@ -626,7 +626,7 @@ enum class moe_stream_loan_step : uint8_t {
 // moved since the last ask means that loan was refused: retrying would refuse again, so the latch holds until
 // end_prompt. An ACCEPTED loan that still left the ring short, or a BUSY one, leaves the count alone, so the next short
 // micro-batch asks again; a repeated request is harmless, since the largest since the last boundary wins.
-// With a `sizer`, the loan is sized from the plan it leaves (moe_stream_loan_size_post_loan, llama.cpp-8p5x): lent
+// With a `sizer`, the loan is sized from the plan it leaves (moe_stream_loan_size_post_loan): lent
 // triplets become host matrices, which can widen the window and so the ring the next micro-batch reserves. The request
 // is that converged loan, in that geometry's slots. When no loan converges, none is asked: the latch holds as for a
 // refused loan, and REFUSED is answered once. A null `sizer` has no plan to size against, and asks for the shortfall as
@@ -1363,12 +1363,12 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
     return out;
 }
 
-// ---- Loan sizing (llama.cpp-8p5x, owner ruling c-ifgn): a short ring's loan, sized from the plan the loan leaves. -----
+// ---- Loan sizing: a short ring's loan, sized from the plan the loan leaves. ----------------------------------------
 //
 // A loan flips its triplets to the host, and a host matrix the executor claims takes a ring slot, so the ring the next
 // micro-batch rebuilds from the published plan (prepare()) can be wider than the one the reserve was short of: the
 // window, min(role_items_max, G_plan), grows with the heaviest role's host matrices. The cap does not move with a loan
-// (the lent bytes count back as resident, llama.cpp-7999), so a wider ring can also exceed it.
+// (the lent bytes count back as resident), so a wider ring can also exceed it.
 //
 // Each step sizes the request for a target geometry, selects the triplets that request takes (moe_expert_loan_select,
 // the walk the boundary's loan repeats over the same plan), and sizes the ring of the plan with those triplets read as
@@ -1383,8 +1383,8 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
 // The sizing refuses (converged false) when the post-loan ring cannot exist (n_slots 0: over the cap), when it differs
 // from the target without growing (a lent matrix with a larger f16 expert can lower G_plan), when the bound is spent,
 // and when it has nothing to size (no plan or no geometry). It reads the plan only: no device, no lock, nothing lent.
-// The claims hook answers from its own plan, the pre-loan one (c-gi44); a staged claim reads the layout of the
-// weight's device experts, which a loan of AOS triplets leaves as it was.
+// The claims hook answers from its own plan, the pre-loan one (one fact, one source); a staged claim reads the layout
+// of the weight's device experts, which a loan of AOS triplets leaves as it was.
 static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & sizer,
                                                                     size_t                        bytes_short) {
     moe_stream_loan_sizing           out;

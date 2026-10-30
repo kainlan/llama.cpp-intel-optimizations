@@ -152,8 +152,8 @@ const moe_stream_staged * moe_stream_phase::find(int layer, int expert_id, exper
 }
 
 // The index lookup comes first: a layer with no host entry answers without touching the ring. A RING decision stood
-// only where begin_layer's ring_ready() kept a ring, so ring_ready() here answers from the ring held and never reaches a
-// reserve, which is why it is handed no loan sizer.
+// only where begin_layer's ring_ready() kept a ring, so ring_ready() here answers from the ring held and never
+// reaches a reserve, which is why it is handed no loan sizer.
 bool moe_stream_phase::executor_claims(int layer) {
     const auto it = index_.layers.find(layer);
     return it != index_.layers.end() && decision_of(layer).choice == moe_exec_choice::RING &&
@@ -497,9 +497,10 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
 // attempt per micro-batch. A reserve the WEIGHT zone was short of asks the backend for an expert loan at the next graph
 // boundary, so the next micro-batch's attempt may succeed, until a loan this prompt asked for comes back refused
 // (llama.cpp-3460, c-0tmn). With begin_layer's `sizer` the loan is sized from the plan it leaves, whose ring can be
-// wider, and none is asked when no loan converges (moe_stream_loan_size_post_loan, llama.cpp-8p5x). A refused reserve keeps the slots it got, and its ring waits in pending_ring_
-// for the next micro-batch's attempt, which continues from those slots, so the room a loan freed in holes a slot wide
-// adds up across attempts instead of being asked for again as one block (llama.cpp-am87). The hold lives only while a
+// wider, and none is asked when no loan converges (moe_stream_loan_size_post_loan). A refused reserve keeps the slots
+// it got, and its ring waits in pending_ring_ for the next micro-batch's attempt, which continues from those slots, so
+// the room a loan freed in holes a slot wide adds up across attempts instead of being asked for again as one block
+// (llama.cpp-am87). The hold lives only while a
 // loan can still fund it: once a loan this prompt asked for comes back refused, or the op wires no loan hook, the
 // refused ring gives its slots back at once, because mid-prompt runtime allocations prefer the WEIGHT zone too (lead
 // ruling, c-zgrd).
@@ -736,7 +737,7 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe
 }
 
 // One WARN per prompt when a loan the short ring asked for comes back REFUSED (llama.cpp-3460), or when no loan could
-// be sized because the ring of the plan a loan would leave never settles or does not fit (llama.cpp-8p5x): the helper
+// be sized because the ring of the plan a loan would leave never settles or does not fit: the helper
 // answers REFUSED once and then latches. It goes out under the same gate as the ring-unavailable line (lead ruling
 // c-kcyf), so at default verbosity under AUTO the phase still prints nothing of its own; there the loan transaction's
 // own "[MOE-EXEC] loan device %d refused: %s" line, which the latch makes print once per prompt, is the one WARN for a
