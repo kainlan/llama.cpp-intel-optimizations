@@ -197,26 +197,37 @@ When the WEIGHT zone cannot give every slot, `moe_stream_ring::reserve` keeps
 the slots it got and reports the shortfall: the bytes of the slots it still has
 to allocate (llama.cpp-am87). `ring_ready()` asks for a loan through the op's
 `request_loan` hook, which the backend wires to
-`ggml_sycl_request_expert_loan`. The request carries the shortfall in bytes and
-the ring's slot size, and the selector counts the whole slots each lent matrix
-frees, so a triplet whose matrices are each below a slot is not lent
-(llama.cpp-9x8t). It asks once per micro-batch, since the reserve
-latch stops later layers before the reserve. The loan runs at the next graph
-boundary, and the next micro-batch's reserve continues from the slots the
-refused one kept. The phase keeps that partial ring only while a loan can still
-fund it. A loan the boundary runner refuses stops the asking for the rest of the
-prompt, and from then on a refused reserve gives its slots back at once, because
-mid-prompt runtime allocations prefer the WEIGHT zone too. A BUSY refusal does
-not, because the runner re-posts that request itself. The auto-ubatch fit only
-probes the loan bytes (`ggml_sycl_expert_loan_probe_bytes`) for its ring term,
-`ggml_sycl_hold_ring_uncovered`, and lends nothing. When a loan
-runs, the refill runs at the decode boundary through
-`ggml_sycl_expert_refill_transaction_run`. It re-admits
-lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying
-each lent host copy back owner to owner on the copy queue, behind its writes. A
-triplet that can never be prepared stays on the host, with one WARN. A prompt
-whose ring never engaged used none of its loan, so the first decode graph's
-boundary returns all of it in one refill transaction, whatever
+`ggml_sycl_request_expert_loan`. `moe_stream_loan_size_post_loan` sizes the
+request from the plan the loan would leave, not from the shortfall alone: lent
+triplets become host matrices, which can widen the executor window and so the
+ring. It selects the triplets a request takes, rebuilds the ring geometry with
+them read as host, and repeats until the ring it sized for is the ring the loan
+leaves, or a smaller one in the same slot size. The request then carries that
+ring's bytes in that ring's slot size, less the slots the reserve already holds
+while the slot size has not changed. The selector counts the whole slots each
+lent matrix frees, so a triplet whose matrices are each below a slot is not lent
+(llama.cpp-9x8t). When the sizing does not converge (the post-loan ring exceeds
+the cap, does not grow in another slot size, or the sizing spends its bound of
+G_plan + 1 steps), no loan is asked: the latch goes REFUSED for the rest of the
+prompt, and the phase prints one WARN at every verbosity. A sized loan is asked
+once per micro-batch, since the reserve latch stops later layers before the
+reserve. The loan runs at the next graph boundary, and the next micro-batch's
+reserve continues from the slots the refused one kept. The phase keeps that
+partial ring only while a loan can still fund it. A loan the boundary runner
+refuses stops the asking for the rest of the prompt, and from then on a refused
+reserve gives its slots back at once, because mid-prompt runtime allocations
+prefer the WEIGHT zone too. A BUSY refusal does not, because the runner re-posts
+that request itself. The auto-ubatch fit's ring term,
+`ggml_sycl_hold_ring_uncovered`, sizes the same loan with the whole ring short
+and lends nothing: it charges the converged post-loan ring less what the probe
+of that loan would lend (`ggml_sycl_expert_loan_probe_bytes`), or the whole
+pre-loan ring when the sizing does not converge. When a loan runs, the refill
+runs at the decode boundary through `ggml_sycl_expert_refill_transaction_run`.
+It re-admits lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode
+graph, copying each lent host copy back owner to owner on the copy queue, behind
+its writes. A triplet that can never be prepared stays on the host, with one
+WARN. A prompt whose ring never engaged used none of its loan, so the first
+decode graph's boundary returns all of it in one refill transaction, whatever
 `GGML_SYCL_MOE_REFILL_PER_GRAPH` says, and one WARN names that decode graph
 (llama.cpp-i4ny). Each refill republishes the plan and forces a re-record, so
 one per triplet was the cost. A context that ends with triplets still lent

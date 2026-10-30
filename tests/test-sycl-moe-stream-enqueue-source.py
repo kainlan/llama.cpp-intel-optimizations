@@ -798,7 +798,8 @@ PROMPT_KERNEL_RETURN = ("return ggml_sycl_moe_staged_capability_refusal(cap, typ
                         "ggml_sycl::moe_staged_route_refusal::NONE;")
 INDEX_CALL = ("moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, "
               "op.window, &index_);")
-INDEX_BUILD_CALL = "moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints)"
+INDEX_BUILD_CALL = ("moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints, "
+                    "as_host)")
 PREPARE_SIG = "void moe_stream_phase::prepare("
 INDEX_PROMPT_UNASKED = "GGML_UNUSED(prompt_kernel);"
 # A call of the predicate itself, by the hook's name or through op.: the backend's definition carries a prefix.
@@ -863,9 +864,9 @@ def test_staging_source_mutants():
                                         "op.library_claims, moe_stream_window_hints(), &index_);"))
     # The shared geometry helper builds the index blind or without the claims hook, whatever prepare() passes.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, nullptr, nullptr, "
-                                                          "library_claims, hints)"), PHASE)
+                                                          "library_claims, hints, as_host)"), PHASE)
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, prompt_kernel, "
-                                                          "graph_ctx, nullptr, hints)"), PHASE)
+                                                          "graph_ctx, nullptr, hints, as_host)"), PHASE)
 
 
 BATCH_HPP_REL = "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
@@ -1005,7 +1006,8 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
             and "MXFP4" not in lc and "moe_classify_tensor" not in lc
             and "g_moe_gate_up_pairs.find(layer)" in body(n, LAYER_WEIGHT_SIG)
             and n.count(LIBRARY_CLAIMS_FILL) == 1 and n.count(ROUTE_CONSUMER_REFUSAL) == 1
-            and "moe_stream_library_claims_fn library_claims, const moe_stream_window_hints & hints)" in h
+            and ("moe_stream_library_claims_fn library_claims, const moe_stream_window_hints & hints, "
+                 "const std::unordered_set<uint64_t> * as_host = nullptr)") in h
             and ITEM_DEFAULT_NONE in body(h, "struct moe_stream_item")
             and ordered(build, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY, "li.items.push_back(item);",
                         INDEX_SLOT_SKIP, "++li.n_streamable;", REGION_SIZE)
@@ -1139,15 +1141,15 @@ def test_library_claims_index_plan_mutants():
 # ---- the policy gate -------------------------------------------------------------------------------------------------
 
 STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage_window("
-RING_READY_SIG = "bool moe_stream_phase::ring_ready()"
+RING_READY_SIG = "bool moe_stream_phase::ring_ready(const moe_stream_loan_sizer * sizer)"
 EXECUTOR_CLAIMS_SIG = "bool moe_stream_phase::executor_claims(int layer)"
 EXECUTOR_CLAIMS_BODY = ("{ const auto it = index_.layers.find(layer); return it != index_.layers.end() && "
                         "decision_of(layer).choice == moe_exec_choice::RING && "
-                        "moe_stream_executor_claims(it->second, geo_) && ring_ready(); }")
+                        "moe_stream_executor_claims(it->second, geo_) && ring_ready(nullptr); }")
 WINDOW_GUARD = "if (req.layer != cur_layer_ || !executor_claims(req.layer)) { GGML_ABORT("
 # begin_layer keeps a RING decision only where the executor claims the layer and the ring reserves.
 RING_STANDS = ("if (moe_stream_stage_now(st.decision, op.policy) && !(moe_stream_executor_claims(cur->second, geo_) && "
-               "ring_ready())) { st.decision.choice = moe_exec_choice::CPU; "
+               "ring_ready(&sizer))) { st.decision.choice = moe_exec_choice::CPU; "
                "st.decision.reason = moe_exec_reason::RING_UNAVAILABLE; }")
 STAGE_PRED_SIG = "static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_policy policy)"
 STAGE_PRED_BODY = "{ return d.choice == moe_exec_choice::RING && policy != moe_exec_policy::CPU; }"
@@ -1162,7 +1164,8 @@ LAYER_CLAIMED_STEPS = (
 )
 POLICY_FROM_CONFIG = "call.op.policy = ggml_sycl_moe_exec_config().policy;"
 STAGE_WINDOW_CALL_RE = re.compile(r"(?<![:\w])stage_window\(")
-RING_READY_CALL_RE = re.compile(r"(?<![:\w])ring_ready\(\)")
+# begin_layer hands its short reserve a loan sizer; executor_claims, which only sees a held ring, hands none.
+RING_READY_CALL_RE = re.compile(r"(?<![:\w])ring_ready\((?:&sizer|nullptr)\)")
 
 
 def claim_staging_follows_the_decision(phase: str, sycl: str, hpp: str) -> bool:
@@ -1207,10 +1210,12 @@ def test_policy_gate_mutants():
     # executor_claims without the RING choice: a CPU layer would stage.
     assert not c(mutate(PHASE, "decision_of(layer).choice == moe_exec_choice::RING && ", ""), SYCL, PLAN_HPP)
     # executor_claims without the layer's claim.
-    assert not c(mutate(PHASE, "moe_stream_executor_claims(it->second, geo_) && ring_ready(); }", "ring_ready(); }"),
+    assert not c(mutate(PHASE, "moe_stream_executor_claims(it->second, geo_) && ring_ready(nullptr); }",
+                        "ring_ready(nullptr); }"),
                  SYCL, PLAN_HPP)
     # begin_layer keeps RING on a layer the executor does not claim.
-    assert not c(mutate(PHASE, "!(moe_stream_executor_claims(cur->second, geo_) && ring_ready())", "!ring_ready()"),
+    assert not c(mutate(PHASE, "!(moe_stream_executor_claims(cur->second, geo_) && ring_ready(&sizer))",
+                        "!ring_ready(&sizer)"),
                  SYCL, PLAN_HPP)
     # AUTO never staging: the record-only predicate of lead ruling c-3skf.
     assert not c(PHASE, SYCL, mutate(PLAN_HPP, STAGE_PRED_BODY,
@@ -1227,7 +1232,7 @@ def test_policy_gate_mutants():
     assert not c(mutate(PHASE, "report(layer, st);", "(void) stage_window({}, 0, cache, op); report(layer, st);"),
                  SYCL, PLAN_HPP)
     # The ring reserved outside the two askers.
-    assert not c(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = ccs.is_in_order(); ring_ready();"),
+    assert not c(mutate(PHASE, "in_order_ = ccs.is_in_order();", "in_order_ = ccs.is_in_order(); ring_ready(nullptr);"),
                  SYCL, PLAN_HPP)
     # The op's policy pinned to RING instead of read from GGML_SYCL_MOE_EXEC.
     assert not c(PHASE, mutate(SYCL, POLICY_FROM_CONFIG, "call.op.policy = moe_exec_policy::RING;"), PLAN_HPP)
@@ -1460,20 +1465,34 @@ RING_HPP = read(RING_HPP_REL)
 # The reserve-failed branch's condition, without its brace: body() opens at the first brace after it.
 RESERVE_SHORT_IF = "if (!ring->reserve(device_, geo_, &bytes_short))"
 LOAN_CALL = ("moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, geo_.slot_bytes, request_loan_, "
-             "loan_refusals_)")
+             "loan_refusals_, sizer)")
 LOAN_REFUSED_WARN = "== moe_stream_loan_step::REFUSED) { warn_loan_refused(bytes_short); }"
 LOAN_LATCH_CLEAR = "loan_latch_ = moe_stream_loan_latch();"
 LOAN_HOOKS_STORED = ("request_loan_ = op.request_loan;", "loan_refusals_ = op.loan_refusals;")
 LOAN_HELPER_SIG = "static inline moe_stream_loan_step moe_stream_loan_on_short_reserve("
-# The helper's steps, in order: nothing to ask, a refusal since the last ask latches, else ask with the shortfall.
+# The helper's steps, in order: nothing to ask, a refusal since the last ask latches, else size the loan from the plan
+# it leaves and ask with what converged, or latch when nothing converges. A null sizer asks with the
+# shortfall as reported.
 LOAN_HELPER_ORDER = (
     "if (request_loan == nullptr || latch.refused || bytes_short == 0) { return moe_stream_loan_step::NONE; }",
     "const uint64_t refusals_now = loan_refusals != nullptr ? loan_refusals(device) : 0;",
     "if (latch.asked && refusals_now != latch.refusals_seen) { latch.refused = true; "
     "return moe_stream_loan_step::REFUSED; }",
-    "latch.asked = true; latch.refusals_seen = refusals_now; request_loan(device, bytes_short, slot_bytes); "
+    "size_t bytes = bytes_short; size_t slot = slot_bytes;",
+    "if (sizer != nullptr) { const moe_stream_loan_sizing sized = moe_stream_loan_size_post_loan(*sizer, bytes_short); "
+    "if (!sized.converged) { latch.refused = true; latch.unconverged = true; latch.sizing_steps = sized.steps; "
+    "latch.post_slots = sized.geo.n_slots; latch.post_bytes = sized.geo.bytes; "
+    "return moe_stream_loan_step::REFUSED; } "
+    "bytes = sized.bytes; slot = sized.geo.slot_bytes; }",
+    "latch.asked = true; latch.refusals_seen = refusals_now; request_loan(device, bytes, slot); "
     "return moe_stream_loan_step::REQUEST;",
 )
+# begin_layer's short reserve sizes its loan from begin_layer's own plan, with the geometry, hooks and executor window
+# prepare() sized the ring with.
+LOAN_SIZER_FILL = ("moe_stream_loan_sizer sizer; sizer.plan = &plan; sizer.device = device_; sizer.geo = geo_; "
+                   "sizer.prompt_kernel = op.prompt_kernel; sizer.graph_ctx = op.graph_ctx; "
+                   "sizer.library_claims = op.library_claims; sizer.hints = window_;")
+LOAN_WINDOW_KEPT = "window_ = op.window;"
 # The hook's type carries the ring's slot size beside the bytes, so the loan is counted in slots (llama.cpp-9x8t).
 LOAN_FN_TYPE = "using moe_stream_request_loan_fn = void (*)(int device, size_t bytes, size_t slot_bytes);"
 RESERVE_DECL = "bool reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short = nullptr);"
@@ -1514,7 +1533,8 @@ def claim_short_reserve_requests_a_loan(phase: str, hpp: str, sycl: str, ring_cp
     rc = norm(ring_cpp)
     return (n.count("moe_stream_loan_on_short_reserve(") == 1
             and ordered(branch, LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN)
-            and ordered(body(n, BEGIN_LAYER_SIG), *LOAN_HOOKS_STORED, "ring_ready()")
+            and ordered(body(n, BEGIN_LAYER_SIG), *LOAN_HOOKS_STORED, LOAN_SIZER_FILL, "ring_ready(&sizer)")
+            and n.count(LOAN_WINDOW_KEPT) == 1 and LOAN_WINDOW_KEPT in body(n, PREPARE_SIG)
             and n.count(LOAN_LATCH_CLEAR) == 1 and LOAN_LATCH_CLEAR in body(n, END_PROMPT_SIG)
             and h.count("request_loan(device, ") == 1 and h.count(LOAN_FN_TYPE) == 1
             and ordered(body(h, LOAN_HELPER_SIG), *LOAN_HELPER_ORDER)
@@ -1555,8 +1575,7 @@ def test_short_reserve_loan_mutants():
     # The request without the ring's slot: the loan would be counted in bytes, and a lent triplet whose matrices are
     # each below a slot would fund none (llama.cpp-9x8t).
     assert not c(phase=mutate(PHASE, "bytes_short, geo_.slot_bytes, request_loan_", "bytes_short, 0, request_loan_"))
-    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short, slot_bytes);",
-                            "request_loan(device, bytes_short, 0);"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes, slot);", "request_loan(device, bytes, 0);"))
     assert not c(hpp=mutate(PLAN_HPP, LOAN_FN_TYPE,
                             "using moe_stream_request_loan_fn = void (*)(int device, size_t bytes);"))
     # The boundary runner asks the transaction in bytes.
@@ -1576,11 +1595,25 @@ def test_short_reserve_loan_mutants():
     assert not c(hpp=mutate(PLAN_HPP, "latch.refused = true; return moe_stream_loan_step::REFUSED;",
                             "return moe_stream_loan_step::REFUSED;"))
     # The helper asks for the whole ring, or asks a second time.
-    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short, slot_bytes);",
-                            "request_loan(device, SIZE_MAX, slot_bytes);"))
-    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes_short, slot_bytes);",
-                            "request_loan(device, bytes_short, slot_bytes); "
-                            "request_loan(device, bytes_short, slot_bytes);"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes, slot);", "request_loan(device, SIZE_MAX, slot);"))
+    assert not c(hpp=mutate(PLAN_HPP, "request_loan(device, bytes, slot);",
+                            "request_loan(device, bytes, slot); request_loan(device, bytes, slot);"))
+    # The loan sized from the pre-loan geometry: the converged request dropped, or its slot size.
+    assert not c(hpp=mutate(PLAN_HPP, "bytes = sized.bytes; slot = sized.geo.slot_bytes;",
+                            "slot = sized.geo.slot_bytes;"))
+    assert not c(hpp=mutate(PLAN_HPP, "bytes = sized.bytes; slot = sized.geo.slot_bytes;", "bytes = sized.bytes;"))
+    # A loan that does not converge asked anyway, or refused without the latch.
+    assert not c(hpp=mutate(PLAN_HPP, "if (!sized.converged) { latch.refused = true; latch.unconverged = true; "
+                                      "latch.sizing_steps = sized.steps; latch.post_slots = sized.geo.n_slots; "
+                                      "latch.post_bytes = sized.geo.bytes; return moe_stream_loan_step::REFUSED; } ",
+                            ""))
+    # The refusal's reason not kept for the WARN: the post-loan ring's slots, which tell over-cap from no growth.
+    assert not c(hpp=mutate(PLAN_HPP, "latch.post_slots = sized.geo.n_slots; ", ""))
+    assert not c(hpp=mutate(PLAN_HPP, "latch.refused = true; latch.unconverged = true;", "latch.unconverged = true;"))
+    # begin_layer hands no sizer, or a sizer with another window than the ring was sized with.
+    assert not c(phase=mutate(PHASE, "ring_ready(&sizer)))", "ring_ready(nullptr)))"))
+    assert not c(phase=mutate(PHASE, "sizer.hints = window_;", "sizer.hints = op.window;"))
+    assert not c(phase=mutate(PHASE, LOAN_WINDOW_KEPT, ""))
     # The reserve exposes no shortfall, or exposes the whole ring.
     assert not c(ring_hpp=mutate(RING_HPP, RESERVE_DECL,
                                  "bool reserve(int device, const moe_stream_ring_geometry & geo);"))
@@ -1594,6 +1627,61 @@ def test_short_reserve_loan_mutants():
     # The hooks not wired by the backend.
     assert not c(sycl=mutate(SYCL, WIRE_REQUEST, ""))
     assert not c(sycl=mutate(SYCL, WIRE_REFUSALS, ""))
+
+
+# The loan sizing's exits, in order. The request is sized for the target before the post-loan ring is compared. The
+# same ring converges; a vanished ring (over the cap) is refused; a ring in the target's slot size that is no larger
+# is covered, so it converges with the request still sized for the target; a ring in another slot size that does not
+# grow, or a spent bound, is refused; otherwise the target becomes the post-loan ring.
+LOAN_SIZING_SIG = ("static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & "
+                   "sizer, size_t bytes_short)")
+LOAN_SIZING_REQUEST = "out.bytes = bytes;"
+LOAN_SIZING_SAME = "if (moe_stream_ring_geometry_same(post, target)) { out.converged = true; return out; }"
+LOAN_SIZING_VANISHED = "if (post.n_slots == 0) { return out; }"
+LOAN_SIZING_COVERED = ("if (post.slot_bytes == target.slot_bytes && post.bytes <= target.bytes) { "
+                       "out.converged = true; return out; }")
+LOAN_SIZING_GROWS = "if (post.bytes <= target.bytes || step > idx.window_experts) { return out; }"
+LOAN_SIZING_NEXT = "target = post;"
+# The bytes a step would lend come from the ledger's own helper, so the sizing and the published lent_bytes cannot
+# disagree about a triplet's device bytes.
+LOAN_SIZING_LENT = "lent += moe_expert_triplet_dst_bytes(*sizer.plan, triplet);"
+
+
+def claim_loan_sizing_converges_or_covers(hpp: str) -> bool:
+    h = norm(hpp)
+    at = h.find(LOAN_SIZING_SIG + " {")
+    b = body(h[at:], LOAN_SIZING_SIG) if at >= 0 else ""
+    return (ordered(b, LOAN_SIZING_LENT, LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED,
+                    LOAN_SIZING_COVERED, LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
+            and b.count("out.bytes = ") == 1 and b.count("out.converged = true;") == 2 and "dst_size" not in b)
+
+
+def test_loan_sizing_converges_or_covers():
+    assert claim_loan_sizing_converges_or_covers(PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.hpp: whole file (the sizing body is searched in it)", norm(PLAN_HPP),
+        LOAN_SIZING_SIG + " {", LOAN_SIZING_LENT, LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED,
+        LOAN_SIZING_COVERED, LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
+
+
+def test_loan_sizing_mutants():
+    c = claim_loan_sizing_converges_or_covers
+    # A smaller post-loan ring refused, the strict reading.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_COVERED, ""))
+    # Covered in any slot size: a ring of larger slots is not comparable by bytes.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_COVERED,
+                        "if (post.bytes <= target.bytes) { out.converged = true; return out; }"))
+    # A vanished ring (over the cap) no longer refused, so a zero-byte ring reads as covered.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_VANISHED, ""))
+    # The covered request resized to the smaller ring, below what the target's request frees.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_COVERED,
+                        "if (post.slot_bytes == target.slot_bytes && post.bytes <= target.bytes) { "
+                        "out.bytes = post.bytes; out.converged = true; return out; }"))
+    # Never iterating: the first post-loan ring is the last.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_NEXT, ""))
+    # A second source for a triplet's lent bytes: the sizing sums dst_size itself instead of asking the ledger's helper.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_LENT,
+                        "for (int r = 0; r < 3; ++r) { const placement_entry * e = sizer.plan->find_expert_entry("
+                        "triplet[r].layer_id, triplet[r].expert_id, triplet[r].role); lent += e ? e->dst_size : 0; }"))
 
 
 # ---- the ring reserves slot by slot (llama.cpp-am87) -----------------------------------------------------------------
@@ -1766,45 +1854,84 @@ def test_ring_slot_by_slot_fails_on_the_single_allocation_ring():
 
 
 LOAN_WARN_SIG = "void moe_stream_phase::warn_loan_refused(size_t bytes_short) const"
-LOAN_WARN_GUARD = ("if (log_ == nullptr || log_->sink == nullptr || "
-                   "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+LOAN_WARN_NULL = "if (log_ == nullptr || log_->sink == nullptr) { return; }"
+LOAN_WARN_UNCONVERGED_IF = "if (loan_latch_.unconverged) {"
+# The reason clause, asked steps first: a sizer with no plan or no ring takes no step and leaves 0 slots, and that
+# state is not over the cap.
+LOAN_WARN_WHY = ('const char * why = loan_latch_.sizing_steps == 0 ? "no sizing step ran, no plan or no ring" : '
+                 'loan_latch_.post_slots == 0 ? "over the cap" : "it did not grow, or the sizing spent its bound";')
+LOAN_WARN_UNCONVERGED_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would "
+                             "leave after %u sizing steps (post-loan ring %u slots, %zu bytes: %s): no loan this "
+                             "prompt")
+LOAN_WARN_UNCONVERGED_ARGS = ("device_, bytes_short / (1024.0 * 1024.0), loan_latch_.sizing_steps, "
+                              "loan_latch_.post_slots, loan_latch_.post_bytes, why);")
+LOAN_WARN_GATE = "if (policy_ != moe_exec_policy::RING && log_->trace < 1) { return; }"
 LOAN_WARN_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
                  "prompt")
 LOAN_WARN_EMIT = "log_->sink(log_->sink_ctx, line);"
 
 
 def claim_refused_loan_warns_once(phase: str, tree: dict) -> bool:
-    """The brief's one WARN for a REFUSED loan (llama.cpp-3460): the helper answers REFUSED once per prompt, the branch
-    calls warn_loan_refused for it, and that WARN goes out through the decision log's sink under the gate of lead
-    ruling c-kcyf (an explicit ring or a trace), so the phase still prints nothing of its own at default verbosity
-    under AUTO (c-xod7-q1). There, the loan transaction's own "[MOE-EXEC] loan device %d refused" line, which the
-    latch now makes print once per prompt, is the one WARN. The format exists once in the backend."""
+    """The one WARN per prompt for a loan the short ring did not get (llama.cpp-3460): the helper answers REFUSED once
+    per prompt, the branch calls warn_loan_refused for it, and the line goes out through the decision log's sink. A
+    loan the boundary refused is gated as lead ruling c-kcyf gates the phase's lines (an explicit ring or a trace),
+    because at default verbosity under AUTO the loan transaction's own "[MOE-EXEC] loan device %d refused" line,
+    which the latch makes print once per prompt, is already its WARN. A loan that never converged asks the
+    transaction nothing, so its line is not gated: a refusal is never silent. Each format exists once in the backend."""
     w = body(norm(phase), LOAN_WARN_SIG)
     count = sum(norm(text).count(LOAN_WARN_FMT) for text in tree.values())
-    return (count == 1 and w.startswith("{ " + LOAN_WARN_GUARD)
-            and ordered(w, LOAN_WARN_GUARD, LOAN_WARN_FMT, LOAN_WARN_EMIT))
+    unconverged = sum(norm(text).count(LOAN_WARN_UNCONVERGED_FMT) for text in tree.values())
+    return (count == 1 and unconverged == 1 and w.startswith("{ " + LOAN_WARN_NULL)
+            and ordered(w, LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_WHY, LOAN_WARN_UNCONVERGED_FMT,
+                        LOAN_WARN_UNCONVERGED_ARGS, "} else {",
+                        LOAN_WARN_GATE, LOAN_WARN_FMT, LOAN_WARN_EMIT)
+            and w.count("policy_") == 1 and w.count("log_->trace") == 1 and w.count(LOAN_WARN_EMIT) == 1)
 
 
 def test_refused_loan_warns_once():
     assert claim_refused_loan_warns_once(PHASE, SYCL_TREE), first_missing(
-        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_loan_refused (the warn format "
-        "is counted across the sycl tree)",
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_loan_refused (the warn formats "
+        "are counted across the sycl tree)",
         body(norm(PHASE), LOAN_WARN_SIG),
-        LOAN_WARN_GUARD, LOAN_WARN_FMT, LOAN_WARN_EMIT,
-        signature=LOAN_WARN_SIG)
+        LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_WHY, LOAN_WARN_UNCONVERGED_FMT, LOAN_WARN_GATE,
+        LOAN_WARN_FMT, LOAN_WARN_EMIT, signature=LOAN_WARN_SIG)
 
 
 def test_refused_loan_warn_mutants():
-    # Ungated: AUTO would print the phase's own line at default verbosity.
-    ungated = mutate(PHASE, " || (policy_ != moe_exec_policy::RING && log_->trace < 1)", "")
-    assert not claim_refused_loan_warns_once(ungated, {PHASE_REL: ungated})
+    c = claim_refused_loan_warns_once
+    # The refused loan's line ungated: AUTO would print the phase's own line next to the transaction's at default
+    # verbosity.
+    ungated = mutate(PHASE, LOAN_WARN_GATE, "")
+    assert not c(ungated, {PHASE_REL: ungated})
+    # The unconverged line re-gated, at the top as before or inside its own branch: a silent refusal under AUTO.
+    regated = mutate(PHASE, LOAN_WARN_NULL, "if (log_ == nullptr || log_->sink == nullptr || "
+                                            "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+    assert not c(regated, {PHASE_REL: regated})
+    in_branch = mutate(PHASE, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_IF + " " + LOAN_WARN_GATE)
+    assert not c(in_branch, {PHASE_REL: in_branch})
+    # The unconverged line without its reason: the reader cannot tell an over-cap ring from one that did not grow.
+    reasonless = mutate(PHASE, LOAN_WARN_UNCONVERGED_ARGS, "device_, bytes_short / (1024.0 * 1024.0));")
+    assert not c(reasonless, {PHASE_REL: reasonless})
+    # The reason clause dropped from the arguments, its step test removed, or the slot count asked first: each prints
+    # "over the cap" for a sizer that took no step, where no cap was met.
+    whyless = mutate(PHASE, LOAN_WARN_UNCONVERGED_ARGS, LOAN_WARN_UNCONVERGED_ARGS.replace(", why);", ");"))
+    assert not c(whyless, {PHASE_REL: whyless})
+    stepless = mutate(PHASE, LOAN_WARN_WHY, LOAN_WARN_WHY.replace(
+        'loan_latch_.sizing_steps == 0 ? "no sizing step ran, no plan or no ring" : ', ""))
+    assert not c(stepless, {PHASE_REL: stepless})
+    cap_first = mutate(PHASE, LOAN_WARN_WHY,
+                       'const char * why = loan_latch_.post_slots == 0 ? "over the cap" : loan_latch_.sizing_steps == '
+                       '0 ? "no sizing step ran, no plan or no ring" : "it did not grow, or the sizing spent its '
+                       'bound";')
+    assert not c(cap_first, {PHASE_REL: cap_first})
     # Never emitted.
     silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
-    assert not claim_refused_loan_warns_once(silent, {PHASE_REL: silent})
-    # The format restated elsewhere.
-    tree = dict(SYCL_TREE)
-    tree["extra.cpp"] = '"' + LOAN_WARN_FMT + '"'
-    assert not claim_refused_loan_warns_once(PHASE, tree)
+    assert not c(silent, {PHASE_REL: silent})
+    # A format restated elsewhere.
+    for fmt in (LOAN_WARN_FMT, LOAN_WARN_UNCONVERGED_FMT):
+        tree = dict(SYCL_TREE)
+        tree["extra.cpp"] = '"' + fmt + '"'
+        assert not c(PHASE, tree)
 
 
 DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u "
