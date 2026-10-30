@@ -126,3 +126,15 @@ def run_without_source(script: str):
         shutil.copy(os.path.abspath(__file__), os.path.join(tests, "sycl_gate.py"))
         done = subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60)
         return done.returncode, done.stdout + done.stderr
+
+
+def first_missing(where: str, text: str, *anchors: str) -> str:
+    """The message for `assert claim(...), first_missing(...)`: names the first anchor the claim needs that `text`
+    does not contain, and where it looked, so a stale pin says what it expected instead of a bare AssertionError.
+    When every anchor is present the claim failed on an order, count or depth condition, and the message says so.
+    Never empty, so the assert always prints it."""
+    for anchor in anchors:
+        if anchor not in text:
+            shown = anchor if len(anchor) <= 100 else anchor[:97] + "..."
+            return "%s: missing %r" % (where, shown)
+    return "%s: all %d anchors present; an order, count or depth condition failed" % (where, len(anchors))

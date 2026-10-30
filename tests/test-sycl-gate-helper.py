@@ -128,6 +128,40 @@ def test_plain_frame_failure_still_names_its_operands() -> None:
     assert "token='missing'" in result.stderr
 
 
+def _first_missing():
+    sys.path.insert(0, str(TESTS))
+    from sycl_gate import first_missing
+    return first_missing
+
+
+def test_first_missing_names_the_absent_anchor_and_where_it_looked() -> None:
+    assert _first_missing()("W", "a", "a", "b") == "W: missing 'b'"
+
+
+def test_first_missing_names_the_first_of_two_missing_anchors() -> None:
+    message = _first_missing()("W", "zzz", "a", "b")
+    assert message == "W: missing 'a'"
+
+
+def test_first_missing_with_every_anchor_present_says_an_order_count_or_depth_condition_failed() -> None:
+    message = _first_missing()("W", "a b c", "a", "b", "c")
+    assert message == "W: all 3 anchors present; an order, count or depth condition failed"
+
+
+def test_first_missing_truncates_a_long_anchor_and_stays_short() -> None:
+    message = _first_missing()("W", "", "x" * 300)
+    assert "..." in message
+    assert "x" * 98 not in message
+    assert len(message) < 160
+
+
+def test_first_missing_is_never_empty() -> None:
+    first_missing = _first_missing()
+    assert first_missing("W", "")
+    assert first_missing("W", "t")
+    assert first_missing("", "", "a")
+
+
 if __name__ == "__main__":
     import sys
 
