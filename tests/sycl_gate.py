@@ -22,7 +22,8 @@ the first forbidden text its region holds) as the message.
 
     from sycl_gate import first_missing
 
-    assert claim_x(SYCL), first_missing("file: region", region, ANCHOR_A, ANCHOR_B)
+    assert claim_x(SYCL), first_missing(
+        "file: region", region, ANCHOR_A, ANCHOR_B)
 
 Second, the text helpers for source-contract pins, at the end of the module:
 ROOT (the repo root), strip_comments (source text with comments blanked, line

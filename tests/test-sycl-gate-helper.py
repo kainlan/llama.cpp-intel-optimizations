@@ -5,9 +5,9 @@ zero recorded checks must fail, and a failing generator expression must be annot
 module-level variable that shares a comprehension variable's name. The message helpers the pytest-style pins pass
 as assert messages, first_missing and first_present, are pinned here too: what each names, the singular and plural
 wording, and the 100-character cut. The text helpers the three MoE source-contract pins share are pinned last: norm
-(comment stripping, whitespace canonicalisation, idempotence), read (text, or empty for a missing file), body (brace
-balancing, string literals, a signature ending in "{", an empty result), ordered (each needle after the one before) and
-mutate (one replacement on normalised text, and a missing old text is refused).
+(comment stripping, whitespace canonicalisation, idempotence), read (text, or empty for a missing file), ROOT (the repo
+root beside tests/), body (brace balancing, string literals, a signature ending in "{", an empty result), ordered (each
+needle after the one before) and mutate (one replacement on normalised text, and a missing old text is refused).
 """
 import subprocess
 import sys
@@ -255,7 +255,7 @@ def test_body_balances_braces_and_skips_literals() -> None:
 
 def test_body_skips_an_escaped_quote_inside_a_literal() -> None:
     text = 'void f() { g("a\\"}"); } void h() { }'
-    assert body(text, "void f()") == 'void f() { g("a\\"}"); }'[len("void f() "):]
+    assert body(text, "void f()") == '{ g("a\\"}"); }'
 
 
 def test_body_signature_ending_in_brace_opens_the_body_itself() -> None:
