@@ -1707,6 +1707,54 @@ def test_short_reserve_loan_mutants():
     assert not c(sycl=mutate(SYCL, WIRE_REFUSALS, ""))
 
 
+# The loan sizing's exits, in order. The request is sized for the target before the post-loan ring is compared. The
+# same ring converges; a vanished ring (over the cap) is refused; a ring in the target's slot size that is no larger
+# is covered, so it converges with the request still sized for the target; a ring in another slot size that does not
+# grow, or a spent bound, is refused; otherwise the target becomes the post-loan ring.
+LOAN_SIZING_SIG = ("static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & "
+                   "sizer, size_t bytes_short)")
+LOAN_SIZING_REQUEST = "out.bytes = bytes;"
+LOAN_SIZING_SAME = "if (moe_stream_ring_geometry_same(post, target)) { out.converged = true; return out; }"
+LOAN_SIZING_VANISHED = "if (post.n_slots == 0) { return out; }"
+LOAN_SIZING_COVERED = ("if (post.slot_bytes == target.slot_bytes && post.bytes <= target.bytes) { "
+                       "out.converged = true; return out; }")
+LOAN_SIZING_GROWS = "if (post.bytes <= target.bytes || step > idx.window_experts) { return out; }"
+LOAN_SIZING_NEXT = "target = post;"
+
+
+def claim_loan_sizing_converges_or_covers(hpp: str) -> bool:
+    h = norm(hpp)
+    at = h.find(LOAN_SIZING_SIG + " {")
+    b = body(h[at:], LOAN_SIZING_SIG) if at >= 0 else ""
+    return (ordered(b, LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED, LOAN_SIZING_COVERED,
+                    LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
+            and b.count("out.bytes = ") == 1 and b.count("out.converged = true;") == 2)
+
+
+def test_loan_sizing_converges_or_covers():
+    assert claim_loan_sizing_converges_or_covers(PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.hpp: whole file (the sizing body is searched in it)", norm(PLAN_HPP),
+        LOAN_SIZING_SIG + " {", LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED, LOAN_SIZING_COVERED,
+        LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
+
+
+def test_loan_sizing_mutants():
+    c = claim_loan_sizing_converges_or_covers
+    # A smaller post-loan ring refused, the strict reading.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_COVERED, ""))
+    # Covered in any slot size: a ring of larger slots is not comparable by bytes.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_COVERED,
+                        "if (post.bytes <= target.bytes) { out.converged = true; return out; }"))
+    # A vanished ring (over the cap) no longer refused, so a zero-byte ring reads as covered.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_VANISHED, ""))
+    # The covered request resized to the smaller ring, below what the target's request frees.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_COVERED,
+                        "if (post.slot_bytes == target.slot_bytes && post.bytes <= target.bytes) { "
+                        "out.bytes = post.bytes; out.converged = true; return out; }"))
+    # Never iterating: the first post-loan ring is the last.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_NEXT, ""))
+
+
 # ---- the ring reserves slot by slot (llama.cpp-am87) -----------------------------------------------------------------
 
 SLOT_LOOP = "while (slots_.size() < geo.n_slots)"

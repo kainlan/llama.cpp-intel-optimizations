@@ -602,9 +602,10 @@ struct moe_stream_loan_sizer {
 
 // A loan sized from the plan it leaves (moe_stream_loan_size_post_loan).
 struct moe_stream_loan_sizing {
-    bool                     converged  = false;  // the geometry the request was sized for is the post-loan one
-    size_t                   bytes      = 0;      // the request: the slots of `geo` not held, times geo.slot_bytes
-    moe_stream_ring_geometry geo        = {};     // converged: the geometry the request funds; else the last post-loan
+    // The post-loan ring is the one the request was sized for, or a smaller one in its slot size (covered).
+    bool                     converged  = false;
+    size_t                   bytes      = 0;   // the request: the sized-for ring's slots not held, times its slot size
+    moe_stream_ring_geometry geo        = {};  // the last post-loan ring: when converged, the one prepare() reserves
     uint32_t                 steps      = 0;      // post-loan geometries computed
     uint32_t                 n_triplets = 0;      // triplets the request selects
 };
@@ -1378,11 +1379,15 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
 // n_slots - bytes_short / slot_bytes, count while the slot size is the reserve's: prepare() gives them back on the new
 // geometry, and each leaves a hole one such slot wide. With another slot size they count for nothing.
 //
-// Lending more only adds host matrices, so a step that does not converge widens the ring, by a region slot or a larger
-// slot, and the window stops at G_plan: within G_plan + 1 post-loan geometries the request converges, or none does.
-// The sizing refuses (converged false) when the post-loan ring cannot exist (n_slots 0: over the cap), when it differs
-// from the target without growing (a lent matrix with a larger f16 expert can lower G_plan), when the bound is spent,
-// and when it has nothing to size (no plan or no geometry). It reads the plan only: no device, no lock, nothing lent.
+// A post-loan ring in the target's slot size that is no larger than the target is covered too: the loan frees at least
+// the room the target's request names, and prepare() reserves the smaller ring inside it. That happens when a lent
+// matrix's f16 expert is larger than every host one, which lowers G_plan and so the window. The request then stays the
+// one sized for the target, and `geo` is the smaller ring the loan leaves.
+// Otherwise lending more only adds host matrices, so a step that does not converge widens the ring, by a region slot or
+// a larger slot, and the window stops at G_plan: within G_plan + 1 post-loan geometries the request converges, or none
+// does. The sizing refuses (converged false) when the post-loan ring cannot exist (n_slots 0: over the cap), when a
+// ring in another slot size does not grow (the two sizes are not comparable), when the bound is spent, and when it has
+// nothing to size (no plan or no geometry). It reads the plan only: no device, no lock, nothing lent.
 // The claims hook answers from its own plan, the pre-loan one (one fact, one source); a staged claim reads the layout
 // of the weight's device experts, which a loan of AOS triplets leaves as it was.
 static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & sizer,
@@ -1424,7 +1429,14 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
             out.converged = true;
             return out;
         }
-        if (post.n_slots == 0 || post.bytes <= target.bytes || step > idx.window_experts) {
+        if (post.n_slots == 0) {
+            return out;
+        }
+        if (post.slot_bytes == target.slot_bytes && post.bytes <= target.bytes) {
+            out.converged = true;  // covered: the smaller ring fits in the room the target's request frees
+            return out;
+        }
+        if (post.bytes <= target.bytes || step > idx.window_experts) {
             return out;
         }
         target = post;
