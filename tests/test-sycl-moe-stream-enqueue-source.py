@@ -512,10 +512,10 @@ def claim_phase_never_waits(phase: str) -> bool:
 
 def test_phase_never_waits():
     assert claim_phase_never_waits(PHASE), first_present(
-        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file (literal forms of the claim's wait regex, which also "
-        "allows a space before the parenthesis; the claim also fails on an empty file)",
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file (literal forms of ANY_WAIT_RE; the claim also fails on "
+        "an empty file)",
         norm(PHASE),
-        "wait(", "wait_and_throw(")
+        "wait(", "wait_and_throw(", "wait (", "wait_and_throw (")
 
 
 def test_phase_wait_mutants():
@@ -530,8 +530,8 @@ def claim_mul_mat_id_waits_unchanged(sycl: str) -> bool:
 
 def test_mul_mat_id_waits_unchanged():
     assert claim_mul_mat_id_waits_unchanged(SYCL), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file; the claim counts the waits in the body of "
-        "ggml_sycl_mul_mat_id against the count on master",
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the claim counts the waits in the body of "
+        "ggml_sycl_mul_mat_id against the count on master)",
         norm(SYCL),
         MMID_SIG)
 
@@ -570,11 +570,15 @@ def claim_phase_allocates_only_ring_slots(phase: str) -> bool:
     return bool(n) and not any(a in n for a in ALLOCATOR_NAMES) and n.count("ring_->acquire_slot(") == 1
 
 
-def test_phase_allocates_only_ring_slots():
-    assert claim_phase_allocates_only_ring_slots(PHASE), first_missing(
-        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file; the claim also fails on an allocator name",
-        norm(PHASE),
+def allocates_only_ring_slots_message(phase: str) -> str:
+    return first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file (the claim also fails on an allocator name)",
+        norm(phase),
         "ring_->acquire_slot(")
+
+
+def test_phase_allocates_only_ring_slots():
+    assert claim_phase_allocates_only_ring_slots(PHASE), allocates_only_ring_slots_message(PHASE)
 
 
 def test_allocator_mutants():
@@ -1267,13 +1271,17 @@ def claim_staging_follows_the_decision(phase: str, sycl: str, hpp: str) -> bool:
             and norm(sycl).count(POLICY_FROM_CONFIG) == 1)
 
 
-def test_staging_follows_the_decision():
-    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP), first_missing(
+def staging_follows_the_decision_message(phase: str) -> str:
+    return first_missing(
         "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::window_begin (the executor claim, "
         "the predicates in moe-stream-plan.hpp and the policy in ggml-sycl.cpp are searched too)",
-        body(norm(PHASE), WINDOW_BEGIN_SIG),
+        body(norm(phase), WINDOW_BEGIN_SIG),
         "{ " + WINDOW_GUARD,
         signature=WINDOW_BEGIN_SIG)
+
+
+def test_staging_follows_the_decision():
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP), staging_follows_the_decision_message(PHASE)
 
 
 def test_policy_gate_mutants():
@@ -1492,16 +1500,8 @@ def test_claims_count_production_sites_only():
     assert raw.count(guard) == 1
     assert "moe_stream_phase::test_reserve_ring(" in raw and "moe_stream_phase::test_reserve_ring(" not in PHASE
     assert "moe_stream_phase::test_acquire_slot(" in raw and "moe_stream_phase::test_acquire_slot(" not in PHASE
-    assert claim_phase_allocates_only_ring_slots(PHASE), first_missing(
-        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file; the claim also fails on an allocator name",
-        norm(PHASE),
-        "ring_->acquire_slot(")
-    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP), first_missing(
-        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::window_begin (the executor claim, "
-        "the predicates in moe-stream-plan.hpp and the policy in ggml-sycl.cpp are searched too)",
-        body(norm(PHASE), WINDOW_BEGIN_SIG),
-        "{ " + WINDOW_GUARD,
-        signature=WINDOW_BEGIN_SIG)
+    assert claim_phase_allocates_only_ring_slots(PHASE), allocates_only_ring_slots_message(PHASE)
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP), staging_follows_the_decision_message(PHASE)
     # The seams outside their block: a second slot acquisition and a second ring_ready() call, both counted.
     unguarded = production(raw.replace(guard, "#if 1"))
     assert not claim_phase_allocates_only_ring_slots(unguarded)
