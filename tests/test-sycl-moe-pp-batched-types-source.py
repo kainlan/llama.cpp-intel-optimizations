@@ -56,7 +56,7 @@ dequant. These claims pin that shape:
       is recorded as a reader of its half, the dequant and the GEMM address the same half, and the lambda holds no
       host wait outside the debugging compare arm's CPU readback (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE).
       When the slot holds every active expert (one group), a windowed op's phases each dequantize into their own
-      region and wait for no earlier phase: one pure predicate in moe-mmvq-tables.hpp
+      region and are given no wait on an earlier phase's GEMMs: one pure predicate in moe-mmvq-tables.hpp
       (moe_pp_batched_phases_reuse_buffers, true unless there is exactly one group) decides both the phase's offset
       (moe_pp_batched_phase_weight_offset) and whether the wait is submitted, the executor asks it and never
       re-derives it, and the phase's region is asserted to lie in the claimed slot; the route log's weight figure
