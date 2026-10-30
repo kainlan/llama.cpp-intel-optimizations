@@ -262,10 +262,19 @@ refuses stops the asking for the rest of the prompt, and from then on a refused
 reserve gives its slots back at once, because mid-prompt runtime allocations
 prefer the WEIGHT zone too. A BUSY refusal does not, because the runner re-posts
 that request itself. The auto-ubatch fit's ring term,
-`ggml_sycl_hold_ring_uncovered`, sizes the same loan with the whole ring short
-and lends nothing: it charges the converged post-loan ring less what the probe
-of that loan would lend (`ggml_sycl_expert_loan_probe_bytes`), or the whole
-pre-loan ring when the sizing does not converge. When a loan runs, the refill
+`ggml_sycl_hold_ring_uncovered`, credits the planned room first: the room's
+whole slots of the ring's slot size, and only on the device the plan holds it
+for. A room that holds the whole ring charges nothing. Otherwise the term sizes
+the same loan for the slots the room leaves short, as a short reserve's held
+slots, and lends nothing: it charges the converged post-loan ring less the
+room's slots that ring keeps and what the probe of that loan would lend
+(`ggml_sycl_expert_loan_probe_bytes`). The room's slots count only while the
+slot size has not changed, the sizer's own rule for a reserve's held slots
+(`moe_stream_ring_slots_kept`). When the sizing does not converge, the term
+charges the slots the room leaves short. The room sits inside the arena, and the
+fit charges against free memory outside it, so the credit counts nothing twice.
+When a runtime context's KV takes the room (above), the credit is too large and
+the prompt's reserve and the loan decide. When a loan runs, the refill
 runs at the decode boundary through `ggml_sycl_expert_refill_transaction_run`.
 It re-admits lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode
 graph, copying each lent host copy back owner to owner on the copy queue, behind
@@ -279,8 +288,8 @@ owes them to the next context: its backend free marks the ledger and copies
 nothing, and its refill report adds how many it owes. The next context's
 first graph entry, before any MUL_MAT_ID, returns them in one transaction. A
 process that exits after its last context pays nothing. The fit's
-ring term charges the ring bytes that no loan would cover to the rung's demand,
-so a rung that needs them is refused with a figure.
+ring term charges the ring bytes that neither the room nor a loan would cover to
+the rung's demand, so a rung that needs them is refused with a figure.
 
 **Gates.** Three gates keep the rule enforceable.
 
