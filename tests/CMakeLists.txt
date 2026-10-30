@@ -1015,12 +1015,14 @@ if (Python3_Interpreter_FOUND)
     # GGML_SYCL_MEMCPY_SITE_CENSUS): gated on the env through one static bool,
     # the caller's file:line forwarded from mem_copy_async/mem_copy and the
     # generic copy wrappers into mem_copy_direct_submit, the host-host branch
-    # tagged H2H, printed to stderr at backend free and at exit. WITH --self-test
-    # (25 mutants, 1 harmless probe).
-    add_test(NAME test-sycl-memcpy-site-census-source
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-memcpy-site-census-source.py --self-test)
-    set_tests_properties(test-sycl-memcpy-site-census-source PROPERTIES
-        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # tagged H2H, printed to stderr at backend free and at exit. A second pytest
+    # case runs the self-test (25 mutants, 1 harmless probe).
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-memcpy-site-census-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-memcpy-site-census-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;source;source-contract;hostonly;python"
+        TIMEOUT 120)
     # The host-expert MoE decode levers (llama.cpp-z4kd): the GLU of a host-expert
     # layer asks moe_glu_input_host_produced (not the stale MUL_MAT_ID walk), the
     # wait census times B1 around the id readback and classifies only when on,
@@ -1042,11 +1044,14 @@ if (Python3_Interpreter_FOUND)
     set_tests_properties(test-sycl-moe-hostpath-no-host-wait-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # TOP_K runs on the device for every k <= ncols: one shape selector decides the
-    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). WITH --self-test.
-    add_test(NAME test-sycl-topk-source
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-topk-source.py --self-test)
-    set_tests_properties(test-sycl-topk-source PROPERTIES
-        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). A pytest case runs
+    # the mutant self-test.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-topk-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-topk-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;source;source-contract;hostonly;python"
+        TIMEOUT 120)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
     # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
     # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.

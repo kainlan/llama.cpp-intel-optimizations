@@ -946,7 +946,7 @@ REMEMBER_DEVICE = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_
 # Each lent triplet's device bytes sit beside it in the ledger and move with it (llama.cpp-7999).
 POP_READMITTED = ("if (refill) { ledger.triplets.pop_back(); ledger.triplet_bytes.pop_back(); } "
                   "else { ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); "
-                  "ledger.triplet_bytes.push_back(ggml_sycl_expert_triplet_dst_bytes(*next_plan, placed)); }")
+                  "ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)); }")
 
 
 def claim_refill_flips_back_and_forgets_the_host_copy(sycl: str) -> bool:

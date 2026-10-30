@@ -43,14 +43,14 @@ WHAT THIS DOES NOT PROVE.  It reads source text with comments blanked.  It does
 not show that the table accounts for the profiler's mem_ops launches (a GPU
 run), nor that the printed counts are right (test-mem-copy-site-census).
 
-NOT VACUOUS.  --self-test applies in-memory mutants to the real sources,
-requires each to fail, then requires the unmodified tree to pass.
+NOT VACUOUS.  test_memcpy_site_census_self_test
+applies in-memory mutants to the real sources, requires each to fail, then
+requires the unmodified tree to pass.
 """
 
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -521,18 +521,9 @@ def test_memcpy_site_census_self_test() -> None:
     assert self_test() == 0
 
 
-def main() -> int:
-    if "--self-test" in sys.argv[1:]:
-        if self_test() != 0:
-            return 1
-    try:
-        run(load())
-    except ContractError as e:
-        print(f"FAIL: {e}")
-        return 1
-    print("PASS: th86 memcpy site census pins hold (env gate, caller site, host-host tag, exit/flush print, env row)")
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

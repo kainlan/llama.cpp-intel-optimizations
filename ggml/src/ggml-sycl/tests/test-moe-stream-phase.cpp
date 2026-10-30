@@ -280,8 +280,10 @@ ggml_sycl::moe_stream_loan_step run_short_ubatch(ggml_sycl::moe_stream_loan_latc
         size_t bytes_short = 0;
         if (!stub_reserve_refuses(short_by, &bytes_short)) {
             reserve_failed = true;
+            // No loan sizer: these cases drive the latch alone, so the request is the shortfall as reported. The
+            // sizing from the plan a loan leaves is test-moe-stream-plan's.
             step           = ggml_sycl::moe_stream_loan_on_short_reserve(latch, device, bytes_short, kLoanSlotBytes,
-                                                                         stub_request_loan, stub_loan_refusals);
+                                                                         stub_request_loan, stub_loan_refusals, nullptr);
         }
     }
     return step;
@@ -1081,12 +1083,12 @@ int main() {
         CHECK((*g_loan_at).requests == 5 && !lt().asked);
         // No request hook (a phase no backend op reached): nothing is asked.
         CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(lt(), 1, short_by, kLoanSlotBytes, nullptr,
-                                                          stub_loan_refusals) == moe_stream_loan_step::NONE);
+                                                          stub_loan_refusals, nullptr) == moe_stream_loan_step::NONE);
         CHECK((*g_loan_at).requests == 5 && !lt().asked);
         // No refusal count: a loan is never seen refused, so every short micro-batch asks.
         for (int u = 0; u < 3; ++u) {
-            CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(lt(), 0, short_by, 0, stub_request_loan, nullptr) ==
-                  moe_stream_loan_step::REQUEST);
+            CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(lt(), 0, short_by, 0, stub_request_loan, nullptr,
+                                                              nullptr) == moe_stream_loan_step::REQUEST);
         }
         CHECK((*g_loan_at).requests == 8 && (*g_loan_at).last_device == 0);
         CHECK((*g_loan_at).last_slot_bytes == 0);  // a slot size of 0 reaches the backend as is: it counts bytes

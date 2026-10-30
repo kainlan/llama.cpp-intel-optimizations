@@ -657,17 +657,18 @@ def test_shared_body_call_sites_have_a_mutation_witness():
     )
 
 
-# llama.cpp-tsfl round 1 F2/F8: after F2 added a SECOND `if (probe_mode) {`
-# inside the transaction body (the KV-demotion WARN/INFO branch, much
-# earlier in the function than the probe's own exit branch), a plain
-# re.search() for the bare `if (probe_mode) {` pattern finds THAT one
-# first, not the exit branch this section's checks actually care about.
-# Identify the exit branch specifically by content unique to it: it is the
-# only `if (probe_mode)` block that captures a rollback result into
-# `rollback_ok` (round 1 F1).
+# The transaction body has a SECOND `if (probe_mode) {` besides the probe's own exit branch: the KV-demotion WARN/INFO
+# branch, much earlier in the function. A plain re.search() for the bare `if (probe_mode) {` pattern finds THAT one
+# first, not the exit branch this section's checks actually care about. So the exit branch is identified by content
+# unique to it: it is the only `if (probe_mode)` block that captures a rollback result into `rollback_ok`.
+# test_probe_branch_ordering_has_a_mutation_witness() identifies the same branch by a SECOND, separate search over raw
+# text; both use _ROLLBACK_CAPTURE, so a change to how the branch is recognised belongs in both places.
+_ROLLBACK_CAPTURE = "rollback_ok"
+
+
 def _find_probe_exit_branch(body_norm: str):
     for m in re.finditer(r"if\s*\(\s*probe_mode\s*\)\s*\{", body_norm):
-        if "rollback_ok" in body_norm[m.start() : m.start() + 800]:
+        if _ROLLBACK_CAPTURE in body_norm[m.start() : m.start() + 800]:
             return m
     return None
 
@@ -730,26 +731,44 @@ def test_probe_branch_ordering_has_a_mutation_witness():
     original position and re-inserts it, byte-identical, immediately after
     the publish call -- a real reordering."""
     raw = GGML_SYCL_CPP
-    # Anchored with a leading "\n" so this matches only a LINE that starts
-    # with exactly 4 spaces then "if (probe_mode) {" -- plain substring
-    # search without the anchor also matches as a SUFFIX of the two more
-    # deeply indented if(probe_mode) blocks (F2's demotion branch at 12
-    # spaces, F3's ring-replan success branch at 8), since "    if
-    # (probe_mode) {\n" is itself a trailing substring of both.
+    # A line that starts with exactly 4 spaces then "if (probe_mode) {" is NOT unique in the file: the loan
+    # transaction further down has its own probe branch at that indent, and the leading "\n" only excludes the two
+    # more deeply indented blocks inside the runtime-context transaction (the KV-demotion branch at 12 spaces and the
+    # ring-replan success branch at 8), since "    if (probe_mode) {\n" is itself a trailing substring of both.
+    # So the indent narrows the candidates and the CONTENT picks the branch: the exit branch is the only one whose
+    # own text captures a rollback result into `rollback_ok` (_ROLLBACK_CAPTURE). This looks for that capture in the
+    # raw text up to the branch's first ACCEPTED return; _find_probe_exit_branch() looks for it in comment-stripped
+    # text within a fixed window after the `if`. The two are separate searches. If they ever disagree, the re-find
+    # assertion further down fires only when the helper finds nothing in the mutated text; when the helper still
+    # finds the real, unmoved branch, the ordering assertion at the end fails instead, with its "branch still appears
+    # to precede it" message, which then points at the wrong cause.
     branch_start_marker = "\n    if (probe_mode) {\n"
     branch_end_marker = "        return ggml_sycl_txn_result::ACCEPTED;\n    }\n"
     publish_marker = "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
 
-    assert raw.count(branch_start_marker) == 1, (
-        f"mutation target (branch start) not unique -- found {raw.count(branch_start_marker)}; the exit "
-        "branch is identified by exactly 4-space indentation at the start of a line, distinct from the two "
-        "other, more deeply indented if(probe_mode) blocks (F2's demotion branch, F3's ring-replan success "
-        "branch)"
+    candidates = []
+    seen_lines = []
+    search_from = 0
+    while True:
+        marker_idx = raw.find(branch_start_marker, search_from)
+        if marker_idx == -1:
+            break
+        search_from = marker_idx + 1
+        candidate_start = marker_idx + 1  # skip the leading "\n" itself -- it belongs to the previous line
+        seen_lines.append(raw.count("\n", 0, candidate_start) + 1)
+        candidate_end = raw.find(branch_end_marker, candidate_start)
+        if candidate_end == -1:
+            continue  # a 4-space probe branch with no ACCEPTED exit after it (the loan transaction's)
+        candidate_end += len(branch_end_marker)
+        if _ROLLBACK_CAPTURE in raw[candidate_start:candidate_end]:
+            candidates.append((candidate_start, candidate_end))
+    assert len(candidates) == 1, (
+        f"mutation target (branch start) not unique -- found {len(candidates)} 4-space `if (probe_mode) {{` "
+        f"blocks whose own text captures `{_ROLLBACK_CAPTURE}`, at ggml-sycl.cpp lines "
+        f"{[raw.count(chr(10), 0, c[0]) + 1 for c in candidates]} (4-space probe branches seen at lines "
+        f"{seen_lines}); the exit branch is the only one that does, so the witness cannot tell which block to move"
     )
-    start = raw.find(branch_start_marker) + 1  # skip the leading "\n" itself -- it belongs to the previous line
-    end = raw.find(branch_end_marker, start)
-    assert end != -1, "mutation target (branch end) not found after the branch start"
-    end += len(branch_end_marker)
+    start, end = candidates[0]
     branch_block = raw[start:end]
 
     # llama.cpp-tsfl: search from `end`, not index 0 -- an unrelated,

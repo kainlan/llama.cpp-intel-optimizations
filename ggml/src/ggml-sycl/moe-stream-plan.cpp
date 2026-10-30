@@ -123,8 +123,17 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
             // chose the ring, ring always (llama.cpp-3460). It stands only on a layer the executor claims whole, once
             // the ring reserves at the first such layer: the ring serves the executor only (W2). Every decision is
             // reported.
+            // A short reserve sizes its loan from this plan, with the hooks and window prepare() sized the ring with.
+            moe_stream_loan_sizer sizer;
+            sizer.plan           = &plan;
+            sizer.device         = device_;
+            sizer.geo            = geo_;
+            sizer.prompt_kernel  = op.prompt_kernel;
+            sizer.graph_ctx      = op.graph_ctx;
+            sizer.library_claims = op.library_claims;
+            sizer.hints          = window_;
             if (moe_stream_stage_now(st.decision, op.policy) &&
-                !(moe_stream_executor_claims(cur->second, geo_) && ring_ready())) {
+                !(moe_stream_executor_claims(cur->second, geo_) && ring_ready(&sizer))) {
                 st.decision.choice = moe_exec_choice::CPU;
                 st.decision.reason = moe_exec_reason::RING_UNAVAILABLE;
             }
@@ -142,11 +151,13 @@ const moe_stream_staged * moe_stream_phase::find(int layer, int expert_id, exper
     return it == table_.end() ? nullptr : &it->second;
 }
 
-// The index lookup comes first: a layer with no host entry answers without touching the ring.
+// The index lookup comes first: a layer with no host entry answers without touching the ring. A RING decision stood
+// only where begin_layer's ring_ready() kept a ring, so ring_ready() here answers from the ring held and never
+// reaches a reserve, which is why it is handed no loan sizer.
 bool moe_stream_phase::executor_claims(int layer) {
     const auto it = index_.layers.find(layer);
     return it != index_.layers.end() && decision_of(layer).choice == moe_exec_choice::RING &&
-           moe_stream_executor_claims(it->second, geo_) && ring_ready();
+           moe_stream_executor_claims(it->second, geo_) && ring_ready(nullptr);
 }
 
 // A window the last call prefetched is staged already; any other is staged now, whole, into a region of its own. Then
@@ -316,8 +327,7 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     const moe_stream_ring_geometry geo = moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx,
                                                                        op.library_claims, op.window, &index_);
     const bool                     same_queue = ccs_.has_value() && *ccs_ == ccs;
-    const bool same_geo = geo.slot_bytes == geo_.slot_bytes && geo.n_slots == geo_.n_slots && geo.bytes == geo_.bytes &&
-                          geo.region_slots == geo_.region_slots;
+    const bool                     same_geo   = moe_stream_ring_geometry_same(geo, geo_);
     if (prepared_ && (device != device_ || !same_queue || !same_geo)) {
         teardown(ring_ ? compute_barrier() : sycl::event());
     }
@@ -329,6 +339,7 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     }
     device_   = device;
     geo_      = geo;
+    window_   = op.window;
     prepared_ = true;
     if (!record_looked_up_) {
         record_valid_     = ggml_backend_sycl_moe_exec_rates_lookup(device, &record_);
@@ -483,15 +494,16 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
 
 // The ring is reserved at the first layer whose RING decision stands (begin_layer, executor_claims), so a prompt whose
 // every layer runs on the CPU reserves nothing. A failed reserve stays failed for the rest of the micro-batch: one
-// attempt per micro-batch. A reserve the WEIGHT zone was short of asks the backend for an expert loan of the shortfall
-// at the next graph boundary, so the next micro-batch's attempt may succeed, until a loan this prompt asked for comes
-// back refused (llama.cpp-3460, c-0tmn). A refused reserve keeps the slots it got, and its ring waits in pending_ring_
-// for the next micro-batch's attempt, which continues from those slots, so the room a loan freed in holes a slot wide
-// adds up across attempts instead of being asked for again as one block (llama.cpp-am87). The hold lives only while a
-// loan can still fund it: once a loan this prompt asked for comes back refused, or the op wires no loan hook, the
-// refused ring gives its slots back at once, because mid-prompt runtime allocations prefer the WEIGHT zone too (lead
-// ruling, c-zgrd).
-bool moe_stream_phase::ring_ready() {
+// attempt per micro-batch. A reserve the WEIGHT zone was short of asks the backend for an expert loan at the next graph
+// boundary, so the next micro-batch's attempt may succeed, until a loan this prompt asked for comes back refused
+// (llama.cpp-3460, c-0tmn). With begin_layer's `sizer` the loan is sized from the plan it leaves, whose ring can be
+// wider, and none is asked when no loan converges (moe_stream_loan_size_post_loan). A refused reserve keeps the slots
+// it got, and its ring waits in pending_ring_ for the next micro-batch's attempt, which continues from those slots, so
+// the room a loan freed in holes a slot wide adds up across attempts instead of being asked for again as one block
+// (llama.cpp-am87). The hold lives only while a loan can still fund it: once a loan this prompt asked for comes back
+// refused, or the op wires no loan hook, the refused ring gives its slots back at once, because mid-prompt runtime
+// allocations prefer the WEIGHT zone too (lead ruling, c-zgrd).
+bool moe_stream_phase::ring_ready(const moe_stream_loan_sizer * sizer) {
     if (ring_) {
         return true;
     }
@@ -504,7 +516,7 @@ bool moe_stream_phase::ring_ready() {
     if (!ring->reserve(device_, geo_, &bytes_short)) {
         reserve_failed_ = true;
         if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, geo_.slot_bytes, request_loan_,
-                                             loan_refusals_) == moe_stream_loan_step::REFUSED) {
+                                             loan_refusals_, sizer) == moe_stream_loan_step::REFUSED) {
             warn_loan_refused(bytes_short);
         }
         // Decided after the loan step, which may latch a REFUSED loan in this very call. A ring not kept gives its
@@ -687,7 +699,7 @@ bool moe_stream_phase::test_reserve_ring(int device, const moe_stream_ring_geome
     reserve_failed_ = false;
     ccs_.emplace(ccs);
     in_order_ = ccs.is_in_order();
-    return ring_ready();
+    return ring_ready(nullptr);
 }
 
 mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
@@ -723,19 +735,38 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe
     op.log->sink(op.log->sink_ctx, line);
 }
 
-// One WARN per prompt when a loan the short ring asked for comes back REFUSED (llama.cpp-3460): the helper answers
-// REFUSED once and then latches. It goes out under the same gate as the ring-unavailable line (lead ruling c-kcyf), so
-// at default verbosity under AUTO the phase still prints nothing of its own; there the loan transaction's own
-// "[MOE-EXEC] loan device %d refused: %s" line, which the latch makes print once per prompt, is the one WARN.
+// One WARN per prompt when a loan the short ring asked for comes back REFUSED (llama.cpp-3460), or when no loan could
+// be sized because the ring of the plan a loan would leave never settles or does not fit: the helper answers REFUSED
+// once and then latches. A refused loan's line goes out under the same gate as the ring-unavailable line (lead ruling
+// c-kcyf), since at default verbosity under AUTO the loan transaction's own "[MOE-EXEC] loan device %d refused: %s"
+// line, which the latch makes print once per prompt, is already the one WARN for it. A loan never sized asks the
+// transaction nothing, so nothing else would say why the prompt runs without its ring: that line goes out under the
+// transaction line's condition instead, every policy and verbosity, once per prompt.
 void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
-    if (log_ == nullptr || log_->sink == nullptr || (policy_ != moe_exec_policy::RING && log_->trace < 1)) {
+    if (log_ == nullptr || log_->sink == nullptr) {
         return;
     }
-    char line[200];
-    std::snprintf(line, sizeof(line),
-                  "[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
-                  "prompt",
-                  device_, bytes_short / (1024.0 * 1024.0));
+    char line[320];
+    if (loan_latch_.unconverged) {
+        // The reason must hold in every state the latch can carry: a sizer with no plan or no ring takes no step and
+        // leaves 0 slots without any cap having been met, so the step count is asked before the slot count.
+        const char * why = loan_latch_.sizing_steps == 0 ? "no sizing step ran, no plan or no ring" :
+                           loan_latch_.post_slots == 0   ? "over the cap" :
+                                                           "it did not grow, or the sizing spent its bound";
+        std::snprintf(line, sizeof(line),
+                      "[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would leave after "
+                      "%u sizing steps (post-loan ring %u slots, %zu bytes: %s): no loan this prompt",
+                      device_, bytes_short / (1024.0 * 1024.0), loan_latch_.sizing_steps, loan_latch_.post_slots,
+                      loan_latch_.post_bytes, why);
+    } else {
+        if (policy_ != moe_exec_policy::RING && log_->trace < 1) {
+            return;
+        }
+        std::snprintf(line, sizeof(line),
+                      "[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan "
+                      "this prompt",
+                      device_, bytes_short / (1024.0 * 1024.0));
+    }
     log_->sink(log_->sink_ctx, line);
 }
 

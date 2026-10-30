@@ -284,6 +284,312 @@ void test_ring_cap_is_loan_invariant() {
     CHECK(after.bytes == before.bytes);
 }
 
+// The loan request's stub hooks: what the phase's short reserve would post to the backend, and the backend's REFUSED
+// count, which no case here moves.
+struct loan_requests {
+    int    n          = 0;
+    size_t bytes      = 0;
+    size_t slot_bytes = 0;
+};
+
+loan_requests g_requests;
+
+void stub_request_loan(int, size_t bytes, size_t slot_bytes) {
+    ++g_requests.n;
+    g_requests.bytes      = bytes;
+    g_requests.slot_bytes = slot_bytes;
+}
+
+uint64_t stub_loan_refusals(int) {
+    return 0;
+}
+
+// The make_typed_plan() layout for the loan sizing. G_plan is 5 (a planned slot of 10 matrices), and
+// each host layer has 3 host matrices per role, so the window is 3 and the ring 2 x 3 slots of kSrc = 24576 bytes.
+// Every resident matrix charges kDst = 4352 bytes, one slot. The loan walk meets layer 3 first, which is whole on the
+// device (bulk-staged, not lendable), then layer 2's resident experts 7, 4, 3, 2, 0: every triplet it lends lands in
+// layer 2 and adds one host matrix to each of its roles, widening the window up to G_plan. `anchor_extra` adds device
+// bytes to a layer-3 entry, so the cap admits the widest ring (2 x 5 slots = 40960 bytes, 11 x that resident) or, at 0,
+// only the first one (300288 resident bytes: 24576 fits under an eleventh, 32768 does not).
+constexpr size_t kAnchorExtra = 200000;
+
+placement_plan make_loan_plan(size_t anchor_extra) {
+    placement_plan plan = make_typed_plan();
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.layer_id == 3 && e.expert_id == 0 && e.expert_role == expert_tensor_role::GATE) {
+            e.dst_size += anchor_extra;
+        }
+    }
+    return plan;
+}
+
+ggml_sycl::moe_stream_window_hints loan_hints() {
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes = 10 * kSrc;  // fit = 10 -> G_plan = 5
+    return hints;
+}
+
+ggml_sycl::moe_stream_loan_sizer loan_sizer(const placement_plan & plan) {
+    ggml_sycl::moe_stream_loan_sizer sizer;
+    sizer.plan           = &plan;
+    sizer.device         = 0;
+    sizer.library_claims = claims_all;
+    sizer.hints          = loan_hints();
+    sizer.geo            = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, sizer.hints);
+    return sizer;
+}
+
+// The geometry of `plan` with the first `n_triplets` triplets of layer 2's loan walk flipped to the host, as the
+// transaction's update_expert_placement flips them, and their device bytes counted as lent: the ring prepare() would
+// rebuild after that loan.
+ggml_sycl::moe_stream_ring_geometry geometry_after_loan(
+    const placement_plan &                     plan,
+    int                                        n_triplets,
+    const ggml_sycl::moe_stream_window_hints & base = loan_hints()) {
+    const int      walk[5]   = { 7, 4, 3, 2, 0 };
+    placement_plan lent_plan = plan;
+    size_t         lent      = 0;
+    for (ggml_sycl::placement_entry & e : lent_plan.entries) {
+        for (int t = 0; t < n_triplets; ++t) {
+            if (e.layer_id == 2 && e.expert_id == walk[t] &&
+                ggml_sycl::detail::moe_expert_role_is_triplet(e.expert_role)) {
+                e.on_device     = false;
+                e.target_device = -1;
+                lent += e.dst_size;
+            }
+        }
+    }
+    ggml_sycl::moe_stream_window_hints hints = base;
+    hints.lent_bytes                         = lent;
+    return ggml_sycl::moe_stream_plan_ring_geometry(lent_plan, 0, nullptr, nullptr, claims_all, hints);
+}
+
+// The loan is sized from the plan it leaves: lending widens the window, so the
+// request sized for the reserve's geometry would leave the next micro-batch's ring short again. The request iterates
+// to the geometry its own loan leaves.
+void test_loan_converges_on_the_post_loan_ring() {
+    const placement_plan                   plan  = make_loan_plan(kAnchorExtra);
+    const ggml_sycl::moe_stream_loan_sizer sizer = loan_sizer(plan);
+    CHECK(sizer.geo.region_slots == 3 && sizer.geo.n_slots == 6 && sizer.geo.slot_bytes == kSrc);
+
+    // No slot held: the reserve is the whole ring short. Its 6 slots take layer 2's experts 7 and 4 (3 slots each),
+    // which give layer 2 five host matrices per role: the window becomes G_plan, and the ring 10 slots. The first
+    // request no longer funds the ring it leaves.
+    CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, 6 * kSrc, kSrc, nullptr).size() == 6);
+    const auto first_post = geometry_after_loan(plan, 2);
+    CHECK(first_post.region_slots == 5 && first_post.n_slots == 10 && first_post.bytes == 10 * kSrc);
+
+    // Iterated: 10 slots take experts 7, 4, 3 and 2 (12 slots). Layer 2 then has 7 host matrices per role, and the
+    // window stays at G_plan: the ring that loan leaves is the ring it was sized for.
+    const ggml_sycl::moe_stream_loan_sizing whole = ggml_sycl::moe_stream_loan_size_post_loan(sizer, 6 * kSrc);
+    CHECK(whole.converged);
+    CHECK(whole.steps == 2);
+    CHECK(whole.bytes == 10 * kSrc);
+    CHECK(whole.n_triplets == 4);
+    CHECK(whole.geo.region_slots == 5 && whole.geo.n_slots == 10 && whole.geo.slot_bytes == kSrc);
+    // The overlay sizes what a really flipped plan sizes.
+    const auto real_post = geometry_after_loan(plan, 4);
+    CHECK(ggml_sycl::moe_stream_ring_geometry_same(whole.geo, real_post));
+    // The boundary's loan reselects the same four triplets from the same plan.
+    CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, whole.bytes, whole.geo.slot_bytes, nullptr).size() == 12);
+
+    // Five of six slots held: one slot short takes expert 7 alone, which widens the window to 4 and the ring to 8
+    // slots. The 5 held slots still count (same slot size), so the second request is 3 slots, which expert 7 funds:
+    // the ring stays at 8.
+    const ggml_sycl::moe_stream_loan_sizing held = ggml_sycl::moe_stream_loan_size_post_loan(sizer, kSrc);
+    CHECK(held.converged);
+    CHECK(held.steps == 2);
+    CHECK(held.bytes == 3 * kSrc);
+    CHECK(held.n_triplets == 1);
+    CHECK(held.geo.region_slots == 4 && held.geo.n_slots == 8);
+    CHECK(ggml_sycl::moe_stream_ring_geometry_same(held.geo, geometry_after_loan(plan, 1)));
+
+    // Through the short reserve's loan step: the converged request, counted in that geometry's slots.
+    g_requests = loan_requests();
+    ggml_sycl::moe_stream_loan_latch latch;
+    CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(latch, 0, 6 * kSrc, kSrc, stub_request_loan, stub_loan_refusals,
+                                                      &sizer) == ggml_sycl::moe_stream_loan_step::REQUEST);
+    CHECK(g_requests.n == 1 && g_requests.bytes == 10 * kSrc && g_requests.slot_bytes == kSrc);
+    CHECK(latch.asked && !latch.refused && !latch.unconverged);
+
+    // A loan that leaves the window where it was converges at once, with the reserve's own shortfall: G_plan is capped
+    // at 2 before and after the loan, so the window cannot move.
+    ggml_sycl::moe_stream_loan_sizer capped = sizer;
+    capped.hints.weight_slot_bytes          = 4 * kSrc;  // fit = 4 -> G_plan = 2
+    capped.geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, capped.hints);
+    CHECK(capped.geo.n_slots == 4);
+    const ggml_sycl::moe_stream_loan_sizing flat = ggml_sycl::moe_stream_loan_size_post_loan(capped, 2 * kSrc);
+    CHECK(flat.converged && flat.steps == 1 && flat.bytes == 2 * kSrc && flat.n_triplets == 1);
+}
+
+// A loan can leave a SMALLER ring in the same slot size: a lent matrix whose f16 expert is larger than every host one
+// lowers G_plan, and with it the window. That ring fits in the room the request frees, so the sizing converges at
+// once and the request stays the one sized for the target; the geometry is the smaller ring prepare() reserves.
+void test_loan_into_a_smaller_ring_is_covered() {
+    placement_plan plan = make_loan_plan(kAnchorExtra);
+    // Layer 2's expert 7, the walk's first lendable triplet, as Q4_0 matrices of 64 x 112: 2 blocks of 18 bytes a
+    // row, 4032 source bytes, so one kSrc slot still holds it and the largest matrix stays kSrc; but 14336 f16 bytes,
+    // so the planned slot of 10 x kSrc fits 2 of them and G_plan drops from 5 to 1 once it is a host matrix.
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.layer_id == 2 && e.expert_id == 7 && ggml_sycl::detail::moe_expert_role_is_triplet(e.expert_role)) {
+            e.type     = GGML_TYPE_Q4_0;
+            e.ne[0]    = 64;
+            e.ne[1]    = 112;
+            e.src_size = 112 * ggml_row_size(GGML_TYPE_Q4_0, 64);
+        }
+    }
+    const ggml_sycl::moe_stream_loan_sizer sizer = loan_sizer(plan);
+    CHECK(sizer.geo.region_slots == 3 && sizer.geo.n_slots == 6 && sizer.geo.slot_bytes == kSrc);
+    CHECK(sizer.geo.bytes == 6 * kSrc);
+
+    // The whole ring short: 6 slots take experts 7 and 4. Layer 2 then has 5 host matrices per role, but G_plan is 1,
+    // so the ring the loan leaves is 2 slots of kSrc, smaller than the 6 it was sized for.
+    const ggml_sycl::moe_stream_loan_sizing whole = ggml_sycl::moe_stream_loan_size_post_loan(sizer, 6 * kSrc);
+    CHECK(whole.converged);
+    CHECK(whole.steps == 1);
+    CHECK(whole.bytes == sizer.geo.bytes);
+    CHECK(whole.n_triplets == 2);
+    CHECK(whole.geo.slot_bytes == kSrc && whole.geo.region_slots == 1 && whole.geo.n_slots == 2);
+    CHECK(whole.geo.bytes == 2 * kSrc);
+    CHECK(ggml_sycl::moe_stream_ring_geometry_same(whole.geo, geometry_after_loan(plan, 2)));
+
+    // Through the short reserve's loan step: the request is the target's, in its slot size.
+    g_requests = loan_requests();
+    ggml_sycl::moe_stream_loan_latch latch;
+    CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(latch, 0, 6 * kSrc, kSrc, stub_request_loan, stub_loan_refusals,
+                                                      &sizer) == ggml_sycl::moe_stream_loan_step::REQUEST);
+    CHECK(g_requests.n == 1 && g_requests.bytes == 6 * kSrc && g_requests.slot_bytes == kSrc);
+    CHECK(latch.asked && !latch.refused && !latch.unconverged);
+}
+
+// A loan whose first triplet is larger than a slot moves the ring to a larger slot size. The reserve's held slots were
+// cut in the old size, so they credit nothing in the new one: the next request is the whole new ring.
+void test_loan_into_a_larger_slot_credits_no_held_slot() {
+    placement_plan plan = make_loan_plan(1000000);  // resident room for the 8-slot ring of 2 x kSrc slots below
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.layer_id != 2 || !ggml_sycl::detail::moe_expert_role_is_triplet(e.expert_role) || !e.on_device) {
+            continue;
+        }
+        // Each resident layer-2 matrix charges 2 x kDst = 8704 bytes: 2 slots of kSrc, 1 slot of 2 x kSrc.
+        e.dst_size         = 2 * kDst;
+        e.vram_charge_size = 2 * kDst;
+        if (e.expert_id == 7) {
+            // The walk's first lendable triplet as F16 matrices of 64 x 64: 2 x kSrc source and f16 bytes.
+            e.ne[0]    = 64;
+            e.ne[1]    = 64;
+            e.src_size = 2 * kSrc;
+        }
+    }
+    ggml_sycl::moe_stream_loan_sizer sizer = loan_sizer(plan);
+
+    // A planned slot of 20 matrices of kSrc and a group cap of 4: G_plan is 4 before the loan (fit 20) and after it
+    // (fit 10), so only the role counts and the slot size move the ring.
+    sizer.hints.weight_slot_bytes = 20 * kSrc;
+    sizer.hints.group_cap         = 4;
+    sizer.geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, sizer.hints);
+    CHECK(sizer.geo.region_slots == 3 && sizer.geo.n_slots == 6 && sizer.geo.slot_bytes == kSrc);
+
+    // One slot short, five held. Step 1 asks for that one kSrc slot, which expert 7 funds alone (2 slots a matrix);
+    // lent, it is a host matrix of 2 x kSrc, so the ring it leaves is 2 x 4 slots of 2 x kSrc. Step 2 asks for all 8
+    // of them: the held slots are kSrc wide, not 2 x kSrc, and credit nothing. Experts 7, 4 and 3 (one slot a matrix)
+    // fund that ring and leave the same one.
+    const auto first_post = geometry_after_loan(plan, 1, sizer.hints);
+    CHECK(first_post.slot_bytes == 2 * kSrc && first_post.region_slots == 4 && first_post.n_slots == 8);
+    const ggml_sycl::moe_stream_loan_sizing held = ggml_sycl::moe_stream_loan_size_post_loan(sizer, kSrc);
+    CHECK(held.converged);
+    CHECK(held.steps == 2);
+    CHECK(held.bytes == static_cast<size_t>(first_post.n_slots) * first_post.slot_bytes);
+    CHECK(held.n_triplets == 3);
+    CHECK(ggml_sycl::moe_stream_ring_geometry_same(held.geo, first_post));
+    CHECK(ggml_sycl::moe_stream_ring_geometry_same(held.geo, geometry_after_loan(plan, 3, sizer.hints)));
+
+    // Through the short reserve's loan step: the whole new ring, in its slot size.
+    g_requests = loan_requests();
+    ggml_sycl::moe_stream_loan_latch latch;
+    CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(latch, 0, kSrc, kSrc, stub_request_loan, stub_loan_refusals,
+                                                      &sizer) == ggml_sycl::moe_stream_loan_step::REQUEST);
+    CHECK(g_requests.n == 1 && g_requests.bytes == 16 * kSrc && g_requests.slot_bytes == 2 * kSrc);
+}
+
+// A ring in another slot size is not comparable by bytes, so one that did not grow is refused, not covered: here the
+// lent matrix is wider than a slot and, as Q8_0, its f16 expert is larger again, which drops G_plan to 2.
+void test_loan_into_another_slot_size_that_does_not_grow_is_refused() {
+    placement_plan plan = make_loan_plan(kAnchorExtra);
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.layer_id == 2 && e.expert_id == 7 && ggml_sycl::detail::moe_expert_role_is_triplet(e.expert_role)) {
+            // Q8_0 matrices of 64 x 64: 2 blocks of 34 bytes a row, 4352 source bytes (one 4352-byte slot, 17 x the
+            // 256-byte alignment), but 8192 f16 bytes, so the planned slot of 10 x kSrc fits 5 and G_plan is 2.
+            e.type     = GGML_TYPE_Q8_0;
+            e.ne[0]    = 64;
+            e.ne[1]    = 64;
+            e.src_size = 64 * ggml_row_size(GGML_TYPE_Q8_0, 64);
+        }
+    }
+    const ggml_sycl::moe_stream_loan_sizer sizer = loan_sizer(plan);
+    CHECK(sizer.geo.n_slots == 6 && sizer.geo.slot_bytes == kSrc && sizer.geo.bytes == 6 * kSrc);
+
+    // The whole ring short takes experts 7 and 4: the ring they leave is 2 x 2 slots of 4352 bytes, smaller than the
+    // 6 x kSrc target in bytes but in another slot size.
+    const ggml_sycl::moe_stream_loan_sizing whole = ggml_sycl::moe_stream_loan_size_post_loan(sizer, 6 * kSrc);
+    CHECK(!whole.converged);
+    CHECK(whole.steps == 1);
+    CHECK(whole.geo.slot_bytes == 4352 && whole.geo.n_slots == 4 && whole.geo.bytes == 4 * 4352);
+    CHECK(ggml_sycl::moe_stream_ring_geometry_same(whole.geo, geometry_after_loan(plan, 2)));
+
+    g_requests = loan_requests();
+    ggml_sycl::moe_stream_loan_latch latch;
+    CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(latch, 0, 6 * kSrc, kSrc, stub_request_loan, stub_loan_refusals,
+                                                      &sizer) == ggml_sycl::moe_stream_loan_step::REFUSED);
+    CHECK(g_requests.n == 0);
+    CHECK(latch.refused && latch.unconverged && !latch.asked);
+    CHECK(latch.sizing_steps == 1 && latch.post_slots == 4 && latch.post_bytes == 4 * 4352);
+}
+
+// No loan converges when the ring it leaves exceeds the cap: the cap does not move with the loan (lent bytes count
+// back as resident), but the ring widens. The sizing refuses, the short reserve's loan step answers REFUSED once and
+// asks for nothing, and the latch holds for the prompt, as for a loan the boundary refused.
+void test_loan_whose_post_loan_ring_exceeds_the_cap_is_refused() {
+    const placement_plan                   plan  = make_loan_plan(0);
+    const ggml_sycl::moe_stream_loan_sizer sizer = loan_sizer(plan);
+    // 300288 resident bytes: the 24576-byte ring fits under an eleventh (27298), the 32768-byte one does not.
+    CHECK(sizer.geo.n_slots == 6 && sizer.geo.bytes == 6 * kSrc);
+    CHECK(geometry_after_loan(plan, 1).n_slots == 0);
+
+    const ggml_sycl::moe_stream_loan_sizing whole = ggml_sycl::moe_stream_loan_size_post_loan(sizer, 6 * kSrc);
+    CHECK(!whole.converged);
+    CHECK(whole.steps == 1);
+    CHECK(whole.geo.n_slots == 0);
+    const ggml_sycl::moe_stream_loan_sizing held = ggml_sycl::moe_stream_loan_size_post_loan(sizer, kSrc);
+    CHECK(!held.converged && held.steps == 1);
+
+    g_requests = loan_requests();
+    ggml_sycl::moe_stream_loan_latch latch;
+    CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(latch, 0, 6 * kSrc, kSrc, stub_request_loan, stub_loan_refusals,
+                                                      &sizer) == ggml_sycl::moe_stream_loan_step::REFUSED);
+    CHECK(g_requests.n == 0);
+    CHECK(latch.refused && latch.unconverged && !latch.asked);
+    // The reason the WARN prints: one step, and a post-loan ring of 0 slots, over the cap.
+    CHECK(latch.sizing_steps == 1 && latch.post_slots == 0 && latch.post_bytes == 0);
+    // Once per prompt: later short micro-batches ask nothing and answer NONE.
+    CHECK(ggml_sycl::moe_stream_loan_on_short_reserve(latch, 0, 6 * kSrc, kSrc, stub_request_loan, stub_loan_refusals,
+                                                      &sizer) == ggml_sycl::moe_stream_loan_step::NONE);
+    CHECK(g_requests.n == 0);
+
+    // Nothing to size (no plan, no ring, or nothing short) converges to nothing, before any step.
+    ggml_sycl::moe_stream_loan_sizer no_plan = sizer;
+    no_plan.plan                             = nullptr;
+
+    const ggml_sycl::moe_stream_loan_sizing planless = ggml_sycl::moe_stream_loan_size_post_loan(no_plan, 6 * kSrc);
+    CHECK(!planless.converged && planless.steps == 0);
+    ggml_sycl::moe_stream_loan_sizer no_ring = sizer;
+    no_ring.geo                              = {};
+
+    const ggml_sycl::moe_stream_loan_sizing ringless = ggml_sycl::moe_stream_loan_size_post_loan(no_ring, 6 * kSrc);
+    CHECK(!ringless.converged && ringless.steps == 0);
+    const ggml_sycl::moe_stream_loan_sizing nothing_short = ggml_sycl::moe_stream_loan_size_post_loan(sizer, 0);
+    CHECK(!nothing_short.converged && nothing_short.steps == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -368,6 +674,11 @@ int main() {
 
     test_window_sizing();
     test_ring_cap_is_loan_invariant();
+    test_loan_converges_on_the_post_loan_ring();
+    test_loan_whose_post_loan_ring_exceeds_the_cap_is_refused();
+    test_loan_into_a_smaller_ring_is_covered();
+    test_loan_into_a_larger_slot_credits_no_held_slot();
+    test_loan_into_another_slot_size_that_does_not_grow_is_refused();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);
