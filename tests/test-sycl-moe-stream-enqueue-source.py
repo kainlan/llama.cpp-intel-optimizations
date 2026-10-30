@@ -1564,7 +1564,9 @@ LOAN_HELPER_ORDER = (
     "return moe_stream_loan_step::REFUSED; }",
     "size_t bytes = bytes_short; size_t slot = slot_bytes;",
     "if (sizer != nullptr) { const moe_stream_loan_sizing sized = moe_stream_loan_size_post_loan(*sizer, bytes_short); "
-    "if (!sized.converged) { latch.refused = true; latch.unconverged = true; return moe_stream_loan_step::REFUSED; } "
+    "if (!sized.converged) { latch.refused = true; latch.unconverged = true; latch.sizing_steps = sized.steps; "
+    "latch.post_slots = sized.geo.n_slots; latch.post_bytes = sized.geo.bytes; "
+    "return moe_stream_loan_step::REFUSED; } "
     "bytes = sized.bytes; slot = sized.geo.slot_bytes; }",
     "latch.asked = true; latch.refusals_seen = refusals_now; request_loan(device, bytes, slot); "
     "return moe_stream_loan_step::REQUEST;",
@@ -1686,7 +1688,11 @@ def test_short_reserve_loan_mutants():
     assert not c(hpp=mutate(PLAN_HPP, "bytes = sized.bytes; slot = sized.geo.slot_bytes;", "bytes = sized.bytes;"))
     # A loan that does not converge asked anyway, or refused without the latch.
     assert not c(hpp=mutate(PLAN_HPP, "if (!sized.converged) { latch.refused = true; latch.unconverged = true; "
-                                      "return moe_stream_loan_step::REFUSED; } ", ""))
+                                      "latch.sizing_steps = sized.steps; latch.post_slots = sized.geo.n_slots; "
+                                      "latch.post_bytes = sized.geo.bytes; return moe_stream_loan_step::REFUSED; } ",
+                            ""))
+    # The refusal's reason not kept for the WARN: the post-loan ring's slots, which tell over-cap from no growth.
+    assert not c(hpp=mutate(PLAN_HPP, "latch.post_slots = sized.geo.n_slots; ", ""))
     assert not c(hpp=mutate(PLAN_HPP, "latch.refused = true; latch.unconverged = true;", "latch.unconverged = true;"))
     # begin_layer hands no sizer, or a sizer with another window than the ring was sized with.
     assert not c(phase=mutate(PHASE, "ring_ready(&sizer)))", "ring_ready(nullptr)))"))
@@ -1720,22 +1726,25 @@ LOAN_SIZING_COVERED = ("if (post.slot_bytes == target.slot_bytes && post.bytes <
                        "out.converged = true; return out; }")
 LOAN_SIZING_GROWS = "if (post.bytes <= target.bytes || step > idx.window_experts) { return out; }"
 LOAN_SIZING_NEXT = "target = post;"
+# The bytes a step would lend come from the ledger's own helper, so the sizing and the published lent_bytes cannot
+# disagree about a triplet's device bytes.
+LOAN_SIZING_LENT = "lent += moe_expert_triplet_dst_bytes(*sizer.plan, triplet);"
 
 
 def claim_loan_sizing_converges_or_covers(hpp: str) -> bool:
     h = norm(hpp)
     at = h.find(LOAN_SIZING_SIG + " {")
     b = body(h[at:], LOAN_SIZING_SIG) if at >= 0 else ""
-    return (ordered(b, LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED, LOAN_SIZING_COVERED,
-                    LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
-            and b.count("out.bytes = ") == 1 and b.count("out.converged = true;") == 2)
+    return (ordered(b, LOAN_SIZING_LENT, LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED,
+                    LOAN_SIZING_COVERED, LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
+            and b.count("out.bytes = ") == 1 and b.count("out.converged = true;") == 2 and "dst_size" not in b)
 
 
 def test_loan_sizing_converges_or_covers():
     assert claim_loan_sizing_converges_or_covers(PLAN_HPP), first_missing(
         "ggml/src/ggml-sycl/moe-stream-plan.hpp: whole file (the sizing body is searched in it)", norm(PLAN_HPP),
-        LOAN_SIZING_SIG + " {", LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED, LOAN_SIZING_COVERED,
-        LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
+        LOAN_SIZING_SIG + " {", LOAN_SIZING_LENT, LOAN_SIZING_REQUEST, LOAN_SIZING_SAME, LOAN_SIZING_VANISHED,
+        LOAN_SIZING_COVERED, LOAN_SIZING_GROWS, LOAN_SIZING_NEXT)
 
 
 def test_loan_sizing_mutants():
@@ -1753,6 +1762,10 @@ def test_loan_sizing_mutants():
                         "out.bytes = post.bytes; out.converged = true; return out; }"))
     # Never iterating: the first post-loan ring is the last.
     assert not c(mutate(PLAN_HPP, LOAN_SIZING_NEXT, ""))
+    # A second source for a triplet's lent bytes: the sizing sums dst_size itself instead of asking the ledger's helper.
+    assert not c(mutate(PLAN_HPP, LOAN_SIZING_LENT,
+                        "for (int r = 0; r < 3; ++r) { const placement_entry * e = sizer.plan->find_expert_entry("
+                        "triplet[r].layer_id, triplet[r].expert_id, triplet[r].role); lent += e ? e->dst_size : 0; }"))
 
 
 # ---- the ring reserves slot by slot (llama.cpp-am87) -----------------------------------------------------------------
@@ -1927,8 +1940,11 @@ def test_ring_slot_by_slot_fails_on_the_single_allocation_ring():
 LOAN_WARN_SIG = "void moe_stream_phase::warn_loan_refused(size_t bytes_short) const"
 LOAN_WARN_NULL = "if (log_ == nullptr || log_->sink == nullptr) { return; }"
 LOAN_WARN_UNCONVERGED_IF = "if (loan_latch_.unconverged) {"
-LOAN_WARN_UNCONVERGED_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would leave: "
-                             "no loan this prompt")
+LOAN_WARN_UNCONVERGED_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would "
+                             "leave after %u sizing steps (post-loan ring %u slots, %zu bytes; 0 slots = over the "
+                             "cap): no loan this prompt")
+LOAN_WARN_UNCONVERGED_ARGS = ("device_, bytes_short / (1024.0 * 1024.0), loan_latch_.sizing_steps, "
+                              "loan_latch_.post_slots, loan_latch_.post_bytes);")
 LOAN_WARN_GATE = "if (policy_ != moe_exec_policy::RING && log_->trace < 1) { return; }"
 LOAN_WARN_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
                  "prompt")
@@ -1946,7 +1962,8 @@ def claim_refused_loan_warns_once(phase: str, tree: dict) -> bool:
     count = sum(norm(text).count(LOAN_WARN_FMT) for text in tree.values())
     unconverged = sum(norm(text).count(LOAN_WARN_UNCONVERGED_FMT) for text in tree.values())
     return (count == 1 and unconverged == 1 and w.startswith("{ " + LOAN_WARN_NULL)
-            and ordered(w, LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_FMT, "} else {",
+            and ordered(w, LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_FMT,
+                        LOAN_WARN_UNCONVERGED_ARGS, "} else {",
                         LOAN_WARN_GATE, LOAN_WARN_FMT, LOAN_WARN_EMIT)
             and w.count("policy_") == 1 and w.count("log_->trace") == 1 and w.count(LOAN_WARN_EMIT) == 1)
 
@@ -1972,6 +1989,9 @@ def test_refused_loan_warn_mutants():
     assert not c(regated, {PHASE_REL: regated})
     in_branch = mutate(PHASE, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_IF + " " + LOAN_WARN_GATE)
     assert not c(in_branch, {PHASE_REL: in_branch})
+    # The unconverged line without its reason: the reader cannot tell an over-cap ring from one that did not grow.
+    reasonless = mutate(PHASE, LOAN_WARN_UNCONVERGED_ARGS, "device_, bytes_short / (1024.0 * 1024.0));")
+    assert not c(reasonless, {PHASE_REL: reasonless})
     # Never emitted.
     silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
     assert not c(silent, {PHASE_REL: silent})

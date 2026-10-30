@@ -746,12 +746,14 @@ void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
     if (log_ == nullptr || log_->sink == nullptr) {
         return;
     }
-    char line[200];
+    char line[256];
     if (loan_latch_.unconverged) {
         std::snprintf(line, sizeof(line),
-                      "[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would leave: no "
-                      "loan this prompt",
-                      device_, bytes_short / (1024.0 * 1024.0));
+                      "[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would leave after "
+                      "%u sizing steps (post-loan ring %u slots, %zu bytes; 0 slots = over the cap): no loan this "
+                      "prompt",
+                      device_, bytes_short / (1024.0 * 1024.0), loan_latch_.sizing_steps, loan_latch_.post_slots,
+                      loan_latch_.post_bytes);
     } else {
         if (policy_ != moe_exec_policy::RING && log_->trace < 1) {
             return;

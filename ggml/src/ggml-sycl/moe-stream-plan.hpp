@@ -585,6 +585,11 @@ struct moe_stream_loan_latch {
     bool     refused       = false;  // one came back REFUSED, or none could be sized: ask for no other until end_prompt
     bool     unconverged   = false;  // the refusal was the sizing's: no ring of the plan a loan would leave fits
     uint64_t refusals_seen = 0;      // the device's REFUSED count at the last ask
+    // When the sizing refused, why, for the once-per-prompt WARN: the post-loan geometries it computed and the last
+    // post-loan ring, whose 0 slots mean it exceeded the cap (otherwise it did not grow, or the bound was spent).
+    uint32_t sizing_steps  = 0;
+    uint32_t post_slots    = 0;
+    size_t   post_bytes    = 0;
 };
 
 // What sizes a short ring's loan from the plan the loan would leave: the plan and the device the ring
@@ -652,8 +657,11 @@ static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_l
     if (sizer != nullptr) {
         const moe_stream_loan_sizing sized = moe_stream_loan_size_post_loan(*sizer, bytes_short);
         if (!sized.converged) {
-            latch.refused     = true;
-            latch.unconverged = true;
+            latch.refused      = true;
+            latch.unconverged  = true;
+            latch.sizing_steps = sized.steps;
+            latch.post_slots   = sized.geo.n_slots;
+            latch.post_bytes   = sized.geo.bytes;
             return moe_stream_loan_step::REFUSED;
         }
         bytes = sized.bytes;
@@ -1364,6 +1372,21 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
     return out;
 }
 
+// A lent triplet's device bytes: its three entries' dst_size in `plan`, the bytes moe_stream_plan_index_build stops
+// counting as resident on the device when the loan flips them to the host (the flip leaves dst_size as it is). One
+// source for both readers: the backend's lent ledger, whose sum is the published lent_bytes, and the loan sizing,
+// which adds what it would lend to lent_bytes. The sizing's fixed point is the ring prepare() rebuilds only while the
+// two agree.
+static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,
+                                                  const expert_placement_key (&placed)[3]) {
+    size_t bytes = 0;
+    for (int r = 0; r < 3; ++r) {
+        const placement_entry * e = plan.find_expert_entry(placed[r].layer_id, placed[r].expert_id, placed[r].role);
+        bytes += e ? e->dst_size : 0;
+    }
+    return bytes;
+}
+
 // ---- Loan sizing: a short ring's loan, sized from the plan the loan leaves. ----------------------------------------
 //
 // A loan flips its triplets to the host, and a host matrix the executor claims takes a ring slot, so the ring the next
@@ -1419,10 +1442,12 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
             moe_expert_loan_select(*sizer.plan, sizer.device, bytes, target.slot_bytes, nullptr);
         as_host.clear();
         size_t lent = 0;
-        for (const expert_placement_key & k : keys) {
-            as_host.insert(moe_stream_table_key(k.layer_id, k.expert_id, expert_tensor_role::UNKNOWN));
-            const placement_entry * e = sizer.plan->find_expert_entry(k.layer_id, k.expert_id, k.role);
-            lent += e != nullptr ? e->dst_size : 0;
+        // The selection returns whole triplets, gate/up/down in order, three keys each.
+        for (size_t i = 0; i + 3 <= keys.size(); i += 3) {
+            const expert_placement_key triplet[3] = { keys[i], keys[i + 1], keys[i + 2] };
+            as_host.insert(
+                moe_stream_table_key(triplet[0].layer_id, triplet[0].expert_id, expert_tensor_role::UNKNOWN));
+            lent += moe_expert_triplet_dst_bytes(*sizer.plan, triplet);
         }
         moe_stream_window_hints hints = sizer.hints;
         hints.lent_bytes              = hints.lent_bytes + lent < hints.lent_bytes ? SIZE_MAX : hints.lent_bytes + lent;
