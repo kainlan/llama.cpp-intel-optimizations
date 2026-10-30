@@ -27,94 +27,24 @@ The fix this gate pins:
     room's and not the previous round's;
   - the line's slot figures are the ring the held room was taken from, and the round bound is written once.
 
-Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
+Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text (sycl_gate.norm, which also joins adjacent
+string literals) and has a mutant that must make it fail.
 
 Pytest-style (module-level test_* functions): register with llama_test_pytest.
 """
 
 import re
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-
-_LEXEME_RE = re.compile(
-    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
-    re.DOTALL,
-)
-
-
-def strip_comments(src: str) -> str:
-    def repl(m: re.Match) -> str:
-        tok = m.group(0)
-        if tok[0] in "\"'":
-            return tok
-        return "\n" * tok.count("\n")
-
-    return _LEXEME_RE.sub(repl, src)
-
-
-def norm(text: str) -> str:
-    """Comment-stripped, whitespace-canonical text, so a clang-format re-wrap cannot turn a claim red."""
-    t = re.sub(r"\s+", " ", strip_comments(text))
-    t = re.sub(r"\( ", "(", t)
-    t = re.sub(r" \)", ")", t)
-    t = re.sub(r" ,", ",", t)
-    t = re.sub(r",(?! )", ", ", t)
-    return t
-
-
-def read(rel: str) -> str:
-    return (ROOT / rel).read_text()
-
+from sycl_gate import body, norm, ordered, read
 
 CACHE = norm(read("ggml/src/ggml-sycl/unified-cache.cpp"))
 CACHE_HPP = norm(read("ggml/src/ggml-sycl/unified-cache.hpp"))
 SYCL = norm(read("ggml/src/ggml-sycl/ggml-sycl.cpp"))
 
 
-def body(text: str, signature: str) -> str:
-    """The brace-balanced body of the first definition whose text starts with `signature` (string literals are
-    skipped while balancing). Empty when there is none."""
-    at = text.find(signature)
-    if at < 0:
-        return ""
-    open_at = text.find("{", at + len(signature) - 1)
-    if open_at < 0:
-        return ""
-    depth = 0
-    i = open_at
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch in "\"'":
-            j = i + 1
-            while j < n and text[j] != ch:
-                j += 2 if text[j] == "\\" else 1
-            i = j + 1
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[open_at:i + 1]
-        i += 1
-    return ""
-
-
-def ordered(text: str, *needles: str) -> bool:
-    """Every needle is present, each after the one before it."""
-    at = 0
-    for needle in needles:
-        at = text.find(needle, at)
-        if at < 0:
-            return False
-        at += len(needle)
-    return True
-
-
 def _once(text: str, old: str, new: str) -> str:
-    """`text` (already normalized) with the one occurrence of `old` replaced by `new`."""
+    """`text` (already normalized) with the one occurrence of `old` replaced by `new`. Stricter than sycl_gate.mutate,
+    which needs `old` present: an anchor that matches twice would let a mutant edit the wrong copy."""
     assert text.count(old) == 1, f"mutant anchor must match exactly once: {old!r} x{text.count(old)}"
     return text.replace(old, new, 1)
 
@@ -413,7 +343,7 @@ def test_mutant_claim_asks_the_type_after_the_staged_branch_fails():
 
 # ---- (g) the decision line -----------------------------------------------------------------------------------------
 
-HELD_LINE = '"[SYCL-PLAN] MoE window ring room on device %d: held %.1f MB in the WEIGHT zone before the "'
+HELD_LINE = '"[SYCL-PLAN] MoE window ring room on device %d: held %.1f MB in the WEIGHT zone before the routed experts'
 WARN_WHEN = "const bool warn = displaced > 0 || !settled;"
 LEVEL = "ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,"
 
