@@ -14,7 +14,7 @@ and `finish()` turns the record into the process exit status.
     finish("my gate: PASS")
 
 Not a pytest plugin: pytest-style gates (module-level test_* functions) are
-already independent, one result per function, and need only the message helpers:
+already independent, one result per function. This module serves them two kinds of helper. The message helpers:
 a claim that returns a bare bool says nothing about WHICH token failed, so pass
 first_missing (names the first anchor the claim needs that its region lacks) or
 first_present (names the first forbidden text its region holds) as the message.
@@ -22,6 +22,10 @@ first_present (names the first forbidden text its region holds) as the message.
     from sycl_gate import first_missing
 
     assert claim_x(SYCL), first_missing("file: region", region, ANCHOR_A, ANCHOR_B)
+
+And the text helpers the MoE source-contract pins share, at the end of the module: norm (comment-stripped,
+whitespace-canonical text), read (a repo file's text, or empty when it is missing), body (the brace-balanced body of a
+definition), ordered (needles in order) and mutate (a normalised text with one replacement, for positive controls).
 """
 import contextlib
 import linecache

@@ -3,9 +3,11 @@
 A helper that can pass vacuously or blame the wrong needle undermines every gate that uses it, so pin both:
 zero recorded checks must fail, and a failing generator expression must be annotated without naming a stale
 module-level variable that shares a comprehension variable's name. The message helpers the pytest-style pins pass
-as assert messages, first_missing and first_present, are pinned here too, and so are the text helpers the three
-source-contract pins share (norm, read, body, ordered, mutate): what each names, the singular and plural
-wording, and the 100-character cut.
+as assert messages, first_missing and first_present, are pinned here too: what each names, the singular and plural
+wording, and the 100-character cut. The text helpers the three MoE source-contract pins share are pinned last: norm
+(comment stripping, whitespace canonicalisation, idempotence), read (text, or empty for a missing file), body (brace
+balancing, string literals, a signature ending in "{", an empty result), ordered (each needle after the one before) and
+mutate (one replacement on normalised text, and a missing old text is refused).
 """
 import subprocess
 import sys
@@ -213,12 +215,6 @@ def test_first_present_is_never_empty() -> None:
     assert first_present("", "t", "t")
 
 
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-q"]))
-
-
 def test_norm_strips_comments_and_canonicalises_whitespace() -> None:
     assert norm("a  (\n b ,c ) // gone\n/* gone */ d") == "a (b, c) d"
     assert norm("f(\"x\"\n   \"y\")") == 'f("xy")'
@@ -254,6 +250,7 @@ def test_body_is_empty_when_signature_or_closing_brace_is_missing() -> None:
 
 
 def test_ordered_requires_every_needle_after_the_previous_one() -> None:
+    assert not ordered("x", "x", "x")
     assert ordered("a b c", "a", "b", "c")
     assert not ordered("a b c", "b", "a")
     assert not ordered("a b c", "a", "z")
@@ -268,3 +265,9 @@ def test_mutate_replaces_once_on_normalised_text_and_demands_the_old_text() -> N
         assert "mutant precondition" in str(error)
     else:
         raise AssertionError("mutate accepted a missing old text")
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

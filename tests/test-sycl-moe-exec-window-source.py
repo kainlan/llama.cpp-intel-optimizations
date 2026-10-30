@@ -35,12 +35,9 @@ each claim with mutants that must turn it red (its positive controls):
   - the prose that named the retired staging (moe_stream_phase::stage, reuse_after_readers, stage()) is gone.
 """
 import re
-from pathlib import Path
 
 import pytest
 from sycl_gate import body, first_missing, first_present, mutate, norm, ordered, read
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
