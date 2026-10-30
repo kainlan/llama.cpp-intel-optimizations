@@ -640,6 +640,200 @@ static bool run_kv_context_room_before_experts_test() {
     return true;
 }
 
+// An explicit micro-batch's PP MoE oneDNN scratch ring that the RUNTIME zone planned for the load's own micro-batch
+// cannot hold is placed, not refused (owner ruling 2026-10-30): the routed experts give up the room, and only when moving
+// every device-resident expert would not free it is the context refused, with the largest -ub that fits. The ring here
+// has a 256 KiB weight slot, 1 KiB of activation and 512 B of output per row, and depth 2; the rest of the RUNTIME
+// requirement is 1 MiB, and no floor. So the ring is 2 MiB at the default 512 and 6.5 MiB at 2048, and the zone grows
+// from 3 MiB to 7.5 MiB: a 4.5 MiB room, exactly six of the synthetic model's 768 KiB triplets.
+namespace explicit_ubatch_case {
+constexpr size_t mib           = 1024 * 1024;
+constexpr size_t zone_default  = 3 * mib;
+constexpr size_t zone_explicit = 7 * mib + mib / 2;
+constexpr size_t room          = zone_explicit - zone_default;
+constexpr size_t ring_explicit = 6 * mib + mib / 2;
+constexpr size_t runtime_fixed = 1 * mib;
+
+static ggml_sycl::pp_moe_onednn_explicit_ubatch_room room_with_zone(size_t runtime_zone_bytes) {
+    ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch                 = 2048;
+    in.n_ubatch_default         = 512;
+    in.weight_slot_bytes        = 256 * 1024;
+    in.activation_bytes_per_row = 1024;
+    in.output_bytes_per_row     = 512;
+    in.ring_depth               = 2;
+    in.runtime_fixed_bytes      = runtime_fixed;
+    in.runtime_floor_bytes      = 0;
+    in.runtime_zone_bytes       = runtime_zone_bytes;
+    return ggml_sycl::pp_moe_onednn_explicit_ubatch_plan_room(in);
+}
+
+static ggml_sycl::placement_plan plan(size_t expert_bytes_left, size_t runtime_zone_bytes) {
+    using namespace kv_order_case;
+    ggml_sycl::placement_kv_info kv = kv_info(0);
+    kv.n_ubatch_context             = 2048;
+    kv.explicit_ubatch              = room_with_zone(runtime_zone_bytes);
+    const size_t budget             = 2 * dense_bytes + 2 * kv_at_512 + expert_bytes_left;
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_experts);
+}
+
+// Every dense layer, its KV and every routed-expert role on the same device in both plans.
+static bool same_device_placement(const ggml_sycl::placement_plan & a, const ggml_sycl::placement_plan & b) {
+    using namespace kv_order_case;
+    for (int l = 0; l < 2; ++l) {
+        if (a.get_layer_device(l) != b.get_layer_device(l) || a.get_kv_device(l) != b.get_kv_device(l)) {
+            return false;
+        }
+        for (int e = 0; e < n_experts; ++e) {
+            for (auto role : { ggml_sycl::expert_tensor_role::GATE, ggml_sycl::expert_tensor_role::UP,
+                               ggml_sycl::expert_tensor_role::DOWN }) {
+                const auto pa = a.lookup_expert_placement(l, e, role);
+                const auto pb = b.lookup_expert_placement(l, e, role);
+                if (pa.found() != pb.found() || pa.on_device != pb.on_device) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+}  // namespace explicit_ubatch_case
+
+static bool run_explicit_ubatch_ring_placement_test() {
+    using namespace explicit_ubatch_case;
+    using action         = ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
+    const size_t triplet = kv_order_case::triplet_bytes;
+    bool         ok      = true;
+
+    const auto room0 = room_with_zone(zone_default);
+    if (!room0.valid || room0.ring_bytes != ring_explicit || room0.zone_default_bytes != zone_default ||
+        room0.zone_bytes != zone_explicit || room0.room_bytes != room || room0.room_reserved_bytes != 0 ||
+        room != 6 * triplet) {
+        printf(
+            "FAIL: the n_ubatch=2048 ring is %zu bytes in a %zu-byte zone over %zu (room %zu, held %zu), want %zu in "
+            "%zu over %zu (room %zu, held 0)\n",
+            room0.ring_bytes, room0.zone_bytes, room0.zone_default_bytes, room0.room_bytes, room0.room_reserved_bytes,
+            ring_explicit, zone_explicit, zone_default, room);
+        ok = false;
+    }
+
+    // The experts have the room to give, but the zone has not grown: the plan says so, and already holds the whole
+    // room against them, so two triplets stay on the device and six move. The backend grows the zone (which takes the
+    // room from the weight capacity) and plans again.
+    const auto   grow = plan(8 * triplet, zone_default);
+    const auto & gxub = grow.explicit_ubatch;
+    if (gxub.action != action::GROW_ZONE || gxub.n_ubatch != 2048 || gxub.expert_budget_bytes != 8 * triplet ||
+        gxub.hold_bytes != room || gxub.hold_reason == nullptr || kv_order_case::device_triplets(grow) != 2 ||
+        gxub.moved_experts != 6 || gxub.moved_layers != 2 || gxub.moved_bytes != 6 * triplet) {
+        printf(
+            "FAIL: an unreserved room the experts can give asks to grow the zone and holds the room: action %s, "
+            "budget %zu, hold %zu, %zu device triplets, %zu moved; want grow-zone, %zu, %zu, 2, 6\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(gxub.action), gxub.expert_budget_bytes,
+            gxub.hold_bytes, kv_order_case::device_triplets(grow), gxub.moved_experts, 8 * triplet, room);
+        ok = false;
+    }
+
+    // The zone holds the room, which came out of the weight capacity: two triplets stay on the device, and the six the
+    // room displaced are the ones the decision line names, with their bytes. The dense weights and their KV stay put.
+    const auto   placed = plan(2 * triplet, zone_explicit);
+    const auto & xub    = placed.explicit_ubatch;
+    if (xub.action != action::PLACE || xub.room_reserved_bytes != room || xub.hold_bytes != room ||
+        kv_order_case::device_triplets(placed) != 2 || xub.moved_experts != 6 || xub.moved_layers != 2 ||
+        xub.moved_bytes != 6 * triplet || xub.ring_bytes != ring_explicit || placed.get_layer_device(0) != 0 ||
+        placed.get_layer_device(1) != 0 || placed.get_kv_device(0) != 0 || placed.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: a held room places the ring and moves the experts it displaced: action %s, held %zu, hold %zu, %zu "
+            "device triplets, moved %zu experts in %zu layers (%zu bytes); want place, %zu, %zu, 2, 6 in 2 (%zu)\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.room_reserved_bytes, xub.hold_bytes,
+            kv_order_case::device_triplets(placed), xub.moved_experts, xub.moved_layers, xub.moved_bytes, room, room,
+            6 * triplet);
+        ok = false;
+    }
+
+    // Growing the zone does not change the plan: the hold is the whole room before and after, so the plan the backend
+    // grows the zone for is the plan it keeps, triplet for triplet.
+    if (!same_device_placement(grow, placed) || grow.weight_vram_bytes != placed.weight_vram_bytes ||
+        grow.weight_host_bytes != placed.weight_host_bytes || grow.kv_vram_bytes != placed.kv_vram_bytes) {
+        printf(
+            "FAIL: the plans before and after the zone grows differ: weights %zu/%zu device, %zu/%zu host, kv %zu/%zu, "
+            "same placement %d\n",
+            grow.weight_vram_bytes, placed.weight_vram_bytes, grow.weight_host_bytes, placed.weight_host_bytes,
+            grow.kv_vram_bytes, placed.kv_vram_bytes, same_device_placement(grow, placed) ? 1 : 0);
+        ok = false;
+    }
+
+    // The hold comes after the dense and KV phases: against the same budget with no micro-batch named, the dense
+    // layers, their KV and its bytes are where they were, and the device weights differ by the six moved triplets.
+    const auto baseline = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+    bool dense_kv_same = baseline.kv_vram_bytes == grow.kv_vram_bytes && baseline.kv_host_bytes == grow.kv_host_bytes &&
+                         baseline.weight_vram_bytes == grow.weight_vram_bytes + 6 * triplet;
+    for (int l = 0; l < 2; ++l) {
+        dense_kv_same = dense_kv_same && baseline.get_layer_device(l) == grow.get_layer_device(l) &&
+                        baseline.get_kv_device(l) == grow.get_kv_device(l);
+    }
+    if (!dense_kv_same || kv_order_case::device_triplets(baseline) != 8) {
+        printf(
+            "FAIL: the hold must leave the dense and KV phases as they were: kv %zu/%zu device, %zu/%zu host, weights "
+            "%zu vs %zu + 6 triplets, %zu baseline device triplets\n",
+            baseline.kv_vram_bytes, grow.kv_vram_bytes, baseline.kv_host_bytes, grow.kv_host_bytes,
+            baseline.weight_vram_bytes, grow.weight_vram_bytes, kv_order_case::device_triplets(baseline));
+        ok = false;
+    }
+
+    // The two device triplets give 1.5 MiB, less than the room: refused, and the largest micro-batch whose ring fits
+    // the zone plus those bytes, less the fixed rest (3 + 1.5 - 1 = 3.5 MiB), is 1024 (its ring is exactly 3.5 MiB).
+    const auto partial = plan(2 * triplet, zone_default);
+    if (partial.explicit_ubatch.action != action::REFUSE ||
+        partial.explicit_ubatch.max_ring_runtime_bytes != 3 * mib + mib / 2 ||
+        partial.explicit_ubatch.largest_fitting_n_ubatch != 1024 || kv_order_case::device_triplets(partial) != 2 ||
+        partial.explicit_ubatch.moved_experts != 0 || partial.explicit_ubatch.hold_bytes != 0) {
+        printf(
+            "FAIL: a room the device experts cannot give is refused with the largest fit: action %s, ring room %zu, "
+            "largest -ub %u, %zu device triplets; want refuse, %zu, 1024, 2\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(partial.explicit_ubatch.action),
+            partial.explicit_ubatch.max_ring_runtime_bytes, partial.explicit_ubatch.largest_fitting_n_ubatch,
+            kv_order_case::device_triplets(partial), 3 * mib + mib / 2);
+        ok = false;
+    }
+
+    // Nothing to demote (no expert fits beside the dense weights and their KV): refused, and the largest fit is the
+    // load's own 512, whose 2 MiB ring is what the zone holds beside the fixed rest.
+    const auto none = plan(0, zone_default);
+    if (none.explicit_ubatch.action != action::REFUSE || none.explicit_ubatch.max_ring_runtime_bytes != 2 * mib ||
+        none.explicit_ubatch.largest_fitting_n_ubatch != 512 || kv_order_case::device_triplets(none) != 0 ||
+        none.explicit_ubatch.hold_bytes != 0) {
+        printf(
+            "FAIL: with nothing to demote the context is refused with the largest fit: action %s, ring room %zu, "
+            "largest -ub %u; want refuse, %zu, 512\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(none.explicit_ubatch.action),
+            none.explicit_ubatch.max_ring_runtime_bytes, none.explicit_ubatch.largest_fitting_n_ubatch, 2 * mib);
+        ok = false;
+    }
+
+    // No micro-batch named: no decision, and the plan is the one the load always made.
+    ggml_sycl::placement_kv_info plain   = kv_order_case::kv_info(0);
+    const auto                   unnamed = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        plain, nullptr, kv_order_case::n_experts);
+    if (unnamed.explicit_ubatch.n_ubatch != 0 || unnamed.explicit_ubatch.action != action::NONE ||
+        unnamed.explicit_ubatch.hold_bytes != 0 || kv_order_case::device_triplets(unnamed) != 8) {
+        printf("FAIL: no named micro-batch makes no decision: n_ubatch %u, action %s, %zu device triplets\n",
+               unnamed.explicit_ubatch.n_ubatch,
+               ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(unnamed.explicit_ubatch.action),
+               kv_order_case::device_triplets(unnamed));
+        ok = false;
+    }
+
+    if (ok) {
+        printf(
+            "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "
+            "only when they cannot give it\n");
+    }
+    return ok;
+}
+
 // Layer 0's triplets are four times layer 1's. The room's cost is net: with the room added back, the first-fit pack
 // takes a second large triplet and then has no space for the small ones the real pack placed, so counting only the
 // triplets that fit the larger budget and not the real one (one large triplet) over-states what the room cost.
@@ -3361,6 +3555,7 @@ int main() {
         mock_ok = run_moe_device_policy_mock_test() && mock_ok;
         mock_ok = run_moe_triplet_planner_test() && mock_ok;
         mock_ok = run_kv_context_room_before_experts_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_ring_placement_test() && mock_ok;
         mock_ok = run_kv_context_room_cost_is_net_test() && mock_ok;
         mock_ok = run_kv_context_room_follows_the_requested_context_test() && mock_ok;
         mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
