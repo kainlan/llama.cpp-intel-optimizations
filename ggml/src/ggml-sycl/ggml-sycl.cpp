@@ -17131,6 +17131,31 @@ static double ggml_sycl_plan_cost_param(const char * name, double def, double ma
 // executor's claim predicate; declared here for the capability query's prompt route.
 static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout);
 
+// Which of the two dense scratch plans a store accepted.
+struct ggml_sycl_dense_scratch_planned {
+    bool mmq_src1    = false;
+    bool dequant_f16 = false;
+};
+
+// Plans this load's dense MMQ/MMVQ Q8_1 src1 buffer and dense f16 dequant buffers (llama.cpp-479i) on `device` from the
+// inventory maxima at `n_ubatch`, keyed by `owner`, the owner of the load effect the stage holds (llama.cpp-45qo):
+// populate_inventory_globals plans the load's planning shape, and the explicit micro-batch's PP MoE ring placement
+// plans that micro-batch, whose grown RUNTIME zone holds both. A build that cannot reach the f16 arm plans nothing for
+// it: the buffers would be a reservation nothing draws, and the hold, the fit check and the ring would each count it.
+static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch(int                                   device,
+                                                                         ggml_sycl::lifecycle::SlotToken       owner,
+                                                                         const ggml_sycl::path_scoped_maxima & maxima,
+                                                                         uint32_t n_ubatch) {
+    ggml_sycl_dense_scratch_planned planned;
+    const bool                      f16_drawable = ggml_sycl_dequant_f16_scratch_drawable();
+    planned.mmq_src1 =
+        ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(device, owner, maxima.mmq_src1_bytes_per_token, n_ubatch);
+    planned.dequant_f16 = ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(
+        device, owner, f16_drawable ? maxima.dequant_f16_weight_bytes : 0,
+        f16_drawable ? maxima.dequant_f16_src1_bytes_per_token : 0, n_ubatch);
+    return planned;
+}
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17212,33 +17237,25 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     const bool                            owned      = plan_owner.generation != 0;
     const char *                          unplanned =
         owned ? " -- sizing overflowed, nothing planned" : " -- no staged load owns it, nothing planned";
+    // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from the inventory
+    // maxima the adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch will not supply),
+    // in the same RUNTIME zone (ggml_sycl_plan_load_dense_scratch).
     {
-        const uint32_t mmq_src1_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
-        const bool     mmq_src1_planned =
-            owned && ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
-                         ctx->device, plan_owner, inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch);
+        const uint32_t                        dense_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
+        const ggml_sycl_dense_scratch_planned dense_planned =
+            owned ? ggml_sycl_plan_load_dense_scratch(ctx->device, plan_owner, inventory_maxima, dense_n_ubatch) :
+                    ggml_sycl_dense_scratch_planned{};
         GGML_LOG_INFO("[SYCL-PLAN] dense MMQ src1 Q8_1 scratch: %.1f MB (%zu B/token x n_ubatch=%u, RUNTIME zone)%s\n",
                       ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
-                      inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch, mmq_src1_planned ? "" : unplanned);
-    }
-    // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from
-    // the inventory maxima the adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
-    // will not supply), in the same RUNTIME zone.
-    // A build that cannot reach the f16 arm plans nothing for it: the buffers would be a reservation nothing draws,
-    // and the hold, the fit check and the ring would each count it.
-    {
-        const uint32_t dequant_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
-        const bool     f16_drawable     = ggml_sycl_dequant_f16_scratch_drawable();
-        const bool     dequant_planned =
-            owned && ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(
-                         ctx->device, plan_owner, f16_drawable ? inventory_maxima.dequant_f16_weight_bytes : 0,
-                         f16_drawable ? inventory_maxima.dequant_f16_src1_bytes_per_token : 0, dequant_n_ubatch);
+                      inventory_maxima.mmq_src1_bytes_per_token, dense_n_ubatch,
+                      dense_planned.mmq_src1 ? "" : unplanned);
         GGML_LOG_INFO(
             "[SYCL-PLAN] dense f16 dequant scratch: %.1f MB (weights %.1f MB + %zu B/token x n_ubatch=%u, RUNTIME "
             "zone)%s\n",
             ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
             inventory_maxima.dequant_f16_weight_bytes / (1024.0 * 1024.0),
-            inventory_maxima.dequant_f16_src1_bytes_per_token, dequant_n_ubatch, dequant_planned ? "" : unplanned);
+            inventory_maxima.dequant_f16_src1_bytes_per_token, dense_n_ubatch,
+            dense_planned.dequant_f16 ? "" : unplanned);
     }
     {
         const bool pp_pipeline_enabled               = pp_pipeline_env_enabled();
@@ -17349,6 +17366,12 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // llama.cpp-7fmt: whether that is the model's default context. The room's lines say so, and for the default
     // context an expert type with no measured CPU rate refuses the room instead of being priced at the fallback.
     g_placement_kv_info.n_ctx_context_is_default = inventory->n_ctx_context_is_default;
+    // The micro-batch the caller named, whose PP MoE oneDNN scratch ring the planner plans in the RUNTIME zone (0:
+    // none named, so the ring keeps the load's planning shape).
+    g_placement_kv_info.n_ubatch_context         = inventory->n_ubatch_context;
+    // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
+    // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
+    g_placement_kv_info.explicit_ubatch          = {};
     // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs that room by, layer by layer: the share of the requested
     // context a conversation is expected to fill (a percent, so at most 100), the two host read rates (the CPU expert
     // rate, when its variable is given, prices every expert type), and the cost of each CPU split a host layer adds.
@@ -17521,6 +17544,38 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
 
 thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
 
+// Publishes the PP MoE oneDNN scratch ring and the dense scratch of `n_ubatch` on `device` as this load's plan, with
+// every ring slot in the RUNTIME zone as at load, so ensure_planned_arena_zones() sizes the zone for both and the
+// runtime context transaction finds the ring already planned for a context of that micro-batch. The explicit
+// micro-batch's placement publishes its micro-batch, and a zone that cannot grow gets the load's planning shape back.
+// False when the ring's slot sizing overflows, no staged load owns the dense plan, or a dense store is refused. Caller
+// holds g_tensor_inventory_mutex.
+static bool ggml_sycl_publish_load_ubatch_scratch(int device, uint32_t n_ubatch) {
+    const ggml_sycl::lifecycle::SlotToken owner           = g_sycl_plan_load_effect_owner;
+    size_t                                activation_slot = 0;
+    size_t                                output_slot     = 0;
+    if (owner.generation == 0 ||
+        !ggml_sycl::unified_cache_pp_moe_onednn_slots_for_ubatch(device, n_ubatch, &activation_slot, &output_slot)) {
+        return false;
+    }
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(
+        device, ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device), activation_slot,
+        output_slot, ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(device));
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, n_ubatch);
+    const ggml_sycl::path_scoped_maxima maxima =
+        ggml_sycl::zone_scoped_maxima(ggml_sycl::unified_cache_adapt_zone_inventory(g_tensor_inventory_detail));
+    const ggml_sycl_dense_scratch_planned dense = ggml_sycl_plan_load_dense_scratch(device, owner, maxima, n_ubatch);
+    return dense.mmq_src1 && dense.dequant_f16;
+}
+
+// The RUNTIME room the explicit micro-batch's PP MoE oneDNN scratch ring needs on `device`, composed from the plan as
+// published now, into the planner's input (placement_kv_info::explicit_ubatch). No micro-batch above the load's
+// planning shape was named: no room.
+static void ggml_sycl_fill_explicit_ubatch_room(int device) {
+    g_placement_kv_info.explicit_ubatch = ggml_sycl::unified_cache_explicit_ubatch_room(
+        device, g_placement_kv_info.n_ubatch_context, g_placement_kv_info.n_ubatch);
+}
+
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex.
@@ -17665,25 +17720,74 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // planner input. compute_placement_plan() owns the arena zone charge
         // (SCRATCH + ONEDNN + RUNTIME) and subtracts it exactly once before
         // packing weights/KV into the shared zone.
-        size_t plan_budget = vram_budget;
-        auto * cache       = ggml_sycl::get_unified_cache_for_device(ctx->device);
-        if (cache && cache->arena_active()) {
-            const size_t arena_total   = cache->arena_total_size();
-            const size_t zone_overhead = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) +
-                                         cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN) +
-                                         cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
-            plan_budget = arena_total;
-            GGML_LOG_INFO(
-                "[SYCL] Plan budget tied to arena: %.1f MB arena "
-                "(shared zone %.1f MB after %.1f MB zones)\n",
-                plan_budget / (1024.0 * 1024.0),
-                arena_total > zone_overhead ? (arena_total - zone_overhead) / (1024.0 * 1024.0) : 0.0,
-                zone_overhead / (1024.0 * 1024.0));
-        }
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
-        plan_candidate = ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
-                                                           g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
-        have_plan      = true;
+
+        // with_room: the planner holds the explicit micro-batch's RUNTIME room (below) against the routed experts.
+        // Without it the plan is the load's planning shape alone, as before the ruling.
+        auto plan_single_device = [&](bool with_room) {
+            size_t plan_budget = vram_budget;
+            auto * cache       = ggml_sycl::get_unified_cache_for_device(ctx->device);
+            if (cache && cache->arena_active()) {
+                const size_t arena_total   = cache->arena_total_size();
+                const size_t zone_overhead = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) +
+                                             cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN) +
+                                             cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+                plan_budget = arena_total;
+                GGML_LOG_INFO(
+                    "[SYCL] Plan budget tied to arena: %.1f MB arena "
+                    "(shared zone %.1f MB after %.1f MB zones)\n",
+                    plan_budget / (1024.0 * 1024.0),
+                    arena_total > zone_overhead ? (arena_total - zone_overhead) / (1024.0 * 1024.0) : 0.0,
+                    zone_overhead / (1024.0 * 1024.0));
+            }
+            if (with_room) {
+                ggml_sycl_fill_explicit_ubatch_room(ctx->device);
+            } else {
+                g_placement_kv_info.explicit_ubatch = {};
+            }
+            return ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
+                                                     g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
+        };
+        // An explicit micro-batch's PP MoE oneDNN scratch ring (owner ruling 2026-10-30): the planner holds the
+        // RUNTIME room the ring needs against the routed experts. Every stage of the load re-publishes the ring and the
+        // dense scratch at the load's planning shape, so a zone an earlier stage already grew for the room (zones never
+        // shrink) gets the micro-batch's back before the plan.
+        const uint32_t explicit_n_ubatch = g_placement_kv_info.n_ubatch_context;
+        ggml_sycl_fill_explicit_ubatch_room(ctx->device);
+        if (g_placement_kv_info.explicit_ubatch.valid && g_placement_kv_info.explicit_ubatch.room_bytes > 0 &&
+            g_placement_kv_info.explicit_ubatch.room_reserved_bytes >= g_placement_kv_info.explicit_ubatch.room_bytes) {
+            (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch);
+        }
+        plan_candidate = plan_single_device(/*with_room=*/true);
+        if (plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {
+            // The experts can give the room: grow the RUNTIME zone for the micro-batch's ring and dense scratch, which
+            // takes the room from the weight capacity, and plan again. The hold is the whole room either way, so the
+            // second plan moves the same experts and only reads PLACE.
+            const size_t room_short =
+                plan_candidate.explicit_ubatch.room_bytes - plan_candidate.explicit_ubatch.room_reserved_bytes;
+            bool placed = ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch) &&
+                          ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);
+            if (placed) {
+                plan_candidate = plan_single_device(/*with_room=*/true);
+                placed =
+                    plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE;
+            }
+            if (!placed) {
+                // The arena could not grow (another live model's allocations, or the tail chunk's cap): the load keeps
+                // its planning shape and plans without the room, so no expert leaves the device for a zone that did
+                // not grow, and the context's transaction re-plans the ring as it did before.
+                (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
+                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
+                    GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
+                }
+                plan_candidate = plan_single_device(/*with_room=*/false);
+                GGML_LOG_WARN(
+                    "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB more RUNTIME zone, which the "
+                    "arena could not reserve on device %d; the ring is re-planned when the context opens\n",
+                    explicit_n_ubatch, room_short / (1024.0 * 1024.0), ctx->device);
+            }
+        }
+        have_plan = true;
         GGML_LOG_INFO(
             "[SYCL] Placement plan computed: %zu entries, "
             "%.1f MB device + %.1f MB host\n",
@@ -20337,6 +20441,33 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
     };
 
+    // The explicit micro-batch's PP MoE oneDNN scratch ring, placed by the load (owner ruling 2026-10-30), announced
+    // like the KV demotions above: once, against the final plan, for the micro-batch the load decided for. A WARN, so
+    // the one line survives default verbosity, when the ring's room moved routed experts to the host tier and the
+    // published plan was made for another micro-batch (the load's own, or a previous context's); a second context of
+    // the same micro-batch, a room the weight zone's slack held, and a probe, which places nothing, print it at INFO.
+    auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan) {
+        const ggml_sycl::placement_explicit_ubatch & xub = final_plan.explicit_ubatch;
+        if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE ||
+            xub.n_ubatch != next_kv_info.n_ubatch) {
+            return;
+        }
+        if (!probe_mode && xub.moved_experts > 0 && current->kv_info.n_ubatch != next_kv_info.n_ubatch) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: re-placed %zu experts (%zu "
+                "layers) to the host tier, %.1f MB moved (device %d)\n",
+                xub.n_ubatch, xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb,
+                ctx->device);
+        } else {
+            GGML_LOG_INFO(
+                "[SYCL-PLAN] %sPP MoE oneDNN scratch ring for n_ubatch=%u holds %.1f MB of the RUNTIME zone: %zu "
+                "experts "
+                "(%zu layers, %.1f MB) on the host tier for it (device %d)\n",
+                probe_mode ? "probe: " : "", xub.n_ubatch, xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers,
+                xub.moved_bytes / mb, ctx->device);
+        }
+    };
+
     // llama.cpp-oyfl: the KV/MMID replan above fits the device budget, but a
     // fitting KV shape says nothing about the non-flash-attention batched
     // mul_mat path's own scratch demand -- that consumer never went through
@@ -20543,6 +20674,31 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // retry. Only that shape maps to BUSY; every other refusal
     // (DOES_NOT_FIT) is the deterministic "this size does not fit" answer
     // and stays a PLAN_REJECTED-mapped refusal, unchanged from before.
+    // The explicit micro-batch the load could not place (owner ruling 2026-10-30): its ring's RUNTIME room is more than
+    // every device-resident routed expert gives up, so the context is refused by name, with the largest -ub whose ring
+    // fits what they would have given, by the ring admission's own slot arithmetic (pp_moe_onednn_explicit_ubatch_
+    // decide). Only for the micro-batch the load decided for: any other, the auto trial's rungs included (they name no
+    // micro-batch at load), goes through the ring re-plan below.
+    {
+        const ggml_sycl::placement_explicit_ubatch & xub = next_plan.explicit_ubatch;
+        if (xub.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::REFUSE &&
+            xub.n_ubatch == next_kv_info.n_ubatch) {
+            char fits[64] = "";
+            if (xub.largest_fitting_n_ubatch >= 32) {
+                std::snprintf(fits, sizeof(fits), "; the largest -ub that fits is %u", xub.largest_fitting_n_ubatch);
+            } else {
+                std::snprintf(fits, sizeof(fits), "; no -ub of 32 or more fits");
+            }
+            GGML_SYCL_RUNTIME_TXN_REFUSAL(
+                probe_mode,
+                "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f "
+                "MB, "
+                "more than the RUNTIME zone can hold with every device-resident expert re-placed to the host tier "
+                "(%.1f MB)%s (device=%d)\n",
+                xub.n_ubatch, xub.ring_bytes / mb, xub.max_ring_runtime_bytes / mb, fits, ctx->device);
+            return refuse("PP MoE oneDNN scratch ring does not fit");
+        }
+    }
     const ggml_sycl_ring_replan_result ring_replan_result =
         ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);
     if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {
@@ -20614,6 +20770,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             return refuse("probe rollback failed: ring left at candidate size");
         }
         announce_kv_host_demotions(next_plan);
+        announce_explicit_ubatch_placement(next_plan);
         if (out) {
             out->accepted        = true;
             out->would_demote_kv = kv_was_demoted;
@@ -20697,6 +20854,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
                                                       hold_kv_room);
     announce_kv_host_demotions(*immutable->plan);
+    announce_explicit_ubatch_placement(*immutable->plan);
     // The commit point the dump's context_txn snapshot entries name: the RUNTIME room and the ONEDNN
     // capacity as they stand once this transaction has published.
     ggml_sycl::unified_cache_dump_capture_zone_figures(ctx->device, ggml_sycl::dump_point::CONTEXT_TXN);

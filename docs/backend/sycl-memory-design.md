@@ -2643,6 +2643,53 @@ Host tests: `ggml/src/ggml-sycl/tests/test-pp-moe-ring-admission.cpp` pins the
 arithmetic. `tests/test-sycl-pp-moe-ring-kv-zone-source.py` pins the wiring, with
 a mutation witness per check.
 
+### Explicit micro-batch placement (owner ruling 2026-10-30)
+
+An explicit `-ub` whose ring needs more RUNTIME zone than the load's planning
+shape reserved is placed at load, the way KV that does not fit is re-placed
+rather than refused. The caller names the micro-batch in
+`llama_model_params::n_ubatch_hint`. Both `common` and `llama-bench` name none
+for an automatic micro-batch, so the auto-ubatch trial is unchanged. The planner
+computes the RUNTIME room the ring and the dense scratch need at that micro-batch
+(`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as a named term
+on the routed-expert budget, at the start of the MoE block. By then the dense
+weights, their KV and the KV context room are placed, so the room never moves a
+dense layer or KV. That answers the objection above to growing the zone at load:
+the requested context's KV room is now held first, so KV still wins. The experts
+are packed into the budget less the hold. The hold is the whole room both before
+and after the zone grows, so the plan the load grows the zone for is the plan it
+keeps. When the experts can give the room, the load grows the RUNTIME zone and
+plans again. The experts that no longer fit go to the host tier, where the CPU
+runs them. The context then prints one WARN line:
+
+```
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB: re-placed <M> experts (<K> layers)
+to the host tier, <X> MB moved (device 0)
+```
+
+The context is refused only when moving every device-resident routed expert
+would not free the room. The refusal names the largest `-ub` whose ring fits,
+from `pp_moe_onednn_admit_ring()`'s slot arithmetic:
+
+```
+[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=<N> needs <R> MB, more
+than the RUNTIME zone can hold with every device-resident expert re-placed to the host tier (<F> MB); the
+largest -ub that fits is <L> (device=0)
+```
+
+An arena that cannot grow, because another live model holds allocations in it,
+keeps the planning shape, and the load plans without the room. So no expert
+leaves the device for a zone that did not grow. The context then re-plans the
+ring as described above.
+Only the single-device plan places. A multi-device plan makes no decision, so
+its context keeps the context-time path. The RUNTIME zone's fixed part uses the
+compute term measured at the load's planning shape (`llama.cpp-fkpg`), so the
+room for a much larger micro-batch can be short by that term's growth. Host
+tests: `test-pp-moe-ring-admission.cpp` pins the room and the decision,
+`tests/test-sycl-layout-choice.cpp` pins the planner's choice and the bytes it
+moves, and `tests/test-sycl-explicit-ubatch-placement-source.py` pins the
+wiring and both log lines, with a mutant per claim.
+
 ### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
 
 The dense quantized `MUL_MAT` quantizes its F32 activations into one persistent Q8_1 src1 buffer per backend context

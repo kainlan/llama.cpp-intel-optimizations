@@ -590,10 +590,17 @@ def evaluate(backend, common, cache, zone):
 
     # M4: a second live model must not shrink the first one's plan. Since llama.cpp-45qo the inputs are each owner's
     # own terms and a store sizes the merge it will publish (the owner keying is pinned in full by
-    # test-sycl-dense-scratch-owner-source).
+    # test-sycl-dense-scratch-owner-source). Both stores sit in one helper keyed by the owner its caller passes, and the
+    # load passes the owner of its load effect.
+    populate_fn = function_body(backend, r"static void populate_inventory_globals\([^)]*\)\s*\{") or ""
+    dense_plan_fn = function_body(
+        backend, r"static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch\([^)]*\)\s*\{") or ""
     results["the load-time plan keeps another live model's inputs"] = \
-        "plan_owner = g_sycl_plan_load_effect_owner;" in backend[max(0, plan_f16_at - 2400):plan_f16_at + 400] and \
-        backend[max(0, plan_f16_at - 2400):plan_f16_at + 400].count("ctx->device, plan_owner,") == 2 and \
+        "plan_owner = g_sycl_plan_load_effect_owner;" in populate_fn and \
+        populate_fn.count("ctx->device, plan_owner,") == 1 and \
+        "ggml_sycl_plan_load_dense_scratch(ctx->device, plan_owner," in populate_fn and \
+        len(re.findall(r"unified_cache_set_planned_(?:mmq_src1|dequant_f16)_scratch\(\s*device,\s*owner,",
+                       dense_plan_fn)) == 2 and \
         "owners.merged_accepted_if_set(" in store_q8_fn and "owners.merged_accepted_if_set(" in store_f16_fn
 
     # M8: validate first, then store. llama.cpp-45qo: a rejected figure overwrites its owner's inputs for that buffer

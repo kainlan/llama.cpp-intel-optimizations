@@ -1,0 +1,453 @@
+"""Source contract for explicit micro-batch placement: an explicit -ub whose PP MoE oneDNN scratch ring does not fit
+the RUNTIME zone planned for the load's own micro-batch is placed, not refused (owner ruling 2026-10-30).
+
+Host-only: reads sources, builds nothing, loads no model and touches no device.
+
+The defect (B70, Qwen3.8, `llama-bench -ub 2048 -p 2048 -n 0 -fa 1`): the load planned the ring for n_ubatch 512, the
+context asked for 2048, the ring re-plan could not fit the four times larger activation and output slots, and the
+context was refused with "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=2048
+needs ...", so the arm produced no row. KV that does not fit is re-placed to the host tier rather than refused; the ring
+now follows the same rule.
+
+What this gate pins:
+- the transport: the micro-batch the caller names reaches the planner (llama_model_params::n_ubatch_hint, then
+  ggml_sycl_tensor_inventory::n_ubatch_context, then placement_kv_info::n_ubatch_context), and both callers name none
+  (0) when the backend picks the micro-batch itself, so the auto-ubatch trial never places;
+- the planner holds the ring's RUNTIME room as a named term on the routed-expert budget, inside the MoE block after the
+  dense weights, their KV and the KV context room, so only routed experts give it up; the hold is the whole room before
+  and after the zone grows, the pack predicate is the budget less it, and the triplets it moved come from a first-fit
+  pack with the hold added back;
+- the load grows the RUNTIME zone for that micro-batch before the plan it keeps, and falls back to the load's planning
+  shape, planned without the room, when the arena cannot grow;
+- the context announces the placement in ONE WARN line, with the experts and bytes moved;
+- the fallback refusal names the largest -ub that fits, from the ring admission's own slot arithmetic.
+
+Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
+mutant that must make it fail.
+
+Pytest-style (module-level test_* functions): register with llama_test_pytest.
+"""
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+_LEXEME_RE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
+    re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            return tok
+        return "\n" * tok.count("\n")
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+def norm(text: str) -> str:
+    """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so a clang-format re-wrap of
+    a claim or of a log literal cannot turn it red."""
+    t = re.sub(r"\s+", " ", strip_comments(text))
+    t = re.sub(r"\( ", "(", t)
+    t = re.sub(r" \)", ")", t)
+    t = re.sub(r" ,", ",", t)
+    t = re.sub(r",(?! )", ", ", t)
+    return t.replace('" "', "")
+
+
+def read(rel: str) -> str:
+    return (ROOT / rel).read_text()
+
+
+SYCL_CPP = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
+CACHE_CPP = read("ggml/src/ggml-sycl/unified-cache.cpp")
+ADMISSION_CPP = read("ggml/src/ggml-sycl/moe-scratch-admission.cpp")
+LLAMA_H = read("include/llama.h")
+SYCL_H = read("ggml/include/ggml-sycl.h")
+MODEL_CPP = read("src/llama-model.cpp")
+COMMON_CPP = read("common/common.cpp")
+BENCH_CPP = read("tools/llama-bench/llama-bench.cpp")
+
+
+def body(text: str, signature: str) -> str:
+    """The brace-balanced body of the first definition whose text starts with `signature` (string literals are
+    skipped while balancing). Empty when there is none."""
+    at = text.find(signature)
+    if at < 0:
+        return ""
+    open_at = text.find("{", at + len(signature))
+    if open_at < 0:
+        return ""
+    depth = 0
+    i = open_at
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at:i + 1]
+        i += 1
+    return ""
+
+
+def ordered(text: str, *needles: str) -> bool:
+    """Every needle is present, each after the one before it."""
+    at = 0
+    for needle in needles:
+        at = text.find(needle, at)
+        if at < 0:
+            return False
+        at += len(needle)
+    return True
+
+
+TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
+STORE_SIG = "static void compute_and_store_plan_for_inventory("
+PLANNER_SIG = "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
+DECIDE_SIG = "pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide("
+POPULATE_SIG = "static void llama_model_sycl_populate_inventory("
+BENCH_HINT_SIG = "uint32_t n_ubatch_hint() const"
+
+# The decision line: one WARN, when the room moved experts and the context is the first of its micro-batch.
+WARN_LITERAL = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: re-placed %zu '
+                'experts (%zu layers) to the host tier, %.1f MB moved (device %d)\\n", xub.n_ubatch, '
+                'xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb, ctx->device);')
+WARN_GATE = "if (!probe_mode && xub.moved_experts > 0 && current->kv_info.n_ubatch != next_kv_info.n_ubatch) {"
+ANNOUNCE_DEF = "auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan)"
+ANNOUNCE_FOR = ("if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || "
+                "xub.n_ubatch != next_kv_info.n_ubatch) { return; }")
+ANNOUNCE_PROBE = "announce_kv_host_demotions(next_plan); announce_explicit_ubatch_placement(next_plan);"
+ANNOUNCE_COMMIT = "announce_kv_host_demotions(*immutable->plan); announce_explicit_ubatch_placement(*immutable->plan);"
+
+# The fallback refusal, by name, with the largest -ub that fits.
+REFUSE_FOR = ("if (xub.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::REFUSE && "
+              "xub.n_ubatch == next_kv_info.n_ubatch) {")
+FITS = 'std::snprintf(fits, sizeof(fits), "; the largest -ub that fits is %u", xub.largest_fitting_n_ubatch);'
+REFUSE_LITERAL = ('"[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs '
+                  '%.1f MB, more than the RUNTIME zone can hold with every device-resident expert re-placed to the '
+                  'host tier (%.1f MB)%s (device=%d)\\n", xub.n_ubatch, xub.ring_bytes / mb, '
+                  'xub.max_ring_runtime_bytes / mb, fits, ctx->device);')
+RING_REPLAN = ("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, "
+               "&ring_kv_zone);")
+LARGEST_FIT = "decision.largest_fitting_n_ubatch = pp_moe_onednn_admit_ring(fit).largest_fitting_n_ubatch;"
+FIT_INPUTS = (
+    "fit.runtime_available_bytes = decision.max_ring_runtime_bytes;",
+    "fit.weight_slot_bytes = in.weight_slot_bytes;",
+    "fit.activation_bytes_per_row = in.activation_bytes_per_row;",
+    "fit.output_bytes_per_row = in.output_bytes_per_row;",
+    "fit.ring_depth = in.ring_depth;",
+    "fit.n_ubatch = in.n_ubatch;",
+)
+
+# The planner: a named hold on the expert budget, after the KV context room and before the pack's stats (where a
+# second hold term composes); the pack predicate is the budget less the hold; moved counted with the hold added back.
+KV_ROOM = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);"
+HOLD_CALL = "const size_t ubatch_hold_bytes = hold_explicit_ubatch_room(plan, kv_info, remaining);"
+STATS_DECL = "moe_triplet_pack_stats stats;"
+WITHOUT_ROOM = "size_t without_ubatch_room = remaining + ubatch_hold_bytes;"
+PACK_PREDICATE = "const bool on_device = group.charge_bytes <= remaining;"
+MOVED = ("if (ubatch_hold_bytes > 0 && group.charge_bytes <= without_ubatch_room) { without_ubatch_room -= "
+         "group.charge_bytes; if (!on_device) { plan.explicit_ubatch.moved_experts++; "
+         "plan.explicit_ubatch.moved_bytes += group.bytes; ubatch_moved_layers.insert(group.layer_id); } }")
+HOLD_SIG = ("static size_t hold_explicit_ubatch_room(placement_plan & plan, const placement_kv_info & kv_info, "
+            "size_t & remaining)")
+DECIDE = "pp_moe_onednn_explicit_ubatch_decide(room, remaining);"
+HOLD_REASON = 'xub.hold_reason = "PP MoE oneDNN scratch ring RUNTIME room";'
+HOLD_GATE = ("if (decision.action == pp_moe_onednn_explicit_ubatch_action::PLACE || "
+             "decision.action == pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {")
+HOLD_STEPS = ("remaining += room.room_reserved_bytes; xub.hold_bytes = room.room_bytes; "
+              "remaining -= xub.hold_bytes;")
+
+# The load: plan with the room, grow the zone for the micro-batch, plan again, and fall back to the planning shape
+# planned without the room.
+LAMBDA_ROOM = ("if (with_room) { ggml_sycl_fill_explicit_ubatch_room(ctx->device); } else { "
+               "g_placement_kv_info.explicit_ubatch = {}; } return ggml_sycl::compute_placement_plan(")
+FIRST_PLAN = "plan_candidate = plan_single_device(true);"
+GROW_BRANCH = "if (plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {"
+GROW_PUBLISH = ("bool placed = ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch) && "
+                "ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);")
+GROW_REPLAN = ("if (placed) { plan_candidate = plan_single_device(true); placed = "
+               "plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE; }")
+GROW_FALLBACK = "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);"
+FALLBACK_PLAN = "plan_candidate = plan_single_device(false);"
+
+# The transport.
+PARAM_FIELD = "uint32_t n_ctx_hint; uint32_t n_ubatch_hint; };"
+# The default is the last positional initializer, labelled by a comment, so it is matched on the raw text.
+MODEL_DEFAULT_RE = re.compile(r"/\*\.n_ctx_hint\s*=\*/\s*0,\s*/\*\.n_ubatch_hint\s*=\*/\s*0,\s*\};")
+INVENTORY_SET = "inventory.n_ubatch_context = n_ubatch_hint;"
+CALLER_PASSES = "hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
+BACKEND_COPY = "g_placement_kv_info.n_ubatch_context = inventory->n_ubatch_context;"
+OFFSET_PIN = "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,"
+# The header's own pins, compiled by both sides of the dlopen boundary (libllama fills the struct, libggml-sycl reads it).
+HEADER_SIZE_PIN = ('static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, '
+                   '"ggml_sycl_tensor_inventory layout changed");')
+HEADER_OFFSET_PIN = ('static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, '
+                     '"n_ubatch_context moved");')
+COMMON_NONE = "mparams.n_ubatch_hint = 0; if (!params.n_ubatch_auto && params.n_batch > 0) {"
+BENCH_NONE = "if (n_ubatch < 0 || n_batch <= 0) { return 0; }"
+BENCH_SET = "mparams.n_ubatch_hint = n_ubatch_hint();"
+BENCH_EQUAL = "n_ubatch_hint() == other.n_ubatch_hint() &&"
+
+
+def claim_placement_is_one_warn_line(sycl_cpp: str) -> bool:
+    """The context announces the placement once, at WARN, with the experts, layers and bytes the room moved: only for
+    the micro-batch the load placed, only when it moved experts, never for a probe, and only when the published plan
+    was made for another micro-batch. Both announce sites call it, each right after the KV demotions' line."""
+    txn = body(norm(sycl_cpp), TXN_SIG)
+    announce = body(txn, ANNOUNCE_DEF)
+    return (bool(announce) and ordered(announce, ANNOUNCE_FOR, WARN_GATE, WARN_LITERAL)
+            and announce.count("GGML_LOG_WARN(") == 1
+            and txn.count(ANNOUNCE_PROBE) == 1 and txn.count(ANNOUNCE_COMMIT) == 1
+            and txn.count("announce_explicit_ubatch_placement(") == 2)
+
+
+def claim_refusal_names_the_largest_fit(sycl_cpp: str, admission_cpp: str) -> bool:
+    """The fallback refusal is for the micro-batch the load decided for, names the largest -ub that fits, and comes
+    before the ring re-plan; the figure is the ring admission's binary search over the ring's own geometry."""
+    txn = body(norm(sycl_cpp), TXN_SIG)
+    decide = body(norm(admission_cpp), DECIDE_SIG)
+    return (bool(txn) and ordered(txn, REFUSE_FOR, FITS, REFUSE_LITERAL, RING_REPLAN)
+            and bool(decide) and LARGEST_FIT in decide and all(f in decide for f in FIT_INPUTS))
+
+
+def claim_planner_moves_only_experts(cache_cpp: str) -> bool:
+    """The room is a named hold on the routed-expert budget, taken after the KV context room and before the pack's
+    stats, against what the dense weights, their KV and that room left, so it never moves a dense layer or KV. The
+    pack predicate is the budget less the hold, and the triplets a pack with the hold added back puts on the device
+    and the real pack does not are the ones it moved. The hold is the whole room on PLACE and GROW_ZONE alike, with the
+    part the zone already holds returned first, so the plan the load grows the zone for is the plan it keeps."""
+    cache = norm(cache_cpp)
+    planner = body(cache, PLANNER_SIG)
+    hold = body(cache, HOLD_SIG)
+    return (bool(planner) and ordered(planner, KV_ROOM, HOLD_CALL, STATS_DECL, WITHOUT_ROOM, PACK_PREDICATE, MOVED)
+            and planner.count(PACK_PREDICATE) == 1
+            and bool(hold) and ordered(hold, DECIDE, HOLD_REASON, HOLD_GATE, HOLD_STEPS))
+
+
+def claim_load_grows_the_zone_before_the_plan(sycl_cpp: str) -> bool:
+    """A room the experts can give grows the RUNTIME zone for the micro-batch, and the plan the load keeps is made
+    again with the room held. A zone that cannot grow gets the load's planning shape back and is planned without the
+    room, so no expert leaves the device for a zone that did not grow: the plan the load made before the ruling."""
+    store = body(norm(sycl_cpp), STORE_SIG)
+    return (bool(store)
+            and ordered(store, LAMBDA_ROOM, FIRST_PLAN, GROW_BRANCH, GROW_PUBLISH, GROW_REPLAN, GROW_FALLBACK,
+                        FALLBACK_PLAN)
+            and store.count("plan_single_device(false)") == 1)
+
+
+def claim_transport_names_no_micro_batch_for_auto(llama_h: str, model_cpp: str, sycl_cpp: str, common_cpp: str,
+                                                  bench_cpp: str, sycl_h: str = SYCL_H) -> bool:
+    """The micro-batch the caller names reaches the planner, and neither caller names one when the backend picks the
+    micro-batch itself, so the auto-ubatch trial's rungs never match a placed micro-batch. llama-bench reloads the
+    model when the named micro-batch changes."""
+    model = norm(model_cpp)
+    sycl = norm(sycl_cpp)
+    bench = norm(bench_cpp)
+    bench_hint = body(bench, BENCH_HINT_SIG)
+    return (PARAM_FIELD in norm(llama_h) and len(MODEL_DEFAULT_RE.findall(model_cpp)) == 1
+            and INVENTORY_SET in body(model, POPULATE_SIG) and model.count(CALLER_PASSES) == 2
+            and BACKEND_COPY in sycl and OFFSET_PIN in sycl
+            and HEADER_SIZE_PIN in norm(sycl_h) and HEADER_OFFSET_PIN in norm(sycl_h)
+            and COMMON_NONE in norm(common_cpp)
+            and bool(bench_hint) and bench_hint.lstrip("{ ").startswith(BENCH_NONE)
+            and BENCH_SET in bench and BENCH_EQUAL in bench)
+
+
+def test_placement_is_one_warn_line():
+    assert claim_placement_is_one_warn_line(SYCL_CPP)
+
+
+def test_refusal_names_the_largest_fit():
+    assert claim_refusal_names_the_largest_fit(SYCL_CPP, ADMISSION_CPP)
+
+
+def test_planner_moves_only_experts():
+    assert claim_planner_moves_only_experts(CACHE_CPP)
+
+
+def test_load_grows_the_zone_before_the_plan():
+    assert claim_load_grows_the_zone_before_the_plan(SYCL_CPP)
+
+
+def test_transport_names_no_micro_batch_for_auto():
+    assert claim_transport_names_no_micro_batch_for_auto(LLAMA_H, MODEL_CPP, SYCL_CPP, COMMON_CPP, BENCH_CPP)
+
+
+# ---- mutants: each must turn its claim red --------------------------------------------------------------------------
+
+
+def _once(text: str, old: str, new: str) -> str:
+    """`text` normalized, with the one occurrence of `old` (matched on normalized text) replaced by `new`."""
+    n = norm(text)
+    assert n.count(old) == 1, f"mutant anchor must match exactly once: {old!r} x{n.count(old)}"
+    return n.replace(old, new, 1)
+
+
+def test_mutant_decision_line_at_info_fails():
+    """Below default verbosity the decision is invisible, which is how the refusal it replaces read as no row."""
+    assert not claim_placement_is_one_warn_line(
+        _once(SYCL_CPP, WARN_LITERAL, WARN_LITERAL.replace("GGML_LOG_WARN(", "GGML_LOG_INFO(", 1)))
+
+
+def test_mutant_decision_line_without_the_bytes_moved_fails():
+    assert not claim_placement_is_one_warn_line(
+        _once(SYCL_CPP, WARN_LITERAL, WARN_LITERAL.replace(", %.1f MB moved", "").replace(", xub.moved_bytes / mb", "")))
+
+
+def test_mutant_decision_line_every_context_fails():
+    """Without the micro-batch filter every later context of the same micro-batch would print it again."""
+    assert not claim_placement_is_one_warn_line(
+        _once(SYCL_CPP, WARN_GATE, "if (!probe_mode && xub.moved_experts > 0) {"))
+
+
+def test_mutant_decision_line_for_a_probe_fails():
+    """A probe places nothing; the auto-ubatch trial runs in probe mode."""
+    assert not claim_placement_is_one_warn_line(
+        _once(SYCL_CPP, WARN_GATE, WARN_GATE.replace("!probe_mode && ", "", 1)))
+
+
+def test_mutant_commit_site_not_announced_fails():
+    assert not claim_placement_is_one_warn_line(
+        _once(SYCL_CPP, ANNOUNCE_COMMIT, "announce_kv_host_demotions(*immutable->plan);"))
+
+
+def test_mutant_refusal_without_the_largest_fit_fails():
+    """The figure is what the user needs to retry with; the ruling keeps it for the refusal only."""
+    assert not claim_refusal_names_the_largest_fit(_once(SYCL_CPP, FITS, ""), ADMISSION_CPP)
+
+
+def test_mutant_refusal_literal_reworded_fails():
+    assert not claim_refusal_names_the_largest_fit(
+        _once(SYCL_CPP, REFUSE_LITERAL, REFUSE_LITERAL.replace("re-placed to the host tier", "evicted", 1)),
+        ADMISSION_CPP)
+
+
+def test_mutant_refusal_after_the_ring_replan_fails():
+    """After the re-plan the legacy refusal (no largest fit) would answer first."""
+    n = _once(SYCL_CPP, RING_REPLAN, "")
+    at = n.find(REFUSE_FOR)
+    assert at >= 0
+    assert not claim_refusal_names_the_largest_fit(n[:at] + RING_REPLAN + " " + n[at:], ADMISSION_CPP)
+
+
+def test_mutant_largest_fit_not_from_the_ring_arithmetic_fails():
+    assert not claim_refusal_names_the_largest_fit(
+        SYCL_CPP, _once(ADMISSION_CPP, LARGEST_FIT, "decision.largest_fitting_n_ubatch = in.n_ubatch_default;"))
+
+
+def test_mutant_room_dips_into_the_kv_room_fails():
+    """Held before the KV context room, the ring would take the device bytes the opening context's KV holds."""
+    n = _once(CACHE_CPP, HOLD_CALL, "")
+    at = n.find(KV_ROOM)
+    assert at >= 0
+    assert not claim_planner_moves_only_experts(n[:at] + HOLD_CALL + " " + n[at:])
+
+
+def test_mutant_hold_only_on_place_fails():
+    """Holding nothing on GROW_ZONE packs the experts into the bytes the zone is about to take: the plan the load grows
+    the zone for would not be the plan it keeps."""
+    assert not claim_planner_moves_only_experts(
+        _once(CACHE_CPP, HOLD_GATE, "if (decision.action == pp_moe_onednn_explicit_ubatch_action::PLACE) {"))
+
+
+def test_mutant_hold_without_returning_the_grown_zone_fails():
+    """After the zone grew, its part of the room already left the weight capacity; holding it again double-counts."""
+    assert not claim_planner_moves_only_experts(
+        _once(CACHE_CPP, HOLD_STEPS, HOLD_STEPS.replace("remaining += room.room_reserved_bytes; ", "", 1)))
+
+
+def test_mutant_pack_predicate_ignores_the_hold_fails():
+    assert not claim_planner_moves_only_experts(
+        _once(CACHE_CPP, PACK_PREDICATE,
+              "const bool on_device = group.charge_bytes <= remaining + ubatch_hold_bytes;"))
+
+
+def test_mutant_moved_counts_device_experts_fails():
+    assert not claim_planner_moves_only_experts(
+        _once(CACHE_CPP, MOVED, MOVED.replace("if (!on_device) {", "if (on_device) {", 1)))
+
+
+def test_mutant_grown_zone_not_replanned_fails():
+    """Growing the zone without planning again keeps a plan packed into weight capacity the zone now holds."""
+    assert not claim_load_grows_the_zone_before_the_plan(_once(SYCL_CPP, GROW_REPLAN, "if (placed) { }"))
+
+
+def test_mutant_failed_growth_keeps_the_micro_batch_fails():
+    assert not claim_load_grows_the_zone_before_the_plan(_once(SYCL_CPP, GROW_FALLBACK, ""))
+
+
+def test_mutant_failed_growth_plans_with_the_room_fails():
+    """Planned with the room after the zone failed to grow, the fill reads GROW_ZONE again and the hold moves experts
+    to the host tier for a ring the zone cannot hold: worse than the load before the ruling."""
+    assert not claim_load_grows_the_zone_before_the_plan(
+        _once(SYCL_CPP, FALLBACK_PLAN, "plan_candidate = plan_single_device(true);"))
+
+
+def test_mutant_plan_without_room_keeps_the_room_fails():
+    assert not claim_load_grows_the_zone_before_the_plan(
+        _once(SYCL_CPP, LAMBDA_ROOM, LAMBDA_ROOM.replace(" g_placement_kv_info.explicit_ubatch = {};", "", 1)))
+
+
+def test_mutant_common_names_the_auto_micro_batch_fails():
+    """Naming the trial's micro-batch would let a rung place experts; the trial must stay unchanged."""
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP, SYCL_CPP,
+        _once(COMMON_CPP, COMMON_NONE, "mparams.n_ubatch_hint = 0; if (params.n_batch > 0) {"), BENCH_CPP)
+
+
+def test_mutant_bench_names_the_auto_micro_batch_fails():
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP, SYCL_CPP, COMMON_CPP, _once(BENCH_CPP, BENCH_NONE, "if (n_batch <= 0) { return 0; }"))
+
+
+def test_mutant_bench_reuses_the_model_across_micro_batches_fails():
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP, SYCL_CPP, COMMON_CPP, _once(BENCH_CPP, BENCH_EQUAL, ""))
+
+
+def test_mutant_header_layout_unpinned_fails():
+    """Without the header's pin, libllama could write the field where libggml-sycl does not read it."""
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP, SYCL_CPP, COMMON_CPP, BENCH_CPP, _once(SYCL_H, HEADER_OFFSET_PIN, ""))
+
+
+def test_mutant_backend_ignores_the_field_fails():
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP, _once(SYCL_CPP, BACKEND_COPY, ""), COMMON_CPP, BENCH_CPP)
+
+
+def test_mutant_default_hint_dropped_fails():
+    """A positional initializer list one short leaves the field zero-initialized, but a reordered one would not be."""
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP.replace("/*.n_ubatch_hint               =*/ 0,", "", 1), SYCL_CPP, COMMON_CPP, BENCH_CPP)
+
+
+def test_mutant_one_loader_stage_drops_the_hint_fails():
+    n = norm(MODEL_CPP)
+    at = n.find(CALLER_PASSES)
+    assert at >= 0
+    dropped = n[:at] + "hparams, model.get_n_ctx_hint());" + n[at + len(CALLER_PASSES):]
+    assert not claim_transport_names_no_micro_batch_for_auto(LLAMA_H, dropped, SYCL_CPP, COMMON_CPP, BENCH_CPP)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

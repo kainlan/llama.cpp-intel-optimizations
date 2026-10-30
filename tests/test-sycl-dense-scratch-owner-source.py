@@ -466,19 +466,27 @@ def claim_no_device_global_merge_remains(sycl: str, cache: str, cache_h: str, zo
 # ---- D7: the load-time owner ----------------------------------------------------------------------------------------
 
 
+DENSE_HELPER_SIG = "static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch("
+
+
 def claim_load_plan_is_keyed_by_the_open_load(sycl: str) -> bool:
     """populate_inventory_globals keys both plan stores by the owner of the load effect stage_inventory_plan holds on
     this thread, which the stage's scope sets beside the transaction id and restores with it; with no staged load it
-    stores nothing. No second lease is taken, so a failed acquire cannot read as "no open load"."""
+    stores nothing. No second lease is taken, so a failed acquire cannot read as "no open load". Both stores sit in
+    one helper (ggml_sycl_plan_load_dense_scratch), keyed by the owner its caller passes: populate passes this owner,
+    and the explicit micro-batch's ring placement re-plans the same load's figures at its micro-batch."""
     t = norm(sycl)
     b = body(t, POPULATE_SIG)
+    helper = body(t, DENSE_HELPER_SIG)
     stage = body(t, STAGE_SIG)
     owner_writes = re.findall(r"\bg_sycl_plan_load_effect_owner\s*=(?!=)", t)
     return (bool(b) and bool(stage) and ordered(
         b, "const ggml_sycl::lifecycle::SlotToken plan_owner = g_sycl_plan_load_effect_owner;",
         "const bool owned = plan_owner.generation != 0;",
-        "owned && ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(ctx->device, plan_owner,",
-        "owned && ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(ctx->device, plan_owner,")
+        "owned ? ggml_sycl_plan_load_dense_scratch(ctx->device, plan_owner, inventory_maxima,")
+        and bool(helper) and ordered(
+            helper, "ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(device, owner,",
+            "ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(device, owner,")
         and "acquire_load_effect(" not in b
         and "ggml_sycl_acquire_plan_load_effect" not in t
         and "static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owner{};" in t
@@ -960,9 +968,14 @@ def test_mutant_context_census_back_fails():
 
 def test_mutant_load_plan_without_an_owner_fails():
     assert not claim_load_plan_is_keyed_by_the_open_load(
-        _once(SYCL, "owned && ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(ctx->device, plan_owner,",
-              "ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(ctx->device, "
-              "ggml_sycl::lifecycle::SlotToken{ 0, 1 },"))
+        _once(SYCL, "owned ? ggml_sycl_plan_load_dense_scratch(ctx->device, plan_owner,",
+              "owned ? ggml_sycl_plan_load_dense_scratch(ctx->device, ggml_sycl::lifecycle::SlotToken{ 0, 1 },"))
+
+
+def test_mutant_dense_helper_ignores_its_owner_fails():
+    assert not claim_load_plan_is_keyed_by_the_open_load(
+        _once(SYCL, "ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(device, owner,",
+              "ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(device, ggml_sycl::lifecycle::SlotToken{ 0, 1 },"))
 
 
 def test_mutant_load_plan_taking_a_second_lease_fails():

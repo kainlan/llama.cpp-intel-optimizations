@@ -79,9 +79,12 @@ def reserve_call_arguments(source):
 # directory, with token pasting banned, so a new reservation site (or one that raises the ceiling and reads it back)
 # cannot appear without editing this gate. A count failure says which pin to bump after review.
 RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
-SET_PLANNED_CALLS_IN_FILE = 3   # plan, replan x2
-# Whole ggml-sycl directory, comments and strings removed: definition + the wrapper's call + hpp declaration + 5 calls.
-DIRECTORY_TOKENS = {"reserve": 8, "wrapper": 2, "setter": 5}
+# plan, the explicit micro-batch's load placement (ggml_sycl_publish_load_ubatch_scratch: the same planner-sized ring,
+# published at the micro-batch the caller named), replan x2
+SET_PLANNED_CALLS_IN_FILE = 4
+# Whole ggml-sycl directory, comments and strings removed: reserve is definition + the wrapper's call + hpp declaration
+# + 5 calls; setter is definition + hpp declaration + the 4 calls above.
+DIRECTORY_TOKENS = {"reserve": 8, "wrapper": 2, "setter": 6}
 _DIRECTORY_TOKEN_PATTERNS = {
     "reserve": r"(?<!\w)reserve_pp_moe_onednn_scratch\b",
     "wrapper": r"\bunified_cache_reserve_pp_moe_onednn_scratch\b",

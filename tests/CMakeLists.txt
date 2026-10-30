@@ -4738,6 +4738,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# An explicit -ub whose PP MoE oneDNN scratch ring does not fit the RUNTIME zone planned for the load's own micro-batch is
+# placed, not refused (owner ruling 2026-10-30): the load moves routed experts to the host tier for the ring's room and
+# the context prints one WARN line; only when the experts cannot give the room is it refused, with the largest -ub that
+# fits. The caller names no micro-batch for -ub auto, so the trial never places. A mutant per claim. Text only.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-explicit-ubatch-placement-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-explicit-ubatch-placement-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in
