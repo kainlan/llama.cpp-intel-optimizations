@@ -36819,11 +36819,11 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
 // and the loan selection); the callers are the transaction and the auto-ubatch trial's checks, never a per-graph
 // path, so a per-query cache is not warranted today.
-// The ring the loan funds is the one the plan it leaves sizes: lent triplets become host matrices,
-// which can widen the window. So the fit sizes the loan as the stream phase sizes it, from the post-loan plan with the
-// whole ring short (moe_stream_loan_size_post_loan; nothing is held before the prompt), and charges that geometry's
-// bytes less what the probe of that loan lends. When no loan converges the phase asks for none, so the pre-loan ring
-// is a demand on free memory, all of it, as a refused probe charges.
+// The ring the loan funds is the one the plan it leaves sizes: lent triplets become host matrices, which can widen the
+// window. So the fit sizes the loan as the stream phase sizes it, from the post-loan plan with the whole ring short
+// (moe_stream_loan_size_post_loan; nothing is held before the prompt), and charges that geometry's bytes less what the
+// probe of that loan lends. When no loan converges the phase asks for none, so the pre-loan ring is a demand on free
+// memory, all of it, as a refused probe charges.
 static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {

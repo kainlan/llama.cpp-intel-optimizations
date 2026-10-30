@@ -606,8 +606,8 @@ struct moe_stream_loan_sizing {
     bool                     converged  = false;
     size_t                   bytes      = 0;   // the request: the sized-for ring's slots not held, times its slot size
     moe_stream_ring_geometry geo        = {};  // the last post-loan ring: when converged, the one prepare() reserves
-    uint32_t                 steps      = 0;      // post-loan geometries computed
-    uint32_t                 n_triplets = 0;      // triplets the request selects
+    uint32_t                 steps      = 0;   // post-loan geometries computed
+    uint32_t                 n_triplets = 0;   // triplets the request selects
 };
 
 static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & sizer,
@@ -627,11 +627,11 @@ enum class moe_stream_loan_step : uint8_t {
 // moved since the last ask means that loan was refused: retrying would refuse again, so the latch holds until
 // end_prompt. An ACCEPTED loan that still left the ring short, or a BUSY one, leaves the count alone, so the next short
 // micro-batch asks again; a repeated request is harmless, since the largest since the last boundary wins.
-// With a `sizer`, the loan is sized from the plan it leaves (moe_stream_loan_size_post_loan): lent
-// triplets become host matrices, which can widen the window and so the ring the next micro-batch reserves. The request
-// is that converged loan, in that geometry's slots. When no loan converges, none is asked: the latch holds as for a
-// refused loan, and REFUSED is answered once. A null `sizer` has no plan to size against, and asks for the shortfall as
-// reported, in `slot_bytes`.
+// With a `sizer`, the loan is sized from the plan it leaves (moe_stream_loan_size_post_loan): lent triplets become host
+// matrices, which can widen the window and so the ring the next micro-batch reserves. The request is that converged
+// loan, in that geometry's slots. When no loan converges, none is asked: the latch holds as for a refused loan, and
+// REFUSED is answered once. A null `sizer` has no plan to size against, and asks for the shortfall as reported, in
+// `slot_bytes`.
 static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_loan_latch &       latch,
                                                                     int                           device,
                                                                     size_t                        bytes_short,
@@ -1389,7 +1389,16 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
 // ring in another slot size does not grow (the two sizes are not comparable), when the bound is spent, and when it has
 // nothing to size (no plan or no geometry). It reads the plan only: no device, no lock, nothing lent.
 // The claims hook answers from its own plan, the pre-loan one (one fact, one source); a staged claim reads the layout
-// of the weight's device experts, which a loan of AOS triplets leaves as it was.
+// of the weight's device experts, which a loan of AOS triplets leaves as it was. So the overlay claims what the
+// post-loan plan claims only while each lent triplet comes from a (layer, role) that already has a host expert: the
+// staged claim refuses a weight with none (ggml_sycl_moe_tensor_plan_staged_layout, counts.host == 0), so a matrix lent
+// from an all-device weight stages NONE here although the published post-loan plan may claim it. Today such a weight is
+// excluded only because it is bulk-staged at load, and a bulk tensor is not lendable (moe_loan_tensor_bulk_staged in
+// moe_loan_triplet_is_lendable). That exclusion fails when a resident expert carries an alternate on the same device,
+// since the tensor then does not bulk-stage. The fixed point is then not the ring prepare() rebuilds: the sizing
+// under-counts the post-loan ring, and that prompt pays one more boundary round trip (the next short reserve asks
+// again), or, when the real ring exceeds the cap, ring_ready() returns before any reserve on n_slots == 0 and the
+// prompt runs without a ring.
 static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & sizer,
                                                                     size_t                        bytes_short) {
     moe_stream_loan_sizing           out;

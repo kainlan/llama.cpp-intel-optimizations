@@ -1925,45 +1925,61 @@ def test_ring_slot_by_slot_fails_on_the_single_allocation_ring():
 
 
 LOAN_WARN_SIG = "void moe_stream_phase::warn_loan_refused(size_t bytes_short) const"
-LOAN_WARN_GUARD = ("if (log_ == nullptr || log_->sink == nullptr || "
-                   "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+LOAN_WARN_NULL = "if (log_ == nullptr || log_->sink == nullptr) { return; }"
+LOAN_WARN_UNCONVERGED_IF = "if (loan_latch_.unconverged) {"
+LOAN_WARN_UNCONVERGED_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and no loan fits the ring it would leave: "
+                             "no loan this prompt")
+LOAN_WARN_GATE = "if (policy_ != moe_exec_policy::RING && log_->trace < 1) { return; }"
 LOAN_WARN_FMT = ("[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this "
                  "prompt")
 LOAN_WARN_EMIT = "log_->sink(log_->sink_ctx, line);"
 
 
 def claim_refused_loan_warns_once(phase: str, tree: dict) -> bool:
-    """The brief's one WARN for a REFUSED loan (llama.cpp-3460): the helper answers REFUSED once per prompt, the branch
-    calls warn_loan_refused for it, and that WARN goes out through the decision log's sink under the gate of lead
-    ruling c-kcyf (an explicit ring or a trace), so the phase still prints nothing of its own at default verbosity
-    under AUTO (c-xod7-q1). There, the loan transaction's own "[MOE-EXEC] loan device %d refused" line, which the
-    latch now makes print once per prompt, is the one WARN. The format exists once in the backend."""
+    """The one WARN per prompt for a loan the short ring did not get (llama.cpp-3460): the helper answers REFUSED once
+    per prompt, the branch calls warn_loan_refused for it, and the line goes out through the decision log's sink. A
+    loan the boundary refused is gated as lead ruling c-kcyf gates the phase's lines (an explicit ring or a trace),
+    because at default verbosity under AUTO the loan transaction's own "[MOE-EXEC] loan device %d refused" line,
+    which the latch makes print once per prompt, is already its WARN. A loan that never converged asks the
+    transaction nothing, so its line is not gated: a refusal is never silent. Each format exists once in the backend."""
     w = body(norm(phase), LOAN_WARN_SIG)
     count = sum(norm(text).count(LOAN_WARN_FMT) for text in tree.values())
-    return (count == 1 and w.startswith("{ " + LOAN_WARN_GUARD)
-            and ordered(w, LOAN_WARN_GUARD, LOAN_WARN_FMT, LOAN_WARN_EMIT))
+    unconverged = sum(norm(text).count(LOAN_WARN_UNCONVERGED_FMT) for text in tree.values())
+    return (count == 1 and unconverged == 1 and w.startswith("{ " + LOAN_WARN_NULL)
+            and ordered(w, LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_FMT, "} else {",
+                        LOAN_WARN_GATE, LOAN_WARN_FMT, LOAN_WARN_EMIT)
+            and w.count("policy_") == 1 and w.count("log_->trace") == 1 and w.count(LOAN_WARN_EMIT) == 1)
 
 
 def test_refused_loan_warns_once():
     assert claim_refused_loan_warns_once(PHASE, SYCL_TREE), first_missing(
-        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_loan_refused (the warn format "
-        "is counted across the sycl tree)",
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_loan_refused (the warn formats "
+        "are counted across the sycl tree)",
         body(norm(PHASE), LOAN_WARN_SIG),
-        LOAN_WARN_GUARD, LOAN_WARN_FMT, LOAN_WARN_EMIT,
-        signature=LOAN_WARN_SIG)
+        LOAN_WARN_NULL, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_FMT, LOAN_WARN_GATE, LOAN_WARN_FMT,
+        LOAN_WARN_EMIT, signature=LOAN_WARN_SIG)
 
 
 def test_refused_loan_warn_mutants():
-    # Ungated: AUTO would print the phase's own line at default verbosity.
-    ungated = mutate(PHASE, " || (policy_ != moe_exec_policy::RING && log_->trace < 1)", "")
-    assert not claim_refused_loan_warns_once(ungated, {PHASE_REL: ungated})
+    c = claim_refused_loan_warns_once
+    # The refused loan's line ungated: AUTO would print the phase's own line next to the transaction's at default
+    # verbosity.
+    ungated = mutate(PHASE, LOAN_WARN_GATE, "")
+    assert not c(ungated, {PHASE_REL: ungated})
+    # The unconverged line re-gated, at the top as before or inside its own branch: a silent refusal under AUTO.
+    regated = mutate(PHASE, LOAN_WARN_NULL, "if (log_ == nullptr || log_->sink == nullptr || "
+                                            "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+    assert not c(regated, {PHASE_REL: regated})
+    in_branch = mutate(PHASE, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_IF + " " + LOAN_WARN_GATE)
+    assert not c(in_branch, {PHASE_REL: in_branch})
     # Never emitted.
     silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
-    assert not claim_refused_loan_warns_once(silent, {PHASE_REL: silent})
-    # The format restated elsewhere.
-    tree = dict(SYCL_TREE)
-    tree["extra.cpp"] = '"' + LOAN_WARN_FMT + '"'
-    assert not claim_refused_loan_warns_once(PHASE, tree)
+    assert not c(silent, {PHASE_REL: silent})
+    # A format restated elsewhere.
+    for fmt in (LOAN_WARN_FMT, LOAN_WARN_UNCONVERGED_FMT):
+        tree = dict(SYCL_TREE)
+        tree["extra.cpp"] = '"' + fmt + '"'
+        assert not c(PHASE, tree)
 
 
 DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u "

@@ -500,10 +500,9 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
 // wider, and none is asked when no loan converges (moe_stream_loan_size_post_loan). A refused reserve keeps the slots
 // it got, and its ring waits in pending_ring_ for the next micro-batch's attempt, which continues from those slots, so
 // the room a loan freed in holes a slot wide adds up across attempts instead of being asked for again as one block
-// (llama.cpp-am87). The hold lives only while a
-// loan can still fund it: once a loan this prompt asked for comes back refused, or the op wires no loan hook, the
-// refused ring gives its slots back at once, because mid-prompt runtime allocations prefer the WEIGHT zone too (lead
-// ruling, c-zgrd).
+// (llama.cpp-am87). The hold lives only while a loan can still fund it: once a loan this prompt asked for comes back
+// refused, or the op wires no loan hook, the refused ring gives its slots back at once, because mid-prompt runtime
+// allocations prefer the WEIGHT zone too (lead ruling, c-zgrd).
 bool moe_stream_phase::ring_ready(const moe_stream_loan_sizer * sizer) {
     if (ring_) {
         return true;
@@ -737,13 +736,14 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe
 }
 
 // One WARN per prompt when a loan the short ring asked for comes back REFUSED (llama.cpp-3460), or when no loan could
-// be sized because the ring of the plan a loan would leave never settles or does not fit: the helper
-// answers REFUSED once and then latches. It goes out under the same gate as the ring-unavailable line (lead ruling
-// c-kcyf), so at default verbosity under AUTO the phase still prints nothing of its own; there the loan transaction's
-// own "[MOE-EXEC] loan device %d refused: %s" line, which the latch makes print once per prompt, is the one WARN for a
-// refused loan, and a loan never sized asks the transaction nothing.
+// be sized because the ring of the plan a loan would leave never settles or does not fit: the helper answers REFUSED
+// once and then latches. A refused loan's line goes out under the same gate as the ring-unavailable line (lead ruling
+// c-kcyf), since at default verbosity under AUTO the loan transaction's own "[MOE-EXEC] loan device %d refused: %s"
+// line, which the latch makes print once per prompt, is already the one WARN for it. A loan never sized asks the
+// transaction nothing, so nothing else would say why the prompt runs without its ring: that line goes out under the
+// transaction line's condition instead, every policy and verbosity, once per prompt.
 void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
-    if (log_ == nullptr || log_->sink == nullptr || (policy_ != moe_exec_policy::RING && log_->trace < 1)) {
+    if (log_ == nullptr || log_->sink == nullptr) {
         return;
     }
     char line[200];
@@ -753,6 +753,9 @@ void moe_stream_phase::warn_loan_refused(size_t bytes_short) const {
                       "loan this prompt",
                       device_, bytes_short / (1024.0 * 1024.0));
     } else {
+        if (policy_ != moe_exec_policy::RING && log_->trace < 1) {
+            return;
+        }
         std::snprintf(line, sizeof(line),
                       "[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan "
                       "this prompt",
