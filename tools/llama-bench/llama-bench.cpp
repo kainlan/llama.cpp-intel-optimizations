@@ -1298,7 +1298,10 @@ struct cmd_params_instance {
     // depends on -b and -ub alone, so it does not reload on a context change either, and it is compared: the routed
     // experts the load moved to the host tier for one micro-batch's PP MoE scratch ring stay there, so a reused model
     // would measure a smaller micro-batch with experts it did not need to move, and a larger one would find no room for
-    // its ring. "-ub auto" names none, and neither does a build without the SYCL backend, so neither reloads.
+    // its ring. The reload re-plans the experts but not the arena's zones: the arena outlives the model and keeps the
+    // RUNTIME zone an earlier, larger micro-batch grew, so a later instance plans against that zone and keeps fewer
+    // experts on the device than a fresh process would. "-ub auto" names none, and neither does a build without the
+    // SYCL backend, so neither reloads.
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                n_ubatch_hint() == other.n_ubatch_hint() &&

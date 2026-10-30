@@ -2653,7 +2653,13 @@ for an automatic micro-batch, so the auto-ubatch trial is unchanged.
 `llama-bench` names the micro-batch from `-b` and `-ub` alone, not clamped by
 each test's context, and names none on a build without the SYCL backend. So
 the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
-reloads the model only when the named micro-batch changes. The planner
+reloads the model only when the named micro-batch changes. A reload re-plans
+the experts but not the arena's zones. The arena outlives the model and keeps a
+zone that is larger than a new plan needs. It rebuilds only a zone that is too
+small, and only while it holds nothing, which the PP MoE ring a previous context
+left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
+instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
+experts on the device than a fresh process would. The planner
 computes the RUNTIME room the ring, the dense scratch and the compute buffers
 need at that micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as a named term
 on the routed-expert budget, at the start of the MoE block. By then the dense
