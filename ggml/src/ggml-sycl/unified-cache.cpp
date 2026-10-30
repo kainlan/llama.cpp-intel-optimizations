@@ -968,11 +968,6 @@ static std::atomic<size_t>   g_planned_pp_moe_onednn_output_bytes_per_row[GGML_S
 static std::atomic<uint32_t> g_planned_pp_moe_onednn_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>     g_planned_pp_moe_onednn_activation_in_kv_zone[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>     g_planned_pp_moe_onednn_output_in_kv_zone[GGML_SYCL_MAX_DEVICES]{};
-// The compute buffers' growth above the planned compute term at the micro-batch the ring above was published for
-// (pp_moe_onednn_explicit_ubatch_compute_growth): the term is measured at the load's planning micro-batch, and an
-// explicit micro-batch's zone holds that micro-batch's buffers. Per device, like the ring it is published with; 0 at the
-// load's planning shape.
-static std::atomic<size_t>        g_planned_compute_growth_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>     g_atexit_registered{ false };  // Ensure atexit handler registered once
 static std::atomic<int>      g_cache_assert_enabled{ -1 };
 static std::atomic<int>      g_copy_trace_enabled{ -1 };
@@ -2983,13 +2978,6 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
         return false;
     }
     base += moe_host_scatter;
-    // The compute buffers' growth above the compute term at the explicit micro-batch the ring was published for lives
-    // in this zone too, checked the same way.
-    const size_t compute_growth = unified_cache_get_planned_compute_growth_bytes(device_id);
-    if (compute_growth > SIZE_MAX - base) {
-        return false;
-    }
-    base += compute_growth;
     // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
     // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
     const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
@@ -3034,29 +3022,25 @@ pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      d
     in.activation_bytes_per_row = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device_id);
     in.output_bytes_per_row     = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device_id);
     in.ring_depth               = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
-    // The requirement as ensure_planned_arena_zones() reads it, less the three terms that follow the micro-batch: the
-    // ring's RUNTIME part, the dense scratch and the compute buffers' growth, all as published now. What is left is the
-    // same at any micro-batch, and holds the compute term the growth is scaled from.
+    // The requirement as ensure_planned_arena_zones() reads it, less the two terms that follow the micro-batch: the
+    // ring's RUNTIME part and the dense scratch, both as published now. What is left is the same at any micro-batch.
     size_t       requirement    = 0;
     const size_t ring_bytes     = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
     const size_t ring_kv_bytes  = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device_id);
     const size_t ring_runtime   = ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0;
     const size_t mmq_src1       = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
     const size_t dequant_f16    = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
-    const size_t compute_growth = unified_cache_get_planned_compute_growth_bytes(device_id);
     if (!unified_cache_get_planned_runtime_zone_requirement(device_id, &requirement) ||
         !unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch_default, &in.dense_scratch_default_bytes) ||
         !unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch, &in.dense_scratch_bytes) ||
         mmq_src1 > SIZE_MAX - dequant_f16 || ring_runtime > SIZE_MAX - mmq_src1 - dequant_f16 ||
-        compute_growth > SIZE_MAX - ring_runtime - mmq_src1 - dequant_f16 ||
-        requirement < ring_runtime + mmq_src1 + dequant_f16 + compute_growth) {
+        requirement < ring_runtime + mmq_src1 + dequant_f16) {
         in.weight_slot_bytes = 0;  // an unanswerable term plans no room
         return pp_moe_onednn_explicit_ubatch_plan_room(in);
     }
-    in.runtime_fixed_bytes   = requirement - ring_runtime - mmq_src1 - dequant_f16 - compute_growth;
-    in.compute_default_bytes = unified_cache_get_planned_compute_term_bytes(device_id);
-    in.runtime_floor_bytes   = unified_cache_runtime_zone_floor_bytes();
-    in.runtime_zone_bytes    = cache->zone_capacity(vram_zone_id::RUNTIME);
+    in.runtime_fixed_bytes = requirement - ring_runtime - mmq_src1 - dequant_f16;
+    in.runtime_floor_bytes = unified_cache_runtime_zone_floor_bytes();
+    in.runtime_zone_bytes  = cache->zone_capacity(vram_zone_id::RUNTIME);
     return pp_moe_onednn_explicit_ubatch_plan_room(in);
 }
 
@@ -3792,20 +3776,6 @@ uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id) {
         return 0;
     }
     return g_planned_pp_moe_onednn_n_ubatch[device_id].load(std::memory_order_acquire);
-}
-
-void unified_cache_set_planned_compute_growth_bytes(int device_id, size_t bytes) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return;
-    }
-    g_planned_compute_growth_bytes[device_id].store(bytes, std::memory_order_release);
-}
-
-size_t unified_cache_get_planned_compute_growth_bytes(int device_id) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return 0;
-    }
-    return g_planned_compute_growth_bytes[device_id].load(std::memory_order_acquire);
 }
 
 bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
@@ -33434,19 +33404,28 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
 
 // The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
 // the runtime context transaction announces the outcome once, at WARN, when the context opens.
+size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
+                                              size_t                            compute_term,
+                                              uint32_t *                        n_ubatch) {
+    const bool placed = xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.n_ubatch != 0;
+    if (n_ubatch != nullptr) {
+        *n_ubatch = placed ? xub.n_ubatch : 0;
+    }
+    return placed ? compute_term : 0;
+}
+
 static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, int device_id) {
     if (xub.n_ubatch == 0) {
         return;
     }
     const double mb = 1024.0 * 1024.0;
     GGML_LOG_INFO(
-        "[PLACEMENT] explicit n_ubatch=%u PP MoE oneDNN scratch ring: %s (ring %.1f MB, compute buffers %.1f MB, "
-        "RUNTIME room %.1f MB of which %.1f MB already in the zone, expert budget %.1f MB, hold '%s' %.1f MB, moved "
-        "%zu experts in %zu layers, %.1f MB) on device %d\n",
-        xub.n_ubatch, pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.ring_bytes / mb,
-        xub.compute_room_bytes / mb, xub.room_bytes / mb, xub.room_reserved_bytes / mb, xub.expert_budget_bytes / mb,
-        xub.hold_reason != nullptr ? xub.hold_reason : "", xub.hold_bytes / mb, xub.moved_experts, xub.moved_layers,
-        xub.moved_bytes / mb, device_id);
+        "[PLACEMENT] explicit n_ubatch=%u PP MoE oneDNN scratch ring: %s (ring %.1f MB, RUNTIME room %.1f MB of which "
+        "%.1f MB already in the zone, expert budget %.1f MB, hold '%s' %.1f MB, moved %zu experts in %zu layers, "
+        "%.1f MB) on device %d\n",
+        xub.n_ubatch, pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.ring_bytes / mb, xub.room_bytes / mb,
+        xub.room_reserved_bytes / mb, xub.expert_budget_bytes / mb, xub.hold_reason != nullptr ? xub.hold_reason : "",
+        xub.hold_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb, device_id);
 }
 
 // The routed-expert budget's hold for an explicit micro-batch's PP MoE oneDNN scratch ring: the ring is planned in the
@@ -33473,7 +33452,6 @@ static size_t hold_explicit_ubatch_room(placement_plan & plan, const placement_k
     xub.ring_bytes                                        = room.ring_bytes;
     xub.room_bytes                                        = room.room_bytes;
     xub.room_reserved_bytes                               = room.room_reserved_bytes;
-    xub.compute_room_bytes                                = room.compute_bytes;
     xub.expert_budget_bytes                               = remaining;
     xub.max_ring_runtime_bytes                            = decision.max_ring_runtime_bytes;
     xub.largest_fitting_n_ubatch                          = decision.largest_fitting_n_ubatch;

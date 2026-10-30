@@ -10,8 +10,6 @@
 
 #include "moe-scratch-admission.hpp"
 
-#include "zone-sizing.hpp"
-
 #include <limits>
 
 namespace ggml_sycl {
@@ -238,31 +236,19 @@ static bool pp_moe_onednn_ring_bytes_at(const pp_moe_onednn_explicit_ubatch_inpu
     return true;
 }
 
-// The RUNTIME zone for a requirement of fixed + dense + ring + compute growth, as the arena reserves it: at least the
-// floor, rounded up to 256 bytes. False on overflow.
+// The RUNTIME zone for a requirement of fixed + dense + ring, as the arena reserves it: at least the floor, rounded up
+// to 256 bytes. False on overflow.
 static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,
                                              size_t                                       dense_bytes,
                                              size_t                                       ring_bytes,
-                                             size_t                                       compute_growth_bytes,
                                              size_t *                                     out) {
     constexpr size_t kMax = std::numeric_limits<size_t>::max();
-    if (in.runtime_fixed_bytes > kMax - dense_bytes || in.runtime_fixed_bytes + dense_bytes > kMax - ring_bytes ||
-        in.runtime_fixed_bytes + dense_bytes + ring_bytes > kMax - compute_growth_bytes) {
+    if (in.runtime_fixed_bytes > kMax - dense_bytes || in.runtime_fixed_bytes + dense_bytes > kMax - ring_bytes) {
         return false;
     }
-    const size_t requirement = in.runtime_fixed_bytes + dense_bytes + ring_bytes + compute_growth_bytes;
+    const size_t requirement = in.runtime_fixed_bytes + dense_bytes + ring_bytes;
     return pp_moe_onednn_checked_align_slot_bytes(
         requirement > in.runtime_floor_bytes ? requirement : in.runtime_floor_bytes, out);
-}
-
-size_t pp_moe_onednn_explicit_ubatch_compute_growth(size_t   compute_default_bytes,
-                                                    uint32_t n_ubatch_default,
-                                                    uint32_t n_ubatch) {
-    if (n_ubatch_default == 0 || n_ubatch <= n_ubatch_default) {
-        return 0;
-    }
-    const size_t scaled = zone_hold_scale_request(compute_default_bytes, n_ubatch_default, n_ubatch);
-    return scaled == std::numeric_limits<size_t>::max() ? scaled : scaled - compute_default_bytes;
 }
 
 pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
@@ -280,21 +266,13 @@ pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
     // nothing can be planned against them.
     size_t ring_default = 0;
     if (!pp_moe_onednn_ring_bytes_at(in, in.n_ubatch_default, &ring_default) ||
-        !pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_default_bytes, ring_default, 0,
-                                          &room.zone_default_bytes)) {
+        !pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_default_bytes, ring_default, &room.zone_default_bytes)) {
         room.valid = false;
         return room;
     }
-    room.compute_growth_bytes =
-        pp_moe_onednn_explicit_ubatch_compute_growth(in.compute_default_bytes, in.n_ubatch_default, in.n_ubatch);
-    room.compute_bytes = room.compute_growth_bytes > kMax - in.compute_default_bytes ?
-                             kMax :
-                             in.compute_default_bytes + room.compute_growth_bytes;
-    // An overflowing ring or compute growth for the explicit micro-batch is a room no budget holds, not a wrapped small
-    // one.
-    if (room.compute_growth_bytes == kMax || !pp_moe_onednn_ring_bytes_at(in, in.n_ubatch, &room.ring_bytes) ||
-        !pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_bytes, room.ring_bytes, room.compute_growth_bytes,
-                                          &room.zone_bytes)) {
+    // An overflowing ring for the explicit micro-batch is a room no budget holds, not a wrapped small one.
+    if (!pp_moe_onednn_ring_bytes_at(in, in.n_ubatch, &room.ring_bytes) ||
+        !pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_bytes, room.ring_bytes, &room.zone_bytes)) {
         room.ring_bytes = room.ring_bytes == 0 ? kMax : room.ring_bytes;
         room.zone_bytes = kMax;
         room.room_bytes = kMax;
@@ -325,42 +303,23 @@ pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide(
     }
     decision.action                                 = pp_moe_onednn_explicit_ubatch_action::REFUSE;
     // With every device-resident routed expert on the host tier the zone could be as large as it is now plus their
-    // bytes; the fixed rest, the dense scratch at the explicit micro-batch and the compute growth at the micro-batch
-    // asked about still take their share of it.
+    // bytes; the fixed rest and the dense scratch at the explicit micro-batch still take their share of it.
     const pp_moe_onednn_explicit_ubatch_inputs & in = room.in;
     const size_t                                 zone =
         in.runtime_zone_bytes > kMax - expert_budget_bytes ? kMax : in.runtime_zone_bytes + expert_budget_bytes;
-    const size_t fixed =
+    const size_t taken =
         in.runtime_fixed_bytes > kMax - in.dense_scratch_bytes ? kMax : in.runtime_fixed_bytes + in.dense_scratch_bytes;
-    auto ring_room_at = [&](uint32_t n_ubatch) -> size_t {
-        const size_t growth =
-            pp_moe_onednn_explicit_ubatch_compute_growth(in.compute_default_bytes, in.n_ubatch_default, n_ubatch);
-        const size_t taken = growth > kMax - fixed ? kMax : fixed + growth;
-        return zone > taken ? zone - taken : 0;
-    };
-    decision.max_ring_runtime_bytes = ring_room_at(in.n_ubatch);
-    // The largest micro-batch whose whole ring fits beside its own compute growth, by the ring admission's own slot
-    // arithmetic: no KV zone part is offered, so a ring that does not fit them entirely is not admitted. The growth
-    // shrinks with the micro-batch, so each candidate is asked with its own room; the ring and the growth only grow
-    // with it, so admission is monotone and a binary search over multiples of 32 below in.n_ubatch finds the largest.
+    decision.max_ring_runtime_bytes = zone > taken ? zone - taken : 0;
+    // The largest micro-batch whose whole ring fits those bytes, by the ring admission's own slot arithmetic: no KV
+    // zone part is offered, so a ring that does not fit them entirely is not admitted.
     pp_moe_onednn_ring_admission_inputs fit;
-    fit.weight_slot_bytes        = in.weight_slot_bytes;
-    fit.activation_bytes_per_row = in.activation_bytes_per_row;
-    fit.output_bytes_per_row     = in.output_bytes_per_row;
-    fit.ring_depth               = in.ring_depth;
-    uint32_t lo                  = 0;                           // count of 32-row steps known to fit (0: none)
-    uint32_t hi                  = (in.n_ubatch - 1) / 32 + 1;  // count known not to fit
-    while (hi - lo > 1) {
-        const uint32_t mid          = lo + (hi - lo) / 2;
-        fit.n_ubatch                = mid * 32;
-        fit.runtime_available_bytes = ring_room_at(fit.n_ubatch);
-        if (pp_moe_onednn_admit_ring(fit).admit) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    decision.largest_fitting_n_ubatch = lo * 32;
+    fit.runtime_available_bytes       = decision.max_ring_runtime_bytes;
+    fit.weight_slot_bytes             = in.weight_slot_bytes;
+    fit.activation_bytes_per_row      = in.activation_bytes_per_row;
+    fit.output_bytes_per_row          = in.output_bytes_per_row;
+    fit.ring_depth                    = in.ring_depth;
+    fit.n_ubatch                      = in.n_ubatch;
+    decision.largest_fitting_n_ubatch = pp_moe_onednn_admit_ring(fit).largest_fitting_n_ubatch;
     return decision;
 }
 

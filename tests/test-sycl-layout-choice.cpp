@@ -654,10 +654,7 @@ constexpr size_t room          = zone_explicit - zone_default;
 constexpr size_t ring_explicit = 6 * mib + mib / 2;
 constexpr size_t runtime_fixed = 1 * mib;
 
-// `compute_default_bytes` is the load's measured compute term at 512, part of the fixed rest; 0 leaves the compute
-// buffers out of the room.
-static ggml_sycl::pp_moe_onednn_explicit_ubatch_room room_with_zone(size_t runtime_zone_bytes,
-                                                                    size_t compute_default_bytes = 0) {
+static ggml_sycl::pp_moe_onednn_explicit_ubatch_room room_with_zone(size_t runtime_zone_bytes) {
     ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs in;
     in.n_ubatch                 = 2048;
     in.n_ubatch_default         = 512;
@@ -668,17 +665,14 @@ static ggml_sycl::pp_moe_onednn_explicit_ubatch_room room_with_zone(size_t runti
     in.runtime_fixed_bytes      = runtime_fixed;
     in.runtime_floor_bytes      = 0;
     in.runtime_zone_bytes       = runtime_zone_bytes;
-    in.compute_default_bytes    = compute_default_bytes;
     return ggml_sycl::pp_moe_onednn_explicit_ubatch_plan_room(in);
 }
 
-static ggml_sycl::placement_plan plan(size_t expert_bytes_left,
-                                      size_t runtime_zone_bytes,
-                                      size_t compute_default_bytes = 0) {
+static ggml_sycl::placement_plan plan(size_t expert_bytes_left, size_t runtime_zone_bytes) {
     using namespace kv_order_case;
     ggml_sycl::placement_kv_info kv = kv_info(0);
     kv.n_ubatch_context             = 2048;
-    kv.explicit_ubatch              = room_with_zone(runtime_zone_bytes, compute_default_bytes);
+    kv.explicit_ubatch              = room_with_zone(runtime_zone_bytes);
     const size_t budget             = 2 * dense_bytes + 2 * kv_at_512 + expert_bytes_left;
     return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_experts);
 }
@@ -818,53 +812,6 @@ static bool run_explicit_ubatch_ring_placement_test() {
         ok = false;
     }
 
-    // The compute buffers at the explicit micro-batch: the load measured a 256 KiB compute term at 512 (part of the
-    // 1 MiB fixed rest), and at 2048 the buffers are estimated at four times that, so the zone also needs their
-    // 768 KiB growth, one more triplet: a 7-triplet room. Six triplets hold the ring's room but not the buffers'
-    // growth: without the term that budget grows the zone, with it the context is refused. The largest fit is 1824,
-    // whose ring is the most the 7.5 MiB zone holds beside the fixed rest and that micro-batch's own 656 KiB growth;
-    // the ring room at 2048 is 7.5 - 1 - 0.75 = 5.75 MiB.
-    constexpr size_t compute_term   = 256 * 1024;
-    constexpr size_t compute_growth = 3 * compute_term;
-    const auto       ring_only      = plan(6 * triplet, zone_default);
-    const auto       with_compute   = plan(6 * triplet, zone_default, compute_term);
-    const auto &     cxub           = with_compute.explicit_ubatch;
-    if (ring_only.explicit_ubatch.action != action::GROW_ZONE || cxub.action != action::REFUSE ||
-        cxub.room_bytes != room + compute_growth || cxub.compute_room_bytes != compute_term + compute_growth ||
-        cxub.max_ring_runtime_bytes != 5 * mib + 3 * mib / 4 || cxub.largest_fitting_n_ubatch != 1824 ||
-        kv_order_case::device_triplets(with_compute) != 6 || cxub.hold_bytes != 0) {
-        printf(
-            "FAIL: a budget that holds the ring but not the compute buffers' growth is refused: without the term "
-            "%s, with it %s (room %zu, compute %zu, ring room %zu, largest -ub %u, %zu device triplets, hold %zu); "
-            "want grow-zone, refuse (%zu, %zu, %zu, 1824, 6, 0)\n",
-            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(ring_only.explicit_ubatch.action),
-            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(cxub.action), cxub.room_bytes, cxub.compute_room_bytes,
-            cxub.max_ring_runtime_bytes, cxub.largest_fitting_n_ubatch, kv_order_case::device_triplets(with_compute),
-            cxub.hold_bytes, room + compute_growth, compute_term + compute_growth, 5 * mib + 3 * mib / 4);
-        ok = false;
-    }
-
-    // Eight triplets give the 7-triplet room: the zone grows by it, and the placed plan keeps one triplet on the
-    // device, moves seven, and records the compute room the fit credits.
-    const auto   grow_compute   = plan(8 * triplet, zone_default, compute_term);
-    const auto   placed_compute = plan(1 * triplet, zone_explicit + compute_growth, compute_term);
-    const auto & pxub           = placed_compute.explicit_ubatch;
-    if (grow_compute.explicit_ubatch.action != action::GROW_ZONE ||
-        grow_compute.explicit_ubatch.hold_bytes != 7 * triplet || pxub.action != action::PLACE ||
-        pxub.hold_bytes != 7 * triplet || pxub.moved_experts != 7 || pxub.compute_room_bytes != 4 * compute_term ||
-        kv_order_case::device_triplets(placed_compute) != 1 || !same_device_placement(grow_compute, placed_compute)) {
-        printf(
-            "FAIL: a room with the compute buffers' growth is held whole: grow %s (hold %zu), place %s (hold %zu, "
-            "moved %zu, compute %zu, %zu device triplets, same placement %d); want grow-zone (%zu), place (%zu, 7, "
-            "%zu, 1, 1)\n",
-            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(grow_compute.explicit_ubatch.action),
-            grow_compute.explicit_ubatch.hold_bytes, ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(pxub.action),
-            pxub.hold_bytes, pxub.moved_experts, pxub.compute_room_bytes,
-            kv_order_case::device_triplets(placed_compute), same_device_placement(grow_compute, placed_compute) ? 1 : 0,
-            7 * triplet, 7 * triplet, 4 * compute_term);
-        ok = false;
-    }
-
     // No micro-batch named: no decision, and the plan is the one the load always made.
     ggml_sycl::placement_kv_info plain   = kv_order_case::kv_info(0);
     const auto                   unnamed = ggml_sycl::compute_placement_plan(
@@ -879,10 +826,34 @@ static bool run_explicit_ubatch_ring_placement_test() {
         ok = false;
     }
 
+    // The compute room the hold-spill fit credits is the planned compute term at the micro-batch the PLACE plan placed.
+    // The GROW_ZONE plan is planned again once the zone grows and is never the published one, and the two refusals and
+    // the unnamed plan sized no room, so each gives none.
+    constexpr size_t compute_term = 256 * 1024;
+    uint32_t         room_n       = 0;
+    const size_t     room_placed =
+        ggml_sycl::placement_explicit_ubatch_compute_room(placed.explicit_ubatch, compute_term, &room_n);
+    size_t room_others = 0;
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        uint32_t other_n = 1;
+        room_others +=
+            ggml_sycl::placement_explicit_ubatch_compute_room(other->explicit_ubatch, compute_term, &other_n);
+        room_others += other_n;
+    }
+    if (room_placed != compute_term || room_n != 2048 || room_others != 0 ||
+        ggml_sycl::placement_explicit_ubatch_compute_room(placed.explicit_ubatch, compute_term, nullptr) !=
+            compute_term) {
+        printf(
+            "FAIL: the compute room is the planned term at the placed micro-batch only: %zu at n_ubatch %u for the "
+            "placed plan, %zu summed over grow-zone, both refusals and no decision; want %zu at 2048, 0\n",
+            room_placed, room_n, room_others, compute_term);
+        ok = false;
+    }
+
     if (ok) {
         printf(
-            "PASS: an explicit micro-batch's ring and compute-buffer room comes out of the routed experts, refused "
-            "with the largest fit only when they cannot give it\n");
+            "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "
+            "only when they cannot give it\n");
     }
     return ok;
 }

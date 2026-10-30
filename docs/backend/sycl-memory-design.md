@@ -2660,9 +2660,9 @@ small, and only while it holds nothing, which the PP MoE ring a previous context
 left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
 instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
 experts on the device than a fresh process would. The planner
-computes the RUNTIME room the ring, the dense scratch and the compute buffers
-need at that micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as a named term
-on the routed-expert budget, at the start of the MoE block. By then the dense
+computes the RUNTIME room the ring and the dense scratch need at that
+micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as
+a named term on the routed-expert budget, at the start of the MoE block. By then the dense
 weights, their KV and the KV context room are placed, so the room never moves a
 dense layer or KV. That answers the objection above to growing the zone at load:
 the requested context's KV room is now held first, so KV still wins. The experts
@@ -2673,19 +2673,18 @@ plans again. The experts that no longer fit go to the host tier, where the CPU
 runs them. The context then prints one WARN line:
 
 ```
-[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB, beside <C> MB of compute buffers:
-re-placed <M> experts (<K> layers) to the host tier, <X> MB moved (device 0)
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB: re-placed <M> experts (<K> layers)
+to the host tier, <X> MB moved (device 0)
 ```
 
 The context is refused only when moving every device-resident routed expert
-would not free the room. The refusal names the largest `-ub` whose ring fits
-beside that micro-batch's own compute buffers, from
-`pp_moe_onednn_admit_ring()`'s slot arithmetic:
+would not free the room. The refusal names the largest `-ub` whose ring fits,
+from `pp_moe_onednn_admit_ring()`'s slot arithmetic:
 
 ```
 [SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=<N> needs <R> MB, more
-than the RUNTIME zone can hold beside <C> MB of compute buffers with every device-resident expert re-placed to
-the host tier (<F> MB); the largest -ub that fits is <L> (device=0)
+than the RUNTIME zone can hold with every device-resident expert re-placed to the host tier (<F> MB); the
+largest -ub that fits is <L> (device=0)
 ```
 
 The arena can fail to grow for two reasons, and each prints its own line first:
@@ -2719,35 +2718,34 @@ The context then re-plans the ring as described above.
 Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
 
-The compute buffers are part of the room because the load measures its compute
-term at the planning shape: `n_ctx_train` and ubatch 512 (`llama.cpp-fkpg`).
-The buffers at the named micro-batch are estimated by scaling that term
-linearly, with the estimator the hold-spill fit already scales a rung's buffers
-with (`zone_hold_scale_request()`). The growth above the term is published with
-the ring as its own RUNTIME requirement term
-(`unified_cache_get_planned_compute_growth_bytes()`), and every stage that
-re-publishes the planning shape clears it. The routed experts give the growth
-up with the ring's room, and the ring re-plan leaves it room.
+The room does not grow for the compute buffers. The RUNTIME zone's fixed part
+holds the compute term the load measured at its planning shape, `n_ctx_train`
+and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
+scratch sit beside it. So once the plan has placed the micro-batch, the
+hold-spill fit credits a compute buffer of that rung no larger than the term,
+whole or nothing (`placement_explicit_ubatch_compute_room()` and
+`zone_hold_fit_rung_has_compute_room()`). Every other rung, the auto trial's
+included, is judged as before. Without the credit the fit charges the buffer as
+if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
+refused the context: 1993.8 MB of worst-case spill against 1946.2 MB free
+outside the arena, although the zone held the 1960 MiB buffer beside a term of
+about 2055 MiB. The 256 MB driver headroom is not added to the hold. It is free
+memory outside the arena, which demoting experts does not change, and the fit
+still requires it there.
 
-Once the plan has placed the micro-batch, the hold-spill fit credits a compute
-buffer of that rung no larger than the room, whole or nothing. Without the
-credit the fit charges the buffer as if the hold kept it out of the zone. On the
-B70 with Qwen3.8 at `-ub 2048` that refused the context: 1993.8 MB of
-worst-case spill against 1946.2 MB free outside the arena, although the zone
-held the 1960 MiB buffer. The 256 MB driver headroom is not added to the hold.
-It is free memory outside the arena, which demoting experts does not change,
-and the fit still requires it there.
-
-The estimate is conservative. On that model and card the term is about
-2055 MiB, so at 2048 the room holds about 8220 MiB of compute buffers where the
-context measured 1960 MiB. The placement moves about 6.2 GB more experts than
-the measured buffer needs.
+The credit can over-credit a rung whose compute buffers span several chunks,
+because the fit compares the rung's largest single buffer with a term that is a
+sum of per-chunk peaks, which the other chunks draw on too. A buffer larger than
+the term at the placed micro-batch gets no credit, so the hold-spill refusal and
+its largest `-ub` advice still answer that case.
 
 Host tests: `test-pp-moe-ring-admission.cpp` pins the room and the decision,
-`test-zone-sizing.cpp` pins the fit's credit, `tests/test-sycl-layout-choice.cpp`
-pins the planner's choice and the bytes it moves, and
-`tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring and the
-placement, refusal and failed-growth lines, with a mutant per claim.
+`test-zone-sizing.cpp` pins the fit's credit and that every other rung is judged
+as before, `tests/test-sycl-layout-choice.cpp` pins the planner's choice, the
+bytes it moves and the compute room it gives the fit, and
+`tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring, the fit's
+credit and the placement, refusal and failed-growth lines, with a mutant per
+claim.
 
 ### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
 

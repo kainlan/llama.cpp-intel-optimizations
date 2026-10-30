@@ -878,9 +878,6 @@ struct placement_explicit_ubatch {
     size_t                               ring_bytes               = 0;  // the whole ring at n_ubatch
     size_t                               room_bytes               = 0;  // its RUNTIME zone over the default ring's
     size_t                               room_reserved_bytes      = 0;  // of that room, what the zone already holds
-    // The compute buffers at n_ubatch the room sizes the zone to hold (the load's measured compute term scaled to it).
-    // Once PLACE has grown the zone, the hold-spill fit credits a compute buffer of that micro-batch against it.
-    size_t                               compute_room_bytes       = 0;
     size_t                               expert_budget_bytes      = 0;  // the device bytes left to the routed experts
     // The routed-expert triplets a first-fit pack with the held room added back puts on the device and the real pack
     // puts on the host, the distinct layers they belong to, and their device bytes: what the room moved.
@@ -896,6 +893,15 @@ struct placement_explicit_ubatch {
     const char *                         hold_reason              = nullptr;
     size_t                               hold_bytes               = 0;
 };
+
+// The compute room the RUNTIME zone of a placed explicit micro-batch holds for that micro-batch's compute buffers, for
+// the hold-spill fit to credit (zone_hold_fit_inputs): `compute_term`, the planned compute term the zone holds beside
+// the micro-batch's ring and dense scratch, with xub.n_ubatch in *n_ubatch. Only PLACE sized the zone for the
+// micro-batch. GROW_ZONE plans again and reads PLACE, a growth that failed plans with no decision, and REFUSE and NONE
+// sized nothing, so each of those gives 0 with *n_ubatch 0.
+size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
+                                              size_t                            compute_term,
+                                              uint32_t *                        n_ubatch);
 
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
@@ -2531,13 +2537,6 @@ size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_i
 void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_t n_ubatch);
 uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
 
-// The compute buffers' growth above the planned compute term at the micro-batch the ring was last published for at
-// load (pp_moe_onednn_explicit_ubatch_compute_growth), folded into unified_cache_get_planned_runtime_zone_requirement()
-// so an explicit micro-batch's RUNTIME zone holds that micro-batch's compute buffers. Published with the ring by the
-// load, 0 at its planning shape.
-void   unified_cache_set_planned_compute_growth_bytes(int device_id, size_t bytes);
-size_t unified_cache_get_planned_compute_growth_bytes(int device_id);
-
 // Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
 // align256(n_ubatch * per_row) for both activation and output, through the
 // same pp_moe_onednn_checked_align_slot_bytes() (moe-scratch-admission.hpp)
@@ -2598,11 +2597,11 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
 // at least this, and an explicit micro-batch's room is measured against the same floor.
 size_t unified_cache_runtime_zone_floor_bytes();
 
-// The RUNTIME zone room the PP MoE oneDNN scratch ring and the compute buffers of the explicit micro-batch `n_ubatch`
-// need on `device_id` above the zone the load's `n_ubatch_default` needs. Composed from the published plan: the ring
-// geometry, the requirement less its ring, dense scratch and compute growth parts, the planned compute term, the dense
-// scratch at both micro-batches, the floor, and the RUNTIME zone as the arena holds it now. Invalid when the device has
-// no active arena or no ring, n_ubatch is not above n_ubatch_default, or a planned term is unanswerable.
+// The RUNTIME zone room the PP MoE oneDNN scratch ring of the explicit micro-batch `n_ubatch` needs on `device_id`
+// above the zone the ring of the load's `n_ubatch_default` needs. Composed from the published plan: the ring geometry,
+// the requirement less its ring and dense scratch parts, the dense scratch at both micro-batches, the floor, and the
+// RUNTIME zone as the arena holds it now. Invalid when the device has no active arena or no ring, n_ubatch is not above
+// n_ubatch_default, or a planned term is unanswerable.
 pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      device_id,
                                                                       uint32_t n_ubatch,
                                                                       uint32_t n_ubatch_default);

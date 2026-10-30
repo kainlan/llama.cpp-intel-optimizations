@@ -19,12 +19,11 @@ What this gate pins:
   pack with the hold added back;
 - the load grows the RUNTIME zone for that micro-batch before the plan it keeps, and falls back to the load's planning
   shape, planned without the room, when the arena cannot grow;
-- the room holds the micro-batch's compute buffers too: the load's measured compute term scaled to it by the hold-spill
-  fit's own estimator, published with the ring as a RUNTIME requirement term, and credited by the hold-spill fit at
-  that rung once the plan placed it;
-- the context announces the placement in ONE WARN line, with the compute buffers and the experts and bytes moved;
-- the fallback refusal names the largest -ub that fits, from the ring admission's own slot arithmetic, each candidate
-  beside its own compute buffers.
+- the context announces the placement in ONE WARN line, with the experts and bytes moved;
+- the fallback refusal names the largest -ub that fits, from the ring admission's own slot arithmetic;
+- the hold-spill fit credits a compute buffer no larger than the planned compute term at the micro-batch the published
+  single-device plan PLACED on the device, read once before the demand, whole or nothing; every other rung, and every
+  load that placed none, is judged as before.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -128,10 +127,9 @@ POPULATE_SIG = "static void llama_model_sycl_populate_inventory("
 BENCH_HINT_SIG = "uint32_t n_ubatch_hint() const"
 
 # The decision line: one WARN, when the room moved experts and the context is the first of its micro-batch.
-WARN_LITERAL = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB, beside %.1f MB '
-                'of compute buffers: re-placed %zu experts (%zu layers) to the host tier, %.1f MB moved (device %d)'
-                '\\n", xub.n_ubatch, xub.ring_bytes / mb, xub.compute_room_bytes / mb, xub.moved_experts, '
-                'xub.moved_layers, xub.moved_bytes / mb, ctx->device);')
+WARN_LITERAL = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: re-placed %zu '
+                'experts (%zu layers) to the host tier, %.1f MB moved (device %d)\\n", xub.n_ubatch, '
+                'xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb, ctx->device);')
 WARN_GATE = "if (!probe_mode && xub.moved_experts > 0 && current->kv_info.n_ubatch != next_kv_info.n_ubatch) {"
 ANNOUNCE_DEF = "auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan)"
 ANNOUNCE_FOR = ("if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || "
@@ -144,65 +142,35 @@ REFUSE_FOR = ("if (xub.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action
               "xub.n_ubatch == next_kv_info.n_ubatch) {")
 FITS = 'std::snprintf(fits, sizeof(fits), "; the largest -ub that fits is %u", xub.largest_fitting_n_ubatch);'
 REFUSE_LITERAL = ('"[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs '
-                  '%.1f MB, more than the RUNTIME zone can hold beside %.1f MB of compute buffers with every '
-                  'device-resident expert re-placed to the host tier (%.1f MB)%s (device=%d)\\n", xub.n_ubatch, '
-                  'xub.ring_bytes / mb, xub.compute_room_bytes / mb, xub.max_ring_runtime_bytes / mb, fits, '
-                  'ctx->device);')
+                  '%.1f MB, more than the RUNTIME zone can hold with every device-resident expert re-placed to the '
+                  'host tier (%.1f MB)%s (device=%d)\\n", xub.n_ubatch, xub.ring_bytes / mb, '
+                  'xub.max_ring_runtime_bytes / mb, fits, ctx->device);')
 RING_REPLAN = ("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, "
                "&ring_kv_zone);")
-# The ring room at a micro-batch is the zone with every device expert moved, less the fixed rest, the dense scratch and
-# that micro-batch's own compute growth; the refusal reports it at the explicit micro-batch, and the largest fit is the
-# ring admission's answer over multiples of 32, each asked with its own room.
-RING_ROOM_GROWTH = ("const size_t growth = pp_moe_onednn_explicit_ubatch_compute_growth(in.compute_default_bytes, "
-                    "in.n_ubatch_default, n_ubatch);")
-MAX_RING = "decision.max_ring_runtime_bytes = ring_room_at(in.n_ubatch);"
-LARGEST_FIT = "decision.largest_fitting_n_ubatch = lo * 32;"
+LARGEST_FIT = "decision.largest_fitting_n_ubatch = pp_moe_onednn_admit_ring(fit).largest_fitting_n_ubatch;"
 FIT_INPUTS = (
+    "fit.runtime_available_bytes = decision.max_ring_runtime_bytes;",
     "fit.weight_slot_bytes = in.weight_slot_bytes;",
     "fit.activation_bytes_per_row = in.activation_bytes_per_row;",
     "fit.output_bytes_per_row = in.output_bytes_per_row;",
     "fit.ring_depth = in.ring_depth;",
-    "fit.n_ubatch = mid * 32;",
-    "fit.runtime_available_bytes = ring_room_at(fit.n_ubatch);",
-    "if (pp_moe_onednn_admit_ring(fit).admit) {",
+    "fit.n_ubatch = in.n_ubatch;",
 )
 
-# The compute buffers of the explicit micro-batch: the measured term scaled by the hold-spill fit's own estimator, its
-# growth part of the zone the room sizes, published with the ring as a requirement term the fixed rest excludes, and
-# recorded on the decision.
-GROWTH_SIG = "size_t pp_moe_onednn_explicit_ubatch_compute_growth("
-GROWTH_SCALE = "const size_t scaled = zone_hold_scale_request(compute_default_bytes, n_ubatch_default, n_ubatch);"
-PLAN_ROOM_SIG = "pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room("
-ROOM_GROWTH = ("room.compute_growth_bytes = pp_moe_onednn_explicit_ubatch_compute_growth(in.compute_default_bytes, "
-               "in.n_ubatch_default, in.n_ubatch);")
-ZONE_DEFAULT = ("pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_default_bytes, ring_default, 0, "
-                "&room.zone_default_bytes)")
-ZONE_EXPLICIT = ("pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_bytes, room.ring_bytes, "
-                 "room.compute_growth_bytes, &room.zone_bytes)")
-REQUIREMENT_SUM = ("const size_t compute_growth = unified_cache_get_planned_compute_growth_bytes(device_id); "
-                   "if (compute_growth > SIZE_MAX - base) { return false; } base += compute_growth;")
-ROOM_FN_SIG = "pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int device_id,"
-FIXED_REST = "in.runtime_fixed_bytes = requirement - ring_runtime - mmq_src1 - dequant_f16 - compute_growth;"
-COMPUTE_TERM = "in.compute_default_bytes = unified_cache_get_planned_compute_term_bytes(device_id);"
-HOLD_COMPUTE = "xub.compute_room_bytes = room.compute_bytes;"
-PUBLISH_SIG = "static bool ggml_sycl_publish_load_ubatch_scratch(int device, uint32_t n_ubatch)"
-PUBLISH_GROWTH = ("const size_t compute_growth = ggml_sycl::pp_moe_onednn_explicit_ubatch_compute_growth("
-                  "ggml_sycl::unified_cache_get_planned_compute_term_bytes(device), g_placement_kv_info.n_ubatch, "
-                  "n_ubatch); ggml_sycl::unified_cache_set_planned_compute_growth_bytes(device, compute_growth);")
-PUBLISH_RETURN = "return dense.mmq_src1 && dense.dequant_f16 && compute_growth != SIZE_MAX;"
-POPULATE_RESET = ("ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(ctx->device, inventory->n_ubatch); "
-                  "ggml_sycl::unified_cache_set_planned_compute_growth_bytes(ctx->device, 0);")
-RING_PENDING_GROWTH = ("ring_kv_zone.runtime_pending_bytes += "
-                       "ggml_sycl::unified_cache_get_planned_compute_growth_bytes(ctx->device);")
-
-# The hold-spill fit credits the compute room of the explicit micro-batch the published plan placed on the device.
+# The hold-spill fit credits the planned compute term at the explicit micro-batch the published plan placed on the
+# device: the room comes from the placement's own helper (PLACE only), each field is assigned once, before the demand.
 FIT_SIG = "static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer)"
 FIT_PLAN = "const auto room_plan = ggml_sycl_global_plan_owner();"
-FIT_GATE = ("if (!room_plan->multi_device && room_plan->device_id == q.device && "
-            "xub.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE) {")
-FIT_ROOM = "in.compute_room_n_ubatch = xub.n_ubatch; in.compute_room_bytes = xub.compute_room_bytes;"
+FIT_GATE = "if (!room_plan->multi_device && room_plan->device_id == q.device) {"
+FIT_ROOM = ("room_bytes = ggml_sycl::placement_explicit_ubatch_compute_room(room_plan->explicit_ubatch, "
+            "ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device), &room_n_ubatch);")
+FIT_FIELDS = "in.compute_room_n_ubatch = room_n_ubatch; in.compute_room_bytes = room_bytes;"
 FIT_DEMAND = "a.demand = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);"
 FIT_FITS = "const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);"
+ROOM_HELPER_SIG = "size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,"
+ROOM_HELPER_RULE = ("const bool placed = xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.n_ubatch != 0; "
+                    "if (n_ubatch != nullptr) { *n_ubatch = placed ? xub.n_ubatch : 0; } "
+                    "return placed ? compute_term : 0;")
 CREDIT_SIG = "bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request)"
 CREDIT_RULE = "return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;"
 DEMAND_SIG = "size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
@@ -285,42 +253,20 @@ def claim_refusal_names_the_largest_fit(sycl_cpp: str, admission_cpp: str) -> bo
     txn = body(norm(sycl_cpp), TXN_SIG)
     decide = body(norm(admission_cpp), DECIDE_SIG)
     return (bool(txn) and ordered(txn, REFUSE_FOR, FITS, REFUSE_LITERAL, RING_REPLAN)
-            and bool(decide) and ordered(decide, RING_ROOM_GROWTH, MAX_RING, *FIT_INPUTS, LARGEST_FIT))
+            and bool(decide) and LARGEST_FIT in decide and all(f in decide for f in FIT_INPUTS))
 
 
-def claim_room_holds_the_compute_buffers(admission_cpp: str, cache_cpp: str, sycl_cpp: str) -> bool:
-    """The explicit micro-batch's room holds its compute buffers: the load's measured compute term, scaled to the
-    micro-batch by the estimator the hold-spill fit scales a rung's buffers with, grows the zone that micro-batch needs
-    (and not the default's). The load publishes that growth with the ring as a RUNTIME requirement term and clears it
-    with the planning shape, the room's fixed rest excludes it and holds the term it is scaled from, the decision
-    records the compute room, and the ring re-plan leaves the growth its room."""
-    admission = norm(admission_cpp)
-    cache = norm(cache_cpp)
-    sycl = norm(sycl_cpp)
-    growth = body(admission, GROWTH_SIG)
-    plan_room = body(admission, PLAN_ROOM_SIG)
-    room_fn = body(cache, ROOM_FN_SIG)
-    publish = body(sycl, PUBLISH_SIG)
-    txn = body(sycl, TXN_SIG)
-    return (bool(growth) and GROWTH_SCALE in growth
-            and bool(plan_room) and ordered(plan_room, ZONE_DEFAULT, ROOM_GROWTH, ZONE_EXPLICIT)
-            and cache.count(REQUIREMENT_SUM) == 1
-            and bool(room_fn) and ordered(room_fn, FIXED_REST, COMPUTE_TERM)
-            and HOLD_COMPUTE in body(cache, HOLD_SIG)
-            and bool(publish) and ordered(publish, PUBLISH_GROWTH, PUBLISH_RETURN)
-            and sycl.count(POPULATE_RESET) == 1
-            and bool(txn) and ordered(txn, RING_PENDING_GROWTH, RING_REPLAN))
-
-
-def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str) -> bool:
-    """The hold-spill fit credits the compute room of the explicit micro-batch the published plan PLACED on the
-    device, read before the demand is asked: at that rung a request no larger than the room adds nothing to the bound
-    (whole or nothing), the plan stays in it, and every other rung and load is judged as before."""
+def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cache_cpp: str) -> bool:
+    """The hold-spill fit credits the planned compute term at the explicit micro-batch the published single-device
+    plan PLACED on the device, read once before the demand is asked: at that rung a request no larger than the term
+    adds nothing to the bound (whole or nothing), the plan stays in it, and every other rung and load is judged as
+    before."""
     fit = body(norm(sycl_cpp), FIT_SIG)
     zone = norm(zone_cpp)
     demand = body(zone, DEMAND_SIG)
-    return (bool(fit) and ordered(fit, FIT_PLAN, FIT_GATE, FIT_ROOM, FIT_DEMAND, FIT_FITS)
-            and fit.count("in.compute_room_bytes =") == 1
+    return (bool(fit) and ordered(fit, FIT_PLAN, FIT_GATE, FIT_ROOM, FIT_FIELDS, FIT_DEMAND, FIT_FITS)
+            and fit.count("in.compute_room_n_ubatch =") == 1 and fit.count("in.compute_room_bytes =") == 1
+            and ROOM_HELPER_RULE in body(norm(cache_cpp), ROOM_HELPER_SIG)
             and CREDIT_RULE in body(zone, CREDIT_SIG)
             and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND))
 
@@ -393,16 +339,12 @@ def test_refusal_names_the_largest_fit():
     assert claim_refusal_names_the_largest_fit(SYCL_CPP, ADMISSION_CPP)
 
 
+def test_fit_credits_the_placed_compute_room():
+    assert claim_fit_credits_the_placed_compute_room(SYCL_CPP, ZONE_CPP, CACHE_CPP)
+
+
 def test_planner_moves_only_experts():
     assert claim_planner_moves_only_experts(CACHE_CPP)
-
-
-def test_room_holds_the_compute_buffers():
-    assert claim_room_holds_the_compute_buffers(ADMISSION_CPP, CACHE_CPP, SYCL_CPP)
-
-
-def test_fit_credits_the_placed_compute_room():
-    assert claim_fit_credits_the_placed_compute_room(SYCL_CPP, ZONE_CPP)
 
 
 def test_load_grows_the_zone_before_the_plan():
@@ -483,105 +425,26 @@ def test_mutant_largest_fit_not_from_the_ring_arithmetic_fails():
         SYCL_CPP, _once(ADMISSION_CPP, LARGEST_FIT, "decision.largest_fitting_n_ubatch = in.n_ubatch_default;"))
 
 
-def test_mutant_largest_fit_asked_with_one_room_fails():
-    """Asked with the explicit micro-batch's room, every candidate is charged the largest compute growth, so the figure
-    is smaller than the largest -ub that really fits."""
-    assert not claim_refusal_names_the_largest_fit(
-        SYCL_CPP, _once(ADMISSION_CPP, "fit.runtime_available_bytes = ring_room_at(fit.n_ubatch);",
-                        "fit.runtime_available_bytes = decision.max_ring_runtime_bytes;"))
-
-
-def test_mutant_ring_room_without_the_compute_growth_fails():
-    """Without the growth the refusal reports ring room the compute buffers take, and names a -ub that does not fit."""
-    assert not claim_refusal_names_the_largest_fit(
-        SYCL_CPP, _once(ADMISSION_CPP, RING_ROOM_GROWTH, "const size_t growth = 0;"))
-
-
-def test_mutant_decision_line_without_the_compute_buffers_fails():
-    assert not claim_placement_is_one_warn_line(
-        _once(SYCL_CPP, WARN_LITERAL,
-              WARN_LITERAL.replace(", beside %.1f MB of compute buffers", "").replace(" xub.compute_room_bytes / mb,", "")))
-
-
-def test_mutant_refusal_without_the_compute_buffers_fails():
-    assert not claim_refusal_names_the_largest_fit(
-        _once(SYCL_CPP, REFUSE_LITERAL,
-              REFUSE_LITERAL.replace(" beside %.1f MB of compute buffers", "").replace(" xub.compute_room_bytes / mb,", "")),
-        ADMISSION_CPP)
-
-
-def test_mutant_room_without_the_compute_growth_fails():
-    """The zone the explicit micro-batch needs would hold the ring but not its compute buffers."""
-    assert not claim_room_holds_the_compute_buffers(
-        _once(ADMISSION_CPP, ZONE_EXPLICIT, ZONE_EXPLICIT.replace("room.compute_growth_bytes", "0", 1)), CACHE_CPP,
-        SYCL_CPP)
-
-
-def test_mutant_default_zone_with_the_growth_fails():
-    """Charged to the default's zone too, the growth cancels out of the room."""
-    assert not claim_room_holds_the_compute_buffers(
-        _once(ADMISSION_CPP, ZONE_DEFAULT, ZONE_DEFAULT.replace("ring_default, 0,", "ring_default, room.compute_growth_bytes,", 1)),
-        CACHE_CPP, SYCL_CPP)
-
-
-def test_mutant_growth_not_by_the_fit_estimator_fails():
-    """Two estimators for one compute buffer: the room and the fit's credit would disagree about what the zone holds."""
-    assert not claim_room_holds_the_compute_buffers(
-        _once(ADMISSION_CPP, GROWTH_SCALE,
-              "const size_t scaled = compute_default_bytes / n_ubatch_default * n_ubatch;"), CACHE_CPP, SYCL_CPP)
-
-
-def test_mutant_requirement_without_the_growth_fails():
-    """A requirement without the growth grows the zone for the ring alone, and the re-plan reads GROW_ZONE again."""
-    assert not claim_room_holds_the_compute_buffers(
-        ADMISSION_CPP, _once(CACHE_CPP, REQUIREMENT_SUM, REQUIREMENT_SUM.replace(" base += compute_growth;", "", 1)),
-        SYCL_CPP)
-
-
-def test_mutant_fixed_rest_keeps_the_published_growth_fails():
-    """After the publish, a fixed rest holding the growth counts it twice, so the grown zone never reads PLACE."""
-    assert not claim_room_holds_the_compute_buffers(
-        ADMISSION_CPP, _once(CACHE_CPP, FIXED_REST, FIXED_REST.replace(" - compute_growth;", ";", 1)), SYCL_CPP)
-
-
-def test_mutant_room_without_the_compute_term_fails():
-    assert not claim_room_holds_the_compute_buffers(ADMISSION_CPP, _once(CACHE_CPP, COMPUTE_TERM, ""), SYCL_CPP)
-
-
-def test_mutant_decision_without_the_compute_room_fails():
-    assert not claim_room_holds_the_compute_buffers(ADMISSION_CPP, _once(CACHE_CPP, HOLD_COMPUTE, ""), SYCL_CPP)
-
-
-def test_mutant_publish_without_the_growth_fails():
-    assert not claim_room_holds_the_compute_buffers(
-        ADMISSION_CPP, CACHE_CPP,
-        _once(SYCL_CPP, "ggml_sycl::unified_cache_set_planned_compute_growth_bytes(device, compute_growth);", ""))
-
-
-def test_mutant_planning_shape_keeps_the_growth_fails():
-    """A stage that re-publishes the planning shape without clearing the growth would size the zone for buffers of a
-    micro-batch it no longer plans."""
-    assert not claim_room_holds_the_compute_buffers(
-        ADMISSION_CPP, CACHE_CPP,
-        _once(SYCL_CPP, POPULATE_RESET,
-              "ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(ctx->device, inventory->n_ubatch);"))
-
-
-def test_mutant_ring_replan_takes_the_growth_fails():
-    assert not claim_room_holds_the_compute_buffers(ADMISSION_CPP, CACHE_CPP, _once(SYCL_CPP, RING_PENDING_GROWTH, ""))
-
-
 def test_mutant_fit_credits_an_unplaced_room_fails():
-    """A GROW_ZONE or REFUSE decision did not grow the zone, so its compute room is not there to credit."""
+    """A GROW_ZONE or REFUSE decision did not size the zone for the micro-batch, so there is no room to credit."""
     assert not claim_fit_credits_the_placed_compute_room(
-        _once(SYCL_CPP, FIT_GATE,
-              FIT_GATE.replace("ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE",
-                               "ggml_sycl::pp_moe_onednn_explicit_ubatch_action::REFUSE", 1)), ZONE_CPP)
+        SYCL_CPP, ZONE_CPP,
+        _once(CACHE_CPP, ROOM_HELPER_RULE,
+              ROOM_HELPER_RULE.replace("xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && ", "", 1)))
+
+
+def test_mutant_fit_room_without_the_helper_fails():
+    """The term read straight from the getter credits a rung no PLACE decision sized the zone for."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, FIT_ROOM,
+              "room_bytes = ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device); "
+              "room_n_ubatch = room_plan->explicit_ubatch.n_ubatch;"), ZONE_CPP, CACHE_CPP)
 
 
 def test_mutant_fit_credits_another_device_fails():
     assert not claim_fit_credits_the_placed_compute_room(
-        _once(SYCL_CPP, FIT_GATE, FIT_GATE.replace(" && room_plan->device_id == q.device", "", 1)), ZONE_CPP)
+        _once(SYCL_CPP, FIT_GATE, FIT_GATE.replace(" && room_plan->device_id == q.device", "", 1)), ZONE_CPP,
+        CACHE_CPP)
 
 
 def test_mutant_fit_credit_after_the_demand_fails():
@@ -589,19 +452,28 @@ def test_mutant_fit_credit_after_the_demand_fails():
     n = _once(SYCL_CPP, FIT_DEMAND, "")
     at = n.find(FIT_PLAN)
     assert at >= 0
-    assert not claim_fit_credits_the_placed_compute_room(n[:at] + FIT_DEMAND + " " + n[at:], ZONE_CPP)
+    assert not claim_fit_credits_the_placed_compute_room(n[:at] + FIT_DEMAND + " " + n[at:], ZONE_CPP, CACHE_CPP)
 
 
 def test_mutant_credit_takes_part_of_a_larger_request_fails():
     """Whole or nothing: a request above the room is held back whole and spills whole."""
     assert not claim_fit_credits_the_placed_compute_room(
-        SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, "return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch;"))
+        SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, "return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch;"),
+        CACHE_CPP)
+
+
+def test_mutant_credit_ignores_the_rung_fails():
+    """Every rung would be credited the room planned for one, the auto trial's included."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, "return n_ubatch != 0 && request <= in.compute_room_bytes;"), CACHE_CPP)
 
 
 def test_mutant_credit_drops_the_plan_fails():
     assert not claim_fit_credits_the_placed_compute_room(
-        SYCL_CPP, _once(ZONE_CPP, DEMAND_BOUND,
-                        "zone_hold_spill_raw_demand(zone_hold_spill_bound(0, request, n_ubatch, n_ubatch), in.kv_room);"))
+        SYCL_CPP,
+        _once(ZONE_CPP, DEMAND_BOUND,
+              "zone_hold_spill_raw_demand(zone_hold_spill_bound(0, request, n_ubatch, n_ubatch), in.kv_room);"),
+        CACHE_CPP)
 
 
 def test_mutant_room_dips_into_the_kv_room_fails():

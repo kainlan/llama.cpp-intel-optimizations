@@ -1716,7 +1716,7 @@ int main() {
         const uint32_t largest_without = ggml_sycl::zone_hold_fit_largest_ub(in, 2048);
         const size_t   room            = 2055 * MiB;
         in.compute_room_n_ubatch       = 2048;
-        in.compute_room_bytes    = room;
+        in.compute_room_bytes          = room;
         CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 1960 * MiB), "the buffer fits the room");
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB - 64 * MiB,
               "with the room the buffer spills nothing; the plan stays in the bound");
