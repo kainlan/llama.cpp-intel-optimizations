@@ -14,7 +14,14 @@ and `finish()` turns the record into the process exit status.
     finish("my gate: PASS")
 
 Not a pytest plugin: pytest-style gates (module-level test_* functions) are
-already independent, one result per function.
+already independent, one result per function, and need only the message helpers:
+a claim that returns a bare bool says nothing about WHICH token failed, so pass
+first_missing (names the first anchor the claim needs that its region lacks) or
+first_present (names the first forbidden text its region holds) as the message.
+
+    from sycl_gate import first_missing
+
+    assert claim_x(SYCL), first_missing("file: region", region, ANCHOR_A, ANCHOR_B)
 """
 import contextlib
 import linecache
@@ -126,3 +133,36 @@ def run_without_source(script: str):
         shutil.copy(os.path.abspath(__file__), os.path.join(tests, "sycl_gate.py"))
         done = subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60)
         return done.returncode, done.stdout + done.stderr
+
+
+def _shown(text: str) -> str:
+    """`text` for a failure message: whole when short, else cut to 100 characters with a trailing "..."."""
+    return text if len(text) <= 100 else text[:97] + "..."
+
+
+def first_missing(where: str, text: str, *anchors: str, signature: str = "") -> str:
+    """The message for `assert claim(...), first_missing(...)`: names the first anchor the claim needs that `text`
+    does not contain, and where it looked, so a stale pin says what it expected instead of a bare AssertionError.
+    When every anchor is present the claim failed on an order, count or depth condition, and the message says so.
+    `signature`, when given, is the text that opens the region `text` was cut from (a function body); an empty
+    `text` then means the signature moved, and the message names the signature. Never empty, so the assert always
+    prints it."""
+    if signature and not text:
+        return "%s: missing %r" % (where, _shown(signature))
+    for anchor in anchors:
+        if anchor not in text:
+            return "%s: missing %r" % (where, _shown(anchor))
+    if len(anchors) == 1:
+        return "%s: the anchor is present; an order, count or depth condition failed" % where
+    return "%s: all %d anchors present; an order, count or depth condition failed" % (where, len(anchors))
+
+
+def first_present(where: str, text: str, *forbidden: str) -> str:
+    """The message for an absence claim: names the first forbidden text that `text` does contain, and where, or says
+    none of them is present (so the claim failed on an emptiness or count condition). Never empty."""
+    for found in forbidden:
+        if found in text:
+            return "%s: found %r" % (where, _shown(found))
+    if len(forbidden) == 1:
+        return "%s: the forbidden text is absent; an emptiness or count condition failed" % where
+    return "%s: none of %d forbidden texts present; an emptiness or count condition failed" % (where, len(forbidden))
