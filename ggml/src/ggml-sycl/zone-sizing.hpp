@@ -486,6 +486,13 @@ inline size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, ui
     return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
 }
 
+// Whether a live RUNTIME zone of `live_zone_bytes` is larger than the zone a plan sizes, the larger of `floor_bytes`
+// and `requirement`, by more than the arena's rounding of that zone up to 256 bytes. The arena keeps a zone larger
+// than a plan needs and rebuilds a zone only while it holds nothing, so a zone kept above a load's plan was grown by an
+// earlier load in the process, and the load's routed experts are planned against it. A zone the load sized for itself,
+// as every first load of a process does, is at most the rounding above its plan and never qualifies.
+bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement);
+
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
 // request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to

@@ -23,7 +23,10 @@ What this gate pins:
 - the fallback refusal names the largest -ub that fits, from the ring admission's own slot arithmetic;
 - the hold-spill fit credits a compute buffer no larger than the planned compute term at the micro-batch the published
   single-device plan PLACED on the device, read once before the demand, whole or nothing; every other rung, and every
-  load that placed none, is judged as before.
+  load that placed none, is judged as before;
+- a load whose plan was packed against a RUNTIME zone an earlier load in the process grew says so in ONE WARN after
+  its late plan, only when the live zone is more than the arena's 256-byte rounding above the zone the plan sizes, so
+  the first load of a process never prints it.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -178,6 +181,24 @@ DEMAND_CREDIT = ("size_t request = zone_hold_fit_request(in, n_ubatch); "
                  "if (zone_hold_fit_rung_has_compute_room(in, n_ubatch, request)) { request = 0; }")
 DEMAND_BOUND = "zone_hold_spill_raw_demand(zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);"
 
+# A RUNTIME zone an earlier load grew: one WARN after the late plan, gated by the predicate on the zone the plan sizes.
+SET_INV_SIG = ("static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
+               "ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory)")
+LATE_PLAN = ("compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct); "
+             "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);")
+KEPT_SIG = "static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device)"
+KEPT_READS = ("if (cache == nullptr || !cache->arena_active() || "
+              "!ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement)) { return; }")
+KEPT_LIVE = "const size_t live = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);"
+KEPT_FLOOR = "const size_t floor = ggml_sycl::unified_cache_runtime_zone_floor_bytes();"
+KEPT_GATE = "if (!ggml_sycl::zone_runtime_kept_above_plan(live, floor, requirement)) { return; }"
+KEPT_WARN = ('GGML_LOG_WARN("[SYCL-PLAN] RUNTIME zone on device %d holds %.1f MB where this plan requires %.1f MB: an '
+             'earlier load in this process grew it, and the routed experts are planned against the grown zone\\n", '
+             'device, live / mb, std::max(floor, requirement) / mb);')
+KEPT_RULE_SIG = "bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement)"
+KEPT_RULE = ("const size_t planned = std::max(floor_bytes, requirement); "
+             "return live_zone_bytes > planned && live_zone_bytes - planned > 255;")
+
 # The planner: a named hold on the expert budget, after the KV context room and before the pack's stats (where a
 # second hold term composes); the pack predicate is the budget less the hold; moved counted with the hold added back.
 KV_ROOM = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);"
@@ -271,6 +292,21 @@ def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cach
             and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND))
 
 
+def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str) -> bool:
+    """A load whose plan was packed against a RUNTIME zone an earlier load grew says so in ONE WARN after its late
+    plan, and only when the live zone is more than the arena's 256-byte rounding above the zone the plan sizes (the
+    larger of the floor and the requirement): the first load of a process, whose zone is its own plan's, never prints
+    it."""
+    sycl = norm(sycl_cpp)
+    late = body(sycl, SET_INV_SIG)
+    kept = body(sycl, KEPT_SIG)
+    return (bool(late) and late.count(LATE_PLAN) == 1
+            and sycl.count("ggml_sycl_warn_runtime_zone_kept_from_earlier_load(") == 2
+            and bool(kept) and ordered(kept, KEPT_READS, KEPT_LIVE, KEPT_FLOOR, KEPT_GATE, KEPT_WARN)
+            and kept.count("GGML_LOG_") == 1
+            and KEPT_RULE in body(norm(zone_cpp), KEPT_RULE_SIG))
+
+
 def claim_planner_moves_only_experts(cache_cpp: str) -> bool:
     """The room is a named hold on the routed-expert budget, taken after the KV context room and before the pack's
     stats, against what the dense weights, their KV and that room left, so it never moves a dense layer or KV. The
@@ -341,6 +377,10 @@ def test_refusal_names_the_largest_fit():
 
 def test_fit_credits_the_placed_compute_room():
     assert claim_fit_credits_the_placed_compute_room(SYCL_CPP, ZONE_CPP, CACHE_CPP)
+
+
+def test_grown_zone_is_announced():
+    assert claim_grown_zone_is_announced(SYCL_CPP, ZONE_CPP)
 
 
 def test_planner_moves_only_experts():
@@ -466,6 +506,52 @@ def test_mutant_credit_ignores_the_rung_fails():
     """Every rung would be credited the room planned for one, the auto trial's included."""
     assert not claim_fit_credits_the_placed_compute_room(
         SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, "return n_ubatch != 0 && request <= in.compute_room_bytes;"), CACHE_CPP)
+
+
+def test_mutant_grown_zone_rule_drops_the_comparison_fails():
+    """Every load with a RUNTIME zone would print it, the first load of a process included."""
+    assert not claim_grown_zone_is_announced(
+        SYCL_CPP, _once(ZONE_CPP, KEPT_RULE, "const size_t planned = std::max(floor_bytes, requirement); "
+                                             "return live_zone_bytes != 0;"))
+
+
+def test_mutant_grown_zone_warn_ungated_fails():
+    assert not claim_grown_zone_is_announced(_once(SYCL_CPP, KEPT_GATE, ""), ZONE_CPP)
+
+
+def test_mutant_grown_zone_rule_without_the_slack_fails():
+    """A first load whose requirement is not a multiple of 256 bytes would print it for the arena's own rounding."""
+    assert not claim_grown_zone_is_announced(
+        SYCL_CPP, _once(ZONE_CPP, KEPT_RULE, "const size_t planned = std::max(floor_bytes, requirement); "
+                                             "return live_zone_bytes > planned;"))
+
+
+def test_mutant_grown_zone_rule_ignores_the_floor_fails():
+    """A first load whose zone the floor sized would print it."""
+    assert not claim_grown_zone_is_announced(
+        SYCL_CPP, _once(ZONE_CPP, KEPT_RULE, KEPT_RULE.replace("std::max(floor_bytes, requirement)", "requirement", 1)))
+
+
+def test_mutant_grown_zone_warn_at_info_fails():
+    assert not claim_grown_zone_is_announced(
+        _once(SYCL_CPP, KEPT_WARN, KEPT_WARN.replace("GGML_LOG_WARN(", "GGML_LOG_INFO(", 1)), ZONE_CPP)
+
+
+def test_mutant_grown_zone_warn_before_the_plan_fails():
+    """Asked before the late plan, the requirement is the previous stage's, not this plan's."""
+    assert not claim_grown_zone_is_announced(
+        _once(SYCL_CPP, LATE_PLAN, "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); "
+                                   "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);"), ZONE_CPP)
+
+
+def test_mutant_grown_zone_warn_from_the_early_plan_too_fails():
+    """Asked from the early plan as well, one load prints it twice."""
+    early = ("compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem); "
+             "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct); }")
+    n = norm(SYCL_CPP)
+    assert n.count(early) == 1
+    n = n.replace(early, early[:-1] + "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); }", 1)
+    assert not claim_grown_zone_is_announced(n, ZONE_CPP)
 
 
 def test_mutant_credit_drops_the_plan_fails():

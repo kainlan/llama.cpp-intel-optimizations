@@ -1886,6 +1886,34 @@ int main() {
         CHECK(mismatches == 0, "no rung but the named one is judged differently from the fit before the room");
     }
 
+    // ---- Case 24e (a RUNTIME zone an earlier load grew): the arena reserves the larger of the floor and the requirement,
+    // rounded up to 256 bytes, so a zone a load sized for itself is never reported as kept above its plan, and only a
+    // zone more than that rounding above the plan is. The second instance of a -ub 2048,512 sweep plans 512 against
+    // the zone the 2048 load grew. ----------------------------------------------------------------------------------
+    {
+        const size_t MiB   = 1024 * 1024;
+        const size_t floor = 64 * MiB;
+
+        auto reserved = [&](size_t requirement) -> size_t {
+            const size_t planned = requirement > floor ? requirement : floor;
+            return (planned + 255) & ~size_t(255);
+        };
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(reserved(18050 * MiB), floor, 18050 * MiB),
+              "a zone the load sized for its own requirement is not kept above its plan");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(reserved(18050 * MiB + 1), floor, 18050 * MiB + 1),
+              "nor is one rounded up to the arena's 256-byte grain (255 bytes above)");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(reserved(10 * MiB), floor, 10 * MiB),
+              "nor one the floor sized, far above a small requirement");
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(reserved(18050 * MiB), floor, 2264 * MiB),
+              "a zone a 2048 load grew is kept above the plan of a later 512 load");
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(reserved(2264 * MiB) + 256, floor, 2264 * MiB),
+              "one grain above the plan is kept above it");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(2264 * MiB, floor, 18050 * MiB),
+              "a zone below the plan is not kept above it");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(SIZE_MAX, floor, SIZE_MAX),
+              "a saturated plan never wraps into a kept zone");
+    }
+
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
     // THAT rung's measured request, not of which other rungs ran before it or in what order. A rung with its own
     // record uses it and only it; a rung without one is scaled from the SET of records (order never matters). -----

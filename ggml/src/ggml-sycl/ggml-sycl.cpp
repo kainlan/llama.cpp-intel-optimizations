@@ -17917,6 +17917,29 @@ void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t              
     compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
 }
 
+// A load whose plan was packed against a RUNTIME zone an earlier load in this process grew says so, once, after its
+// late plan: the arena keeps a zone larger than a plan needs and rebuilds a zone only while it holds nothing, which the
+// PP MoE oneDNN ring a previous context left prevents, so the load's routed experts give up the larger zone. The first
+// load of a process sizes its zone for its own plan and never prints it. Caller holds g_tensor_inventory_mutex.
+static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
+    auto * cache       = ggml_sycl::get_unified_cache_for_device(device);
+    size_t requirement = 0;
+    if (cache == nullptr || !cache->arena_active() ||
+        !ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement)) {
+        return;
+    }
+    const size_t live  = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+    const size_t floor = ggml_sycl::unified_cache_runtime_zone_floor_bytes();
+    if (!ggml_sycl::zone_runtime_kept_above_plan(live, floor, requirement)) {
+        return;
+    }
+    const double mb = 1024.0 * 1024.0;
+    GGML_LOG_WARN(
+        "[SYCL-PLAN] RUNTIME zone on device %d holds %.1f MB where this plan requires %.1f MB: an earlier load in this "
+        "process grew it, and the routed experts are planned against the grown zone\n",
+        device, live / mb, std::max(floor, requirement) / mb);
+}
+
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
     ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
     if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
@@ -18158,6 +18181,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     // Host-pinned pool pre-sizing is plan-derived and happens when host zones
     // are configured, so all-VRAM models do not allocate a full host copy here.
     compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
+    ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);
 
     GGML_LOG_INFO(
         "[SYCL] Tensor inventory set: %zu tensors, %.2f GB total "

@@ -2659,8 +2659,19 @@ zone that is larger than a new plan needs. It rebuilds only a zone that is too
 small, and only while it holds nothing, which the PP MoE ring a previous context
 left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
 instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
-experts on the device than a fresh process would. The planner
-computes the RUNTIME room the ring and the dense scratch need at that
+experts on the device than a fresh process would. Such a load prints one WARN
+line after its plan, when the live zone is more than the arena's 256-byte
+rounding above the zone its own plan sizes (`zone_runtime_kept_above_plan()`):
+
+```
+[SYCL-PLAN] RUNTIME zone on device 0 holds <Z> MB where this plan requires <R> MB: an earlier load in this
+process grew it, and the routed experts are planned against the grown zone
+```
+
+The first load of a process never prints it, because its zone is the one its
+own plan sized. Re-planning the zone at such a load is future work.
+
+The planner computes the RUNTIME room the ring and the dense scratch need at that
 micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as
 a named term on the routed-expert budget, at the start of the MoE block. By then the dense
 weights, their KV and the KV context room are placed, so the room never moves a
