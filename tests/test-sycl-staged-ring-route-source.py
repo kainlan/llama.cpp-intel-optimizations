@@ -509,6 +509,11 @@ def staged_branch(sycl: str) -> str:
     return body(b[at:], GUARD) if at >= 0 else ""
 
 
+def staged_branch_signature(text: str) -> str:
+    """The signature whose absence leaves staged_branch(text) empty."""
+    return GUARD if build_body(text) else BUILD_SIG
+
+
 # ---- one writer, one place -------------------------------------------------------------------------------------------
 
 
@@ -595,7 +600,7 @@ def test_entry_is_the_fact():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch",
         staged_branch(SYCL),
         FIND, SLOT, VIEW, *ENTRY_FIELDS,
-        signature=(GUARD if build_body(SYCL) else BUILD_SIG))
+        signature=staged_branch_signature(SYCL))
 
 
 def test_entry_is_the_fact_mutants():
@@ -650,7 +655,7 @@ def test_served_only_as_plain_kernel():
         "capability refusal and the executor's plain-kernel reads are searched in their own bodies)",
         staged_branch(SYCL),
         ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN,
-        signature=(GUARD if build_body(SYCL) else BUILD_SIG))
+        signature=staged_branch_signature(SYCL))
 
 
 def test_served_only_as_plain_kernel_mutants():
@@ -705,7 +710,7 @@ def test_executor_entry_refused_by_its_consumer():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch",
         staged_branch(SYCL),
         REFUSAL_OPEN, EXECUTOR_REFUSAL,
-        signature=(GUARD if build_body(SYCL) else BUILD_SIG))
+        signature=staged_branch_signature(SYCL))
 
 
 def test_executor_entry_refused_by_its_consumer_mutants():
@@ -1341,7 +1346,7 @@ def test_no_host_waits():
         if not all(bodies) else
         first_present("ggml/src/ggml-sycl/ggml-sycl.cpp: the bodies of ggml_sycl_build_moe_resolved_batch, the device "
                       "recipe and the admission predicate (literal forms of WAIT_RE)", " ".join(bodies),
-                      "wait(", "wait_and_throw(", "get_info<"))
+                      "wait(", "wait_and_throw(", "get_info<", "wait (", "wait_and_throw (", "get_info <"))
 
 
 def test_no_host_waits_mutants():
