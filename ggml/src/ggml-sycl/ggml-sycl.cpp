@@ -17095,13 +17095,14 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
 static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owner{};
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
-// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), and the context's provenance appended
-// after it (llama.cpp-7fmt).
+// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), the context's provenance appended
+// after it (llama.cpp-7fmt), and the micro-batch the caller named, in the provenance's padding.
 static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184, "n_ctx_context_is_default moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
 
 // llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
 // host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,

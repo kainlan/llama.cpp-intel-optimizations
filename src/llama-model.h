@@ -815,6 +815,9 @@ struct llama_model {
     // llama_model_params::n_ctx_hint, for the SYCL plan builders, which take the model by reference.
     uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }
 
+    // llama_model_params::n_ubatch_hint, for the same builders.
+    uint32_t get_n_ubatch_hint() const { return params.n_ubatch_hint; }
+
   protected:
     llama_model_params params;
 

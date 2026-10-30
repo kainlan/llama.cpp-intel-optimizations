@@ -1220,11 +1220,26 @@ struct cmd_params_instance {
     // the context every test of this instance creates: the prompt, the generated tokens and the depth
     uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }
 
+    // the micro-batch every test of this instance creates its context with, as llama_context resolves it (see
+    // to_llama_cparams): an n_ubatch of 0 is n_batch, and a causal context's n_batch is at most its n_ctx. 0 for
+    // "-ub auto", where the SYCL backend picks the micro-batch itself.
+    uint32_t n_ubatch_hint() const {
+        if (n_ubatch < 0 || n_batch <= 0) {
+            return 0;
+        }
+        const uint32_t batch = n_ctx() > 0 ? std::min((uint32_t) n_batch, n_ctx()) : (uint32_t) n_batch;
+        return n_ubatch > 0 ? std::min(batch, (uint32_t) n_ubatch) : batch;
+    }
+
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
 
         // llama.cpp-ak0p: the SYCL load holds this context's KV room ahead of the routed experts (see equal_mparams).
         mparams.n_ctx_hint = n_ctx();
+
+        // The load plans the PP MoE scratch ring for this micro-batch and moves routed experts to the host tier for its
+        // room (see equal_mparams).
+        mparams.n_ubatch_hint = n_ubatch_hint();
 
         mparams.n_gpu_layers = n_gpu_layers;
         if (!devices.empty()) {
@@ -1279,8 +1294,12 @@ struct cmd_params_instance {
 
     // n_ctx_hint is left out, so a context change does not reload the model: a reused model keeps the first
     // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p).
+    // n_ubatch_hint is compared: the routed experts the load moved to the host tier for one micro-batch's PP MoE
+    // scratch ring stay there, so a reused model would measure a smaller micro-batch with experts it did not need to
+    // move, and a larger one would find no room for its ring.
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               n_ubatch_hint() == other.n_ubatch_hint() &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&

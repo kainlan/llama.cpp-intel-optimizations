@@ -1691,6 +1691,18 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // (llama-server --parallel), so it is never multiplied by n_parallel.
     mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;
 
+    // the micro-batch the caller will create the context with, resolved as llama_context resolves it: an n_ubatch of
+    // 0 is n_batch, and a causal context's n_batch is at most its n_ctx (the default context, n_ctx 0, is the training
+    // context and bounds nothing here). Without -ub the SYCL backend picks the micro-batch itself (n_ubatch_auto), so
+    // no micro-batch is named (0) and the load keeps its planning shape. The SYCL load plans the PP MoE scratch ring
+    // for a named one and moves routed experts to the host tier for its room.
+    mparams.n_ubatch_hint = 0;
+    if (!params.n_ubatch_auto && params.n_batch > 0) {
+        const uint32_t n_batch =
+            params.n_ctx > 0 ? std::min((uint32_t) params.n_batch, (uint32_t) params.n_ctx) : (uint32_t) params.n_batch;
+        mparams.n_ubatch_hint = params.n_ubatch > 0 ? std::min(n_batch, (uint32_t) params.n_ubatch) : n_batch;
+    }
+
     return mparams;
 }
 
