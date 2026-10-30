@@ -16,6 +16,7 @@
 #endif
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/moe-stream-plan.hpp"
 #include "ggml-sycl/soa-reorder-types.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml-sycl/vram-headroom.hpp"
@@ -1075,6 +1076,309 @@ static bool run_kv_context_room_is_cost_based_test() {
         ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr, n_experts);
     expect_room(ok, "(i) without -c, the override prices untyped experts and holds every KV context room",
                 overridden_default, 2 * full_room, 2, 4 * triplet_bytes);
+    return ok;
+}
+
+// The prompt phase's window ring reserves its slots in the WEIGHT zone, which the routed experts fill at default
+// placement. The planner holds the ring's bytes there before it packs the experts, so the first reserve finds them
+// and the expert loan is only the fallback. The synthetic model has two layers of Q4_0 gate/up/down experts, 32
+// experts each, every matrix 256 x 128: 18432 bytes, a whole number of the ring's 256-byte slot alignment. The
+// executor's planned f16 weight slot holds six f16 experts, so a phase holds three (its two-buffer rule), and the ring
+// is two regions of three slots: two triplets' bytes.
+namespace ring_room_case {
+constexpr int      n_exps       = 32;
+constexpr int      n_triplets   = 2 * n_exps;
+constexpr int      ncols        = 256;
+constexpr int      nrows        = 128;
+constexpr size_t   matrix_bytes = 18432;  // ggml_row_size(Q4_0, 256) * 128 = 144 * 128
+constexpr size_t   f16_expert   = static_cast<size_t>(ncols) * nrows * 2;
+constexpr size_t   weight_slot  = 6 * f16_expert;
+constexpr size_t   ring_bytes   = 2 * 3 * matrix_bytes;
+constexpr uint64_t q4_0_bit     = uint64_t(1) << GGML_TYPE_Q4_0;
+// Dense weights and their KV at the planner's n_ctx, as kv_order_case plans them; no context room is requested.
+constexpr size_t   base         = 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512;
+
+static std::vector<ggml_sycl::placement_tensor_info> inventory() {
+    std::vector<ggml_sycl::placement_tensor_info> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk = "blk." + std::to_string(l) + ".";
+        inv.push_back(ggml_sycl::placement_tensor_info(blk + "attn_q.weight", kv_order_case::dense_bytes));
+        for (const char * role : { "gate", "up", "down" }) {
+            ggml_sycl::placement_tensor_info tensor(blk + "ffn_" + role + "_exps.weight", 0);
+            tensor.type  = GGML_TYPE_Q4_0;
+            tensor.ne[0] = ncols;
+            tensor.ne[1] = nrows;
+            tensor.ne[2] = n_exps;
+            tensor.ne[3] = 1;
+            tensor.size  = ggml_row_size(GGML_TYPE_Q4_0, ncols) * static_cast<size_t>(nrows) * n_exps;
+            inv.push_back(tensor);
+        }
+    }
+    return inv;
+}
+
+static ggml_sycl::placement_kv_info kv_info(uint64_t staged_types, size_t group_cap) {
+    ggml_sycl::placement_kv_info kv = kv_order_case::kv_info(0);
+    kv.moe_stream_staged_types      = staged_types;
+    kv.moe_stream_group_cap         = group_cap;
+    return kv;
+}
+
+static ggml_sycl::placement_plan plan_for(size_t budget, uint64_t staged_types, size_t group_cap = 0) {
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(staged_types, group_cap), nullptr, n_exps);
+}
+
+static size_t device_triplets(const ggml_sycl::placement_plan & plan) {
+    size_t n = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_exps; ++e) {
+            const auto gate = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::GATE);
+            const auto up   = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::UP);
+            const auto down = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::DOWN);
+            n += gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device;
+        }
+    }
+    return n;
+}
+
+// What one device triplet charges the budget: the device layout's bytes, rounded as the planner charges them. Read
+// from a plan that put layer 0's expert 0 on the device.
+static size_t triplet_charge(const ggml_sycl::placement_plan & plan) {
+    size_t charge = 0;
+    for (const auto & e : plan.entries) {
+        if (e.layer_id == 0 && e.expert_id == 0 && e.on_device) {
+            charge += e.vram_charge_size;
+        }
+    }
+    return charge;
+}
+
+// The test's own claims hook: a (layer, role) is claimed when its type's bit is in the mask, read from the plan's
+// entries. It is written here, not borrowed from the planner, so the ring the case expects comes from the shared
+// geometry function and the mask alone.
+struct claims_ctx {
+    const ggml_sycl::placement_plan * plan;
+    uint64_t                          staged_types;
+};
+
+static bool claims_by_type(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role) {
+    const auto * ctx = static_cast<const claims_ctx *>(graph_ctx);
+    for (const auto & e : ctx->plan->entries) {
+        if (e.layer_id == layer && e.expert_id >= 0 && e.expert_role == role) {
+            return e.type >= 0 && e.type < 64 && ((ctx->staged_types >> e.type) & 1) != 0;
+        }
+    }
+    return false;
+}
+
+// The ring the prompt phase would reserve for `plan` on device 0, sized by moe_stream_plan_ring_geometry, the function
+// the phase and the auto-ubatch fit size it with, under this case's planned weight slot and no loan.
+static ggml_sycl::moe_stream_ring_geometry ring_of(const ggml_sycl::placement_plan & plan,
+                                                   uint64_t                          staged_types,
+                                                   size_t                            group_cap,
+                                                   size_t                            slot_bytes = weight_slot) {
+    claims_ctx                         ctx{ &plan, staged_types };
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes = slot_bytes;
+    hints.group_cap         = group_cap;
+    hints.lent_bytes        = 0;
+    return ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, &ctx, claims_by_type, hints);
+}
+
+static size_t left_over(size_t budget, const ggml_sycl::placement_plan & plan) {
+    const size_t placed = plan.weight_vram_bytes + plan.kv_vram_bytes + plan.kv_context_reserve_bytes;
+    return budget > placed ? budget - placed : 0;
+}
+
+// What one device triplet adds to the bytes the ring's cap reads (the resident entries' dst_size), read like
+// triplet_charge from a plan that put layer 0's expert 0 on the device.
+static size_t triplet_dst(const ggml_sycl::placement_plan & plan) {
+    size_t dst = 0;
+    for (const auto & e : plan.entries) {
+        if (e.layer_id == 0 && e.expert_id == 0 && e.on_device) {
+            dst += e.dst_size;
+        }
+    }
+    return dst;
+}
+}  // namespace ring_room_case
+
+// A budget whose experts fill the zone exactly (40 of 64 triplets) without the room: the planner holds the window
+// ring's bytes before the experts, the zone keeps exactly those bytes unfilled (to the pack's granularity, one
+// triplet), the plan counts them, and they survive the runtime transaction's KV re-derivation.
+static bool run_moe_stream_ring_room_before_experts_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+
+    // Every expert fits: no expert is on the host, so no ring is reserved and no room is held.
+    const auto   roomy  = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, q4_0_bit);
+    const size_t charge = triplet_charge(roomy);
+    if (charge == 0 || device_triplets(roomy) != n_triplets || roomy.moe_stream_ring_reserve_bytes != 0) {
+        printf("FAIL: a budget every expert fits holds no ring room: %zu device triplets of %d, room %zu, charge %zu\n",
+               device_triplets(roomy), n_triplets, roomy.moe_stream_ring_reserve_bytes, charge);
+        ok = false;
+    }
+
+    const size_t budget = base + 40 * charge;
+    // Nothing staged (mask 0): no ring, so no room, and the experts fill the zone.
+    const auto   none   = plan_for(budget, 0);
+    if (none.moe_stream_ring_reserve_bytes != 0 || device_triplets(none) != 40 || left_over(budget, none) != 0) {
+        printf(
+            "FAIL: with no staged type the planner holds no ring room: room %zu, %zu device triplets (want 40), "
+            "%zu bytes left (want 0)\n",
+            none.moe_stream_ring_reserve_bytes, device_triplets(none), left_over(budget, none));
+        ok = false;
+    }
+
+    const auto                                plan = plan_for(budget, q4_0_bit);
+    const ggml_sycl::moe_stream_ring_geometry ring = ring_of(plan, q4_0_bit, 0);
+    const size_t                              left = left_over(budget, plan);
+    if (plan.moe_stream_ring_reserve_bytes != ring_bytes || ring.bytes != ring_bytes) {
+        printf(
+            "FAIL: the planner must hold the window ring's %zu bytes (2 x 3 slots x %zu): held %zu, and the plan's "
+            "own ring is %zu bytes\n",
+            ring_bytes, matrix_bytes, plan.moe_stream_ring_reserve_bytes, ring.bytes);
+        ok = false;
+    }
+    if (left < plan.moe_stream_ring_reserve_bytes || left - plan.moe_stream_ring_reserve_bytes >= charge ||
+        device_triplets(plan) >= 40) {
+        printf(
+            "FAIL: the experts must leave exactly the ring's room unfilled: %zu bytes left for a %zu-byte room "
+            "(one triplet charges %zu), %zu device triplets (40 without the room)\n",
+            left, plan.moe_stream_ring_reserve_bytes, charge, device_triplets(plan));
+        ok = false;
+    }
+    if (plan.vram_bytes != plan.weight_vram_bytes + plan.kv_vram_bytes + plan.kv_context_reserve_bytes +
+                               plan.moe_stream_ring_reserve_bytes) {
+        printf(
+            "FAIL: the ring's room must count in the plan's device bytes: vram=%zu weights=%zu kv=%zu kv room=%zu "
+            "ring room=%zu\n",
+            plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes,
+            plan.moe_stream_ring_reserve_bytes);
+        ok = false;
+    }
+    ggml_sycl::placement_plan runtime = plan;
+    runtime.refresh_kv_byte_totals();
+    if (runtime.vram_bytes != runtime.weight_vram_bytes + runtime.kv_vram_bytes + plan.moe_stream_ring_reserve_bytes ||
+        runtime.moe_stream_ring_reserve_bytes != plan.moe_stream_ring_reserve_bytes) {
+        printf(
+            "FAIL: the runtime KV re-derivation must keep the ring's room in the device bytes: vram=%zu "
+            "weights=%zu kv=%zu room=%zu\n",
+            runtime.vram_bytes, runtime.weight_vram_bytes, runtime.kv_vram_bytes,
+            runtime.moe_stream_ring_reserve_bytes);
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: the planner holds the window ring's room in the WEIGHT zone before the routed experts\n");
+    }
+    return ok;
+}
+
+// The room's own displacement changes the ring it is for: the planner iterates to the room that equals the ring of
+// the plan it produces. A weight slot of 128 f16 experts makes the window the host experts per role (up to 64), and
+// a budget of 63 triplets leaves one triplet on the host without the room, so the first ring is 2 x 1 slots. Holding
+// it moves a second triplet to the host, which widens the window to 2 slots, and holding that moves a third; three
+// host triplets need 2 x 3 slots, which the room for them does not change. A group cap of 2 stops the window at 2.
+static bool run_moe_stream_ring_room_converges_test() {
+    using namespace ring_room_case;
+    bool             ok        = true;
+    constexpr size_t wide_slot = 128 * f16_expert;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, wide_slot, 0, 0, 1);
+
+    const size_t charge = triplet_charge(plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, 0));
+    const size_t budget = base + 63 * charge;
+
+    const auto   no_room = plan_for(budget, 0);
+    const size_t first   = ring_of(no_room, q4_0_bit, 0, wide_slot).bytes;
+    const auto   plan    = plan_for(budget, q4_0_bit);
+    const size_t ring    = ring_of(plan, q4_0_bit, 0, wide_slot).bytes;
+    if (first != 2 * matrix_bytes || plan.moe_stream_ring_reserve_bytes != ring ||
+        plan.moe_stream_ring_reserve_bytes != 2 * 3 * matrix_bytes) {
+        printf(
+            "FAIL: the room must grow from the first ring (%zu bytes, want %zu) to the ring of the plan it makes: "
+            "held %zu, that plan's ring %zu, want %zu\n",
+            first, 2 * matrix_bytes, plan.moe_stream_ring_reserve_bytes, ring, 2 * 3 * matrix_bytes);
+        ok = false;
+    }
+
+    const auto   capped      = plan_for(budget, q4_0_bit, 2);
+    const size_t capped_ring = ring_of(capped, q4_0_bit, 2, wide_slot).bytes;
+    if (capped.moe_stream_ring_reserve_bytes != capped_ring ||
+        capped.moe_stream_ring_reserve_bytes != 2 * 2 * matrix_bytes) {
+        printf(
+            "FAIL: a group cap of 2 bounds the window, so the room stops at 2 x 2 slots: held %zu, that plan's "
+            "ring %zu, want %zu\n",
+            capped.moe_stream_ring_reserve_bytes, capped_ring, 2 * 2 * matrix_bytes);
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: the ring's room converges to the ring of the plan it produces\n");
+    }
+    return ok;
+}
+
+// The ring's cap refuses a ring over an eleventh of the device's resident expert bytes, and the room itself displaces
+// experts, so a ring the cap passes without its room can fail it with the room held. The planner then holds nothing
+// and keeps the pack it had without the room: the experts the room would displace stay on the device, and the phase's
+// reserve asks for a loan. With Q4_0 at 18432 bytes a matrix a triplet is 55296 bytes, and 11 x 110592 (the 2 x 3
+// ring) is 1216512 = 22 x 55296, so at 22 device triplets the ring sits exactly at the cap. Holding its 110592 bytes
+// moves two triplets (2 x 55296) to the host and leaves 20 x 55296 = 1105920 < 1216512, which the cap refuses. The
+// case derives both counts from the plan's own dst and charge figures, so the budget follows the planned layout.
+static bool run_moe_stream_ring_room_cap_refuses_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+
+    const auto   roomy  = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, 0);
+    const size_t charge = triplet_charge(roomy);
+    const size_t dst    = triplet_dst(roomy);
+    if (charge == 0 || dst == 0) {
+        printf("FAIL: the cap case needs a device triplet's charge and dst bytes: charge %zu, dst %zu\n", charge, dst);
+        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+        return false;
+    }
+    // The fewest device triplets whose dst bytes the 2 x 3 ring's cap passes, and the triplets its room displaces
+    // from a pack of whole triplets.
+    const size_t n_dev     = (11 * ring_bytes + dst - 1) / dst;
+    const size_t displaced = (ring_bytes + charge - 1) / charge;
+    const size_t budget    = base + n_dev * charge;
+
+    const auto none = plan_for(budget, 0);
+    if (device_triplets(none) != n_dev || ring_of(none, q4_0_bit, 0).bytes != ring_bytes) {
+        printf(
+            "FAIL: without the room the 2 x 3 ring must pass the cap: %zu device triplets (want %zu), ring %zu "
+            "bytes (want %zu)\n",
+            device_triplets(none), n_dev, ring_of(none, q4_0_bit, 0).bytes, ring_bytes);
+        ok = false;
+    }
+    // The planner's second round: the pack with the room held, which the cap must refuse.
+    const auto held = plan_for(budget - ring_bytes, 0);
+    if (device_triplets(held) != n_dev - displaced || ring_of(held, q4_0_bit, 0).bytes != 0) {
+        printf(
+            "FAIL: with the room held the cap must refuse the ring: %zu device triplets (want %zu), ring %zu bytes "
+            "(want 0)\n",
+            device_triplets(held), n_dev - displaced, ring_of(held, q4_0_bit, 0).bytes);
+        ok = false;
+    }
+
+    const auto plan = plan_for(budget, q4_0_bit);
+    if (plan.moe_stream_ring_reserve_bytes != 0 || device_triplets(plan) != device_triplets(none)) {
+        printf(
+            "FAIL: a room the ring's cap refuses must not be held: room %zu (want 0), %zu device triplets (want "
+            "%zu, the pack without the room)\n",
+            plan.moe_stream_ring_reserve_bytes, device_triplets(plan), device_triplets(none));
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: the planner holds no ring room the ring's cap refuses once the room displaces experts\n");
+    }
     return ok;
 }
 
@@ -3364,6 +3668,9 @@ int main() {
         mock_ok = run_kv_context_room_cost_is_net_test() && mock_ok;
         mock_ok = run_kv_context_room_follows_the_requested_context_test() && mock_ok;
         mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;
         mock_ok = run_dense_weights_before_kv_test() && mock_ok;
         mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
         mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;
