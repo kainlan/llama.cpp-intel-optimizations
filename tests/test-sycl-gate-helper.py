@@ -199,11 +199,11 @@ def test_first_present_with_one_forbidden_text_reads_in_the_singular() -> None:
 
 
 def test_first_present_shows_a_text_of_exactly_100_characters_whole() -> None:
-    assert first_present("W", "y" * 100, "y" * 100) == "W: found %r" % ("y" * 100)
+    assert first_present("W", "x" * 100, "x" * 100) == "W: found %r" % ("x" * 100)
 
 
 def test_first_present_cuts_a_text_of_101_characters_to_97_and_dots() -> None:
-    assert first_present("W", "y" * 101, "y" * 101) == "W: found %r" % ("y" * 97 + "...")
+    assert first_present("W", "x" * 101, "x" * 101) == "W: found %r" % ("x" * 97 + "...")
 
 
 def test_first_present_is_never_empty() -> None:
