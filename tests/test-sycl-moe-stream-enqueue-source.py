@@ -101,44 +101,7 @@ Pytest-style (module-level test_* functions): registered with llama_test_pytest.
 """
 
 import re
-from pathlib import Path
-from sycl_gate import first_missing, first_present
-
-ROOT = Path(__file__).resolve().parents[1]
-
-_LEXEME_RE = re.compile(
-    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
-    re.DOTALL,
-)
-
-
-def strip_comments(src: str) -> str:
-    def repl(m: re.Match) -> str:
-        tok = m.group(0)
-        if tok[0] in "\"'":
-            return tok
-        return "\n" * tok.count("\n")
-
-    return _LEXEME_RE.sub(repl, src)
-
-
-def norm(text: str) -> str:
-    """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
-    re-wrap nor a re-split format string can turn a claim red. Idempotent, so a mutant built on normalized text is
-    read the same way as the source."""
-    t = re.sub(r"\s+", " ", strip_comments(text))
-    t = re.sub(r"\( ", "(", t)
-    t = re.sub(r" \)", ")", t)
-    t = re.sub(r" ,", ",", t)
-    t = re.sub(r",(?! )", ", ", t)
-    t = re.sub(r'(?<!\\)" "', "", t)
-    return t
-
-
-def read(rel: str) -> str:
-    """The file's text, or empty when it does not exist yet, so a missing file fails the claims instead of erroring."""
-    p = ROOT / rel
-    return p.read_text(errors="replace") if p.exists() else ""
+from sycl_gate import ROOT, body, first_missing, first_present, mutate, norm, ordered, read
 
 
 _PRIVATE_IF_RE = re.compile(
@@ -194,46 +157,6 @@ SYCL_TREE = {
     if p.is_file() and p.suffix in (".c", ".cpp", ".h", ".hpp") and "tests" not in p.relative_to(ROOT).parts[3:]
 }
 
-def body(text: str, signature: str) -> str:
-    """The brace-balanced body of the first definition whose text starts with `signature` (string literals are
-    skipped while balancing). Empty when there is none."""
-    at = text.find(signature)
-    if at < 0:
-        return ""
-    open_at = text.find("{", at + len(signature))
-    if open_at < 0:
-        return ""
-    depth = 0
-    i = open_at
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch in "\"'":
-            j = i + 1
-            while j < n and text[j] != ch:
-                j += 2 if text[j] == "\\" else 1
-            i = j + 1
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[open_at:i + 1]
-        i += 1
-    return ""
-
-
-def ordered(text: str, *needles: str) -> bool:
-    """Every needle is present, each after the one before it."""
-    at = 0
-    for needle in needles:
-        at = text.find(needle, at)
-        if at < 0:
-            return False
-        at += len(needle)
-    return True
-
 
 def call_args(text: str, name: str) -> list:
     """The argument text of every call `name(...)` (name ends with "("), parentheses balanced, string literals
@@ -261,13 +184,6 @@ def call_args(text: str, name: str) -> list:
         out.append(text[start:i - 1])
         at = text.find(name, at + len(name))
     return out
-
-
-def mutate(text: str, old: str, new: str) -> str:
-    """`text` (normalized) with `old` replaced once; the mutant must exist, or it would prove nothing."""
-    n = norm(text)
-    assert old in n, f"mutant precondition: {old!r} is not in the text"
-    return n.replace(old, new, 1)
 
 
 MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try"
