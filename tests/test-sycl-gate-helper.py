@@ -195,7 +195,7 @@ def test_first_present_names_the_first_of_two_forbidden_texts() -> None:
 
 
 def test_first_present_with_none_present_names_how_many_were_searched() -> None:
-    message = _first_present()("W", "clean", "a", "b", "c")
+    message = _first_present()("W", "xyz", "a", "b", "c")
     assert message == "W: none of 3 forbidden texts present; an emptiness or count condition failed"
 
 
