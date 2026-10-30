@@ -4738,10 +4738,10 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
-# An explicit -ub whose PP MoE oneDNN scratch ring does not fit the RUNTIME zone planned for the load's own micro-batch is
-# placed, not refused (owner ruling 2026-10-30): the load moves routed experts to the host tier for the ring's room and
-# the context prints one WARN line; only when the experts cannot give the room is it refused, with the largest -ub that
-# fits. The caller names no micro-batch for -ub auto, so the trial never places. A mutant per claim. Text only.
+# An explicit -ub whose PP MoE oneDNN scratch ring does not fit the RUNTIME zone planned for the load's own micro-batch
+# is placed, not refused: the load moves routed experts to the host tier for the ring's room and the context prints one
+# WARN line; only when the experts cannot give the room is it refused, with the largest -ub that fits. The caller names
+# no micro-batch for -ub auto, so the trial never places. A mutant per claim. Text only.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-explicit-ubatch-placement-source

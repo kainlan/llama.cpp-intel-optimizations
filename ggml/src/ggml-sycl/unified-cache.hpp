@@ -686,10 +686,10 @@ struct placement_kv_info {
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
     // above stays the load's planning shape.
     uint32_t                           n_ubatch_context = 0;
-    // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone
-    // (owner ruling 2026-10-30). The backend fills it on the single-device path before each plan
-    // (unified_cache_explicit_ubatch_room()); it is invalid when no micro-batch above n_ubatch was named, the model has
-    // no ring, or there is no arena. The planner weighs it against the routed experts (placement_plan::explicit_ubatch).
+    // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone.
+    // The backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
+    // when no micro-batch above n_ubatch was named, the model has no ring, or there is no arena. The planner weighs it
+    // against the routed experts (placement_plan::explicit_ubatch).
     pp_moe_onednn_explicit_ubatch_room explicit_ubatch;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
@@ -867,11 +867,11 @@ struct expert_residency_counts {
     int64_t on_target = 0;  // found, on_device and target_device == the queried device
 };
 
-// The planner's decision on an explicit micro-batch's PP MoE oneDNN scratch ring (owner ruling 2026-10-30;
-// docs/backend/sycl-memory-design.md, "Explicit micro-batch placement"). The ring is planned in the RUNTIME zone for the
-// micro-batch the caller named, and routed experts give up the device room it needs, as KV that does not fit is
-// re-placed rather than refused. A load fact the runtime context transaction reads: PLACE announces the experts the room
-// moved to the host tier, REFUSE refuses the context with the largest -ub that fits.
+// The planner's decision on an explicit micro-batch's PP MoE oneDNN scratch ring (docs/backend/sycl-memory-design.md,
+// "Explicit micro-batch placement"). The ring is planned in the RUNTIME zone for the micro-batch the caller named, and
+// routed experts give up the device room it needs, as KV that does not fit is re-placed rather than refused. A load
+// fact the runtime context transaction reads: PLACE announces the experts the room moved to the host tier, REFUSE
+// refuses the context with the largest -ub that fits.
 struct placement_explicit_ubatch {
     uint32_t                             n_ubatch                 = 0;  // the micro-batch decided for; 0 = no decision
     pp_moe_onednn_explicit_ubatch_action action                   = pp_moe_onednn_explicit_ubatch_action::NONE;
@@ -2589,10 +2589,10 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
 size_t unified_cache_runtime_zone_floor_bytes();
 
 // The RUNTIME zone room the PP MoE oneDNN scratch ring of the explicit micro-batch `n_ubatch` needs on `device_id`
-// above the zone the ring of the load's `n_ubatch_default` needs (owner ruling 2026-10-30). Composed from the published
-// plan: the ring geometry, the requirement less its ring and dense scratch parts, the dense scratch at both micro-
-// batches, the floor, and the RUNTIME zone as the arena holds it now. Invalid when the device has no active arena or no
-// ring, n_ubatch is not above n_ubatch_default, or a planned term is unanswerable.
+// above the zone the ring of the load's `n_ubatch_default` needs. Composed from the published plan: the ring geometry,
+// the requirement less its ring and dense scratch parts, the dense scratch at both micro-batches, the floor, and the
+// RUNTIME zone as the arena holds it now. Invalid when the device has no active arena or no ring, n_ubatch is not above
+// n_ubatch_default, or a planned term is unanswerable.
 pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      device_id,
                                                                       uint32_t n_ubatch,
                                                                       uint32_t n_ubatch_default);

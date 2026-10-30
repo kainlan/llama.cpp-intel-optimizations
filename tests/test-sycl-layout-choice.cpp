@@ -641,11 +641,11 @@ static bool run_kv_context_room_before_experts_test() {
 }
 
 // An explicit micro-batch's PP MoE oneDNN scratch ring that the RUNTIME zone planned for the load's own micro-batch
-// cannot hold is placed, not refused (owner ruling 2026-10-30): the routed experts give up the room, and only when moving
-// every device-resident expert would not free it is the context refused, with the largest -ub that fits. The ring here
-// has a 256 KiB weight slot, 1 KiB of activation and 512 B of output per row, and depth 2; the rest of the RUNTIME
-// requirement is 1 MiB, and no floor. So the ring is 2 MiB at the default 512 and 6.5 MiB at 2048, and the zone grows
-// from 3 MiB to 7.5 MiB: a 4.5 MiB room, exactly six of the synthetic model's 768 KiB triplets.
+// cannot hold is placed, not refused: the routed experts give up the room, and only when moving every device-resident
+// expert would not free it is the context refused, with the largest -ub that fits. The ring here has a 256 KiB weight
+// slot, 1 KiB of activation and 512 B of output per row, and depth 2; the rest of the RUNTIME requirement is 1 MiB, and
+// no floor. So the ring is 2 MiB at the default 512 and 6.5 MiB at 2048, and the zone grows from 3 MiB to 7.5 MiB: a
+// 4.5 MiB room, exactly six of the synthetic model's 768 KiB triplets.
 namespace explicit_ubatch_case {
 constexpr size_t mib           = 1024 * 1024;
 constexpr size_t zone_default  = 3 * mib;

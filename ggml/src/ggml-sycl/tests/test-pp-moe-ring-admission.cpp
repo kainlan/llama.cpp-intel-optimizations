@@ -301,11 +301,11 @@ void test_degenerate_and_overflow() {
 }
 
 // An explicit micro-batch (pp_moe_onednn_explicit_ubatch_plan_room/_decide). THE SHAPE THIS IS FIT TO (B70,
-// Qwen3.8-Flash-Next IQ3_XXS, llama.cpp-86bl): weight slot 425 MiB, per row 2.5 MiB activation + 5 MiB output, ring
-// depth 1, so the ring is 4265 MiB at the default 512 and 15785 MiB at -ub 2048. Dense scratch 6912 + 12288 B/token
-// plus a 60 MiB weight copy; the rest of the RUNTIME requirement (compute and state terms, MoE control, host scatter)
-// is about 2168 MiB. The experts were packed into about 18880 MiB of the WEIGHT zone. Every figure is a multiple of
-// 256, so the zone's rounding enters only the alignment case.
+// Qwen3.8-Flash-Next IQ3_XXS): weight slot 425 MiB, per row 2.5 MiB activation + 5 MiB output, ring depth 1, so the
+// ring is 4265 MiB at the default 512 and 15785 MiB at -ub 2048. Dense scratch 6912 + 12288 B/token plus a 60 MiB
+// weight copy; the rest of the RUNTIME requirement (compute and state terms, MoE control, host scatter) is about 2168
+// MiB. The experts were packed into about 18880 MiB of the WEIGHT zone. Every figure is a multiple of 256, so the
+// zone's rounding enters only the alignment case.
 constexpr size_t kQwenWeightSlot   = 425ull * kMiB;
 constexpr size_t kQwenActPerRow    = 2621440ull;
 constexpr size_t kQwenOutPerRow    = 5242880ull;

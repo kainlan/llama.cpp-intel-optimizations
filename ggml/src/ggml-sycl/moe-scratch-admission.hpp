@@ -217,9 +217,9 @@ struct pp_moe_onednn_ring_admission {
 pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_admission_inputs & in);
 
 // An explicit micro-batch (-ub N) whose ring the RUNTIME zone planned for the load's own micro-batch cannot hold is
-// placed, not refused (owner ruling 2026-10-30): the load plans the RUNTIME zone for N and the routed experts give up
-// the room, moving from the device WEIGHT tier to the host tier. These two functions are that decision's arithmetic;
-// the planner supplies the device bytes its routed experts are packed into.
+// placed, not refused: the load plans the RUNTIME zone for N and the routed experts give up the room, moving from the
+// device WEIGHT tier to the host tier. These two functions are that decision's arithmetic; the planner supplies the
+// device bytes its routed experts are packed into.
 //
 // The RUNTIME zone is sized as the arena sizes it: the larger of its floor and the planned requirement, rounded up to
 // 256 bytes. The requirement splits into the ring, the dense scratch (both scale with the micro-batch) and a fixed

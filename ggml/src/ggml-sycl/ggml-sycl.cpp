@@ -17723,7 +17723,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
 
         // with_room: the planner holds the explicit micro-batch's RUNTIME room (below) against the routed experts.
-        // Without it the plan is the load's planning shape alone, as before the ruling.
+        // Without it the plan is the load's planning-shape plan.
         auto plan_single_device = [&](bool with_room) {
             size_t plan_budget = vram_budget;
             auto * cache       = ggml_sycl::get_unified_cache_for_device(ctx->device);
@@ -17748,10 +17748,10 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             return ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
                                                      g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
         };
-        // An explicit micro-batch's PP MoE oneDNN scratch ring (owner ruling 2026-10-30): the planner holds the
-        // RUNTIME room the ring needs against the routed experts. Every stage of the load re-publishes the ring and the
-        // dense scratch at the load's planning shape, so a zone an earlier stage already grew for the room (zones never
-        // shrink) gets the micro-batch's back before the plan.
+        // An explicit micro-batch's PP MoE oneDNN scratch ring: the planner holds the RUNTIME room the ring needs
+        // against the routed experts. Every stage of the load re-publishes the ring and the dense scratch at the load's
+        // planning shape, so a zone an earlier stage already grew for the room (zones never shrink) gets the
+        // micro-batch's back before the plan.
         const uint32_t explicit_n_ubatch = g_placement_kv_info.n_ubatch_context;
         ggml_sycl_fill_explicit_ubatch_room(ctx->device);
         if (g_placement_kv_info.explicit_ubatch.valid && g_placement_kv_info.explicit_ubatch.room_bytes > 0 &&
@@ -20441,11 +20441,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
     };
 
-    // The explicit micro-batch's PP MoE oneDNN scratch ring, placed by the load (owner ruling 2026-10-30), announced
-    // like the KV demotions above: once, against the final plan, for the micro-batch the load decided for. A WARN, so
-    // the one line survives default verbosity, when the ring's room moved routed experts to the host tier and the
-    // published plan was made for another micro-batch (the load's own, or a previous context's); a second context of
-    // the same micro-batch, a room the weight zone's slack held, and a probe, which places nothing, print it at INFO.
+    // The explicit micro-batch's PP MoE oneDNN scratch ring, placed by the load, announced like the KV demotions above:
+    // once, against the final plan, for the micro-batch the load decided for. A WARN, so the one line survives default
+    // verbosity, when the ring's room moved routed experts to the host tier and the published plan was made for another
+    // micro-batch (the load's own, or a previous context's); a second context of the same micro-batch, a room the
+    // weight zone's slack held, and a probe, which places nothing, print it at INFO.
     auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan) {
         const ggml_sycl::placement_explicit_ubatch & xub = final_plan.explicit_ubatch;
         if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE ||
@@ -20668,17 +20668,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             }
         }
     }
-    // llama.cpp-jumy: RELEASE_REFUSED is a transient failure to release the
-    // ring's OLD physical backing (still claimed by an in-flight dispatch)
-    // -- nothing about the requested size was evaluated, so a caller may
-    // retry. Only that shape maps to BUSY; every other refusal
-    // (DOES_NOT_FIT) is the deterministic "this size does not fit" answer
-    // and stays a PLAN_REJECTED-mapped refusal, unchanged from before.
-    // The explicit micro-batch the load could not place (owner ruling 2026-10-30): its ring's RUNTIME room is more than
-    // every device-resident routed expert gives up, so the context is refused by name, with the largest -ub whose ring
-    // fits what they would have given, by the ring admission's own slot arithmetic (pp_moe_onednn_explicit_ubatch_
-    // decide). Only for the micro-batch the load decided for: any other, the auto trial's rungs included (they name no
-    // micro-batch at load), goes through the ring re-plan below.
+    // The explicit micro-batch the load could not place: its ring's RUNTIME room is more than every device-resident
+    // routed expert gives up, so the context is refused by name, with the largest -ub whose ring fits what they would
+    // have given, by the ring admission's own slot arithmetic (pp_moe_onednn_explicit_ubatch_decide). Only for the
+    // micro-batch the load decided for: any other, the auto trial's rungs included (they name no micro-batch at load),
+    // goes through the ring re-plan below.
     {
         const ggml_sycl::placement_explicit_ubatch & xub = next_plan.explicit_ubatch;
         if (xub.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::REFUSE &&
@@ -20699,6 +20693,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             return refuse("PP MoE oneDNN scratch ring does not fit");
         }
     }
+    // llama.cpp-jumy: RELEASE_REFUSED is a transient failure to release the
+    // ring's OLD physical backing (still claimed by an in-flight dispatch)
+    // -- nothing about the requested size was evaluated, so a caller may
+    // retry. Only that shape maps to BUSY; every other refusal
+    // (DOES_NOT_FIT) is the deterministic "this size does not fit" answer
+    // and stays a PLAN_REJECTED-mapped refusal, unchanged from before.
     const ggml_sycl_ring_replan_result ring_replan_result =
         ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);
     if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {

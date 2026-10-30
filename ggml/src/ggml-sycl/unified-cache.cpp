@@ -33402,8 +33402,8 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
                       room.expert_groups_without);
 }
 
-// The explicit micro-batch's ring decision, for the plan's log (owner ruling 2026-10-30). INFO: it is printed for every
-// stage of the load, and the runtime context transaction announces the outcome once, at WARN, when the context opens.
+// The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
+// the runtime context transaction announces the outcome once, at WARN, when the context opens.
 static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, int device_id) {
     if (xub.n_ubatch == 0) {
         return;
@@ -33418,13 +33418,13 @@ static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, 
         xub.hold_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb, device_id);
 }
 
-// The routed-expert budget's hold for an explicit micro-batch's PP MoE oneDNN scratch ring (owner ruling 2026-10-30):
-// the ring is planned in the RUNTIME zone for the micro-batch the caller named, and its room comes out of the routed
-// experts, the last tier of device residency, as the KV context room does. It is weighed against `remaining` once the
-// dense weights, their KV and the KV context room are placed, so it never moves a dense layer or KV. The planner's own
-// layer-ordered pack decides which experts give the room, not the loan's popularity order: the micro-batch is known at
-// load, before any graph, so the plan is made with fewer device experts instead of being patched after it (bulk-staged
-// experts are not lendable either).
+// The routed-expert budget's hold for an explicit micro-batch's PP MoE oneDNN scratch ring: the ring is planned in the
+// RUNTIME zone for the micro-batch the caller named, and its room comes out of the routed experts, the last tier of
+// device residency, as the KV context room does. It is weighed against `remaining` once the dense weights, their KV and
+// the KV context room are placed, so it never moves a dense layer or KV. The planner's own layer-ordered pack decides
+// which experts give the room, not the loan's popularity order: the micro-batch is known at load, before any graph, so
+// the plan is made with fewer device experts instead of being patched after it (bulk-staged experts are not lendable
+// either).
 //
 // The hold is the whole room at every stage of the load. The part the RUNTIME zone already holds (a zone an earlier
 // stage grew for it) was taken from the weight capacity `remaining` was read from, so it is returned before the room

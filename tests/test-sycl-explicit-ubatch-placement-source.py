@@ -1,5 +1,5 @@
 """Source contract for explicit micro-batch placement: an explicit -ub whose PP MoE oneDNN scratch ring does not fit
-the RUNTIME zone planned for the load's own micro-batch is placed, not refused (owner ruling 2026-10-30).
+the RUNTIME zone planned for the load's own micro-batch is placed, not refused.
 
 Host-only: reads sources, builds nothing, loads no model and touches no device.
 
@@ -242,7 +242,7 @@ def claim_planner_moves_only_experts(cache_cpp: str) -> bool:
 def claim_load_grows_the_zone_before_the_plan(sycl_cpp: str) -> bool:
     """A room the experts can give grows the RUNTIME zone for the micro-batch, and the plan the load keeps is made
     again with the room held. A zone that cannot grow gets the load's planning shape back and is planned without the
-    room, so no expert leaves the device for a zone that did not grow: the plan the load made before the ruling."""
+    room, so no expert leaves the device for a zone that did not grow: the load's planning-shape plan."""
     store = body(norm(sycl_cpp), STORE_SIG)
     return (bool(store)
             and ordered(store, LAMBDA_ROOM, FIRST_PLAN, GROW_BRANCH, GROW_PUBLISH, GROW_REPLAN, GROW_FALLBACK,
@@ -327,7 +327,7 @@ def test_mutant_commit_site_not_announced_fails():
 
 
 def test_mutant_refusal_without_the_largest_fit_fails():
-    """The figure is what the user needs to retry with; the ruling keeps it for the refusal only."""
+    """The figure is what the user needs to retry with, and only a refusal has a retry to name."""
     assert not claim_refusal_names_the_largest_fit(_once(SYCL_CPP, FITS, ""), ADMISSION_CPP)
 
 
@@ -393,7 +393,7 @@ def test_mutant_failed_growth_keeps_the_micro_batch_fails():
 
 def test_mutant_failed_growth_plans_with_the_room_fails():
     """Planned with the room after the zone failed to grow, the fill reads GROW_ZONE again and the hold moves experts
-    to the host tier for a ring the zone cannot hold: worse than the load before the ruling."""
+    to the host tier for a ring the zone cannot hold: worse than the load's planning-shape plan."""
     assert not claim_load_grows_the_zone_before_the_plan(
         _once(SYCL_CPP, FALLBACK_PLAN, "plan_candidate = plan_single_device(true);"))
 
