@@ -33367,6 +33367,11 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
 // which those are. The claim the geometry asks is the type half of the executor's staged claim, as a mask the backend
 // fills (placement_kv_info::moe_stream_staged_types).
 static_assert(GGML_TYPE_COUNT <= 64, "the staged-type mask holds one bit per ggml_type");
+// The room is n_slots x slot_bytes with no padding: a WEIGHT-zone block takes round_request(slot_bytes, alignment), which
+// is slot_bytes exactly when the slot alignment is the zone allocator's grain (slot_bytes is a multiple of it, and the
+// allocator keeps no header in the zone). Another alignment would need the room padded for it.
+static_assert(MOE_STREAM_RING_SLOT_ALIGN == tlsf_allocator::block_grain,
+              "the window ring's room counts whole slots: a slot alignment other than the zone's grain needs padding");
 
 struct moe_stream_room_claims {
     std::unordered_map<uint64_t, ggml_type> types;  // (layer, role) keyed with expert 0 -> the role's expert type

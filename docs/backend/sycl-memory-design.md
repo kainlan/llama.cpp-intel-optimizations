@@ -198,7 +198,12 @@ packs again with the room held until the ring fits in it. The room comes out of
 the WEIGHT zone's remaining bytes and counts in the plan's `vram_bytes`, which
 the WOQ guard keeps free. It survives the runtime KV re-derivation, because the
 ring is reserved again at every prompt. It is accounting, not an allocation: the
-ring still reserves its slots at each prompt and releases them at its end. One
+ring still reserves its slots at each prompt and releases them at its end. The
+room needs no padding: the ring allocates each slot at
+`MOE_STREAM_RING_SLOT_ALIGN`, which is the zone allocator's 256-byte grain, the
+slot is a multiple of it, and the allocator keeps no header in the zone. Only
+the single-device planner holds a room. A multi-device plan holds none, so there
+the ring still depends on the loan. One
 `[SYCL-PLAN] MoE window ring room` line per placement pass names the room and
 the experts it displaced, as a WARN when it displaced any. None is held, with a
 WARN, when the eleventh-of-the-expert-bytes cap above refuses the ring once the

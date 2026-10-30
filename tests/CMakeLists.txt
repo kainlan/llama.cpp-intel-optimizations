@@ -3471,6 +3471,27 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
+    # test-sycl-moe-stream-ring-room: the window ring's planned room, n_slots x slot_bytes free in the WEIGHT zone,
+    # funds every slot of moe_stream_ring::reserve, and one grain less funds one slot fewer -- on a real device cache,
+    # with no model loaded. It allocates a 64 MB arena and fills its WEIGHT zone, so it carries `cache` and stays out of
+    # the throttled sweep (run it by name, one at a time).
+    llama_build(test-sycl-moe-stream-ring-room.cpp)
+    target_include_directories(test-sycl-moe-stream-ring-room PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-moe-stream-ring-room PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-moe-stream-ring-room PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-moe-stream-ring-room PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-moe-stream-ring-room PRIVATE "-fsycl")
+        target_link_options(test-sycl-moe-stream-ring-room PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-moe-stream-ring-room LABEL "main")
+    set_tests_properties(test-sycl-moe-stream-ring-room PROPERTIES
+        LABELS "sycl;cache;moe"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
+
     # test-sycl-model-lifecycle-hooks: the weight-ownership hooks must actually
     # be INVOKED on a real llama_model load and teardown (llama.cpp-viga).
     #

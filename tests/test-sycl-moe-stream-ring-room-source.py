@@ -18,7 +18,9 @@ The fix this gate pins:
     or the room exceeds what is left;
   - the backend fills the planner's inputs where it copies the inventory in: the staged-type mask, the type half of
     the executor's staged claim, and the group cap;
-  - the decision prints one [SYCL-PLAN] line, a WARN when the room displaced experts or did not settle.
+  - the decision prints one [SYCL-PLAN] line, a WARN when the room displaced experts or did not settle;
+  - the room needs no padding: where it is sized, the build refuses a slot alignment other than the zone
+    allocator's grain, the one alignment at which each slot takes exactly its bytes.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -365,6 +367,32 @@ def test_mutant_decision_line_never_warns_fails():
 
 def test_mutant_decision_line_renamed_fails():
     assert not claim_decision_line_is_visible(_once(CACHE, HELD_LINE, HELD_LINE.replace("[SYCL-PLAN]", "[PLACEMENT]")))
+
+
+# ---- (h) the room needs no padding ---------------------------------------------------------------------------------
+
+ALIGN_ASSERT = "static_assert(MOE_STREAM_RING_SLOT_ALIGN == tlsf_allocator::block_grain,"
+
+
+def claim_room_needs_no_padding(cache: str) -> bool:
+    """A WEIGHT-zone block takes the request rounded to the larger of its alignment and the grain, so n_slots x
+    slot_bytes funds every slot only while the slot alignment is the grain: the build checks it once, beside the room."""
+    at = cache.find(ALIGN_ASSERT)
+    return cache.count(ALIGN_ASSERT) == 1 and 0 <= at < cache.find(HELPER_SIG)
+
+
+def test_room_needs_no_padding():
+    assert claim_room_needs_no_padding(CACHE)
+
+
+def test_mutant_alignment_assert_dropped_fails():
+    assert not claim_room_needs_no_padding(_once(CACHE, ALIGN_ASSERT, "static_assert(true,"))
+
+
+def test_mutant_alignment_assert_weakened_fails():
+    """At an alignment below the grain a slot still takes a whole number of grains, more than slot_bytes."""
+    weakened = ALIGN_ASSERT.replace(" == ", " <= ")
+    assert not claim_room_needs_no_padding(_once(CACHE, ALIGN_ASSERT, weakened))
 
 
 if __name__ == "__main__":
