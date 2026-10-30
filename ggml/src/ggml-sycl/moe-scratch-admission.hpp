@@ -216,4 +216,67 @@ struct pp_moe_onednn_ring_admission {
 // or n_ubatch 0, or both per-row terms 0) or when a slot size overflows size_t.
 pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_admission_inputs & in);
 
+// An explicit micro-batch (-ub N) whose ring the RUNTIME zone planned for the load's own micro-batch cannot hold is
+// placed, not refused (owner ruling 2026-10-30): the load plans the RUNTIME zone for N and the routed experts give up
+// the room, moving from the device WEIGHT tier to the host tier. These two functions are that decision's arithmetic;
+// the planner supplies the device bytes its routed experts are packed into.
+//
+// The RUNTIME zone is sized as the arena sizes it: the larger of its floor and the planned requirement, rounded up to
+// 256 bytes. The requirement splits into the ring, the dense scratch (both scale with the micro-batch) and a fixed
+// rest. The room is what the zone for N needs beyond the zone for the default micro-batch. Zones never shrink, so a
+// zone already grown (an earlier stage of the same load) may hold part or all of it.
+struct pp_moe_onednn_explicit_ubatch_inputs {
+    uint32_t n_ubatch                    = 0;  // the explicit micro-batch; 0 = none
+    uint32_t n_ubatch_default            = 0;  // the load's own planning micro-batch
+    size_t   weight_slot_bytes           = 0;
+    size_t   activation_bytes_per_row    = 0;
+    size_t   output_bytes_per_row        = 0;
+    uint32_t ring_depth                  = 0;
+    size_t   runtime_fixed_bytes         = 0;  // RUNTIME requirement apart from the ring and the dense scratch
+    size_t   dense_scratch_default_bytes = 0;  // the dense scratch at n_ubatch_default
+    size_t   dense_scratch_bytes         = 0;  // the dense scratch at n_ubatch
+    size_t   runtime_floor_bytes         = 0;  // the RUNTIME zone's floor
+    size_t   runtime_zone_bytes          = 0;  // the RUNTIME zone as it is reserved now
+};
+
+struct pp_moe_onednn_explicit_ubatch_room {
+    // An explicit micro-batch above the default, and a ring to size (a model with routed experts).
+    bool                                 valid = false;
+    pp_moe_onednn_explicit_ubatch_inputs in;
+    size_t                               ring_bytes          = 0;  // the ring at in.n_ubatch; SIZE_MAX on overflow
+    size_t                               zone_default_bytes  = 0;  // the RUNTIME zone the default micro-batch needs
+    size_t                               zone_bytes          = 0;  // the one in.n_ubatch needs; SIZE_MAX on overflow
+    size_t                               room_bytes          = 0;  // zone_bytes - zone_default_bytes, or 0
+    size_t                               room_reserved_bytes = 0;  // the part of room_bytes the zone already holds
+};
+
+enum class pp_moe_onednn_explicit_ubatch_action : uint8_t {
+    NONE = 0,   // no explicit micro-batch above the default, or the default zone already holds its ring
+    PLACE,      // the zone holds the room, and the experts were packed beside it
+    GROW_ZONE,  // the experts can give the room up, but the zone must grow by it first, then the plan is re-made
+    REFUSE,     // moving every device-resident routed expert to the host tier would not free the room
+};
+
+struct pp_moe_onednn_explicit_ubatch_decision {
+    pp_moe_onednn_explicit_ubatch_action action                   = pp_moe_onednn_explicit_ubatch_action::NONE;
+    // REFUSE: the RUNTIME bytes the ring could have with every device-resident routed expert moved to the host tier,
+    // and the largest multiple of 32 whose ring fits them, from pp_moe_onednn_admit_ring()'s slot arithmetic (0 when
+    // even the weight slot does not fit).
+    size_t                               max_ring_runtime_bytes   = 0;
+    uint32_t                             largest_fitting_n_ubatch = 0;
+};
+
+// Pure: the room an explicit micro-batch needs. Not valid when in.n_ubatch does not exceed in.n_ubatch_default, the
+// default is 0, or there is no ring (weight slot 0, ring_depth 0, or both per-row terms 0).
+pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
+    const pp_moe_onednn_explicit_ubatch_inputs & in);
+
+// Pure: the decision, given the device bytes the routed experts are packed into once the dense weights, their KV and
+// the KV context room are placed (`expert_budget_bytes`, with the zone as it is now).
+pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide(
+    const pp_moe_onednn_explicit_ubatch_room & room,
+    size_t                                     expert_budget_bytes);
+
+const char * pp_moe_onednn_explicit_ubatch_action_name(pp_moe_onednn_explicit_ubatch_action action);
+
 }  // namespace ggml_sycl
