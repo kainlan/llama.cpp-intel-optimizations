@@ -424,8 +424,9 @@ inline moe_pp_batched_f16_groups moe_pp_batched_f16_plan_groups(size_t slot_byte
 
 // Whether the f16 arm's phases write one region in turn (two halves alternating, or the one buffer a slot that holds a
 // single expert has) and so must each wait for the GEMMs that last read their buffer. When the slot holds every active
-// expert (one group) each phase has its own region and waits for nothing: a windowed op splits such a layer into
-// phases by the ring window, and those phases overlap instead of running one after another.
+// expert (one group) each phase has its own region and waits for no earlier phase's GEMMs: a windowed op splits such a
+// layer into phases by the ring window, and those phases are not made to run one after another (each still waits for
+// its own window's copies).
 inline bool moe_pp_batched_phases_reuse_buffers(const moe_pp_batched_f16_groups & groups) {
     return groups.groups != 1;
 }

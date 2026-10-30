@@ -91187,7 +91187,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // alternate halves as above, and a slot that holds one expert is one buffer every phase reuses: both wait
             // for the GEMMs that last read their buffer. When the slot holds every active expert (one group), each
             // phase dequantizes into its own region at phase.begin experts and waits for no earlier phase's GEMMs, so
-            // the phases overlap (moe_pp_batched_phases_reuse_buffers decides both, in the loop below).
+            // the phases are not made to run one after another (moe_pp_batched_phases_reuse_buffers decides both, in
+            // the loop below).
             size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group;
             if (pp_stream_windowed) {
                 phase_experts =

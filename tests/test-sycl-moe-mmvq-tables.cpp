@@ -674,7 +674,8 @@ int main() {
 
     // 12. Where each phase of the f16 arm dequantizes, and whether it waits for the GEMMs that last read its buffer.
     // A slot that holds every active expert (one group) gives each phase its own region at phase.begin experts, so a
-    // windowed op's phases overlap; two halves, or the one buffer of a one-expert slot, are reused and keep the wait.
+    // windowed op's phases wait for no earlier phase's GEMMs; two halves, or the one buffer of a one-expert slot, are
+    // reused and keep the wait.
     {
         const size_t weight_elems = 10;  // half-elements per expert
         const size_t f16_expert   = weight_elems * 2;
