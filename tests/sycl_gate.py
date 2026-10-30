@@ -128,13 +128,30 @@ def run_without_source(script: str):
         return done.returncode, done.stdout + done.stderr
 
 
-def first_missing(where: str, text: str, *anchors: str) -> str:
+def _shown(text: str) -> str:
+    """`text` for a failure message: whole when short, else cut to 100 characters with a trailing "..."."""
+    return text if len(text) <= 100 else text[:97] + "..."
+
+
+def first_missing(where: str, text: str, *anchors: str, signature: str = "") -> str:
     """The message for `assert claim(...), first_missing(...)`: names the first anchor the claim needs that `text`
     does not contain, and where it looked, so a stale pin says what it expected instead of a bare AssertionError.
     When every anchor is present the claim failed on an order, count or depth condition, and the message says so.
-    Never empty, so the assert always prints it."""
+    `signature`, when given, is the text that opens the region `text` was cut from (a function body); an empty
+    `text` then means the signature moved, and the message names the signature. Never empty, so the assert always
+    prints it."""
+    if signature and not text:
+        return "%s: missing %r" % (where, _shown(signature))
     for anchor in anchors:
         if anchor not in text:
-            shown = anchor if len(anchor) <= 100 else anchor[:97] + "..."
-            return "%s: missing %r" % (where, shown)
+            return "%s: missing %r" % (where, _shown(anchor))
     return "%s: all %d anchors present; an order, count or depth condition failed" % (where, len(anchors))
+
+
+def first_present(where: str, text: str, *forbidden: str) -> str:
+    """The message for an absence claim: names the first forbidden text that `text` does contain, and where, or says
+    none of them is present (so the claim failed on an emptiness or count condition). Never empty."""
+    for found in forbidden:
+        if found in text:
+            return "%s: found %r" % (where, _shown(found))
+    return "%s: none of %d forbidden texts present; an emptiness or count condition failed" % (where, len(forbidden))

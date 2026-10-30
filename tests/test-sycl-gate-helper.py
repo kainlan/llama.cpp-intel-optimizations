@@ -162,6 +162,52 @@ def test_first_missing_is_never_empty() -> None:
     assert first_missing("", "", "a")
 
 
+def test_first_missing_with_a_signature_and_empty_text_names_the_signature() -> None:
+    first_missing = _first_missing()
+    assert first_missing("W", "", "a", "b", signature="void f()") == "W: missing 'void f()'"
+
+
+def test_first_missing_with_a_signature_and_text_behaves_as_without_it() -> None:
+    first_missing = _first_missing()
+    assert first_missing("W", "a", "a", "b", signature="void f()") == first_missing("W", "a", "a", "b")
+    assert first_missing("W", "a b", "a", "b", signature="void f()") == first_missing("W", "a b", "a", "b")
+
+
+def test_first_missing_truncates_a_long_signature() -> None:
+    message = _first_missing()("W", "", "a", signature="s" * 300)
+    assert "..." in message
+    assert "s" * 98 not in message
+    assert len(message) < 160
+
+
+def _first_present():
+    sys.path.insert(0, str(TESTS))
+    from sycl_gate import first_present
+    return first_present
+
+
+def test_first_present_names_the_forbidden_text_and_where_it_looked() -> None:
+    assert _first_present()("W", "x bad y", "good", "bad") == "W: found 'bad'"
+
+
+def test_first_present_names_the_first_of_two_forbidden_texts() -> None:
+    assert _first_present()("W", "b a", "a", "b") == "W: found 'a'"
+
+
+def test_first_present_with_none_present_names_how_many_were_searched() -> None:
+    message = _first_present()("W", "clean", "a", "b", "c")
+    assert message == "W: none of 3 forbidden texts present; an emptiness or count condition failed"
+
+
+def test_first_present_truncates_and_is_never_empty() -> None:
+    first_present = _first_present()
+    message = first_present("W", "y" * 300, "y" * 300)
+    assert "..." in message
+    assert len(message) < 160
+    assert first_present("W", "")
+    assert first_present("", "t", "t")
+
+
 if __name__ == "__main__":
     import sys
 
