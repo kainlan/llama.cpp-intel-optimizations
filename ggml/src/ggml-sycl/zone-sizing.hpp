@@ -473,9 +473,8 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
 
 // A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
 // linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
-// request is 0; SIZE_MAX when the product overflows. The one estimator for a compute buffer at a micro-batch nobody
-// measured: the hold-spill fit scales a rung's record with it, and the explicit micro-batch's placement scales the
-// load's measured compute term (pp_moe_onednn_explicit_ubatch_plan_room).
+// request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a
+// micro-batch nobody measured: it scales a rung's record with it.
 inline size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
     if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
         return request;
@@ -500,8 +499,9 @@ size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_uba
 // eats the driver headroom. `kv_zone_free` is what a compute buffer can count on in that zone NOW
 // (zone_kv_room_for_compute: its largest free block, net of the KV this context has yet to place). It is an
 // estimate in three ways: other buffers may take that room before the spill does, a spill is several buffers and the
-// room is one block, and the spill figure it is subtracted from is itself a heuristic. The realized check, which
-// counts the RAW spills a rung actually made, is the backstop; this is the transaction-time prediction only.
+// room is one block, and the spill figure it is subtracted from is itself a heuristic. The realized check, run once
+// the rung's buffers exist, asks the same bound with the rung's measured request; the RAW spills the rung made reach
+// only its refusal text, so this estimate is never checked against them.
 size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free);
 
 // The KV-zone room a compute buffer can count on. The runtime-context transaction publishes BEFORE this context's KV
@@ -541,8 +541,9 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 // supplies all of it, and a demand on free memory otherwise.
 //
 // compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
-// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone carries the load's
-// measured compute term scaled to it. 0 for none, the case of every load that names no micro-batch.
+// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned compute
+// term (the compute buffers the load measured at its planning shape) beside that micro-batch's ring and dense scratch.
+// 0 for none, the case of every load that names no micro-batch.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
     size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
@@ -564,7 +565,9 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
 
 // Whether the RUNTIME zone was planned to serve `request` at `n_ubatch` beside the hold: the rung is the one the plan
 // sized a compute room for, and the request is no larger than that room. Whole or nothing: a request above the room
-// gets no part of it.
+// gets no part of it. It can over-credit a rung whose compute buffers span several chunks, because the request is the
+// rung's largest single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other
+// chunks draw on too. The bound has the same limit, since it charges one request rather than the rung's chunks.
 bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request);
 
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
