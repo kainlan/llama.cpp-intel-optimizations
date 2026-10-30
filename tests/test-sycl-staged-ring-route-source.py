@@ -73,10 +73,7 @@ Pytest-style (module-level test_* functions): registered with llama_test_pytest.
 """
 
 import re
-from pathlib import Path
-from sycl_gate import body, first_missing, first_present, mutate, norm, ordered, read
-
-ROOT = Path(__file__).resolve().parents[1]
+from sycl_gate import ROOT, body, first_missing, first_present, mutate, norm, ordered, read
 
 
 SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"

@@ -14,6 +14,7 @@ import sys
 import textwrap
 from pathlib import Path
 
+import sycl_gate
 from sycl_gate import body, first_missing, first_present, mutate, norm, ordered, read
 
 TESTS = Path(__file__).resolve().parent
@@ -221,20 +222,40 @@ def test_norm_strips_comments_and_canonicalises_whitespace() -> None:
     assert norm('s = "// kept";') == 's = "// kept";'
 
 
+def test_strip_comments_keeps_a_quote_character_literal_whole() -> None:
+    assert norm("c = '\"'; /* x */ d = \"y\";") == "c = '\"'; d = \"y\";"
+
+
+def test_norm_does_not_join_literals_across_an_escaped_quote() -> None:
+    assert norm('s = "a\\" ";') == 's = "a\\" ";'
+    assert norm('s = "a" "b";') == 's = "ab";'
+
+
 def test_norm_is_idempotent() -> None:
     once = norm("if ( a ,b ) {\n  f( \"p\" \"q\" ) ; // c\n}")
     assert norm(once) == once
 
 
-def test_read_returns_text_or_empty() -> None:
+def test_read_returns_text_or_empty(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)  # a cwd-relative read would find nothing here
     assert "def read(" in read("tests/sycl_gate.py")
     assert read("tests/no-such-file-anywhere.txt") == ""
+
+
+def test_root_is_the_repo_root_beside_tests() -> None:
+    assert sycl_gate.ROOT == Path(sycl_gate.__file__).resolve().parents[1]
+    assert (sycl_gate.ROOT / "tests" / "sycl_gate.py").is_file()
 
 
 def test_body_balances_braces_and_skips_literals() -> None:
     text = 'void f() { if (x) { g("}"); } } void h() { }'
     assert body(text, "void f()") == '{ if (x) { g("}"); } }'
     assert body(text, "void h()") == "{ }"
+
+
+def test_body_skips_an_escaped_quote_inside_a_literal() -> None:
+    text = 'void f() { g("a\\"}"); } void h() { }'
+    assert body(text, "void f()") == 'void f() { g("a\\"}"); }'[len("void f() "):]
 
 
 def test_body_signature_ending_in_brace_opens_the_body_itself() -> None:
@@ -251,6 +272,7 @@ def test_body_is_empty_when_signature_or_closing_brace_is_missing() -> None:
 
 def test_ordered_requires_every_needle_after_the_previous_one() -> None:
     assert not ordered("x", "x", "x")
+    assert not ordered("aa", "aa", "a")
     assert ordered("a b c", "a", "b", "c")
     assert not ordered("a b c", "b", "a")
     assert not ordered("a b c", "a", "z")

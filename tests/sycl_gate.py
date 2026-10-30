@@ -14,18 +14,22 @@ and `finish()` turns the record into the process exit status.
     finish("my gate: PASS")
 
 Not a pytest plugin: pytest-style gates (module-level test_* functions) are
-already independent, one result per function. This module serves them two kinds of helper. The message helpers:
-a claim that returns a bare bool says nothing about WHICH token failed, so pass
-first_missing (names the first anchor the claim needs that its region lacks) or
-first_present (names the first forbidden text its region holds) as the message.
+already independent, one result per function; they use two kinds of helper
+from this module. First, the message helpers: a claim that returns a bare
+bool says nothing about WHICH token failed, so pass first_missing (names the
+first anchor the claim needs that its region lacks) or first_present (names
+the first forbidden text its region holds) as the message.
 
     from sycl_gate import first_missing
 
     assert claim_x(SYCL), first_missing("file: region", region, ANCHOR_A, ANCHOR_B)
 
-And the text helpers the MoE source-contract pins share, at the end of the module: norm (comment-stripped,
-whitespace-canonical text), read (a repo file's text, or empty when it is missing), body (the brace-balanced body of a
-definition), ordered (needles in order) and mutate (a normalised text with one replacement, for positive controls).
+Second, the text helpers for source-contract pins, at the end of the module:
+ROOT (the repo root), strip_comments (source text with comments blanked, line
+breaks kept), norm (comment-stripped, whitespace-canonical text), read (a repo
+file's text, or empty when it is missing), body (the brace-balanced body of a
+definition), ordered (needles in order) and mutate (a normalised text with one
+replacement, for positive controls).
 """
 import contextlib
 import linecache
@@ -173,11 +177,11 @@ def first_present(where: str, text: str, *forbidden: str) -> str:
     return "%s: none of %d forbidden texts present; an emptiness or count condition failed" % (where, len(forbidden))
 
 
-# ---- text helpers shared by the source-contract pins (exec-window, staged-ring-route, stream-enqueue) -------------------
+# ---- text helpers for source-contract pins ----------------------------------------------------------------------------
 
 # The repo root, resolved the way the pins resolved it from their own path: this file sits in tests/, so parents[1] of
-# it is the same directory as parents[1] of any pin beside it.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+# it is the same directory as parents[1] of any pin beside it. The pins import it rather than define their own.
+ROOT = Path(__file__).resolve().parents[1]
 
 _LEXEME_RE = re.compile(
     r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
@@ -186,6 +190,7 @@ _LEXEME_RE = re.compile(
 
 
 def strip_comments(src: str) -> str:
+    """`src` with comments blanked (their line breaks kept) and string and character literals left whole."""
     def repl(m: re.Match) -> str:
         tok = m.group(0)
         if tok[0] in "\"'":
@@ -209,8 +214,9 @@ def norm(text: str) -> str:
 
 
 def read(rel: str) -> str:
-    """The file's text, or empty when it does not exist yet, so a missing file fails the claims instead of erroring."""
-    p = _REPO_ROOT / rel
+    """The file's text, or empty when it does not exist yet, so a missing file fails a presence claim instead of
+    erroring. An absence claim passes vacuously on "", so it needs a non-empty region (or a check that this read is)."""
+    p = ROOT / rel
     return p.read_text(errors="replace") if p.exists() else ""
 
 
