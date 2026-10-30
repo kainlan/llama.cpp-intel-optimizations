@@ -4661,8 +4661,8 @@ endif()
 # zone at every prompt, and an expert loan cannot fund a slot larger than every lendable matrix, so a room the planner
 # left is what lets the ring engage at default placement. The room is the shared ring geometry over the pack the
 # planner predicts, counted in vram_bytes and kept in the plan's accounting through the runtime KV re-derivation. The
-# auto-ubatch fit still probes the loan for the whole ring and does not credit the room. A mutant per claim. Text
-# only: no device, no model.
+# auto-ubatch fit credits the room in whole slots and probes the loan only for the slots the room leaves short. A
+# mutant per claim. Text only: no device, no model.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-stream-ring-room-source

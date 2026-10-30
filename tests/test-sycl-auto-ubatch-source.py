@@ -2829,7 +2829,7 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
 
 _RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {"
 _RING_HELPER_END = "const char * moe_batch_reject_reason_name("
-_RING_REMAINDER_LINE = "return loan.geo.bytes > lent ? loan.geo.bytes - lent : 0;"
+_RING_REMAINDER_LINE = "return loan.geo.bytes > room_kept + lent ? loan.geo.bytes - room_kept - lent : 0;"
 _RING_PROBE_LINE = ("const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, loan.bytes, "
                     "loan.geo.slot_bytes);")
 _RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
@@ -2846,8 +2846,8 @@ def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:
 
 
 def _ring_helper_remainder_pinned(raw_cpp: str) -> bool:
-    """The helper returns what the loan did NOT cover: the clamped difference of the ring and the probe's lent bytes,
-    each exactly once."""
+    """The helper returns what neither the planned room nor the loan covers: the clamped difference of the ring and
+    the room's kept slots plus the probe's lent bytes, each exactly once."""
     body = _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END)
     return body.count(_RING_REMAINDER_LINE) == 1 and body.count(_RING_PROBE_LINE) == 1
 
@@ -2878,7 +2878,7 @@ def test_the_ring_helper_returns_the_clamped_uncovered_remainder():
 def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
     assert GGML_SYCL_CPP.count(_RING_REMAINDER_LINE) == 1
     if mutation == "no-clamp":
-        mutated = GGML_SYCL_CPP.replace(_RING_REMAINDER_LINE, "return loan.geo.bytes - lent;")
+        mutated = GGML_SYCL_CPP.replace(_RING_REMAINDER_LINE, "return loan.geo.bytes - room_kept - lent;")
     elif mutation == "returns-lent":
         mutated = GGML_SYCL_CPP.replace(_RING_REMAINDER_LINE, "return lent;")
     else:
@@ -2891,13 +2891,14 @@ def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
 
 # The ring a loan funds is the one the plan it leaves sizes: lent triplets become host matrices, which can widen the
 # window, so a request sized from the pre-loan ring can fund a ring prepare() no longer builds. The fit sizes the loan
-# as the stream phase does, through the one post-loan sizing with the whole ring short (nothing is held before the
-# prompt), from a sizer carrying the pre-loan geometry, the every-weight claims hook and the executor window; it
-# probes that loan in the post-loan ring's slots and charges the post-loan ring less what the probe lends. A loan that
-# does not converge is never asked for, so the whole pre-loan ring is a demand, as a refused probe charges.
+# as the stream phase does, through the one post-loan sizing with the ring short of what the planned room holds, from
+# a sizer carrying the pre-loan geometry, the every-weight claims hook and the executor window; it probes that loan in
+# the post-loan ring's slots and charges the post-loan ring less the room's kept slots and what the probe lends. A
+# loan that does not converge is never asked for, so the part of the pre-loan ring the room does not hold is a demand,
+# as a refused probe charges.
 _RING_LOAN_SIZING = ("const ggml_sycl::moe_stream_loan_sizing loan = "
-                     "ggml_sycl::moe_stream_loan_size_post_loan(sizer, geo.bytes);")
-_RING_LOAN_REFUSED = "if (!loan.converged) { return geo.bytes; }"
+                     "ggml_sycl::moe_stream_loan_size_post_loan(sizer, bytes_short);")
+_RING_LOAN_REFUSED = "if (!loan.converged) { return bytes_short; }"
 _RING_SIZER_FILL = ("sizer.plan = call.plan.get();", "sizer.device = device;", "sizer.geo = geo;",
                     "sizer.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;", "sizer.graph_ctx = &call;",
                     "sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;",
@@ -2927,13 +2928,16 @@ _RING_LOAN_MUTANTS = {
     # The remainder is taken from the pre-loan ring, which undercharges a loan that widens the window.
     "charges-the-pre-loan-ring": (_RING_REMAINDER_LINE, "return geo.bytes > lent ? geo.bytes - lent : 0;"),
     # A loan that cannot converge charges nothing, as if the ring were lent.
-    "refused-charges-nothing": ("if (!loan.converged) {\n        return geo.bytes;",
+    "refused-charges-nothing": ("if (!loan.converged) {\n        return bytes_short;",
                                 "if (!loan.converged) {\n        return 0;"),
     # The refusal is dropped: the probe then lends toward a ring the phase never asks for.
-    "refused-path-dropped": ("if (!loan.converged) {\n        return geo.bytes;\n    }\n", ""),
+    "refused-path-dropped": ("if (!loan.converged) {\n        return bytes_short;\n    }\n", ""),
     # The sizing is asked with nothing short, so it never sizes a loan.
-    "sizes-nothing-short": ("moe_stream_loan_size_post_loan(sizer, geo.bytes);",
+    "sizes-nothing-short": ("moe_stream_loan_size_post_loan(sizer, bytes_short);",
                             "moe_stream_loan_size_post_loan(sizer, 0);"),
+    # The sizing is asked for the whole ring, so the loan also funds the slots the planned room holds.
+    "sizes-the-whole-ring": ("moe_stream_loan_size_post_loan(sizer, bytes_short);",
+                             "moe_stream_loan_size_post_loan(sizer, geo.bytes);"),
     # The sizer claims nothing, so the post-loan index stages no host matrix and sizes no ring.
     "sizer-claims-nothing": ("sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;",
                              "sizer.library_claims = nullptr;"),
@@ -3240,6 +3244,101 @@ def test_the_ring_geometry_counts_the_rings_loan_back_as_resident():
 def test_the_lent_back_ring_cap_pin_has_a_mutation_witness(old, new):
     mutated = _mutate_raw_ws_tolerant(MOE_STREAM_PLAN_HPP, old, new)
     assert not _ring_cap_counts_the_loan_back(mutated), "the mutant must make the pin fail"
+
+
+# The planned room: the single-device planner holds the window ring's bytes free in the WEIGHT zone
+# (placement_plan::moe_stream_ring_reserve_bytes), and a prompt's first reserve takes them before any loan. The fit
+# credits that room first, in whole slots of its own geometry, as the reserve holds them, and sizes the loan for the
+# slots it leaves short, so the post-loan sizing credits those held slots as it credits a short reserve's. A room the
+# planner held for another device funds none of this one's ring. The room's slots the post-loan ring keeps come from
+# the sizing's own rule (moe_stream_ring_slots_kept), the one place that rule is spelled, so the fit and the loan
+# cannot credit the room differently.
+_ROOM_READ = "const size_t room = call.plan->device_id == device ? call.plan->moe_stream_ring_reserve_bytes : 0;"
+_ROOM_SLOTS = ("const uint32_t room_slots = static_cast<uint32_t>(std::min<size_t>(geo.n_slots, "
+               "room / geo.slot_bytes));")
+_ROOM_WHOLE = "if (room_slots == geo.n_slots) { return 0; }"
+_ROOM_SHORT = "const size_t bytes_short = static_cast<size_t>(geo.n_slots - room_slots) * geo.slot_bytes;"
+_ROOM_KEPT = ("const size_t room_kept = static_cast<size_t>(ggml_sycl::moe_stream_ring_slots_kept(loan.geo, "
+              "geo.slot_bytes, room_slots)) * loan.geo.slot_bytes;")
+_SLOTS_KEPT_START = "static inline uint32_t moe_stream_ring_slots_kept("
+_SLOTS_KEPT_RULE = "return ring.slot_bytes == held_slot_bytes ? std::min(held, ring.n_slots) : 0;"
+_SIZER_START = ("static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & sizer, "
+                "size_t bytes_short) {")
+_SIZER_CREDIT = "const uint32_t credit = moe_stream_ring_slots_kept(target, geo.slot_bytes, held);"
+
+
+def _flat(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def _ring_helper_credits_the_planned_room(raw_cpp: str, raw_hpp: str) -> bool:
+    """The room is read for this device, credited in whole slots before the sizer, a room that holds the whole ring
+    charges nothing, the sizer is asked for the slots the room leaves short, and the remainder subtracts the room's
+    slots the post-loan ring keeps, by the sizing's own rule. The rule is spelled once, in moe_stream_ring_slots_kept,
+    which the sizing's credit also asks."""
+    body = _flat(_body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END))
+    steps = [_flat(s) for s in (_ROOM_READ, _ROOM_SLOTS, _ROOM_WHOLE, _ROOM_SHORT, _RING_LOAN_SIZING,
+                                _RING_LOAN_REFUSED, _RING_PROBE_LINE, _ROOM_KEPT, _RING_REMAINDER_LINE)]
+    if any(body.count(step) != 1 for step in steps):
+        return False
+    at = [body.find(step) for step in steps]
+    if at != sorted(at) or body.count("moe_stream_ring_reserve_bytes") != 1:
+        return False
+    hpp = _flat(strip_comments(raw_hpp))
+    kept_at = hpp.find(_flat(_SLOTS_KEPT_START))
+    sizer_at = hpp.find(_flat(_SIZER_START))
+    return (kept_at != -1 and sizer_at != -1 and hpp.count(_flat(_SLOTS_KEPT_RULE)) == 1
+            and hpp.find(_flat(_SLOTS_KEPT_RULE), kept_at) > kept_at
+            and hpp.count("std::min(held,") == 1
+            and hpp.count(_flat(_SIZER_CREDIT)) == 1 and hpp.find(_flat(_SIZER_CREDIT)) > sizer_at)
+
+
+def test_the_ring_helper_credits_the_planned_room_before_the_loan():
+    assert _ring_helper_credits_the_planned_room(GGML_SYCL_CPP, MOE_STREAM_PLAN_HPP)
+
+
+_ROOM_CPP_MUTANTS = {
+    # No room is read: the fit charges the room's slots against free memory a second time.
+    "room-ignored": ("call.plan->device_id == device ? call.plan->moe_stream_ring_reserve_bytes : 0;", "0;"),
+    # A room planned for another device is credited to this one's ring.
+    "room-any-device": ("call.plan->device_id == device ? call.plan->moe_stream_ring_reserve_bytes : 0;",
+                        "call.plan->moe_stream_ring_reserve_bytes;"),
+    # The room is credited in bytes, so a part slot the reserve cannot hold counts as covered.
+    "room-in-bytes": (_ROOM_SHORT, "const size_t bytes_short = geo.bytes > room ? geo.bytes - room : 0;"),
+    # A room that holds the whole ring no longer answers 0 before the sizer.
+    "whole-room-dropped": ("if (room_slots == geo.n_slots) {", "if (false) {"),
+    # A refused loan charges the whole ring, as if the room held nothing.
+    "refused-charges-the-whole-ring": ("if (!loan.converged) {\n        return bytes_short;",
+                                       "if (!loan.converged) {\n        return geo.bytes;"),
+    # The remainder ignores the room's slots.
+    "kept-dropped": (_ROOM_KEPT, "const size_t room_kept = 0;"),
+    # The room's slots count in any slot size, a rule the sizing does not have.
+    "kept-by-its-own-rule": (_ROOM_KEPT,
+                             "const size_t room_kept = static_cast<size_t>(room_slots) * loan.geo.slot_bytes;"),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(_ROOM_CPP_MUTANTS))
+def test_the_planned_room_credit_has_a_mutation_witness(mutation):
+    real, broken = _ROOM_CPP_MUTANTS[mutation]
+    mutated = _mutate_raw_ws_tolerant(GGML_SYCL_CPP, real, broken)
+    assert not _ring_helper_credits_the_planned_room(mutated, MOE_STREAM_PLAN_HPP), "the mutant must make the pin fail"
+
+
+_ROOM_HPP_MUTANTS = {
+    # The sizing spells the rule again instead of asking the helper.
+    "sizer-inlines-the-rule": (_SIZER_CREDIT, "const uint32_t credit = target.slot_bytes == geo.slot_bytes ? "
+                                              "std::min(held, target.n_slots) : 0;"),
+    # The helper keeps held slots in any slot size.
+    "rule-ignores-the-slot-size": (_SLOTS_KEPT_RULE, "return std::min(held, ring.n_slots);"),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(_ROOM_HPP_MUTANTS))
+def test_the_slots_kept_rule_has_a_mutation_witness(mutation):
+    real, broken = _ROOM_HPP_MUTANTS[mutation]
+    mutated = _mutate_raw_ws_tolerant(MOE_STREAM_PLAN_HPP, real, broken)
+    assert not _ring_helper_credits_the_planned_room(GGML_SYCL_CPP, mutated), "the mutant must make the pin fail"
 
 
 if __name__ == "__main__":

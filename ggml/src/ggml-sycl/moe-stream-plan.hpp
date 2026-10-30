@@ -394,6 +394,16 @@ static inline bool moe_stream_ring_geometry_same(const moe_stream_ring_geometry 
            a.region_slots == b.region_slots;
 }
 
+// The slots of `ring` that `held` slots of `held_slot_bytes` still fund: all of them, up to the ring's own count,
+// while the slot size is the same, and none in another size, where each leaves a hole one such slot wide. The loan
+// sizing credits a short reserve's held slots by it (moe_stream_loan_size_post_loan), and the auto-ubatch fit credits
+// the planner's ring room by it (ggml_sycl_hold_ring_uncovered), so the two cannot credit held slots differently.
+static inline uint32_t moe_stream_ring_slots_kept(const moe_stream_ring_geometry & ring,
+                                                  size_t                           held_slot_bytes,
+                                                  uint32_t                         held) {
+    return ring.slot_bytes == held_slot_bytes ? std::min(held, ring.n_slots) : 0;
+}
+
 // True iff the batched executor takes every host matrix of the layer from the ring (W2): the layer has items, each one
 // staged AOS_ONLY for the executor (the index build's record of the claim), and no host entry is one the ring cannot
 // stage (fused GATE_UP, CHUNK_*). The geometry-free half of moe_stream_executor_claims, which the ring-unavailable rule
@@ -1437,7 +1447,7 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
     moe_stream_ring_geometry     target = geo;
     std::unordered_set<uint64_t> as_host;
     for (uint32_t step = 1;; ++step) {
-        const uint32_t credit = target.slot_bytes == geo.slot_bytes ? std::min(held, target.n_slots) : 0;
+        const uint32_t credit = moe_stream_ring_slots_kept(target, geo.slot_bytes, held);
         const size_t   bytes  = static_cast<size_t>(target.n_slots - credit) * target.slot_bytes;
         const std::vector<expert_placement_key> keys =
             moe_expert_loan_select(*sizer.plan, sizer.device, bytes, target.slot_bytes, nullptr);

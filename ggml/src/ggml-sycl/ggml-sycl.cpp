@@ -36836,10 +36836,19 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // bounded, and the callers are the transaction and the auto-ubatch trial's checks, never a per-graph path, so a
 // per-query cache is not warranted today.
 // The ring the loan funds is the one the plan it leaves sizes: lent triplets become host matrices, which can widen the
-// window. So the fit sizes the loan as the stream phase sizes it, from the post-loan plan with the whole ring short
-// (moe_stream_loan_size_post_loan; nothing is held before the prompt), and charges that geometry's bytes less what the
-// probe of that loan lends. When no loan converges the phase asks for none, so the pre-loan ring is a demand on free
-// memory, all of it, as a refused probe charges.
+// window. So the fit sizes the loan as the stream phase sizes it, from the post-loan plan with the ring short of what
+// the planned room holds (moe_stream_loan_size_post_loan), and charges that geometry's bytes less the room's slots it
+// keeps and what the probe of that loan lends. When no loan converges the phase asks for none, so the part of the
+// pre-loan ring the room does not hold is a demand on free memory, all of it, as a refused probe charges.
+// The planned room is the bytes the single-device planner held free in the WEIGHT zone for this ring
+// (placement_plan::moe_stream_ring_reserve_bytes). They sit inside the arena, outside the free memory the fit charges
+// against, and a prompt's first reserve takes them before any loan, so the fit credits them first, in whole slots of
+// this geometry, as that reserve holds them. The loan is then sized for the slots the room leaves short, which the
+// sizing credits as a short reserve's held slots, and the room's slots the post-loan ring keeps follow the sizing's own
+// rule (moe_stream_ring_slots_kept). A room planned for another device funds none of this one's ring, and a
+// multi-device plan holds none. The room is the plan's accounting, not an allocation: a runtime context whose KV takes
+// those bytes (KV has priority) leaves the reserve short, and the credit is then too large, the case the memory design
+// doc names.
 static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
@@ -36856,6 +36865,13 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     if (geo.bytes == 0) {
         return 0;
     }
+    const size_t   room       = call.plan->device_id == device ? call.plan->moe_stream_ring_reserve_bytes : 0;
+    const uint32_t room_slots = static_cast<uint32_t>(std::min<size_t>(geo.n_slots, room / geo.slot_bytes));
+    if (room_slots == geo.n_slots) {
+        return 0;  // the room holds the whole ring: nothing to lend and nothing to charge
+    }
+    const size_t bytes_short = static_cast<size_t>(geo.n_slots - room_slots) * geo.slot_bytes;
+
     ggml_sycl::moe_stream_loan_sizer sizer;
     sizer.plan           = call.plan.get();
     sizer.device         = device;
@@ -36865,12 +36881,15 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;
     sizer.hints          = call.op.window;
 
-    const ggml_sycl::moe_stream_loan_sizing loan = ggml_sycl::moe_stream_loan_size_post_loan(sizer, geo.bytes);
+    const ggml_sycl::moe_stream_loan_sizing loan = ggml_sycl::moe_stream_loan_size_post_loan(sizer, bytes_short);
     if (!loan.converged) {
-        return geo.bytes;
+        return bytes_short;
     }
     const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, loan.bytes, loan.geo.slot_bytes);
-    return loan.geo.bytes > lent ? loan.geo.bytes - lent : 0;
+    const size_t room_kept =
+        static_cast<size_t>(ggml_sycl::moe_stream_ring_slots_kept(loan.geo, geo.slot_bytes, room_slots)) *
+        loan.geo.slot_bytes;
+    return loan.geo.bytes > room_kept + lent ? loan.geo.bytes - room_kept - lent : 0;
 }
 
 namespace ggml_sycl {
