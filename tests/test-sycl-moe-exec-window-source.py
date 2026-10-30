@@ -38,7 +38,7 @@ import re
 from pathlib import Path
 
 import pytest
-from sycl_gate import first_missing
+from sycl_gate import first_missing, first_present
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -175,7 +175,8 @@ def claim_stream_call_at_function_scope(sycl: str) -> bool:
 def test_stream_call_at_function_scope():
     assert claim_stream_call_at_function_scope(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id", body(norm(SYCL), MMID_SIG),
-        STREAM_CALL_DECL, PROMPT_BRANCH, CLAIM_BEGIN, CLAIM, EXEC_SIG)
+        STREAM_CALL_DECL, PROMPT_BRANCH, CLAIM_BEGIN, CLAIM, EXEC_SIG,
+        signature=MMID_SIG)
 
 
 def test_stream_call_at_function_scope_mutants():
@@ -233,7 +234,8 @@ def claim_window_path_is_per_op(sycl: str) -> bool:
 def test_window_path_is_per_op():
     assert claim_window_path_is_per_op(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of the try_pp_onednn_f16_batched lambda", body(norm(SYCL), EXEC_SIG),
-        ROLE_DECL, WOQ_ARM, WINDOWED, EARLY_LOOP, *WINDOWED_USES)
+        ROLE_DECL, WOQ_ARM, WINDOWED, EARLY_LOOP, *WINDOWED_USES,
+        signature=EXEC_SIG)
 
 
 def test_window_path_is_per_op_mutants():
@@ -281,7 +283,8 @@ def test_early_loop_defers():
     assert claim_early_loop_defers(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of the expert loop in the try_pp_onednn_f16_batched lambda "
         "(the deferred field is searched in pp_onednn_batched_expert)",
-        body(body(norm(SYCL), EXEC_SIG), EARLY_LOOP), DEFERRED)
+        body(body(norm(SYCL), EXEC_SIG), EARLY_LOOP), DEFERRED,
+        signature=EARLY_LOOP)
 
 
 def test_early_loop_defers_mutants():
@@ -328,7 +331,8 @@ def claim_phase_is_a_window(sycl: str) -> bool:
 def test_phase_is_a_window():
     assert claim_phase_is_a_window(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of the try_pp_onednn_f16_batched lambda", body(norm(SYCL), EXEC_SIG),
-        WINDOWED, PHASE_CAP, HALF_ELEMS, PHASES_BUILD, SORT, PHASE_IDS, PHASE_LOOP)
+        WINDOWED, PHASE_CAP, HALF_ELEMS, PHASES_BUILD, SORT, PHASE_IDS, PHASE_LOOP,
+        signature=EXEC_SIG)
 
 
 def test_phase_is_a_window_mutants():
@@ -401,7 +405,8 @@ def claim_phase_brackets_its_window(sycl: str) -> bool:
 def test_phase_brackets_its_window():
     assert claim_phase_brackets_its_window(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of the phase loop in the try_pp_onednn_f16_batched lambda",
-        body(body(norm(SYCL), EXEC_SIG), PHASE_LOOP), *PHASE_STEPS)
+        body(body(norm(SYCL), EXEC_SIG), PHASE_LOOP), *PHASE_STEPS,
+        signature=PHASE_LOOP)
 
 
 def test_phase_brackets_its_window_mutants():
@@ -487,7 +492,8 @@ def test_window_begin_feeds_misses_and_note():
     assert claim_window_begin_feeds_misses_and_note(PLAN_CPP), first_missing(
         "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::window_begin "
         "(the note_window feed is a regex there)", body(norm(PLAN_CPP), WB_SIG),
-        WB_MISSING, WB_EXPOSED, WB_MISSES, "note_window(")
+        WB_MISSING, WB_EXPOSED, WB_MISSES, "note_window(",
+        signature=WB_SIG)
 
 
 def test_window_begin_feeds_misses_and_note_mutants():
@@ -542,7 +548,8 @@ def test_exposed_is_a_layers_first_window():
     assert claim_exposed_is_a_layers_first_window(PLAN_HPP, PLAN_CPP), first_missing(
         "ggml/src/ggml-sycl/moe-stream-plan.hpp: body of moe_stream_window_exposed "
         "(begin_ubatch's reset is searched in moe-stream-plan.cpp)", body(norm(PLAN_HPP), EXPOSED_SIG),
-        EXPOSED_RETURN)
+        EXPOSED_RETURN,
+        signature=EXPOSED_SIG)
 
 
 def test_exposed_is_a_layers_first_window_mutants():
@@ -621,7 +628,8 @@ def test_deferred_slot_and_draining_declines():
     assert claim_deferred_slot_and_draining_declines(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of resolve_deferred_expert "
         "(the drain and the GEMM failure path are searched in the enclosing lambda)",
-        body(body(norm(SYCL), EXEC_SIG), RESOLVE_SIG), *RESOLVE_STEPS)
+        body(body(norm(SYCL), EXEC_SIG), RESOLVE_SIG), *RESOLVE_STEPS,
+        signature=RESOLVE_SIG)
 
 
 def test_deferred_slot_and_draining_declines_mutants():
@@ -705,7 +713,8 @@ def claim_trace_lines(sycl: str) -> bool:
 def test_trace_lines():
     assert claim_trace_lines(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of the try_pp_onednn_f16_batched lambda", body(norm(SYCL), EXEC_SIG),
-        COUNTERS, PHASE_LOOP, PP_MOE_FMT, PP_MOE_ARGS, EXEC_TRACE_FMT, EXEC_TRACE_ARGS)
+        COUNTERS, PHASE_LOOP, PP_MOE_FMT, PP_MOE_ARGS, EXEC_TRACE_FMT, EXEC_TRACE_ARGS,
+        signature=EXEC_SIG)
 
 
 def test_trace_lines_mutants():
@@ -730,9 +739,10 @@ def claim_no_stale_prose(sycl: str, test_hpp: str) -> bool:
 
 
 def test_no_stale_prose():
-    assert claim_no_stale_prose(SYCL, TEST_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp and ggml-sycl-test.hpp: whole files, empty or carrying a retired phrase",
-        norm(SYCL), MMID_SIG)
+    assert claim_no_stale_prose(SYCL, TEST_HPP), first_present(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the claim also fails on an empty file and searches "
+        "ggml-sycl-test.hpp for its own retired phrases)",
+        SYCL, *STALE_SYCL)
 
 
 @pytest.mark.parametrize("stale", STALE_SYCL)
