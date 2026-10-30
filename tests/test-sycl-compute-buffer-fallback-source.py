@@ -657,14 +657,10 @@ def test_shared_body_call_sites_have_a_mutation_witness():
     )
 
 
-# llama.cpp-tsfl round 1 F2/F8: after F2 added a SECOND `if (probe_mode) {`
-# inside the transaction body (the KV-demotion WARN/INFO branch, much
-# earlier in the function than the probe's own exit branch), a plain
-# re.search() for the bare `if (probe_mode) {` pattern finds THAT one
-# first, not the exit branch this section's checks actually care about.
-# Identify the exit branch specifically by content unique to it: it is the
-# only `if (probe_mode)` block that captures a rollback result into
-# `rollback_ok` (round 1 F1).
+# The transaction body has a SECOND `if (probe_mode) {` besides the probe's own exit branch: the KV-demotion WARN/INFO
+# branch, much earlier in the function. A plain re.search() for the bare `if (probe_mode) {` pattern finds THAT one
+# first, not the exit branch this section's checks actually care about. So the exit branch is identified by content
+# unique to it: it is the only `if (probe_mode)` block that captures a rollback result into `rollback_ok`.
 # test_probe_branch_ordering_has_a_mutation_witness() identifies the same branch by a SECOND, separate search over raw
 # text; both use _ROLLBACK_CAPTURE, so a change to how the branch is recognised belongs in both places.
 _ROLLBACK_CAPTURE = "rollback_ok"
