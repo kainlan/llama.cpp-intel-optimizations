@@ -129,7 +129,7 @@ bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, 
         if (!allocation) {
             break;
         }
-        mem_handle slot     = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        mem_handle slot     = mem_handle::from_owned_alloc(std::move(allocation.owner), MOE_STREAM_RING_SLOT_LAYOUT);
         const auto resolved = slot.resolve(device);
         if (!resolved.ptr || !resolved.on_device) {
             // No loan makes a slot resolve: no shortfall is reported.

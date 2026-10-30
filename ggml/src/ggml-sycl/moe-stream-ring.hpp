@@ -80,6 +80,12 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
 
 namespace ggml_sycl {
 
+// The layout every ring slot holds, and the only layout the ring stages (W2 of
+// docs/plans/2026-10-24-prefill-window-ring.md). The slot's wrap, its acquire,
+// its stage-table entry and the executor's reader and check all read this one
+// fact, so none restates it.
+static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;
+
 // Not thread-safe: one ring belongs to one device's prompt executor, which
 // acquires, flips and releases from its submitting thread. Nothing here queries
 // an event or waits on the host. A region's reuse is ordered on the device: the
