@@ -222,9 +222,12 @@ pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_a
 // device bytes its routed experts are packed into.
 //
 // The RUNTIME zone is sized as the arena sizes it: the larger of its floor and the planned requirement, rounded up to
-// 256 bytes. The requirement splits into the ring, the dense scratch (both scale with the micro-batch) and a fixed
-// rest. The room is what the zone for N needs beyond the zone for the default micro-batch. Zones never shrink, so a
-// zone already grown (an earlier stage of the same load) may hold part or all of it.
+// 256 bytes. The requirement splits into the ring, the dense scratch (both scale with the micro-batch), the compute
+// buffers' growth above the load's measured compute term, and a fixed rest that holds that term. The term was measured
+// at the default micro-batch; at N the compute buffers are estimated by scaling it linearly (zone_hold_scale_request,
+// the estimator the hold-spill fit scales a rung's buffers with), and the growth is what that adds. The room is what
+// the zone for N needs beyond the zone for the default micro-batch. Zones never shrink, so a zone already grown (an
+// earlier stage of the same load) may hold part or all of it.
 struct pp_moe_onednn_explicit_ubatch_inputs {
     uint32_t n_ubatch                    = 0;  // the explicit micro-batch; 0 = none
     uint32_t n_ubatch_default            = 0;  // the load's own planning micro-batch
@@ -237,6 +240,7 @@ struct pp_moe_onednn_explicit_ubatch_inputs {
     size_t   dense_scratch_bytes         = 0;  // the dense scratch at n_ubatch
     size_t   runtime_floor_bytes         = 0;  // the RUNTIME zone's floor
     size_t   runtime_zone_bytes          = 0;  // the RUNTIME zone as it is reserved now
+    size_t   compute_default_bytes       = 0;  // the measured compute term at n_ubatch_default (in the fixed rest)
 };
 
 struct pp_moe_onednn_explicit_ubatch_room {
@@ -248,6 +252,11 @@ struct pp_moe_onednn_explicit_ubatch_room {
     size_t                               zone_bytes          = 0;  // the one in.n_ubatch needs; SIZE_MAX on overflow
     size_t                               room_bytes          = 0;  // zone_bytes - zone_default_bytes, or 0
     size_t                               room_reserved_bytes = 0;  // the part of room_bytes the zone already holds
+    // The compute buffers' room at in.n_ubatch (the measured term scaled to it), and its growth above the term; both
+    // SIZE_MAX on overflow. The growth is part of zone_bytes, and the room is what the hold-spill fit credits a compute
+    // buffer of that micro-batch against (zone_hold_fit_rung_has_compute_room).
+    size_t                               compute_bytes        = 0;
+    size_t                               compute_growth_bytes = 0;
 };
 
 enum class pp_moe_onednn_explicit_ubatch_action : uint8_t {
@@ -260,11 +269,18 @@ enum class pp_moe_onednn_explicit_ubatch_action : uint8_t {
 struct pp_moe_onednn_explicit_ubatch_decision {
     pp_moe_onednn_explicit_ubatch_action action                   = pp_moe_onednn_explicit_ubatch_action::NONE;
     // REFUSE: the RUNTIME bytes the ring could have with every device-resident routed expert moved to the host tier,
-    // and the largest multiple of 32 whose ring fits them, from pp_moe_onednn_admit_ring()'s slot arithmetic (0 when
-    // even the weight slot does not fit).
+    // beside the compute growth at in.n_ubatch, and the largest multiple of 32 whose ring fits beside its own compute
+    // growth, from pp_moe_onednn_admit_ring()'s slot arithmetic (0 when even the weight slot does not fit).
     size_t                               max_ring_runtime_bytes   = 0;
     uint32_t                             largest_fitting_n_ubatch = 0;
 };
+
+// Pure: the compute buffers' growth from the measured term at `n_ubatch_default` to `n_ubatch`: the term scaled by
+// zone_hold_scale_request, less the term. 0 at or below the default or for an unknown micro-batch, SIZE_MAX on
+// overflow. The room's zone holds it, and the load publishes it as the RUNTIME requirement's own term.
+size_t pp_moe_onednn_explicit_ubatch_compute_growth(size_t   compute_default_bytes,
+                                                    uint32_t n_ubatch_default,
+                                                    uint32_t n_ubatch);
 
 // Pure: the room an explicit micro-batch needs. Not valid when in.n_ubatch does not exceed in.n_ubatch_default, the
 // default is 0, or there is no ring (weight slot 0, ring_depth 0, or both per-row terms 0).

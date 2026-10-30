@@ -29,6 +29,7 @@
 using ggml_sycl::pp_moe_onednn_admit_ring;
 using ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
 using ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_compute_growth;
 using ggml_sycl::pp_moe_onednn_explicit_ubatch_decide;
 using ggml_sycl::pp_moe_onednn_explicit_ubatch_decision;
 using ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs;
@@ -405,6 +406,78 @@ void test_explicit_ubatch_refusal_names_the_largest_fit() {
     check(none.largest_fitting_n_ubatch == 480, "and the largest -ub that fits the default zone is 480");
 }
 
+// The compute buffers at an explicit micro-batch. The load measured its compute term, 2055 MiB of the fixed rest, at
+// the default 512; at 2048 the buffers are estimated by scaling it linearly, 8220 MiB, so the zone must grow by 6165 MiB
+// more than the ring and the dense scratch need. That growth is part of the room the experts give up.
+void test_explicit_ubatch_compute_term() {
+    printf("explicit -ub 2048 with the compute buffers' growth:\n");
+    const size_t kCompute = 2055ull * kMiB;
+    const size_t kGrowth  = 6165ull * kMiB;
+    check(pp_moe_onednn_explicit_ubatch_compute_growth(kCompute, 512, 2048) == kGrowth,
+          "the growth at 2048 is the 2055 MiB term scaled to 8220 MiB, less the term");
+    check(pp_moe_onednn_explicit_ubatch_compute_growth(kCompute, 512, 512) == 0, "none at the default");
+    check(pp_moe_onednn_explicit_ubatch_compute_growth(kCompute, 512, 256) == 0, "none below it");
+    check(pp_moe_onednn_explicit_ubatch_compute_growth(kCompute, 0, 2048) == 0, "none without a default");
+    check(pp_moe_onednn_explicit_ubatch_compute_growth(0, 512, 2048) == 0, "none without a measured term");
+    check(pp_moe_onednn_explicit_ubatch_compute_growth(kMax / 2, 512, 2048) == kMax, "SIZE_MAX on overflow");
+
+    pp_moe_onednn_explicit_ubatch_inputs in       = qwen_inputs(2048, qwen_zone(512));
+    in.compute_default_bytes                      = kCompute;
+    const pp_moe_onednn_explicit_ubatch_room room = pp_moe_onednn_explicit_ubatch_plan_room(in);
+    const pp_moe_onednn_explicit_ubatch_room ring_only =
+        pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(2048, qwen_zone(512)));
+    check(room.compute_growth_bytes == kGrowth && room.compute_bytes == 8220ull * kMiB,
+          "the room records the growth and the compute room it gives");
+    check(room.zone_default_bytes == qwen_zone(512), "the default zone is unchanged: the term is already in it");
+    check(room.zone_bytes == qwen_zone(2048) + kGrowth, "the zone for 2048 holds the growth beside the ring");
+    check(room.room_bytes == ring_only.room_bytes + kGrowth, "and the room is the ring's room plus the growth");
+    check(ring_only.compute_growth_bytes == 0 && ring_only.compute_bytes == 0, "without a term there is none");
+
+    // A budget the ring's room fits and the compute growth does not: placed without the term, refused with it.
+    const size_t budget = 15000ull * kMiB;
+    check(ring_only.room_bytes <= budget && room.room_bytes > budget,
+          "the fixture's budget sits between the ring's 11548 MiB room and the 17713 MiB with the growth");
+    check(pp_moe_onednn_explicit_ubatch_decide(ring_only, budget).action ==
+              pp_moe_onednn_explicit_ubatch_action::GROW_ZONE,
+          "the ring alone would grow the zone");
+    const pp_moe_onednn_explicit_ubatch_decision d = pp_moe_onednn_explicit_ubatch_decide(room, budget);
+    check(d.action == pp_moe_onednn_explicit_ubatch_action::REFUSE, "with the compute buffers it is refused");
+    check(
+        d.max_ring_runtime_bytes == qwen_zone(512) + budget - kQwenFixed - qwen_dense(2048) - kGrowth,
+        "the ring could have the zone plus every device expert, less the fixed rest, the dense scratch and the growth");
+    // A smaller micro-batch has a smaller growth, so each candidate is asked with its own: 1792 fits beside its 5137.5
+    // MiB growth, 1824 does not. Charging every candidate the growth at 2048 would name only 1664.
+    check(d.largest_fitting_n_ubatch == 1792, "the largest -ub that fits beside its own growth is 1792");
+    check(pp_moe_onednn_explicit_ubatch_decide(room, room.room_bytes).action ==
+              pp_moe_onednn_explicit_ubatch_action::GROW_ZONE,
+          "a budget of the whole room grows the zone");
+    check(pp_moe_onednn_explicit_ubatch_decide(room, room.room_bytes - 1).action ==
+              pp_moe_onednn_explicit_ubatch_action::REFUSE,
+          "one byte short of it refuses");
+
+    // The re-plan with the zone grown by the whole room, growth included: placed.
+    pp_moe_onednn_explicit_ubatch_inputs grown_in  = qwen_inputs(2048, qwen_zone(2048) + kGrowth);
+    grown_in.compute_default_bytes                 = kCompute;
+    const pp_moe_onednn_explicit_ubatch_room grown = pp_moe_onednn_explicit_ubatch_plan_room(grown_in);
+    check(grown.room_reserved_bytes == grown.room_bytes, "a zone grown by the growth too holds the whole room");
+    check(pp_moe_onednn_explicit_ubatch_decide(grown, 0).action == pp_moe_onednn_explicit_ubatch_action::PLACE,
+          "and is placed");
+    // A zone grown for the ring alone still needs the growth from the experts.
+    pp_moe_onednn_explicit_ubatch_inputs ring_grown = qwen_inputs(2048, qwen_zone(2048));
+    ring_grown.compute_default_bytes                = kCompute;
+    const pp_moe_onednn_explicit_ubatch_room part   = pp_moe_onednn_explicit_ubatch_plan_room(ring_grown);
+    check(part.room_bytes - part.room_reserved_bytes == kGrowth, "a zone grown for the ring alone is short the growth");
+
+    // An overflowing growth is a room no budget holds.
+    pp_moe_onednn_explicit_ubatch_inputs huge  = qwen_inputs(2048, qwen_zone(512));
+    huge.compute_default_bytes                 = kMax / 2;
+    const pp_moe_onednn_explicit_ubatch_room h = pp_moe_onednn_explicit_ubatch_plan_room(huge);
+    check(h.valid && h.room_bytes == kMax && h.zone_bytes == kMax, "an overflowing growth saturates the room");
+    check(pp_moe_onednn_explicit_ubatch_decide(h, kQwenExpertBudget).action ==
+              pp_moe_onednn_explicit_ubatch_action::REFUSE,
+          "and is refused");
+}
+
 void test_explicit_ubatch_none_and_floor() {
     printf("explicit -ub at or below what the default zone holds:\n");
     check(!pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(512, qwen_zone(512))).valid,
@@ -501,6 +574,7 @@ int main() {
     test_degenerate_and_overflow();
     test_explicit_ubatch_room_qwen_b70();
     test_explicit_ubatch_refusal_names_the_largest_fit();
+    test_explicit_ubatch_compute_term();
     test_explicit_ubatch_none_and_floor();
     test_explicit_ubatch_alignment_and_overflow();
     test_explicit_ubatch_action_names();
