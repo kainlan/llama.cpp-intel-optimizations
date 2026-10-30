@@ -985,6 +985,15 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
+    # llama.cpp-8ucb: the ring windows' timing line is printed only at GGML_SYCL_MOE_EXEC_TRACE=2 (readers_wait_us as the
+    # gate's end minus the copy's ready time, start_lag_us as its own field); below level 2 the cost stays one branch per
+    # site. The pin landed unregistered.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-exec-window-timing-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-window-timing-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
     # llama.cpp-348c: the batched oneDNN prompt executor is type-keyed: one support table that the device test
     # covers, claimed prompts reaching the executor ahead of the Q4_K D2H fallback by route precedence (the fallback
     # itself unchanged), one refusal enum whose post-claim causes warn by default, one [PP-MOE] line per (device,
