@@ -693,14 +693,19 @@ int main() {
             ++failures;
         }
 
-        // Two halves (slot of 4, 7 active): phases alternate buffers 0, 1, 0 and wait for the half's readers.
+        // Two halves (slot of 4, 7 active): two experts per group, so a phase of two experts in a half of
+        // 2 * weight_elems, as the executor builds it. Phases alternate buffers 0, 1, 0 and wait for the half's
+        // readers.
         const moe_pp_batched_f16_groups halves = moe_pp_batched_f16_plan_groups(4 * f16_expert, f16_expert, 7, 0);
-        const size_t                    halves_want[3] = { 0, half_elems, 0 };
+        const size_t                    halves_half    = 2 * weight_elems;
+        const size_t                    halves_want[3] = { 0, 20, 0 };
         for (size_t p = 0; p < 3; ++p) {
-            const size_t got = moe_pp_batched_phase_weight_offset(halves, p * 2, p % 2, half_elems, weight_elems);
-            if (halves.buffers != 2 || !moe_pp_batched_phases_reuse_buffers(halves) || got != halves_want[p]) {
-                std::printf("FAIL: two halves, phase %zu: buffers %zu reuse %d offset %zu; want 2, 1, %zu\n", p,
-                            halves.buffers, moe_pp_batched_phases_reuse_buffers(halves) ? 1 : 0, got, halves_want[p]);
+            const size_t got = moe_pp_batched_phase_weight_offset(halves, p * 2, p % 2, halves_half, weight_elems);
+            if (halves.buffers != 2 || halves.experts_per_group != 2 || !moe_pp_batched_phases_reuse_buffers(halves) ||
+                got != halves_want[p]) {
+                std::printf("FAIL: two halves, phase %zu: buffers %zu x %zu reuse %d offset %zu; want 2 x 2, 1, %zu\n",
+                            p, halves.buffers, halves.experts_per_group,
+                            moe_pp_batched_phases_reuse_buffers(halves) ? 1 : 0, got, halves_want[p]);
                 ++failures;
             }
         }
