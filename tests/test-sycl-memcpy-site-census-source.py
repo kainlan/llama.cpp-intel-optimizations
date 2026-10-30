@@ -43,8 +43,9 @@ WHAT THIS DOES NOT PROVE.  It reads source text with comments blanked.  It does
 not show that the table accounts for the profiler's mem_ops launches (a GPU
 run), nor that the printed counts are right (test-mem-copy-site-census).
 
-NOT VACUOUS.  test_memcpy_site_census_self_test applies in-memory mutants to the real sources,
-requires each to fail, then requires the unmodified tree to pass.
+NOT VACUOUS.  test_memcpy_site_census_self_test
+applies in-memory mutants to the real sources, requires each to fail, then
+requires the unmodified tree to pass.
 """
 
 from __future__ import annotations
