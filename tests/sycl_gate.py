@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from pathlib import Path
 
 _RESULTS = []
 
@@ -166,3 +167,92 @@ def first_present(where: str, text: str, *forbidden: str) -> str:
     if len(forbidden) == 1:
         return "%s: the forbidden text is absent; an emptiness or count condition failed" % where
     return "%s: none of %d forbidden texts present; an emptiness or count condition failed" % (where, len(forbidden))
+
+
+# ---- text helpers shared by the source-contract pins (exec-window, staged-ring-route, stream-enqueue) -------------------
+
+# The repo root, resolved the way the pins resolved it from their own path: this file sits in tests/, so parents[1] of
+# it is the same directory as parents[1] of any pin beside it.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_LEXEME_RE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
+    re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            return tok
+        return "\n" * tok.count("\n")
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+def norm(text: str) -> str:
+    """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
+    re-wrap nor a re-split format string can turn a claim red. Idempotent, so a mutant built on normalized text is
+    read the same way as the source."""
+    t = re.sub(r"\s+", " ", strip_comments(text))
+    t = re.sub(r"\( ", "(", t)
+    t = re.sub(r" \)", ")", t)
+    t = re.sub(r" ,", ",", t)
+    t = re.sub(r",(?! )", ", ", t)
+    t = re.sub(r'(?<!\\)" "', "", t)
+    return t
+
+
+def read(rel: str) -> str:
+    """The file's text, or empty when it does not exist yet, so a missing file fails the claims instead of erroring."""
+    p = _REPO_ROOT / rel
+    return p.read_text(errors="replace") if p.exists() else ""
+
+
+def body(text: str, signature: str) -> str:
+    """The brace-balanced body of the first definition whose text starts with `signature` (string literals skipped
+    while balancing). A signature ending in "{" opens the body itself. Empty when there is none."""
+    at = text.find(signature)
+    if at < 0:
+        return ""
+    open_at = at + len(signature) - 1 if signature.endswith("{") else text.find("{", at + len(signature))
+    if open_at < 0:
+        return ""
+    depth = 0
+    i = open_at
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at:i + 1]
+        i += 1
+    return ""
+
+
+def ordered(text: str, *needles: str) -> bool:
+    """Every needle is present, each after the one before it."""
+    at = 0
+    for needle in needles:
+        at = text.find(needle, at)
+        if at < 0:
+            return False
+        at += len(needle)
+    return True
+
+
+def mutate(text: str, old: str, new: str) -> str:
+    """`text` (normalized) with `old` replaced once; the mutant must exist, or it would prove nothing."""
+    n = norm(text)
+    assert old in n, f"mutant precondition: {old!r} is not in the text"
+    return n.replace(old, new, 1)

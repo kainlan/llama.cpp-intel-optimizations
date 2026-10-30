@@ -3,7 +3,8 @@
 A helper that can pass vacuously or blame the wrong needle undermines every gate that uses it, so pin both:
 zero recorded checks must fail, and a failing generator expression must be annotated without naming a stale
 module-level variable that shares a comprehension variable's name. The message helpers the pytest-style pins pass
-as assert messages, first_missing and first_present, are pinned here too: what each names, the singular and plural
+as assert messages, first_missing and first_present, are pinned here too, and so are the text helpers the three
+source-contract pins share (norm, read, body, ordered, mutate): what each names, the singular and plural
 wording, and the 100-character cut.
 """
 import subprocess
@@ -11,7 +12,7 @@ import sys
 import textwrap
 from pathlib import Path
 
-from sycl_gate import first_missing, first_present
+from sycl_gate import body, first_missing, first_present, mutate, norm, ordered, read
 
 TESTS = Path(__file__).resolve().parent
 
@@ -216,3 +217,54 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_norm_strips_comments_and_canonicalises_whitespace() -> None:
+    assert norm("a  (\n b ,c ) // gone\n/* gone */ d") == "a (b, c) d"
+    assert norm("f(\"x\"\n   \"y\")") == 'f("xy")'
+    assert norm('s = "// kept";') == 's = "// kept";'
+
+
+def test_norm_is_idempotent() -> None:
+    once = norm("if ( a ,b ) {\n  f( \"p\" \"q\" ) ; // c\n}")
+    assert norm(once) == once
+
+
+def test_read_returns_text_or_empty() -> None:
+    assert "def read(" in read("tests/sycl_gate.py")
+    assert read("tests/no-such-file-anywhere.txt") == ""
+
+
+def test_body_balances_braces_and_skips_literals() -> None:
+    text = 'void f() { if (x) { g("}"); } } void h() { }'
+    assert body(text, "void f()") == '{ if (x) { g("}"); } }'
+    assert body(text, "void h()") == "{ }"
+
+
+def test_body_signature_ending_in_brace_opens_the_body_itself() -> None:
+    text = "struct s { int a; struct t { int b; } u; };"
+    assert body(text, "struct s {") == "{ int a; struct t { int b; } u; }"
+    assert body(text, "struct t {") == "{ int b; }"
+
+
+def test_body_is_empty_when_signature_or_closing_brace_is_missing() -> None:
+    assert body("void f() { x", "void f()") == ""
+    assert body("void f() { }", "void g()") == ""
+    assert body("void f();", "void f()") == ""
+
+
+def test_ordered_requires_every_needle_after_the_previous_one() -> None:
+    assert ordered("a b c", "a", "b", "c")
+    assert not ordered("a b c", "b", "a")
+    assert not ordered("a b c", "a", "z")
+    assert ordered("abc")
+
+
+def test_mutate_replaces_once_on_normalised_text_and_demands_the_old_text() -> None:
+    assert mutate("x  =  1; // c\nx = 1;", "x = 1;", "x = 2;") == "x = 2; x = 1;"
+    try:
+        mutate("a", "zzz", "b")
+    except AssertionError as error:
+        assert "mutant precondition" in str(error)
+    else:
+        raise AssertionError("mutate accepted a missing old text")
