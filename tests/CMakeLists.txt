@@ -986,8 +986,8 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
     # llama.cpp-8ucb: the ring windows' timing line is printed only at GGML_SYCL_MOE_EXEC_TRACE=2 (readers_wait_us as the
-    # gate's end minus the copy's ready time, start_lag_us as its own field); below level 2 the cost stays one branch per
-    # site. The pin landed unregistered.
+    # gate's command_end minus the later of the copy's command_submit and the previous copy's command_end, start_lag_us
+    # as its own field); below level 2 the cost stays one branch per site.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-window-timing-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-window-timing-source.py
