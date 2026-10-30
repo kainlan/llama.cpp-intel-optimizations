@@ -529,7 +529,8 @@ def test_single_writer():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_build_moe_resolved_batch (the assignment is "
         "counted across the sycl tree and the route struct is searched in moe-resolved-batch.hpp)",
         build_body(SYCL),
-        LAMBDA_OPEN, GUARD, FIND, ASSIGN, SERVE_RETURN, ROUTE_CORE)
+        LAMBDA_OPEN, GUARD, FIND, ASSIGN, SERVE_RETURN, ROUTE_CORE,
+        signature=BUILD_SIG)
 
 
 def test_single_writer_mutants():
@@ -567,7 +568,8 @@ def test_owner_and_keys():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_build_moe_resolved_batch (the layer key is also "
         "searched in the body of ggml_sycl_moe_stream_prepare)",
         build_body(SYCL),
-        STREAM_DECL, LAYER_DECL, ROLE_DECL, LAMBDA_OPEN)
+        STREAM_DECL, LAYER_DECL, ROLE_DECL, LAMBDA_OPEN,
+        signature=BUILD_SIG)
 
 
 def test_owner_and_keys_mutants():
@@ -592,7 +594,8 @@ def test_entry_is_the_fact():
     assert claim_entry_is_the_fact(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch",
         staged_branch(SYCL),
-        FIND, SLOT, VIEW, *ENTRY_FIELDS)
+        FIND, SLOT, VIEW, *ENTRY_FIELDS,
+        signature=GUARD)
 
 
 def test_entry_is_the_fact_mutants():
@@ -646,7 +649,8 @@ def test_served_only_as_plain_kernel():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch (the "
         "capability refusal and the executor's plain-kernel reads are searched in their own bodies)",
         staged_branch(SYCL),
-        ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN)
+        ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN,
+        signature=GUARD)
 
 
 def test_served_only_as_plain_kernel_mutants():
@@ -700,7 +704,8 @@ def test_executor_entry_refused_by_its_consumer():
     assert claim_executor_entry_refused_by_its_consumer(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch",
         staged_branch(SYCL),
-        REFUSAL_OPEN, EXECUTOR_REFUSAL)
+        REFUSAL_OPEN, EXECUTOR_REFUSAL,
+        signature=GUARD)
 
 
 def test_executor_entry_refused_by_its_consumer_mutants():
@@ -745,7 +750,8 @@ def test_executor_handoff_counted_apart():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_build_moe_resolved_batch (the handoff counters "
         "are searched in moe-stream-plan.cpp and moe-stream-plan.hpp)",
         build_body(SYCL),
-        EXECUTOR_TAKES, LAMBDA_OPEN)
+        EXECUTOR_TAKES, LAMBDA_OPEN,
+        signature=BUILD_SIG)
 
 
 def test_executor_handoff_counted_apart_mutants():
@@ -799,7 +805,8 @@ def test_executor_reads_staged_slots():
     assert claim_executor_reads_staged_slots(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of the try_pp_onednn_f16_batched lambda",
         body(norm(SYCL), EXEC_SIG),
-        EXEC_FIND, EXEC_STAGED_COUNT, *EXEC_STREAM_KEY, *EXEC_STAGED_STEPS, EXEC_LEASE_HOLD)
+        EXEC_FIND, EXEC_STAGED_COUNT, *EXEC_STREAM_KEY, *EXEC_STAGED_STEPS, EXEC_LEASE_HOLD,
+        signature=EXEC_SIG)
 
 
 def test_executor_reads_staged_slots_mutants():
@@ -925,7 +932,8 @@ def test_fully_staged_layer_leaves_hybrid():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id",
         body(norm(SYCL), MMID_SIG),
         STAGED_LAYER_DECL, STAGED_LAYER_SET, STAGED_LAYER_BEGIN, STAGED_LAYER_SITE, RETAINED_BUILD, PROBE_CLAIM,
-        PLAN_HAS_CPU, ROUTE_CLAIM, HYBRID_WITH_PLAN)
+        PLAN_HAS_CPU, ROUTE_CLAIM, HYBRID_WITH_PLAN,
+        signature=MMID_SIG)
 
 
 def test_fully_staged_layer_leaves_hybrid_mutants():
@@ -988,7 +996,8 @@ def test_decode_builds_skip_the_phase():
     assert claim_decode_builds_skip_the_phase(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_build_moe_resolved_batch",
         build_body(SYCL),
-        STREAM_DECL, LAYER_DECL, ROLE_DECL, LAMBDA_OPEN, GUARD, FIND, REFUSAL_OPEN, REFUSAL_STEPS[0])
+        STREAM_DECL, LAYER_DECL, ROLE_DECL, LAMBDA_OPEN, GUARD, FIND, REFUSAL_OPEN, REFUSAL_STEPS[0],
+        signature=BUILD_SIG)
 
 
 def test_decode_builds_skip_the_phase_mutants():
@@ -1020,7 +1029,8 @@ def test_one_device_recipe():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_build_moe_resolved_batch (the capability query "
         "is searched in the body of ggml_sycl_moe_build_device_recipe)",
         build_body(SYCL),
-        STAGED_RECIPE_CALL, CORE_RECIPE_CALL, ASSIGN)
+        STAGED_RECIPE_CALL, CORE_RECIPE_CALL, ASSIGN,
+        signature=BUILD_SIG)
 
 
 def test_one_device_recipe_mutants():
@@ -1056,7 +1066,8 @@ def test_no_persistent_handle():
         "searches the staged branch for retained handles, the pointer-table-from-batch uploader and "
         "ggml_sycl_mul_mat_id)",
         body(norm(SYCL), UPLOAD_SIG),
-        UPLOAD_STAGED, UPLOAD_CLEAR, UPLOAD_LEASE)
+        UPLOAD_STAGED, UPLOAD_CLEAR, UPLOAD_LEASE,
+        signature=UPLOAD_SIG)
 
 
 def test_no_persistent_handle_mutants():
@@ -1260,7 +1271,8 @@ def test_staged_batch_refused_by_name():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the xmx refusal is searched in the "
         "body of try_xmx_sorted_moe)",
         body(norm(SYCL), MMID_SIG),
-        PER_EXPERT_ANCHOR + " " + PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
+        PER_EXPERT_ANCHOR + " " + PER_EXPERT_REFUSE, *PER_EXPERT_STEPS,
+        signature=MMID_SIG)
 
 
 def test_staged_batch_refused_by_name_mutants():
@@ -1302,7 +1314,8 @@ def test_barrier_after_build():
     assert claim_barrier_after_build(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_build_moe_resolved_batch",
         build_body(SYCL),
-        LAMBDA_OPEN, *BARRIER)
+        LAMBDA_OPEN, *BARRIER,
+        signature=BUILD_SIG)
 
 
 def test_barrier_after_build_mutants():
@@ -1357,7 +1370,8 @@ def test_admission_cache_graph_keyed():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the predicate, the role validator "
         "and the names-staged helper are searched in their own bodies)",
         body(norm(SYCL), MMID_SIG),
-        EARLY_LOOKUP, MAIN_LOOKUP, POPULATE)
+        EARLY_LOOKUP, MAIN_LOOKUP, POPULATE,
+        signature=MMID_SIG)
 
 
 def test_admission_cache_graph_keyed_mutants():
@@ -1386,7 +1400,8 @@ def test_prompt_builds_pass_invocation():
     assert claim_prompt_builds_pass_invocation(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id",
         body(norm(SYCL), MMID_SIG),
-        *[f"{role}, false, &ctx, ctx.stream());" for role in TRIAD_ROLES], RETAINED_PROMPT)
+        *[f"{role}, false, &ctx, ctx.stream());" for role in TRIAD_ROLES], RETAINED_PROMPT,
+        signature=MMID_SIG)
 
 
 def test_prompt_builds_pass_invocation_mutants():
@@ -1413,7 +1428,8 @@ def test_validator():
         "ggml/src/ggml-sycl/moe-resolved-batch.hpp: body of validate_moe_execution_recipe (its signature is "
         "searched for the residency parameter)",
         body(norm(BATCH_HPP), VALIDATOR_SIG),
-        WORKSPACE_REFUSE, VALIDATOR_CLAUSE)
+        WORKSPACE_REFUSE, VALIDATOR_CLAUSE,
+        signature=VALIDATOR_SIG)
 
 
 def test_validator_mutants():
@@ -1442,7 +1458,8 @@ def test_trace():
         "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::report_staged_routes (the trace "
         "formats are counted across the sycl tree)",
         body(norm(PHASE), REPORT_SIG),
-        TRACE_FMT + '", ' + TALLY_ARGS, TRACE_EMIT, *TRACE_REFUSALS)
+        TRACE_FMT + '", ' + TALLY_ARGS, TRACE_EMIT, *TRACE_REFUSALS,
+        signature=REPORT_SIG)
 
 
 def test_trace_mutants():
@@ -1487,7 +1504,8 @@ def test_reported_once_on_every_exit():
         "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::report_staged_routes (the "
         "destructor and end_prompt are searched in their own bodies)",
         body(norm(PHASE), REPORT_SIG),
-        REPORT_HEAD, REPORT_RESET)
+        REPORT_HEAD, REPORT_RESET,
+        signature=REPORT_SIG)
 
 
 def test_reported_once_on_every_exit_mutants():
@@ -1530,7 +1548,8 @@ def test_refusals_warn_under_ring():
         "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::report_staged_routes (begin_layer, "
         "the policy member in moe-stream-plan.hpp and the warn format across the sycl tree are searched too)",
         body(norm(PHASE), REPORT_SIG),
-        "log_->trace_sink(log_->sink_ctx, causes.c_str()); } }", *REFUSALS_WARN, REPORT_RESET)
+        "log_->trace_sink(log_->sink_ctx, causes.c_str()); } }", *REFUSALS_WARN, REPORT_RESET,
+        signature=REPORT_SIG)
 
 
 def test_refusals_warn_under_ring_mutants():
@@ -1610,7 +1629,8 @@ def test_tag_is_the_layout():
         "searched in mem-handle.hpp and mem-handle.cpp, the ring acquire in moe-stream-ring.hpp and "
         "moe-stream-ring.cpp, the tag check in ggml-sycl.cpp)",
         body(norm(PHASE), STAGE_SIG),
-        PHASE_AOS_ACQUIRE, PHASE_AOS_ENTRY)
+        PHASE_AOS_ACQUIRE, PHASE_AOS_ENTRY,
+        signature=STAGE_SIG)
 
 
 def test_tag_is_the_layout_mutants():
@@ -1687,7 +1707,8 @@ def test_executor_reads_the_ring_slot_layout():
         "definition is searched in moe-stream-ring.hpp and counted across the sycl tree with a regex)",
         body(norm(SYCL), EXEC_SIG),
         EXEC_DEFER_OPEN, EXEC_DEFER_CLOSE, EXEC_RESOLVE_SIG, "expert.layout = ggml_sycl::" + SLOT_LAYOUT_NAME + ";",
-        EXEC_AOS_ONLY)
+        EXEC_AOS_ONLY,
+        signature=EXEC_SIG)
 
 
 def test_executor_ring_slot_layout_mutants():
