@@ -734,8 +734,11 @@ def test_probe_branch_ordering_has_a_mutation_witness():
     # transaction further down has its own probe branch at that indent, and the leading "\n" only excludes the two
     # more deeply indented blocks inside the runtime-context transaction (F2's demotion branch at 12 spaces, F3's
     # ring-replan success branch at 8), since "    if (probe_mode) {\n" is itself a trailing substring of both.
-    # So the indent narrows the candidates and the CONTENT picks the branch, as _find_probe_exit_branch() does: the
-    # exit branch is the only one whose own text captures a rollback result into `rollback_ok` (round 1 F1).
+    # So the indent narrows the candidates and the CONTENT picks the branch: the exit branch is the only one whose
+    # own text captures a rollback result into `rollback_ok`. This looks for that capture in the raw text up to the
+    # branch's first ACCEPTED return; _find_probe_exit_branch() looks for it in comment-stripped text within a
+    # fixed window after the `if`. The two are separate searches, so the assertion below that re-finds the moved
+    # branch with that helper fails if they ever disagree.
     branch_start_marker = "\n    if (probe_mode) {\n"
     branch_end_marker = "        return ggml_sycl_txn_result::ACCEPTED;\n    }\n"
     publish_marker = "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"

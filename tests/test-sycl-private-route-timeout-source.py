@@ -17,7 +17,8 @@ def strip_cmake_comments(cmake: str) -> str:
 
 def private_route_properties(cmake: str) -> str:
     # Comments are removed first: the body ends at the first ")", and the registration's own comments contain
-    # parentheses (a comment's "(llama.cpp-n8da)" would otherwise cut the body off before ENVIRONMENT and TIMEOUT).
+    # parentheses (the "(level_zero:1 selects the B50 for a second run)" in its comment would otherwise cut the body
+    # off before ENVIRONMENT and TIMEOUT).
     match = re.search(
         rf"set_tests_properties\(\s*{re.escape(TEST_NAME)}\s+PROPERTIES(?P<body>.*?)\)",
         strip_cmake_comments(cmake),
@@ -31,8 +32,8 @@ def test_private_route_watchdog_is_explicit_bounded_and_isolated() -> None:
     cmake = CMAKE.read_text()
     properties = private_route_properties(cmake)
 
-    # ENVIRONMENT is one quoted ";"-list (the registration also pins ONEAPI_DEVICE_SELECTOR, llama.cpp-n8da), so the
-    # watchdog is one entry of that list, not the whole string.
+    # ENVIRONMENT is one quoted ";"-list: the registration deliberately pins ONEAPI_DEVICE_SELECTOR beside the
+    # watchdog (commit 414856e27), so the watchdog is one entry of that list, not the whole string.
     environment = re.search(r'ENVIRONMENT\s+"([^"]*)"', properties)
     assert environment, "private route must set an ENVIRONMENT"
     watchdog_entries = [
