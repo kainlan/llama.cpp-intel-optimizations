@@ -471,6 +471,22 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   size_t hold,
                                   size_t alloc_size);
 
+// A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
+// linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
+// request is 0; SIZE_MAX when the product overflows. The one estimator for a compute buffer at a micro-batch nobody
+// measured: the hold-spill fit scales a rung's record with it, and the explicit micro-batch's placement scales the
+// load's measured compute term (pp_moe_onednn_explicit_ubatch_plan_room).
+inline size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
+    if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
+        return request;
+    }
+    if (request > SIZE_MAX / to_n_ubatch) {
+        return SIZE_MAX;
+    }
+    const size_t product = request * to_n_ubatch;
+    return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
+}
+
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
 // request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to
@@ -523,6 +539,10 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 
 // ring_bytes is the prefill ring's bytes no loan can cover (llama.cpp-kjef): the ring is lent, so it is 0 when a loan
 // supplies all of it, and a demand on free memory otherwise.
+//
+// compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
+// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone carries the load's
+// measured compute term scaled to it. 0 for none, the case of every load that names no micro-batch.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
     size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
@@ -532,6 +552,8 @@ struct zone_hold_fit_inputs {
     zone_hold_plan_fn              plan_of     = nullptr;
     void *                         plan_ctx    = nullptr;
     size_t                         ring_bytes  = 0;
+    uint32_t                       compute_room_n_ubatch = 0;
+    size_t                         compute_room_bytes    = 0;
 };
 
 // The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
@@ -540,8 +562,15 @@ struct zone_hold_fit_inputs {
 // is recorded: the demand is then the plan alone, a lower bound.
 size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
+// Whether the RUNTIME zone was planned to serve `request` at `n_ubatch` beside the hold: the rung is the one the plan
+// sized a compute room for, and the request is no larger than that room. Whole or nothing: a request above the room
+// gets no part of it.
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request);
+
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
 // zone_hold_spill_bound(plan, the rung's request) and the KV room, plus the ring bytes no loan covers (saturating).
+// A request the zone was planned to serve (zone_hold_fit_rung_has_compute_room) is never held back, since the hold
+// keeps a request out only when the zone's free bytes less the hold are short of it, so it adds nothing to the bound.
 // 0 for an unknown n_ubatch.
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 

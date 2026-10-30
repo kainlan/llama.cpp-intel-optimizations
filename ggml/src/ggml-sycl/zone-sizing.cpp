@@ -498,17 +498,6 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
     return hold <= available && size <= available - hold;
 }
 
-static size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
-    if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
-        return request;
-    }
-    if (request > SIZE_MAX / to_n_ubatch) {
-        return SIZE_MAX;
-    }
-    const size_t product = request * to_n_ubatch;
-    return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
-}
-
 size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch) {
     if (plan == 0) {
         return 0;
@@ -556,15 +545,24 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
     return scaled;
 }
 
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request) {
+    return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;
+}
+
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
     if (n_ubatch == 0) {
         return 0;
     }
     // No plan function, no hold: the ring is still a demand.
-    const size_t plan  = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
-    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch.
-    const size_t spill = zone_hold_spill_raw_demand(
-        zone_hold_spill_bound(plan, zone_hold_fit_request(in, n_ubatch), n_ubatch, n_ubatch), in.kv_room);
+    const size_t plan    = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
+    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch. One
+    // the zone was planned to serve is not held back, so it spills nothing; the plan stays in the bound as it is.
+    size_t       request = zone_hold_fit_request(in, n_ubatch);
+    if (zone_hold_fit_rung_has_compute_room(in, n_ubatch, request)) {
+        request = 0;
+    }
+    const size_t spill =
+        zone_hold_spill_raw_demand(zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);
     // The ring is lent bytes, so only the part no loan covers is a demand on free memory (llama.cpp-kjef). The one
     // place it is added, so every consumer of the fit reads it. Saturating, so a wrapped sum never reads as a fit.
     return in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
