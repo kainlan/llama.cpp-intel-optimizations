@@ -219,13 +219,14 @@ room needs no padding: the ring allocates each slot at
 slot is a multiple of it, and the allocator keeps no header in the zone. Only
 the single-device planner holds a room. A multi-device plan holds none, so there
 the ring still depends on the loan. One
-`[SYCL-PLAN] MoE window ring room` line per placement pass names the room and
-the experts it displaced, as a WARN when it displaced any. None is held, with a
-WARN, when the eleventh-of-the-expert-bytes cap above refuses the ring once the
-room is held, or when the room exceeds what is left; the ring then needs the
-loan below. The staged-type mask the room is sized over is the type half of the
-executor's staged claim, and the backend fills it, with the group cap, where it
-copies the inventory in.
+`[SYCL-PLAN] MoE window ring room` line per placement pass that sizes a ring
+names the room and the experts it displaced, as a WARN when it displaced any or
+did not settle. None is held, with a WARN, when the eleventh-of-the-expert-bytes
+cap above refuses the ring once the room is held, or when the room exceeds what
+is left; the ring then needs the loan below. The staged-type mask the room is
+sized over is the type half of the executor's staged claim: the mask and the
+claim ask one helper, `ggml_sycl_moe_pp_batched_claims_staged_type`, and the
+backend fills the mask, with the group cap, where it copies the inventory in.
 
 **The loan and the refill.** A loan lends resident expert triplets to the ring
 when the planned room is not held or falls short.

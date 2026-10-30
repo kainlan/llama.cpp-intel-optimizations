@@ -33420,9 +33420,11 @@ static size_t moe_stream_room_dry_pack(placement_plan &                       pl
 // Holding room moves experts to the host, which can widen the window or raise the slot, so the room is iterated to the
 // ring of the plan it produces: R starts at 0 and takes the ring of the pack with R held while that ring is larger.
 // R only grows, and it is bounded by two windows of G_plan slots of the largest claimable matrix, so it settles in a
-// few rounds; the loop stops at 8. A run that has not settled by then holds the 8th round's ring, which no pack with
-// that room held was checked against: the phase's ring can then be larger, and the loan funds the rest. The line's
-// cost figures are taken from one more dry pack with the held room, so they describe the room the plan holds.
+// few rounds; the loop stops at max_rounds. A run that has not settled by then holds the last round's ring, which no
+// pack with that room held was checked against: the phase's ring can then be larger, and the loan funds the rest. The
+// line's cost figures are taken from one more dry pack with the held room, so they describe the room the plan holds.
+// A ring that shrinks below R without reaching 0 settles with R still held, so the line names the ring R was taken
+// from, whose slots make up R, not the last round's smaller one.
 // R is held whole or not at all, never min(R, remaining). In a settled run R > remaining cannot happen: with nothing
 // left for the experts the geometry is 0 and the cap answers first. In a run that has not settled, a partial room
 // would send every expert to the host for a ring the cap then refuses.
@@ -33466,7 +33468,8 @@ static void hold_moe_stream_ring_room(placement_plan &                       pla
     size_t                   placed_without = 0;
     size_t                   groups_with    = 0;
     size_t                   placed_with    = 0;
-    moe_stream_ring_geometry geo;
+    moe_stream_ring_geometry geo;       // the ring of the last round's pack
+    moe_stream_ring_geometry held_geo;  // the ring `room` was taken from
     bool                     settled = false;
     int                      rounds  = 0;
     while (rounds < max_rounds) {
@@ -33482,7 +33485,8 @@ static void hold_moe_stream_ring_room(placement_plan &                       pla
             settled = true;
             break;
         }
-        room = geo.bytes;
+        room     = geo.bytes;
+        held_geo = geo;
     }
     if (!settled) {
         // The last round packed with the previous round's room: pack once more with the room this run holds, so the
@@ -33526,9 +33530,8 @@ static void hold_moe_stream_ring_room(placement_plan &                       pla
     plan.vram_bytes += room;
     const size_t displaced = placed_without > placed_with ? placed_without - placed_with : 0;
     const bool   warn      = displaced > 0 || !settled;
-    const char * unsettled = settled ? "" :
-                                       " (not settled after 8 rounds: the phase's ring may be larger, and an "
-                                       "expert loan funds the rest)";
+    const char * unsettled =
+        settled ? "" : " (not settled: the phase's ring may be larger, and an expert loan funds the rest)";
     // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
     // once.
     ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
@@ -33537,8 +33540,8 @@ static void hold_moe_stream_ring_room(placement_plan &                       pla
                       "in %d round(s))%s; it cost %.1f MB of device-resident routed experts: %.1f MB (%zu "
                       "triplet(s)) on the device, against %.1f MB (%zu) without the room. An expert loan funds a "
                       "reserve this room cannot.\n",
-                      device_id, room / mb, geo.n_slots, geo.slot_bytes / mb, geo.region_slots, rounds, unsettled,
-                      displaced / mb, placed_with / mb, groups_with, placed_without / mb, groups_without);
+                      device_id, room / mb, held_geo.n_slots, held_geo.slot_bytes / mb, held_geo.region_slots, rounds,
+                      unsettled, displaced / mb, placed_with / mb, groups_with, placed_without / mb, groups_without);
 }
 
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,

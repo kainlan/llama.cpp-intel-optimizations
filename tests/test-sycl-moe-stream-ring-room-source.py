@@ -16,13 +16,15 @@ The fix this gate pins:
   - the room comes out of `remaining`, is recorded in the plan and counted in vram_bytes, and the runtime
     transaction's KV re-derivation keeps it there; none is held when the ring's cap refuses the ring under its room
     or the room exceeds what is left;
-  - the backend fills the planner's inputs where it copies the inventory in: the staged-type mask, the type half of
-    the executor's staged claim, and the group cap;
+  - the backend fills the planner's inputs where it copies the inventory in: the staged-type mask and the group
+    cap. The mask and the executor's staged claim ask one helper for the claim's type half, the only place its two
+    terms are spelled;
   - the decision prints one [SYCL-PLAN] line, a WARN when the room displaced experts or did not settle;
   - the room needs no padding: where it is sized, the build refuses a slot alignment other than the zone
     allocator's grain, the one alignment at which each slot takes exactly its bytes;
-  - a run that has not settled in 8 rounds packs once more with the room it holds, so the line's cost is that
-    room's and not the previous round's.
+  - a run that has not settled in max_rounds packs once more with the room it holds, so the line's cost is that
+    room's and not the previous round's;
+  - the line's slot figures are the ring the held room was taken from, and the round bound is written once.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -197,6 +199,12 @@ def test_mutant_room_held_past_what_is_left_fails():
     assert not claim_room_is_held_counted_and_guarded(_once(CACHE, LEFT_GUARD, "if (false) {"))
 
 
+def test_mutant_cap_guard_dropped_fails():
+    """Without the cap's refusal the planner would hold room for a ring the phase's cap refuses once the room has
+    displaced experts, and those experts would go to the host for nothing."""
+    assert not claim_room_is_held_counted_and_guarded(_once(CACHE, CAP_GUARD, "if (false) {"))
+
+
 # ---- (c) the room is the shared geometry, iterated over the predicted pack ---------------------------------------
 
 HINTS = ("hints.weight_slot_bytes = plan.pp_moe_onednn_weight_slot_bytes;",
@@ -299,10 +307,19 @@ def test_mutant_refresh_zeroes_the_room_fails():
 
 FILL_MASK = "g_placement_kv_info.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();"
 FILL_CAP = "g_placement_kv_info.moe_stream_group_cap = ggml_sycl_moe_pp_f16_group_experts_max();"
-MASK_TERMS = ("if (moe_pp_batched_takes_staged_type(type) && "
-              "ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS)) {")
-CLAIM_TERMS = ("moe_pp_batched_takes_staged_type(weight->type) && "
-               "ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) &&")
+TYPE_SIG = "static bool ggml_sycl_moe_pp_batched_claims_staged_type(ggml_type type) {"
+TYPE_TERMS = ("moe_pp_batched_takes_staged_type(type) && "
+              "ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS)")
+TYPE_BODY = "{ return " + TYPE_TERMS + "; }"
+MASK_ASKS = "if (ggml_sycl_moe_pp_batched_claims_staged_type(type)) {"
+CLAIM_ASKS = ("planned = plan != nullptr && ggml_sycl_moe_pp_batched_claims_staged_type(weight->type) && "
+              "ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);")
+CLAIM_INLINE = ("planned = plan != nullptr && moe_pp_batched_takes_staged_type(weight->type) && "
+                "ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) && "
+                "ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);")
+# Each term of the type half, wherever it is spelled: the staged-type question, and the layout question asked at AOS.
+STAGED_TERM_RE = re.compile(r"\bmoe_pp_batched_takes_staged_type\(")
+AOS_TERM_RE = re.compile(r"\bggml_sycl_moe_pp_batched_takes_layout\([^()]*, GGML_LAYOUT_AOS\)")
 
 
 def claim_backend_fills_the_inputs(sycl: str) -> bool:
@@ -311,11 +328,17 @@ def claim_backend_fills_the_inputs(sycl: str) -> bool:
 
 
 def claim_mask_is_the_staged_claims_type_half(sycl: str) -> bool:
-    """The mask and the staged claim ask the same two type questions, so the room is sized over the matrices the
-    executor will claim."""
+    """The mask and the staged claim ask one helper for the type half, so the room is sized over the matrices the
+    executor will claim. The helper is the only place either term is spelled in the file (a census, so a second copy
+    anywhere goes red), and the claim's staged branch asks nothing else about the type."""
+    h = body(sycl, TYPE_SIG)
     m = body(sycl, MASK_SIG)
     c = body(sycl, CLAIM_SIG)
-    return bool(m) and bool(c) and MASK_TERMS in m and CLAIM_TERMS in c
+    if not (h and m and c):
+        return False
+    helper_only = (len(STAGED_TERM_RE.findall(sycl)) == 1 and len(STAGED_TERM_RE.findall(h)) == 1
+                   and len(AOS_TERM_RE.findall(sycl)) == 1 and len(AOS_TERM_RE.findall(h)) == 1)
+    return h == TYPE_BODY and helper_only and m.count(MASK_ASKS) == 1 and c.count(CLAIM_ASKS) == 1
 
 
 def test_backend_fills_the_inputs():
@@ -334,14 +357,29 @@ def test_mutant_group_cap_not_filled_fails():
     assert not claim_backend_fills_the_inputs(_once(SYCL, FILL_CAP, ""))
 
 
-def test_mutant_mask_drops_the_layout_term_fails():
+def test_mutant_helper_drops_the_layout_term_fails():
     assert not claim_mask_is_the_staged_claims_type_half(
-        _once(SYCL, MASK_TERMS, "if (moe_pp_batched_takes_staged_type(type)) {"))
+        _once(SYCL, TYPE_BODY, "{ return moe_pp_batched_takes_staged_type(type); }"))
 
 
-def test_mutant_claim_moves_its_staged_layout_alone_fails():
+def test_mutant_claim_inlines_its_own_terms_again_fails():
+    assert not claim_mask_is_the_staged_claims_type_half(_once(SYCL, CLAIM_ASKS, CLAIM_INLINE))
+
+
+def test_mutant_mask_inlines_its_own_terms_again_fails():
     assert not claim_mask_is_the_staged_claims_type_half(
-        _once(SYCL, CLAIM_TERMS, CLAIM_TERMS.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")))
+        _once(SYCL, MASK_ASKS, "if (" + TYPE_TERMS + ") {"))
+
+
+def test_mutant_claim_adds_a_type_term_the_mask_lacks_fails():
+    assert not claim_mask_is_the_staged_claims_type_half(
+        _once(SYCL, CLAIM_ASKS, CLAIM_ASKS.replace("plan != nullptr && ",
+                                                   "plan != nullptr && weight->type != GGML_TYPE_Q8_0 && ")))
+
+
+def test_mutant_mask_stops_asking_the_helper_fails():
+    assert not claim_mask_is_the_staged_claims_type_half(
+        _once(SYCL, MASK_ASKS, "if (moe_pp_batched_takes_staged_type(type)) {"))
 
 
 # ---- (g) the decision line -----------------------------------------------------------------------------------------
@@ -438,3 +476,49 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---- (j) the line names the ring the room was taken from, and the round bound has one source ---------------------
+
+HELD_GEO_TAKEN = "room = geo.bytes; held_geo = geo;"
+LINE_SLOTS = "held_geo.n_slots, held_geo.slot_bytes / mb, held_geo.region_slots, rounds,"
+ROUND_BOUND = "constexpr int max_rounds = 8;"
+UNSETTLED_SUFFIX = '" (not settled: the phase\'s ring may be larger, and an expert loan funds the rest)"'
+ROUND_COUNT_LITERAL_RE = re.compile(r'"[^"]*\b\d+ rounds?\b[^"]*"')
+
+
+def claim_line_names_the_held_ring(cache: str) -> bool:
+    """The held ring is taken with the room, so a ring that shrinks below the room without reaching 0 leaves the line
+    naming the slots that make up the room; the last round's geometry never reaches the line's slot figures."""
+    h = body(cache, HELPER_SIG)
+    return (bool(h) and h.count(HELD_GEO_TAKEN) == 1 and h.count(LINE_SLOTS) == 1
+            and not any(f"geo.{f}" in h.replace("held_geo.", "") for f in ("n_slots", "slot_bytes", "region_slots")))
+
+
+def claim_round_bound_has_one_source(cache: str) -> bool:
+    """The bound is max_rounds alone: the line prints the rounds it took and the unsettled suffix names no count."""
+    h = body(cache, HELPER_SIG)
+    return (bool(h) and h.count(ROUND_BOUND) == 1 and h.count(UNSETTLED_SUFFIX) == 1
+            and not ROUND_COUNT_LITERAL_RE.search(h))
+
+
+def test_line_names_the_held_ring():
+    assert claim_line_names_the_held_ring(CACHE)
+
+
+def test_mutant_line_prints_the_last_rounds_ring_fails():
+    assert not claim_line_names_the_held_ring(
+        _once(CACHE, LINE_SLOTS, "geo.n_slots, geo.slot_bytes / mb, geo.region_slots, rounds,"))
+
+
+def test_mutant_held_ring_not_taken_with_the_room_fails():
+    assert not claim_line_names_the_held_ring(_once(CACHE, HELD_GEO_TAKEN, "room = geo.bytes;"))
+
+
+def test_round_bound_has_one_source():
+    assert claim_round_bound_has_one_source(CACHE)
+
+
+def test_mutant_suffix_spells_the_bound_again_fails():
+    assert not claim_round_bound_has_one_source(
+        _once(CACHE, UNSETTLED_SUFFIX, UNSETTLED_SUFFIX.replace("(not settled:", "(not settled after 8 rounds:")))

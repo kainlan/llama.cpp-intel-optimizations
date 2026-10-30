@@ -17130,16 +17130,24 @@ static double ggml_sycl_plan_cost_param(const char * name, double def, double ma
 // executor's claim predicate; declared here for the capability query's prompt route.
 static bool ggml_sycl_moe_pp_batched_takes_layout(ggml_type type, layout_mode layout);
 
-// The types whose host-staged experts the batched prompt executor claims, one bit per ggml_type: the two type terms of
-// its staged claim (ggml_sycl_moe_pp_onednn_batched_claims_tensor with host_staged), under the runtime knobs. The
-// planner sizes the window ring's room from it (placement_kv_info::moe_stream_staged_types), since only a claimed
-// matrix takes a ring slot. The claim's other terms read a weight's planned layout, which the plan decides after this.
+// The type half of the batched prompt executor's staged claim: the type is one moe_pp_batched_takes_staged_type names,
+// and the executor takes it at AOS, the layout a staged slot holds, under the runtime knobs. The staged claim
+// (ggml_sycl_moe_pp_onednn_batched_claims_tensor with host_staged) and the planner's staged-type mask both ask it here,
+// so the window ring's room is sized over exactly the matrices the executor claims.
+static bool ggml_sycl_moe_pp_batched_claims_staged_type(ggml_type type) {
+    return moe_pp_batched_takes_staged_type(type) && ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS);
+}
+
+// The types whose host-staged experts the batched prompt executor claims, one bit per ggml_type: the type half of its
+// staged claim (ggml_sycl_moe_pp_batched_claims_staged_type). The planner sizes the window ring's room from it
+// (placement_kv_info::moe_stream_staged_types), since only a claimed matrix takes a ring slot. The claim's other term
+// reads a weight's planned layout, which the plan decides after this.
 static uint64_t ggml_sycl_moe_stream_staged_types() {
     static_assert(GGML_TYPE_COUNT <= 64, "the staged-type mask holds one bit per ggml_type");
     uint64_t mask = 0;
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         const ggml_type type = static_cast<ggml_type>(t);
-        if (moe_pp_batched_takes_staged_type(type) && ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS)) {
+        if (ggml_sycl_moe_pp_batched_claims_staged_type(type)) {
             mask |= uint64_t(1) << t;
         }
     }
@@ -82626,10 +82634,11 @@ static const char * ggml_sycl_moe_pp_dequant_label(ggml_type type) {
 // The staged claim (host_staged, llama.cpp-3460) answers for the weight once the stream ring has staged its host
 // experts, from the plan the ring's index build holds (c-gi44); the ring then stages them for the executor. Its planned
 // layout is the device experts' (ggml_sycl_moe_tensor_plan_staged_layout, which lets the other experts be on the
-// host), and it needs two more things. The type is one moe_pp_batched_takes_staged_type names, the helper the cost
-// model's seed asks too: it has an MMID kernel, so the hybrid route can still take the op when the ring stages too
-// little, and an f16 row at AOS, the layout a staged slot holds. And ggml_sycl_moe_pp_batched_takes_layout takes AOS
-// under the runtime knobs. The device experts' layout then passes the same checks below as a resident weight's.
+// host), and its type passes ggml_sycl_moe_pp_batched_claims_staged_type, which the planner's staged-type mask also
+// asks. That helper wants a type moe_pp_batched_takes_staged_type names, the predicate the cost model's seed reads: it
+// has an MMID kernel, so the hybrid route can still take the op when the ring stages too little, and an f16 row at AOS,
+// the layout a staged slot holds. It also wants ggml_sycl_moe_pp_batched_takes_layout to take AOS under the runtime
+// knobs. The device experts' layout then passes the same checks below as a resident weight's.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan,
                                                           const ggml_tensor *               weight,
                                                           int                               device,
@@ -82644,8 +82653,7 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     layout_mode planned_layout = GGML_LAYOUT_AOS;
     bool        planned        = false;
     if (host_staged) {
-        planned = plan != nullptr && moe_pp_batched_takes_staged_type(weight->type) &&
-                  ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) &&
+        planned = plan != nullptr && ggml_sycl_moe_pp_batched_claims_staged_type(weight->type) &&
                   ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);
     } else {
         planned = plan != nullptr ? ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) :

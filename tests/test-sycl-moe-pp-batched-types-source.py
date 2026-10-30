@@ -86,9 +86,10 @@ dequant. These claims pin that shape:
       deferred expert the phase loop declines (llama.cpp-8epx).
   (s) one type question for a host-staged weight (llama.cpp-3460): moe_pp_batched_takes_staged_type in
       moe-mmvq-tables.hpp is exactly an MMVQ-ID kernel (moe_mmvq_admission_supports_type) and an f16 row at AOS. The
-      staged claim asks it, beside the runtime knobs (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost
-      model's device-rate seed (moe_exec_dev_gflops_seed) asks it before it seeds any type but MXFP4; neither asks
-      either table term itself. So no type is seeded at the executor's rate while the claim refuses it (IQ1_S, IQ1_M
+      staged claim asks it through ggml_sycl_moe_pp_batched_claims_staged_type, which is exactly it beside the
+      runtime knobs (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost model's device-rate seed
+      (moe_exec_dev_gflops_seed) asks it before it seeds any type but MXFP4; none of them asks either table term
+      itself. So no type is seeded at the executor's rate while the claim refuses it (IQ1_S, IQ1_M
       and IQ4_XS have the f16 row and no MMVQ-ID kernel), and (h) holds for the staged claim too: it never takes a
       type with no MMVQ-ID kernel, so such a type is never admitted on a hybrid layer.
 
@@ -199,8 +200,10 @@ LEASE_HELPER = "auto retain_expert_leases_until = [&](const sycl::event & until)
 STAGED_TYPE = "moe_pp_batched_takes_staged_type"
 STAGED_TYPE_BODY = ("{ return moe_mmvq_admission_supports_type(type) && "
                     "moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS); }")
-STAGED_CLAIM_HEAD = "planned = plan != nullptr && moe_pp_batched_takes_staged_type(weight->type) && "
-STAGED_CLAIM_KNOBS = "ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) && "
+CLAIMS_STAGED_TYPE = "ggml_sycl_moe_pp_batched_claims_staged_type"
+CLAIMS_STAGED_TYPE_BODY = ("{ return moe_pp_batched_takes_staged_type(type) && "
+                           "ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS); }")
+STAGED_CLAIM_HEAD = "planned = plan != nullptr && ggml_sycl_moe_pp_batched_claims_staged_type(weight->type) && "
 SEED_GATE = "if (!moe_pp_batched_takes_staged_type(t)) { return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED; }"
 SEED_MXFP4 = "if (t == GGML_TYPE_MXFP4) { return 3990.0; }"
 TABLE_TERMS = ("moe_mmvq_admission_supports_type(", "moe_pp_batched_f16_supports_layout(")
@@ -1108,14 +1111,17 @@ def claim_s_staged_type(s):
     claim = claim_predicate_body(s["sycl"])
     if claim is None:
         return fails + ["the plan-taking ggml_sycl_moe_pp_onednn_batched_claims_tensor definition was not found"]
-    staged = statement(claim, STAGED_CLAIM_HEAD)
-    if staged is None:
-        fails.append(f"the staged claim does not ask {STAGED_TYPE} about the weight's type")
-    elif STAGED_CLAIM_KNOBS not in staged:
-        fails.append("the staged claim does not ask ggml_sycl_moe_pp_batched_takes_layout at AOS (the runtime knobs)")
+    if statement(claim, STAGED_CLAIM_HEAD) is None:
+        fails.append(f"the staged claim does not ask {CLAIMS_STAGED_TYPE} about the weight's type")
+    claims_type = one_definition(s["sycl"], CLAIMS_STAGED_TYPE)
+    if claims_type is None:
+        fails.append(f"{CLAIMS_STAGED_TYPE} is not defined exactly once in ggml-sycl.cpp")
+    elif claims_type != CLAIMS_STAGED_TYPE_BODY:
+        fails.append(f"{CLAIMS_STAGED_TYPE} is not exactly {STAGED_TYPE} and ggml_sycl_moe_pp_batched_takes_layout at "
+                     "AOS (the runtime knobs)")
     for term in TABLE_TERMS:
-        if term in claim:
-            fails.append(f"the claim predicate asks {term}...) itself, a second source for the type question")
+        if term in claim or (claims_type is not None and term in claims_type):
+            fails.append(f"the staged claim asks {term}...) itself, a second source for the type question")
     seed = one_definition(s["cost"], "moe_exec_dev_gflops_seed")
     if seed is None:
         return fails + ["moe_exec_dev_gflops_seed is not defined exactly once in moe-exec-cost.hpp"]
@@ -1361,7 +1367,10 @@ MUTANTS = [
     ("s", "sycl", STAGED_CLAIM_HEAD, "planned = plan != nullptr && moe_mmvq_admission_supports_type(weight->type) && "),
     ("s", "sycl", STAGED_CLAIM_HEAD,
      STAGED_CLAIM_HEAD + "moe_pp_batched_f16_supports_layout(weight->type, GGML_LAYOUT_AOS) && "),
-    ("s", "sycl", STAGED_CLAIM_HEAD + STAGED_CLAIM_KNOBS, STAGED_CLAIM_HEAD),
+    ("s", "sycl", CLAIMS_STAGED_TYPE_BODY, "{ return moe_pp_batched_takes_staged_type(type); }"),
+    ("s", "sycl", CLAIMS_STAGED_TYPE_BODY,
+     CLAIMS_STAGED_TYPE_BODY.replace("moe_pp_batched_takes_staged_type(type)",
+                                     "moe_mmvq_admission_supports_type(type)")),
     ("s", "cost", "if (!moe_pp_batched_takes_staged_type(t)) {",
      "if (!moe_pp_batched_f16_supports_layout(t, GGML_LAYOUT_AOS)) {"),
     ("s", "cost", SEED_MXFP4, SEED_MXFP4 + " if (t == GGML_TYPE_IQ4_XS) { return 5000.0; }"),
@@ -1385,6 +1394,7 @@ def test_claims_are_not_vacuous(sources):
     assert one_definition(sources["sycl"], "ggml_sycl_moe_query_route_capability") is not None
     assert one_definition(sources["ggml_c"], "ggml_quantize_requires_imatrix") is not None
     assert one_definition(sources["tables"], STAGED_TYPE) is not None
+    assert one_definition(sources["sycl"], CLAIMS_STAGED_TYPE) is not None
     assert one_definition(sources["cost"], "moe_exec_dev_gflops_seed") is not None
 
 

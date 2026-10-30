@@ -1189,6 +1189,18 @@ static size_t left_over(size_t budget, const ggml_sycl::placement_plan & plan) {
     const size_t placed = plan.weight_vram_bytes + plan.kv_vram_bytes + plan.kv_context_reserve_bytes;
     return budget > placed ? budget - placed : 0;
 }
+
+// What one device triplet adds to the bytes the ring's cap reads (the resident entries' dst_size), read like
+// triplet_charge from a plan that put layer 0's expert 0 on the device.
+static size_t triplet_dst(const ggml_sycl::placement_plan & plan) {
+    size_t dst = 0;
+    for (const auto & e : plan.entries) {
+        if (e.layer_id == 0 && e.expert_id == 0 && e.on_device) {
+            dst += e.dst_size;
+        }
+    }
+    return dst;
+}
 }  // namespace ring_room_case
 
 // A budget whose experts fill the zone exactly (40 of 64 triplets) without the room: the planner holds the window
@@ -1306,6 +1318,66 @@ static bool run_moe_stream_ring_room_converges_test() {
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
     if (ok) {
         printf("PASS: the ring's room converges to the ring of the plan it produces\n");
+    }
+    return ok;
+}
+
+// The ring's cap refuses a ring over an eleventh of the device's resident expert bytes, and the room itself displaces
+// experts, so a ring the cap passes without its room can fail it with the room held. The planner then holds nothing
+// and keeps the pack it had without the room: the experts the room would displace stay on the device, and the phase's
+// reserve asks for a loan. With Q4_0 at 18432 bytes a matrix a triplet is 55296 bytes, and 11 x 110592 (the 2 x 3
+// ring) is 1216512 = 22 x 55296, so at 22 device triplets the ring sits exactly at the cap. Holding its 110592 bytes
+// moves two triplets (2 x 55296) to the host and leaves 20 x 55296 = 1105920 < 1216512, which the cap refuses. The
+// case derives both counts from the plan's own dst and charge figures, so the budget follows the planned layout.
+static bool run_moe_stream_ring_room_cap_refuses_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+
+    const auto   roomy  = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, 0);
+    const size_t charge = triplet_charge(roomy);
+    const size_t dst    = triplet_dst(roomy);
+    if (charge == 0 || dst == 0) {
+        printf("FAIL: the cap case needs a device triplet's charge and dst bytes: charge %zu, dst %zu\n", charge, dst);
+        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+        return false;
+    }
+    // The fewest device triplets whose dst bytes the 2 x 3 ring's cap passes, and the triplets its room displaces
+    // from a pack of whole triplets.
+    const size_t n_dev     = (11 * ring_bytes + dst - 1) / dst;
+    const size_t displaced = (ring_bytes + charge - 1) / charge;
+    const size_t budget    = base + n_dev * charge;
+
+    const auto none = plan_for(budget, 0);
+    if (device_triplets(none) != n_dev || ring_of(none, q4_0_bit, 0).bytes != ring_bytes) {
+        printf(
+            "FAIL: without the room the 2 x 3 ring must pass the cap: %zu device triplets (want %zu), ring %zu "
+            "bytes (want %zu)\n",
+            device_triplets(none), n_dev, ring_of(none, q4_0_bit, 0).bytes, ring_bytes);
+        ok = false;
+    }
+    // The planner's second round: the pack with the room held, which the cap must refuse.
+    const auto held = plan_for(budget - ring_bytes, 0);
+    if (device_triplets(held) != n_dev - displaced || ring_of(held, q4_0_bit, 0).bytes != 0) {
+        printf(
+            "FAIL: with the room held the cap must refuse the ring: %zu device triplets (want %zu), ring %zu bytes "
+            "(want 0)\n",
+            device_triplets(held), n_dev - displaced, ring_of(held, q4_0_bit, 0).bytes);
+        ok = false;
+    }
+
+    const auto plan = plan_for(budget, q4_0_bit);
+    if (plan.moe_stream_ring_reserve_bytes != 0 || device_triplets(plan) != device_triplets(none)) {
+        printf(
+            "FAIL: a room the ring's cap refuses must not be held: room %zu (want 0), %zu device triplets (want "
+            "%zu, the pack without the room)\n",
+            plan.moe_stream_ring_reserve_bytes, device_triplets(plan), device_triplets(none));
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: the planner holds no ring room the ring's cap refuses once the room displaces experts\n");
     }
     return ok;
 }
@@ -3598,6 +3670,7 @@ int main() {
         mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;
         mock_ok = run_dense_weights_before_kv_test() && mock_ok;
         mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
         mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;
