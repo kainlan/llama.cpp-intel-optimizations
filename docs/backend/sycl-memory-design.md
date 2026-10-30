@@ -2649,7 +2649,11 @@ An explicit `-ub` whose ring needs more RUNTIME zone than the load's planning
 shape reserved is placed at load, the way KV that does not fit is re-placed
 rather than refused. The caller names the micro-batch in
 `llama_model_params::n_ubatch_hint`. Both `common` and `llama-bench` name none
-for an automatic micro-batch, so the auto-ubatch trial is unchanged. The planner
+for an automatic micro-batch, so the auto-ubatch trial is unchanged.
+`llama-bench` names the micro-batch from `-b` and `-ub` alone, not clamped by
+each test's context, and names none on a build without the SYCL backend. So
+the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
+reloads the model only when the named micro-batch changes. The planner
 computes the RUNTIME room the ring and the dense scratch need at that micro-batch
 (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as a named term
 on the routed-expert budget, at the start of the MoE block. By then the dense

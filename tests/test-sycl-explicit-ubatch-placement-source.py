@@ -203,7 +203,9 @@ HEADER_SIZE_PIN = ('static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, '
 HEADER_OFFSET_PIN = ('static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, '
                      '"n_ubatch_context moved");')
 COMMON_NONE = "mparams.n_ubatch_hint = 0; if (!params.n_ubatch_auto && params.n_batch > 0) {"
-BENCH_NONE = "if (n_ubatch < 0 || n_batch <= 0) { return 0; }"
+BENCH_NONE = 'if (n_ubatch < 0 || n_batch <= 0 || ggml_backend_reg_by_name("SYCL") == nullptr) { return 0; }'
+# Read from -b and -ub alone, so the prompt and generation tests of one pair name the same micro-batch.
+BENCH_RETURN = "return n_ubatch > 0 ? std::min((uint32_t) n_batch, (uint32_t) n_ubatch) : (uint32_t) n_batch;"
 BENCH_SET = "mparams.n_ubatch_hint = n_ubatch_hint();"
 BENCH_EQUAL = "n_ubatch_hint() == other.n_ubatch_hint() &&"
 
@@ -279,6 +281,16 @@ def claim_transport_names_no_micro_batch_for_auto(llama_h: str, model_cpp: str, 
             and BENCH_SET in bench and BENCH_EQUAL in bench)
 
 
+def claim_bench_reloads_only_on_a_micro_batch_change(bench_cpp: str) -> bool:
+    """llama-bench reloads the model when the named micro-batch changes and at no other test boundary: the hint reads
+    -b and -ub and nothing sized by the context, so `-ub 512 -p 512 -n 128` loads once, and "-ub auto" and a build
+    without the SYCL backend name none, so they never reload on it."""
+    bench_hint = body(norm(bench_cpp), BENCH_HINT_SIG)
+    return (bool(bench_hint) and bench_hint.lstrip("{ ").startswith(BENCH_NONE)
+            and bench_hint.count("return ") == 2 and BENCH_RETURN in bench_hint
+            and "n_ctx" not in bench_hint and "n_prompt" not in bench_hint and "n_gen" not in bench_hint)
+
+
 def test_placement_is_one_warn_line():
     assert claim_placement_is_one_warn_line(SYCL_CPP)
 
@@ -293,6 +305,10 @@ def test_planner_moves_only_experts():
 
 def test_load_grows_the_zone_before_the_plan():
     assert claim_load_grows_the_zone_before_the_plan(SYCL_CPP)
+
+
+def test_bench_reloads_only_on_a_micro_batch_change():
+    assert claim_bench_reloads_only_on_a_micro_batch_change(BENCH_CPP)
 
 
 def test_failed_growth_warns():
@@ -441,8 +457,23 @@ def test_mutant_common_names_the_auto_micro_batch_fails():
 
 
 def test_mutant_bench_names_the_auto_micro_batch_fails():
-    assert not claim_transport_names_no_micro_batch_for_auto(
-        LLAMA_H, MODEL_CPP, SYCL_CPP, COMMON_CPP, _once(BENCH_CPP, BENCH_NONE, "if (n_batch <= 0) { return 0; }"))
+    mutant = _once(BENCH_CPP, BENCH_NONE, BENCH_NONE.replace("n_ubatch < 0 || ", "", 1))
+    assert not claim_transport_names_no_micro_batch_for_auto(LLAMA_H, MODEL_CPP, SYCL_CPP, COMMON_CPP, mutant)
+    assert not claim_bench_reloads_only_on_a_micro_batch_change(mutant)
+
+
+def test_mutant_bench_names_a_micro_batch_without_sycl_fails():
+    """Without the SYCL backend nothing reads the hint, so naming one there would only make a -ub sweep reload."""
+    mutant = _once(BENCH_CPP, BENCH_NONE, BENCH_NONE.replace(' || ggml_backend_reg_by_name("SYCL") == nullptr', "", 1))
+    assert not claim_bench_reloads_only_on_a_micro_batch_change(mutant)
+
+
+def test_mutant_bench_hint_clamped_by_the_context_fails():
+    """Clamped by the context, pp512 and tg128 of `-ub 512` name 512 and 128 and the model reloads between them."""
+    clamped = "std::min(std::min((uint32_t) n_batch, n_ctx()), (uint32_t) n_ubatch)"
+    mutant = _once(BENCH_CPP, BENCH_RETURN,
+                   BENCH_RETURN.replace("std::min((uint32_t) n_batch, (uint32_t) n_ubatch)", clamped, 1))
+    assert not claim_bench_reloads_only_on_a_micro_batch_change(mutant)
 
 
 def test_mutant_bench_reuses_the_model_across_micro_batches_fails():

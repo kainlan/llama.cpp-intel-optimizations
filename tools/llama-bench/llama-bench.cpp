@@ -1220,15 +1220,16 @@ struct cmd_params_instance {
     // the context every test of this instance creates: the prompt, the generated tokens and the depth
     uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }
 
-    // the micro-batch every test of this instance creates its context with, as llama_context resolves it (see
-    // to_llama_cparams): an n_ubatch of 0 is n_batch, and a causal context's n_batch is at most its n_ctx. 0 for
-    // "-ub auto", where the SYCL backend picks the micro-batch itself.
+    // the micro-batch this instance names to the load: -ub, at most -b (an n_ubatch of 0 is n_batch). It is read from
+    // -b and -ub alone, not clamped by the context as llama_context clamps it, so the prompt and generation tests of one
+    // -b/-ub pair name the same micro-batch and share one model (see equal_mparams); a context smaller than the
+    // micro-batch runs on the placement made for it. 0 for "-ub auto", where the SYCL backend picks the micro-batch
+    // itself, and 0 without the SYCL backend, the only one whose load reads it.
     uint32_t n_ubatch_hint() const {
-        if (n_ubatch < 0 || n_batch <= 0) {
+        if (n_ubatch < 0 || n_batch <= 0 || ggml_backend_reg_by_name("SYCL") == nullptr) {
             return 0;
         }
-        const uint32_t batch = n_ctx() > 0 ? std::min((uint32_t) n_batch, n_ctx()) : (uint32_t) n_batch;
-        return n_ubatch > 0 ? std::min(batch, (uint32_t) n_ubatch) : batch;
+        return n_ubatch > 0 ? std::min((uint32_t) n_batch, (uint32_t) n_ubatch) : (uint32_t) n_batch;
     }
 
     llama_model_params to_llama_mparams() const {
@@ -1293,10 +1294,11 @@ struct cmd_params_instance {
     }
 
     // n_ctx_hint is left out, so a context change does not reload the model: a reused model keeps the first
-    // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p).
-    // n_ubatch_hint is compared: the routed experts the load moved to the host tier for one micro-batch's PP MoE
-    // scratch ring stay there, so a reused model would measure a smaller micro-batch with experts it did not need to
-    // move, and a larger one would find no room for its ring.
+    // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p). n_ubatch_hint
+    // depends on -b and -ub alone, so it does not reload on a context change either, and it is compared: the routed
+    // experts the load moved to the host tier for one micro-batch's PP MoE scratch ring stay there, so a reused model
+    // would measure a smaller micro-batch with experts it did not need to move, and a larger one would find no room for
+    // its ring. "-ub auto" names none, and neither does a build without the SYCL backend, so neither reloads.
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                n_ubatch_hint() == other.n_ubatch_hint() &&
