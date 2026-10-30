@@ -351,7 +351,7 @@ EXEC_FIND = "ctx.moe_stream->find(pp_stream_layer, expert.expert_id, pp_stream_r
 # expert the window did not stage is declined, never aborted (the 9433 contract), and every decline in the phase loop
 # first drains the phases it already submitted.
 EXEC_DEFER = ("} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) { "
-              "expert.deferred = true; expert.layout = GGML_LAYOUT_AOS; } else { ")
+              "expert.deferred = true; expert.layout = ggml_sycl::MOE_STREAM_RING_SLOT_LAYOUT; } else { ")
 EXEC_HOST_ONLY = ("return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, "
                   "ggml_sycl_expert_resolve_reason_name(route.reason), i02); }")
 EXEC_RESOLVE_SIG = ("auto resolve_deferred_expert = [&](pp_onednn_batched_expert & expert, "
@@ -361,7 +361,7 @@ EXEC_ENTRY = ("const bool executor_entry = staged != nullptr && "
 EXEC_NOT_STAGED = ("if (!executor_entry) { drain_submitted_phases(); "
                    "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, \"window-not-staged\", "
                    "expert.expert_id); }")
-EXEC_AOS_ONLY = "GGML_ASSERT(staged->layout == GGML_LAYOUT_AOS);"
+EXEC_AOS_ONLY = "GGML_ASSERT(staged->layout == ggml_sycl::MOE_STREAM_RING_SLOT_LAYOUT);"
 EXEC_VIEW_CHECK = ("if (view.ptr == nullptr || !view.on_device) { drain_submitted_phases(); "
                    "return reject_batched(moe_pp_batched_refusal::EXPERT_NOT_LOCAL, \"staged-slot-view\", "
                    "expert.expert_id); }")
@@ -1494,8 +1494,8 @@ RING_ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode la
 # The slot's own allocation, re-tagged with the caller's layout (llama.cpp-am87: one allocation per slot).
 RING_SLICE = "return slots_[index].slice(0, geo_.slot_bytes, layout);"
 STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage_window("
-PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_AOS);"
-PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, GGML_LAYOUT_AOS, item.consumer };"
+PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT);"
+PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
 TAG_AGREES = "if (view.layout != s->layout) { return moe_staged_route_refusal::LAYOUT; }"
 
 
@@ -1551,15 +1551,76 @@ def test_tag_is_the_layout_mutants():
         *with_(4, PHASE_AOS_ACQUIRE, "mem_handle aos = ring_->acquire_slot(GGML_LAYOUT_SOA);"))
     # The entry recorded as SOA for an AOS slot.
     assert not claim_tag_is_the_layout(
-        *with_(4, PHASE_AOS_ENTRY, PHASE_AOS_ENTRY.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")))
+        *with_(4, PHASE_AOS_ENTRY, PHASE_AOS_ENTRY.replace("MOE_STREAM_RING_SLOT_LAYOUT", "GGML_LAYOUT_SOA")))
     # A SOA slot acquired beside it again.
     assert not claim_tag_is_the_layout(
         *with_(4, PHASE_AOS_ACQUIRE, PHASE_AOS_ACQUIRE + " mem_handle soa = ring_->acquire_slot(GGML_LAYOUT_SOA);"))
     # A second AOS slot per matrix.
     assert not claim_tag_is_the_layout(
-        *with_(4, PHASE_AOS_ACQUIRE, PHASE_AOS_ACQUIRE + " mem_handle aos2 = ring_->acquire_slot(GGML_LAYOUT_AOS);"))
+        *with_(4, PHASE_AOS_ACQUIRE,
+               PHASE_AOS_ACQUIRE + " mem_handle aos2 = ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT);"))
     # The resolver trusting the entry without checking the slot agrees.
     assert not claim_tag_is_the_layout(*with_(5, TAG_AGREES, ""))
+
+
+# ---- the ring slot's layout is read from one constant at the executor's two sites ------------------------------------
+
+SLOT_LAYOUT_NAME = "MOE_STREAM_RING_SLOT_LAYOUT"
+SLOT_LAYOUT_DEF = "static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;"
+SLOT_LAYOUT_DEFINITION_RE = re.compile(
+    r"\b(?:ggml_layout_mode|auto)\s+MOE_STREAM_RING_SLOT_LAYOUT\b|#\s*define\s+MOE_STREAM_RING_SLOT_LAYOUT\b")
+EXEC_DEFER_OPEN = "} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {"
+EXEC_DEFER_CLOSE = "} else { return reject_batched("
+
+
+def claim_executor_reads_the_ring_slot_layout(sycl: str, ring_hpp: str) -> bool:
+    """The batched prompt executor names the layout a ring slot holds through MOE_STREAM_RING_SLOT_LAYOUT, defined once
+    in moe-stream-ring.hpp as GGML_LAYOUT_AOS, and spells no GGML_LAYOUT_AOS of its own at its two sites: the deferral
+    branch of the expert loop, which picks the reader for the layout the ring stages, and resolve_deferred_expert's
+    assert that the stage-table entry holds it. The rest of ggml-sycl.cpp legitimately uses the literal, so the scan is
+    scoped to those two blocks by their anchors."""
+    h = norm(ring_hpp)
+    lam = body(norm(sycl), EXEC_SIG)
+    at = lam.find(EXEC_DEFER_OPEN)
+    end = lam.find(EXEC_DEFER_CLOSE, at)
+    defer = lam[at:end] if at >= 0 and end > at else ""
+    resolve = body(lam, EXEC_RESOLVE_SIG)
+    elsewhere = sum(len(SLOT_LAYOUT_DEFINITION_RE.findall(norm(text))) for rel, text in SYCL_TREE.items()
+                    if rel not in (RING_HPP_REL, SYCL_REL))
+    elsewhere += len(SLOT_LAYOUT_DEFINITION_RE.findall(norm(sycl)))
+    return (h.count(SLOT_LAYOUT_DEF) == 1 and len(SLOT_LAYOUT_DEFINITION_RE.findall(h)) + elsewhere == 1
+            and "expert.layout = ggml_sycl::" + SLOT_LAYOUT_NAME + ";" in defer and "GGML_LAYOUT_AOS" not in defer
+            and EXEC_AOS_ONLY in resolve and "GGML_LAYOUT_AOS" not in resolve)
+
+
+def test_executor_reads_the_ring_slot_layout():
+    assert claim_executor_reads_the_ring_slot_layout(SYCL, RING_HPP)
+
+
+def test_executor_ring_slot_layout_mutants():
+    def c(sycl=SYCL, ring_hpp=RING_HPP):
+        return claim_executor_reads_the_ring_slot_layout(sycl, ring_hpp)
+
+    # Each site restored to the literal.
+    assert not c(sycl=mutate(SYCL, EXEC_DEFER, EXEC_DEFER.replace("ggml_sycl::" + SLOT_LAYOUT_NAME, "GGML_LAYOUT_AOS")))
+    literal_assert = EXEC_AOS_ONLY.replace("ggml_sycl::" + SLOT_LAYOUT_NAME, "GGML_LAYOUT_AOS")
+    assert not c(sycl=mutate(SYCL, EXEC_AOS_ONLY, literal_assert))
+    # The constant naming another layout.
+    soa_def = SLOT_LAYOUT_DEF.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")
+    assert not c(ring_hpp=mutate(RING_HPP, SLOT_LAYOUT_DEF, soa_def))
+    # A second definition, in the header or in the executor's own file.
+    assert not c(ring_hpp=norm(RING_HPP) + " " + SLOT_LAYOUT_DEF)
+    assert not claim_executor_reads_the_ring_slot_layout(norm(SYCL) + " " + SLOT_LAYOUT_DEF, RING_HPP)
+    # Other spellings of a second definition: brace-initialized, or a macro.
+    brace_def = " static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT{GGML_LAYOUT_AOS};"
+    assert not c(ring_hpp=norm(RING_HPP) + brace_def)
+    assert not c(sycl=norm(SYCL) + " #define MOE_STREAM_RING_SLOT_LAYOUT GGML_LAYOUT_AOS")
+    # A shadow in another scope, spelled constexpr auto, inside the deferral block.
+    shadow_def = "constexpr auto MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_SOA; "
+    shadow = EXEC_DEFER.replace("expert.deferred = true; ", "expert.deferred = true; " + shadow_def)
+    assert not c(sycl=mutate(SYCL, EXEC_DEFER, shadow))
+    # Control: a comparison is a use, not a definition.
+    assert c(sycl=norm(SYCL) + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);")
 
 
 if __name__ == "__main__":
