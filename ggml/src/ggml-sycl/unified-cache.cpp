@@ -33419,8 +33419,14 @@ static size_t moe_stream_room_dry_pack(placement_plan &                       pl
 // Holds the window ring's room out of `remaining`, the last term before the expert pack, and counts it in the plan.
 // Holding room moves experts to the host, which can widen the window or raise the slot, so the room is iterated to the
 // ring of the plan it produces: R starts at 0 and takes the ring of the pack with R held while that ring is larger.
-// R only grows, and it is bounded by two windows of G_plan slots of the largest claimable matrix; a few rounds settle
-// it. No room is held when no ring would exist (nothing staged, no host expert, no planned weight slot), or when the
+// R only grows, and it is bounded by two windows of G_plan slots of the largest claimable matrix, so it settles in a
+// few rounds; the loop stops at 8. A run that has not settled by then holds the 8th round's ring, which no pack with
+// that room held was checked against: the phase's ring can then be larger, and the loan funds the rest. The line's
+// cost figures are taken from one more dry pack with the held room, so they describe the room the plan holds.
+// R is held whole or not at all, never min(R, remaining). In a settled run R > remaining cannot happen: with nothing
+// left for the experts the geometry is 0 and the cap answers first. In a run that has not settled, a partial room
+// would send every expert to the host for a ring the cap then refuses.
+// No room is held when no ring would exist (nothing staged, no host expert, no planned weight slot), or when the
 // ring's cap, an eleventh of the device's expert bytes, refuses the ring once its room displaces experts. The phase,
 // the ring and the loan are unchanged: a reserve this room cannot fund still asks for a loan.
 static void hold_moe_stream_ring_room(placement_plan &                       plan,
@@ -33477,6 +33483,12 @@ static void hold_moe_stream_ring_room(placement_plan &                       pla
             break;
         }
         room = geo.bytes;
+    }
+    if (!settled) {
+        // The last round packed with the previous round's room: pack once more with the room this run holds, so the
+        // cost the line prints is that room's.
+        const size_t held_avail = remaining > room ? remaining - room : 0;
+        placed_with             = moe_stream_room_dry_pack(plan, groups, device_id, held_avail, &groups_with);
     }
 
     size_t i = 0;

@@ -20,7 +20,9 @@ The fix this gate pins:
     the executor's staged claim, and the group cap;
   - the decision prints one [SYCL-PLAN] line, a WARN when the room displaced experts or did not settle;
   - the room needs no padding: where it is sized, the build refuses a slot alignment other than the zone
-    allocator's grain, the one alignment at which each slot takes exactly its bytes.
+    allocator's grain, the one alignment at which each slot takes exactly its bytes;
+  - a run that has not settled in 8 rounds packs once more with the room it holds, so the line's cost is that
+    room's and not the previous round's.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -393,6 +395,41 @@ def test_mutant_alignment_assert_weakened_fails():
     """At an alignment below the grain a slot still takes a whole number of grains, more than slot_bytes."""
     weakened = ALIGN_ASSERT.replace(" == ", " <= ")
     assert not claim_room_needs_no_padding(_once(CACHE, ALIGN_ASSERT, weakened))
+
+
+# ---- (i) an unsettled run's cost is the held room's ------------------------------------------------------------------
+
+UNSETTLED_REPACK = ("if (!settled) { const size_t held_avail = remaining > room ? remaining - room : 0; "
+                    "placed_with = moe_stream_room_dry_pack(plan, groups, device_id, held_avail, &groups_with); }")
+RESTORE = "plan.entries[idx].on_device = saved[i].first;"
+
+
+def claim_unsettled_cost_is_the_held_rooms(cache: str) -> bool:
+    """The loop's last round packs with the previous round's room, so a run that stops unsettled packs once more with
+    the room it holds, after the loop and before the entries are restored and the line is printed."""
+    h = body(cache, HELPER_SIG)
+    return (bool(h) and h.count(UNSETTLED_REPACK) == 1
+            and ordered(h, "room = geo.bytes;", UNSETTLED_REPACK, RESTORE, HELD_LINE))
+
+
+def test_unsettled_cost_is_the_held_rooms():
+    assert claim_unsettled_cost_is_the_held_rooms(CACHE)
+
+
+def test_mutant_unsettled_repack_dropped_fails():
+    assert not claim_unsettled_cost_is_the_held_rooms(_once(CACHE, UNSETTLED_REPACK, ""))
+
+
+def test_mutant_unsettled_repack_ignores_the_room_fails():
+    mutant = _once(CACHE, UNSETTLED_REPACK, UNSETTLED_REPACK.replace("device_id, held_avail,", "device_id, remaining,"))
+    assert not claim_unsettled_cost_is_the_held_rooms(mutant)
+
+
+def test_mutant_unsettled_repack_after_the_restore_fails():
+    """Packing after the restore would leave the entries as the dry pack wrote them, not as the plan had them."""
+    restore_loop_end = RESTORE + " plan.entries[idx].target_device = saved[i].second; ++i; } } }"
+    mutant = _once(_once(CACHE, UNSETTLED_REPACK, ""), restore_loop_end, restore_loop_end + " " + UNSETTLED_REPACK)
+    assert not claim_unsettled_cost_is_the_held_rooms(mutant)
 
 
 if __name__ == "__main__":

@@ -194,11 +194,26 @@ ring's own size: `moe_stream_plan_ring_geometry`, which the phase and the fit
 size the ring with, under the planned f16 weight slot, the executor's group cap
 and nothing lent, over the host experts the pack is predicted to leave. Holding
 the room can push more experts to the host and widen the ring, so the planner
-packs again with the room held until the ring fits in it. The room comes out of
-the WEIGHT zone's remaining bytes and counts in the plan's `vram_bytes`, which
-the WOQ guard keeps free. It survives the runtime KV re-derivation, because the
-ring is reserved again at every prompt. It is accounting, not an allocation: the
-ring still reserves its slots at each prompt and releases them at its end. The
+packs again with the room held until the ring fits in it, for at most 8 rounds.
+A run that has not settled by then holds the 8th round's ring, which no pack
+with that room held was checked against; the line says so, the phase's ring can
+then be larger, and the loan funds the rest. The room is held whole or not at
+all. In a settled run it cannot exceed what is left, because with nothing left
+for the experts the ring's cap refuses the ring first. In a run that has not
+settled, a partial room would send every expert to the host for a ring the cap
+then refuses. The room comes out of the WEIGHT zone's remaining bytes and
+counts in the plan's `vram_bytes`, which the WOQ guard keeps free. It is
+accounting, not an allocation: the ring still reserves its slots at each prompt
+and releases them at its end. The runtime KV re-derivation keeps the room in
+the plan's accounting (`refresh_kv_byte_totals`), and the oneDNN scratch ring's
+budget room, which reads `vram_bytes`, leaves it alone. The runtime KV fit does
+not: it reads the zone's live free bytes (`ggml_sycl_kv_capacity_live`), and
+the ring holds no slots between prompts, so there the room counts as KV
+headroom. KV has priority at runtime, as in the planner's order of dense
+weights, then KV, then experts. A context whose KV exceeds the load plan's KV
+plus its KV room therefore takes the ring's room. The prompt's reserve is then
+refused, and the loan and the "reserve refused" line are what remain; no
+plan-time line says why, and on Qwen3.8 the loan finds nothing to lend. The
 room needs no padding: the ring allocates each slot at
 `MOE_STREAM_RING_SLOT_ALIGN`, which is the zone allocator's 256-byte grain, the
 slot is a multiple of it, and the allocator keeps no header in the zone. Only
