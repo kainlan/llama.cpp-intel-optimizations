@@ -1563,12 +1563,12 @@ def test_tag_is_the_layout_mutants():
     assert not claim_tag_is_the_layout(*with_(5, TAG_AGREES, ""))
 
 
-# ---- the ring slot's layout is read from one constant at the executor's two sites -----------------------------------
+# ---- the ring slot's layout is read from one constant at the executor's two sites ------------------------------------
 
 SLOT_LAYOUT_NAME = "MOE_STREAM_RING_SLOT_LAYOUT"
 SLOT_LAYOUT_DEF = "static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;"
 SLOT_LAYOUT_DEFINITION_RE = re.compile(
-    r"\bggml_layout_mode\s+MOE_STREAM_RING_SLOT_LAYOUT\b|#\s*define\s+MOE_STREAM_RING_SLOT_LAYOUT\b")
+    r"\b(?:ggml_layout_mode|auto)\s+MOE_STREAM_RING_SLOT_LAYOUT\b|#\s*define\s+MOE_STREAM_RING_SLOT_LAYOUT\b")
 EXEC_DEFER_OPEN = "} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {"
 EXEC_DEFER_CLOSE = "} else { return reject_batched("
 
@@ -1615,6 +1615,10 @@ def test_executor_ring_slot_layout_mutants():
     brace_def = " static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT{GGML_LAYOUT_AOS};"
     assert not c(ring_hpp=norm(RING_HPP) + brace_def)
     assert not c(sycl=norm(SYCL) + " #define MOE_STREAM_RING_SLOT_LAYOUT GGML_LAYOUT_AOS")
+    # A shadow in another scope, spelled constexpr auto, inside the deferral block.
+    shadow = EXEC_DEFER.replace("expert.deferred = true; ",
+                                "expert.deferred = true; constexpr auto MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_SOA; ")
+    assert not c(sycl=mutate(SYCL, EXEC_DEFER, shadow))
     # Control: a comparison is a use, not a definition.
     assert c(sycl=norm(SYCL) + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);")
 

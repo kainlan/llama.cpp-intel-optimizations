@@ -2331,12 +2331,12 @@ def test_end_prompt_reports_ring_engagement_mutants():
     assert not c(phase=mutate(PHASE, ENGAGED_BODY, "{ return ring_engaged_; }"))
 
 
-# ---- the ring slot's layout is one named constant ------------------------------------------------------------------
+# ---- the ring slot's layout is one named constant --------------------------------------------------------------------
 
 SLOT_LAYOUT_NAME = "MOE_STREAM_RING_SLOT_LAYOUT"
 SLOT_LAYOUT_DEF = "static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;"
 SLOT_LAYOUT_DEFINITION_RE = re.compile(
-    r"\bggml_layout_mode\s+MOE_STREAM_RING_SLOT_LAYOUT\b|#\s*define\s+MOE_STREAM_RING_SLOT_LAYOUT\b")
+    r"\b(?:ggml_layout_mode|auto)\s+MOE_STREAM_RING_SLOT_LAYOUT\b|#\s*define\s+MOE_STREAM_RING_SLOT_LAYOUT\b")
 RING_RESERVE_SIG = "bool moe_stream_ring::reserve("
 SLOT_WRAP = ("mem_handle slot = mem_handle::from_owned_alloc(std::move(allocation.owner), "
              "MOE_STREAM_RING_SLOT_LAYOUT);")
@@ -2384,6 +2384,9 @@ def test_ring_slot_layout_constant_mutants():
     brace_def = " static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT{GGML_LAYOUT_AOS};"
     assert not c(ring_hpp=norm(RING_HPP) + brace_def)
     assert not c(phase=norm(PHASE) + " #define MOE_STREAM_RING_SLOT_LAYOUT GGML_LAYOUT_AOS")
+    # A shadow in another scope, spelled constexpr auto, before the acquire.
+    assert not c(phase=mutate(PHASE, AOS_ACQUIRE, "constexpr auto MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_SOA; "
+                              + AOS_ACQUIRE))
     # Control: a comparison is a use, not a definition.
     assert c(phase=mutate(PHASE, RETAIN, RETAIN + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);"))
 
