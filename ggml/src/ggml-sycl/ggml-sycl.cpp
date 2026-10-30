@@ -91370,13 +91370,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             bool gemm_declined = false;
             for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {
                 const pp_batched_phase & phase         = phases[p];
-                sycl::half *             phase_weights =
-                    batched_weights +
+                const size_t             phase_offset =
                     moe_pp_batched_phase_weight_offset(f16_groups, phase.begin, phase.buffer, half_elems, weight_elems);
-                GGML_ASSERT(pp_woq_arm || (static_cast<size_t>(phase_weights - batched_weights) +
-                                           (phase.end - phase.begin) * weight_elems) *
-                                                  sizeof(sycl::half) <=
-                                              reserved.weight_size);
+                sycl::half * phase_weights = batched_weights + phase_offset;
+                GGML_ASSERT(pp_woq_arm ||
+                            (phase_offset + (phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <=
+                                reserved.weight_size);
                 // The dequant kernels and GEMM groups this phase submits, for a window's timing line.
                 uint32_t                 phase_launches = 0;
                 // llama.cpp-8epx: for a windowed op this phase is one ring window (W1). window_begin is asked exactly

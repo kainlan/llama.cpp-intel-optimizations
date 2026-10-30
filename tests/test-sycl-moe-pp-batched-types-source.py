@@ -163,10 +163,11 @@ REUSE_BODY = "{ return groups.groups != 1; }"
 OFFSET_FN = "moe_pp_batched_phase_weight_offset"
 OFFSET_BODY = ("return moe_pp_batched_phases_reuse_buffers(groups) ? phase_buffer * half_elems : "
                "phase_begin * weight_elems;")
-PHASE_OFFSET = ("sycl::half * phase_weights = batched_weights + "
-                "moe_pp_batched_phase_weight_offset(f16_groups, phase.begin, phase.buffer, half_elems, weight_elems);")
-PHASE_BOUND = ("GGML_ASSERT(pp_woq_arm || (static_cast<size_t>(phase_weights - batched_weights) + "
-               "(phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <= reserved.weight_size);")
+PHASE_OFFSET = ("const size_t phase_offset = "
+                "moe_pp_batched_phase_weight_offset(f16_groups, phase.begin, phase.buffer, half_elems, weight_elems); "
+                "sycl::half * phase_weights = batched_weights + phase_offset;")
+PHASE_BOUND = ("GGML_ASSERT(pp_woq_arm || (phase_offset + (phase.end - phase.begin) * weight_elems) * "
+               "sizeof(sycl::half) <= reserved.weight_size);")
 # The route log's weight figure: the f16 arm's buffers when its phases reuse them, else every active expert's region.
 WEIGHT_USED = ("const size_t f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ? "
                "phase_buffers * half_elems : active_count * weight_elems; "
@@ -1265,7 +1266,7 @@ MUTANTS = [
     ("m", "sycl", "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);",
      "sycl::event::wait(half_readers[phase.buffer]);"),
     ("m", "sycl", "half_readers[phase.buffer].push_back(*group_event);", ""),
-    ("m", "sycl", PHASE_OFFSET, "sycl::half * phase_weights = batched_weights;"),
+    ("m", "sycl", PHASE_OFFSET, "const size_t phase_offset = 0; sycl::half * phase_weights = batched_weights;"),
     ("m", "tables", "plan.buffers = fit >= 2 ? 2 : 1;", "plan.buffers = 1;"),
     # Every phase reuses a buffer again (the one-group serialization back); the wait taken whatever the predicate
     # says; the offset taken from the buffer whatever the predicate says; the offset never by buffer; the bound gone.
@@ -1274,8 +1275,12 @@ MUTANTS = [
      "phase_begin * weight_elems;"),
     ("m", "sycl", "if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_readers[phase.buffer].empty())",
      "if (!half_readers[phase.buffer].empty())"),
-    ("m", "sycl", PHASE_OFFSET, "sycl::half * phase_weights = batched_weights + phase.buffer * half_elems;"),
+    ("m", "sycl", PHASE_OFFSET, "const size_t phase_offset = phase.buffer * half_elems; "
+     "sycl::half * phase_weights = batched_weights + phase_offset;"),
     ("m", "sycl", PHASE_BOUND, ""),
+    # The bound re-deriving the offset from the two pointers instead of reading the helper's result.
+    ("m", "sycl", PHASE_BOUND, "GGML_ASSERT(pp_woq_arm || (static_cast<size_t>(phase_weights - batched_weights) + "
+     "(phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <= reserved.weight_size);"),
     # The route log's weight figure: one window's buffers whatever the predicate says, the plan re-derived there.
     ("m", "sycl", WEIGHT_USED, "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : "
      "phase_buffers * half_elems * sizeof(sycl::half);"),
