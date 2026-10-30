@@ -739,10 +739,12 @@ def claim_no_stale_prose(sycl: str, test_hpp: str) -> bool:
 
 
 def test_no_stale_prose():
-    assert claim_no_stale_prose(SYCL, TEST_HPP), first_present(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the claim also fails on an empty file and searches "
-        "ggml-sycl-test.hpp for its own retired phrases)",
-        SYCL, *STALE_SYCL)
+    assert claim_no_stale_prose(SYCL, TEST_HPP), (
+        first_present("ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the claim also fails on an empty file)", SYCL,
+                      *STALE_SYCL)
+        if any(s in SYCL for s in STALE_SYCL) or not SYCL else
+        first_present("ggml/src/ggml-sycl/ggml-sycl-test.hpp: whole file (the claim also fails on an empty file)",
+                      TEST_HPP, *STALE_TEST_HPP))
 
 
 @pytest.mark.parametrize("stale", STALE_SYCL)
