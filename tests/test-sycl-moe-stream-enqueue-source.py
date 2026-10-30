@@ -102,6 +102,7 @@ Pytest-style (module-level test_* functions): registered with llama_test_pytest.
 
 import re
 from pathlib import Path
+from sycl_gate import first_missing
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -318,7 +319,12 @@ def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
 
 
 def test_begin_layer_once_in_prompt_branch():
-    assert claim_begin_layer_once_in_prompt_branch(SYCL)
+    assert claim_begin_layer_once_in_prompt_branch(SYCL), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the admission branch holds the "
+        "begin_layer call)",
+        body(norm(SYCL), MMID_SIG),
+        BEGIN_CALL, ADMIT_BRANCH + " {", "ctx.moe_graphs_disabled_once = true;", GRAPH_SINK, SNAPSHOT, BEGIN_GUARD,
+        HYBRID_WITH_PLAN)
 
 
 def test_begin_layer_mutants():
@@ -362,7 +368,10 @@ def claim_copy_on_bcs_behind_region_gate(phase: str) -> bool:
 
 
 def test_copy_on_bcs_behind_region_gate():
-    assert claim_copy_on_bcs_behind_region_gate(PHASE)
+    assert claim_copy_on_bcs_behind_region_gate(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file",
+        norm(PHASE),
+        HOST_RESOLVE, COPY_DEPS, READY_DEP, COPY_DECL)
 
 
 def test_copy_mutants():
@@ -390,7 +399,11 @@ def claim_window_copy_is_the_only_submission(phase: str) -> bool:
 
 
 def test_window_copy_is_the_only_submission():
-    assert claim_window_copy_is_the_only_submission(PHASE)
+    assert claim_window_copy_is_the_only_submission(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::stage_window (the claim also fails "
+        "on a second submission or a reorder call)",
+        body(norm(PHASE), STAGE_SIG),
+        "mem_copy_async(")
 
 
 def test_window_copy_only_mutants():
@@ -418,7 +431,10 @@ def claim_window_entry_reads_in_place(phase: str) -> bool:
 
 
 def test_window_entry_reads_in_place():
-    assert claim_window_entry_reads_in_place(PHASE)
+    assert claim_window_entry_reads_in_place(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::stage_window",
+        body(norm(PHASE), STAGE_SIG),
+        COPY_DECL, RETAIN, TABLE_WRITE)
 
 
 def test_window_entry_mutants():
@@ -463,7 +479,11 @@ def claim_submission_failure_aborts(phase: str) -> bool:
 
 
 def test_submission_failure_aborts():
-    assert claim_submission_failure_aborts(PHASE)
+    assert claim_submission_failure_aborts(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file (the try block holding the copy, and the handler "
+        "after it)",
+        norm(PHASE),
+        COPY_DECL, RETAIN, RETHROW, "catch (const std::exception & e) {", ABORT)
 
 
 def test_abort_mutants():
@@ -488,7 +508,10 @@ def claim_phase_never_waits(phase: str) -> bool:
 
 
 def test_phase_never_waits():
-    assert claim_phase_never_waits(PHASE)
+    assert claim_phase_never_waits(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file; the claim also fails on any wait call",
+        norm(PHASE),
+        STAGE_SIG)
 
 
 def test_phase_wait_mutants():
@@ -502,7 +525,11 @@ def claim_mul_mat_id_waits_unchanged(sycl: str) -> bool:
 
 
 def test_mul_mat_id_waits_unchanged():
-    assert claim_mul_mat_id_waits_unchanged(SYCL)
+    assert claim_mul_mat_id_waits_unchanged(SYCL), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file; the claim counts the waits in the body of "
+        "ggml_sycl_mul_mat_id against the count on master",
+        norm(SYCL),
+        MMID_SIG)
 
 
 def test_mul_mat_id_wait_mutants():
@@ -516,7 +543,11 @@ def claim_phase_queries_no_status_and_casts_no_const(phase: str) -> bool:
 
 
 def test_phase_queries_no_status_and_casts_no_const():
-    assert claim_phase_queries_no_status_and_casts_no_const(PHASE)
+    assert claim_phase_queries_no_status_and_casts_no_const(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file; the claim also fails on a status query or a "
+        "const cast",
+        norm(PHASE),
+        STAGE_SIG)
 
 
 def test_status_and_const_cast_mutants():
@@ -537,7 +568,10 @@ def claim_phase_allocates_only_ring_slots(phase: str) -> bool:
 
 
 def test_phase_allocates_only_ring_slots():
-    assert claim_phase_allocates_only_ring_slots(PHASE)
+    assert claim_phase_allocates_only_ring_slots(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file; the claim also fails on an allocator name",
+        norm(PHASE),
+        "ring_->acquire_slot(")
 
 
 def test_allocator_mutants():
@@ -578,7 +612,11 @@ def claim_only_direct_owned_typed_items_stream(phase: str, hpp: str) -> bool:
 
 
 def test_only_direct_owned_typed_items_stream():
-    assert claim_only_direct_owned_typed_items_stream(PHASE, PLAN_HPP)
+    assert claim_only_direct_owned_typed_items_stream(PHASE, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::stage_window (the owner, fit and "
+        "item predicates are searched in moe-stream-plan.hpp)",
+        body(norm(PHASE), STAGE_SIG),
+        TYPED_GUARD, OWNER_CALL, "ring_->acquire_slot(", COPY_DECL)
 
 
 def test_streamed_item_mutants():
@@ -625,7 +663,11 @@ def claim_window_matrix_takes_one_aos_slot(phase: str, hpp: str) -> bool:
 
 
 def test_window_matrix_takes_one_aos_slot():
-    assert claim_window_matrix_takes_one_aos_slot(PHASE, PLAN_HPP)
+    assert claim_window_matrix_takes_one_aos_slot(PHASE, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::stage_window (the staging enum and "
+        "the geometry are searched in moe-stream-plan.hpp)",
+        body(norm(PHASE), STAGE_SIG),
+        SLOTS_CHECK, AOS_ACQUIRE, COPY_DECL)
 
 
 def test_window_slot_mutants():
@@ -665,7 +707,10 @@ def claim_region_closes_after_last_copy(phase: str) -> bool:
 
 
 def test_region_closes_after_last_copy():
-    assert claim_region_closes_after_last_copy(PHASE)
+    assert claim_region_closes_after_last_copy(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::stage_window",
+        body(norm(PHASE), STAGE_SIG),
+        STAGE_CLOSE, REGION_KEYS_CLEAR, ITEM_LOOP, COPY_DECL, REGION_LAST)
 
 
 def test_region_close_mutants():
@@ -748,7 +793,11 @@ def claim_reuse_waits_for_window_readers(phase: str, hpp: str = PLAN_HPP) -> boo
 
 
 def test_reuse_waits_for_window_readers():
-    assert claim_reuse_waits_for_window_readers(PHASE)
+    assert claim_reuse_waits_for_window_readers(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::stage_window (the read gate is "
+        "searched in window_done, reset_regions and the region reads struct of moe-stream-plan.hpp)",
+        body(norm(PHASE), STAGE_SIG),
+        STAGE_CLOSE, REUSE_COND, ITEM_LOOP, COPY_DEPS, READY_DEP, REUSE_TAKE, REUSE_DEP, COPY_DECL, REUSE_RECORD)
 
 
 def test_reuse_mutants():
@@ -852,7 +901,11 @@ def claim_staging_from_the_claim_alone(sycl: str, hpp: str, phase: str) -> bool:
 
 
 def test_staging_from_the_claim_alone():
-    assert claim_staging_from_the_claim_alone(SYCL, PLAN_HPP, PHASE)
+    assert claim_staging_from_the_claim_alone(SYCL, PLAN_HPP, PHASE), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the prompt kernel body is searched in it; the index "
+        "build is searched in moe-stream-plan.hpp and the prepare call in moe-stream-plan.cpp)",
+        norm(SYCL),
+        PROMPT_KERNEL_SIG + " {", PROMPT_KERNEL_QUERY, PROMPT_KERNEL_RETURN, PROMPT_KERNEL_FILL)
 
 
 def test_staging_source_mutants():
@@ -935,7 +988,11 @@ def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
 
 
 def test_staging_mirrors_serving():
-    assert claim_staging_mirrors_serving(SYCL, BATCH_HPP)
+    assert claim_staging_mirrors_serving(SYCL, BATCH_HPP), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the capability refusal and prompt kernel bodies are "
+        "searched in it; the direct-kernel helpers are searched in moe-resolved-batch.hpp)",
+        norm(SYCL),
+        STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, PROMPT_KERNEL_RETURN, ROUTE_CAP_ASK)
 
 
 def test_staging_mirrors_serving_mutants():
@@ -1031,7 +1088,12 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
 
 
 def test_claimed_weight_stages_for_the_executor():
-    assert claim_claimed_weight_stages_for_the_executor(SYCL, PLAN_HPP, PHASE)
+    assert claim_claimed_weight_stages_for_the_executor(SYCL, PLAN_HPP, PHASE), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the library claims body is searched in it; the index "
+        "build is searched in moe-stream-plan.hpp)",
+        norm(SYCL),
+        LIBRARY_CLAIMS_SIG + " {", LIBRARY_CLAIMS_WEIGHT, LIBRARY_CLAIMS_QUERY, LIBRARY_CLAIMS_FILL,
+        ROUTE_CONSUMER_REFUSAL)
 
 
 def test_library_claim_mutants():
@@ -1106,7 +1168,13 @@ def claim_library_claims_read_the_index_plan(sycl: str) -> bool:
 
 
 def test_library_claims_read_the_index_plan():
-    assert claim_library_claims_read_the_index_plan(SYCL)
+    assert claim_library_claims_read_the_index_plan(SYCL), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the library claims, claims-tensor, primary-layout and "
+        "staged-layout bodies are searched in it)",
+        norm(SYCL),
+        LIBRARY_CLAIMS_SIG + " {", LIBRARY_CLAIMS_GUARD, LIBRARY_CLAIMS_QUERY, CLAIMS_PLAN_SIG + " {",
+        CLAIMS_PLAN_LAYOUT, CLAIMS_STAGED_LAYOUT, CLAIMS_ENTRY, STAGED_CLAIM_ENTRY, PRIMARY_PLAN_SIG + " {",
+        PRIMARY_ENTRY_TAIL, STAGED_PLAN_SIG + " {")
 
 
 def test_library_claims_index_plan_mutants():
@@ -1193,7 +1261,11 @@ def claim_staging_follows_the_decision(phase: str, sycl: str, hpp: str) -> bool:
 
 
 def test_staging_follows_the_decision():
-    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP)
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::window_begin (the executor claim, "
+        "the predicates in moe-stream-plan.hpp and the policy in ggml-sycl.cpp are searched too)",
+        body(norm(PHASE), WINDOW_BEGIN_SIG),
+        "{ " + WINDOW_GUARD)
 
 
 def test_policy_gate_mutants():
@@ -1256,7 +1328,11 @@ def claim_window_decline_reaches_the_executor(phase: str) -> bool:
 
 
 def test_window_decline_reaches_the_executor():
-    assert claim_window_decline_reaches_the_executor(PHASE)
+    assert claim_window_decline_reaches_the_executor(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::window_begin (the no-lease skip is "
+        "searched in stage_window)",
+        body(norm(PHASE), WINDOW_BEGIN_SIG),
+        PREFETCHED_BRANCH, RESTAGE_UNPREFETCHED, WHOLE_SET, STAGED_COUNT)
 
 
 def test_window_decline_mutants():
@@ -1292,7 +1368,10 @@ def claim_ubatch_resets_the_window_state(phase: str) -> bool:
 
 
 def test_ubatch_resets_the_window_state():
-    assert claim_ubatch_resets_the_window_state(PHASE)
+    assert claim_ubatch_resets_the_window_state(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::begin_ubatch",
+        body(norm(PHASE), BEGIN_UBATCH_SIG),
+        *UBATCH_RESETS)
 
 
 def test_ubatch_reset_mutants():
@@ -1333,7 +1412,11 @@ def claim_phase_decides_through_tested_predicates(phase: str, hpp: str) -> bool:
 
 
 def test_phase_decides_through_tested_predicates():
-    assert claim_phase_decides_through_tested_predicates(PHASE, PLAN_HPP)
+    assert claim_phase_decides_through_tested_predicates(PHASE, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::begin_layer (the window id and "
+        "exposure calls are searched in window_begin, the predicate signatures in moe-stream-plan.hpp)",
+        body(norm(PHASE), BEGIN_LAYER_SIG),
+        UBATCH_PRED_CALL, RING_STANDS)
 
 
 def test_predicate_mutants():
@@ -1398,8 +1481,15 @@ def test_claims_count_production_sites_only():
     assert raw.count(guard) == 1
     assert "moe_stream_phase::test_reserve_ring(" in raw and "moe_stream_phase::test_reserve_ring(" not in PHASE
     assert "moe_stream_phase::test_acquire_slot(" in raw and "moe_stream_phase::test_acquire_slot(" not in PHASE
-    assert claim_phase_allocates_only_ring_slots(PHASE)
-    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP)
+    assert claim_phase_allocates_only_ring_slots(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: whole file; the claim also fails on an allocator name",
+        norm(PHASE),
+        "ring_->acquire_slot(")
+    assert claim_staging_follows_the_decision(PHASE, SYCL, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::window_begin (the executor claim, "
+        "the predicates in moe-stream-plan.hpp and the policy in ggml-sycl.cpp are searched too)",
+        body(norm(PHASE), WINDOW_BEGIN_SIG),
+        "{ " + WINDOW_GUARD)
     # The seams outside their block: a second slot acquisition and a second ring_ready() call, both counted.
     unguarded = production(raw.replace(guard, "#if 1"))
     assert not claim_phase_allocates_only_ring_slots(unguarded)
@@ -1410,7 +1500,11 @@ def test_claims_count_production_sites_only():
 
 
 def test_reserve_failure_lasts_one_ubatch():
-    assert claim_reserve_failure_lasts_one_ubatch(PHASE)
+    assert claim_reserve_failure_lasts_one_ubatch(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::ring_ready (the latch clears are "
+        "searched in begin_ubatch, end_prompt and begin_layer)",
+        body(norm(PHASE), RING_READY_SIG),
+        LATCH_GUARD, "->reserve(", LATCH_SET)
 
 
 def test_reserve_latch_mutants():
@@ -1507,7 +1601,12 @@ def claim_short_reserve_requests_a_loan(phase: str, hpp: str, sycl: str, ring_cp
 
 
 def test_short_reserve_requests_a_loan():
-    assert claim_short_reserve_requests_a_loan(PHASE, PLAN_HPP, SYCL, RING_CPP, RING_HPP)
+    assert claim_short_reserve_requests_a_loan(PHASE, PLAN_HPP, SYCL, RING_CPP, RING_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::ring_ready (the loan hooks are "
+        "searched in begin_layer, the helper in moe-stream-plan.hpp, the reserve in moe-stream-ring.cpp and "
+        "the refusal counters in ggml-sycl.cpp)",
+        body(norm(PHASE), RING_READY_SIG),
+        RESERVE_SHORT_IF + " {", LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN)
 
 
 def test_short_reserve_loan_mutants():
@@ -1651,7 +1750,12 @@ def claim_ring_reserves_slot_by_slot(ring_cpp: str, ring_hpp: str) -> bool:
 
 
 def test_ring_reserves_slot_by_slot():
-    assert claim_ring_reserves_slot_by_slot(RING_CPP, RING_HPP)
+    assert claim_ring_reserves_slot_by_slot(RING_CPP, RING_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-ring.cpp: body of moe_stream_ring::reserve (the valid declaration is "
+        "searched in moe-stream-ring.hpp)",
+        body(norm(RING_CPP), RESERVE_DEF_SIG),
+        SAME_RING, GIVE_BACK_IF, "geo_ = geo;", "device_ = device;", SLOT_LOOP, HELD, REFUSED_IF, *FALLBACK_REQ,
+        FALLBACK_CALL, *SLOT_USES)
 
 
 def test_ring_slot_by_slot_mutants():
@@ -1751,7 +1855,11 @@ def claim_refused_loan_warns_once(phase: str, tree: dict) -> bool:
 
 
 def test_refused_loan_warns_once():
-    assert claim_refused_loan_warns_once(PHASE, SYCL_TREE)
+    assert claim_refused_loan_warns_once(PHASE, SYCL_TREE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_loan_refused (the warn format "
+        "is counted across the sycl tree)",
+        body(norm(PHASE), LOAN_WARN_SIG),
+        LOAN_WARN_GUARD, LOAN_WARN_FMT, LOAN_WARN_EMIT)
 
 
 def test_refused_loan_warn_mutants():
@@ -1808,7 +1916,11 @@ def claim_ring_unavailable_diagnostic(phase: str, hpp: str, tree: dict) -> bool:
 
 
 def test_ring_unavailable_diagnostic():
-    assert claim_ring_unavailable_diagnostic(PHASE, PLAN_HPP, SYCL_TREE)
+    assert claim_ring_unavailable_diagnostic(PHASE, PLAN_HPP, SYCL_TREE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_ring_unavailable (the rule is "
+        "searched in moe-stream-plan.hpp, the format counted across the sycl tree)",
+        body(norm(PHASE), WARN_SIG),
+        DIAG_FMT, DIAG_RULE_CALL, DIAG_ARGS, DIAG_EMIT)
 
 
 def test_ring_unavailable_diagnostic_mutants():
@@ -1869,7 +1981,11 @@ def claim_ring_unavailable_once_per_prompt(phase: str) -> bool:
 
 
 def test_ring_unavailable_once_per_prompt():
-    assert claim_ring_unavailable_once_per_prompt(PHASE)
+    assert claim_ring_unavailable_once_per_prompt(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::warn_ring_unavailable (the clear "
+        "is searched in end_prompt and begin_ubatch, the call in begin_layer)",
+        body(norm(PHASE), WARN_SIG),
+        WARN_GUARD, WARN_SET, DIAG_EMIT)
 
 
 def test_ring_unavailable_once_mutants():
@@ -1919,7 +2035,10 @@ def claim_auto_still_reports(phase: str) -> bool:
 
 
 def test_auto_still_reports():
-    assert claim_auto_still_reports(PHASE)
+    assert claim_auto_still_reports(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::begin_layer (the decide branch)",
+        body(norm(PHASE), BEGIN_LAYER_SIG),
+        DECIDE_IF + " {", RING_STANDS, REPORT_CALL)
 
 
 def test_auto_report_mutants():
@@ -1944,7 +2063,10 @@ def claim_begin_layer_weighs_only_its_layer(phase: str, hpp: str) -> bool:
 
 
 def test_begin_layer_weighs_only_its_layer():
-    assert claim_begin_layer_weighs_only_its_layer(PHASE, PLAN_HPP)
+    assert claim_begin_layer_weighs_only_its_layer(PHASE, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::begin_layer",
+        body(norm(PHASE), BEGIN_LAYER_SIG),
+        "index_.layers.find(layer)", WEIGH_CALL)
 
 
 def test_begin_layer_weigh_mutants():
@@ -1993,7 +2115,11 @@ def claim_teardown_gates_before_release(phase: str, hpp: str = PLAN_HPP, ring_cp
 
 
 def test_teardown_gates_before_release():
-    assert claim_teardown_gates_before_release(PHASE)
+    assert claim_teardown_gates_before_release(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::teardown (the ring release is "
+        "searched in moe-stream-ring.cpp and moe-stream-ring.hpp)",
+        body(norm(PHASE), TEARDOWN_SIG),
+        "close_region(last_use);", TEARDOWN_RELEASE)
 
 
 def in_body(text: str, signature: str, old: str, new: str) -> str:
@@ -2084,7 +2210,12 @@ def claim_partial_reservation_survives_the_ubatch(phase: str, hpp: str, ring_hpp
 
 
 def test_partial_reservation_survives_the_ubatch():
-    assert claim_partial_reservation_survives_the_ubatch(PHASE, PLAN_HPP)
+    assert claim_partial_reservation_survives_the_ubatch(PHASE, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::ring_ready (the warn, teardown and "
+        "end_prompt bodies are searched too)",
+        body(norm(PHASE), RING_READY_SIG),
+        LATCH_GUARD, PENDING_TAKE, RESERVE_SHORT_IF, RING_READY_RESET, LATCH_SET, LOAN_CALL, LOAN_REFUSED_WARN,
+        LOAN_CAN_FOLLOW, KEEP_WHILE_LOAN)
 
 
 def test_partial_reservation_mutants():
@@ -2153,7 +2284,11 @@ def claim_context_owns_and_ends_the_phase(common: str, sycl: str) -> bool:
 
 
 def test_context_owns_and_ends_the_phase():
-    assert claim_context_owns_and_ends_the_phase(COMMON, SYCL)
+    assert claim_context_owns_and_ends_the_phase(COMMON, SYCL), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_backend_sycl_context::~ggml_backend_sycl_context (the "
+        "member is searched in common.hpp, the layer-done body in ggml-sycl.cpp)",
+        body(norm(SYCL), DTOR_SIG),
+        "qptrs[dev][s]->wait();", "moe_stream.reset();", "ggml_sycl::drain_retained_handles(true);")
 
 
 def test_context_mutants():
@@ -2197,7 +2332,11 @@ def claim_reorder_is_the_load_fills_own(sycl: str, hpp: str) -> bool:
 
 
 def test_reorder_is_the_load_fills_own():
-    assert claim_reorder_is_the_load_fills_own(SYCL, PLAN_HPP)
+    assert claim_reorder_is_the_load_fills_own(SYCL, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the reorder is also searched for in "
+        "moe-stream-plan.hpp, where it must be absent)",
+        norm(SYCL),
+        "static " + REORDER_DEF, REORDER_CALL, LOAD_FILL)
 
 
 def test_reorder_load_fill_mutants():
@@ -2239,7 +2378,11 @@ def claim_trace_line(phase: str, tree: dict) -> bool:
 
 
 def test_trace_line():
-    assert claim_trace_line(PHASE, SYCL_TREE)
+    assert claim_trace_line(PHASE, SYCL_TREE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::report_window (the trace format is "
+        "counted across the sycl tree)",
+        body(norm(PHASE), REPORT_WINDOW_SIG),
+        TRACE_GUARD, TRACE_FMT, TRACE_ARGS, TRACE_EMIT)
 
 
 def test_trace_mutants():
@@ -2304,7 +2447,11 @@ def claim_end_prompt_reports_ring_engagement(phase: str, hpp: str) -> bool:
 
 
 def test_end_prompt_reports_ring_engagement():
-    assert claim_end_prompt_reports_ring_engagement(PHASE, PLAN_HPP)
+    assert claim_end_prompt_reports_ring_engagement(PHASE, PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::end_prompt (the ring-ready and "
+        "accessor bodies are searched too, the declarations in moe-stream-plan.hpp)",
+        body(norm(PHASE), END_PROMPT_SIG),
+        END_PROMPT_EARLY, ENGAGED_COPY, "teardown(")
 
 
 def test_end_prompt_reports_ring_engagement_mutants():
@@ -2360,7 +2507,11 @@ def claim_ring_slot_layout_is_one_constant(ring_hpp: str, ring_cpp: str, phase: 
 
 
 def test_ring_slot_layout_is_one_constant():
-    assert claim_ring_slot_layout_is_one_constant(RING_HPP, RING_CPP, PHASE)
+    assert claim_ring_slot_layout_is_one_constant(RING_HPP, RING_CPP, PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-ring.hpp: whole file (the definition is also counted across the sycl "
+        "tree with a regex, and the reserve and stage_window bodies are searched for the constant)",
+        norm(RING_HPP),
+        SLOT_LAYOUT_DEF)
 
 
 def test_ring_slot_layout_constant_mutants():
