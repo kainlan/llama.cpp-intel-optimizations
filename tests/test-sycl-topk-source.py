@@ -513,21 +513,9 @@ def self_test(s: dict[str, str | None]) -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
-    s = read_sources()
-    if "--self-test" in argv:
-        rc = self_test(s)
-        if rc != 0:
-            return rc
-    try:
-        check(s)
-    except ContractError as e:
-        print(e)
-        return 1
-    print("PASS: TOP_K is accepted for every shape a SYCL kernel implements, and dispatch selects the kernel "
-          "from that same shape rule " + TAG)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

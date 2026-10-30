@@ -521,18 +521,9 @@ def test_memcpy_site_census_self_test() -> None:
     assert self_test() == 0
 
 
-def main() -> int:
-    if "--self-test" in sys.argv[1:]:
-        if self_test() != 0:
-            return 1
-    try:
-        run(load())
-    except ContractError as e:
-        print(f"FAIL: {e}")
-        return 1
-    print("PASS: th86 memcpy site census pins hold (env gate, caller site, host-host tag, exit/flush print, env row)")
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
