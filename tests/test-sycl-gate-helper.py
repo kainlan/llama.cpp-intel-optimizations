@@ -2,12 +2,16 @@
 
 A helper that can pass vacuously or blame the wrong needle undermines every gate that uses it, so pin both:
 zero recorded checks must fail, and a failing generator expression must be annotated without naming a stale
-module-level variable that shares a comprehension variable's name.
+module-level variable that shares a comprehension variable's name. The message helpers the pytest-style pins pass
+as assert messages, first_missing and first_present, are pinned here too: what each names, the singular and plural
+wording, and the 100-character cut.
 """
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
+
+from sycl_gate import first_missing, first_present
 
 TESTS = Path(__file__).resolve().parent
 
@@ -128,89 +132,87 @@ def test_plain_frame_failure_still_names_its_operands() -> None:
     assert "token='missing'" in result.stderr
 
 
-def _first_missing():
-    sys.path.insert(0, str(TESTS))
-    from sycl_gate import first_missing
-    return first_missing
-
-
 def test_first_missing_names_the_absent_anchor_and_where_it_looked() -> None:
-    assert _first_missing()("W", "a", "a", "b") == "W: missing 'b'"
+    assert first_missing("W", "a", "a", "b") == "W: missing 'b'"
 
 
 def test_first_missing_names_the_first_of_two_missing_anchors() -> None:
-    message = _first_missing()("W", "zzz", "a", "b")
-    assert message == "W: missing 'a'"
+    assert first_missing("W", "zzz", "a", "b") == "W: missing 'a'"
 
 
 def test_first_missing_with_every_anchor_present_says_an_order_count_or_depth_condition_failed() -> None:
-    message = _first_missing()("W", "a b c", "a", "b", "c")
+    message = first_missing("W", "a b c", "a", "b", "c")
     assert message == "W: all 3 anchors present; an order, count or depth condition failed"
 
 
-def test_first_missing_truncates_a_long_anchor_and_stays_short() -> None:
-    message = _first_missing()("W", "", "x" * 300)
-    assert "..." in message
-    assert "x" * 98 not in message
-    assert len(message) < 160
+def test_first_missing_with_one_anchor_present_reads_in_the_singular() -> None:
+    assert first_missing("W", "a", "a") == "W: the anchor is present; an order, count or depth condition failed"
+
+
+def test_first_missing_shows_an_anchor_of_exactly_100_characters_whole() -> None:
+    assert first_missing("W", "", "x" * 100) == "W: missing %r" % ("x" * 100)
+
+
+def test_first_missing_cuts_an_anchor_of_101_characters_to_97_and_dots() -> None:
+    assert first_missing("W", "", "x" * 101) == "W: missing %r" % ("x" * 97 + "...")
+    assert len(first_missing("W", "", "x" * 300)) < 160
 
 
 def test_first_missing_is_never_empty() -> None:
-    first_missing = _first_missing()
     assert first_missing("W", "")
     assert first_missing("W", "t")
     assert first_missing("", "", "a")
 
 
 def test_first_missing_with_a_signature_and_empty_text_names_the_signature() -> None:
-    first_missing = _first_missing()
     assert first_missing("W", "", "a", "b", signature="void f()") == "W: missing 'void f()'"
 
 
 def test_first_missing_with_a_signature_and_text_behaves_as_without_it() -> None:
-    first_missing = _first_missing()
     assert first_missing("W", "a", "a", "b", signature="void f()") == first_missing("W", "a", "a", "b")
     assert first_missing("W", "a b", "a", "b", signature="void f()") == first_missing("W", "a b", "a", "b")
 
 
-def test_first_missing_truncates_a_long_signature() -> None:
-    message = _first_missing()("W", "", "a", signature="s" * 300)
-    assert "..." in message
-    assert "s" * 98 not in message
-    assert len(message) < 160
+def test_first_missing_shows_a_signature_of_exactly_100_characters_whole() -> None:
+    assert first_missing("W", "", "a", signature="x" * 100) == "W: missing %r" % ("x" * 100)
 
 
-def _first_present():
-    sys.path.insert(0, str(TESTS))
-    from sycl_gate import first_present
-    return first_present
+def test_first_missing_cuts_a_signature_of_101_characters_to_97_and_dots() -> None:
+    assert first_missing("W", "", "a", signature="x" * 101) == "W: missing %r" % ("x" * 97 + "...")
 
 
 def test_first_present_names_the_forbidden_text_and_where_it_looked() -> None:
-    assert _first_present()("W", "x bad y", "good", "bad") == "W: found 'bad'"
+    assert first_present("W", "x bad y", "good", "bad") == "W: found 'bad'"
 
 
 def test_first_present_names_the_first_of_two_forbidden_texts() -> None:
-    assert _first_present()("W", "b a", "a", "b") == "W: found 'a'"
+    assert first_present("W", "b a", "a", "b") == "W: found 'a'"
 
 
 def test_first_present_with_none_present_names_how_many_were_searched() -> None:
-    message = _first_present()("W", "xyz", "a", "b", "c")
+    message = first_present("W", "xyz", "a", "b", "c")
     assert message == "W: none of 3 forbidden texts present; an emptiness or count condition failed"
 
 
-def test_first_present_truncates_and_is_never_empty() -> None:
-    first_present = _first_present()
-    message = first_present("W", "y" * 300, "y" * 300)
-    assert "..." in message
-    assert len(message) < 160
+def test_first_present_with_one_forbidden_text_reads_in_the_singular() -> None:
+    assert first_present("W", "xyz", "a") == "W: the forbidden text is absent; an emptiness or count condition failed"
+
+
+def test_first_present_shows_a_text_of_exactly_100_characters_whole() -> None:
+    assert first_present("W", "y" * 100, "y" * 100) == "W: found %r" % ("y" * 100)
+
+
+def test_first_present_cuts_a_text_of_101_characters_to_97_and_dots() -> None:
+    assert first_present("W", "y" * 101, "y" * 101) == "W: found %r" % ("y" * 97 + "...")
+
+
+def test_first_present_is_never_empty() -> None:
     assert first_present("W", "")
+    assert first_present("W", "t", "t")
     assert first_present("", "t", "t")
 
 
 if __name__ == "__main__":
-    import sys
-
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))

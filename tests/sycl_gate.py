@@ -14,7 +14,14 @@ and `finish()` turns the record into the process exit status.
     finish("my gate: PASS")
 
 Not a pytest plugin: pytest-style gates (module-level test_* functions) are
-already independent, one result per function.
+already independent, one result per function, and need only the message helpers:
+a claim that returns a bare bool says nothing about WHICH token failed, so pass
+first_missing (names the first anchor the claim needs that its region lacks) or
+first_present (names the first forbidden text its region holds) as the message.
+
+    from sycl_gate import first_missing
+
+    assert claim_x(SYCL), first_missing("file: region", region, ANCHOR_A, ANCHOR_B)
 """
 import contextlib
 import linecache
@@ -145,6 +152,8 @@ def first_missing(where: str, text: str, *anchors: str, signature: str = "") -> 
     for anchor in anchors:
         if anchor not in text:
             return "%s: missing %r" % (where, _shown(anchor))
+    if len(anchors) == 1:
+        return "%s: the anchor is present; an order, count or depth condition failed" % where
     return "%s: all %d anchors present; an order, count or depth condition failed" % (where, len(anchors))
 
 
@@ -154,4 +163,6 @@ def first_present(where: str, text: str, *forbidden: str) -> str:
     for found in forbidden:
         if found in text:
             return "%s: found %r" % (where, _shown(found))
+    if len(forbidden) == 1:
+        return "%s: the forbidden text is absent; an emptiness or count condition failed" % where
     return "%s: none of %d forbidden texts present; an emptiness or count condition failed" % (where, len(forbidden))
