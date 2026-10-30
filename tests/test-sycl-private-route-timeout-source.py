@@ -12,20 +12,48 @@ MIN_CTEST_MARGIN_MS = 10_000
 
 
 def strip_cmake_comments(cmake: str) -> str:
-    return re.sub(r"(?m)^\s*#.*$", "", cmake)
+    """Drop every `#` comment, whole-line or trailing, keeping quoted arguments (a `#` or `)` inside one is text)."""
+    out = []
+    in_quote = False
+    i = 0
+    while i < len(cmake):
+        ch = cmake[i]
+        if in_quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(cmake):
+                out.append(cmake[i + 1])
+                i += 1
+            elif ch == '"':
+                in_quote = False
+        elif ch == '"':
+            in_quote = True
+            out.append(ch)
+        elif ch == "#":
+            while i < len(cmake) and cmake[i] != "\n":
+                i += 1
+            continue  # keep the newline itself
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def private_route_properties(cmake: str) -> str:
-    # Comments are removed first: the body ends at the first ")", and the registration's own comments contain
-    # parentheses (the "(level_zero:1 selects the B50 for a second run)" in its comment would otherwise cut the body
-    # off before ENVIRONMENT and TIMEOUT).
-    match = re.search(
-        rf"set_tests_properties\(\s*{re.escape(TEST_NAME)}\s+PROPERTIES(?P<body>.*?)\)",
-        strip_cmake_comments(cmake),
-        re.DOTALL,
-    )
+    # Comments are removed first, and the body then ends at the first ")" that is outside a quoted argument: the
+    # registration's own comments contain parentheses (the "(level_zero:1 selects the B50 for a second run)" in its
+    # comment would otherwise cut the body off before ENVIRONMENT and TIMEOUT), and so could a trailing comment or a
+    # quoted value.
+    code = strip_cmake_comments(cmake)
+    match = re.search(rf"set_tests_properties\(\s*{re.escape(TEST_NAME)}\s+PROPERTIES", code)
     assert match, f"missing private production-route properties for {TEST_NAME}"
-    return match.group("body")
+    in_quote = False
+    for i in range(match.end(), len(code)):
+        ch = code[i]
+        if ch == '"' and code[i - 1] != "\\":
+            in_quote = not in_quote
+        elif ch == ")" and not in_quote:
+            return code[match.end() : i]
+    raise AssertionError(f"unterminated set_tests_properties for {TEST_NAME}")
 
 
 def test_private_route_watchdog_is_explicit_bounded_and_isolated() -> None:
@@ -41,7 +69,10 @@ def test_private_route_watchdog_is_explicit_bounded_and_isolated() -> None:
         for entry in environment.group(1).split(";")
         if entry.startswith(f"{WATCHDOG_ENV}=")
     ]
-    assert len(watchdog_entries) == 1 and watchdog_entries[0], "private route must explicitly set the backend watchdog"
+    assert len(watchdog_entries) == 1 and watchdog_entries[0], (
+        f"private route must explicitly set the backend watchdog as exactly one well-formed {WATCHDOG_ENV}=<digits> "
+        f"entry of its ';'-separated ENVIRONMENT; the ENVIRONMENT value was {environment.group(1)!r}"
+    )
     outer = re.search(r"TIMEOUT\s+(\d+)", properties)
     assert outer, "private route must retain an outer CTest timeout"
 
