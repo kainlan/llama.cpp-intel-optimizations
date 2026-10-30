@@ -2829,8 +2829,9 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
 
 _RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {"
 _RING_HELPER_END = "const char * moe_batch_reject_reason_name("
-_RING_REMAINDER_LINE = "return geo.bytes > lent ? geo.bytes - lent : 0;"
-_RING_PROBE_LINE = "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, geo.slot_bytes);"
+_RING_REMAINDER_LINE = "return loan.geo.bytes > lent ? loan.geo.bytes - lent : 0;"
+_RING_PROBE_LINE = ("const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, loan.bytes, "
+                    "loan.geo.slot_bytes);")
 _RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
 
 
@@ -2875,19 +2876,81 @@ def test_the_ring_helper_returns_the_clamped_uncovered_remainder():
 
 @pytest.mark.parametrize("mutation", ["no-clamp", "returns-lent", "drops-probe"])
 def test_the_ring_helper_remainder_has_a_mutation_witness(mutation):
-    assert GGML_SYCL_CPP.count("return geo.bytes > lent ? geo.bytes - lent : 0;") == 1
+    assert GGML_SYCL_CPP.count(_RING_REMAINDER_LINE) == 1
     if mutation == "no-clamp":
-        mutated = GGML_SYCL_CPP.replace(
-            "return geo.bytes > lent ? geo.bytes - lent : 0;", "return geo.bytes - lent;"
-        )
+        mutated = GGML_SYCL_CPP.replace(_RING_REMAINDER_LINE, "return loan.geo.bytes - lent;")
     elif mutation == "returns-lent":
-        mutated = GGML_SYCL_CPP.replace("return geo.bytes > lent ? geo.bytes - lent : 0;", "return lent;")
+        mutated = GGML_SYCL_CPP.replace(_RING_REMAINDER_LINE, "return lent;")
     else:
         mutated = GGML_SYCL_CPP.replace(
             _RING_PROBE_LINE, "const size_t lent = 0;"
         )
     assert mutated != GGML_SYCL_CPP
     assert not _ring_helper_remainder_pinned(mutated), "the mutant must make the pin fail"
+
+
+# The ring a loan funds is the one the plan it leaves sizes: lent triplets become host matrices, which can widen the
+# window, so a request sized from the pre-loan ring can fund a ring prepare() no longer builds. The fit sizes the loan
+# as the stream phase does, through the one post-loan sizing with the whole ring short (nothing is held before the
+# prompt), from a sizer carrying the pre-loan geometry, the every-weight claims hook and the executor window; it
+# probes that loan in the post-loan ring's slots and charges the post-loan ring less what the probe lends. A loan that
+# does not converge is never asked for, so the whole pre-loan ring is a demand, as a refused probe charges.
+_RING_LOAN_SIZING = ("const ggml_sycl::moe_stream_loan_sizing loan = "
+                     "ggml_sycl::moe_stream_loan_size_post_loan(sizer, geo.bytes);")
+_RING_LOAN_REFUSED = "if (!loan.converged) { return geo.bytes; }"
+_RING_SIZER_FILL = ("sizer.plan = call.plan.get();", "sizer.device = device;", "sizer.geo = geo;",
+                    "sizer.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;", "sizer.graph_ctx = &call;",
+                    "sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;",
+                    "sizer.hints = call.op.window;")
+
+
+def _ring_helper_sizes_the_post_loan_loan(raw_cpp: str) -> bool:
+    """The sizer is filled once per field, then the post-loan sizing runs once, its refusal returns the pre-loan ring,
+    and only then does the probe ask for the sized loan and the remainder come from the post-loan ring."""
+    body = _body_of(raw_cpp, _RING_HELPER_START, _RING_HELPER_END)
+    steps = (*_RING_SIZER_FILL, _RING_LOAN_SIZING, _RING_LOAN_REFUSED, _RING_PROBE_LINE, _RING_REMAINDER_LINE)
+    if any(body.count(step) != 1 for step in steps):
+        return False
+    at = [body.find(step) for step in steps]
+    return at == sorted(at) and body.count("moe_stream_loan_size_post_loan(") == 1
+
+
+def test_the_ring_helper_sizes_the_loan_from_the_post_loan_plan():
+    assert _ring_helper_sizes_the_post_loan_loan(GGML_SYCL_CPP)
+
+
+_RING_LOAN_MUTANTS = {
+    # The probe asks for the pre-loan ring in the pre-loan slots, the request the post-loan ring outgrows.
+    "probe-asks-the-pre-loan-ring": (_RING_PROBE_LINE,
+                                     "const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, "
+                                     "geo.slot_bytes);"),
+    # The remainder is taken from the pre-loan ring, which undercharges a loan that widens the window.
+    "charges-the-pre-loan-ring": (_RING_REMAINDER_LINE, "return geo.bytes > lent ? geo.bytes - lent : 0;"),
+    # A loan that cannot converge charges nothing, as if the ring were lent.
+    "refused-charges-nothing": ("if (!loan.converged) {\n        return geo.bytes;",
+                                "if (!loan.converged) {\n        return 0;"),
+    # The refusal is dropped: the probe then lends toward a ring the phase never asks for.
+    "refused-path-dropped": ("if (!loan.converged) {\n        return geo.bytes;\n    }\n", ""),
+    # The sizing is asked with nothing short, so it never sizes a loan.
+    "sizes-nothing-short": ("moe_stream_loan_size_post_loan(sizer, geo.bytes);",
+                            "moe_stream_loan_size_post_loan(sizer, 0);"),
+    # The sizer claims nothing, so the post-loan index stages no host matrix and sizes no ring.
+    "sizer-claims-nothing": ("sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;",
+                             "sizer.library_claims = nullptr;"),
+    # The sizer drops the executor window, so the post-loan geometry is sized for a window the phase never uses.
+    "sizer-default-window": ("sizer.hints          = call.op.window;",
+                             "sizer.hints          = ggml_sycl::moe_stream_window_hints();"),
+    # The sizer starts from no geometry, so the first step has no pre-loan ring to compare with.
+    "sizer-no-geometry": ("sizer.geo            = geo;\n", ""),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(_RING_LOAN_MUTANTS))
+def test_the_post_loan_sizing_has_a_mutation_witness(mutation):
+    real, broken = _RING_LOAN_MUTANTS[mutation]
+    assert GGML_SYCL_CPP.count(real) == 1, "the mutation target must exist exactly once"
+    mutated = GGML_SYCL_CPP.replace(real, broken)
+    assert not _ring_helper_sizes_the_post_loan_loan(mutated), "the mutant must make the pin fail"
 
 
 # The fit's ring term counts ring SLOTS, as the loan it stands in for does. The helper
@@ -2918,7 +2981,8 @@ def test_the_ring_probe_counts_slots_and_answers_in_whole_slots():
 
 
 _PROBE_MUTANTS = {
-    "call-passes-zero": (_RING_PROBE_LINE, _RING_PROBE_LINE.replace("geo.bytes, geo.slot_bytes)", "geo.bytes, 0)")),
+    "call-passes-zero": (_RING_PROBE_LINE, _RING_PROBE_LINE.replace("loan.bytes, loan.geo.slot_bytes)",
+                                                                    "loan.bytes, 0)")),
     "probe-forwards-zero": ("device, bytes_wanted, slot_bytes, /*probe_mode=*/true, nullptr, &probe",
                             "device, bytes_wanted, 0, /*probe_mode=*/true, nullptr, &probe"),
     "answers-the-byte-sum": ("return slot_bytes != 0 ? probe.slots_funded * slot_bytes : probe.bytes_freed;",

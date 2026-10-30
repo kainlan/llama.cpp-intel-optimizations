@@ -291,6 +291,31 @@ void test_slot_sized_selection_reports_funded_slots_not_the_byte_sum() {
     CHECK(ggml_sycl::moe_expert_loan_select(plan, 0, kSlot, kSlot, nullptr, nullptr).size() == 3);
 }
 
+// The stream phase sizes its loan by selecting triplets for each candidate request (moe_stream_loan_size_post_loan,
+// llama.cpp-8p5x), and the boundary's loan then selects again from the same plan with the request it was posted. Two
+// facts make the boundary take exactly the triplets the sizing flipped: the same request selects the same keys, and a
+// larger request in the same slot size selects a superset whose head is the smaller request's keys (the walk has one
+// order and only stops later), so a request that grew across the sizing's steps reselects every triplet it counted.
+void test_selection_is_a_prefix_walk_the_boundary_repeats() {
+    const placement_plan              plan = make_slot_plan();
+    std::vector<expert_placement_key> prev;
+    for (size_t slots = 1; slots <= 12; ++slots) {
+        const auto keys  = ggml_sycl::moe_expert_loan_select(plan, 0, slots * kSlot, kSlot, nullptr);
+        const auto again = ggml_sycl::moe_expert_loan_select(plan, 0, slots * kSlot, kSlot, nullptr);
+        CHECK(keys.size() == again.size());
+        for (size_t i = 0; i < keys.size() && i < again.size(); ++i) {
+            CHECK(key_is(keys[i], again[i].layer_id, again[i].expert_id, again[i].role));
+        }
+        CHECK(keys.size() >= prev.size());
+        for (size_t i = 0; i < prev.size() && i < keys.size(); ++i) {
+            CHECK(key_is(keys[i], prev[i].layer_id, prev[i].expert_id, prev[i].role));
+        }
+        prev = keys;
+    }
+    // The walk's last answer is every triplet that funds a slot: experts 3, 2, 1.
+    CHECK(experts_of(prev) == std::vector<int>({ 3, 2, 1 }));
+}
+
 }  // namespace
 
 int main() {
@@ -395,6 +420,7 @@ int main() {
 
     test_slot_sized_selection_skips_matrices_below_a_slot();
     test_slot_sized_selection_reports_funded_slots_not_the_byte_sum();
+    test_selection_is_a_prefix_walk_the_boundary_repeats();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-expert-loan-select: %d failure(s)\n", failures);

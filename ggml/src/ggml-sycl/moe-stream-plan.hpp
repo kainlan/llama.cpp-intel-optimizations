@@ -174,6 +174,7 @@ struct moe_stream_plan_index {
     size_t   matrix_bytes_max            = 0;
     size_t   resident_expert_bytes       = 0;  // dst bytes of the expert entries resident on the device
     uint32_t role_items_max              = 0;  // the most streamable items one role of one layer has
+    uint32_t window_experts              = 0;  // G_plan, the experts one phase holds (moe_stream_window_experts)
     uint32_t window_slots                = 0;  // min(role_items_max, G_plan): a region's size, one executor window
 
     // Only layers with a host expert entry: the rest are skipped, never weighed.
@@ -246,13 +247,18 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 // (llama.cpp-3460), and every other item stages NONE. The claim is asked once per (layer, role). The device's prompt
 // kernels are not asked, since no prompt kernel reads the ring: `prompt_kernel` stays for the callers' one signature.
 // `hints` gives the executor's phase, which with the streamable items per role decides window_slots, the region the
-// ring is sized to.
-static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_plan &          plan,
-                                                                int                             device,
-                                                                moe_stream_prompt_kernel_fn     prompt_kernel,
-                                                                void *                          graph_ctx,
-                                                                moe_stream_library_claims_fn    library_claims,
-                                                                const moe_stream_window_hints & hints) {
+// ring is sized to. `as_host`, when given, names (layer, expert) triplets, keyed moe_stream_table_key(layer, expert,
+// UNKNOWN), whose gate/up/down entries resident on `device` are read as host entries: the plan as a loan of those
+// triplets would leave it (the transaction's update_expert_placement flips on_device and the target only), without
+// copying the plan (moe_stream_loan_size_post_loan).
+static inline moe_stream_plan_index moe_stream_plan_index_build(
+    const placement_plan &               plan,
+    int                                  device,
+    moe_stream_prompt_kernel_fn          prompt_kernel,
+    void *                               graph_ctx,
+    moe_stream_library_claims_fn         library_claims,
+    const moe_stream_window_hints &      hints,
+    const std::unordered_set<uint64_t> * as_host = nullptr) {
     GGML_UNUSED(prompt_kernel);  // kept for the signature; unused since the window ring (W2)
     moe_stream_plan_index        idx;
     // The (layer, expert) keys with a host entry, keyed with role UNKNOWN: counts each layer's distinct host experts.
@@ -267,7 +273,11 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
         if (e.expert_id < 0 || e.layer_id < 0) {
             continue;
         }
-        if (e.on_device) {
+        const bool lent =
+            as_host != nullptr && e.on_device && e.target_device == device &&
+            detail::moe_expert_role_is_triplet(e.expert_role) &&
+            as_host->count(moe_stream_table_key(e.layer_id, e.expert_id, expert_tensor_role::UNKNOWN)) != 0;
+        if (e.on_device && !lent) {
             if (e.target_device == device) {
                 idx.resident_expert_bytes += e.dst_size;
             }
@@ -331,7 +341,8 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
             idx.role_items_max = std::max(idx.role_items_max, static_cast<uint32_t>(kv.second.role_items[r]));
         }
     }
-    idx.window_slots = std::min(idx.role_items_max, moe_stream_window_experts(hints, expert_f16_bytes));
+    idx.window_experts = moe_stream_window_experts(hints, expert_f16_bytes);
+    idx.window_slots   = std::min(idx.role_items_max, idx.window_experts);
     return idx;
 }
 
@@ -346,16 +357,19 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(const placement_
 // `library_claims` claims nothing, so every item stages NONE and the geometry is the default too: no ring. The
 // auto-ubatch fit, a caller with no live graph scan, passes ggml_sycl_moe_stream_claims_every_weight, claiming every
 // weight, so the ring it charges bounds the phase's from above, but for the two edges ggml_sycl_hold_ring_uncovered
-// names.
-static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const placement_plan &          plan,
-                                                                     int                             device,
-                                                                     moe_stream_prompt_kernel_fn     prompt_kernel,
-                                                                     void *                          graph_ctx,
-                                                                     moe_stream_library_claims_fn    library_claims,
-                                                                     const moe_stream_window_hints & hints,
-                                                                     moe_stream_plan_index * index_out = nullptr) {
+// names. `as_host` sizes the plan a loan of those triplets would leave (moe_stream_plan_index_build); the caller then
+// counts their device bytes in hints.lent_bytes, as the published ledger counts a loan that ran.
+static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(
+    const placement_plan &               plan,
+    int                                  device,
+    moe_stream_prompt_kernel_fn          prompt_kernel,
+    void *                               graph_ctx,
+    moe_stream_library_claims_fn         library_claims,
+    const moe_stream_window_hints &      hints,
+    moe_stream_plan_index *              index_out = nullptr,
+    const std::unordered_set<uint64_t> * as_host   = nullptr) {
     moe_stream_plan_index index =
-        moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints);
+        moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints, as_host);
     // The cap reads the device's expert set with the ring's own loan counted back (llama.cpp-7999): a loan moves
     // hints.lent_bytes out of index.resident_expert_bytes, so the sum is the same before and after it. The add
     // saturates defensively: a real sum of device bytes cannot approach SIZE_MAX, so the clamp only keeps a corrupt
@@ -370,6 +384,14 @@ static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(const place
         *index_out = std::move(index);
     }
     return geo;
+}
+
+// True iff two geometries are one ring: the fields prepare() compares before it keeps a ring, and the loan sizing
+// compares to tell a converged loan (moe_stream_loan_size_post_loan).
+static inline bool moe_stream_ring_geometry_same(const moe_stream_ring_geometry & a,
+                                                 const moe_stream_ring_geometry & b) {
+    return a.slot_bytes == b.slot_bytes && a.n_slots == b.n_slots && a.bytes == b.bytes &&
+           a.region_slots == b.region_slots;
 }
 
 // True iff the batched executor takes every host matrix of the layer from the ring (W2): the layer has items, each one
@@ -560,9 +582,35 @@ static inline bool moe_stream_stage_now(const moe_exec_decision & d, moe_exec_po
 // A prompt's loans for its short ring (llama.cpp-3460, c-0tmn). end_prompt resets it; a micro-batch does not.
 struct moe_stream_loan_latch {
     bool     asked         = false;  // a loan was asked this prompt
-    bool     refused       = false;  // one came back REFUSED: ask for no other until end_prompt
+    bool     refused       = false;  // one came back REFUSED, or none could be sized: ask for no other until end_prompt
+    bool     unconverged   = false;  // the refusal was the sizing's: no ring of the plan a loan would leave fits
     uint64_t refusals_seen = 0;      // the device's REFUSED count at the last ask
 };
+
+// What sizes a short ring's loan from the plan the loan would leave (llama.cpp-8p5x): the plan and the device the ring
+// was sized for, the geometry its reserve was short of, and the same hooks and executor window that sized it
+// (moe_stream_plan_ring_geometry). Plain data, read during one call: `plan` is the caller's for that call only.
+struct moe_stream_loan_sizer {
+    const placement_plan *       plan           = nullptr;
+    int                          device         = -1;
+    moe_stream_ring_geometry     geo            = {};
+    moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
+    void *                       graph_ctx      = nullptr;
+    moe_stream_library_claims_fn library_claims = nullptr;
+    moe_stream_window_hints      hints          = {};
+};
+
+// A loan sized from the plan it leaves (moe_stream_loan_size_post_loan).
+struct moe_stream_loan_sizing {
+    bool                     converged  = false;  // the geometry the request was sized for is the post-loan one
+    size_t                   bytes      = 0;      // the request: the slots of `geo` not held, times geo.slot_bytes
+    moe_stream_ring_geometry geo        = {};     // converged: the geometry the request funds; else the last post-loan
+    uint32_t                 steps      = 0;      // post-loan geometries computed
+    uint32_t                 n_triplets = 0;      // triplets the request selects
+};
+
+static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & sizer,
+                                                                    size_t                        bytes_short);
 
 enum class moe_stream_loan_step : uint8_t {
     NONE,     // nothing asked: no shortfall, no request hook, or a loan this prompt was refused
@@ -573,17 +621,23 @@ enum class moe_stream_loan_step : uint8_t {
 // What a short ring reserve does about its shortfall (llama.cpp-3460, closing c-0tmn for production). ring_ready()
 // calls this from its reserve-failed branch, so once per micro-batch (the reserve latch stops the later layers before
 // the reserve, c-i8rz), with the bytes the WEIGHT zone was short of as moe_stream_ring::reserve reported them and the
-// ring's slot size, which the loan counts them in (llama.cpp-9x8t). It asks for a loan of that much at the next graph
-// boundary (ggml_backend_sycl_synchronize runs it, c-tdra), and the next micro-batch's reserve tries again. A REFUSED
-// count that moved since the last ask means that loan was refused: retrying would refuse again, so the latch holds
-// until end_prompt. An ACCEPTED loan that still left the ring short, or a BUSY one, leaves the count alone, so the next
-// short micro-batch asks again; a repeated request is harmless, since the largest since the last boundary wins.
-static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_loan_latch &     latch,
-                                                                    int                         device,
-                                                                    size_t                      bytes_short,
-                                                                    size_t                      slot_bytes,
-                                                                    moe_stream_request_loan_fn  request_loan,
-                                                                    moe_stream_loan_refusals_fn loan_refusals) {
+// ring's slot size, which the loan counts them in (llama.cpp-9x8t). It asks for a loan at the next graph boundary
+// (ggml_backend_sycl_synchronize runs it, c-tdra), and the next micro-batch's reserve tries again. A REFUSED count that
+// moved since the last ask means that loan was refused: retrying would refuse again, so the latch holds until
+// end_prompt. An ACCEPTED loan that still left the ring short, or a BUSY one, leaves the count alone, so the next short
+// micro-batch asks again; a repeated request is harmless, since the largest since the last boundary wins.
+// With a `sizer`, the loan is sized from the plan it leaves (moe_stream_loan_size_post_loan, llama.cpp-8p5x): lent
+// triplets become host matrices, which can widen the window and so the ring the next micro-batch reserves. The request
+// is that converged loan, in that geometry's slots. When no loan converges, none is asked: the latch holds as for a
+// refused loan, and REFUSED is answered once. A null `sizer` has no plan to size against, and asks for the shortfall as
+// reported, in `slot_bytes`.
+static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_loan_latch &       latch,
+                                                                    int                           device,
+                                                                    size_t                        bytes_short,
+                                                                    size_t                        slot_bytes,
+                                                                    moe_stream_request_loan_fn    request_loan,
+                                                                    moe_stream_loan_refusals_fn   loan_refusals,
+                                                                    const moe_stream_loan_sizer * sizer) {
     if (request_loan == nullptr || latch.refused || bytes_short == 0) {
         return moe_stream_loan_step::NONE;
     }
@@ -592,9 +646,21 @@ static inline moe_stream_loan_step moe_stream_loan_on_short_reserve(moe_stream_l
         latch.refused = true;
         return moe_stream_loan_step::REFUSED;
     }
+    size_t bytes = bytes_short;
+    size_t slot  = slot_bytes;
+    if (sizer != nullptr) {
+        const moe_stream_loan_sizing sized = moe_stream_loan_size_post_loan(*sizer, bytes_short);
+        if (!sized.converged) {
+            latch.refused     = true;
+            latch.unconverged = true;
+            return moe_stream_loan_step::REFUSED;
+        }
+        bytes = sized.bytes;
+        slot  = sized.geo.slot_bytes;
+    }
     latch.asked         = true;
     latch.refusals_seen = refusals_now;
-    request_loan(device, bytes_short, slot_bytes);
+    request_loan(device, bytes, slot);
     return moe_stream_loan_step::REQUEST;
 }
 
@@ -1054,7 +1120,7 @@ class moe_stream_phase {
                                    uint32_t                             window_id,
                                    unified_cache &                      cache,
                                    const moe_stream_op &                op);
-    bool              ring_ready();
+    bool              ring_ready(const moe_stream_loan_sizer * sizer);
     void              close_region(sycl::event region_done);
     void              reset_regions();
     sycl::event       compute_barrier();
@@ -1080,6 +1146,7 @@ class moe_stream_phase {
     std::unordered_map<int, layer_state>            layers_;
     std::optional<sycl::queue>                      ccs_;  // the compute queue the readers and the barriers run on
     moe_stream_ring_geometry                        geo_;
+    moe_stream_window_hints                         window_;  // the executor window prepare() sized geo_ with
     ggml_sycl_moe_exec_rates_record                 record_             = {};
     int                                             device_             = -1;
     int                                             cur_layer_          = -1;
@@ -1294,6 +1361,74 @@ static inline std::vector<expert_placement_key> moe_expert_loan_select(const pla
         *slots_selected = slots;
     }
     return out;
+}
+
+// ---- Loan sizing (llama.cpp-8p5x, owner ruling c-ifgn): a short ring's loan, sized from the plan the loan leaves. -----
+//
+// A loan flips its triplets to the host, and a host matrix the executor claims takes a ring slot, so the ring the next
+// micro-batch rebuilds from the published plan (prepare()) can be wider than the one the reserve was short of: the
+// window, min(role_items_max, G_plan), grows with the heaviest role's host matrices. The cap does not move with a loan
+// (the lent bytes count back as resident, llama.cpp-7999), so a wider ring can also exceed it.
+//
+// Each step sizes the request for a target geometry, selects the triplets that request takes (moe_expert_loan_select,
+// the walk the boundary's loan repeats over the same plan), and sizes the ring of the plan with those triplets read as
+// host (moe_stream_plan_ring_geometry's as_host) and their device bytes added to hints.lent_bytes, as the ledger counts
+// them once lent. The request converges when that post-loan geometry is the target: it funds the ring the next
+// micro-batch reserves. The request for a target is its slots not held, times its slot size. The reserve's held slots,
+// n_slots - bytes_short / slot_bytes, count while the slot size is the reserve's: prepare() gives them back on the new
+// geometry, and each leaves a hole one such slot wide. With another slot size they count for nothing.
+//
+// Lending more only adds host matrices, so a step that does not converge widens the ring, by a region slot or a larger
+// slot, and the window stops at G_plan: within G_plan + 1 post-loan geometries the request converges, or none does.
+// The sizing refuses (converged false) when the post-loan ring cannot exist (n_slots 0: over the cap), when it differs
+// from the target without growing (a lent matrix with a larger f16 expert can lower G_plan), when the bound is spent,
+// and when it has nothing to size (no plan or no geometry). It reads the plan only: no device, no lock, nothing lent.
+// The claims hook answers from its own plan, the pre-loan one (c-gi44); a staged claim reads the layout of the
+// weight's device experts, which a loan of AOS triplets leaves as it was.
+static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_stream_loan_sizer & sizer,
+                                                                    size_t                        bytes_short) {
+    moe_stream_loan_sizing           out;
+    const moe_stream_ring_geometry & geo = sizer.geo;
+    if (sizer.plan == nullptr || geo.n_slots == 0 || geo.slot_bytes == 0 || bytes_short == 0) {
+        return out;
+    }
+    // Rounded up, so a shortfall that is not whole slots credits fewer held slots, never more.
+    const size_t   short_slots = bytes_short / geo.slot_bytes + (bytes_short % geo.slot_bytes != 0 ? 1 : 0);
+    const uint32_t held        = short_slots >= geo.n_slots ? 0 : geo.n_slots - static_cast<uint32_t>(short_slots);
+
+    moe_stream_ring_geometry     target = geo;
+    std::unordered_set<uint64_t> as_host;
+    for (uint32_t step = 1;; ++step) {
+        const uint32_t credit = target.slot_bytes == geo.slot_bytes ? std::min(held, target.n_slots) : 0;
+        const size_t   bytes  = static_cast<size_t>(target.n_slots - credit) * target.slot_bytes;
+        const std::vector<expert_placement_key> keys =
+            moe_expert_loan_select(*sizer.plan, sizer.device, bytes, target.slot_bytes, nullptr);
+        as_host.clear();
+        size_t lent = 0;
+        for (const expert_placement_key & k : keys) {
+            as_host.insert(moe_stream_table_key(k.layer_id, k.expert_id, expert_tensor_role::UNKNOWN));
+            const placement_entry * e = sizer.plan->find_expert_entry(k.layer_id, k.expert_id, k.role);
+            lent += e != nullptr ? e->dst_size : 0;
+        }
+        moe_stream_window_hints hints = sizer.hints;
+        hints.lent_bytes              = hints.lent_bytes + lent < hints.lent_bytes ? SIZE_MAX : hints.lent_bytes + lent;
+        moe_stream_plan_index          idx;
+        const moe_stream_ring_geometry post =
+            moe_stream_plan_ring_geometry(*sizer.plan, sizer.device, sizer.prompt_kernel, sizer.graph_ctx,
+                                          sizer.library_claims, hints, &idx, &as_host);
+        out.steps      = step;
+        out.bytes      = bytes;
+        out.n_triplets = static_cast<uint32_t>(keys.size() / 3);
+        out.geo        = post;
+        if (moe_stream_ring_geometry_same(post, target)) {
+            out.converged = true;
+            return out;
+        }
+        if (post.n_slots == 0 || post.bytes <= target.bytes || step > idx.window_experts) {
+            return out;
+        }
+        target = post;
+    }
 }
 
 }  // namespace ggml_sycl
