@@ -1044,7 +1044,8 @@ if (Python3_Interpreter_FOUND)
     set_tests_properties(test-sycl-moe-hostpath-no-host-wait-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # TOP_K runs on the device for every k <= ncols: one shape selector decides the
-    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). A pytest case runs the mutant self-test.
+    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). A pytest case runs
+    # the mutant self-test.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-topk-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-topk-source.py
