@@ -91185,9 +91185,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // llama.cpp-8epx: for an op that reads ring windows, a phase is one ring window (W1, W4 of
             // docs/plans/2026-10-24-prefill-window-ring.md), so it holds at most window_experts() experts, a ring
             // region's slots. A group the slot would take whole then splits into more phases. With two buffers they
-            // alternate halves as above. With one (every active expert fits the slot) every phase lands in buffer 0,
-            // so each phase's dequant waits for the previous phase's GEMMs (the half_readers barrier below) although
-            // the slot could hold every expert: those phases run one after another.
+            // alternate halves as above, and a slot that holds one expert is one buffer every phase reuses: both wait
+            // for the GEMMs that last read their buffer. When the slot holds every active expert (one group), each
+            // phase dequantizes into its own region at phase.begin experts and is given no wait on an earlier phase's
+            // GEMMs, so the phases are not made to run one after another (moe_pp_batched_phases_reuse_buffers decides
+            // both, in the loop below).
             size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group;
             if (pp_stream_windowed) {
                 phase_experts =
@@ -91369,7 +91371,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             bool gemm_declined = false;
             for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {
                 const pp_batched_phase & phase         = phases[p];
-                sycl::half *             phase_weights = batched_weights + phase.buffer * half_elems;
+                const size_t             phase_offset =
+                    moe_pp_batched_phase_weight_offset(f16_groups, phase.begin, phase.buffer, half_elems, weight_elems);
+                sycl::half * phase_weights = batched_weights + phase_offset;
+                GGML_ASSERT(pp_woq_arm ||
+                            (phase_offset + (phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <=
+                                reserved.weight_size);
                 // The dequant kernels and GEMM groups this phase submits, for a window's timing line.
                 uint32_t                 phase_launches = 0;
                 // llama.cpp-8epx: for a windowed op this phase is one ring window (W1). window_begin is asked exactly
@@ -91423,7 +91430,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // their events orders every later submission on this in-order queue after them, on the device.
                     // Submission order alone does not, because the oneDNN primitive is not ordered with the queue
                     // (llama.cpp-dboi, the comment above).
-                    if (!half_readers[phase.buffer].empty()) {
+                    if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_readers[phase.buffer].empty()) {
                         stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);
                         half_readers[phase.buffer].clear();
                     }
@@ -91809,10 +91816,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                // The weight figure is what this dispatch used of the slot: the WOQ planes of every active expert,
-                // or the f16 arm's buffers.
-                const size_t weight_used_bytes =
-                    pp_woq_arm ? weight_bytes : phase_buffers * half_elems * sizeof(sycl::half);
+                // The weight figure is what this dispatch used of the slot: the WOQ planes of every active expert;
+                // the f16 arm's buffers when its phases reuse them; otherwise every active expert's own region, which
+                // the last phase's region ends at.
+                const size_t f16_used_elems    = moe_pp_batched_phases_reuse_buffers(f16_groups) ?
+                                                     phase_buffers * half_elems :
+                                                     active_count * weight_elems;
+                const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : f16_used_elems * sizeof(sycl::half);
                 static std::atomic<int> batched_log{ 0 };
                 if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96) {
                     GGML_LOG_INFO(

@@ -672,6 +672,102 @@ int main() {
         }
     }
 
+    // 12. Where each phase of the f16 arm dequantizes, and whether it waits for the GEMMs that last read its buffer.
+    // A slot that holds every active expert (one group) gives each phase its own region at phase.begin experts, so a
+    // windowed op's phases are given no wait on an earlier phase's GEMMs; two halves, or the one buffer of a
+    // one-expert slot, are reused and keep the wait.
+    {
+        const size_t weight_elems = 10;  // half-elements per expert
+        const size_t f16_expert   = weight_elems * 2;
+        const size_t half_elems   = 30;  // one buffer's half-elements: a phase of three experts
+
+        // (A) The slot holds every active expert, no cap: one group, phases at their own regions.
+        const moe_pp_batched_f16_groups whole = moe_pp_batched_f16_plan_groups(10 * f16_expert, f16_expert, 7, 0);
+        const size_t whole_off0 = moe_pp_batched_phase_weight_offset(whole, 0, 0, half_elems, weight_elems);
+        const size_t whole_off3 = moe_pp_batched_phase_weight_offset(whole, 3, 0, half_elems, weight_elems);
+        if (whole.groups != 1 || moe_pp_batched_phases_reuse_buffers(whole) || whole_off0 != 0 ||
+            whole_off3 != 3 * weight_elems || whole_off0 == whole_off3) {
+            std::printf("FAIL: a slot holding every expert: groups %zu reuse %d offsets %zu, %zu; want 1, 0, 0, %zu\n",
+                        whole.groups, moe_pp_batched_phases_reuse_buffers(whole) ? 1 : 0, whole_off0, whole_off3,
+                        3 * weight_elems);
+            ++failures;
+        }
+
+        // Two halves (slot of 4, 7 active): two experts per group, so a phase of two experts in a half of
+        // 2 * weight_elems, as the executor builds it. Phases alternate buffers 0, 1, 0 and wait for the half's
+        // readers.
+        const moe_pp_batched_f16_groups halves      = moe_pp_batched_f16_plan_groups(4 * f16_expert, f16_expert, 7, 0);
+        const size_t                    halves_half = 2 * weight_elems;
+        const size_t                    halves_want[3] = { 0, 20, 0 };
+        for (size_t p = 0; p < 3; ++p) {
+            const size_t got = moe_pp_batched_phase_weight_offset(halves, p * 2, p % 2, halves_half, weight_elems);
+            if (halves.buffers != 2 || halves.experts_per_group != 2 || !moe_pp_batched_phases_reuse_buffers(halves) ||
+                got != halves_want[p]) {
+                std::printf("FAIL: two halves, phase %zu: buffers %zu x %zu reuse %d offset %zu; want 2 x 2, 1, %zu\n",
+                            p, halves.buffers, halves.experts_per_group,
+                            moe_pp_batched_phases_reuse_buffers(halves) ? 1 : 0, got, halves_want[p]);
+                ++failures;
+            }
+        }
+
+        // (B) A one-expert slot (3 active): one buffer every phase reuses at offset 0, with the wait.
+        const moe_pp_batched_f16_groups single = moe_pp_batched_f16_plan_groups(f16_expert, f16_expert, 3, 0);
+        for (size_t p = 0; p < 3; ++p) {
+            const size_t got = moe_pp_batched_phase_weight_offset(single, p, 0, weight_elems, weight_elems);
+            if (single.buffers != 1 || single.groups != 3 || !moe_pp_batched_phases_reuse_buffers(single) || got != 0) {
+                std::printf("FAIL: a one-expert slot, phase %zu: buffers %zu groups %zu reuse %d offset %zu\n", p,
+                            single.buffers, single.groups, moe_pp_batched_phases_reuse_buffers(single) ? 1 : 0, got);
+                ++failures;
+            }
+        }
+
+        // A cap that bites (slot of 10, 7 active, cap 2): four groups in two halves, reused.
+        const moe_pp_batched_f16_groups capped = moe_pp_batched_f16_plan_groups(10 * f16_expert, f16_expert, 7, 2);
+        if (capped.groups != 4 || !moe_pp_batched_phases_reuse_buffers(capped)) {
+            std::printf("FAIL: a biting cap: groups %zu reuse %d; want 4, 1\n", capped.groups,
+                        moe_pp_batched_phases_reuse_buffers(capped) ? 1 : 0);
+            ++failures;
+        }
+
+        // Over a grid, building phases as the executor does (at most `window` experts each, buffer p % buffers): every
+        // phase's region lies in the slot, and the phases that do not wait write disjoint regions.
+        for (size_t fit = 1; fit <= 12; ++fit) {
+            for (size_t active = 1; active <= 20; ++active) {
+                for (size_t cap = 0; cap <= 3; ++cap) {
+                    const size_t slot_elems = fit * weight_elems;
+                    const size_t slot_bytes = fit * f16_expert + 1;  // a claimed slot need not be whole experts
+                    const moe_pp_batched_f16_groups g =
+                        moe_pp_batched_f16_plan_groups(slot_bytes, f16_expert, active, cap);
+                    for (size_t window = 1; window <= fit; ++window) {
+                        const size_t per    = window < g.experts_per_group ? window : g.experts_per_group;
+                        const size_t halfs  = per * weight_elems;
+                        size_t       prev   = 0;  // end of the previous phase's region, for the disjointness check
+                        bool         ok     = true;
+                        size_t       nphase = 0;
+                        for (size_t begin = 0; begin < active; begin += per, ++nphase) {
+                            const size_t end = begin + per < active ? begin + per : active;
+                            const size_t off =
+                                moe_pp_batched_phase_weight_offset(g, begin, nphase % g.buffers, halfs, weight_elems);
+                            const size_t region_end = off + (end - begin) * weight_elems;
+                            if (region_end > slot_elems) {
+                                ok = false;
+                            }
+                            if (!moe_pp_batched_phases_reuse_buffers(g)) {
+                                ok   = ok && off >= prev;
+                                prev = region_end;
+                            }
+                        }
+                        if (!ok) {
+                            std::printf("FAIL: f16 phase regions at fit=%zu active=%zu cap=%zu window=%zu\n", fit,
+                                        active, cap, window);
+                            ++failures;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;

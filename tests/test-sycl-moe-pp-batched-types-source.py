@@ -54,7 +54,13 @@ dequant. These claims pin that shape:
   (m) the f16 arm's groups alternate between the slot's two halves and chain through events: before a group
       dequantizes into a half, the stream waits, on the device, for the GEMMs that last read that half, every GEMM
       is recorded as a reader of its half, the dequant and the GEMM address the same half, and the lambda holds no
-      host wait outside the debugging compare arm's CPU readback (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE);
+      host wait outside the debugging compare arm's CPU readback (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE).
+      When the slot holds every active expert (one group), a windowed op's phases each dequantize into their own
+      region and are given no wait on an earlier phase's GEMMs: one pure predicate in moe-mmvq-tables.hpp
+      (moe_pp_batched_phases_reuse_buffers, true unless there is exactly one group) decides both the phase's offset
+      (moe_pp_batched_phase_weight_offset) and whether the wait is submitted, the executor asks it and never
+      re-derives it, and the phase's region is asserted to lie in the claimed slot; the route log's weight figure
+      asks the same predicate, so it reports the regions the phases really used;
   (n) the dequant profiler label's name comes from a table built once per type, never from a string the dispatch
       builds;
   (o) every type the f16 table takes runs in the device test (test-moe-pp-batched-dequant.cpp's k_types), or is named
@@ -151,6 +157,23 @@ GROUP_KNOB_CONST = "GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX_ENV"
 # The f16 arm's phase loop, from its head to the barrier on every GEMM event that ends it.
 PHASE_LOOP_HEAD = "for (size_t p = 0; p < phases.size() && !gemm_declined; ++p) {"
 PHASE_LOOP_END = "stream->ext_oneapi_submit_barrier(gemm_events);"
+# A phase's region of the f16 slot and its wait on the readers of its buffer, both decided by the header's predicate.
+REUSE_FN = "moe_pp_batched_phases_reuse_buffers"
+REUSE_BODY = "{ return groups.groups != 1; }"
+OFFSET_FN = "moe_pp_batched_phase_weight_offset"
+OFFSET_BODY = ("return moe_pp_batched_phases_reuse_buffers(groups) ? phase_buffer * half_elems : "
+               "phase_begin * weight_elems;")
+PHASE_OFFSET = ("const size_t phase_offset = "
+                "moe_pp_batched_phase_weight_offset(f16_groups, phase.begin, phase.buffer, half_elems, weight_elems); "
+                "sycl::half * phase_weights = batched_weights + phase_offset;")
+PHASE_BOUND = ("GGML_ASSERT(pp_woq_arm || (phase_offset + (phase.end - phase.begin) * weight_elems) * "
+               "sizeof(sycl::half) <= reserved.weight_size);")
+# The route log's weight figure: the f16 arm's buffers when its phases reuse them, else every active expert's region.
+WEIGHT_USED = ("const size_t f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ? "
+               "phase_buffers * half_elems : active_count * weight_elems; "
+               "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : f16_used_elems * sizeof(sycl::half);")
+PHASE_WAIT = ("if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_readers[phase.buffer].empty()) { "
+              "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]); half_readers[phase.buffer].clear(); }")
 # The debugging compare arm (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE), the one block in the lambda that may wait on
 # the host: it copies the result back and checks it on the CPU.
 COMPARE_HEAD = "if (batched_compare && !active_experts.empty()) {"
@@ -870,11 +893,13 @@ def claim_m_chain(s):
     if start < 0 or end < start:
         return ["the lambda has no phase loop ending in the barrier on every GEMM event"]
     loop = lam[start:end]
-    half = "sycl::half * phase_weights = batched_weights + phase.buffer * half_elems;"
-    if half not in loop:
-        fails.append("a phase does not address its own half of the f16 slot")
-    wait = ("if (!half_readers[phase.buffer].empty()) { stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]); "
-            "half_readers[phase.buffer].clear(); }")
+    if PHASE_OFFSET not in loop:
+        fails.append("a phase does not take its region of the f16 slot from moe_pp_batched_phase_weight_offset")
+    elif PHASE_BOUND not in loop or loop.find(PHASE_BOUND) < loop.find(PHASE_OFFSET):
+        fails.append("a phase's region is not asserted to lie in the claimed slot after it is chosen")
+    if "phase.buffer * half_elems" in loop or "f16_groups.groups" in loop or "f16_groups.buffers" in loop:
+        fails.append("the phase loop re-derives the buffer reuse the header's predicate decides")
+    wait = PHASE_WAIT
     dequant = "dequant_expert_f16(active_experts[i], phase_weights + (i - phase.begin) * weight_elems);"
     at_wait, at_dequant = loop.find(wait), loop.find(dequant)
     if at_wait < 0:
@@ -897,6 +922,14 @@ def claim_m_chain(s):
         fails.append("moe_pp_batched_f16_plan_groups is not defined exactly once in moe-mmvq-tables.hpp")
     elif "plan.buffers = fit >= 2 ? 2 : 1;" not in helper:
         fails.append("the group plan does not split a slot that holds two experts into two halves")
+    if WEIGHT_USED not in lam:
+        fails.append("the route log's weight figure does not ask the reuse predicate for the slot the phases used")
+    for name, want in ((REUSE_FN, REUSE_BODY), (OFFSET_FN, OFFSET_BODY)):
+        body = one_definition(s["tables"], name)
+        if body is None or definitions(s["sycl"], name):
+            fails.append(f"{name} is not defined exactly once, in moe-mmvq-tables.hpp")
+        elif want not in body:
+            fails.append(f"{name} does not answer `{want}`")
     return fails
 
 
@@ -1233,8 +1266,38 @@ MUTANTS = [
     ("m", "sycl", "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);",
      "sycl::event::wait(half_readers[phase.buffer]);"),
     ("m", "sycl", "half_readers[phase.buffer].push_back(*group_event);", ""),
-    ("m", "sycl", "batched_weights + phase.buffer * half_elems;", "batched_weights;"),
+    ("m", "sycl", PHASE_OFFSET, "const size_t phase_offset = 0; sycl::half * phase_weights = batched_weights;"),
     ("m", "tables", "plan.buffers = fit >= 2 ? 2 : 1;", "plan.buffers = 1;"),
+    # Every phase reuses a buffer again (the one-group serialization back); the wait taken whatever the predicate
+    # says; the offset taken from the buffer whatever the predicate says; the offset never by buffer; the bound gone.
+    ("m", "tables", "{ return groups.groups != 1; }", "{ return true; }"),
+    ("m", "tables", "? phase_buffer * half_elems : phase_begin * weight_elems;", "? phase_begin * weight_elems : "
+     "phase_begin * weight_elems;"),
+    ("m", "sycl", "if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_readers[phase.buffer].empty())",
+     "if (!half_readers[phase.buffer].empty())"),
+    ("m", "sycl", PHASE_OFFSET, "const size_t phase_offset = phase.buffer * half_elems; "
+     "sycl::half * phase_weights = batched_weights + phase_offset;"),
+    ("m", "sycl", PHASE_BOUND, ""),
+    # The bound re-deriving the offset from the two pointers instead of reading the helper's result.
+    ("m", "sycl", PHASE_BOUND, "GGML_ASSERT(pp_woq_arm || (static_cast<size_t>(phase_weights - batched_weights) + "
+     "(phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <= reserved.weight_size);"),
+    # The route log's weight figure: one window's buffers whatever the predicate says, the plan re-derived there.
+    ("m", "sycl", WEIGHT_USED, "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : "
+     "phase_buffers * half_elems * sizeof(sycl::half);"),
+    ("m", "sycl", "f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ?",
+     "f16_used_elems = f16_groups.groups != 1 ?"),
+    ("m", "sycl", "phase_buffers * half_elems : active_count * weight_elems;",
+     "phase_buffers * half_elems : phase_buffers * half_elems;"),
+    # A second definition of either function, beside the first or in the executor's file.
+    ("m", "tables", "inline bool moe_pp_batched_phases_reuse_buffers(",
+     "inline bool moe_pp_batched_phases_reuse_buffers(const moe_pp_batched_f16_groups & groups, int) { "
+     "return groups.groups != 1; } inline bool moe_pp_batched_phases_reuse_buffers("),
+    ("m", "tables", "inline size_t moe_pp_batched_phase_weight_offset(",
+     "inline size_t moe_pp_batched_phase_weight_offset(int) { return 0; } "
+     "inline size_t moe_pp_batched_phase_weight_offset("),
+    ("m", "sycl", "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;",
+     "static size_t moe_pp_batched_phase_weight_offset(size_t b) { return b; } "
+     "static size_t g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = 0;"),
     # The wait on the other half's readers; a host wait after the phase loop, outside the compare arm.
     ("m", "sycl", "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]);",
      "stream->ext_oneapi_submit_barrier(half_readers[1 - phase.buffer]);"),
