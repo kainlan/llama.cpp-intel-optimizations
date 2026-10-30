@@ -394,10 +394,12 @@ static inline bool moe_stream_ring_geometry_same(const moe_stream_ring_geometry 
            a.region_slots == b.region_slots;
 }
 
-// The slots of `ring` that `held` slots of `held_slot_bytes` still fund: all of them, up to the ring's own count,
-// while the slot size is the same, and none in another size, where each leaves a hole one such slot wide. The loan
-// sizing credits a short reserve's held slots by it (moe_stream_loan_size_post_loan), and the auto-ubatch fit credits
-// the planner's ring room by it (ggml_sycl_hold_ring_uncovered), so the two cannot credit held slots differently.
+// The slots of `ring` that `held` slots of `held_slot_bytes` still fund: all of them, up to the ring's own count, while
+// the slot size is the same, and none in another size. prepare() gives the held slots back and reserves the new
+// geometry, so each held slot leaves a hole one held slot wide, which a slot of the same size refills and a slot of
+// another size is not sized for. The loan sizing credits a short reserve's held slots by it
+// (moe_stream_loan_size_post_loan), and the auto-ubatch fit credits the planner's ring room by it
+// (ggml_sycl_hold_ring_uncovered), so the two cannot credit held slots differently.
 static inline uint32_t moe_stream_ring_slots_kept(const moe_stream_ring_geometry & ring,
                                                   size_t                           held_slot_bytes,
                                                   uint32_t                         held) {
@@ -1409,9 +1411,8 @@ static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,
 // the walk the boundary's loan repeats over the same plan), and sizes the ring of the plan with those triplets read as
 // host (moe_stream_plan_ring_geometry's as_host) and their device bytes added to hints.lent_bytes, as the ledger counts
 // them once lent. The request converges when that post-loan geometry is the target: it funds the ring the next
-// micro-batch reserves. The request for a target is its slots not held, times its slot size. The reserve's held slots,
-// n_slots - bytes_short / slot_bytes, count while the slot size is the reserve's: prepare() gives them back on the new
-// geometry, and each leaves a hole one such slot wide. With another slot size they count for nothing.
+// micro-batch reserves. The request for a target is its slots not held, times its slot size. The reserve holds
+// n_slots - ceil(bytes_short / slot_bytes) slots, and moe_stream_ring_slots_kept says how many of them a target keeps.
 //
 // A post-loan ring in the target's slot size that is no larger than the target is covered too: the loan frees at least
 // the room the target's request names, and prepare() reserves the smaller ring inside it. That happens when a lent

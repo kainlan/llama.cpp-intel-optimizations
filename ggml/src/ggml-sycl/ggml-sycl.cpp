@@ -18635,8 +18635,9 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
 }
 
 // Defined after the stream phase's claim hooks, far below the fit, since one of them,
-// ggml_sycl_moe_stream_claims_every_weight, sizes the ring it asks about. It is the prefill ring's bytes no loan can
-// cover on `device` (llama.cpp-kjef); the rung does not enter the geometry. See its definition.
+// ggml_sycl_moe_stream_claims_every_weight, sizes the ring it asks about. It is the prefill ring's bytes neither the
+// planned room nor a loan covers on `device` (llama.cpp-kjef); the rung does not enter the geometry. See its
+// definition.
 static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch);
 
 static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
@@ -18676,7 +18677,8 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.rungs        = rungs;
     in.plan_of      = ggml_sycl_hold_plan_at;
     in.plan_ctx     = &device;
-    // Lent bytes cost the card nothing; the part of the ring no loan covers is a demand (zone_hold_fit_demand).
+    // Lent bytes cost the card nothing; the part of the ring neither the planned room nor a loan covers is a demand
+    // (zone_hold_fit_demand).
     in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);
     a.demand        = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);
     a.free_before   = in.free_before;
@@ -18690,8 +18692,8 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     return fits;
 }
 
-// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the
-// rung, plus the prefill-ring bytes no loan covers, from the one fit function.
+// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the rung,
+// plus the prefill-ring bytes neither the planned room nor a loan covers, from the one fit function.
 static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
     ggml_sycl_hold_fit_answer a;
     (void) ggml_sycl_hold_spill_fit(q, &a);
@@ -19014,12 +19016,12 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     // already published still fits the device's current outside-arena
     // headroom, using the free-memory reading taken above.
 
-    // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan
-    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max, and the prefill-ring
-    // bytes no loan covers) is counted here, in the check that already asks what the device can take outside the
-    // arena; those bytes and the non-FA scratch compete for the same headroom. (A flash-attention context asks the
-    // same live free-memory question without the non-FA terms, at the top of this function.) Saturating: a wrapped
-    // sum must not read as a small demand.
+    // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan plus
+    // the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max, and the prefill-ring
+    // bytes neither the planned room nor a loan covers) is counted here, in the check that already asks what the device
+    // can take outside the arena; those bytes and the non-FA scratch compete for the same headroom. (A flash-attention
+    // context asks the same live free-memory question without the non-FA terms, at the top of this function.)
+    // Saturating: a wrapped sum must not read as a small demand.
     const size_t hold_spill_bytes = hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;
     const size_t nonfa_scratch_demand =
         ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
@@ -36809,12 +36811,13 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
     return true;
 }
 
-// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
-// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
-// ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
-// host. 0 with no published plan, no host expert, or no ring (the sizing refuses a ring over an eleventh of the
-// device's resident expert bytes plus the bytes lent to the ring now, ggml_sycl_moe_stream_set_window). A refused
-// probe (a graph is active) lends nothing, so the whole ring counts.
+// The prefill ring's bytes neither the planned room nor a loan covers on `device` (llama.cpp-kjef). The ring's slots
+// are the room's bytes and lent bytes, so a room and a loan that supply all of it cost the card nothing; the remainder
+// (no lendable triplets, or fewer resident bytes than the ring) is a demand on free memory, and the fit refuses a rung
+// that cannot afford it rather than spill the ring to host. 0 with no published plan, no host expert, no ring (the
+// sizing refuses a ring over an eleventh of the device's resident expert bytes plus the bytes lent to the ring now,
+// ggml_sycl_moe_stream_set_window), or a planned room that holds the whole ring. A refused probe (a graph is active)
+// lends nothing, so the post-loan ring less the room's slots it keeps counts.
 //
 // The geometry is the stream phase's own, moe_stream_plan_ring_geometry, so the fit and the ring cannot disagree about
 // how a claimed matrix is sized. Only the prompt-kernel hook and the call as its graph_ctx are passed for the shared

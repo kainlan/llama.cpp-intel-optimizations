@@ -2790,7 +2790,8 @@ def test_the_settle_refusal_record_has_a_mutation_witness(mutation):
 
 
 # ---------------------------------------------------------------------------
-# llama.cpp-kjef (plan Task 13 of llama.cpp-36j0): the hold-spill fit charges the prefill ring bytes no loan covers
+# llama.cpp-kjef (plan Task 13 of llama.cpp-36j0): the hold-spill fit charges the prefill ring bytes neither the
+# planned room nor a loan covers
 # ---------------------------------------------------------------------------
 
 _HOLD_FIT_START = "static bool ggml_sycl_hold_spill_fit("
