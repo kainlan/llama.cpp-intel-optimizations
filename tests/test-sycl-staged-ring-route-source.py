@@ -74,7 +74,7 @@ Pytest-style (module-level test_* functions): registered with llama_test_pytest.
 
 import re
 from pathlib import Path
-from sycl_gate import first_missing
+from sycl_gate import first_missing, first_present
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -595,7 +595,7 @@ def test_entry_is_the_fact():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch",
         staged_branch(SYCL),
         FIND, SLOT, VIEW, *ENTRY_FIELDS,
-        signature=GUARD)
+        signature=(GUARD if build_body(SYCL) else BUILD_SIG))
 
 
 def test_entry_is_the_fact_mutants():
@@ -650,7 +650,7 @@ def test_served_only_as_plain_kernel():
         "capability refusal and the executor's plain-kernel reads are searched in their own bodies)",
         staged_branch(SYCL),
         ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN,
-        signature=GUARD)
+        signature=(GUARD if build_body(SYCL) else BUILD_SIG))
 
 
 def test_served_only_as_plain_kernel_mutants():
@@ -705,7 +705,7 @@ def test_executor_entry_refused_by_its_consumer():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch",
         staged_branch(SYCL),
         REFUSAL_OPEN, EXECUTOR_REFUSAL,
-        signature=GUARD)
+        signature=(GUARD if build_body(SYCL) else BUILD_SIG))
 
 
 def test_executor_entry_refused_by_its_consumer_mutants():
@@ -1334,11 +1334,14 @@ def claim_no_host_waits(sycl: str) -> bool:
 
 
 def test_no_host_waits():
-    assert claim_no_host_waits(SYCL), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file; the claim also fails on a host wait in the body of "
-        "ggml_sycl_build_moe_resolved_batch, the device recipe or the admission predicate",
-        norm(SYCL),
-        BUILD_SIG, RECIPE_SIG, PREDICATE_SIG)
+    bodies = [body(norm(SYCL), sig) for sig in (BUILD_SIG, RECIPE_SIG, PREDICATE_SIG)]
+    assert claim_no_host_waits(SYCL), (
+        first_missing("ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the three bodies the claim reads)", norm(SYCL),
+                      BUILD_SIG, RECIPE_SIG, PREDICATE_SIG)
+        if not all(bodies) else
+        first_present("ggml/src/ggml-sycl/ggml-sycl.cpp: the bodies of ggml_sycl_build_moe_resolved_batch, the device "
+                      "recipe and the admission predicate (literal forms of WAIT_RE)", " ".join(bodies),
+                      "wait(", "wait_and_throw(", "get_info<"))
 
 
 def test_no_host_waits_mutants():
