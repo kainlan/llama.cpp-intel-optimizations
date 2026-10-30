@@ -3055,8 +3055,8 @@ pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      d
     }
     in.runtime_fixed_bytes   = requirement - ring_runtime - mmq_src1 - dequant_f16 - compute_growth;
     in.compute_default_bytes = unified_cache_get_planned_compute_term_bytes(device_id);
-    in.runtime_floor_bytes = unified_cache_runtime_zone_floor_bytes();
-    in.runtime_zone_bytes  = cache->zone_capacity(vram_zone_id::RUNTIME);
+    in.runtime_floor_bytes   = unified_cache_runtime_zone_floor_bytes();
+    in.runtime_zone_bytes    = cache->zone_capacity(vram_zone_id::RUNTIME);
     return pp_moe_onednn_explicit_ubatch_plan_room(in);
 }
 

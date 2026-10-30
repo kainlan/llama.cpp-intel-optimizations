@@ -247,11 +247,11 @@ struct pp_moe_onednn_explicit_ubatch_room {
     // An explicit micro-batch above the default, and a ring to size (a model with routed experts).
     bool                                 valid = false;
     pp_moe_onednn_explicit_ubatch_inputs in;
-    size_t                               ring_bytes          = 0;  // the ring at in.n_ubatch; SIZE_MAX on overflow
-    size_t                               zone_default_bytes  = 0;  // the RUNTIME zone the default micro-batch needs
-    size_t                               zone_bytes          = 0;  // the one in.n_ubatch needs; SIZE_MAX on overflow
-    size_t                               room_bytes          = 0;  // zone_bytes - zone_default_bytes, or 0
-    size_t                               room_reserved_bytes = 0;  // the part of room_bytes the zone already holds
+    size_t                               ring_bytes           = 0;  // the ring at in.n_ubatch; SIZE_MAX on overflow
+    size_t                               zone_default_bytes   = 0;  // the RUNTIME zone the default micro-batch needs
+    size_t                               zone_bytes           = 0;  // the one in.n_ubatch needs; SIZE_MAX on overflow
+    size_t                               room_bytes           = 0;  // zone_bytes - zone_default_bytes, or 0
+    size_t                               room_reserved_bytes  = 0;  // the part of room_bytes the zone already holds
     // The compute buffers' room at in.n_ubatch (the measured term scaled to it), and its growth above the term; both
     // SIZE_MAX on overflow. The growth is part of zone_bytes, and the room is what the hold-spill fit credits a compute
     // buffer of that micro-batch against (zone_hold_fit_rung_has_compute_room).
