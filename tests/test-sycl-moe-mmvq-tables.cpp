@@ -696,8 +696,8 @@ int main() {
         // Two halves (slot of 4, 7 active): two experts per group, so a phase of two experts in a half of
         // 2 * weight_elems, as the executor builds it. Phases alternate buffers 0, 1, 0 and wait for the half's
         // readers.
-        const moe_pp_batched_f16_groups halves = moe_pp_batched_f16_plan_groups(4 * f16_expert, f16_expert, 7, 0);
-        const size_t                    halves_half    = 2 * weight_elems;
+        const moe_pp_batched_f16_groups halves      = moe_pp_batched_f16_plan_groups(4 * f16_expert, f16_expert, 7, 0);
+        const size_t                    halves_half = 2 * weight_elems;
         const size_t                    halves_want[3] = { 0, 20, 0 };
         for (size_t p = 0; p < 3; ++p) {
             const size_t got = moe_pp_batched_phase_weight_offset(halves, p * 2, p % 2, halves_half, weight_elems);
