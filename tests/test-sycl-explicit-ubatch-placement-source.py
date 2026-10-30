@@ -184,6 +184,10 @@ GROW_REPLAN = ("if (placed) { plan_candidate = plan_single_device(true); placed 
                "plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE; }")
 GROW_FALLBACK = "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);"
 FALLBACK_PLAN = "plan_candidate = plan_single_device(false);"
+# The fallback says so at every verbosity: the user named a micro-batch and the load did not place it.
+REVERT_WARN = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB more RUNTIME zone, '
+               'which the arena could not reserve on device %d; the ring is re-planned when the context opens\\n", '
+               'explicit_n_ubatch, room_short / (1024.0 * 1024.0), ctx->device);')
 
 # The transport.
 PARAM_FIELD = "uint32_t n_ctx_hint; uint32_t n_ubatch_hint; };"
@@ -250,6 +254,13 @@ def claim_load_grows_the_zone_before_the_plan(sycl_cpp: str) -> bool:
             and store.count("plan_single_device(false)") == 1)
 
 
+def claim_failed_growth_warns(sycl_cpp: str) -> bool:
+    """A zone that could not grow is said once, at WARN, after the fallback plan: the micro-batch the user named is not
+    placed, and the line names the RUNTIME bytes the arena could not reserve."""
+    store = body(norm(sycl_cpp), STORE_SIG)
+    return bool(store) and ordered(store, GROW_FALLBACK, FALLBACK_PLAN, REVERT_WARN) and store.count(REVERT_WARN) == 1
+
+
 def claim_transport_names_no_micro_batch_for_auto(llama_h: str, model_cpp: str, sycl_cpp: str, common_cpp: str,
                                                   bench_cpp: str, sycl_h: str = SYCL_H) -> bool:
     """The micro-batch the caller names reaches the planner, and neither caller names one when the backend picks the
@@ -282,6 +293,10 @@ def test_planner_moves_only_experts():
 
 def test_load_grows_the_zone_before_the_plan():
     assert claim_load_grows_the_zone_before_the_plan(SYCL_CPP)
+
+
+def test_failed_growth_warns():
+    assert claim_failed_growth_warns(SYCL_CPP)
 
 
 def test_transport_names_no_micro_batch_for_auto():
@@ -398,6 +413,21 @@ def test_mutant_failed_growth_plans_with_the_room_fails():
         _once(SYCL_CPP, FALLBACK_PLAN, "plan_candidate = plan_single_device(true);"))
 
 
+def test_mutant_failed_growth_at_info_fails():
+    """At INFO the line is dropped at default verbosity, and the user is not told the micro-batch was not placed."""
+    assert not claim_failed_growth_warns(
+        _once(SYCL_CPP, REVERT_WARN, REVERT_WARN.replace("GGML_LOG_WARN(", "GGML_LOG_INFO(", 1)))
+
+
+def test_mutant_failed_growth_reworded_fails():
+    assert not claim_failed_growth_warns(
+        _once(SYCL_CPP, REVERT_WARN, REVERT_WARN.replace("; the ring is re-planned when the context opens", "", 1)))
+
+
+def test_mutant_failed_growth_silent_fails():
+    assert not claim_failed_growth_warns(_once(SYCL_CPP, REVERT_WARN, ""))
+
+
 def test_mutant_plan_without_room_keeps_the_room_fails():
     assert not claim_load_grows_the_zone_before_the_plan(
         _once(SYCL_CPP, LAMBDA_ROOM, LAMBDA_ROOM.replace(" g_placement_kv_info.explicit_ubatch = {};", "", 1)))
@@ -438,10 +468,12 @@ def test_mutant_default_hint_dropped_fails():
 
 
 def test_mutant_one_loader_stage_drops_the_hint_fails():
-    n = norm(MODEL_CPP)
-    at = n.find(CALLER_PASSES)
-    assert at >= 0
-    dropped = n[:at] + "hparams, model.get_n_ctx_hint());" + n[at + len(CALLER_PASSES):]
+    """Mutated on the raw text: the default's initializer labels are comments, which normalizing strips, so a mutant
+    built from normalized text fails the claim whether or not the caller passes the hint."""
+    anchor = "model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
+    assert MODEL_CPP.count(anchor) == 2
+    assert claim_transport_names_no_micro_batch_for_auto(LLAMA_H, MODEL_CPP, SYCL_CPP, COMMON_CPP, BENCH_CPP)
+    dropped = MODEL_CPP.replace(anchor, "model.get_n_ctx_hint());", 1)
     assert not claim_transport_names_no_micro_batch_for_auto(LLAMA_H, dropped, SYCL_CPP, COMMON_CPP, BENCH_CPP)
 
 

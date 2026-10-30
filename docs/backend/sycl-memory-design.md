@@ -2677,10 +2677,34 @@ than the RUNTIME zone can hold with every device-resident expert re-placed to th
 largest -ub that fits is <L> (device=0)
 ```
 
-An arena that cannot grow, because another live model holds allocations in it,
-keeps the planning shape, and the load plans without the room. So no expert
-leaves the device for a zone that did not grow. The context then re-plans the
-ring as described above.
+The arena can fail to grow for two reasons, and each prints its own line first:
+
+- **Another live model holds allocations in the arena.** Zones are rebuilt only
+  in an unused arena, so `ensure_planned_arena_zones()` refuses the rebuild with
+  an ERROR:
+
+  ```
+  [VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: need scratch=<S> MB
+  oneDNN=<O> MB runtime=<R> MB; have scratch=<S0> MB oneDNN=<O0> MB runtime=<R0> MB; live_zone=<L> MB chunk_leases=<C>
+  ```
+
+- **The tail chunk's cap.** The rebuilt arena's tail chunk holds the ONEDNN,
+  RUNTIME and SCRATCH zones plus a minimum KV carve-out, and the device's
+  per-allocation cap may be smaller than that sum. `arena_reserve()` then refuses
+  with `[VRAM-ARENA] Per-chunk cap <P> MB too small to hold tail zones (<T> MB) +
+  min KV (<K> MB); refusing reservation`.
+
+Either way the load keeps the planning shape: it re-publishes the ring and the
+dense scratch at the load's own micro-batch, sizes the zones for them, and plans
+without the room. So no expert leaves the device for a zone that did not grow.
+One WARN line, at every verbosity, says the named micro-batch was not placed:
+
+```
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=<N> needs <X> MB more RUNTIME zone, which the arena could
+not reserve on device 0; the ring is re-planned when the context opens
+```
+
+The context then re-plans the ring as described above.
 Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path. The RUNTIME zone's fixed part uses the
 compute term measured at the load's planning shape (`llama.cpp-fkpg`), so the
@@ -2688,7 +2712,8 @@ room for a much larger micro-batch can be short by that term's growth. Host
 tests: `test-pp-moe-ring-admission.cpp` pins the room and the decision,
 `tests/test-sycl-layout-choice.cpp` pins the planner's choice and the bytes it
 moves, and `tests/test-sycl-explicit-ubatch-placement-source.py` pins the
-wiring and both log lines, with a mutant per claim.
+wiring and the placement, refusal and failed-growth lines, with a mutant per
+claim.
 
 ### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
 
