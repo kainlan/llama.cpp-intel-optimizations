@@ -101,7 +101,7 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     // the records' growth fails (drop_window_timing()).
     window_timing_.enabled = op.log != nullptr && op.log->trace >= 2 && !window_marks_failed_;
     request_loan_  = op.request_loan;
-    loan_refusals_ = op.loan_refusals;
+    loan_refusals_         = op.loan_refusals;
 
     // The layer is weighed at its own first op, never a layer ahead: the executor stages its own windows.
     const auto cur = index_.layers.find(layer);
@@ -169,7 +169,7 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     // The host time this call takes, for the window's timing line (trace level 2 only).
     const bool timed   = window_timing_.enabled;
     const auto t_begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    const auto li = index_.layers.find(req.layer);  // executor_claims found it
+    const auto li      = index_.layers.find(req.layer);  // executor_claims found it
 
     // The bytes this call copies, the window's own and its prefetch's: note_window() counts them once, here.
     size_t     bytes_staged   = 0;
@@ -409,8 +409,8 @@ bool moe_stream_phase::take_prompt_ended() {
 void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
     const moe_stream_ring_geometry geo =
         moe_stream_plan_ring_geometry(plan, device, op.graph_ctx, op.library_claims, op.window, &index_);
-    const bool                     same_queue = ccs_.has_value() && *ccs_ == ccs;
-    const bool                     same_geo   = moe_stream_ring_geometry_same(geo, geo_);
+    const bool same_queue = ccs_.has_value() && *ccs_ == ccs;
+    const bool same_geo   = moe_stream_ring_geometry_same(geo, geo_);
     if (prepared_ && (device != device_ || !same_queue || !same_geo)) {
         teardown(ring_ ? compute_barrier() : sycl::event());
     }

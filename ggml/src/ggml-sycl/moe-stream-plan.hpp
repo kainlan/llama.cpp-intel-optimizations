@@ -351,7 +351,7 @@ static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(
     // hints.lent_bytes out of index.resident_expert_bytes, so the sum is the same before and after it. The add
     // saturates defensively: a real sum of device bytes cannot approach SIZE_MAX, so the clamp only keeps a corrupt
     // or sentinel lent_bytes from wrapping into a refusal.
-    size_t resident_with_lent = index.resident_expert_bytes + hints.lent_bytes;
+    size_t                resident_with_lent = index.resident_expert_bytes + hints.lent_bytes;
     if (resident_with_lent < index.resident_expert_bytes) {
         resident_with_lent = SIZE_MAX;
     }
@@ -1155,7 +1155,7 @@ class moe_stream_phase {
     sycl::event                                     region_last_;  // its last copy's event (see stage_window())
     moe_stream_plan_index                           index_;
     std::unordered_map<int, layer_state>            layers_;
-    std::optional<sycl::queue>                      ccs_;  // the compute queue the readers and the barriers run on
+    std::optional<sycl::queue>                      ccs_;     // the compute queue the readers and the barriers run on
     moe_stream_ring_geometry                        geo_;
     moe_stream_window_hints                         window_;  // the executor window prepare() sized geo_ with
     ggml_sycl_moe_exec_rates_record                 record_             = {};
@@ -1172,9 +1172,9 @@ class moe_stream_phase {
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
     // Each region's last fill: its window and that window's read gate (stage_window(), window_done()).
     moe_stream_region_reads<sycl::event>            region_reads_;
-    int      prev_window_layer_      = -1;          // the layer of this micro-batch's last window_begin, -1 for none
-    uint32_t next_window_id_         = UINT32_MAX;  // the window the last window_begin prefetched, UINT32_MAX for none
-    bool     next_window_whole_      = false;       // that prefetch staged every matrix of its window
+    int      prev_window_layer_ = -1;          // the layer of this micro-batch's last window_begin, -1 for none
+    uint32_t next_window_id_    = UINT32_MAX;  // the window the last window_begin prefetched, UINT32_MAX for none
+    bool     next_window_whole_ = false;       // that prefetch staged every matrix of its window
     // The queue the window timing's marks go on under GGML_SYCL_MOE_EXEC_TRACE=2: built at the first mark
     // (timing_queue()), dropped when prepare() takes another compute queue, never built below trace level 2. Declared
     // ahead of the timeline, so the marks the records hold go before their queue does. Records may still hold marks
@@ -1192,19 +1192,19 @@ class moe_stream_phase {
     uint64_t                                ubatch_seq_    = 0;  // begin_ubatch counts micro-batches for the timing key
     // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor, and
     // window_begin feeds the log's window counters.
-    moe_exec_decision_log *     log_ = nullptr;
-    moe_exec_policy             policy_        = moe_exec_policy::AUTO;
+    moe_exec_decision_log *                 log_           = nullptr;
+    moe_exec_policy                         policy_        = moe_exec_policy::AUTO;
     // The last op's loan hooks, which ring_ready() calls on a short reserve, and this prompt's loans (llama.cpp-3460).
-    moe_stream_request_loan_fn  request_loan_  = nullptr;
-    moe_stream_loan_refusals_fn loan_refusals_ = nullptr;
-    moe_stream_loan_latch       loan_latch_;
-    moe_staged_route_tally      staged_routes_;
-    uint64_t                    ring_releases_            = 0;
+    moe_stream_request_loan_fn              request_loan_  = nullptr;
+    moe_stream_loan_refusals_fn             loan_refusals_ = nullptr;
+    moe_stream_loan_latch                   loan_latch_;
+    moe_staged_route_tally                  staged_routes_;
+    uint64_t                                ring_releases_            = 0;
     // This prompt kept a whole reservation (ring_ready()); end_prompt copies it into last_prompt_ring_engaged_ and
     // marks the prompt ended for take_prompt_ended() (llama.cpp-i4ny).
-    bool                        ring_engaged_             = false;
-    bool                        last_prompt_ring_engaged_ = false;
-    bool                        prompt_ended_             = false;
+    bool                                    ring_engaged_             = false;
+    bool                                    last_prompt_ring_engaged_ = false;
+    bool                                    prompt_ended_             = false;
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------

@@ -1304,11 +1304,10 @@ struct cmd_params_instance {
     // SYCL backend, so neither reloads.
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
-               n_ubatch_hint() == other.n_ubatch_hint() &&
-               split_mode == other.split_mode &&
-               main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
-               devices == other.devices && no_host == other.no_host && repack == other.repack &&
+               n_ubatch_hint() == other.n_ubatch_hint() && split_mode == other.split_mode &&
+               main_gpu == other.main_gpu && tensor_split == other.tensor_split && load_mode == other.load_mode &&
+               lazy_mode == other.lazy_mode && devices == other.devices && no_host == other.no_host &&
+               repack == other.repack &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 

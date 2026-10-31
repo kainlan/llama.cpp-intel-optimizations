@@ -91620,7 +91620,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             (phase_offset + (phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <=
                                 reserved.weight_size);
                 // The dequant kernels and GEMM groups this phase submits, for a window's timing line.
-                uint32_t                 phase_launches = 0;
+                uint32_t phase_launches = 0;
                 // llama.cpp-8epx: for a windowed op this phase is one ring window (W1). window_begin is asked exactly
                 // once per window: it copies the window's host matrices no prefetch staged into a region, and the
                 // window after it into the other region, under this window's dequants and GEMMs. That window is the

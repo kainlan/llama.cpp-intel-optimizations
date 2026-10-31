@@ -577,7 +577,7 @@ int main() {
         // No claim: every host item is still listed and the cost model still sees every host byte, but none takes a
         // slot, so no window and no ring.
         const moe_stream_plan_index   unclaimed = index_of(plan, nullptr);
-        const moe_stream_layer_info * u0 = layer_info(unclaimed, 0);
+        const moe_stream_layer_info * u0        = layer_info(unclaimed, 0);
         CHECK(u0 != nullptr);
         if (u0) {
             CHECK(u0->items.size() == 9 && u0->n_streamable == 0);

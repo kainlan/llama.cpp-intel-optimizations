@@ -38,12 +38,12 @@ struct moe_exec_layer_inputs {
     uint32_t n_tokens             = 0;  // rows of this micro-batch reaching the layer
     int      n_expert             = 0;
     int      n_expert_used        = 0;
-    size_t   host_expert_bytes    = 0;    // this layer's host-resident triplet bytes
+    size_t   host_expert_bytes    = 0;  // this layer's host-resident triplet bytes
     int      n_host_experts       = 0;
-    int64_t  K                    = 0;    // n_embd for gate/up, n_ff for down (use the larger: an upper bound)
-    int64_t  N                    = 0;    // K and N are n_embd and n_ff in either order: only the product is used
-    size_t   ring_bytes_free      = 0;    // ring bytes the layer may use (0 = no ring)
-    size_t   stage_unit_bytes_max = 0;    // the largest one matrix the ring stages for the layer (one slot)
+    int64_t  K                    = 0;  // n_embd for gate/up, n_ff for down (use the larger: an upper bound)
+    int64_t  N                    = 0;  // K and N are n_embd and n_ff in either order: only the product is used
+    size_t   ring_bytes_free      = 0;  // ring bytes the layer may use (0 = no ring)
+    size_t   stage_unit_bytes_max = 0;  // the largest one matrix the ring stages for the layer (one slot)
 };
 
 struct moe_exec_decision {
