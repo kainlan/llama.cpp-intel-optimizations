@@ -20,6 +20,9 @@ What this gate pins:
   keep fewer triplets on the device;
 - the load grows the RUNTIME zone for that micro-batch before the plan it keeps, and falls back to the load's planning
   shape, planned without the room, when the arena cannot grow;
+- before its first plan, a load whose zone already holds the room (grown by an earlier stage of the load or an earlier
+  load in the process) re-publishes the micro-batch's ring and dense scratch, asking the planner's own decision with no
+  expert budget, and publishes the planning shape again when that publish fails;
 - a load announces the placement in ONE WARN line, with the bytes and layers moved and both packs' triplets, at the
   first non-probe context since the load whose room cost device bytes, whatever that context's micro-batch; the plan that context publishes carries a mark every later
   context's plan copies, so no later context repeats it;
@@ -288,12 +291,22 @@ GROW_PUBLISH = ("bool placed = ggml_sycl_publish_load_ubatch_scratch(ctx->device
                 "ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);")
 GROW_REPLAN = ("if (placed) { plan_candidate = plan_single_device(true); placed = "
                "plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE; }")
-GROW_FALLBACK = "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);"
+GROW_FALLBACK = ("if (!placed) { "
+                 "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);")
 FALLBACK_PLAN = "plan_candidate = plan_single_device(false);"
 # The fallback says so at every verbosity: the user named a micro-batch and the load did not place it.
 REVERT_WARN = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB more RUNTIME zone, '
                'which the arena could not reserve on device %d; the ring is re-planned when the context opens\\n", '
                'explicit_n_ubatch, room_short / (1024.0 * 1024.0), ctx->device);')
+
+# Before the first plan: a zone that already holds the room gets the micro-batch's ring and dense scratch back, by the
+# planner's decision with no expert budget, and a publish that fails part-way gets the planning shape back.
+PRE_FILL = ("const uint32_t explicit_n_ubatch = g_placement_kv_info.n_ubatch_context; "
+            "ggml_sycl_fill_explicit_ubatch_room(ctx->device);")
+PRE_DECIDE = ("ggml_sycl::pp_moe_onednn_explicit_ubatch_decide(g_placement_kv_info.explicit_ubatch, 0).action == "
+              "ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE")
+PRE_GATE = ("if (" + PRE_DECIDE + " && !ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch)) { "
+            "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch); }")
 
 # The transport.
 PARAM_FIELD = "uint32_t n_ctx_hint; uint32_t n_ubatch_hint; };"
@@ -432,6 +445,17 @@ def claim_load_grows_the_zone_before_the_plan(sycl_cpp: str) -> bool:
             and store.count("plan_single_device(false)") == 1)
 
 
+def claim_held_room_is_republished_before_the_plan(sycl_cpp: str) -> bool:
+    """Before the first plan, the room is filled from the plan as published and, when the planner's decision with no
+    expert budget is PLACE (the zone already holds the room: an earlier stage of the load or an earlier load in the
+    process grew it), the micro-batch's ring and dense scratch are published again so the plan reads them; a publish
+    that fails part-way publishes the planning shape again, as the fallback does. The predicate is the decision, not a
+    copy of its rule."""
+    store = body(norm(sycl_cpp), STORE_SIG)
+    return (bool(store) and ordered(store, PRE_FILL, PRE_GATE, FIRST_PLAN, GROW_BRANCH)
+            and store.count(PRE_GATE) == 1 and "room_reserved_bytes >=" not in store)
+
+
 def claim_failed_growth_warns(sycl_cpp: str) -> bool:
     """A zone that could not grow is said once, at WARN, after the fallback plan: the micro-batch the user named is not
     placed, and the line names the RUNTIME bytes the arena could not reserve."""
@@ -501,6 +525,10 @@ def test_bench_reloads_only_on_a_micro_batch_change():
 
 def test_failed_growth_warns():
     assert claim_failed_growth_warns(SYCL_CPP)
+
+
+def test_held_room_is_republished_before_the_plan():
+    assert claim_held_room_is_republished_before_the_plan(SYCL_CPP)
 
 
 def test_transport_names_no_micro_batch_for_auto():
@@ -853,7 +881,41 @@ def test_mutant_grown_zone_not_replanned_fails():
 
 
 def test_mutant_failed_growth_keeps_the_micro_batch_fails():
-    assert not claim_load_grows_the_zone_before_the_plan(_once(SYCL_CPP, GROW_FALLBACK, ""))
+    assert not claim_load_grows_the_zone_before_the_plan(_once(SYCL_CPP, GROW_FALLBACK, "if (!placed) {"))
+
+
+def test_mutant_held_room_not_republished_fails():
+    """Without it, a later stage of the load, or a later load, plans against the grown zone with the ring published at
+    the planning shape, so the room it holds is never charged to the routed experts."""
+    assert not claim_held_room_is_republished_before_the_plan(_once(SYCL_CPP, PRE_GATE, ""))
+
+
+def test_mutant_held_room_predicate_rederived_fails():
+    """A copy of the decision's rule is a second source for one fact, free to drift from the planner's."""
+    rederived = ("g_placement_kv_info.explicit_ubatch.valid && g_placement_kv_info.explicit_ubatch.room_bytes > 0 && "
+                 "g_placement_kv_info.explicit_ubatch.room_reserved_bytes >= "
+                 "g_placement_kv_info.explicit_ubatch.room_bytes")
+    assert not claim_held_room_is_republished_before_the_plan(
+        _once(SYCL_CPP, PRE_GATE, PRE_GATE.replace(PRE_DECIDE, rederived, 1)))
+
+
+def test_mutant_held_room_failed_publish_left_half_done_fails():
+    assert not claim_held_room_is_republished_before_the_plan(
+        _once(SYCL_CPP, PRE_GATE,
+              "if (" + PRE_DECIDE + ") { "
+              "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch); }"))
+
+
+def test_mutant_held_room_republished_after_the_plan_fails():
+    """Published after the first plan, the plan has already read the planning-shape ring."""
+    moved = _once(SYCL_CPP, PRE_GATE + " " + FIRST_PLAN, FIRST_PLAN + " " + PRE_GATE)
+    assert not claim_held_room_is_republished_before_the_plan(moved)
+
+
+def test_mutant_held_room_read_before_the_fill_fails():
+    """Without the fill the decision reads the room an earlier plan left in placement_kv_info."""
+    assert not claim_held_room_is_republished_before_the_plan(
+        _once(SYCL_CPP, PRE_FILL, "const uint32_t explicit_n_ubatch = g_placement_kv_info.n_ubatch_context;"))
 
 
 def test_mutant_failed_growth_plans_with_the_room_fails():

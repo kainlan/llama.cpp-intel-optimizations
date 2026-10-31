@@ -17778,13 +17778,17 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         };
         // An explicit micro-batch's PP MoE oneDNN scratch ring: the planner holds the RUNTIME room the ring needs
         // against the routed experts. Every stage of the load re-publishes the ring and the dense scratch at the load's
-        // planning shape, so a zone an earlier stage already grew for the room (zones never shrink) gets the
-        // micro-batch's back before the plan.
+        // planning shape, so a zone that an earlier stage of the load, or an earlier load in the process, already grew
+        // for the room (zones never shrink) gets the micro-batch's back before the plan. The decision with no expert
+        // budget is PLACE exactly when the zone already holds the room, so the planner's own rule answers it. A publish
+        // that fails part-way is published again at the planning shape, as the fallback below does, rather than left
+        // half at the micro-batch.
         const uint32_t explicit_n_ubatch = g_placement_kv_info.n_ubatch_context;
         ggml_sycl_fill_explicit_ubatch_room(ctx->device);
-        if (g_placement_kv_info.explicit_ubatch.valid && g_placement_kv_info.explicit_ubatch.room_bytes > 0 &&
-            g_placement_kv_info.explicit_ubatch.room_reserved_bytes >= g_placement_kv_info.explicit_ubatch.room_bytes) {
-            (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch);
+        if (ggml_sycl::pp_moe_onednn_explicit_ubatch_decide(g_placement_kv_info.explicit_ubatch, 0).action ==
+                ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE &&
+            !ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch)) {
+            (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
         }
         plan_candidate = plan_single_device(/*with_room=*/true);
         if (plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {
