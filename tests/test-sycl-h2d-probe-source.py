@@ -45,8 +45,7 @@ reused. The probe this gate pins:
     source), and a copy the staged-copy census records as staged is never stored or kept: the seed stands, h2d_probed
     stays false, and both outcomes leave the device unresolved so the next load retries;
   - the probe never writes a reorder rate into the record (llama.cpp-kp1l): the record keeps the looked-up rate, 0 when
-    there was none, and a reorder rate of 0 is a valid record that means unmeasured, so the seed is not persisted as a
-    measurement.
+    none, and a reorder rate of 0 is a valid record. The rate is stored for format stability and read by nothing.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -504,7 +503,7 @@ def claim_two_consumers_read_the_rate(overrides: dict = None) -> bool:
         len({next(i for i, (lo, hi) in enumerate(spans) if lo <= at < hi) for _, at, _ in reads}) == 2
 
 
-# ---- the probed H2D rate: the cost model's source order, the unmeasured reorder rate, the mutex (llama.cpp-kp1l) ----
+# ---- the probed H2D rate: the cost model's source order, the stored, unread reorder rate, the mutex (llama.cpp-kp1l) ----
 
 def claim_assembly_takes_h2d_from_record_then_probe_then_seed(hpp: str) -> bool:
     """moe_stream_rates_assemble prices the h2d term from, in order: the device's tuning-cache record, the device's
@@ -538,7 +537,7 @@ def claim_weigh_passes_the_devices_probed_rate(cpp: str) -> bool:
 
 def claim_probe_does_not_store_the_reorder_seed(src: str) -> bool:
     """The probe measures the H2D rate only. It never writes a reorder rate into the record: it stores what the
-    looked-up record held (0 = unmeasured), so the assembly's seed is not frozen into the file as a measurement."""
+    looked-up record held, 0 when none. The rate is stored for format stability and read by nothing."""
     fn = probe_body(src)
     return bool(fn) and all([
         not re.search(r"reorder_gbps\s*=(?!=)", fn),
@@ -548,7 +547,8 @@ def claim_probe_does_not_store_the_reorder_seed(src: str) -> bool:
 
 
 def claim_record_accepts_an_unmeasured_reorder_rate(io: str) -> bool:
-    """A record's reorder rate of 0 means unmeasured and is valid; a negative or non-finite one is still refused."""
+    """A record's reorder rate of 0 is valid (0 when none, stored for format stability, read by nothing); a negative
+    or non-finite one is still refused."""
     n = norm(io)
     return ("return std::isfinite(h2d_gbps) && h2d_gbps > 0.0 && std::isfinite(reorder_gbps) && reorder_gbps >= 0.0;"
             in n)

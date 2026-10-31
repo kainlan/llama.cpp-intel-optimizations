@@ -21,21 +21,21 @@
 //    capability query would serve (MXFP4 is the one type a prompt kernel reads
 //    as SOA, MMVQ_COMPAT, and no plan is published, so nothing claims it), is
 //    refused by the tag check and counted. So is a Q4_0 AOS entry over the
-//    SOA-tagged slot, which the capability query alone would serve. A Q4_0
-//    SOA entry over the SOA-tagged slot agrees with its tag but is refused all
-//    the same: the only prompt kernel that reads Q4_0 as SOA is the oneDNN
-//    batched prompt executor (llama.cpp-348c), and a staged slot is served only
-//    with MMVQ_COMPAT (c-las5), so the staged route refuses the kernel, which it
+//    SOA-tagged slot, which the capability query alone would serve. A Q4_0 SOA
+//    entry over the SOA-tagged slot agrees with its tag but is refused all the
+//    same: the only prompt kernel that reads Q4_0 as SOA is the oneDNN batched
+//    prompt executor (llama.cpp-348c), and a staged slot is served only with
+//    MMVQ_COMPAT (c-las5), so the staged route refuses the kernel, which it
 //    asks before the tag whatever the slot. The phase's refusals name each
 //    cause, as the trace prints them: two layout refusals and one kernel
-//    refusal, with the query's reason (plan Task 8). A Q4_0
-//    AOS entry over the AOS slot whose consumer is the batched prompt executor
-//    (llama.cpp-3460) is one the route would serve in every other respect, as
-//    case 1 shows, so only the entry's consumer refuses it, as claimed, before
-//    any slot is resolved (llama.cpp-q2ln), and the build falls through to the
-//    route core; in a prompt that core answers HOST, and the executor reads the
-//    slot itself. The weight has no index entry, so the executor does not take
-//    it whole and the entry counts as a refusal, not a handoff.
+//    refusal, with the query's reason (plan Task 8). A Q4_0 AOS entry over the
+//    AOS slot whose consumer is the batched prompt executor (llama.cpp-3460) is
+//    one the route would serve in every other respect, as case 1 shows, so only
+//    the entry's consumer refuses it, as claimed, before any slot is resolved,
+//    and the build falls through to the route core; in a prompt that core
+//    answers HOST, and the executor reads the slot itself. The weight has no
+//    index entry, so the executor does not take it whole and the entry counts
+//    as a refusal, not a handoff.
 // 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.

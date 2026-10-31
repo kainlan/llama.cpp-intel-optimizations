@@ -286,8 +286,8 @@ RE_BULK_REFILL_FIRST="$RE_BULK_REFILL at decode graph 1 after the prompt"
 RE_PP_REFUSED='\[PP-MOE\] refused device='
 RE_PP_ARM_F16='\[PP-MOE\] device=[0-9]+ type=[^ ]+ layout=[^ ]+ arm=f16 '
 RE_TRACE_EXEC='\[MOE-EXEC-TRACE\] executor device [0-9]+ tensor=[^ ]+ experts=[0-9]+ staged=[0-9]+ arm=[a-z0-9]+'
-# The executor's per-layer trace line with its misses=N field (llama.cpp-8epx): the experts its windows did not have
-# staged ahead. Every executor trace line carries the field, so this matches each one the trace prints.
+# The executor's per-layer trace line with its misses=N field: the experts its windows did not have staged ahead.
+# Every executor trace line carries the field, so this matches each one the trace prints.
 RE_TRACE_MISSES='\[MOE-EXEC-TRACE\] executor device [0-9]+ .* misses=[0-9]+'
 RE_WATCHDOG='SYCL-WATCHDOG\] No GPU progress'
 RE_PLACE='MoE experts: [0-9]+ on device, [0-9]+ on host'

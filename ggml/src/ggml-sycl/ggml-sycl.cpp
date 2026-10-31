@@ -33022,16 +33022,16 @@ double ggml_sycl_h2d_probed_gbps(int device) {
 // kept: the seed stands and the device is probed again at the next load. (A probe that copied from an unzoned pool
 // buffer, and so staged, read 4.7 and 6.2 GB/s and persisted it; that is why the detection exists.)
 //
-// Once per process and device for a final answer (measured, from the cache, or env-skipped): a device that holds a
-// rate is left alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever
-// the tuning cache holds, 0 skips the probe and keeps the seed. Every outcome logs through the one report line, an
+// Once per process and device for a final answer (measured, from the cache, or env-skipped): a device that holds a rate
+// is left alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever the
+// tuning cache holds, 0 skips the probe and keeps the seed. Every outcome logs through the one report line, an
 // exception included (its text rides in the source word), so a device logs one WARN line per outcome. A stored record
 // is read back instead of probing. A probe that cannot allocate keeps the seed and says so: never an abort. A refused
 // store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the measured rate resolved for
 // the process and is logged "probed, not stored", and the cost model still prices with it (see Consumers). The probe
-// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0 when
-// there was none, for the file format's sake; nothing reads it. The tuning cache is keyed by the
-// visible devices, so a device hidden from the scheduler probes again on every start.
+// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0 when there
+// was none, for the file format's sake; nothing reads it. The tuning cache is keyed by the visible devices, so a device
+// hidden from the scheduler probes again on every start.
 //
 // Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE, RETRY_ALLOC or RETRY_FAILED allocates 64 MiB and times
 // 8 x 64 MiB again at every outermost load, silently after its reason's first line. That is bounded and load-time
@@ -37011,17 +37011,17 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // lends nothing, so the post-loan ring less the room's slots it keeps counts.
 //
 // The geometry is the stream phase's own, moe_stream_plan_ring_geometry, so the fit and the ring cannot disagree about
-// how a claimed matrix is sized. The rung does not enter the geometry, so the fit passes no rows. The claims hook is
-// what sizes the ring, and the fit cannot pass the backend's: it reads g_moe_gate_up_pairs, a thread-local scan of a
-// graph that is stale outside compute (a previous model's weight tensors can still be in it), so asking it here could
-// read freed tensors. A null hook claims nothing and so sizes no ring, an
-// under-count. The fit passes ggml_sycl_moe_stream_claims_every_weight instead: a claim is the only way a matrix takes
-// a slot, so claiming every weight stages every host matrix one AOS slot holds, and the fit's ring bounds the phase's
-// from above. Two edges escape the bound: the cap can refuse the whole set's ring where a claimed subset's would pass
-// it (the fit then charges 0), and a claimed subset whose largest f16 expert is smaller than the whole set's gets a
-// wider window. The ring holds one executor window per region, and the window is read from the same helper the phase
-// uses (ggml_sycl_moe_stream_set_window): the device's planned f16 weight slot, which the load publishes before any
-// context transaction, so the fit charges the window-sized ring the phase reserves.
+// how a claimed matrix is sized. The rung does not enter the geometry. The claims hook is what sizes the ring, and the
+// fit cannot pass the backend's: it reads g_moe_gate_up_pairs, a thread-local scan of a graph that is stale outside
+// compute (a previous model's weight tensors can still be in it), so asking it here could read freed tensors. A null
+// hook claims nothing and so sizes no ring, an under-count. The fit passes ggml_sycl_moe_stream_claims_every_weight
+// instead: a claim is the only way a matrix takes a slot, so claiming every weight stages every host matrix one AOS
+// slot holds, and the fit's ring bounds the phase's from above. Two edges escape the bound: the cap can refuse the
+// whole set's ring where a claimed subset's would pass it (the fit then charges 0), and a claimed subset whose largest
+// f16 expert is smaller than the whole set's gets a wider window. The ring holds one executor window per region, and
+// the window is read from the same helper the phase uses (ggml_sycl_moe_stream_set_window): the device's planned f16
+// weight slot, which the load publishes before any context transaction, so the fit charges the window-sized ring the
+// phase reserves.
 // The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
 // context transaction, before it publishes, this can see the previous plan or none, and the realized check (run after
 // the rung's buffers exist) then carries the ring. Every call rebuilds the geometry: one plan index build, then the
@@ -37213,22 +37213,22 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
     auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
         if (moe_stream != nullptr && stream_layer >= 0) {
             const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role);
-            // The executor's entry (llama.cpp-3460) is told apart by the consumer the ring's index build wrote into
-            // it, not by a claim asked again here (one fact, one source), and before a slot is resolved or a recipe
-            // built, since the route never serves it (llama.cpp-q2ln). Its reader is the executor's dequant kernel, a
-            // plain kernel on this same in-order compute queue, which writes the executor's f16 weight slot; oneDNN
-            // reads only that slot, never the ring's. The dequant is ordered like the route's kernel: it waits for the
-            // copy into the slot (the entry's ready event), and a rewrite of the slot waits for the region's read
-            // gate, the barrier the executor submits on this queue behind the dequants of the window the region last
-            // held (moe_stream_phase::window_done), or for a barrier submitted at the refill when none was recorded
+            // The executor's entry (llama.cpp-3460) is told apart by the consumer the ring's index build wrote into it,
+            // not by a claim asked again here (one fact, one source), and before a slot is resolved or a recipe built,
+            // since the route never serves it. Its reader is the executor's dequant kernel, a plain kernel on this same
+            // in-order compute queue, which writes the executor's f16 weight slot; oneDNN reads only that slot, never
+            // the ring's. The dequant is ordered like the route's kernel: it waits for the copy into the slot (the
+            // entry's ready event), and a rewrite of the slot waits for the region's read gate, the barrier the
+            // executor submits on this queue behind the dequants of the window the region last held
+            // (moe_stream_phase::window_done), or for a barrier submitted at the refill when none was recorded
             // (moe_stream_phase::stage_window). Leaving it to the route core keeps that core's HOST answer for the
-            // expert, which the executor's expert loop defers to its window and its phase loop takes to the stage
-            // table (resolve_deferred_expert), and a batch the executor declines reaches the per-expert path's CPU
-            // route for it instead of a staged slot that path cannot read. On a weight the executor takes whole
-            // (executor_takes_weight) the entry is the executor's handoff, counted apart from the refusals. The
-            // window ring stages windows only for layers the executor claims whole, so an EXECUTOR entry on a layer
-            // it does not claim is not expected; if one appears, it is counted as a CLAIMED refusal: the expert runs
-            // on the CPU, its copy wasted.
+            // expert, which the executor's expert loop defers to its window and its phase loop takes to the stage table
+            // (resolve_deferred_expert), and a batch the executor declines reaches the per-expert path's CPU route for
+            // it instead of a staged slot that path cannot read. On a weight the executor takes whole
+            // (executor_takes_weight) the entry is the executor's handoff, counted apart from the refusals. The window
+            // ring stages windows only for layers the executor claims whole, so an EXECUTOR entry on a layer it does
+            // not claim is not expected; if one appears, it is counted as a CLAIMED refusal: the expert runs on the
+            // CPU, its copy wasted.
             if (s != nullptr && s->consumer == moe_stream_consumer::EXECUTOR) {
                 if (executor_takes_weight()) {
                     moe_stream->count_executor_handoff();
@@ -37267,11 +37267,11 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 // MMVQ_COMPAT kernel: any other kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS,
                 // SECONDARY_SOA), or a type that needs its direct kernel refuses it
                 // (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the library claim alone since
-                // the window ring, W2). So does a slot whose resolved layout is not the entry's: the
-                // phase acquires each slot with the layout it writes there (lead ruling c-o9uw-1), so the two
-                // disagree only for a wrong entry. A refused entry falls through to the route core, whose HOST answer
-                // stands, and is counted with its cause and the capability's reason or the validator's reject reason,
-                // in the order asked here, so the trace says why (plan Task 8).
+                // the window ring, W2). So does a slot whose resolved layout is not the entry's: the phase acquires
+                // each slot with the layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a
+                // wrong entry. A refused entry falls through to the route core, whose HOST answer stands, and is
+                // counted with its cause and the capability's reason or the validator's reject reason, in the order
+                // asked here, so the trace says why (plan Task 8).
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
                     const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);

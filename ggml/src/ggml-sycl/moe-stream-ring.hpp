@@ -6,7 +6,7 @@
 // matrices from equal WEIGHT-zone slots, one window of experts at a time (one
 // role of one executor phase). Each host matrix of a window is copied whole
 // into one slot, AOS, and the executor's dequant reads it there in place: no
-// SOA staging, no reorder (W2 of the window ring, llama.cpp-a2xb).
+// SOA staging, no reorder (W2 of the window ring).
 // This header holds two things:
 //
 //   moe_stream_ring_size()  the pure geometry: two regions, each holding one
