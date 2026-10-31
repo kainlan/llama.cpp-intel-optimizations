@@ -569,7 +569,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
         region_last_      = copied;
         // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader the
         // index build named for the item, the executor (llama.cpp-3460).
-        table_[key]       = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };
+        table_[key]       = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };
         region_keys_[cur_region_].push_back(key);
         n.bytes += item.src_bytes;
         ++n.staged;

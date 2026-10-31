@@ -37212,10 +37212,33 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
     };
     auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
         if (moe_stream != nullptr && stream_layer >= 0) {
-            if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {
+            const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role);
+            // The executor's entry (llama.cpp-3460) is told apart by the consumer the ring's index build wrote into
+            // it, not by a claim asked again here (one fact, one source), and before a slot is resolved or a recipe
+            // built, since the route never serves it (llama.cpp-q2ln). Its reader is the executor's dequant kernel, a
+            // plain kernel on this same in-order compute queue, which writes the executor's f16 weight slot; oneDNN
+            // reads only that slot, never the ring's. The dequant is ordered like the route's kernel: it waits for the
+            // copy into the slot (the entry's ready event), and a rewrite of the slot waits for the region's read
+            // gate, the barrier the executor submits on this queue behind the dequants of the window the region last
+            // held (moe_stream_phase::window_done), or for a barrier submitted at the refill when none was recorded
+            // (moe_stream_phase::stage_window). Leaving it to the route core keeps that core's HOST answer for the
+            // expert, which the executor's expert loop defers to its window and its phase loop takes to the stage
+            // table (resolve_deferred_expert), and a batch the executor declines reaches the per-expert path's CPU
+            // route for it instead of a staged slot that path cannot read. On a weight the executor takes whole
+            // (executor_takes_weight) the entry is the executor's handoff, counted apart from the refusals. The
+            // window ring stages windows only for layers the executor claims whole, so an EXECUTOR entry on a layer
+            // it does not claim is not expected; if one appears, it is counted as a CLAIMED refusal: the expert runs
+            // on the CPU, its copy wasted.
+            if (s != nullptr && s->consumer == moe_stream_consumer::EXECUTOR) {
+                if (executor_takes_weight()) {
+                    moe_stream->count_executor_handoff();
+                } else {
+                    moe_stream->count_staged_route(moe_staged_route_refusal::CLAIMED, nullptr);
+                }
+            } else if (s != nullptr) {
                 // Ruling C (c-3bde): the slot and the layout it holds come from the entry, never from the slice's
-                // tag. The lease is the slot itself; its pointer is only checked here.
-                const mem_handle & slot = s->layout == GGML_LAYOUT_SOA ? s->soa : s->aos;
+                // tag. The lease is the slot itself; its pointer is only checked here. Every ring slot is AOS.
+                const mem_handle & slot = s->aos;
                 const resolved_ptr view = slot.resolve(submit_device);
                 moe_batch_route    staged;
                 staged.residency         = moe_batch_residency::PRIMARY_DEVICE;
@@ -37241,34 +37264,16 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 staged.recipe_reason                          = "staged-ring";
                 // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the
                 // slot's reuse; it does not order a library's internals. The route serves a slot only as a plain
-                // MMVQ_COMPAT kernel: an entry the batched prompt executor consumes, any other kernel (XMX_TILED,
-                // MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), or a type that needs its direct
-                // kernel refuses it (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the library
-                // claim alone since the window ring, W2). So does a slot whose resolved layout is not the entry's: the
+                // MMVQ_COMPAT kernel: any other kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS,
+                // SECONDARY_SOA), or a type that needs its direct kernel refuses it
+                // (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the library claim alone since
+                // the window ring, W2). So does a slot whose resolved layout is not the entry's: the
                 // phase acquires each slot with the layout it writes there (lead ruling c-o9uw-1), so the two
                 // disagree only for a wrong entry. A refused entry falls through to the route core, whose HOST answer
                 // stands, and is counted with its cause and the capability's reason or the validator's reject reason,
                 // in the order asked here, so the trace says why (plan Task 8).
-                // The executor's entry (llama.cpp-3460) is refused by the consumer the ring's index build wrote into
-                // it, not by a claim asked again here (one fact, one source). Its reader is the executor's dequant
-                // kernel, a plain kernel on this same in-order compute queue, which writes the executor's f16 weight
-                // slot; oneDNN reads only that slot, never the ring's. The dequant is ordered like the route's kernel:
-                // it waits for the copy into the slot (the entry's ready event), and a rewrite of the slot waits for
-                // the region's read gate, the barrier the executor submits on this queue behind the dequants of the
-                // window the region last held (moe_stream_phase::window_done), or for a barrier submitted at the
-                // refill when none was recorded (moe_stream_phase::stage_window). Leaving it to the route core keeps
-                // that core's HOST answer for the expert, which the executor's expert loop defers to its window and
-                // its phase loop takes to the stage table (resolve_deferred_expert), and a batch the executor declines
-                // reaches the per-expert path's CPU route for it instead of a staged slot that path cannot read. On a
-                // weight the executor takes whole (executor_takes_weight) the entry is the executor's handoff, counted
-                // apart from the refusals. The window ring stages windows only for layers the executor claims whole,
-                // so an EXECUTOR entry on a layer it does not claim is not expected; if one appears, CLAIMED is a
-                // refusal: the expert runs on the CPU, its copy wasted.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
-                    if (s->consumer == moe_stream_consumer::EXECUTOR) {
-                        return moe_staged_route_refusal::CLAIMED;
-                    }
                     const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);
                     if (by_cap != moe_staged_route_refusal::NONE) {
                         refusal_detail = cap.reason;
@@ -37299,11 +37304,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     }
                     return moe_staged_route_refusal::NONE;
                 }();
-                if (refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()) {
-                    moe_stream->count_executor_handoff();
-                } else {
-                    moe_stream->count_staged_route(refusal, refusal_detail);
-                }
+                moe_stream->count_staged_route(refusal, refusal_detail);
                 if (refusal == moe_staged_route_refusal::NONE) {
                     return staged;
                 }
@@ -37402,7 +37403,6 @@ bool test_moe_stream_insert_staged(ggml_backend_t     backend,
                                    int                layer,
                                    int                expert_id,
                                    expert_tensor_role role,
-                                   mem_handle         soa,
                                    mem_handle         aos,
                                    sycl::event        ready,
                                    ggml_layout_mode   layout,
@@ -37415,7 +37415,6 @@ bool test_moe_stream_insert_staged(ggml_backend_t     backend,
         ctx->moe_stream.reset(new moe_stream_phase());
     }
     moe_stream_staged entry;
-    entry.soa      = std::move(soa);
     entry.aos      = std::move(aos);
     entry.ready    = ready;
     entry.layout   = layout;

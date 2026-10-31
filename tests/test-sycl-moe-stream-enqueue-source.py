@@ -197,7 +197,7 @@ HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan ="
 COPY_DECL = "copied = mem_copy_async("
 REORDER_CALL = "ggml_sycl_reorder_weight_gpu("
 RETAIN = "retain_handles_until_event({ aos, host }, copied);"
-TABLE_WRITE = "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
+TABLE_WRITE = "table_[key] = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
 ABORT = 'GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());'
 RETHROW = "catch (const ggml_sycl_fallback_error &) { throw; }"
 TRACE_FMT = "[MOE-EXEC-TRACE] stage window layer %d role %s phase %zu: %d items %zu bytes"
@@ -369,16 +369,16 @@ def test_window_entry_mutants():
     assert not c(mutate(PHASE, RETAIN, "retain_handles_until_event({ aos, host }, ring_->current_region_gate());"))
     # Tagged SOA: a reader would read the slot as a layout it does not hold.
     assert not c(mutate(PHASE, TABLE_WRITE, TABLE_WRITE.replace("MOE_STREAM_RING_SLOT_LAYOUT", "GGML_LAYOUT_SOA")))
-    # A SOA slot named that no reorder wrote.
+    # The retired SOA slot back in the entry.
     assert not c(mutate(PHASE, TABLE_WRITE,
-                        "table_[key] = { aos, aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"))
+                        "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"))
     # The entry's event the region's gate instead of the copy.
     assert not c(mutate(PHASE, TABLE_WRITE,
-                        "table_[key] = { mem_handle(), aos, ring_->current_region_gate(), MOE_STREAM_RING_SLOT_LAYOUT, "
+                        "table_[key] = { aos, ring_->current_region_gate(), MOE_STREAM_RING_SLOT_LAYOUT, "
                         "item.consumer };"))
     # The consumer dropped: the entry would read as the staged route's.
     assert not c(mutate(PHASE, TABLE_WRITE,
-                        "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT };"))
+                        "table_[key] = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT };"))
 
 
 def claim_submission_failure_aborts(phase: str) -> bool:
@@ -955,8 +955,8 @@ PRIMARY_ENTRY_TAIL = "return ggml_sycl_moe_tensor_plan_primary_layout(*plan_owne
 PLAN_READERS = ("ggml_sycl_cache_plan_owner(", "coherent_placement_plan_owner(", "coherent_cache_placement_plan_owner(",
                 "global_placement_plan_owner(", "ggml_sycl_global_plan_owner(", "get_unified_cache_for_device(")
 LIBRARY_CLAIMS_FILL = "call.op.library_claims = ggml_sycl_moe_stream_library_claims;"
-ROUTE_CONSUMER_REFUSAL = ("if (s->consumer == moe_stream_consumer::EXECUTOR) { "
-                          "return moe_staged_route_refusal::CLAIMED; }")
+# The staged route turns the executor's entry away first, by its consumer (llama.cpp-q2ln).
+ROUTE_CONSUMER_REFUSAL = "if (s != nullptr && s->consumer == moe_stream_consumer::EXECUTOR) {"
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 ITEM_DEFAULT_NONE = "moe_stream_staging staging = moe_stream_staging::NONE;"
@@ -1023,7 +1023,7 @@ def test_library_claim_mutants():
     # The backend leaves the predicate unset: no weight would ever stage for the executor.
     assert not c(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
     # The route serves the executor's entries, so a library-free reader is no longer the only one it hands them to.
-    assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, ""), PLAN_HPP, PHASE)
+    assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, "if (false) {"), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
     # A claimed matrix whose consumer stays the route's: the route would refuse nothing and serve it.

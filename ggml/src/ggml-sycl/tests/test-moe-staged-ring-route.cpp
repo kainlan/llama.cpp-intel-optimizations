@@ -15,25 +15,21 @@
 //    answers and the counts do not move.
 // 3. An expert with no entry falls through to the route core, uncounted.
 // 4. Each slot resolves with the layout it was acquired for (lead ruling
-//    c-o9uw-1), and the tag check alone decides between two entries that differ
-//    in nothing else. The SOA case is MXFP4, the one type a prompt kernel reads
-//    as SOA (MMVQ_COMPAT): no plan is published, so the oneDNN batched executor
-//    claims nothing. A MXFP4 SOA entry over the SOA slot is served from it, with
-//    layout SOA. The same entry naming the AOS-tagged slot as its SOA slot is
-//    refused and counted. So is a Q4_0 AOS entry over the SOA-tagged slot, which
-//    the capability query alone would serve. A Q4_0 SOA entry over the
-//    SOA-tagged slot agrees with its tag but is refused all the same: the only
-//    prompt kernel that reads Q4_0 as SOA is the oneDNN batched prompt executor
-//    (llama.cpp-348c), and a staged slot is served only with MMVQ_COMPAT
-//    (c-las5), so the staged route refuses the kernel. The phase's refusals name
-//    each cause, as the trace prints them: two layout refusals and one kernel
-//    refusal, with the query's reason (plan Task 8). A Q4_0 AOS entry over the
-//    AOS slot whose consumer is the batched prompt executor (llama.cpp-3460) is
-//    one the route would serve in every other respect, as case 1 shows, so only
-//    the entry's consumer refuses it, as claimed, and the build falls through to
-//    the route core; in a prompt that core answers HOST, and the executor reads
-//    the slot itself. The weight has no index entry, so the executor does not
-//    take it whole and the entry counts as a refusal, not a handoff.
+//    c-o9uw-1), and the route refuses an entry whose slot's tag is not the
+//    entry's layout. Every entry's slot is its AOS slot (the ring stages AOS
+//    only). A MXFP4 entry naming layout SOA over the AOS-tagged slot, which the
+//    capability query would serve (MXFP4 is the one type a prompt kernel reads
+//    as SOA, MMVQ_COMPAT, and no plan is published, so nothing claims it), is
+//    refused by the tag check and counted. So is a Q4_0 AOS entry over the
+//    SOA-tagged slot, which the capability query alone would serve. The phase's
+//    refusals name each cause, as the trace prints them (plan Task 8). A Q4_0
+//    AOS entry over the AOS slot whose consumer is the batched prompt executor
+//    (llama.cpp-3460) is one the route would serve in every other respect, as
+//    case 1 shows, so only the entry's consumer refuses it, as claimed, before
+//    any slot is resolved (llama.cpp-q2ln), and the build falls through to the
+//    route core; in a prompt that core answers HOST, and the executor reads the
+//    slot itself. The weight has no index entry, so the executor does not take
+//    it whole and the entry counts as a refusal, not a handoff.
 // 5. Two micro-batches: after begin_ubatch the first entry is gone, and an
 //    entry for the same expert in another slot is served from that slot, whose
 //    bytes differ from the first one's by construction.
@@ -193,7 +189,7 @@ int main() {
     (void) get_unified_cache_for_device(device);
 
     // A Q4_0 expert tensor of the stream phase's layer and role, with no data and no cache entry, and a MXFP4 one of
-    // the same layer, role and shape for the SOA cases.
+    // the same layer, role and shape for the SOA-tag case.
     ggml_init_params params  = { 4 * ggml_tensor_overhead(), nullptr, true };
     ggml_context *   tctx    = ggml_init(params);
     ggml_tensor *    src0    = ggml_new_tensor_3d(tctx, GGML_TYPE_Q4_0, 256, 64, 8);
@@ -231,15 +227,13 @@ int main() {
         const int32_t miss_ids[]    = { 6, 6 };
         const int32_t tag_ids[]     = { 7, 7 };
         const int32_t soa_tag_ids[] = { 2, 2 };
-        const int32_t soa_q4_ids[]  = { 4, 4 };
         const int32_t claimed_ids[] = { 1, 1 };
         size_t        served = 0, refused = 0;
 
         // The build results hold slot leases; they all go before the ring is released below.
         {
             // Case 1: served. The insert makes the backend's phase.
-            CHECK(test_moe_stream_insert_staged(backend, kLayer, kExpert, role, mem_handle(), slot_a, fill_a,
-                                                GGML_LAYOUT_AOS),
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, kExpert, role, slot_a, fill_a, GGML_LAYOUT_AOS),
                   "an AOS entry goes into the backend's stage table");
             const moe_resolved_batch_result first =
                 test_moe_staged_ring_build(backend, src0, prompt_ids, 2, 1, GGML_LAYOUT_AOS);
@@ -270,52 +264,30 @@ int main() {
             // Case 4: the slots carry the layouts they were acquired for.
             CHECK(slot_a.resolve(device).layout == GGML_LAYOUT_AOS && slot_s.resolve(device).layout == GGML_LAYOUT_SOA,
                   "slot A resolves as AOS and slot S as SOA, the layouts they were acquired for");
-            // A MXFP4 SOA entry over the SOA slot: the tags agree, a prompt kernel reads MXFP4 as SOA and nothing
-            // claims the weight, so it is served from the SOA slot.
-            CHECK(test_moe_stream_insert_staged(backend, kLayer, 6, role, slot_s, slot_a, fill_s, GGML_LAYOUT_SOA),
-                  "a SOA entry goes into the stage table");
-            const moe_resolved_batch_result soa =
-                test_moe_staged_ring_build(backend, src0_mx, miss_ids, 2, 1, GGML_LAYOUT_SOA);
-            check_served(q, device, soa, 6, GGML_LAYOUT_SOA, slot_s, fill_s, 0x33, "MXFP4 SOA entry");
-            counts(backend, &served, &refused);
-            CHECK(served == 2 && refused == 0, "the SOA entry is served (served %zu, refused %zu)", served, refused);
-            // The same entry naming the AOS-tagged slot as its SOA slot: type, kernel and claim are as above, so only
-            // the tag check can refuse it.
-            CHECK(test_moe_stream_insert_staged(backend, kLayer, 2, role, slot_a, slot_a, fill_a, GGML_LAYOUT_SOA),
+            // A MXFP4 entry naming layout SOA over the AOS-tagged slot: the capability query serves MXFP4 as SOA and
+            // nothing claims the weight, so only the tag check can refuse it.
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, 2, role, slot_a, fill_a, GGML_LAYOUT_SOA),
                   "a SOA entry over an AOS-tagged slot goes into the stage table");
             const moe_resolved_batch_result soa_mistagged =
                 test_moe_staged_ring_build(backend, src0_mx, soa_tag_ids, 2, 1, GGML_LAYOUT_SOA);
             CHECK(!soa_mistagged, "a SOA entry whose slot carries AOS is refused and falls through (reject %s)",
                   moe_batch_reject_reason_name(soa_mistagged.reject));
             counts(backend, &served, &refused);
-            CHECK(served == 2 && refused == 1, "the SOA tag refusal is counted (served %zu, refused %zu)", served,
+            CHECK(served == 1 && refused == 1, "the SOA tag refusal is counted (served %zu, refused %zu)", served,
                   refused);
             // An AOS entry over the SOA-tagged slot: the query would serve Q4_0 as AOS, the tag check refuses it.
-            CHECK(
-                test_moe_stream_insert_staged(backend, kLayer, 7, role, mem_handle(), slot_s, fill_s, GGML_LAYOUT_AOS),
-                "an AOS entry over a SOA-tagged slot goes into the stage table");
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, 7, role, slot_s, fill_s, GGML_LAYOUT_AOS),
+                  "an AOS entry over a SOA-tagged slot goes into the stage table");
             const moe_resolved_batch_result mistagged =
                 test_moe_staged_ring_build(backend, src0, tag_ids, 2, 1, GGML_LAYOUT_AOS);
             CHECK(!mistagged && mistagged.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
                   "an entry whose slot carries another layout is refused and falls through (reject %s)",
                   moe_batch_reject_reason_name(mistagged.reject));
             counts(backend, &served, &refused);
-            CHECK(served == 2 && refused == 2, "the tag refusal is counted (served %zu, refused %zu)", served, refused);
-            // A Q4_0 SOA entry over the SOA-tagged slot: the tags agree, but the only prompt kernel that reads Q4_0 as
-            // SOA is the oneDNN batched executor (ONEDNN_BATCHED_PROMPT, llama.cpp-348c), and a staged slot is served
-            // only with MMVQ_COMPAT, so the staged route refuses the kernel before the tag is looked at.
-            CHECK(test_moe_stream_insert_staged(backend, kLayer, 4, role, slot_s, slot_a, fill_s, GGML_LAYOUT_SOA),
-                  "a Q4_0 SOA entry over the SOA-tagged slot goes into the stage table");
-            const moe_resolved_batch_result soa_q4 =
-                test_moe_staged_ring_build(backend, src0, soa_q4_ids, 2, 1, GGML_LAYOUT_SOA);
-            CHECK(!soa_q4, "a Q4_0 SOA entry is refused and falls through (reject %s)",
-                  moe_batch_reject_reason_name(soa_q4.reject));
-            counts(backend, &served, &refused);
-            CHECK(served == 2 && refused == 3, "the Q4_0 SOA refusal is counted (served %zu, refused %zu)", served,
-                  refused);
+            CHECK(served == 1 && refused == 2, "the tag refusal is counted (served %zu, refused %zu)", served, refused);
             // A Q4_0 AOS entry over the AOS slot, as case 1's, that the batched executor consumes: only the consumer
             // refuses it.
-            CHECK(test_moe_stream_insert_staged(backend, kLayer, 1, role, mem_handle(), slot_a, fill_a, GGML_LAYOUT_AOS,
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, 1, role, slot_a, fill_a, GGML_LAYOUT_AOS,
                                                 /*executor_consumer=*/true),
                   "an AOS entry the batched executor consumes goes into the stage table");
             const moe_resolved_batch_result claimed =
@@ -324,7 +296,7 @@ int main() {
                   "an entry the executor consumes is refused and falls through to the route core (reject %s)",
                   moe_batch_reject_reason_name(claimed.reject));
             counts(backend, &served, &refused);
-            CHECK(served == 2 && refused == 4, "the consumer refusal is counted (served %zu, refused %zu)", served,
+            CHECK(served == 1 && refused == 3, "the consumer refusal is counted (served %zu, refused %zu)", served,
                   refused);
             // The phase has no index entry for the weight, so the executor does not take it whole: the entry is a
             // refusal, not a handoff.
@@ -332,10 +304,8 @@ int main() {
             CHECK(n_handed_off == 0, "an executor entry on a weight the executor does not take is no handoff (%zu)",
                   n_handed_off);
             const std::string causes = refusals(backend);
-            CHECK(causes == "layout=2 kernel(local-onednn-batched-prompt)=1 claimed=1",
-                  "the refusals name their causes: two layout, one kernel with the query's reason, one claimed "
-                  "(got \"%s\")",
-                  causes.c_str());
+            CHECK(causes == "layout=2 claimed=1",
+                  "the refusals name their causes: two layout, one claimed (got \"%s\")", causes.c_str());
 
             // Case 5: the next micro-batch starts with an empty table and reads its own slot.
             CHECK(test_moe_stream_begin_ubatch(backend, 2), "the next micro-batch begins");
@@ -344,8 +314,7 @@ int main() {
             CHECK(!stale && stale.reject == moe_batch_reject_reason::ROUTE_UNAVAILABLE,
                   "after begin_ubatch the first micro-batch's entry is gone (reject %s)",
                   moe_batch_reject_reason_name(stale.reject));
-            (void) test_moe_stream_insert_staged(backend, kLayer, kExpert, role, mem_handle(), slot_b, fill_b,
-                                                 GGML_LAYOUT_AOS);
+            (void) test_moe_stream_insert_staged(backend, kLayer, kExpert, role, slot_b, fill_b, GGML_LAYOUT_AOS);
             const moe_resolved_batch_result second =
                 test_moe_staged_ring_build(backend, src0, prompt_ids, 2, 1, GGML_LAYOUT_AOS);
             check_served(q, device, second, kExpert, GGML_LAYOUT_AOS, slot_b, fill_b, 0x22, "micro-batch 2");
@@ -386,8 +355,7 @@ int main() {
         const int32_t n = static_cast<int32_t>(src0->ne[2]);
         {
             const int32_t prompt_ids[] = { kExpert, kExpert };
-            CHECK(test_moe_stream_insert_staged(backend, kLayer, kExpert, role, mem_handle(), slot, fill,
-                                                GGML_LAYOUT_AOS),
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, kExpert, role, slot, fill, GGML_LAYOUT_AOS),
                   "an AOS entry over the phase's slot goes into the stage table");
             const moe_resolved_batch_result r =
                 test_moe_staged_ring_build(backend, src0, prompt_ids, 2, 1, GGML_LAYOUT_AOS);
