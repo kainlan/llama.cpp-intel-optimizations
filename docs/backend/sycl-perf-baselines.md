@@ -658,6 +658,63 @@ every arm, `Shmem` flat at 1.45 GB; `llama.cpp-qov5` c-c774). A record, not a ba
 differ by Tasks 5, 11 and 8 (`llama.cpp-a64a`, `llama.cpp-am87`, `llama.cpp-ny6i`): the per-slot reserve moved the
 ring's engagement from the twelfth boundary to the fourth and pp2048 from 56.4 to 66.5; the floors remain unmet.
 
+#### Record at 671279356, the window ring with 8p5x/384v/86bl merged (2026-10-31 03:44-04:11 EDT, Task 10 run r7)
+
+The gate re-run for Task 10 (`llama.cpp-qov5`, comments c-1hc8, c-7vb3 and c-4m7d), by the lead, from the merge tree
+at master 671279356 with a build made after that commit. "r7" is the seventh Task 10 gate launch of this session: r1
+to r4 are the 0f1d9172c record, r5 is the 4229a205d record, and r6 was refused for a stale binary and is not a run.
+The tree contains the three merges that landed since 4229a205d: `llama.cpp-8p5x`, `llama.cpp-384v` and
+`llama.cpp-86bl`. All arms ran with the gate's defaults, 200 and 500 for the PP floors. The Qwen3.8 arms and `MI_b70`
+ran on the Arc Pro B70 (`level_zero:0`), and `GO_gate`, `GO_pp`, `GO_noc` and `MI_b50` on the Arc Pro B50
+(`level_zero:1`) (c-4tfx corrects c-4m7d). Host load read 13.4-21.8, `builders_pre` and `builders_post` were 0 in
+every arm, `Shmem` went 0.58 -> 0.61 GB, and the kernel log shows 0 GT-reset/guc_id/CAT-error lines (`journalctl -k`
+since 03:40, read 04:20). The Qwen placement lines were `MoE experts: 42633 on device, 31095 on host` (first context)
+and `37962 on device, 35766 on host` (second), 23 host layers in the default-ub Qwen arms (`Q_pp_ub2048` reports
+layers=38, because the explicit `-ub 2048` placement demotes more experts to the host; c-4tfx). The gate's own summary
+reads `verdicts_pass=10 verdicts_fail=3 not_exercised_or_unscored=0`, with four arms RECORDED and not scored; every
+arm returned rc=0 and the script itself exits 1 because arms FAILed. The ring engaged on every layer-ubatch in every
+PP arm with 0 refusals, and with 0 misses where the arm's line reports them (not `Q_staged`, which reports
+`trace_misses=0`). The explicit `-ub 2048` arm placed without a refusal (`llama.cpp-86bl`).
+
+**This is a record, not a baseline for the Qwen prefill figures**: the 200/500 floors are unmet with the ring fully
+engaged, and the attribution is `llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`. The three FAILs are `Q_pp`,
+`Q_pp_ub2048` and `GO_pp`. `GO_pp` failed on both items: pp512 is the `llama.cpp-zuze` master regression, and tg128
+39.2 is above the 31.0-33.0 band, which is a baseline question for that ticket's neighbourhood and not a Task 10
+defect (c-4m7d). Q_pp_cpu reads 16.0 and 47.5 on this tree, so the ring is 4.8x and 1.6x over the CPU executor.
+
+Against the 4229a205d record (c-4m7d): Q_pp pp512 30.9 ± 29.39 -> 76.5 ± 0.17, because the straddle is gone and the
+ring engages on the first context with no loan (`llama.cpp-86bl`, `llama.cpp-384v`); pp2048 66.5 -> 75.7; Q_pp_ub2048
+planner refusal -> 87.8 with the ring on all 152 layer-ubatches; Q_staged NOT_EXERCISED -> PASS; Q_tg 4.10 (with a
+loan) -> 18.43 (no loan); Q_noc 11.63 -> 17.81; Q_pp_cpu pp2048 32.5 -> 47.5, which is host state and not a change
+this record can attribute. The floors in the table are the gate's defaults as carried in the earlier records in this
+file: c-c774 and c-xkq4 for 200/500, 11.0 and 9.5, and the `Q_tok_cpu` and `Q_decline` rules as in the earlier tables.
+The `Q_staged` cell is the plan's `ring_engaged=yes` and `trace_misses=0` criterion (c-7vb3), and the control arms'
+count rules (`GO_gate`, `GO_noc`, `MI_b70`, `MI_b50`, `resets`) are as in the earlier tables. The `GO_pp` reference
+figures (827.4, 871, the 31.0-33.0 band, 32.0) come from the gate's own `GO_pp` line (c-7vb3) and c-4m7d.
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
+| Q_pp | pp512 t/s | 76.5 ± 0.17 | 200 | FAIL | 0 | ub=512 layers=23 summary=2 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=460 loan_exercised=no windows=3393 exposed=460 misses=0 trace_misses=NA |
+| Q_pp | pp2048 t/s | 75.7 ± 0.28 | 500 | FAIL | 0 | same run |
+| Q_pp_ub2048 | pp2048 t/s | 87.8 ± 0.67 | 500 | FAIL | 0 | ub=2048 layers=38 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=152 loan_exercised=no windows=1644 exposed=152 misses=0 trace_misses=NA; pp512=NA; placed with no refusal (`llama.cpp-86bl`) |
+| Q_staged | ring_layers | 23 | ring_engaged=yes and trace_misses=0 | PASS | 0 | executor_dispatches=282 ring_layer_dispatches=138 pp_moe_arm_f16_lines=7 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=46 trace_misses=0 |
+| Q_pp_cpu | pp512 t/s | 16.02 | - | RECORDED | 0 | layers=23 forced_cpu_lines=23 rc=0 |
+| Q_pp_cpu | pp2048 t/s | 47.49 | - | RECORDED | 0 | same run |
+| Q_tok | md5 | 2a6c2cf6 | - | RECORDED | 0 | auto load 1, rc=0 |
+| Q_tok_2 | md5 | 9577403b | - | RECORDED | 0 | auto load 2, rc=0 |
+| Q_tok_cpu_1 | md5 | 2a6c2cf6 | - | RECORDED | 0 | cpu load 1, rc=0 |
+| Q_tok_cpu | md5 | - | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=2 min_prefix=154 auto_md5=2a6c2cf6,9577403b cpu_md5=2a6c2cf6,9577403b auto_flip=yes cpu_flip=yes |
+| Q_tg | tg t/s | 18.43 | 11.0 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised loan_exercised=no ring_engaged=yes bulk_refill=not_owed |
+| Q_noc | tg t/s | 17.81 | 9.5 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised loan_exercised=no ring_engaged=yes bulk_refill=not_owed |
+| Q_decline | md5 | 9577403b | md5 equals Q_tok or Q_tok_2 | PASS | 0 | decline_lines=1 declined_layers=1 summary_cpu=35 ref_md5=2a6c2cf6,9577403b ref_layer20=ring layers=31 kv_rejected=0 wrong_device=0 rc=0 |
+| GO_gate | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| GO_pp | pp512 t/s | 813.8 ± 5.78 | 827.4 (95 % of 871) | FAIL | 0 | `llama.cpp-zuze`: master regression; ref_pp512=871 |
+| GO_pp | tg128 t/s | 39.2 ± 0.11 | 31.0-33.0 (32.0 ± 3 %) | FAIL | 0 | above the band; the gate's tg check is two-sided and it reported `tg128=39.2>33.0` inside the GO_pp FAIL line (c-4m7d corrects c-7vb3's reading); ref_tg128=32.0 |
+| GO_noc | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | |
+
 #### Copy overlap: does a cache-queue H2D copy overlap a compute kernel? (`llama.cpp-efck`, 2026-10-24)
 
 `test-sycl-copy-overlap` times 16 x 4 MiB pinned H2D copies alone and then concurrent with a spin kernel on the compute
