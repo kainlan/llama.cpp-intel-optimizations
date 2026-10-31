@@ -768,6 +768,54 @@ int main() {
         }
     }
 
+    // 13. How many experts a windowed op's phase holds, and how many phases a layer runs. A phase spans every active
+    // expert of the dispatch, device-resident and host, while its ring window stages only the phase's host matrices of
+    // one role. So the cap is the f16 slot's phase, G_plan, never the region's slots, min(role_items_max, G_plan), and
+    // the f16 group size still bounds it while the two are separate formulas.
+    {
+        struct phase_case {
+            size_t       per_group, cap, active, want_per, want_phases;
+            const char * name;
+        };
+
+        const phase_case phase_cases[] = {
+            { 20, 20, 60, 20, 3,  "3 host matrices per role, G_plan 20: ceil(60 / 20) phases, not ceil(60 / 3)" },
+            { 20, 20, 20, 20, 1,  "every active expert in one phase of G_plan"                                  },
+            { 3,  3,  60, 3,  20, "G_plan 3 (at or below the host matrices per role): phases unchanged"         },
+            { 8,  20, 60, 8,  8,  "an f16 group smaller than G_plan bounds the phase"                           },
+            { 20, 8,  60, 8,  8,  "G_plan smaller than the f16 group bounds the phase"                          },
+            { 20, 0,  60, 0,  0,  "no window: no phase experts, which the executor asserts against"             },
+            { 0,  20, 60, 0,  0,  "no f16 group: no phase experts"                                              },
+            { 20, 20, 0,  20, 0,  "no active expert: no phase"                                                  },
+        };
+        for (const auto & c : phase_cases) {
+            const size_t per = moe_pp_batched_phase_experts(c.per_group, c.cap);
+            const size_t n   = moe_pp_batched_phase_count(c.active, per);
+            if (per != c.want_per || n != c.want_phases) {
+                std::printf("FAIL: phase experts for: %s: got %zu experts, %zu phases; want %zu, %zu\n", c.name, per, n,
+                            c.want_per, c.want_phases);
+                ++failures;
+            }
+        }
+        // Over a grid: the phases cover every active expert with none empty, and no phase exceeds either bound.
+        for (size_t per_group = 1; per_group <= 24; ++per_group) {
+            for (size_t cap = 1; cap <= 24; ++cap) {
+                for (size_t active = 1; active <= 64; ++active) {
+                    const size_t per = moe_pp_batched_phase_experts(per_group, cap);
+                    const size_t n   = moe_pp_batched_phase_count(active, per);
+                    const bool   ok  = per >= 1 && per <= per_group && per <= cap && (per == per_group || per == cap) &&
+                                    n * per >= active && (n - 1) * per < active;
+                    if (!ok) {
+                        std::printf(
+                            "FAIL: phase experts break an invariant at group=%zu cap=%zu active=%zu: %zu, %zu\n",
+                            per_group, cap, active, per, n);
+                        ++failures;
+                    }
+                }
+            }
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;

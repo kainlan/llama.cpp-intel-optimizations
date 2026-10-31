@@ -23,6 +23,7 @@
 // that refuses with a shortfall, with stub hooks for the backend's loan request and its boundary runner's REFUSED
 // count, and drives the helper ring_ready() calls, moe_stream_loan_on_short_reserve.
 
+#include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-stream-plan.hpp"
 
 #include <algorithm>
@@ -537,6 +538,73 @@ void test_window_timing_records_one_record_per_window_only_under_trace() {
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=50 exposed=0 submit_us=2 "
               "copy_us=-1 readers_wait_us=-1 start_lag_us=-1 launches=0");
     CHECK(copy_queries == 0);
+}
+
+// A phase spans every active expert of the dispatch, device-resident and host, and its window stages only the phase's
+// host matrices of one role. So the executor caps a phase at G_plan, the experts the f16 slot's phase holds
+// (moe_stream_phase_experts), not at the region's slots, min(role_items_max, G_plan). With 3 host matrices per role and
+// G_plan 8, the 8 active experts run as one phase, not three, and each of its windows still fits the region. With
+// G_plan at or below the host matrices per role the region is G_plan, and the phases are what they always were.
+void test_phase_holds_g_plan_not_the_region(const placement_plan & plan) {
+    const size_t expert_f16 = static_cast<size_t>(kCols) * static_cast<size_t>(kRows) * 2;
+
+    struct phase_case {
+        size_t       fit;     // the f16 slot holds this many experts
+        uint32_t     g_plan;  // fit >= 2 ? fit / 2 : fit
+        uint32_t     region;  // min(role_items_max 3, G_plan)
+        size_t       phases;  // ceil(8 active / phase experts)
+        const char * name;
+    };
+
+    const phase_case cases[] = {
+        { 16, 8, 3, 1, "G_plan above the host matrices per role: one phase of every active expert"       },
+        { 4,  2, 2, 4, "G_plan below the host matrices per role: the region is G_plan, phases unchanged" },
+    };
+    const int32_t active[kExperts] = { 0, 1, 2, 3, 4, 5, 6, 7 };  // experts 1, 5 and 6 are on the host
+    for (const phase_case & c : cases) {
+        ggml_sycl::moe_stream_window_hints hints;
+        hints.weight_slot_bytes = c.fit * expert_f16;
+        const moe_stream_plan_index idx =
+            ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels_soa_q4, nullptr, claims_all, hints);
+        // The ring the phase would hold: two regions of window_slots slots, as moe_stream_ring_size shapes it.
+        ggml_sycl::moe_stream_ring_geometry geo;
+        geo.slot_bytes   = 4096;
+        geo.region_slots = idx.window_slots;
+        geo.n_slots      = 2 * idx.window_slots;
+        geo.bytes        = geo.n_slots * geo.slot_bytes;
+
+        const uint32_t                  cap = ggml_sycl::moe_stream_phase_experts(idx, geo);
+        const moe_pp_batched_f16_groups groups =
+            moe_pp_batched_f16_plan_groups(c.fit * expert_f16, expert_f16, static_cast<size_t>(kExperts), 0);
+        const size_t per = moe_pp_batched_phase_experts(groups.experts_per_group, cap);
+        const size_t n   = moe_pp_batched_phase_count(static_cast<size_t>(kExperts), per);
+        const bool   ok  = idx.role_items_max == 3 && idx.window_experts == c.g_plan && idx.window_slots == c.region &&
+                        cap == c.g_plan && per == c.g_plan && n == c.phases;
+        if (!ok) {
+            std::fprintf(stderr,
+                         "CHECK failed: %s: role_items_max %u G_plan %u window_slots %u cap %u phase experts %zu "
+                         "phases %zu; want 3, %u, %u, %u, %u, %zu\n",
+                         c.name, idx.role_items_max, idx.window_experts, idx.window_slots, cap, per, n, c.g_plan,
+                         c.region, c.g_plan, c.g_plan, c.phases);
+            ++failures;
+        }
+        // No ring geometry, no window: the phase holds nothing from the ring.
+        CHECK(ggml_sycl::moe_stream_phase_experts(idx, ggml_sycl::moe_stream_ring_geometry()) == 0);
+
+        // Every window of every phase fits its region: at most the phase's host matrices of one role.
+        const moe_stream_layer_info * l0 = layer_info(idx, 0);
+        CHECK(l0 != nullptr);
+        for (size_t p = 0; l0 != nullptr && per != 0 && p < n; ++p) {
+            const size_t begin = p * per;
+            const size_t count = std::min(per, static_cast<size_t>(kExperts) - begin);
+            for (expert_tensor_role role : kRoles) {
+                const size_t items = ggml_sycl::moe_stream_window_items(*l0, role, active + begin, count).size();
+                CHECK(items <= geo.region_slots);
+                // The one phase of the first case holds every host matrix of the role: the region exactly.
+                CHECK(c.phases != 1 || items == geo.region_slots);
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -1090,6 +1158,9 @@ int main() {
         rr().window_done(9, 45);
         CHECK(!rr().read_gate[0] && !rr().read_gate[1]);
     }
+
+    // ---- a phase holds G_plan experts, its windows the region's slots ----
+    test_phase_holds_g_plan_not_the_region(plan);
 
     // ---- the per-window timing under GGML_SYCL_MOE_EXEC_TRACE=2 ----
     test_window_timing_records_one_record_per_window_only_under_trace();
