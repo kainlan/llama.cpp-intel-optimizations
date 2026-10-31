@@ -31,8 +31,8 @@ in-memory copy of the normalized source, never a file:
     (ggml_sycl_submit_marker) on timing_queue(), an in-order profiling queue built lazily from the compute queue's
     context and device, and dropped when prepare() takes another compute queue;
   - a mark that fails to submit is caught in its own helper, never by stage_window's copy abort: drop_window_timing
-    turns the timing off for the rest of the phase with one WARN, which the catalog names, and begin_layer does not
-    turn it back on;
+    turns the timing off for every later prompt in the backend context with one WARN, which the catalog names, and
+    begin_layer does not turn it back on;
   - the timeline reads device times only from the marks and the read gate: flush asks end_of() of exactly the start
     mark, the end mark, the gate and the free mark, the record holds no copy event, and the event reader asks for
     command_start and command_end only;

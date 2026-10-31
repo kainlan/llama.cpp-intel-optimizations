@@ -580,10 +580,10 @@ third at every policy and verbosity, the fourth under `ring` only, the aborts al
   window. `-1` means unmeasured: no device times on a mark or on the gate, no copies of the window's own, or no read
   gate (a region's first fill). A prefetched window that never began prints nothing.
 - WARN `[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines from this phase`:
-  `GGML_SYCL_MOE_EXEC_TRACE=2`, at most once per ring phase, when a timing mark, or the timing queue built for it,
-  throws. The window timing then stays off for the rest of the phase and the prompt goes on, because nothing the
-  copies or the readers wait on depends on the marks. The windows recorded before it still print at the next
-  synchronize, with `-1` where a mark is missing.
+  `GGML_SYCL_MOE_EXEC_TRACE=2`, at most once per backend context, when a timing mark, or the timing queue built for
+  it, throws. Window timing then stays off for every later prompt in that context, and the prompt goes on, because
+  nothing the copies or the readers wait on depends on the marks. Windows begun before the failure still print at the
+  next synchronize. The window being begun when a mark failed, and any window it prefetched, print nothing.
 
 **Trace** (`GGML_SYCL_MOE_EXEC_TRACE>=1`, all INFO, in the order a layer-ubatch prints them)
 

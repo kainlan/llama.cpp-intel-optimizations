@@ -319,9 +319,12 @@ void moe_stream_phase::mark_window_end(uint64_t key, const sycl::event & last_co
 }
 
 // A timing mark, or the timing queue built for it, threw. The marks are a diagnostic that nothing the copies or the
-// readers wait on depends on, so the window timing goes off for the rest of this phase, with one warning through the
-// decision log's WARN sink, as the phase's other lines go, and the prompt goes on; begin_layer does not turn it back
-// on. The windows recorded so far still print at the next flush, with -1 where a mark is missing.
+// readers wait on depends on, so the prompt goes on, with one warning through the decision log's WARN sink, as the
+// phase's other lines go. That warning comes at most once per backend context: window timing then stays off for every
+// later prompt in that context, because this phase lives in the backend context and the per-prompt reset does not
+// clear window_marks_failed_, and begin_layer does not turn it back on. Windows begun before the failure still print
+// at the next flush. The window being begun when a mark failed, and any window it prefetched, print nothing: their
+// marks went in while they were staged, before begun(), and begun() records nothing once the timing is off.
 void moe_stream_phase::drop_window_timing(const sycl::exception & e) {
     window_marks_failed_   = true;
     window_timing_.enabled = false;

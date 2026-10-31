@@ -1219,7 +1219,8 @@ class moe_stream_phase {
     // of a queue prepare() dropped: a SYCL event outlives its queue, so those marks stay valid and the next flush
     // reads them.
     std::optional<sycl::queue>              timing_queue_;
-    // A timing mark failed to submit (drop_window_timing()): the window timing stays off for the rest of this phase.
+    // A timing mark failed to submit (drop_window_timing()): window timing then stays off for every later prompt in
+    // this backend context, which holds this phase; the per-prompt reset does not clear this flag.
     bool                                    window_marks_failed_ = false;
     // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
     // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
