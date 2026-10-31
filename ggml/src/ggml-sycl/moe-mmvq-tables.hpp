@@ -9,6 +9,9 @@
 
 #include "ggml.h"
 
+#include <cstddef>
+#include <cstdint>
+
 // Single source of truth for batched-MoE MUL_MAT_ID (type, layout) coverage.
 //
 // Three tables, one invariant and one publication predicate. Two tables describe
@@ -420,6 +423,12 @@ inline moe_pp_batched_f16_groups moe_pp_batched_f16_plan_groups(size_t slot_byte
     }
     plan.groups = (active + plan.experts_per_group - 1) / plan.experts_per_group;
     return plan;
+}
+
+// The experts one group holds when the expert count is unbounded: the window the prompt stream's ring is sized to
+// (moe_stream_window_experts), by the same two-buffer rule and cap. 0 when the slot holds no expert.
+inline size_t moe_pp_batched_f16_window_experts(size_t slot_bytes, size_t expert_bytes, size_t cap) {
+    return moe_pp_batched_f16_plan_groups(slot_bytes, expert_bytes, SIZE_MAX, cap).experts_per_group;
 }
 
 // Whether the f16 arm's phases write one region in turn (two halves alternating, or the one buffer a slot that holds a

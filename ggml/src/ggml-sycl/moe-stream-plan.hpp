@@ -7,6 +7,7 @@
 
 #include "moe-exec-cost.hpp"
 #include "moe-exec-policy.hpp"
+#include "moe-mmvq-tables.hpp"  // moe_pp_batched_f16_window_experts: the window the ring is sized to
 #include "moe-stream-ring.hpp"
 #include "unified-cache.hpp"
 
@@ -215,10 +216,9 @@ static inline int moe_stream_role_slot(expert_tensor_role role) {
 }  // namespace detail
 
 // What the ring's sizing needs from the batched executor (W3 of docs/plans/2026-10-24-prefill-window-ring.md): the
-// planned f16 weight slot it dequantizes a phase into, and the group cap it honours. A phase holds
-// G_plan = fit >= 2 ? fit / 2 : fit experts (fit = slot / one expert's f16 bytes), the executor's own two-buffer rule
-// (moe_pp_batched_f16_plan_groups), capped. 0 slot bytes (a dense model, or before the load publishes the inventory
-// globals) means no window and no ring.
+// planned f16 weight slot it dequantizes a phase into, and the group cap it honours. A phase holds G_plan experts, the
+// executor's own two-buffer rule and cap (moe_pp_batched_f16_window_experts). 0 slot bytes (a dense model, or before
+// the load publishes the inventory globals) means no window and no ring.
 struct moe_stream_window_hints {
     size_t weight_slot_bytes = 0;  // unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device)
     size_t group_cap         = 0;  // ggml_sycl_moe_pp_f16_group_experts_max(); 0 = none
@@ -232,11 +232,7 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
     if (h.weight_slot_bytes == 0 || expert_f16_bytes == 0) {
         return 0;
     }
-    const size_t fit = h.weight_slot_bytes / expert_f16_bytes;
-    size_t       g   = fit >= 2 ? fit / 2 : fit;
-    if (h.group_cap != 0 && g > h.group_cap) {
-        g = h.group_cap;
-    }
+    const size_t g = moe_pp_batched_f16_window_experts(h.weight_slot_bytes, expert_f16_bytes, h.group_cap);
     return g > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(g);
 }
 
