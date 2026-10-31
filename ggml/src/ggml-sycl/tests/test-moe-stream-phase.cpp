@@ -326,54 +326,82 @@ void test_declined_line() {
     CHECK(std::strstr(summary, "summary: 0 layer-ubatches ring, 1 cpu, 0 forced,") != nullptr);
 }
 
-// The per-window timing the phase keeps under GGML_SYCL_MOE_EXEC_TRACE=2, over int events. The file
-// has no fake cache or ring to drive window_begin with, so the test drives the timeline the phase holds over
-// sycl::event, in the order the phase feeds it: stage_window() reports each copy (window_begin of phase 0 copies its
-// own exposed window, then prefetches phase 1), window_begin reports the window, the executor reports its launches,
-// and the synchronize boundary flushes one line per window. The fake profiler answers device submit, start and end
-// times in ns; event 4 has none, as a copy on a queue without profiling.
-bool fake_event_times(int ev, uint64_t * submit_ns, uint64_t * start_ns, uint64_t * end_ns) {
+// The per-window timing the phase keeps under GGML_SYCL_MOE_EXEC_TRACE=2, over int events. The file has no fake cache
+// or ring to drive window_begin with, so the test drives the timeline the phase holds over sycl::event, in the order
+// the phase feeds it: stage_window() marks a window before its first copy, reports each copy and marks the window again
+// behind its last copy (window_begin of phase 0 stages its own exposed window, then prefetches phase 1), window_begin
+// reports the window, the executor reports its launches, and the synchronize boundary flushes one line per window. The
+// fake profiler answers a mark's or a read gate's device command_end in ns. The copies (events 1 to 9) have none, as
+// copies on the unified cache's copy queue, which has no profiling, and the flush must never ask one.
+bool fake_event_end(int ev, uint64_t * end_ns) {
     switch (ev) {
-        case 1:  // window 0's first copy: submitted at 0.5 ms, held by its gate until 0.9 ms, started at 1.0 ms
-            *submit_ns = 500000;
-            *start_ns  = 1000000;
-            *end_ns    = 1400000;
-            return true;
-        case 2:  // window 0's last copy
-            *submit_ns = 500000;
-            *start_ns  = 1400000;
-            *end_ns    = 2000000;
-            return true;
-        case 3:  // window 1's first copy: submitted at 1.5 ms, but the copy ahead of it on the queue ran to 2.0 ms
-            *submit_ns = 1500000;
-            *start_ns  = 2100000;
-            *end_ns    = 2300000;
-            return true;
-        case 5:  // a copy the runtime gave device start and end but no submit time
-            *submit_ns = 0;
-            *start_ns  = 3000000;
-            *end_ns    = 3100000;
-            return true;
         case 10:  // window 0's read gate: the dequants of the window its region last held were done at 0.9 ms
-            *submit_ns = 100000;
-            *start_ns  = 800000;
-            *end_ns    = 900000;
+            *end_ns = 900000;
             return true;
         case 11:  // window 1's read gate
-            *submit_ns = 1000000;
-            *start_ns  = 1900000;
-            *end_ns    = 2080000;
+            *end_ns = 2080000;
             return true;
-        default:
+        case 12:  // the read gate of a later stage of window 1, which the window's record does not keep
+            *end_ns = 3200000;
+            return true;
+        case 20:  // window 0's free mark: every other dependency of its first copy was done at 0.5 ms
+            *end_ns = 500000;
+            return true;
+        case 21:  // window 0's start mark: the gate released the first copy, which could start at 1.0 ms
+            *end_ns = 1000000;
+            return true;
+        case 22:  // window 0's end mark, behind its last copy
+            *end_ns = 2000000;
+            return true;
+        case 23:  // window 1's free mark: behind window 0's last copy, which held the in-order copy queue to 2.0 ms
+            *end_ns = 2000000;
+            return true;
+        case 24:  // window 1's start mark
+            *end_ns = 2100000;
+            return true;
+        case 28:  // the free and start marks of a later stage of window 1, which the window's record does not keep
+            *end_ns = 3000000;
+            return true;
+        case 29:
+            *end_ns = 3500000;
+            return true;
+        case 31:  // micro-batch 8's window 0: its start and end marks
+            *end_ns = 400000;
+            return true;
+        case 32:
+            *end_ns = 1000000;
+            return true;
+        case 34:  // the start and end marks of a window whose free mark (33) has no device times
+            *end_ns = 2100000;
+            return true;
+        case 35:
+            *end_ns = 2300000;
+            return true;
+        case 36:  // a free mark that ended after its gate (10, at 0.9 ms) had: the gate held the copy back not at all
+            *end_ns = 3000000;
+            return true;
+        case 37:
+            *end_ns = 3100000;
+            return true;
+        case 38:
+            *end_ns = 3400000;
+            return true;
+        default:  // every other event, the copies (1 to 9) among them, has no device times
             return false;
     }
 }
 
 void test_window_timing_records_one_record_per_window_only_under_trace() {
     using timeline_t = ggml_sycl::moe_stream_window_timeline<int>;
+    using gate_t     = std::optional<int>;
     std::vector<std::string> lines;
     const auto               sink = [&](const char * line) {
         lines.push_back(line);
+    };
+    int        copy_queries = 0;  // the flush asks the marks and the read gates for times, never a copy
+    const auto end_of       = [&](int ev, uint64_t * end_ns) {
+        copy_queries += ev < 10 ? 1 : 0;
+        return fake_event_end(ev, end_ns);
     };
     const uint32_t w0 = ggml_sycl::moe_stream_window_id(4, expert_tensor_role::UP, 0);
     const uint32_t w1 = ggml_sycl::moe_stream_window_id(4, expert_tensor_role::UP, 1);
@@ -384,63 +412,83 @@ void test_window_timing_records_one_record_per_window_only_under_trace() {
     // As in the region-reads case, every use goes through a volatile pointer so -O3 cannot fold the checks away.
     timeline_t off;
     timeline_t * volatile off_at = &off;
-    const std::optional<int> gate10(10);
-    (*off_at).copied(k0, 1, 1000, gate10);
+    (*off_at).marked(k0, 20, 21, gate_t(10));
+    (*off_at).copied(k0, 1, 1000);
+    (*off_at).ended(k0, 22);
     (*off_at).begun(k0, 4, expert_tensor_role::UP, 0, true, 12.4);
     (*off_at).launched(k0, 3);
     CHECK((*off_at).records.empty());
-    CHECK((*off_at).flush(0, fake_event_times, sink) == 0);
+    CHECK(!(*off_at).queue_tail.has_value());
+    CHECK((*off_at).flush(0, end_of, sink) == 0);
     CHECK(lines.empty());
 
     timeline_t on;
     timeline_t * volatile on_at = &on;
     (*on_at).enabled            = true;
     // window_begin of phase 0: window 0 is not prefetched, so it is staged whole (exposed), then window 1 is prefetched
-    // into the other region, behind its own read gate.
-    (*on_at).copied(k0, 1, 1000, gate10);
-    (*on_at).copied(k0, 2, 1000, gate10);
-    (*on_at).copied(k1, 3, 500, std::optional<int>(11));
-    (*on_at).copied(k1, 4, 500, std::optional<int>(11));
+    // into the other region, behind its own read gate. Each stage marks before its first copy and behind its last.
+    (*on_at).marked(k0, 20, 21, gate_t(10));
+    (*on_at).copied(k0, 1, 1000);
+    (*on_at).copied(k0, 2, 1000);
+    (*on_at).ended(k0, 22);
+    (*on_at).marked(k1, 23, 24, gate_t(11));
+    (*on_at).copied(k1, 3, 500);
+    (*on_at).copied(k1, 4, 500);
+    (*on_at).ended(k1, 25);
+    // The next free mark waits behind the latest copy, which holds the in-order copy queue until it is done.
+    CHECK((*on_at).queue_tail == std::optional<int>(4));
+    // A later stage of window 1 marks again: the record keeps the marks and the gate of the window's first copy.
+    (*on_at).marked(k1, 28, 29, gate_t(12));
     (*on_at).begun(k0, 4, expert_tensor_role::UP, 0, true, 12.4);
     (*on_at).launched(k0, 3);  // two dequants and one GEMM group
     // window_begin of phase 1: prefetched, so it copies nothing of its own.
     (*on_at).begun(k1, 4, expert_tensor_role::UP, 1, false, 3.6);
     (*on_at).launched(k1, 2);
     // A prefetch whose window never began (the op fell back first) is recorded but prints no line.
-    (*on_at).copied(ggml_sycl::moe_stream_window_timing_key(7, w1 + 1), 9, 500, std::optional<int>());
+    const uint64_t k_fell = ggml_sycl::moe_stream_window_timing_key(7, w1 + 1);
+    (*on_at).marked(k_fell, 40, 41, gate_t());
+    (*on_at).copied(k_fell, 9, 500);
+    (*on_at).ended(k_fell, 42);
     CHECK((*on_at).records.size() == 3);
 
-    CHECK((*on_at).flush(0, fake_event_times, sink) == 2);
+    CHECK((*on_at).flush(0, end_of, sink) == 2);
     CHECK(lines.size() == 2);
-    // copy_us spans the first copy's start to the last copy's end (1.0 ms). No copy was queued ahead of window 0, so
-    // the first copy could have started at its submit (0.5 ms): readers_wait_us is the gate's end after that (0.4 ms),
-    // and start_lag_us is the copy's start after the gate's end (0.1 ms).
+    // copy_us spans the start mark's end to the end mark's (1.0 ms). Every other dependency of the first copy was done
+    // when the free mark ended (0.5 ms), so readers_wait_us is the gate's end after that (0.4 ms), and start_lag_us is
+    // the start mark's end after the gate's (0.1 ms).
     CHECK(lines.size() > 0 &&
           lines[0] ==
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 0 bytes=2000 exposed=1 submit_us=12 "
               "copy_us=1000 readers_wait_us=400 start_lag_us=100 launches=3");
-    // The last copy has no device times, so the copy span is unmeasured. Window 0's last copy held the queue until
-    // 2.0 ms, after window 1's submit (1.5 ms), so the gate's end (2.08 ms) cost 0.08 ms of waiting, not 0.58 ms; the
-    // copy started 0.02 ms after the gate.
+    // The end mark has no device times, so the copy span is unmeasured. Window 0's last copy held the copy queue until
+    // 2.0 ms and the free mark waited behind it, so the gate's end (2.08 ms) cost 0.08 ms of waiting; the start mark
+    // ended 0.02 ms after the gate. The later stage's marks and gate (3.0 to 3.5 ms) are never read.
     CHECK(lines.size() > 1 &&
           lines[1] ==
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=1000 exposed=0 submit_us=4 "
               "copy_us=-1 readers_wait_us=80 start_lag_us=20 launches=2");
-    // The flush empties the timeline: the next boundary prints only what came after it.
+    // The flush empties the timeline and keeps the queue's last copy: the next boundary prints only what came after
+    // it, and the first free mark after it still waits behind that copy, the never-begun prefetch's, which may still be
+    // in flight on the in-order copy queue.
     CHECK((*on_at).records.empty());
-    CHECK((*on_at).flush(0, fake_event_times, sink) == 0);
+    CHECK((*on_at).queue_tail == std::optional<int>(9));
+    CHECK((*on_at).flush(0, end_of, sink) == 0);
 
-    // The same window in the next micro-batch is a record of its own: micro-batch 7's window 0, copied again after the
+    // The same window in the next micro-batch is a record of its own: micro-batch 7's window 0, staged again after the
     // flush and never begun, prints nothing, and micro-batch 8's window 0 prints only its own bytes. A window that
     // copied nothing of its own measures neither span.
     const uint64_t k0_next = ggml_sycl::moe_stream_window_timing_key(8, w0);
-    (*on_at).copied(k0, 1, 1000, gate10);
-    (*on_at).copied(k0_next, 2, 700, std::optional<int>());
+    (*on_at).marked(k0, 20, 21, gate_t(10));
+    (*on_at).copied(k0, 1, 1000);
+    (*on_at).ended(k0, 22);
+    (*on_at).marked(k0_next, 30, 31, gate_t());
+    (*on_at).copied(k0_next, 2, 700);
+    (*on_at).ended(k0_next, 32);
     CHECK((*on_at).records.size() == 2);
     (*on_at).begun(k0_next, 4, expert_tensor_role::UP, 0, true, 1.0);
     (*on_at).begun(ggml_sycl::moe_stream_window_timing_key(8, w1), 4, expert_tensor_role::UP, 1, false, 1.0);
     lines.clear();
-    CHECK((*on_at).flush(1, fake_event_times, sink) == 2);
+    CHECK((*on_at).flush(1, end_of, sink) == 2);
     // No read gate (a region's first fill since the ring was reserved): neither the wait nor the lag is measured.
     CHECK(lines.size() > 0 &&
           lines[0] ==
@@ -451,33 +499,44 @@ void test_window_timing_records_one_record_per_window_only_under_trace() {
               "[MOE-EXEC-TRACE] window device 1 layer 4 role up phase 1 bytes=0 exposed=0 submit_us=1 "
               "copy_us=-1 readers_wait_us=-1 start_lag_us=-1 launches=0");
 
-    // The copy queued ahead has no device times, so when the window's copy could have started is unknown: the wait
-    // is unmeasured, while the lag after the gate still is (0.02 ms).
-    const uint64_t k_a = ggml_sycl::moe_stream_window_timing_key(9, w0);
+    // A free mark without device times leaves the wait unmeasured; the copy span (0.2 ms) and the lag after the gate
+    // (0.02 ms) do not use it and are still measured.
     const uint64_t k_b = ggml_sycl::moe_stream_window_timing_key(9, w1);
-    (*on_at).copied(k_a, 4, 100, std::optional<int>());
-    (*on_at).copied(k_b, 3, 200, std::optional<int>(11));
+    (*on_at).marked(k_b, 33, 34, gate_t(11));
+    (*on_at).copied(k_b, 3, 200);
+    (*on_at).ended(k_b, 35);
     (*on_at).begun(k_b, 4, expert_tensor_role::UP, 1, false, 2.0);
     lines.clear();
-    CHECK((*on_at).flush(0, fake_event_times, sink) == 1);
+    CHECK((*on_at).flush(0, end_of, sink) == 1);
     CHECK(lines.size() > 0 &&
           lines[0] ==
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=200 exposed=0 submit_us=2 "
               "copy_us=200 readers_wait_us=-1 start_lag_us=20 launches=0");
-    // The flush also forgets the queue's last copy: a window after the boundary measures from its submit alone.
-    CHECK(!(*on_at).queue_tail.has_value());
 
-    // A copy with no submit time (0) leaves the wait unmeasured instead of reading as the gate's end (2080 us); the
-    // copy span and the lag (0.92 ms) do not use the submit and are still measured.
+    // A gate that was done before the copy's other dependencies held the copy back not at all: the wait clamps at 0,
+    // and the lag (2.2 ms) says what did hold it. A start mark without device times leaves all three spans unmeasured,
+    // whatever the end mark and the gate say.
     const uint64_t k_c = ggml_sycl::moe_stream_window_timing_key(10, w1);
-    (*on_at).copied(k_c, 5, 300, std::optional<int>(11));
+    const uint64_t k_d = ggml_sycl::moe_stream_window_timing_key(11, w1);
+    (*on_at).marked(k_c, 36, 37, gate_t(10));
+    (*on_at).copied(k_c, 5, 300);
+    (*on_at).ended(k_c, 38);
     (*on_at).begun(k_c, 4, expert_tensor_role::UP, 1, false, 2.0);
+    (*on_at).marked(k_d, 20, 39, gate_t(10));
+    (*on_at).copied(k_d, 6, 50);
+    (*on_at).ended(k_d, 22);
+    (*on_at).begun(k_d, 4, expert_tensor_role::UP, 1, false, 2.0);
     lines.clear();
-    CHECK((*on_at).flush(0, fake_event_times, sink) == 1);
+    CHECK((*on_at).flush(0, end_of, sink) == 2);
     CHECK(lines.size() > 0 &&
           lines[0] ==
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=300 exposed=0 submit_us=2 "
-              "copy_us=100 readers_wait_us=-1 start_lag_us=920 launches=0");
+              "copy_us=300 readers_wait_us=0 start_lag_us=2200 launches=0");
+    CHECK(lines.size() > 1 &&
+          lines[1] ==
+              "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=50 exposed=0 submit_us=2 "
+              "copy_us=-1 readers_wait_us=-1 start_lag_us=-1 launches=0");
+    CHECK(copy_queries == 0);
 }
 
 }  // namespace

@@ -33717,8 +33717,8 @@ void ggml_backend_sycl_print_sycl_devices() {
 
 // The MoE executor's knobs (llama.cpp-36j0), parsed once. The backend reads GGML_SYCL_MOE_EXEC and
 // GGML_SYCL_MOE_EXEC_TRACE only here: the trace level (2 runs the load-time host-expert copy probe and prints the
-// per-window timing lines) comes from here too. The unified cache, built before any backend op, parses the level
-// through the same moe_exec_config_parse to decide whether its copy queue records device times.
+// per-window timing lines) comes from here too. The unified cache's copy queue is never profiled, at any level: the
+// window timing reads marker kernels on the ring's own timing queue instead (moe_stream_phase::timing_queue).
 static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {
     static const ggml_sycl::moe_exec_config config = [] {
         ggml_sycl::moe_exec_config c =

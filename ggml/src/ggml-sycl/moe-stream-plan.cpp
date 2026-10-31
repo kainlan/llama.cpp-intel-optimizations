@@ -18,6 +18,9 @@
 #include <cstring>
 #include <exception>
 
+// The window timing's mark, an empty kernel (moe_stream_phase::mark_window_start and mark_window_end).
+class moe_stream_timing_mark;
+
 namespace ggml_sycl {
 
 namespace {
@@ -26,18 +29,18 @@ const char * moe_stream_getenv(const char * name) {
     return std::getenv(name);
 }
 
-// An event's device command_submit, command_start and command_end in ns, for the window timing line; false when the
-// event has none (its queue was built without profiling, or the runtime refuses the query). Read only at the
-// synchronize boundary.
-bool moe_stream_event_times(const sycl::event & ev, uint64_t * submit_ns, uint64_t * start_ns, uint64_t * end_ns) {
+// A mark's or a read gate's device command_end in ns, for the window timing line; false when the event has none (its
+// queue was built without profiling, or the runtime refuses the query). Read only at the synchronize boundary, and
+// never of a copy: the copy queue has no profiling.
+bool moe_stream_event_end(const sycl::event & ev, uint64_t * end_ns) {
+    uint64_t start_ns = 0;
     try {
-        *submit_ns = ev.get_profiling_info<sycl::info::event_profiling::command_submit>();
-        *start_ns  = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
-        *end_ns    = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        start_ns = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        *end_ns  = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
     } catch (const sycl::exception &) {
         return false;
     }
-    return *start_ns != 0 && *end_ns >= *start_ns;
+    return start_ns != 0 && *end_ns >= start_ns;
 }
 
 }  // namespace
@@ -100,8 +103,9 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
     policy_        = op.policy;
-    // The window timing is trace level 2's, like the copy queue's profiling that copy_us reads.
-    window_timing_.enabled = op.log != nullptr && op.log->trace >= 2;
+    // The window timing, and the timing queue its marks go on, are trace level 2's, until a mark, the timing queue or
+    // the records' growth fails (drop_window_timing()).
+    window_timing_.enabled = op.log != nullptr && op.log->trace >= 2 && !window_marks_failed_;
     request_loan_  = op.request_loan;
     loan_refusals_ = op.loan_refusals;
 
@@ -235,8 +239,16 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     if (timed) {
         const double submit_us =
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_begin).count();
-        window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, req.role, req.phase, exposed,
-                             submit_us);
+        // A window with no copies of its own and no prefetch has no record yet, so begun() grows the records here. A
+        // record that cannot grow turns the timing off as a mark's failure does, and that window prints nothing.
+        try {
+            window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, req.role, req.phase,
+                                 exposed, submit_us);
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (const std::exception & e) {
+            drop_window_timing(e);
+        }
     }
     return staged;
 }
@@ -259,7 +271,8 @@ void moe_stream_phase::window_launched(int layer, expert_tensor_role role, size_
 }
 
 // The windows' lines go out at WARN through the decision log's sink: llama-bench drops INFO without -v, and the
-// trace sink is INFO. The caller has waited for the queue, so reading the device times does not wait on compute work.
+// trace sink is INFO. The caller has waited for the compute queue, so every mark of a begun window follows only
+// finished work, and reading the marks' device times does not wait on compute work.
 void moe_stream_phase::flush_window_timing() {
     if (window_timing_.records.empty()) {
         return;
@@ -269,7 +282,85 @@ void moe_stream_phase::flush_window_timing() {
         return;
     }
     moe_exec_decision_log * log = log_;
-    window_timing_.flush(device_, moe_stream_event_times, [log](const char * line) { log->sink(log->sink_ctx, line); });
+    window_timing_.flush(device_, moe_stream_event_end, [log](const char * line) { log->sink(log->sink_ctx, line); });
+}
+
+// The queue the window timing's marks go on: in order and profiling, on the compute queue's context and device, so a
+// mark can wait on a copy and on a read gate and still carries device times. Not the copy queue, which has no
+// profiling, and not the compute queue, whose readers would then wait for the prefetch copies.
+sycl::queue & moe_stream_phase::timing_queue() {
+    if (!timing_queue_) {
+        timing_queue_.emplace(ccs_->get_context(), ccs_->get_device(), default_queue_properties());
+    }
+    return *timing_queue_;
+}
+
+// The window's free and start marks, submitted just before its first copy, so the window's own submit loop does not
+// end them late. `deps` is everything that copy waits on except `gate`, its read gate. The free mark also waits for the
+// copy queued before, since the copy queue is in order; the start mark adds the gate. A later stage of a window already
+// marked submits nothing: marked() keeps the first copy's marks and would discard these. A mark that fails to submit,
+// or a record or the marks' copy of `deps` that cannot grow (std::bad_alloc), is caught here, not by stage_window()'s
+// copy handler: drop_window_timing() turns the timing off and the copies go on. `deps` comes by reference so that its
+// copy is made inside the try; a by-value parameter would be copied at the call site, inside the copy handler's try.
+// A planned refusal (ggml_sycl_fallback_error) is rethrown, as stage_window()'s handler rethrows it.
+void moe_stream_phase::mark_window_start(uint64_t                           key,
+                                         const std::vector<sycl::event> &   deps,
+                                         const std::optional<sycl::event> & gate) {
+    const auto * prior = window_timing_.find(key);
+    if (prior != nullptr && prior->start_marked) {
+        return;
+    }
+    try {
+        std::vector<sycl::event> mark_deps = deps;
+        if (window_timing_.queue_tail) {
+            mark_deps.push_back(*window_timing_.queue_tail);
+        }
+        sycl::queue &     q         = timing_queue();
+        const sycl::event free_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, mark_deps);
+        if (gate) {
+            mark_deps.push_back(*gate);
+        }
+        const sycl::event start_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, mark_deps);
+        window_timing_.marked(key, free_mark, start_mark, gate);
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
+        drop_window_timing(e);
+    }
+}
+
+// The window's end mark, behind its last copy. A failure to submit or record it is caught as the start marks' is;
+// stage_window() calls this after its copy handler's try, so nothing else would catch it.
+void moe_stream_phase::mark_window_end(uint64_t key, const sycl::event & last_copy) {
+    try {
+        window_timing_.ended(key, ggml_sycl_submit_marker<moe_stream_timing_mark>(timing_queue(), { last_copy }));
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
+        drop_window_timing(e);
+    }
+}
+
+// A timing mark, the timing queue built for it, or the records' growth threw. The marks are a diagnostic that nothing
+// the copies or the readers wait on depends on, so the prompt goes on, with one warning through the decision log's
+// WARN sink, as the phase's other lines go. That warning comes at most once per backend context: window timing then
+// stays off for every later prompt in that context, because this phase lives in the backend context and the
+// per-prompt reset does not clear window_marks_failed_, and begin_layer does not turn it back on. Windows begun before
+// the failure still print at the next flush. The window being begun when the timing failed, and any window it
+// prefetched, print nothing: begun() records nothing once the timing is off, and a window whose record could not grow
+// has none.
+void moe_stream_phase::drop_window_timing(const std::exception & e) {
+    window_marks_failed_   = true;
+    window_timing_.enabled = false;
+    if (log_ == nullptr || log_->sink == nullptr) {
+        return;
+    }
+    char line[384];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines in "
+                  "this context",
+                  device_, e.what());
+    log_->sink(log_->sink_ctx, line);
 }
 
 bool moe_stream_phase::region_open() const {
@@ -333,6 +424,10 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     }
     if (!same_queue) {
         ccs_.emplace(ccs);
+        timing_queue_.reset();  // built anew at the next mark, on this queue's context and device
+        // The copy queued before goes too: under a new compute queue it may be another device's copy, which the next
+        // free mark, built on this queue's context, must not wait on.
+        window_timing_.queue_tail.reset();
         // A region's readers, the executor's dequants, run in order on this queue, and its read gates are barriers on
         // it; on any other queue the ring is not offered, and the ring-unavailable diagnostic says so.
         in_order_ = ccs.is_in_order();
@@ -421,6 +516,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
     // has no reader to wait for.
     const bool                 refill_after_readers = region_reads_.window[cur_region_] != UINT32_MAX;
     std::optional<sycl::event> reuse_gate;
+    const uint64_t             timing_key = moe_stream_window_timing_key(ubatch_seq_, window_id);
 
     const int               device     = device_;
     std::vector<uint64_t> & other_keys = region_keys_[1 - cur_region_];
@@ -457,6 +553,10 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
                 reuse_gate = region_reads_.read_gate[cur_region_] ? *region_reads_.read_gate[cur_region_] :
                                                                     ccs_->ext_oneapi_submit_barrier();
             }
+            // Trace level 2: the window's free and start marks, before the gate joins the copy's dependencies.
+            if (window_timing_.enabled && n.staged == 0) {
+                mark_window_start(timing_key, deps, reuse_gate);
+            }
             if (reuse_gate) {
                 deps.push_back(*reuse_gate);
             }
@@ -475,7 +575,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
             // here, so that region's next refill does not drop it.
             other_keys.erase(std::remove(other_keys.begin(), other_keys.end(), key), other_keys.end());
         }
-        window_timing_.copied(moe_stream_window_timing_key(ubatch_seq_, window_id), copied, item.src_bytes, reuse_gate);
+        window_timing_.copied(timing_key, copied, item.src_bytes);
         region_submitted_ = true;
         region_last_      = copied;
         // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader the
@@ -484,6 +584,10 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
         region_keys_[cur_region_].push_back(key);
         n.bytes += item.src_bytes;
         ++n.staged;
+    }
+    // Trace level 2: the window's end mark, behind its last copy.
+    if (window_timing_.enabled && n.staged != 0) {
+        mark_window_end(timing_key, region_last_);
     }
     // A copy went in, so the region's last fill is now this window, with no read gate until its window_done.
     if (n.staged != 0) {
@@ -584,6 +688,9 @@ void moe_stream_phase::teardown(sycl::event last_use) {
     table_.clear();
     reset_regions();
     geo_ = moe_stream_ring_geometry();
+    // The ring is given back, so the next ring's first free mark waits behind no copy of this one. This and a new
+    // compute queue in prepare() are the only places that forget the queue's last copy; a flush keeps it.
+    window_timing_.queue_tail.reset();
 }
 
 // The layer's decision goes to the decision log, its change line and its trace line (moe_exec_decision_log::note). The
@@ -698,6 +805,9 @@ bool moe_stream_phase::test_reserve_ring(int device, const moe_stream_ring_geome
     geo_            = geo;
     reserve_failed_ = false;
     ccs_.emplace(ccs);
+    // As prepare() does: the timing queue and the copy queued before follow the compute queue.
+    timing_queue_.reset();
+    window_timing_.queue_tail.reset();
     in_order_ = ccs.is_in_order();
     return ring_ready(nullptr);
 }

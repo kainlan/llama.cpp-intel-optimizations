@@ -410,8 +410,9 @@ def test_abort_mutants():
     # the enqueue's handler narrowed (the phase has other std::exception handlers, so the mutant names this one)
     assert not claim_submission_failure_aborts(
         mutate(PHASE, "catch (const std::exception & e) { " + ABORT, "catch (const sycl::exception & e) { " + ABORT))
-    # the planned refusal swallowed by the abort
-    assert not claim_submission_failure_aborts(mutate(PHASE, RETHROW + " ", ""))
+    # the planned refusal swallowed by the abort. Scoped to stage_window's body: the window timing's mark helpers
+    # rethrow a planned refusal too, earlier in the file, so a whole-file replace would edit the first of them instead.
+    assert not claim_submission_failure_aborts(in_body(PHASE, STAGE_SIG, RETHROW + " ", ""))
     # the copy moved out of the guarded block
     n = norm(PHASE)
     copy_stmt = n[n.find(COPY_DECL):n.find(";", n.find(COPY_DECL)) + 1]
@@ -1904,8 +1905,10 @@ def test_refused_loan_warn_mutants():
     ungated = mutate(PHASE, LOAN_WARN_GATE, "")
     assert not c(ungated, {PHASE_REL: ungated})
     # The unconverged line re-gated, at the top as before or inside its own branch: a silent refusal under AUTO.
-    regated = mutate(PHASE, LOAN_WARN_NULL, "if (log_ == nullptr || log_->sink == nullptr || "
-                                            "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+    # Scoped to this helper's body, like the never-emitted mutant below: other phase warnings open with the same guard
+    # and emit through the same sink call, so a whole-file replace would edit the first of them instead.
+    regated = in_body(PHASE, LOAN_WARN_SIG, LOAN_WARN_NULL, "if (log_ == nullptr || log_->sink == nullptr || "
+                      "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
     assert not c(regated, {PHASE_REL: regated})
     in_branch = mutate(PHASE, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_IF + " " + LOAN_WARN_GATE)
     assert not c(in_branch, {PHASE_REL: in_branch})
@@ -1925,7 +1928,7 @@ def test_refused_loan_warn_mutants():
                        'bound";')
     assert not c(cap_first, {PHASE_REL: cap_first})
     # Never emitted.
-    silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
+    silent = in_body(PHASE, LOAN_WARN_SIG, LOAN_WARN_EMIT, "(void) line;")
     assert not c(silent, {PHASE_REL: silent})
     # A format restated elsewhere.
     for fmt in (LOAN_WARN_FMT, LOAN_WARN_UNCONVERGED_FMT):
