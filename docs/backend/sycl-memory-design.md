@@ -2828,9 +2828,9 @@ whole or nothing (`placement_explicit_ubatch_compute_room()` and
 `zone_hold_fit_rung_has_compute_room()`). Every other rung, the auto trial's
 included, is judged as before. Without the credit the fit charges the buffer as
 if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
-refused the context: 1993.8 MB of worst-case spill against 1946.2 MB free
+refused the context: 1993.8 MiB of worst-case spill against 1946.2 MiB free
 outside the arena, although the zone held the 1960 MiB buffer beside a term of
-about 2055 MiB. The 256 MB driver headroom is not added to the hold. It is free
+about 2055 MiB. The 256 MiB driver headroom is not added to the hold. It is free
 memory outside the arena, which demoting experts does not change, and the fit
 still requires it there.
 
