@@ -151,7 +151,6 @@ struct moe_stream_layer_info {
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
     int     n_streamable     = 0;  // items the ring gives slots: staging AOS_ONLY
     int     region_slots     = 0;  // the slots its streamable items take: one each
-    size_t  soa_bytes        = 0;  // always 0: the ring reorders nothing (W2); the cost model's reorder input
     size_t  matrix_bytes_max = 0;  // the largest one streamable matrix's slot bytes: the unit the ring stages
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
     int64_t N                = 0;  // the largest ne[1] over the host expert entries
@@ -514,15 +513,10 @@ static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int
 //   h2d:     the device's tuning-cache record where it measured, else `probed_h2d_gbps` (the device's own resolved rate
 //            from ggml_sycl_measure_h2d_pinned: 0 when the probe has not measured or read one back), else the seed. A
 //            run with the tuning cache disabled, or a record the store refused, still prices with the probed rate.
-//   reorder: the record's rate where it measured, else the seed. A record rate that is not positive means
-//            "unmeasured": the probe measures the H2D rate only and stores reorder as 0, so a later change of the seed
-//            is not masked by a copy of the old seed in the file. A record written before llama.cpp-kp1l (the
-//            CACHE_VERSION did not change) holds the old 200 GB/s seed as `reorder_gbps` and is read as measured, and
-//            GGML_SYCL_H2D_PROBE=1 over such a record carries it forward (the GGML_SYCL_MOE_EXEC_REORDER_GBPS catalog
-//            row). Deleting the device's `*-moe-exec-rates.json` clears it.
 //   dev:     each type's recorded rate (the record's per-type slot, which has no writer yet), else its seed, as a
 //            byte-weighted harmonic mean over the mix.
-// A value is taken only when finite and positive. The environment overrides apply last and win over all of them.
+// A value is taken only when finite and positive. The environment overrides apply last and win over all of them. The
+// record's reorder_gbps is not read: the ring reorders nothing.
 static inline moe_exec_rates moe_stream_rates_assemble(const std::vector<std::pair<ggml_type, size_t>> & host_mix,
                                                        const ggml_sycl_moe_exec_rates_record *           record,
                                                        double             probed_h2d_gbps,
@@ -534,9 +528,6 @@ static inline moe_exec_rates moe_stream_rates_assemble(const std::vector<std::pa
         r.h2d_gbps = probed_h2d_gbps;
     }
     if (record != nullptr) {
-        if (detail::moe_stream_rate_measured(record->reorder_gbps)) {
-            r.reorder_gbps = record->reorder_gbps;
-        }
         // The device GEMM rate is the byte-weighted harmonic mean over the mix, as the seed's is, of each type's
         // recorded rate, else its seed.
         double bytes = 0.0;
@@ -1137,7 +1128,7 @@ class moe_stream_phase {
 
     void              prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op);
     size_t            ring_bytes_free() const;
-    moe_exec_decision weigh(const moe_stream_layer_info & li, const moe_stream_op & op, double window_us) const;
+    moe_exec_decision weigh(const moe_stream_layer_info & li, const moe_stream_op & op) const;
     moe_exec_decision decision_of(int layer) const;
     stage_counts      stage_window(const std::vector<moe_stream_item> & items,
                                    uint32_t                             window_id,

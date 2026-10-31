@@ -103,13 +103,12 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     request_loan_  = op.request_loan;
     loan_refusals_ = op.loan_refusals;
 
-    // The layer is weighed at its own first op, never a layer ahead: the executor stages its own windows, and no copy
-    // of a layer hides under the previous layer's (there is no cross-layer prefetch), so the cost model gets no window.
+    // The layer is weighed at its own first op, never a layer ahead: the executor stages its own windows.
     const auto cur = index_.layers.find(layer);
     if (cur != index_.layers.end()) {
         layer_state & st = layers_[layer];
         if (!st.decided) {
-            st.decision = weigh(cur->second, op, 0.0);
+            st.decision = weigh(cur->second, op);
             st.decided  = true;
             // GGML_SYCL_MOE_EXEC_DECLINE_LAYER forces this layer off the executor (llama.cpp-ny6i): a CPU decision is
             // never staged, so the ring is neither reserved nor claimed for it and the layer runs the hybrid path.
@@ -443,9 +442,7 @@ size_t moe_stream_phase::ring_bytes_free() const {
     return static_cast<size_t>(geo_.region_slots) * geo_.slot_bytes;
 }
 
-moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
-                                          const moe_stream_op &         op,
-                                          double                        window_us) const {
+moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li, const moe_stream_op & op) const {
     moe_exec_layer_inputs in;
     in.n_tokens             = n_tokens_;  // the micro-batch's, from begin_ubatch
     in.n_expert             = op.n_expert;
@@ -454,10 +451,9 @@ moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
     in.n_host_experts       = li.n_host_experts;
     in.K                    = li.K;
     in.N                    = li.N;
-    in.window_us            = window_us;
     in.ring_bytes_free      = ring_bytes_free();
     in.stage_unit_bytes_max = li.matrix_bytes_max;  // one slot: a window is staged a matrix at a time
-    in.soa_bytes            = li.soa_bytes;         // 0: every slot is AOS, read in place, so no reorder is priced
+
     // The device's probed H2D rate (llama.cpp-kp1l), read live and under the probe's mutex: another model's load may
     // run the probe while this prompt weighs. 0 while the device is unresolved or keeps the seed.
     const double         probed_h2d_gbps = ggml_sycl_h2d_probed_gbps(device_);

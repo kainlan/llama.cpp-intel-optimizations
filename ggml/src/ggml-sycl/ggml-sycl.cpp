@@ -33029,8 +33029,8 @@ double ggml_sycl_h2d_probed_gbps(int device) {
 // is read back instead of probing. A probe that cannot allocate keeps the seed and says so: never an abort. A refused
 // store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the measured rate resolved for
 // the process and is logged "probed, not stored", and the cost model still prices with it (see Consumers). The probe
-// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0
-// (unmeasured) when there was none, and the rates assembly takes the seed for it. The tuning cache is keyed by the
+// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0 when
+// there was none, for the file format's sake; nothing reads it. The tuning cache is keyed by the
 // visible devices, so a device hidden from the scheduler probes again on every start.
 //
 // Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE, RETRY_ALLOC or RETRY_FAILED allocates 64 MiB and times

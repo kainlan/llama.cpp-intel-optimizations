@@ -186,18 +186,6 @@ const moe_stream_layer_info * layer_info(const moe_stream_plan_index & idx, int 
     return it == idx.layers.end() ? nullptr : &it->second;
 }
 
-// No layer of `idx` has a byte to reorder: the ring stages AOS slots for the executor only, and moe_stream_staging has
-// no SOA value. An index with no layers answers false: a check over nothing would pass vacuously, and every index this
-// test builds has layers.
-bool no_layer_reorders(const moe_stream_plan_index & idx) {
-    for (const auto & kv : idx.layers) {
-        if (kv.second.soa_bytes != 0) {
-            return false;
-        }
-    }
-    return !idx.layers.empty();
-}
-
 // Every item of `li` stages `staging` for `consumer`.
 bool items_all(const moe_stream_layer_info & li, moe_stream_staging staging, moe_stream_consumer consumer) {
     for (const moe_stream_item & it : li.items) {
@@ -543,7 +531,6 @@ int main() {
     const moe_stream_plan_index idx  = index_of(plan, claims_all);
     CHECK(idx.layers.size() == 4);
     CHECK(layer_info(idx, 3) == nullptr);  // no host expert: skipped, never weighed
-    CHECK(no_layer_reorders(idx));
 
     const moe_stream_layer_info * l0 = layer_info(idx, 0);
     CHECK(l0 != nullptr);
@@ -562,7 +549,6 @@ int main() {
         CHECK(l0->region_slots == 9);
         CHECK(l0->role_items[0] == 3 && l0->role_items[1] == 3 && l0->role_items[2] == 3);
         CHECK(l0->host_bytes == 9 * src_bytes());
-        CHECK(l0->soa_bytes == 0);
         CHECK(l0->matrix_bytes_max == src_bytes());  // the AOS bytes a slot holds, not the plan's device size
         CHECK(l0->K == kCols && l0->N == kRows);
         CHECK(l0->host_mix.size() == 1 && l0->host_mix[0].first == GGML_TYPE_Q4_0 &&
@@ -574,13 +560,11 @@ int main() {
         CHECK(l1->items.size() == 9 && l1->n_untriplet == 1);
         CHECK(l1->n_host_experts == 3);  // expert 1's fused entry is the same expert
         CHECK(l1->host_bytes == 9 * src_bytes() + kFused);
-        CHECK(l1->soa_bytes == 0);       // the fused entry is never staged; the claimed items are read in place
     }
     const moe_stream_layer_info * l4 = layer_info(idx, 4);
     CHECK(l4 != nullptr);
     if (l4) {
         CHECK(l4->items.empty() && l4->n_host_experts == 1 && l4->n_untriplet == 1);
-        CHECK(l4->soa_bytes == 0);
     }
     CHECK(idx.host_matrices_per_layer_max == 9);
     CHECK(idx.region_slots_max == 9);
@@ -594,8 +578,7 @@ int main() {
     {
         // No claim: every host item is still listed and the cost model still sees every host byte, but none takes a
         // slot, so no window and no ring.
-        const moe_stream_plan_index unclaimed = index_of(plan, nullptr);
-        CHECK(no_layer_reorders(unclaimed));
+        const moe_stream_plan_index   unclaimed = index_of(plan, nullptr);
         const moe_stream_layer_info * u0 = layer_info(unclaimed, 0);
         CHECK(u0 != nullptr);
         if (u0) {
@@ -624,7 +607,6 @@ int main() {
         const moe_stream_plan_index   iq_claimed = index_of(make_mixed_plan(), claims_all);
         const moe_stream_layer_info * i1         = layer_info(iq_claimed, 1);
         const moe_stream_layer_info * f1         = layer_info(iq_free, 1);
-        CHECK(no_layer_reorders(iq_free) && no_layer_reorders(iq_claimed));
         CHECK(i1 != nullptr && f1 != nullptr);
         if (i1 && f1) {
             CHECK(f1->items.size() == 12 && f1->n_streamable == 0 && f1->region_slots == 0);
@@ -644,7 +626,6 @@ int main() {
         claims_probe                probe;
         const moe_stream_plan_index claimed =
             ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, &probe, claims_l0_gate_l2, kWideWindow);
-        CHECK(no_layer_reorders(claimed));
         const moe_stream_layer_info * c0 = layer_info(claimed, 0);
         const moe_stream_layer_info * c1 = layer_info(claimed, 1);
         const moe_stream_layer_info * c2 = layer_info(claimed, 2);
@@ -906,7 +887,7 @@ int main() {
     };
     const moe_exec_rates seed      = ggml_sycl::moe_exec_rates_seed(q4);
     const moe_exec_rates no_record = ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 0.0, nullptr);
-    CHECK(near(no_record.h2d_gbps, seed.h2d_gbps) && near(no_record.reorder_gbps, seed.reorder_gbps));
+    CHECK(near(no_record.h2d_gbps, seed.h2d_gbps));
     CHECK(near(no_record.dev_gflops, seed.dev_gflops) && near(no_record.cpu_gbps, seed.cpu_gbps));
     ggml_sycl_moe_exec_rates_record rec{};
     rec.h2d_gbps                  = 25.0;
@@ -915,7 +896,7 @@ int main() {
     rec.types[0]                  = GGML_TYPE_Q4_0;
     rec.dev_gflops[0]             = 1260.0;
     const moe_exec_rates measured = ggml_sycl::moe_stream_rates_assemble(q4, &rec, 0.0, nullptr);
-    CHECK(near(measured.h2d_gbps, 25.0) && near(measured.reorder_gbps, 300.0) && near(measured.dev_gflops, 1260.0));
+    CHECK(near(measured.h2d_gbps, 25.0) && near(measured.dev_gflops, 1260.0));
     const std::vector<std::pair<ggml_type, size_t>> mix = {
         { GGML_TYPE_Q4_0,  1000 },
         { GGML_TYPE_MXFP4, 1000 }
@@ -927,13 +908,13 @@ int main() {
     unmeasured.h2d_gbps                        = 0.0;
     unmeasured.reorder_gbps                    = -1.0;
     const moe_exec_rates fallback              = ggml_sycl::moe_stream_rates_assemble(q4, &unmeasured, 0.0, nullptr);
-    CHECK(near(fallback.h2d_gbps, seed.h2d_gbps) && near(fallback.reorder_gbps, seed.reorder_gbps));
+    CHECK(near(fallback.h2d_gbps, seed.h2d_gbps));
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, 0.0, fake_env_h2d).h2d_gbps, 31.0));
 
     // llama.cpp-kp1l: h2d is the record's, else the device's probed rate, else the seed; the override wins over all.
     // No record at all (the tuning cache disabled): the probed rate prices, not the seed.
     const moe_exec_rates probed_only = ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 26.5, nullptr);
-    CHECK(near(probed_only.h2d_gbps, 26.5) && near(probed_only.reorder_gbps, seed.reorder_gbps));
+    CHECK(near(probed_only.h2d_gbps, 26.5));
     // A record that measured h2d wins over the probed rate.
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, 26.5, nullptr).h2d_gbps, 25.0));
     // A record without an h2d rate falls to the probed rate, then to the seed when that is not a rate either.
@@ -946,11 +927,13 @@ int main() {
     // The environment override is applied last: over the record and over the probed rate.
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 26.5, fake_env_h2d).h2d_gbps, 31.0));
 
-    // A record that says reorder is unmeasured (0) takes the seed for it, and a later seed change is not masked.
+    // The record's reorder_gbps is stored for the file format only: no rate moves with it.
     ggml_sycl_moe_exec_rates_record no_reorder = rec;
     no_reorder.reorder_gbps                    = 0.0;
     const moe_exec_rates no_reorder_rates      = ggml_sycl::moe_stream_rates_assemble(q4, &no_reorder, 0.0, nullptr);
-    CHECK(near(no_reorder_rates.reorder_gbps, seed.reorder_gbps) && near(no_reorder_rates.h2d_gbps, 25.0));
+    CHECK(near(no_reorder_rates.h2d_gbps, measured.h2d_gbps) && near(no_reorder_rates.cpu_gbps, measured.cpu_gbps) &&
+          near(no_reorder_rates.dev_gflops, measured.dev_gflops) &&
+          near(no_reorder_rates.cpu_gflops, measured.cpu_gflops));
     CHECK(ggml_sycl::moe_exec_rates_valid(measured) && ggml_sycl::moe_exec_rates_valid(fallback));
 
     // ---- the predicates begin_layer and executor_claims decide by ----

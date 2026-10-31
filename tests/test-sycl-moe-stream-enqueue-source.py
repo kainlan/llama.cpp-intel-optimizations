@@ -2047,7 +2047,7 @@ def test_ring_unavailable_once_mutants():
 
 REPORT_CALL = "report(layer, st);"
 DECIDE_IF = "if (!st.decided)"
-WEIGH_CALL = "st.decision = weigh(cur->second, op, 0.0);"
+WEIGH_CALL = "st.decision = weigh(cur->second, op);"
 
 
 def brace_depth(text: str, at: int) -> int:
@@ -2090,8 +2090,8 @@ def test_auto_report_mutants():
 
 def claim_begin_layer_weighs_only_its_layer(phase: str, hpp: str) -> bool:
     """Task 2b of llama.cpp-a2xb: begin_layer weighs and decides its own layer at its first op with no copy window,
-    since no copy of a layer hides under the previous layer's (there is no cross-layer prefetch), so weigh's window_us
-    is 0.0 and the layer's state keeps no window. It looks up no other layer and stages nothing: window_begin stages."""
+    since no copy of a layer hides under the previous layer's (there is no cross-layer prefetch), so weigh takes no
+    window and the layer's state keeps none. It looks up no other layer and stages nothing: window_begin stages."""
     b = body(norm(phase), BEGIN_LAYER_SIG)
     return (b.count("index_.layers.find(") == 1 and "index_.layers.find(layer)" in b and b.count("weigh(") == 1
             and WEIGH_CALL in b and "stage_window(" not in b and "window_begin(" not in b
@@ -2112,7 +2112,7 @@ def test_begin_layer_weigh_mutants():
     assert not c(mutate(PHASE, WEIGH_CALL, "st.decision = weigh(cur->second, op, 1000.0);"), PLAN_HPP)
     # The next layer looked up and weighed ahead.
     assert not c(mutate(PHASE, WEIGH_CALL, WEIGH_CALL + " const auto nxt = index_.layers.find(layer + 1); "
-                                                        "(void) weigh(nxt->second, op, 0.0);"), PLAN_HPP)
+                                                        "(void) weigh(nxt->second, op);"), PLAN_HPP)
     # The layer staged at its first op.
     assert not c(mutate(PHASE, WEIGH_CALL, WEIGH_CALL + " (void) stage_window({}, 0, cache, op);"), PLAN_HPP)
     # The layer's state keeps a window.
