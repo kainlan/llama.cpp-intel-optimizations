@@ -33403,8 +33403,7 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
                       room.expert_groups_without);
 }
 
-// The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
-// the runtime context transaction announces the outcome once, at WARN, when the context opens.
+// The compute room a placed explicit micro-batch gives the hold-spill fit; unified-cache.hpp describes it.
 size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
                                               size_t                            compute_term,
                                               uint32_t *                        n_ubatch) {
@@ -33415,6 +33414,8 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
     return placed ? compute_term : 0;
 }
 
+// The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
+// the runtime context transaction announces the outcome once, at WARN, when the context opens.
 static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, int device_id) {
     if (xub.n_ubatch == 0) {
         return;
