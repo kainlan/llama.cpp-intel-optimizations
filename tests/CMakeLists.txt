@@ -1015,12 +1015,14 @@ if (Python3_Interpreter_FOUND)
     # GGML_SYCL_MEMCPY_SITE_CENSUS): gated on the env through one static bool,
     # the caller's file:line forwarded from mem_copy_async/mem_copy and the
     # generic copy wrappers into mem_copy_direct_submit, the host-host branch
-    # tagged H2H, printed to stderr at backend free and at exit. WITH --self-test
-    # (25 mutants, 1 harmless probe).
-    add_test(NAME test-sycl-memcpy-site-census-source
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-memcpy-site-census-source.py --self-test)
-    set_tests_properties(test-sycl-memcpy-site-census-source PROPERTIES
-        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # tagged H2H, printed to stderr at backend free and at exit. A second pytest
+    # case runs the self-test (25 mutants, 1 harmless probe).
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-memcpy-site-census-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-memcpy-site-census-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;source;source-contract;hostonly;python"
+        TIMEOUT 120)
     # The host-expert MoE decode levers (llama.cpp-z4kd): the GLU of a host-expert
     # layer asks moe_glu_input_host_produced (not the stale MUL_MAT_ID walk), the
     # wait census times B1 around the id readback and classifies only when on,
@@ -1042,11 +1044,14 @@ if (Python3_Interpreter_FOUND)
     set_tests_properties(test-sycl-moe-hostpath-no-host-wait-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # TOP_K runs on the device for every k <= ncols: one shape selector decides the
-    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). WITH --self-test.
-    add_test(NAME test-sycl-topk-source
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-topk-source.py --self-test)
-    set_tests_properties(test-sycl-topk-source PROPERTIES
-        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). A pytest case runs
+    # the mutant self-test.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-topk-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-topk-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;source;source-contract;hostonly;python"
+        TIMEOUT 120)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
     # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
     # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
@@ -3471,6 +3476,27 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
+    # test-sycl-moe-stream-ring-room: the window ring's planned room, n_slots x slot_bytes free in the WEIGHT zone,
+    # funds every slot of moe_stream_ring::reserve, and one grain less funds one slot fewer -- on a real device cache,
+    # with no model loaded. It allocates a 64 MB arena and fills its WEIGHT zone, so it carries `cache` and stays out of
+    # the throttled sweep (run it by name, one at a time).
+    llama_build(test-sycl-moe-stream-ring-room.cpp)
+    target_include_directories(test-sycl-moe-stream-ring-room PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-moe-stream-ring-room PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-moe-stream-ring-room PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-moe-stream-ring-room PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-moe-stream-ring-room PRIVATE "-fsycl")
+        target_link_options(test-sycl-moe-stream-ring-room PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-moe-stream-ring-room LABEL "main")
+    set_tests_properties(test-sycl-moe-stream-ring-room PROPERTIES
+        LABELS "sycl;cache;moe"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
+
     # test-sycl-model-lifecycle-hooks: the weight-ownership hooks must actually
     # be INVOKED on a real llama_model load and teardown (llama.cpp-viga).
     #
@@ -4627,6 +4653,20 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-kv-before-experts-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-before-experts-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# The window ring's room is held in the WEIGHT zone before the routed experts: the ring reserves its slots from that
+# zone at every prompt, and an expert loan cannot fund a slot larger than every lendable matrix, so a room the planner
+# left is what lets the ring engage at default placement. The room is the shared ring geometry over the pack the
+# planner predicts, counted in vram_bytes and kept in the plan's accounting through the runtime KV re-derivation. The
+# auto-ubatch fit credits the room in whole slots and probes the loan only for the slots the room leaves short. A
+# mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-stream-ring-room-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-stream-ring-room-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

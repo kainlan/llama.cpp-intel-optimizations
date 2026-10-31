@@ -662,6 +662,14 @@ struct placement_kv_info {
     double                host_split_us            = PLACEMENT_HOST_SPLIT_US_DEFAULT;
     // GGML_SYCL_PLAN_CPU_EXPERT_GBPS was given, so cpu_expert_gbps prices every routed-expert type (llama.cpp-7fmt).
     bool                  cpu_expert_gbps_set      = false;
+    // What sizes the prompt phase's window ring at plan time, so the planner can hold the ring's room in the WEIGHT
+    // zone before it packs the routed experts. moe_stream_staged_types has bit t set when the batched prompt
+    // executor takes a host-staged expert of ggml_type t, which is the type half of its staged claim: only a claimed
+    // matrix takes a ring slot. moe_stream_group_cap is the executor's group cap
+    // (GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX, 0 = none), which bounds the ring's window. The backend fills both
+    // where it copies the inventory in; a test sets them directly. Mask 0 sizes no ring and holds no room.
+    uint64_t              moe_stream_staged_types  = 0;
+    size_t                moe_stream_group_cap     = 0;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention
@@ -928,6 +936,12 @@ struct placement_plan {
     size_t                                     kv_context_room_displaced_bytes = 0;
     // The explicit micro-batch's PP MoE oneDNN scratch ring decision (single-device plans; see the struct).
     placement_explicit_ubatch                  explicit_ubatch;
+    // Device room the load plan held in the WEIGHT zone, after the KV room and before the routed experts, for the
+    // prompt phase's window ring: the bytes moe_stream_plan_ring_geometry gives for this plan, so the ring's first
+    // reserve finds its slots there and the expert loan is only the fallback. Counted in vram_bytes, and kept there
+    // when the runtime context transaction re-derives the KV totals, because the ring is reserved again at every
+    // prompt. 0 when the plan stages nothing, has no host expert, or is a multi-device plan.
+    size_t                                     moe_stream_ring_reserve_bytes   = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     // llama.cpp-3aos: mirrors placement_kv_info::layer_kind/layer_k_width/
     // layer_v_width -- see that struct's field comments. Copied in at plan
@@ -1272,6 +1286,8 @@ struct placement_plan {
         kv_context_reserve_bytes = 0;
         vram_bytes               = weight_vram_bytes + kv_vram_bytes;
         host_bytes               = weight_host_bytes + kv_host_bytes;
+        // The window ring's room is not KV: it stays held, since the ring is reserved again at every prompt.
+        vram_bytes += moe_stream_ring_reserve_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
         }

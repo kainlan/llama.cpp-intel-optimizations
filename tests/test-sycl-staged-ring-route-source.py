@@ -73,44 +73,7 @@ Pytest-style (module-level test_* functions): registered with llama_test_pytest.
 """
 
 import re
-from pathlib import Path
-from sycl_gate import first_missing, first_present
-
-ROOT = Path(__file__).resolve().parents[1]
-
-_LEXEME_RE = re.compile(
-    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
-    re.DOTALL,
-)
-
-
-def strip_comments(src: str) -> str:
-    def repl(m: re.Match) -> str:
-        tok = m.group(0)
-        if tok[0] in "\"'":
-            return tok
-        return "\n" * tok.count("\n")
-
-    return _LEXEME_RE.sub(repl, src)
-
-
-def norm(text: str) -> str:
-    """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
-    re-wrap nor a re-split format string can turn a claim red. Idempotent, so a mutant built on normalized text is
-    read the same way as the source."""
-    t = re.sub(r"\s+", " ", strip_comments(text))
-    t = re.sub(r"\( ", "(", t)
-    t = re.sub(r" \)", ")", t)
-    t = re.sub(r" ,", ",", t)
-    t = re.sub(r",(?! )", ", ", t)
-    t = re.sub(r'(?<!\\)" "', "", t)
-    return t
-
-
-def read(rel: str) -> str:
-    """The file's text, or empty when it does not exist yet, so a missing file fails the claims instead of erroring."""
-    p = ROOT / rel
-    return p.read_text(errors="replace") if p.exists() else ""
+from sycl_gate import ROOT, body, first_missing, first_present, mutate, norm, ordered, read
 
 
 SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
@@ -142,47 +105,6 @@ SYCL_TREE = {
 }
 
 
-def body(text: str, signature: str) -> str:
-    """The brace-balanced body of the first definition whose text starts with `signature` (string literals are
-    skipped while balancing). A signature ending in "{" opens the body itself. Empty when there is none."""
-    at = text.find(signature)
-    if at < 0:
-        return ""
-    open_at = at + len(signature) - 1 if signature.endswith("{") else text.find("{", at + len(signature))
-    if open_at < 0:
-        return ""
-    depth = 0
-    i = open_at
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch in "\"'":
-            j = i + 1
-            while j < n and text[j] != ch:
-                j += 2 if text[j] == "\\" else 1
-            i = j + 1
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[open_at:i + 1]
-        i += 1
-    return ""
-
-
-def ordered(text: str, *needles: str) -> bool:
-    """Every needle is present, each after the one before it."""
-    at = 0
-    for needle in needles:
-        at = text.find(needle, at)
-        if at < 0:
-            return False
-        at += len(needle)
-    return True
-
-
 def call_args(text: str, name: str) -> list:
     """The argument text of every call `name(...)` (name ends with "("), parentheses balanced, string literals
     skipped. A definition or declaration matches too; callers pick the shape they expect."""
@@ -209,13 +131,6 @@ def call_args(text: str, name: str) -> list:
         out.append(text[start:i - 1])
         at = text.find(name, at + len(name))
     return out
-
-
-def mutate(text: str, old: str, new: str) -> str:
-    """`text` (normalized) with `old` replaced once; the mutant must exist, or it would prove nothing."""
-    n = norm(text)
-    assert old in n, f"mutant precondition: {old!r} is not in the text"
-    return n.replace(old, new, 1)
 
 
 BUILD_SIG = "moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,"

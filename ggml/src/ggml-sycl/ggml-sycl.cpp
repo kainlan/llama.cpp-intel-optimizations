@@ -17156,6 +17156,30 @@ static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch(int    
     return planned;
 }
 
+// The type half of the batched prompt executor's staged claim: the type is one moe_pp_batched_takes_staged_type names,
+// and the executor takes it at AOS, the layout a staged slot holds, under the runtime knobs. The staged claim
+// (ggml_sycl_moe_pp_onednn_batched_claims_tensor with host_staged) and the planner's staged-type mask both ask it here,
+// so the window ring's room is sized over exactly the matrices the executor claims.
+static bool ggml_sycl_moe_pp_batched_claims_staged_type(ggml_type type) {
+    return moe_pp_batched_takes_staged_type(type) && ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS);
+}
+
+// The types whose host-staged experts the batched prompt executor claims, one bit per ggml_type: the type half of its
+// staged claim (ggml_sycl_moe_pp_batched_claims_staged_type). The planner sizes the window ring's room from it
+// (placement_kv_info::moe_stream_staged_types), since only a claimed matrix takes a ring slot. The claim's other term
+// reads a weight's planned layout, which the plan decides after this.
+static uint64_t ggml_sycl_moe_stream_staged_types() {
+    static_assert(GGML_TYPE_COUNT <= 64, "the staged-type mask holds one bit per ggml_type");
+    uint64_t mask = 0;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = static_cast<ggml_type>(t);
+        if (ggml_sycl_moe_pp_batched_claims_staged_type(type)) {
+            mask |= uint64_t(1) << t;
+        }
+    }
+    return mask;
+}
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17385,6 +17409,10 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                                   std::numeric_limits<double>::max(), &g_placement_kv_info.cpu_expert_gbps_set);
     g_placement_kv_info.host_split_us = ggml_sycl_plan_cost_param(
         "GGML_SYCL_PLAN_HOST_SPLIT_US", ggml_sycl::PLACEMENT_HOST_SPLIT_US_DEFAULT, std::numeric_limits<double>::max());
+    // What the planner sizes the prompt phase's window ring with, so it holds the ring's room before the routed experts:
+    // the executor's staged types and its group cap, the inputs the phase's own sizing reads when it runs.
+    g_placement_kv_info.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();
+    g_placement_kv_info.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
             "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB "
@@ -18736,8 +18764,9 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
 }
 
 // Defined after the stream phase's claim hooks, far below the fit, since one of them,
-// ggml_sycl_moe_stream_claims_every_weight, sizes the ring it asks about. It is the prefill ring's bytes no loan can
-// cover on `device` (llama.cpp-kjef); the rung does not enter the geometry. See its definition.
+// ggml_sycl_moe_stream_claims_every_weight, sizes the ring it asks about. It is the prefill ring's bytes neither the
+// planned room nor a loan covers on `device` (llama.cpp-kjef); the rung does not enter the geometry. See its
+// definition.
 static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch);
 
 static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
@@ -18777,7 +18806,8 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.rungs        = rungs;
     in.plan_of      = ggml_sycl_hold_plan_at;
     in.plan_ctx     = &device;
-    // Lent bytes cost the card nothing; the part of the ring no loan covers is a demand (zone_hold_fit_demand).
+    // Lent bytes cost the card nothing; the part of the ring neither the planned room nor a loan covers is a demand
+    // (zone_hold_fit_demand).
     in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);
     // The explicit micro-batch the published plan placed on this device: its RUNTIME zone holds the planned compute term
     // beside that micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger than the
@@ -18806,8 +18836,8 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     return fits;
 }
 
-// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the
-// rung, plus the prefill-ring bytes no loan covers, from the one fit function.
+// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the rung,
+// plus the prefill-ring bytes neither the planned room nor a loan covers, from the one fit function.
 static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
     ggml_sycl_hold_fit_answer a;
     (void) ggml_sycl_hold_spill_fit(q, &a);
@@ -18844,9 +18874,9 @@ static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query &
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
         "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
-        "net of the KV-zone room a compute buffer can use, plus the prefill-ring bytes no loan covers) would leave "
-        "device %d %.1f MB free (of %.1f MB free before it), under the %.1f MB driver headroom the arena expects; "
-        "%s; or free VRAM on this card (another process) before loading\n",
+        "net of the KV-zone room a compute buffer can use, plus the prefill-ring bytes neither the planned room nor "
+        "a loan covers) would leave device %d %.1f MB free (of %.1f MB free before it), under the %.1f MB driver "
+        "headroom the arena expects; %s; or free VRAM on this card (another process) before loading\n",
         a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
         ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
     return false;
@@ -18883,10 +18913,10 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: at n_ubatch=%u the compute buffers the planned dense scratch "
-        "keeps out of the RUNTIME zone (worst case %.1f MB, with any prefill-ring bytes no loan covers; %llu "
-        "request(s) totalling %.1f MB were held out and now live outside the arena) leave device %d %.1f MB free "
-        "(of %.1f MB free before them), under the %.1f MB driver headroom the arena expects; a smaller -ub keeps "
-        "those buffers in the zone\n",
+        "keeps out of the RUNTIME zone (worst case %.1f MB, with any prefill-ring bytes neither the planned room nor "
+        "a loan covers; %llu request(s) totalling %.1f MB were held out and now live outside the arena) leave device "
+        "%d %.1f MB free (of %.1f MB free before them), under the %.1f MB driver headroom the arena expects; "
+        "a smaller -ub keeps those buffers in the zone\n",
         n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
         free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
@@ -19130,12 +19160,12 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     // already published still fits the device's current outside-arena
     // headroom, using the free-memory reading taken above.
 
-    // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan
-    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max, and the prefill-ring
-    // bytes no loan covers) is counted here, in the check that already asks what the device can take outside the
-    // arena; those bytes and the non-FA scratch compete for the same headroom. (A flash-attention context asks the
-    // same live free-memory question without the non-FA terms, at the top of this function.) Saturating: a wrapped
-    // sum must not read as a small demand.
+    // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan plus
+    // the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max, and the prefill-ring
+    // bytes neither the planned room nor a loan covers) is counted here, in the check that already asks what the device
+    // can take outside the arena; those bytes and the non-FA scratch compete for the same headroom. (A flash-attention
+    // context asks the same live free-memory question without the non-FA terms, at the top of this function.)
+    // Saturating: a wrapped sum must not read as a small demand.
     const size_t hold_spill_bytes = hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;
     const size_t nonfa_scratch_demand =
         ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
@@ -21101,19 +21131,6 @@ static std::atomic<uint32_t> g_sycl_expert_readmitted_total[GGML_SYCL_MAX_DEVICE
 // (moe_stream_window_hints::lent_bytes), so its cap reads the same figure before a loan and after it.
 static std::atomic<size_t> g_sycl_expert_lent_bytes[GGML_SYCL_MAX_DEVICES];
 
-// A lent triplet's device bytes: its three entries' dst_size in `plan`, the bytes moe_stream_plan_index_build stops
-// counting as resident on the device when the loan flips them to the host (the flip leaves dst_size as it is).
-static size_t ggml_sycl_expert_triplet_dst_bytes(const ggml_sycl::placement_plan & plan,
-                                                 const ggml_sycl::expert_placement_key (&placed)[3]) {
-    size_t bytes = 0;
-    for (int r = 0; r < 3; ++r) {
-        const ggml_sycl::placement_entry * e =
-            plan.find_expert_entry(placed[r].layer_id, placed[r].expert_id, placed[r].role);
-        bytes += e ? e->dst_size : 0;
-    }
-    return bytes;
-}
-
 // The sum of a ledger's triplet_bytes. The caller holds g_tensor_inventory_mutex.
 static size_t ggml_sycl_expert_lent_ledger_bytes(const ggml_sycl_expert_lent_ledger & ledger) {
     GGML_ASSERT(ledger.triplet_bytes.size() == ledger.triplets.size());
@@ -21657,7 +21674,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 ledger.triplet_bytes.pop_back();
             } else {
                 ledger.triplets.push_back({ placed[0], placed[1], placed[2] });
-                ledger.triplet_bytes.push_back(ggml_sycl_expert_triplet_dst_bytes(*next_plan, placed));
+                ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed));
             }
             ++lent;
             freed += refill ? refilled.bytes_readmitted : record.bytes_freed;
@@ -21821,8 +21838,9 @@ static std::atomic<uint64_t> g_sycl_expert_loan_refusals[GGML_SYCL_MAX_DEVICES];
 // llama.cpp-3460, c-0tmn); the boundary runner below also calls it to re-post a request a transient refusal sent back.
 // The request counts its bytes in ring slots of `slot_bytes`, 0 counting bytes (llama.cpp-9x8t). The slot size is
 // stored before the bytes, whose release publishes it to the runner that acquires them. It is stored whether or not
-// these bytes win: the ring's geometry is constant between two graph boundaries (prepare() rebuilds it per micro-batch;
-// a loan can grow it, llama.cpp-8p5x), and one micro-batch posts every request in that interval, so they agree on it.
+// these bytes win: one micro-batch posts every request between two graph boundaries, and the phase sizes each from
+// the plan the loan would leave, in the slots of that post-loan geometry (moe_stream_loan_size_post_loan), so they
+// agree on it. The runner's selection over the same plan takes the triplets that sizing took.
 static void ggml_sycl_request_expert_loan(int device, size_t bytes_wanted, size_t slot_bytes) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes_wanted == 0) {
         return;
@@ -21866,9 +21884,8 @@ static bool ggml_sycl_run_pending_expert_loan_on_device(int                     
     }
     // Loaded after the acquire that took the bytes, so it is the size their request stored before them, or a newer one:
     // a request posted between the exchange and this load can overwrite it. That is harmless. The newer size is the
-    // geometry the next micro-batch's reserve asks for (constant between two graph boundaries; prepare() rebuilds it
-    // per micro-batch, and a loan can grow it, llama.cpp-8p5x), and that request's own bytes stay for the next
-    // boundary.
+    // slot of the post-loan geometry the next micro-batch's request was sized in (moe_stream_loan_size_post_loan), and
+    // that request's own bytes stay for the next boundary.
     const size_t slot_bytes = g_sycl_expert_loan_slot_bytes[device].load(std::memory_order_acquire);
 
     ggml_sycl_expert_loan_result   local;
@@ -36992,12 +37009,13 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
     return true;
 }
 
-// The prefill ring's bytes no loan can cover on `device` (llama.cpp-kjef). The ring is lent bytes, so a loan that
-// supplies all of it costs the card nothing; the remainder (no lendable triplets, or fewer resident bytes than the
-// ring) is a demand on free memory, and the fit refuses a rung that cannot afford it rather than spill the ring to
-// host. 0 with no published plan, no host expert, or no ring (the sizing refuses a ring over an eleventh of the
-// device's resident expert bytes plus the bytes lent to the ring now, ggml_sycl_moe_stream_set_window). A refused
-// probe (a graph is active) lends nothing, so the whole ring counts.
+// The prefill ring's bytes neither the planned room nor a loan covers on `device` (llama.cpp-kjef). The ring's slots
+// are the room's bytes and lent bytes, so a room and a loan that supply all of it cost the card nothing; the remainder
+// (no lendable triplets, or fewer resident bytes than the ring) is a demand on free memory, and the fit refuses a rung
+// that cannot afford it rather than spill the ring to host. 0 with no published plan, no host expert, no ring (the
+// sizing refuses a ring over an eleventh of the device's resident expert bytes plus the bytes lent to the ring now,
+// ggml_sycl_moe_stream_set_window), or a planned room that holds the whole ring. A refused probe (a graph is active)
+// lends nothing, so the post-loan ring less the room's slots it keeps counts.
 //
 // The geometry is the stream phase's own, moe_stream_plan_ring_geometry, so the fit and the ring cannot disagree about
 // how a claimed matrix is sized. Only the prompt-kernel hook and the call as its graph_ctx are passed for the shared
@@ -37013,10 +37031,26 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // uses (ggml_sycl_moe_stream_set_window): the device's planned f16 weight slot, which the load publishes before any
 // context transaction, so the fit charges the window-sized ring the phase reserves.
 // The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
-// context transaction, before it publishes, this can see the previous plan or none, and the realized check (run
-// after the rung's buffers exist) then carries the ring. The geometry is rebuilt on every call (the plan index build
-// and the loan selection); the callers are the transaction and the auto-ubatch trial's checks, never a per-graph
-// path, so a per-query cache is not warranted today.
+// context transaction, before it publishes, this can see the previous plan or none, and the realized check (run after
+// the rung's buffers exist) then carries the ring. Every call rebuilds the geometry: one plan index build, then the
+// loan sizing's index build and selection per step, at most G_plan + 1 steps, then the probe's selection. That is
+// bounded, and the callers are the transaction and the auto-ubatch trial's checks, never a per-graph path, so a
+// per-query cache is not warranted today.
+// The ring the loan funds is the one the plan it leaves sizes: lent triplets become host matrices, which can widen the
+// window. So the fit sizes the loan as the stream phase sizes it, from the post-loan plan with the ring short of what
+// the planned room holds (moe_stream_loan_size_post_loan), and charges that geometry's bytes less the room's slots it
+// keeps and what the probe of that loan lends. When no loan converges the phase asks for none, so the part of the
+// pre-loan ring the room does not hold is a demand on free memory, all of it, and not the post-loan ring a refused
+// probe charges.
+// The planned room is the bytes the single-device planner held free in the WEIGHT zone for this ring
+// (placement_plan::moe_stream_ring_reserve_bytes). They sit inside the arena, outside the free memory the fit charges
+// against, and a prompt's first reserve takes them before any loan, so the fit credits them first, in whole slots of
+// this geometry, as that reserve holds them. The loan is then sized for the slots the room leaves short, which the
+// sizing credits as a short reserve's held slots, and the room's slots the post-loan ring keeps follow the sizing's own
+// rule (moe_stream_ring_slots_kept). A room planned for another device funds none of this one's ring, and a
+// multi-device plan holds none. The room is the plan's accounting, not an allocation: a runtime context whose KV takes
+// those bytes (KV has priority) leaves the reserve short, and the credit is then too large, the case the memory design
+// doc names.
 static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
@@ -37033,8 +37067,31 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     if (geo.bytes == 0) {
         return 0;
     }
-    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, geo.bytes, geo.slot_bytes);
-    return geo.bytes > lent ? geo.bytes - lent : 0;
+    const size_t   room       = call.plan->device_id == device ? call.plan->moe_stream_ring_reserve_bytes : 0;
+    const uint32_t room_slots = static_cast<uint32_t>(std::min<size_t>(geo.n_slots, room / geo.slot_bytes));
+    if (room_slots == geo.n_slots) {
+        return 0;  // the room holds the whole ring: nothing to lend and nothing to charge
+    }
+    const size_t bytes_short = static_cast<size_t>(geo.n_slots - room_slots) * geo.slot_bytes;
+
+    ggml_sycl::moe_stream_loan_sizer sizer;
+    sizer.plan           = call.plan.get();
+    sizer.device         = device;
+    sizer.geo            = geo;
+    sizer.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
+    sizer.graph_ctx      = &call;
+    sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;
+    sizer.hints          = call.op.window;
+
+    const ggml_sycl::moe_stream_loan_sizing loan = ggml_sycl::moe_stream_loan_size_post_loan(sizer, bytes_short);
+    if (!loan.converged) {
+        return bytes_short;
+    }
+    const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, loan.bytes, loan.geo.slot_bytes);
+    const size_t room_kept =
+        static_cast<size_t>(ggml_sycl::moe_stream_ring_slots_kept(loan.geo, geo.slot_bytes, room_slots)) *
+        loan.geo.slot_bytes;
+    return loan.geo.bytes > room_kept + lent ? loan.geo.bytes - room_kept - lent : 0;
 }
 
 namespace ggml_sycl {
@@ -82804,10 +82861,11 @@ static const char * ggml_sycl_moe_pp_dequant_label(ggml_type type) {
 // The staged claim (host_staged, llama.cpp-3460) answers for the weight once the stream ring has staged its host
 // experts, from the plan the ring's index build holds (c-gi44); the ring then stages them for the executor. Its planned
 // layout is the device experts' (ggml_sycl_moe_tensor_plan_staged_layout, which lets the other experts be on the
-// host), and it needs two more things. The type is one moe_pp_batched_takes_staged_type names, the helper the cost
-// model's seed asks too: it has an MMID kernel, so the hybrid route can still take the op when the ring stages too
-// little, and an f16 row at AOS, the layout a staged slot holds. And ggml_sycl_moe_pp_batched_takes_layout takes AOS
-// under the runtime knobs. The device experts' layout then passes the same checks below as a resident weight's.
+// host), and its type passes ggml_sycl_moe_pp_batched_claims_staged_type, which the planner's staged-type mask also
+// asks. That helper wants a type moe_pp_batched_takes_staged_type names, the predicate the cost model's seed reads: it
+// has an MMID kernel, so the hybrid route can still take the op when the ring stages too little, and an f16 row at AOS,
+// the layout a staged slot holds. It also wants ggml_sycl_moe_pp_batched_takes_layout to take AOS under the runtime
+// knobs. The device experts' layout then passes the same checks below as a resident weight's.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::placement_plan * plan,
                                                           const ggml_tensor *               weight,
                                                           int                               device,
@@ -82822,8 +82880,7 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     layout_mode planned_layout = GGML_LAYOUT_AOS;
     bool        planned        = false;
     if (host_staged) {
-        planned = plan != nullptr && moe_pp_batched_takes_staged_type(weight->type) &&
-                  ggml_sycl_moe_pp_batched_takes_layout(weight->type, GGML_LAYOUT_AOS) &&
+        planned = plan != nullptr && ggml_sycl_moe_pp_batched_claims_staged_type(weight->type) &&
                   ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);
     } else {
         planned = plan != nullptr ? ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) :

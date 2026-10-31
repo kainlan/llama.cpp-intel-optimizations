@@ -41,7 +41,7 @@ THE CONTRACT.
 WHAT THIS DOES NOT PROVE.  It reads source text.  It does not show the kernels return the right
 indices -- that is test-backend-ops -o TOP_K, run by the lead on the device.
 
-NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and requires each
+NOT VACUOUS.  test_self_test runs the gate on in-memory mutants of the real sources and requires each
 to FAIL on its own pin, then requires the unmodified tree to pass.
 
 THE RED, against 2b6da473e (the unmodified base):
@@ -51,7 +51,6 @@ THE RED, against 2b6da473e (the unmodified base):
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -381,7 +380,7 @@ def test_self_test() -> None:
     assert self_test(read_sources()) == 0
 
 
-# --self-test ---------------------------------------------------------------------------------------
+# self_test (run by test_self_test) -----------------------------------------------------------------
 
 
 def self_test(s: dict[str, str | None]) -> int:
@@ -513,21 +512,9 @@ def self_test(s: dict[str, str | None]) -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
-    s = read_sources()
-    if "--self-test" in argv:
-        rc = self_test(s)
-        if rc != 0:
-            return rc
-    try:
-        check(s)
-    except ContractError as e:
-        print(e)
-        return 1
-    print("PASS: TOP_K is accepted for every shape a SYCL kernel implements, and dispatch selects the kernel "
-          "from that same shape rule " + TAG)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

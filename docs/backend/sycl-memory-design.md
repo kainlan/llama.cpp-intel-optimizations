@@ -185,7 +185,51 @@ rows, for either queue: under the v2 Level Zero adapter the copies from either
 queue already run on the blitter and overlap compute, so the
 `GGML_SYCL_COPY_ENGINE` knob was descoped (llama.cpp-a64a).
 
-**The loan and the refill.** A loan lends resident expert triplets to the ring.
+**The planned room.** At default placement the routed experts fill the WEIGHT
+zone, and a loan cannot fund a slot larger than every lendable matrix, so the
+ring's room is planned and the loan is the fallback. The single-device planner
+holds the room before it packs the routed experts (`hold_moe_stream_ring_room`,
+the last term after the KV room and the PP-alternate charges). The room is the
+ring's own size: `moe_stream_plan_ring_geometry`, which the phase and the fit
+size the ring with, under the planned f16 weight slot, the executor's group cap
+and nothing lent, over the host experts the pack is predicted to leave. Holding
+the room can push more experts to the host and widen the ring, so the planner
+packs again with the room held until the ring fits in it, for at most 8 rounds.
+A run that has not settled by then holds the 8th round's ring, which no pack
+with that room held was checked against; the line says so, the phase's ring can
+then be larger, and the loan funds the rest. The room is held whole or not at
+all. In a settled run it cannot exceed what is left, because with nothing left
+for the experts the ring's cap refuses the ring first. In a run that has not
+settled, a partial room would send every expert to the host for a ring the cap
+then refuses. The room comes out of the WEIGHT zone's remaining bytes and
+counts in the plan's `vram_bytes`, which the WOQ guard keeps free. It is
+accounting, not an allocation: the ring still reserves its slots at each prompt
+and releases them at its end. The runtime KV re-derivation keeps the room in
+the plan's accounting (`refresh_kv_byte_totals`), and the oneDNN scratch ring's
+budget room, which reads `vram_bytes`, leaves it alone. The runtime KV fit does
+not: it reads the zone's live free bytes (`ggml_sycl_kv_capacity_live`), and
+the ring holds no slots between prompts, so there the room counts as KV
+headroom. KV has priority at runtime, as in the planner's order of dense
+weights, then KV, then experts. A context whose KV exceeds the load plan's KV
+plus its KV room therefore takes the ring's room. The prompt's reserve is then
+refused, and the loan and the "reserve refused" line are what remain; no
+plan-time line says why, and on Qwen3.8 the loan finds nothing to lend. The
+room needs no padding: the ring allocates each slot at
+`MOE_STREAM_RING_SLOT_ALIGN`, which is the zone allocator's 256-byte grain, the
+slot is a multiple of it, and the allocator keeps no header in the zone. Only
+the single-device planner holds a room. A multi-device plan holds none, so there
+the ring still depends on the loan. One
+`[SYCL-PLAN] MoE window ring room` line per placement pass that sizes a ring
+names the room and the experts it displaced, as a WARN when it displaced any or
+did not settle. None is held, with a WARN, when the eleventh-of-the-expert-bytes
+cap above refuses the ring once the room is held, or when the room exceeds what
+is left; the ring then needs the loan below. The staged-type mask the room is
+sized over is the type half of the executor's staged claim: the mask and the
+claim ask one helper, `ggml_sycl_moe_pp_batched_claims_staged_type`, and the
+backend fills the mask, with the group cap, where it copies the inventory in.
+
+**The loan and the refill.** A loan lends resident expert triplets to the ring
+when the planned room is not held or falls short.
 `moe_expert_loan_select` picks whole (gate, up, down) triplets from the
 published plan. The cache copies each to pinned host storage and withdraws its
 device copy, and the WEIGHT-zone bytes it frees are the ring's slots. The loan
@@ -197,26 +241,46 @@ When the WEIGHT zone cannot give every slot, `moe_stream_ring::reserve` keeps
 the slots it got and reports the shortfall: the bytes of the slots it still has
 to allocate (llama.cpp-am87). `ring_ready()` asks for a loan through the op's
 `request_loan` hook, which the backend wires to
-`ggml_sycl_request_expert_loan`. The request carries the shortfall in bytes and
-the ring's slot size, and the selector counts the whole slots each lent matrix
-frees, so a triplet whose matrices are each below a slot is not lent
-(llama.cpp-9x8t). It asks once per micro-batch, since the reserve
-latch stops later layers before the reserve. The loan runs at the next graph
-boundary, and the next micro-batch's reserve continues from the slots the
-refused one kept. The phase keeps that partial ring only while a loan can still
-fund it. A loan the boundary runner refuses stops the asking for the rest of the
-prompt, and from then on a refused reserve gives its slots back at once, because
-mid-prompt runtime allocations prefer the WEIGHT zone too. A BUSY refusal does
-not, because the runner re-posts that request itself. The auto-ubatch fit only
-probes the loan bytes (`ggml_sycl_expert_loan_probe_bytes`) for its ring term,
-`ggml_sycl_hold_ring_uncovered`, and lends nothing. When a loan
-runs, the refill runs at the decode boundary through
-`ggml_sycl_expert_refill_transaction_run`. It re-admits
-lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode graph, copying
-each lent host copy back owner to owner on the copy queue, behind its writes. A
-triplet that can never be prepared stays on the host, with one WARN. A prompt
-whose ring never engaged used none of its loan, so the first decode graph's
-boundary returns all of it in one refill transaction, whatever
+`ggml_sycl_request_expert_loan`. `moe_stream_loan_size_post_loan` sizes the
+request from the plan the loan would leave, not from the shortfall alone: lent
+triplets become host matrices, which can widen the executor window and so the
+ring. It selects the triplets a request takes, rebuilds the ring geometry with
+them read as host, and repeats until the ring it sized for is the ring the loan
+leaves, or a smaller one in the same slot size. The request then carries that
+ring's bytes in that ring's slot size, less the slots the reserve already holds
+while the slot size has not changed. The selector counts the whole slots each
+lent matrix frees, so a triplet whose matrices are each below a slot is not lent
+(llama.cpp-9x8t). When the sizing does not converge (the post-loan ring exceeds
+the cap, does not grow in another slot size, or the sizing spends its bound of
+G_plan + 1 steps), no loan is asked: the latch goes REFUSED for the rest of the
+prompt, and the phase prints one WARN at every verbosity. A sized loan is asked
+once per micro-batch, since the reserve latch stops later layers before the
+reserve. The loan runs at the next graph boundary, and the next micro-batch's
+reserve continues from the slots the refused one kept. The phase keeps that
+partial ring only while a loan can still fund it. A loan the boundary runner
+refuses stops the asking for the rest of the prompt, and from then on a refused
+reserve gives its slots back at once, because mid-prompt runtime allocations
+prefer the WEIGHT zone too. A BUSY refusal does not, because the runner re-posts
+that request itself. The auto-ubatch fit's ring term,
+`ggml_sycl_hold_ring_uncovered`, credits the planned room first: the room's
+whole slots of the ring's slot size, and only on the device the plan holds it
+for. A room that holds the whole ring charges nothing. Otherwise the term sizes
+the same loan for the slots the room leaves short, as a short reserve's held
+slots, and lends nothing: it charges the converged post-loan ring less the
+room's slots that ring keeps and what the probe of that loan would lend
+(`ggml_sycl_expert_loan_probe_bytes`). The room's slots count only while the
+slot size has not changed, the sizer's own rule for a reserve's held slots
+(`moe_stream_ring_slots_kept`). When the sizing does not converge, the term
+charges the slots the room leaves short. The room sits inside the arena, and the
+fit charges against free memory outside it, so the credit counts nothing twice.
+When a runtime context's KV takes the room (above), the credit is too large and
+the prompt's reserve and the loan decide. When a loan runs, the refill
+runs at the decode boundary through `ggml_sycl_expert_refill_transaction_run`.
+It re-admits lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode
+graph, copying each lent host copy back owner to owner on the copy queue, behind
+its writes. A triplet that can never be prepared stays on the host, with one
+WARN. A prompt whose ring never engaged used none of its loan, so the first
+decode graph's boundary returns all of it in one refill transaction, whatever
 `GGML_SYCL_MOE_REFILL_PER_GRAPH` says, and one WARN names that decode graph
 (llama.cpp-i4ny). Each refill republishes the plan and forces a re-record, so
 one per triplet was the cost. A context that ends with triplets still lent
@@ -224,8 +288,8 @@ owes them to the next context: its backend free marks the ledger and copies
 nothing, and its refill report adds how many it owes. The next context's
 first graph entry, before any MUL_MAT_ID, returns them in one transaction. A
 process that exits after its last context pays nothing. The fit's
-ring term charges the ring bytes that no loan would cover to the rung's demand,
-so a rung that needs them is refused with a figure.
+ring term charges the ring bytes that neither the room nor a loan would cover to
+the rung's demand, so a rung that needs them is refused with a figure.
 
 **Gates.** Three gates keep the rule enforceable.
 

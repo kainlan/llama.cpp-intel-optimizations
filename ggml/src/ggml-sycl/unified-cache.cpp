@@ -23,6 +23,7 @@
 #include "moe-exec-policy.hpp"
 #include "moe-host-scatter.hpp"
 #include "moe-resolved-batch.hpp"
+#include "moe-stream-plan.hpp"
 #include "onednn-woq.hpp"
 #include "planned-load-terms.hpp"
 #include "range-index.hpp"
@@ -33466,6 +33467,191 @@ static size_t hold_explicit_ubatch_room(placement_plan & plan, const placement_k
     return xub.hold_bytes;
 }
 
+// The prompt phase's window ring reserves 2 x window_slots slots of the largest staged host matrix in the WEIGHT zone
+// (moe_stream_ring::reserve), and the routed experts fill that zone at default placement, so without room held here
+// the first reserve is short and only an expert loan can fund the ring. The room is the ring's own size:
+// moe_stream_plan_ring_geometry, the function the phase and the auto-ubatch fit size the ring with, over the plan the
+// expert pack is about to produce, since the window and the slot are read from the host experts and the pack decides
+// which those are. The claim the geometry asks is the type half of the executor's staged claim, as a mask the backend
+// fills (placement_kv_info::moe_stream_staged_types).
+static_assert(GGML_TYPE_COUNT <= 64, "the staged-type mask holds one bit per ggml_type");
+// The room is n_slots x slot_bytes with no padding: a WEIGHT-zone block takes round_request(slot_bytes, alignment), which
+// is slot_bytes exactly when the slot alignment is the zone allocator's grain (slot_bytes is a multiple of it, and the
+// allocator keeps no header in the zone). Another alignment would need the room padded for it.
+static_assert(MOE_STREAM_RING_SLOT_ALIGN == tlsf_allocator::block_grain,
+              "the window ring's room counts whole slots: a slot alignment other than the zone's grain needs padding");
+
+struct moe_stream_room_claims {
+    std::unordered_map<uint64_t, ggml_type> types;  // (layer, role) keyed with expert 0 -> the role's expert type
+    uint64_t                                staged_types = 0;
+};
+
+static bool moe_stream_room_claims_by_type(void * graph_ctx, int layer, expert_tensor_role role) {
+    const auto * claims = static_cast<const moe_stream_room_claims *>(graph_ctx);
+    const auto   it     = claims->types.find(moe_stream_table_key(layer, 0, role));
+    if (it == claims->types.end()) {
+        return false;
+    }
+    const int type = static_cast<int>(it->second);
+    return type >= 0 && type < GGML_TYPE_COUNT && ((claims->staged_types >> type) & 1u) != 0;
+}
+
+// The expert pack's first-fit (compute_placement_plan: a group goes on the device when its charge fits what is left)
+// over `avail` bytes, written into the entries' placement so the ring's geometry can read the split. The pack itself
+// rewrites every group entry after this. Returns the device bytes it placed, and the groups in *n_groups.
+static size_t moe_stream_room_dry_pack(placement_plan &                       plan,
+                                       const std::vector<moe_triplet_group> & groups,
+                                       int                                    device_id,
+                                       size_t                                 avail,
+                                       size_t *                               n_groups) {
+    size_t placed = 0;
+    size_t n      = 0;
+    for (const auto & group : groups) {
+        const bool fits = group.charge_bytes <= avail;
+        if (fits) {
+            avail -= group.charge_bytes;
+            placed += group.bytes;
+            ++n;
+        }
+        for (size_t idx : group.indices) {
+            if (idx < plan.entries.size()) {
+                plan.entries[idx].on_device     = fits;
+                plan.entries[idx].target_device = fits ? device_id : -1;
+            }
+        }
+    }
+    *n_groups = n;
+    return placed;
+}
+
+// Holds the window ring's room out of `remaining`, the last term before the expert pack, and counts it in the plan.
+// Holding room moves experts to the host, which can widen the window or raise the slot, so the room is iterated to the
+// ring of the plan it produces: R starts at 0 and takes the ring of the pack with R held while that ring is larger.
+// R only grows, and it is bounded by two windows of G_plan slots of the largest claimable matrix, so it settles in a
+// few rounds; the loop stops at max_rounds. A run that has not settled by then holds the last round's ring, which no
+// pack with that room held was checked against: the phase's ring can then be larger, and the loan funds the rest. The
+// line's cost figures are taken from one more dry pack with the held room, so they describe the room the plan holds.
+// A ring that shrinks below R without reaching 0 settles with R still held, so the line names the ring R was taken
+// from, whose slots make up R, not the last round's smaller one.
+// R is held whole or not at all, never min(R, remaining). In a settled run R > remaining cannot happen: with nothing
+// left for the experts the geometry is 0 and the cap answers first. In a run that has not settled, a partial room
+// would send every expert to the host for a ring the cap then refuses.
+// No room is held when no ring would exist (nothing staged, no host expert, no planned weight slot), or when the
+// ring's cap, an eleventh of the device's expert bytes, refuses the ring once its room displaces experts. The phase,
+// the ring and the loan are unchanged: a reserve this room cannot fund still asks for a loan.
+static void hold_moe_stream_ring_room(placement_plan &                       plan,
+                                      const std::vector<moe_triplet_group> & groups,
+                                      const placement_kv_info &              kv_info,
+                                      int                                    device_id,
+                                      size_t &                               remaining) {
+    plan.moe_stream_ring_reserve_bytes = 0;
+    if (kv_info.moe_stream_staged_types == 0 || plan.pp_moe_onednn_weight_slot_bytes == 0 || groups.empty()) {
+        return;
+    }
+    moe_stream_room_claims claims;
+    claims.staged_types = kv_info.moe_stream_staged_types;
+    for (const auto & e : plan.entries) {
+        if (e.expert_id >= 0 && e.layer_id >= 0) {
+            claims.types.emplace(moe_stream_table_key(e.layer_id, 0, e.expert_role), e.type);
+        }
+    }
+    moe_stream_window_hints hints;
+    hints.weight_slot_bytes = plan.pp_moe_onednn_weight_slot_bytes;
+    hints.group_cap         = kv_info.moe_stream_group_cap;
+    hints.lent_bytes        = 0;  // the phase reads the published plan with nothing lent when this room funds it
+
+    // The pack rewrites every group entry, but the entries go back as they were, so this pass changes only the room.
+    std::vector<std::pair<bool, int>> saved;
+    for (const auto & group : groups) {
+        for (size_t idx : group.indices) {
+            if (idx < plan.entries.size()) {
+                saved.push_back({ plan.entries[idx].on_device, plan.entries[idx].target_device });
+            }
+        }
+    }
+
+    constexpr int            max_rounds     = 8;
+    size_t                   room           = 0;
+    size_t                   groups_without = 0;
+    size_t                   placed_without = 0;
+    size_t                   groups_with    = 0;
+    size_t                   placed_with    = 0;
+    moe_stream_ring_geometry geo;       // the ring of the last round's pack
+    moe_stream_ring_geometry held_geo;  // the ring `room` was taken from
+    bool                     settled = false;
+    int                      rounds  = 0;
+    while (rounds < max_rounds) {
+        const size_t avail = remaining > room ? remaining - room : 0;
+        placed_with        = moe_stream_room_dry_pack(plan, groups, device_id, avail, &groups_with);
+        if (rounds == 0) {
+            placed_without = placed_with;
+            groups_without = groups_with;
+        }
+        geo = moe_stream_plan_ring_geometry(plan, device_id, nullptr, &claims, moe_stream_room_claims_by_type, hints);
+        ++rounds;
+        if (geo.bytes <= room) {
+            settled = true;
+            break;
+        }
+        room     = geo.bytes;
+        held_geo = geo;
+    }
+    if (!settled) {
+        // The last round packed with the previous round's room: pack once more with the room this run holds, so the
+        // cost the line prints is that room's.
+        const size_t held_avail = remaining > room ? remaining - room : 0;
+        placed_with             = moe_stream_room_dry_pack(plan, groups, device_id, held_avail, &groups_with);
+    }
+
+    size_t i = 0;
+    for (const auto & group : groups) {
+        for (size_t idx : group.indices) {
+            if (idx < plan.entries.size()) {
+                plan.entries[idx].on_device     = saved[i].first;
+                plan.entries[idx].target_device = saved[i].second;
+                ++i;
+            }
+        }
+    }
+
+    const double mb = 1024.0 * 1024.0;  // MB as the sibling [SYCL-PLAN] lines print it
+    if (room == 0) {
+        return;  // no ring would exist with all of `remaining` for the experts: nothing to hold, nothing to say
+    }
+    if (settled && geo.bytes == 0) {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] MoE window ring room on device %d: none held: the ring's cap (an eleventh of the device's "
+            "expert bytes) refuses the %.1f MB ring once its room displaces experts, so the prompt phase's reserve "
+            "asks for an expert loan\n",
+            device_id, room / mb);
+        return;
+    }
+    if (room > remaining) {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] MoE window ring room on device %d: none held: the %.1f MB ring exceeds the %.1f MB left "
+            "after the dense weights and the KV, so the prompt phase's reserve asks for an expert loan\n",
+            device_id, room / mb, remaining / mb);
+        return;
+    }
+    remaining -= room;
+    plan.moe_stream_ring_reserve_bytes = room;
+    plan.vram_bytes += room;
+    const size_t displaced = placed_without > placed_with ? placed_without - placed_with : 0;
+    const bool   warn      = displaced > 0 || !settled;
+    const char * unsettled =
+        settled ? "" : " (not settled: the phase's ring may be larger, and an expert loan funds the rest)";
+    // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
+    // once.
+    ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[SYCL-PLAN] MoE window ring room on device %d: held %.1f MB in the WEIGHT zone before the "
+                      "routed experts for the prompt phase's window ring (%u slots x %.2f MB, %u per region, sized "
+                      "in %d round(s))%s; it cost %.1f MB of device-resident routed experts: %.1f MB (%zu "
+                      "triplet(s)) on the device, against %.1f MB (%zu) without the room. An expert loan funds a "
+                      "reserve this room cannot.\n",
+                      device_id, room / mb, held_geo.n_slots, held_geo.slot_bytes / mb, held_geo.region_slots, rounds,
+                      unsettled, displaced / mb, placed_with / mb, groups_with, placed_without / mb, groups_without);
+}
+
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,
                                       size_t                                     vram_budget,
                                       int                                        device_id,
@@ -33888,6 +34074,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 "no_layout_bytes=%zu\n",
                 device_id, pp_alt_groups, pp_alt_entries, pp_alt_charge / (1024.0 * 1024.0), pp_alt_no_layout_bytes);
         }
+        // The window ring's room, the last term held before the pack: the ring is sized over the host experts the pack
+        // leaves, so the room is sized over the pack it predicts, after every group's charge is final.
+        hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining);
         moe_triplet_pack_stats stats;
         stats.groups  = moe_groups.size();
         stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;

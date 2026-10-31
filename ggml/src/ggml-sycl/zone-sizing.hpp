@@ -544,8 +544,8 @@ struct zone_hold_rung_request {
 // The planned dense scratch (the most the hold can be) at a rung.
 typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 
-// ring_bytes is the prefill ring's bytes no loan can cover (llama.cpp-kjef): the ring is lent, so it is 0 when a loan
-// supplies all of it, and a demand on free memory otherwise.
+// ring_bytes is the prefill ring's bytes neither the planned room nor a loan covers (llama.cpp-kjef): the ring's slots
+// are the room's bytes and lent bytes, so it is 0 when the two supply all of it, and a demand on free memory otherwise.
 //
 // compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
 // to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned compute
@@ -578,10 +578,10 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
 bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request);
 
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
-// zone_hold_spill_bound(plan, the rung's request) and the KV room, plus the ring bytes no loan covers (saturating).
-// A request the zone was planned to serve (zone_hold_fit_rung_has_compute_room) is never held back, since the hold
-// keeps a request out only when the zone's free bytes less the hold are short of it, so it adds nothing to the bound.
-// 0 for an unknown n_ubatch.
+// zone_hold_spill_bound(plan, the rung's request) and the KV room, plus the ring bytes neither the planned room nor a
+// loan covers (saturating). A request the zone was planned to serve (zone_hold_fit_rung_has_compute_room) is never
+// held back, since the hold keeps a request out only when the zone's free bytes less the hold are short of it, so
+// it adds nothing to the bound. 0 for an unknown n_ubatch.
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // Whether the rung fits: zone_hold_spill_bound_fits(free_before, headroom, demand).
