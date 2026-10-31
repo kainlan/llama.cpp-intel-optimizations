@@ -65,6 +65,8 @@ What this gate pins:
     the test hook, after begin_layer (a new geometry re-reserves the ring), and once the phase is gone in the context
     destructor. Each record is counted on its extra, the context's member documents that a record's extra outlives
     it, and release_extra_gpu asserts no record is left.
+  - a stage-table entry's layout defaults to the ring's one slot layout, MOE_STREAM_RING_SLOT_LAYOUT, the constant
+    the ring slices every slot with, so an entry built without naming a layout claims the layout its slot holds.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -1658,6 +1660,31 @@ def test_executor_ring_slot_layout_mutants():
     assert not c(sycl=mutate(SYCL, EXEC_DEFER, shadow))
     # Control: a comparison is a use, not a definition.
     assert c(sycl=norm(SYCL) + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);")
+
+
+
+STAGED_SIG = "struct moe_stream_staged"
+STAGED_LAYOUT_DEFAULT = "ggml_layout_mode layout = MOE_STREAM_RING_SLOT_LAYOUT;"
+
+
+def claim_staged_layout_defaults_to_the_slot_layout(hpp: str) -> bool:
+    """The entry's layout defaults to the ring's slot layout, by the constant, not a literal: one fact, one source."""
+    b = body(norm(hpp), STAGED_SIG)
+    return b.count("layout =") == 1 and STAGED_LAYOUT_DEFAULT in b
+
+
+def test_staged_layout_defaults_to_the_slot_layout():
+    assert claim_staged_layout_defaults_to_the_slot_layout(PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.hpp: body of struct moe_stream_staged",
+        body(norm(PLAN_HPP), STAGED_SIG), STAGED_LAYOUT_DEFAULT, signature=STAGED_SIG)
+
+
+def test_staged_layout_default_mutants():
+    c = claim_staged_layout_defaults_to_the_slot_layout
+    # The retired SOA default back.
+    assert not c(mutate(PLAN_HPP, STAGED_LAYOUT_DEFAULT, "ggml_layout_mode layout = GGML_LAYOUT_SOA;"))
+    # The slot layout spelled as a literal: a second source for the ring's one fact.
+    assert not c(mutate(PLAN_HPP, STAGED_LAYOUT_DEFAULT, "ggml_layout_mode layout = GGML_LAYOUT_AOS;"))
 
 
 if __name__ == "__main__":

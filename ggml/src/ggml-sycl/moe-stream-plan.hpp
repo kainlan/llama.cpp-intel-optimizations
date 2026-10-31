@@ -90,12 +90,13 @@ static inline bool moe_expert_role_is_triplet(expert_tensor_role r) {
 // acquired with the layout written there (lead ruling c-o9uw-1), so the slice's own tag agrees, and the route refuses a
 // slot where it does not. The ring stages AOS slots for the batched executor only (W2): `soa` is empty, `ready` is the
 // copy's event, `layout` is AOS and `consumer` is the item's, EXECUTOR (llama.cpp-3460), by which the route refuses the
-// entry. The SOA fields stay: the resolver still picks an entry's slot by `layout`.
+// entry. `layout` defaults to MOE_STREAM_RING_SLOT_LAYOUT, the layout every ring slot holds. The SOA field stays:
+// the resolver still picks an entry's slot by `layout`.
 struct moe_stream_staged {
     mem_handle          soa;
     mem_handle          aos;
     sycl::event         ready;
-    ggml_layout_mode    layout   = GGML_LAYOUT_SOA;
+    ggml_layout_mode    layout   = MOE_STREAM_RING_SLOT_LAYOUT;
     moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
 };
 
