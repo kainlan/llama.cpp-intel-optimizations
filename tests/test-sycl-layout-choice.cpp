@@ -641,6 +641,316 @@ static bool run_kv_context_room_before_experts_test() {
     return true;
 }
 
+// An explicit micro-batch's PP MoE oneDNN scratch ring that the RUNTIME zone planned for the load's own micro-batch
+// cannot hold is placed, not refused: the routed experts give up the room, and only when moving every device-resident
+// expert would not free it is the context refused, with the largest -ub that fits. The ring here has a 256 KiB weight
+// slot, 1 KiB of activation and 512 B of output per row, and depth 2; the rest of the RUNTIME requirement is 1 MiB, and
+// no floor. So the ring is 2 MiB at the default 512 and 6.5 MiB at 2048, and the zone grows from 3 MiB to 7.5 MiB: a
+// 4.5 MiB room, exactly six of the synthetic model's 768 KiB triplets.
+namespace explicit_ubatch_case {
+constexpr size_t mib           = 1024 * 1024;
+constexpr size_t zone_default  = 3 * mib;
+constexpr size_t zone_explicit = 7 * mib + mib / 2;
+constexpr size_t room          = zone_explicit - zone_default;
+constexpr size_t ring_explicit = 6 * mib + mib / 2;
+constexpr size_t runtime_fixed = 1 * mib;
+
+static ggml_sycl::pp_moe_onednn_explicit_ubatch_room room_with_zone(size_t runtime_zone_bytes) {
+    ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch                 = 2048;
+    in.n_ubatch_default         = 512;
+    in.weight_slot_bytes        = 256 * 1024;
+    in.activation_bytes_per_row = 1024;
+    in.output_bytes_per_row     = 512;
+    in.ring_depth               = 2;
+    in.runtime_fixed_bytes      = runtime_fixed;
+    in.runtime_floor_bytes      = 0;
+    in.runtime_zone_bytes       = runtime_zone_bytes;
+    return ggml_sycl::pp_moe_onednn_explicit_ubatch_plan_room(in);
+}
+
+static ggml_sycl::placement_plan plan(size_t expert_bytes_left, size_t runtime_zone_bytes) {
+    using namespace kv_order_case;
+    ggml_sycl::placement_kv_info kv = kv_info(0);
+    kv.n_ubatch_context             = 2048;
+    kv.explicit_ubatch              = room_with_zone(runtime_zone_bytes);
+    const size_t budget             = 2 * dense_bytes + 2 * kv_at_512 + expert_bytes_left;
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_experts);
+}
+
+// Every dense layer, its KV and every routed-expert role on the same device in both plans.
+static bool same_device_placement(const ggml_sycl::placement_plan & a, const ggml_sycl::placement_plan & b) {
+    using namespace kv_order_case;
+    for (int l = 0; l < 2; ++l) {
+        if (a.get_layer_device(l) != b.get_layer_device(l) || a.get_kv_device(l) != b.get_kv_device(l)) {
+            return false;
+        }
+        for (int e = 0; e < n_experts; ++e) {
+            for (auto role : { ggml_sycl::expert_tensor_role::GATE, ggml_sycl::expert_tensor_role::UP,
+                               ggml_sycl::expert_tensor_role::DOWN }) {
+                const auto pa = a.lookup_expert_placement(l, e, role);
+                const auto pb = b.lookup_expert_placement(l, e, role);
+                if (pa.found() != pb.found() || pa.on_device != pb.on_device) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+}  // namespace explicit_ubatch_case
+
+static bool run_explicit_ubatch_ring_placement_test() {
+    using namespace explicit_ubatch_case;
+    using action         = ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
+    const size_t triplet = kv_order_case::triplet_bytes;
+    bool         ok      = true;
+
+    const auto room0 = room_with_zone(zone_default);
+    if (!room0.valid || room0.ring_bytes != ring_explicit || room0.zone_default_bytes != zone_default ||
+        room0.zone_bytes != zone_explicit || room0.room_bytes != room || room0.room_reserved_bytes != 0 ||
+        room != 6 * triplet) {
+        printf(
+            "FAIL: the n_ubatch=2048 ring is %zu bytes in a %zu-byte zone over %zu (room %zu, held %zu), want %zu in "
+            "%zu over %zu (room %zu, held 0)\n",
+            room0.ring_bytes, room0.zone_bytes, room0.zone_default_bytes, room0.room_bytes, room0.room_reserved_bytes,
+            ring_explicit, zone_explicit, zone_default, room);
+        ok = false;
+    }
+
+    // The experts have the room to give, but the zone has not grown: the plan says so, and already holds the whole
+    // room against them, so two triplets stay on the device and six move. The backend grows the zone (which takes the
+    // room from the weight capacity) and plans again.
+    const auto   grow = plan(8 * triplet, zone_default);
+    const auto & gxub = grow.explicit_ubatch;
+    if (gxub.action != action::GROW_ZONE || gxub.n_ubatch != 2048 || gxub.expert_budget_bytes != 8 * triplet ||
+        gxub.hold_bytes != room || gxub.hold_reason == nullptr || kv_order_case::device_triplets(grow) != 2 ||
+        gxub.expert_groups != 2 || gxub.expert_groups_without != 8 || gxub.moved_layers != 2 ||
+        gxub.moved_bytes() != 6 * triplet) {
+        printf(
+            "FAIL: an unreserved room the experts can give asks to grow the zone and holds the room: action %s, "
+            "budget %zu, hold %zu, %zu device triplets, %zu against %zu with the hold added back; want grow-zone, "
+            "%zu, %zu, 2, 2 against 8\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(gxub.action), gxub.expert_budget_bytes,
+            gxub.hold_bytes, kv_order_case::device_triplets(grow), gxub.expert_groups, gxub.expert_groups_without,
+            8 * triplet, room);
+        ok = false;
+    }
+
+    // The zone holds the room, which came out of the weight capacity: two triplets stay on the device, and the six the
+    // room displaced are the ones the decision line names, with their bytes. The dense weights and their KV stay put.
+    const auto   placed = plan(2 * triplet, zone_explicit);
+    const auto & xub    = placed.explicit_ubatch;
+    if (xub.action != action::PLACE || xub.room_reserved_bytes != room || xub.hold_bytes != room ||
+        kv_order_case::device_triplets(placed) != 2 || xub.expert_groups != 2 || xub.expert_groups_without != 8 ||
+        xub.moved_layers != 2 || xub.moved_bytes() != 6 * triplet || xub.ring_bytes != ring_explicit ||
+        placed.get_layer_device(0) != 0 || placed.get_layer_device(1) != 0 || placed.get_kv_device(0) != 0 ||
+        placed.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: a held room places the ring and moves the experts it displaced: action %s, held %zu, hold %zu, %zu "
+            "device triplets, %zu against %zu with the hold added back, moved %zu bytes from %zu layers; want place, "
+            "%zu, %zu, 2, 2 against 8, %zu from 2\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.room_reserved_bytes, xub.hold_bytes,
+            kv_order_case::device_triplets(placed), xub.expert_groups, xub.expert_groups_without, xub.moved_bytes(),
+            xub.moved_layers, room, room, 6 * triplet);
+        ok = false;
+    }
+
+    // Growing the zone does not change the plan: the hold is the whole room before and after, so the plan the backend
+    // grows the zone for is the plan it keeps, triplet for triplet.
+    if (!same_device_placement(grow, placed) || grow.weight_vram_bytes != placed.weight_vram_bytes ||
+        grow.weight_host_bytes != placed.weight_host_bytes || grow.kv_vram_bytes != placed.kv_vram_bytes) {
+        printf(
+            "FAIL: the plans before and after the zone grows differ: weights %zu/%zu device, %zu/%zu host, kv %zu/%zu, "
+            "same placement %d\n",
+            grow.weight_vram_bytes, placed.weight_vram_bytes, grow.weight_host_bytes, placed.weight_host_bytes,
+            grow.kv_vram_bytes, placed.kv_vram_bytes, same_device_placement(grow, placed) ? 1 : 0);
+        ok = false;
+    }
+
+    // The hold comes after the dense and KV phases: against the same budget with no micro-batch named, the dense
+    // layers, their KV and its bytes are where they were, and the device weights differ by the six moved triplets.
+    const auto baseline = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+    bool dense_kv_same = baseline.kv_vram_bytes == grow.kv_vram_bytes && baseline.kv_host_bytes == grow.kv_host_bytes &&
+                         baseline.weight_vram_bytes == grow.weight_vram_bytes + 6 * triplet;
+    for (int l = 0; l < 2; ++l) {
+        dense_kv_same = dense_kv_same && baseline.get_layer_device(l) == grow.get_layer_device(l) &&
+                        baseline.get_kv_device(l) == grow.get_kv_device(l);
+    }
+    if (!dense_kv_same || kv_order_case::device_triplets(baseline) != 8) {
+        printf(
+            "FAIL: the hold must leave the dense and KV phases as they were: kv %zu/%zu device, %zu/%zu host, weights "
+            "%zu vs %zu + 6 triplets, %zu baseline device triplets\n",
+            baseline.kv_vram_bytes, grow.kv_vram_bytes, baseline.kv_host_bytes, grow.kv_host_bytes,
+            baseline.weight_vram_bytes, grow.weight_vram_bytes, kv_order_case::device_triplets(baseline));
+        ok = false;
+    }
+
+    // The two device triplets give 1.5 MiB, less than the room: refused, and the largest micro-batch whose ring fits
+    // the zone plus those bytes, less the fixed rest (3 + 1.5 - 1 = 3.5 MiB), is 1024 (its ring is exactly 3.5 MiB).
+    const auto partial = plan(2 * triplet, zone_default);
+    if (partial.explicit_ubatch.action != action::REFUSE ||
+        partial.explicit_ubatch.max_ring_runtime_bytes != 3 * mib + mib / 2 ||
+        partial.explicit_ubatch.largest_fitting_n_ubatch != 1024 || kv_order_case::device_triplets(partial) != 2 ||
+        partial.explicit_ubatch.moved_bytes() != 0 || partial.explicit_ubatch.hold_bytes != 0) {
+        printf(
+            "FAIL: a room the device experts cannot give is refused with the largest fit: action %s, ring room %zu, "
+            "largest -ub %u, %zu device triplets; want refuse, %zu, 1024, 2\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(partial.explicit_ubatch.action),
+            partial.explicit_ubatch.max_ring_runtime_bytes, partial.explicit_ubatch.largest_fitting_n_ubatch,
+            kv_order_case::device_triplets(partial), 3 * mib + mib / 2);
+        ok = false;
+    }
+
+    // Nothing to demote (no expert fits beside the dense weights and their KV): refused, and the largest fit is the
+    // load's own 512, whose 2 MiB ring is what the zone holds beside the fixed rest.
+    const auto none = plan(0, zone_default);
+    if (none.explicit_ubatch.action != action::REFUSE || none.explicit_ubatch.max_ring_runtime_bytes != 2 * mib ||
+        none.explicit_ubatch.largest_fitting_n_ubatch != 512 || kv_order_case::device_triplets(none) != 0 ||
+        none.explicit_ubatch.hold_bytes != 0) {
+        printf(
+            "FAIL: with nothing to demote the context is refused with the largest fit: action %s, ring room %zu, "
+            "largest -ub %u; want refuse, %zu, 512\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(none.explicit_ubatch.action),
+            none.explicit_ubatch.max_ring_runtime_bytes, none.explicit_ubatch.largest_fitting_n_ubatch, 2 * mib);
+        ok = false;
+    }
+
+    // No micro-batch named: no decision, and the plan is the one the load always made.
+    ggml_sycl::placement_kv_info plain   = kv_order_case::kv_info(0);
+    const auto                   unnamed = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        plain, nullptr, kv_order_case::n_experts);
+    if (unnamed.explicit_ubatch.n_ubatch != 0 || unnamed.explicit_ubatch.action != action::NONE ||
+        unnamed.explicit_ubatch.hold_bytes != 0 || kv_order_case::device_triplets(unnamed) != 8) {
+        printf("FAIL: no named micro-batch makes no decision: n_ubatch %u, action %s, %zu device triplets\n",
+               unnamed.explicit_ubatch.n_ubatch,
+               ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(unnamed.explicit_ubatch.action),
+               kv_order_case::device_triplets(unnamed));
+        ok = false;
+    }
+
+    // The compute room the hold-spill fit credits is the planned compute term at the micro-batch the PLACE plan placed.
+    // The GROW_ZONE plan is planned again once the zone grows and is never the published one, and the two refusals and
+    // the unnamed plan sized no room, so each gives none.
+    constexpr size_t compute_term = 256 * 1024;
+    uint32_t         room_n       = 0;
+    const size_t     room_placed =
+        ggml_sycl::placement_explicit_ubatch_compute_room(placed.explicit_ubatch, compute_term, &room_n);
+    size_t room_others = 0;
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        uint32_t other_n = 1;
+        room_others +=
+            ggml_sycl::placement_explicit_ubatch_compute_room(other->explicit_ubatch, compute_term, &other_n);
+        room_others += other_n;
+    }
+    if (room_placed != compute_term || room_n != 2048 || room_others != 0 ||
+        ggml_sycl::placement_explicit_ubatch_compute_room(placed.explicit_ubatch, compute_term, nullptr) !=
+            compute_term) {
+        printf(
+            "FAIL: the compute room is the planned term at the placed micro-batch only: %zu at n_ubatch %u for the "
+            "placed plan, %zu summed over grow-zone, both refusals and no decision; want %zu at 2048, 0\n",
+            room_placed, room_n, room_others, compute_term);
+        ok = false;
+    }
+
+    // The first non-probe context since the load announces the placement at WARN. The rule reads the plan alone, so a
+    // context whose micro-batch differs (-p 512 under -ub 2048) still announces it. The plan that context publishes
+    // carries the mark and the next context copies it, so none announces again. A probe never announces, and neither
+    // does a plan that placed nothing or a room that cost no device bytes.
+    ggml_sycl::placement_plan published = placed;
+    const bool                fresh     = !published.explicit_ubatch.announced;
+
+    const bool first_announces = ggml_sycl::placement_explicit_ubatch_announces(published.explicit_ubatch, false);
+    const bool probe_announces = ggml_sycl::placement_explicit_ubatch_announces(published.explicit_ubatch, true);
+
+    published.explicit_ubatch.announced   = true;
+    const ggml_sycl::placement_plan later = published;
+    const bool later_announces = ggml_sycl::placement_explicit_ubatch_announces(later.explicit_ubatch, false);
+
+    ggml_sycl::placement_explicit_ubatch slack = placed.explicit_ubatch;
+    slack.expert_bytes_without                 = slack.expert_bytes;
+    bool others_announce                       = ggml_sycl::placement_explicit_ubatch_announces(slack, false);
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        others_announce =
+            others_announce || ggml_sycl::placement_explicit_ubatch_announces(other->explicit_ubatch, false);
+    }
+    if (!fresh || !first_announces || probe_announces || later_announces || others_announce) {
+        printf(
+            "FAIL: a load announces its placement once, at the first non-probe context: fresh plan unmarked %d, first "
+            "context %d, probe %d, a context after the mark %d, a plan with nothing to announce %d; want 1, 1, 0, 0, "
+            "0\n",
+            fresh ? 1 : 0, first_announces ? 1 : 0, probe_announces ? 1 : 0, later_announces ? 1 : 0,
+            others_announce ? 1 : 0);
+        ok = false;
+    }
+
+    if (ok) {
+        printf(
+            "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "
+            "only when they cannot give it\n");
+    }
+    return ok;
+}
+
+// The ring each context re-plans for. A load that PLACED the micro-batch keeps the ring at that size for every context
+// whose own micro-batch is no larger (llama-bench's -p 512 and -n 128 contexts under -ub 2048), so none of them
+// releases the placed ring for the next context to re-admit. A larger context, a context that names no micro-batch, and
+// every plan that placed nothing re-plan for the context's own micro-batch. The plans are the ring-placement case's.
+static bool run_explicit_ubatch_ring_kept_for_smaller_contexts_test() {
+    using namespace explicit_ubatch_case;
+    using action         = ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
+    const auto   name    = ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name;
+    const size_t triplet = kv_order_case::triplet_bytes;
+
+    const auto placed  = plan(2 * triplet, zone_explicit);
+    const auto grow    = plan(8 * triplet, zone_default);
+    const auto partial = plan(2 * triplet, zone_default);
+    const auto none    = plan(0, zone_default);
+    const auto unnamed = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+    // The rule reads the decision, so each plan must make the one this case names, or the case proves nothing.
+    if (placed.explicit_ubatch.action != action::PLACE || placed.explicit_ubatch.n_ubatch != 2048 ||
+        grow.explicit_ubatch.action != action::GROW_ZONE || partial.explicit_ubatch.action != action::REFUSE ||
+        none.explicit_ubatch.action != action::REFUSE || unnamed.explicit_ubatch.action != action::NONE) {
+        printf(
+            "FAIL: the ring-keep plans decide %s at %u, %s, %s, %s and %s; want place at 2048, grow-zone, refuse, "
+            "refuse and none\n",
+            name(placed.explicit_ubatch.action), placed.explicit_ubatch.n_ubatch, name(grow.explicit_ubatch.action),
+            name(partial.explicit_ubatch.action), name(none.explicit_ubatch.action),
+            name(unnamed.explicit_ubatch.action));
+        return false;
+    }
+
+    const auto &   xub        = placed.explicit_ubatch;
+    const uint32_t kept_128   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 128);
+    const uint32_t kept_512   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 512);
+    const uint32_t kept_2048  = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 2048);
+    const uint32_t own_4096   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 4096);
+    const uint32_t own_0      = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 0);
+    bool           others_own = true;
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        for (const uint32_t n_ubatch : { 128u, 512u, 2048u }) {
+            const uint32_t ring_n_ubatch =
+                ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(other->explicit_ubatch, n_ubatch);
+            others_own = others_own && ring_n_ubatch == n_ubatch;
+        }
+    }
+    if (kept_128 != 2048 || kept_512 != 2048 || kept_2048 != 2048 || own_4096 != 4096 || own_0 != 0 || !others_own) {
+        printf(
+            "FAIL: a placed load keeps its ring for every context no larger than its micro-batch: contexts at 128, 512 "
+            "and 2048 re-plan for %u, %u and %u, at 4096 for %u, at 0 for %u, and plans that placed nothing for the "
+            "context's own %d; want 2048, 2048, 2048, 4096, 0 and 1\n",
+            kept_128, kept_512, kept_2048, own_4096, own_0, others_own ? 1 : 0);
+        return false;
+    }
+    printf("PASS: a placed explicit micro-batch keeps its ring for every context of the load no larger than it\n");
+    return true;
+}
+
 // Layer 0's triplets are four times layer 1's. The room's cost is net: with the room added back, the first-fit pack
 // takes a second large triplet and then has no space for the small ones the real pack placed, so counting only the
 // triplets that fit the larger budget and not the real one (one large triplet) over-states what the room cost.
@@ -701,6 +1011,102 @@ static bool run_kv_context_room_cost_is_net_test() {
         return false;
     }
     printf("PASS: the KV context room's cost is the net device bytes of routed experts\n");
+    return true;
+}
+
+// The explicit micro-batch's cost is net too, on the same unequal triplets: layer 0's are four times layer 1's. The
+// ring here has a 256 KiB weight slot, 192 B of activation and 96 B of output per row, and depth 1, so the ring at 2560
+// is 576 KiB more than at the default 512. The RUNTIME zone already holds that room, which it took from the weight
+// capacity when it grew, so the budget the planner is given is what is left beside the zone, as for the placed plan
+// above. The hold credits what the zone holds before it charges the room, so it takes nothing more from that budget.
+// Left for the experts: one large triplet and two small ones; with the hold added back, two large and one small. The
+// device keeps as many triplets and 576 KiB less, and only layer 0 keeps fewer. Counting the triplets that fit the
+// larger budget and not the real one would say one large triplet, 768 KiB, moved.
+static bool run_explicit_ubatch_cost_is_net_test() {
+    using namespace kv_order_case;
+    constexpr size_t small_bytes   = expert_bytes / 4;
+    constexpr size_t small_triplet = 3 * small_bytes;
+    constexpr size_t room_bytes    = 2048 * (192 + 96);
+    constexpr size_t fixed_bytes   = 1024 * 1024;
+
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk  = "blk." + std::to_string(l) + ".";
+        const size_t      role = l == 0 ? expert_bytes : small_bytes;
+        inv.push_back({ blk + "attn_q.weight", dense_bytes });
+        inv.push_back({ blk + "ffn_gate_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_up_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_down_exps.weight", n_experts * role });
+    }
+
+    ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch                 = 2560;
+    in.n_ubatch_default         = 512;
+    in.weight_slot_bytes        = 256 * 1024;
+    in.activation_bytes_per_row = 192;
+    in.output_bytes_per_row     = 96;
+    in.ring_depth               = 1;
+    in.runtime_fixed_bytes      = fixed_bytes;
+    in.runtime_floor_bytes      = 0;
+    in.runtime_zone_bytes       = fixed_bytes + 256 * 1024 + 2560 * (192 + 96);
+
+    ggml_sycl::placement_kv_info kv = kv_info(0);
+    kv.n_ubatch_context             = 2560;
+    kv.explicit_ubatch              = ggml_sycl::pp_moe_onednn_explicit_ubatch_plan_room(in);
+    if (!kv.explicit_ubatch.valid || kv.explicit_ubatch.room_bytes != room_bytes ||
+        kv.explicit_ubatch.room_reserved_bytes != room_bytes || room_bytes != triplet_bytes - small_triplet) {
+        printf("FAIL: the n_ubatch=2560 room is %zu bytes, %zu of them held; want %zu, all held\n",
+               kv.explicit_ubatch.room_bytes, kv.explicit_ubatch.room_reserved_bytes, room_bytes);
+        return false;
+    }
+
+    // The packs take triplets in (layer, expert) order; see the KV room's case above for why the ranks are set here.
+    int prior_rank[2][n_experts];
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            prior_rank[l][e] = ggml_sycl::get_expert_popularity_rank(l, e);
+            ggml_sycl::set_expert_popularity_rank(l, e, l * n_experts + e);
+        }
+    }
+    const size_t left   = triplet_bytes + 2 * small_triplet;
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + left;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv, nullptr, n_experts);
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            ggml_sycl::set_expert_popularity_rank(l, e, prior_rank[l][e]);
+        }
+    }
+
+    const auto & xub = plan.explicit_ubatch;
+    // The experts are packed into what the dense weights and their KV leave of the budget; the zone's room is
+    // not in it.
+    if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || xub.expert_budget_bytes != left ||
+        xub.hold_bytes != room_bytes || device_triplets(plan) != 3) {
+        printf(
+            "FAIL: the held room places the ring: action %s, expert budget %zu, hold %zu, %zu device triplets; want "
+            "place, %zu, %zu, 3\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.expert_budget_bytes, xub.hold_bytes,
+            device_triplets(plan), left, room_bytes);
+        return false;
+    }
+    // Net: (2 large + 1 small) - (1 large + 2 small) = the room's bytes, in the one layer that keeps fewer triplets.
+    if (xub.expert_groups != 3 || xub.expert_groups_without != 3 || xub.expert_bytes != left ||
+        xub.expert_bytes_without != 2 * triplet_bytes + small_triplet || xub.moved_bytes() != room_bytes ||
+        xub.moved_layers != 1) {
+        printf(
+            "FAIL: the room moves %zu device bytes of routed experts net from 1 layer: %zu bytes (%zu triplets) on the "
+            "device against %zu (%zu) with the hold added back, %zu moved from %zu layers; want %zu (3) against %zu "
+            "(3), not the gross %zu\n",
+            room_bytes, xub.expert_bytes, xub.expert_groups, xub.expert_bytes_without, xub.expert_groups_without,
+            xub.moved_bytes(), xub.moved_layers, left, 2 * triplet_bytes + small_triplet, triplet_bytes);
+        return false;
+    }
+    // The bytes decide the announcement: the device keeps as many triplets, and the room still cost 576 KiB of them.
+    if (!ggml_sycl::placement_explicit_ubatch_announces(xub, false)) {
+        printf("FAIL: a room that cost device bytes with the triplet count unchanged must still be announced\n");
+        return false;
+    }
+    printf("PASS: the explicit micro-batch room's cost is the net device bytes of routed experts\n");
     return true;
 }
 
@@ -3665,7 +4071,10 @@ int main() {
         mock_ok = run_moe_device_policy_mock_test() && mock_ok;
         mock_ok = run_moe_triplet_planner_test() && mock_ok;
         mock_ok = run_kv_context_room_before_experts_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_ring_placement_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_ring_kept_for_smaller_contexts_test() && mock_ok;
         mock_ok = run_kv_context_room_cost_is_net_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_cost_is_net_test() && mock_ok;
         mock_ok = run_kv_context_room_follows_the_requested_context_test() && mock_ok;
         mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;

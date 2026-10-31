@@ -2707,6 +2707,155 @@ Host tests: `ggml/src/ggml-sycl/tests/test-pp-moe-ring-admission.cpp` pins the
 arithmetic. `tests/test-sycl-pp-moe-ring-kv-zone-source.py` pins the wiring, with
 a mutation witness per check.
 
+### Explicit micro-batch placement
+
+An explicit `-ub` whose ring needs more RUNTIME zone than the load's planning
+shape reserved is placed at load, the way KV that does not fit is re-placed
+rather than refused. The caller names the micro-batch in
+`llama_model_params::n_ubatch_hint`. Both `common` and `llama-bench` name none
+for an automatic micro-batch, so the auto-ubatch trial is unchanged.
+`llama-bench` names the micro-batch from `-b` and `-ub` alone, not clamped by
+each test's context, and names none on a build without the SYCL backend. So
+the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
+reloads the model only when the named micro-batch changes. A reload re-plans
+the experts but not the arena's zones. The arena outlives the model and keeps a
+zone that is larger than a new plan needs. It rebuilds only a zone that is too
+small, and only while it holds nothing, which the PP MoE ring a previous context
+left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
+instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
+experts on the device than a fresh process would. Such a load prints one WARN
+line after its plan, when the live zone is larger than the zone the arena
+reserves for its own plan (`zone_runtime_kept_above_plan()`):
+
+```
+[SYCL-PLAN] RUNTIME zone on device 0 holds <Z> MB where this plan requires <R> MB: an earlier load in this
+process grew it, and the routed experts are planned against the grown zone
+```
+
+The first load of a process never prints it, because its zone is the one its
+own plan sized. Re-planning the zone at such a load is future work.
+
+That reserved zone is one figure, from one function. The function
+`zone_runtime_reserved_bytes()` takes the larger of the floor and the
+requirement and rounds it up to the arena's 256-byte grain, with the addition
+checked. The arena's reserve, the zone `ensure_planned_arena_zones()` plans,
+the room the planner holds for an explicit micro-batch, the check above and its
+WARN all ask it. So the zone a plan counts on and the zone the arena holds
+cannot round apart.
+
+The planner computes the RUNTIME room the ring and the dense scratch need at
+that micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that
+room as a named term on the routed-expert budget, at the start of the MoE block.
+By then the dense weights, their KV and the KV context room are placed, so the
+room never moves a dense layer or KV. That answers the objection above to
+growing the zone at load: the requested context's KV room is now held first, so
+KV still wins. The window ring's room is held after it, as the last term before
+the expert pack. So the routed-expert budget the decision reads still counts
+bytes that room may later hold. The decision cannot see them: the window ring's
+room is sized over the pack it predicts, so it is held last, once every group's
+charge is final, and this room is decided before that. The experts are packed
+into the budget less the holds. The hold is the whole room both before and after
+the zone grows, so the plan the load grows the zone for is the plan it keeps.
+When the experts can give the room, the load grows the RUNTIME zone and plans
+again. The experts that no longer fit go to the host tier, where the CPU runs
+them. The first context after the load prints one WARN line, whatever
+micro-batch that context runs, because the line names the micro-batch the load
+placed (`placement_explicit_ubatch_announces()`). So a `-p` below `-ub` still
+announces it. The plan that context publishes carries a mark, and every later
+context's plan copies it, so a `-d` or `-fa` list that opens more contexts on
+the same model does not print it again:
+
+```
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB: it re-placed <X> MB of routed experts
+to the host tier, from <K> layers: <D> triplets on the device, against <W> without its room, on device 0
+```
+
+The figures are net, as for the KV context room. The planner packs the experts
+a second time with the hold added back, and the room moved the device bytes
+that pack places beyond the real one. The layers are the ones where the real
+pack keeps fewer triplets. Counting the triplets that fit the larger budget and
+not the real one would over-state the cost: that budget can take a larger
+triplet and then skip smaller ones the real pack placed. With triplets of
+unequal size the device can keep as many triplets and still hold fewer bytes,
+so the bytes, not the count, decide whether the line prints.
+
+Every context of the load whose micro-batch is at or below the placed one
+re-plans the ring for the placed micro-batch
+(`placement_explicit_ubatch_ring_n_ubatch()`), so it keeps the placed ring:
+the load decided the ring's size, and a ring released for a smaller context
+would have to be re-admitted by the next one, into a zone with no slack
+beyond its terms.
+
+The context is refused only when moving every device-resident routed expert
+would not free the room. The refusal names the largest `-ub` whose ring fits,
+from `pp_moe_onednn_admit_ring()`'s slot arithmetic:
+
+```
+[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=<N> needs <R> MB, more
+than the RUNTIME zone can hold with every device-resident expert re-placed to the host tier (<F> MB); the
+largest -ub that fits is <L> (device=0)
+```
+
+The arena can fail to grow for two reasons, and each prints its own line first:
+
+- **Another live model holds allocations in the arena.** Zones are rebuilt only
+  in an unused arena, so `ensure_planned_arena_zones()` refuses the rebuild with
+  an ERROR:
+
+  ```
+  [VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: need scratch=<S> MB
+  oneDNN=<O> MB runtime=<R> MB; have scratch=<S0> MB oneDNN=<O0> MB runtime=<R0> MB; live_zone=<L> MB chunk_leases=<C>
+  ```
+
+- **The tail chunk's cap.** The rebuilt arena's tail chunk holds the ONEDNN,
+  RUNTIME and SCRATCH zones plus a minimum KV carve-out, and the device's
+  per-allocation cap may be smaller than that sum. `arena_reserve()` then refuses
+  with `[VRAM-ARENA] Per-chunk cap <P> MB too small to hold tail zones (<T> MB) +
+  min KV (<K> MB); refusing reservation`.
+
+Either way the load keeps the planning shape: it re-publishes the ring and the
+dense scratch at the load's own micro-batch, sizes the zones for them, and plans
+without the room. So no expert leaves the device for a zone that did not grow.
+One WARN line, at every verbosity, says the named micro-batch was not placed:
+
+```
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=<N> needs <X> MB more RUNTIME zone, which the arena could
+not reserve on device 0; the ring is re-planned when the context opens
+```
+
+The context then re-plans the ring as described above.
+Only the single-device plan places. A multi-device plan makes no decision, so
+its context keeps the context-time path.
+
+The room does not grow for the compute buffers. The RUNTIME zone's fixed part
+holds the compute term the load measured at its planning shape, `n_ctx_train`
+and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
+scratch sit beside it. So once the plan has placed the micro-batch, the
+hold-spill fit credits a compute buffer of that rung no larger than the term,
+whole or nothing (`placement_explicit_ubatch_compute_room()` and
+`zone_hold_fit_rung_has_compute_room()`). Every other rung, the auto trial's
+included, is judged as before. Without the credit the fit charges the buffer as
+if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
+refused the context: 1993.8 MiB of worst-case spill against 1946.2 MiB free
+outside the arena, although the zone held the 1960 MiB buffer beside a term of
+about 2055 MiB. The 256 MiB driver headroom is not added to the hold. It is free
+memory outside the arena, which demoting experts does not change, and the fit
+still requires it there.
+
+The credit can over-credit a rung whose compute buffers span several chunks,
+because the fit compares the rung's largest single buffer with a term that is a
+sum of per-chunk peaks, which the other chunks draw on too. A buffer larger than
+the term at the placed micro-batch gets no credit, so the hold-spill refusal and
+its largest `-ub` advice still answer that case.
+
+Host tests: `test-pp-moe-ring-admission.cpp` pins the room and the decision,
+`test-zone-sizing.cpp` pins the fit's credit and that every other rung is judged
+as before, `tests/test-sycl-layout-choice.cpp` pins the planner's choice, the
+bytes it moves and the compute room it gives the fit, and
+`tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring, the fit's
+credit and the placement, refusal and failed-growth lines, with a mutant per
+claim.
+
 ### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
 
 The dense quantized `MUL_MAT` quantizes its F32 activations into one persistent Q8_1 src1 buffer per backend context

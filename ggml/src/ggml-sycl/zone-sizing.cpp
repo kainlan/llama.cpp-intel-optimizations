@@ -498,6 +498,16 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
     return hold <= available && size <= available - hold;
 }
 
+bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement) {
+    // The reserved zone already carries the arena's rounding, so every byte above it was grown.
+    size_t reserved = 0;
+    return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
+}
+
+// A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
+// linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
+// request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a
+// micro-batch nobody measured: the spill bound and the fit's request scale a rung's record with it.
 static size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
     if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
         return request;
@@ -556,15 +566,24 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
     return scaled;
 }
 
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request) {
+    return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;
+}
+
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
     if (n_ubatch == 0) {
         return 0;
     }
     // No plan function, no hold: the ring is still a demand.
-    const size_t plan  = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
-    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch.
-    const size_t spill = zone_hold_spill_raw_demand(
-        zone_hold_spill_bound(plan, zone_hold_fit_request(in, n_ubatch), n_ubatch, n_ubatch), in.kv_room);
+    const size_t plan    = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
+    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch. One
+    // the zone was planned to serve is not held back, so it spills nothing; the plan stays in the bound as it is.
+    size_t       request = zone_hold_fit_request(in, n_ubatch);
+    if (zone_hold_fit_rung_has_compute_room(in, n_ubatch, request)) {
+        request = 0;
+    }
+    const size_t spill =
+        zone_hold_spill_raw_demand(zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);
     // The ring's slots are the planned room's bytes and lent bytes, so only the part neither the planned room nor a
     // loan covers is a demand on free memory (llama.cpp-kjef). The one place it is added, so every consumer of the fit
     // reads it. Saturating, so a wrapped sum never reads as a fit.

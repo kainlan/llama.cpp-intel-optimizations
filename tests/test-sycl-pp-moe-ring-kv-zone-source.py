@@ -152,7 +152,7 @@ def transaction_violations(sycl_cpp: str) -> list[str]:
     calls = re.findall(r"ggml_sycl_replan_pp_moe_onednn_ring\(([^;]*?)\)\s*(?:;|==)", txn)
     rollbacks = [c for c in calls if re.match(r"\s*ctx->device\s*,\s*pre_replan_pp_moe_ring_n_ubatch\b", c)]
     admitting = [c for c in calls if c not in rollbacks]
-    if len(admitting) != 1 or not re.fullmatch(r"\s*ctx->device\s*,\s*next_kv_info\.n_ubatch\s*,\s*probe_mode\s*,"
+    if len(admitting) != 1 or not re.fullmatch(r"\s*ctx->device\s*,\s*ring_n_ubatch\s*,\s*probe_mode\s*,"
                                                r"\s*&\s*ring_kv_zone\s*", admitting[0]):
         found.append("the ring is not re-planned with the transaction's KV-zone inputs")
     if len(rollbacks) != 4 or any("ring_kv_zone" in c for c in rollbacks):
@@ -378,7 +378,7 @@ def test_ring_kv_zone_wiring_holds() -> None:
 # the wiring the way a plausible edit would, and must turn its check red.
 MUTATIONS = [
     ("rollback-free call", "sycl",
-     "next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)", "next_kv_info.n_ubatch, probe_mode)",
+     "ring_n_ubatch, probe_mode, &ring_kv_zone)", "ring_n_ubatch, probe_mode)",
      "the ring is not re-planned with the transaction's KV-zone inputs"),
     ("rollback re-admitted", "sycl",
      "(void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);",
@@ -408,9 +408,9 @@ MUTATIONS = [
      "the ring is not admitted against the VRAM budget room its charge draws on"),
     ("budget room read after the re-plan", "sycl",
      ("    ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);\n",
-      "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);\n"),
+      "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone);\n"),
      ("",
-      "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);\n"
+      "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone);\n"
       "    ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);\n"),
      "the ring is not admitted against the VRAM budget room its charge draws on"),
     ("admission not given the budget room", "sycl",

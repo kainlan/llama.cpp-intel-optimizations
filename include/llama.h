@@ -364,6 +364,13 @@ extern "C" {
         // of 0 creates (n_ctx_train), without the caller reading the model first. The context itself may still be
         // created at any size.
         uint32_t n_ctx_hint;
+
+        // the micro-batch the caller is about to create its context with (llama_context_params::n_ubatch, as the
+        // context resolves it); 0 = none named, which includes a micro-batch the SYCL backend picks itself
+        // (n_ubatch_auto). A placement hint: a backend that places weights at load (SYCL) plans the PP MoE scratch
+        // ring for this micro-batch and moves routed experts to the host tier when the ring needs their room. The
+        // context may still be created with any n_ubatch.
+        uint32_t n_ubatch_hint;
     };
 
     struct llama_sampler_seq_config {

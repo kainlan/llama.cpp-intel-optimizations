@@ -175,9 +175,13 @@ def evaluate(cache, module, header):
         # poisoned term become a SMALLER zone instead of a refusal.
         "the zone sizing no longer adds its terms unchecked":
             "planned_pp_pipeline + planned_pp_moe_onednn" not in cache,
+        # Unanswerable covers both failures: the checked sum, and the rounding to the arena's grain that every
+        # RUNTIME plan shares. Either one resets the requirement and the zone together, so the zone stays the floor.
         "an unanswerable requirement keeps the default zone rather than shrinking it":
-            ordered(cache, "if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch))",
-                    "planned_runtime_scratch = 0;"),
+            ordered(cache,
+                    "if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) ||",
+                    "!zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {",
+                    "planned_runtime_scratch = 0;\n runtime_zone = runtime_floor;"),
 
         # --- fail-closed semantics that the executable test pins from below ---
         # ABSENCE: the flag must record INVALID, so a device nobody planned for

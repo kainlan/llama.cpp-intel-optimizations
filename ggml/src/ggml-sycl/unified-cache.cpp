@@ -2998,6 +2998,53 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
     return true;
 }
 
+size_t unified_cache_runtime_zone_floor_bytes() {
+    size_t floor_bytes = 512 * 1024 * 1024;
+    if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
+        floor_bytes = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
+    }
+    return floor_bytes;
+}
+
+pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      device_id,
+                                                                      uint32_t n_ubatch,
+                                                                      uint32_t n_ubatch_default) {
+    pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch         = n_ubatch;
+    in.n_ubatch_default = n_ubatch_default;
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || !vram_arena_enabled()) {
+        return pp_moe_onednn_explicit_ubatch_plan_room(in);  // no ring geometry: invalid
+    }
+    unified_cache * cache = get_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return pp_moe_onednn_explicit_ubatch_plan_room(in);
+    }
+    in.weight_slot_bytes        = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id);
+    in.activation_bytes_per_row = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device_id);
+    in.output_bytes_per_row     = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device_id);
+    in.ring_depth               = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
+    // The requirement as ensure_planned_arena_zones() reads it, less the two terms that follow the micro-batch: the
+    // ring's RUNTIME part and the dense scratch, both as published now. What is left is the same at any micro-batch.
+    size_t       requirement    = 0;
+    const size_t ring_bytes     = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
+    const size_t ring_kv_bytes  = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device_id);
+    const size_t ring_runtime   = ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0;
+    const size_t mmq_src1       = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
+    const size_t dequant_f16    = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
+    if (!unified_cache_get_planned_runtime_zone_requirement(device_id, &requirement) ||
+        !unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch_default, &in.dense_scratch_default_bytes) ||
+        !unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch, &in.dense_scratch_bytes) ||
+        mmq_src1 > SIZE_MAX - dequant_f16 || ring_runtime > SIZE_MAX - mmq_src1 - dequant_f16 ||
+        requirement < ring_runtime + mmq_src1 + dequant_f16) {
+        in.weight_slot_bytes = 0;  // an unanswerable term plans no room
+        return pp_moe_onednn_explicit_ubatch_plan_room(in);
+    }
+    in.runtime_fixed_bytes = requirement - ring_runtime - mmq_src1 - dequant_f16;
+    in.runtime_floor_bytes = unified_cache_runtime_zone_floor_bytes();
+    in.runtime_zone_bytes  = cache->zone_capacity(vram_zone_id::RUNTIME);
+    return pp_moe_onednn_explicit_ubatch_plan_room(in);
+}
+
 void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
@@ -3741,17 +3788,10 @@ bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
     if (act_per_row == 0 || out_per_row == 0) {
         return false;  // dense model: no MoE PP ring planned
     }
-    if (n_ubatch != 0 && (act_per_row > std::numeric_limits<size_t>::max() / n_ubatch ||
-                          out_per_row > std::numeric_limits<size_t>::max() / n_ubatch)) {
-        return false;  // n_ubatch * per_row would overflow
-    }
-    const size_t act_raw     = static_cast<size_t>(n_ubatch) * act_per_row;
-    const size_t out_raw     = static_cast<size_t>(n_ubatch) * out_per_row;
-    size_t       act_aligned = 0;
-    size_t       out_aligned = 0;
-    if (!pp_moe_onednn_checked_align_slot_bytes(act_raw, &act_aligned) ||
-        !pp_moe_onednn_checked_align_slot_bytes(out_raw, &out_aligned)) {
-        return false;  // align256() would overflow
+    size_t act_aligned = 0;
+    size_t out_aligned = 0;
+    if (!pp_moe_onednn_slots_at(n_ubatch, act_per_row, out_per_row, &act_aligned, &out_aligned)) {
+        return false;  // n_ubatch * per_row, or its rounding, would overflow
     }
     if (activation_slot_bytes != nullptr) {
         *activation_slot_bytes = act_aligned;
@@ -6760,10 +6800,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     }
 #endif
 
-    size_t runtime_zone = 512 * 1024 * 1024;
-    if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
-        runtime_zone = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
-    }
+    const size_t                  runtime_floor         = unified_cache_runtime_zone_floor_bytes();
     const size_t                  planned_pp_pipeline   = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
     const size_t                  planned_pp_moe_onednn = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id);
     const moe_control_requirement planned_moe_control   = unified_cache_get_planned_moe_control_requirement(dev_id);
@@ -6772,17 +6809,25 @@ bool unified_cache::ensure_planned_arena_zones() {
     // The addition is checked because a plan whose CONTROL sizing failed must
     // not quietly become a SMALLER runtime zone than one that succeeded --
     // which is exactly what an unchecked `a + b + c` on a poisoned term does.
+    //
+    // The zone is the one every RUNTIME plan counts on
+    // (zone_runtime_reserved_bytes): the explicit micro-batch's room and the
+    // check for a zone an earlier load grew ask the same function. A
+    // requirement whose rounding overflows is as unanswerable as one whose
+    // sum did.
     size_t planned_runtime_scratch = 0;
-    if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch)) {
+    size_t runtime_zone            = runtime_floor;
+    if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) ||
+        !zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {
         planned_runtime_scratch = 0;
+        runtime_zone            = runtime_floor;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Runtime zone requirement for device %d is unanswerable "
             "(pipeline=%zu moe_onednn=%zu control_valid=%d); keeping the %.1f MB default\n",
             dev_id, planned_pp_pipeline, planned_pp_moe_onednn, static_cast<int>(planned_moe_control.valid),
-            runtime_zone / (1024.0 * 1024.0));
+            runtime_floor / (1024.0 * 1024.0));
     }
-    if (planned_runtime_scratch > 0 && runtime_zone < planned_runtime_scratch) {
-        runtime_zone = planned_runtime_scratch;
+    if (planned_runtime_scratch > runtime_floor) {
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
             "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
@@ -27230,6 +27275,11 @@ bool device_pool_arena_owns(const unified_cache * cache, const void * ptr) {
     return cache->vram_owns(ptr);
 }
 
+// The arena reserves every zone in whole grains of k_zone_arena_alignment, and the zone allocator places every block
+// on its block grain. Both name one figure, so they are held equal here, where both headers are visible.
+static_assert(k_zone_arena_alignment == tlsf_allocator::block_grain,
+              "zone-sizing.hpp's arena grain must be the zone allocator's block grain");
+
 bool unified_cache::arena_reserve(sycl::queue & queue,
                                   size_t        budget_bytes,
                                   size_t        max_alloc_size,
@@ -27276,10 +27326,15 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_queue_ = &queue;
 
-    // Align zone sizes to 256 bytes.
-    scratch_bytes = (scratch_bytes + 255) & ~size_t(255);
-    onednn_bytes  = (onednn_bytes + 255) & ~size_t(255);
-    runtime_bytes = (runtime_bytes + 255) & ~size_t(255);
+    // Align zone sizes to the arena's grain. The RUNTIME zone is rounded by the function every RUNTIME plan counts on,
+    // with no floor: the callers apply it.
+    scratch_bytes = (scratch_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    onednn_bytes  = (onednn_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {
+        GGML_LOG_ERROR("[VRAM-ARENA] RUNTIME zone of %zu bytes cannot be rounded to the arena's grain\n",
+                       runtime_bytes);
+        return false;
+    }
 
     // Try single-chunk first.  All zones share one contiguous allocation.
     // Falls back to N-chunk (tail zones in last chunk, weights spread across
@@ -33359,6 +33414,86 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
                       room.expert_groups_without);
 }
 
+// The compute room a placed explicit micro-batch gives the hold-spill fit; unified-cache.hpp describes it.
+size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
+                                              size_t                            compute_term,
+                                              uint32_t *                        n_ubatch) {
+    const bool placed = xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.n_ubatch != 0;
+    if (n_ubatch != nullptr) {
+        *n_ubatch = placed ? xub.n_ubatch : 0;
+    }
+    return placed ? compute_term : 0;
+}
+
+// The announce rule for a placed explicit micro-batch; unified-cache.hpp describes it.
+bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode) {
+    return !probe_mode && xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.moved_bytes() > 0 &&
+           !xub.announced;
+}
+
+// The ring micro-batch of a placed explicit micro-batch; unified-cache.hpp describes it.
+uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch) {
+    const bool kept =
+        xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && n_ubatch != 0 && n_ubatch <= xub.n_ubatch;
+    return kept ? xub.n_ubatch : n_ubatch;
+}
+
+// The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
+// the runtime context transaction announces the outcome once, at WARN, when the context opens.
+static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, int device_id) {
+    if (xub.n_ubatch == 0) {
+        return;
+    }
+    const double mb = 1024.0 * 1024.0;
+    GGML_LOG_INFO(
+        "[PLACEMENT] explicit n_ubatch=%u PP MoE oneDNN scratch ring: %s (ring %.1f MB, "
+        "RUNTIME room %.1f MB of which %.1f MB already in the zone, expert budget %.1f MB, hold '%s' %.1f MB, "
+        "moved %.1f MB of routed experts from %zu layers: %.1f MB (%zu triplets) on the device, "
+        "against %.1f MB (%zu) with the hold added back) on device %d\n",
+        xub.n_ubatch, pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.ring_bytes / mb, xub.room_bytes / mb,
+        xub.room_reserved_bytes / mb, xub.expert_budget_bytes / mb, xub.hold_reason != nullptr ? xub.hold_reason : "",
+        xub.hold_bytes / mb, xub.moved_bytes() / mb, xub.moved_layers, xub.expert_bytes / mb, xub.expert_groups,
+        xub.expert_bytes_without / mb, xub.expert_groups_without, device_id);
+}
+
+// The routed-expert budget's hold for an explicit micro-batch's PP MoE oneDNN scratch ring: the ring is planned in the
+// RUNTIME zone for the micro-batch the caller named, and its room comes out of the routed experts, the last tier of
+// device residency, as the KV context room does. It is weighed against `remaining` once the dense weights, their KV and
+// the KV context room are placed, so it never moves a dense layer or KV. The planner's own layer-ordered pack decides
+// which experts give the room, not the loan's popularity order: the micro-batch is known at load, before any graph, so
+// the plan is made with fewer device experts instead of being patched after it (bulk-staged experts are not lendable
+// either).
+//
+// The hold is the whole room at every stage of the load. The part the RUNTIME zone already holds (a zone an earlier
+// stage grew for it) was taken from the weight capacity `remaining` was read from, so it is returned before the room
+// is held: before the zone grows (GROW_ZONE) and after (PLACE), the experts see the same budget. A REFUSE holds
+// nothing, and the context is refused by name. Returns the bytes held; `plan.explicit_ubatch` records the decision.
+static size_t hold_explicit_ubatch_room(placement_plan & plan, const placement_kv_info & kv_info, size_t & remaining) {
+    if (!kv_info.explicit_ubatch.valid) {
+        return 0;
+    }
+    const pp_moe_onednn_explicit_ubatch_room &   room     = kv_info.explicit_ubatch;
+    const pp_moe_onednn_explicit_ubatch_decision decision = pp_moe_onednn_explicit_ubatch_decide(room, remaining);
+    placement_explicit_ubatch &                  xub      = plan.explicit_ubatch;
+    xub.n_ubatch                                          = room.in.n_ubatch;
+    xub.action                                            = decision.action;
+    xub.ring_bytes                                        = room.ring_bytes;
+    xub.room_bytes                                        = room.room_bytes;
+    xub.room_reserved_bytes                               = room.room_reserved_bytes;
+    xub.expert_budget_bytes                               = remaining;
+    xub.max_ring_runtime_bytes                            = decision.max_ring_runtime_bytes;
+    xub.largest_fitting_n_ubatch                          = decision.largest_fitting_n_ubatch;
+    xub.hold_reason                                       = "PP MoE oneDNN scratch ring RUNTIME room";
+    if (decision.action == pp_moe_onednn_explicit_ubatch_action::PLACE ||
+        decision.action == pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {
+        // decide() admits the room only when room - reserved fits `remaining`, so neither step wraps.
+        remaining += room.room_reserved_bytes;
+        xub.hold_bytes = room.room_bytes;
+        remaining -= xub.hold_bytes;
+    }
+    return xub.hold_bytes;
+}
+
 // The prompt phase's window ring reserves 2 x window_slots slots of the largest staged host matrix in the WEIGHT zone
 // (moe_stream_ring::reserve), and the routed experts fill that zone at default placement, so without room held here
 // the first reserve is short and only an expert loan can fund the ring. The room is the ring's own size:
@@ -33929,6 +34064,11 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // same routed expert).  Under pressure, keep a complete triplet on one
     // domain or mark the triplet as an explicit host/CPU domain.
     {
+        // A named hold on the routed-expert budget: the explicit micro-batch's PP MoE oneDNN scratch ring room in the
+        // RUNTIME zone. The pack below sees the budget less it, and a parallel first-fit with it added back says which
+        // triplets it moved to the host tier.
+        const size_t ubatch_hold_bytes = hold_explicit_ubatch_room(plan, kv_info, remaining);
+
         const char * hotness_source = nullptr;
         if (!planner_xmx_moe_forced()) {
             prepare_single_moe_pp_gate_up_primary_layouts_for_pack(plan, device_id, kv_info, envelope);
@@ -33969,6 +34109,12 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
         // The same first-fit pack with the KV context room added back, so the room's line can say what it cost.
         size_t without_room = remaining + room.held;
+
+        // And with the explicit micro-batch's hold added back. The room moved the difference between that pack's device
+        // triplets and the real one's, as for the KV context room, and the layers it moved them out of are the ones
+        // whose device triplets that pack counts above the real one's.
+        size_t                       without_ubatch_room = remaining + ubatch_hold_bytes;
+        std::unordered_map<int, int> ubatch_layer_drop;  // per layer: device triplets without the hold, less with it
         for (const auto & group : moe_groups) {
             if (moe_triplet_complete(group)) {
                 stats.complete_groups++;
@@ -33982,6 +34128,19 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 without_room -= group.charge_bytes;
                 room.expert_bytes_without += group.bytes;
                 room.expert_groups_without++;
+            }
+            if (ubatch_hold_bytes > 0) {
+                if (group.charge_bytes <= without_ubatch_room) {
+                    without_ubatch_room -= group.charge_bytes;
+                    plan.explicit_ubatch.expert_bytes_without += group.bytes;
+                    plan.explicit_ubatch.expert_groups_without++;
+                    ubatch_layer_drop[group.layer_id]++;
+                }
+                if (on_device) {
+                    plan.explicit_ubatch.expert_bytes += group.bytes;
+                    plan.explicit_ubatch.expert_groups++;
+                    ubatch_layer_drop[group.layer_id]--;
+                }
             }
             if (on_device) {
                 remaining -= group.charge_bytes;
@@ -34017,6 +34176,11 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         }
         room.expert_bytes  = stats.device_bytes;
         room.expert_groups = stats.device_groups;
+
+        for (const auto & [layer_id, drop] : ubatch_layer_drop) {
+            GGML_UNUSED(layer_id);
+            plan.explicit_ubatch.moved_layers += drop > 0;
+        }
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.
@@ -34037,6 +34201,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     }
     plan.kv_context_room_displaced_bytes = room.displaced_bytes();
     log_kv_context_room(room, kv_info, device_id);
+    log_explicit_ubatch_decision(plan.explicit_ubatch, device_id);
 
     // llama.cpp-21jd: dense WOQ extra copies for this single-device plan
     // (compute_multi_device_plan makes the same per-device call).

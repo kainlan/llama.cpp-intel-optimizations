@@ -397,7 +397,8 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
                                                 size_t                               total_size,
                                                 size_t                               max_pp_pipeline_weight_bytes,
                                                 const llama_hparams &                hparams,
-                                                uint32_t                             n_ctx_hint) {
+                                                uint32_t                             n_ctx_hint,
+                                                uint32_t                             n_ubatch_hint) {
     const uint32_t n_layer             = hparams.n_layer();
     inventory                         = {};
     inventory.tensors                 = tensors.data();
@@ -447,6 +448,10 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);
     inventory.n_ctx_context                    = ctx_room.n_ctx_context;
     inventory.n_ctx_context_is_default         = ctx_room.is_default;
+    // The micro-batch the caller named (llama_model_params::n_ubatch_hint, 0 for none): the planner plans the PP MoE
+    // scratch ring in the RUNTIME zone for it and moves routed experts to the host tier for the room. Like the context
+    // room above, only that decision reads it; n_ubatch stays the load's planning shape.
+    inventory.n_ubatch_context                 = n_ubatch_hint;
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
         // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16
@@ -732,7 +737,7 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
                                         kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
                                         kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
-                                        hparams, model.get_n_ctx_hint());
+                                        hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, true);
 
@@ -788,7 +793,7 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
                                         kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
                                         kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
-                                        hparams, model.get_n_ctx_hint());
+                                        hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
 
@@ -3970,6 +3975,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.n_ctx_hint                  =*/ 0,
+        /*.n_ubatch_hint               =*/ 0,
     };
     // clang-format on
 

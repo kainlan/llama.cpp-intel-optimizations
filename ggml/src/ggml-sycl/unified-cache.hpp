@@ -691,6 +691,15 @@ struct placement_kv_info {
     // key cache (a second buffer over the layer's cells, K only); empty or 0 where a layer has none.
     std::vector<uint32_t> layer_idx_k_width;
 
+    // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
+    // above stays the load's planning shape.
+    uint32_t                           n_ubatch_context = 0;
+    // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone. The
+    // backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
+    // when no micro-batch above n_ubatch was named, the model has no ring, or there is no arena. The planner weighs it
+    // against the routed experts (placement_plan::explicit_ubatch).
+    pp_moe_onednn_explicit_ubatch_room explicit_ubatch;
+
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
 
     uint32_t idx_k_width(uint32_t il) const { return il < layer_idx_k_width.size() ? layer_idx_k_width[il] : 0; }
@@ -866,6 +875,70 @@ struct expert_residency_counts {
     int64_t on_target = 0;  // found, on_device and target_device == the queried device
 };
 
+// The planner's decision on an explicit micro-batch's PP MoE oneDNN scratch ring (docs/backend/sycl-memory-design.md,
+// "Explicit micro-batch placement"). The ring is planned in the RUNTIME zone for the micro-batch the caller named, and
+// routed experts give up the device room it needs, as KV that does not fit is re-placed rather than refused. A load
+// fact the runtime context transaction reads: PLACE announces the experts the room moved to the host tier, REFUSE
+// refuses the context with the largest -ub that fits.
+struct placement_explicit_ubatch {
+    uint32_t                             n_ubatch                 = 0;  // the micro-batch decided for; 0 = no decision
+    pp_moe_onednn_explicit_ubatch_action action                   = pp_moe_onednn_explicit_ubatch_action::NONE;
+    size_t                               ring_bytes               = 0;  // the whole ring at n_ubatch
+    size_t                               room_bytes               = 0;  // its RUNTIME zone over the default ring's
+    size_t                               room_reserved_bytes      = 0;  // of that room, what the zone already holds
+    // The device bytes left to the routed experts when the room was decided. They still count bytes the window ring's
+    // room may later hold: that room is sized over the pack it predicts, so it is held last, once every group's
+    // charge is final, and this room is decided before it.
+    size_t                               expert_budget_bytes      = 0;
+    // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
+    // first-fit pack puts there with the held room added back (all 0 when nothing was held). The room moved the
+    // difference. Counting instead the triplets that fit the second budget and not the real one over-states it, as
+    // for the KV context room: the larger budget can take a larger triplet and then skip smaller ones the real pack
+    // did place. The layers are the ones that keep fewer triplets on the device.
+    size_t                               expert_bytes             = 0;
+    size_t                               expert_groups            = 0;
+    size_t                               expert_bytes_without     = 0;
+    size_t                               expert_groups_without    = 0;
+    size_t                               moved_layers             = 0;
+    // REFUSE: the most the ring could have with every device-resident routed expert on the host tier, and the largest
+    // micro-batch whose ring fits that.
+    size_t                               max_ring_runtime_bytes   = 0;
+    uint32_t                             largest_fitting_n_ubatch = 0;
+    // The named hold on the routed-expert budget: what it is for, and the bytes the expert pack saw subtracted (the
+    // whole room on PLACE and GROW_ZONE, 0 otherwise).
+    const char *                         hold_reason              = nullptr;
+    size_t                               hold_bytes               = 0;
+    // Set on the plan the context that announced the placement at WARN published. Every later context's plan copies
+    // it, so a load announces its placement once, whatever micro-batch each context runs.
+    bool                                 announced                = false;
+
+    size_t moved_bytes() const { return expert_bytes_without > expert_bytes ? expert_bytes_without - expert_bytes : 0; }
+};
+
+// The compute room the RUNTIME zone of a placed explicit micro-batch holds for that micro-batch's compute buffers, for
+// the hold-spill fit to credit (zone_hold_fit_inputs): `compute_term`, the planned compute term the zone holds beside
+// the micro-batch's ring and dense scratch, with xub.n_ubatch in *n_ubatch. Only PLACE sized the zone for the
+// micro-batch. GROW_ZONE plans again and reads PLACE, a growth that failed plans with no decision, and REFUSE and NONE
+// sized nothing, so each of those gives 0 with *n_ubatch 0.
+size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
+                                              size_t                            compute_term,
+                                              uint32_t *                        n_ubatch);
+
+// Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
+// since the load whose plan PLACED the micro-batch and whose room cost device bytes of routed experts. The bytes
+// decide, not the count of triplets: with triplets of unequal size the device can keep as many triplets and still hold
+// fewer bytes. The context's own micro-batch does not enter, because the line names the micro-batch the load placed,
+// and a context whose micro-batch differs (llama-bench's -p below -ub) would otherwise leave a load that moved experts
+// unannounced.
+bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode);
+
+// The micro-batch the runtime context transaction re-plans the PP MoE oneDNN scratch ring for: the one the load placed
+// when its plan PLACED it and the context's own micro-batch is no larger, else the context's own. The load decided the
+// ring's size, and a smaller context deriving a smaller ring would be a second source for that fact; the ring it
+// released would then have to be re-admitted by the next context of the same load. A context at 0 names no micro-batch,
+// so it keeps its own and the re-plan reports it.
+uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch);
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
@@ -889,6 +962,8 @@ struct placement_plan {
     // puts on the device, minus those the real pack put there (net). A load fact, for the log and the planner tests;
     // the runtime never promotes the experts back (fkpg).
     size_t                                     kv_context_room_displaced_bytes = 0;
+    // The explicit micro-batch's PP MoE oneDNN scratch ring decision (single-device plans; see the struct).
+    placement_explicit_ubatch                  explicit_ubatch;
     // Device room the load plan held in the WEIGHT zone, after the KV room and before the routed experts, for the
     // prompt phase's window ring: the bytes moe_stream_plan_ring_geometry gives for this plan, so the ring's first
     // reserve finds its slots there and the expert loan is only the fallback. Counted in vram_bytes, and kept there
@@ -2507,12 +2582,12 @@ void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_
 uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
 
 // Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
-// align256(n_ubatch * per_row) for both activation and output, through the
-// same pp_moe_onednn_checked_align_slot_bytes() (moe-scratch-admission.hpp)
-// the ring's own admission uses, so the two cannot round or overflow-check
-// differently. Returns false (leaving the output params untouched) when the
-// per-row bytes are 0 (dense model, no ring planned) or the multiply/align
-// would overflow.
+// align256(n_ubatch * per_row) for both activation and output, through
+// pp_moe_onednn_slots_at() (moe-scratch-admission.hpp), the helper the ring's
+// admission and the explicit micro-batch's room size their slots with, so the
+// three cannot round or overflow-check differently. Returns false (leaving the
+// output params untouched) when the per-row bytes are 0 (dense model, no ring
+// planned) or the multiply/align would overflow.
 bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
                                                   uint32_t n_ubatch,
                                                   size_t * activation_slot_bytes,
@@ -2561,6 +2636,19 @@ size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
 // requirement could not be computed, which is what stops an unsizable plan from
 // silently becoming a smaller RUNTIME zone.
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out);
+
+// The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()
+// reserves at least this, and an explicit micro-batch's room is measured against the same floor.
+size_t unified_cache_runtime_zone_floor_bytes();
+
+// The RUNTIME zone room the PP MoE oneDNN scratch ring of the explicit micro-batch `n_ubatch` needs on `device_id`
+// above the zone the ring of the load's `n_ubatch_default` needs. Composed from the published plan: the ring geometry,
+// the requirement less its ring and dense scratch parts, the dense scratch at both micro-batches, the floor, and the
+// RUNTIME zone as the arena holds it now. Invalid when the device has no active arena or no ring, n_ubatch is not above
+// n_ubatch_default, or a planned term is unanswerable.
+pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      device_id,
+                                                                      uint32_t n_ubatch,
+                                                                      uint32_t n_ubatch_default);
 
 // Parse GGML_SYCL_MULTI_GPU_MODE env var.
 // Returns HYBRID for MoE models, LAYER for dense-only, unless overridden.

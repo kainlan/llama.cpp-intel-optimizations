@@ -666,6 +666,9 @@ INTERNAL_WRAPPER_SITES = {
         "!ggml_sycl_placement_plan_uses_device((*ggml_sycl_global_plan_owner()), d)) {": 1,
         "!ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
         "const auto plan_owner = ggml_sycl_global_plan_owner();": 2,
+        # The hold-spill fit (ggml_sycl_hold_spill_fit) reads the published plan once for the explicit micro-batch it
+        # placed, whose RUNTIME zone holds the planned compute term: the fit credits a buffer no larger at that rung.
+        "const auto room_plan = ggml_sycl_global_plan_owner();": 1,
         "ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_global_plan_owner()), ctx.device);": 1,
         "ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner())))) {": 1,
         "ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,

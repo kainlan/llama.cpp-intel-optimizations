@@ -178,7 +178,8 @@ def claim_zone_requirement_folds_in_the_term(cache: str) -> bool:
     out_at = req.find("*out = base + mmq_src1 + dequant_f16", add_at)
     return (min(read_at, check_at, add_at, out_at) >= 0
             and re.search(r"unified_cache_get_planned_runtime_zone_requirement\(dev_id, &planned_runtime_scratch\).*?"
-                          r"runtime_zone = planned_runtime_scratch;", t) is not None)
+                          r"zone_runtime_reserved_bytes\(runtime_floor, planned_runtime_scratch, "
+                          r"&runtime_zone\)", t) is not None)
 
 
 def claim_fit_counts_the_term(cache: str) -> bool:
@@ -258,7 +259,7 @@ def claim_ring_is_charged_the_unheld_scratch(sycl: str) -> bool:
     held = txn.find("const size_t moe_host_scatter_held = ctx->moe_host_scatter_scratch.capacity(ctx->device);", planned)
     charged = txn.find("ring_kv_zone.runtime_pending_bytes += moe_host_scatter_planned > moe_host_scatter_held ? "
                        "moe_host_scatter_planned - moe_host_scatter_held : 0;", held)
-    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)",
+    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone)",
                     charged)
     return min(planned, held, charged, ring) >= 0
 

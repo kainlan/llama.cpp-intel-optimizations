@@ -31,6 +31,7 @@ using ggml_sycl::pp_moe_onednn_scratch_refusal_latch;
 using ggml_sycl::pp_moe_onednn_scratch_shape;
 using ggml_sycl::PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT;
 using ggml_sycl::pp_moe_onednn_should_report_refusal;
+using ggml_sycl::pp_moe_onednn_slots_at;
 
 static void check(bool condition, const std::string & message) {
     if (!condition) {
@@ -86,6 +87,26 @@ static void test_checked_alignment() {
     shape.output_slot_bytes     = max_size;
     shape.ring_depth            = 1;
     check(!pp_moe_onednn_align_scratch_shape(shape, nullptr), "one unalignable dimension fails the whole shape");
+}
+
+// The one slot sizer the ring's admission, the explicit micro-batch's room and the cache's re-plan share.
+static void test_slots_at() {
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    size_t       act      = 7;
+    size_t       out      = 7;
+
+    check(pp_moe_onednn_slots_at(0, 192, 96, &act, &out) && act == 0 && out == 0, "0 rows size two empty slots");
+    check(pp_moe_onednn_slots_at(2048, 192, 96, &act, &out) && act == 2048 * 192 && out == 2048 * 96,
+          "aligned products are the slots");
+    check(pp_moe_onednn_slots_at(3, 100, 1, &act, &out) && act == 512 && out == PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT,
+          "300 and 3 bytes round up to whole slots");
+
+    act = 7;
+    out = 7;
+    check(!pp_moe_onednn_slots_at(4, max_size / 2, 96, &act, &out), "an overflowing activation product fails");
+    check(!pp_moe_onednn_slots_at(4, 192, max_size / 2, &act, &out), "an overflowing output product fails");
+    check(!pp_moe_onednn_slots_at(1, 192, max_size, &act, &out), "an unalignable output slot fails");
+    check(act == 7 && out == 7, "a failed sizing leaves both slots untouched");
 }
 
 static void test_exact_and_smaller_requests_are_admitted() {
@@ -423,6 +444,7 @@ int main() {
         void (*fn)();
     } cases[] = {
         { "checked-alignment",                       test_checked_alignment                       },
+        { "slots-at",                                test_slots_at                                },
         { "exact-and-smaller-requests-are-admitted", test_exact_and_smaller_requests_are_admitted },
         { "an-unaligned-plan-admits-itself",         test_an_unaligned_plan_admits_itself         },
         { "missing-plan-fails-closed",               test_missing_plan_fails_closed               },

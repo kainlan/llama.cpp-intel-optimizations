@@ -410,6 +410,30 @@ static void test(void) {
         assert(common_model_params_to_llama(negative_ctx_params).n_ctx_hint == 0);
     }
 
+    // An explicit -ub reaches the model load as llama_model_params::n_ubatch_hint, resolved as llama_context resolves
+    // it (n_batch bounds it, and a causal context's n_ctx bounds n_batch), so the SYCL load plans the PP MoE scratch
+    // ring for it and moves routed experts to the host tier for its room. "-ub auto" names none (0), so the SYCL
+    // backend's own trial is unchanged; without -ub a SYCL build picks the micro-batch itself and names none too.
+    {
+        const auto ubatch_hint = [&](std::vector<std::string> args) {
+            common_params ub_params;
+            assert(true ==
+                   common_params_parse(args.size(), list_str_to_char(args).data(), ub_params, LLAMA_EXAMPLE_COMMON));
+            return common_model_params_to_llama(ub_params).n_ubatch_hint;
+        };
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-c", "4096", "-ub", "2048" }) == 2048);
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-b", "1024", "-ub", "2048" }) == 1024);
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-c", "1024", "-ub", "2048" }) == 1024);
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-ub", "auto" }) == 0);
+
+        common_params default_params;
+        argv = { "binary_name", "-m", "model_file.gguf" };
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), default_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(default_params).n_ubatch_hint ==
+               (default_params.n_ubatch_auto ? 0u : (uint32_t) default_params.n_ubatch));
+    }
+
 #ifndef _WIN32
     // --help and --version stay metadata-only with -c given: they exit inside the parse, so nothing after it (the
     // model parameters, the load) runs. Each runs in a child, because both call exit(0).

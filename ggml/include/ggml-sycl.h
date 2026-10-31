@@ -377,7 +377,23 @@ struct ggml_sycl_tensor_inventory {
     // before this field passes a 184-byte object, and libggml-sycl would read this byte past its end. libllama and
     // libggml-sycl must be rebuilt together.
     bool                           n_ctx_context_is_default;
+    // The micro-batch the caller named for the context it is about to create (llama_model_params::n_ubatch_hint);
+    // 0 = none named, which includes a micro-batch the backend picks itself. When it is above n_ubatch, the planner
+    // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
+    // host tier for the room, as it re-places KV that does not fit. It sits in the padding after the bool above, so the
+    // struct stays 192 bytes (pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
+    // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
+    // still be rebuilt together for the planner to see it.
+    uint32_t                       n_ubatch_context;
 };
+
+#if defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
+// Both sides of the dlopen boundary compile the inventory's layout from here: libllama, which fills it, and
+// libggml-sycl, which reads it (ggml-sycl.cpp pins the same figures). A field that moves fails both builds instead of
+// being read from the wrong place.
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
+#endif
 
 // SYCL-side projection of the four placement-envelope fields the llama
 // layer carries on llama_model_params.  Populated by the llama layer at

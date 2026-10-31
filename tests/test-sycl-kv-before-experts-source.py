@@ -277,9 +277,11 @@ RESOLVE_SIG = ("static inline llama_n_ctx_hint_resolution llama_n_ctx_hint_resol
 HINT_PICK_RE = re.compile(r"return \{ n_ctx_hint != 0 \? GGML_PAD\(n_ctx_hint, (\d+)\) : 0, false \};")
 HINT_PICK = "inventory.n_ctx_context = ctx_room.n_ctx_context;"
 HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);"
-HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint());"
+# Both builders pass the model's context hint, with its micro-batch hint after it (test-sycl-explicit-ubatch-placement-
+# source pins that one), and the inventory ends with the micro-batch, after the context's provenance.
+HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
-            "bool n_ctx_context_is_default; }")
+            "bool n_ctx_context_is_default; uint32_t n_ubatch_context; }")
 COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
 TAIL_ASSERTS = (
     "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
@@ -330,9 +332,11 @@ def claim_envelope_keeps_no_context(model: str) -> bool:
 
 
 def claim_api_carries_the_hint(llama_h: str, model: str) -> bool:
-    """llama_model_params ends with the hint, after the booleans, and it defaults to 0 (no request)."""
-    return ("bool load_mtp; uint32_t n_ctx_hint; };" in norm(llama_h)
-            and re.search(r"/\*\.load_mtp\s*=\*/\s*false,\s*/\*\.n_ctx_hint\s*=\*/\s*0,\s*\};", model) is not None)
+    """llama_model_params carries the hint after the booleans, followed only by the micro-batch hint, and both
+    default to 0 (no request)."""
+    return ("bool load_mtp; uint32_t n_ctx_hint; uint32_t n_ubatch_hint; };" in norm(llama_h)
+            and re.search(r"/\*\.load_mtp\s*=\*/\s*false,\s*/\*\.n_ctx_hint\s*=\*/\s*0,"
+                          r"\s*/\*\.n_ubatch_hint\s*=\*/\s*0,\s*\};", model) is not None)
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
@@ -602,7 +606,7 @@ def test_mutant_late_builder_drops_the_hint_fails():
     at = n.find("static void llama_model_sycl_set_late_inventory(")
     assert at >= 0 and n.find(HINT_PASS, at) >= 0
     k = n.find(HINT_PASS, at)
-    mutant = n[:k] + "max_pp_pipeline_weight_bytes, hparams, 0);" + n[k + len(HINT_PASS):]
+    mutant = n[:k] + "max_pp_pipeline_weight_bytes, hparams, 0, model.get_n_ubatch_hint());" + n[k + len(HINT_PASS):]
     assert not claim_loader_hands_the_requested_context(mutant, MODEL_H, SYCL, SYCL_H, RESOLVER)
 
 
@@ -616,7 +620,7 @@ def test_mutant_field_inserted_before_the_indexer_widths_fails():
 def test_mutant_field_appended_fails():
     """A field appended after the context's provenance: the struct no longer ends where the consumer's size pin
     says."""
-    mutant = _once(SYCL_H, "bool n_ctx_context_is_default; };", "bool n_ctx_context_is_default; uint8_t spare; };")
+    mutant = _once(SYCL_H, "uint32_t n_ubatch_context; };", "uint32_t n_ubatch_context; uint8_t spare; };")
     assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant, RESOLVER)
 
 
@@ -638,7 +642,8 @@ def test_mutant_envelope_carries_the_hint_fails():
 
 def test_mutant_api_hint_not_last_fails():
     assert not claim_api_carries_the_hint(
-        _once(LLAMA_H, "bool load_mtp; uint32_t n_ctx_hint; };", "uint32_t n_ctx_hint; bool load_mtp; };"), MODEL)
+        _once(LLAMA_H, "bool load_mtp; uint32_t n_ctx_hint; uint32_t n_ubatch_hint; };",
+              "uint32_t n_ctx_hint; bool load_mtp; uint32_t n_ubatch_hint; };"), MODEL)
 
 
 def test_mutant_common_drops_the_hint_fails():

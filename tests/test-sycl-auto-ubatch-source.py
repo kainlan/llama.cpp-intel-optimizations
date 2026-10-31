@@ -2116,11 +2116,13 @@ def test_planner_gate_check_has_a_mutation_witness():
 def test_planner_gate_check_else_branch_has_a_mutation_witness():
     """Mutation witness for the planner-gate check: a
     compute_multi_device_plan() call in the single-device else branch,
-    AFTER the gate's block, must fail it too."""
+    AFTER the gate's block, must fail it too. The else branch plans through
+    its plan_single_device lambda, which an explicit micro-batch's
+    placement calls again after growing the RUNTIME zone."""
     code = GGML_SYCL_CPP_CODE
     fn = code.find(_PLANNER_FN)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
-    target = "plan_candidate = ggml_sycl::compute_placement_plan("
+    target = "return ggml_sycl::compute_placement_plan("
     at = code.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
     gate_at = code.find(_PLANNER_GATE, fn)
@@ -2128,7 +2130,7 @@ def test_planner_gate_check_else_branch_has_a_mutation_witness():
     gate_open = gate_at + len(_PLANNER_GATE) - 1
     gate_end = gate_open + 1 + len(_brace_block(code, gate_open))
     assert at > gate_end, "the else-branch target must come after the gate's block"
-    mutated = code[:at] + "plan_candidate = ggml_sycl::compute_multi_device_plan(" + code[at + len(target):]
+    mutated = code[:at] + "return ggml_sycl::compute_multi_device_plan(" + code[at + len(target):]
     with pytest.raises(AssertionError, match="reachable only inside"):
         _assert_planner_branches_on_the_gate(_normalize_ws(mutated))
 

@@ -303,7 +303,7 @@ def claim_ring_leaves_the_term_room(sycl: str) -> bool:
     return bool(txn) and ordered(
         txn, "ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;",
         "ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_compute_term_bytes(ctx->device);",
-        "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)")
+        "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone)")
 
 
 def claim_landing_line_names_the_term(sycl: str) -> bool:
@@ -922,7 +922,7 @@ def claim_ring_leaves_the_state_room(sycl: str) -> bool:
     return bool(txn) and ordered(
         txn, "ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_compute_term_bytes(ctx->device);",
         "ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_state_term_bytes(ctx->device);",
-        "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)")
+        "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone)")
 
 
 def test_the_state_reservation_sizes_at_the_grain_and_writes_only_the_term():
