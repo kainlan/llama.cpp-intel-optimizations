@@ -286,7 +286,8 @@ pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
 // Pure: the decision, given the device bytes the routed experts are packed into once the dense weights, their KV and
 // the KV context room are placed (`expert_budget_bytes`, with the zone as it is now). The planner asks before it holds
 // the window ring's room, the last term before the expert pack, so the figure still counts bytes that room may later
-// hold. They are not subtracted: the composition order is ruled, and this room is held first.
+// hold. It cannot see them: the window ring's room is sized over the pack it predicts, so it is held last, once every
+// group's charge is final, and this room is decided before that.
 pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide(
     const pp_moe_onednn_explicit_ubatch_room & room,
     size_t                                     expert_budget_bytes);
