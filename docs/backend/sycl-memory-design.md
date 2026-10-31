@@ -311,8 +311,11 @@ the rung's demand, so a rung that needs them is refused with a figure.
   occurrence of each. The teardown summary is one line, printed by
   `ggml_sycl_moe_exec_log_report` at backend free.
 
-The end-to-end numbers are recorded by Task 15 (llama.cpp-x6zo) and are not
-restated here.
+The end-to-end numbers are in
+[sycl-perf-baselines.md](sycl-perf-baselines.md): the "Record at 671279356"
+subsection gives the window ring's measured prefill and decode, and the
+"Attribution at 3eb28b301" subsection says where the remaining prefill time
+goes. They are not restated here.
 
 ### Layout follows residency (owner ruling, 2026-08-16 — do not drift)
 

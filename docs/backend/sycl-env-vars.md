@@ -447,16 +447,17 @@ prints on a change of choice only.
 copy probe. The trace lines are INFO, so they need `-lv 4` or `-v`. The WARN lines show at default verbosity;
 the catalog gives each one's condition.
 
-### MoE executor log lines (`[MOE-EXEC*]` catalog)
+### MoE executor log lines (`[MOE-EXEC*]` and `[MOE-STREAM-RING]` catalog)
 
-Every format literal that ggml/src/ggml-sycl prints with the prefix `[MOE-EXEC]` or `[MOE-EXEC-TRACE]`, listed once (35
-distinct literals; the loan-refused literal prints at two sites). The two staged-route refusal lines are assembled from
-a literal prefix and one piece per cause, so they are shown with `<cause>` placeholders and are not in the count. The
-loan and refill tests in `ggml-sycl.cpp` also build the text they expect; those are not prints. The count is the
-distinct code spans in this section that start with the prefix, contain a space and hold no placeholder:
+Every format literal that ggml/src/ggml-sycl prints with the prefix `[MOE-EXEC]`, `[MOE-EXEC-TRACE]` or
+`[MOE-STREAM-RING]`, listed once (42 distinct literals; the loan-refused literal prints at two sites). The two
+staged-route refusal lines are assembled from a literal prefix and one piece per cause, so they are shown with
+`<cause>` placeholders and are not in the count. The loan and refill tests in `ggml-sycl.cpp` also build the text they
+expect; those are not prints. The count is the distinct code spans in this section that start with a prefix, contain
+a space and hold no placeholder:
 
 ```bash
-awk '/^### MoE executor log lines/{f=1;next} f&&/^### /{f=0} f' docs/backend/sycl-env-vars.md | python3 -c 'import sys,re; print(len({" ".join(s.split()) for s in re.findall(r"`(\[MOE-EXEC[^`<]* [^`<]*)`", sys.stdin.read())}))'
+awk '/^### MoE executor log lines/{f=1;next} f&&/^### /{f=0} f' docs/backend/sycl-env-vars.md | python3 -c 'import sys,re; print(len({" ".join(s.split()) for s in re.findall(r"`(\[MOE-(?:EXEC|STREAM-RING)[^`<]* [^`<]*)`", sys.stdin.read())}))'
 ```
 
 A literal shown here is one printed line: the lines below wrap at 120 columns, the output does not. `WARN` lines show at
@@ -487,8 +488,8 @@ third at every policy and verbosity, the fourth under `ring` only, the aborts al
 - WARN `[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u window_slots=%u
   matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)`: once per prompt, at the first layer that
   answers `ring-unavailable`. The rule names why. `host_matrices_per_layer_max` is the slot need of the heaviest whole
-  layer, one slot per matrix. The ring holds one executor window per region (`window_slots`), so `n_slots` is twice `window_slots`.
-  `resident_expert_bytes` is the device's expert set after the ring's own loan, and the ring's cap is
+  layer, one slot per matrix. The ring holds one executor window per region (`window_slots`), so `n_slots` is twice
+  `window_slots`. `resident_expert_bytes` is the device's expert set after the ring's own loan, and the ring's cap is
   `bytes > (resident_expert_bytes + lent_bytes) / 11`.
 - WARN `[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this prompt`:
   once per prompt, when a loan asked for the short ring comes back refused. At default verbosity under `auto` the
@@ -543,6 +544,32 @@ third at every policy and verbosity, the fourth under `ring` only, the aborts al
   prefix stays, so the gate's RE_REFILL still reads it (llama.cpp-i4ny).
 - ERROR `[MOE-EXEC] %s device %d: %u moved triplets left unpublished, the plan swap lost`: `%s` is `loan` or `refill`,
   and a concurrent transaction won the plan swap.
+
+**Ring reservation** (`moe_stream_ring::reserve`, when a prompt's stream phase reserves its ring; every line is a WARN
+and shows at default verbosity, except the last, which goes through the decision log's sink under the gate of the
+ring-unavailable line)
+
+- WARN `[MOE-STREAM-RING] reserve: device %d already holds a ring of %.1f MB; release it first`: reserve was asked of
+  a ring that is already reserved. It refuses and the held ring stays as it was. Every reserve follows a release, so
+  this is a caller defect: report it with the log.
+- WARN `[MOE-STREAM-RING] reserve: geometry of %u slots (%u per region) x %zu bytes in %zu bytes is not two equal
+  aligned regions on device %d`: the geometry is not one `moe_stream_ring_size` produces (fewer than two or an odd
+  number of slots, unequal regions, a slot size that is not a multiple of 256 bytes, or bytes that are not slots times
+  slot size). It refuses. A caller defect: report it.
+- WARN `[MOE-STREAM-RING] reserve: device %d gives back the %zu of %u slots held for a %.1f MB ring to reserve %.1f MB
+  on device %d`: a partial reservation kept for another geometry or device goes back before the new ring is reserved.
+  It is expected when the window or the slot size changes between prompts. No action.
+- WARN `[MOE-STREAM-RING] reserve: slot %zu of %.2f MB did not resolve on device %d`: a slot was allocated but its
+  handle does not resolve to device memory on that device. It refuses and reports no shortfall, so no loan is asked
+  for. An allocator defect: report it.
+- WARN `[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give %.1f MB (%u slots x %.2f MB) on device %d (holding %u
+  of %u slots)`: the WEIGHT zone ran out before every slot was allocated. The slots already held stay held for the
+  next reserve, and the missing slots' bytes are what the expert loan the phase asks for next must free. A loan line
+  or the partial-release line below follows. Expected on a card whose WEIGHT zone is full at the first prompt.
+- WARN `[MOE-STREAM-RING] partial reservation released on device %d: no loan can follow (held %u of %u slots)`: once
+  per prompt under `GGML_SYCL_MOE_EXEC=ring` or a trace level of 1 or more, when a refused ring gives back the slots
+  it held because no loan can fund it any more. It does not print for a ring that held no slot. It explains the
+  "holding K of N slots" line before it; the layers then answer `ring-unavailable`.
 
 **Probes** (load time)
 
