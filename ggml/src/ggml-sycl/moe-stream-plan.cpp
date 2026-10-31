@@ -813,8 +813,8 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
 // explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log. The
 // rule is asked of that layer `li`, since whether the executor claims it is the layer's. host_matrices_per_layer_max is
 // the most slots one layer's streamable matrices take, one each; the ring holds one executor window (window_slots) per
-// region instead, so n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked for, so when the cap refused it
-// they are the uncapped request.
+// region instead, so n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked for, so when the cap
+// refused it they are the uncapped request.
 void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li) {
     if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr ||
         (op.policy != moe_exec_policy::RING && op.log->trace < 1)) {
