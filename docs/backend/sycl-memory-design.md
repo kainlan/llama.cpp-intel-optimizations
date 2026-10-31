@@ -145,8 +145,8 @@ bytes, halved when two fit (the executor's own two-buffer rule, capped by
 `GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX`). `moe_stream_ring_size` is given
 `window_slots`, the smaller of `G_plan` and the most host matrices one role of
 one layer has (`role_items_max`), and sizes two regions of that many slots, each
-slot one matrix of the largest streamable size. `region_slots_max`, the slot
-need of the heaviest whole layer, no longer sizes anything and only appears in
+slot one matrix of the largest streamable size. `host_matrices_per_layer_max`,
+the slot need of the heaviest whole layer, sizes nothing and only appears in
 the ring-unavailable WARN beside `window_slots`. The sizing refuses the ring,
 leaving none, when its bytes exceed an eleventh of the device's expert bytes
 counted with the bytes lent to the ring (`bytes > (resident_expert_bytes +

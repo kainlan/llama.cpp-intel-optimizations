@@ -811,9 +811,9 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
 
 // One WARN per prompt saying why the ring is unavailable, at the first layer that answers RING_UNAVAILABLE, under an
 // explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log. The
-// rule is asked of that layer `li`, since whether the executor claims it is the layer's. region_slots_max is the most
-// slots one layer's streamable matrices take; the ring holds one executor window (window_slots) per region instead, so
-// n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked for, so when the cap refused it
+// rule is asked of that layer `li`, since whether the executor claims it is the layer's. host_matrices_per_layer_max is
+// the most slots one layer's streamable matrices take, one each; the ring holds one executor window (window_slots) per
+// region instead, so n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked for, so when the cap refused it
 // they are the uncapped request.
 void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li) {
     if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr ||
@@ -826,11 +826,10 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe
     char line[384];
     std::snprintf(line, sizeof(line),
                   "[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
-                  "region_slots_max=%u window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u "
-                  "bytes=%zu)",
+                  "window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)",
                   device_, moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, reserve_failed_),
-                  index_.host_matrices_per_layer_max, index_.region_slots_max, index_.window_slots,
-                  index_.matrix_bytes_max, index_.resident_expert_bytes, asked.n_slots, asked.bytes);
+                  index_.host_matrices_per_layer_max, index_.window_slots, index_.matrix_bytes_max,
+                  index_.resident_expert_bytes, asked.n_slots, asked.bytes);
     op.log->sink(op.log->sink_ctx, line);
 }
 

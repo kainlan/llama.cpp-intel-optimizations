@@ -42,7 +42,7 @@ What this gate pins:
     the stage-table entry holds the AOS slot, the copy's event, layout AOS and the consumer the index build named
     (ruling C: the entry is the answer);
   - every window matrix takes one slot, acquired with the layout it holds, AOS (lead ruling c-o9uw-1), and the ring is
-    sized so: one slot per staged matrix (moe_stream_staging_slots), one executor window per region;
+    sized so: one slot per staged matrix (each counts once in its role), one executor window per region;
   - what stages comes from the library executor's claim alone (W2): the index build marks a matrix whose weight the
     oneDNN batched prompt executor claims AOS_ONLY with consumer EXECUTOR and leaves every other one NONE, its
     default; no prompt-kernel predicate exists to ask. The backend answers the claims predicate with
@@ -566,9 +566,10 @@ def test_streamed_item_mutants():
 SLOTS_CHECK = "if (ring_->slots_free() == 0) { ++n.exhausted; continue; }"
 AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT);"
 STAGING_ENUM = "enum class moe_stream_staging : uint8_t { NONE, AOS_ONLY, };"
-STAGING_SLOTS_SIG = "static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging)"
-STAGING_SLOTS_BODY = "{ return staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }"
-REGION_SIZE = "li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));"
+# A staged matrix counts once in its layer and once in its role: the role count bounds window_slots, which sizes the
+# ring, so a matrix takes one slot. A matrix that stages NONE is skipped before either count (INDEX_SLOT_SKIP).
+STREAMABLE_COUNT = "++li.n_streamable;"
+ROLE_COUNT = "li.role_items[detail::moe_stream_role_slot(item.role)] += 1;"
 INDEX_BUILD_SIG = "static inline moe_stream_plan_index moe_stream_plan_index_build("
 RING_GEOMETRY_SIG = "static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry("
 # The one place the ring is sized (llama.cpp-kjef): the phase's prepare() and the auto-ubatch fit both call the helper.
@@ -578,14 +579,16 @@ RING_SIZE_CALL = "moe_stream_ring_size(index.window_slots, index.matrix_bytes_ma
 
 def claim_window_matrix_takes_one_aos_slot(phase: str, hpp: str) -> bool:
     """W2: every slot holds AOS, so a staged matrix takes ONE slot, both when the ring is sized (one slot per staged
-    matrix from the one slot-count helper, the ring sized from the index's window) and when a window stages it: the
+    matrix, counted once in its role, the ring sized from the index's window) and when a window stages it: the
     region is checked for a free slot, then the one slot is acquired with the layout it will hold, AOS (lead ruling
     c-o9uw-1), then the copy goes in. Staging has no SOA value to size a second slot for."""
     h = norm(hpp)
     n = norm(phase)
     s = body(n, STAGE_SIG)
-    return (h.count(STAGING_ENUM) == 1 and body(h, STAGING_SLOTS_SIG) == STAGING_SLOTS_BODY
-            and REGION_SIZE in body(h, INDEX_BUILD_SIG) and RING_SIZE_CALL in body(h, RING_GEOMETRY_SIG)
+    b = body(h, INDEX_BUILD_SIG)
+    return (h.count(STAGING_ENUM) == 1 and ordered(b, INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
+            and b.count("li.role_items[") == 1 and "moe_stream_staging_slots" not in h and "region_slots_max" not in h
+            and "li.region_slots" not in b and RING_SIZE_CALL in body(h, RING_GEOMETRY_SIG)
             and "moe_stream_plan_ring_geometry(" in body(n, PREPARE_SIG)
             and n.count("ring_->acquire_slot(") == 1 and ordered(s, SLOTS_CHECK, AOS_ACQUIRE, COPY_DECL))
 
@@ -610,7 +613,12 @@ def test_window_slot_mutants():
     assert not c(PHASE, mutate(PLAN_HPP, STAGING_ENUM,
                                "enum class moe_stream_staging : uint8_t { NONE, SOA, AOS_ONLY, };"))
     # The ring sized as if every matrix took two.
-    assert not c(PHASE, mutate(PLAN_HPP, "moe_stream_staging::AOS_ONLY ? 1u", "moe_stream_staging::AOS_ONLY ? 2u"))
+    assert not c(PHASE, mutate(PLAN_HPP, ROLE_COUNT, ROLE_COUNT.replace("+= 1;", "+= 2;")))
+    # A matrix that stages NONE counted in its role.
+    assert not c(PHASE, mutate(PLAN_HPP, INDEX_SLOT_SKIP + " " + STREAMABLE_COUNT + " " + ROLE_COUNT,
+                               ROLE_COUNT + " " + INDEX_SLOT_SKIP + " " + STREAMABLE_COUNT))
+    # The retired per-layer slot count back.
+    assert not c(PHASE, mutate(PLAN_HPP, ROLE_COUNT, ROLE_COUNT + " li.region_slots += 1;"))
     # No free-slot check, or a check for two.
     assert not c(mutate(PHASE, SLOTS_CHECK, ""), PLAN_HPP)
     assert not c(mutate(PHASE, "ring_->slots_free() == 0", "ring_->slots_free() < 2"), PLAN_HPP)
@@ -982,7 +990,7 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
                  "const std::unordered_set<uint64_t> * as_host = nullptr)") in h
             and ITEM_DEFAULT_NONE in body(h, "struct moe_stream_item")
             and ordered(build, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY, "li.items.push_back(item);",
-                        INDEX_SLOT_SKIP, "++li.n_streamable;", REGION_SIZE)
+                        INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
             and build.count("item.staging = ") == 1
             and h.count("library_claims(graph_ctx") == 1
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
@@ -1908,11 +1916,12 @@ def test_refused_loan_warn_mutants():
         assert not c(PHASE, tree)
 
 
-DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u "
+DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
             "window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)")
 # One argument per field, in the format's order. window_slots and matrix_bytes_max are the ring's sizing inputs (a
-# region holds one executor window, so n_slots is 2 x window_slots); region_slots_max is what a whole layer would take.
-DIAG_ARGS = ("index_.host_matrices_per_layer_max, index_.region_slots_max, index_.window_slots, "
+# region holds one executor window, so n_slots is 2 x window_slots); host_matrices_per_layer_max is what a whole layer
+# would take, one slot per matrix.
+DIAG_ARGS = ("index_.host_matrices_per_layer_max, index_.window_slots, "
              "index_.matrix_bytes_max, index_.resident_expert_bytes, asked.n_slots, asked.bytes);")
 DIAG_EMIT = "op.log->sink(op.log->sink_ctx, line);"
 DIAG_RULE_CALL = "moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, reserve_failed_)"
@@ -1961,14 +1970,14 @@ def test_ring_unavailable_diagnostic_mutants():
     renamed = mutate(PHASE, "n_slots=%u ", "slots=%u ")
     assert not claim_ring_unavailable_diagnostic(renamed, PLAN_HPP, {PHASE_REL: renamed})
     # A layer's slot need or the window left out, or printed under another field's name.
-    dropped = mutate(PHASE, " region_slots_max=%u", "")
+    dropped = mutate(PHASE, " (host_matrices_per_layer_max=%u ", " (")
     assert not claim_ring_unavailable_diagnostic(dropped, PLAN_HPP, {PHASE_REL: dropped})
     no_window = mutate(PHASE, " window_slots=%u", "")
     assert not claim_ring_unavailable_diagnostic(no_window, PLAN_HPP, {PHASE_REL: no_window})
     # (anchored on the whole argument list: the ring sizing passes window_slots and matrix_bytes_max to
     # moe_stream_ring_size too)
-    swapped = mutate(PHASE, "index_.region_slots_max, index_.window_slots, index_.matrix_bytes_max,",
-                     "index_.window_slots, index_.region_slots_max, index_.matrix_bytes_max,")
+    swapped = mutate(PHASE, "index_.host_matrices_per_layer_max, index_.window_slots, index_.matrix_bytes_max,",
+                     "index_.window_slots, index_.host_matrices_per_layer_max, index_.matrix_bytes_max,")
     assert not claim_ring_unavailable_diagnostic(swapped, PLAN_HPP, {PHASE_REL: swapped})
     # The window rule dropped from the helper, or asked after the cap it would otherwise be reported as.
     assert not claim_ring_unavailable_diagnostic(

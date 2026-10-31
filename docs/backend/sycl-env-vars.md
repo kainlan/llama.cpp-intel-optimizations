@@ -484,10 +484,10 @@ null log callback otherwise drops all of it).
 **Ring and window** (the first two lines print under `GGML_SYCL_MOE_EXEC=ring` or a trace level of 1 or more, the
 third at every policy and verbosity, the fourth under `ring` only, the aborts always)
 
-- WARN `[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u
-  window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)`: once per prompt, at the first
-  layer that answers `ring-unavailable`. The rule names why. `region_slots_max` is the slot need of the heaviest whole
-  layer. The ring holds one executor window per region (`window_slots`), so `n_slots` is twice `window_slots`.
+- WARN `[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u window_slots=%u
+  matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)`: once per prompt, at the first layer that
+  answers `ring-unavailable`. The rule names why. `host_matrices_per_layer_max` is the slot need of the heaviest whole
+  layer, one slot per matrix. The ring holds one executor window per region (`window_slots`), so `n_slots` is twice `window_slots`.
   `resident_expert_bytes` is the device's expert set after the ring's own loan, and the ring's cap is
   `bytes > (resident_expert_bytes + lent_bytes) / 11`.
 - WARN `[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this prompt`:

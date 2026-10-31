@@ -137,11 +137,6 @@ static inline bool moe_stream_item_aos_fits(const moe_stream_item & item, size_t
     return detail::moe_stream_item_rows_bytes(item) != 0 && item.src_bytes <= slot_bytes;
 }
 
-// The slots one item takes in a region: one staged AOS-only, none otherwise.
-static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging) {
-    return staging == moe_stream_staging::AOS_ONLY ? 1u : 0u;
-}
-
 // One layer's host expert entries, read in the one scan of the plan a micro-batch makes (c-7soh).
 struct moe_stream_layer_info {
     std::vector<moe_stream_item>              items;     // host gate/up/down entries in plan.entries order, typed
@@ -149,8 +144,7 @@ struct moe_stream_layer_info {
     size_t  host_bytes       = 0;  // AOS bytes of every host expert entry of the layer, fused ones included
     int     n_host_experts   = 0;  // distinct expert ids with a host entry
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
-    int     n_streamable     = 0;  // items the ring gives slots: staging AOS_ONLY
-    int     region_slots     = 0;  // the slots its streamable items take: one each
+    int     n_streamable     = 0;  // items the ring gives slots, one each: staging AOS_ONLY
     size_t  matrix_bytes_max = 0;  // the largest one streamable matrix's slot bytes: the unit the ring stages
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
     int64_t N                = 0;  // the largest ne[1] over the host expert entries
@@ -161,10 +155,9 @@ struct moe_stream_layer_info {
 
 // The plan as the phase reads it for one micro-batch, and the inputs of the ring's geometry (ruling B, c-3bde).
 struct moe_stream_plan_index {
-    uint32_t host_matrices_per_layer_max = 0;  // the most streamable items one layer has
-    // The most slots one layer's streamable items take, one each. The ring is sized from window_slots, not from this;
-    // the ring-unavailable WARN prints both.
-    uint32_t region_slots_max            = 0;
+    // The most streamable items one layer has, one slot each. The ring is sized from window_slots, not from this; the
+    // ring-unavailable WARN prints both.
+    uint32_t host_matrices_per_layer_max = 0;
     // The largest streamable item's src bytes: the AOS bytes one slot holds.
     size_t   matrix_bytes_max            = 0;
     size_t   resident_expert_bytes       = 0;  // dst bytes of the expert entries resident on the device
@@ -313,7 +306,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
             continue;
         }
         ++li.n_streamable;
-        li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));
         li.role_items[detail::moe_stream_role_slot(item.role)] += 1;
         li.matrix_bytes_max  = std::max(li.matrix_bytes_max, e.src_size);
         idx.matrix_bytes_max = std::max(idx.matrix_bytes_max, e.src_size);
@@ -324,7 +316,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
     for (const auto & kv : idx.layers) {
         idx.host_matrices_per_layer_max =
             std::max(idx.host_matrices_per_layer_max, static_cast<uint32_t>(kv.second.n_streamable));
-        idx.region_slots_max = std::max(idx.region_slots_max, static_cast<uint32_t>(kv.second.region_slots));
         for (int r = 0; r < 3; ++r) {
             idx.role_items_max = std::max(idx.role_items_max, static_cast<uint32_t>(kv.second.role_items[r]));
         }

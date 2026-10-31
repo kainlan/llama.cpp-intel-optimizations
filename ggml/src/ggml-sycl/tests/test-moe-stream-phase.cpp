@@ -546,7 +546,6 @@ int main() {
         // One AOS slot per matrix, read in place by the executor: nothing reorders.
         CHECK(items_all(*l0, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
         CHECK(l0->n_host_experts == 3 && l0->n_untriplet == 0 && l0->n_streamable == 9);
-        CHECK(l0->region_slots == 9);
         CHECK(l0->role_items[0] == 3 && l0->role_items[1] == 3 && l0->role_items[2] == 3);
         CHECK(l0->host_bytes == 9 * src_bytes());
         CHECK(l0->matrix_bytes_max == src_bytes());  // the AOS bytes a slot holds, not the plan's device size
@@ -567,7 +566,6 @@ int main() {
         CHECK(l4->items.empty() && l4->n_host_experts == 1 && l4->n_untriplet == 1);
     }
     CHECK(idx.host_matrices_per_layer_max == 9);
-    CHECK(idx.region_slots_max == 9);
     CHECK(idx.matrix_bytes_max == src_bytes());
     CHECK(idx.role_items_max == 3 && idx.window_slots == 3);
     // Resident on device 0: 24 triplet entries per layer for layers 3 and 4 minus the host ones, 15 for layers 0-2.
@@ -582,11 +580,11 @@ int main() {
         const moe_stream_layer_info * u0 = layer_info(unclaimed, 0);
         CHECK(u0 != nullptr);
         if (u0) {
-            CHECK(u0->items.size() == 9 && u0->n_streamable == 0 && u0->region_slots == 0);
+            CHECK(u0->items.size() == 9 && u0->n_streamable == 0);
             CHECK(items_all(*u0, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
             CHECK(u0->n_host_experts == 3 && u0->host_bytes == 9 * src_bytes());
         }
-        CHECK(unclaimed.host_matrices_per_layer_max == 0 && unclaimed.region_slots_max == 0);
+        CHECK(unclaimed.host_matrices_per_layer_max == 0);
         CHECK(unclaimed.matrix_bytes_max == 0 && unclaimed.role_items_max == 0 && unclaimed.window_slots == 0);
         // A predicate that claims no weight builds the same index.
         const moe_stream_plan_index   refused = index_of(plan, claims_none);
@@ -594,12 +592,12 @@ int main() {
         CHECK(r0 != nullptr && items_all(*r0, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
         CHECK(refused.host_matrices_per_layer_max == 0 && refused.window_slots == 0);
 
-        // The claim alone decides: every claimed Q4_0 matrix takes one AOS slot, whatever the prompt kernels read.
+        // The claim alone decides: every claimed Q4_0 matrix takes one AOS slot.
         const moe_stream_plan_index   claimed_q4 = index_of(plan, claims_all);
         const moe_stream_layer_info * k0         = layer_info(claimed_q4, 0);
         CHECK(k0 != nullptr && items_all(*k0, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
-        CHECK(claimed_q4.region_slots_max == 9 && claimed_q4.matrix_bytes_max == src_bytes());
-        CHECK(claimed_q4.host_matrices_per_layer_max == 9 && claimed_q4.window_slots == 3);
+        CHECK(claimed_q4.host_matrices_per_layer_max == 9 && claimed_q4.matrix_bytes_max == src_bytes());
+        CHECK(claimed_q4.window_slots == 3);
 
         // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
         // MMVQ reads here, takes one AOS slot of its own bytes. Unclaimed it takes none.
@@ -609,14 +607,14 @@ int main() {
         const moe_stream_layer_info * f1         = layer_info(iq_free, 1);
         CHECK(i1 != nullptr && f1 != nullptr);
         if (i1 && f1) {
-            CHECK(f1->items.size() == 12 && f1->n_streamable == 0 && f1->region_slots == 0);
-            CHECK(i1->items.size() == 12 && i1->n_streamable == 12 && i1->region_slots == 12);
+            CHECK(f1->items.size() == 12 && f1->n_streamable == 0);
+            CHECK(i1->items.size() == 12 && i1->n_streamable == 12);
             CHECK(items_all(*i1, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
             CHECK(f1->n_host_experts == 4 && f1->host_bytes > 0);
         }
         // A slot holds the largest claimed matrix's AOS bytes: the IQ3_XXS device size the plan carries plays no part.
         CHECK(iq_claimed.matrix_bytes_max == std::max(src_bytes(), iq_src_bytes()));
-        CHECK(iq_claimed.host_matrices_per_layer_max == 12 && iq_claimed.region_slots_max == 12);
+        CHECK(iq_claimed.host_matrices_per_layer_max == 12);
         CHECK(iq_free.host_matrices_per_layer_max == 0 && iq_free.matrix_bytes_max == 0);
     }
 
@@ -640,12 +638,12 @@ int main() {
             CHECK(items_all(*c1, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
             CHECK(items_all(*c2, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
             // Layer 0: the three claimed gates, one slot each; layer 1: nothing; layer 2: all nine.
-            CHECK(c0->n_streamable == 3 && c0->region_slots == 3);
+            CHECK(c0->n_streamable == 3);
             CHECK(c0->role_items[0] == 3 && c0->role_items[1] == 0 && c0->role_items[2] == 0);
-            CHECK(c1->n_streamable == 0 && c1->region_slots == 0);
-            CHECK(c2->n_streamable == 9 && c2->region_slots == 9);
+            CHECK(c1->n_streamable == 0);
+            CHECK(c2->n_streamable == 9);
         }
-        CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.region_slots_max == 9 && claimed.role_items_max == 3);
+        CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.role_items_max == 3);
         // Asked once per (layer, role) with a matrix one AOS slot holds, not once per expert: layers 0-2, three roles.
         CHECK(probe.calls == 9);
 
@@ -662,7 +660,7 @@ int main() {
         const moe_stream_plan_index z =
             ggml_sycl::moe_stream_plan_index_build(zeroed, 0, &zprobe, claims_l0_gate_l2, kWideWindow);
         const moe_stream_layer_info * z2 = layer_info(z, 2);
-        CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0 && z2->region_slots == 0);
+        CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0);
         if (z2) {
             CHECK(items_all(*z2, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
         }
@@ -860,8 +858,6 @@ int main() {
     bad       = iq;
     bad.nrows = 0;
     CHECK(!ggml_sycl::moe_stream_item_aos_fits(bad, 4096));
-    CHECK(ggml_sycl::moe_stream_staging_slots(moe_stream_staging::AOS_ONLY) == 1u);
-    CHECK(ggml_sycl::moe_stream_staging_slots(moe_stream_staging::NONE) == 0u);
 
     // ---- a host lease the ring may copy from directly (llama.cpp-9y0p) ----
     alloc_metadata owner{};
