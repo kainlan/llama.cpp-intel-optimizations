@@ -810,7 +810,7 @@ STAGED_LAYER_SET = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->exec
 STAGED_LAYER_ASSIGN = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->"
 # The release site stays directly after begin_layer (claim_staged_pointer_released_with_ring); the bool follows it,
 # inside the same block, the claim's own (stream_call lives at function scope since llama.cpp-8epx).
-STAGED_LAYER_SITE = ("prompt_ids_snapshot.size(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx); "
+STAGED_LAYER_SITE = ("*ctx.stream(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx); "
                      + STAGED_LAYER_SET + " }")
 RETAINED_BUILD = ("retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, ctx.device, "
                   "prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]), "
@@ -1040,7 +1040,7 @@ EXTRA_RELEASE_ASSERT = ("GGML_ASSERT(extra->weight_ext == nullptr || "
                         "extra->weight_ext->moe_stream_payload_records.load(std::memory_order_acquire) == 0);")
 RELEASE_SITES = (
     "sycl_ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*sycl_ctx);",
-    "prompt_ids_snapshot.size(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx);",
+    "*ctx.stream(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx);",
     "moe_stream.reset(); ggml_sycl_moe_stream_release_payload(*this);",
     "ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*ctx);",
 )

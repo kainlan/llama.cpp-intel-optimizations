@@ -83,14 +83,8 @@ static_assert(GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX == moe_exec_decision_log::MAX
 moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
                                                 const placement_plan & plan,
                                                 int                    device,
-                                                unified_cache &        cache,
                                                 sycl::queue &          ccs,
-                                                const int32_t *        ids,
-                                                size_t                 n_ids,
                                                 const moe_stream_op &  op) {
-    GGML_UNUSED(cache);
-    GGML_UNUSED(ids);
-    GGML_UNUSED(n_ids);
     const bool new_ubatch = moe_stream_ubatch_starts(ubatch_live_, layer, cur_layer_, op.graph_seq, cur_graph_seq_);
     if (!new_ubatch && layer == cur_layer_) {
         return decision_of(layer);  // the layer's later ops: the first one decided

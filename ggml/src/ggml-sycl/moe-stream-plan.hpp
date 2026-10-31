@@ -1040,16 +1040,13 @@ class moe_stream_phase {
     // layer, and a RING decision stands only on a layer the executor claims whole (moe_stream_executor_claims) once the
     // ring reserves, at the first such layer; anything else is RING_UNAVAILABLE. The layer the op's decline_layer names
     // is CPU, DECLINED, whatever the cost model chose (moe_stream_layer_declined). Nothing is staged here, and no layer
-    // is weighed ahead: the executor stages its windows (window_begin), whose experts and cache are their own, so
-    // `cache` and the ids are not read. A layer below the last one, or the same layer in a new graph, starts a
-    // micro-batch (moe_stream_ubatch_starts). Returns the layer's decision.
+    // is weighed ahead: the executor stages its windows (window_begin), whose experts and cache are their own. A layer
+    // below the last one, or the same layer in a new graph, starts a micro-batch (moe_stream_ubatch_starts). Returns
+    // the layer's decision.
     moe_exec_decision         begin_layer(int                    layer,
                                           const placement_plan & plan,
                                           int                    device,
-                                          unified_cache &        cache,
                                           sycl::queue &          ccs,
-                                          const int32_t *        ids,
-                                          size_t                 n_ids,
                                           const moe_stream_op &  op);
     const moe_stream_staged * find(int layer, int expert_id, expert_tensor_role role) const;
     // True iff slots were taken from the ring's current region since it last flipped.

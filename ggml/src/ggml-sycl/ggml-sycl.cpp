@@ -18773,7 +18773,7 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
 // ggml_sycl_moe_stream_claims_every_weight, sizes the ring it asks about. It is the prefill ring's bytes neither the
 // planned room nor a loan covers on `device` (llama.cpp-kjef); the rung does not enter the geometry. See its
 // definition.
-static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch);
+static size_t ggml_sycl_hold_ring_uncovered(int device);
 
 static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
     ggml_sycl_hold_fit_answer  a;
@@ -18814,7 +18814,7 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.plan_ctx     = &device;
     // Lent bytes cost the card nothing; the part of the ring neither the planned room nor a loan covers is a demand
     // (zone_hold_fit_demand).
-    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);
+    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
     // The explicit micro-batch the published plan placed on this device: its RUNTIME zone holds the planned compute
     // term beside that micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger than
     // the term (whole or nothing). Every other rung, and every load that placed no micro-batch, is judged as before.
@@ -37011,7 +37011,7 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // lends nothing, so the post-loan ring less the room's slots it keeps counts.
 //
 // The geometry is the stream phase's own, moe_stream_plan_ring_geometry, so the fit and the ring cannot disagree about
-// how a claimed matrix is sized. The rung does not enter the geometry, so `n_ubatch` is unused. The claims hook is
+// how a claimed matrix is sized. The rung does not enter the geometry, so the fit passes no rows. The claims hook is
 // what sizes the ring, and the fit cannot pass the backend's: it reads g_moe_gate_up_pairs, a thread-local scan of a
 // graph that is stale outside compute (a previous model's weight tensors can still be in it), so asking it here could
 // read freed tensors. A null hook claims nothing and so sizes no ring, an
@@ -37043,12 +37043,11 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // multi-device plan holds none. The room is the plan's accounting, not an allocation: a runtime context whose KV takes
 // those bytes (KV has priority) leaves the reserve short, and the credit is then too large, the case the memory design
 // doc names.
-static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
+static size_t ggml_sycl_hold_ring_uncovered(int device) {
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
         return 0;
     }
-    GGML_UNUSED(n_ubatch);  // kept for the callers' signature: the rows mattered only to the prompt-kernel hook
     ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the claims hook's graph_ctx, never read
     call.plan = current->plan;
     ggml_sycl_moe_stream_set_window(call.op, device);
@@ -84060,8 +84059,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // this op where the ring can be given back. The resolved-batch builds below read the stage table through the
         // STAGED_RING route (llama.cpp-o9uw).
         if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) {
-            ctx.moe_stream->begin_layer(stream_call.layer, *stream_call.plan, ctx.device, *stream_call.cache,
-                                        *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+            ctx.moe_stream->begin_layer(stream_call.layer, *stream_call.plan, ctx.device, *ctx.stream(),
                                         stream_call.op);
             ggml_sycl_moe_stream_release_payload(ctx);
             // The index and the decision are the ones begin_layer just built, for the layer begin_layer was given.

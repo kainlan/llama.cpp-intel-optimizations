@@ -2798,7 +2798,7 @@ def test_the_settle_refusal_record_has_a_mutation_witness(mutation):
 
 _HOLD_FIT_START = "static bool ggml_sycl_hold_spill_fit("
 _HOLD_FIT_END = "static size_t ggml_sycl_planned_scratch_hold_spill_bound("
-_RING_BYTES_LINE = "in.ring_bytes = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);"
+_RING_BYTES_LINE = "in.ring_bytes = ggml_sycl_hold_ring_uncovered(q.device);"
 
 
 def _hold_fit_ring_bytes_pinned(raw_cpp: str) -> bool:
@@ -2819,7 +2819,7 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
     end = GGML_SYCL_CPP.find(_HOLD_FIT_END, start)
     assert start != -1 and end != -1
     # Whitespace-tolerant, so the assignment's column alignment never turns the witness into a vacuous miss.
-    assignment = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
+    assignment = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
     m = re.search(assignment, GGML_SYCL_CPP[start:end], re.M)
     assert m, "the assignment must sit in the fit body"
     at, line = start + m.start(), m.group(0)
@@ -2830,12 +2830,12 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
     assert not _hold_fit_ring_bytes_pinned(mutated), "the mutant must make the pin fail"
 
 
-_RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {"
+_RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device) {"
 _RING_HELPER_END = "const char * moe_batch_reject_reason_name("
 _RING_REMAINDER_LINE = "return loan.geo.bytes > room_kept + lent ? loan.geo.bytes - room_kept - lent : 0;"
 _RING_PROBE_LINE = ("const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, loan.bytes, "
                     "loan.geo.slot_bytes);")
-_RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
+_RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
 
 
 def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:

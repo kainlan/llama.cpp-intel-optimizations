@@ -188,6 +188,7 @@ def call_args(text: str, name: str) -> list:
 MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try"
 ADMIT_BRANCH = "if (ne12 != 1)"
 BEGIN_CALL = "moe_stream->begin_layer("
+BEGIN_ARGS = "stream_call.layer, *stream_call.plan, ctx.device, *ctx.stream(), stream_call.op"
 BEGIN_GUARD = "if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) {"
 GRAPH_SINK = 'throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt batch cannot enter graph sink");'
 SNAPSHOT = "prompt_ids_snapshot = prompt_ids_entry.host_ids;"
@@ -214,8 +215,8 @@ ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
 
 def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
     """One consultation site, in ggml_sycl_mul_mat_id's prompt ids-admission branch: after the graph-sink refusal and
-    the ids snapshot, guarded by the prompt-batch predicate, passing the snapshot, which begin_layer no longer reads
-    (a signature pin), and before moe_hybrid_with_plan."""
+    the ids snapshot, guarded by the prompt-batch predicate, and before moe_hybrid_with_plan. It passes the layer, the
+    plan, the device, the compute queue and the op, and nothing begin_layer would not read: no cache, no ids."""
     n = norm(sycl)
     if n.count(BEGIN_CALL) != 1:
         return False
@@ -229,8 +230,7 @@ def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
         return False
     args = call_args(branch[call_at:], BEGIN_CALL)
     return (ordered(branch[:call_at], "ctx.moe_graphs_disabled_once = true;", GRAPH_SINK, SNAPSHOT, BEGIN_GUARD)
-            and bool(args) and "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()" in args[0]
-            and "*ctx.stream()" in args[0] and ordered(b, BEGIN_CALL, HYBRID_WITH_PLAN))
+            and bool(args) and args[0] == BEGIN_ARGS and ordered(b, BEGIN_CALL, HYBRID_WITH_PLAN))
 
 
 def test_begin_layer_once_in_prompt_branch():
@@ -259,9 +259,13 @@ def test_begin_layer_mutants():
     late = mutate(SYCL, BEGIN_GUARD + " " + stmt, BEGIN_GUARD)
     late = late.replace(HYBRID_WITH_PLAN, stmt + " " + HYBRID_WITH_PLAN, 1)
     assert not claim_begin_layer_once_in_prompt_branch(late)
-    # the snapshot not passed: begin_layer no longer reads it, so this pins the call's signature
+    # the cache or the ids passed again, which begin_layer does not read
     assert not claim_begin_layer_once_in_prompt_branch(
-        mutate(SYCL, "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()", "nullptr, 0"))
+        mutate(SYCL, "ctx.device, *ctx.stream(), stream_call.op);",
+               "ctx.device, *stream_call.cache, *ctx.stream(), stream_call.op);"))
+    assert not claim_begin_layer_once_in_prompt_branch(
+        mutate(SYCL, "ctx.device, *ctx.stream(), stream_call.op);",
+               "ctx.device, *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), stream_call.op);"))
 
 
 # ---- the enqueue -----------------------------------------------------------------------------------------------------
