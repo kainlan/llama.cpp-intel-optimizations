@@ -688,8 +688,9 @@ planner refusal -> 87.8 with the ring on all 152 layer-ubatches; Q_staged NOT_EX
 loan) -> 18.43 (no loan); Q_noc 11.63 -> 17.81; Q_pp_cpu pp2048 32.5 -> 47.5, which is host state and not a change
 this record can attribute. The floors in the table are the gate's defaults as carried in the earlier records in this
 file: c-c774 and c-xkq4 for 200/500, 11.0 and 9.5, and the `Q_tok_cpu` and `Q_decline` rules as in the earlier tables.
-The `GO_pp` reference figures (827.4, 871, the 31.0-33.0 band, 32.0) come from the gate's own `GO_pp` line (c-7vb3)
-and c-4m7d.
+The `Q_staged` cell is the plan's `ring_engaged=yes` and `trace_misses=0` criterion (c-7vb3), and the control arms'
+count rules (`GO_gate`, `GO_noc`, `MI_b70`, `MI_b50`, `resets`) are as in the earlier tables. The `GO_pp` reference
+figures (827.4, 871, the 31.0-33.0 band, 32.0) come from the gate's own `GO_pp` line (c-7vb3) and c-4m7d.
 
 | arm | metric | value | floor | verdict | builders_post | notes |
 |-----|--------|-------|-------|---------|---------------|-------|
