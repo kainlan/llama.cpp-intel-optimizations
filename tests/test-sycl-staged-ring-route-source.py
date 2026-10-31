@@ -26,7 +26,7 @@ What this gate pins:
     NVFP4 matrix, a slice whose resolved layout is not the entry's, or a route either validator refuses falls through
     to the route core. Every lookup is counted served or refused, and every refusal with its cause, in the order
     asked, and with the capability's reason or the validator's reject reason (plan Task 8: the trace says why); the
-    capability part is one helper, the one the prompt-kernel predicate answers through;
+    capability part is one helper, which the route alone asks;
   - the batched executor consumes a staged slot whose entry names it as the consumer, for an expert it would otherwise
     decline (llama.cpp-3460): its expert loop defers a claimed layer's HOST expert to its window (llama.cpp-8epx),
     and one stage-table lookup per deferred expert after that window's window_begin, keyed as the staged route keys
@@ -65,6 +65,9 @@ What this gate pins:
     the test hook, after begin_layer (a new geometry re-reserves the ring), and once the phase is gone in the context
     destructor. Each record is counted on its extra, the context's member documents that a record's extra outlives
     it, and release_extra_gpu asserts no record is left.
+  - a stage-table entry's layout defaults to the ring's one slot layout, MOE_STREAM_RING_SLOT_LAYOUT, the constant
+    the ring slices every slot with, so an entry built without naming a layout claims the layout its slot holds; the
+    entry holds one slot, `aos`, with no SOA slot beside it, and the device test's insert hook takes that one slot.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -86,6 +89,7 @@ RING_CPP_REL = "ggml/src/ggml-sycl/moe-stream-ring.cpp"
 PLAN_HPP_REL = "ggml/src/ggml-sycl/moe-stream-plan.hpp"
 COMMON_REL = "ggml/src/ggml-sycl/common.hpp"
 COMMON_CPP_REL = "ggml/src/ggml-sycl/common.cpp"
+TEST_HPP_REL = "ggml/src/ggml-sycl/ggml-sycl-test.hpp"
 
 SYCL = read(SYCL_REL)
 BATCH_HPP = read(BATCH_HPP_REL)
@@ -97,6 +101,7 @@ RING_CPP = read(RING_CPP_REL)
 PLAN_HPP = read(PLAN_HPP_REL)
 COMMON = read(COMMON_REL)
 COMMON_CPP = read(COMMON_CPP_REL)
+TEST_HPP = read(TEST_HPP_REL)
 # Every C/C++ source of the SYCL backend outside its tests/, by path from the repository root.
 SYCL_TREE = {
     p.relative_to(ROOT).as_posix(): p.read_text(errors="replace")
@@ -153,12 +158,16 @@ ROUTE_STRUCT_SIG = "struct moe_batch_route {"
 ASSIGN = "staged.recipe.transfer = moe_recipe_transfer::STAGED_RING;"
 ASSIGN_RE = r"(?<![=!<>])=\s*(?:ggml_sycl::)?moe_recipe_transfer::STAGED_RING\b"
 GUARD = "if (moe_stream != nullptr && stream_layer >= 0) {"
-FIND = "if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {"
-# An executor entry on a weight the executor takes whole is its handoff, counted apart from the refusals; CLAIMED is
-# a refusal only on a weight the ring staged partly (llama.cpp-3460).
-HANDOFF = ("if (refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()) { "
-           "moe_stream->count_executor_handoff(); } else { moe_stream->count_staged_route(refusal, refusal_detail); } ")
-SERVE_RETURN = HANDOFF + "if (refusal == moe_staged_route_refusal::NONE) { return staged; }"
+FIND = "const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role);"
+# The consumer is asked first, before a slot is resolved or a recipe built (llama.cpp-q2ln). An executor entry on a
+# weight the executor takes whole is its handoff, counted apart from the refusals; CLAIMED is a refusal only on a
+# weight the ring staged partly (llama.cpp-3460). Either way the expert falls through to the route core.
+HANDOFF_CHOICE = ("if (executor_takes_weight()) { moe_stream->count_executor_handoff(); } else { "
+                  "moe_stream->count_staged_route(moe_staged_route_refusal::CLAIMED, nullptr); }")
+EXECUTOR_FIRST = ("if (s != nullptr && s->consumer == moe_stream_consumer::EXECUTOR) { " + HANDOFF_CHOICE +
+                  " } else if (s != nullptr) {")
+SERVE_RETURN = ("moe_stream->count_staged_route(refusal, refusal_detail); "
+                "if (refusal == moe_staged_route_refusal::NONE) { return staged; }")
 # Asked once per build, at the first executor entry, for the build's layer: the answer the prompt path takes after
 # begin_layer (STAGED_LAYER_SET).
 EXECUTOR_TAKES = ("bool executor_asked = false; bool executor_takes = false; "
@@ -178,9 +187,10 @@ PREPARE_LAYER = "call.layer = ggml_sycl_moe_stream_layer_of(src0);"
 # The batched executor's claims: the route asks neither; the ring's index build asked the second (llama.cpp-3460).
 CLAIM_CALLS = ("ggml_sycl_moe_pp_onednn_batched_claims_tensor(",
                "ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(")
+# The refusal lambda's first step before llama.cpp-q2ln, asked after the slot and the recipe: retired.
 EXECUTOR_REFUSAL = "if (s->consumer == moe_stream_consumer::EXECUTOR) { return moe_staged_route_refusal::CLAIMED; }"
 
-SLOT = "const mem_handle & slot = s->layout == GGML_LAYOUT_SOA ? s->soa : s->aos;"
+SLOT = "const mem_handle & slot = s->aos;"
 VIEW = "const resolved_ptr view = slot.resolve(submit_device);"
 ENTRY_FIELDS = (
     "staged.residency = moe_batch_residency::PRIMARY_DEVICE;",
@@ -199,7 +209,6 @@ ENTRY_FIELDS = (
 REFUSAL_OPEN = ("const char * refusal_detail = nullptr; const moe_staged_route_refusal refusal = [&]() {")
 # The resolver's refusals, in the order it asks them; each names its cause and, where there is one, its detail.
 REFUSAL_STEPS = (
-    EXECUTOR_REFUSAL,
     "const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);",
     "if (by_cap != moe_staged_route_refusal::NONE) { refusal_detail = cap.reason; return by_cap; }",
     "if (view.ptr == nullptr || !view.on_device) { return moe_staged_route_refusal::VIEW; }",
@@ -523,7 +532,9 @@ def test_entry_is_the_fact_mutants():
         mutate(SYCL, "staged.actual_layout = s->layout;", "staged.actual_layout = view.layout;"))
     assert not claim_entry_is_the_fact(
         mutate(SYCL, "staged.recipe.layout = s->layout;", "staged.recipe.layout = view.layout;"))
-    assert not claim_entry_is_the_fact(mutate(SYCL, SLOT, "const mem_handle & slot = s->aos;"))
+    # The retired SOA arm back: an entry's slot is its AOS slot.
+    assert not claim_entry_is_the_fact(
+        mutate(SYCL, SLOT, "const mem_handle & slot = s->layout == GGML_LAYOUT_SOA ? s->soa : s->aos;"))
     assert not claim_entry_is_the_fact(
         mutate(SYCL, "staged.ready_event = s->ready;", "staged.ready_event = view.ready_event;"))
 
@@ -558,7 +569,7 @@ def claim_served_only_as_plain_kernel(sycl: str) -> bool:
     at = br.find(REFUSAL_OPEN)
     lam = body(br[at:], "const moe_staged_route_refusal refusal = [&]()") if at >= 0 else ""
     cap = body(norm(sycl), STAGED_CAP_SIG)
-    return (ordered(br, ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN)
+    return (ordered(br, EXECUTOR_FIRST, ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN)
             and lam.count("return moe_staged_route_refusal::NONE;") == 1 and br.count("return staged;") == 1
             and ordered(cap, *STAGED_CAP_STEPS) and re.findall(r"moe_route_kernel::(\w+)", cap) == ["MMVQ_COMPAT"]
             and norm(sycl).count(STAGED_CAP_SIG + " {") == 1 and executor_reads_through_plain_kernels(sycl))
@@ -569,14 +580,14 @@ def test_served_only_as_plain_kernel():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch (the "
         "capability refusal and the executor's plain-kernel reads are searched in their own bodies)",
         staged_branch(SYCL),
-        ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN,
+        EXECUTOR_FIRST, ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN,
         signature=staged_branch_signature(SYCL))
 
 
 def test_served_only_as_plain_kernel_mutants():
     c = claim_served_only_as_plain_kernel
     # An entry the batched executor consumes served to the route.
-    assert not c(mutate(SYCL, REFUSAL_STEPS[0], ""))
+    assert not c(mutate(SYCL, EXECUTOR_FIRST, "if (s != nullptr) {"))
     # Another kernel served.
     assert not c(mutate(SYCL, "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {",
                         "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT && "
@@ -584,9 +595,9 @@ def test_served_only_as_plain_kernel_mutants():
     # A Q1_0/NVFP4 slot staged and served past the capability helper.
     assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""))
     # A slot whose resolved layout is not the entry's.
-    assert not c(mutate(SYCL, REFUSAL_STEPS[4], ""))
+    assert not c(mutate(SYCL, REFUSAL_STEPS[3], ""))
     # The route validator skipped.
-    assert not c(mutate(SYCL, REFUSAL_STEPS[7], ""))
+    assert not c(mutate(SYCL, REFUSAL_STEPS[6], ""))
     # A refusal counted without its detail, so the trace cannot say why.
     assert not c(mutate(SYCL, "refusal_detail = cap.reason; return by_cap;", "return by_cap;"))
     assert not c(mutate(SYCL, "moe_stream->count_staged_route(refusal, refusal_detail);",
@@ -608,14 +619,20 @@ def test_served_only_as_plain_kernel_mutants():
 
 
 def claim_executor_entry_refused_by_its_consumer(sycl: str) -> bool:
-    """The route refuses an entry the batched executor consumes by the entry's own consumer, the fact the ring wrote
-    when it staged the slot (one fact, one source, c-gi44), as the first step of its refusal lambda. It asks no claim
-    of the executor's: neither claim predicate is called in the build, so a build pays no plan read for it, and the
-    staged claim stays the index build's alone (llama.cpp-3460)."""
+    """The route turns an entry the batched executor consumes away by the entry's own consumer, the fact the ring wrote
+    when it staged the slot (one fact, one source, c-gi44), right after the lookup and before it resolves a slot or
+    builds a device recipe, so an executor entry costs neither (llama.cpp-q2ln). CLAIMED is counted there only, never
+    by the refusal lambda. It asks no claim of the executor's: neither claim predicate is called in the build, so a
+    build pays no plan read for it, and the staged claim stays the index build's alone (llama.cpp-3460)."""
     b = build_body(sycl)
-    lam_at = staged_branch(sycl).find(REFUSAL_OPEN)
-    lam = staged_branch(sycl)[lam_at:] if lam_at >= 0 else ""
-    return (lam.find(EXECUTOR_REFUSAL) >= 0 and lam.find(EXECUTOR_REFUSAL) == lam.find("if (", len(REFUSAL_OPEN))
+    br = staged_branch(sycl)
+    at = br.find(FIND)
+    after = br[at + len(FIND):] if at >= 0 else ""
+    lam_at = br.find(REFUSAL_OPEN)
+    lam = body(br[lam_at:], "const moe_staged_route_refusal refusal = [&]()") if lam_at >= 0 else ""
+    return (at >= 0 and after.lstrip().startswith(EXECUTOR_FIRST)
+            and ordered(br, FIND, EXECUTOR_FIRST, SLOT, VIEW, "ggml_sycl_moe_build_device_recipe(", REFUSAL_OPEN)
+            and br.count("moe_staged_route_refusal::CLAIMED") == 1 and "CLAIMED" not in lam and lam != ""
             and not any(c in b for c in CLAIM_CALLS) and "stream_library_claimed" not in b
             and "stream_claim_asked" not in b)
 
@@ -624,27 +641,30 @@ def test_executor_entry_refused_by_its_consumer():
     assert claim_executor_entry_refused_by_its_consumer(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: staged branch of ggml_sycl_build_moe_resolved_batch",
         staged_branch(SYCL),
-        REFUSAL_OPEN, EXECUTOR_REFUSAL,
+        FIND, EXECUTOR_FIRST, SLOT, VIEW, "ggml_sycl_moe_build_device_recipe(", REFUSAL_OPEN,
         signature=staged_branch_signature(SYCL))
 
 
 def test_executor_entry_refused_by_its_consumer_mutants():
     c = claim_executor_entry_refused_by_its_consumer
+    consumer = "s != nullptr && s->consumer == moe_stream_consumer::EXECUTOR"
     # The route asks the plan claim again (the shape before llama.cpp-3460).
-    assert not c(mutate(SYCL, EXECUTOR_REFUSAL,
-                        "if (ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device)) { "
-                        "return moe_staged_route_refusal::CLAIMED; }"))
+    assert not c(mutate(SYCL, consumer,
+                        "s != nullptr && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, submit_device)"))
     # The route re-derives the consumer from the slot's layout instead of reading the entry's.
-    assert not c(mutate(SYCL, EXECUTOR_REFUSAL,
-                        "if (s->layout == GGML_LAYOUT_AOS) { return moe_staged_route_refusal::CLAIMED; }"))
+    assert not c(mutate(SYCL, consumer, "s != nullptr && s->layout == GGML_LAYOUT_AOS"))
     # The staged claim asked in the build beside the entry's consumer.
-    assert not c(mutate(SYCL, EXECUTOR_REFUSAL,
-                        "if (ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*sctx, src0, submit_device)) { "
-                        "return moe_staged_route_refusal::CLAIMED; } " + EXECUTOR_REFUSAL))
-    # The refusal asked after the capability, so a cause other than the consumer is counted for the executor's entry.
-    m = mutate(SYCL, EXECUTOR_REFUSAL + " ", "")
-    m = m.replace("if (view.ptr == nullptr", EXECUTOR_REFUSAL + " if (view.ptr == nullptr", 1)
+    assert not c(mutate(SYCL, EXECUTOR_FIRST,
+                        "(void) ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(*sctx, src0, submit_device); " +
+                        EXECUTOR_FIRST))
+    # The consumer asked after the slot and the recipe, in the refusal lambda (the shape before llama.cpp-q2ln).
+    m = mutate(SYCL, EXECUTOR_FIRST, "if (s != nullptr) {")
+    m = m.replace(REFUSAL_OPEN, REFUSAL_OPEN + " " + EXECUTOR_REFUSAL, 1)
     assert not c(m)
+    # A second CLAIMED, from the lambda, beside the early branch.
+    assert not c(mutate(SYCL, REFUSAL_OPEN, REFUSAL_OPEN + " " + EXECUTOR_REFUSAL))
+    # The slot resolved ahead of the consumer check.
+    assert not c(mutate(SYCL, FIND, FIND + " (void) s->aos.resolve(submit_device);"))
 
 
 def claim_executor_handoff_counted_apart(sycl: str, phase: str, hpp: str) -> bool:
@@ -660,7 +680,7 @@ def claim_executor_handoff_counted_apart(sycl: str, phase: str, hpp: str) -> boo
     n = norm(phase)
     return (b.count("->executor_claims(") == 1 and "->executor_staged(" not in b and b.count(EXECUTOR_TAKES) == 1
             and ordered(b, EXECUTOR_TAKES, LAMBDA_OPEN) and br.count("executor_takes_weight()") == 1
-            and ordered(br, REFUSAL_OPEN, EXECUTOR_REFUSAL, SERVE_RETURN)
+            and br.count(EXECUTOR_FIRST) == 1 and ordered(br, EXECUTOR_FIRST, REFUSAL_OPEN, SERVE_RETURN)
             and body(n, HANDOFF_SIG) == HANDOFF_BODY and body(n, TALLY_HANDOFF_SIG) == TALLY_HANDOFF_BODY
             and norm(hpp).count(TALLY_HANDED_OFF) == 1)
 
@@ -678,12 +698,12 @@ def test_executor_handoff_counted_apart_mutants():
     def c(sycl=SYCL, phase=PHASE, hpp=PLAN_HPP):
         return claim_executor_handoff_counted_apart(sycl, phase, hpp)
     # Every executor entry counted as a handoff, a partly staged weight's too, so its wasted copies never warn.
-    assert not c(mutate(SYCL, "refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()",
-                        "refusal == moe_staged_route_refusal::CLAIMED"))
+    assert not c(mutate(SYCL, HANDOFF_CHOICE, "moe_stream->count_executor_handoff();"))
     # Every executor entry counted as a refusal again (the shape before the handoff field).
-    assert not c(mutate(SYCL, HANDOFF, "moe_stream->count_staged_route(refusal, refusal_detail); "))
+    assert not c(mutate(SYCL, HANDOFF_CHOICE,
+                        "moe_stream->count_staged_route(moe_staged_route_refusal::CLAIMED, nullptr);"))
     # The phase asked per expert instead of once per build.
-    assert not c(mutate(SYCL, "&& executor_takes_weight()", "&& moe_stream->executor_claims(stream_layer)"))
+    assert not c(mutate(SYCL, "if (executor_takes_weight()) {", "if (moe_stream->executor_claims(stream_layer)) {"))
     # The phase asked about another layer than the build's.
     assert not c(mutate(SYCL, "executor_claims(stream_layer);", "executor_claims(stream_layer + 1);"))
     # The retired per-ids stage-table question back in its place.
@@ -810,7 +830,7 @@ STAGED_LAYER_SET = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->exec
 STAGED_LAYER_ASSIGN = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->"
 # The release site stays directly after begin_layer (claim_staged_pointer_released_with_ring); the bool follows it,
 # inside the same block, the claim's own (stream_call lives at function scope since llama.cpp-8epx).
-STAGED_LAYER_SITE = ("prompt_ids_snapshot.size(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx); "
+STAGED_LAYER_SITE = ("*ctx.stream(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx); "
                      + STAGED_LAYER_SET + " }")
 RETAINED_BUILD = ("retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, ctx.device, "
                   "prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]), "
@@ -1040,7 +1060,7 @@ EXTRA_RELEASE_ASSERT = ("GGML_ASSERT(extra->weight_ext == nullptr || "
                         "extra->weight_ext->moe_stream_payload_records.load(std::memory_order_acquire) == 0);")
 RELEASE_SITES = (
     "sycl_ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*sycl_ctx);",
-    "prompt_ids_snapshot.size(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx);",
+    "*ctx.stream(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx);",
     "moe_stream.reset(); ggml_sycl_moe_stream_release_payload(*this);",
     "ctx->moe_stream->end_prompt(); ggml_sycl_moe_stream_release_payload(*ctx);",
 )
@@ -1520,7 +1540,7 @@ RING_ACQUIRE_SIG = "mem_handle moe_stream_ring::acquire_slot(ggml_layout_mode la
 RING_SLICE = "return slots_[index].slice(0, geo_.slot_bytes, layout);"
 STAGE_SIG = "moe_stream_phase::stage_counts moe_stream_phase::stage_window("
 PHASE_AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT);"
-PHASE_AOS_ENTRY = "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
+PHASE_AOS_ENTRY = "table_[key] = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
 TAG_AGREES = "if (view.layout != s->layout) { return moe_staged_route_refusal::LAYOUT; }"
 
 
@@ -1658,6 +1678,45 @@ def test_executor_ring_slot_layout_mutants():
     assert not c(sycl=mutate(SYCL, EXEC_DEFER, shadow))
     # Control: a comparison is a use, not a definition.
     assert c(sycl=norm(SYCL) + " (void) (MOE_STREAM_RING_SLOT_LAYOUT == GGML_LAYOUT_SOA);")
+
+
+
+STAGED_SIG = "struct moe_stream_staged"
+STAGED_LAYOUT_DEFAULT = "ggml_layout_mode layout = MOE_STREAM_RING_SLOT_LAYOUT;"
+STAGED_ONE_SLOT = "mem_handle aos;"
+INSERT_HOOK_PARAMS = "expert_tensor_role role, mem_handle aos, sycl::event ready, ggml_layout_mode layout,"
+INSERT_HOOK_HEAD = "bool test_moe_stream_insert_staged(ggml_backend_t backend, int layer, int expert_id, "
+
+
+def claim_staged_layout_defaults_to_the_slot_layout(hpp: str, sycl: str = SYCL, test_hpp: str = TEST_HPP) -> bool:
+    """The entry's layout defaults to the ring's slot layout, by the constant, not a literal: one fact, one source. The
+    entry holds the one AOS slot (the SOA slot retired with the SOA staging), and the insert hook's declaration and
+    definition take that one slot."""
+    b = body(norm(hpp), STAGED_SIG)
+    hooks = [x for x in (norm(sycl), norm(test_hpp)) if INSERT_HOOK_HEAD in x]
+    return (b.count("layout =") == 1 and STAGED_LAYOUT_DEFAULT in b and b.count("mem_handle") == 1
+            and STAGED_ONE_SLOT in b and len(hooks) == 2
+            and all(x.count(INSERT_HOOK_HEAD + INSERT_HOOK_PARAMS) == 1 for x in hooks))
+
+
+def test_staged_layout_defaults_to_the_slot_layout():
+    assert claim_staged_layout_defaults_to_the_slot_layout(PLAN_HPP), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.hpp: body of struct moe_stream_staged",
+        body(norm(PLAN_HPP), STAGED_SIG), STAGED_LAYOUT_DEFAULT, signature=STAGED_SIG)
+
+
+def test_staged_layout_default_mutants():
+    c = claim_staged_layout_defaults_to_the_slot_layout
+    # The retired SOA default back.
+    assert not c(mutate(PLAN_HPP, STAGED_LAYOUT_DEFAULT, "ggml_layout_mode layout = GGML_LAYOUT_SOA;"))
+    # The slot layout spelled as a literal: a second source for the ring's one fact.
+    assert not c(mutate(PLAN_HPP, STAGED_LAYOUT_DEFAULT, "ggml_layout_mode layout = GGML_LAYOUT_AOS;"))
+    # The retired SOA slot back in the entry.
+    assert not c(mutate(PLAN_HPP, STAGED_ONE_SLOT, "mem_handle soa; " + STAGED_ONE_SLOT))
+    # The hook's SOA parameter back, in the definition or the declaration.
+    soa_params = INSERT_HOOK_PARAMS.replace("mem_handle aos,", "mem_handle soa, mem_handle aos,")
+    assert not c(PLAN_HPP, sycl=mutate(SYCL, INSERT_HOOK_PARAMS, soa_params))
+    assert not c(PLAN_HPP, test_hpp=mutate(TEST_HPP, INSERT_HOOK_PARAMS, soa_params))
 
 
 if __name__ == "__main__":

@@ -83,14 +83,8 @@ static_assert(GGML_SYCL_MOE_EXEC_DECLINE_LAYER_MAX == moe_exec_decision_log::MAX
 moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
                                                 const placement_plan & plan,
                                                 int                    device,
-                                                unified_cache &        cache,
                                                 sycl::queue &          ccs,
-                                                const int32_t *        ids,
-                                                size_t                 n_ids,
                                                 const moe_stream_op &  op) {
-    GGML_UNUSED(cache);
-    GGML_UNUSED(ids);
-    GGML_UNUSED(n_ids);
     const bool new_ubatch = moe_stream_ubatch_starts(ubatch_live_, layer, cur_layer_, op.graph_seq, cur_graph_seq_);
     if (!new_ubatch && layer == cur_layer_) {
         return decision_of(layer);  // the layer's later ops: the first one decided
@@ -106,16 +100,15 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     // The window timing, and the timing queue its marks go on, are trace level 2's, until a mark, the timing queue or
     // the records' growth fails (drop_window_timing()).
     window_timing_.enabled = op.log != nullptr && op.log->trace >= 2 && !window_marks_failed_;
-    request_loan_  = op.request_loan;
-    loan_refusals_ = op.loan_refusals;
+    request_loan_          = op.request_loan;
+    loan_refusals_         = op.loan_refusals;
 
-    // The layer is weighed at its own first op, never a layer ahead: the executor stages its own windows, and no copy
-    // of a layer hides under the previous layer's (there is no cross-layer prefetch), so the cost model gets no window.
+    // The layer is weighed at its own first op, never a layer ahead: the executor stages its own windows.
     const auto cur = index_.layers.find(layer);
     if (cur != index_.layers.end()) {
         layer_state & st = layers_[layer];
         if (!st.decided) {
-            st.decision = weigh(cur->second, op, 0.0);
+            st.decision = weigh(cur->second, op);
             st.decided  = true;
             // GGML_SYCL_MOE_EXEC_DECLINE_LAYER forces this layer off the executor (llama.cpp-ny6i): a CPU decision is
             // never staged, so the ring is neither reserved nor claimed for it and the layer runs the hybrid path.
@@ -132,7 +125,6 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
             sizer.plan           = &plan;
             sizer.device         = device_;
             sizer.geo            = geo_;
-            sizer.prompt_kernel  = op.prompt_kernel;
             sizer.graph_ctx      = op.graph_ctx;
             sizer.library_claims = op.library_claims;
             sizer.hints          = window_;
@@ -177,7 +169,7 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     // The host time this call takes, for the window's timing line (trace level 2 only).
     const bool timed   = window_timing_.enabled;
     const auto t_begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    const auto li = index_.layers.find(req.layer);  // executor_claims found it
+    const auto li      = index_.layers.find(req.layer);  // executor_claims found it
 
     // The bytes this call copies, the window's own and its prefetch's: note_window() counts them once, here.
     size_t     bytes_staged   = 0;
@@ -415,10 +407,10 @@ bool moe_stream_phase::take_prompt_ended() {
 // compute queue gives the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache
 // record is read once per prompt.
 void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
-    const moe_stream_ring_geometry geo = moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx,
-                                                                       op.library_claims, op.window, &index_);
-    const bool                     same_queue = ccs_.has_value() && *ccs_ == ccs;
-    const bool                     same_geo   = moe_stream_ring_geometry_same(geo, geo_);
+    const moe_stream_ring_geometry geo =
+        moe_stream_plan_ring_geometry(plan, device, op.graph_ctx, op.library_claims, op.window, &index_);
+    const bool same_queue = ccs_.has_value() && *ccs_ == ccs;
+    const bool same_geo   = moe_stream_ring_geometry_same(geo, geo_);
     if (prepared_ && (device != device_ || !same_queue || !same_geo)) {
         teardown(ring_ ? compute_barrier() : sycl::event());
     }
@@ -450,9 +442,7 @@ size_t moe_stream_phase::ring_bytes_free() const {
     return static_cast<size_t>(geo_.region_slots) * geo_.slot_bytes;
 }
 
-moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
-                                          const moe_stream_op &         op,
-                                          double                        window_us) const {
+moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li, const moe_stream_op & op) const {
     moe_exec_layer_inputs in;
     in.n_tokens             = n_tokens_;  // the micro-batch's, from begin_ubatch
     in.n_expert             = op.n_expert;
@@ -461,10 +451,9 @@ moe_exec_decision moe_stream_phase::weigh(const moe_stream_layer_info & li,
     in.n_host_experts       = li.n_host_experts;
     in.K                    = li.K;
     in.N                    = li.N;
-    in.window_us            = window_us;
     in.ring_bytes_free      = ring_bytes_free();
     in.stage_unit_bytes_max = li.matrix_bytes_max;  // one slot: a window is staged a matrix at a time
-    in.soa_bytes            = li.soa_bytes;         // 0: every slot is AOS, read in place, so no reorder is priced
+
     // The device's probed H2D rate (llama.cpp-kp1l), read live and under the probe's mutex: another model's load may
     // run the probe while this prompt weighs. 0 while the device is unresolved or keeps the seed.
     const double         probed_h2d_gbps = ggml_sycl_h2d_probed_gbps(device_);
@@ -580,7 +569,7 @@ moe_stream_phase::stage_counts moe_stream_phase::stage_window(const std::vector<
         region_last_      = copied;
         // The entry's handle is the AOS slot, with the layout it really holds (ruling C, c-3bde), and the reader the
         // index build named for the item, the executor (llama.cpp-3460).
-        table_[key]       = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };
+        table_[key]       = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };
         region_keys_[cur_region_].push_back(key);
         n.bytes += item.src_bytes;
         ++n.staged;
@@ -822,10 +811,10 @@ mem_handle moe_stream_phase::test_acquire_slot(ggml_layout_mode layout) {
 
 // One WARN per prompt saying why the ring is unavailable, at the first layer that answers RING_UNAVAILABLE, under an
 // explicit ring or a trace (lead ruling c-kcyf): a ring-unavailable trace line must be explainable from the log. The
-// rule is asked of that layer `li`, since whether the executor claims it is the layer's. region_slots_max is the most
-// slots one layer's streamable matrices take; the ring holds one executor window (window_slots) per region instead, so
-// n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked for, so when the cap refused it
-// they are the uncapped request.
+// rule is asked of that layer `li`, since whether the executor claims it is the layer's. host_matrices_per_layer_max is
+// the most slots one layer's streamable matrices take, one each; the ring holds one executor window (window_slots) per
+// region instead, so n_slots is 2 x window_slots. The slots and bytes are the ring the layer asked for, so when the cap
+// refused it they are the uncapped request.
 void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li) {
     if (warned_unavailable_ || op.log == nullptr || op.log->sink == nullptr ||
         (op.policy != moe_exec_policy::RING && op.log->trace < 1)) {
@@ -837,11 +826,10 @@ void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, const moe
     char line[384];
     std::snprintf(line, sizeof(line),
                   "[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
-                  "region_slots_max=%u window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u "
-                  "bytes=%zu)",
+                  "window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)",
                   device_, moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, reserve_failed_),
-                  index_.host_matrices_per_layer_max, index_.region_slots_max, index_.window_slots,
-                  index_.matrix_bytes_max, index_.resident_expert_bytes, asked.n_slots, asked.bytes);
+                  index_.host_matrices_per_layer_max, index_.window_slots, index_.matrix_bytes_max,
+                  index_.resident_expert_bytes, asked.n_slots, asked.bytes);
     op.log->sink(op.log->sink_ctx, line);
 }
 

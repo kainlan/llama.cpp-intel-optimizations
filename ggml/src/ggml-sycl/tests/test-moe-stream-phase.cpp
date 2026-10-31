@@ -12,8 +12,8 @@
 // The ring serves the batched prompt executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md). A matrix whose
 // weight the executor claims once its host experts are staged takes one AOS slot, which the executor's dequant kernel
 // reads, and its entry names the executor as its consumer (llama.cpp-3460). A matrix the executor does not claim stages
-// NONE, whatever the device's prompt kernels read, and the prompt-kernel predicate is no longer asked. The tests pass
-// the claims as a predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
+// NONE, whatever the device's prompt kernels read: no kernel predicate is asked. The tests pass the claims as a
+// predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
 //
 // The phase stages a layer a window at a time: one executor phase of one role (moe_stream_window_items). The regions'
 // read gates are kept by moe_stream_region_reads, keyed by the window each region holds, which the phase holds over
@@ -156,22 +156,11 @@ size_t iq_src_bytes() {
     return ggml_row_size(GGML_TYPE_IQ3_XXS, kCols) * static_cast<size_t>(kRows);
 }
 
-// A stand-in no real table matches: Q4_0 read as SOA and as AOS. The index build no longer asks it.
-bool kernels_soa_q4(void *, ggml_type type, ggml_layout_mode layout, int64_t, int64_t) {
-    return type == GGML_TYPE_Q4_0 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_AOS);
-}
-
-// kernels_soa_q4, counting its calls in *graph_ctx.
-bool kernels_soa_q4_counted(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1) {
-    ++*static_cast<int *>(graph_ctx);
-    return kernels_soa_q4(nullptr, type, layout, ne0, ne1);
-}
-
 // A planned weight slot that holds every expert: the window is the most streamable items one role of a layer has.
 const ggml_sycl::moe_stream_window_hints kWideWindow = { SIZE_MAX, 0 };
 
 moe_stream_plan_index index_of(const placement_plan & plan, ggml_sycl::moe_stream_library_claims_fn claims) {
-    return ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels_soa_q4, nullptr, claims, kWideWindow);
+    return ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, claims, kWideWindow);
 }
 
 // The library executor's claims, handed to the index build through graph_ctx as the backend's call is.
@@ -196,18 +185,6 @@ bool claims_none(void *, int, expert_tensor_role) {
 const moe_stream_layer_info * layer_info(const moe_stream_plan_index & idx, int layer) {
     const auto it = idx.layers.find(layer);
     return it == idx.layers.end() ? nullptr : &it->second;
-}
-
-// No layer of `idx` has a byte to reorder: the ring stages AOS slots for the executor only, and moe_stream_staging has
-// no SOA value. An index with no layers answers false: a check over nothing would pass vacuously, and every index this
-// test builds has layers.
-bool no_layer_reorders(const moe_stream_plan_index & idx) {
-    for (const auto & kv : idx.layers) {
-        if (kv.second.soa_bytes != 0) {
-            return false;
-        }
-    }
-    return !idx.layers.empty();
 }
 
 // Every item of `li` stages `staging` for `consumer`.
@@ -569,7 +546,7 @@ void test_phase_holds_g_plan_not_the_region(const placement_plan & plan) {
         // the 230400 resident bytes.
         moe_stream_plan_index                     idx;
         const ggml_sycl::moe_stream_ring_geometry geo =
-            ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, kernels_soa_q4, nullptr, claims_all, hints, &idx);
+            ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, hints, &idx);
         CHECK(geo.n_slots != 0 && geo.region_slots == idx.window_slots);
 
         const uint32_t                  cap = ggml_sycl::moe_stream_phase_experts(idx, geo);
@@ -621,7 +598,6 @@ int main() {
     const moe_stream_plan_index idx  = index_of(plan, claims_all);
     CHECK(idx.layers.size() == 4);
     CHECK(layer_info(idx, 3) == nullptr);  // no host expert: skipped, never weighed
-    CHECK(no_layer_reorders(idx));
 
     const moe_stream_layer_info * l0 = layer_info(idx, 0);
     CHECK(l0 != nullptr);
@@ -637,10 +613,8 @@ int main() {
         // One AOS slot per matrix, read in place by the executor: nothing reorders.
         CHECK(items_all(*l0, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
         CHECK(l0->n_host_experts == 3 && l0->n_untriplet == 0 && l0->n_streamable == 9);
-        CHECK(l0->region_slots == 9);
         CHECK(l0->role_items[0] == 3 && l0->role_items[1] == 3 && l0->role_items[2] == 3);
         CHECK(l0->host_bytes == 9 * src_bytes());
-        CHECK(l0->soa_bytes == 0);
         CHECK(l0->matrix_bytes_max == src_bytes());  // the AOS bytes a slot holds, not the plan's device size
         CHECK(l0->K == kCols && l0->N == kRows);
         CHECK(l0->host_mix.size() == 1 && l0->host_mix[0].first == GGML_TYPE_Q4_0 &&
@@ -652,16 +626,13 @@ int main() {
         CHECK(l1->items.size() == 9 && l1->n_untriplet == 1);
         CHECK(l1->n_host_experts == 3);  // expert 1's fused entry is the same expert
         CHECK(l1->host_bytes == 9 * src_bytes() + kFused);
-        CHECK(l1->soa_bytes == 0);       // the fused entry is never staged; the claimed items are read in place
     }
     const moe_stream_layer_info * l4 = layer_info(idx, 4);
     CHECK(l4 != nullptr);
     if (l4) {
         CHECK(l4->items.empty() && l4->n_host_experts == 1 && l4->n_untriplet == 1);
-        CHECK(l4->soa_bytes == 0);
     }
     CHECK(idx.host_matrices_per_layer_max == 9);
-    CHECK(idx.region_slots_max == 9);
     CHECK(idx.matrix_bytes_max == src_bytes());
     CHECK(idx.role_items_max == 3 && idx.window_slots == 3);
     // Resident on device 0: 24 triplet entries per layer for layers 3 and 4 minus the host ones, 15 for layers 0-2.
@@ -672,16 +643,15 @@ int main() {
     {
         // No claim: every host item is still listed and the cost model still sees every host byte, but none takes a
         // slot, so no window and no ring.
-        const moe_stream_plan_index unclaimed = index_of(plan, nullptr);
-        CHECK(no_layer_reorders(unclaimed));
-        const moe_stream_layer_info * u0 = layer_info(unclaimed, 0);
+        const moe_stream_plan_index   unclaimed = index_of(plan, nullptr);
+        const moe_stream_layer_info * u0        = layer_info(unclaimed, 0);
         CHECK(u0 != nullptr);
         if (u0) {
-            CHECK(u0->items.size() == 9 && u0->n_streamable == 0 && u0->region_slots == 0);
+            CHECK(u0->items.size() == 9 && u0->n_streamable == 0);
             CHECK(items_all(*u0, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
             CHECK(u0->n_host_experts == 3 && u0->host_bytes == 9 * src_bytes());
         }
-        CHECK(unclaimed.host_matrices_per_layer_max == 0 && unclaimed.region_slots_max == 0);
+        CHECK(unclaimed.host_matrices_per_layer_max == 0);
         CHECK(unclaimed.matrix_bytes_max == 0 && unclaimed.role_items_max == 0 && unclaimed.window_slots == 0);
         // A predicate that claims no weight builds the same index.
         const moe_stream_plan_index   refused = index_of(plan, claims_none);
@@ -689,38 +659,22 @@ int main() {
         CHECK(r0 != nullptr && items_all(*r0, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
         CHECK(refused.host_matrices_per_layer_max == 0 && refused.window_slots == 0);
 
-        // The prompt kernels decide nothing and are never asked, claimed or not: the counted predicate reads Q4_0 as
-        // SOA, yet a claimed matrix still takes one AOS slot.
-        int                         calls = 0;
-        const moe_stream_plan_index counted =
-            ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels_soa_q4_counted, &calls, claims_all, kWideWindow);
-        const moe_stream_layer_info * k0 = layer_info(counted, 0);
-        CHECK(k0 != nullptr && items_all(*k0, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
-        CHECK(counted.region_slots_max == 9 && counted.matrix_bytes_max == src_bytes());
-        (void) ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels_soa_q4_counted, &calls, nullptr, kWideWindow);
-        CHECK(calls == 0);
-        // No predicate at all: the claim still decides.
-        const moe_stream_plan_index blind =
-            ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, kWideWindow);
-        CHECK(blind.host_matrices_per_layer_max == 9 && blind.region_slots_max == 9 && blind.window_slots == 3);
-
-        // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
-        // kernels_soa_q4 reads, takes one AOS slot of its own bytes. Unclaimed it takes none.
+        // The claim alone decides: a claimed IQ3_XXS matrix takes one AOS slot of its own bytes. Unclaimed it takes
+        // none.
         const moe_stream_plan_index   iq_free    = index_of(make_mixed_plan(), nullptr);
         const moe_stream_plan_index   iq_claimed = index_of(make_mixed_plan(), claims_all);
         const moe_stream_layer_info * i1         = layer_info(iq_claimed, 1);
         const moe_stream_layer_info * f1         = layer_info(iq_free, 1);
-        CHECK(no_layer_reorders(iq_free) && no_layer_reorders(iq_claimed));
         CHECK(i1 != nullptr && f1 != nullptr);
         if (i1 && f1) {
-            CHECK(f1->items.size() == 12 && f1->n_streamable == 0 && f1->region_slots == 0);
-            CHECK(i1->items.size() == 12 && i1->n_streamable == 12 && i1->region_slots == 12);
+            CHECK(f1->items.size() == 12 && f1->n_streamable == 0);
+            CHECK(i1->items.size() == 12 && i1->n_streamable == 12);
             CHECK(items_all(*i1, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
             CHECK(f1->n_host_experts == 4 && f1->host_bytes > 0);
         }
         // A slot holds the largest claimed matrix's AOS bytes: the IQ3_XXS device size the plan carries plays no part.
         CHECK(iq_claimed.matrix_bytes_max == std::max(src_bytes(), iq_src_bytes()));
-        CHECK(iq_claimed.host_matrices_per_layer_max == 12 && iq_claimed.region_slots_max == 12);
+        CHECK(iq_claimed.host_matrices_per_layer_max == 12);
         CHECK(iq_free.host_matrices_per_layer_max == 0 && iq_free.matrix_bytes_max == 0);
     }
 
@@ -728,9 +682,8 @@ int main() {
     {
         // claims_l0_gate_l2: layer 0's GATE weight and every weight of layer 2. Host experts are 1, 5 and 6.
         claims_probe                probe;
-        const moe_stream_plan_index claimed = ggml_sycl::moe_stream_plan_index_build(
-            make_plan(), 0, kernels_soa_q4, &probe, claims_l0_gate_l2, kWideWindow);
-        CHECK(no_layer_reorders(claimed));
+        const moe_stream_plan_index claimed =
+            ggml_sycl::moe_stream_plan_index_build(make_plan(), 0, &probe, claims_l0_gate_l2, kWideWindow);
         const moe_stream_layer_info * c0 = layer_info(claimed, 0);
         const moe_stream_layer_info * c1 = layer_info(claimed, 1);
         const moe_stream_layer_info * c2 = layer_info(claimed, 2);
@@ -745,12 +698,12 @@ int main() {
             CHECK(items_all(*c1, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
             CHECK(items_all(*c2, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
             // Layer 0: the three claimed gates, one slot each; layer 1: nothing; layer 2: all nine.
-            CHECK(c0->n_streamable == 3 && c0->region_slots == 3);
+            CHECK(c0->n_streamable == 3);
             CHECK(c0->role_items[0] == 3 && c0->role_items[1] == 0 && c0->role_items[2] == 0);
-            CHECK(c1->n_streamable == 0 && c1->region_slots == 0);
-            CHECK(c2->n_streamable == 9 && c2->region_slots == 9);
+            CHECK(c1->n_streamable == 0);
+            CHECK(c2->n_streamable == 9);
         }
-        CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.region_slots_max == 9 && claimed.role_items_max == 3);
+        CHECK(claimed.host_matrices_per_layer_max == 9 && claimed.role_items_max == 3);
         // Asked once per (layer, role) with a matrix one AOS slot holds, not once per expert: layers 0-2, three roles.
         CHECK(probe.calls == 9);
 
@@ -765,9 +718,9 @@ int main() {
         zeroed.build_index();
         claims_probe                zprobe;
         const moe_stream_plan_index z =
-            ggml_sycl::moe_stream_plan_index_build(zeroed, 0, kernels_soa_q4, &zprobe, claims_l0_gate_l2, kWideWindow);
+            ggml_sycl::moe_stream_plan_index_build(zeroed, 0, &zprobe, claims_l0_gate_l2, kWideWindow);
         const moe_stream_layer_info * z2 = layer_info(z, 2);
-        CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0 && z2->region_slots == 0);
+        CHECK(z2 != nullptr && z2->items.size() == 9 && z2->n_streamable == 0);
         if (z2) {
             CHECK(items_all(*z2, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
         }
@@ -784,7 +737,7 @@ int main() {
     claims_probe                partial_probe;
     // Layer 0 claims only its gates, layer 2 every weight (claims_l0_gate_l2).
     const moe_stream_plan_index partial =
-        ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels_soa_q4, &partial_probe, claims_l0_gate_l2, kWideWindow);
+        ggml_sycl::moe_stream_plan_index_build(plan, 0, &partial_probe, claims_l0_gate_l2, kWideWindow);
     const moe_stream_plan_index unclaimed = index_of(plan, nullptr);
 
     // ---- the executor takes a layer's weights whole, or not at all (moe_stream_executor_claims) ----
@@ -965,8 +918,6 @@ int main() {
     bad       = iq;
     bad.nrows = 0;
     CHECK(!ggml_sycl::moe_stream_item_aos_fits(bad, 4096));
-    CHECK(ggml_sycl::moe_stream_staging_slots(moe_stream_staging::AOS_ONLY) == 1u);
-    CHECK(ggml_sycl::moe_stream_staging_slots(moe_stream_staging::NONE) == 0u);
 
     // ---- a host lease the ring may copy from directly (llama.cpp-9y0p) ----
     alloc_metadata owner{};
@@ -992,7 +943,7 @@ int main() {
     };
     const moe_exec_rates seed      = ggml_sycl::moe_exec_rates_seed(q4);
     const moe_exec_rates no_record = ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 0.0, nullptr);
-    CHECK(near(no_record.h2d_gbps, seed.h2d_gbps) && near(no_record.reorder_gbps, seed.reorder_gbps));
+    CHECK(near(no_record.h2d_gbps, seed.h2d_gbps));
     CHECK(near(no_record.dev_gflops, seed.dev_gflops) && near(no_record.cpu_gbps, seed.cpu_gbps));
     ggml_sycl_moe_exec_rates_record rec{};
     rec.h2d_gbps                  = 25.0;
@@ -1001,7 +952,7 @@ int main() {
     rec.types[0]                  = GGML_TYPE_Q4_0;
     rec.dev_gflops[0]             = 1260.0;
     const moe_exec_rates measured = ggml_sycl::moe_stream_rates_assemble(q4, &rec, 0.0, nullptr);
-    CHECK(near(measured.h2d_gbps, 25.0) && near(measured.reorder_gbps, 300.0) && near(measured.dev_gflops, 1260.0));
+    CHECK(near(measured.h2d_gbps, 25.0) && near(measured.dev_gflops, 1260.0));
     const std::vector<std::pair<ggml_type, size_t>> mix = {
         { GGML_TYPE_Q4_0,  1000 },
         { GGML_TYPE_MXFP4, 1000 }
@@ -1011,15 +962,14 @@ int main() {
                2000.0 / (1000.0 / 1260.0 + 1000.0 / ggml_sycl::moe_exec_dev_gflops_seed(GGML_TYPE_MXFP4))));
     ggml_sycl_moe_exec_rates_record unmeasured = rec;
     unmeasured.h2d_gbps                        = 0.0;
-    unmeasured.reorder_gbps                    = -1.0;
     const moe_exec_rates fallback              = ggml_sycl::moe_stream_rates_assemble(q4, &unmeasured, 0.0, nullptr);
-    CHECK(near(fallback.h2d_gbps, seed.h2d_gbps) && near(fallback.reorder_gbps, seed.reorder_gbps));
+    CHECK(near(fallback.h2d_gbps, seed.h2d_gbps));
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, 0.0, fake_env_h2d).h2d_gbps, 31.0));
 
     // llama.cpp-kp1l: h2d is the record's, else the device's probed rate, else the seed; the override wins over all.
     // No record at all (the tuning cache disabled): the probed rate prices, not the seed.
     const moe_exec_rates probed_only = ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 26.5, nullptr);
-    CHECK(near(probed_only.h2d_gbps, 26.5) && near(probed_only.reorder_gbps, seed.reorder_gbps));
+    CHECK(near(probed_only.h2d_gbps, 26.5));
     // A record that measured h2d wins over the probed rate.
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, 26.5, nullptr).h2d_gbps, 25.0));
     // A record without an h2d rate falls to the probed rate, then to the seed when that is not a rate either.
@@ -1032,11 +982,13 @@ int main() {
     // The environment override is applied last: over the record and over the probed rate.
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, nullptr, 26.5, fake_env_h2d).h2d_gbps, 31.0));
 
-    // A record that says reorder is unmeasured (0) takes the seed for it, and a later seed change is not masked.
+    // The record's reorder_gbps is stored for the file format only: no rate moves with it.
     ggml_sycl_moe_exec_rates_record no_reorder = rec;
     no_reorder.reorder_gbps                    = 0.0;
     const moe_exec_rates no_reorder_rates      = ggml_sycl::moe_stream_rates_assemble(q4, &no_reorder, 0.0, nullptr);
-    CHECK(near(no_reorder_rates.reorder_gbps, seed.reorder_gbps) && near(no_reorder_rates.h2d_gbps, 25.0));
+    CHECK(near(no_reorder_rates.h2d_gbps, measured.h2d_gbps) && near(no_reorder_rates.cpu_gbps, measured.cpu_gbps) &&
+          near(no_reorder_rates.dev_gflops, measured.dev_gflops) &&
+          near(no_reorder_rates.cpu_gflops, measured.cpu_gflops));
     CHECK(ggml_sycl::moe_exec_rates_valid(measured) && ggml_sycl::moe_exec_rates_valid(fallback));
 
     // ---- the predicates begin_layer and executor_claims decide by ----

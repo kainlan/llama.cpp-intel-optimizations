@@ -9,6 +9,9 @@
 
 #include "ggml.h"
 
+#include <cstddef>
+#include <cstdint>
+
 // Single source of truth for batched-MoE MUL_MAT_ID (type, layout) coverage.
 //
 // Three tables, one invariant and one publication predicate. Two tables describe
@@ -422,6 +425,12 @@ inline moe_pp_batched_f16_groups moe_pp_batched_f16_plan_groups(size_t slot_byte
     return plan;
 }
 
+// The experts one group holds when the expert count is unbounded: the window the prompt stream's ring is sized to
+// (moe_stream_window_experts), by the same two-buffer rule and cap. 0 when the slot holds no expert.
+inline size_t moe_pp_batched_f16_window_experts(size_t slot_bytes, size_t expert_bytes, size_t cap) {
+    return moe_pp_batched_f16_plan_groups(slot_bytes, expert_bytes, SIZE_MAX, cap).experts_per_group;
+}
+
 // Whether the f16 arm's phases write one region in turn (two halves alternating, or the one buffer a slot that holds a
 // single expert has) and so must each wait for the GEMMs that last read their buffer. When the slot holds every active
 // expert (one group) each phase has its own region and is given no wait on an earlier phase's GEMMs: a windowed op
@@ -443,8 +452,11 @@ inline size_t moe_pp_batched_phase_weight_offset(const moe_pp_batched_f16_groups
 }
 
 // The experts one phase of an op that reads ring windows holds: the f16 group's size, capped by the experts the ring's
-// phase holds (moe_stream_phase::phase_experts, G_plan). The group size still bounds it, so a phase never exceeds its
-// f16 buffer, while the two are computed by separate formulas. 0 when either is 0, which the executor asserts against.
+// phase holds (moe_stream_phase::phase_experts, G_plan). Both come from one rule, moe_pp_batched_f16_plan_groups, at
+// two expert counts: G_plan at an unbounded count (moe_pp_batched_f16_window_experts), the group size at this
+// dispatch's active count. So either can be the smaller: active experts that all fit one buffer can make a group larger
+// than G_plan, and fewer active experts than G_plan do make it smaller. 0 when either is 0, which the executor asserts
+// against.
 inline size_t moe_pp_batched_phase_experts(size_t experts_per_group, size_t ring_phase_experts) {
     return ring_phase_experts < experts_per_group ? ring_phase_experts : experts_per_group;
 }

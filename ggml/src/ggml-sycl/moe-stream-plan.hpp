@@ -7,6 +7,7 @@
 
 #include "moe-exec-cost.hpp"
 #include "moe-exec-policy.hpp"
+#include "moe-mmvq-tables.hpp"  // moe_pp_batched_f16_window_experts: the window the ring is sized to
 #include "moe-stream-ring.hpp"
 #include "unified-cache.hpp"
 
@@ -45,12 +46,6 @@ enum class moe_stream_consumer : uint8_t {
     ROUTE,
     EXECUTOR,
 };
-
-// True iff the device runs a prompt MUL_MAT_ID over a device-resident expert of `type` in `layout`, ne0 x ne1
-// (c-hmey). The backend answers from ggml_sycl_moe_query_route_capability. The ring no longer asks it (W2): it stages
-// only what the library executor claims. The index build keeps the parameter for its callers' one signature.
-using moe_stream_prompt_kernel_fn =
-    bool (*)(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1);
 
 // True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight once the ring has
 // staged its host experts (llama.cpp-3460). The ring then stages each of that weight's host matrices into one AOS slot
@@ -93,14 +88,14 @@ static inline bool moe_expert_role_is_triplet(expert_tensor_role r) {
 // One staged matrix: the slot its reader reads, the event after which that slot holds the matrix, and `layout`, the
 // layout the slot really holds (ruling C, c-3bde), which the resolver's STAGED_RING route reads from here. Each slot is
 // acquired with the layout written there (lead ruling c-o9uw-1), so the slice's own tag agrees, and the route refuses a
-// slot where it does not. The ring stages AOS slots for the batched executor only (W2): `soa` is empty, `ready` is the
-// copy's event, `layout` is AOS and `consumer` is the item's, EXECUTOR (llama.cpp-3460), by which the route refuses the
-// entry. The SOA fields stay: the resolver still picks an entry's slot by `layout`.
+// slot where it does not. The ring stages AOS slots for the batched executor only (W2): `aos` is the slot, `ready` is
+// the copy's event, `layout` is AOS and `consumer` is the item's, EXECUTOR (llama.cpp-3460), by which the route turns
+// the entry away before it resolves the slot. `layout` defaults to MOE_STREAM_RING_SLOT_LAYOUT, the layout every ring
+// slot holds.
 struct moe_stream_staged {
-    mem_handle          soa;
     mem_handle          aos;
     sycl::event         ready;
-    ggml_layout_mode    layout   = GGML_LAYOUT_SOA;
+    ggml_layout_mode    layout   = MOE_STREAM_RING_SLOT_LAYOUT;
     moe_stream_consumer consumer = moe_stream_consumer::ROUTE;
 };
 
@@ -142,11 +137,6 @@ static inline bool moe_stream_item_aos_fits(const moe_stream_item & item, size_t
     return detail::moe_stream_item_rows_bytes(item) != 0 && item.src_bytes <= slot_bytes;
 }
 
-// The slots one item takes in a region: one staged AOS-only, none otherwise.
-static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging) {
-    return staging == moe_stream_staging::AOS_ONLY ? 1u : 0u;
-}
-
 // One layer's host expert entries, read in the one scan of the plan a micro-batch makes (c-7soh).
 struct moe_stream_layer_info {
     std::vector<moe_stream_item>              items;     // host gate/up/down entries in plan.entries order, typed
@@ -154,9 +144,7 @@ struct moe_stream_layer_info {
     size_t  host_bytes       = 0;  // AOS bytes of every host expert entry of the layer, fused ones included
     int     n_host_experts   = 0;  // distinct expert ids with a host entry
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
-    int     n_streamable     = 0;  // items the ring gives slots: staging AOS_ONLY
-    int     region_slots     = 0;  // the slots its streamable items take: one each
-    size_t  soa_bytes        = 0;  // always 0: the ring reorders nothing (W2); the cost model's reorder input
+    int     n_streamable     = 0;  // items the ring gives slots, one each: staging AOS_ONLY
     size_t  matrix_bytes_max = 0;  // the largest one streamable matrix's slot bytes: the unit the ring stages
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
     int64_t N                = 0;  // the largest ne[1] over the host expert entries
@@ -167,10 +155,9 @@ struct moe_stream_layer_info {
 
 // The plan as the phase reads it for one micro-batch, and the inputs of the ring's geometry (ruling B, c-3bde).
 struct moe_stream_plan_index {
-    uint32_t host_matrices_per_layer_max = 0;  // the most streamable items one layer has
-    // The most slots one layer's streamable items take, one each. The ring is sized from window_slots, not from this;
-    // the ring-unavailable WARN prints both.
-    uint32_t region_slots_max            = 0;
+    // The most streamable items one layer has, one slot each. The ring is sized from window_slots, not from this; the
+    // ring-unavailable WARN prints both.
+    uint32_t host_matrices_per_layer_max = 0;
     // The largest streamable item's src bytes: the AOS bytes one slot holds.
     size_t   matrix_bytes_max            = 0;
     size_t   resident_expert_bytes       = 0;  // dst bytes of the expert entries resident on the device
@@ -215,10 +202,9 @@ static inline int moe_stream_role_slot(expert_tensor_role role) {
 }  // namespace detail
 
 // What the ring's sizing needs from the batched executor (W3 of docs/plans/2026-10-24-prefill-window-ring.md): the
-// planned f16 weight slot it dequantizes a phase into, and the group cap it honours. A phase holds
-// G_plan = fit >= 2 ? fit / 2 : fit experts (fit = slot / one expert's f16 bytes), the executor's own two-buffer rule
-// (moe_pp_batched_f16_plan_groups), capped. 0 slot bytes (a dense model, or before the load publishes the inventory
-// globals) means no window and no ring.
+// planned f16 weight slot it dequantizes a phase into, and the group cap it honours. A phase holds G_plan experts, the
+// executor's own two-buffer rule and cap (moe_pp_batched_f16_window_experts). 0 slot bytes (a dense model, or before
+// the load publishes the inventory globals) means no window and no ring.
 struct moe_stream_window_hints {
     size_t weight_slot_bytes = 0;  // unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device)
     size_t group_cap         = 0;  // ggml_sycl_moe_pp_f16_group_experts_max(); 0 = none
@@ -229,14 +215,7 @@ struct moe_stream_window_hints {
 
 // The experts one executor phase holds for an expert of `expert_f16_bytes`: G_plan above, 0 when the slot holds none.
 static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints & h, size_t expert_f16_bytes) {
-    if (h.weight_slot_bytes == 0 || expert_f16_bytes == 0) {
-        return 0;
-    }
-    const size_t fit = h.weight_slot_bytes / expert_f16_bytes;
-    size_t       g   = fit >= 2 ? fit / 2 : fit;
-    if (h.group_cap != 0 && g > h.group_cap) {
-        g = h.group_cap;
-    }
+    const size_t g = moe_pp_batched_f16_window_experts(h.weight_slot_bytes, expert_f16_bytes, h.group_cap);
     return g > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(g);
 }
 
@@ -245,8 +224,8 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE). The ring serves the batched prompt
 // executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md): a matrix one AOS slot holds, whose weight the
 // library executor claims once staged, stages AOS_ONLY for the executor, whose own tables are the authority there
-// (llama.cpp-3460), and every other item stages NONE. The claim is asked once per (layer, role). The device's prompt
-// kernels are not asked, since no prompt kernel reads the ring: `prompt_kernel` stays for the callers' one signature.
+// (llama.cpp-3460), and every other item stages NONE. The claim is asked once per (layer, role). No prompt kernel
+// reads the ring, so the device's prompt kernels are not asked.
 // `hints` gives the executor's phase, which with the streamable items per role decides window_slots, the region the
 // ring is sized to. `as_host`, when given, names (layer, expert) triplets, keyed moe_stream_table_key(layer, expert,
 // UNKNOWN), whose gate/up/down entries resident on `device` are read as host entries: the plan as a loan of those
@@ -255,12 +234,10 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 static inline moe_stream_plan_index moe_stream_plan_index_build(
     const placement_plan &               plan,
     int                                  device,
-    moe_stream_prompt_kernel_fn          prompt_kernel,
     void *                               graph_ctx,
     moe_stream_library_claims_fn         library_claims,
     const moe_stream_window_hints &      hints,
     const std::unordered_set<uint64_t> * as_host = nullptr) {
-    GGML_UNUSED(prompt_kernel);  // kept for the signature; unused since the window ring (W2)
     moe_stream_plan_index        idx;
     // The (layer, expert) keys with a host entry, keyed with role UNKNOWN: counts each layer's distinct host experts.
     std::unordered_set<uint64_t> host_experts;
@@ -326,7 +303,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
             continue;
         }
         ++li.n_streamable;
-        li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));
         li.role_items[detail::moe_stream_role_slot(item.role)] += 1;
         li.matrix_bytes_max  = std::max(li.matrix_bytes_max, e.src_size);
         idx.matrix_bytes_max = std::max(idx.matrix_bytes_max, e.src_size);
@@ -337,7 +313,6 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
     for (const auto & kv : idx.layers) {
         idx.host_matrices_per_layer_max =
             std::max(idx.host_matrices_per_layer_max, static_cast<uint32_t>(kv.second.n_streamable));
-        idx.region_slots_max = std::max(idx.region_slots_max, static_cast<uint32_t>(kv.second.region_slots));
         for (int r = 0; r < 3; ++r) {
             idx.role_items_max = std::max(idx.role_items_max, static_cast<uint32_t>(kv.second.role_items[r]));
         }
@@ -363,19 +338,17 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
 static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(
     const placement_plan &               plan,
     int                                  device,
-    moe_stream_prompt_kernel_fn          prompt_kernel,
     void *                               graph_ctx,
     moe_stream_library_claims_fn         library_claims,
     const moe_stream_window_hints &      hints,
     moe_stream_plan_index *              index_out = nullptr,
     const std::unordered_set<uint64_t> * as_host   = nullptr) {
-    moe_stream_plan_index index =
-        moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints, as_host);
+    moe_stream_plan_index index = moe_stream_plan_index_build(plan, device, graph_ctx, library_claims, hints, as_host);
     // The cap reads the device's expert set with the ring's own loan counted back (llama.cpp-7999): a loan moves
     // hints.lent_bytes out of index.resident_expert_bytes, so the sum is the same before and after it. The add
     // saturates defensively: a real sum of device bytes cannot approach SIZE_MAX, so the clamp only keeps a corrupt
     // or sentinel lent_bytes from wrapping into a refusal.
-    size_t resident_with_lent = index.resident_expert_bytes + hints.lent_bytes;
+    size_t                resident_with_lent = index.resident_expert_bytes + hints.lent_bytes;
     if (resident_with_lent < index.resident_expert_bytes) {
         resident_with_lent = SIZE_MAX;
     }
@@ -538,15 +511,10 @@ static inline bool moe_stream_owner_streamable(const alloc_metadata & owner, int
 //   h2d:     the device's tuning-cache record where it measured, else `probed_h2d_gbps` (the device's own resolved rate
 //            from ggml_sycl_measure_h2d_pinned: 0 when the probe has not measured or read one back), else the seed. A
 //            run with the tuning cache disabled, or a record the store refused, still prices with the probed rate.
-//   reorder: the record's rate where it measured, else the seed. A record rate that is not positive means
-//            "unmeasured": the probe measures the H2D rate only and stores reorder as 0, so a later change of the seed
-//            is not masked by a copy of the old seed in the file. A record written before llama.cpp-kp1l (the
-//            CACHE_VERSION did not change) holds the old 200 GB/s seed as `reorder_gbps` and is read as measured, and
-//            GGML_SYCL_H2D_PROBE=1 over such a record carries it forward (the GGML_SYCL_MOE_EXEC_REORDER_GBPS catalog
-//            row). Deleting the device's `*-moe-exec-rates.json` clears it.
 //   dev:     each type's recorded rate (the record's per-type slot, which has no writer yet), else its seed, as a
 //            byte-weighted harmonic mean over the mix.
-// A value is taken only when finite and positive. The environment overrides apply last and win over all of them.
+// A value is taken only when finite and positive. The environment overrides apply last and win over all of them. The
+// record's reorder_gbps is not read: the ring reorders nothing.
 static inline moe_exec_rates moe_stream_rates_assemble(const std::vector<std::pair<ggml_type, size_t>> & host_mix,
                                                        const ggml_sycl_moe_exec_rates_record *           record,
                                                        double             probed_h2d_gbps,
@@ -558,9 +526,6 @@ static inline moe_exec_rates moe_stream_rates_assemble(const std::vector<std::pa
         r.h2d_gbps = probed_h2d_gbps;
     }
     if (record != nullptr) {
-        if (detail::moe_stream_rate_measured(record->reorder_gbps)) {
-            r.reorder_gbps = record->reorder_gbps;
-        }
         // The device GEMM rate is the byte-weighted harmonic mean over the mix, as the seed's is, of each type's
         // recorded rate, else its seed.
         double bytes = 0.0;
@@ -623,7 +588,6 @@ struct moe_stream_loan_sizer {
     const placement_plan *       plan           = nullptr;
     int                          device         = -1;
     moe_stream_ring_geometry     geo            = {};
-    moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
     void *                       graph_ctx      = nullptr;
     moe_stream_library_claims_fn library_claims = nullptr;
     moe_stream_window_hints      hints          = {};
@@ -713,8 +677,6 @@ struct moe_stream_op {
     // The host lease of (layer, expert, role) and its bytes, or an invalid handle.
     mem_handle (*host_lease)(void * graph_ctx, int layer, int expert_id, expert_tensor_role role, size_t * bytes) =
         nullptr;
-    // Handed to the index build, which no longer asks it (moe_stream_prompt_kernel_fn).
-    moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
     // Unset, the library executor claims no weight and nothing stages for it (moe_stream_plan_index_build).
     moe_stream_library_claims_fn library_claims = nullptr;
     // Unset, a short ring reserve asks for no loan (moe_stream_loan_on_short_reserve).
@@ -1067,16 +1029,13 @@ class moe_stream_phase {
     // layer, and a RING decision stands only on a layer the executor claims whole (moe_stream_executor_claims) once the
     // ring reserves, at the first such layer; anything else is RING_UNAVAILABLE. The layer the op's decline_layer names
     // is CPU, DECLINED, whatever the cost model chose (moe_stream_layer_declined). Nothing is staged here, and no layer
-    // is weighed ahead: the executor stages its windows (window_begin), whose experts and cache are their own, so
-    // `cache` and the ids are not read. A layer below the last one, or the same layer in a new graph, starts a
-    // micro-batch (moe_stream_ubatch_starts). Returns the layer's decision.
+    // is weighed ahead: the executor stages its windows (window_begin), whose experts and cache are their own. A layer
+    // below the last one, or the same layer in a new graph, starts a micro-batch (moe_stream_ubatch_starts). Returns
+    // the layer's decision.
     moe_exec_decision         begin_layer(int                    layer,
                                           const placement_plan & plan,
                                           int                    device,
-                                          unified_cache &        cache,
                                           sycl::queue &          ccs,
-                                          const int32_t *        ids,
-                                          size_t                 n_ids,
                                           const moe_stream_op &  op);
     const moe_stream_staged * find(int layer, int expert_id, expert_tensor_role role) const;
     // True iff slots were taken from the ring's current region since it last flipped.
@@ -1168,7 +1127,7 @@ class moe_stream_phase {
 
     void              prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op);
     size_t            ring_bytes_free() const;
-    moe_exec_decision weigh(const moe_stream_layer_info & li, const moe_stream_op & op, double window_us) const;
+    moe_exec_decision weigh(const moe_stream_layer_info & li, const moe_stream_op & op) const;
     moe_exec_decision decision_of(int layer) const;
     stage_counts      stage_window(const std::vector<moe_stream_item> & items,
                                    uint32_t                             window_id,
@@ -1204,7 +1163,7 @@ class moe_stream_phase {
     sycl::event                                     region_last_;  // its last copy's event (see stage_window())
     moe_stream_plan_index                           index_;
     std::unordered_map<int, layer_state>            layers_;
-    std::optional<sycl::queue>                      ccs_;  // the compute queue the readers and the barriers run on
+    std::optional<sycl::queue>                      ccs_;     // the compute queue the readers and the barriers run on
     moe_stream_ring_geometry                        geo_;
     moe_stream_window_hints                         window_;  // the executor window prepare() sized geo_ with
     ggml_sycl_moe_exec_rates_record                 record_             = {};
@@ -1221,9 +1180,9 @@ class moe_stream_phase {
     bool                                            warned_unavailable_ = false;  // this prompt's diagnostic is out
     // Each region's last fill: its window and that window's read gate (stage_window(), window_done()).
     moe_stream_region_reads<sycl::event>            region_reads_;
-    int      prev_window_layer_      = -1;          // the layer of this micro-batch's last window_begin, -1 for none
-    uint32_t next_window_id_         = UINT32_MAX;  // the window the last window_begin prefetched, UINT32_MAX for none
-    bool     next_window_whole_      = false;       // that prefetch staged every matrix of its window
+    int      prev_window_layer_ = -1;          // the layer of this micro-batch's last window_begin, -1 for none
+    uint32_t next_window_id_    = UINT32_MAX;  // the window the last window_begin prefetched, UINT32_MAX for none
+    bool     next_window_whole_ = false;       // that prefetch staged every matrix of its window
     // The queue the window timing's marks go on under GGML_SYCL_MOE_EXEC_TRACE=2: built at the first mark
     // (timing_queue()), dropped when prepare() takes another compute queue, never built below trace level 2. Declared
     // ahead of the timeline, so the marks the records hold go before their queue does. Records may still hold marks
@@ -1241,19 +1200,19 @@ class moe_stream_phase {
     uint64_t                                ubatch_seq_    = 0;  // begin_ubatch counts micro-batches for the timing key
     // The last op's decision log and policy: report_staged_routes() reads both, from end_prompt and the destructor, and
     // window_begin feeds the log's window counters.
-    moe_exec_decision_log *     log_ = nullptr;
-    moe_exec_policy             policy_        = moe_exec_policy::AUTO;
+    moe_exec_decision_log *                 log_           = nullptr;
+    moe_exec_policy                         policy_        = moe_exec_policy::AUTO;
     // The last op's loan hooks, which ring_ready() calls on a short reserve, and this prompt's loans (llama.cpp-3460).
-    moe_stream_request_loan_fn  request_loan_  = nullptr;
-    moe_stream_loan_refusals_fn loan_refusals_ = nullptr;
-    moe_stream_loan_latch       loan_latch_;
-    moe_staged_route_tally      staged_routes_;
-    uint64_t                    ring_releases_            = 0;
+    moe_stream_request_loan_fn              request_loan_  = nullptr;
+    moe_stream_loan_refusals_fn             loan_refusals_ = nullptr;
+    moe_stream_loan_latch                   loan_latch_;
+    moe_staged_route_tally                  staged_routes_;
+    uint64_t                                ring_releases_            = 0;
     // This prompt kept a whole reservation (ring_ready()); end_prompt copies it into last_prompt_ring_engaged_ and
     // marks the prompt ended for take_prompt_ended() (llama.cpp-i4ny).
-    bool                        ring_engaged_             = false;
-    bool                        last_prompt_ring_engaged_ = false;
-    bool                        prompt_ended_             = false;
+    bool                                    ring_engaged_             = false;
+    bool                                    last_prompt_ring_engaged_ = false;
+    bool                                    prompt_ended_             = false;
 };
 
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------
@@ -1512,9 +1471,8 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
         moe_stream_window_hints hints = sizer.hints;
         hints.lent_bytes              = hints.lent_bytes + lent < hints.lent_bytes ? SIZE_MAX : hints.lent_bytes + lent;
         moe_stream_plan_index          idx;
-        const moe_stream_ring_geometry post =
-            moe_stream_plan_ring_geometry(*sizer.plan, sizer.device, sizer.prompt_kernel, sizer.graph_ctx,
-                                          sizer.library_claims, hints, &idx, &as_host);
+        const moe_stream_ring_geometry post = moe_stream_plan_ring_geometry(
+            *sizer.plan, sizer.device, sizer.graph_ctx, sizer.library_claims, hints, &idx, &as_host);
         out.steps      = step;
         out.bytes      = bytes;
         out.n_triplets = static_cast<uint32_t>(keys.size() / 3);

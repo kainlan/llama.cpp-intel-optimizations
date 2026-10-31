@@ -969,7 +969,7 @@ struct placement_plan {
     // reserve finds its slots there and the expert loan is only the fallback. Counted in vram_bytes, and kept there
     // when the runtime context transaction re-derives the KV totals, because the ring is reserved again at every
     // prompt. 0 when the plan stages nothing, has no host expert, or is a multi-device plan.
-    size_t                                     moe_stream_ring_reserve_bytes   = 0;
+    size_t                                     moe_stream_ring_reserve_bytes = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     // llama.cpp-3aos: mirrors placement_kv_info::layer_kind/layer_k_width/
     // layer_v_width -- see that struct's field comments. Copied in at plan

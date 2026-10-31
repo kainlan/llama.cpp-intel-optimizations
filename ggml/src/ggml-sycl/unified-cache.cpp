@@ -33609,7 +33609,7 @@ static void hold_moe_stream_ring_room(placement_plan &                       pla
             placed_without = placed_with;
             groups_without = groups_with;
         }
-        geo = moe_stream_plan_ring_geometry(plan, device_id, nullptr, &claims, moe_stream_room_claims_by_type, hints);
+        geo = moe_stream_plan_ring_geometry(plan, device_id, &claims, moe_stream_room_claims_by_type, hints);
         ++rounds;
         if (geo.bytes <= room) {
             settled = true;

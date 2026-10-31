@@ -42,18 +42,17 @@ What this gate pins:
     the stage-table entry holds the AOS slot, the copy's event, layout AOS and the consumer the index build named
     (ruling C: the entry is the answer);
   - every window matrix takes one slot, acquired with the layout it holds, AOS (lead ruling c-o9uw-1), and the ring is
-    sized so: one slot per staged matrix (moe_stream_staging_slots), one executor window per region;
+    sized so: one slot per staged matrix (each counts once in its role), one executor window per region;
   - what stages comes from the library executor's claim alone (W2): the index build marks a matrix whose weight the
     oneDNN batched prompt executor claims AOS_ONLY with consumer EXECUTOR and leaves every other one NONE, its
-    default; it takes the prompt-kernel predicate but never asks it. The backend answers the claims predicate with
+    default; no prompt-kernel predicate exists to ask. The backend answers the claims predicate with
     ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor, the check the staged route refuses a weight on (c-las5), from
     call.plan, the plan the index build holds (lead ruling c-gi44); only the check's two-argument entry point, the
     batched executor's own route, reads the device's plan, by passing no plan;
-  - the prompt-kernel predicate answers through the one helper the staged route refuses on (llama.cpp-o9uw),
+  - the staged route refuses through one helper, its only caller (llama.cpp-o9uw),
     ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel for a type with no
     direct-kernel requirement (Q1_0 and NVFP4 run only through their direct kernel, which the recipe validator and the
-    executor choice ask through moe_type_needs_direct_kernel). Since W2 the ring stages from the library claim alone
-    and never asks the predicate; the pin keeps the still-wired predicate on the resolver's helper;
+    executor choice ask through moe_type_needs_direct_kernel);
   - a region closes on the event of its last copy;
   - a refilled region's copies wait for its read gate: the barrier the executor submits behind the dequants of the
     window the region last held and hands to window_done (lead ruling c-o9uw-1), recorded for the region holding that
@@ -101,7 +100,7 @@ Pytest-style (module-level test_* functions): registered with llama_test_pytest.
 """
 
 import re
-from sycl_gate import ROOT, body, first_missing, first_present, mutate, norm, ordered, read
+from sycl_gate import ROOT, body, first_missing, first_present, mutate, norm, ordered, read, strip_comments
 
 
 _PRIVATE_IF_RE = re.compile(
@@ -189,6 +188,7 @@ def call_args(text: str, name: str) -> list:
 MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try"
 ADMIT_BRANCH = "if (ne12 != 1)"
 BEGIN_CALL = "moe_stream->begin_layer("
+BEGIN_ARGS = "stream_call.layer, *stream_call.plan, ctx.device, *ctx.stream(), stream_call.op"
 BEGIN_GUARD = "if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) {"
 GRAPH_SINK = 'throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt batch cannot enter graph sink");'
 SNAPSHOT = "prompt_ids_snapshot = prompt_ids_entry.host_ids;"
@@ -197,7 +197,7 @@ HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan ="
 COPY_DECL = "copied = mem_copy_async("
 REORDER_CALL = "ggml_sycl_reorder_weight_gpu("
 RETAIN = "retain_handles_until_event({ aos, host }, copied);"
-TABLE_WRITE = "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
+TABLE_WRITE = "table_[key] = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
 ABORT = 'GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());'
 RETHROW = "catch (const ggml_sycl_fallback_error &) { throw; }"
 TRACE_FMT = "[MOE-EXEC-TRACE] stage window layer %d role %s phase %zu: %d items %zu bytes"
@@ -215,8 +215,8 @@ ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
 
 def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
     """One consultation site, in ggml_sycl_mul_mat_id's prompt ids-admission branch: after the graph-sink refusal and
-    the ids snapshot, guarded by the prompt-batch predicate, passing the snapshot, which begin_layer no longer reads
-    (a signature pin), and before moe_hybrid_with_plan."""
+    the ids snapshot, guarded by the prompt-batch predicate, and before moe_hybrid_with_plan. It passes the layer, the
+    plan, the device, the compute queue and the op, and nothing begin_layer would not read: no cache, no ids."""
     n = norm(sycl)
     if n.count(BEGIN_CALL) != 1:
         return False
@@ -230,8 +230,7 @@ def claim_begin_layer_once_in_prompt_branch(sycl: str) -> bool:
         return False
     args = call_args(branch[call_at:], BEGIN_CALL)
     return (ordered(branch[:call_at], "ctx.moe_graphs_disabled_once = true;", GRAPH_SINK, SNAPSHOT, BEGIN_GUARD)
-            and bool(args) and "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()" in args[0]
-            and "*ctx.stream()" in args[0] and ordered(b, BEGIN_CALL, HYBRID_WITH_PLAN))
+            and bool(args) and args[0] == BEGIN_ARGS and ordered(b, BEGIN_CALL, HYBRID_WITH_PLAN))
 
 
 def test_begin_layer_once_in_prompt_branch():
@@ -260,9 +259,13 @@ def test_begin_layer_mutants():
     late = mutate(SYCL, BEGIN_GUARD + " " + stmt, BEGIN_GUARD)
     late = late.replace(HYBRID_WITH_PLAN, stmt + " " + HYBRID_WITH_PLAN, 1)
     assert not claim_begin_layer_once_in_prompt_branch(late)
-    # the snapshot not passed: begin_layer no longer reads it, so this pins the call's signature
+    # the cache or the ids passed again, which begin_layer does not read
     assert not claim_begin_layer_once_in_prompt_branch(
-        mutate(SYCL, "prompt_ids_snapshot.data(), prompt_ids_snapshot.size()", "nullptr, 0"))
+        mutate(SYCL, "ctx.device, *ctx.stream(), stream_call.op);",
+               "ctx.device, *stream_call.cache, *ctx.stream(), stream_call.op);"))
+    assert not claim_begin_layer_once_in_prompt_branch(
+        mutate(SYCL, "ctx.device, *ctx.stream(), stream_call.op);",
+               "ctx.device, *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), stream_call.op);"))
 
 
 # ---- the enqueue -----------------------------------------------------------------------------------------------------
@@ -366,16 +369,16 @@ def test_window_entry_mutants():
     assert not c(mutate(PHASE, RETAIN, "retain_handles_until_event({ aos, host }, ring_->current_region_gate());"))
     # Tagged SOA: a reader would read the slot as a layout it does not hold.
     assert not c(mutate(PHASE, TABLE_WRITE, TABLE_WRITE.replace("MOE_STREAM_RING_SLOT_LAYOUT", "GGML_LAYOUT_SOA")))
-    # A SOA slot named that no reorder wrote.
+    # The retired SOA slot back in the entry.
     assert not c(mutate(PHASE, TABLE_WRITE,
-                        "table_[key] = { aos, aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"))
+                        "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"))
     # The entry's event the region's gate instead of the copy.
     assert not c(mutate(PHASE, TABLE_WRITE,
-                        "table_[key] = { mem_handle(), aos, ring_->current_region_gate(), MOE_STREAM_RING_SLOT_LAYOUT, "
+                        "table_[key] = { aos, ring_->current_region_gate(), MOE_STREAM_RING_SLOT_LAYOUT, "
                         "item.consumer };"))
     # The consumer dropped: the entry would read as the staged route's.
     assert not c(mutate(PHASE, TABLE_WRITE,
-                        "table_[key] = { mem_handle(), aos, copied, MOE_STREAM_RING_SLOT_LAYOUT };"))
+                        "table_[key] = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT };"))
 
 
 def claim_submission_failure_aborts(phase: str) -> bool:
@@ -563,9 +566,10 @@ def test_streamed_item_mutants():
 SLOTS_CHECK = "if (ring_->slots_free() == 0) { ++n.exhausted; continue; }"
 AOS_ACQUIRE = "mem_handle aos = ring_->acquire_slot(MOE_STREAM_RING_SLOT_LAYOUT);"
 STAGING_ENUM = "enum class moe_stream_staging : uint8_t { NONE, AOS_ONLY, };"
-STAGING_SLOTS_SIG = "static inline uint32_t moe_stream_staging_slots(moe_stream_staging staging)"
-STAGING_SLOTS_BODY = "{ return staging == moe_stream_staging::AOS_ONLY ? 1u : 0u; }"
-REGION_SIZE = "li.region_slots += static_cast<int>(moe_stream_staging_slots(item.staging));"
+# A staged matrix counts once in its layer and once in its role: the role count bounds window_slots, which sizes the
+# ring, so a matrix takes one slot. A matrix that stages NONE is skipped before either count (INDEX_SLOT_SKIP).
+STREAMABLE_COUNT = "++li.n_streamable;"
+ROLE_COUNT = "li.role_items[detail::moe_stream_role_slot(item.role)] += 1;"
 INDEX_BUILD_SIG = "static inline moe_stream_plan_index moe_stream_plan_index_build("
 RING_GEOMETRY_SIG = "static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry("
 # The one place the ring is sized (llama.cpp-kjef): the phase's prepare() and the auto-ubatch fit both call the helper.
@@ -575,14 +579,16 @@ RING_SIZE_CALL = "moe_stream_ring_size(index.window_slots, index.matrix_bytes_ma
 
 def claim_window_matrix_takes_one_aos_slot(phase: str, hpp: str) -> bool:
     """W2: every slot holds AOS, so a staged matrix takes ONE slot, both when the ring is sized (one slot per staged
-    matrix from the one slot-count helper, the ring sized from the index's window) and when a window stages it: the
+    matrix, counted once in its role, the ring sized from the index's window) and when a window stages it: the
     region is checked for a free slot, then the one slot is acquired with the layout it will hold, AOS (lead ruling
     c-o9uw-1), then the copy goes in. Staging has no SOA value to size a second slot for."""
     h = norm(hpp)
     n = norm(phase)
     s = body(n, STAGE_SIG)
-    return (h.count(STAGING_ENUM) == 1 and body(h, STAGING_SLOTS_SIG) == STAGING_SLOTS_BODY
-            and REGION_SIZE in body(h, INDEX_BUILD_SIG) and RING_SIZE_CALL in body(h, RING_GEOMETRY_SIG)
+    b = body(h, INDEX_BUILD_SIG)
+    return (h.count(STAGING_ENUM) == 1 and ordered(b, INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
+            and b.count("li.role_items[") == 1 and "moe_stream_staging_slots" not in h and "region_slots_max" not in h
+            and "li.region_slots" not in b and RING_SIZE_CALL in body(h, RING_GEOMETRY_SIG)
             and "moe_stream_plan_ring_geometry(" in body(n, PREPARE_SIG)
             and n.count("ring_->acquire_slot(") == 1 and ordered(s, SLOTS_CHECK, AOS_ACQUIRE, COPY_DECL))
 
@@ -607,7 +613,12 @@ def test_window_slot_mutants():
     assert not c(PHASE, mutate(PLAN_HPP, STAGING_ENUM,
                                "enum class moe_stream_staging : uint8_t { NONE, SOA, AOS_ONLY, };"))
     # The ring sized as if every matrix took two.
-    assert not c(PHASE, mutate(PLAN_HPP, "moe_stream_staging::AOS_ONLY ? 1u", "moe_stream_staging::AOS_ONLY ? 2u"))
+    assert not c(PHASE, mutate(PLAN_HPP, ROLE_COUNT, ROLE_COUNT.replace("+= 1;", "+= 2;")))
+    # A matrix that stages NONE counted in its role.
+    assert not c(PHASE, mutate(PLAN_HPP, INDEX_SLOT_SKIP + " " + STREAMABLE_COUNT + " " + ROLE_COUNT,
+                               ROLE_COUNT + " " + INDEX_SLOT_SKIP + " " + STREAMABLE_COUNT))
+    # The retired per-layer slot count back.
+    assert not c(PHASE, mutate(PLAN_HPP, ROLE_COUNT, ROLE_COUNT + " li.region_slots += 1;"))
     # No free-slot check, or a check for two.
     assert not c(mutate(PHASE, SLOTS_CHECK, ""), PLAN_HPP)
     assert not c(mutate(PHASE, "ring_->slots_free() == 0", "ring_->slots_free() < 2"), PLAN_HPP)
@@ -789,41 +800,22 @@ def test_reuse_mutants():
     assert not c(in_body(PHASE, TEARDOWN_SIG, " reset_regions();", ""))
 
 
-PROMPT_KERNEL_SIG = ("static bool ggml_sycl_moe_stream_prompt_kernel(void * graph_ctx, ggml_type type, "
-                     "ggml_layout_mode layout, int64_t ne0, int64_t ne1)")
-PROMPT_KERNEL_QUERY = ("ggml_sycl_moe_query_route_capability(type, layout, moe_route_phase::PROMPT, ne0, ne1, "
-                       "static_cast<size_t>(call->op.n_tokens), call->device, moe_layer_route_residency::DEVICE, "
-                       "call->device);")
-PROMPT_KERNEL_FILL = "call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;"
-PROMPT_KERNEL_RETURN = ("return ggml_sycl_moe_staged_capability_refusal(cap, type) == "
-                        "ggml_sycl::moe_staged_route_refusal::NONE;")
-INDEX_CALL = ("moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, "
-              "op.window, &index_);")
-INDEX_BUILD_CALL = ("moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints, "
-                    "as_host)")
+INDEX_CALL = "moe_stream_plan_ring_geometry(plan, device, op.graph_ctx, op.library_claims, op.window, &index_);"
+INDEX_BUILD_CALL = "moe_stream_plan_index_build(plan, device, graph_ctx, library_claims, hints, as_host)"
 PREPARE_SIG = "void moe_stream_phase::prepare("
-INDEX_PROMPT_UNASKED = "GGML_UNUSED(prompt_kernel);"
-# A call of the predicate itself, by the hook's name or through op.: the backend's definition carries a prefix.
-PROMPT_KERNEL_CALL_RE = re.compile(r"(?<!\w)prompt_kernel\(")
+# Any trace of the retired prompt-kernel predicate: its name, a field or parameter of it, or a call through it.
+PROMPT_KERNEL_RE = re.compile(r"(?<!\w)(?:\w*_)?prompt_kernel(?:_fn)?(?!\w)")
 
 
 def claim_staging_from_the_claim_alone(sycl: str, hpp: str, phase: str) -> bool:
-    """W2 (Task 2b of llama.cpp-a2xb): what a matrix stages comes from the library executor's claim alone, and the SOA
-    and route staging that the MMVQ kernels' answer used to pick is retired. The index build still takes the
-    prompt-kernel predicate, whose signature the geometry helper shares with the auto-ubatch fit, but never asks it,
-    and the phase asks it nowhere: the phase builds the index once per micro-batch, in prepare(), through the one
-    geometry helper, with the op's hooks and window. The backend still fills the predicate from
-    ggml_sycl_moe_query_route_capability, asked for the call's own device, with no table of its own."""
-    n = norm(sycl)
-    # The forward declaration ends in ";" and the definition in " {": the body is the definition's.
-    at = n.find(PROMPT_KERNEL_SIG + " {")
-    pk = body(n[at:], PROMPT_KERNEL_SIG) if at >= 0 else ""
-    h = norm(hpp)
-    p = norm(phase)
-    return (n.count(PROMPT_KERNEL_SIG + " {") == 1 and PROMPT_KERNEL_QUERY in pk and PROMPT_KERNEL_RETURN in pk
-            and "moe_mmvq_" not in pk and "soa_reorder" not in pk and n.count(PROMPT_KERNEL_FILL) == 1
-            and body(h, INDEX_BUILD_SIG).startswith("{ " + INDEX_PROMPT_UNASKED)
-            and not PROMPT_KERNEL_CALL_RE.search(h) and not PROMPT_KERNEL_CALL_RE.search(p)
+    """W2 (Task 2b of llama.cpp-a2xb): what a matrix stages comes from the library executor's claim alone. The prompt
+    kernels' predicate that once picked SOA or route staging is gone from the backend, the plan header and the phase,
+    so no index build or sizing can ask it again. The phase builds the index once per micro-batch, in prepare(),
+    through the one geometry helper, with the op's claims hook, its graph_ctx and its window."""
+    n = norm(strip_comments(sycl))
+    h = norm(strip_comments(hpp))
+    p = norm(strip_comments(phase))
+    return (not PROMPT_KERNEL_RE.search(n) and not PROMPT_KERNEL_RE.search(h) and not PROMPT_KERNEL_RE.search(p)
             and INDEX_CALL in body(p, PREPARE_SIG)
             and p.count("moe_stream_plan_ring_geometry(") == 1 and p.count("moe_stream_plan_index_build(") == 0
             and INDEX_BUILD_CALL in body(h, RING_GEOMETRY_SIG))
@@ -831,43 +823,39 @@ def claim_staging_from_the_claim_alone(sycl: str, hpp: str, phase: str) -> bool:
 
 def test_staging_from_the_claim_alone():
     assert claim_staging_from_the_claim_alone(SYCL, PLAN_HPP, PHASE), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the prompt kernel body is searched in it; the index "
-        "build is searched in moe-stream-plan.hpp and the prepare call in moe-stream-plan.cpp)",
-        norm(SYCL),
-        PROMPT_KERNEL_SIG + " {", PROMPT_KERNEL_QUERY, PROMPT_KERNEL_RETURN, PROMPT_KERNEL_FILL)
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: prepare() (the index build is searched in moe-stream-plan.hpp)",
+        norm(PHASE), INDEX_CALL)
 
 
 def test_staging_source_mutants():
     c = claim_staging_from_the_claim_alone
-    # The index build asks the kernels again.
-    assert not c(SYCL, mutate(PLAN_HPP, INDEX_PROMPT_UNASKED,
-                              INDEX_PROMPT_UNASKED + " (void) prompt_kernel(graph_ctx, GGML_TYPE_Q4_0, "
-                                                     "GGML_LAYOUT_SOA, 0, 0);"), PHASE)
-    # The phase asks them at every window matrix.
+    # The predicate comes back as an op field, a sizer field, or a backend hook.
+    assert not c(SYCL, mutate(PLAN_HPP, "moe_stream_library_claims_fn library_claims = nullptr;",
+                              "moe_stream_library_claims_fn library_claims = nullptr; "
+                              "void * prompt_kernel = nullptr;"),
+                 PHASE)
+    assert not c(SYCL, mutate(PLAN_HPP, "using moe_stream_library_claims_fn =",
+                              "using moe_stream_prompt_kernel_fn = bool (*)(void *); "
+                              "using moe_stream_library_claims_fn ="),
+                 PHASE)
+    assert not c(mutate(SYCL, "call.op.library_claims = ggml_sycl_moe_stream_library_claims;",
+                        "call.op.library_claims = ggml_sycl_moe_stream_library_claims; "
+                        "call.op.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;"), PLAN_HPP, PHASE)
+    # The phase asks a kernel predicate at every window matrix.
     asked = TYPED_GUARD + " (void) op.prompt_kernel(op.graph_ctx, item.type, GGML_LAYOUT_AOS, item.ncols, item.nrows);"
     assert not c(SYCL, PLAN_HPP, mutate(PHASE, TYPED_GUARD, asked))
-    # A second table answering what the device reads.
-    assert not c(mutate(SYCL, PROMPT_KERNEL_QUERY,
-                        PROMPT_KERNEL_QUERY + " (void) moe_mmvq_capability_supports_layout(type, layout);"),
-                 PLAN_HPP, PHASE)
-    # Asked for the decode phase.
-    assert not c(mutate(SYCL, "type, layout, moe_route_phase::PROMPT, ne0, ne1,",
-                        "type, layout, moe_route_phase::DECODE, ne0, ne1,"), PLAN_HPP, PHASE)
-    # The backend leaves the predicate unset.
-    assert not c(mutate(SYCL, PROMPT_KERNEL_FILL, ""), PLAN_HPP, PHASE)
     # The index built without the op's hooks.
     assert not c(SYCL, PLAN_HPP,
                  mutate(PHASE, INDEX_CALL,
-                        "moe_stream_plan_ring_geometry(plan, device, nullptr, nullptr, op.library_claims, op.window, "
-                        "&index_);"))
+                        "moe_stream_plan_ring_geometry(plan, device, nullptr, op.library_claims, op.window, &index_);"))
     # prepare() stops passing the op's window: the geometry would size no ring, whatever the op carries.
     assert not c(SYCL, PLAN_HPP, mutate(PHASE, "op.library_claims, op.window, &index_);",
                                         "op.library_claims, moe_stream_window_hints(), &index_);"))
     # The shared geometry helper builds the index blind or without the claims hook, whatever prepare() passes.
-    assert not c(SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, nullptr, nullptr, "
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, nullptr, "
                                                           "library_claims, hints, as_host)"), PHASE)
-    assert not c(SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, prompt_kernel, "
-                                                          "graph_ctx, nullptr, hints, as_host)"), PHASE)
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_BUILD_CALL, "moe_stream_plan_index_build(plan, device, graph_ctx, "
+                                                          "nullptr, hints, as_host)"), PHASE)
 
 
 BATCH_HPP_REL = "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
@@ -895,22 +883,17 @@ DIRECT_USES = (
 
 
 def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
-    """llama.cpp-o9uw: the prompt-kernel predicate and the staged-route resolver ask one helper, which admits a
-    supported MMVQ_COMPAT kernel and nothing else, and refuses a type that runs only through its direct kernel. Which
-    types those are is one predicate, the one the recipe validator and the executor choice ask, and neither of those
-    spells the types out. Since W2 the ring stages from the library claim alone and never asks the prompt-kernel
-    predicate; this pin keeps the still-wired predicate on the resolver's helper, so the two cannot drift apart. The
-    predicate's only answer other than the helper's is false for a missing call."""
+    """llama.cpp-o9uw: the staged-route resolver asks one helper, which admits a supported MMVQ_COMPAT kernel and
+    nothing else, and refuses a type that runs only through its direct kernel. Which types those are is one predicate,
+    the one the recipe validator and the executor choice ask, and neither of those spells the types out. The resolver
+    is the helper's only caller: the ring stages from the library claim alone (W2) and asks no kernel predicate."""
     n = norm(sycl)
     b = norm(batch_hpp)
-    at = n.find(PROMPT_KERNEL_SIG + " {")
-    pk = body(n[at:], PROMPT_KERNEL_SIG) if at >= 0 else ""
     cap = body(n, STAGED_CAP_SIG)
     return (n.count(STAGED_CAP_SIG + " {") == 1 and ordered(cap, *STAGED_CAP_STEPS)
             and re.findall(r"moe_route_kernel::(\w+)", cap) == ["MMVQ_COMPAT"]
-            and pk.endswith(PROMPT_KERNEL_RETURN + " }") and "return true" not in pk
             and ROUTE_CAP_ASK in body(n, BUILD_SIG)
-            and n.count("ggml_sycl_moe_staged_capability_refusal(") == 3
+            and n.count("ggml_sycl_moe_staged_capability_refusal(") == 2
             and b.count(DIRECT_SIG + " " + DIRECT_BODY) == 1 and all(b.count(use) == 1 for use in DIRECT_USES)
             and not any(t in body(b, sig) for t in ("GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4")
                         for sig in (VALIDATE_SIG, CHOOSE_SIG)))
@@ -918,16 +901,14 @@ def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
 
 def test_staging_mirrors_serving():
     assert claim_staging_mirrors_serving(SYCL, BATCH_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the capability refusal and prompt kernel bodies are "
-        "searched in it; the direct-kernel helpers are searched in moe-resolved-batch.hpp)",
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the capability refusal body is searched in it; the "
+        "direct-kernel helpers are searched in moe-resolved-batch.hpp)",
         norm(SYCL),
-        STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, PROMPT_KERNEL_RETURN, ROUTE_CAP_ASK)
+        STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, ROUTE_CAP_ASK)
 
 
 def test_staging_mirrors_serving_mutants():
     c = claim_staging_mirrors_serving
-    # The predicate answering from the capability alone again, so it drifts from the resolver's helper on Q1_0/NVFP4.
-    assert not c(mutate(SYCL, PROMPT_KERNEL_RETURN, "return cap.supported;"), BATCH_HPP)
     # The helper admitting a direct-kernel type.
     assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""), BATCH_HPP)
     # The helper admitting another kernel.
@@ -944,10 +925,8 @@ def test_staging_mirrors_serving_mutants():
     assert not c(SYCL, mutate(BATCH_HPP, DIRECT_USES[2],
                               "operand.recipe().kind != moe_batch_executor::HOST_CPU && "
                               "operand.recipe().request.type == GGML_TYPE_NVFP4;"))
-    # The predicate answering yes before it asks the helper.
-    head = PROMPT_KERNEL_SIG + " { const auto * call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx); "
-    assert not c(mutate(SYCL, head + "if (call == nullptr) { return false; }",
-                        head + "if (call != nullptr) { return true; }"), BATCH_HPP)
+    # A second caller of the helper beside the resolver (a kernel predicate asking it again).
+    assert not c(mutate(SYCL, ROUTE_CAP_ASK, ROUTE_CAP_ASK + " (void) " + ROUTE_CAP_ASK), BATCH_HPP)
     # The predicate losing one of its types.
     assert not c(SYCL, mutate(BATCH_HPP, DIRECT_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
 
@@ -976,8 +955,8 @@ PRIMARY_ENTRY_TAIL = "return ggml_sycl_moe_tensor_plan_primary_layout(*plan_owne
 PLAN_READERS = ("ggml_sycl_cache_plan_owner(", "coherent_placement_plan_owner(", "coherent_cache_placement_plan_owner(",
                 "global_placement_plan_owner(", "ggml_sycl_global_plan_owner(", "get_unified_cache_for_device(")
 LIBRARY_CLAIMS_FILL = "call.op.library_claims = ggml_sycl_moe_stream_library_claims;"
-ROUTE_CONSUMER_REFUSAL = ("if (s->consumer == moe_stream_consumer::EXECUTOR) { "
-                          "return moe_staged_route_refusal::CLAIMED; }")
+# The staged route turns the executor's entry away first, by its consumer (llama.cpp-q2ln).
+ROUTE_CONSUMER_REFUSAL = "if (s != nullptr && s->consumer == moe_stream_consumer::EXECUTOR) {"
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 ITEM_DEFAULT_NONE = "moe_stream_staging staging = moe_stream_staging::NONE;"
@@ -1011,7 +990,7 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
                  "const std::unordered_set<uint64_t> * as_host = nullptr)") in h
             and ITEM_DEFAULT_NONE in body(h, "struct moe_stream_item")
             and ordered(build, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY, "li.items.push_back(item);",
-                        INDEX_SLOT_SKIP, "++li.n_streamable;", REGION_SIZE)
+                        INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
             and build.count("item.staging = ") == 1
             and h.count("library_claims(graph_ctx") == 1
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
@@ -1044,7 +1023,7 @@ def test_library_claim_mutants():
     # The backend leaves the predicate unset: no weight would ever stage for the executor.
     assert not c(mutate(SYCL, LIBRARY_CLAIMS_FILL, ""), PLAN_HPP, PHASE)
     # The route serves the executor's entries, so a library-free reader is no longer the only one it hands them to.
-    assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, ""), PLAN_HPP, PHASE)
+    assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, "if (false) {"), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
     # A claimed matrix whose consumer stays the route's: the route would refuse nothing and serve it.
@@ -1491,7 +1470,7 @@ LOAN_HELPER_ORDER = (
 # begin_layer's short reserve sizes its loan from begin_layer's own plan, with the geometry, hooks and executor window
 # prepare() sized the ring with.
 LOAN_SIZER_FILL = ("moe_stream_loan_sizer sizer; sizer.plan = &plan; sizer.device = device_; sizer.geo = geo_; "
-                   "sizer.prompt_kernel = op.prompt_kernel; sizer.graph_ctx = op.graph_ctx; "
+                   "sizer.graph_ctx = op.graph_ctx; "
                    "sizer.library_claims = op.library_claims; sizer.hints = window_;")
 LOAN_WINDOW_KEPT = "window_ = op.window;"
 # The hook's type carries the ring's slot size beside the bytes, so the loan is counted in slots (llama.cpp-9x8t).
@@ -1937,11 +1916,12 @@ def test_refused_loan_warn_mutants():
         assert not c(PHASE, tree)
 
 
-DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u "
+DIAG_FMT = ("[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u "
             "window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)")
 # One argument per field, in the format's order. window_slots and matrix_bytes_max are the ring's sizing inputs (a
-# region holds one executor window, so n_slots is 2 x window_slots); region_slots_max is what a whole layer would take.
-DIAG_ARGS = ("index_.host_matrices_per_layer_max, index_.region_slots_max, index_.window_slots, "
+# region holds one executor window, so n_slots is 2 x window_slots); host_matrices_per_layer_max is what a whole layer
+# would take, one slot per matrix.
+DIAG_ARGS = ("index_.host_matrices_per_layer_max, index_.window_slots, "
              "index_.matrix_bytes_max, index_.resident_expert_bytes, asked.n_slots, asked.bytes);")
 DIAG_EMIT = "op.log->sink(op.log->sink_ctx, line);"
 DIAG_RULE_CALL = "moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, reserve_failed_)"
@@ -1990,14 +1970,14 @@ def test_ring_unavailable_diagnostic_mutants():
     renamed = mutate(PHASE, "n_slots=%u ", "slots=%u ")
     assert not claim_ring_unavailable_diagnostic(renamed, PLAN_HPP, {PHASE_REL: renamed})
     # A layer's slot need or the window left out, or printed under another field's name.
-    dropped = mutate(PHASE, " region_slots_max=%u", "")
+    dropped = mutate(PHASE, " (host_matrices_per_layer_max=%u ", " (")
     assert not claim_ring_unavailable_diagnostic(dropped, PLAN_HPP, {PHASE_REL: dropped})
     no_window = mutate(PHASE, " window_slots=%u", "")
     assert not claim_ring_unavailable_diagnostic(no_window, PLAN_HPP, {PHASE_REL: no_window})
     # (anchored on the whole argument list: the ring sizing passes window_slots and matrix_bytes_max to
     # moe_stream_ring_size too)
-    swapped = mutate(PHASE, "index_.region_slots_max, index_.window_slots, index_.matrix_bytes_max,",
-                     "index_.window_slots, index_.region_slots_max, index_.matrix_bytes_max,")
+    swapped = mutate(PHASE, "index_.host_matrices_per_layer_max, index_.window_slots, index_.matrix_bytes_max,",
+                     "index_.window_slots, index_.host_matrices_per_layer_max, index_.matrix_bytes_max,")
     assert not claim_ring_unavailable_diagnostic(swapped, PLAN_HPP, {PHASE_REL: swapped})
     # The window rule dropped from the helper, or asked after the cap it would otherwise be reported as.
     assert not claim_ring_unavailable_diagnostic(
@@ -2076,7 +2056,7 @@ def test_ring_unavailable_once_mutants():
 
 REPORT_CALL = "report(layer, st);"
 DECIDE_IF = "if (!st.decided)"
-WEIGH_CALL = "st.decision = weigh(cur->second, op, 0.0);"
+WEIGH_CALL = "st.decision = weigh(cur->second, op);"
 
 
 def brace_depth(text: str, at: int) -> int:
@@ -2119,8 +2099,8 @@ def test_auto_report_mutants():
 
 def claim_begin_layer_weighs_only_its_layer(phase: str, hpp: str) -> bool:
     """Task 2b of llama.cpp-a2xb: begin_layer weighs and decides its own layer at its first op with no copy window,
-    since no copy of a layer hides under the previous layer's (there is no cross-layer prefetch), so weigh's window_us
-    is 0.0 and the layer's state keeps no window. It looks up no other layer and stages nothing: window_begin stages."""
+    since no copy of a layer hides under the previous layer's (there is no cross-layer prefetch), so weigh takes no
+    window and the layer's state keeps none. It looks up no other layer and stages nothing: window_begin stages."""
     b = body(norm(phase), BEGIN_LAYER_SIG)
     return (b.count("index_.layers.find(") == 1 and "index_.layers.find(layer)" in b and b.count("weigh(") == 1
             and WEIGH_CALL in b and "stage_window(" not in b and "window_begin(" not in b
@@ -2141,7 +2121,7 @@ def test_begin_layer_weigh_mutants():
     assert not c(mutate(PHASE, WEIGH_CALL, "st.decision = weigh(cur->second, op, 1000.0);"), PLAN_HPP)
     # The next layer looked up and weighed ahead.
     assert not c(mutate(PHASE, WEIGH_CALL, WEIGH_CALL + " const auto nxt = index_.layers.find(layer + 1); "
-                                                        "(void) weigh(nxt->second, op, 0.0);"), PLAN_HPP)
+                                                        "(void) weigh(nxt->second, op);"), PLAN_HPP)
     # The layer staged at its first op.
     assert not c(mutate(PHASE, WEIGH_CALL, WEIGH_CALL + " (void) stage_window({}, 0, cache, op);"), PLAN_HPP)
     # The layer's state keeps a window.

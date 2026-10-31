@@ -709,12 +709,12 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store_layout1(const struct 
 // GGML_TYPE_COUNT is part of the layout and there is no capacity field: lookup writes sizeof(record) bytes, so a
 // frontend built against a different GGML_TYPE_COUNT than the backend would be overrun.
 // Field meaning (llama.cpp-kp1l): h2d_gbps is always finite and positive in a record lookup returns, and store refuses
-// one that is not. reorder_gbps is finite and not negative, and 0 means "unmeasured": the executor then uses its own
-// seed. dev_gflops[i] is the slot for a measured device GEMM rate of types[i]; no probe writes it yet, and a type
-// without an entry takes its seed.
+// one that is not. reorder_gbps is finite and not negative; it is stored for format stability and read by nothing,
+// since the ring reorders nothing and the executor prices no reorder. dev_gflops[i] is the slot for a measured device
+// GEMM rate of types[i]; no probe writes it yet, and a type without an entry takes its seed.
 struct ggml_sycl_moe_exec_rates_record {
     double   h2d_gbps;
-    double   reorder_gbps;
+    double   reorder_gbps;  // stored for format stability, read by nothing
     uint32_t n_types;
     int32_t  types[GGML_TYPE_COUNT];
     double   dev_gflops[GGML_TYPE_COUNT];

@@ -186,7 +186,7 @@ DECLINE_FILL = "call.op.decline_layer = ggml_sycl_moe_exec_decline_layer();"
 DECLINE_GUARD = "if (moe_stream_layer_declined(layer, op.decline_layer)) {"
 DECLINE_CHOICE = "st.decision.choice = moe_exec_choice::CPU;"
 DECLINE_REASON = "st.decision.reason = moe_exec_reason::DECLINED;"
-WEIGH_CALL = "st.decision = weigh(cur->second, op, 0.0);"
+WEIGH_CALL = "st.decision = weigh(cur->second, op);"
 RING_GATE = "if (moe_stream_stage_now(st.decision, op.policy) &&"
 REPORT_CALL = "report(layer, st);"
 REASON_CASE = 'case moe_exec_reason::DECLINED: return "declined";'

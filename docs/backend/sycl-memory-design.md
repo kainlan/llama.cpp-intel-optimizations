@@ -145,8 +145,8 @@ bytes, halved when two fit (the executor's own two-buffer rule, capped by
 `GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX`). `moe_stream_ring_size` is given
 `window_slots`, the smaller of `G_plan` and the most host matrices one role of
 one layer has (`role_items_max`), and sizes two regions of that many slots, each
-slot one matrix of the largest streamable size. `region_slots_max`, the slot
-need of the heaviest whole layer, no longer sizes anything and only appears in
+slot one matrix of the largest streamable size. `host_matrices_per_layer_max`,
+the slot need of the heaviest whole layer, sizes nothing and only appears in
 the ring-unavailable WARN beside `window_slots`. The sizing refuses the ring,
 leaving none, when its bytes exceed an eleventh of the device's expert bytes
 counted with the bytes lent to the ring (`bytes > (resident_expert_bytes +
@@ -311,8 +311,11 @@ the rung's demand, so a rung that needs them is refused with a figure.
   occurrence of each. The teardown summary is one line, printed by
   `ggml_sycl_moe_exec_log_report` at backend free.
 
-The end-to-end numbers are recorded by Task 15 (llama.cpp-x6zo) and are not
-restated here.
+The end-to-end numbers are in
+[sycl-perf-baselines.md](sycl-perf-baselines.md): the "Record at 671279356"
+subsection gives the window ring's measured prefill and decode, and the
+"Attribution at 3eb28b301" subsection says where the remaining prefill time
+goes. They are not restated here.
 
 ### Layout follows residency (owner ruling, 2026-08-16 — do not drift)
 

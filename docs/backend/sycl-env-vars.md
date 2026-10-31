@@ -366,7 +366,6 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_MOE_EXEC_H2D_GBPS=<GB/s>` | **20 seed** | **llama.cpp-36j0.** The pinned host-to-device rate, in GB/s (1e9 bytes/s), that prices the ring's copy term `t_ring` in the `[MOE-EXEC]` and `[MOE-EXEC-TRACE]` lines. The rate comes from the first of these that has one: this environment override, which is applied last when the rates are assembled (`moe_stream_rates_assemble`, `moe_exec_rates_apply_env`); the device's tuning-cache record; the device's probed rate (the load-time probe's measurement, or the stored rate it read back); the 20 GB/s seed. The probed rate reaches the cost model even when the tuning cache is disabled or refused the store (`GGML_SYCL_TUNING_CACHE=0`, the probe line says "probed, not stored"). With no stored record, `GGML_SYCL_H2D_PROBE=0` skips the probe and the seed stands. Unparsable, not finite, zero or negative keeps the default. |
 | `GGML_SYCL_MOE_EXEC_CPU_GBPS=<GB/s>` | **byte-weighted per-type rate** | **llama.cpp-36j0.** The CPU expert read rate, in GB/s, that prices the bandwidth term of `t_cpu`. The default is the byte-weighted rate over the layer's measured routed-expert types (`moe_exec_rates_seed`), and 40 GB/s only when no type in the mix is measured. Unparsable, not finite, zero or negative keeps the default. |
 | `GGML_SYCL_MOE_EXEC_DEV_GFLOPS=<GFLOP/s>` | **byte-weighted per-type seed** | **llama.cpp-36j0.** The device expert GEMM rate, in GFLOP/s, that prices the compute term of `t_ring`. The default is the byte-weighted harmonic mean of `moe_exec_dev_gflops_seed` over the layer's types. Its seeds are 3990 GFLOP/s for MXFP4 and 600 for any type the batched executor does not take from a staged slot, both from the Task 9 measurement (llama.cpp-g4uy). The other two were measured on d52110c80 (llama.cpp-348c) and seeded in llama.cpp-3460: 9000 for Q4_0, and 5000 for every other type the batched executor takes from a staged slot. `moe_pp_batched_takes_staged_type` (`moe-mmvq-tables.hpp`) names those types, and the staged claim asks the same helper: an f16 row at AOS and an MMVQ-ID kernel. IQ1_S, IQ1_M and IQ4_XS have no MMVQ-ID kernel, so they seed 600 until one exists (llama.cpp-w4qk). A per-type rate in the device's tuning-cache record replaces that seed (`moe_stream_rates_assemble`), and the env override applies after it. Unparsable, not finite, zero or negative keeps the default. |
-| `GGML_SYCL_MOE_EXEC_REORDER_GBPS=<GB/s>` | **200 seed** | **llama.cpp-36j0.** The on-device AOS-to-SOA reorder rate, in GB/s, that prices the reorder term of `t_ring`. The term covers only the bytes the ring stages SOA (`soa_bytes`, from the stream plan's index build), the touched share of them for a routed-only layer: an AOS_ONLY item, which includes every weight the library executor claims, is copied and read in place, so a layer staged wholly AOS_ONLY has no reorder term (llama.cpp-b5hm). The 200 GB/s seed stands until a measurement replaces it. The H2D probe measures no reorder rate: it stores the reorder rate of the record it looked up, 0 when there is none, and a tuning-cache record reads 0 as "unmeasured", so the seed stands and a later change of the seed is not masked by a stored copy. `GGML_SYCL_H2D_PROBE=1` over an existing record re-stores that record's own reorder rate, so a record stored before llama.cpp-kp1l carries its then-seed forward as a positive rate, which is still read as measured. Unparsable, not finite, zero or negative keeps the default. |
 | `GGML_SYCL_H2D_PROBE=<0\|1>` | **unset** | **llama.cpp-xr4i.** Unset, a stored tuning-cache rate is read back, and a device with none is probed once at load. `1` probes again whatever the tuning cache holds. `0` skips the probe. A stored tuning-cache record is still read back, so the 20 GB/s seed is kept only when the cache holds no record. A measured rate that the store refused (tuning cache disabled) is logged "probed, not stored" and still prices the cost model for the process. Any value other than exactly `0` or `1` acts as unset. A probe times 8 iterations and persists the maximum over iterations 2 to 8. The line `[MOE-EXEC] h2d probe device D: X GB/s (probed; iterations lo-hi)` prints the spread. A maximum under half the seed (10 GB/s) is not persisted: the seed stands and the device retries at the next load. The tuning-cache and `seed, GGML_SYCL_H2D_PROBE=0` lines keep their exact strings. |
 | `GGML_SYCL_MOE_REFILL_PER_GRAPH=<1..1024>` | **1** | **llama.cpp-sif1.** How many lent expert triplets one decode graph re-admits to the device, in the background on the copy queue. The count is per decode `graph_compute` call, however many context synchronizes follow it (`ggml_sycl_moe_refill_per_graph`, read once per process). A triplet that can never be prepared stays on the host with one WARN. The bulk refill ignores it: after a prompt whose ring never engaged, the first decode graph re-admits the whole loan in one transaction, and so does the next context's first graph for a loan an ended context left lent (llama.cpp-i4ny). Unparsable, or outside 1 to 1024, logs `[MOE-EXEC] GGML_SYCL_MOE_REFILL_PER_GRAPH=... is not a count from 1 to 1024; keeping 1` and keeps 1. |
 | `-DGGML_SYCL_MOE_STREAM_RING_SIZING_ONLY` | **undefined** | **llama.cpp-36j0.** A compile-time define, not read from the environment, so the literal-search command does not list it. It is set only for the `test-moe-stream-ring-sizing` build (`ggml/src/ggml-sycl/CMakeLists.txt`), so it is a test builds only switch. Defined, `moe-stream-ring.cpp` and `moe-stream-ring.hpp` compile out the reservation and copy code and keep only `moe_stream_ring_size`, the pure geometry, so the host-only test builds without SYCL. |
@@ -448,16 +447,17 @@ prints on a change of choice only.
 copy probe. The trace lines are INFO, so they need `-lv 4` or `-v`. The WARN lines show at default verbosity;
 the catalog gives each one's condition.
 
-### MoE executor log lines (`[MOE-EXEC*]` catalog)
+### MoE executor log lines (`[MOE-EXEC*]` and `[MOE-STREAM-RING]` catalog)
 
-Every format literal that ggml/src/ggml-sycl prints with the prefix `[MOE-EXEC]` or `[MOE-EXEC-TRACE]`, listed once (35
-distinct literals; the loan-refused literal prints at two sites). The two staged-route refusal lines are assembled from
-a literal prefix and one piece per cause, so they are shown with `<cause>` placeholders and are not in the count. The
-loan and refill tests in `ggml-sycl.cpp` also build the text they expect; those are not prints. The count is the
-distinct code spans in this section that start with the prefix, contain a space and hold no placeholder:
+Every format literal that ggml/src/ggml-sycl prints with the prefix `[MOE-EXEC]`, `[MOE-EXEC-TRACE]` or
+`[MOE-STREAM-RING]`, listed once (42 distinct literals; the loan-refused literal prints at two sites). The two
+staged-route refusal lines are assembled from a literal prefix and one piece per cause, so they are shown with
+`<cause>` placeholders and are not in the count. The loan and refill tests in `ggml-sycl.cpp` also build the text they
+expect; those are not prints. The count is the distinct code spans in this section that start with a prefix, contain
+a space and hold no placeholder:
 
 ```bash
-awk '/^### MoE executor log lines/{f=1;next} f&&/^### /{f=0} f' docs/backend/sycl-env-vars.md | python3 -c 'import sys,re; print(len({" ".join(s.split()) for s in re.findall(r"`(\[MOE-EXEC[^`<]* [^`<]*)`", sys.stdin.read())}))'
+awk '/^### MoE executor log lines/{f=1;next} f&&/^### /{f=0} f' docs/backend/sycl-env-vars.md | python3 -c 'import sys,re; print(len({" ".join(s.split()) for s in re.findall(r"`(\[MOE-(?:EXEC|STREAM-RING)[^`<]* [^`<]*)`", sys.stdin.read())}))'
 ```
 
 A literal shown here is one printed line: the lines below wrap at 120 columns, the output does not. `WARN` lines show at
@@ -485,11 +485,11 @@ null log callback otherwise drops all of it).
 **Ring and window** (the first two lines print under `GGML_SYCL_MOE_EXEC=ring` or a trace level of 1 or more, the
 third at every policy and verbosity, the fourth under `ring` only, the aborts always)
 
-- WARN `[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u region_slots_max=%u
-  window_slots=%u matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)`: once per prompt, at the first
-  layer that answers `ring-unavailable`. The rule names why. `region_slots_max` is the slot need of the heaviest whole
-  layer. The ring holds one executor window per region (`window_slots`), so `n_slots` is twice `window_slots`.
-  `resident_expert_bytes` is the device's expert set after the ring's own loan, and the ring's cap is
+- WARN `[MOE-EXEC] device %d: stream ring unavailable: %s (host_matrices_per_layer_max=%u window_slots=%u
+  matrix_bytes_max=%zu resident_expert_bytes=%zu n_slots=%u bytes=%zu)`: once per prompt, at the first layer that
+  answers `ring-unavailable`. The rule names why. `host_matrices_per_layer_max` is the slot need of the heaviest whole
+  layer, one slot per matrix. The ring holds one executor window per region (`window_slots`), so `n_slots` is twice
+  `window_slots`. `resident_expert_bytes` is the device's expert set after the ring's own loan, and the ring's cap is
   `bytes > (resident_expert_bytes + lent_bytes) / 11`.
 - WARN `[MOE-EXEC] device %d: stream ring %.1f MiB short and its expert loan refused: no further loan this prompt`:
   once per prompt, when a loan asked for the short ring comes back refused. At default verbosity under `auto` the
@@ -544,6 +544,32 @@ third at every policy and verbosity, the fourth under `ring` only, the aborts al
   prefix stays, so the gate's RE_REFILL still reads it (llama.cpp-i4ny).
 - ERROR `[MOE-EXEC] %s device %d: %u moved triplets left unpublished, the plan swap lost`: `%s` is `loan` or `refill`,
   and a concurrent transaction won the plan swap.
+
+**Ring reservation** (`moe_stream_ring::reserve`, when a prompt's stream phase reserves its ring; every line is a WARN
+and shows at default verbosity, except the last, which goes through the decision log's sink under the gate of the
+ring-unavailable line)
+
+- WARN `[MOE-STREAM-RING] reserve: device %d already holds a ring of %.1f MB; release it first`: reserve was asked of
+  a ring that is already reserved. It refuses and the held ring stays as it was. Every reserve follows a release, so
+  this is a caller defect: report it with the log.
+- WARN `[MOE-STREAM-RING] reserve: geometry of %u slots (%u per region) x %zu bytes in %zu bytes is not two equal
+  aligned regions on device %d`: the geometry is not one `moe_stream_ring_size` produces (fewer than two or an odd
+  number of slots, unequal regions, a slot size that is not a multiple of 256 bytes, or bytes that are not slots times
+  slot size). It refuses. A caller defect: report it.
+- WARN `[MOE-STREAM-RING] reserve: device %d gives back the %zu of %u slots held for a %.1f MB ring to reserve %.1f MB
+  on device %d`: a partial reservation kept for another geometry or device goes back before the new ring is reserved.
+  It is expected when the window or the slot size changes between prompts. No action.
+- WARN `[MOE-STREAM-RING] reserve: slot %zu of %.2f MB did not resolve on device %d`: a slot was allocated but its
+  handle does not resolve to device memory on that device. It refuses and reports no shortfall, so no loan is asked
+  for. An allocator defect: report it.
+- WARN `[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give %.1f MB (%u slots x %.2f MB) on device %d (holding %u
+  of %u slots)`: the WEIGHT zone ran out before every slot was allocated. The slots already held stay held for the
+  next reserve, and the missing slots' bytes are what the expert loan the phase asks for next must free. A loan line
+  or the partial-release line below follows. Expected on a card whose WEIGHT zone is full at the first prompt.
+- WARN `[MOE-STREAM-RING] partial reservation released on device %d: no loan can follow (held %u of %u slots)`: once
+  per prompt under `GGML_SYCL_MOE_EXEC=ring` or a trace level of 1 or more, when a refused ring gives back the slots
+  it held because no loan can fund it any more. It does not print for a ring that held no slot. It explains the
+  "holding K of N slots" line before it; the layers then answer `ring-unavailable`.
 
 **Probes** (load time)
 

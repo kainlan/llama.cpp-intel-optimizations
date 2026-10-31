@@ -1588,7 +1588,7 @@ static ggml_sycl::moe_stream_ring_geometry ring_of(const ggml_sycl::placement_pl
     hints.weight_slot_bytes = slot_bytes;
     hints.group_cap         = group_cap;
     hints.lent_bytes        = 0;
-    return ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, &ctx, claims_by_type, hints);
+    return ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, &ctx, claims_by_type, hints);
 }
 
 static size_t left_over(size_t budget, const ggml_sycl::placement_plan & plan) {

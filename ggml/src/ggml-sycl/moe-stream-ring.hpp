@@ -2,10 +2,11 @@
 // MoE prefill expert streaming ring (llama.cpp-36j0, Task 6 of
 // docs/plans/2026-10-19-moe-executor-cost-model-prefill-ring.md).
 //
-// A layer's host-resident expert matrices are copied into equal WEIGHT-zone
-// slots and run there with the device kernels resident experts use. A matrix
-// staged as SOA spends two slots, the AOS copy destination and the SOA reorder
-// destination; a matrix staged AOS-only spends one, read in place (c-hmey).
+// The prompt's batched executor reads a claimed layer's host-resident expert
+// matrices from equal WEIGHT-zone slots, one window of experts at a time (one
+// role of one executor phase). Each host matrix of a window is copied whole
+// into one slot, AOS, and the executor's dequant reads it there in place: no
+// SOA staging, no reorder (W2 of the window ring).
 // This header holds two things:
 //
 //   moe_stream_ring_size()  the pure geometry: two regions, each holding one
@@ -15,12 +16,14 @@
 //   moe_stream_ring         the reservation: one allocation per slot (scattered
 //                           room a slot wide gives the ring, llama.cpp-am87),
 //                           each slot handed out as a mem_handle, split into two
-//                           epoch regions. Layer l+1 streams into one region
-//                           while layer l runs from the other, so a region's
-//                           reuse is ordered after the event that ended its
-//                           previous use. That ordering happens on the device:
-//                           the caller chains every copy into a region on
-//                           current_region_gate(). No host query, no wait.
+//                           regions of one window each. The copies of window
+//                           w+1 go into one region while window w's GEMMs read
+//                           the other, so the copies run one window ahead of
+//                           the GEMMs, and a region's reuse is ordered after the
+//                           event that ended its previous window. That ordering
+//                           happens on the device: the caller chains every copy
+//                           into a region on current_region_gate(). No host
+//                           query, no wait.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -39,9 +42,9 @@ namespace ggml_sycl {
 // whatever the quant's block size.
 static constexpr size_t MOE_STREAM_RING_SLOT_ALIGN = 256;
 
-// slot_bytes is one matrix's slot: the largest streamable matrix's bytes on the
-// device (max(src_size, dst_size) staged as SOA, src_size staged AOS-only),
-// rounded up to MOE_STREAM_RING_SLOT_ALIGN. A region holds one executor
+// slot_bytes is one matrix's slot: the largest streamable matrix's AOS bytes
+// (its src_size, the bytes the copy moves), rounded up to
+// MOE_STREAM_RING_SLOT_ALIGN. A region holds one executor
 // window: region_slots = moe_stream_plan_index::window_slots, the experts one
 // phase of the batched executor reads from one role. n_slots = 2 *
 // region_slots and bytes = n_slots * slot_bytes.

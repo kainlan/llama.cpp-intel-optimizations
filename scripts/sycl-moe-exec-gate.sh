@@ -286,8 +286,8 @@ RE_BULK_REFILL_FIRST="$RE_BULK_REFILL at decode graph 1 after the prompt"
 RE_PP_REFUSED='\[PP-MOE\] refused device='
 RE_PP_ARM_F16='\[PP-MOE\] device=[0-9]+ type=[^ ]+ layout=[^ ]+ arm=f16 '
 RE_TRACE_EXEC='\[MOE-EXEC-TRACE\] executor device [0-9]+ tensor=[^ ]+ experts=[0-9]+ staged=[0-9]+ arm=[a-z0-9]+'
-# The executor's per-layer trace line with a misses=N field. Master's executor trace does not print misses= yet:
-# this matches the line once the window executor adds the field, and counts nothing before that.
+# The executor's per-layer trace line with its misses=N field: the experts its windows did not have staged ahead.
+# Every executor trace line carries the field, so this matches each one the trace prints.
 RE_TRACE_MISSES='\[MOE-EXEC-TRACE\] executor device [0-9]+ .* misses=[0-9]+'
 RE_WATCHDOG='SYCL-WATCHDOG\] No GPU progress'
 RE_PLACE='MoE experts: [0-9]+ on device, [0-9]+ on host'
@@ -538,8 +538,9 @@ summary_fields() {
     grep -aoE -- "$RE_WINDOW_FIELDS" <<< "$win" | awk '{ w += $2; e += $4; m += $6 } END { print w + 0, e + 0, m + 0 }'
 }
 
-# trace_misses <file>: the sum of misses=N over the executor trace lines that carry the field, or NA when none does
-# (the trace is off, or the executor does not print misses= yet). NA is not a failure; only a sum above 0 is.
+# trace_misses <file>: the sum of misses=N over the executor trace lines, or NA when the log has none: the arm ran
+# with the trace off (GGML_SYCL_MOE_EXEC_TRACE unset) or never dispatched the batched executor. NA is not a failure;
+# only a sum above 0 is.
 trace_misses() {
     cat "$1" 2>/dev/null | grep -aE -- "$RE_TRACE_MISSES" | grep -aoE ' misses=[0-9]+' | cut -d= -f2 \
         | awk '{ n += $1; c++ } END { if (c == 0) print "NA"; else print n + 0 }'

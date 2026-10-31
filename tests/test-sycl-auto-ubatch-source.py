@@ -2798,7 +2798,7 @@ def test_the_settle_refusal_record_has_a_mutation_witness(mutation):
 
 _HOLD_FIT_START = "static bool ggml_sycl_hold_spill_fit("
 _HOLD_FIT_END = "static size_t ggml_sycl_planned_scratch_hold_spill_bound("
-_RING_BYTES_LINE = "in.ring_bytes = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);"
+_RING_BYTES_LINE = "in.ring_bytes = ggml_sycl_hold_ring_uncovered(q.device);"
 
 
 def _hold_fit_ring_bytes_pinned(raw_cpp: str) -> bool:
@@ -2819,7 +2819,7 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
     end = GGML_SYCL_CPP.find(_HOLD_FIT_END, start)
     assert start != -1 and end != -1
     # Whitespace-tolerant, so the assignment's column alignment never turns the witness into a vacuous miss.
-    assignment = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
+    assignment = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
     m = re.search(assignment, GGML_SYCL_CPP[start:end], re.M)
     assert m, "the assignment must sit in the fit body"
     at, line = start + m.start(), m.group(0)
@@ -2830,12 +2830,12 @@ def test_the_ring_bytes_pin_has_a_mutation_witness(mutation):
     assert not _hold_fit_ring_bytes_pinned(mutated), "the mutant must make the pin fail"
 
 
-_RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {"
+_RING_HELPER_START = "static size_t ggml_sycl_hold_ring_uncovered(int device) {"
 _RING_HELPER_END = "const char * moe_batch_reject_reason_name("
 _RING_REMAINDER_LINE = "return loan.geo.bytes > room_kept + lent ? loan.geo.bytes - room_kept - lent : 0;"
 _RING_PROBE_LINE = ("const size_t lent = ggml_sycl_expert_loan_probe_bytes(device, loan.bytes, "
                     "loan.geo.slot_bytes);")
-_RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device,\s*q\.n_ubatch\);\n"
+_RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q\.device\);\n"
 
 
 def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:
@@ -2903,7 +2903,7 @@ _RING_LOAN_SIZING = ("const ggml_sycl::moe_stream_loan_sizing loan = "
                      "ggml_sycl::moe_stream_loan_size_post_loan(sizer, bytes_short);")
 _RING_LOAN_REFUSED = "if (!loan.converged) { return bytes_short; }"
 _RING_SIZER_FILL = ("sizer.plan = call.plan.get();", "sizer.device = device;", "sizer.geo = geo;",
-                    "sizer.prompt_kernel = ggml_sycl_moe_stream_prompt_kernel;", "sizer.graph_ctx = &call;",
+                    "sizer.graph_ctx = &call;",
                     "sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;",
                     "sizer.hints = call.op.window;")
 
@@ -3051,11 +3051,10 @@ def test_the_shared_ring_geometry_pin_has_a_mutation_witness(where):
 # takes a ring slot, so the claims hook sizes the ring: a null hook claims nothing and sizes NO ring, and the fit would
 # under-count and wave a rung through. The backend's hook reads a thread-local graph scan that is stale outside compute
 # (a previous model's weight tensors), so the fit passes a hook that claims every weight (llama.cpp-9433), which IS the
-# upper bound: every host matrix one AOS slot holds takes its slot. Only the prompt-kernel hook and the call as its
-# graph_ctx are passed for the shared signature; the index build no longer asks the prompt-kernel hook, so those two
-# mutants below pin the call's shape, not a sizing input. The fit fills no rows: the rung does not enter the geometry.
+# upper bound: every host matrix one AOS slot holds takes its slot. The call is the hook's graph_ctx, which the
+# every-weight hook does not read. The fit fills no rows: the rung does not enter the geometry.
 _RING_GEOMETRY_CALL = (
-    "ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call, "
+    "ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, &call, "
     "ggml_sycl_moe_stream_claims_every_weight, call.op.window);"
 )
 # The fit's claims hook answers true for every weight and reads nothing: answering false would size no ring.
@@ -3095,8 +3094,8 @@ def test_the_fit_hands_the_shared_ring_geometry_its_hooks_and_window():
 @pytest.mark.parametrize(
     "old,new",
     [
-        ("ggml_sycl_moe_stream_prompt_kernel, &call,", "nullptr, &call,"),
-        ("ggml_sycl_moe_stream_prompt_kernel, &call,", "ggml_sycl_moe_stream_prompt_kernel, nullptr,"),
+        ("device, &call, ggml_sycl_moe_stream_claims_every_weight,",
+         "device, nullptr, ggml_sycl_moe_stream_claims_every_weight,"),
         ("&call, ggml_sycl_moe_stream_claims_every_weight,", "&call, ggml_sycl_moe_stream_library_claims,"),
         ("&call, ggml_sycl_moe_stream_claims_every_weight,", "&call, nullptr,"),
         (_CLAIMS_EVERY_WEIGHT_DEF, _CLAIMS_EVERY_WEIGHT_DEF.replace("return true;", "return false;")),
@@ -3104,7 +3103,6 @@ def test_the_fit_hands_the_shared_ring_geometry_its_hooks_and_window():
         ("call.op.window);", "ggml_sycl::moe_stream_window_hints());"),
     ],
     ids=[
-        "no-prompt-kernel",
         "no-graph-ctx",
         "backend-library-claims",
         "null-claims",
@@ -3174,8 +3172,7 @@ def test_the_shared_ring_geometry_pin_sees_a_duplicated_call(where):
     """The single-call clause: a second call beside the shared one (a second sizing in the same function)."""
     if where == "phase":
         call = (
-            "moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx, op.library_claims, op.window, "
-            "&index_);"
+            "moe_stream_plan_ring_geometry(plan, device, op.graph_ctx, op.library_claims, op.window, &index_);"
         )
         mutated = _mutate_raw_ws_tolerant(MOE_STREAM_PLAN_CPP, call, call + " (void) " + call)
         assert not _ring_geometry_is_shared(mutated, GGML_SYCL_CPP), "the mutant must make the pin fail"

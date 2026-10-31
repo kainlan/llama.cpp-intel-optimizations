@@ -18773,7 +18773,7 @@ static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
 // ggml_sycl_moe_stream_claims_every_weight, sizes the ring it asks about. It is the prefill ring's bytes neither the
 // planned room nor a loan covers on `device` (llama.cpp-kjef); the rung does not enter the geometry. See its
 // definition.
-static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch);
+static size_t ggml_sycl_hold_ring_uncovered(int device);
 
 static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
     ggml_sycl_hold_fit_answer  a;
@@ -18814,7 +18814,7 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.plan_ctx     = &device;
     // Lent bytes cost the card nothing; the part of the ring neither the planned room nor a loan covers is a demand
     // (zone_hold_fit_demand).
-    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);
+    in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
     // The explicit micro-batch the published plan placed on this device: its RUNTIME zone holds the planned compute
     // term beside that micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger than
     // the term (whole or nothing). Every other rung, and every load that placed no micro-batch, is judged as before.
@@ -33022,16 +33022,16 @@ double ggml_sycl_h2d_probed_gbps(int device) {
 // kept: the seed stands and the device is probed again at the next load. (A probe that copied from an unzoned pool
 // buffer, and so staged, read 4.7 and 6.2 GB/s and persisted it; that is why the detection exists.)
 //
-// Once per process and device for a final answer (measured, from the cache, or env-skipped): a device that holds a
-// rate is left alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever
-// the tuning cache holds, 0 skips the probe and keeps the seed. Every outcome logs through the one report line, an
+// Once per process and device for a final answer (measured, from the cache, or env-skipped): a device that holds a rate
+// is left alone, which is what lets every outermost load call this. GGML_SYCL_H2D_PROBE=1 probes again whatever the
+// tuning cache holds, 0 skips the probe and keeps the seed. Every outcome logs through the one report line, an
 // exception included (its text rides in the source word), so a device logs one WARN line per outcome. A stored record
 // is read back instead of probing. A probe that cannot allocate keeps the seed and says so: never an abort. A refused
 // store (a device the tuning cache is not keyed by, or a disabled cache) still leaves the measured rate resolved for
 // the process and is logged "probed, not stored", and the cost model still prices with it (see Consumers). The probe
-// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0
-// (unmeasured) when there was none, and the rates assembly takes the seed for it. The tuning cache is keyed by the
-// visible devices, so a device hidden from the scheduler probes again on every start.
+// measures the H2D rate only: the record it stores keeps whatever reorder rate the looked-up record held, 0 when there
+// was none, for the file format's sake; nothing reads it. The tuning cache is keyed by the visible devices, so a device
+// hidden from the scheduler probes again on every start.
 //
 // Cost: a device that stays in RETRY_STAGED, RETRY_NO_RATE, RETRY_ALLOC or RETRY_FAILED allocates 64 MiB and times
 // 8 x 64 MiB again at every outermost load, silently after its reason's first line. That is bounded and load-time
@@ -33825,12 +33825,6 @@ static ggml_sycl::mem_handle ggml_sycl_moe_stream_host_lease(void *             
     return std::move(*resolved.lifetime);
 }
 
-// Defined after ggml_sycl_moe_query_route_capability, which answers it.
-static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
-                                               ggml_type        type,
-                                               ggml_layout_mode layout,
-                                               int64_t          ne0,
-                                               int64_t          ne1);
 // Defined after ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor's declaration, which answers it.
 static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role);
 
@@ -33883,7 +33877,6 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.log            = &ggml_sycl_moe_exec_log();
     call.op.graph_ctx      = &call;
     call.op.host_lease     = ggml_sycl_moe_stream_host_lease;
-    call.op.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;
     call.op.request_loan   = ggml_sycl_request_expert_loan;
     call.op.loan_refusals  = ggml_sycl_expert_loan_refusals;
@@ -36651,9 +36644,8 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
 // What a staged ring slot is served with (c-las5): a plain MMVQ_COMPAT kernel on the submit queue, for a type that
 // does not need its own direct kernel (moe_type_needs_direct_kernel: Q1_0 and NVFP4 run on a device only through
 // DEVICE_MMVQ_Q1_NVFP4_AOS, so validate_moe_execution_recipe refuses an MMVQ_COMPAT recipe for them). NONE when the
-// capability `cap` of `type` can be served, else the cause. The resolver's staged route asks it, and so does the
-// ring's prompt-kernel predicate below, which the index build no longer calls: the ring stages by the library claim
-// alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
+// capability `cap` of `type` can be served, else the cause. The resolver's staged route is its only caller: the ring
+// stages by the library claim alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
 static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap,
                                                                                    ggml_type                    type) {
     if (!cap.supported) {
@@ -36666,27 +36658,6 @@ static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refus
         return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL;
     }
     return ggml_sycl::moe_staged_route_refusal::NONE;
-}
-
-// The stream ring's prompt-kernel predicate (c-hmey): whether the staged ring route can serve a slot of (type, layout)
-// on the call's device. The route builds its device recipe from this same query (ggml_sycl_moe_build_device_recipe) and
-// serves only what ggml_sycl_moe_staged_capability_refusal accepts. The index build keeps it for the shared signature
-// and has not asked it since the window ring (W2): staging follows the library claim alone. A ring slot lives on the
-// call's device, so that device both holds the expert and submits the op. The rows are the micro-batch's, the most one
-// expert can take; for the AOS and SOA layouts the query refuses only zero rows.
-static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
-                                               ggml_type        type,
-                                               ggml_layout_mode layout,
-                                               int64_t          ne0,
-                                               int64_t          ne1) {
-    const auto * call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx);
-    if (call == nullptr) {
-        return false;
-    }
-    const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
-        type, layout, moe_route_phase::PROMPT, ne0, ne1, static_cast<size_t>(call->op.n_tokens), call->device,
-        moe_layer_route_residency::DEVICE, call->device);
-    return ggml_sycl_moe_staged_capability_refusal(cap, type) == ggml_sycl::moe_staged_route_refusal::NONE;
 }
 
 static void ggml_sycl_moe_secondary_dispatch_layout_candidates(ggml_type                  type,
@@ -37040,18 +37011,17 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // lends nothing, so the post-loan ring less the room's slots it keeps counts.
 //
 // The geometry is the stream phase's own, moe_stream_plan_ring_geometry, so the fit and the ring cannot disagree about
-// how a claimed matrix is sized. Only the prompt-kernel hook and the call as its graph_ctx are passed for the shared
-// signature: since the window ring (W2) the index build does not ask that hook, so the rung does not enter the geometry
-// and `n_ubatch` is unused. The claims hook is what sizes the ring, and the fit cannot pass the backend's: it reads
-// g_moe_gate_up_pairs, a thread-local scan of a graph that is stale outside compute (a previous model's weight tensors
-// can still be in it), so asking it here could read freed tensors. A null hook claims nothing and so sizes no ring, an
-// under-count. The fit passes ggml_sycl_moe_stream_claims_every_weight instead: a claim is the only way a matrix takes
-// a slot, so claiming every weight stages every host matrix one AOS slot holds, and the fit's ring bounds the phase's
-// from above. Two edges escape the bound: the cap can refuse the whole set's ring where a claimed subset's would pass
-// it (the fit then charges 0), and a claimed subset whose largest f16 expert is smaller than the whole set's gets a
-// wider window. The ring holds one executor window per region, and the window is read from the same helper the phase
-// uses (ggml_sycl_moe_stream_set_window): the device's planned f16 weight slot, which the load publishes before any
-// context transaction, so the fit charges the window-sized ring the phase reserves.
+// how a claimed matrix is sized. The rung does not enter the geometry. The claims hook is what sizes the ring, and the
+// fit cannot pass the backend's: it reads g_moe_gate_up_pairs, a thread-local scan of a graph that is stale outside
+// compute (a previous model's weight tensors can still be in it), so asking it here could read freed tensors. A null
+// hook claims nothing and so sizes no ring, an under-count. The fit passes ggml_sycl_moe_stream_claims_every_weight
+// instead: a claim is the only way a matrix takes a slot, so claiming every weight stages every host matrix one AOS
+// slot holds, and the fit's ring bounds the phase's from above. Two edges escape the bound: the cap can refuse the
+// whole set's ring where a claimed subset's would pass it (the fit then charges 0), and a claimed subset whose largest
+// f16 expert is smaller than the whole set's gets a wider window. The ring holds one executor window per region, and
+// the window is read from the same helper the phase uses (ggml_sycl_moe_stream_set_window): the device's planned f16
+// weight slot, which the load publishes before any context transaction, so the fit charges the window-sized ring the
+// phase reserves.
 // The plan is the process-global snapshot, the source the loan body reads, not the asking owner's plan: at the runtime
 // context transaction, before it publishes, this can see the previous plan or none, and the realized check (run after
 // the rung's buffers exist) then carries the ring. Every call rebuilds the geometry: one plan index build, then the
@@ -37073,19 +37043,17 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // multi-device plan holds none. The room is the plan's accounting, not an allocation: a runtime context whose KV takes
 // those bytes (KV has priority) leaves the reserve short, and the credit is then too large, the case the memory design
 // doc names.
-static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
+static size_t ggml_sycl_hold_ring_uncovered(int device) {
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
         return 0;
     }
-    GGML_UNUSED(n_ubatch);  // kept for the callers' signature: the rows mattered only to the prompt-kernel hook
-    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the hooks' graph_ctx, which neither reads
+    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the claims hook's graph_ctx, never read
     call.plan = current->plan;
     ggml_sycl_moe_stream_set_window(call.op, device);
 
-    const ggml_sycl::moe_stream_ring_geometry geo =
-        ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call,
-                                                 ggml_sycl_moe_stream_claims_every_weight, call.op.window);
+    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
+        *call.plan, device, &call, ggml_sycl_moe_stream_claims_every_weight, call.op.window);
     if (geo.bytes == 0) {
         return 0;
     }
@@ -37100,7 +37068,6 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     sizer.plan           = call.plan.get();
     sizer.device         = device;
     sizer.geo            = geo;
-    sizer.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     sizer.graph_ctx      = &call;
     sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;
     sizer.hints          = call.op.window;
@@ -37245,10 +37212,33 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
     };
     auto result = build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
         if (moe_stream != nullptr && stream_layer >= 0) {
-            if (const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role)) {
+            const moe_stream_staged * s = moe_stream->find(stream_layer, expert_id, stream_role);
+            // The executor's entry (llama.cpp-3460) is told apart by the consumer the ring's index build wrote into it,
+            // not by a claim asked again here (one fact, one source), and before a slot is resolved or a recipe built,
+            // since the route never serves it. Its reader is the executor's dequant kernel, a plain kernel on this same
+            // in-order compute queue, which writes the executor's f16 weight slot; oneDNN reads only that slot, never
+            // the ring's. The dequant is ordered like the route's kernel: it waits for the copy into the slot (the
+            // entry's ready event), and a rewrite of the slot waits for the region's read gate, the barrier the
+            // executor submits on this queue behind the dequants of the window the region last held
+            // (moe_stream_phase::window_done), or for a barrier submitted at the refill when none was recorded
+            // (moe_stream_phase::stage_window). Leaving it to the route core keeps that core's HOST answer for the
+            // expert, which the executor's expert loop defers to its window and its phase loop takes to the stage table
+            // (resolve_deferred_expert), and a batch the executor declines reaches the per-expert path's CPU route for
+            // it instead of a staged slot that path cannot read. On a weight the executor takes whole
+            // (executor_takes_weight) the entry is the executor's handoff, counted apart from the refusals. The window
+            // ring stages windows only for layers the executor claims whole, so an EXECUTOR entry on a layer it does
+            // not claim is not expected; if one appears, it is counted as a CLAIMED refusal: the expert runs on the
+            // CPU, its copy wasted.
+            if (s != nullptr && s->consumer == moe_stream_consumer::EXECUTOR) {
+                if (executor_takes_weight()) {
+                    moe_stream->count_executor_handoff();
+                } else {
+                    moe_stream->count_staged_route(moe_staged_route_refusal::CLAIMED, nullptr);
+                }
+            } else if (s != nullptr) {
                 // Ruling C (c-3bde): the slot and the layout it holds come from the entry, never from the slice's
-                // tag. The lease is the slot itself; its pointer is only checked here.
-                const mem_handle & slot = s->layout == GGML_LAYOUT_SOA ? s->soa : s->aos;
+                // tag. The lease is the slot itself; its pointer is only checked here. Every ring slot is AOS.
+                const mem_handle & slot = s->aos;
                 const resolved_ptr view = slot.resolve(submit_device);
                 moe_batch_route    staged;
                 staged.residency         = moe_batch_residency::PRIMARY_DEVICE;
@@ -37274,34 +37264,16 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 staged.recipe_reason                          = "staged-ring";
                 // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the
                 // slot's reuse; it does not order a library's internals. The route serves a slot only as a plain
-                // MMVQ_COMPAT kernel: an entry the batched prompt executor consumes, any other kernel (XMX_TILED,
-                // MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS, SECONDARY_SOA), or a type that needs its direct
-                // kernel refuses it (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the library
-                // claim alone since the window ring, W2). So does a slot whose resolved layout is not the entry's: the
-                // phase acquires each slot with the layout it writes there (lead ruling c-o9uw-1), so the two
-                // disagree only for a wrong entry. A refused entry falls through to the route core, whose HOST answer
-                // stands, and is counted with its cause and the capability's reason or the validator's reject reason,
-                // in the order asked here, so the trace says why (plan Task 8).
-                // The executor's entry (llama.cpp-3460) is refused by the consumer the ring's index build wrote into
-                // it, not by a claim asked again here (one fact, one source). Its reader is the executor's dequant
-                // kernel, a plain kernel on this same in-order compute queue, which writes the executor's f16 weight
-                // slot; oneDNN reads only that slot, never the ring's. The dequant is ordered like the route's kernel:
-                // it waits for the copy into the slot (the entry's ready event), and a rewrite of the slot waits for
-                // the region's read gate, the barrier the executor submits on this queue behind the dequants of the
-                // window the region last held (moe_stream_phase::window_done), or for a barrier submitted at the
-                // refill when none was recorded (moe_stream_phase::stage_window). Leaving it to the route core keeps
-                // that core's HOST answer for the expert, which the executor's expert loop defers to its window and
-                // its phase loop takes to the stage table (resolve_deferred_expert), and a batch the executor declines
-                // reaches the per-expert path's CPU route for it instead of a staged slot that path cannot read. On a
-                // weight the executor takes whole (executor_takes_weight) the entry is the executor's handoff, counted
-                // apart from the refusals. The window ring stages windows only for layers the executor claims whole,
-                // so an EXECUTOR entry on a layer it does not claim is not expected; if one appears, CLAIMED is a
-                // refusal: the expert runs on the CPU, its copy wasted.
+                // MMVQ_COMPAT kernel: any other kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS,
+                // SECONDARY_SOA), or a type that needs its direct kernel refuses it
+                // (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the library claim alone since
+                // the window ring, W2). So does a slot whose resolved layout is not the entry's: the phase acquires
+                // each slot with the layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a
+                // wrong entry. A refused entry falls through to the route core, whose HOST answer stands, and is
+                // counted with its cause and the capability's reason or the validator's reject reason, in the order
+                // asked here, so the trace says why (plan Task 8).
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
-                    if (s->consumer == moe_stream_consumer::EXECUTOR) {
-                        return moe_staged_route_refusal::CLAIMED;
-                    }
                     const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);
                     if (by_cap != moe_staged_route_refusal::NONE) {
                         refusal_detail = cap.reason;
@@ -37332,11 +37304,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     }
                     return moe_staged_route_refusal::NONE;
                 }();
-                if (refusal == moe_staged_route_refusal::CLAIMED && executor_takes_weight()) {
-                    moe_stream->count_executor_handoff();
-                } else {
-                    moe_stream->count_staged_route(refusal, refusal_detail);
-                }
+                moe_stream->count_staged_route(refusal, refusal_detail);
                 if (refusal == moe_staged_route_refusal::NONE) {
                     return staged;
                 }
@@ -37435,7 +37403,6 @@ bool test_moe_stream_insert_staged(ggml_backend_t     backend,
                                    int                layer,
                                    int                expert_id,
                                    expert_tensor_role role,
-                                   mem_handle         soa,
                                    mem_handle         aos,
                                    sycl::event        ready,
                                    ggml_layout_mode   layout,
@@ -37448,7 +37415,6 @@ bool test_moe_stream_insert_staged(ggml_backend_t     backend,
         ctx->moe_stream.reset(new moe_stream_phase());
     }
     moe_stream_staged entry;
-    entry.soa      = std::move(soa);
     entry.aos      = std::move(aos);
     entry.ready    = ready;
     entry.layout   = layout;
@@ -84092,8 +84058,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // this op where the ring can be given back. The resolved-batch builds below read the stage table through the
         // STAGED_RING route (llama.cpp-o9uw).
         if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, src0, ids, stream_call)) {
-            ctx.moe_stream->begin_layer(stream_call.layer, *stream_call.plan, ctx.device, *stream_call.cache,
-                                        *ctx.stream(), prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+            ctx.moe_stream->begin_layer(stream_call.layer, *stream_call.plan, ctx.device, *ctx.stream(),
                                         stream_call.op);
             ggml_sycl_moe_stream_release_payload(ctx);
             // The index and the decision are the ones begin_layer just built, for the layer begin_layer was given.
@@ -91660,7 +91625,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             (phase_offset + (phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <=
                                 reserved.weight_size);
                 // The dequant kernels and GEMM groups this phase submits, for a window's timing line.
-                uint32_t                 phase_launches = 0;
+                uint32_t phase_launches = 0;
                 // llama.cpp-8epx: for a windowed op this phase is one ring window (W1). window_begin is asked exactly
                 // once per window: it copies the window's host matrices no prefetch staged into a region, and the
                 // window after it into the other region, under this window's dequants and GEMMs. That window is the

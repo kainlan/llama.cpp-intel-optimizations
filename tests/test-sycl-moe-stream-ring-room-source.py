@@ -140,8 +140,7 @@ def test_mutant_cap_guard_dropped_fails():
 
 HINTS = ("hints.weight_slot_bytes = plan.pp_moe_onednn_weight_slot_bytes;",
          "hints.group_cap = kv_info.moe_stream_group_cap;", "hints.lent_bytes = 0;")
-GEOMETRY = ("geo = moe_stream_plan_ring_geometry(plan, device_id, nullptr, &claims, moe_stream_room_claims_by_type, "
-            "hints);")
+GEOMETRY = "geo = moe_stream_plan_ring_geometry(plan, device_id, &claims, moe_stream_room_claims_by_type, hints);"
 ROUND = ("while (rounds < max_rounds) {",
          "placed_with = moe_stream_room_dry_pack(plan, groups, device_id, avail, &groups_with);", GEOMETRY,
          "if (geo.bytes <= room) { settled = true; break; }", "room = geo.bytes;")
