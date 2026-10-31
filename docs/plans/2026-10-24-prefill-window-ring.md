@@ -1706,6 +1706,30 @@ and Arc Pro B50 (`level_zero:1`, 16 GB), Intel GPU stack 26.35, oneAPI 2026.1; m
 cards, GPT-OSS and Mistral controls unchanged, `Shmem` flat, kernel log clean. Automated tests passing is necessary but
 not sufficient; the gate run on this host is the evidence, recorded with the merge SHA.
 
+**Observed result (2026-10-31, master 671279356, gate run r7):** the lead ran the gate on the merge tree
+(`llama.cpp-qov5` c-1hc8 and c-7vb3). The gate's own summary was `verdicts_pass=10 verdicts_fail=3
+not_exercised_or_unscored=0`, every arm rc=0, builders 0 throughout. Step by step:
+
+1. **Backend present:** no separate record in c-7vb3. The run used a build made after the head commit (c-1hc8), and the
+   Qwen and control arms all ran on the backend (every arm rc=0).
+2. **Copy-overlap spike:** not re-run in r7. The 2026-10-25 campaign ran it on both cards and it passed (four rows each,
+   `overlap=yes`, `staged_h2d=0`, rc=0; `llama.cpp-qov5` c-bg4s, and `llama.cpp-efck` c-0cu6 for the 2026-10-24 rows).
+3. **Probe on the ring's queue:** not re-run in r7. The h2d-probe gate was descoped with Task 5 (c-bg4s).
+4. **Gate, ring arms.** Held: `ring_engaged=yes` with `misses=0` and 0 PP-MOE refusals on `Q_pp`, `Q_pp_ub2048` and
+   `Q_staged`, and `Q_staged=PASS`. Did not hold: `Q_pp` pp512 76.5 against 200 and pp2048 75.7 against 500, and
+   `Q_pp_ub2048` pp2048 87.8 against 500, so `Q_pp` and `Q_pp_ub2048` are FAIL. The explicit `-ub 2048` arm placed with
+   no refusal. The forced-CPU reference reads 16.0 and 47.5, so the ring is 4.8x and 1.6x over it, short of the floors.
+5. **Correctness:** held. `Q_tok` and `Q_tok_cpu_1` read the same md5, the `Q_tok_cpu` pairs are equal (`pairs_equal=2`),
+   and `Q_decline` PASS (one declined layer).
+6. **Decode unchanged:** held. `Q_tg` 18.43 and `Q_noc` 17.81, both PASS, refill not exercised.
+7. **Controls:** held. GPT-OSS count gates (`GO_gate`, `GO_noc`) and both Mistral digit gates (`MI_b70`, `MI_b50`) PASS.
+   `GO_pp` pp512 813.8 against the 827.4 floor is FAIL: the `llama.cpp-zuze` master regression, not this plan's.
+8. **Memory:** held. `Shmem` 578592 kB before and 607312 kB after, within 1 GB, and `resets` PASS with count 0.
+9. **Record:** the figures are the baselines subsection "Record at 671279356" in `docs/backend/sycl-perf-baselines.md`.
+
+The expectation on throughput was not met: the ring is engaged and numerically correct, but the 200 and 500 t/s floors
+are unmet. The attribution is `llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`.
+
 ---
 
 ## Tracker

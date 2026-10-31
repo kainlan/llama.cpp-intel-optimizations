@@ -658,6 +658,42 @@ every arm, `Shmem` flat at 1.45 GB; `llama.cpp-qov5` c-c774). A record, not a ba
 differ by Tasks 5, 11 and 8 (`llama.cpp-a64a`, `llama.cpp-am87`, `llama.cpp-ny6i`): the per-slot reserve moved the
 ring's engagement from the twelfth boundary to the fourth and pp2048 from 56.4 to 66.5; the floors remain unmet.
 
+#### Record at 671279356, the window ring with 8p5x/384v/86bl merged (2026-10-31 03:44-04:11 EDT, Task 10 run r7)
+
+The gate re-run for Task 10 (`llama.cpp-qov5`, comments c-1hc8 and c-7vb3), by the lead, from the merge tree at master
+671279356 with a build made after that commit. It contains the three merges that landed since 4229a205d: `llama.cpp-8p5x`,
+`llama.cpp-384v` and `llama.cpp-86bl`. All arms ran with the default floors. The gate's own summary reads
+`verdicts_pass=10 verdicts_fail=3 not_exercised_or_unscored=0`, with four arms RECORDED and not scored. Every arm
+returned rc=0 (the script itself exits 1 because arms FAILed), `builders_pre` and `builders_post` were 0 in every arm, and
+`Shmem` went from 578592 kB to 607312 kB. The ring engaged on every layer-ubatch in every PP arm with 0 misses and 0
+refusals, and the explicit `-ub 2048` arm placed without a refusal (`llama.cpp-86bl`). **This is a record, not a baseline
+for the Qwen prefill figures**: the 200/500 floors are unmet with the ring fully engaged, and the attribution is
+`llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`. The `GO_pp` FAIL is the `llama.cpp-zuze` master regression. Q_pp_cpu
+reads 16.0 and 47.5 on this tree, so the ring is 4.8x and 1.6x over the CPU executor.
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
+| Q_pp | pp512 t/s | 76.5 ± 0.17 | 200 | FAIL | 0 | ub=512 layers=23 summary=2 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=460 loan_exercised=no windows=3393 exposed=460 misses=0 trace_misses=NA; sd512=0.171044 |
+| Q_pp | pp2048 t/s | 75.7 ± 0.28 | 500 | FAIL | 0 | same run; sd2048=0.279101 |
+| Q_pp_ub2048 | pp2048 t/s | 87.8 ± 0.67 | 500 | FAIL | 0 | ub=2048 layers=38 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=152 loan_exercised=no windows=1644 exposed=152 misses=0 trace_misses=NA; pp512=NA; sd2048=0.667918; placed with no refusal (`llama.cpp-86bl`) |
+| Q_staged | ring_layers | 23 | - | PASS | 0 | executor_dispatches=282 ring_layer_dispatches=138 pp_moe_arm_f16_lines=7 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=46 trace_misses=0 |
+| Q_pp_cpu | pp512 t/s | 16.02 | - | RECORDED | 0 | layers=23 forced_cpu_lines=23 rc=0 |
+| Q_pp_cpu | pp2048 t/s | 47.49 | - | RECORDED | 0 | same run |
+| Q_tok | md5 | 2a6c2cf6 | - | RECORDED | 0 | auto load 1, rc=0 |
+| Q_tok_2 | md5 | 9577403b | - | RECORDED | 0 | auto load 2, rc=0 |
+| Q_tok_cpu_1 | md5 | 2a6c2cf6 | - | RECORDED | 0 | cpu load 1, rc=0 |
+| Q_tok_cpu | md5 | - | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=2 min_prefix=154 auto_md5=2a6c2cf6,9577403b cpu_md5=2a6c2cf6,9577403b auto_flip=yes cpu_flip=yes |
+| Q_tg | tg t/s | 18.43 | 11.0 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised loan_exercised=no ring_engaged=yes bulk_refill=not_owed |
+| Q_noc | tg t/s | 17.81 | 9.5 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised loan_exercised=no ring_engaged=yes bulk_refill=not_owed |
+| Q_decline | md5 | 9577403b | md5 equals Q_tok or Q_tok_2 | PASS | 0 | decline_lines=1 declined_layers=1 summary_cpu=35 ref_md5=2a6c2cf6,9577403b ref_layer20=ring layers=31 kv_rejected=0 wrong_device=0 rc=0 |
+| GO_gate | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| GO_pp | pp512 t/s | 813.8 ± 5.78 | 827.4 | FAIL | 0 | `llama.cpp-zuze`, the master pp512 regression; ref_pp512=871; sd512=5.778991 |
+| GO_pp | tg128 t/s | 39.2 ± 0.11 | 33.0 | not recorded | 0 | ref_tg128=32.0; sd128=0.113950; the gate's line reads tg128=39.2>33.0 inside the FAIL, and the lead reads tg128 as above its floor (no separate tg128 verdict is recorded) |
+| GO_noc | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | |
+
 #### Copy overlap: does a cache-queue H2D copy overlap a compute kernel? (`llama.cpp-efck`, 2026-10-24)
 
 `test-sycl-copy-overlap` times 16 x 4 MiB pinned H2D copies alone and then concurrent with a spin kernel on the compute
