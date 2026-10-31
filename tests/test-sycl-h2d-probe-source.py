@@ -503,7 +503,7 @@ def claim_two_consumers_read_the_rate(overrides: dict = None) -> bool:
         len({next(i for i, (lo, hi) in enumerate(spans) if lo <= at < hi) for _, at, _ in reads}) == 2
 
 
-# ---- the probed H2D rate: the cost model's source order, the stored, unread reorder rate, the mutex (llama.cpp-kp1l) ----
+# ---- the probed H2D rate: the cost model's source order, the unread reorder rate, the mutex (llama.cpp-kp1l) ----
 
 def claim_assembly_takes_h2d_from_record_then_probe_then_seed(hpp: str) -> bool:
     """moe_stream_rates_assemble prices the h2d term from, in order: the device's tuning-cache record, the device's
