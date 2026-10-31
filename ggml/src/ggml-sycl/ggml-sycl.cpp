@@ -33825,12 +33825,6 @@ static ggml_sycl::mem_handle ggml_sycl_moe_stream_host_lease(void *             
     return std::move(*resolved.lifetime);
 }
 
-// Defined after ggml_sycl_moe_query_route_capability, which answers it.
-static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
-                                               ggml_type        type,
-                                               ggml_layout_mode layout,
-                                               int64_t          ne0,
-                                               int64_t          ne1);
 // Defined after ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor's declaration, which answers it.
 static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role);
 
@@ -33883,7 +33877,6 @@ static bool ggml_sycl_moe_stream_prepare(ggml_backend_sycl_context & ctx,
     call.op.log            = &ggml_sycl_moe_exec_log();
     call.op.graph_ctx      = &call;
     call.op.host_lease     = ggml_sycl_moe_stream_host_lease;
-    call.op.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     call.op.library_claims = ggml_sycl_moe_stream_library_claims;
     call.op.request_loan   = ggml_sycl_request_expert_loan;
     call.op.loan_refusals  = ggml_sycl_expert_loan_refusals;
@@ -36651,9 +36644,8 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
 // What a staged ring slot is served with (c-las5): a plain MMVQ_COMPAT kernel on the submit queue, for a type that
 // does not need its own direct kernel (moe_type_needs_direct_kernel: Q1_0 and NVFP4 run on a device only through
 // DEVICE_MMVQ_Q1_NVFP4_AOS, so validate_moe_execution_recipe refuses an MMVQ_COMPAT recipe for them). NONE when the
-// capability `cap` of `type` can be served, else the cause. The resolver's staged route asks it, and so does the
-// ring's prompt-kernel predicate below, which the index build no longer calls: the ring stages by the library claim
-// alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
+// capability `cap` of `type` can be served, else the cause. The resolver's staged route is its only caller: the ring
+// stages by the library claim alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
 static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap,
                                                                                    ggml_type                    type) {
     if (!cap.supported) {
@@ -36666,27 +36658,6 @@ static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refus
         return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL;
     }
     return ggml_sycl::moe_staged_route_refusal::NONE;
-}
-
-// The stream ring's prompt-kernel predicate (c-hmey): whether the staged ring route can serve a slot of (type, layout)
-// on the call's device. The route builds its device recipe from this same query (ggml_sycl_moe_build_device_recipe) and
-// serves only what ggml_sycl_moe_staged_capability_refusal accepts. The index build keeps it for the shared signature
-// and has not asked it since the window ring (W2): staging follows the library claim alone. A ring slot lives on the
-// call's device, so that device both holds the expert and submits the op. The rows are the micro-batch's, the most one
-// expert can take; for the AOS and SOA layouts the query refuses only zero rows.
-static bool ggml_sycl_moe_stream_prompt_kernel(void *           graph_ctx,
-                                               ggml_type        type,
-                                               ggml_layout_mode layout,
-                                               int64_t          ne0,
-                                               int64_t          ne1) {
-    const auto * call = static_cast<const ggml_sycl_moe_stream_call *>(graph_ctx);
-    if (call == nullptr) {
-        return false;
-    }
-    const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
-        type, layout, moe_route_phase::PROMPT, ne0, ne1, static_cast<size_t>(call->op.n_tokens), call->device,
-        moe_layer_route_residency::DEVICE, call->device);
-    return ggml_sycl_moe_staged_capability_refusal(cap, type) == ggml_sycl::moe_staged_route_refusal::NONE;
 }
 
 static void ggml_sycl_moe_secondary_dispatch_layout_candidates(ggml_type                  type,
@@ -37040,11 +37011,10 @@ static bool ggml_sycl_moe_stream_claims_every_weight(void *, int, ggml_sycl::exp
 // lends nothing, so the post-loan ring less the room's slots it keeps counts.
 //
 // The geometry is the stream phase's own, moe_stream_plan_ring_geometry, so the fit and the ring cannot disagree about
-// how a claimed matrix is sized. Only the prompt-kernel hook and the call as its graph_ctx are passed for the shared
-// signature: since the window ring (W2) the index build does not ask that hook, so the rung does not enter the geometry
-// and `n_ubatch` is unused. The claims hook is what sizes the ring, and the fit cannot pass the backend's: it reads
-// g_moe_gate_up_pairs, a thread-local scan of a graph that is stale outside compute (a previous model's weight tensors
-// can still be in it), so asking it here could read freed tensors. A null hook claims nothing and so sizes no ring, an
+// how a claimed matrix is sized. The rung does not enter the geometry, so `n_ubatch` is unused. The claims hook is
+// what sizes the ring, and the fit cannot pass the backend's: it reads g_moe_gate_up_pairs, a thread-local scan of a
+// graph that is stale outside compute (a previous model's weight tensors can still be in it), so asking it here could
+// read freed tensors. A null hook claims nothing and so sizes no ring, an
 // under-count. The fit passes ggml_sycl_moe_stream_claims_every_weight instead: a claim is the only way a matrix takes
 // a slot, so claiming every weight stages every host matrix one AOS slot holds, and the fit's ring bounds the phase's
 // from above. Two edges escape the bound: the cap can refuse the whole set's ring where a claimed subset's would pass
@@ -37079,13 +37049,12 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
         return 0;
     }
     GGML_UNUSED(n_ubatch);  // kept for the callers' signature: the rows mattered only to the prompt-kernel hook
-    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the hooks' graph_ctx, which neither reads
+    ggml_sycl_moe_stream_call call;  // plain data, acquires nothing; the claims hook's graph_ctx, never read
     call.plan = current->plan;
     ggml_sycl_moe_stream_set_window(call.op, device);
 
-    const ggml_sycl::moe_stream_ring_geometry geo =
-        ggml_sycl::moe_stream_plan_ring_geometry(*call.plan, device, ggml_sycl_moe_stream_prompt_kernel, &call,
-                                                 ggml_sycl_moe_stream_claims_every_weight, call.op.window);
+    const ggml_sycl::moe_stream_ring_geometry geo = ggml_sycl::moe_stream_plan_ring_geometry(
+        *call.plan, device, &call, ggml_sycl_moe_stream_claims_every_weight, call.op.window);
     if (geo.bytes == 0) {
         return 0;
     }
@@ -37100,7 +37069,6 @@ static size_t ggml_sycl_hold_ring_uncovered(int device, uint32_t n_ubatch) {
     sizer.plan           = call.plan.get();
     sizer.device         = device;
     sizer.geo            = geo;
-    sizer.prompt_kernel  = ggml_sycl_moe_stream_prompt_kernel;
     sizer.graph_ctx      = &call;
     sizer.library_claims = ggml_sycl_moe_stream_claims_every_weight;
     sizer.hints          = call.op.window;

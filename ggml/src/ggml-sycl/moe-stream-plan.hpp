@@ -47,12 +47,6 @@ enum class moe_stream_consumer : uint8_t {
     EXECUTOR,
 };
 
-// True iff the device runs a prompt MUL_MAT_ID over a device-resident expert of `type` in `layout`, ne0 x ne1
-// (c-hmey). The backend answers from ggml_sycl_moe_query_route_capability. The ring no longer asks it (W2): it stages
-// only what the library executor claims. The index build keeps the parameter for its callers' one signature.
-using moe_stream_prompt_kernel_fn =
-    bool (*)(void * graph_ctx, ggml_type type, ggml_layout_mode layout, int64_t ne0, int64_t ne1);
-
 // True iff the prompt's library executor (the oneDNN batched one) claims `layer`'s `role` weight once the ring has
 // staged its host experts (llama.cpp-3460). The ring then stages each of that weight's host matrices into one AOS slot
 // whose consumer is the executor, and the staged route refuses the entry by that consumer: the index build asks the
@@ -241,8 +235,8 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE). The ring serves the batched prompt
 // executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md): a matrix one AOS slot holds, whose weight the
 // library executor claims once staged, stages AOS_ONLY for the executor, whose own tables are the authority there
-// (llama.cpp-3460), and every other item stages NONE. The claim is asked once per (layer, role). The device's prompt
-// kernels are not asked, since no prompt kernel reads the ring: `prompt_kernel` stays for the callers' one signature.
+// (llama.cpp-3460), and every other item stages NONE. The claim is asked once per (layer, role). No prompt kernel
+// reads the ring, so the device's prompt kernels are not asked.
 // `hints` gives the executor's phase, which with the streamable items per role decides window_slots, the region the
 // ring is sized to. `as_host`, when given, names (layer, expert) triplets, keyed moe_stream_table_key(layer, expert,
 // UNKNOWN), whose gate/up/down entries resident on `device` are read as host entries: the plan as a loan of those
@@ -251,12 +245,10 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 static inline moe_stream_plan_index moe_stream_plan_index_build(
     const placement_plan &               plan,
     int                                  device,
-    moe_stream_prompt_kernel_fn          prompt_kernel,
     void *                               graph_ctx,
     moe_stream_library_claims_fn         library_claims,
     const moe_stream_window_hints &      hints,
     const std::unordered_set<uint64_t> * as_host = nullptr) {
-    GGML_UNUSED(prompt_kernel);  // kept for the signature; unused since the window ring (W2)
     moe_stream_plan_index        idx;
     // The (layer, expert) keys with a host entry, keyed with role UNKNOWN: counts each layer's distinct host experts.
     std::unordered_set<uint64_t> host_experts;
@@ -359,14 +351,12 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
 static inline moe_stream_ring_geometry moe_stream_plan_ring_geometry(
     const placement_plan &               plan,
     int                                  device,
-    moe_stream_prompt_kernel_fn          prompt_kernel,
     void *                               graph_ctx,
     moe_stream_library_claims_fn         library_claims,
     const moe_stream_window_hints &      hints,
     moe_stream_plan_index *              index_out = nullptr,
     const std::unordered_set<uint64_t> * as_host   = nullptr) {
-    moe_stream_plan_index index =
-        moe_stream_plan_index_build(plan, device, prompt_kernel, graph_ctx, library_claims, hints, as_host);
+    moe_stream_plan_index index = moe_stream_plan_index_build(plan, device, graph_ctx, library_claims, hints, as_host);
     // The cap reads the device's expert set with the ring's own loan counted back (llama.cpp-7999): a loan moves
     // hints.lent_bytes out of index.resident_expert_bytes, so the sum is the same before and after it. The add
     // saturates defensively: a real sum of device bytes cannot approach SIZE_MAX, so the clamp only keeps a corrupt
@@ -609,7 +599,6 @@ struct moe_stream_loan_sizer {
     const placement_plan *       plan           = nullptr;
     int                          device         = -1;
     moe_stream_ring_geometry     geo            = {};
-    moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
     void *                       graph_ctx      = nullptr;
     moe_stream_library_claims_fn library_claims = nullptr;
     moe_stream_window_hints      hints          = {};
@@ -699,8 +688,6 @@ struct moe_stream_op {
     // The host lease of (layer, expert, role) and its bytes, or an invalid handle.
     mem_handle (*host_lease)(void * graph_ctx, int layer, int expert_id, expert_tensor_role role, size_t * bytes) =
         nullptr;
-    // Handed to the index build, which no longer asks it (moe_stream_prompt_kernel_fn).
-    moe_stream_prompt_kernel_fn  prompt_kernel  = nullptr;
     // Unset, the library executor claims no weight and nothing stages for it (moe_stream_plan_index_build).
     moe_stream_library_claims_fn library_claims = nullptr;
     // Unset, a short ring reserve asks for no loan (moe_stream_loan_on_short_reserve).
@@ -1497,9 +1484,8 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
         moe_stream_window_hints hints = sizer.hints;
         hints.lent_bytes              = hints.lent_bytes + lent < hints.lent_bytes ? SIZE_MAX : hints.lent_bytes + lent;
         moe_stream_plan_index          idx;
-        const moe_stream_ring_geometry post =
-            moe_stream_plan_ring_geometry(*sizer.plan, sizer.device, sizer.prompt_kernel, sizer.graph_ctx,
-                                          sizer.library_claims, hints, &idx, &as_host);
+        const moe_stream_ring_geometry post = moe_stream_plan_ring_geometry(
+            *sizer.plan, sizer.device, sizer.graph_ctx, sizer.library_claims, hints, &idx, &as_host);
         out.steps      = step;
         out.bytes      = bytes;
         out.n_triplets = static_cast<uint32_t>(keys.size() / 3);

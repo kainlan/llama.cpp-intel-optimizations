@@ -132,7 +132,6 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
             sizer.plan           = &plan;
             sizer.device         = device_;
             sizer.geo            = geo_;
-            sizer.prompt_kernel  = op.prompt_kernel;
             sizer.graph_ctx      = op.graph_ctx;
             sizer.library_claims = op.library_claims;
             sizer.hints          = window_;
@@ -415,8 +414,8 @@ bool moe_stream_phase::take_prompt_ended() {
 // compute queue gives the old ring back first (ruling D, c-fjx1), after a barrier on the old queue. The tuning-cache
 // record is read once per prompt.
 void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::queue & ccs, const moe_stream_op & op) {
-    const moe_stream_ring_geometry geo = moe_stream_plan_ring_geometry(plan, device, op.prompt_kernel, op.graph_ctx,
-                                                                       op.library_claims, op.window, &index_);
+    const moe_stream_ring_geometry geo =
+        moe_stream_plan_ring_geometry(plan, device, op.graph_ctx, op.library_claims, op.window, &index_);
     const bool                     same_queue = ccs_.has_value() && *ccs_ == ccs;
     const bool                     same_geo   = moe_stream_ring_geometry_same(geo, geo_);
     if (prepared_ && (device != device_ || !same_queue || !same_geo)) {

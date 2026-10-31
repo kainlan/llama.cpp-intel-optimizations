@@ -168,36 +168,36 @@ void test_window_sizing() {
     ggml_sycl::moe_stream_window_hints hints;
     hints.weight_slot_bytes = 10 * kSrc;  // fit = 10 -> G_plan = 5
     hints.group_cap         = 0;
-    auto idx = ggml_sycl::moe_stream_plan_index_build(plan, /*device*/ 0, nullptr, nullptr, claims_all, hints);
+    auto idx                = ggml_sycl::moe_stream_plan_index_build(plan, /*device*/ 0, nullptr, claims_all, hints);
     CHECK(idx.host_matrices_per_layer_max == 9);  // a layer has 9 host matrices, one role of it 3
     CHECK(idx.role_items_max == 3);
     CHECK(idx.window_slots == 3);                 // min(3 host items per role, G_plan 5)
     hints.weight_slot_bytes = 4 * kSrc;           // fit = 4 -> G_plan = 2
-    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, claims_all, hints);
     CHECK(idx.window_slots == 2);
     hints.weight_slot_bytes = 1 * kSrc;  // fit = 1 -> G_plan = 1 (one buffer)
-    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, claims_all, hints);
     CHECK(idx.window_slots == 1);
     hints.weight_slot_bytes = kSrc - 1;  // fit = 0: the slot holds no expert
-    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, claims_all, hints);
     CHECK(idx.window_slots == 0);
     hints.weight_slot_bytes = 10 * kSrc;
     hints.group_cap         = 2;  // GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX caps G_plan
-    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, claims_all, hints);
     CHECK(idx.window_slots == 2);
     hints.group_cap         = 0;
     hints.weight_slot_bytes = 0;  // no planned slot (before the load publishes the inventory): no window, no ring
-    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, claims_all, hints);
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, claims_all, hints);
     CHECK(idx.window_slots == 0);
     // Nothing staged (no claim, no prompt kernel): no streamable item, so no window whatever the slot holds.
     hints.weight_slot_bytes = 10 * kSrc;
-    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, nullptr, hints);
+    idx                     = ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, hints);
     CHECK(idx.role_items_max == 0);
     CHECK(idx.window_slots == 0);
     // The geometry is sized from the window: 2 regions x 3 slots x 4096 (already 256-aligned) = 24576 bytes, against
     // 2 x 9 slots for the whole-layer ring.
     ggml_sycl::moe_stream_plan_index gidx;
-    const auto geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, hints, &gidx);
+    const auto geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, hints, &gidx);
     CHECK(geo.region_slots == 3);
     CHECK(geo.n_slots == 6);
     CHECK(geo.bytes == 6 * kSrc);
@@ -211,7 +211,7 @@ void test_window_sizing() {
     // against gate/up is the same 4096 bytes, so fit stays 10 and the window 3. The product of the layer's
     // per-dimension maxima, 64 x 64 x 2, would make fit 5, G_plan 2 and the window 2.
     const placement_plan transposed = make_typed_plan(/*down_transposed*/ true);
-    idx = ggml_sycl::moe_stream_plan_index_build(transposed, 0, nullptr, nullptr, claims_all, hints);
+    idx                             = ggml_sycl::moe_stream_plan_index_build(transposed, 0, nullptr, claims_all, hints);
     CHECK(idx.role_items_max == 3);
     CHECK(idx.window_slots == 3);
 }
@@ -240,7 +240,7 @@ void test_ring_cap_is_loan_invariant() {
         e.dst_size          = lendable ? kDst : anchor ? resident - lent : 0;
     }
     ggml_sycl::moe_stream_plan_index idx;
-    const auto before = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, hints, &idx);
+    const auto before = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, hints, &idx);
     CHECK(idx.resident_expert_bytes == resident);
     CHECK(idx.window_slots == 2);
     CHECK(before.region_slots == 2 && before.n_slots == 4 && before.bytes == ring_bytes);
@@ -252,14 +252,13 @@ void test_ring_cap_is_loan_invariant() {
             e.dst_size -= 1;
         }
     }
-    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(short_plan, 0, nullptr, nullptr, claims_all, hints).bytes == 0);
+    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(short_plan, 0, nullptr, claims_all, hints).bytes == 0);
 
     // A sentinel lent_bytes saturates rather than wraps: R + SIZE_MAX would wrap to R - 1 = 180223, and
     // 180223 / 11 = 16383 refuses the ring; clamped to SIZE_MAX the cap admits it.
     ggml_sycl::moe_stream_window_hints sentinel_hints = hints;
     sentinel_hints.lent_bytes                         = SIZE_MAX;
-    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, sentinel_hints).bytes ==
-          ring_bytes);
+    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, sentinel_hints).bytes == ring_bytes);
 
     // The loan: the lendable triplet moves to the host (target_device -1, as the transaction's
     // update_expert_placement sets it) and its device bytes come back through hints.lent_bytes.
@@ -273,8 +272,7 @@ void test_ring_cap_is_loan_invariant() {
     ggml_sycl::moe_stream_window_hints lent_hints = hints;
     lent_hints.lent_bytes                         = lent;
     ggml_sycl::moe_stream_plan_index lidx;
-    const auto                       after =
-        ggml_sycl::moe_stream_plan_ring_geometry(lent_plan, 0, nullptr, nullptr, claims_all, lent_hints, &lidx);
+    const auto after = ggml_sycl::moe_stream_plan_ring_geometry(lent_plan, 0, nullptr, claims_all, lent_hints, &lidx);
     CHECK(lidx.resident_expert_bytes == resident - lent);
     CHECK(lidx.role_items_max == 4);
     CHECK(lidx.window_slots == 2);
@@ -335,7 +333,7 @@ ggml_sycl::moe_stream_loan_sizer loan_sizer(const placement_plan & plan) {
     sizer.device         = 0;
     sizer.library_claims = claims_all;
     sizer.hints          = loan_hints();
-    sizer.geo            = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, sizer.hints);
+    sizer.geo            = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, sizer.hints);
     return sizer;
 }
 
@@ -361,7 +359,7 @@ ggml_sycl::moe_stream_ring_geometry geometry_after_loan(
     }
     ggml_sycl::moe_stream_window_hints hints = base;
     hints.lent_bytes                         = lent;
-    return ggml_sycl::moe_stream_plan_ring_geometry(lent_plan, 0, nullptr, nullptr, claims_all, hints);
+    return ggml_sycl::moe_stream_plan_ring_geometry(lent_plan, 0, nullptr, claims_all, hints);
 }
 
 // The loan is sized from the plan it leaves: lending widens the window, so the
@@ -416,7 +414,7 @@ void test_loan_converges_on_the_post_loan_ring() {
     // at 2 before and after the loan, so the window cannot move.
     ggml_sycl::moe_stream_loan_sizer capped = sizer;
     capped.hints.weight_slot_bytes          = 4 * kSrc;  // fit = 4 -> G_plan = 2
-    capped.geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, capped.hints);
+    capped.geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, capped.hints);
     CHECK(capped.geo.n_slots == 4);
     const ggml_sycl::moe_stream_loan_sizing flat = ggml_sycl::moe_stream_loan_size_post_loan(capped, 2 * kSrc);
     CHECK(flat.converged && flat.steps == 1 && flat.bytes == 2 * kSrc && flat.n_triplets == 1);
@@ -486,7 +484,7 @@ void test_loan_into_a_larger_slot_credits_no_held_slot() {
     // (fit 10), so only the role counts and the slot size move the ring.
     sizer.hints.weight_slot_bytes = 20 * kSrc;
     sizer.hints.group_cap         = 4;
-    sizer.geo = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, nullptr, claims_all, sizer.hints);
+    sizer.geo                     = ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, sizer.hints);
     CHECK(sizer.geo.region_slots == 3 && sizer.geo.n_slots == 6 && sizer.geo.slot_bytes == kSrc);
 
     // One slot short, five held. Step 1 asks for that one kSrc slot, which expert 7 funds alone (2 slots a matrix);
@@ -652,8 +650,8 @@ int main() {
     // experts). The null library_claims makes the production staging NONE for every item, and the hand-built entries'
     // zeroed type and shape would force it too; only the list is compared. The comparison fails on a dropped role, a
     // reordered expert, or a fused GATE_UP host entry listed as a triplet (layer 1 would then have 10 items, not 9).
-    const ggml_sycl::moe_stream_plan_index idx = ggml_sycl::moe_stream_plan_index_build(
-        plan, 0, nullptr, nullptr, nullptr, ggml_sycl::moe_stream_window_hints());
+    const ggml_sycl::moe_stream_plan_index idx =
+        ggml_sycl::moe_stream_plan_index_build(plan, 0, nullptr, nullptr, ggml_sycl::moe_stream_window_hints());
     for (int l = 0; l < kLayers; ++l) {
         const auto ref = plan_build(plan, l, moe_exec_regime::STREAM_ALL, nullptr, 0);
         const auto it  = idx.layers.find(l);
