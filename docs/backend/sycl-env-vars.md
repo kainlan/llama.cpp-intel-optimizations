@@ -579,7 +579,7 @@ third at every policy and verbosity, the fourth under `ring` only, the aborts al
   that the gate held the copy. `launches` counts the dequant kernels and the GEMM groups the executor submitted for the
   window. `-1` means unmeasured: no device times on a mark or on the gate, no copies of the window's own, or no read
   gate (a region's first fill). A prefetched window that never began prints nothing.
-- WARN `[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines from this phase`:
+- WARN `[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines in this context`:
   `GGML_SYCL_MOE_EXEC_TRACE=2`, at most once per backend context, when a timing mark, or the timing queue built for
   it, throws. Window timing then stays off for every later prompt in that context, and the prompt goes on, because
   nothing the copies or the readers wait on depends on the marks. Windows begun before the failure still print at the

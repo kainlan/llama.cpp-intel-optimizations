@@ -333,8 +333,8 @@ void moe_stream_phase::drop_window_timing(const sycl::exception & e) {
     }
     char line[384];
     std::snprintf(line, sizeof(line),
-                  "[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines from "
-                  "this phase",
+                  "[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines in "
+                  "this context",
                   device_, e.what());
     log_->sink(log_->sink_ctx, line);
 }

@@ -382,8 +382,8 @@ def test_marks_mutants():
 
 MARK_CATCH = "catch (const sycl::exception & e) { drop_window_timing(e); }"
 DROP_SIG = "void moe_stream_phase::drop_window_timing(const sycl::exception & e) {"
-DROP_WARN = ('"[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines from this '
-             'phase"')
+DROP_WARN = ('"[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines in this '
+             'context"')
 DROP_SINK = "log_->sink(log_->sink_ctx, line);"
 DROP_BODY = ("{ window_marks_failed_ = true; " + TIMING_OFF + " if (log_ == nullptr || log_->sink == nullptr) { "
              "return; } char line[384]; std::snprintf(line, sizeof(line), " + DROP_WARN + ", device_, e.what()); "
