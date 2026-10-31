@@ -44,40 +44,8 @@ Pytest-style (module-level test_* functions): register with llama_test_pytest.
 """
 
 import re
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-
-_LEXEME_RE = re.compile(
-    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
-    re.DOTALL,
-)
-
-
-def strip_comments(src: str) -> str:
-    def repl(m: re.Match) -> str:
-        tok = m.group(0)
-        if tok[0] in "\"'":
-            return tok
-        return "\n" * tok.count("\n")
-
-    return _LEXEME_RE.sub(repl, src)
-
-
-def norm(text: str) -> str:
-    """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so a clang-format re-wrap of
-    a claim or of a log literal cannot turn it red."""
-    t = re.sub(r"\s+", " ", strip_comments(text))
-    t = re.sub(r"\( ", "(", t)
-    t = re.sub(r" \)", ")", t)
-    t = re.sub(r" ,", ",", t)
-    t = re.sub(r",(?! )", ", ", t)
-    return t.replace('" "', "")
-
-
-def read(rel: str) -> str:
-    return (ROOT / rel).read_text()
-
+from sycl_gate import body, norm, ordered, read
 
 SYCL_CPP = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 CACHE_CPP = read("ggml/src/ggml-sycl/unified-cache.cpp")
@@ -92,36 +60,6 @@ COMMON_CPP = read("common/common.cpp")
 BENCH_CPP = read("tools/llama-bench/llama-bench.cpp")
 
 
-def body(text: str, signature: str) -> str:
-    """The brace-balanced body of the first definition whose text starts with `signature` (string literals are
-    skipped while balancing). Empty when there is none."""
-    at = text.find(signature)
-    if at < 0:
-        return ""
-    open_at = text.find("{", at + len(signature))
-    if open_at < 0:
-        return ""
-    depth = 0
-    i = open_at
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch in "\"'":
-            j = i + 1
-            while j < n and text[j] != ch:
-                j += 2 if text[j] == "\\" else 1
-            i = j + 1
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[open_at:i + 1]
-        i += 1
-    return ""
-
-
 def struct_text(text: str, head: str) -> str:
     """The text of the first struct starting with `head`, up to its closing `};` (a struct of plain fields, which holds
     no nested braces). Empty when there is none."""
@@ -130,17 +68,6 @@ def struct_text(text: str, head: str) -> str:
         return ""
     end = text.find("};", at)
     return text[at:end] if end >= 0 else ""
-
-
-def ordered(text: str, *needles: str) -> bool:
-    """Every needle is present, each after the one before it."""
-    at = 0
-    for needle in needles:
-        at = text.find(needle, at)
-        if at < 0:
-            return False
-        at += len(needle)
-    return True
 
 
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
