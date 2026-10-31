@@ -471,21 +471,6 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   size_t hold,
                                   size_t alloc_size);
 
-// A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
-// linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
-// request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a
-// micro-batch nobody measured: it scales a rung's record with it.
-inline size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
-    if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
-        return request;
-    }
-    if (request > SIZE_MAX / to_n_ubatch) {
-        return SIZE_MAX;
-    }
-    const size_t product = request * to_n_ubatch;
-    return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
-}
-
 // The arena's grain: it reserves every zone as a whole number of these bytes (the TLSF allocator's alignment).
 constexpr size_t k_zone_arena_alignment = 256;
 

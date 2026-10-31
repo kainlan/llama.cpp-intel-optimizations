@@ -1758,11 +1758,13 @@ int main() {
         in.compute_room_n_ubatch = 0;
         CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 0, 0), "n_ubatch 0 has no room");
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "and no demand");
-        // The scaler: rounded up, unchanged for an unknown or equal micro-batch, saturating on overflow.
-        CHECK(ggml_sycl::zone_hold_scale_request(3, 2, 3) == 5, "4.5 rounds up to 5");
-        CHECK(ggml_sycl::zone_hold_scale_request(7 * MiB, 0, 2048) == 7 * MiB, "an unknown source micro-batch");
-        CHECK(ggml_sycl::zone_hold_scale_request(7 * MiB, 512, 512) == 7 * MiB, "an equal one");
-        CHECK(ggml_sycl::zone_hold_scale_request(SIZE_MAX / 2, 512, 2048) == SIZE_MAX, "an overflowing product");
+        // The scaler, through the spill bound that adds a 1-byte plan to it: rounded up, unchanged for an unknown or
+        // equal micro-batch, saturating on overflow.
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 3, 2, 3) == 1 + 5, "4.5 rounds up to 5");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 7 * MiB, 0, 2048) == 1 + 7 * MiB, "an unknown source micro-batch");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 7 * MiB, 2048, 0) == 1 + 7 * MiB, "an unknown target micro-batch");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 7 * MiB, 512, 512) == 1 + 7 * MiB, "an equal one");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, SIZE_MAX / 2, 512, 2048) == SIZE_MAX, "an overflowing product");
     }
 
     // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the cases

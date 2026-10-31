@@ -504,6 +504,21 @@ bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, si
     return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
 }
 
+// A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
+// linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
+// request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a
+// micro-batch nobody measured: the spill bound and the fit's request scale a rung's record with it.
+static size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
+    if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
+        return request;
+    }
+    if (request > SIZE_MAX / to_n_ubatch) {
+        return SIZE_MAX;
+    }
+    const size_t product = request * to_n_ubatch;
+    return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
+}
+
 size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch) {
     if (plan == 0) {
         return 0;
