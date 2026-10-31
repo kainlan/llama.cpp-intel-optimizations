@@ -1688,12 +1688,12 @@ int main() {
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 0, "no plan and no ring is no demand");
     }
 
-    // ---- Case 24c (compute room): the RUNTIME zone of an explicit micro-batch the load placed holds the planned compute
-    // term beside that micro-batch's ring and dense scratch, so at that rung a compute buffer no larger than the term
-    // is served by the zone and the hold cannot keep it out. The B70 / Qwen3.8 IQ3_XXS context at -ub 2048: plan
-    // 98 MiB, one 1960 MiB compute buffer, 64 MiB of KV-zone room, 1946 MiB free outside the arena, and the 2055 MiB
-    // compute term the load measured at its planning shape (n_ctx_train, ubatch 512). Without the room the bound
-    // charges the whole buffer as a spill and refuses the context, although no request was held out. ----------------
+    // ---- Case 24c (compute room): the RUNTIME zone of an explicit micro-batch the load placed holds the planned
+    // compute term beside that micro-batch's ring and dense scratch, so at that rung a compute buffer no larger than
+    // the term is served by the zone and the hold cannot keep it out. The B70 / Qwen3.8 IQ3_XXS context at -ub 2048:
+    // plan 98 MiB, one 1960 MiB compute buffer, 64 MiB of KV-zone room, 1946 MiB free outside the arena, and the
+    // 2055 MiB compute term the load measured at its planning shape (n_ctx_train, ubatch 512). Without the room the
+    // bound charges the whole buffer as a spill and refuses the context, although no request was held out. ------------
     {
         const size_t MiB  = 1024 * 1024;
         auto         plan = [](void *, uint32_t) -> size_t {
@@ -1767,11 +1767,11 @@ int main() {
         CHECK(ggml_sycl::zone_hold_spill_bound(1, SIZE_MAX / 2, 512, 2048) == SIZE_MAX, "an overflowing product");
     }
 
-    // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the cases
-    // above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound over the
-    // plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even with a room
-    // of SIZE_MAX, and every rung but the named one does when one is. So a load that names no micro-batch, the auto
-    // trial included, and every other rung of one that does are judged as before. --------------------------------
+    // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
+    // cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound
+    // over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even
+    // with a room of SIZE_MAX, and every rung but the named one does when one is. So a load that names no micro-batch,
+    // the auto trial included, and every other rung of one that does are judged as before. ----------------------------
     {
         const size_t MiB = 1024 * 1024;
 

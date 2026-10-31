@@ -18815,9 +18815,9 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     // Lent bytes cost the card nothing; the part of the ring neither the planned room nor a loan covers is a demand
     // (zone_hold_fit_demand).
     in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device, q.n_ubatch);
-    // The explicit micro-batch the published plan placed on this device: its RUNTIME zone holds the planned compute term
-    // beside that micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger than the
-    // term (whole or nothing). Every other rung, and every load that placed no micro-batch, is judged as before.
+    // The explicit micro-batch the published plan placed on this device: its RUNTIME zone holds the planned compute
+    // term beside that micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger than
+    // the term (whole or nothing). Every other rung, and every load that placed no micro-batch, is judged as before.
     {
         const auto room_plan     = ggml_sycl_global_plan_owner();
         uint32_t   room_n_ubatch = 0;

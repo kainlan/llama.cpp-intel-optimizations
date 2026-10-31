@@ -694,8 +694,8 @@ struct placement_kv_info {
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
     // above stays the load's planning shape.
     uint32_t                           n_ubatch_context = 0;
-    // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone.
-    // The backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
+    // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone. The
+    // backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
     // when no micro-batch above n_ubatch was named, the model has no ring, or there is no arena. The planner weighs it
     // against the routed experts (placement_plan::explicit_ubatch).
     pp_moe_onednn_explicit_ubatch_room explicit_ubatch;
@@ -924,10 +924,10 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
                                               uint32_t *                        n_ubatch);
 
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
-// since the load whose plan PLACED the micro-batch and whose room cost device bytes of routed experts. The bytes decide,
-// not the count of triplets: with triplets of unequal size the device can keep as many triplets and still hold fewer
-// bytes. The context's own micro-batch does not enter, because the line names the micro-batch the load placed, and a
-// context whose micro-batch differs (llama-bench's -p below -ub) would otherwise leave a load that moved experts
+// since the load whose plan PLACED the micro-batch and whose room cost device bytes of routed experts. The bytes
+// decide, not the count of triplets: with triplets of unequal size the device can keep as many triplets and still hold
+// fewer bytes. The context's own micro-batch does not enter, because the line names the micro-batch the load placed,
+// and a context whose micro-batch differs (llama-bench's -p below -ub) would otherwise leave a load that moved experts
 // unannounced.
 bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode);
 
@@ -2629,8 +2629,8 @@ size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
 // silently becoming a smaller RUNTIME zone.
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out);
 
-// The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones() reserves
-// at least this, and an explicit micro-batch's room is measured against the same floor.
+// The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()
+// reserves at least this, and an explicit micro-batch's room is measured against the same floor.
 size_t unified_cache_runtime_zone_floor_bytes();
 
 // The RUNTIME zone room the PP MoE oneDNN scratch ring of the explicit micro-batch `n_ubatch` needs on `device_id`

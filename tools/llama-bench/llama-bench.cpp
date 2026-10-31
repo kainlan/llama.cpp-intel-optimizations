@@ -1221,8 +1221,8 @@ struct cmd_params_instance {
     uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }
 
     // the micro-batch this instance names to the load: -ub, at most -b (an n_ubatch of 0 is n_batch). It is read from
-    // -b and -ub alone, not clamped by the context as llama_context clamps it, so the prompt and generation tests of one
-    // -b/-ub pair name the same micro-batch and share one model (see equal_mparams); a context smaller than the
+    // -b and -ub alone, not clamped by the context as llama_context clamps it, so the prompt and generation tests of
+    // one -b/-ub pair name the same micro-batch and share one model (see equal_mparams); a context smaller than the
     // micro-batch runs on the placement made for it. 0 for "-ub auto", where the SYCL backend picks the micro-batch
     // itself, and 0 without the SYCL backend, the only one whose load reads it.
     uint32_t n_ubatch_hint() const {

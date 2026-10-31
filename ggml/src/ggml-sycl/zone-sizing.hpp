@@ -551,9 +551,9 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 // are the room's bytes and lent bytes, so it is 0 when the two supply all of it, and a demand on free memory otherwise.
 //
 // compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
-// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned compute
-// term (the compute buffers the load measured at its planning shape) beside that micro-batch's ring and dense scratch.
-// 0 for none, the case of every load that names no micro-batch.
+// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned
+// compute term (the compute buffers the load measured at its planning shape) beside that micro-batch's ring and dense
+// scratch. 0 for none, the case of every load that names no micro-batch.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
     size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
