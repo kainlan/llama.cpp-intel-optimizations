@@ -406,6 +406,10 @@ DROP_BODY = ("{ window_marks_failed_ = true; " + TIMING_OFF + " if (log_ == null
              + DROP_SINK + " }")
 COPY_ABORT = 'catch (const std::exception & e) { GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what()); }'
 FAILED_MEMBER = "bool window_marks_failed_ = false;"
+BEGUN_CALL = ("window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, req.role, req.phase, "
+              "exposed, submit_us);")
+BEGUN_GUARDED = "try { " + BEGUN_CALL + " } " + MARK_HANDLERS
+WINDOW_BEGIN_SIG = "uint32_t moe_stream_phase::window_begin("
 
 
 def claim_mark_failure(plan_cpp: str, plan_hpp: str, doc: str) -> bool:
@@ -416,12 +420,16 @@ def claim_mark_failure(plan_cpp: str, plan_hpp: str, doc: str) -> bool:
     stage_window calls drop_window_timing, and stage_window's copy handler still aborts, so a mark's failure never
     reaches the copy abort and a copy's never turns the timing off. drop_window_timing sets the sticky flag, turns the
     timeline off and warns once through the decision log's WARN sink (the phase makes no log call of its own), without
-    aborting or throwing; begin_layer keeps it off while the flag is set; the catalog names the warning."""
+    aborting or throwing; begin_layer keeps it off while the flag is set; the catalog names the warning. window_begin
+    records the window under the same handlers, since begun() grows the records there for a window that has no
+    record yet (no copies of its own and no prefetch), so a std::bad_alloc turns the timing off instead of leaving
+    window_begin, and a window whose record could not grow prints nothing."""
     n = norm(plan_cpp)
     stage = body(n, STAGE_SIG)
     return (body(n, START_SIG) == "{ " + START_SKIP + " try " + START_BODY + " " + MARK_HANDLERS + " }"
             and body(n, END_SIG) == "{ try " + END_BODY + " " + MARK_HANDLERS + " }"
-            and n.count(MARK_CATCH) == 2 and n.count("drop_window_timing(") == 3
+            and n.count(MARK_CATCH) == 3 and n.count("drop_window_timing(") == 4
+            and body(n, WINDOW_BEGIN_SIG).count(BEGUN_GUARDED) == 1 and n.count("window_timing_.begun(") == 1
             and body(n, DROP_SIG) == DROP_BODY and n.count("window_marks_failed_ = true;") == 1
             and "drop_window_timing" not in stage and stage.count(COPY_ABORT) == 1
             and n.count(ENABLE) == 1 and norm(plan_hpp).count(FAILED_MEMBER) == 1
@@ -439,14 +447,16 @@ def test_mark_failure_mutants():
     assert not claim_mark_failure(mutate(PLAN_CPP, "try " + END_BODY + " " + MARK_HANDLERS, END_BODY), PLAN_HPP,
                                   ENV_DOC)
     # a planned refusal swallowed into the timing path instead of reaching the backend's fallback
-    assert not claim_mark_failure(mutate(PLAN_CPP, MARK_HANDLERS, MARK_CATCH, count=2), PLAN_HPP, ENV_DOC)
+    assert not claim_mark_failure(mutate(PLAN_CPP, MARK_HANDLERS, MARK_CATCH, count=3), PLAN_HPP, ENV_DOC)
+    # window_begin's record outside its try, so a std::bad_alloc from the records' growth leaves window_begin
+    assert not claim_mark_failure(mutate(PLAN_CPP, BEGUN_GUARDED, BEGUN_CALL), PLAN_HPP, ENV_DOC)
     # the mark's handler rethrowing into the copy abort
     assert not claim_mark_failure(mutate(PLAN_CPP, "{ drop_window_timing(e); }", "{ drop_window_timing(e); throw; }",
-                                         count=2), PLAN_HPP, ENV_DOC)
+                                         count=3), PLAN_HPP, ENV_DOC)
     # the handlers narrowed to sycl::exception, so a std::bad_alloc from the records reaches the copy abort, or escapes
     # stage_window from mark_window_end
     assert not claim_mark_failure(mutate(PLAN_CPP, MARK_CATCH, MARK_CATCH.replace("std::exception", "sycl::exception"),
-                                         count=2), PLAN_HPP, ENV_DOC)
+                                         count=3), PLAN_HPP, ENV_DOC)
     # the failure path aborting like the copy's, or leaving the timeline on
     aborting = DROP_BODY.replace(DROP_SINK, 'GGML_ABORT("%s", line);')
     assert not claim_mark_failure(mutate(PLAN_CPP, DROP_BODY, aborting), PLAN_HPP, ENV_DOC)
@@ -639,8 +649,7 @@ def test_launches_mutants():
 
 COPIED = "window_timing_.copied(timing_key, copied, item.src_bytes);"
 BEGUN = ("if (timed) { const double submit_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::"
-         "now() - t_begin).count(); window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, "
-         "req.role, req.phase, exposed, submit_us); }")
+         "now() - t_begin).count(); " + BEGUN_GUARDED + " }")
 CLOCK = "const auto t_begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();"
 
 

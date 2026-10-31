@@ -583,7 +583,7 @@ third at every policy and verbosity, the fourth under `ring` only, the aborts al
   `GGML_SYCL_MOE_EXEC_TRACE=2`, at most once per backend context, when a timing mark or the timing queue built for it
   throws, or the timing records cannot grow. Window timing then stays off for every later prompt in that context, and
   the prompt goes on, because nothing the copies or the readers wait on depends on the marks. Windows begun before the
-  failure still print at the next synchronize. The window being begun when a mark failed, and any window it
+  failure still print at the next synchronize. The window being begun when the timing failed, and any window it
   prefetched, print nothing.
 
 **Trace** (`GGML_SYCL_MOE_EXEC_TRACE>=1`, all INFO, in the order a layer-ubatch prints them)

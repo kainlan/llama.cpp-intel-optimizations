@@ -238,8 +238,16 @@ uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
     if (timed) {
         const double submit_us =
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_begin).count();
-        window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, req.role, req.phase, exposed,
-                             submit_us);
+        // A window with no copies of its own and no prefetch has no record yet, so begun() grows the records here. A
+        // record that cannot grow turns the timing off as a mark's failure does, and that window prints nothing.
+        try {
+            window_timing_.begun(moe_stream_window_timing_key(ubatch_seq_, wid), req.layer, req.role, req.phase,
+                                 exposed, submit_us);
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (const std::exception & e) {
+            drop_window_timing(e);
+        }
     }
     return staged;
 }
@@ -335,9 +343,9 @@ void moe_stream_phase::mark_window_end(uint64_t key, const sycl::event & last_co
 // WARN sink, as the phase's other lines go. That warning comes at most once per backend context: window timing then
 // stays off for every later prompt in that context, because this phase lives in the backend context and the
 // per-prompt reset does not clear window_marks_failed_, and begin_layer does not turn it back on. Windows begun before
-// the failure still print at the next flush. The window being begun when a mark failed, and any window it prefetched,
-// print nothing: their marks went in while they were staged, before begun(), and begun() records nothing once the
-// timing is off.
+// the failure still print at the next flush. The window being begun when the timing failed, and any window it
+// prefetched, print nothing: begun() records nothing once the timing is off, and a window whose record could not grow
+// has none.
 void moe_stream_phase::drop_window_timing(const std::exception & e) {
     window_marks_failed_   = true;
     window_timing_.enabled = false;
