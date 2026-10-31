@@ -215,9 +215,6 @@ struct moe_stream_window_hints {
 
 // The experts one executor phase holds for an expert of `expert_f16_bytes`: G_plan above, 0 when the slot holds none.
 static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints & h, size_t expert_f16_bytes) {
-    if (h.weight_slot_bytes == 0 || expert_f16_bytes == 0) {
-        return 0;
-    }
     const size_t g = moe_pp_batched_f16_window_experts(h.weight_slot_bytes, expert_f16_bytes, h.group_cap);
     return g > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(g);
 }

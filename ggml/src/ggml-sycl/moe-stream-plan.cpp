@@ -100,7 +100,7 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     // The window timing, and the timing queue its marks go on, are trace level 2's, until a mark, the timing queue or
     // the records' growth fails (drop_window_timing()).
     window_timing_.enabled = op.log != nullptr && op.log->trace >= 2 && !window_marks_failed_;
-    request_loan_  = op.request_loan;
+    request_loan_          = op.request_loan;
     loan_refusals_         = op.loan_refusals;
 
     // The layer is weighed at its own first op, never a layer ahead: the executor stages its own windows.
