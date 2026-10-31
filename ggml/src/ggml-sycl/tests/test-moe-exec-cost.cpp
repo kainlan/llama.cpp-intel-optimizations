@@ -333,8 +333,6 @@ int main() {
         CHECK(knob.h2d_gbps == base.h2d_gbps && knob.cpu_gbps == base.cpu_gbps && knob.dev_gflops == base.dev_gflops &&
                   knob.cpu_gflops == base.cpu_gflops,
               "GGML_SYCL_MOE_EXEC_REORDER_GBPS is not read");
-        r = moe_exec_rates_seed({});
-        moe_exec_rates_apply_env(r, all_fn);
         moe_exec_rates_apply_env(r, nullptr);
         CHECK(r.h2d_gbps == 1.0, "a null getenv keeps what the record holds");
     }

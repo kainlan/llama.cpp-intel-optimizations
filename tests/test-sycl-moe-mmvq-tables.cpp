@@ -115,7 +115,7 @@ size_t window_experts_reference(size_t slot_bytes, size_t expert_bytes, size_t c
 // a slot of SIZE_MAX bytes holding SIZE_MAX one-byte experts with no cap or with a cap of SIZE_MAX (which is no cap),
 // where fit equals the unbounded expert count and the executor's rule takes its one-group arm (SIZE_MAX instead of
 // SIZE_MAX / 2). No slot has SIZE_MAX bytes.
-int count_window_experts_mismatches(bool report) {
+int count_window_experts_mismatches() {
     const size_t slots[] = {
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 63, 64, 65, 1000, 4096, 4097, 1 << 20, size_t(3) << 30, SIZE_MAX / 2, SIZE_MAX
     };
@@ -132,10 +132,8 @@ int count_window_experts_mismatches(bool report) {
                 const size_t got  = moe_pp_batched_f16_window_experts(slot, expert, cap);
                 if (got != want) {
                     ++mismatches;
-                    if (report) {
-                        std::printf("  FAIL window experts: slot=%zu expert=%zu cap=%zu got=%zu want=%zu\n", slot,
-                                    expert, cap, got, want);
-                    }
+                    std::printf("  FAIL window experts: slot=%zu expert=%zu cap=%zu got=%zu want=%zu\n", slot, expert,
+                                cap, got, want);
                 }
             }
         }
@@ -817,10 +815,10 @@ int main() {
         }
     }
 
-    // The stream ring's window is the executor's two-buffer rule (moe_pp_batched_f16_window_experts), equal to the
+    // 13. The stream ring's window is the executor's two-buffer rule (moe_pp_batched_f16_window_experts), equal to the
     // formula the stream plan carried, including the cap and a slot that holds one expert (G = 1, one buffer).
     {
-        const int n = count_window_experts_mismatches(true);
+        const int n = count_window_experts_mismatches();
         if (n != 0) {
             std::printf("FAIL: %d window-experts points differ from the reference rule\n", n);
             ++failures;
@@ -849,7 +847,7 @@ int main() {
         }
     }
 
-    // 13. How many experts a windowed op's phase holds, and how many phases a layer runs. A phase spans every active
+    // 14. How many experts a windowed op's phase holds, and how many phases a layer runs. A phase spans every active
     // expert of the dispatch, device-resident and host, while its ring window stages only the phase's host matrices of
     // one role. So the cap is the f16 slot's phase, G_plan, never the region's slots, min(role_items_max, G_plan), and
     // the f16 group size still bounds it: one rule gives both, at an unbounded expert count and at the dispatch's

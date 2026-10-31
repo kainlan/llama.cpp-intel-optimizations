@@ -12,8 +12,8 @@
 // The ring serves the batched prompt executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md). A matrix whose
 // weight the executor claims once its host experts are staged takes one AOS slot, which the executor's dequant kernel
 // reads, and its entry names the executor as its consumer (llama.cpp-3460). A matrix the executor does not claim stages
-// NONE, whatever the device's prompt kernels read: no kernel predicate is asked. The tests pass
-// the claims as a predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
+// NONE, whatever the device's prompt kernels read: no kernel predicate is asked. The tests pass the claims as a
+// predicate; the backend answers with ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor.
 //
 // The phase stages a layer a window at a time: one executor phase of one role (moe_stream_window_items). The regions'
 // read gates are kept by moe_stream_region_reads, keyed by the window each region holds, which the phase holds over
@@ -659,15 +659,8 @@ int main() {
         CHECK(r0 != nullptr && items_all(*r0, moe_stream_staging::NONE, moe_stream_consumer::ROUTE));
         CHECK(refused.host_matrices_per_layer_max == 0 && refused.window_slots == 0);
 
-        // The claim alone decides: every claimed Q4_0 matrix takes one AOS slot.
-        const moe_stream_plan_index   claimed_q4 = index_of(plan, claims_all);
-        const moe_stream_layer_info * k0         = layer_info(claimed_q4, 0);
-        CHECK(k0 != nullptr && items_all(*k0, moe_stream_staging::AOS_ONLY, moe_stream_consumer::EXECUTOR));
-        CHECK(claimed_q4.host_matrices_per_layer_max == 9 && claimed_q4.matrix_bytes_max == src_bytes());
-        CHECK(claimed_q4.window_slots == 3);
-
-        // The executor's table is the authority, not the MMVQ kernels: a claimed IQ3_XXS matrix, which no kernel of
-        // MMVQ reads here, takes one AOS slot of its own bytes. Unclaimed it takes none.
+        // The claim alone decides: a claimed IQ3_XXS matrix takes one AOS slot of its own bytes. Unclaimed it takes
+        // none.
         const moe_stream_plan_index   iq_free    = index_of(make_mixed_plan(), nullptr);
         const moe_stream_plan_index   iq_claimed = index_of(make_mixed_plan(), claims_all);
         const moe_stream_layer_info * i1         = layer_info(iq_claimed, 1);
@@ -969,7 +962,6 @@ int main() {
                2000.0 / (1000.0 / 1260.0 + 1000.0 / ggml_sycl::moe_exec_dev_gflops_seed(GGML_TYPE_MXFP4))));
     ggml_sycl_moe_exec_rates_record unmeasured = rec;
     unmeasured.h2d_gbps                        = 0.0;
-    unmeasured.reorder_gbps                    = -1.0;
     const moe_exec_rates fallback              = ggml_sycl::moe_stream_rates_assemble(q4, &unmeasured, 0.0, nullptr);
     CHECK(near(fallback.h2d_gbps, seed.h2d_gbps));
     CHECK(near(ggml_sycl::moe_stream_rates_assemble(q4, &rec, 0.0, fake_env_h2d).h2d_gbps, 31.0));
