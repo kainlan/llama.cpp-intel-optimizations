@@ -103,8 +103,8 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
     policy_        = op.policy;
-    // The window timing, and the timing queue its marks go on, are trace level 2's.
-    window_timing_.enabled = op.log != nullptr && op.log->trace >= 2;
+    // The window timing, and the timing queue its marks go on, are trace level 2's, until a mark fails to submit.
+    window_timing_.enabled = op.log != nullptr && op.log->trace >= 2 && !window_marks_failed_;
     request_loan_  = op.request_loan;
     loan_refusals_ = op.loan_refusals;
 
@@ -288,25 +288,52 @@ sycl::queue & moe_stream_phase::timing_queue() {
 
 // The window's free and start marks, submitted just before its first copy, so the window's own submit loop does not
 // end them late. `deps` is everything that copy waits on except `gate`, its read gate. The free mark also waits for the
-// copy queued before, since the copy queue is in order; the start mark adds the gate.
+// copy queued before, since the copy queue is in order; the start mark adds the gate. A mark that fails to submit is
+// caught here, not by stage_window()'s copy handler: drop_window_timing() turns the timing off and the copies go on.
 void moe_stream_phase::mark_window_start(uint64_t                           key,
                                          std::vector<sycl::event>           deps,
                                          const std::optional<sycl::event> & gate) {
-    if (window_timing_.queue_tail) {
-        deps.push_back(*window_timing_.queue_tail);
+    try {
+        if (window_timing_.queue_tail) {
+            deps.push_back(*window_timing_.queue_tail);
+        }
+        sycl::queue &     q         = timing_queue();
+        const sycl::event free_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps);
+        if (gate) {
+            deps.push_back(*gate);
+        }
+        const sycl::event start_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps);
+        window_timing_.marked(key, free_mark, start_mark, gate);
+    } catch (const sycl::exception & e) {
+        drop_window_timing(e);
     }
-    sycl::queue &     q         = timing_queue();
-    const sycl::event free_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps);
-    if (gate) {
-        deps.push_back(*gate);
-    }
-    const sycl::event start_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps);
-    window_timing_.marked(key, free_mark, start_mark, gate);
 }
 
-// The window's end mark, behind its last copy.
+// The window's end mark, behind its last copy. A failure to submit it is caught as the start marks' is.
 void moe_stream_phase::mark_window_end(uint64_t key, const sycl::event & last_copy) {
-    window_timing_.ended(key, ggml_sycl_submit_marker<moe_stream_timing_mark>(timing_queue(), { last_copy }));
+    try {
+        window_timing_.ended(key, ggml_sycl_submit_marker<moe_stream_timing_mark>(timing_queue(), { last_copy }));
+    } catch (const sycl::exception & e) {
+        drop_window_timing(e);
+    }
+}
+
+// A timing mark, or the timing queue built for it, threw. The marks are a diagnostic that nothing the copies or the
+// readers wait on depends on, so the window timing goes off for the rest of this phase, with one warning through the
+// decision log's WARN sink, as the phase's other lines go, and the prompt goes on; begin_layer does not turn it back
+// on. The windows recorded so far still print at the next flush, with -1 where a mark is missing.
+void moe_stream_phase::drop_window_timing(const sycl::exception & e) {
+    window_marks_failed_   = true;
+    window_timing_.enabled = false;
+    if (log_ == nullptr || log_->sink == nullptr) {
+        return;
+    }
+    char line[384];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines from "
+                  "this phase",
+                  device_, e.what());
+    log_->sink(log_->sink_ctx, line);
 }
 
 bool moe_stream_phase::region_open() const {
@@ -370,7 +397,7 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     }
     if (!same_queue) {
         ccs_.emplace(ccs);
-        timing_queue_.reset();  // its marks wait on the compute queue's events, so it shares that queue's context
+        timing_queue_.reset();  // built anew at the next mark, on this queue's context and device
         // A region's readers, the executor's dequants, run in order on this queue, and its read gates are barriers on
         // it; on any other queue the ring is not offered, and the ring-unavailable diagnostic says so.
         in_order_ = ccs.is_in_order();

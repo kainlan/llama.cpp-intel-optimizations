@@ -985,10 +985,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
-    # llama.cpp-8ucb, llama.cpp-ivb6: the ring windows' timing line is printed only at GGML_SYCL_MOE_EXEC_TRACE=2, timed
-    # by marker kernels on a queue the ring builds only at that level (readers_wait_us as the gate's command_end minus
-    # the free mark's, start_lag_us as the start mark's minus the gate's); the unified cache's copy queue is never
-    # profiled, and below level 2 the cost stays one branch per site.
+    # The ring windows' timing line is printed only at GGML_SYCL_MOE_EXEC_TRACE=2. Its device times come from marker
+    # kernels on a queue the ring builds only at that level, not from the copies: copy events read for their times made
+    # the unified cache's copy queue a profiling queue, and a traced prefill stalled in the runtime below this backend.
+    # The pin guards that the copy queue is never profiled, the marks' placement and figures (readers_wait_us as the
+    # gate's command_end minus the free mark's, start_lag_us as the start mark's minus the gate's), and that below
+    # level 2 the cost stays one branch per site.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-window-timing-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-window-timing-source.py

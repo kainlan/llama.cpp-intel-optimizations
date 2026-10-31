@@ -20,7 +20,6 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
-#include "moe-exec-policy.hpp"
 #include "moe-host-scatter.hpp"
 #include "moe-resolved-batch.hpp"
 #include "moe-stream-plan.hpp"
@@ -6408,9 +6407,9 @@ unified_cache::unified_cache(sycl::queue & queue,
     // under GGML_SYCL_MOE_EXEC_TRACE=2, its copy events were counter-based timestamp events, and a traced Qwen3.8
     // prefill on the B70 stalled in its first micro-batch, at a window that varied from run to run, until the watchdog
     // ended the run; the same prefill untraced finishes. The stall is below this backend, in the runtime or the
-    // driver, and tied to no copy count or layer. The window line times marker kernels on a queue of the ring's own
-    // instead (moe_stream_phase::timing_queue), which wait on these copies from outside, so no copy is read for its
-    // device times or asked for its status.
+    // driver, and tied to no copy count or layer, nor to the first three-phase layer or the first region reuse. The
+    // window line times marker kernels on a queue of the ring's own instead (moe_stream_phase::timing_queue), which
+    // wait on these copies from outside, so no copy is read for its device times or asked for its status.
     try {
         bcs_queue_ =
             std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});

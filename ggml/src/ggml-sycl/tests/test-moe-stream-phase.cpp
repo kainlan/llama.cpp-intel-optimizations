@@ -386,7 +386,7 @@ bool fake_event_end(int ev, uint64_t * end_ns) {
         case 38:
             *end_ns = 3400000;
             return true;
-        default:  // the copies (1 to 9), and marks 25, 33 and 39, have no device times
+        default:  // every other event, the copies (1 to 9) among them, has no device times
             return false;
     }
 }

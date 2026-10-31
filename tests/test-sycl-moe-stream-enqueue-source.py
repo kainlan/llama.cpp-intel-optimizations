@@ -1904,8 +1904,10 @@ def test_refused_loan_warn_mutants():
     ungated = mutate(PHASE, LOAN_WARN_GATE, "")
     assert not c(ungated, {PHASE_REL: ungated})
     # The unconverged line re-gated, at the top as before or inside its own branch: a silent refusal under AUTO.
-    regated = mutate(PHASE, LOAN_WARN_NULL, "if (log_ == nullptr || log_->sink == nullptr || "
-                                            "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
+    # Scoped to this helper's body, like the never-emitted mutant below: other phase warnings open with the same guard
+    # and emit through the same sink call, so a whole-file replace would edit the first of them instead.
+    regated = in_body(PHASE, LOAN_WARN_SIG, LOAN_WARN_NULL, "if (log_ == nullptr || log_->sink == nullptr || "
+                      "(policy_ != moe_exec_policy::RING && log_->trace < 1)) { return; }")
     assert not c(regated, {PHASE_REL: regated})
     in_branch = mutate(PHASE, LOAN_WARN_UNCONVERGED_IF, LOAN_WARN_UNCONVERGED_IF + " " + LOAN_WARN_GATE)
     assert not c(in_branch, {PHASE_REL: in_branch})
@@ -1925,7 +1927,7 @@ def test_refused_loan_warn_mutants():
                        'bound";')
     assert not c(cap_first, {PHASE_REL: cap_first})
     # Never emitted.
-    silent = mutate(PHASE, LOAN_WARN_EMIT, "(void) line;")
+    silent = in_body(PHASE, LOAN_WARN_SIG, LOAN_WARN_EMIT, "(void) line;")
     assert not c(silent, {PHASE_REL: silent})
     # A format restated elsewhere.
     for fmt in (LOAN_WARN_FMT, LOAN_WARN_UNCONVERGED_FMT):

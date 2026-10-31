@@ -1,5 +1,6 @@
-"""Source contract for the ring windows' timing line under GGML_SYCL_MOE_EXEC_TRACE=2 (llama.cpp-8ucb, Task 12 of
-docs/plans/2026-10-24-prefill-window-ring.md; the timing source moved off the copies in llama.cpp-ivb6).
+"""Source contract for the ring windows' timing line under GGML_SYCL_MOE_EXEC_TRACE=2 (Task 12 of
+docs/plans/2026-10-24-prefill-window-ring.md). The line's timing source moved off the copies because profiled copy
+events stalled the runtime, and this gate guards that move.
 
 Host-only: reads sources, builds nothing, loads no model and touches no device. test-moe-stream-phase pins what the
 timeline records and prints (it links ggml-sycl, so only the lead runs it); this gate pins how the backend feeds it.
@@ -7,26 +8,31 @@ timeline records and prints (it links ggml-sycl, so only the lead runs it); this
 Why the copies are not timed: with the copy (BCS) queue built with enable_profiling at trace level 2, its events were
 counter-based timestamp events, and a traced Qwen3.8 prefill on the B70 stalled in its first micro-batch, at a window
 that varied from run to run, until the watchdog ended the run, while the same run untraced finished. The stall is below
-this backend, in the runtime or the driver, and tied to no copy count or layer. The window line now reads empty marker
-kernels on a profiling queue of the phase's own, which wait on the copies from outside, and no copy event is read for
-its device times or asked for its status.
+this backend, in the runtime or the driver, and tied to no copy count or layer, nor to the first three-phase layer or
+the first region reuse. The window line now reads empty marker kernels on a profiling queue of the phase's own, which
+wait on the copies from outside, and no copy event is read for its device times or asked for its status.
 
 What this gate pins, each claim with mutants that must turn it red (its positive controls). Every mutant edits an
 in-memory copy of the normalized source, never a file:
   - the line's format literal (adjacent string literals joined) appears exactly once under ggml/src/ggml-sycl,
     outside tests/, inside moe_stream_window_timeline's flush;
   - the line is trace level 2's and nothing else's: begin_layer enables the timeline from the op's decision log at
-    `trace >= 2` (the only assignment of `enabled`), each of the timeline's recorders returns at once when it is
+    `trace >= 2` unless a mark has failed (the only assignment that can turn `enabled` on; the failure path's is the
+    other, which turns it off), each of the timeline's recorders returns at once when it is
     disabled, and flush_window_timing prints only at trace level 2, through the decision log's WARN sink (the trace
     sink is INFO, which llama-bench drops without -v);
   - the cache's copy queue has no profiling at any level: the BCS queue is built in order only, by one assignment,
-    with no trace switch, no default_queue_properties() and no enable_profiling anywhere in unified-cache.cpp;
+    with no trace switch and not from default_queue_properties() (which carries enable_profiling), and the literal
+    enable_profiling appears nowhere in unified-cache.cpp;
   - the marks: stage_window, at trace level 2 only, submits the window's free and start marks just before its first
     copy (after the read gate is chosen, before the gate joins the copy's dependencies) and its end mark after the
     loop, behind the last copy. The free mark waits on the copy's dependencies without the read gate plus the copy
     queued before it, the start mark on the same plus the gate. Every mark is an empty kernel
     (ggml_sycl_submit_marker) on timing_queue(), an in-order profiling queue built lazily from the compute queue's
     context and device, and dropped when prepare() takes another compute queue;
+  - a mark that fails to submit is caught in its own helper, never by stage_window's copy abort: drop_window_timing
+    turns the timing off for the rest of the phase with one WARN, which the catalog names, and begin_layer does not
+    turn it back on;
   - the timeline reads device times only from the marks and the read gate: flush asks end_of() of exactly the start
     mark, the end mark, the gate and the free mark, the record holds no copy event, and the event reader asks for
     command_start and command_end only;
@@ -183,7 +189,8 @@ def test_literal_mutants():
 
 # ---- the trace-level gate -----------------------------------------------------------------------------------------
 
-ENABLE = "window_timing_.enabled = op.log != nullptr && op.log->trace >= 2;"
+ENABLE = "window_timing_.enabled = op.log != nullptr && op.log->trace >= 2 && !window_marks_failed_;"
+TIMING_OFF = "window_timing_.enabled = false;"
 EARLY = "if (!enabled) { return; }"
 RECORDERS = (
     "void marked(uint64_t key, const event_t & free_mark, const event_t & start_mark, "
@@ -198,15 +205,16 @@ FLUSH_SINK = "[log](const char * line) { log->sink(log->sink_ctx, line); }"
 
 
 def claim_trace_gate(plan_cpp: str, plan_hpp: str) -> bool:
-    """Level 2 enables the timeline (its one assignment, in begin_layer); every recorder returns at once when disabled;
-    the flush prints only at level 2, through the WARN sink."""
+    """Level 2 enables the timeline (the one assignment that can turn it on, in begin_layer; the other turns it off);
+    every recorder returns at once when disabled; the flush prints only at level 2, through the WARN sink."""
     cpp = norm(plan_cpp)
     hpp = norm(plan_hpp)
     begin_layer = body(cpp, "moe_exec_decision moe_stream_phase::begin_layer(")
     timeline = body(hpp, TIMELINE_SIG)
     flush = body(cpp, "void moe_stream_phase::flush_window_timing() {")
     recorders_gated = all(body(timeline, sig).startswith("{ " + EARLY) for sig in RECORDERS)
-    return (begin_layer.count(ENABLE) == 1 and cpp.count("window_timing_.enabled =") == 1 and recorders_gated
+    return (begin_layer.count(ENABLE) == 1 and cpp.count("window_timing_.enabled =") == 2
+            and cpp.count(TIMING_OFF) == 1 and recorders_gated
             and flush.count(FLUSH_GATE) == 1 and flush.count(FLUSH_SINK) == 1 and "trace_sink" not in flush)
 
 
@@ -218,6 +226,8 @@ def test_trace_gate_mutants():
     # the line at level 1, or always
     assert not claim_trace_gate(mutate(PLAN_CPP, ENABLE, ENABLE.replace(">= 2", ">= 1")), PLAN_HPP)
     assert not claim_trace_gate(mutate(PLAN_CPP, ENABLE, "window_timing_.enabled = true;"), PLAN_HPP)
+    # the failure path turning the timeline on instead of off
+    assert not claim_trace_gate(mutate(PLAN_CPP, TIMING_OFF, "window_timing_.enabled = true;"), PLAN_HPP)
     # a recorder that records while disabled, one mutant per recorder
     for sig in RECORDERS:
         gated = norm(sig) + " " + EARLY
@@ -237,7 +247,8 @@ BCS_ASSIGN_RE = re.compile(r"\bbcs_queue_ =(?!=)")
 
 def claim_bcs_plain(uc_cpp: str) -> bool:
     """The BCS queue is built in order only, by its one assignment: no trace level switches it, it is not built from
-    default_queue_properties() (which carries enable_profiling), and no queue in the file takes enable_profiling."""
+    default_queue_properties() (which carries enable_profiling), and the literal enable_profiling appears nowhere in
+    the file. Other queues in the file may still use default_queue_properties(); this claim binds the BCS queue."""
     n = norm(uc_cpp)
     return (n.count(BCS_PLAIN) == 1 and len(BCS_ASSIGN_RE.findall(n)) == 1 and "enable_profiling" not in n
             and "bcs_profiling" not in n and "moe_exec_config_parse(" not in n)
@@ -322,7 +333,7 @@ def claim_marks(plan_cpp: str, plan_hpp: str) -> bool:
     return (stage.count(TIMING_KEY) == 1 and stage.count(MARK_AT) == 1 and stage.count(END_AT) == 1
             and ordered(stage, TIMING_KEY, REUSE_TAKE, MARK_AT, REUSE_DEP, COPY_DECL, LOOP_END, END_AT, "return n;")
             and n.count("mark_window_start(") == 2 and n.count("mark_window_end(") == 2
-            and body(n, START_SIG) == START_BODY and body(n, END_SIG) == END_BODY
+            and body(body(n, START_SIG), "try {") == START_BODY and body(body(n, END_SIG), "try {") == END_BODY
             and n.count(MARK_KERNEL) == 1 and n.count(MARKER) == 3
             and body(n, TQ_SIG) == TQ_BODY and n.count("timing_queue_.emplace(") == 1 and n.count("timing_queue()") == 3
             and prepare.count(NEW_CCS) == 1 and n.count("timing_queue_.reset();") == 1
@@ -359,11 +370,71 @@ def test_marks_mutants():
     # the timing queue without profiling (its marks would have no device times)
     assert not claim_marks(mutate(PLAN_CPP, "default_queue_properties()", "sycl::property::queue::in_order{}"),
                            PLAN_HPP)
-    # a timing queue kept across a new compute queue, whose events it cannot wait on
+    # a timing queue kept across a new compute queue object: prepare() drops it on any new queue, and the next mark
+    # builds it again
     assert not claim_marks(mutate(PLAN_CPP, " timing_queue_.reset();", ""), PLAN_HPP)
     # a barrier instead of the marker kernel
     assert not claim_marks(mutate(PLAN_CPP, "ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps); if (gate)",
                                   "q.ext_oneapi_submit_barrier(deps); if (gate)"), PLAN_HPP)
+
+
+# ---- a mark that fails ---------------------------------------------------------------------------------------------
+
+MARK_CATCH = "catch (const sycl::exception & e) { drop_window_timing(e); }"
+DROP_SIG = "void moe_stream_phase::drop_window_timing(const sycl::exception & e) {"
+DROP_WARN = ('"[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines from this '
+             'phase"')
+DROP_SINK = "log_->sink(log_->sink_ctx, line);"
+DROP_BODY = ("{ window_marks_failed_ = true; " + TIMING_OFF + " if (log_ == nullptr || log_->sink == nullptr) { "
+             "return; } char line[384]; std::snprintf(line, sizeof(line), " + DROP_WARN + ", device_, e.what()); "
+             + DROP_SINK + " }")
+COPY_ABORT = 'catch (const std::exception & e) { GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what()); }'
+FAILED_MEMBER = "bool window_marks_failed_ = false;"
+
+
+def claim_mark_failure(plan_cpp: str, plan_hpp: str, doc: str) -> bool:
+    """Each mark helper wraps its whole body in a try whose one handler, for sycl::exception, hands the failure to
+    drop_window_timing; nothing in stage_window calls it, and stage_window's copy handler still aborts, so a mark's
+    failure never reaches the copy abort and a copy's never turns the timing off. drop_window_timing sets the sticky
+    flag, turns the timeline off and warns once through the decision log's WARN sink (the phase makes no log call of
+    its own), without aborting or throwing; begin_layer keeps it off while the flag is set; the catalog names the
+    warning."""
+    n = norm(plan_cpp)
+    stage = body(n, STAGE_SIG)
+    return (body(n, START_SIG) == "{ try " + START_BODY + " " + MARK_CATCH + " }"
+            and body(n, END_SIG) == "{ try " + END_BODY + " " + MARK_CATCH + " }"
+            and n.count(MARK_CATCH) == 2 and n.count("drop_window_timing(") == 3
+            and body(n, DROP_SIG) == DROP_BODY and n.count("window_marks_failed_ = true;") == 1
+            and "drop_window_timing" not in stage and stage.count(COPY_ABORT) == 1
+            and n.count(ENABLE) == 1 and norm(plan_hpp).count(FAILED_MEMBER) == 1
+            and DROP_WARN.strip('"') in re.sub(r"\s+", " ", doc))
+
+
+def test_mark_failure():
+    assert claim_mark_failure(PLAN_CPP, PLAN_HPP, ENV_DOC)
+
+
+def test_mark_failure_mutants():
+    # a mark's failure left to stage_window's copy handler, which aborts the prompt: either helper without its try
+    assert not claim_mark_failure(mutate(PLAN_CPP, "try " + START_BODY + " " + MARK_CATCH, START_BODY), PLAN_HPP,
+                                  ENV_DOC)
+    assert not claim_mark_failure(mutate(PLAN_CPP, "try " + END_BODY + " " + MARK_CATCH, END_BODY), PLAN_HPP, ENV_DOC)
+    # the mark's handler rethrowing into the copy abort
+    assert not claim_mark_failure(mutate(PLAN_CPP, "{ drop_window_timing(e); }", "{ drop_window_timing(e); throw; }",
+                                         count=2), PLAN_HPP, ENV_DOC)
+    # the failure path aborting like the copy's, or leaving the timeline on
+    aborting = DROP_BODY.replace(DROP_SINK, 'GGML_ABORT("%s", line);')
+    assert not claim_mark_failure(mutate(PLAN_CPP, DROP_BODY, aborting), PLAN_HPP, ENV_DOC)
+    assert not claim_mark_failure(mutate(PLAN_CPP, " " + TIMING_OFF, ""), PLAN_HPP, ENV_DOC)
+    # begin_layer turning the timing back on at the next layer, so the warning repeats
+    assert not claim_mark_failure(mutate(PLAN_CPP, " && !window_marks_failed_;", ";"), PLAN_HPP, ENV_DOC)
+    # the copy's failure swallowed by the timing's path instead of aborting
+    assert not claim_mark_failure(mutate(PLAN_CPP, COPY_ABORT, "catch (const sycl::exception & e) { "
+                                         "drop_window_timing(e); }"), PLAN_HPP, ENV_DOC)
+    # the warning missing from the catalog
+    warn = DROP_WARN.strip('"')
+    assert warn in re.sub(r"\s+", " ", ENV_DOC), "mutant precondition: the catalog names the warning"
+    assert not claim_mark_failure(PLAN_CPP, PLAN_HPP, ENV_DOC.replace("window timing marks failed", "window marks"))
 
 
 # ---- what the timeline reads --------------------------------------------------------------------------------------

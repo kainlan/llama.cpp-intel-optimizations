@@ -1176,6 +1176,7 @@ class moe_stream_phase {
     sycl::queue &     timing_queue();
     void mark_window_start(uint64_t key, std::vector<sycl::event> deps, const std::optional<sycl::event> & gate);
     void mark_window_end(uint64_t key, const sycl::event & last_copy);
+    void              drop_window_timing(const sycl::exception & e);
     void              warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li);
     void              warn_loan_refused(size_t bytes_short) const;
     void              warn_partial_released(uint32_t held) const;
@@ -1214,8 +1215,12 @@ class moe_stream_phase {
     bool     next_window_whole_      = false;       // that prefetch staged every matrix of its window
     // The queue the window timing's marks go on under GGML_SYCL_MOE_EXEC_TRACE=2: built at the first mark
     // (timing_queue()), dropped when prepare() takes another compute queue, never built below trace level 2. Declared
-    // ahead of the timeline, so the marks the records hold go before their queue does.
+    // ahead of the timeline, so the marks the records hold go before their queue does. Records may still hold marks
+    // of a queue prepare() dropped: a SYCL event outlives its queue, so those marks stay valid and the next flush
+    // reads them.
     std::optional<sycl::queue>              timing_queue_;
+    // A timing mark failed to submit (drop_window_timing()): the window timing stays off for the rest of this phase.
+    bool                                    window_marks_failed_ = false;
     // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
     // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
     // and flush_window_timing() prints and clears it. Written by the submitting thread only, so it takes no lock.
