@@ -887,10 +887,45 @@ static bool run_explicit_ubatch_ring_placement_test() {
         ok = false;
     }
 
-    // The ring each context re-plans for. A load that PLACED the micro-batch keeps the ring at that size for every
-    // context whose own micro-batch is no larger (llama-bench's -p 512 and -n 128 contexts under -ub 2048), so none of
-    // them releases the placed ring for the next context to re-admit. A larger context, a context that names no
-    // micro-batch, and every plan that placed nothing re-plan for the context's own micro-batch.
+    if (ok) {
+        printf(
+            "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "
+            "only when they cannot give it\n");
+    }
+    return ok;
+}
+
+// The ring each context re-plans for. A load that PLACED the micro-batch keeps the ring at that size for every context
+// whose own micro-batch is no larger (llama-bench's -p 512 and -n 128 contexts under -ub 2048), so none of them releases
+// the placed ring for the next context to re-admit. A larger context, a context that names no micro-batch, and every
+// plan that placed nothing re-plan for the context's own micro-batch. The plans are the ring-placement case's.
+static bool run_explicit_ubatch_ring_kept_for_smaller_contexts_test() {
+    using namespace explicit_ubatch_case;
+    using action         = ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
+    const auto   name    = ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name;
+    const size_t triplet = kv_order_case::triplet_bytes;
+
+    const auto placed  = plan(2 * triplet, zone_explicit);
+    const auto grow    = plan(8 * triplet, zone_default);
+    const auto partial = plan(2 * triplet, zone_default);
+    const auto none    = plan(0, zone_default);
+    const auto unnamed = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+    // The rule reads the decision, so each plan must make the one this case names, or the case proves nothing.
+    if (placed.explicit_ubatch.action != action::PLACE || placed.explicit_ubatch.n_ubatch != 2048 ||
+        grow.explicit_ubatch.action != action::GROW_ZONE || partial.explicit_ubatch.action != action::REFUSE ||
+        none.explicit_ubatch.action != action::REFUSE || unnamed.explicit_ubatch.action != action::NONE) {
+        printf(
+            "FAIL: the ring-keep plans decide %s at %u, %s, %s, %s and %s; want place at 2048, grow-zone, refuse, "
+            "refuse and none\n",
+            name(placed.explicit_ubatch.action), placed.explicit_ubatch.n_ubatch, name(grow.explicit_ubatch.action),
+            name(partial.explicit_ubatch.action), name(none.explicit_ubatch.action),
+            name(unnamed.explicit_ubatch.action));
+        return false;
+    }
+
+    const auto &   xub        = placed.explicit_ubatch;
     const uint32_t kept_128   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 128);
     const uint32_t kept_512   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 512);
     const uint32_t kept_2048  = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 2048);
@@ -910,15 +945,10 @@ static bool run_explicit_ubatch_ring_placement_test() {
             "and 2048 re-plan for %u, %u and %u, at 4096 for %u, at 0 for %u, and plans that placed nothing for the "
             "context's own %d; want 2048, 2048, 2048, 4096, 0 and 1\n",
             kept_128, kept_512, kept_2048, own_4096, own_0, others_own ? 1 : 0);
-        ok = false;
+        return false;
     }
-
-    if (ok) {
-        printf(
-            "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "
-            "only when they cannot give it\n");
-    }
-    return ok;
+    printf("PASS: a placed explicit micro-batch keeps its ring for every context of the load no larger than it\n");
+    return true;
 }
 
 // Layer 0's triplets are four times layer 1's. The room's cost is net: with the room added back, the first-fit pack
@@ -4041,6 +4071,7 @@ int main() {
         mock_ok = run_moe_triplet_planner_test() && mock_ok;
         mock_ok = run_kv_context_room_before_experts_test() && mock_ok;
         mock_ok = run_explicit_ubatch_ring_placement_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_ring_kept_for_smaller_contexts_test() && mock_ok;
         mock_ok = run_kv_context_room_cost_is_net_test() && mock_ok;
         mock_ok = run_explicit_ubatch_cost_is_net_test() && mock_ok;
         mock_ok = run_kv_context_room_follows_the_requested_context_test() && mock_ok;
