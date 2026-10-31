@@ -677,10 +677,50 @@ PP arm with 0 refusals, and with 0 misses where the arm's line reports them (not
 `trace_misses=0`). The explicit `-ub 2048` arm placed without a refusal (`llama.cpp-86bl`).
 
 **This is a record, not a baseline for the Qwen prefill figures**: the 200/500 floors are unmet with the ring fully
-engaged, and the attribution is `llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`. The three FAILs are `Q_pp`,
+engaged, and the attribution is `llama.cpp-8ucb`'s (see "Attribution at 3eb28b301" below). The three FAILs are `Q_pp`,
 `Q_pp_ub2048` and `GO_pp`. `GO_pp` failed on both items: pp512 is the `llama.cpp-zuze` master regression, and tg128
 39.2 is above the 31.0-33.0 band, which is a baseline question for that ticket's neighbourhood and not a Task 10
 defect (c-4m7d). Q_pp_cpu reads 16.0 and 47.5 on this tree, so the ring is 4.8x and 1.6x over the CPU executor.
+
+### Attribution at 3eb28b301 (`llama.cpp-8ucb`, 2026-10-31)
+
+Lead-run on the merge tree at master 3eb28b301 (`llama.cpp-ivb6` merged), Arc Pro B70 (`level_zero:0`),
+Qwen3.8-Flash-Next-GSQ-RCO IQ3_XXS, `llama-bench -p 2048 -n 0 -r 3 -fa 1`; every arm rc=0, `builders` 0, `Shmem`
+0.58 GB flat, kernel log 0 GT-reset/guc_id/CAT-error lines; comments c-w5fg and c-3xqg on the task, outputs in the
+session scratchpad `8ucb-roundD/`. The ring engaged on all 368 layer-ubatches in every arm with 0 refusals, 0 loans
+and 0 misses.
+
+Trace perturbation (U T T U, `GGML_SYCL_MOE_EXEC_TRACE=2` on the T arms): pp2048 74.20 / 75.20 / 75.28 / 76.83 t/s;
+traced and untraced agree within the untraced spread, so the window lines describe the untraced path.
+
+Per-window budget of one engaged layer-ubatch (2688 windows over 368 layer-ubatches): 232.9 MiB copied in 9.30 ms
+(26.3 GB/s against the probe's 25.6; pinned source), `readers_wait_us` 0 on 2677 of 2688 windows, host submit 7.8 ms,
+420 launches, exposed-window start lag 17.8 ms median, MoE op host time ~32 ms; the cost model predicted
+`t_ring` 69-88 ms per layer-ubatch. Candidates (b) pageable source, (c) readers_done serialisation and (d) copy
+granularity are dead by measurement; (a) launch overhead is real but small.
+
+**The largest contributor is not the ring.** The per-layer-embedding table `per_layer_token_embd.weight` (IQ4_NL
+[160, 320001536], 27466 MiB, 16 random 90-byte rows per token) stays mmap-backed under upstream's lazy-read AUTO
+mode ("lazy read enabled", `CPU_Mapped model buffer size = 27465.95 MiB`) and the CPU scheduler split page-faults it
+from the degraded bcachefs array on every ubatch: a state+wchan sampler put the bench main thread in D state on
+`bch2_read_single_folio` for 90 of 138 samples in ~4.7 s bursts per ~6.8 s ubatch, the DWARF stack runs
+`ggml_compute_forward_get_rows` -> `dequantize_row_iq4_nl` -> page fault -> bcachefs read, and the GT idle sampler
+shows the B70 busy ~2 s then idle for the rest of each ubatch. Same-binary ABBA on `llama-bench -lzm`:
+
+| arm | lazy mode | pp2048 t/s | sd |
+|---|---|---:|---:|
+| lzm_auto_1 | auto (default) | 76.95 | 0.43 |
+| lzm_off_1 | off | 265.82 | 3.44 |
+| lzm_off_2 | off | 266.42 | 4.68 |
+| lzm_auto_2 | auto (default) | 76.57 | 0.58 |
+
+3.46x from the load mode alone; with the table read into RAM the device is 99 % busy through the pp phases and the
+ring executes at or under its predicted `t_ring` (a 512-token ubatch takes 1.93 s for 47 MoE layers). The follow-up
+is `llama.cpp-th32` (planner-decided placement of lazy n-gram tables). The remaining gap to the 500 floor is device
+time the kernel profiler does not attribute (434 ms of ~1930 ms per ubatch are labelled; the `moe.pp.dequant` label
+records ~100 ns per launch): `llama.cpp-qmen`, then the dequant/GEMM work under `llama.cpp-36j0`. **These are
+records, not baselines**; at the default load mode every Qwen3.8 prefill figure on this host measures the disk, not
+the executor, and the 200/500 floors were set for the executor.
 
 Against the 4229a205d record (c-4m7d): Q_pp pp512 30.9 ± 29.39 -> 76.5 ± 0.17, because the straddle is gone and the
 ring engages on the first context with no loan (`llama.cpp-86bl`, `llama.cpp-384v`); pp2048 66.5 -> 75.7; Q_pp_ub2048

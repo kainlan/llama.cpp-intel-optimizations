@@ -1736,7 +1736,15 @@ Step by step:
 9. **Record:** the figures are the baselines subsection "Record at 671279356" in `docs/backend/sycl-perf-baselines.md`.
 
 The expectation on throughput was not met: the ring is engaged and numerically correct, but the 200 and 500 t/s floors
-are unmet. The attribution is `llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`.
+are unmet. The attribution (`llama.cpp-8ucb`, c-w5fg and c-3xqg, 2026-10-31 on master 3eb28b301) found the
+largest contributor outside the ring: the 27.5 GB `per_layer_token_embd.weight` n-gram table stays mmap-backed under
+the loader's lazy-read AUTO mode and is page-faulted from the degraded bcachefs array by the CPU scheduler split on
+every ubatch (~4.7 s of a ~6.8 s ubatch, GPU idle). With the table read into RAM (`llama-bench -lzm off`, same binary,
+ABBA) pp2048 is 265.8/266.4 t/s against 76.9/76.6 at the default, and the ring runs at or under its predicted
+`t_ring`. Follow-ups: `llama.cpp-th32` (planner-decided placement of lazy tables) for the table, and
+`llama.cpp-qmen` then `llama.cpp-36j0` for the unattributed device time that remains between 266 and the 500 floor.
+The per-window budget itself (copy at 26.3 GB/s, readers_wait 0, submit 7.8 ms, exposed-window lag 17.8 ms) is in
+the baselines subsection "Attribution at 3eb28b301".
 
 ---
 
