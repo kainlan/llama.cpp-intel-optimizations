@@ -21,8 +21,14 @@
 //    capability query would serve (MXFP4 is the one type a prompt kernel reads
 //    as SOA, MMVQ_COMPAT, and no plan is published, so nothing claims it), is
 //    refused by the tag check and counted. So is a Q4_0 AOS entry over the
-//    SOA-tagged slot, which the capability query alone would serve. The phase's
-//    refusals name each cause, as the trace prints them (plan Task 8). A Q4_0
+//    SOA-tagged slot, which the capability query alone would serve. A Q4_0
+//    SOA entry over the SOA-tagged slot agrees with its tag but is refused all
+//    the same: the only prompt kernel that reads Q4_0 as SOA is the oneDNN
+//    batched prompt executor (llama.cpp-348c), and a staged slot is served only
+//    with MMVQ_COMPAT (c-las5), so the staged route refuses the kernel, which it
+//    asks before the tag whatever the slot. The phase's refusals name each
+//    cause, as the trace prints them: two layout refusals and one kernel
+//    refusal, with the query's reason (plan Task 8). A Q4_0
 //    AOS entry over the AOS slot whose consumer is the batched prompt executor
 //    (llama.cpp-3460) is one the route would serve in every other respect, as
 //    case 1 shows, so only the entry's consumer refuses it, as claimed, before
@@ -227,6 +233,7 @@ int main() {
         const int32_t miss_ids[]    = { 6, 6 };
         const int32_t tag_ids[]     = { 7, 7 };
         const int32_t soa_tag_ids[] = { 2, 2 };
+        const int32_t soa_q4_ids[]  = { 4, 4 };
         const int32_t claimed_ids[] = { 1, 1 };
         size_t        served = 0, refused = 0;
 
@@ -285,6 +292,18 @@ int main() {
                   moe_batch_reject_reason_name(mistagged.reject));
             counts(backend, &served, &refused);
             CHECK(served == 1 && refused == 2, "the tag refusal is counted (served %zu, refused %zu)", served, refused);
+            // A Q4_0 SOA entry over the SOA-tagged slot: the tags agree, but the only prompt kernel that reads Q4_0 as
+            // SOA is the oneDNN batched executor (ONEDNN_BATCHED_PROMPT, llama.cpp-348c), and a staged slot is served
+            // only with MMVQ_COMPAT, so the staged route refuses the kernel before the tag is looked at.
+            CHECK(test_moe_stream_insert_staged(backend, kLayer, 4, role, slot_s, fill_s, GGML_LAYOUT_SOA),
+                  "a Q4_0 SOA entry over the SOA-tagged slot goes into the stage table");
+            const moe_resolved_batch_result soa_q4 =
+                test_moe_staged_ring_build(backend, src0, soa_q4_ids, 2, 1, GGML_LAYOUT_SOA);
+            CHECK(!soa_q4, "a Q4_0 SOA entry is refused and falls through (reject %s)",
+                  moe_batch_reject_reason_name(soa_q4.reject));
+            counts(backend, &served, &refused);
+            CHECK(served == 1 && refused == 3, "the Q4_0 SOA refusal is counted (served %zu, refused %zu)", served,
+                  refused);
             // A Q4_0 AOS entry over the AOS slot, as case 1's, that the batched executor consumes: only the consumer
             // refuses it.
             CHECK(test_moe_stream_insert_staged(backend, kLayer, 1, role, slot_a, fill_a, GGML_LAYOUT_AOS,
@@ -296,7 +315,7 @@ int main() {
                   "an entry the executor consumes is refused and falls through to the route core (reject %s)",
                   moe_batch_reject_reason_name(claimed.reject));
             counts(backend, &served, &refused);
-            CHECK(served == 1 && refused == 3, "the consumer refusal is counted (served %zu, refused %zu)", served,
+            CHECK(served == 1 && refused == 4, "the consumer refusal is counted (served %zu, refused %zu)", served,
                   refused);
             // The phase has no index entry for the weight, so the executor does not take it whole: the entry is a
             // refusal, not a handoff.
@@ -304,8 +323,10 @@ int main() {
             CHECK(n_handed_off == 0, "an executor entry on a weight the executor does not take is no handoff (%zu)",
                   n_handed_off);
             const std::string causes = refusals(backend);
-            CHECK(causes == "layout=2 claimed=1",
-                  "the refusals name their causes: two layout, one claimed (got \"%s\")", causes.c_str());
+            CHECK(causes == "layout=2 kernel(local-onednn-batched-prompt)=1 claimed=1",
+                  "the refusals name their causes: two layout, one kernel with the query's reason, one claimed "
+                  "(got \"%s\")",
+                  causes.c_str());
 
             // Case 5: the next micro-batch starts with an empty table and reads its own slot.
             CHECK(test_moe_stream_begin_ubatch(backend, 2), "the next micro-batch begins");
