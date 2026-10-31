@@ -886,7 +886,9 @@ struct placement_explicit_ubatch {
     size_t                               ring_bytes               = 0;  // the whole ring at n_ubatch
     size_t                               room_bytes               = 0;  // its RUNTIME zone over the default ring's
     size_t                               room_reserved_bytes      = 0;  // of that room, what the zone already holds
-    size_t                               expert_budget_bytes      = 0;  // the device bytes left to the routed experts
+    // The device bytes left to the routed experts when the room was decided. They still count bytes the window ring's
+    // room, held after this one as the last term before the pack, may later hold: the composition order is ruled.
+    size_t                               expert_budget_bytes      = 0;
     // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
     // first-fit pack puts there with the held room added back (all 0 when nothing was held). The room moved the
     // difference. Counting instead the triplets that fit the second budget and not the real one over-states it, as

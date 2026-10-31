@@ -2743,22 +2743,26 @@ the room the planner holds for an explicit micro-batch, the check above and its
 WARN all ask it. So the zone a plan counts on and the zone the arena holds
 cannot round apart.
 
-The planner computes the RUNTIME room the ring and the dense scratch need at that
-micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as
-a named term on the routed-expert budget, at the start of the MoE block. By then the dense
-weights, their KV and the KV context room are placed, so the room never moves a
-dense layer or KV. That answers the objection above to growing the zone at load:
-the requested context's KV room is now held first, so KV still wins. The experts
-are packed into the budget less the hold. The hold is the whole room both before
-and after the zone grows, so the plan the load grows the zone for is the plan it
-keeps. When the experts can give the room, the load grows the RUNTIME zone and
-plans again. The experts that no longer fit go to the host tier, where the CPU
-runs them. The first context after the load prints one WARN line, whatever
-micro-batch that context runs, because the line names the micro-batch the load
-placed (`placement_explicit_ubatch_announces()`). So a `-p` below `-ub` still
-announces it. The plan that context publishes carries a mark, and every later
-context's plan copies it, so a `-d` or `-fa` list that opens more contexts on
-the same model does not print it again:
+The planner computes the RUNTIME room the ring and the dense scratch need at
+that micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that
+room as a named term on the routed-expert budget, at the start of the MoE block.
+By then the dense weights, their KV and the KV context room are placed, so the
+room never moves a dense layer or KV. That answers the objection above to
+growing the zone at load: the requested context's KV room is now held first, so
+KV still wins. The window ring's room is held after it, as the last term before
+the expert pack. So the routed-expert budget the decision reads still counts
+bytes that room may later hold. They are not subtracted: the composition order
+is ruled, and this room is held first. The experts are packed into the budget
+less the holds. The hold is the whole room both before and after the zone grows,
+so the plan the load grows the zone for is the plan it keeps. When the experts
+can give the room, the load grows the RUNTIME zone and plans again. The experts
+that no longer fit go to the host tier, where the CPU runs them. The first
+context after the load prints one WARN line, whatever micro-batch that context
+runs, because the line names the micro-batch the load placed
+(`placement_explicit_ubatch_announces()`). So a `-p` below `-ub` still announces
+it. The plan that context publishes carries a mark, and every later context's
+plan copies it, so a `-d` or `-fa` list that opens more contexts on the same
+model does not print it again:
 
 ```
 [SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB: it re-placed <X> MB of routed experts

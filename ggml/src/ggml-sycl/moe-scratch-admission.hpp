@@ -235,7 +235,8 @@ pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_a
 // The RUNTIME zone is sized as the arena sizes it: the larger of its floor and the planned requirement, rounded up to
 // 256 bytes. The requirement splits into the ring, the dense scratch (both scale with the micro-batch) and a fixed
 // rest. The room is what the zone for N needs beyond the zone for the default micro-batch. Zones never shrink, so a
-// zone already grown (an earlier stage of the same load) may hold part or all of it.
+// zone already grown (by an earlier stage of the same load, or by an earlier load in the process) may hold part or all
+// of it.
 struct pp_moe_onednn_explicit_ubatch_inputs {
     uint32_t n_ubatch                    = 0;  // the explicit micro-batch; 0 = none
     uint32_t n_ubatch_default            = 0;  // the load's own planning micro-batch
@@ -283,7 +284,9 @@ pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
     const pp_moe_onednn_explicit_ubatch_inputs & in);
 
 // Pure: the decision, given the device bytes the routed experts are packed into once the dense weights, their KV and
-// the KV context room are placed (`expert_budget_bytes`, with the zone as it is now).
+// the KV context room are placed (`expert_budget_bytes`, with the zone as it is now). The planner asks before it holds
+// the window ring's room, the last term before the expert pack, so the figure still counts bytes that room may later
+// hold. They are not subtracted: the composition order is ruled, and this room is held first.
 pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide(
     const pp_moe_onednn_explicit_ubatch_room & room,
     size_t                                     expert_budget_bytes);
