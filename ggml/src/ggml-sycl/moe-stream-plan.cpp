@@ -18,7 +18,7 @@
 #include <cstring>
 #include <exception>
 
-// The window timing's mark, an empty kernel (moe_stream_phase::mark_window_start).
+// The window timing's mark, an empty kernel (moe_stream_phase::mark_window_start and mark_window_end).
 class moe_stream_timing_mark;
 
 namespace ggml_sycl {
@@ -288,11 +288,18 @@ sycl::queue & moe_stream_phase::timing_queue() {
 
 // The window's free and start marks, submitted just before its first copy, so the window's own submit loop does not
 // end them late. `deps` is everything that copy waits on except `gate`, its read gate. The free mark also waits for the
-// copy queued before, since the copy queue is in order; the start mark adds the gate. A mark that fails to submit is
-// caught here, not by stage_window()'s copy handler: drop_window_timing() turns the timing off and the copies go on.
+// copy queued before, since the copy queue is in order; the start mark adds the gate. A later stage of a window already
+// marked submits nothing: marked() keeps the first copy's marks and would discard these. A mark that fails to submit,
+// or a record that cannot grow (std::bad_alloc), is caught here, not by stage_window()'s copy handler:
+// drop_window_timing() turns the timing off and the copies go on. A planned refusal (ggml_sycl_fallback_error) is
+// rethrown, as stage_window()'s handler rethrows it.
 void moe_stream_phase::mark_window_start(uint64_t                           key,
                                          std::vector<sycl::event>           deps,
                                          const std::optional<sycl::event> & gate) {
+    const auto * prior = window_timing_.find(key);
+    if (prior != nullptr && prior->start_marked) {
+        return;
+    }
     try {
         if (window_timing_.queue_tail) {
             deps.push_back(*window_timing_.queue_tail);
@@ -304,28 +311,34 @@ void moe_stream_phase::mark_window_start(uint64_t                           key,
         }
         const sycl::event start_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps);
         window_timing_.marked(key, free_mark, start_mark, gate);
-    } catch (const sycl::exception & e) {
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
         drop_window_timing(e);
     }
 }
 
-// The window's end mark, behind its last copy. A failure to submit it is caught as the start marks' is.
+// The window's end mark, behind its last copy. A failure to submit or record it is caught as the start marks' is;
+// stage_window() calls this after its copy handler's try, so nothing else would catch it.
 void moe_stream_phase::mark_window_end(uint64_t key, const sycl::event & last_copy) {
     try {
         window_timing_.ended(key, ggml_sycl_submit_marker<moe_stream_timing_mark>(timing_queue(), { last_copy }));
-    } catch (const sycl::exception & e) {
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
         drop_window_timing(e);
     }
 }
 
-// A timing mark, or the timing queue built for it, threw. The marks are a diagnostic that nothing the copies or the
-// readers wait on depends on, so the prompt goes on, with one warning through the decision log's WARN sink, as the
-// phase's other lines go. That warning comes at most once per backend context: window timing then stays off for every
-// later prompt in that context, because this phase lives in the backend context and the per-prompt reset does not
-// clear window_marks_failed_, and begin_layer does not turn it back on. Windows begun before the failure still print
-// at the next flush. The window being begun when a mark failed, and any window it prefetched, print nothing: their
-// marks went in while they were staged, before begun(), and begun() records nothing once the timing is off.
-void moe_stream_phase::drop_window_timing(const sycl::exception & e) {
+// A timing mark, the timing queue built for it, or the records' growth threw. The marks are a diagnostic that nothing
+// the copies or the readers wait on depends on, so the prompt goes on, with one warning through the decision log's
+// WARN sink, as the phase's other lines go. That warning comes at most once per backend context: window timing then
+// stays off for every later prompt in that context, because this phase lives in the backend context and the
+// per-prompt reset does not clear window_marks_failed_, and begin_layer does not turn it back on. Windows begun before
+// the failure still print at the next flush. The window being begun when a mark failed, and any window it prefetched,
+// print nothing: their marks went in while they were staged, before begun(), and begun() records nothing once the
+// timing is off.
+void moe_stream_phase::drop_window_timing(const std::exception & e) {
     window_marks_failed_   = true;
     window_timing_.enabled = false;
     if (log_ == nullptr || log_->sink == nullptr) {
@@ -401,6 +414,9 @@ void moe_stream_phase::prepare(const placement_plan & plan, int device, sycl::qu
     if (!same_queue) {
         ccs_.emplace(ccs);
         timing_queue_.reset();  // built anew at the next mark, on this queue's context and device
+        // The copy queued before goes too: under a new compute queue it may be another device's copy, which the next
+        // free mark, built on this queue's context, must not wait on.
+        window_timing_.queue_tail.reset();
         // A region's readers, the executor's dequants, run in order on this queue, and its read gates are barriers on
         // it; on any other queue the ring is not offered, and the ring-unavailable diagnostic says so.
         in_order_ = ccs.is_in_order();
@@ -661,6 +677,9 @@ void moe_stream_phase::teardown(sycl::event last_use) {
     table_.clear();
     reset_regions();
     geo_ = moe_stream_ring_geometry();
+    // The ring is given back, so the next ring's first free mark waits behind no copy of this one. This and a new
+    // compute queue in prepare() are the only places that forget the queue's last copy; a flush keeps it.
+    window_timing_.queue_tail.reset();
 }
 
 // The layer's decision goes to the decision log, its change line and its trace line (moe_exec_decision_log::note). The
@@ -775,6 +794,7 @@ bool moe_stream_phase::test_reserve_ring(int device, const moe_stream_ring_geome
     geo_            = geo;
     reserve_failed_ = false;
     ccs_.emplace(ccs);
+    timing_queue_.reset();  // as prepare() does: the timing queue follows the compute queue
     in_order_ = ccs.is_in_order();
     return ring_ready(nullptr);
 }

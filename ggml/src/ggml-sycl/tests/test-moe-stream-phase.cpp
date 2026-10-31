@@ -467,10 +467,11 @@ void test_window_timing_records_one_record_per_window_only_under_trace() {
           lines[1] ==
               "[MOE-EXEC-TRACE] window device 0 layer 4 role up phase 1 bytes=1000 exposed=0 submit_us=4 "
               "copy_us=-1 readers_wait_us=80 start_lag_us=20 launches=2");
-    // The flush empties the timeline and forgets the queue's last copy: the next boundary prints only what came after
-    // it, and the first free mark after it waits on its own copy's dependencies alone.
+    // The flush empties the timeline and keeps the queue's last copy: the next boundary prints only what came after
+    // it, and the first free mark after it still waits behind that copy, the never-begun prefetch's, which may still be
+    // in flight on the in-order copy queue.
     CHECK((*on_at).records.empty());
-    CHECK(!(*on_at).queue_tail.has_value());
+    CHECK((*on_at).queue_tail == std::optional<int>(9));
     CHECK((*on_at).flush(0, end_of, sink) == 0);
 
     // The same window in the next micro-batch is a record of its own: micro-batch 7's window 0, staged again after the

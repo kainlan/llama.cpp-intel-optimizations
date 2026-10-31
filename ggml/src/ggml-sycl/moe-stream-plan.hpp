@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -856,12 +857,9 @@ template <typename event_t> struct moe_stream_window_timeline {
 
     bool                   enabled = false;  // trace level 2
     std::vector<record>    records;
-    std::optional<event_t> queue_tail;       // the latest copy recorded since the previous flush
+    std::optional<event_t> queue_tail;       // the latest copy recorded; a flush keeps it, the phase resets it
 
-    void clear() {
-        records.clear();
-        queue_tail.reset();
-    }
+    void clear() { records.clear(); }
 
     // The latest record under `key`: a window's records are recent, so the search runs from the back.
     record * find(uint64_t key) {
@@ -1174,12 +1172,12 @@ class moe_stream_phase {
     void              report_window(int layer, expert_tensor_role role, size_t phase, const stage_counts & n) const;
     void              report_staged_routes();
     sycl::queue &     timing_queue();
-    void mark_window_start(uint64_t key, std::vector<sycl::event> deps, const std::optional<sycl::event> & gate);
-    void mark_window_end(uint64_t key, const sycl::event & last_copy);
-    void drop_window_timing(const sycl::exception & e);
     void              warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li);
     void              warn_loan_refused(size_t bytes_short) const;
     void              warn_partial_released(uint32_t held) const;
+    void mark_window_start(uint64_t key, std::vector<sycl::event> deps, const std::optional<sycl::event> & gate);
+    void mark_window_end(uint64_t key, const sycl::event & last_copy);
+    void drop_window_timing(const std::exception & e);
 
     std::unique_ptr<moe_stream_ring>                ring_;
     // A refused reserve's ring and the slots it got, for the next micro-batch's ring_ready() to continue from while a

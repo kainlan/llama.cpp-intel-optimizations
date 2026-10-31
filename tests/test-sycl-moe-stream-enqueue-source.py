@@ -410,8 +410,9 @@ def test_abort_mutants():
     # the enqueue's handler narrowed (the phase has other std::exception handlers, so the mutant names this one)
     assert not claim_submission_failure_aborts(
         mutate(PHASE, "catch (const std::exception & e) { " + ABORT, "catch (const sycl::exception & e) { " + ABORT))
-    # the planned refusal swallowed by the abort
-    assert not claim_submission_failure_aborts(mutate(PHASE, RETHROW + " ", ""))
+    # the planned refusal swallowed by the abort. Scoped to stage_window's body: the window timing's mark helpers
+    # rethrow a planned refusal too, earlier in the file, so a whole-file replace would edit the first of them instead.
+    assert not claim_submission_failure_aborts(in_body(PHASE, STAGE_SIG, RETHROW + " ", ""))
     # the copy moved out of the guarded block
     n = norm(PHASE)
     copy_stmt = n[n.find(COPY_DECL):n.find(";", n.find(COPY_DECL)) + 1]

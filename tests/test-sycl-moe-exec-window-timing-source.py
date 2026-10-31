@@ -38,7 +38,8 @@ in-memory copy of the normalized source, never a file:
     command_start and command_end only;
   - copy_us is the end mark's end after the start mark's end; readers_wait_us is the gate's end after the free mark's
     end (clamped at 0), the wait FOR the gate; start_lag_us is the start mark's end after the gate's end, a separate
-    field. Only a window's first copy is marked, copied() moves the queue's last copy on, and a flush forgets it;
+    field. Only a window's first copy is marked, copied() moves the queue's last copy on, and a flush keeps it: only
+    teardown() and a new compute queue in prepare() forget it;
   - the executor counts its launches: one per dequant kernel and one per GEMM group of the phase, and hands the count
     to window_launched after the phase's GEMM stage, on a windowed op only;
   - stage_window records each copy with its bytes, window_begin records the window with the host time it took, and
@@ -308,6 +309,9 @@ TQ_BODY = ("{ if (!timing_queue_) { timing_queue_.emplace(ccs_->get_context(), c
 PREPARE_SIG = "void moe_stream_phase::prepare("
 NEW_CCS = "if (!same_queue) { ccs_.emplace(ccs); timing_queue_.reset();"
 TQ_MEMBER = "std::optional<sycl::queue> timing_queue_;"
+START_SKIP = "const auto * prior = window_timing_.find(key); if (prior != nullptr && prior->start_marked) { return; }"
+CCS_SET = "ccs_.emplace(ccs);"
+CCS_SET_DROP = "ccs_.emplace(ccs); timing_queue_.reset();"
 
 
 def ordered(text: str, *parts: str) -> bool:
@@ -325,18 +329,22 @@ def claim_marks(plan_cpp: str, plan_hpp: str) -> bool:
     the read gate is chosen and before the gate joins the copy's dependencies, so the free mark misses only the gate;
     its end mark after the loop, behind its last copy. The free mark adds the copy queued before (the copy queue is in
     order), the start mark the gate. Every mark is an empty kernel on timing_queue(): an in-order profiling queue on
-    the compute queue's context and device, built at the first mark and dropped when prepare() takes a new compute
-    queue. The two helpers are called once each, from stage_window, and timing_queue() only from them."""
+    the compute queue's context and device, built at the first mark and dropped wherever the compute queue changes
+    (prepare() and the test_reserve_ring hook alike). A later stage of a window already marked submits no marks, since
+    marked() would discard them. The two helpers are called once each, from stage_window, and timing_queue() only
+    from them."""
     n = norm(plan_cpp)
     stage = body(n, STAGE_SIG)
     prepare = body(n, PREPARE_SIG)
     return (stage.count(TIMING_KEY) == 1 and stage.count(MARK_AT) == 1 and stage.count(END_AT) == 1
             and ordered(stage, TIMING_KEY, REUSE_TAKE, MARK_AT, REUSE_DEP, COPY_DECL, LOOP_END, END_AT, "return n;")
             and n.count("mark_window_start(") == 2 and n.count("mark_window_end(") == 2
+            and body(n, START_SIG).startswith("{ " + START_SKIP + " try {")
             and body(body(n, START_SIG), "try {") == START_BODY and body(body(n, END_SIG), "try {") == END_BODY
             and n.count(MARK_KERNEL) == 1 and n.count(MARKER) == 3
             and body(n, TQ_SIG) == TQ_BODY and n.count("timing_queue_.emplace(") == 1 and n.count("timing_queue()") == 3
-            and prepare.count(NEW_CCS) == 1 and n.count("timing_queue_.reset();") == 1
+            and prepare.count(NEW_CCS) == 1 and n.count("timing_queue_.reset();") == 2
+            and n.count(CCS_SET) == 2 and n.count(CCS_SET_DROP) == 2
             and norm(plan_hpp).count(TQ_MEMBER) == 1)
 
 
@@ -372,7 +380,13 @@ def test_marks_mutants():
                            PLAN_HPP)
     # a timing queue kept across a new compute queue object: prepare() drops it on any new queue, and the next mark
     # builds it again
-    assert not claim_marks(mutate(PLAN_CPP, " timing_queue_.reset();", ""), PLAN_HPP)
+    assert not claim_marks(mutate(PLAN_CPP, NEW_CCS, NEW_CCS.replace(" timing_queue_.reset();", "")), PLAN_HPP)
+    # the test hook taking a compute queue without dropping the timing queue built on the last one
+    hook = "ccs_.emplace(ccs); timing_queue_.reset(); in_order_ = ccs.is_in_order(); return ring_ready(nullptr);"
+    assert norm(PLAN_CPP).count(hook) == 1, "mutant precondition: the test hook drops the timing queue"
+    assert not claim_marks(mutate(PLAN_CPP, hook, hook.replace(" timing_queue_.reset();", "")), PLAN_HPP)
+    # a later stage of a marked window submitting marks that marked() then discards
+    assert not claim_marks(mutate(PLAN_CPP, START_SKIP + " ", ""), PLAN_HPP)
     # a barrier instead of the marker kernel
     assert not claim_marks(mutate(PLAN_CPP, "ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps); if (gate)",
                                   "q.ext_oneapi_submit_barrier(deps); if (gate)"), PLAN_HPP)
@@ -380,8 +394,10 @@ def test_marks_mutants():
 
 # ---- a mark that fails ---------------------------------------------------------------------------------------------
 
-MARK_CATCH = "catch (const sycl::exception & e) { drop_window_timing(e); }"
-DROP_SIG = "void moe_stream_phase::drop_window_timing(const sycl::exception & e) {"
+MARK_CATCH = "catch (const std::exception & e) { drop_window_timing(e); }"
+FALLBACK_RETHROW = "catch (const ggml_sycl_fallback_error &) { throw; }"
+MARK_HANDLERS = FALLBACK_RETHROW + " " + MARK_CATCH
+DROP_SIG = "void moe_stream_phase::drop_window_timing(const std::exception & e) {"
 DROP_WARN = ('"[MOE-EXEC-TRACE] window timing marks failed on device %d: %s; no more window timing lines in this '
              'context"')
 DROP_SINK = "log_->sink(log_->sink_ctx, line);"
@@ -393,16 +409,18 @@ FAILED_MEMBER = "bool window_marks_failed_ = false;"
 
 
 def claim_mark_failure(plan_cpp: str, plan_hpp: str, doc: str) -> bool:
-    """Each mark helper wraps its whole body in a try whose one handler, for sycl::exception, hands the failure to
-    drop_window_timing; nothing in stage_window calls it, and stage_window's copy handler still aborts, so a mark's
-    failure never reaches the copy abort and a copy's never turns the timing off. drop_window_timing sets the sticky
-    flag, turns the timeline off and warns once through the decision log's WARN sink (the phase makes no log call of
-    its own), without aborting or throwing; begin_layer keeps it off while the flag is set; the catalog names the
-    warning."""
+    """Each mark helper wraps its marks in a try that rethrows a planned refusal (ggml_sycl_fallback_error), as
+    every std::exception handler in the backend must, and hands any other std::exception (a sycl::exception from the
+    submit and a std::bad_alloc from the records' growth alike) to drop_window_timing;
+    mark_window_end runs outside stage_window's copy try, so nothing else would catch it there. Nothing in
+    stage_window calls drop_window_timing, and stage_window's copy handler still aborts, so a mark's failure never
+    reaches the copy abort and a copy's never turns the timing off. drop_window_timing sets the sticky flag, turns the
+    timeline off and warns once through the decision log's WARN sink (the phase makes no log call of its own), without
+    aborting or throwing; begin_layer keeps it off while the flag is set; the catalog names the warning."""
     n = norm(plan_cpp)
     stage = body(n, STAGE_SIG)
-    return (body(n, START_SIG) == "{ try " + START_BODY + " " + MARK_CATCH + " }"
-            and body(n, END_SIG) == "{ try " + END_BODY + " " + MARK_CATCH + " }"
+    return (body(n, START_SIG) == "{ " + START_SKIP + " try " + START_BODY + " " + MARK_HANDLERS + " }"
+            and body(n, END_SIG) == "{ try " + END_BODY + " " + MARK_HANDLERS + " }"
             and n.count(MARK_CATCH) == 2 and n.count("drop_window_timing(") == 3
             and body(n, DROP_SIG) == DROP_BODY and n.count("window_marks_failed_ = true;") == 1
             and "drop_window_timing" not in stage and stage.count(COPY_ABORT) == 1
@@ -416,11 +434,18 @@ def test_mark_failure():
 
 def test_mark_failure_mutants():
     # a mark's failure left to stage_window's copy handler, which aborts the prompt: either helper without its try
-    assert not claim_mark_failure(mutate(PLAN_CPP, "try " + START_BODY + " " + MARK_CATCH, START_BODY), PLAN_HPP,
+    assert not claim_mark_failure(mutate(PLAN_CPP, "try " + START_BODY + " " + MARK_HANDLERS, START_BODY), PLAN_HPP,
                                   ENV_DOC)
-    assert not claim_mark_failure(mutate(PLAN_CPP, "try " + END_BODY + " " + MARK_CATCH, END_BODY), PLAN_HPP, ENV_DOC)
+    assert not claim_mark_failure(mutate(PLAN_CPP, "try " + END_BODY + " " + MARK_HANDLERS, END_BODY), PLAN_HPP,
+                                  ENV_DOC)
+    # a planned refusal swallowed into the timing path instead of reaching the backend's fallback
+    assert not claim_mark_failure(mutate(PLAN_CPP, MARK_HANDLERS, MARK_CATCH, count=2), PLAN_HPP, ENV_DOC)
     # the mark's handler rethrowing into the copy abort
     assert not claim_mark_failure(mutate(PLAN_CPP, "{ drop_window_timing(e); }", "{ drop_window_timing(e); throw; }",
+                                         count=2), PLAN_HPP, ENV_DOC)
+    # the handlers narrowed to sycl::exception, so a std::bad_alloc from the records reaches the copy abort, or escapes
+    # stage_window from mark_window_end
+    assert not claim_mark_failure(mutate(PLAN_CPP, MARK_CATCH, MARK_CATCH.replace("std::exception", "sycl::exception"),
                                          count=2), PLAN_HPP, ENV_DOC)
     # the failure path aborting like the copy's, or leaving the timeline on
     aborting = DROP_BODY.replace(DROP_SINK, 'GGML_ABORT("%s", line);')
@@ -429,8 +454,7 @@ def test_mark_failure_mutants():
     # begin_layer turning the timing back on at the next layer, so the warning repeats
     assert not claim_mark_failure(mutate(PLAN_CPP, " && !window_marks_failed_;", ";"), PLAN_HPP, ENV_DOC)
     # the copy's failure swallowed by the timing's path instead of aborting
-    assert not claim_mark_failure(mutate(PLAN_CPP, COPY_ABORT, "catch (const sycl::exception & e) { "
-                                         "drop_window_timing(e); }"), PLAN_HPP, ENV_DOC)
+    assert not claim_mark_failure(mutate(PLAN_CPP, COPY_ABORT, MARK_CATCH), PLAN_HPP, ENV_DOC)
     # the warning missing from the catalog
     warn = DROP_WARN.strip('"')
     assert warn in re.sub(r"\s+", " ", ENV_DOC), "mutant precondition: the catalog names the warning"
@@ -491,7 +515,7 @@ MARKED_BODY = ("{ if (!enabled) { return; } record & r = at(key); if (r.n_copies
                "r.start_marked = true; r.free_mark = free_mark; r.start_mark = start_mark; r.reuse_gate = gate; } }")
 COPIED_BODY = "{ if (!enabled) { return; } record & r = at(key); queue_tail = copy; ++r.n_copies; r.bytes += bytes; }"
 ENDED_BODY = "{ if (!enabled) { return; } record & r = at(key); r.end_marked = true; r.end_mark = end_mark; }"
-CLEAR = "void clear() { records.clear(); queue_tail.reset(); }"
+CLEAR = "void clear() { records.clear(); }"
 FLUSH_END = "} clear(); return printed; }"
 
 
@@ -500,7 +524,7 @@ def claim_figures(plan_hpp: str) -> bool:
     end, clamped at 0 (the wait FOR the gate), measured only when the gate and the free mark have times; start_lag_us
     is the start mark's end after the gate's end, a field of its own. Each figure is assigned once beyond its -1.
     Only a window's first copy is marked, copied() moves the queue's last copy on, a later stage's end mark replaces
-    the earlier one, and the flush ends with the timeline's own clear(), which forgets the queue's last copy."""
+    the earlier one, and the flush ends with the timeline's own clear(), which drops the records."""
     timeline = body(norm(plan_hpp), TIMELINE_SIG)
     flush = body(timeline, FLUSH_SIG)
     return (flush.count(START_TIMED) == 1 and flush.count(COPY_EXPR) == 1 and flush.count(GATE_TIMED) == 1
@@ -528,12 +552,48 @@ def test_figures_mutants():
     assert not claim_figures(mutate(PLAN_HPP, "stop_end - start_end", "stop_end - gate_end"))
     # a later copy's marks replacing the first copy's
     assert not claim_figures(mutate(PLAN_HPP, "if (r.n_copies == 0 && !r.start_marked) {", "if (true) {"))
-    # the queue's last copy never moved on, or never forgotten at the flush
+    # the queue's last copy never moved on
     assert not claim_figures(mutate(PLAN_HPP, " queue_tail = copy;", ""))
-    assert not claim_figures(mutate(PLAN_HPP, CLEAR, "void clear() { records.clear(); }"))
-    assert not claim_figures(mutate(PLAN_HPP, FLUSH_END, "} records.clear(); return printed; }"))
+    # the flush keeping its records, so the next boundary prints them again
+    assert not claim_figures(mutate(PLAN_HPP, FLUSH_END, "} return printed; }"))
     # an end mark that never lands, so copy_us would always read -1
     assert not claim_figures(mutate(PLAN_HPP, " r.end_marked = true;", ""))
+
+
+# ---- the copy queued before ---------------------------------------------------------------------------------------
+
+TAIL_RESET = "window_timing_.queue_tail.reset();"
+TEARDOWN_SIG = "void moe_stream_phase::teardown(sycl::event last_use) {"
+
+
+def claim_queue_tail_kept(plan_hpp: str, plan_cpp: str) -> bool:
+    """The free mark waits behind the copy queued before it even across a synchronize: the timeline's clear(), which the
+    flush ends with, keeps the queue's last copy, and nothing in the timeline forgets it. Only the phase does, in
+    teardown() (the ring's copies end with it) and where prepare() takes a new compute queue (a copy of the old one
+    is no predecessor on the new one), so waiting on an old, finished copy costs nothing, and a never-begun prefetch
+    whose copy is still in flight past a synchronize still orders the next free mark."""
+    timeline = body(norm(plan_hpp), TIMELINE_SIG)
+    n = norm(plan_cpp)
+    return (timeline.count(CLEAR) == 1 and "queue_tail.reset()" not in timeline
+            and n.count("queue_tail.reset()") == 2 and body(n, TEARDOWN_SIG).count(TAIL_RESET) == 1
+            and body(n, PREPARE_SIG).count(NEW_CCS + " " + TAIL_RESET) == 1)
+
+
+def test_queue_tail_kept():
+    assert claim_queue_tail_kept(PLAN_HPP, PLAN_CPP)
+
+
+def test_queue_tail_kept_mutants():
+    # the flush forgetting the queue's last copy again, through clear() or beside it
+    assert not claim_queue_tail_kept(mutate(PLAN_HPP, CLEAR, "void clear() { records.clear(); queue_tail.reset(); }"),
+                                     PLAN_CPP)
+    assert not claim_queue_tail_kept(mutate(PLAN_HPP, FLUSH_END, "} clear(); queue_tail.reset(); return printed; }"),
+                                     PLAN_CPP)
+    # teardown keeping a copy of a ring that is gone, or a new compute queue keeping the old queue's copy
+    teardown = body(norm(PLAN_CPP), TEARDOWN_SIG)
+    assert teardown.count(TAIL_RESET) == 1, "mutant precondition: teardown forgets the queue's last copy"
+    assert not claim_queue_tail_kept(PLAN_HPP, mutate(PLAN_CPP, teardown, teardown.replace(" " + TAIL_RESET, "")))
+    assert not claim_queue_tail_kept(PLAN_HPP, mutate(PLAN_CPP, NEW_CCS + " " + TAIL_RESET, NEW_CCS))
 
 
 # ---- the executor's launch count ----------------------------------------------------------------------------------
@@ -769,6 +829,38 @@ def test_off_cost_mutants():
     dtor = body(cpp, DTOR_SIG)
     assert dtor.count(" flush_window_timing();") == 1, "mutant precondition: the destructor flushes"
     assert not claim_off_cost(cpp.replace(dtor, dtor.replace(" flush_window_timing();", "")))
+
+
+# ---- the knobs' comment in the backend ----------------------------------------------------------------------------
+
+CONFIG_SIG = "static const ggml_sycl::moe_exec_config & ggml_sycl_moe_exec_config() {"
+STALE_CONFIG = "copy queue records device times"
+
+
+def comment_flat(text: str) -> str:
+    """`text` with each comment's wrapped lines read as one, so a re-wrap cannot hide a phrase."""
+    return re.sub(r"\s+", " ", re.sub(r"\n[ \t]*//+", " ", text))
+
+
+def claim_config_comment(sycl: str) -> bool:
+    """ggml-sycl.cpp no longer says the unified cache parses the trace level to decide whether its copy queue records
+    device times: the copy queue is never profiled, and the unified cache does not read the level at all. The
+    function the comment sits on must exist, so a missing file does not pass."""
+    return CONFIG_SIG in sycl and STALE_CONFIG not in comment_flat(sycl)
+
+
+def test_config_comment():
+    assert claim_config_comment(SYCL)
+
+
+def test_config_comment_mutants():
+    # the stale sentence back, wrapped across two comment lines as it was
+    stale = ("// The unified cache, built before any backend op, parses the level\n// through the same "
+             "moe_exec_config_parse to decide whether its copy queue records device times.\n")
+    assert CONFIG_SIG in SYCL, "mutant precondition: the knobs' function exists"
+    assert not claim_config_comment(SYCL.replace(CONFIG_SIG, stale + CONFIG_SIG, 1))
+    # no backend source at all
+    assert not claim_config_comment("")
 
 
 # ---- the knob's own comment ---------------------------------------------------------------------------------------
