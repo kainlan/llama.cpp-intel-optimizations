@@ -20510,24 +20510,25 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
     };
 
-    // The explicit micro-batch's PP MoE oneDNN scratch ring, placed by the load, announced like the KV demotions above:
-    // once, against the final plan, for the micro-batch the load decided for. A WARN, so the one line survives default
-    // verbosity, when the ring's room moved routed experts to the host tier and the published plan was made for another
-    // micro-batch (the load's own, or a previous context's); a second context of the same micro-batch, a room the
-    // weight zone's slack held, and a probe, which places nothing, print it at INFO.
-    auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan) {
+    // The explicit micro-batch's PP MoE oneDNN scratch ring, placed by the load, announced like the KV demotions above,
+    // against the final plan. `warn` is placement_explicit_ubatch_announces() for this context: one WARN per load, so
+    // the line survives default verbosity, at the first non-probe context since the load when the ring's room moved
+    // routed experts to the host tier, whatever micro-batch that context runs. llama-bench opens one context per
+    // instance on one model, so a -d or -fa list would otherwise print it again with no expert moving. A context of the
+    // placed micro-batch prints it at INFO otherwise: a room the weight zone's slack held, a context after the one that
+    // announced, and a probe, which places nothing.
+    auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan, bool warn) {
         const ggml_sycl::placement_explicit_ubatch & xub = final_plan.explicit_ubatch;
-        if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE ||
-            xub.n_ubatch != next_kv_info.n_ubatch) {
+        if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE) {
             return;
         }
-        if (!probe_mode && xub.moved_experts > 0 && current->kv_info.n_ubatch != next_kv_info.n_ubatch) {
+        if (warn) {
             GGML_LOG_WARN(
                 "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: re-placed %zu experts (%zu "
                 "layers) to the host tier, %.1f MB moved (device %d)\n",
                 xub.n_ubatch, xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb,
                 ctx->device);
-        } else {
+        } else if (xub.n_ubatch == next_kv_info.n_ubatch) {
             GGML_LOG_INFO(
                 "[SYCL-PLAN] %sPP MoE oneDNN scratch ring for n_ubatch=%u holds %.1f MB of the RUNTIME zone: %zu "
                 "experts "
@@ -20798,6 +20799,15 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
     }
 
+    // Decided on the final plan: the context that announces the explicit micro-batch's placement marks the plan it
+    // publishes, and every later context copies the mark with the plan, so none of them announces it again. A refused
+    // or lost publication discards the mark with next_plan, and the next context announces instead.
+    const bool warn_explicit_ubatch =
+        ggml_sycl::placement_explicit_ubatch_announces(next_plan.explicit_ubatch, probe_mode);
+    if (warn_explicit_ubatch) {
+        next_plan.explicit_ubatch.announced = true;
+    }
+
     if (probe_mode) {
         // llama.cpp-tsfl: every candidate check up to this point has passed
         // (KV/MMID budget, non-FA attention scratch, PP MoE oneDNN ring) --
@@ -20839,7 +20849,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             return refuse("probe rollback failed: ring left at candidate size");
         }
         announce_kv_host_demotions(next_plan);
-        announce_explicit_ubatch_placement(next_plan);
+        announce_explicit_ubatch_placement(next_plan, warn_explicit_ubatch);
         if (out) {
             out->accepted        = true;
             out->would_demote_kv = kv_was_demoted;
@@ -20923,7 +20933,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
                                                       hold_kv_room);
     announce_kv_host_demotions(*immutable->plan);
-    announce_explicit_ubatch_placement(*immutable->plan);
+    announce_explicit_ubatch_placement(*immutable->plan, warn_explicit_ubatch);
     // The commit point the dump's context_txn snapshot entries name: the RUNTIME room and the ONEDNN
     // capacity as they stand once this transaction has published.
     ggml_sycl::unified_cache_dump_capture_zone_figures(ctx->device, ggml_sycl::dump_point::CONTEXT_TXN);

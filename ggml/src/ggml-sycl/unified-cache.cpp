@@ -33414,6 +33414,12 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
     return placed ? compute_term : 0;
 }
 
+// The announce rule for a placed explicit micro-batch; unified-cache.hpp describes it.
+bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode) {
+    return !probe_mode && xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.moved_experts > 0 &&
+           !xub.announced;
+}
+
 // The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
 // the runtime context transaction announces the outcome once, at WARN, when the context opens.
 static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, int device_id) {

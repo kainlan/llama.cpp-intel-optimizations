@@ -900,6 +900,9 @@ struct placement_explicit_ubatch {
     // whole room on PLACE and GROW_ZONE, 0 otherwise).
     const char *                         hold_reason              = nullptr;
     size_t                               hold_bytes               = 0;
+    // Set on the plan the context that announced the placement at WARN published. Every later context's plan copies
+    // it, so a load announces its placement once, whatever micro-batch each context runs.
+    bool                                 announced                = false;
 };
 
 // The compute room the RUNTIME zone of a placed explicit micro-batch holds for that micro-batch's compute buffers, for
@@ -910,6 +913,12 @@ struct placement_explicit_ubatch {
 size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
                                               size_t                            compute_term,
                                               uint32_t *                        n_ubatch);
+
+// Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
+// since the load whose plan PLACED the micro-batch with routed experts moved to the host tier. The context's own
+// micro-batch does not enter, because the line names the micro-batch the load placed, and a context whose micro-batch
+// differs (llama-bench's -p below -ub) would otherwise leave a load that moved experts unannounced.
+bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode);
 
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.

@@ -19,7 +19,9 @@ What this gate pins:
   pack with the hold added back;
 - the load grows the RUNTIME zone for that micro-batch before the plan it keeps, and falls back to the load's planning
   shape, planned without the room, when the arena cannot grow;
-- the context announces the placement in ONE WARN line, with the experts and bytes moved;
+- a load announces the placement in ONE WARN line, with the experts and bytes moved, at the first non-probe context
+  since the load whatever that context's micro-batch; the plan that context publishes carries a mark every later
+  context's plan copies, so no later context repeats it;
 - the fallback refusal names the largest -ub that fits, from the ring admission's own slot arithmetic;
 - the hold-spill fit credits a compute buffer no larger than the planned compute term at the micro-batch the published
   single-device plan PLACED on the device, read once before the demand, whole or nothing; every other rung, and every
@@ -72,6 +74,7 @@ def read(rel: str) -> str:
 
 SYCL_CPP = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 CACHE_CPP = read("ggml/src/ggml-sycl/unified-cache.cpp")
+CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
 ADMISSION_CPP = read("ggml/src/ggml-sycl/moe-scratch-admission.cpp")
 ZONE_CPP = read("ggml/src/ggml-sycl/zone-sizing.cpp")
 LLAMA_H = read("include/llama.h")
@@ -111,6 +114,16 @@ def body(text: str, signature: str) -> str:
     return ""
 
 
+def struct_text(text: str, head: str) -> str:
+    """The text of the first struct starting with `head`, up to its closing `};` (a struct of plain fields, which holds
+    no nested braces). Empty when there is none."""
+    at = text.find(head)
+    if at < 0:
+        return ""
+    end = text.find("};", at)
+    return text[at:end] if end >= 0 else ""
+
+
 def ordered(text: str, *needles: str) -> bool:
     """Every needle is present, each after the one before it."""
     at = 0
@@ -129,16 +142,33 @@ DECIDE_SIG = "pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubat
 POPULATE_SIG = "static void llama_model_sycl_populate_inventory("
 BENCH_HINT_SIG = "uint32_t n_ubatch_hint() const"
 
-# The decision line: one WARN, when the room moved experts and the context is the first of its micro-batch.
+# The decision line: one WARN per load, at the first non-probe context since the load when the room moved experts.
 WARN_LITERAL = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: re-placed %zu '
                 'experts (%zu layers) to the host tier, %.1f MB moved (device %d)\\n", xub.n_ubatch, '
                 'xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb, ctx->device);')
-WARN_GATE = "if (!probe_mode && xub.moved_experts > 0 && current->kv_info.n_ubatch != next_kv_info.n_ubatch) {"
-ANNOUNCE_DEF = "auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan)"
-ANNOUNCE_FOR = ("if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || "
-                "xub.n_ubatch != next_kv_info.n_ubatch) { return; }")
-ANNOUNCE_PROBE = "announce_kv_host_demotions(next_plan); announce_explicit_ubatch_placement(next_plan);"
-ANNOUNCE_COMMIT = "announce_kv_host_demotions(*immutable->plan); announce_explicit_ubatch_placement(*immutable->plan);"
+WARN_GATE = "if (warn) {"
+INFO_GATE = "} else if (xub.n_ubatch == next_kv_info.n_ubatch) {"
+ANNOUNCE_DEF = "auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan, bool warn)"
+ANNOUNCE_FOR = "if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE) { return; }"
+ANNOUNCE_PROBE = ("announce_kv_host_demotions(next_plan); "
+                  "announce_explicit_ubatch_placement(next_plan, warn_explicit_ubatch);")
+ANNOUNCE_COMMIT = ("announce_kv_host_demotions(*immutable->plan); "
+                   "announce_explicit_ubatch_placement(*immutable->plan, warn_explicit_ubatch);")
+# The mark: decided once on the final plan, set on next_plan before it is published, and carried by the two whole-plan
+# copies a context makes (the load's or previous context's plan, and the KV demotion's working copy).
+PLAN_COPY = "auto next_plan = ggml_sycl::placement_plan(*current->plan);"
+DEMOTED_COPY = "ggml_sycl::placement_plan demoted_plan = next_plan;"
+DEMOTED_BACK = "next_plan = std::move(demoted_plan);"
+WARN_DECIDE = ("const bool warn_explicit_ubatch = "
+               "ggml_sycl::placement_explicit_ubatch_announces(next_plan.explicit_ubatch, probe_mode);")
+WARN_MARK = "if (warn_explicit_ubatch) { next_plan.explicit_ubatch.announced = true; }"
+PROBE_BRANCH = "if (probe_mode) { const bool rollback_ok ="
+PUBLISH = "next->plan = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));"
+ANNOUNCES_SIG = "bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode)"
+ANNOUNCES_RULE = ("return !probe_mode && xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && "
+                  "xub.moved_experts > 0 && !xub.announced;")
+XUB_STRUCT = "struct placement_explicit_ubatch {"
+XUB_MARK_FIELD = "bool announced = false;"
 
 # The fallback refusal, by name, with the largest -ub that fits.
 REFUSE_FOR = ("if (xub.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::REFUSE && "
@@ -256,16 +286,27 @@ BENCH_SET = "mparams.n_ubatch_hint = n_ubatch_hint();"
 BENCH_EQUAL = "n_ubatch_hint() == other.n_ubatch_hint() &&"
 
 
-def claim_placement_is_one_warn_line(sycl_cpp: str) -> bool:
-    """The context announces the placement once, at WARN, with the experts, layers and bytes the room moved: only for
-    the micro-batch the load placed, only when it moved experts, never for a probe, and only when the published plan
-    was made for another micro-batch. Both announce sites call it, each right after the KV demotions' line."""
+def claim_placement_is_one_warn_line(sycl_cpp: str, cache_cpp: str, cache_hpp: str) -> bool:
+    """A load announces the placement once, at WARN, with the experts, layers and bytes the room moved: at the first
+    non-probe context since the load whose plan PLACED the micro-batch and moved experts, whatever that context's own
+    micro-batch (nothing before the WARN reads it; only the INFO line is filtered by it). The decision is made once on
+    the final plan, before the probe branch, and the context that announces marks next_plan before it is published.
+    The mark rides the two whole-plan copies a context makes, and nothing else in the transaction writes it, so every
+    later context's plan carries it. Both announce sites pass the decision, each right after the KV demotions' line."""
     txn = body(norm(sycl_cpp), TXN_SIG)
     announce = body(txn, ANNOUNCE_DEF)
-    return (bool(announce) and ordered(announce, ANNOUNCE_FOR, WARN_GATE, WARN_LITERAL)
+    before_warn = announce.split(WARN_GATE, 1)[0] if WARN_GATE in announce else ""
+    return (bool(announce) and ordered(announce, ANNOUNCE_FOR, WARN_GATE, WARN_LITERAL, INFO_GATE)
             and announce.count("GGML_LOG_WARN(") == 1
+            and "next_kv_info" not in before_warn and "current->" not in before_warn
+            and txn.count(PLAN_COPY) == 1 and txn.count(DEMOTED_COPY) == 1 and txn.count(DEMOTED_BACK) == 1
+            and ordered(txn, PLAN_COPY, DEMOTED_COPY, DEMOTED_BACK, WARN_DECIDE, WARN_MARK, PROBE_BRANCH, PUBLISH)
+            and txn.count(WARN_DECIDE) == 1 and txn.count(".announced") == 1
+            and re.search(r"\.explicit_ubatch\s*=[^=]", txn) is None
             and txn.count(ANNOUNCE_PROBE) == 1 and txn.count(ANNOUNCE_COMMIT) == 1
-            and txn.count("announce_explicit_ubatch_placement(") == 2)
+            and txn.count("announce_explicit_ubatch_placement(") == 2
+            and ANNOUNCES_RULE in body(norm(cache_cpp), ANNOUNCES_SIG)
+            and XUB_MARK_FIELD in struct_text(norm(cache_hpp), XUB_STRUCT))
 
 
 def claim_refusal_names_the_largest_fit(sycl_cpp: str, admission_cpp: str) -> bool:
@@ -368,7 +409,7 @@ def claim_bench_reloads_only_on_a_micro_batch_change(bench_cpp: str) -> bool:
 
 
 def test_placement_is_one_warn_line():
-    assert claim_placement_is_one_warn_line(SYCL_CPP)
+    assert claim_placement_is_one_warn_line(SYCL_CPP, CACHE_CPP, CACHE_HPP)
 
 
 def test_refusal_names_the_largest_fit():
@@ -413,32 +454,84 @@ def _once(text: str, old: str, new: str) -> str:
     return n.replace(old, new, 1)
 
 
+def _one_warn(sycl_cpp: str = None, cache_cpp: str = None, cache_hpp: str = None) -> bool:
+    return claim_placement_is_one_warn_line(sycl_cpp if sycl_cpp is not None else SYCL_CPP,
+                                            cache_cpp if cache_cpp is not None else CACHE_CPP,
+                                            cache_hpp if cache_hpp is not None else CACHE_HPP)
+
+
 def test_mutant_decision_line_at_info_fails():
     """Below default verbosity the decision is invisible, which is how the refusal it replaces read as no row."""
-    assert not claim_placement_is_one_warn_line(
-        _once(SYCL_CPP, WARN_LITERAL, WARN_LITERAL.replace("GGML_LOG_WARN(", "GGML_LOG_INFO(", 1)))
+    assert not _one_warn(_once(SYCL_CPP, WARN_LITERAL, WARN_LITERAL.replace("GGML_LOG_WARN(", "GGML_LOG_INFO(", 1)))
 
 
 def test_mutant_decision_line_without_the_bytes_moved_fails():
-    assert not claim_placement_is_one_warn_line(
+    assert not _one_warn(
         _once(SYCL_CPP, WARN_LITERAL, WARN_LITERAL.replace(", %.1f MB moved", "").replace(", xub.moved_bytes / mb", "")))
 
 
 def test_mutant_decision_line_every_context_fails():
-    """Without the micro-batch filter every later context of the same micro-batch would print it again."""
-    assert not claim_placement_is_one_warn_line(
-        _once(SYCL_CPP, WARN_GATE, "if (!probe_mode && xub.moved_experts > 0) {"))
+    """Without the mark in the rule every later context would print it again: llama-bench opens one context per
+    instance on one model, so a -d or -fa list printed it twice with no expert moving."""
+    assert not _one_warn(cache_cpp=_once(CACHE_CPP, ANNOUNCES_RULE, ANNOUNCES_RULE.replace(" && !xub.announced", "", 1)))
 
 
 def test_mutant_decision_line_for_a_probe_fails():
     """A probe places nothing; the auto-ubatch trial runs in probe mode."""
-    assert not claim_placement_is_one_warn_line(
-        _once(SYCL_CPP, WARN_GATE, WARN_GATE.replace("!probe_mode && ", "", 1)))
+    assert not _one_warn(cache_cpp=_once(CACHE_CPP, ANNOUNCES_RULE, ANNOUNCES_RULE.replace("!probe_mode && ", "", 1)))
+
+
+def test_mutant_decision_line_for_a_room_that_moved_nothing_fails():
+    """A room the weight zone's slack held moved no expert, so there is nothing to announce at WARN."""
+    assert not _one_warn(
+        cache_cpp=_once(CACHE_CPP, ANNOUNCES_RULE, ANNOUNCES_RULE.replace(" && xub.moved_experts > 0", "", 1)))
 
 
 def test_mutant_commit_site_not_announced_fails():
-    assert not claim_placement_is_one_warn_line(
-        _once(SYCL_CPP, ANNOUNCE_COMMIT, "announce_kv_host_demotions(*immutable->plan);"))
+    assert not _one_warn(_once(SYCL_CPP, ANNOUNCE_COMMIT, "announce_kv_host_demotions(*immutable->plan);"))
+
+
+def test_mutant_mark_never_set_fails():
+    """The announcing context publishes no mark, so every later context announces again."""
+    assert not _one_warn(_once(SYCL_CPP, WARN_MARK, ""))
+
+
+def test_mutant_mark_set_after_publish_fails():
+    """A mark set once next_plan has been moved into the published snapshot never reaches it."""
+    n = _once(SYCL_CPP, WARN_MARK, "")
+    assert n.count(PUBLISH) == 1
+    assert not _one_warn(n.replace(PUBLISH, PUBLISH + " " + WARN_MARK, 1))
+
+
+def test_mutant_mark_reset_after_the_plan_copy_fails():
+    """The previous context's mark is dropped from the copy, so this context announces again."""
+    assert not _one_warn(_once(SYCL_CPP, PLAN_COPY, PLAN_COPY + " next_plan.explicit_ubatch.announced = false;"))
+
+
+def test_mutant_demoted_plan_drops_the_mark_fails():
+    """The KV demotion's working copy comes back without the decision, and with it the mark."""
+    assert not _one_warn(_once(SYCL_CPP, DEMOTED_COPY, DEMOTED_COPY + " demoted_plan.explicit_ubatch = {};"))
+
+
+def test_mutant_warn_gated_on_the_previous_micro_batch_fails():
+    """The old gate: any context of another micro-batch reset it, so the named micro-batch's next context printed it
+    again with no expert moving."""
+    assert not _one_warn(
+        _once(SYCL_CPP, WARN_GATE, "if (warn && current->kv_info.n_ubatch != next_kv_info.n_ubatch) {"))
+
+
+def test_mutant_warn_filtered_by_the_context_micro_batch_fails():
+    """With -p below -ub every context resolves a micro-batch other than the placed one, so a load that moved experts
+    announced nothing at default verbosity."""
+    assert not _one_warn(
+        _once(SYCL_CPP, ANNOUNCE_FOR,
+              "if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || "
+              "xub.n_ubatch != next_kv_info.n_ubatch) { return; }"))
+
+
+def test_mutant_mark_field_without_a_default_fails():
+    """A load's fresh plan must start unmarked, or its first context never announces."""
+    assert not _one_warn(cache_hpp=_once(CACHE_HPP, XUB_MARK_FIELD, "bool announced;"))
 
 
 def test_mutant_refusal_without_the_largest_fit_fails():

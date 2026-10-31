@@ -851,6 +851,37 @@ static bool run_explicit_ubatch_ring_placement_test() {
         ok = false;
     }
 
+    // The first non-probe context since the load announces the placement at WARN. The rule reads the plan alone, so a
+    // context whose micro-batch differs (-p 512 under -ub 2048) still announces it. The plan that context publishes
+    // carries the mark and the next context copies it, so none announces again. A probe never announces, and neither
+    // does a plan that placed nothing or a room that moved no expert.
+    ggml_sycl::placement_plan published = placed;
+    const bool                fresh     = !published.explicit_ubatch.announced;
+
+    const bool first_announces = ggml_sycl::placement_explicit_ubatch_announces(published.explicit_ubatch, false);
+    const bool probe_announces = ggml_sycl::placement_explicit_ubatch_announces(published.explicit_ubatch, true);
+
+    published.explicit_ubatch.announced   = true;
+    const ggml_sycl::placement_plan later = published;
+    const bool later_announces = ggml_sycl::placement_explicit_ubatch_announces(later.explicit_ubatch, false);
+
+    ggml_sycl::placement_explicit_ubatch slack = placed.explicit_ubatch;
+    slack.moved_experts                        = 0;
+    bool others_announce                       = ggml_sycl::placement_explicit_ubatch_announces(slack, false);
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        others_announce =
+            others_announce || ggml_sycl::placement_explicit_ubatch_announces(other->explicit_ubatch, false);
+    }
+    if (!fresh || !first_announces || probe_announces || later_announces || others_announce) {
+        printf(
+            "FAIL: a load announces its placement once, at the first non-probe context: fresh plan unmarked %d, first "
+            "context %d, probe %d, a context after the mark %d, a plan with nothing to announce %d; want 1, 1, 0, 0, "
+            "0\n",
+            fresh ? 1 : 0, first_announces ? 1 : 0, probe_announces ? 1 : 0, later_announces ? 1 : 0,
+            others_announce ? 1 : 0);
+        ok = false;
+    }
+
     if (ok) {
         printf(
             "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "
