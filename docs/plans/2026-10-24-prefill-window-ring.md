@@ -90,7 +90,7 @@ executor takes the weight when every host item of the role has consumer EXECUTOR
 and the ring can be reserved. `stage()` becomes `stage_window(items)`. The SOA/ROUTE-consumer staging path is
 retired from the index build: an item the executor does not claim is `NONE`; a layer the executor does not claim
 answers RING_UNAVAILABLE with the rule name `executor does not claim`. The `moe_stream_staged.soa`/`layout` fields
-and the resolver's STAGED_RING route stay (they are read by code this plan does not touch).
+and the resolver's STAGED_RING route stay (they are read by code this plan does not touch). (Corrected 2026-10-31: `moe_stream_staged::soa` is gone, because the ring stages AOS only and no entry is served from an SOA slot (b31611272); the `layout` field stays and defaults to `MOE_STREAM_RING_SLOT_LAYOUT`, the layout every ring slot holds (a7c8f4ebd).)
 
 **W3. Sizing.** The index gains `role_items_max` (the most host items one role of one layer has) and `window_slots`;
 the geometry call becomes `moe_stream_ring_size(index.window_slots, index.matrix_bytes_max, index.resident_expert_bytes)`.
@@ -99,7 +99,7 @@ capped by `GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX` when set; the slot bytes come
 `unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device)` through a new hints struct. The executor caps its
 phase at `window_experts()` so a phase never exceeds the region (W4), which is why the sizing need not know the active
 count. The cost model's `triplet_bytes_max` becomes `stage_unit_bytes_max` (one matrix), and `weigh` passes
-`window_us = 0.0`: there is no layer-ahead copy to discount. (Corrected 2026-10-31: the executor caps its phase at
+`window_us = 0.0`: there is no layer-ahead copy to discount. (Corrected 2026-10-31, second: the cost model has no window or reorder term at all; `weigh` takes `(li, op)` and passes no `window_us`, and `t_ring = copy + device GEMM + fixed` (ed43a555e).) (Corrected 2026-10-31: the executor caps its phase at
 `G_plan` (`phase_experts()`), not at `window_experts()`; a window holds at most `min(G_plan, role_items)` host matrices
 of one role, which is at most `window_slots`, so the phase still never exceeds the region.)
 
