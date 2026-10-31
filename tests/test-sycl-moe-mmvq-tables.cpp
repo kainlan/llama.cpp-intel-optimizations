@@ -111,9 +111,10 @@ size_t window_experts_reference(size_t slot_bytes, size_t expert_bytes, size_t c
     return g;
 }
 
-// The points where the helper and the reference disagree over a grid of slot, expert and cap. One point is left out:
-// a slot of SIZE_MAX bytes holding SIZE_MAX one-byte experts with no cap, where fit equals the unbounded expert count
-// and the executor's rule takes its one-group arm (SIZE_MAX instead of SIZE_MAX / 2). No slot has SIZE_MAX bytes.
+// The points where the helper and the reference disagree over a grid of slot, expert and cap. Two points are left out,
+// a slot of SIZE_MAX bytes holding SIZE_MAX one-byte experts with no cap or with a cap of SIZE_MAX (which is no cap),
+// where fit equals the unbounded expert count and the executor's rule takes its one-group arm (SIZE_MAX instead of
+// SIZE_MAX / 2). No slot has SIZE_MAX bytes.
 int count_window_experts_mismatches(bool report) {
     const size_t slots[] = {
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 63, 64, 65, 1000, 4096, 4097, 1 << 20, size_t(3) << 30, SIZE_MAX / 2, SIZE_MAX
