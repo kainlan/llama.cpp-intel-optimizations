@@ -111,8 +111,9 @@ GEMMs. The WOQ (MXFP4) arm is unchanged: the claim predicate (`moe_pp_batched_ta
 so it never sees a ring layer; admitting it is a follow-up ticket. A layer declined at claim time stays in the hybrid
 world (`enqueue_host_expert_rows`), which is what llama.cpp-8p5x c-0blp expects (read it). A stage failure **after** a
 claim is an invariant violation (the window fits the region by construction) and aborts with a message.
-(Corrected 2026-10-31: `phase_experts` is `min(G, phase_experts())`, `G_plan`, not `min(G, window_experts())`; the
-window still fits the region, since it holds only the phase's host matrices of one role.)
+(Corrected 2026-10-31: `phase_experts` is `min(G, phase_experts())`, the latter being `G_plan`, not
+`min(G, window_experts())`; the window still fits the region, since it holds only the phase's host matrices of one
+role.)
 
 **W5. Copy queue (amended 2026-10-24 from the Task 4 rows).** The ring copies on the cache's BCS queue
 (`cache.get_bcs_queue()`, a plain in-order queue on the compute queue's context, `unified-cache.cpp:6365`) as it does

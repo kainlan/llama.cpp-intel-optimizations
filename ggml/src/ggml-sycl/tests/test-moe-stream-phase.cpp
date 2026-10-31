@@ -564,14 +564,13 @@ void test_phase_holds_g_plan_not_the_region(const placement_plan & plan) {
     for (const phase_case & c : cases) {
         ggml_sycl::moe_stream_window_hints hints;
         hints.weight_slot_bytes = c.fit * expert_f16;
-        const moe_stream_plan_index idx =
-            ggml_sycl::moe_stream_plan_index_build(plan, 0, kernels_soa_q4, nullptr, claims_all, hints);
-        // The ring the phase would hold: two regions of window_slots slots, as moe_stream_ring_size shapes it.
-        ggml_sycl::moe_stream_ring_geometry geo;
-        geo.slot_bytes   = 4096;
-        geo.region_slots = idx.window_slots;
-        geo.n_slots      = 2 * idx.window_slots;
-        geo.bytes        = geo.n_slots * geo.slot_bytes;
+        // The index and the ring together, from the sizer prepare() calls, so the region is the one production sizes.
+        // This plan's resident experts fund a ring of either case: 6 or 4 slots of 2304 bytes, under an eleventh of
+        // the 230400 resident bytes.
+        moe_stream_plan_index                     idx;
+        const ggml_sycl::moe_stream_ring_geometry geo =
+            ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, kernels_soa_q4, nullptr, claims_all, hints, &idx);
+        CHECK(geo.n_slots != 0 && geo.region_slots == idx.window_slots);
 
         const uint32_t                  cap = ggml_sycl::moe_stream_phase_experts(idx, geo);
         const moe_pp_batched_f16_groups groups =

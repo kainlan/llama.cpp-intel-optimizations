@@ -445,8 +445,8 @@ inline size_t moe_pp_batched_phase_weight_offset(const moe_pp_batched_f16_groups
 // The experts one phase of an op that reads ring windows holds: the f16 group's size, capped by the experts the ring's
 // phase holds (moe_stream_phase::phase_experts, G_plan). The group size still bounds it, so a phase never exceeds its
 // f16 buffer, while the two are computed by separate formulas. 0 when either is 0, which the executor asserts against.
-inline size_t moe_pp_batched_phase_experts(size_t experts_per_group, size_t window_phase_experts) {
-    return window_phase_experts < experts_per_group ? window_phase_experts : experts_per_group;
+inline size_t moe_pp_batched_phase_experts(size_t experts_per_group, size_t ring_phase_experts) {
+    return ring_phase_experts < experts_per_group ? ring_phase_experts : experts_per_group;
 }
 
 // The phases `active` experts take at `phase_experts` each: ceil(active / phase_experts), 0 for no phase experts.
