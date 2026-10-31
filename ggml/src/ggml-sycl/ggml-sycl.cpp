@@ -17814,8 +17814,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 }
                 plan_candidate = plan_single_device(/*with_room=*/false);
                 GGML_LOG_WARN(
-                    "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB more RUNTIME zone, which the "
-                    "arena could not reserve on device %d; the ring is re-planned when the context opens\n",
+                    "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB more RUNTIME zone, "
+                    "which the arena could not reserve on device %d; the ring is re-planned when the context opens\n",
                     explicit_n_ubatch, room_short / (1024.0 * 1024.0), ctx->device);
             }
         }
@@ -17969,8 +17969,8 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
     }
     const double mb = 1024.0 * 1024.0;
     GGML_LOG_WARN(
-        "[SYCL-PLAN] RUNTIME zone on device %d holds %.1f MB where this plan requires %.1f MB: an earlier load in this "
-        "process grew it, and the routed experts are planned against the grown zone\n",
+        "[SYCL-PLAN] RUNTIME zone on device %d holds %.1f MB where this plan requires %.1f MB: "
+        "an earlier load in this process grew it, and the routed experts are planned against the grown zone\n",
         device, live / mb, reserved / mb);
 }
 
