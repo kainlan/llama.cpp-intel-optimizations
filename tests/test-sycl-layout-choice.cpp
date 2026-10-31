@@ -896,9 +896,9 @@ static bool run_explicit_ubatch_ring_placement_test() {
 }
 
 // The ring each context re-plans for. A load that PLACED the micro-batch keeps the ring at that size for every context
-// whose own micro-batch is no larger (llama-bench's -p 512 and -n 128 contexts under -ub 2048), so none of them releases
-// the placed ring for the next context to re-admit. A larger context, a context that names no micro-batch, and every
-// plan that placed nothing re-plan for the context's own micro-batch. The plans are the ring-placement case's.
+// whose own micro-batch is no larger (llama-bench's -p 512 and -n 128 contexts under -ub 2048), so none of them
+// releases the placed ring for the next context to re-admit. A larger context, a context that names no micro-batch, and
+// every plan that placed nothing re-plan for the context's own micro-batch. The plans are the ring-placement case's.
 static bool run_explicit_ubatch_ring_kept_for_smaller_contexts_test() {
     using namespace explicit_ubatch_case;
     using action         = ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
@@ -1078,7 +1078,8 @@ static bool run_explicit_ubatch_cost_is_net_test() {
     }
 
     const auto & xub = plan.explicit_ubatch;
-    // The experts are packed into what the dense weights and their KV leave of the budget; the zone's room is not in it.
+    // The experts are packed into what the dense weights and their KV leave of the budget; the zone's room is
+    // not in it.
     if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || xub.expert_budget_bytes != left ||
         xub.hold_bytes != room_bytes || device_triplets(plan) != 3) {
         printf(
