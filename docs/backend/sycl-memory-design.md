@@ -146,8 +146,9 @@ bytes, halved when two fit (the executor's own two-buffer rule, capped by
 `window_slots`, the smaller of `G_plan` and the most host matrices one role of
 one layer has (`role_items_max`), and sizes two regions of that many slots, each
 slot one matrix of the largest streamable size. `host_matrices_per_layer_max`,
-the slot need of the heaviest whole layer, sizes nothing and only appears in
-the ring-unavailable WARN beside `window_slots`. The sizing refuses the ring,
+the slot need of the heaviest whole layer, sizes nothing; it selects the
+ring-unavailable rule for a layer with no host matrix of a streamable type and appears in the ring-unavailable WARN
+beside `window_slots`. The sizing refuses the ring,
 leaving none, when its bytes exceed an eleventh of the device's expert bytes
 counted with the bytes lent to the ring (`bytes > (resident_expert_bytes +
 lent_bytes) / 11`). That is a tenth of what the device's expert set keeps once the
