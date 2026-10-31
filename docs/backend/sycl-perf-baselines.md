@@ -664,15 +664,17 @@ The gate re-run for Task 10 (`llama.cpp-qov5`, comments c-1hc8, c-7vb3 and c-4m7
 at master 671279356 with a build made after that commit. "r7" is the seventh Task 10 gate launch of this session: r1
 to r4 are the 0f1d9172c record, r5 is the 4229a205d record, and r6 was refused for a stale binary and is not a run.
 The tree contains the three merges that landed since 4229a205d: `llama.cpp-8p5x`, `llama.cpp-384v` and
-`llama.cpp-86bl`. All arms ran with the gate's defaults, 200 and 500 for the PP floors. Qwen3.8 arms ran on the Arc
-Pro B70 (`level_zero:0`) and the GPT-OSS and Mistral B50 arms on the Arc Pro B50 (`level_zero:1`). Host load read
-13.4-21.8, `builders_pre` and `builders_post` were 0 in every arm, `Shmem` went 0.58 -> 0.61 GB, and the kernel log
-shows 0 GT-reset/guc_id/CAT-error lines (`journalctl -k` since 03:40, read 04:20). The Qwen placement lines were `MoE
-experts: 42633 on device, 31095 on host` (first context) and `37962 on device, 35766 on host` (second), 23 host
-layers. The gate's own summary reads `verdicts_pass=10 verdicts_fail=3 not_exercised_or_unscored=0`, with four arms
-RECORDED and not scored; every arm returned rc=0 and the script itself exits 1 because arms FAILed. The ring engaged
-on every layer-ubatch in every PP arm with 0 misses and 0 refusals, and the explicit `-ub 2048` arm placed without a
-refusal (`llama.cpp-86bl`).
+`llama.cpp-86bl`. All arms ran with the gate's defaults, 200 and 500 for the PP floors. The Qwen3.8 arms and `MI_b70`
+ran on the Arc Pro B70 (`level_zero:0`), and `GO_gate`, `GO_pp`, `GO_noc` and `MI_b50` on the Arc Pro B50
+(`level_zero:1`) (c-4tfx corrects c-4m7d). Host load read 13.4-21.8, `builders_pre` and `builders_post` were 0 in
+every arm, `Shmem` went 0.58 -> 0.61 GB, and the kernel log shows 0 GT-reset/guc_id/CAT-error lines (`journalctl -k`
+since 03:40, read 04:20). The Qwen placement lines were `MoE experts: 42633 on device, 31095 on host` (first context)
+and `37962 on device, 35766 on host` (second), 23 host layers in the default-ub Qwen arms (`Q_pp_ub2048` reports
+layers=38, because the explicit `-ub 2048` placement demotes more experts to the host; c-4tfx). The gate's own summary
+reads `verdicts_pass=10 verdicts_fail=3 not_exercised_or_unscored=0`, with four arms RECORDED and not scored; every
+arm returned rc=0 and the script itself exits 1 because arms FAILed. The ring engaged on every layer-ubatch in every
+PP arm with 0 refusals, and with 0 misses where the arm's line reports them (not `Q_staged`, which reports
+`trace_misses=0`). The explicit `-ub 2048` arm placed without a refusal (`llama.cpp-86bl`).
 
 **This is a record, not a baseline for the Qwen prefill figures**: the 200/500 floors are unmet with the ring fully
 engaged, and the attribution is `llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`. The three FAILs are `Q_pp`,
@@ -684,8 +686,10 @@ Against the 4229a205d record (c-4m7d): Q_pp pp512 30.9 ± 29.39 -> 76.5 ± 0.17,
 ring engages on the first context with no loan (`llama.cpp-86bl`, `llama.cpp-384v`); pp2048 66.5 -> 75.7; Q_pp_ub2048
 planner refusal -> 87.8 with the ring on all 152 layer-ubatches; Q_staged NOT_EXERCISED -> PASS; Q_tg 4.10 (with a
 loan) -> 18.43 (no loan); Q_noc 11.63 -> 17.81; Q_pp_cpu pp2048 32.5 -> 47.5, which is host state and not a change
-this record can attribute. The floors in the table are the gate's defaults as carried in the earlier records (c-c774,
-c-xkq4), not figures from c-7vb3.
+this record can attribute. The floors in the table are the gate's defaults as carried in the earlier records in this
+file: c-c774 and c-xkq4 for 200/500, 11.0 and 9.5, and the `Q_tok_cpu` and `Q_decline` rules as in the earlier tables.
+The `GO_pp` reference figures (827.4, 871, the 31.0-33.0 band, 32.0) come from the gate's own `GO_pp` line (c-7vb3)
+and c-4m7d.
 
 | arm | metric | value | floor | verdict | builders_post | notes |
 |-----|--------|-------|-------|---------|---------------|-------|

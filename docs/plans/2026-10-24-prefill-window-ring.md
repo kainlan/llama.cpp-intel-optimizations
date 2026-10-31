@@ -1718,8 +1718,9 @@ Step by step:
    `overlap=yes`, `staged_h2d=0`, rc=0; `llama.cpp-qov5` c-bg4s, and `llama.cpp-efck` c-0cu6 for the 2026-10-24 rows).
 3. **Probe on the ring's queue:** not re-run in r7. The h2d-probe gate was descoped with Task 5 (c-bg4s). The "probed
    H2D rate" line is absent from `Q_pp.err`, so that part of the step was not observed in r7 (c-4m7d).
-4. **Gate, ring arms.** Held: `ring_engaged=yes` with `misses=0` and 0 PP-MOE refusals on `Q_pp`, `Q_pp_ub2048`
-   and `Q_staged`, and `Q_staged=PASS`. `trace_misses` was NA on `Q_pp` and `Q_pp_ub2048` and 0 only on `Q_staged`.
+4. **Gate, ring arms.** Held: `ring_engaged=yes` and 0 PP-MOE refusals on `Q_pp`, `Q_pp_ub2048` and `Q_staged`,
+   `misses=0` on `Q_pp` and `Q_pp_ub2048`, and `Q_staged=PASS` (its line has no `misses=` field). `trace_misses` was
+   NA on `Q_pp` and `Q_pp_ub2048` and 0 only on `Q_staged`.
    Did not hold: `Q_pp` pp512 76.5 against 200 and pp2048 75.7 against 500, and `Q_pp_ub2048` pp2048 87.8 against
    500, so both are FAIL. The explicit `-ub 2048` arm placed with no refusal. The forced-CPU reference reads 16.0 and
    47.5, so the ring is 4.8x and 1.6x over it, short of the floors.
@@ -1736,7 +1737,6 @@ Step by step:
 
 The expectation on throughput was not met: the ring is engaged and numerically correct, but the 200 and 500 t/s floors
 are unmet. The attribution is `llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`.
-
 
 ---
 
