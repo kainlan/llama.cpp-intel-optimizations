@@ -103,7 +103,8 @@ moe_exec_decision moe_stream_phase::begin_layer(int                    layer,
     cur_graph_seq_ = op.graph_seq;
     log_           = op.log;
     policy_        = op.policy;
-    // The window timing, and the timing queue its marks go on, are trace level 2's, until a mark fails to submit.
+    // The window timing, and the timing queue its marks go on, are trace level 2's, until a mark, the timing queue or
+    // the records' growth fails (drop_window_timing()).
     window_timing_.enabled = op.log != nullptr && op.log->trace >= 2 && !window_marks_failed_;
     request_loan_  = op.request_loan;
     loan_refusals_ = op.loan_refusals;
@@ -298,26 +299,28 @@ sycl::queue & moe_stream_phase::timing_queue() {
 // end them late. `deps` is everything that copy waits on except `gate`, its read gate. The free mark also waits for the
 // copy queued before, since the copy queue is in order; the start mark adds the gate. A later stage of a window already
 // marked submits nothing: marked() keeps the first copy's marks and would discard these. A mark that fails to submit,
-// or a record that cannot grow (std::bad_alloc), is caught here, not by stage_window()'s copy handler:
-// drop_window_timing() turns the timing off and the copies go on. A planned refusal (ggml_sycl_fallback_error) is
-// rethrown, as stage_window()'s handler rethrows it.
+// or a record or the marks' copy of `deps` that cannot grow (std::bad_alloc), is caught here, not by stage_window()'s
+// copy handler: drop_window_timing() turns the timing off and the copies go on. `deps` comes by reference so that its
+// copy is made inside the try; a by-value parameter would be copied at the call site, inside the copy handler's try.
+// A planned refusal (ggml_sycl_fallback_error) is rethrown, as stage_window()'s handler rethrows it.
 void moe_stream_phase::mark_window_start(uint64_t                           key,
-                                         std::vector<sycl::event>           deps,
+                                         const std::vector<sycl::event> &   deps,
                                          const std::optional<sycl::event> & gate) {
     const auto * prior = window_timing_.find(key);
     if (prior != nullptr && prior->start_marked) {
         return;
     }
     try {
+        std::vector<sycl::event> mark_deps = deps;
         if (window_timing_.queue_tail) {
-            deps.push_back(*window_timing_.queue_tail);
+            mark_deps.push_back(*window_timing_.queue_tail);
         }
         sycl::queue &     q         = timing_queue();
-        const sycl::event free_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps);
+        const sycl::event free_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, mark_deps);
         if (gate) {
-            deps.push_back(*gate);
+            mark_deps.push_back(*gate);
         }
-        const sycl::event start_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, deps);
+        const sycl::event start_mark = ggml_sycl_submit_marker<moe_stream_timing_mark>(q, mark_deps);
         window_timing_.marked(key, free_mark, start_mark, gate);
     } catch (const ggml_sycl_fallback_error &) {
         throw;
@@ -802,7 +805,9 @@ bool moe_stream_phase::test_reserve_ring(int device, const moe_stream_ring_geome
     geo_            = geo;
     reserve_failed_ = false;
     ccs_.emplace(ccs);
-    timing_queue_.reset();  // as prepare() does: the timing queue follows the compute queue
+    // As prepare() does: the timing queue and the copy queued before follow the compute queue.
+    timing_queue_.reset();
+    window_timing_.queue_tail.reset();
     in_order_ = ccs.is_in_order();
     return ring_ready(nullptr);
 }

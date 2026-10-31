@@ -1175,9 +1175,11 @@ class moe_stream_phase {
     void              warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li);
     void              warn_loan_refused(size_t bytes_short) const;
     void              warn_partial_released(uint32_t held) const;
-    void mark_window_start(uint64_t key, std::vector<sycl::event> deps, const std::optional<sycl::event> & gate);
-    void mark_window_end(uint64_t key, const sycl::event & last_copy);
-    void drop_window_timing(const std::exception & e);
+    void              mark_window_start(uint64_t                           key,
+                                        const std::vector<sycl::event> &   deps,
+                                        const std::optional<sycl::event> & gate);
+    void              mark_window_end(uint64_t key, const sycl::event & last_copy);
+    void              drop_window_timing(const std::exception & e);
 
     std::unique_ptr<moe_stream_ring>                ring_;
     // A refused reserve's ring and the slots it got, for the next micro-batch's ring_ready() to continue from while a
@@ -1217,8 +1219,9 @@ class moe_stream_phase {
     // of a queue prepare() dropped: a SYCL event outlives its queue, so those marks stay valid and the next flush
     // reads them.
     std::optional<sycl::queue>              timing_queue_;
-    // A timing mark failed to submit (drop_window_timing()): window timing then stays off for every later prompt in
-    // this backend context, which holds this phase; the per-prompt reset does not clear this flag.
+    // A timing mark, the timing queue or the records' growth failed (drop_window_timing()): window timing then stays
+    // off for every later prompt in this backend context, which holds this phase; the per-prompt reset does not clear
+    // this flag.
     bool                                    window_marks_failed_ = false;
     // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
     // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
