@@ -661,15 +661,16 @@ ring's engagement from the twelfth boundary to the fourth and pp2048 from 56.4 t
 #### Record at 671279356, the window ring with 8p5x/384v/86bl merged (2026-10-31 03:44-04:11 EDT, Task 10 run r7)
 
 The gate re-run for Task 10 (`llama.cpp-qov5`, comments c-1hc8 and c-7vb3), by the lead, from the merge tree at master
-671279356 with a build made after that commit. It contains the three merges that landed since 4229a205d: `llama.cpp-8p5x`,
-`llama.cpp-384v` and `llama.cpp-86bl`. All arms ran with the default floors. The gate's own summary reads
-`verdicts_pass=10 verdicts_fail=3 not_exercised_or_unscored=0`, with four arms RECORDED and not scored. Every arm
-returned rc=0 (the script itself exits 1 because arms FAILed), `builders_pre` and `builders_post` were 0 in every arm, and
-`Shmem` went from 578592 kB to 607312 kB. The ring engaged on every layer-ubatch in every PP arm with 0 misses and 0
-refusals, and the explicit `-ub 2048` arm placed without a refusal (`llama.cpp-86bl`). **This is a record, not a baseline
-for the Qwen prefill figures**: the 200/500 floors are unmet with the ring fully engaged, and the attribution is
-`llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`. The `GO_pp` FAIL is the `llama.cpp-zuze` master regression. Q_pp_cpu
-reads 16.0 and 47.5 on this tree, so the ring is 4.8x and 1.6x over the CPU executor.
+671279356 with a build made after that commit. It contains the three merges that landed since 4229a205d:
+`llama.cpp-8p5x`, `llama.cpp-384v` and `llama.cpp-86bl`. All arms ran with the default floors. The gate's own summary
+reads `verdicts_pass=10 verdicts_fail=3 not_exercised_or_unscored=0`, with four arms RECORDED and not scored. Every
+arm returned rc=0 (the script itself exits 1 because arms FAILed), `builders_pre` and `builders_post` were 0 in every
+arm, and `Shmem` went from 578592 kB to 607312 kB. The ring engaged on every layer-ubatch in every PP arm with 0
+misses and 0 refusals, and the explicit `-ub 2048` arm placed without a refusal (`llama.cpp-86bl`). **This is a
+record, not a baseline for the Qwen prefill figures**: the 200/500 floors are unmet with the ring fully engaged, and
+the attribution is `llama.cpp-8ucb`'s, blocked on `llama.cpp-ivb6`. The `GO_pp` FAIL is the `llama.cpp-zuze` master
+regression. Q_pp_cpu reads 16.0 and 47.5 on this tree, so the ring is 4.8x and 1.6x over the CPU executor. The floors
+in the table are the gate's defaults as carried in the earlier records (c-c774, c-xkq4), not figures from c-7vb3.
 
 | arm | metric | value | floor | verdict | builders_post | notes |
 |-----|--------|-------|-------|---------|---------------|-------|

@@ -1719,8 +1719,8 @@ not_exercised_or_unscored=0`, every arm rc=0, builders 0 throughout. Step by ste
    `Q_staged`, and `Q_staged=PASS`. Did not hold: `Q_pp` pp512 76.5 against 200 and pp2048 75.7 against 500, and
    `Q_pp_ub2048` pp2048 87.8 against 500, so `Q_pp` and `Q_pp_ub2048` are FAIL. The explicit `-ub 2048` arm placed with
    no refusal. The forced-CPU reference reads 16.0 and 47.5, so the ring is 4.8x and 1.6x over it, short of the floors.
-5. **Correctness:** held. `Q_tok` and `Q_tok_cpu_1` read the same md5, the `Q_tok_cpu` pairs are equal (`pairs_equal=2`),
-   and `Q_decline` PASS (one declined layer).
+5. **Correctness:** held. `Q_tok` and `Q_tok_cpu_1` read the same md5, the `Q_tok_cpu` pairs are equal
+   (`pairs_equal=2`), and `Q_decline` PASS (one declined layer).
 6. **Decode unchanged:** held. `Q_tg` 18.43 and `Q_noc` 17.81, both PASS, refill not exercised.
 7. **Controls:** held. GPT-OSS count gates (`GO_gate`, `GO_noc`) and both Mistral digit gates (`MI_b70`, `MI_b50`) PASS.
    `GO_pp` pp512 813.8 against the 827.4 floor is FAIL: the `llama.cpp-zuze` master regression, not this plan's.
