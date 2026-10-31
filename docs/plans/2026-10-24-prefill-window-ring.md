@@ -78,7 +78,10 @@ builder's source lines, which cost two wasted and two on-demand window copies pe
 the next window is phase 0 of the next role (GATE to UP, UP to DOWN; DOWN prefetches nothing). There is **no cross-layer
 prefetch** in this plan: the first GATE window of each layer is an exposed copy, counted as `exposed`, never as a
 `miss`. Cross-layer look-ahead is a follow-up ticket this plan creates
-but does not implement.
+but does not implement. (Corrected 2026-10-31 by the epic's final integration review: `G` is capped at `G_plan`,
+`moe_stream_phase::phase_experts()`, not at the region's slots. This paragraph said `window_experts()`, which answered
+`min(role_items_max, G_plan)`; a phase spans device and host experts while its window holds only the phase's host
+matrices of one role, so the region cap split a layer with few host matrices per role into that many experts a phase.)
 
 **W2. Phase API.** `moe_stream_phase` gains `window_begin(req, cache, op, &misses)` (stages the window's missing host
 experts now and the next window into the other region) and `window_done(layer, role, readers_done)` (records the
@@ -96,7 +99,9 @@ capped by `GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX` when set; the slot bytes come
 `unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device)` through a new hints struct. The executor caps its
 phase at `window_experts()` so a phase never exceeds the region (W4), which is why the sizing need not know the active
 count. The cost model's `triplet_bytes_max` becomes `stage_unit_bytes_max` (one matrix), and `weigh` passes
-`window_us = 0.0`: there is no layer-ahead copy to discount.
+`window_us = 0.0`: there is no layer-ahead copy to discount. (Corrected 2026-10-31: the executor caps its phase at
+`G_plan` (`phase_experts()`), not at `window_experts()`; a window holds at most `min(G_plan, role_items)` host matrices
+of one role, which is at most `window_slots`, so the phase still never exceeds the region.)
 
 **W4. Executor.** `ggml_sycl_mul_mat_id`'s batched f16 arm: the stream call is hoisted to function scope; the early
 expert loop marks a claimed layer's HOST experts `deferred` instead of calling `find`; `phase_experts` is
@@ -106,6 +111,8 @@ GEMMs. The WOQ (MXFP4) arm is unchanged: the claim predicate (`moe_pp_batched_ta
 so it never sees a ring layer; admitting it is a follow-up ticket. A layer declined at claim time stays in the hybrid
 world (`enqueue_host_expert_rows`), which is what llama.cpp-8p5x c-0blp expects (read it). A stage failure **after** a
 claim is an invariant violation (the window fits the region by construction) and aborts with a message.
+(Corrected 2026-10-31: `phase_experts` is `min(G, phase_experts())`, `G_plan`, not `min(G, window_experts())`; the
+window still fits the region, since it holds only the phase's host matrices of one role.)
 
 **W5. Copy queue (amended 2026-10-24 from the Task 4 rows).** The ring copies on the cache's BCS queue
 (`cache.get_bcs_queue()`, a plain in-order queue on the compute queue's context, `unified-cache.cpp:6365`) as it does
