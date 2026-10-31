@@ -1176,7 +1176,7 @@ class moe_stream_phase {
     sycl::queue &     timing_queue();
     void mark_window_start(uint64_t key, std::vector<sycl::event> deps, const std::optional<sycl::event> & gate);
     void mark_window_end(uint64_t key, const sycl::event & last_copy);
-    void              drop_window_timing(const sycl::exception & e);
+    void drop_window_timing(const sycl::exception & e);
     void              warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li);
     void              warn_loan_refused(size_t bytes_short) const;
     void              warn_partial_released(uint32_t held) const;
