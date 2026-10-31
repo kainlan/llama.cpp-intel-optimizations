@@ -887,6 +887,32 @@ static bool run_explicit_ubatch_ring_placement_test() {
         ok = false;
     }
 
+    // The ring each context re-plans for. A load that PLACED the micro-batch keeps the ring at that size for every
+    // context whose own micro-batch is no larger (llama-bench's -p 512 and -n 128 contexts under -ub 2048), so none of
+    // them releases the placed ring for the next context to re-admit. A larger context, a context that names no
+    // micro-batch, and every plan that placed nothing re-plan for the context's own micro-batch.
+    const uint32_t kept_128   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 128);
+    const uint32_t kept_512   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 512);
+    const uint32_t kept_2048  = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 2048);
+    const uint32_t own_4096   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 4096);
+    const uint32_t own_0      = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 0);
+    bool           others_own = true;
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        for (const uint32_t n_ubatch : { 128u, 512u, 2048u }) {
+            const uint32_t ring_n_ubatch =
+                ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(other->explicit_ubatch, n_ubatch);
+            others_own = others_own && ring_n_ubatch == n_ubatch;
+        }
+    }
+    if (kept_128 != 2048 || kept_512 != 2048 || kept_2048 != 2048 || own_4096 != 4096 || own_0 != 0 || !others_own) {
+        printf(
+            "FAIL: a placed load keeps its ring for every context no larger than its micro-batch: contexts at 128, 512 "
+            "and 2048 re-plan for %u, %u and %u, at 4096 for %u, at 0 for %u, and plans that placed nothing for the "
+            "context's own %d; want 2048, 2048, 2048, 4096, 0 and 1\n",
+            kept_128, kept_512, kept_2048, own_4096, own_0, others_own ? 1 : 0);
+        ok = false;
+    }
+
     if (ok) {
         printf(
             "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "

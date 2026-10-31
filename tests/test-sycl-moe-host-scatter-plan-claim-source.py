@@ -259,7 +259,7 @@ def claim_ring_is_charged_the_unheld_scratch(sycl: str) -> bool:
     held = txn.find("const size_t moe_host_scatter_held = ctx->moe_host_scatter_scratch.capacity(ctx->device);", planned)
     charged = txn.find("ring_kv_zone.runtime_pending_bytes += moe_host_scatter_planned > moe_host_scatter_held ? "
                        "moe_host_scatter_planned - moe_host_scatter_held : 0;", held)
-    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)",
+    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone)",
                     charged)
     return min(planned, held, charged, ring) >= 0
 

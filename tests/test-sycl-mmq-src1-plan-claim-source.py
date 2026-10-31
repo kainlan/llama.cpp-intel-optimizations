@@ -111,7 +111,7 @@ def claim_transaction_claims_after_commit_before_hold(sycl: str) -> bool:
     txn = body(norm(sycl), TXN_SIG)
     if not txn:
         return False
-    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)")
+    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone)")
     commit = txn.find("dense_guard.commit();")
     claim = txn.find("ggml_sycl_mmq_src1_claim_plan(*ctx);")
     if min(ring, commit, claim) < 0:
@@ -175,7 +175,7 @@ def claim_ring_replan_is_charged_the_dense_plans(sycl: str) -> bool:
     fit = txn.find("ggml_sycl::unified_cache_dense_scratch_runtime_fit(ctx->device, next_kv_info.n_ubatch, &needed,")
     taken = txn.find("dense_scratch_runtime_bytes = needed;", fit)
     charged = txn.find("ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;", taken)
-    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)",
+    ring = txn.find("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone)",
                     charged)
     return min(fit, taken, charged, ring) >= 0
 

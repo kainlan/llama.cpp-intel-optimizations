@@ -931,6 +931,13 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
 // unannounced.
 bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode);
 
+// The micro-batch the runtime context transaction re-plans the PP MoE oneDNN scratch ring for: the one the load placed
+// when its plan PLACED it and the context's own micro-batch is no larger, else the context's own. The load decided the
+// ring's size, and a smaller context deriving a smaller ring would be a second source for that fact; the ring it
+// released would then have to be re-admitted by the next context of the same load. A context at 0 names no micro-batch,
+// so it keeps its own and the re-plan reports it.
+uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch);
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {

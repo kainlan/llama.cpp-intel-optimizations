@@ -2778,6 +2778,13 @@ triplet and then skip smaller ones the real pack placed. With triplets of
 unequal size the device can keep as many triplets and still hold fewer bytes,
 so the bytes, not the count, decide whether the line prints.
 
+Every context of the load whose micro-batch is at or below the placed one
+re-plans the ring for the placed micro-batch
+(`placement_explicit_ubatch_ring_n_ubatch()`), so it keeps the placed ring:
+the load decided the ring's size, and a ring released for a smaller context
+would have to be re-admitted by the next one, into a zone with no slack
+beyond its terms.
+
 The context is refused only when moving every device-resident routed expert
 would not free the room. The refusal names the largest `-ub` whose ring fits,
 from `pp_moe_onednn_admit_ring()`'s slot arithmetic:

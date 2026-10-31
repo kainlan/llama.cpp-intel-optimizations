@@ -24,9 +24,12 @@ What this gate pins:
   load in the process) re-publishes the micro-batch's ring and dense scratch, asking the planner's own decision with no
   expert budget, and publishes the planning shape again when that publish fails;
 - a load announces the placement in ONE WARN line, with the bytes and layers moved and both packs' triplets, at the
-  first non-probe context since the load whose room cost device bytes, whatever that context's micro-batch; the plan that context publishes carries a mark every later
-  context's plan copies, so no later context repeats it;
+  first non-probe context since the load whose room cost device bytes, whatever that context's micro-batch; the plan
+  that context publishes carries a mark every later context's plan copies, so no later context repeats it;
 - the fallback refusal names the largest -ub that fits, from the ring admission's own slot arithmetic;
+- a load that placed its explicit micro-batch keeps the ring at that size for every context whose own micro-batch is no
+  larger: the transaction re-plans the ring for placement_explicit_ubatch_ring_n_ubatch()'s answer, so the re-plan's
+  idempotent return keeps the placed ring instead of releasing it for a smaller one the next context must re-admit;
 - the hold-spill fit credits a compute buffer no larger than the planned compute term at the micro-batch the published
   single-device plan PLACED on the device, read once before the demand, whole or nothing; every other rung, and every
   load that placed none, is judged as before;
@@ -114,8 +117,14 @@ REFUSE_LITERAL = ('"[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN s
                   '%.1f MB, more than the RUNTIME zone can hold with every device-resident expert re-placed to the '
                   'host tier (%.1f MB)%s (device=%d)\\n", xub.n_ubatch, xub.ring_bytes / mb, '
                   'xub.max_ring_runtime_bytes / mb, fits, ctx->device);')
-RING_REPLAN = ("ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, "
-               "&ring_kv_zone);")
+RING_REPLAN = "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone);"
+# The ring a context re-plans for: the placed micro-batch's when the plan PLACED it and the context's own is no larger.
+RING_N_UBATCH = ("const uint32_t ring_n_ubatch = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch("
+                 "next_plan.explicit_ubatch, next_kv_info.n_ubatch);")
+RING_HELPER_SIG = ("uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, "
+                   "uint32_t n_ubatch)")
+RING_HELPER_RULE = ("const bool kept = xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && n_ubatch != 0 && "
+                    "n_ubatch <= xub.n_ubatch; return kept ? xub.n_ubatch : n_ubatch;")
 LARGEST_FIT = "decision.largest_fitting_n_ubatch = pp_moe_onednn_admit_ring(fit).largest_fitting_n_ubatch;"
 FIT_INPUTS = (
     "fit.runtime_available_bytes = decision.max_ring_runtime_bytes;",
@@ -288,6 +297,18 @@ def claim_refusal_names_the_largest_fit(sycl_cpp: str, admission_cpp: str) -> bo
             and bool(decide) and LARGEST_FIT in decide and all(f in decide for f in FIT_INPUTS))
 
 
+def claim_placed_ring_is_kept_for_smaller_contexts(sycl_cpp: str, cache_cpp: str, cache_hpp: str) -> bool:
+    """The transaction re-plans the ring for the helper's answer, computed once after the fallback refusal, and never
+    for the context's own micro-batch directly. The helper keeps the placed micro-batch only for a plan that PLACED it
+    and a context naming a micro-batch no larger; anything else re-plans for the context's own."""
+    txn = body(norm(sycl_cpp), TXN_SIG)
+    return (bool(txn) and txn.count(RING_N_UBATCH) == 1 and txn.count(RING_REPLAN) == 1
+            and ordered(txn, REFUSE_LITERAL, RING_N_UBATCH, RING_REPLAN)
+            and "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch" not in txn
+            and RING_HELPER_RULE in body(norm(cache_cpp), RING_HELPER_SIG)
+            and RING_HELPER_SIG + ";" in norm(cache_hpp))
+
+
 def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cache_cpp: str) -> bool:
     """The hold-spill fit credits the planned compute term at the explicit micro-batch the published single-device
     plan PLACED on the device, read once before the demand is asked: at that rung a request no larger than the term
@@ -424,6 +445,10 @@ def test_placement_is_one_warn_line():
 
 def test_refusal_names_the_largest_fit():
     assert claim_refusal_names_the_largest_fit(SYCL_CPP, ADMISSION_CPP)
+
+
+def test_placed_ring_is_kept_for_smaller_contexts():
+    assert claim_placed_ring_is_kept_for_smaller_contexts(SYCL_CPP, CACHE_CPP, CACHE_HPP)
 
 
 def test_fit_credits_the_placed_compute_room():
@@ -585,6 +610,37 @@ def test_mutant_refusal_after_the_ring_replan_fails():
 def test_mutant_largest_fit_not_from_the_ring_arithmetic_fails():
     assert not claim_refusal_names_the_largest_fit(
         SYCL_CPP, _once(ADMISSION_CPP, LARGEST_FIT, "decision.largest_fitting_n_ubatch = in.n_ubatch_default;"))
+
+
+def _ring_kept(sycl_cpp: str = None, cache_cpp: str = None) -> bool:
+    return claim_placed_ring_is_kept_for_smaller_contexts(sycl_cpp if sycl_cpp is not None else SYCL_CPP,
+                                                          cache_cpp if cache_cpp is not None else CACHE_CPP, CACHE_HPP)
+
+
+def test_mutant_ring_replanned_for_the_context_micro_batch_fails():
+    """The depth-sweep refusal: a -n 128 context shrank the placed ring, and the next -p 512 context could not regrow
+    it in a zone with no slack beyond its terms."""
+    assert not _ring_kept(sycl_cpp=_once(SYCL_CPP, RING_REPLAN,
+                                         RING_REPLAN.replace("ring_n_ubatch", "next_kv_info.n_ubatch", 1)))
+
+
+def test_mutant_ring_kept_for_a_larger_context_fails():
+    """A context above the placed micro-batch would dispatch more rows than the kept ring's slots hold."""
+    assert not _ring_kept(cache_cpp=_once(CACHE_CPP, RING_HELPER_RULE,
+                                          RING_HELPER_RULE.replace(" && n_ubatch <= xub.n_ubatch", "", 1)))
+
+
+def test_mutant_ring_kept_for_a_plan_that_placed_nothing_fails():
+    """Only PLACE sized the zone for the micro-batch; a refused or ungrown plan has no placed ring to keep."""
+    assert not _ring_kept(cache_cpp=_once(
+        CACHE_CPP, RING_HELPER_RULE,
+        RING_HELPER_RULE.replace("xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && ", "", 1)))
+
+
+def test_mutant_ring_kept_for_a_context_naming_no_micro_batch_fails():
+    """A context at 0 names no micro-batch: the re-plan reports it rather than answer for it."""
+    assert not _ring_kept(cache_cpp=_once(CACHE_CPP, RING_HELPER_RULE,
+                                          RING_HELPER_RULE.replace("n_ubatch != 0 && ", "", 1)))
 
 
 def test_mutant_fit_credits_an_unplaced_room_fails():

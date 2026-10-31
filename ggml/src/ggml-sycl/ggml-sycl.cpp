@@ -20770,6 +20770,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             return refuse("PP MoE oneDNN scratch ring does not fit");
         }
     }
+    // The ring is re-planned for the micro-batch the load placed when this context's own is no larger: the load decided
+    // the ring's size, and a smaller ring derived from this context would be a second source for it. The re-plan then
+    // finds the ring already planned at that size, so no context of the load releases it for a smaller one.
+    const uint32_t ring_n_ubatch =
+        ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(next_plan.explicit_ubatch, next_kv_info.n_ubatch);
     // llama.cpp-jumy: RELEASE_REFUSED is a transient failure to release the
     // ring's OLD physical backing (still claimed by an in-flight dispatch)
     // -- nothing about the requested size was evaluated, so a caller may
@@ -20777,7 +20782,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // (DOES_NOT_FIT) is the deterministic "this size does not fit" answer
     // and stays a PLAN_REJECTED-mapped refusal, unchanged from before.
     const ggml_sycl_ring_replan_result ring_replan_result =
-        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);
+        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone);
     if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {
         // refusal already logged (ERROR normally, INFO in probe mode)
         return busy("busy (PP MoE oneDNN scratch ring claimed by an in-flight dispatch)");
@@ -20852,7 +20857,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             GGML_LOG_ERROR(
                 "[SYCL-PLAN] probe rollback of the PP MoE oneDNN scratch ring to n_ubatch=%u failed; ring left "
                 "at n_ubatch=%u\n",
-                pre_replan_pp_moe_ring_n_ubatch, next_kv_info.n_ubatch);
+                pre_replan_pp_moe_ring_n_ubatch, ring_n_ubatch);
             return refuse("probe rollback failed: ring left at candidate size");
         }
         announce_kv_host_demotions(next_plan);

@@ -240,7 +240,7 @@ def test_replan_call_has_a_mutation_witness():
     raw = GGML_SYCL_CPP
     call_block = (
         "    const ggml_sycl_ring_replan_result ring_replan_result =\n"
-        "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);\n"
+        "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, ring_n_ubatch, probe_mode, &ring_kv_zone);\n"
         "    if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {\n"
         "        // refusal already logged (ERROR normally, INFO in probe mode)\n"
         '        return busy("busy (PP MoE oneDNN scratch ring claimed by an in-flight dispatch)");\n'

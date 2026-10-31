@@ -33426,6 +33426,13 @@ bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, 
            !xub.announced;
 }
 
+// The ring micro-batch of a placed explicit micro-batch; unified-cache.hpp describes it.
+uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch) {
+    const bool kept =
+        xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && n_ubatch != 0 && n_ubatch <= xub.n_ubatch;
+    return kept ? xub.n_ubatch : n_ubatch;
+}
+
 // The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
 // the runtime context transaction announces the outcome once, at WARN, when the context opens.
 static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, int device_id) {
