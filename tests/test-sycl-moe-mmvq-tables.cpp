@@ -15,6 +15,7 @@
 #include "../ggml/src/ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -92,6 +93,53 @@ bool control_premise_holds() {
 
 bool fake_cap_over_advertising(ggml_type t, ggml_layout_mode l) {
     return cap_wrapper(t, l) || (t == k_control_type && l == k_control_layout);
+}
+
+// The stream ring's window (moe_stream_window_experts) is the executor's own two-buffer rule for an unbounded expert
+// count: moe_pp_batched_f16_window_experts. This is the formula the stream plan carried before it delegated, copied
+// here so the helper is checked against it point by point: G = fit >= 2 ? fit / 2 : fit, then the cap, 0 when the
+// slot or the expert is 0.
+size_t window_experts_reference(size_t slot_bytes, size_t expert_bytes, size_t cap) {
+    if (slot_bytes == 0 || expert_bytes == 0) {
+        return 0;
+    }
+    const size_t fit = slot_bytes / expert_bytes;
+    size_t       g   = fit >= 2 ? fit / 2 : fit;
+    if (cap != 0 && g > cap) {
+        g = cap;
+    }
+    return g;
+}
+
+// The points where the helper and the reference disagree over a grid of slot, expert and cap. One point is left out:
+// a slot of SIZE_MAX bytes holding SIZE_MAX one-byte experts with no cap, where fit equals the unbounded expert count
+// and the executor's rule takes its one-group arm (SIZE_MAX instead of SIZE_MAX / 2). No slot has SIZE_MAX bytes.
+int count_window_experts_mismatches(bool report) {
+    const size_t slots[] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 63, 64, 65, 1000, 4096, 4097, 1 << 20, size_t(3) << 30, SIZE_MAX / 2, SIZE_MAX
+    };
+    const size_t experts[]  = { 0, 1, 2, 3, 7, 64, 1000, 1 << 20 };
+    const size_t caps[]     = { 0, 1, 2, 3, 5, 1000, SIZE_MAX };
+    int          mismatches = 0;
+    for (const size_t slot : slots) {
+        for (const size_t expert : experts) {
+            for (const size_t cap : caps) {
+                if (slot == SIZE_MAX && expert == 1 && (cap == 0 || cap == SIZE_MAX)) {
+                    continue;
+                }
+                const size_t want = window_experts_reference(slot, expert, cap);
+                const size_t got  = moe_pp_batched_f16_window_experts(slot, expert, cap);
+                if (got != want) {
+                    ++mismatches;
+                    if (report) {
+                        std::printf("  FAIL window experts: slot=%zu expert=%zu cap=%zu got=%zu want=%zu\n", slot,
+                                    expert, cap, got, want);
+                    }
+                }
+            }
+        }
+    }
+    return mismatches;
 }
 
 }  // namespace
@@ -764,6 +812,38 @@ int main() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // The stream ring's window is the executor's two-buffer rule (moe_pp_batched_f16_window_experts), equal to the
+    // formula the stream plan carried, including the cap and a slot that holds one expert (G = 1, one buffer).
+    {
+        const int n = count_window_experts_mismatches(true);
+        if (n != 0) {
+            std::printf("FAIL: %d window-experts points differ from the reference rule\n", n);
+            ++failures;
+        }
+
+        const struct {
+            size_t slot, expert, cap, want;
+        } named[] = {
+            { 0,       64, 0, 0 }, // an empty slot: no window
+            { 63,      64, 0, 0 }, // fit 0: no window
+            { 64,      64, 0, 1 }, // fit 1: the one buffer every group reuses, G = 1
+            { 127,     64, 5, 1 }, // fit 1 under a larger cap
+            { 128,     64, 0, 1 }, // fit 2: two halves of one expert each
+            { 192,     64, 0, 1 }, // fit 3: two halves, 1 each
+            { 64 * 10, 64, 3, 3 }, // fit 10, G 5, a cap below it wins
+            { 64 * 10, 64, 9, 5 }, // a cap above fit / 2 does not raise it
+        };
+
+        for (const auto & c : named) {
+            const size_t got = moe_pp_batched_f16_window_experts(c.slot, c.expert, c.cap);
+            if (got != c.want) {
+                std::printf("FAIL: window experts slot=%zu expert=%zu cap=%zu: got %zu, want %zu\n", c.slot, c.expert,
+                            c.cap, got, c.want);
+                ++failures;
             }
         }
     }
