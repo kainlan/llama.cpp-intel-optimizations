@@ -20762,10 +20762,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             }
             GGML_SYCL_RUNTIME_TXN_REFUSAL(
                 probe_mode,
-                "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f "
-                "MB, "
-                "more than the RUNTIME zone can hold with every device-resident expert re-placed to the host tier "
-                "(%.1f MB)%s (device=%d)\n",
+                "[SYCL-PLAN] runtime context update rejected: "
+                "PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB, "
+                "more than the RUNTIME zone can hold "
+                "with every device-resident expert re-placed to the host tier (%.1f MB)%s (device=%d)\n",
                 xub.n_ubatch, xub.ring_bytes / mb, xub.max_ring_runtime_bytes / mb, fits, ctx->device);
             return refuse("PP MoE oneDNN scratch ring does not fit");
         }
