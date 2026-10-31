@@ -800,52 +800,58 @@ static inline uint64_t moe_stream_window_timing_key(uint64_t ubatch_seq, uint32_
 }
 
 // The per-window timing GGML_SYCL_MOE_EXEC_TRACE=2 prints, one record per window, kept by the phase over sycl::event
-// and flushed at the synchronize boundary, where the host has already waited for the queue, so reading an event's
-// device times never waits on the compute path. Disabled (below trace level 2) it records nothing. Enabled, at() grows
-// `records` on the submitting thread inside graph compute, a trace-only allocation path, and clear() keeps the
-// vector's capacity, so later prompts of the same shape reuse it. The submitting thread is the only writer, so the
-// records take no lock. Templated on the event so test-moe-stream-phase drives it without a SYCL object. Each figure
-// and where it comes from:
+// and flushed at the synchronize boundary, where the host has already waited for the compute queue, so every mark of
+// a begun window follows only finished work and reading its device times never waits on the compute path. Disabled
+// (below trace level 2) it records nothing. Enabled, at() grows `records` on the submitting thread inside graph
+// compute, a trace-only allocation path, and clear() keeps the vector's capacity, so later prompts of the same shape
+// reuse it. The submitting thread is the only writer, so the records take no lock. Templated on the event so
+// test-moe-stream-phase drives it without a SYCL object.
+//
+// The device times come from marks, never from the copies: the copy queue has no profiling (unified_cache's
+// constructor), and no copy event is read for its times or asked for its status. A mark is an empty kernel on the
+// phase's timing queue (moe_stream_phase::timing_queue), submitted by stage_window: the free mark and the start mark
+// just before the window's first copy, the end mark behind its last copy. The free mark waits on everything the first
+// copy waits on except its read gate (the region's gate, the host entry's ready event and the copy queued before it
+// on the in-order copy queue); the start mark on the same plus the read gate. Each figure and where it comes from:
 //   bytes            the window's own copies' bytes: those staged for it, whichever window_begin call staged them
 //                    (a prefetched window's copies go in during the window before it)
 //   exposed          moe_stream_window_exposed: the layer's first window, which nothing staged ahead
 //   submit_us        host steady_clock time inside window_begin for this window, its own copies and the prefetch of
 //                    the next window included: the host-side submit overhead
-//   copy_us          device time of the window's copies: the first copy's command_start to the last copy's
-//                    command_end. The copy queue is in order, so the span covers every copy of the window (and any
-//                    other submitter's work interleaved on that queue). -1 when a copy has no device times (the copy
-//                    queue is built with profiling only under trace level 2) or the window copied nothing itself
+//   copy_us          device time of the window's copies: the start mark's command_end to the end mark's command_end.
+//                    The copy queue is in order, so the span covers every copy of the window (and any other
+//                    submitter's work interleaved on that queue), plus the timing queue's own latency at both ends.
+//                    -1 when the window copied nothing itself or a mark has no device times
 //   readers_wait_us  how long the window's first copy waited FOR its read gate (the barrier behind the dequants of
 //                    the window the region last held, or the compute-queue barrier that stands in for it): the gate's
-//                    command_end minus the moment the copy could otherwise have started, the later of the copy's
-//                    command_submit and the command_end of the copy queued before it on the copy queue (the last copy
-//                    this timeline saw since the previous flush; none: the submit alone). Clamped at 0. A large value
-//                    means the copy queue sat waiting for the compute queue to release the region. -1 when the copies
-//                    waited on no read gate, an event has no device times, or the first copy's command_submit is 0
-//                    (the runtime gave no submit time). Other submitters' work on the copy queue and the copy's other
-//                    dependencies are not seen
-//   start_lag_us     the first copy's command_start minus the read gate's command_end, clamped at 0: how late the copy
-//                    began after the gate released it. The copy depends on the gate, so it never starts before the
-//                    gate's end; a large value means the copy queue was busy or the copy was submitted late, i.e. the
-//                    gate was NOT what held it. -1 when the copies waited on no read gate, or the first copy or the
-//                    gate has no device times
+//                    command_end minus the free mark's, the moment every other dependency of the copy was done.
+//                    Clamped at 0. A large value means the copy queue sat waiting for the compute queue to release the
+//                    region. -1 when the copies waited on no read gate, or the gate or a mark has no device times.
+//                    Other submitters' work on the copy queue is not seen
+//   start_lag_us     the start mark's command_end minus the read gate's, clamped at 0: how late the copy could begin
+//                    after the gate released it. The start mark waits on the gate, so it never ends before it; a large
+//                    value means another dependency (the copy queued before, the region's gate, the host entry) was
+//                    still running, i.e. the gate was NOT what held the copy. -1 when the copies waited on no read
+//                    gate, or the start mark or the gate has no device times
 //   launches         the dequant kernels and the GEMM groups the executor submitted for the window
 template <typename event_t> struct moe_stream_window_timeline {
     struct record {
-        uint64_t               key       = 0;
-        bool                   begun     = false;  // window_begin named it; a prefetch never begun prints nothing
-        int                    layer     = -1;
-        expert_tensor_role     role      = expert_tensor_role::UNKNOWN;
-        size_t                 phase     = 0;
-        bool                   exposed   = false;
-        double                 submit_us = 0.0;
-        size_t                 bytes     = 0;
-        uint32_t               launches  = 0;
-        uint32_t               n_copies  = 0;
-        event_t                first_copy{};
-        event_t                last_copy{};
+        uint64_t               key          = 0;
+        bool                   begun        = false;  // window_begin named it; a prefetch never begun prints nothing
+        int                    layer        = -1;
+        expert_tensor_role     role         = expert_tensor_role::UNKNOWN;
+        size_t                 phase        = 0;
+        bool                   exposed      = false;
+        double                 submit_us    = 0.0;
+        size_t                 bytes        = 0;
+        uint32_t               launches     = 0;
+        uint32_t               n_copies     = 0;
+        bool                   start_marked = false;  // the free and start marks are the window's first copy's
+        bool                   end_marked   = false;  // the end mark follows the window's last copy
+        event_t                free_mark{};
+        event_t                start_mark{};
+        event_t                end_mark{};
         std::optional<event_t> reuse_gate;  // the read gate the window's copies waited on
-        std::optional<event_t> prev_copy;   // the copy queued just before the first copy, if this timeline saw one
     };
 
     bool                   enabled = false;  // trace level 2
@@ -877,21 +883,43 @@ template <typename event_t> struct moe_stream_window_timeline {
         return records.back();
     }
 
-    // stage_window() copied `bytes` for the window under `key`, as `copy`, after `gate`.
-    void copied(uint64_t key, const event_t & copy, size_t bytes, const std::optional<event_t> & gate) {
+    // stage_window() is about to submit the first copy of the window under `key`: `free_mark` and `start_mark` follow
+    // that copy's dependencies without and with `gate`, its read gate. A later stage of the same window keeps them.
+    void marked(uint64_t                       key,
+                const event_t &                free_mark,
+                const event_t &                start_mark,
+                const std::optional<event_t> & gate) {
         if (!enabled) {
             return;
         }
         record & r = at(key);
-        if (r.n_copies == 0) {
-            r.first_copy = copy;
-            r.reuse_gate = gate;
-            r.prev_copy  = queue_tail;
+        if (r.n_copies == 0 && !r.start_marked) {
+            r.start_marked = true;
+            r.free_mark    = free_mark;
+            r.start_mark   = start_mark;
+            r.reuse_gate   = gate;
         }
-        queue_tail  = copy;
-        r.last_copy = copy;
+    }
+
+    // stage_window() copied `bytes` for the window under `key`, as `copy`, which the next free mark waits behind.
+    void copied(uint64_t key, const event_t & copy, size_t bytes) {
+        if (!enabled) {
+            return;
+        }
+        record & r = at(key);
+        queue_tail = copy;
         ++r.n_copies;
         r.bytes += bytes;
+    }
+
+    // stage_window() submitted its last copy for the window under `key`, and `end_mark` follows it.
+    void ended(uint64_t key, const event_t & end_mark) {
+        if (!enabled) {
+            return;
+        }
+        record & r   = at(key);
+        r.end_marked = true;
+        r.end_mark   = end_mark;
     }
 
     // window_begin() ran for the window under `key`.
@@ -919,10 +947,9 @@ template <typename event_t> struct moe_stream_window_timeline {
         }
     }
 
-    // One line per begun window to `sink`, then the records go. `times(ev, &submit_ns, &start_ns, &end_ns)` answers
-    // an event's device command_submit, command_start and command_end, false when it has none. Returns the lines
-    // printed.
-    template <typename times_fn, typename sink_fn> size_t flush(int device, times_fn times, sink_fn sink) {
+    // One line per begun window to `sink`, then the records go. `end_of(ev, &end_ns)` answers an event's device
+    // command_end, false when it has none; it is asked only of the marks and the read gate. Returns the lines printed.
+    template <typename end_fn, typename sink_fn> size_t flush(int device, end_fn end_of, sink_fn sink) {
         size_t printed = 0;
         for (const record & r : records) {
             if (!r.begun) {
@@ -931,26 +958,22 @@ template <typename event_t> struct moe_stream_window_timeline {
             double     copy_us         = -1.0;
             double     readers_wait_us = -1.0;
             double     start_lag_us    = -1.0;
-            uint64_t   first_submit = 0, first_start = 0, first_end = 0;
-            const bool first_timed = r.n_copies != 0 && times(r.first_copy, &first_submit, &first_start, &first_end);
-            uint64_t   last_submit = 0, last_start = 0, last_end = 0;
-            if (first_timed && times(r.last_copy, &last_submit, &last_start, &last_end) && last_end >= first_start) {
-                copy_us = static_cast<double>(last_end - first_start) / 1e3;
+            uint64_t   start_end       = 0;
+            const bool start_timed     = r.n_copies != 0 && r.start_marked && end_of(r.start_mark, &start_end);
+            uint64_t   stop_end        = 0;
+            if (start_timed && r.end_marked && end_of(r.end_mark, &stop_end) && stop_end >= start_end) {
+                copy_us = static_cast<double>(stop_end - start_end) / 1e3;
             }
-            uint64_t   gate_submit = 0, gate_start = 0, gate_end = 0;
-            const bool gate_timed =
-                first_timed && r.reuse_gate && times(*r.reuse_gate, &gate_submit, &gate_start, &gate_end);
-            // The moment the first copy could have started without its gate: its submit, or the end of the copy
-            // ahead of it on the in-order copy queue when that is later.
-            uint64_t       prev_submit = 0, prev_start = 0, prev_end = 0;
-            const bool     prev_known = !r.prev_copy || times(*r.prev_copy, &prev_submit, &prev_start, &prev_end);
-            const uint64_t ready      = std::max(first_submit, prev_end);
-            // A zero submit is no time at all, not the device clock's origin: the wait would read as the gate's end.
-            if (gate_timed && prev_known && first_submit != 0) {
-                readers_wait_us = gate_end > ready ? static_cast<double>(gate_end - ready) / 1e3 : 0.0;
+            uint64_t   gate_end   = 0;
+            const bool gate_timed = start_timed && r.reuse_gate && end_of(*r.reuse_gate, &gate_end);
+            // The moment the first copy could have started without its gate: the free mark waits on every other
+            // dependency of that copy.
+            uint64_t   free_end   = 0;
+            if (gate_timed && end_of(r.free_mark, &free_end)) {
+                readers_wait_us = gate_end > free_end ? static_cast<double>(gate_end - free_end) / 1e3 : 0.0;
             }
             if (gate_timed) {
-                start_lag_us = first_start > gate_end ? static_cast<double>(first_start - gate_end) / 1e3 : 0.0;
+                start_lag_us = start_end > gate_end ? static_cast<double>(start_end - gate_end) / 1e3 : 0.0;
             }
             char line[288];
             std::snprintf(line, sizeof(line),
@@ -1091,7 +1114,7 @@ class moe_stream_phase {
     // timing line (moe_stream_window_timeline). Records nothing below GGML_SYCL_MOE_EXEC_TRACE=2.
     void     window_launched(int layer, expert_tensor_role role, size_t phase, uint32_t n);
     // At the synchronize boundary, after the queue wait: one WARN line per window since the last flush, under
-    // GGML_SYCL_MOE_EXEC_TRACE=2 (moe_stream_window_timeline), then the records go. Reading the events' device times
+    // GGML_SYCL_MOE_EXEC_TRACE=2 (moe_stream_window_timeline), then the records go. Reading the marks' device times
     // there never waits on the compute path. Prints nothing below trace level 2.
     void     flush_window_timing();
 
@@ -1150,6 +1173,9 @@ class moe_stream_phase {
     void              report(int layer, const layer_state & st) const;
     void              report_window(int layer, expert_tensor_role role, size_t phase, const stage_counts & n) const;
     void              report_staged_routes();
+    sycl::queue &     timing_queue();
+    void mark_window_start(uint64_t key, std::vector<sycl::event> deps, const std::optional<sycl::event> & gate);
+    void mark_window_end(uint64_t key, const sycl::event & last_copy);
     void              warn_ring_unavailable(const moe_stream_op & op, const moe_stream_layer_info & li);
     void              warn_loan_refused(size_t bytes_short) const;
     void              warn_partial_released(uint32_t held) const;
@@ -1186,6 +1212,10 @@ class moe_stream_phase {
     int      prev_window_layer_      = -1;          // the layer of this micro-batch's last window_begin, -1 for none
     uint32_t next_window_id_         = UINT32_MAX;  // the window the last window_begin prefetched, UINT32_MAX for none
     bool     next_window_whole_      = false;       // that prefetch staged every matrix of its window
+    // The queue the window timing's marks go on under GGML_SYCL_MOE_EXEC_TRACE=2: built at the first mark
+    // (timing_queue()), dropped when prepare() takes another compute queue, never built below trace level 2. Declared
+    // ahead of the timeline, so the marks the records hold go before their queue does.
+    std::optional<sycl::queue>              timing_queue_;
     // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
     // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
     // and flush_window_timing() prints and clears it. Written by the submitting thread only, so it takes no lock.

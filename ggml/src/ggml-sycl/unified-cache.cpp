@@ -6404,20 +6404,14 @@ unified_cache::unified_cache(sycl::queue & queue,
     // enables pipelining: H2D copies and reorder kernels interleave via event deps
     // instead of serializing on a single command list.
     //
-    // Under GGML_SYCL_MOE_EXEC_TRACE=2 the queue also records device times: the stream ring's per-window timing line
-    // reads its copies' command_submit/command_start/command_end (moe_stream_window_timeline).
-    // Profiling changes the queue's event kind and its timing, so a traced run compares only with a traced run. The
-    // level is parsed here through the same parser and named constant the backend's knob accessor uses, not a second
-    // spelling.
-    const bool bcs_profiling =
-        moe_exec_config_parse([](const char * name) -> const char * { return std::getenv(name); }).trace >= 2;
+    // The queue has no profiling at any trace level. Built with profiling for the stream ring's window timing line
+    // under GGML_SYCL_MOE_EXEC_TRACE=2, it left a traced Qwen3.8 prefill on the B70 waiting at its 49th window on a
+    // copy that never signalled, until the watchdog ended the run. The window line times marker kernels on a queue of
+    // the ring's own instead (moe_stream_phase::timing_queue), which wait on these copies from outside, so no copy is
+    // read for its device times or asked for its status.
     try {
-        bcs_queue_ = bcs_profiling ? std::make_unique<sycl::queue>(
-                                         queue_.get_context(), queue_.get_device(),
-                                         sycl::property_list{ sycl::property::queue::in_order{},
-                                                              sycl::property::queue::enable_profiling{} }) :
-                                     std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),
-                                                                   sycl::property::queue::in_order{});
+        bcs_queue_ =
+            std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});
         GGML_LOG_INFO("[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining\n");
         // Give the device pool a reference so it can drain BCS before chunk allocs.
         if (layout_pool_) {
