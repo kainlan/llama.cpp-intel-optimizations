@@ -17137,11 +17137,11 @@ struct ggml_sycl_dense_scratch_planned {
     bool dequant_f16 = false;
 };
 
-// Plans this load's dense MMQ/MMVQ Q8_1 src1 buffer and dense f16 dequant buffers (llama.cpp-479i) on `device` from the
-// inventory maxima at `n_ubatch`, keyed by `owner`, the owner of the load effect the stage holds (llama.cpp-45qo):
-// populate_inventory_globals plans the load's planning shape, and the explicit micro-batch's PP MoE ring placement
-// plans that micro-batch, whose grown RUNTIME zone holds both. A build that cannot reach the f16 arm plans nothing for
-// it: the buffers would be a reservation nothing draws, and the hold, the fit check and the ring would each count it.
+// Plans this load's dense MMQ/MMVQ Q8_1 src1 buffer and dense f16 dequant buffers on `device` from the inventory maxima
+// at `n_ubatch`, keyed by `owner`, the owner of the load effect the stage holds: populate_inventory_globals plans the
+// load's planning shape, and the explicit micro-batch's PP MoE ring placement plans that micro-batch, whose grown
+// RUNTIME zone holds both. A build that cannot reach the f16 arm plans nothing for it: the buffers would be a
+// reservation nothing draws, and the hold, the fit check and the ring would each count it.
 static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch(int                                   device,
                                                                          ggml_sycl::lifecycle::SlotToken       owner,
                                                                          const ggml_sycl::path_scoped_maxima & maxima,
@@ -17261,9 +17261,9 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     const bool                            owned      = plan_owner.generation != 0;
     const char *                          unplanned =
         owned ? " -- sizing overflowed, nothing planned" : " -- no staged load owns it, nothing planned";
-    // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from the inventory
-    // maxima the adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch will not supply),
-    // in the same RUNTIME zone (ggml_sycl_plan_load_dense_scratch).
+    // The dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from the inventory maxima the
+    // adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch will not supply), in the same
+    // RUNTIME zone (ggml_sycl_plan_load_dense_scratch).
     {
         const uint32_t                        dense_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
         const ggml_sycl_dense_scratch_planned dense_planned =
