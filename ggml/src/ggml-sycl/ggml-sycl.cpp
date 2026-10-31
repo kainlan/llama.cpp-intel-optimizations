@@ -91424,24 +91424,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 size_t end    = 0;
                 size_t buffer = 0;  // the f16 slot buffer its experts are dequantized into
             };
-            // llama.cpp-8epx: for an op that reads ring windows, a phase is one ring window (W1, W4 of
-            // docs/plans/2026-10-24-prefill-window-ring.md), so it holds at most window_experts() experts, a ring
-            // region's slots. A group the slot would take whole then splits into more phases. With two buffers they
+            // For an op that reads ring windows, a phase is one ring window (W1, W4 of
+            // docs/plans/2026-10-24-prefill-window-ring.md), and it holds at most phase_experts() experts, G_plan, the
+            // phase the f16 slot holds. Not the ring region's slots: a phase spans every active expert, device-resident
+            // and host, while its window stages only the phase's host matrices of one role, at most
+            // min(G_plan, role_items_max), which is window_slots, one ring region's slots. A cap at the ring region
+            // would split a layer with few host matrices per role into that many experts per phase, each phase with
+            // its own window, barriers and GEMMs.
+            // The f16 group size still bounds the phase (moe_pp_batched_phase_experts). With two buffers the phases
             // alternate halves as above, and a slot that holds one expert is one buffer every phase reuses: both wait
             // for the GEMMs that last read their buffer. When the slot holds every active expert (one group), each
-            // phase dequantizes into its own region at phase.begin experts and is given no wait on an earlier phase's
-            // GEMMs, so the phases are not made to run one after another (moe_pp_batched_phases_reuse_buffers decides
-            // both, in the loop below).
+            // phase dequantizes into its own range of the slot at phase.begin experts and is given no wait on an
+            // earlier phase's GEMMs, so the phases are not made to run one after another
+            // (moe_pp_batched_phases_reuse_buffers decides both, in the loop below).
             size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group;
             if (pp_stream_windowed) {
                 phase_experts =
-                    std::min(f16_groups.experts_per_group, static_cast<size_t>(ctx.moe_stream->window_experts()));
+                    moe_pp_batched_phase_experts(f16_groups.experts_per_group, ctx.moe_stream->phase_experts());
                 GGML_ASSERT(phase_experts > 0);
             }
             const size_t phase_buffers = pp_woq_arm ? 1 : f16_groups.buffers;
             const size_t half_elems    = phase_experts * weight_elems;  // one buffer's half-elements (f16 arm)
             std::vector<pp_batched_phase> phases;
-            phases.reserve((active_count + phase_experts - 1) / phase_experts);
+            phases.reserve(moe_pp_batched_phase_count(active_count, phase_experts));
             for (size_t begin = 0; begin < active_count; begin += phase_experts) {
                 pp_batched_phase phase;
                 phase.begin  = begin;

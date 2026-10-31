@@ -14,8 +14,11 @@ each claim with mutants that must turn it red (its positive controls):
     and nothing asserts the WOQ arm away: a windowless op of a claimed layer runs as on an unclaimed one;
   - the expert loop defers a windowed op's HOST experts (expert.deferred, AOS, the ring's only layout) and asks the
     stage table nothing: their slots are read in their phase, after window_begin;
-  - for a windowed op a phase is one window: phase_experts is capped at window_experts(), the region's slots, and the
-    phases and the f16 halves are built from the capped count;
+  - for a windowed op a phase is one window: phase_experts is capped at phase_experts(), G_plan, the phase the f16
+    slot holds (moe_stream_phase_experts), still bounded by the f16 group size (moe_pp_batched_phase_experts), never
+    at the ring region's slots: a phase spans device and host experts while its window stages only its host matrices
+    of one role, at most min(G_plan, role_items_max), a region. The phases and the f16 halves are built from the
+    capped count, and the phase no longer has an accessor that answers the region's slots (window_experts());
   - each phase of a windowed op asks window_begin exactly once with the phase's experts and the window after it (the
     next phase of the role, or phase 0 of the next role in the order the graph dispatches them, GATE, UP, DOWN; none
     after DOWN), sums its return into pp_staged_experts and its misses, counted per window, into pp_window_misses; then
@@ -124,7 +127,7 @@ SORT = "std::sort(active_experts.begin(), active_experts.end(),"
 # readers_done barrier.
 WINDOWED_USES = (
     "} else if (pp_stream_windowed && route.kind == moe_expert_route_kind::HOST) {",
-    "if (pp_stream_windowed) { phase_experts = std::min(",
+    "if (pp_stream_windowed) { phase_experts = moe_pp_batched_phase_experts(",
     "if (pp_stream_windowed) { phase_ids.reserve(active_count);",
     "if (pp_stream_windowed) { ggml_sycl::moe_stream_window_request window_req;",
     "if (pp_stream_windowed) { const sycl::event readers_done =",
@@ -224,9 +227,10 @@ def test_early_loop_defers_mutants():
 
 PHASE_CAP = ("size_t phase_experts = pp_woq_arm ? active_count : f16_groups.experts_per_group; "
              "if (pp_stream_windowed) { "
-             "phase_experts = std::min(f16_groups.experts_per_group, "
-             "static_cast<size_t>(ctx.moe_stream->window_experts())); "
+             "phase_experts = moe_pp_batched_phase_experts(f16_groups.experts_per_group, "
+             "ctx.moe_stream->phase_experts()); "
              "GGML_ASSERT(phase_experts > 0); }")
+PHASE_CAP_CALL = "moe_pp_batched_phase_experts(f16_groups.experts_per_group, ctx.moe_stream->phase_experts())"
 HALF_ELEMS = "const size_t half_elems = phase_experts * weight_elems;"
 PHASES_BUILD = "for (size_t begin = 0; begin < active_count; begin += phase_experts) {"
 PHASE_IDS = ("std::vector<int32_t> phase_ids; if (pp_stream_windowed) { "
@@ -235,9 +239,11 @@ PHASE_IDS = ("std::vector<int32_t> phase_ids; if (pp_stream_windowed) { "
 
 
 def claim_phase_is_a_window(sycl: str) -> bool:
-    """For a windowed op the phase is capped at window_experts(), the region's slots, so a window never exceeds its
-    region (window_begin aborts on one that does), and the f16 halves and the phases follow the capped count. The
-    phase ids are read after the experts are sorted, since a phase indexes the sorted list."""
+    """For a windowed op the phase is capped at phase_experts(), G_plan, bounded by the f16 group size. A window then
+    holds at most min(G_plan, role_items_max) host matrices of one role, a region, so it never exceeds its region
+    (window_begin aborts on one that does), and a layer with few host matrices per role is not split into that many
+    experts per phase. The f16 halves and the phases follow the capped count. The phase ids are read after the experts
+    are sorted, since a phase indexes the sorted list."""
     lam = body(norm(sycl), EXEC_SIG)
     return (lam.count(PHASE_CAP) == 1 and "const size_t phase_experts" not in lam
             and ordered(lam, WINDOWED, PHASE_CAP, HALF_ELEMS, PHASES_BUILD)
@@ -256,12 +262,58 @@ def test_phase_is_a_window_mutants():
     # The phase cap removed: a group the slot takes whole would exceed the ring's region.
     assert not c(mutate(SYCL, PHASE_CAP, "size_t phase_experts = pp_woq_arm ? active_count : "
                                          "f16_groups.experts_per_group;"))
+    # The cap restored to the region's slots: a layer with few host matrices per role fragments into that many experts
+    # per phase.
+    assert not c(mutate(SYCL, PHASE_CAP_CALL, "std::min(f16_groups.experts_per_group, "
+                                              "static_cast<size_t>(ctx.moe_stream->window_experts()))"))
+    # The cap without the f16 group bound: a G_plan above the group size would overrun the phase's f16 buffer.
+    assert not c(mutate(SYCL, PHASE_CAP_CALL, "ctx.moe_stream->phase_experts()"))
     # The halves sized before the cap.
     m = mutate(SYCL, HALF_ELEMS, "")
     assert not c(m.replace(PHASE_CAP, HALF_ELEMS + " " + PHASE_CAP, 1))
     # The phase ids read before the sort: a phase's window names the wrong experts.
     m = mutate(SYCL, PHASE_IDS, "")
     assert not c(m.replace(SORT, PHASE_IDS + " " + SORT, 1))
+
+
+# ---- the phase's cap is G_plan, never the region's slots -------------------------------------------------------------
+
+PHASE_EXPERTS_FN = ("static inline uint32_t moe_stream_phase_experts(const moe_stream_plan_index & idx, "
+                    "const moe_stream_ring_geometry & geo)")
+PHASE_EXPERTS_RULE = "return geo.n_slots != 0 ? idx.window_experts : 0;"
+PHASE_EXPERTS_FWD = "uint32_t phase_experts() const { return moe_stream_phase_experts(index_, geo_); }"
+REGION_ACCESSOR = "window_experts() const"
+
+
+def claim_phase_experts_is_g_plan(hpp: str) -> bool:
+    """moe_stream_phase::phase_experts() forwards to the one rule, moe_stream_phase_experts, which answers the index's
+    G_plan (window_experts, the experts the f16 slot's phase holds) when a ring geometry exists, never the region's
+    slots (geo.region_slots, index window_slots). No accessor answering the region's slots remains on the phase."""
+    h = norm(hpp)
+    return (body(h, PHASE_EXPERTS_FN).strip() == "{ " + PHASE_EXPERTS_RULE + " }" and h.count(PHASE_EXPERTS_FWD) == 1
+            and REGION_ACCESSOR not in h)
+
+
+def test_phase_experts_is_g_plan():
+    h = norm(PLAN_HPP)
+    assert claim_phase_experts_is_g_plan(PLAN_HPP), (
+        first_present("ggml/src/ggml-sycl/moe-stream-plan.hpp: whole file", h, REGION_ACCESSOR)
+        if REGION_ACCESSOR in h else
+        first_missing("ggml/src/ggml-sycl/moe-stream-plan.hpp: body of moe_stream_phase_experts and the class",
+                      body(h, PHASE_EXPERTS_FN) + " " + h, PHASE_EXPERTS_RULE, PHASE_EXPERTS_FWD,
+                      signature=PHASE_EXPERTS_FN))
+
+
+def test_phase_experts_is_g_plan_mutants():
+    c = claim_phase_experts_is_g_plan
+    # The rule answers the region's slots: the defect this cap fixed, through either field that holds them.
+    assert not c(mutate(PLAN_HPP, PHASE_EXPERTS_RULE, "return geo.region_slots;"))
+    assert not c(mutate(PLAN_HPP, PHASE_EXPERTS_RULE, "return geo.n_slots != 0 ? idx.window_slots : 0;"))
+    # The forwarder bypasses the rule and reads the region.
+    assert not c(mutate(PLAN_HPP, PHASE_EXPERTS_FWD, "uint32_t phase_experts() const { return geo_.region_slots; }"))
+    # An accessor answering the region's slots comes back beside it.
+    assert not c(mutate(PLAN_HPP, PHASE_EXPERTS_FWD,
+                        PHASE_EXPERTS_FWD + " uint32_t window_experts() const { return geo_.region_slots; }"))
 
 
 # ---- each phase of a claimed layer is bracketed by window_begin and window_done --------------------------------------

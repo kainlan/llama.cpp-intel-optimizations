@@ -474,6 +474,16 @@ static inline std::vector<moe_stream_item> moe_stream_window_items(const moe_str
     return out;
 }
 
+// The experts one executor phase holds on a layer that reads ring windows: G_plan (the index's window_experts), the
+// phase the f16 slot holds, and 0 with no ring geometry. Not the region's slots: a phase spans every active expert of the
+// dispatch, device-resident and host, while its window stages only the phase's host matrices of one role
+// (moe_stream_window_items), at most min(G_plan, the role's host matrices) <= min(G_plan, role_items_max), which is
+// window_slots, a region. A ring geometry exists only for window_slots >= 1, so G_plan >= 1 wherever this is not 0.
+static inline uint32_t moe_stream_phase_experts(const moe_stream_plan_index &    idx,
+                                                const moe_stream_ring_geometry & geo) {
+    return geo.n_slots != 0 ? idx.window_experts : 0;
+}
+
 // True iff a window is exposed: staged with no earlier window of its layer to hide under, which is only the layer's
 // first window in the micro-batch. Every later window has the window before it to hide under, which prefetches the
 // next one (see moe_stream_window_request), and no window prefetches across layers. begin_ubatch resets the last
@@ -1078,8 +1088,9 @@ class moe_stream_phase {
     // there never waits on the compute path. Prints nothing below trace level 2.
     void     flush_window_timing();
 
-    // The host experts one window stages at most: a region's slots, one executor phase (W3). 0 with no ring geometry.
-    uint32_t window_experts() const { return geo_.region_slots; }
+    // The experts one executor phase holds (moe_stream_phase_experts): G_plan, 0 with no ring geometry. prepare() sets
+    // the index and the geometry together, so both describe one plan.
+    uint32_t phase_experts() const { return moe_stream_phase_experts(index_, geo_); }
 
     size_t staged_routes_served() const { return staged_routes_.served; }
 

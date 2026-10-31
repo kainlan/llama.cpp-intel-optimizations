@@ -451,6 +451,18 @@ inline size_t moe_pp_batched_phase_weight_offset(const moe_pp_batched_f16_groups
     return moe_pp_batched_phases_reuse_buffers(groups) ? phase_buffer * half_elems : phase_begin * weight_elems;
 }
 
+// The experts one phase of an op that reads ring windows holds: the f16 group's size, capped by the experts the ring's
+// phase holds (moe_stream_phase::phase_experts, G_plan). The group size still bounds it, so a phase never exceeds its
+// f16 buffer, while the two are computed by separate formulas. 0 when either is 0, which the executor asserts against.
+inline size_t moe_pp_batched_phase_experts(size_t experts_per_group, size_t ring_phase_experts) {
+    return ring_phase_experts < experts_per_group ? ring_phase_experts : experts_per_group;
+}
+
+// The phases `active` experts take at `phase_experts` each: ceil(active / phase_experts), 0 for no phase experts.
+inline size_t moe_pp_batched_phase_count(size_t active, size_t phase_experts) {
+    return phase_experts == 0 ? 0 : (active + phase_experts - 1) / phase_experts;
+}
+
 // Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is reported
 // once per (device, cause) by its name. The latch is a 32-bit mask per device: COUNT, last, is the number of
 // causes, and the latch static_asserts that it fits.
