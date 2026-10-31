@@ -1886,28 +1886,41 @@ int main() {
         CHECK(mismatches == 0, "no rung but the named one is judged differently from the fit before the room");
     }
 
-    // ---- Case 24e (a RUNTIME zone an earlier load grew): the arena reserves the larger of the floor and the requirement,
-    // rounded up to 256 bytes, so a zone a load sized for itself is never reported as kept above its plan, and only a
-    // zone more than that rounding above the plan is. The second instance of a -ub 2048,512 sweep plans 512 against
-    // the zone the 2048 load grew. ----------------------------------------------------------------------------------
+    // ---- Case 24e (a RUNTIME zone an earlier load grew): the arena reserves the larger of the floor and the
+    // requirement, rounded up to 256 bytes, so a zone a load sized for itself is never reported as kept above its
+    // plan, and only a zone above that reservation is. The second instance of a -ub 2048,512 sweep plans 512
+    // against the zone the 2048 load grew. -------------------------------------------------------------------------
     {
         const size_t MiB   = 1024 * 1024;
         const size_t floor = 64 * MiB;
 
-        auto reserved = [&](size_t requirement) -> size_t {
-            const size_t planned = requirement > floor ? requirement : floor;
-            return (planned + 255) & ~size_t(255);
-        };
-        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(reserved(18050 * MiB), floor, 18050 * MiB),
+        // The reservation itself, against figures written out by hand.
+        size_t zone = 0;
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, 10 * MiB, &zone) && zone == floor, "the floor wins");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, 18050 * MiB, &zone) && zone == 18050 * MiB,
+              "an aligned requirement is reserved as it is");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, 18050 * MiB + 1, &zone) && zone == 18050 * MiB + 256,
+              "one byte over rounds up to the next 256-byte grain");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(0, 0, &zone) && zone == 0, "nothing reserves nothing");
+        zone = 7;
+        CHECK(!ggml_sycl::zone_runtime_reserved_bytes(floor, SIZE_MAX - 254, &zone) && zone == 7,
+              "a rounding that overflows fails and leaves the output alone");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, SIZE_MAX - 255, &zone) && zone == SIZE_MAX - 255,
+              "the largest aligned requirement is reserved");
+
+        // The live zones below are the reservations above, written out: 18050 MiB, 18050 MiB + 256, the floor.
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB, floor, 18050 * MiB),
               "a zone the load sized for its own requirement is not kept above its plan");
-        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(reserved(18050 * MiB + 1), floor, 18050 * MiB + 1),
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB + 256, floor, 18050 * MiB + 1),
               "nor is one rounded up to the arena's 256-byte grain (255 bytes above)");
-        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(reserved(10 * MiB), floor, 10 * MiB),
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(floor, floor, 10 * MiB),
               "nor one the floor sized, far above a small requirement");
-        CHECK(ggml_sycl::zone_runtime_kept_above_plan(reserved(18050 * MiB), floor, 2264 * MiB),
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB, floor, 2264 * MiB),
               "a zone a 2048 load grew is kept above the plan of a later 512 load");
-        CHECK(ggml_sycl::zone_runtime_kept_above_plan(reserved(2264 * MiB) + 256, floor, 2264 * MiB),
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(2264 * MiB + 256, floor, 2264 * MiB),
               "one grain above the plan is kept above it");
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB + 512, floor, 18050 * MiB + 1),
+              "and one grain above a rounded plan is too");
         CHECK(!ggml_sycl::zone_runtime_kept_above_plan(2264 * MiB, floor, 18050 * MiB),
               "a zone below the plan is not kept above it");
         CHECK(!ggml_sycl::zone_runtime_kept_above_plan(SIZE_MAX, floor, SIZE_MAX),

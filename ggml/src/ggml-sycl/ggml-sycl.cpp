@@ -17956,16 +17956,18 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
         !ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement)) {
         return;
     }
-    const size_t live  = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
-    const size_t floor = ggml_sycl::unified_cache_runtime_zone_floor_bytes();
-    if (!ggml_sycl::zone_runtime_kept_above_plan(live, floor, requirement)) {
+    const size_t live     = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+    const size_t floor    = ggml_sycl::unified_cache_runtime_zone_floor_bytes();
+    size_t       reserved = 0;
+    if (!ggml_sycl::zone_runtime_kept_above_plan(live, floor, requirement) ||
+        !ggml_sycl::zone_runtime_reserved_bytes(floor, requirement, &reserved)) {
         return;
     }
     const double mb = 1024.0 * 1024.0;
     GGML_LOG_WARN(
         "[SYCL-PLAN] RUNTIME zone on device %d holds %.1f MB where this plan requires %.1f MB: an earlier load in this "
         "process grew it, and the routed experts are planned against the grown zone\n",
-        device, live / mb, std::max(floor, requirement) / mb);
+        device, live / mb, reserved / mb);
 }
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(

@@ -2724,8 +2724,8 @@ small, and only while it holds nothing, which the PP MoE ring a previous context
 left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
 instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
 experts on the device than a fresh process would. Such a load prints one WARN
-line after its plan, when the live zone is more than the arena's 256-byte
-rounding above the zone its own plan sizes (`zone_runtime_kept_above_plan()`):
+line after its plan, when the live zone is larger than the zone the arena
+reserves for its own plan (`zone_runtime_kept_above_plan()`):
 
 ```
 [SYCL-PLAN] RUNTIME zone on device 0 holds <Z> MB where this plan requires <R> MB: an earlier load in this
@@ -2734,6 +2734,14 @@ process grew it, and the routed experts are planned against the grown zone
 
 The first load of a process never prints it, because its zone is the one its
 own plan sized. Re-planning the zone at such a load is future work.
+
+That reserved zone is one figure, from one function. The function
+`zone_runtime_reserved_bytes()` takes the larger of the floor and the
+requirement and rounds it up to the arena's 256-byte grain, with the addition
+checked. The arena's reserve, the zone `ensure_planned_arena_zones()` plans,
+the room the planner holds for an explicit micro-batch, the check above and its
+WARN all ask it. So the zone a plan counts on and the zone the arena holds
+cannot round apart.
 
 The planner computes the RUNTIME room the ring and the dense scratch need at that
 micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that room as

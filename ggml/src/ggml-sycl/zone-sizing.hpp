@@ -486,11 +486,29 @@ inline size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, ui
     return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
 }
 
-// Whether a live RUNTIME zone of `live_zone_bytes` is larger than the zone a plan sizes, the larger of `floor_bytes`
-// and `requirement`, by more than the arena's rounding of that zone up to 256 bytes. The arena keeps a zone larger
-// than a plan needs and rebuilds a zone only while it holds nothing, so a zone kept above a load's plan was grown by an
-// earlier load in the process, and the load's routed experts are planned against it. A zone the load sized for itself,
-// as every first load of a process does, is at most the rounding above its plan and never qualifies.
+// The arena's grain: it reserves every zone as a whole number of these bytes (the TLSF allocator's alignment).
+constexpr size_t k_zone_arena_alignment = 256;
+
+// The RUNTIME zone the arena reserves for a plan into *out: the larger of `floor_bytes` and `requirement`, rounded up
+// to k_zone_arena_alignment. False, leaving *out untouched, when the rounding would overflow. The arena's reserve, the
+// zone the cache plans, the room an explicit micro-batch plans against, and the check for a zone an earlier load grew
+// all ask this one function, so the zone a plan counts on and the zone the arena holds cannot round apart. Inline so
+// that the host-only admission unit, which links no zone-sizing code, asks it too.
+inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, size_t * out) {
+    const size_t planned = requirement > floor_bytes ? requirement : floor_bytes;
+    if (planned > SIZE_MAX - (k_zone_arena_alignment - 1)) {
+        return false;
+    }
+    *out = (planned + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    return true;
+}
+
+// Whether a live RUNTIME zone of `live_zone_bytes` is larger than the zone the arena reserves for a plan of
+// `floor_bytes` and `requirement` (zone_runtime_reserved_bytes). The arena keeps a zone larger than a plan needs and
+// rebuilds a zone only while it holds nothing, so a zone kept above a load's plan was grown by an earlier load in the
+// process, and the load's routed experts are planned against it. A zone the load sized for itself, as every first
+// load of a process does, is the zone its plan reserves and never qualifies; nor does any zone when the plan's
+// rounding overflows.
 bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement);
 
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the

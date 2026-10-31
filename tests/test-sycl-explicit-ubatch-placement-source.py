@@ -28,8 +28,11 @@ What this gate pins:
   single-device plan PLACED on the device, read once before the demand, whole or nothing; every other rung, and every
   load that placed none, is judged as before;
 - a load whose plan was packed against a RUNTIME zone an earlier load in the process grew says so in ONE WARN after
-  its late plan, only when the live zone is more than the arena's 256-byte rounding above the zone the plan sizes, so
-  the first load of a process never prints it.
+  its late plan, only when the live zone is larger than the zone the arena reserves for that plan, so the first load
+  of a process never prints it;
+- the RUNTIME zone is one reservation: the arena's reserve, the zone the cache plans, the explicit micro-batch's room,
+  the check for a grown zone and its WARN all ask zone_runtime_reserved_bytes() (the larger of the floor and the
+  requirement, rounded up to the arena's 256-byte grain, checked), so none of them can round apart from the others.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -78,6 +81,7 @@ CACHE_CPP = read("ggml/src/ggml-sycl/unified-cache.cpp")
 CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
 ADMISSION_CPP = read("ggml/src/ggml-sycl/moe-scratch-admission.cpp")
 ZONE_CPP = read("ggml/src/ggml-sycl/zone-sizing.cpp")
+ZONE_HPP = read("ggml/src/ggml-sycl/zone-sizing.hpp")
 LLAMA_H = read("include/llama.h")
 SYCL_H = read("ggml/include/ggml-sycl.h")
 MODEL_CPP = read("src/llama-model.cpp")
@@ -223,13 +227,30 @@ KEPT_READS = ("if (cache == nullptr || !cache->arena_active() || "
               "!ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement)) { return; }")
 KEPT_LIVE = "const size_t live = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);"
 KEPT_FLOOR = "const size_t floor = ggml_sycl::unified_cache_runtime_zone_floor_bytes();"
-KEPT_GATE = "if (!ggml_sycl::zone_runtime_kept_above_plan(live, floor, requirement)) { return; }"
+KEPT_GATE = ("if (!ggml_sycl::zone_runtime_kept_above_plan(live, floor, requirement) || "
+             "!ggml_sycl::zone_runtime_reserved_bytes(floor, requirement, &reserved)) { return; }")
 KEPT_WARN = ('GGML_LOG_WARN("[SYCL-PLAN] RUNTIME zone on device %d holds %.1f MB where this plan requires %.1f MB: an '
              'earlier load in this process grew it, and the routed experts are planned against the grown zone\\n", '
-             'device, live / mb, std::max(floor, requirement) / mb);')
+             'device, live / mb, reserved / mb);')
 KEPT_RULE_SIG = "bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement)"
-KEPT_RULE = ("const size_t planned = std::max(floor_bytes, requirement); "
-             "return live_zone_bytes > planned && live_zone_bytes - planned > 255;")
+KEPT_RULE = ("size_t reserved = 0; "
+             "return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;")
+
+# The RUNTIME zone as the arena reserves it: one checked helper, asked by every site that sizes, plans against or
+# compares with that zone.
+ARENA_ALIGNMENT = "constexpr size_t k_zone_arena_alignment = 256;"
+RESERVED_SIG = "inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, size_t * out)"
+RESERVED_RULE = ("const size_t planned = requirement > floor_bytes ? requirement : floor_bytes; "
+                 "if (planned > SIZE_MAX - (k_zone_arena_alignment - 1)) { return false; } "
+                 "*out = (planned + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1); return true;")
+ARENA_RESERVE_SIG = "bool unified_cache::arena_reserve(sycl::queue & queue,"
+ARENA_RESERVE_CALL = "if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {"
+ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones()"
+ENSURE_CALL = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) || "
+               "!zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {")
+ROOM_ZONE_SIG = "static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,"
+ROOM_ZONE_CALL = ("return zone_runtime_reserved_bytes(in.runtime_floor_bytes, "
+                  "in.runtime_fixed_bytes + dense_bytes + ring_bytes, out);")
 
 # The planner: a named hold on the expert budget, after the KV context room and before the pack's stats (where a
 # second hold term composes); the pack predicate is the budget less the hold; what it moved is the difference between
@@ -342,11 +363,11 @@ def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cach
             and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND))
 
 
-def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str) -> bool:
+def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str, zone_hpp: str = ZONE_HPP) -> bool:
     """A load whose plan was packed against a RUNTIME zone an earlier load grew says so in ONE WARN after its late
-    plan, and only when the live zone is more than the arena's 256-byte rounding above the zone the plan sizes (the
-    larger of the floor and the requirement): the first load of a process, whose zone is its own plan's, never prints
-    it."""
+    plan, and only when the live zone is larger than the zone the arena reserves for the plan (the larger of the floor
+    and the requirement, rounded up to the arena's grain): the first load of a process, whose zone is its own plan's,
+    never prints it."""
     sycl = norm(sycl_cpp)
     late = body(sycl, SET_INV_SIG)
     kept = body(sycl, KEPT_SIG)
@@ -354,7 +375,31 @@ def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str) -> bool:
             and sycl.count("ggml_sycl_warn_runtime_zone_kept_from_earlier_load(") == 2
             and bool(kept) and ordered(kept, KEPT_READS, KEPT_LIVE, KEPT_FLOOR, KEPT_GATE, KEPT_WARN)
             and kept.count("GGML_LOG_") == 1
-            and KEPT_RULE in body(norm(zone_cpp), KEPT_RULE_SIG))
+            and KEPT_RULE in body(norm(zone_cpp), KEPT_RULE_SIG)
+            and RESERVED_RULE in body(norm(zone_hpp), RESERVED_SIG))
+
+
+def claim_runtime_zone_is_one_reservation(zone_hpp: str, zone_cpp: str, cache_cpp: str, admission_cpp: str,
+                                          sycl_cpp: str) -> bool:
+    """The RUNTIME zone is reserved, planned, planned against and compared through one checked helper: the arena's
+    reserve, the zone ensure_planned_arena_zones() plans, the explicit micro-batch's room, the grown-zone rule and its
+    WARN each call zone_runtime_reserved_bytes(), and none of them rounds the zone itself. The helper takes the larger
+    of the floor and the requirement and rounds it up to the arena's named grain with the addition checked."""
+    hpp = norm(zone_hpp)
+    cache = norm(cache_cpp)
+    reserve = body(cache, ARENA_RESERVE_SIG)
+    ensure = body(cache, ENSURE_SIG)
+    room = body(norm(admission_cpp), ROOM_ZONE_SIG)
+    rule = body(norm(zone_cpp), KEPT_RULE_SIG)
+    kept = body(norm(sycl_cpp), KEPT_SIG)
+    sites = (reserve, ensure, room, rule, kept)
+    return (ARENA_ALIGNMENT in hpp and RESERVED_RULE in body(hpp, RESERVED_SIG)
+            and all(site.count("zone_runtime_reserved_bytes(") == 1 for site in sites)
+            and ARENA_RESERVE_CALL in reserve and "runtime_bytes = (runtime_bytes +" not in reserve
+            and ENSURE_CALL in ensure and "runtime_zone = planned_runtime_scratch;" not in ensure
+            and ROOM_ZONE_CALL in room and "align" not in room
+            and KEPT_RULE in rule and "std::max(" not in rule
+            and KEPT_GATE in kept and KEPT_WARN in kept and "std::max(" not in kept)
 
 
 def claim_planner_moves_only_experts(cache_cpp: str, cache_hpp: str = CACHE_HPP) -> bool:
@@ -436,6 +481,10 @@ def test_fit_credits_the_placed_compute_room():
 
 def test_grown_zone_is_announced():
     assert claim_grown_zone_is_announced(SYCL_CPP, ZONE_CPP)
+
+
+def test_runtime_zone_is_one_reservation():
+    assert claim_runtime_zone_is_one_reservation(ZONE_HPP, ZONE_CPP, CACHE_CPP, ADMISSION_CPP, SYCL_CPP)
 
 
 def test_planner_moves_only_experts():
@@ -629,8 +678,8 @@ def test_mutant_credit_ignores_the_rung_fails():
 def test_mutant_grown_zone_rule_drops_the_comparison_fails():
     """Every load with a RUNTIME zone would print it, the first load of a process included."""
     assert not claim_grown_zone_is_announced(
-        SYCL_CPP, _once(ZONE_CPP, KEPT_RULE, "const size_t planned = std::max(floor_bytes, requirement); "
-                                             "return live_zone_bytes != 0;"))
+        SYCL_CPP,
+        _once(ZONE_CPP, KEPT_RULE, KEPT_RULE.replace("live_zone_bytes > reserved", "live_zone_bytes != 0", 1)))
 
 
 def test_mutant_grown_zone_warn_ungated_fails():
@@ -639,15 +688,74 @@ def test_mutant_grown_zone_warn_ungated_fails():
 
 def test_mutant_grown_zone_rule_without_the_slack_fails():
     """A first load whose requirement is not a multiple of 256 bytes would print it for the arena's own rounding."""
-    assert not claim_grown_zone_is_announced(
-        SYCL_CPP, _once(ZONE_CPP, KEPT_RULE, "const size_t planned = std::max(floor_bytes, requirement); "
-                                             "return live_zone_bytes > planned;"))
+    rounding = "*out = (planned + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);"
+    assert not claim_grown_zone_is_announced(SYCL_CPP, ZONE_CPP, _once(ZONE_HPP, rounding, "*out = planned;"))
 
 
 def test_mutant_grown_zone_rule_ignores_the_floor_fails():
     """A first load whose zone the floor sized would print it."""
     assert not claim_grown_zone_is_announced(
-        SYCL_CPP, _once(ZONE_CPP, KEPT_RULE, KEPT_RULE.replace("std::max(floor_bytes, requirement)", "requirement", 1)))
+        SYCL_CPP, _once(ZONE_CPP, KEPT_RULE, KEPT_RULE.replace("(floor_bytes, requirement,", "(0, requirement,", 1)))
+
+
+def test_mutant_grown_zone_warn_prints_the_unrounded_plan_fails():
+    """The WARN would name a zone the arena never reserved, up to 255 bytes short of the one it holds."""
+    assert not claim_grown_zone_is_announced(
+        _once(SYCL_CPP, KEPT_WARN, KEPT_WARN.replace("reserved / mb", "std::max(floor, requirement) / mb", 1)),
+        ZONE_CPP)
+
+
+# Each mutant re-inlines the RUNTIME zone's rounding at one of the five sites, the drift the one helper exists to stop.
+def test_mutant_arena_reserve_rounds_the_runtime_zone_itself_fails():
+    inlined = "runtime_bytes = (runtime_bytes + 255) & ~size_t(255); if (false) {"
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, ZONE_CPP, _once(CACHE_CPP, ARENA_RESERVE_CALL, inlined), ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_ensure_plans_the_unrounded_requirement_fails():
+    inlined = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch)) {")
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, ZONE_CPP, _once(CACHE_CPP, ENSURE_CALL, inlined), ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_room_rounds_the_zone_itself_fails():
+    inlined = ("const size_t requirement = in.runtime_fixed_bytes + dense_bytes + ring_bytes; "
+               "return pp_moe_onednn_checked_align_slot_bytes("
+               "requirement > in.runtime_floor_bytes ? requirement : in.runtime_floor_bytes, out);")
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, ZONE_CPP, CACHE_CPP, _once(ADMISSION_CPP, ROOM_ZONE_CALL, inlined), SYCL_CPP)
+
+
+def test_mutant_kept_rule_rounds_the_plan_itself_fails():
+    inlined = ("const size_t planned = std::max(floor_bytes, requirement); "
+               "return live_zone_bytes > planned && live_zone_bytes - planned > 255;")
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, _once(ZONE_CPP, KEPT_RULE, inlined), CACHE_CPP, ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_kept_warn_prints_its_own_plan_fails():
+    inlined = KEPT_WARN.replace("reserved / mb", "std::max(floor, requirement) / mb", 1)
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, ZONE_CPP, CACHE_CPP, ADMISSION_CPP, _once(SYCL_CPP, KEPT_WARN, inlined))
+
+
+def test_mutant_reservation_ignores_the_floor_fails():
+    assert not claim_runtime_zone_is_one_reservation(
+        _once(ZONE_HPP, "const size_t planned = requirement > floor_bytes ? requirement : floor_bytes;",
+              "const size_t planned = requirement;"),
+        ZONE_CPP, CACHE_CPP, ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_reservation_rounding_unchecked_fails():
+    assert not claim_runtime_zone_is_one_reservation(
+        _once(ZONE_HPP, "if (planned > SIZE_MAX - (k_zone_arena_alignment - 1)) { return false; }", ""),
+        ZONE_CPP, CACHE_CPP, ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_reservation_grain_unnamed_fails():
+    assert not claim_runtime_zone_is_one_reservation(
+        _once(ZONE_HPP, ARENA_ALIGNMENT, "constexpr size_t k_zone_arena_grain = 256;"),
+        ZONE_CPP, CACHE_CPP, ADMISSION_CPP, SYCL_CPP)
 
 
 def test_mutant_grown_zone_warn_at_info_fails():

@@ -197,7 +197,8 @@ def claim_zone_requirement_folds_in_the_dense_plans(cache: str) -> bool:
             and "const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);" in req
             and "*out = base + mmq_src1 + dequant_f16 + compute + state;" in req
             and re.search(r"unified_cache_get_planned_runtime_zone_requirement\(dev_id, &planned_runtime_scratch\).*?"
-                          r"runtime_zone = planned_runtime_scratch;", t) is not None)
+                          r"zone_runtime_reserved_bytes\(runtime_floor, planned_runtime_scratch, "
+                          r"&runtime_zone\)", t) is not None)
 
 
 def test_the_publish_claims_the_buffer_after_the_commit_and_before_the_hold():

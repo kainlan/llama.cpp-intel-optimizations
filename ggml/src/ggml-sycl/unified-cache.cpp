@@ -6807,7 +6807,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     }
 #endif
 
-    size_t                        runtime_zone          = unified_cache_runtime_zone_floor_bytes();
+    const size_t                  runtime_floor         = unified_cache_runtime_zone_floor_bytes();
     const size_t                  planned_pp_pipeline   = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
     const size_t                  planned_pp_moe_onednn = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id);
     const moe_control_requirement planned_moe_control   = unified_cache_get_planned_moe_control_requirement(dev_id);
@@ -6816,17 +6816,25 @@ bool unified_cache::ensure_planned_arena_zones() {
     // The addition is checked because a plan whose CONTROL sizing failed must
     // not quietly become a SMALLER runtime zone than one that succeeded --
     // which is exactly what an unchecked `a + b + c` on a poisoned term does.
+    //
+    // The zone is the one every RUNTIME plan counts on
+    // (zone_runtime_reserved_bytes): the explicit micro-batch's room and the
+    // check for a zone an earlier load grew ask the same function. A
+    // requirement whose rounding overflows is as unanswerable as one whose
+    // sum did.
     size_t planned_runtime_scratch = 0;
-    if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch)) {
+    size_t runtime_zone            = runtime_floor;
+    if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) ||
+        !zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {
         planned_runtime_scratch = 0;
+        runtime_zone            = runtime_floor;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Runtime zone requirement for device %d is unanswerable "
             "(pipeline=%zu moe_onednn=%zu control_valid=%d); keeping the %.1f MB default\n",
             dev_id, planned_pp_pipeline, planned_pp_moe_onednn, static_cast<int>(planned_moe_control.valid),
-            runtime_zone / (1024.0 * 1024.0));
+            runtime_floor / (1024.0 * 1024.0));
     }
-    if (planned_runtime_scratch > 0 && runtime_zone < planned_runtime_scratch) {
-        runtime_zone = planned_runtime_scratch;
+    if (planned_runtime_scratch > runtime_floor) {
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
             "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
@@ -27320,10 +27328,15 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_queue_ = &queue;
 
-    // Align zone sizes to 256 bytes.
-    scratch_bytes = (scratch_bytes + 255) & ~size_t(255);
-    onednn_bytes  = (onednn_bytes + 255) & ~size_t(255);
-    runtime_bytes = (runtime_bytes + 255) & ~size_t(255);
+    // Align zone sizes to the arena's grain. The RUNTIME zone is rounded by the function every RUNTIME plan counts on,
+    // with no floor: the callers apply it.
+    scratch_bytes = (scratch_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    onednn_bytes  = (onednn_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {
+        GGML_LOG_ERROR("[VRAM-ARENA] RUNTIME zone of %zu bytes cannot be rounded to the arena's grain\n",
+                       runtime_bytes);
+        return false;
+    }
 
     // Try single-chunk first.  All zones share one contiguous allocation.
     // Falls back to N-chunk (tail zones in last chunk, weights spread across

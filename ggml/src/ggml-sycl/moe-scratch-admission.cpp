@@ -10,6 +10,8 @@
 
 #include "moe-scratch-admission.hpp"
 
+#include "zone-sizing.hpp"
+
 #include <limits>
 
 namespace ggml_sycl {
@@ -236,8 +238,8 @@ static bool pp_moe_onednn_ring_bytes_at(const pp_moe_onednn_explicit_ubatch_inpu
     return true;
 }
 
-// The RUNTIME zone for a requirement of fixed + dense + ring, as the arena reserves it: at least the floor, rounded up
-// to 256 bytes. False on overflow.
+// The RUNTIME zone for a requirement of fixed + dense + ring, as the arena reserves it (zone_runtime_reserved_bytes).
+// False on overflow.
 static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,
                                              size_t                                       dense_bytes,
                                              size_t                                       ring_bytes,
@@ -246,9 +248,7 @@ static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch
     if (in.runtime_fixed_bytes > kMax - dense_bytes || in.runtime_fixed_bytes + dense_bytes > kMax - ring_bytes) {
         return false;
     }
-    const size_t requirement = in.runtime_fixed_bytes + dense_bytes + ring_bytes;
-    return pp_moe_onednn_checked_align_slot_bytes(
-        requirement > in.runtime_floor_bytes ? requirement : in.runtime_floor_bytes, out);
+    return zone_runtime_reserved_bytes(in.runtime_floor_bytes, in.runtime_fixed_bytes + dense_bytes + ring_bytes, out);
 }
 
 pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(

@@ -499,9 +499,9 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
 }
 
 bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement) {
-    // The arena rounds the zone it reserves up to 256 bytes, so up to 255 bytes above the plan are the plan's own.
-    const size_t planned = std::max(floor_bytes, requirement);
-    return live_zone_bytes > planned && live_zone_bytes - planned > 255;
+    // The reserved zone already carries the arena's rounding, so every byte above it was grown.
+    size_t reserved = 0;
+    return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
 }
 
 size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch) {
