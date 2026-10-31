@@ -6405,10 +6405,12 @@ unified_cache::unified_cache(sycl::queue & queue,
     // instead of serializing on a single command list.
     //
     // The queue has no profiling at any trace level. Built with profiling for the stream ring's window timing line
-    // under GGML_SYCL_MOE_EXEC_TRACE=2, it left a traced Qwen3.8 prefill on the B70 waiting at its 49th window on a
-    // copy that never signalled, until the watchdog ended the run. The window line times marker kernels on a queue of
-    // the ring's own instead (moe_stream_phase::timing_queue), which wait on these copies from outside, so no copy is
-    // read for its device times or asked for its status.
+    // under GGML_SYCL_MOE_EXEC_TRACE=2, its copy events were counter-based timestamp events, and a traced Qwen3.8
+    // prefill on the B70 stalled in its first micro-batch, at a window that varied from run to run, until the watchdog
+    // ended the run; the same prefill untraced finishes. The stall is below this backend, in the runtime or the
+    // driver, and tied to no copy count or layer. The window line times marker kernels on a queue of the ring's own
+    // instead (moe_stream_phase::timing_queue), which wait on these copies from outside, so no copy is read for its
+    // device times or asked for its status.
     try {
         bcs_queue_ =
             std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});

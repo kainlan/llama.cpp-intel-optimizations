@@ -4,10 +4,12 @@ docs/plans/2026-10-24-prefill-window-ring.md; the timing source moved off the co
 Host-only: reads sources, builds nothing, loads no model and touches no device. test-moe-stream-phase pins what the
 timeline records and prints (it links ggml-sycl, so only the lead runs it); this gate pins how the backend feeds it.
 
-Why the copies are not timed: with the copy (BCS) queue built with enable_profiling at trace level 2, a traced Qwen3.8
-prefill on the B70 stopped at its 49th window on a copy that never signalled, and the watchdog ended the run, while the
-same run untraced finished. The window line now reads empty marker kernels on a profiling queue of the phase's own,
-which wait on the copies from outside, and no copy event is read for its device times or asked for its status.
+Why the copies are not timed: with the copy (BCS) queue built with enable_profiling at trace level 2, its events were
+counter-based timestamp events, and a traced Qwen3.8 prefill on the B70 stalled in its first micro-batch, at a window
+that varied from run to run, until the watchdog ended the run, while the same run untraced finished. The stall is below
+this backend, in the runtime or the driver, and tied to no copy count or layer. The window line now reads empty marker
+kernels on a profiling queue of the phase's own, which wait on the copies from outside, and no copy event is read for
+its device times or asked for its status.
 
 What this gate pins, each claim with mutants that must turn it red (its positive controls). Every mutant edits an
 in-memory copy of the normalized source, never a file:
