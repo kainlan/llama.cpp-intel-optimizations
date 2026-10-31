@@ -567,7 +567,9 @@ ring-unavailable line)
   next reserve, and the missing slots' bytes are what the expert loan the phase asks for next must free. A loan line
   or the partial-release line below follows. Expected on a card whose WEIGHT zone is full at the first prompt.
 - WARN `[MOE-STREAM-RING] partial reservation released on device %d: no loan can follow (held %u of %u slots)`: once
-  per refused reserve, so it can repeat across the micro-batches of one prompt (each micro-batch tries the reserve again), under `GGML_SYCL_MOE_EXEC=ring` or a trace level of 1 or more, when a refused ring that still held slots gives them back because no loan can fund it any more. It does not print for a ring that held no slot. It explains the
+  per refused reserve, so it can repeat across the micro-batches of one prompt (each micro-batch tries the reserve
+  again), under `GGML_SYCL_MOE_EXEC=ring` or a trace level of 1 or more, when a refused ring that still held slots
+  gives them back because no loan can fund it any more. It does not print for a ring that held no slot. It explains the
   "holding K of N slots" line before it; the layers then answer `ring-unavailable`.
 
 **Probes** (load time)
