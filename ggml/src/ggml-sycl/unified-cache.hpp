@@ -2572,12 +2572,12 @@ void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_
 uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
 
 // Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
-// align256(n_ubatch * per_row) for both activation and output, through the
-// same pp_moe_onednn_checked_align_slot_bytes() (moe-scratch-admission.hpp)
-// the ring's own admission uses, so the two cannot round or overflow-check
-// differently. Returns false (leaving the output params untouched) when the
-// per-row bytes are 0 (dense model, no ring planned) or the multiply/align
-// would overflow.
+// align256(n_ubatch * per_row) for both activation and output, through
+// pp_moe_onednn_slots_at() (moe-scratch-admission.hpp), the helper the ring's
+// admission and the explicit micro-batch's room size their slots with, so the
+// three cannot round or overflow-check differently. Returns false (leaving the
+// output params untouched) when the per-row bytes are 0 (dense model, no ring
+// planned) or the multiply/align would overflow.
 bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
                                                   uint32_t n_ubatch,
                                                   size_t * activation_slot_bytes,

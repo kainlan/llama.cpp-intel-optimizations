@@ -3788,17 +3788,10 @@ bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
     if (act_per_row == 0 || out_per_row == 0) {
         return false;  // dense model: no MoE PP ring planned
     }
-    if (n_ubatch != 0 && (act_per_row > std::numeric_limits<size_t>::max() / n_ubatch ||
-                          out_per_row > std::numeric_limits<size_t>::max() / n_ubatch)) {
-        return false;  // n_ubatch * per_row would overflow
-    }
-    const size_t act_raw     = static_cast<size_t>(n_ubatch) * act_per_row;
-    const size_t out_raw     = static_cast<size_t>(n_ubatch) * out_per_row;
-    size_t       act_aligned = 0;
-    size_t       out_aligned = 0;
-    if (!pp_moe_onednn_checked_align_slot_bytes(act_raw, &act_aligned) ||
-        !pp_moe_onednn_checked_align_slot_bytes(out_raw, &out_aligned)) {
-        return false;  // align256() would overflow
+    size_t act_aligned = 0;
+    size_t out_aligned = 0;
+    if (!pp_moe_onednn_slots_at(n_ubatch, act_per_row, out_per_row, &act_aligned, &out_aligned)) {
+        return false;  // n_ubatch * per_row, or its rounding, would overflow
     }
     if (activation_slot_bytes != nullptr) {
         *activation_slot_bytes = act_aligned;

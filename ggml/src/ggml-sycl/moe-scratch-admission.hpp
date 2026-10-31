@@ -75,6 +75,17 @@ static constexpr size_t PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT = 256;
 // pick up a wrapped -- and therefore admissible-looking -- size.
 bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out);
 
+// The ring's activation and output slots at `n_ubatch` rows, from their per-row bytes: n_ubatch * per_row each,
+// rounded up to the slot alignment, every multiply and rounding checked. Returns false, leaving both outputs
+// untouched, on overflow. n_ubatch 0 sizes two empty slots: 0 rows is not an overflow. The ring's admission, the
+// explicit micro-batch's room and the cache's re-plan of the ring all size the slots here, so no two of them can
+// round or overflow-check a slot differently.
+bool pp_moe_onednn_slots_at(uint32_t n_ubatch,
+                            size_t   activation_bytes_per_row,
+                            size_t   output_bytes_per_row,
+                            size_t * activation_slot_bytes,
+                            size_t * output_slot_bytes);
+
 // Aligns every byte dimension of `shape` into *out. Returns false on overflow.
 bool pp_moe_onednn_align_scratch_shape(const pp_moe_onednn_scratch_shape & shape, pp_moe_onednn_scratch_shape * out);
 

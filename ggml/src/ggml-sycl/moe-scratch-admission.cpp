@@ -27,6 +27,27 @@ bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out) {
     return true;
 }
 
+bool pp_moe_onednn_slots_at(uint32_t n_ubatch,
+                            size_t   activation_bytes_per_row,
+                            size_t   output_bytes_per_row,
+                            size_t * activation_slot_bytes,
+                            size_t * output_slot_bytes) {
+    constexpr size_t kMax = std::numeric_limits<size_t>::max();
+    const size_t     rows = n_ubatch;
+    if (rows != 0 && (activation_bytes_per_row > kMax / rows || output_bytes_per_row > kMax / rows)) {
+        return false;
+    }
+    size_t act_slot = 0;
+    size_t out_slot = 0;
+    if (!pp_moe_onednn_checked_align_slot_bytes(rows * activation_bytes_per_row, &act_slot) ||
+        !pp_moe_onednn_checked_align_slot_bytes(rows * output_bytes_per_row, &out_slot)) {
+        return false;
+    }
+    *activation_slot_bytes = act_slot;
+    *output_slot_bytes     = out_slot;
+    return true;
+}
+
 bool pp_moe_onednn_align_scratch_shape(const pp_moe_onednn_scratch_shape & shape, pp_moe_onednn_scratch_shape * out) {
     pp_moe_onednn_scratch_shape aligned = shape;
     if (!pp_moe_onednn_checked_align_slot_bytes(shape.weight_slot_bytes, &aligned.weight_slot_bytes) ||
@@ -125,13 +146,9 @@ static bool pp_moe_onednn_admit_ring_at(const pp_moe_onednn_ring_admission_input
     const size_t     rows  = n_ubatch;
     out->compute_reserve_bytes =
         in.compute_reserve_bytes_per_row > kMax / rows ? kMax : rows * in.compute_reserve_bytes_per_row;
-    if (in.activation_bytes_per_row > kMax / rows || in.output_bytes_per_row > kMax / rows) {
-        return false;
-    }
     size_t act_slot = 0;
     size_t out_slot = 0;
-    if (!pp_moe_onednn_checked_align_slot_bytes(rows * in.activation_bytes_per_row, &act_slot) ||
-        !pp_moe_onednn_checked_align_slot_bytes(rows * in.output_bytes_per_row, &out_slot)) {
+    if (!pp_moe_onednn_slots_at(n_ubatch, in.activation_bytes_per_row, in.output_bytes_per_row, &act_slot, &out_slot)) {
         return false;
     }
     out->activation_slot_bytes = act_slot;
@@ -215,16 +232,11 @@ pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_a
 static bool pp_moe_onednn_ring_bytes_at(const pp_moe_onednn_explicit_ubatch_inputs & in,
                                         uint32_t                                     n_ubatch,
                                         size_t *                                     out) {
-    constexpr size_t kMax  = std::numeric_limits<size_t>::max();
-    const size_t     depth = in.ring_depth;
-    const size_t     rows  = n_ubatch;
-    if (in.activation_bytes_per_row > kMax / rows || in.output_bytes_per_row > kMax / rows) {
-        return false;
-    }
-    size_t act_slot = 0;
-    size_t out_slot = 0;
-    if (!pp_moe_onednn_checked_align_slot_bytes(rows * in.activation_bytes_per_row, &act_slot) ||
-        !pp_moe_onednn_checked_align_slot_bytes(rows * in.output_bytes_per_row, &out_slot)) {
+    constexpr size_t kMax     = std::numeric_limits<size_t>::max();
+    const size_t     depth    = in.ring_depth;
+    size_t           act_slot = 0;
+    size_t           out_slot = 0;
+    if (!pp_moe_onednn_slots_at(n_ubatch, in.activation_bytes_per_row, in.output_bytes_per_row, &act_slot, &out_slot)) {
         return false;
     }
     if (in.weight_slot_bytes > kMax - act_slot || in.weight_slot_bytes + act_slot > kMax - out_slot) {
