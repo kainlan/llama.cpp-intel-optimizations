@@ -2707,7 +2707,7 @@ Host tests: `ggml/src/ggml-sycl/tests/test-pp-moe-ring-admission.cpp` pins the
 arithmetic. `tests/test-sycl-pp-moe-ring-kv-zone-source.py` pins the wiring, with
 a mutation witness per check.
 
-### Explicit micro-batch placement (owner ruling 2026-10-30)
+### Explicit micro-batch placement
 
 An explicit `-ub` whose ring needs more RUNTIME zone than the load's planning
 shape reserved is placed at load, the way KV that does not fit is re-placed
