@@ -851,9 +851,10 @@ int main() {
     // 13. How many experts a windowed op's phase holds, and how many phases a layer runs. A phase spans every active
     // expert of the dispatch, device-resident and host, while its ring window stages only the phase's host matrices of
     // one role. So the cap is the f16 slot's phase, G_plan, never the region's slots, min(role_items_max, G_plan), and
-    // the f16 group size still bounds it while the two are separate formulas. These cases test the two helpers with the
-    // cap given as G_plan: they cannot tell which cap the executor passes. That is told apart where the cap is derived,
-    // in test-moe-stream-phase.cpp (moe_stream_phase_experts against a region of 3 slots and G_plan 8), and by the
+    // the f16 group size still bounds it: one rule gives both, at an unbounded expert count and at the dispatch's
+    // active count, so either can be the smaller. These cases test the two helpers with the cap given as G_plan: they
+    // cannot tell which cap the executor passes. That is told apart where the cap is derived, in
+    // test-moe-stream-phase.cpp (moe_stream_phase_experts against a region of 3 slots and G_plan 8), and by the
     // exec-window source pin, which fails on the region cap restored at the executor.
     {
         struct phase_case {
