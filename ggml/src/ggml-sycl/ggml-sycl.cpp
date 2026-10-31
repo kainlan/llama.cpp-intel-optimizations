@@ -20524,17 +20524,18 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
         if (warn) {
             GGML_LOG_WARN(
-                "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: re-placed %zu experts (%zu "
-                "layers) to the host tier, %.1f MB moved (device %d)\n",
-                xub.n_ubatch, xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb,
-                ctx->device);
+                "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: "
+                "it re-placed %.1f MB of routed experts to the host tier, from %zu layers: "
+                "%zu triplets on the device, against %zu without its room, on device %d\n",
+                xub.n_ubatch, xub.ring_bytes / mb, xub.moved_bytes() / mb, xub.moved_layers, xub.expert_groups,
+                xub.expert_groups_without, ctx->device);
         } else if (xub.n_ubatch == next_kv_info.n_ubatch) {
             GGML_LOG_INFO(
-                "[SYCL-PLAN] %sPP MoE oneDNN scratch ring for n_ubatch=%u holds %.1f MB of the RUNTIME zone: %zu "
-                "experts "
-                "(%zu layers, %.1f MB) on the host tier for it (device %d)\n",
-                probe_mode ? "probe: " : "", xub.n_ubatch, xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers,
-                xub.moved_bytes / mb, ctx->device);
+                "[SYCL-PLAN] %sPP MoE oneDNN scratch ring for n_ubatch=%u holds %.1f MB of the RUNTIME zone: "
+                "%.1f MB of routed experts are on the host tier for it, from %zu layers: "
+                "%zu triplets on the device, against %zu without its room, on device %d\n",
+                probe_mode ? "probe: " : "", xub.n_ubatch, xub.ring_bytes / mb, xub.moved_bytes() / mb,
+                xub.moved_layers, xub.expert_groups, xub.expert_groups_without, ctx->device);
         }
     };
 

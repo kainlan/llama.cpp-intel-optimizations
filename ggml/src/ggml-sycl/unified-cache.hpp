@@ -887,11 +887,16 @@ struct placement_explicit_ubatch {
     size_t                               room_bytes               = 0;  // its RUNTIME zone over the default ring's
     size_t                               room_reserved_bytes      = 0;  // of that room, what the zone already holds
     size_t                               expert_budget_bytes      = 0;  // the device bytes left to the routed experts
-    // The routed-expert triplets a first-fit pack with the held room added back puts on the device and the real pack
-    // puts on the host, the distinct layers they belong to, and their device bytes: what the room moved.
-    size_t                               moved_experts            = 0;
+    // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
+    // first-fit pack puts there with the held room added back (all 0 when nothing was held). The room moved the
+    // difference. Counting instead the triplets that fit the second budget and not the real one over-states it, as
+    // for the KV context room: the larger budget can take a larger triplet and then skip smaller ones the real pack
+    // did place. The layers are the ones that keep fewer triplets on the device.
+    size_t                               expert_bytes             = 0;
+    size_t                               expert_groups            = 0;
+    size_t                               expert_bytes_without     = 0;
+    size_t                               expert_groups_without    = 0;
     size_t                               moved_layers             = 0;
-    size_t                               moved_bytes              = 0;
     // REFUSE: the most the ring could have with every device-resident routed expert on the host tier, and the largest
     // micro-batch whose ring fits that.
     size_t                               max_ring_runtime_bytes   = 0;
@@ -903,6 +908,8 @@ struct placement_explicit_ubatch {
     // Set on the plan the context that announced the placement at WARN published. Every later context's plan copies
     // it, so a load announces its placement once, whatever micro-batch each context runs.
     bool                                 announced                = false;
+
+    size_t moved_bytes() const { return expert_bytes_without > expert_bytes ? expert_bytes_without - expert_bytes : 0; }
 };
 
 // The compute room the RUNTIME zone of a placed explicit micro-batch holds for that micro-batch's compute buffers, for
@@ -915,9 +922,11 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
                                               uint32_t *                        n_ubatch);
 
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
-// since the load whose plan PLACED the micro-batch with routed experts moved to the host tier. The context's own
-// micro-batch does not enter, because the line names the micro-batch the load placed, and a context whose micro-batch
-// differs (llama-bench's -p below -ub) would otherwise leave a load that moved experts unannounced.
+// since the load whose plan PLACED the micro-batch and whose room cost device bytes of routed experts. The bytes decide,
+// not the count of triplets: with triplets of unequal size the device can keep as many triplets and still hold fewer
+// bytes. The context's own micro-batch does not enter, because the line names the micro-batch the load placed, and a
+// context whose micro-batch differs (llama-bench's -p below -ub) would otherwise leave a load that moved experts
+// unannounced.
 bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode);
 
 // Complete placement plan for all model weights.

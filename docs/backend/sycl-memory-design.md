@@ -2753,9 +2753,18 @@ context's plan copies it, so a `-d` or `-fa` list that opens more contexts on
 the same model does not print it again:
 
 ```
-[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB: re-placed <M> experts (<K> layers)
-to the host tier, <X> MB moved (device 0)
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB: it re-placed <X> MB of routed experts
+to the host tier, from <K> layers: <D> triplets on the device, against <W> without its room, on device 0
 ```
+
+The figures are net, as for the KV context room. The planner packs the experts
+a second time with the hold added back, and the room moved the device bytes
+that pack places beyond the real one. The layers are the ones where the real
+pack keeps fewer triplets. Counting the triplets that fit the larger budget and
+not the real one would over-state the cost: that budget can take a larger
+triplet and then skip smaller ones the real pack placed. With triplets of
+unequal size the device can keep as many triplets and still hold fewer bytes,
+so the bytes, not the count, decide whether the line prints.
 
 The context is refused only when moving every device-resident routed expert
 would not free the room. The refusal names the largest `-ub` whose ring fits,

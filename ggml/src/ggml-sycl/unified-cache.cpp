@@ -33416,7 +33416,7 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
 
 // The announce rule for a placed explicit micro-batch; unified-cache.hpp describes it.
 bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode) {
-    return !probe_mode && xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.moved_experts > 0 &&
+    return !probe_mode && xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.moved_bytes() > 0 &&
            !xub.announced;
 }
 
@@ -33428,12 +33428,14 @@ static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, 
     }
     const double mb = 1024.0 * 1024.0;
     GGML_LOG_INFO(
-        "[PLACEMENT] explicit n_ubatch=%u PP MoE oneDNN scratch ring: %s (ring %.1f MB, RUNTIME room %.1f MB of which "
-        "%.1f MB already in the zone, expert budget %.1f MB, hold '%s' %.1f MB, moved %zu experts in %zu layers, "
-        "%.1f MB) on device %d\n",
+        "[PLACEMENT] explicit n_ubatch=%u PP MoE oneDNN scratch ring: %s (ring %.1f MB, "
+        "RUNTIME room %.1f MB of which %.1f MB already in the zone, expert budget %.1f MB, hold '%s' %.1f MB, "
+        "moved %.1f MB of routed experts from %zu layers: %.1f MB (%zu triplets) on the device, "
+        "against %.1f MB (%zu) with the hold added back) on device %d\n",
         xub.n_ubatch, pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.ring_bytes / mb, xub.room_bytes / mb,
         xub.room_reserved_bytes / mb, xub.expert_budget_bytes / mb, xub.hold_reason != nullptr ? xub.hold_reason : "",
-        xub.hold_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb, device_id);
+        xub.hold_bytes / mb, xub.moved_bytes() / mb, xub.moved_layers, xub.expert_bytes / mb, xub.expert_groups,
+        xub.expert_bytes_without / mb, xub.expert_groups_without, device_id);
 }
 
 // The routed-expert budget's hold for an explicit micro-batch's PP MoE oneDNN scratch ring: the ring is planned in the
@@ -34090,10 +34092,11 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // The same first-fit pack with the KV context room added back, so the room's line can say what it cost.
         size_t without_room = remaining + room.held;
 
-        // And with the explicit micro-batch's hold added back: a triplet that pack puts on the device and the real one
-        // does not is one the ring's room moved to the host tier.
-        size_t                  without_ubatch_room = remaining + ubatch_hold_bytes;
-        std::unordered_set<int> ubatch_moved_layers;
+        // And with the explicit micro-batch's hold added back. The room moved the difference between that pack's device
+        // triplets and the real one's, as for the KV context room, and the layers it moved them out of are the ones
+        // whose device triplets that pack counts above the real one's.
+        size_t                       without_ubatch_room = remaining + ubatch_hold_bytes;
+        std::unordered_map<int, int> ubatch_layer_drop;  // per layer: device triplets without the hold, less with it
         for (const auto & group : moe_groups) {
             if (moe_triplet_complete(group)) {
                 stats.complete_groups++;
@@ -34108,12 +34111,17 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 room.expert_bytes_without += group.bytes;
                 room.expert_groups_without++;
             }
-            if (ubatch_hold_bytes > 0 && group.charge_bytes <= without_ubatch_room) {
-                without_ubatch_room -= group.charge_bytes;
-                if (!on_device) {
-                    plan.explicit_ubatch.moved_experts++;
-                    plan.explicit_ubatch.moved_bytes += group.bytes;
-                    ubatch_moved_layers.insert(group.layer_id);
+            if (ubatch_hold_bytes > 0) {
+                if (group.charge_bytes <= without_ubatch_room) {
+                    without_ubatch_room -= group.charge_bytes;
+                    plan.explicit_ubatch.expert_bytes_without += group.bytes;
+                    plan.explicit_ubatch.expert_groups_without++;
+                    ubatch_layer_drop[group.layer_id]++;
+                }
+                if (on_device) {
+                    plan.explicit_ubatch.expert_bytes += group.bytes;
+                    plan.explicit_ubatch.expert_groups++;
+                    ubatch_layer_drop[group.layer_id]--;
                 }
             }
             if (on_device) {
@@ -34151,7 +34159,10 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         room.expert_bytes  = stats.device_bytes;
         room.expert_groups = stats.device_groups;
 
-        plan.explicit_ubatch.moved_layers = ubatch_moved_layers.size();
+        for (const auto & [layer_id, drop] : ubatch_layer_drop) {
+            GGML_UNUSED(layer_id);
+            plan.explicit_ubatch.moved_layers += drop > 0;
+        }
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.

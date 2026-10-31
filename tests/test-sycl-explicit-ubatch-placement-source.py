@@ -15,12 +15,13 @@ What this gate pins:
   (0) when the backend picks the micro-batch itself, so the auto-ubatch trial never places;
 - the planner holds the ring's RUNTIME room as a named term on the routed-expert budget, inside the MoE block after the
   dense weights, their KV and the KV context room, so only routed experts give it up; the hold is the whole room before
-  and after the zone grows, the pack predicate is the budget less it, and the triplets it moved come from a first-fit
-  pack with the hold added back;
+  and after the zone grows, the pack predicate is the budget less it, and what it moved is net, as for the KV context
+  room: the device bytes a first-fit pack with the hold added back places beyond the real pack's, from the layers that
+  keep fewer triplets on the device;
 - the load grows the RUNTIME zone for that micro-batch before the plan it keeps, and falls back to the load's planning
   shape, planned without the room, when the arena cannot grow;
-- a load announces the placement in ONE WARN line, with the experts and bytes moved, at the first non-probe context
-  since the load whatever that context's micro-batch; the plan that context publishes carries a mark every later
+- a load announces the placement in ONE WARN line, with the bytes and layers moved and both packs' triplets, at the
+  first non-probe context since the load whose room cost device bytes, whatever that context's micro-batch; the plan that context publishes carries a mark every later
   context's plan copies, so no later context repeats it;
 - the fallback refusal names the largest -ub that fits, from the ring admission's own slot arithmetic;
 - the hold-spill fit credits a compute buffer no larger than the planned compute term at the micro-batch the published
@@ -142,10 +143,11 @@ DECIDE_SIG = "pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubat
 POPULATE_SIG = "static void llama_model_sycl_populate_inventory("
 BENCH_HINT_SIG = "uint32_t n_ubatch_hint() const"
 
-# The decision line: one WARN per load, at the first non-probe context since the load when the room moved experts.
-WARN_LITERAL = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: re-placed %zu '
-                'experts (%zu layers) to the host tier, %.1f MB moved (device %d)\\n", xub.n_ubatch, '
-                'xub.ring_bytes / mb, xub.moved_experts, xub.moved_layers, xub.moved_bytes / mb, ctx->device);')
+# The decision line: one WARN per load, at the first non-probe context since the load when the room cost device bytes.
+WARN_LITERAL = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB: it re-placed '
+                '%.1f MB of routed experts to the host tier, from %zu layers: %zu triplets on the device, against %zu '
+                'without its room, on device %d\\n", xub.n_ubatch, xub.ring_bytes / mb, xub.moved_bytes() / mb, '
+                'xub.moved_layers, xub.expert_groups, xub.expert_groups_without, ctx->device);')
 WARN_GATE = "if (warn) {"
 INFO_GATE = "} else if (xub.n_ubatch == next_kv_info.n_ubatch) {"
 ANNOUNCE_DEF = "auto announce_explicit_ubatch_placement = [&](const ggml_sycl::placement_plan & final_plan, bool warn)"
@@ -166,7 +168,7 @@ PROBE_BRANCH = "if (probe_mode) { const bool rollback_ok ="
 PUBLISH = "next->plan = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));"
 ANNOUNCES_SIG = "bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode)"
 ANNOUNCES_RULE = ("return !probe_mode && xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && "
-                  "xub.moved_experts > 0 && !xub.announced;")
+                  "xub.moved_bytes() > 0 && !xub.announced;")
 XUB_STRUCT = "struct placement_explicit_ubatch {"
 XUB_MARK_FIELD = "bool announced = false;"
 
@@ -230,15 +232,22 @@ KEPT_RULE = ("const size_t planned = std::max(floor_bytes, requirement); "
              "return live_zone_bytes > planned && live_zone_bytes - planned > 255;")
 
 # The planner: a named hold on the expert budget, after the KV context room and before the pack's stats (where a
-# second hold term composes); the pack predicate is the budget less the hold; moved counted with the hold added back.
+# second hold term composes); the pack predicate is the budget less the hold; what it moved is the difference between
+# the pack with the hold added back and the real one, as the KV context room counts its cost.
 KV_ROOM = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);"
 HOLD_CALL = "const size_t ubatch_hold_bytes = hold_explicit_ubatch_room(plan, kv_info, remaining);"
 STATS_DECL = "moe_triplet_pack_stats stats;"
 WITHOUT_ROOM = "size_t without_ubatch_room = remaining + ubatch_hold_bytes;"
 PACK_PREDICATE = "const bool on_device = group.charge_bytes <= remaining;"
-MOVED = ("if (ubatch_hold_bytes > 0 && group.charge_bytes <= without_ubatch_room) { without_ubatch_room -= "
-         "group.charge_bytes; if (!on_device) { plan.explicit_ubatch.moved_experts++; "
-         "plan.explicit_ubatch.moved_bytes += group.bytes; ubatch_moved_layers.insert(group.layer_id); } }")
+MOVED = ("if (ubatch_hold_bytes > 0) { if (group.charge_bytes <= without_ubatch_room) { without_ubatch_room -= "
+         "group.charge_bytes; plan.explicit_ubatch.expert_bytes_without += group.bytes; "
+         "plan.explicit_ubatch.expert_groups_without++; ubatch_layer_drop[group.layer_id]++; } "
+         "if (on_device) { plan.explicit_ubatch.expert_bytes += group.bytes; plan.explicit_ubatch.expert_groups++; "
+         "ubatch_layer_drop[group.layer_id]--; } }")
+MOVED_LAYERS = ("for (const auto & [layer_id, drop] : ubatch_layer_drop) { GGML_UNUSED(layer_id); "
+                "plan.explicit_ubatch.moved_layers += drop > 0; }")
+MOVED_NET = ("size_t moved_bytes() const { return expert_bytes_without > expert_bytes ? "
+             "expert_bytes_without - expert_bytes : 0; }")
 HOLD_SIG = ("static size_t hold_explicit_ubatch_room(placement_plan & plan, const placement_kv_info & kv_info, "
             "size_t & remaining)")
 DECIDE = "pp_moe_onednn_explicit_ubatch_decide(room, remaining);"
@@ -348,17 +357,22 @@ def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str) -> bool:
             and KEPT_RULE in body(norm(zone_cpp), KEPT_RULE_SIG))
 
 
-def claim_planner_moves_only_experts(cache_cpp: str) -> bool:
+def claim_planner_moves_only_experts(cache_cpp: str, cache_hpp: str = CACHE_HPP) -> bool:
     """The room is a named hold on the routed-expert budget, taken after the KV context room and before the pack's
     stats, against what the dense weights, their KV and that room left, so it never moves a dense layer or KV. The
-    pack predicate is the budget less the hold, and the triplets a pack with the hold added back puts on the device
-    and the real pack does not are the ones it moved. The hold is the whole room on PLACE and GROW_ZONE alike, with the
-    part the zone already holds returned first, so the plan the load grows the zone for is the plan it keeps."""
+    pack predicate is the budget less the hold. What it moved is net, as the KV context room counts its cost: both
+    packs' device triplets are counted, the bytes moved are the difference, and the layers are the ones the real pack
+    keeps fewer triplets in. Counting the triplets that fit the larger budget and not the real one over-states it,
+    because that budget can take a larger triplet and skip smaller ones the real pack placed. The hold is the whole
+    room on PLACE and GROW_ZONE alike, with the part the zone already holds returned first, so the plan the load grows
+    the zone for is the plan it keeps."""
     cache = norm(cache_cpp)
     planner = body(cache, PLANNER_SIG)
     hold = body(cache, HOLD_SIG)
-    return (bool(planner) and ordered(planner, KV_ROOM, HOLD_CALL, STATS_DECL, WITHOUT_ROOM, PACK_PREDICATE, MOVED)
-            and planner.count(PACK_PREDICATE) == 1
+    return (bool(planner)
+            and ordered(planner, KV_ROOM, HOLD_CALL, STATS_DECL, WITHOUT_ROOM, PACK_PREDICATE, MOVED, MOVED_LAYERS)
+            and planner.count(PACK_PREDICATE) == 1 and planner.count("plan.explicit_ubatch.moved_layers") == 1
+            and MOVED_NET in struct_text(norm(cache_hpp), XUB_STRUCT)
             and bool(hold) and ordered(hold, DECIDE, HOLD_REASON, HOLD_GATE, HOLD_STEPS))
 
 
@@ -467,7 +481,9 @@ def test_mutant_decision_line_at_info_fails():
 
 def test_mutant_decision_line_without_the_bytes_moved_fails():
     assert not _one_warn(
-        _once(SYCL_CPP, WARN_LITERAL, WARN_LITERAL.replace(", %.1f MB moved", "").replace(", xub.moved_bytes / mb", "")))
+        _once(SYCL_CPP, WARN_LITERAL,
+              WARN_LITERAL.replace("it re-placed %.1f MB of routed experts", "it re-placed routed experts", 1)
+              .replace(" xub.moved_bytes() / mb,", "", 1)))
 
 
 def test_mutant_decision_line_every_context_fails():
@@ -484,7 +500,16 @@ def test_mutant_decision_line_for_a_probe_fails():
 def test_mutant_decision_line_for_a_room_that_moved_nothing_fails():
     """A room the weight zone's slack held moved no expert, so there is nothing to announce at WARN."""
     assert not _one_warn(
-        cache_cpp=_once(CACHE_CPP, ANNOUNCES_RULE, ANNOUNCES_RULE.replace(" && xub.moved_experts > 0", "", 1)))
+        cache_cpp=_once(CACHE_CPP, ANNOUNCES_RULE, ANNOUNCES_RULE.replace(" && xub.moved_bytes() > 0", "", 1)))
+
+
+def test_mutant_decision_line_keyed_on_the_triplet_count_fails():
+    """With triplets of unequal size the device can keep as many triplets and still hold fewer bytes, so a rule that
+    reads the count leaves a room that cost device bytes unannounced."""
+    assert not _one_warn(
+        cache_cpp=_once(CACHE_CPP, ANNOUNCES_RULE,
+                        ANNOUNCES_RULE.replace("xub.moved_bytes() > 0", "xub.expert_groups_without > xub.expert_groups",
+                                               1)))
 
 
 def test_mutant_commit_site_not_announced_fails():
@@ -683,8 +708,35 @@ def test_mutant_pack_predicate_ignores_the_hold_fails():
 
 
 def test_mutant_moved_counts_device_experts_fails():
+    """The real pack's own triplets counted as the second pack's: the room would seem to cost nothing."""
     assert not claim_planner_moves_only_experts(
-        _once(CACHE_CPP, MOVED, MOVED.replace("if (!on_device) {", "if (on_device) {", 1)))
+        _once(CACHE_CPP, MOVED, MOVED.replace("if (on_device) {", "if (group.charge_bytes <= without_ubatch_room) {", 1)))
+
+
+def test_mutant_moved_is_the_gross_count_fails():
+    """The gross count: a triplet the second pack places is counted only when the real pack does not, which credits
+    the larger triplet it took and none of the smaller ones the real pack placed instead."""
+    gross = MOVED.replace("plan.explicit_ubatch.expert_bytes_without += group.bytes; "
+                          "plan.explicit_ubatch.expert_groups_without++; ",
+                          "if (!on_device) { plan.explicit_ubatch.expert_bytes_without += group.bytes; "
+                          "plan.explicit_ubatch.expert_groups_without++; } ", 1)
+    assert gross != MOVED
+    assert not claim_planner_moves_only_experts(_once(CACHE_CPP, MOVED, gross))
+
+
+def test_mutant_moved_layers_count_any_change_fails():
+    """A layer the room let keep more triplets is not one it moved experts out of."""
+    assert not claim_planner_moves_only_experts(
+        _once(CACHE_CPP, MOVED_LAYERS, MOVED_LAYERS.replace("drop > 0", "drop != 0", 1)))
+
+
+def test_mutant_moved_bytes_gross_fails():
+    """The second pack's whole device bytes, not the difference, is the room's cost only when the real pack placed
+    nothing."""
+    assert not claim_planner_moves_only_experts(
+        CACHE_CPP,
+        _once(CACHE_HPP, MOVED_NET,
+              "size_t moved_bytes() const { return expert_bytes_without; }"))
 
 
 def test_mutant_grown_zone_not_replanned_fails():
