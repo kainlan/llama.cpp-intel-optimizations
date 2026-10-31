@@ -986,10 +986,12 @@ static bool run_kv_context_room_cost_is_net_test() {
 
 // The explicit micro-batch's cost is net too, on the same unequal triplets: layer 0's are four times layer 1's. The
 // ring here has a 256 KiB weight slot, 192 B of activation and 96 B of output per row, and depth 1, so the ring at 2560
-// is 576 KiB more than at the default 512, and the zone that holds it is the room the experts give. Left for them: one
-// large triplet and two small ones; with the hold added back, two large and one small. The device keeps as many
-// triplets and 576 KiB less, and only layer 0 keeps fewer. Counting the triplets that fit the larger budget and not
-// the real one would say one large triplet, 768 KiB, moved.
+// is 576 KiB more than at the default 512. The RUNTIME zone already holds that room, which it took from the weight
+// capacity when it grew, so the budget the planner is given is what is left beside the zone, as for the placed plan
+// above. The hold credits what the zone holds before it charges the room, so it takes nothing more from that budget.
+// Left for the experts: one large triplet and two small ones; with the hold added back, two large and one small. The
+// device keeps as many triplets and 576 KiB less, and only layer 0 keeps fewer. Counting the triplets that fit the
+// larger budget and not the real one would say one large triplet, 768 KiB, moved.
 static bool run_explicit_ubatch_cost_is_net_test() {
     using namespace kv_order_case;
     constexpr size_t small_bytes   = expert_bytes / 4;
@@ -1037,7 +1039,7 @@ static bool run_explicit_ubatch_cost_is_net_test() {
         }
     }
     const size_t left   = triplet_bytes + 2 * small_triplet;
-    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + room_bytes + left;
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + left;
     const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv, nullptr, n_experts);
     for (int l = 0; l < 2; ++l) {
         for (int e = 0; e < n_experts; ++e) {
@@ -1046,11 +1048,14 @@ static bool run_explicit_ubatch_cost_is_net_test() {
     }
 
     const auto & xub = plan.explicit_ubatch;
-    if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || xub.hold_bytes != room_bytes ||
-        device_triplets(plan) != 3) {
-        printf("FAIL: the held room places the ring: action %s, hold %zu, %zu device triplets; want place, %zu, 3\n",
-               ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.hold_bytes, device_triplets(plan),
-               room_bytes);
+    // The experts are packed into what the dense weights and their KV leave of the budget; the zone's room is not in it.
+    if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || xub.expert_budget_bytes != left ||
+        xub.hold_bytes != room_bytes || device_triplets(plan) != 3) {
+        printf(
+            "FAIL: the held room places the ring: action %s, expert budget %zu, hold %zu, %zu device triplets; want "
+            "place, %zu, %zu, 3\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.expert_budget_bytes, xub.hold_bytes,
+            device_triplets(plan), left, room_bytes);
         return false;
     }
     // Net: (2 large + 1 small) - (1 large + 2 small) = the room's bytes, in the one layer that keeps fewer triplets.
@@ -1058,11 +1063,11 @@ static bool run_explicit_ubatch_cost_is_net_test() {
         xub.expert_bytes_without != 2 * triplet_bytes + small_triplet || xub.moved_bytes() != room_bytes ||
         xub.moved_layers != 1) {
         printf(
-            "FAIL: the room moved %zu device bytes of routed experts net from 1 layer: %zu bytes (%zu triplets) on the "
-            "device against %zu (%zu) with the hold added back, %zu moved from %zu layers (gross would be %zu from "
-            "1)\n",
+            "FAIL: the room moves %zu device bytes of routed experts net from 1 layer: %zu bytes (%zu triplets) on the "
+            "device against %zu (%zu) with the hold added back, %zu moved from %zu layers; want %zu (3) against %zu "
+            "(3), not the gross %zu\n",
             room_bytes, xub.expert_bytes, xub.expert_groups, xub.expert_bytes_without, xub.expert_groups_without,
-            xub.moved_bytes(), xub.moved_layers, triplet_bytes);
+            xub.moved_bytes(), xub.moved_layers, left, 2 * triplet_bytes + small_triplet, triplet_bytes);
         return false;
     }
     // The bytes decide the announcement: the device keeps as many triplets, and the room still cost 576 KiB of them.
