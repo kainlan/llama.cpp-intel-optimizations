@@ -471,7 +471,9 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   size_t hold,
                                   size_t alloc_size);
 
-// The arena's grain: it reserves every zone as a whole number of these bytes (the TLSF allocator's alignment).
+// The arena's grain: it reserves every zone as a whole number of these bytes. It is the zone allocator's block grain
+// (tlsf_allocator::block_grain), which this dependency-free header cannot include, so unified-cache.cpp asserts the
+// two are equal.
 constexpr size_t k_zone_arena_alignment = 256;
 
 // The RUNTIME zone the arena reserves for a plan into *out: the larger of `floor_bytes` and `requirement`, rounded up

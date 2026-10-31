@@ -38,7 +38,8 @@ What this gate pins:
   of a process never prints it;
 - the RUNTIME zone is one reservation: the arena's reserve, the zone the cache plans, the explicit micro-batch's room,
   the check for a grown zone and its WARN all ask zone_runtime_reserved_bytes() (the larger of the floor and the
-  requirement, rounded up to the arena's 256-byte grain, checked), so none of them can round apart from the others.
+  requirement, rounded up to the arena's 256-byte grain, checked), so none of them can round apart from the others;
+  the cache asserts that grain is the zone allocator's block grain, so the two spellings cannot drift.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail.
@@ -178,6 +179,8 @@ KEPT_RULE = ("size_t reserved = 0; "
 # The RUNTIME zone as the arena reserves it: one checked helper, asked by every site that sizes, plans against or
 # compares with that zone.
 ARENA_ALIGNMENT = "constexpr size_t k_zone_arena_alignment = 256;"
+# The grain is a second spelling of the zone allocator's block grain, so the cache asserts the two are equal.
+ARENA_GRAIN_ASSERT = "static_assert(k_zone_arena_alignment == tlsf_allocator::block_grain,"
 RESERVED_SIG = "inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, size_t * out)"
 RESERVED_RULE = ("const size_t planned = requirement > floor_bytes ? requirement : floor_bytes; "
                  "if (planned > SIZE_MAX - (k_zone_arena_alignment - 1)) { return false; } "
@@ -345,7 +348,8 @@ def claim_runtime_zone_is_one_reservation(zone_hpp: str, zone_cpp: str, cache_cp
     """The RUNTIME zone is reserved, planned, planned against and compared through one checked helper: the arena's
     reserve, the zone ensure_planned_arena_zones() plans, the explicit micro-batch's room, the grown-zone rule and its
     WARN each call zone_runtime_reserved_bytes(), and none of them rounds the zone itself. The helper takes the larger
-    of the floor and the requirement and rounds it up to the arena's named grain with the addition checked."""
+    of the floor and the requirement and rounds it up to the arena's named grain with the addition checked, and the
+    cache asserts the grain is the zone allocator's block grain."""
     hpp = norm(zone_hpp)
     cache = norm(cache_cpp)
     reserve = body(cache, ARENA_RESERVE_SIG)
@@ -354,7 +358,8 @@ def claim_runtime_zone_is_one_reservation(zone_hpp: str, zone_cpp: str, cache_cp
     rule = body(norm(zone_cpp), KEPT_RULE_SIG)
     kept = body(norm(sycl_cpp), KEPT_SIG)
     sites = (reserve, ensure, room, rule, kept)
-    return (ARENA_ALIGNMENT in hpp and RESERVED_RULE in body(hpp, RESERVED_SIG)
+    return (ARENA_ALIGNMENT in hpp and cache.count(ARENA_GRAIN_ASSERT) == 1
+            and RESERVED_RULE in body(hpp, RESERVED_SIG)
             and all(site.count("zone_runtime_reserved_bytes(") == 1 for site in sites)
             and ARENA_RESERVE_CALL in reserve and "runtime_bytes = (runtime_bytes +" not in reserve
             and ENSURE_CALL in ensure and "runtime_zone = planned_runtime_scratch;" not in ensure
@@ -767,6 +772,14 @@ def test_mutant_reservation_grain_unnamed_fails():
     assert not claim_runtime_zone_is_one_reservation(
         _once(ZONE_HPP, ARENA_ALIGNMENT, "constexpr size_t k_zone_arena_grain = 256;"),
         ZONE_CPP, CACHE_CPP, ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_reservation_grain_not_the_allocator_grain_fails():
+    """Without the assert, the arena's grain and the zone allocator's block grain are two sources free to drift."""
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, ZONE_CPP,
+        _once(CACHE_CPP, ARENA_GRAIN_ASSERT, "static_assert(k_zone_arena_alignment >= 1,"),
+        ADMISSION_CPP, SYCL_CPP)
 
 
 def test_mutant_grown_zone_warn_at_info_fails():

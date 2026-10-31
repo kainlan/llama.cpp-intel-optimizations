@@ -27275,6 +27275,11 @@ bool device_pool_arena_owns(const unified_cache * cache, const void * ptr) {
     return cache->vram_owns(ptr);
 }
 
+// The arena reserves every zone in whole grains of k_zone_arena_alignment, and the zone allocator places every block
+// on its block grain. Both name one figure, so they are held equal here, where both headers are visible.
+static_assert(k_zone_arena_alignment == tlsf_allocator::block_grain,
+              "zone-sizing.hpp's arena grain must be the zone allocator's block grain");
+
 bool unified_cache::arena_reserve(sycl::queue & queue,
                                   size_t        budget_bytes,
                                   size_t        max_alloc_size,
