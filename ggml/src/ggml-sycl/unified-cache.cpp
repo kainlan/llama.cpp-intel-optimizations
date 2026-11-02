@@ -32673,15 +32673,17 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     return terms;
 }
 
-// A host-resident weight's backing, from the load's fact (design 5efe §4.4). Without the fact every backing
-// is PINNED, today's. With it a routed expert is served in place from the mapping (host experts are AOS here, so no
-// reorder copy exists to charge), and so is token_embd, which the CPU reads as a row gather in the file layout; a dense
-// weight is CPU_OWNED when ggml-cpu repacks it into a buffer of its own (GGML_SYCL_HOST_WEIGHT_LAYOUT=cpu) and
-// FILE_MAPPED when the CPU reads the file layout in place (=plain, =off).
-static placement_host_backing placement_host_backing_when_host(const placement_kv_info & kv_info,
+// A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
+// the fact onto the plan before any entry is made, and every reader, this rule included, asks the plan. Without the
+// fact every backing is PINNED, today's. With it a routed expert is served in place from the mapping (host experts are
+// AOS here, so no reorder copy exists to charge), and so is token_embd, which the CPU reads as a row gather in the file
+// layout; a dense weight is CPU_OWNED when ggml-cpu repacks it into a buffer of its own (libllama resolved
+// GGML_SYCL_HOST_WEIGHT_LAYOUT to cpu) and FILE_MAPPED when the CPU reads the file layout in place (=plain, =off).
+static placement_host_backing placement_host_backing_when_host(const placement_plan &    plan,
+                                                               const placement_kv_info & kv_info,
                                                                bool                      routed_expert,
                                                                bool                      get_rows_only) {
-    if (!kv_info.load_maps_files) {
+    if (!plan.host_backing_maps_files) {
         return placement_host_backing::PINNED;
     }
     if (routed_expert || get_rows_only || !kv_info.host_weight_layout_cpu) {
@@ -34196,7 +34198,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 entry.priority         = prio;
                 entry.on_device        = false;
                 entry.target_device    = -1;
-                entry.host_backing     = placement_host_backing_when_host(kv_info, /*routed_expert=*/true,
+                entry.host_backing     = placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/true,
                                                                           /*get_rows_only=*/false);
                 plan.entries.push_back(std::move(entry));
             }
@@ -34227,7 +34229,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 
         entry.on_device     = false;  // Will be set during packing below
         entry.target_device = -1;     // -1 = host (updated during packing)
-        entry.host_backing  = placement_host_backing_when_host(kv_info, /*routed_expert=*/false, tensor.get_rows_only);
+        entry.host_backing =
+            placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/false, tensor.get_rows_only);
         plan.entries.push_back(std::move(entry));
     }
 
@@ -35717,7 +35720,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 entry.priority         = prio;
                 entry.on_device        = false;
                 entry.target_device    = -1;
-                entry.host_backing     = placement_host_backing_when_host(kv_info, /*routed_expert=*/true,
+                entry.host_backing     = placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/true,
                                                                           /*get_rows_only=*/false);
                 plan.entries.push_back(std::move(entry));
             }
@@ -35737,7 +35740,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         entry.on_device        = false;
         entry.target_device    = -1;
 
-        entry.host_backing = placement_host_backing_when_host(kv_info, /*routed_expert=*/false, tensor.get_rows_only);
+        entry.host_backing =
+            placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/false, tensor.get_rows_only);
 
         entry.priority = tensor_to_placement_priority(usage, name.c_str());
         if (entry.layer_id >= 0) {

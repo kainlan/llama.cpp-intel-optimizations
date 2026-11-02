@@ -73,9 +73,9 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       where the plan maps no files.
 
 The planner (§4.4)
-  P1. every entry-creation site in both builders derives host_backing from the fact
-      (placement_host_backing_when_host), and both builders mark the device-planned entries FILE_MAPPED before the host
-      zones are sized;
+  P1. every entry-creation site in both builders derives host_backing from the fact as the plan holds it
+      (placement_host_backing_when_host reads plan.host_backing_maps_files, never kv_info's), and both builders mark the
+      device-planned entries FILE_MAPPED before the host zones are sized;
   P2. every host-weight accumulation site in the planner passes the entry's host_backing (the per-entry group helper
       reads it itself);
   P3. the readers: charged_host_weight_bytes and refresh_kv_byte_totals count the mapped bytes only when locked, both
@@ -665,10 +665,15 @@ def clause_p1_derivation_sites(t: dict) -> list:
         if not re.search(r"plan\s*\.\s*host_mapped_locked\s*=", body):
             problems.append(f"{builder} does not copy the lock into the plan")
     rule = body_of(ucc, r"static\s+placement_host_backing\s+placement_host_backing_when_host\s*\(")
-    for needle in ("load_maps_files", "host_weight_layout_cpu", "placement_host_backing::CPU_OWNED",
+    for needle in ("host_weight_layout_cpu", "placement_host_backing::CPU_OWNED",
                    "placement_host_backing::FILE_MAPPED", "placement_host_backing::PINNED"):
         if needle not in rule:
             problems.append(f"placement_host_backing_when_host does not read {needle}")
+    # One fact, one source: the rule asks the plan's copy, which the builder made before any entry exists.
+    if not re.search(r"plan\s*\.\s*host_backing_maps_files", rule):
+        problems.append("placement_host_backing_when_host does not read the plan's host_backing_maps_files")
+    if re.search(r"\bload_maps_files\b", rule):
+        problems.append("placement_host_backing_when_host reads load_maps_files instead of the plan's copy")
     return problems
 
 
@@ -857,6 +862,9 @@ MUTANTS = [
                     r"ggml_sycl_resolve_or_host_tensor_ptr(nullptr, 0); \1")),
     ("one builder's dense site keeps the PINNED default", "P1",
      lambda t: _mut(t, UCC, r"entry\s*\.\s*host_backing\s*=\s*placement_host_backing_when_host\s*\([^;]*;", ";")),
+    ("the backing rule reads kv_info's fact instead of the plan's copy", "P1",
+     lambda t: _mut(t, UCC, r"if\s*\(\s*!\s*plan\s*\.\s*host_backing_maps_files\s*\)",
+                    "if (!kv_info.load_maps_files)")),
     ("a planner site charges without the backing", "P2",
      lambda t: _mut(t, UCC, r"plan\s*\.\s*charge_host_weight\s*\(\s*entry\s*\.\s*host_backing\s*,",
                     "plan.charge_host_weight(placement_host_backing::PINNED,")),
