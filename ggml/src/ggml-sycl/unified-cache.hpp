@@ -1350,7 +1350,7 @@ struct placement_plan {
         } else if (backing == placement_host_backing::FILE_MAPPED) {
             host_mapped_bytes += bytes;
             return;
-        } else {
+        } else {  // CPU_OWNED
             host_cpu_owned_bytes += bytes;
         }
         host_bytes += bytes;
@@ -1363,7 +1363,7 @@ struct placement_plan {
         } else if (backing == placement_host_backing::FILE_MAPPED) {
             saturating_sub(host_mapped_bytes, bytes);
             return;
-        } else {
+        } else {  // CPU_OWNED
             saturating_sub(host_cpu_owned_bytes, bytes);
         }
         saturating_sub(host_bytes, bytes);
