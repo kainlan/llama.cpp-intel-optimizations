@@ -45,7 +45,6 @@
 #include "ggml-sycl.h"
 #include "sycl-test-skip.hpp"
 
-#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -463,6 +462,8 @@ alloc_request host_weight_request(sycl::queue & q, size_t bytes) {
 // The request a SYCL_Host buffer makes after the model load (the context's output buffer): category HOST_COMPUTE,
 // which routes to WEIGHT whatever the role. Its role is the buffer type's: WEIGHT while weights are evictable (the
 // default), STAGING otherwise, the same choice ggml_backend_sycl_host_buffer_type_alloc_buffer makes outside a load.
+// The census uses it only when the loader adds no SYCL_Host buffer type; otherwise it allocates through that buffer
+// type itself, so the request cannot drift from the real one.
 alloc_request host_compute_request(sycl::queue & q, size_t bytes) {
     const alloc_role role = ggml_backend_sycl_weights_evictable() ? alloc_role::WEIGHT : alloc_role::STAGING;
     alloc_request    req{};
@@ -547,6 +548,11 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
     const derived_terms     t = derive_terms(plan);
     std::vector<mem_handle> held;
 
+    // The SYCL_Host buffer type the loader adds to a SYCL device's list while weights are evictable: the context's
+    // output buffer and the loader's own buffer both come from it.
+    ggml_backend_buffer_type_t host_buft =
+        ggml_backend_sycl_weights_evictable() ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
+
     auto take = [&](weight_class cls, const alloc_request & req) {
         const size_t before = census.used();
         mem_handle   h      = unified_allocate(req);
@@ -562,6 +568,21 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         held.push_back(std::move(h));
     };
 
+    // One buffer of `bytes` through `buft`, classed by its registered allocation's metadata; nullptr when refused.
+    auto take_buffer = [&](weight_class cls, ggml_backend_buffer_type_t buft, size_t bytes) -> ggml_backend_buffer_t {
+        const size_t          before = census.used();
+        ggml_backend_buffer_t buf    = ggml_backend_buft_alloc_buffer(buft, bytes);
+        if (buf == nullptr) {
+            return nullptr;
+        }
+        alloc_metadata md{};
+        if (!unified_lookup_runtime_allocation(ggml_backend_buffer_get_base(buf), &md)) {
+            md.host_zone = host_zone_id::COUNT;
+        }
+        census.record(cls, md, census.used() - before);
+        return buf;
+    };
+
     // The terms: every planned host weight at the bytes the cache allocates for it, so the census compares cache bytes
     // with the planner's terms, then a logits-sized HOST_COMPUTE request the reserve covers.
     for (const placement_entry & e : plan.entries) {
@@ -575,7 +596,15 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         }
         take(weight_class::HOST_WEIGHTS, host_weight_request(q, cache_bytes));
     }
-    take(weight_class::HOST_COMPUTE_RESERVE, host_compute_request(q, 8 * MiB));
+    ggml_backend_buffer_t reserve_buf = nullptr;
+    if (host_buft != nullptr) {
+        reserve_buf = take_buffer(weight_class::HOST_COMPUTE_RESERVE, host_buft, 8 * MiB);
+        if (reserve_buf == nullptr) {
+            census.failed++;
+        }
+    } else {
+        take(weight_class::HOST_COMPUTE_RESERVE, host_compute_request(q, 8 * MiB));
+    }
 
     check_eq("planned WEIGHT allocations that failed", census.failed, 0);
     check_eq("planned WEIGHT allocations that landed outside WEIGHT", census.not_in_weight, 0);
@@ -590,27 +619,16 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
              capacity_before);
     check(census.used() - used_before <= plan.host_zone_weight_bytes, "the terms fit the planned WEIGHT zone");
 
-    // The unplanned class: the loader's own buffer, through the buffer type the loader adds to a SYCL device's list
-    // (weights evictable), sized as the loader sizes it, every weight it reads. Once the mapped host tier replaces
-    // that buffer type, the buffer no longer lands in WEIGHT and this class reads zero.
-    const size_t loader_requested = tensors.total();
-
-    ggml_backend_buffer_type_t loader_buft =
-        ggml_backend_sycl_weights_evictable() ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
-    ggml_backend_buffer_t loader_buf     = nullptr;
-    size_t                loader_grew_by = 0;
-    if (loader_buft != nullptr) {
-        const size_t used_pre     = census.used();
+    // The unplanned class: the loader's own buffer, through that same buffer type, sized as the loader sizes it,
+    // every weight it reads. Once the mapped host tier replaces that buffer type, the buffer no longer lands in WEIGHT
+    // and this class reads zero.
+    const size_t          loader_requested = tensors.total();
+    ggml_backend_buffer_t loader_buf       = nullptr;
+    size_t                loader_grew_by   = 0;
+    if (host_buft != nullptr) {
         const size_t capacity_pre = cache.host_zone_capacity(host_zone_id::WEIGHT);
-        loader_buf                = ggml_backend_buft_alloc_buffer(loader_buft, loader_requested);
-        if (loader_buf != nullptr) {
-            alloc_metadata md{};
-            if (!unified_lookup_runtime_allocation(ggml_backend_buffer_get_base(loader_buf), &md)) {
-                md.host_zone = host_zone_id::COUNT;
-            }
-            census.record(weight_class::LOADER_RESIDENCY, md, census.used() - used_pre);
-            loader_grew_by = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
-        }
+        loader_buf                = take_buffer(weight_class::LOADER_RESIDENCY, host_buft, loader_requested);
+        loader_grew_by            = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
     }
     const size_t loader_bytes = census.bytes(weight_class::LOADER_RESIDENCY);
 
@@ -621,7 +639,7 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         "  census terms: host_weights=%zu (term %zu + tlsf %zu) host_compute_reserve=%zu (term %zu) blocks=%zu\n",
         host_weights_bytes, t.host_weights, t.blocks * k_tlsf_grain, reserve_bytes, k_host_compute_reserve_bytes,
         t.blocks);
-    if (loader_buft == nullptr) {
+    if (host_buft == nullptr) {
         std::printf("  unplanned loader_residency=0 B (the loader adds no SYCL_Host buffer type here)\n");
     } else if (loader_buf == nullptr) {
         std::printf("  unplanned loader_residency=0 B (the loader's %zu B buffer was refused)\n", loader_requested);
@@ -633,6 +651,9 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
     if (loader_buf != nullptr) {
         ggml_backend_buffer_free(loader_buf);
     }
+    if (reserve_buf != nullptr) {
+        ggml_backend_buffer_free(reserve_buf);
+    }
     held.clear();
     check_eq("the census released every WEIGHT allocation", census.used(), used_before);
     return true;
@@ -643,9 +664,7 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
 int main() {
     std::printf("=== the host WEIGHT zone is exact bytes plus named terms ===\n");
     // One chunk holds every zone, so the census measures TLSF rounding and not where a chunk ends.
-    if (std::getenv("GGML_SYCL_PINNED_CHUNK_MB") == nullptr) {
-        setenv("GGML_SYCL_PINNED_CHUNK_MB", "512", 0);
-    }
+    setenv("GGML_SYCL_PINNED_CHUNK_MB", "512", /*overwrite=*/0);
 
     const std::vector<placement_tensor_info> inventory = q2k_inventory();
     const cache_tensors                      tensors(inventory);
