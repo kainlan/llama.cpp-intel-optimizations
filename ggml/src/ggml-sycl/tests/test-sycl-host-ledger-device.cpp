@@ -286,9 +286,13 @@ struct tagged_yielder {
         return 0;
     }
 
-    // Charges each chunk and registers the yielder; false (and nothing held) when a charge is refused.
+    // Charges each chunk and registers the yielder; false when a chunk is empty, as nothing could be yielded from it,
+    // or when a charge is refused. The chunks charged before that stay held, and the destructor credits them.
     bool hold(std::initializer_list<chunk> list) {
         for (const chunk & c : list) {
+            if (c.bytes == 0) {
+                return false;
+            }
             host_ledger_charge_request req{};
             req.bytes = c.bytes;
             if (!host_ledger_try_charge(req).charged) {
@@ -335,6 +339,11 @@ struct ledger_baseline {
         }
     }
 };
+
+// The ledger's two figures, for a VOID that says why a hold did not fit.
+std::string ledger_state() {
+    return "committed " + num(host_ledger_committed()) + ", budget " + num(host_ledger_budget());
+}
 
 // (l) A class-C charge, made under a held lock with yieldable bytes the yielder could free, refuses and calls no
 // yielder. Class C is every caller that may hold a lock, so its request carries may_yield = false, the default.
@@ -383,7 +392,8 @@ arm_result arm_l_class_c_never_yields() {
 // the shapes they would: a may_yield = false charge for the row cache's step 4, and a may_yield = true charge carrying
 // a load_txn_id for the ring's ensure, first at the ledger and then through unified_allocate_owner, whose request
 // fields must reach the charge. The row cache's own [HOST-PLAN-BUG] line belongs to the row cache and is not scored.
-// Engagement: the yielder holds a chunk of each load and the deficit fits within them, so a yield is possible.
+// Engagement: each leg seeds a budget its hold fits before it holds, the yielder holds a nonempty chunk of each load,
+// and the deficit fits within them, so a yield is possible.
 // Mutant: no load_txn_id exclusion (the ledger hands the yielder 0) frees the caller's own chunk.
 arm_result arm_n_yield_excludes_own_load() {
     arm_result         r;
@@ -392,11 +402,13 @@ arm_result arm_n_yield_excludes_own_load() {
 
     // the row cache's step 4: may not yield, refuses by name, calls nothing
     {
+        // Each leg seeds its own budget before it holds: the budget the last arm or leg left counts that one's chunks.
+        ggml_sycl_test_host_ledger_store_budget(k_roomy_budget);
         tagged_yielder y;
         if (!y.hold({
                 { other, 60, true }
         })) {
-            void_arm(r, "the step-4 leg's chunk could not be charged");
+            void_arm(r, "the step-4 leg's chunk could not be charged: " + ledger_state());
         }
         ggml_sycl_test_host_ledger_store_budget(host_ledger_committed() + 10);
         log_clear();
@@ -411,12 +423,13 @@ arm_result arm_n_yield_excludes_own_load() {
 
     // the ring's ensure, at the ledger
     {
+        ggml_sycl_test_host_ledger_store_budget(k_roomy_budget);
         tagged_yielder y;
         if (!y.hold({
                 { own,   40, true },
                 { other, 40, true }
         })) {
-            void_arm(r, "the ring leg's chunks could not be charged");
+            void_arm(r, "the ring leg's chunks could not be charged: " + ledger_state());
         }
         ggml_sycl_test_host_ledger_store_budget(host_ledger_committed());
         host_ledger_charge_request req{};
@@ -439,6 +452,7 @@ arm_result arm_n_yield_excludes_own_load() {
 
     // the ring's ensure, through the owner entry: the request's may_yield and load_txn_id reach the charge
     {
+        ggml_sycl_test_host_ledger_store_budget(k_roomy_budget);
         const size_t   ask = 64 * 1024;
         const size_t   m   = host_cpu_mapped_size(ask);
         tagged_yielder y;
@@ -446,7 +460,7 @@ arm_result arm_n_yield_excludes_own_load() {
                 { own,   m, true },
                 { other, m, true }
         })) {
-            void_arm(r, "the owner leg's chunks could not be charged");
+            void_arm(r, "the owner leg's chunks of " + num(m) + " bytes could not be charged: " + ledger_state());
         }
         ggml_sycl_test_host_ledger_store_budget(host_ledger_committed());
         alloc_request req     = host_cpu_request(ask);
