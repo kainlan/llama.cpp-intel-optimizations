@@ -557,7 +557,8 @@ struct llama_mmap::impl {
         // range from either side. The window widened outward to 2 MiB alignment is kept off MADV_HUGEPAGE and
         // advised MADV_NOHUGEPAGE: a fault in a VM_HUGEPAGE area reads a whole 2 MiB folio, and the kernel tests
         // VM_HUGEPAGE before VM_RAND_READ, so a RANDOM window inside a hugepage area does nothing.
-        const size_t window   = lazy_window_bytes(fd);
+        // the bdi probe is a few syscalls: only a mapping with lazy ranges needs it
+        const size_t window   = lazy_ranges.empty() ? 0 : lazy_window_bytes(fd);
         const size_t thp_size = 2u * 1024 * 1024;
         ranges       random_windows;
         ranges       huge_windows;
