@@ -188,7 +188,7 @@
       "function": "unified_cache_raw_alloc_host_cpu",
       "name": "mmap",
       "count": 1,
-      "reason": "the HOST_CPU tier's raw layer, a device-free translation unit: unified_cache_raw_alloc_host_cpu's one anonymous mmap is the fully locked, huge-page-advised mapping a HOST_CPU owner holds. Its only caller is the HOST_CPU branch of unified_alloc, reached through unified_allocate_owner, so the mapping has an owner before it exists. Permanent; canonical contract section 3 (Allocator Entry Points, unified_cache_raw_alloc_host_cpu) and section 9.1 (the file-mapping.cpp and host-cpu-mapping.cpp row)"
+      "reason": "the HOST_CPU tier's raw layer, a device-free translation unit: unified_cache_raw_alloc_host_cpu's one anonymous mmap is the fully locked, huge-page-advised mapping a HOST_CPU allocation holds. Its only caller is the HOST_CPU branch of unified_alloc. unified_allocate_owner reaches that branch with its owner control already minted; the legacy unified_alloc entry accepts must_host_cpu too and mints none, so owner-first is a usage rule that canonical contract section 3 states (the unified_cache_raw_alloc_host_cpu row and the HOST_CPU rule), not a property this code enforces. Permanent; canonical contract section 3 (Allocator Entry Points, unified_cache_raw_alloc_host_cpu) and section 9.1 (the file-mapping.cpp and host-cpu-mapping.cpp row)"
     },
     {
       "id": "E-KV-RELEASE-CATCH",
