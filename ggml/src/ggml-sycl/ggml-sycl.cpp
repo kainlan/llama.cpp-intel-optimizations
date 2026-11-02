@@ -15926,12 +15926,13 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
     // llama.cpp-p6i0, for the compute trace: the placement each stage's measure runs over, so a difference between
     // the stages' compute terms can be read against what the plan put on the host.
     GGML_LOG_INFO(
-        "[LOAD-PLAN] measure plan override: load %llu stage %s: weights %.1f MiB device, %.1f MiB host; "
-        "kv %.1f MiB device, %.1f MiB host; kv n_ctx %u n_ubatch %u\n",
+        "[LOAD-PLAN] measure plan override: load %llu stage %s: weights %.1f MiB device, %.1f MiB host placed "
+        "(%.1f MiB host charged); kv %.1f MiB device, %.1f MiB host; kv n_ctx %u n_ubatch %u\n",
         (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage),
-        snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0, snapshot->plan->weight_host_bytes / 1024.0 / 1024.0,
-        snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0, snapshot->plan->kv_host_bytes / 1024.0 / 1024.0,
-        snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
+        snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0,
+        snapshot->plan->placed_host_weight_bytes() / 1024.0 / 1024.0,
+        snapshot->plan->charged_host_weight_bytes() / 1024.0 / 1024.0, snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0,
+        snapshot->plan->kv_host_bytes / 1024.0 / 1024.0, snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
     g_measure_plan_override = std::move(snapshot);
     return true;
 }
