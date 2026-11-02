@@ -53178,8 +53178,10 @@ static ggml_backend_buffer_t ggml_backend_sycl_mapped_buffer_type_alloc_buffer(g
         return ggml_backend_buffer_init(buft, {}, nullptr, 0);
     }
     GGML_ABORT(
-        "%s cannot allocate %zu bytes: its buffers are file mappings from ggml_backend_sycl_mapped_buffer_from_file",
-        ggml_backend_buft_name(buft), size);
+        "ggml_backend_buft_alloc_buffer(%s, %zu bytes): this buffer type's alloc_buffer serves only the zero-size "
+        "dummy of a memory-fit pass; a weight binds to %s only through the from-file hook, "
+        "ggml_backend_sycl_mapped_buffer_from_file",
+        ggml_backend_buft_name(buft), size, ggml_backend_buft_name(buft));
 }
 
 static size_t ggml_backend_sycl_mapped_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {

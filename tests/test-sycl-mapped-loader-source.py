@@ -63,8 +63,9 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
   L10. load_all_data addresses a SYCL_Mapped tensor from its buffer's base, before the loader's lock and mmaps_used;
   L11. the preload serves a SYCL_Mapped source in place: register_host_aos_expert and the host-planned dense copy (the
       m-7 row) take the mapping's owner (ggml_sycl_mapped_buffer_owner) instead of copying;
-  L12. the SYCL_Mapped buft: its own get_name ("SYCL_Mapped"), is_host, listed by supports_buft; set_tensor,
-      memset_tensor and clear abort naming the tensor; alloc_buffer returns a dummy for 0 and aborts otherwise;
+  L12. the SYCL_Mapped buft: its own get_name ("SYCL_Mapped"), is_host, listed by supports_buft; set_tensor and
+      memset_tensor abort naming the tensor, clear naming the buffer's size; alloc_buffer returns a dummy for 0 and
+      aborts otherwise, naming itself and the from-file hook;
       init_tensor registers the host weight; get_max_size takes the device from the buft;
   L13. mapped_buffer_from_file builds on the C2 primitives: file_mapping_segments, unified_allocate_file_mapping,
       WILLNEED and RANDOM advice, and the lock under the plan's host_mapped_locked, refusing where the tier is absent or

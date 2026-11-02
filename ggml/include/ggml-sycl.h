@@ -105,9 +105,10 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(v
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev);
 
 // The mapped host buffer type for a SYCL device (design 5efe §4.3), named "SYCL_Mapped". A weight in it lives in the
-// model file's mapping: is_host is true so the CPU backend executes ops on it, it is read-only (set_tensor,
-// memset_tensor and clear abort, naming the tensor), and its buffers come only from
-// ggml_backend_sycl_mapped_buffer_from_file; alloc_buffer serves only the zero-size dummy of a memory-fit pass.
+// model file's mapping: is_host is true so the CPU backend executes ops on it, it is read-only (set_tensor and
+// memset_tensor abort naming the tensor, clear naming the buffer's size), and its buffers come only from
+// ggml_backend_sycl_mapped_buffer_from_file; alloc_buffer serves only the zero-size dummy of a memory-fit pass and
+// aborts for any other size, naming itself and the from-file hook.
 // NULL for a device that is not a current SYCL device.
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_mapped_buffer_type_for_device(ggml_backend_dev_t dev);
 
