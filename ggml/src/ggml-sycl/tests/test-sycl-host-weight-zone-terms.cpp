@@ -749,7 +749,7 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
 
     // The unplanned class: the loader's own buffer, through that same buffer type, sized as the loader sizes it,
     // every weight it reads. Where the mapped host tier exists, the default load binds SYCL_Mapped instead
-    // (sycl-host-memory-design §4.3): the weights are the file's pages, SYCL_Host never takes them, and the class
+    // (design 5efe §4.3): the weights are the file's pages, SYCL_Host never takes them, and the class
     // reads zero without an allocation. A load under -lm none still takes the SYCL_Host buffer, which this arm
     // measures where the tier does not exist.
     const bool            loader_maps_files = file_mapping_supported();

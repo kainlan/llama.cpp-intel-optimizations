@@ -76,10 +76,9 @@ struct llama_model_sycl_lifecycle_hooks {
     decltype(&ggml_backend_sycl_set_runtime_context_for_model) runtime_context               = nullptr;
     decltype(&ggml_backend_sycl_weights_evictable)             weights_evictable           = nullptr;
     decltype(&ggml_backend_sycl_host_buffer_type_for_device)   host_buffer_type_for_device = nullptr;
-    // The staging proc reads this libllama's inventory layout (its resolved storage inputs, sycl-host-memory-design
-    // §4.3), and the loader binds SYCL_Mapped buffers from the plan it stages. Not part of
-    // llama_model_sycl_hooks_enabled: a backend that lacks them is refused by name in the loading guard rather than
-    // silently treated as a non-SYCL load.
+    // The staging proc reads this libllama's inventory layout (its resolved storage inputs, design 5efe §4.3), and the
+    // loader binds SYCL_Mapped buffers from the plan it stages. Not part of llama_model_sycl_hooks_enabled: a backend
+    // that lacks them is refused by name in the loading guard rather than silently treated as a non-SYCL load.
     decltype(&ggml_backend_sycl_stage_load_inventory_plan)     stage_inventory               = nullptr;
     decltype(&ggml_backend_sycl_mapped_buffer_type_for_device) mapped_buffer_type_for_device = nullptr;
     decltype(&ggml_backend_sycl_mapped_buffer_from_file)       mapped_buffer_from_file       = nullptr;
@@ -741,7 +740,7 @@ static void llama_model_sycl_mark_get_rows_only(std::vector<ggml_sycl_tensor_inf
     }
 }
 
-// Both inventories carry libllama's resolved storage inputs (sycl-host-memory-design §4.3): use_mmap after the caps
+// Both inventories carry libllama's resolved storage inputs (design 5efe §4.3): use_mmap after the caps
 // loop, the load mode's mlock, and the host weight layout. The staging proc derives the host-backing fact from them
 // and keeps it on the plan, which every later reader asks; libllama never derives it.
 static void llama_model_sycl_set_inventory_host_backing(ggml_sycl_tensor_inventory & inventory,
@@ -1977,7 +1976,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     if (!no_host) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         // A load that maps its files serves a host-resident weight from the file's pages in place, ahead of the copy a
-        // pinned host buffer would take (sycl-host-memory-design §4.3).
+        // pinned host buffer would take (design 5efe §4.3).
         if (sycl_maps_files) {
             const auto hooks = llama_model_sycl_hooks();
             for (const auto & dev : devices) {
@@ -3052,7 +3051,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     if (sycl_model_backend && ml.use_mmap) {
         // A load whose staged plan maps its files keeps the mapping: host-resident weights bind SYCL_Mapped in place
-        // and device weights are staged from it (sycl-host-memory-design §4.3). Only a load without the tier still
+        // and device weights are staged from it (design 5efe §4.3). Only a load without the tier still
         // uploads every weight through the loader's own reads.
         if (!ml.sycl_load_maps_files()) {
             LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);
@@ -3131,7 +3130,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (is_sycl_mapped && !ml.no_alloc) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
             // One buffer per file over the file's own mapping, built by the unified cache from the tensors' ranges
-            // (sycl-host-memory-design §4.3). The lazy ranges stay out of every advised and locked segment; the
+            // (design 5efe §4.3). The lazy ranges stay out of every advised and locked segment; the
             // tensors are addressed in load_all_data from the base offset the cache returns.
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 std::vector<ggml_sycl_mapped_tensor_range> tensor_ranges;

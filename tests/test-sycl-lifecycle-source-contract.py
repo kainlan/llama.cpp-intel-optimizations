@@ -46,7 +46,7 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_register_gguf_file_identity": "ggml_backend_sycl_register_gguf_file_identity",
     "ggml_backend_sycl_register_weight_usage": "ggml_backend_sycl_register_weight_usage",
     "ggml_backend_sycl_try_register_weight_usage": "ggml_backend_sycl_try_register_weight_usage",
-    # The staging proc's renamed export (sycl-host-memory-design §4.3); the old name answers with a stub that refuses
+    # The staging proc's renamed export (design 5efe §4.3); the old name answers with a stub that refuses
     # a libllama predating the inventory's storage inputs, and mutates nothing.
     "ggml_backend_sycl_stage_load_inventory_plan": "ggml_backend_sycl_stage_load_inventory_plan",
     "ggml_backend_sycl_model_load_begin": "ggml_backend_sycl_model_load_begin",
@@ -1105,7 +1105,7 @@ checks = {
     and "SYCL host weight registration failed during preload" in backend
     and "dense_alloc_guard" in backend
     # A SYCL_Mapped expert is served in place and allocates nothing, so the owning allocation is an assignment in
-    # the branch that copies (sycl-host-memory-design §4.3).
+    # the branch that copies (design 5efe §4.3).
     and "ggml_sycl::mem_handle host_owner;" in backend
     and "host_owner = ggml_sycl_host_expert_alloc(device, expert_size);" in backend,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
