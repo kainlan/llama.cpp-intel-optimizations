@@ -6,8 +6,10 @@
 //
 // The kernel reports the advice per VMA in /proc/self/smaps ("hg" in VmFlags),
 // so this maps a small file with one unaligned lazy range and checks each
-// region: before and after the range carry "hg", and the range itself,
-// including the pages holding its unaligned ends, does not.
+// region: far before and far after the range carry "hg", and the range itself,
+// including the pages holding its unaligned ends and the 2 MiB-aligned window
+// around it, does not. The window is the MADV_RANDOM window of 2 MiB on each
+// side, widened outward to 2 MiB (docs/design/sycl-mmap-host-tier.md §4.6).
 //
 // Whether THP is available is decided by a positive control that does not go
 // through llama_mmap: the test maps the file itself and advises it
@@ -22,6 +24,8 @@
 #include "test-skip.h"
 
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -35,7 +39,32 @@
 #include <string>
 #include <vector>
 
-static const size_t MiB = 1024 * 1024;
+static const size_t MiB       = 1024 * 1024;
+static const size_t FILE_SIZE = 20 * MiB;
+
+// The backing device's read_ahead_kb, or -1 when /sys has no entry for the
+// file's device. The probes below assume the lazy window is 2 MiB, which holds
+// while twice the read-ahead is at most 2 MiB. A whole disk or a filesystem
+// with its own bdi is /sys/class/bdi/MAJ:MIN; a partition shares its disk's,
+// one directory up.
+static long read_ahead_kb(int fd) {
+    struct stat st = {};
+    if (fstat(fd, &st) != 0) {
+        return -1;
+    }
+    char paths[2][160];
+    snprintf(paths[0], sizeof(paths[0]), "/sys/class/bdi/%u:%u/read_ahead_kb", major(st.st_dev), minor(st.st_dev));
+    snprintf(paths[1], sizeof(paths[1]), "/sys/dev/block/%u:%u/../bdi/read_ahead_kb", major(st.st_dev),
+             minor(st.st_dev));
+    for (const char * p : paths) {
+        std::ifstream in(p);
+        long          kb = -1;
+        if (in >> kb) {
+            return kb;
+        }
+    }
+    return -1;
+}
 
 // VmFlags of the VMA that contains `p`, or "" when no VMA or no VmFlags line
 // for it was found
@@ -64,30 +93,38 @@ static bool has_hugepage(const std::string & flags) {
 int main() {
     char      path[] = "/tmp/test-mmap-lazy-hugepage-XXXXXX";
     const int fd     = mkstemp(path);
-    if (fd < 0 || ftruncate(fd, 8 * MiB) != 0) {
-        fprintf(stderr, "FAIL: could not create an 8 MiB temp file\n");
+    if (fd < 0 || ftruncate(fd, FILE_SIZE) != 0) {
+        fprintf(stderr, "FAIL: could not create a 20 MiB temp file\n");
         return 1;
+    }
+
+    const long ra = read_ahead_kb(fd);
+    if (ra > 1024) {
+        printf("SKIP: read_ahead_kb %ld puts the lazy window past 2 MiB, which the probes assume\n", ra);
+        close(fd);
+        unlink(path);
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     // positive control: can this kernel mark a file mapping VM_HUGEPAGE at all?
     {
-        void * ctl = mmap(nullptr, 8 * MiB, PROT_READ, MAP_SHARED, fd, 0);
+        void * ctl = mmap(nullptr, FILE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
         if (ctl == MAP_FAILED) {
             fprintf(stderr, "FAIL: could not map the temp file for the THP control\n");
             close(fd);
             unlink(path);
             return 1;
         }
-        if (madvise(ctl, 8 * MiB, MADV_HUGEPAGE) != 0) {
+        if (madvise(ctl, FILE_SIZE, MADV_HUGEPAGE) != 0) {
             printf("SKIP: madvise(MADV_HUGEPAGE) failed on the control mapping (THP unavailable): %s\n",
                    strerror(errno));
-            munmap(ctl, 8 * MiB);
+            munmap(ctl, FILE_SIZE);
             close(fd);
             unlink(path);
             return LLAMA_TEST_EXIT_SKIP;
         }
         const std::string ctl_flags = vm_flags_at(ctl);
-        munmap(ctl, 8 * MiB);
+        munmap(ctl, FILE_SIZE);
         if (ctl_flags.empty()) {
             fprintf(stderr, "FAIL: no VmFlags line for the control mapping in /proc/self/smaps\n");
             close(fd);
@@ -103,8 +140,9 @@ int main() {
     }
     close(fd);
 
-    const size_t lazy_beg = 2 * MiB + 100;
-    const size_t lazy_end = 5 * MiB + 7;
+    // the window is [4 MiB + 100, 11 MiB + 7) widened to [4 MiB, 12 MiB)
+    const size_t lazy_beg = 6 * MiB + 100;
+    const size_t lazy_end = 9 * MiB + 7;
 
     int n_failures = 0;
     {
@@ -123,11 +161,17 @@ int main() {
         };
 
         const probe probes[] = {
-            { "before the lazy range",        0,            true  },
-            { "first byte of the lazy range", lazy_beg,     false },
-            { "middle of the lazy range",     3 * MiB,      false },
-            { "last byte of the lazy range",  lazy_end - 1, false },
-            { "after the lazy range",         6 * MiB,      true  },
+            { "before the window",            0,               true  },
+            { "just before the window",       4 * MiB - 4096,  true  },
+            { "window start",                 4 * MiB,         false },
+            { "next to the lazy start",       lazy_beg - 4096, false },
+            { "first byte of the lazy range", lazy_beg,        false },
+            { "middle of the lazy range",     7 * MiB,         false },
+            { "last byte of the lazy range",  lazy_end - 1,    false },
+            { "next to the lazy end",         lazy_end + 4096, false },
+            { "last page of the window",      12 * MiB - 4096, false },
+            { "just after the window",        12 * MiB,        true  },
+            { "after the window",             15 * MiB,        true  },
         };
         for (const probe & pr : probes) {
             const std::string flags = vm_flags_at(base + pr.off);

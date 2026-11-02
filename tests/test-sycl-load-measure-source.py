@@ -300,7 +300,7 @@ def site_ok(code: str) -> bool:
     c = code
     sync = c.find(z("dev_layer sync: corrected"))
     call = c.find(z("llama_load_late_check("))
-    maps = c.find(z("ml.init_mappings(true,"))
+    maps = c.find(z("ml.init_mappings(prefetch_mappings,"))
     prec = c.find(z("prec_policy.load(ml, *this);"))
     if min(sync, call, maps, prec) == -1 or not (sync < call < prec < maps):
         return False
@@ -723,7 +723,7 @@ def test_site_mutants():
     assert not site_ok(code.replace(z("for (size_t i = 0; i < late.not_recorded.size(); ++i) {"), z("for (size_t i = 0; i < late.shrunk.size(); ++i) {"), 1))
     assert not site_ok(code.replace(z("if (!late.unsupported.empty()) {"), z("if (false) {"), 1))
     assert not site_ok(code + z("llama_load_late_check(*this, 0, sycl_model_loading_guard.txn, {});"))
-    moved = code.replace(z("ml.init_mappings(true,"), z("llama_load_late_check(") + z("ml.init_mappings(true,"), 1)
+    moved = code.replace(z("ml.init_mappings(prefetch_mappings,"), z("llama_load_late_check(") + z("ml.init_mappings(prefetch_mappings,"), 1)
     assert not site_ok(moved)
 
 

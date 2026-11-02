@@ -4089,6 +4089,22 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+# llama_mmap leaves the record's lazy ranges cold, whatever the prefetch value (docs/design/sycl-mmap-host-tier.md
+# §4.6 and §7 C4): no WILLNEED over a page that holds a lazy byte, both edges advised MADV_RANDOM, and the 2 MiB-widened
+# window kept off MADV_HUGEPAGE. The fixtures are anonymous files in the build directory (not tmpfs); the test measures
+# the page cache of the file with cachestat(2) and exits 77 when it cannot evict, when THP is never, or when a mutant
+# cannot make the band resident. Host-only: no backend, no device.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build_and_test(test-llama-mmap-lazy-exclusion.cpp ARGS ${CMAKE_BINARY_DIR})
+    target_include_directories(test-llama-mmap-lazy-exclusion PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    set_tests_properties(test-llama-mmap-lazy-exclusion PROPERTIES
+        LABELS "host;lazy"
+        RUN_SERIAL TRUE
+        TIMEOUT 300)
+    set_property(TEST test-llama-mmap-lazy-exclusion PROPERTY
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 # llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
 # checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
 # THP is unavailable, and fails when no VmFlags line can be read.
