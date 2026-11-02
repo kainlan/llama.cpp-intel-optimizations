@@ -715,8 +715,6 @@ same pool), and the GT idle sampler shows the B70 busy ~2 s then idle for the re
 | lzm_off_2 | off | 266.42 | 4.68 |
 | lzm_auto_2 | auto (default) | 76.57 | 0.58 |
 
-/models moved to XFS per drive under mergerfs on 2026-11-01; the stall has not been re-measured on that layout (Task 27 of the th32 plan re-measures).
-
 3.46x from the load mode alone; with the table read into RAM the device is 99 % busy through the pp phases and the
 ring executes at or under its predicted `t_ring` (a 512-token ubatch takes 1.93 s for 47 MoE layers). The follow-up
 is `llama.cpp-th32` (planner-decided placement of lazy n-gram tables). The remaining gap to the 500 floor is device
@@ -724,6 +722,9 @@ time the kernel profiler does not attribute (434 ms of ~1930 ms per ubatch are l
 records ~100 ns per launch): `llama.cpp-qmen`, then the dequant/GEMM work under `llama.cpp-36j0`. **These are
 records, not baselines**; at the default load mode every Qwen3.8 prefill figure on this host measured the disk, not
 the executor, on the bcachefs layout (history), and the 200/500 floors were set for the executor.
+
+/models moved to XFS per drive under mergerfs on 2026-11-01; the stall has not been re-measured on that layout (Task 27
+of the th32 plan re-measures).
 
 Against the 4229a205d record (c-4m7d): Q_pp pp512 30.9 ± 29.39 -> 76.5 ± 0.17, because the straddle is gone and the
 ring engages on the first context with no loan (`llama.cpp-86bl`, `llama.cpp-384v`); pp2048 66.5 -> 75.7; Q_pp_ub2048
