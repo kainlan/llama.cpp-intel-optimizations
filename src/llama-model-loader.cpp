@@ -1317,6 +1317,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     ggml_backend_dev_t         selected_final_dev  = nullptr;
     ggml_backend_buffer_type_t selected_final_buft = nullptr;
+    // The device whose buft_list this tensor was selected FROM -- the SYCL device for any
+    // offloaded layer. selected_final_dev is where it LANDED, which is the CPU device once
+    // a planner-host dense weight is given a CPU-owned buft, and resolving the SYCL hooks
+    // from that is what drops those tensors out of the published plan. Placement decides
+    // the executor; it does not move who owns the placement plan.
+    ggml_backend_dev_t         selected_layer_dev  = nullptr;
     llm_tensor                 selected_tn_tensor  = tn.tensor;
     bool               selected_bias      = false;
 
@@ -1334,6 +1340,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         llm_tensor tn_tensor = tn.tensor;
         if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
             tn_tensor = LLM_TENSOR_OUTPUT;
+        } else if (tn.tensor == LLM_TENSOR_OUTPUT && (flags & TENSOR_DUPLICATED)) {
+            // The mirror of the case above: codeshell reuses output.weight AS the token
+            // embedding when the GGUF omits token_embd.weight (src/models/codeshell.cpp:15-19).
+            // The op must follow the USE, not the name -- llama-arch.cpp maps TOKEN_EMBD to
+            // GGML_OP_GET_ROWS and OUTPUT to GGML_OP_MUL_MAT, so probed as MUL_MAT a
+            // repacking CPU buft accepts it and reorders blocks at set_tensor that GET_ROWS
+            // then reads unreordered.
+            tn_tensor = LLM_TENSOR_TOKEN_EMBD;
         }
 
         llm_tensor_info info;
@@ -1399,6 +1413,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_dev_t layer_dev = buft_list->front().first;
+        selected_layer_dev           = layer_dev;
         selected_tn_tensor           = tn_tensor;
         // upstream b10630 folded the old `bool bias` local into the op
         // selection chain above; recompute the same predicate here for the
@@ -1549,10 +1564,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     auto register_sycl_tensor_metadata = [&](ggml_tensor * tensor) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        if (!tensor || !selected_final_buft || !selected_final_dev) {
+        if (!tensor || !selected_final_buft || !selected_final_dev || !selected_layer_dev) {
             return;
         }
-        const auto sycl_hooks = llama_model_loader_sycl_hooks_for(selected_final_dev);
+        const auto sycl_hooks = llama_model_loader_sycl_hooks_for(selected_layer_dev);
         if (!sycl_hooks.reg || !sycl_hooks.weights_evictable || !sycl_hooks.register_host_weight ||
             !sycl_hooks.register_identity || !sycl_hooks.try_register_usage) {
             return;
@@ -1571,7 +1586,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
             sycl_hooks.register_identity(tensor, weight->second.idx, weight->second.offs, ggml_nbytes(tensor), 0);
         }
-        if (sycl_hooks.weights_evictable()) {
+        // Host-weight registration hands the tensor to the SYCL preload, which treats
+        // tensor->extra as a ggml_tensor_extra_gpu. That is true only when the tensor LANDED
+        // in a SYCL-owned buft. A planner-host weight given a CPU-owned buft (CPU_REPACK)
+        // carries ggml-cpu's repack tensor_traits in extra, and registering it made the
+        // preload move-assign a mem_handle into that object (SIGBUS at load, llama.cpp-ir18).
+        // Identity and usage above are name-keyed and stay registered from the layer device.
+        if (sycl_hooks.weights_evictable() && llama_model_loader_sycl_hooks_for(selected_final_dev).reg) {
             sycl_hooks.register_host_weight(selected_final_dev, tensor);
         }
 
