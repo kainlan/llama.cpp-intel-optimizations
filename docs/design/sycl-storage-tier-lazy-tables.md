@@ -3134,7 +3134,8 @@ planner's (DLM, *lead ruling §T2*).
   `CpuExpertPool`'s compute workers in any measurable way. The pread workers
   sleep in the kernel.
 - **IO.** The cold experts and the engram tables live on the same bcachefs USB
-  members (bcachefs layout, history; see the §2.4 note), and share the one IO engine (§5.2). How much that costs is in §8.4.
+  members (bcachefs layout, history; see the §2.4 note), and share the one IO
+  engine (§5.2). How much that costs is in §8.4.
 - **Later tenants.** A table's residency is immutable after the plan is
   published: a live HOST table is never demoted. Its **row cache** is
   different, because it holds only clean copies of file bytes: no lease, no
@@ -3385,8 +3386,9 @@ Both engines were measured over the table's byte range (Appendix A.2):
 
 **The device ceiling is the same for every engine.** On this filesystem the
 bottleneck is the 256 KiB extent bounce onto USB links, not the syscall
-mechanism (bcachefs layout, history; see the §2.4 note). The choice of engine therefore rests on *timing*, *ownership* and
-*accounting*, and on all three `O_DIRECT` prefetch wins:
+mechanism (bcachefs layout, history; see the §2.4 note). The choice of engine
+therefore rests on *timing*, *ownership* and *accounting*, and on all three
+`O_DIRECT` prefetch wins:
 
 1. **Timing.** A fault happens inside `get_rows`, on a compute thread, *after*
    the graph reached the node, and at an effective QD of however many
@@ -6733,15 +6735,16 @@ client, `llama.cpp-yl3v`'s cold-expert slice reads, through the same pool
 - b) `io_uring` through raw syscalls only.
 - c) Add a liburing dependency.
 
-**D3. Where the tables live. A fact, not a choice** (*lead ruling §T1*, D3) (bcachefs layout, history; see the §2.4 note).
-Plain NVMe is **not** an option on this host. `/` (ext4 on NVMe) has
-**33-38 GiB free** at 97% use (34 GiB at 19:00 today), and the tables come in
-sets: **60.08 GiB** for the DeepSeek Q2_K pair, **78.68 GiB** for the Q3_K_M
-pair, and **50.66 GiB** for Qwen's table. None fits, and a per-table comparison
-would invite a half-measure on a nearly full system disk (M1). The tables stay
-on bcachefs as it is; every S target in §8 is that filesystem's. The one
-filesystem lever left, per-file bcachefs targets on the engram shards, is the
-owner's filesystem policy, and this design does not propose it for v1.
+**D3. Where the tables live. A fact, not a choice** (*lead ruling §T1*, D3)
+(bcachefs layout, history; see the §2.4 note). Plain NVMe is **not** an option
+on this host. `/` (ext4 on NVMe) has **33-38 GiB free** at 97% use (34 GiB at
+19:00 today), and the tables come in sets: **60.08 GiB** for the DeepSeek Q2_K
+pair, **78.68 GiB** for the Q3_K_M pair, and **50.66 GiB** for Qwen's table.
+None fits, and a per-table comparison would invite a half-measure on a nearly
+full system disk (M1). The tables stay on bcachefs as it is; every S target in
+§8 is that filesystem's. The one filesystem lever left, per-file bcachefs
+targets on the engram shards, is the owner's filesystem policy, and this design
+does not propose it for v1.
 
 **DLM. `--lazy-mode` under SYCL? Ruled (a)** (*lead ruling §T2*, where it is
 called D4; renamed here so that "§D4" means only the owner's decision).
