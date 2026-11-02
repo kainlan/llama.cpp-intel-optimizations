@@ -336,7 +336,9 @@ lane's `test-llama-mlock-ranged` and C3's ranged lock sit in the same file.
 `tests/test-sycl-mapped-loader-source.py`, `ggml/src/ggml-sycl/tests/test-sycl-host-backing-plan.cpp`.
 **Acceptance:** source gate passes; `test-sycl-host-backing-plan` is registered `gpu-serial` (it runs the planner on a
 shaped inventory, which initialises SYCL, §11) and the lead runs it; a stale pair (old libllama with new libggml-sycl)
-refuses by name; Mistral and GPT-OSS gates unchanged (lead). **Commit:** RED, then `sycl: host-resident weights are one
+refuses by name; Mistral and GPT-OSS gates unchanged (lead); the census arm of Task 9's
+`test-sycl-host-weight-zone-terms` reports zero bytes in its "unplanned loader residency" class (the SYCL_Host load buffer
+that `SYCL_Mapped` removes; lead ruling z0x4 c-43u2, 2026-11-02), run by the lead. **Commit:** RED, then `sycl: host-resident weights are one
 published fact, the loader binds SYCL_Mapped from it (llama.cpp-5efe C4 part e)`. **Gotchas:** the owner's dirty loader
 edit touches `register_host_weight` in the same file; do not re-implement it, and do not touch the main checkout;
 `GGML_BACKEND_DL=ON` builds resolve the new export through the proc table only.
