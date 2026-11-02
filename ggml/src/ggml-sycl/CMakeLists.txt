@@ -7703,7 +7703,8 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
         add_test(NAME test-sycl-file-mapped-tier COMMAND test-sycl-file-mapped-tier)
         set_tests_properties(test-sycl-file-mapped-tier PROPERTIES
-            LABELS "sycl;allocator;owner;host"
+            # cache: it allocates through the unified cache, so the full sweep's label filter leaves it out
+            LABELS "sycl;allocator;owner;host;cache"
             # no device: pin a selector that shows none, so an incidental SYCL init cannot touch a GPU
             ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
             TIMEOUT 30)
@@ -7719,7 +7720,8 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
         add_test(NAME test-sycl-host-cpu-tier COMMAND test-sycl-host-cpu-tier)
         set_tests_properties(test-sycl-host-cpu-tier PROPERTIES
-            LABELS "sycl;allocator;owner;host"
+            # cache: it allocates through the unified cache, so the full sweep's label filter leaves it out
+            LABELS "sycl;allocator;owner;host;cache"
             ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
             SKIP_RETURN_CODE 77
             TIMEOUT 30)
