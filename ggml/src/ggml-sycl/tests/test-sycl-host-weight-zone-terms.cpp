@@ -23,7 +23,10 @@
 //
 // Arm 1 (no model, no device: the real planner over a synthetic Q2_K-shaped inventory, under a mocked device table)
 // asserts, for both planner builders, that the WEIGHT size is exactly the sum of those terms and is not the 1.2x
-// ratio, and that the plan prints each term by name, and the unplanned class, on a [HOST-PLAN] line.
+// ratio, and that the plan prints each term by name, and the unplanned class, on a [HOST-PLAN] line. It also asserts
+// that the planned host weights equal the plan's weight_host_bytes, but only for the single-device builder: the
+// multi-device builder is known to count a host expert group at the device layout's dst_size rather than the src_size
+// the cache materializes (llama.cpp-4qdx), so for it the two figures are printed, not compared.
 //
 // Arm 2 (the census) constructs device 0's cache, configures the host zones from that plan, and makes every planned
 // WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through
