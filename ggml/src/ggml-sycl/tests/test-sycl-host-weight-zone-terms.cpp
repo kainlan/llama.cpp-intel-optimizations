@@ -6,8 +6,11 @@
 // Q2_K load a 20 % ratio over ~149 GiB of host experts is ~30 GiB the host budget cannot hold.
 //
 // What the cache materializes for a host-resident weight (S1-PRELOAD, ggml-sycl.cpp): a host-planned expert is one
-// pinned WEIGHT allocation of tensor->nb[2] bytes, a host-planned dense weight one of ggml_nbytes(tensor). Both are
-// the entry's AOS src_size: the inventory's size is ggml_nbytes, and an expert's is that over ne[2]. The terms:
+// pinned WEIGHT allocation of tensor->nb[2] bytes, a host-planned dense weight one of ggml_nbytes(tensor). The planner
+// counts an entry at its AOS src_size, the inventory's ggml_nbytes and, for an expert, that over its expert count; arm
+// 1 asserts entry by entry that the two agree, using the cache's expressions on tensors shaped from the inventory.
+// They are two formulas for one size until one byte helper serves both the planner and S1-PRELOAD (llama.cpp-y5x9).
+// The terms:
 //
 //   host_weights          the sum of those bytes over the host-resident entries, one pinned block per entry
 //   host_compute_reserve  64 MiB for the runtime HOST_COMPUTE requests that also land in WEIGHT (the context's
@@ -46,6 +49,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <string>
 #include <sycl/sycl.hpp>
@@ -160,6 +164,84 @@ std::vector<placement_tensor_info> q2k_inventory() {
     inv.push_back(tensor("output_norm.weight", GGML_TYPE_F32, k_embd, 1));
     inv.push_back(tensor("output.weight", GGML_TYPE_Q2_K, k_embd, k_vocab));
     return inv;
+}
+
+// --- the cache's bytes: the tensors S1-PRELOAD copies, shaped from the inventory rows, never allocated ---
+
+// The model's tensors as ggml describes them, from each inventory row's type and ne. S1-PRELOAD sizes a host
+// expert's copy as tensor->nb[2] (register_host_aos_expert, through ggml_sycl_host_expert_alloc) and a host dense
+// weight's as ggml_nbytes(tensor); bytes() answers with exactly those expressions, so a planner figure is compared
+// with the cache's, not with a second derivation of the planner's.
+struct cache_tensors {
+    ggml_context *                       ctx = nullptr;
+    std::map<std::string, ggml_tensor *> by_name;
+
+    explicit cache_tensors(const std::vector<placement_tensor_info> & inventory) {
+        ggml_init_params params{};
+        params.mem_size   = ggml_tensor_overhead() * (inventory.size() + 1);
+        params.mem_buffer = nullptr;
+        params.no_alloc   = true;
+        ctx               = ggml_init(params);
+        for (const placement_tensor_info & row : inventory) {
+            by_name[row.name] = ggml_new_tensor_3d(ctx, row.type, row.ne[0], row.ne[1], row.ne[2]);
+        }
+    }
+
+    ~cache_tensors() {
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
+
+    cache_tensors(const cache_tensors &)             = delete;
+    cache_tensors & operator=(const cache_tensors &) = delete;
+
+    // What S1-PRELOAD allocates for `e`, or SIZE_MAX when no tensor has its name.
+    size_t bytes(const placement_entry & e) const {
+        const auto it = by_name.find(e.name);
+        if (it == by_name.end()) {
+            return SIZE_MAX;
+        }
+        return e.expert_id >= 0 ? static_cast<size_t>(it->second->nb[2]) : ggml_nbytes(it->second);
+    }
+
+    // What the loader's buffer holds: every tensor at ggml_nbytes.
+    size_t total() const {
+        size_t sum = 0;
+        for (const auto & kv : by_name) {
+            sum += ggml_nbytes(kv.second);
+        }
+        return sum;
+    }
+};
+
+// Every entry's placement_entry_host_weight_bytes() is what the cache allocates for that entry.
+void check_entry_bytes(const char * builder, const placement_plan & plan, const cache_tensors & tensors) {
+    size_t n_expert   = 0;
+    size_t n_dense    = 0;
+    size_t unknown    = 0;
+    size_t mismatched = 0;
+    for (const placement_entry & e : plan.entries) {
+        const size_t cache_bytes = tensors.bytes(e);
+        if (cache_bytes == SIZE_MAX) {
+            unknown++;
+            continue;
+        }
+        (e.expert_id >= 0 ? n_expert : n_dense)++;
+        const size_t planned = placement_entry_host_weight_bytes(e);
+        if (planned != cache_bytes) {
+            if (mismatched < 4) {
+                std::printf("  FAIL detail: %s expert=%d planned=%zu cache=%zu\n", e.name.c_str(), e.expert_id, planned,
+                            cache_bytes);
+            }
+            mismatched++;
+        }
+    }
+    std::printf("  [%s] %zu expert entries against nb[2], %zu dense entries against ggml_nbytes\n", builder, n_expert,
+                n_dense);
+    check(n_expert > 0 && n_dense > 0, "the plan has both expert and dense entries to compare");
+    check_eq("entries with no tensor of their name", unknown, 0);
+    check_eq("entries whose planned host bytes are not the cache's", mismatched, 0);
 }
 
 // --- the [HOST-PLAN] line, captured from the log callback ---
@@ -277,10 +359,12 @@ void check_weight_zone(const char *           builder,
     }
 }
 
-// Arm 1: the WEIGHT zone is the exact bytes plus the named terms, and not 1.2x, from both planner builders.
-void arm1_weight_zone_is_exact_bytes_plus_named_terms(placement_plan & out_plan) {
+// Arm 1: the WEIGHT zone is the exact bytes plus the named terms, and not 1.2x, from both planner builders, and every
+// entry's planned bytes are the bytes the cache allocates for it.
+void arm1_weight_zone_is_exact_bytes_plus_named_terms(const std::vector<placement_tensor_info> & inventory,
+                                                      const cache_tensors &                      tensors,
+                                                      placement_plan &                           out_plan) {
     std::printf("(1) a Q2_K-shaped inventory's WEIGHT zone is exact bytes plus named terms, not 1.2x\n");
-    const std::vector<placement_tensor_info> inventory = q2k_inventory();
 
     ggml_log_callback prev_cb   = nullptr;
     void *            prev_data = nullptr;
@@ -292,10 +376,33 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(placement_plan & out_plan)
     g_host_plan_line.clear();
     const placement_plan multi_plan = plan_q2k_two_devices(inventory);
     const std::string    multi_line = g_host_plan_line;
+
+    // The fallback the planner takes for an expert row whose inventory shape was not populated: it splits the row by
+    // the model-wide expert count. Here that count is the tensor's own ne[2], as it is for every architecture but
+    // one, so the fallback still meets nb[2].
+    std::vector<placement_tensor_info> unshaped = inventory;
+    for (placement_tensor_info & row : unshaped) {
+        if (row.name.find("_exps") != std::string::npos) {
+            for (int64_t & n : row.ne) {
+                n = 0;
+            }
+        }
+    }
+    const placement_plan fallback_plan = plan_q2k(unshaped);
     ggml_log_set(prev_cb, prev_data);
 
     check_weight_zone("compute_placement_plan", single_line_plan, single_line, true);
     check_weight_zone("compute_multi_device_plan", multi_plan, multi_line, false);
+
+    std::printf("  planned host bytes against the cache's expressions\n");
+    check_entry_bytes("compute_placement_plan", single_line_plan, tensors);
+    check_entry_bytes("compute_multi_device_plan", multi_plan, tensors);
+    check_entry_bytes("compute_placement_plan, expert rows without a shape", fallback_plan, tensors);
+    // Not asserted: an unshaped expert row whose own expert count is not the model-wide one (grovemoe's chexps trio,
+    // ne[2] = n_expert / n_group_experts). The fallback splits it by the model-wide count, so its planned bytes are
+    // nb[2] x ne[2] / n_expert, not nb[2]. No [HOST-PLAN-BUG] WARN fires for it either: the walked sum and the plan's
+    // weight_host_bytes both carry that same src_size. It agrees once the inventory always carries ne[2]
+    // (llama.cpp-y5x9).
     out_plan = single_line_plan;
 }
 
@@ -397,7 +504,7 @@ struct weight_census {
     size_t used() const { return cache->host_zone_used(host_zone_id::WEIGHT); }
 };
 
-bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan) {
+bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, const cache_tensors & tensors) {
     std::printf("(2) census: every WEIGHT-zone byte belongs to a named term or to unplanned loader residency\n");
     std::optional<sycl::device> dev_opt =
         sycl_test_require_gpu("the WEIGHT-zone census (arm 1, the sizing, DID run and its result stands)");
@@ -450,11 +557,18 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan) {
         held.push_back(std::move(h));
     };
 
-    // The terms: every planned host weight, then a logits-sized HOST_COMPUTE request the reserve covers.
+    // The terms: every planned host weight at the bytes the cache allocates for it, so the census compares cache bytes
+    // with the planner's terms, then a logits-sized HOST_COMPUTE request the reserve covers.
     for (const placement_entry & e : plan.entries) {
-        if (!e.on_device) {
-            take(weight_class::HOST_WEIGHTS, host_weight_request(q, e.src_size));
+        if (e.on_device) {
+            continue;
         }
+        const size_t cache_bytes = tensors.bytes(e);
+        if (cache_bytes == SIZE_MAX) {
+            census.failed++;
+            continue;
+        }
+        take(weight_class::HOST_WEIGHTS, host_weight_request(q, cache_bytes));
     }
     take(weight_class::HOST_COMPUTE_RESERVE, host_compute_request(q, 8 * MiB));
 
@@ -474,10 +588,8 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan) {
     // The unplanned class: the loader's own buffer, through the buffer type the loader adds to a SYCL device's list
     // (weights evictable), sized as the loader sizes it, every weight it reads. Once the mapped host tier replaces
     // that buffer type, the buffer no longer lands in WEIGHT and this class reads zero.
-    size_t loader_requested = 0;
-    for (const placement_entry & e : plan.entries) {
-        loader_requested += e.src_size;
-    }
+    const size_t loader_requested = tensors.total();
+
     ggml_backend_buffer_type_t loader_buft =
         ggml_backend_sycl_weights_evictable() ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
     ggml_backend_buffer_t loader_buf     = nullptr;
@@ -530,10 +642,13 @@ int main() {
         setenv("GGML_SYCL_PINNED_CHUNK_MB", "512", 0);
     }
 
-    placement_plan plan{};
-    arm1_weight_zone_is_exact_bytes_plus_named_terms(plan);
+    const std::vector<placement_tensor_info> inventory = q2k_inventory();
+    const cache_tensors                      tensors(inventory);
 
-    const bool ran_census = arm2_every_weight_zone_allocation_has_a_term(plan);
+    placement_plan plan{};
+    arm1_weight_zone_is_exact_bytes_plus_named_terms(inventory, tensors, plan);
+
+    const bool ran_census = arm2_every_weight_zone_allocation_has_a_term(plan, tensors);
 
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {
