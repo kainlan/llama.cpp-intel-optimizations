@@ -601,11 +601,13 @@ struct llama_mmap::impl {
                     break;
                 }
             }
-            for (const auto & range : huge_windows) {
-                if (madvise((char *) addr + range.first, range.second - range.first, MADV_NOHUGEPAGE)) {
-                    LLAMA_LOG_WARN("warning: madvise(MADV_NOHUGEPAGE) failed: %s\n", strerror(errno));
-                    break;
-                }
+        }
+
+        // Not under !numa: where THP is "always" a VMA is huge unless told otherwise, with or without NUMA.
+        for (const auto & range : huge_windows) {
+            if (madvise((char *) addr + range.first, range.second - range.first, MADV_NOHUGEPAGE)) {
+                LLAMA_LOG_WARN("warning: madvise(MADV_NOHUGEPAGE) failed: %s\n", strerror(errno));
+                break;
             }
         }
 #endif
