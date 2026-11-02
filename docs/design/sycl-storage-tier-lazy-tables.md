@@ -690,8 +690,8 @@ The consumer contract that a model implements is §9.1.
 | `llama-bench` prompts | uniform random tokens, so **always cold**, at any cache size (§8.5) |
 
 **What the planner will choose on this host** (§4.5). The host weights are
-counted at their **exact** bytes (`llama.cpp-rnh3`), not at the 1.2x ratio the
-fork charges today, and the host zones at the bytes the sizing code actually
+counted at their **exact** bytes plus named terms (`llama.cpp-rnh3`), with no
+ratio over them, and the host zones at the bytes the sizing code actually
 commits (§2.3): `dma_staging_pool`, the RUNTIME pool and the **PP MoE oneDNN
 ring** included. The ring has no type gate, so every MoE model carries it
 today: 7.87 GiB on DeepSeek Q2_K and 4.17 GiB on Qwen, charged twice on the
@@ -950,14 +950,15 @@ shard 2 (tensors); Appendix A.1:
     anything. Host overcommit is found at allocation time, not at planning
     time. That is a P4 gap that already exists for host experts, and this
     design must close it (§4).
-- **The host WEIGHT zone is 1.2x the host weights.**
-  `populate_host_zone_sizing()` sizes it as `weight_host_bytes x 1.2 + 64 MiB`
+- **The host WEIGHT zone was 1.2x the host weights at `76c7f6548`.**
+  `populate_host_zone_sizing()` sized it as `weight_host_bytes x 1.2 + 64 MiB`
   (`unified-cache.cpp:27089`, `:27670-27672`), and
   `ggml_sycl_configure_host_zones_for_plan()` eagerly commits WEIGHT + KV +
   STAGING + SCRATCH through `pre_allocate_host_pool()`
   (`76c7f6548 ggml/src/ggml-sycl/ggml-sycl.cpp:5615-5645`). On DeepSeek Q2_K
-  that ratio alone adds ~30 GiB of slack nobody can name. `llama.cpp-rnh3`
-  replaces it with exact bytes plus named terms; T2 depends on it (§4.2).
+  that ratio alone added ~30 GiB of slack nobody can name. `llama.cpp-rnh3`
+  replaced it with exact bytes plus named terms
+  (`placement_plan_host_weight_zone_terms()`); T2 depends on it (§4.2).
 - **The STAGING and SCRATCH zones, and a separate RUNTIME pool, scale with the
   largest tensor.** All three are host-pinned, from the same pool budget.
   - STAGING is `s1_in_flight x (max(2 x max_tensor, max_staging_pair_bytes)
