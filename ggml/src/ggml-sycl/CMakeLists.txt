@@ -7691,8 +7691,9 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;allocator;owner;host;tsan-capable"
         TIMEOUT 30)
 
-    # The FILE_MAPPED tier through the real front door (llama.cpp-5efe C2). Host-only: a file mapping needs no
-    # device, so the labels are those of the intrusive-owner test and carry none of cache/mem-handle/residency.
+    # The FILE_MAPPED tier through the real front door (llama.cpp-5efe C2). A file mapping needs no device, but the
+    # test constructs the unified cache and allocates through it, so its labels are the intrusive-owner test's plus
+    # cache and gpu-serial, and it is registered like every test that constructs the cache: serial, selector pinned.
     # POSIX-only (it reads /proc/self/maps and counts fds), so Linux-only; its name is its binary's (C2 review m2).
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(test-sycl-file-mapped-tier
@@ -7703,15 +7704,17 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
         add_test(NAME test-sycl-file-mapped-tier COMMAND test-sycl-file-mapped-tier)
         set_tests_properties(test-sycl-file-mapped-tier PROPERTIES
-            # cache: it allocates through the unified cache, so the full sweep's label filter leaves it out
-            LABELS "sycl;allocator;owner;host;cache"
-            # no device: pin a selector that shows none, so an incidental SYCL init cannot touch a GPU
-            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+            # cache and gpu-serial: it constructs the unified cache, so the full sweep's label filter leaves it out
+            # and it runs alone, on the discrete cards
+            LABELS "sycl;allocator;owner;host;cache;gpu-serial"
+            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+            RUN_SERIAL TRUE
+            SKIP_RETURN_CODE 77
             TIMEOUT 30)
 
         # The HOST_CPU tier through the same front door (llama.cpp-th32 T1b): a locked anonymous mapping, one registry
-        # record, one munmap. Host-only like the file-mapped tier; SKIP_RETURN_CODE 77 is its refusal to pass when
-        # RLIMIT_MEMLOCK is below the request.
+        # record, one munmap. Needs no device and is registered like the file-mapped tier; SKIP_RETURN_CODE 77 is
+        # also its refusal to pass when RLIMIT_MEMLOCK is below the request.
         add_executable(test-sycl-host-cpu-tier
             tests/test-host-cpu-tier.cpp)
         target_link_libraries(test-sycl-host-cpu-tier PRIVATE
@@ -7720,12 +7723,15 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
         add_test(NAME test-sycl-host-cpu-tier COMMAND test-sycl-host-cpu-tier)
         set_tests_properties(test-sycl-host-cpu-tier PROPERTIES
-            # cache: it allocates through the unified cache, so the full sweep's label filter leaves it out
-            LABELS "sycl;allocator;owner;host;cache"
-            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+            # cache and gpu-serial: it constructs the unified cache, so the full sweep's label filter leaves it out
+            # and it runs alone, on the discrete cards
+            LABELS "sycl;allocator;owner;host;cache;gpu-serial"
+            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+            RUN_SERIAL TRUE
             SKIP_RETURN_CODE 77
             TIMEOUT 30)
     endif()
+
     # The runtime allocation registry's containment lookup follows its range index (llama.cpp-ii25): bounds, nested
     # chunk/suballocation precedence, every registry mutation, and a brute-force oracle. Rows are published through the
     # host-only test seams; nothing is allocated and no device is touched.
