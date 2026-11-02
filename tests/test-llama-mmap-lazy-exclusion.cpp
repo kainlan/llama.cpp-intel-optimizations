@@ -408,7 +408,6 @@ static hugepage_result run_hugepage(int fd, size_t prefetch, bool mutant) {
     if (!evict(fd, H_FILE_SIZE)) {
         return res;
     }
-    res.ran = true;
 
     const uint64_t           shared_begin = page_floor(H_LAZY_BEGIN);
     const uint64_t           shared_end   = page_floor(H_LAZY_END);
@@ -417,6 +416,12 @@ static hugepage_result run_hugepage(int fd, size_t prefetch, bool mutant) {
     const llama_mmap::ranges ranges       = record_ranges({
         { H_LAZY_BEGIN, H_LAZY_END }
     });
+    // evict() tolerates a few resident pages anywhere; a leftover page in a band would read as a folio
+    if (resident_pages(fd, H_FILE_SIZE, shared_begin + g_page, 10 * MiB - (shared_begin + g_page)) != 0 ||
+        resident_pages(fd, H_FILE_SIZE, 24 * MiB, shared_end - 24 * MiB) != 0) {
+        return res;
+    }
+    res.ran = true;
     {
         llama_file f(fixture_path(fd).c_str(), "rb");
         llama_mmap m(&f, prefetch, /*numa =*/false, ranges);
