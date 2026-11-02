@@ -473,7 +473,7 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 // the window is 2 MiB, which is already sixteen times the 128 KiB default.
 static size_t lazy_window_bytes(int fd) {
     const size_t floor_bytes = 2u * 1024 * 1024;
-#    ifdef __linux__
+#        ifdef __linux__
     struct stat st = {};
     if (fstat(fd, &st) == 0) {
         char paths[2][160];
@@ -492,9 +492,9 @@ static size_t lazy_window_bytes(int fd) {
             }
         }
     }
-#    else
+#        else
     (void) fd;
-#    endif
+#        endif
     return floor_bytes;
 }
 #    endif
