@@ -396,8 +396,8 @@ struct hugepage_result {
     int64_t     band_end      = -1;  // lazy bytes from the 2 MiB boundary at 24 MiB up to the shared page
     int64_t     faulted_begin = -1;  // the pages the test read, which must be resident or the probe saw nothing
     int64_t     faulted_end   = -1;
-    std::string flags_before;        // VmFlags of the page next to the begin edge
-    std::string flags_after;         // VmFlags of the page next to the end edge
+    std::string flags_begin;         // VmFlags of the page next to the begin edge
+    std::string flags_end;           // VmFlags of the page next to the end edge
 };
 
 // Maps with `prefetch`, faults the page next to each edge, and reads the folio bands. `mutant` re-advises the window
@@ -433,8 +433,8 @@ static hugepage_result run_hugepage(int fd, size_t prefetch, bool mutant) {
                 res.ran = false;
             }
         }
-        res.flags_before = vm_flags_at(base + fault_begin);
-        res.flags_after  = vm_flags_at(base + fault_end);
+        res.flags_begin = vm_flags_at(base + fault_begin);
+        res.flags_end   = vm_flags_at(base + fault_end);
 
         volatile char sink = 0;
         sink               = sink + base[fault_begin];
@@ -482,7 +482,7 @@ static int hugepage_arm(int * skip) {
             mode.c_str(), label, (long long) prod.band_begin, (long long) prod.band_end, (long long) prod.faulted_begin,
             (long long) prod.faulted_end);
         std::printf("HUGEPAGE arm, %s: VmFlags next to the begin edge '%s', next to the end edge '%s'\n", label,
-                    prod.flags_before.c_str(), prod.flags_after.c_str());
+                    prod.flags_begin.c_str(), prod.flags_end.c_str());
         if (prod.faulted_begin != 1 || prod.faulted_end != 1) {
             std::fprintf(stderr, "FAIL: HUGEPAGE arm, %s: the faulted page is not resident, so the probe saw nothing\n",
                          label);
@@ -492,7 +492,7 @@ static int hugepage_arm(int * skip) {
             std::fprintf(stderr, "FAIL: HUGEPAGE arm, %s: a fault next to a lazy edge read lazy bytes\n", label);
             ++fail;
         }
-        for (const std::string * flags : { &prod.flags_before, &prod.flags_after }) {
+        for (const std::string * flags : { &prod.flags_begin, &prod.flags_end }) {
             if (flags->empty() || !has_flag(*flags, "nh") || has_flag(*flags, "hg")) {
                 std::fprintf(stderr,
                              "FAIL: HUGEPAGE arm, %s: the window next to a lazy edge is not advised NOHUGEPAGE "
