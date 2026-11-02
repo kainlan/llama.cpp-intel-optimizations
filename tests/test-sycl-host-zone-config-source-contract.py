@@ -25,6 +25,7 @@
 # reads and requires the check to flip to RED, so a check whose anchor silently
 # stopped matching real code cannot pass vacuously.
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -302,6 +303,11 @@ def witness_c_headroom(t):
 # --- C2: the WEIGHT zone is the sum of those named terms, never a ratio over
 # the host weights (slack nobody can name is a second source for a fact the
 # plan already knows).
+# Any write to the zone size counts, compound ones included (`*= k_..._ratio`
+# after the terms assignment would otherwise pass); `==` comparisons do not.
+WEIGHT_ZONE_WRITE_RE = re.compile(r"host_zone_weight_bytes\s*[-+*/]?=(?!=)")
+
+
 def check_c2_weight_zone_is_terms(t):
     fn = t["populate_zone_sizing_fn"]
     terms_fn = t["weight_zone_terms_fn"]
@@ -309,7 +315,8 @@ def check_c2_weight_zone_is_terms(t):
         bool(fn) and bool(terms_fn)
         and "placement_plan_host_weight_zone_terms(plan)" in fn
         and WEIGHT_ZONE_FROM_TERMS in fn
-        and fn.count("plan.host_zone_weight_bytes =") == 1
+        and len(WEIGHT_ZONE_WRITE_RE.findall(fn)) == 1
+        and "_ratio" not in fn
         and "_ratio" not in terms_fn
     )
 

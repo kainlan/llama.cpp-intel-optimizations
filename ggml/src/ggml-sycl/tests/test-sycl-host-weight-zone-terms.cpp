@@ -248,12 +248,16 @@ void check_entry_bytes(const char * builder, const placement_plan & plan, const 
 // --- the [HOST-PLAN] line, captured from the log callback ---
 
 std::string g_host_plan_line;
+bool        g_host_plan_bug = false;  // a [HOST-PLAN-BUG] line was logged since the last reset
 
 void capture_log(ggml_log_level level, const char * text, void * user) {
     (void) level;
     (void) user;
     if (text && std::strstr(text, "[HOST-PLAN]") && std::strstr(text, "WEIGHT zone")) {
         g_host_plan_line = text;
+    }
+    if (text && std::strstr(text, "[HOST-PLAN-BUG]")) {
+        g_host_plan_bug = true;
     }
 }
 
@@ -316,12 +320,19 @@ placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & i
 void check_weight_zone(const char *           builder,
                        const placement_plan & plan,
                        const std::string &    line,
+                       bool                   warned,
                        bool                   counts_host_at_src_size) {
     std::printf("  [%s]\n", builder);
     const derived_terms t                = derive_terms(plan);
     const size_t        n_expert_entries = static_cast<size_t>(k_layers) * 3 * k_experts;
     check(t.blocks >= n_expert_entries, "every routed expert is host-resident under the 1 MiB budget");
     check(t.host_weights > 0, "the plan placed weights on the host");
+    // The [HOST-PLAN-BUG] WARN fires exactly when the entries and the plan's running total disagree. A builder whose
+    // figures differ is the WARN's positive control; one whose figures agree is its negative control.
+    const bool figures_differ = t.host_weights != plan.weight_host_bytes;
+    std::printf("  [HOST-PLAN-BUG] control: figures %s, WARN %s\n", figures_differ ? "differ" : "agree",
+                warned ? "logged" : "silent");
+    check(warned == figures_differ, "[HOST-PLAN-BUG] is logged exactly when host_weights != weight_host_bytes");
     if (counts_host_at_src_size) {
         // The plan's own host-weight accounting is the same fact: the term sums what the cache materializes.
         check_eq("host_weights == the plan's weight_host_bytes", t.host_weights, plan.weight_host_bytes);
@@ -372,11 +383,15 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(const std::vector<placemen
     ggml_log_get(&prev_cb, &prev_data);
     ggml_log_set(capture_log, nullptr);
     g_host_plan_line.clear();
+    g_host_plan_bug                       = false;
     const placement_plan single_line_plan = plan_q2k(inventory);
     const std::string    single_line      = g_host_plan_line;
+    const bool           single_warned    = g_host_plan_bug;
     g_host_plan_line.clear();
-    const placement_plan multi_plan = plan_q2k_two_devices(inventory);
-    const std::string    multi_line = g_host_plan_line;
+    g_host_plan_bug                   = false;
+    const placement_plan multi_plan   = plan_q2k_two_devices(inventory);
+    const std::string    multi_line   = g_host_plan_line;
+    const bool           multi_warned = g_host_plan_bug;
 
     // The fallback the planner takes for an expert row whose inventory shape was not populated: it splits the row by
     // the model-wide expert count. Here that count is the tensor's own ne[2], as it is for every architecture but
@@ -397,8 +412,8 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(const std::vector<placemen
     const placement_plan fallback_plan = plan_q2k(unshaped);
     ggml_log_set(prev_cb, prev_data);
 
-    check_weight_zone("compute_placement_plan", single_line_plan, single_line, true);
-    check_weight_zone("compute_multi_device_plan", multi_plan, multi_line, false);
+    check_weight_zone("compute_placement_plan", single_line_plan, single_line, single_warned, true);
+    check_weight_zone("compute_multi_device_plan", multi_plan, multi_line, multi_warned, false);
 
     std::printf("  planned host bytes against the cache's expressions\n");
     check_entry_bytes("compute_placement_plan", single_line_plan, tensors);
