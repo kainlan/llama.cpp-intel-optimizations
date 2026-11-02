@@ -202,6 +202,10 @@ static void test_the_refresh_counts_cpu_owned_and_not_mapped() {
     plan.layer_k_width.assign(2, 64);
     plan.layer_v_width.assign(2, 64);
     plan.planner_n_ctx = 1024;
+    // The planner records every layer's KV owner and writes -1 for a host layer; kv_layer_count() counts the
+    // layers from those records, so a layer without one has no KV to total.
+    plan.kv_device[0]  = -1;
+    plan.kv_device[1]  = -1;
     plan.charge_host_weight(placement_host_backing::PINNED, 10 * MiB);
     plan.charge_host_weight(placement_host_backing::CPU_OWNED, 4 * MiB);
     plan.charge_host_weight(placement_host_backing::FILE_MAPPED, 500 * MiB);
