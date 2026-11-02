@@ -46,7 +46,8 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
   L1. hook structs: the loader hooks resolve planned_host_backing and mapped_buffer_type_for_device by LOAD_SYCL_PROC;
   L2. the caps loops run above the early plan, and both inventories carry libllama's resolved inputs
       (llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock) at both populate sites);
-  L3. select_weight_buft's prefer_host_weights path asks planned_host_backing and returns SYCL_Mapped for FILE_MAPPED;
+  L3. select_weight_buft's prefer_host_weights path asks planned_host_backing and returns SYCL_Mapped for FILE_MAPPED
+      only; every other backing keeps SYCL_Host, as the §4.3 select_weight_buft row says;
   L4. weight_buft_supported's SYCL_Host short-circuit also accepts SYCL_Mapped;
   L5. make_cpu_buft_list puts the device's SYCL_Mapped ahead of its host buft on a load that maps files
       (ml.sycl_load_maps_files());
@@ -430,6 +431,9 @@ def clause_l3_select_weight_buft(t: dict) -> list:
         problems.append("the prefer_host_weights path does not ask planned_host_backing")
     if not re.search(r"GGML_SYCL_HOST_BACKING_FILE_MAPPED", prefer):
         problems.append("the prefer_host_weights path does not test FILE_MAPPED")
+    # SYCL_Mapped only for FILE_MAPPED: a CPU_OWNED weight that no CPU-owned buffer type holds keeps SYCL_Host.
+    if re.search(r"GGML_SYCL_HOST_BACKING_CPU_OWNED", prefer):
+        problems.append("the prefer_host_weights path binds SYCL_Mapped for a backing other than FILE_MAPPED")
     if "mapped_buffer_type_for_device(" not in prefer:
         problems.append("the prefer_host_weights path never returns SYCL_Mapped")
     return problems
@@ -834,6 +838,9 @@ MUTANTS = [
                            r"\s*;", ";")),
     ("select_weight_buft ignores the plan's backing", "L3",
      lambda t: _mut(t, LML, r"planned_host_backing\s*\(\s*ggml_get_name", "planned_target_device(ggml_get_name")),
+    ("select_weight_buft binds SYCL_Mapped for CPU_OWNED too", "L3",
+     lambda t: _mut(t, LML, r"backing\s*==\s*GGML_SYCL_HOST_BACKING_FILE_MAPPED\s*\)",
+                    "backing == GGML_SYCL_HOST_BACKING_FILE_MAPPED || backing == GGML_SYCL_HOST_BACKING_CPU_OWNED)")),
     ("the mlock block locks SYCL_Mapped buffers", "L7",
      lambda t: _mut(t, LM, r"(if\s*\(\s*use_mlock\s*&&\s*ggml_backend_buffer_is_host\s*\(\s*buf\s*\))[^)]*\)",
                     r"\1)")),

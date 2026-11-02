@@ -1144,12 +1144,11 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     if (prefer_host_weights) {
         ggml_backend_dev_t dev = buft_list->front().first;
         const auto         sycl_hooks = llama_model_loader_sycl_hooks_for(dev);
-        // A load that maps files binds the mapped host buffer type for every weight the plan backs from the file
-        // (design 5efe §4.3); a PINNED weight keeps SYCL_Host. CPU_OWNED reaches here only when no CPU-owned buffer type
-        // can hold the weight, and the file layout in place is then what its executor reads.
+        // A load that maps files binds the mapped host buffer type for every weight the plan backs FILE_MAPPED
+        // (design 5efe §4.3, the select_weight_buft row); any other backing keeps SYCL_Host as before.
         if (sycl_hooks.reg && sycl_hooks.planned_host_backing && sycl_hooks.mapped_buffer_type_for_device) {
             const ggml_sycl_host_backing backing = sycl_hooks.planned_host_backing(ggml_get_name(tensor));
-            if (backing == GGML_SYCL_HOST_BACKING_FILE_MAPPED || backing == GGML_SYCL_HOST_BACKING_CPU_OWNED) {
+            if (backing == GGML_SYCL_HOST_BACKING_FILE_MAPPED) {
                 ggml_backend_buffer_type_t mapped_buft = sycl_hooks.mapped_buffer_type_for_device(dev);
                 if (mapped_buft && weight_buft_supported(hparams, tensor, op, mapped_buft, dev)) {
                     return mapped_buft;
