@@ -25,6 +25,7 @@
 # reads and requires the check to flip to RED, so a check whose anchor silently
 # stopped matching real code cannot pass vacuously.
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ args = parser.parse_args()
 root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[1]
 sycl_cpp = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 pool_cpp = (root / "ggml/src/ggml-sycl/pinned-pool.cpp").read_text()
 env_doc = (root / "docs/backend/sycl-env-vars.md").read_text()
 
@@ -121,6 +123,13 @@ texts = {
         cache_cpp,
         "static void populate_host_zone_sizing(placement_plan &                           plan,",
         window=45000),
+    "weight_zone_terms_fn": function_window(
+        cache_cpp,
+        "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"),
+    "charge_host_weight_fn": function_window(
+        cache_hpp, "void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
+    "uncharge_host_weight_fn": function_window(
+        cache_hpp, "void uncharge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
     # llama.cpp-16el: 3200 chars, not the 1400 default -- the strict-parse
     # switch (four cases, two log lines) sits after the glkg comment block and
     # the default window ended inside it.
@@ -275,18 +284,73 @@ def witness_b_alloc_buffer_category(t):
 
 # --- C: the WEIGHT zone (where every runtime HOST_COMPUTE request lands,
 # per B/unified_alloc_host_zone above) reserves headroom for the context's own host
-# buffers (llama_context::output_reserve() et al.), not just weight bytes.
+# buffers (llama_context::output_reserve() et al.), not just weight bytes. The
+# zone is sized as the named terms of placement_plan_host_weight_zone_terms(),
+# the HOST_COMPUTE reserve is one of them, and no ratio over the weights stands in for a term.
+WEIGHT_ZONE_FROM_TERMS = "plan.host_zone_weight_bytes = weight_terms.total();"
+RESERVE_TERM = "terms.host_compute_reserve = k_host_compute_reserve_bytes;"
+
+
 def check_c_headroom(t):
-    fn = t["populate_zone_sizing_fn"]
+    terms_fn = t["weight_zone_terms_fn"]
     return (
-        "k_host_runtime_reserve_bytes" in fn
-        and "plan.host_zone_weight_bytes =" in fn
-        and "k_host_runtime_reserve_bytes;" in fn
+        bool(terms_fn)
+        and "k_host_compute_reserve_bytes = 64ull * 1024ull * 1024ull;" in terms_fn
+        and RESERVE_TERM in terms_fn
     )
 
 
 def witness_c_headroom(t):
-    t["populate_zone_sizing_fn"] = t["populate_zone_sizing_fn"].replace(" +\n        k_host_runtime_reserve_bytes;", ";")
+    t["weight_zone_terms_fn"] = t["weight_zone_terms_fn"].replace(RESERVE_TERM, "terms.host_compute_reserve = 0;")
+    return t
+
+
+# --- C2: the WEIGHT zone is the sum of those named terms, never a ratio over
+# the host weights (slack nobody can name is a second source for a fact the
+# plan already knows).
+# Any write to the zone size counts, compound ones included (`*= k_..._ratio`
+# after the terms assignment would otherwise pass); `==` comparisons do not.
+WEIGHT_ZONE_WRITE_RE = re.compile(r"host_zone_weight_bytes\s*[-+*/]?=(?!=)")
+
+
+def check_c2_weight_zone_is_terms(t):
+    fn = t["populate_zone_sizing_fn"]
+    terms_fn = t["weight_zone_terms_fn"]
+    return (
+        bool(fn) and bool(terms_fn)
+        and "placement_plan_host_weight_zone_terms(plan)" in fn
+        and WEIGHT_ZONE_FROM_TERMS in fn
+        and len(WEIGHT_ZONE_WRITE_RE.findall(fn)) == 1
+        and "_ratio" not in fn
+        and "_ratio" not in terms_fn
+    )
+
+
+def witness_c2_weight_zone_is_terms(t):
+    t["populate_zone_sizing_fn"] = t["populate_zone_sizing_fn"].replace(
+        WEIGHT_ZONE_FROM_TERMS,
+        "plan.host_zone_weight_bytes = static_cast<size_t>(plan.weight_host_bytes * k_weight_headroom_ratio);")
+    return t
+
+
+# --- C3: the walk that sums the host weights and the plan's charge of
+# weight_host_bytes ask one predicate which host backings the WEIGHT zone
+# holds, so the two figures the [HOST-PLAN-BUG] WARN compares cannot disagree
+# on which entries they count.
+WALK_ASKS_PREDICATE = "placement_plan::host_backing_sizes_weight_zone(entry.host_backing)"
+CHARGE_ASKS_PREDICATE = "host_backing_sizes_weight_zone(backing)"
+
+
+def check_c3_one_backing_predicate(t):
+    return (
+        WALK_ASKS_PREDICATE in t["weight_zone_terms_fn"]
+        and CHARGE_ASKS_PREDICATE in t["charge_host_weight_fn"]
+        and CHARGE_ASKS_PREDICATE in t["uncharge_host_weight_fn"]
+    )
+
+
+def witness_c3_one_backing_predicate(t):
+    t["weight_zone_terms_fn"] = t["weight_zone_terms_fn"].replace(WALK_ASKS_PREDICATE, "true")
     return t
 
 
@@ -425,6 +489,10 @@ checks = [
      check_b_alloc_buffer_category, witness_b_alloc_buffer_category),
     ("C: WEIGHT zone reserves headroom for runtime host-compute requests",
      check_c_headroom, witness_c_headroom),
+    ("C2: WEIGHT zone is the sum of its named terms, not a ratio",
+     check_c2_weight_zone_is_terms, witness_c2_weight_zone_is_terms),
+    ("C3: the WEIGHT-term walk and charge_host_weight ask one backing predicate",
+     check_c3_one_backing_predicate, witness_c3_one_backing_predicate),
     ("D: pre-zone runtime chunk growth WARNs with running total vs budget",
      check_d_fallback_warn, witness_d_fallback_warn),
     ("A2: configure_zones capacity-shortfall WARN names budget/zone/runtime bytes",

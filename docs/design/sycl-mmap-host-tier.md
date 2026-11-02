@@ -1181,10 +1181,11 @@ owns role-based routing of **host** non-weight requests).
   `EXPERT_CACHE` to the WEIGHT zone, whatever its role (`uc:15368-15370`).
 - `SYCL_Host` buffers allocate with role `WEIGHT` whenever
   `weights_evictable` holds, even after the load (`gs:42650-42651`).
-- Those tenants fitted, unseen, in the ~20 GB of 1.2x headroom over 100 GB of
-  pinned experts. After the split the WEIGHT zone is 64 MiB. So they would
-  grow zone 0 one ≥ 2048 MB chunk per miss (`uc:15418-15437`), which is what
-  zone 0 did in run2 (`run2.log:2965`, `:2968`).
+- Those tenants fitted, unseen, in the ~20 GB of headroom that the former
+  1.2x ratio left over 100 GB of pinned experts. rnh3 removed the ratio: the
+  WEIGHT zone is now its named terms only, and after the split it is 64 MiB.
+  So they would grow zone 0 one ≥ 2048 MB chunk per miss (`uc:15418-15437`),
+  which is what zone 0 did in run2 (`run2.log:2965`, `:2968`).
 - The known tenants are:
   - llama-context's CPU-backend compute buffer, which uses the first
     device's host buft, i.e. `SYCL_Host` (`src/llama-context.cpp:889-895`);
@@ -2839,10 +2840,15 @@ created") describes a path that does not run.
 - Host experts are all AOS, registered in place (`gs:33442-33462`), so
   `weight_host_bytes` = 0 and `host_cpu_owned_bytes` = 0. The host total is
   experts only: 61671 host tensors = 20557 groups x 3 (`run2.log:2824`).
-- `host_zone_weight_bytes = 0 x 1.2 + k_host_runtime_reserve_bytes (64 MiB,
-  uc:27103)`, and nothing else reaches WEIGHT. So `[HOST-ARENA] configured
-  zones: WEIGHT=` reads **64.0 MB**, against 122924.2 MB in the baseline
-  (`run2.log:2893`).
+- `host_zone_weight_bytes = host_weights + host_compute_reserve +
+  layout_copies + tlsf_bound` (`placement_plan_host_weight_zone_terms()`).
+  Its walk counts the entries `weight_host_bytes` charges, those backed
+  `PINNED` or `HOST_CPU`
+  (`placement_plan::host_backing_sizes_weight_zone()`). Here that is none,
+  so host_weights is 0 and no host blocks remain: the zone is the 64 MiB
+  `host_compute_reserve` plus a TLSF bound of 0, and nothing else reaches
+  WEIGHT. So `[HOST-ARENA] configured zones: WEIGHT=` reads **64.0 MB**,
+  against 122924.2 MB in the baseline (`run2.log:2893`).
 - **The pre-size is two pools, and the "Committed" line counts both**
   (`gs:5615-5688`). Run2's 68 chunks were 65 + 3 (`run2.log:2892`, `:2897`,
   `:2900`). Every figure here is on run2's vehicle, `llama-completion`
@@ -2878,15 +2884,17 @@ created") describes a path that does not run.
     With r2 m-2 missed, the DMA term still leaves SCRATCH, since addendum 11 (1)
     removes it by its own rule; it stays only in the runtime need.
 - **Falsifiers.**
-  - A WEIGHT zone above 64.0 MB must equal 64 MiB + 1.2 x the reordered-expert
-    bytes, and the placement report must print that sum. Otherwise the split
-    missed an accumulation site.
+  - A WEIGHT zone above 64.0 MB must equal 64 MiB + the reordered-expert
+    bytes + their TLSF bound (one 256-byte grain per block), and the
+    `[HOST-PLAN]` line must print those terms. Otherwise the split missed an
+    accumulation site.
   - A base working set other than 3579.2 MB (±0.2) names the zone that
     moved, from the `configured zones` line.
 - **Re-checked against the early-plan fix** (§F2a I-9 addendum 2).
   - The configured zones come from the late plan: `configured zones`
     (`:2893`) follows the late `Totals` (`:2821`) and equals
-    1.2 x 102383.5 + 64. The late plan already excluded the table.
+    1.2 x 102383.5 + 64, the formula of the ratio in force for run2. The late
+    plan already excluded the table.
   - What the record changes is the early plan (§3.1): the early STAGING
     `per_inflight` falls to about 1702 MB, and the early host total to
     102383.5 MB before the split.
@@ -3268,9 +3276,10 @@ lifts it into `host_ledger_budget()`.
     today) moves out of step 2 into `host_mapped_bytes` under `-lm mmap`.
     Under `-lm mmap+mlock` it stays.
   - "Other host weights (`token_embd`)" moves the same way.
-  - The WEIGHT zone term shrinks to 1.2 x the reordered experts, plus rnh3's
-    named terms, plus the 64 MiB reserve. Non-weight host requests move to
-    SCRATCH (§4.4). For Qwen the WEIGHT zone is 64.0 MB (§4.4).
+  - The WEIGHT zone term shrinks to the reordered experts' exact bytes plus
+    rnh3's named terms: the 64 MiB `host_compute_reserve` and the TLSF bound.
+    Non-weight host requests move to SCRATCH (§4.4). For Qwen the WEIGHT zone
+    is 64.0 MB (§4.4).
   - Every "`MemAvailable_pre` needed" row drops by the moved bytes.
     - For Qwen after (s), a HOST table would need about
       180.9 - 99.3 = 81.6 GiB of `MemAvailable_pre` for step 2 plus the table,

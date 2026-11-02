@@ -7732,6 +7732,24 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             TIMEOUT 30)
     endif()
 
+    # The host WEIGHT zone is exact bytes plus named terms. Arm 1 sizes a synthetic Q2_K-shaped inventory through the
+    # real planner under a mocked device table; arm 2, the census, constructs the unified cache and allocates through
+    # it, so the binary is registered like the tier tests above: cache and gpu-serial, serial, selector pinned, and a
+    # host without a device skips (77) after arm 1 has run.
+    add_executable(test-sycl-host-weight-zone-terms
+        tests/test-sycl-host-weight-zone-terms.cpp)
+    target_link_libraries(test-sycl-host-weight-zone-terms PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-host-weight-zone-terms PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-weight-zone-terms COMMAND test-sycl-host-weight-zone-terms)
+    set_tests_properties(test-sycl-host-weight-zone-terms PROPERTIES
+        LABELS "sycl;allocator;owner;host;cache;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60)
+
     # The runtime allocation registry's containment lookup follows its range index (llama.cpp-ii25): bounds, nested
     # chunk/suballocation precedence, every registry mutation, and a brute-force oracle. Rows are published through the
     # host-only test seams; nothing is allocated and no device is touched.

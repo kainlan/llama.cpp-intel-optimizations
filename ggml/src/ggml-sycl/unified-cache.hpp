@@ -1328,36 +1328,43 @@ struct placement_plan {
         return n;
     }
 
-    // Adds a host-planned weight's bytes to its backing's term. Only FILE_MAPPED bytes stay out of host_bytes.
-    void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
+    // Whether a host-planned weight of this backing is charged to weight_host_bytes, and so holds a block in the host
+    // WEIGHT zone. The charge helpers below and placement_plan_host_weight_zone_terms() all ask this one rule, so the
+    // zone's walk and its running total cannot disagree on which entries they count.
+    static constexpr bool host_backing_sizes_weight_zone(placement_host_backing backing) noexcept {
         switch (backing) {
-            case placement_host_backing::FILE_MAPPED:
-                host_mapped_bytes += bytes;
-                return;
-            case placement_host_backing::CPU_OWNED:
-                host_cpu_owned_bytes += bytes;
-                break;
             case placement_host_backing::PINNED:
             case placement_host_backing::HOST_CPU:
-                weight_host_bytes += bytes;
-                break;
+                return true;
+            case placement_host_backing::FILE_MAPPED:
+            case placement_host_backing::CPU_OWNED:
+                return false;
+        }
+        return false;
+    }
+
+    // Adds a host-planned weight's bytes to its backing's term. Only FILE_MAPPED bytes stay out of host_bytes.
+    void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
+        if (host_backing_sizes_weight_zone(backing)) {
+            weight_host_bytes += bytes;
+        } else if (backing == placement_host_backing::FILE_MAPPED) {
+            host_mapped_bytes += bytes;
+            return;
+        } else {  // CPU_OWNED
+            host_cpu_owned_bytes += bytes;
         }
         host_bytes += bytes;
     }
 
     // The inverse of charge_host_weight, saturating at 0 per term.
     void uncharge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
-        switch (backing) {
-            case placement_host_backing::FILE_MAPPED:
-                saturating_sub(host_mapped_bytes, bytes);
-                return;
-            case placement_host_backing::CPU_OWNED:
-                saturating_sub(host_cpu_owned_bytes, bytes);
-                break;
-            case placement_host_backing::PINNED:
-            case placement_host_backing::HOST_CPU:
-                saturating_sub(weight_host_bytes, bytes);
-                break;
+        if (host_backing_sizes_weight_zone(backing)) {
+            saturating_sub(weight_host_bytes, bytes);
+        } else if (backing == placement_host_backing::FILE_MAPPED) {
+            saturating_sub(host_mapped_bytes, bytes);
+            return;
+        } else {  // CPU_OWNED
+            saturating_sub(host_cpu_owned_bytes, bytes);
         }
         saturating_sub(host_bytes, bytes);
     }
@@ -1985,6 +1992,37 @@ struct placement_plan {
     std::map<std::string, expert_residency_group, std::less<>> expert_fallback_groups_;
     std::unordered_set<size_t>                                 expert_fallback_entries_;  // entries counted there
 };
+
+// The host WEIGHT zone's size, term by term: the bytes the cache materializes for every host weight the zone holds,
+// plus one named term for each real extra, never a ratio over the weights. A ratio is slack nobody can name, a second
+// source for a fact the plan already knows, and over a large host-expert set it is more than the host budget holds.
+// populate_host_zone_sizing() sizes host_zone_weight_bytes as total() and prints every term on a [HOST-PLAN] line.
+//
+// One tenant of the zone is deliberately not a term: the model loader's SYCL_Host buffer, which holds every weight
+// the loader reads (role WEIGHT, category HOST_COMPUTE). Planning it would plan a duplicate copy of the weights that
+// the mapped host tier removes; the [HOST-PLAN] line names it as unplanned instead.
+struct host_weight_zone_terms {
+    size_t host_weights         = 0;  // placement_entry_host_weight_bytes() over the entries the zone holds
+    size_t blocks               = 0;  // the pinned allocations those weights take: one per entry the zone holds
+    size_t host_compute_reserve = 0;  // the runtime HOST_COMPUTE requests that also land in WEIGHT, unsized by the plan
+    size_t layout_copies        = 0;  // converted copies of a host weight the plan keeps beside the first: none today
+    size_t tlsf_bound           = 0;  // each block rounded up to the TLSF grain: blocks x grain
+
+    size_t total() const { return host_weights + host_compute_reserve + layout_copies + tlsf_bound; }
+};
+
+// The bytes S1-PRELOAD materializes for a host-resident entry. A host weight is copied once, in AOS, with no layout
+// padding: a dense weight's copy is ggml_nbytes(tensor) and an expert's is tensor->nb[2], which are the entry's
+// src_size (the inventory's size is ggml_nbytes, and an expert's is that over ne[2]), except an unshaped expert row
+// whose own expert count is not the model-wide one (llama.cpp-y5x9).
+size_t placement_entry_host_weight_bytes(const placement_entry & entry);
+
+// The terms over the host-planned entries of `plan` whose backing placement_plan::host_backing_sizes_weight_zone()
+// accepts, the entries charge_host_weight() charges to weight_host_bytes: a FILE_MAPPED entry is served from the
+// file's mapping and a CPU_OWNED one is held by ggml-cpu, so neither takes a block here. The one function both planner
+// builders size the WEIGHT zone through, by way of populate_host_zone_sizing(), and the one place the host weights are
+// summed.
+host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
 
 struct moe_mmid_queue_binding {
     int                       owner_device = -1;
