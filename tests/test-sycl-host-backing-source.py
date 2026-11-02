@@ -216,6 +216,7 @@ def test_the_snapshot_planned_host_bytes_is_the_placed_figure():
     problems = staged_candidate_problems(make)
     assert not problems, problems
     # one source: the stage and the load-time measure's probe both build their candidate through the helper
+    # (tests/test-sycl-tiered-verdict-contract.py reads the same helper for the same fact)
     for name, body in (("lifecycle_stage_placement_plan", stage), ("lifecycle_stage_probe_placement_plan", probe)):
         assert re.search(r"\blifecycle_make_candidate_snapshot\s*\(", body), (
             f"{name} does not build its candidate through lifecycle_make_candidate_snapshot"
