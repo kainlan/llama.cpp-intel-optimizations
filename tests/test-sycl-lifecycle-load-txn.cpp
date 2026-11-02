@@ -22,6 +22,15 @@ static void require(bool v, const char * marker) {
     }
 }
 
+// Sets the publication by name: its two adjacent uint64_t fields would swap silently under a positional initialiser.
+static publication_data make_publication(uint64_t planned, uint64_t actual, tier_verdict verdict) {
+    publication_data p;
+    p.planned_host_bytes = planned;
+    p.actual_host_bytes  = actual;
+    p.verdict            = verdict;
+    return p;
+}
+
 static ModelToken commit_one(Registry & r, publication_data p = {}) {
     auto b = r.begin_outer();
     require(b.code == error::OK, "begin failed");
@@ -451,19 +460,19 @@ static void run_case(const std::string & name, test_mutation mutation) {
         require(!failed.load(std::memory_order_acquire), "mixed placement publication observed");
     } else if (name == "multi-model" || name == "sequential-aba") {
         Registry r;
-        auto     a       = commit_one(r, { 11, 7, tier_verdict::MIXED });
+        auto     a       = commit_one(r, make_publication(11, 7, tier_verdict::MIXED));
         auto     a_state = r.find(a.model);
         require(a_state && a_state->planned_host_bytes == 11 && a_state->actual_host_bytes == 7 &&
                     a_state->verdict == tier_verdict::MIXED,
                 "published planner reporting snapshot mismatch");
-        auto b = commit_one(r, { 22, 0, tier_verdict::HOST });
+        auto b = commit_one(r, make_publication(22, 0, tier_verdict::HOST));
         require(r.find(a.model) == a_state && r.find(b.model), "B load changed A");
         auto bad = r.begin_outer();
         r.end(bad.txn, false);
         require(r.find(a.model) == a_state && r.find(b.model), "failed load changed live model");
         if (name == "sequential-aba") {
             r.teardown(a);
-            auto a2 = commit_one(r, { 11, 7, tier_verdict::MIXED });
+            auto a2 = commit_one(r, make_publication(11, 7, tier_verdict::MIXED));
             require(a2.model.value != a.model.value && a2.owner.generation != a.owner.generation &&
                         r.find(a2.model)->planned_host_bytes == 11,
                     "A-B-A identity/plan contamination");

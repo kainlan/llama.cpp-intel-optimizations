@@ -756,7 +756,11 @@ end_result Registry::end(LoadTxnId id, bool success, uint64_t planned, uint64_t 
         return ticket.replay.token.model.value ? ticket.replay :
                                                  end_result{ ticket.code, ticket.token, ticket.outer, ticket.commit };
     }
-    return finalize_end(ticket, true, { planned, actual, verdict });
+    publication_data publication;
+    publication.planned_host_bytes = planned;
+    publication.actual_host_bytes  = actual;
+    publication.verdict            = verdict;
+    return finalize_end(ticket, true, publication);
 }
 
 live_update_ticket Registry::prepare_live_update(ModelToken token) {

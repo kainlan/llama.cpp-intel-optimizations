@@ -110,13 +110,13 @@ struct ModelState {
     const tier_verdict verdict;
 };
 
-// charged_host_bytes is last so that a positional {planned, actual, verdict} still initialises the first three and
-// charges nothing on host.
+// In ModelState's order. Set the fields by name: charged_host_bytes and actual_host_bytes are adjacent uint64_t, so a
+// positional initialiser that swaps them still compiles.
 struct publication_data {
     uint64_t     planned_host_bytes = 0;
+    uint64_t     charged_host_bytes = 0;
     uint64_t     actual_host_bytes  = 0;
     tier_verdict verdict            = tier_verdict::UNKNOWN;
-    uint64_t     charged_host_bytes = 0;
 };
 
 struct begin_result {
