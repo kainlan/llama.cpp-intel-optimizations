@@ -398,6 +398,23 @@ inline size_t placement_vram_charge_bytes(size_t bytes, size_t alignment = 256) 
     return std::max<size_t>(charged, 256);
 }
 
+// Whose memory a planned weight's host bytes live in (design 5efe §4.4). For a host-executed entry it is the memory
+// the CPU executes from; for a device-planned FILE_MAPPED entry it is the staging source. The plan keeps one byte term
+// per meaning, so a backing decides which term an entry's bytes land in and whether host_bytes is charged.
+enum class placement_host_backing : uint8_t {
+    PINNED,       // copied into the cache's pinned host pool
+    FILE_MAPPED,  // served from the model file's mapping; the page cache is not charged to host_bytes
+    HOST_CPU,     // copied into a cache-owned pageable host allocation
+    CPU_OWNED,    // copied by ggml-cpu outside the cache (CPU_REPACK); anonymous memory, charged
+};
+
+// Which of an entry's sizes a group charge sums. The planner's host groups do not agree on one: the MoE host group
+// charges the file bytes, the dense layer unit and the multi-device MoE group the materialized layout's bytes.
+enum class placement_size_basis : uint8_t {
+    SRC,  // placement_entry::src_size
+    DST,  // placement_entry::dst_size
+};
+
 // Single entry in the placement plan: one weight tensor's placement decision.
 struct placement_entry {
     std::string        name;  // Tensor name (for logging and S1-PRELOAD lookup)
@@ -413,6 +430,7 @@ struct placement_entry {
     int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
     expert_tensor_role expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
     ggml_layout_mode   layout            = GGML_LAYOUT_AOS;         // Materialized device layout planned for this entry
+    placement_host_backing host_backing = placement_host_backing::PINNED;  // which host term this entry's bytes reach
     // Two meanings, two fields (llama.cpp-21jd). alternate_layouts: layouts a device
     // holds as a REPLICA, materialized there instead of the primary (multi-device
     // and no-P2P candidates, MoE PP/i8 variants; readers filter per alternate by
@@ -948,7 +966,16 @@ struct placement_plan {
     size_t                       vram_bytes;         // Total planned bytes on device(s), including KV
     size_t                       host_bytes;         // Total planned bytes on host, including KV
     size_t                       weight_vram_bytes;  // Weight bytes on device(s)
-    size_t                       weight_host_bytes;  // Weight bytes on host
+    // The host weight terms by backing (design 5efe §4.4). Only charge_host_weight / uncharge_host_weight write the
+    // first three, so no site adds host weight without testing the entry's backing.
+    //   weight_host_bytes         host-executed PINNED / HOST_CPU entries; charged; sizes the host WEIGHT zone
+    //   host_cpu_owned_bytes      CPU_OWNED entries; charged (anonymous memory); sizes nothing
+    //   host_mapped_bytes         host-executed FILE_MAPPED entries; not charged (the page cache is not ours)
+    //   host_mapped_source_bytes  device-planned FILE_MAPPED entries' file bytes, the staging sources; not charged
+    size_t                       weight_host_bytes;
+    size_t                       host_cpu_owned_bytes     = 0;
+    size_t                       host_mapped_bytes        = 0;
+    size_t                       host_mapped_source_bytes = 0;
     size_t                       kv_vram_bytes;      // KV bytes on device(s)
     size_t                       kv_host_bytes;      // KV bytes on host
     size_t                       vram_budget;        // VRAM budget used for planning (primary device)
@@ -1301,6 +1328,93 @@ struct placement_plan {
         return n;
     }
 
+    // Adds a host-planned weight's bytes to its backing's term. Only FILE_MAPPED bytes stay out of host_bytes.
+    void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
+        switch (backing) {
+            case placement_host_backing::FILE_MAPPED:
+                host_mapped_bytes += bytes;
+                return;
+            case placement_host_backing::CPU_OWNED:
+                host_cpu_owned_bytes += bytes;
+                break;
+            case placement_host_backing::PINNED:
+            case placement_host_backing::HOST_CPU:
+                weight_host_bytes += bytes;
+                break;
+        }
+        host_bytes += bytes;
+    }
+
+    // The inverse of charge_host_weight, saturating at 0 per term.
+    void uncharge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
+        auto saturating_sub = [](size_t & value, size_t delta) {
+            value = value > delta ? value - delta : 0;
+        };
+        switch (backing) {
+            case placement_host_backing::FILE_MAPPED:
+                saturating_sub(host_mapped_bytes, bytes);
+                return;
+            case placement_host_backing::CPU_OWNED:
+                saturating_sub(host_cpu_owned_bytes, bytes);
+                break;
+            case placement_host_backing::PINNED:
+            case placement_host_backing::HOST_CPU:
+                saturating_sub(weight_host_bytes, bytes);
+                break;
+        }
+        saturating_sub(host_bytes, bytes);
+    }
+
+    // Charges a host-planned group, each entry by its own backing, on one size basis; an out-of-range index is
+    // skipped. host_bytes takes host_bytes_figure for the group's charged share instead of the per-entry sum, because
+    // some sites charge a rounded figure; a group that mixes backings takes that figure pro rata, and a group whose
+    // entries charge no bytes takes none of it.
+    void charge_host_weight_entries(const std::vector<size_t> & indices,
+                                    placement_size_basis        basis,
+                                    size_t                      host_bytes_figure) {
+        const size_t host_bytes_before = host_bytes;
+        size_t       group_bytes       = 0;
+        for (size_t idx : indices) {
+            if (idx >= entries.size()) {
+                continue;
+            }
+            const placement_entry & e     = entries[idx];
+            const size_t            bytes = basis == placement_size_basis::SRC ? e.src_size : e.dst_size;
+            charge_host_weight(e.host_backing, bytes);
+            group_bytes += bytes;
+        }
+        const size_t charged_bytes = host_bytes - host_bytes_before;
+        size_t       figure_share  = 0;
+        if (charged_bytes == 0) {
+            figure_share = 0;
+        } else if (charged_bytes == group_bytes) {
+            figure_share = host_bytes_figure;
+        } else {
+            figure_share =
+                static_cast<size_t>(static_cast<long double>(host_bytes_figure) * charged_bytes / group_bytes);
+        }
+        host_bytes = host_bytes_before + figure_share;
+    }
+
+    // "Placed on host" (what the tiering verdict reads) and "charged" (what the ledger reads), design 5efe §4.4.
+    size_t placed_host_weight_bytes() const noexcept {
+        return weight_host_bytes + host_cpu_owned_bytes + host_mapped_bytes;
+    }
+
+    size_t charged_host_weight_bytes() const noexcept { return weight_host_bytes + host_cpu_owned_bytes; }
+
+    // Re-derives the staging sources from the entries instead of accumulating them, so no placement move can leave
+    // the term stale: the file bytes of every device-planned FILE_MAPPED entry.
+    void recount_host_mapped_source_bytes() noexcept {
+        size_t bytes = 0;
+        for (const placement_entry & e : entries) {
+            if (e.on_device && e.host_backing == placement_host_backing::FILE_MAPPED) {
+                bytes += e.src_size;
+            }
+        }
+        host_mapped_source_bytes = bytes;
+    }
+
     void refresh_kv_byte_totals() {
         kv_vram_bytes = 0;
         kv_host_bytes = 0;
@@ -1321,7 +1435,8 @@ struct placement_plan {
         // The KV of this shape replaces the room the load plan held for the context it expected.
         kv_context_reserve_bytes = 0;
         vram_bytes               = weight_vram_bytes + kv_vram_bytes;
-        host_bytes               = weight_host_bytes + kv_host_bytes;
+        // Mapped weights are placed on host but not charged: the page cache is not ours until it is locked.
+        host_bytes               = weight_host_bytes + host_cpu_owned_bytes + kv_host_bytes;
         // The window ring's room is not KV: it stays held, since the ring is reserved again at every prompt.
         vram_bytes += moe_stream_ring_reserve_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
@@ -1421,11 +1536,11 @@ struct placement_plan {
         if (e.on_device && !on_device) {
             saturating_sub(weight_vram_bytes, charge);
             saturating_sub(vram_bytes, charge + e.kv_size);
-            weight_host_bytes += e.dst_size;
-            host_bytes += e.dst_size + e.kv_size;
+            charge_host_weight(e.host_backing, e.dst_size);
+            host_bytes += e.kv_size;
         } else if (!e.on_device && on_device) {
-            saturating_sub(weight_host_bytes, e.dst_size);
-            saturating_sub(host_bytes, e.dst_size + e.kv_size);
+            uncharge_host_weight(e.host_backing, e.dst_size);
+            saturating_sub(host_bytes, e.kv_size);
             weight_vram_bytes += charge;
             vram_bytes += charge + e.kv_size;
         }
@@ -1445,6 +1560,10 @@ struct placement_plan {
 
         e.on_device     = on_device;
         e.target_device = target;
+        // Only a FILE_MAPPED entry's move can change the staging sources, and the recount walks every entry.
+        if (e.host_backing == placement_host_backing::FILE_MAPPED) {
+            recount_host_mapped_source_bytes();
+        }
 
         if (!on_device) {
             expert_device[layer_id][expert_id] = -1;
@@ -1914,7 +2033,10 @@ struct lifecycle_plan_snapshot {
     uint32_t                              slot               = UINT32_MAX;
     uint64_t                              slot_generation    = 0;
     uint64_t                              version            = 0;
+    // Placed on host (design 5efe §4.4): what the tiering verdict reads, mapped weights included.
     uint64_t                              planned_host_bytes = 0;
+    // Charged on host: the placed bytes less the mapped ones, which the ledger does not own.
+    uint64_t                              charged_host_bytes = 0;
     uint64_t                              actual_host_bytes  = 0;
     lifecycle_plan_verdict                verdict            = lifecycle_plan_verdict::UNKNOWN;
     bool                                  explicit_no_plan   = false;

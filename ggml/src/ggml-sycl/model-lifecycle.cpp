@@ -663,10 +663,12 @@ end_result Registry::finalize_end(const finish_ticket &             ticket,
                                                      txn.finish_reason;
         if (commit) {
             try {
-                auto state = prepared_state ? std::move(prepared_state) :
-                                              std::make_shared<const ModelState>(ModelState{
-                                                  txn.token, model_phase::LIVE, publication.planned_host_bytes,
-                                                  publication.actual_host_bytes, publication.verdict });
+                auto state =
+                    prepared_state ?
+                        std::move(prepared_state) :
+                        std::make_shared<const ModelState>(ModelState{
+                            txn.token, model_phase::LIVE, publication.planned_host_bytes,
+                            publication.charged_host_bytes, publication.actual_host_bytes, publication.verdict });
                 auto model = models_.find(txn.token.model.value);
                 if (model == models_.end()) {
                     throw std::bad_alloc();

@@ -631,7 +631,6 @@ INTERNAL_WRAPPER_SITES = {
         "ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);": 1,
         "ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));": 1,
         "if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {": 1,
-        "if (!actual_weights && cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\\0') {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 16,
         "if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,
