@@ -465,6 +465,7 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
     return res;
 }
 
+#    ifdef _POSIX_MAPPED_FILES
 // The width of the MADV_RANDOM window on each side of a lazy range: at least twice the reach of a synchronous mmap
 // read-around, which is centred on the fault, reaches ra_pages/2 each way, and is doubled by POSIX_FADV_SEQUENTIAL.
 // ra_pages is the backing device's read_ahead_kb. On Linux that is read from /sys (a whole disk or a filesystem with
@@ -496,6 +497,7 @@ static size_t lazy_window_bytes(int fd) {
 #    endif
     return floor_bytes;
 }
+#    endif
 #endif
 
 struct llama_mmap::impl {
