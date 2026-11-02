@@ -177,17 +177,40 @@ def test_both_builders_recount_the_mapped_sources_before_the_totals():
 # ---- 3. the readers ----
 
 
+MAKE_CANDIDATE_SIGNATURE = r"std::shared_ptr<const\s+lifecycle_plan_snapshot>\s+lifecycle_make_candidate_snapshot\s*\("
+
+
+def staged_candidate_problems(make_body: str) -> list:
+    """What is wrong with the candidate builder's host figures. The stage and the probe both build their candidate
+    through lifecycle_make_candidate_snapshot, so that helper is the one writer of a candidate's host bytes."""
+    problems = []
+    if not re.search(
+        r"snapshot\s*->\s*planned_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
+        make_body,
+    ):
+        problems.append("the staged candidate's planned_host_bytes is not the placed figure")
+    if not re.search(
+        r"snapshot\s*->\s*charged_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*charged_host_weight_bytes\s*\(\s*\)\s*;",
+        make_body,
+    ):
+        problems.append("the staged candidate does not carry the charged figure")
+    if "weight_host_bytes" in make_body:
+        problems.append("the candidate builder still reads weight_host_bytes")
+    return problems
+
+
 def test_the_snapshot_planned_host_bytes_is_the_placed_figure():
     cpp = read(CPP)
     stage = function_body(cpp, r"void\s+lifecycle_stage_placement_plan\s*\(")
-    assert re.search(
-        r"snapshot\s*->\s*planned_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
-        stage,
-    ), "the staged candidate's planned_host_bytes is not the placed figure"
-    assert re.search(
-        r"snapshot\s*->\s*charged_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*charged_host_weight_bytes\s*\(\s*\)\s*;",
-        stage,
-    ), "the staged candidate does not carry the charged figure"
+    probe = function_body(cpp, r"void\s+lifecycle_stage_probe_placement_plan\s*\(")
+    make = function_body(cpp, MAKE_CANDIDATE_SIGNATURE)
+    problems = staged_candidate_problems(make)
+    assert not problems, problems
+    # one source: the stage and the load-time measure's probe both build their candidate through the helper
+    for name, body in (("lifecycle_stage_placement_plan", stage), ("lifecycle_stage_probe_placement_plan", probe)):
+        assert re.search(r"\blifecycle_make_candidate_snapshot\s*\(", body), (
+            f"{name} does not build its candidate through lifecycle_make_candidate_snapshot"
+        )
     publish = function_body(cpp, r"bool\s+lifecycle_publish_placement_plan\s*\(")
     assert re.search(
         r"published\s*->\s*planned_host_bytes\s*=\s*published\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
@@ -246,6 +269,19 @@ def test_the_refresh_counts_cpu_owned_and_not_mapped():
 
 
 # ---- positive controls ----
+
+
+def test_the_candidate_clause_rejects_the_old_figure():
+    make = function_body(read(CPP), MAKE_CANDIDATE_SIGNATURE)
+    placed = re.search(
+        r"snapshot\s*->\s*planned_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
+        make,
+    )
+    assert placed, "the control has no placed-figure assignment to replace"
+    old = make.replace(placed.group(0), "snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;")
+    problems = staged_candidate_problems(old)
+    assert "the staged candidate's planned_host_bytes is not the placed figure" in problems, problems
+    assert "the candidate builder still reads weight_host_bytes" in problems, problems
 
 
 def test_the_write_scanner_sees_a_planted_write():
