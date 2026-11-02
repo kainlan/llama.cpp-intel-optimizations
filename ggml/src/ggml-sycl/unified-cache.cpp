@@ -16,6 +16,7 @@
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
 #include "host-reserve-env.hpp"
+#include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
@@ -1005,90 +1006,384 @@ thread_local alloc_owner_control * g_allocating_owner_control = nullptr;
 // persistence sites below can never copy a caller-supplied request field.
 thread_local bool g_allocating_cache_backing = false;
 
-// The host ledger's declared surface (th32 §4.2, §11 T2). Not implemented yet: every charge is refused and nothing is
-// counted.
-host_budget_sample host_ledger_sample() {
-    return {};
+// ---- the process-global host ledger (th32 §4.2, §11 T2) ----
+//
+// Lock-free by design: a charge runs at the top of unified_allocate_owner with no allocator lock held, and a credit
+// runs in unified_free_record under whatever lock its caller holds, so neither may take a mutex. The stored budget
+// starts at 0, which refuses every charge until the first store.
+static std::atomic<size_t> g_host_ledger_committed{ 0 };
+static std::atomic<size_t> g_host_ledger_budget{ 0 };
+static std::atomic<size_t> g_host_ledger_yieldable_bytes{ 0 };
+// The yieldable chunks behind those bytes: a yield makes at most one round per chunk counted at its first shortfall.
+static std::atomic<size_t> g_host_ledger_yieldable_chunks{ 0 };
+// Set while this thread runs a yield round, so a charge a yielder makes never yields again (th32 §4.2).
+thread_local bool          g_host_ledger_in_yield = false;
+
+// One slot per cache instance, so a second cache on a device has its own (th32 §4.2's yielder interface). The
+// handshake: a yield increments in_flight (seq_cst) and then loads fn; the unregister stores null and then waits for
+// in_flight to reach 0. Either the yield's load sees null, or the unregister's wait sees the yield.
+struct host_ledger_yielder_slot {
+    std::atomic<host_ledger_yield_fn> fn{ nullptr };
+    std::atomic<void *>               ctx{ nullptr };
+    std::atomic<uint32_t>             in_flight{ 0 };
+    std::atomic<bool>                 claimed{ false };
+};
+
+static host_ledger_yielder_slot g_host_ledger_yielders[2 * GGML_SYCL_MAX_DEVICES];
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The charge-protocol seams (th32 §11 T2): one hook per point, and the count of budget stores the pass scope made.
+static std::atomic<ggml_sycl_test_host_ledger_hook_fn> g_test_host_ledger_hooks[GGML_SYCL_TEST_HOST_LEDGER_POINT_COUNT];
+static std::atomic<uint64_t>                           g_test_host_ledger_stores{ 0 };
+
+static int32_t host_ledger_hook_fire(int32_t point, int32_t arg) {
+    const ggml_sycl_test_host_ledger_hook_fn fn = g_test_host_ledger_hooks[point].load(std::memory_order_acquire);
+    return fn ? fn(point, arg) : 0;
 }
 
-size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed) {
-    (void) sample;
-    (void) committed;
-    return 0;
+#    define GGML_SYCL_HOST_LEDGER_HOOK(point, arg) \
+        host_ledger_hook_fire(GGML_SYCL_TEST_HOST_LEDGER_POINT_##point, (arg))
+#else
+#    define GGML_SYCL_HOST_LEDGER_HOOK(point, arg) 0
+#endif
+
+// The pinned share of the budget, summed over the caches: defined after the cache lookup it reads.
+static size_t host_ledger_pinned_share();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The charged bytes of the live HOST_CPU rows: defined beside the registry's other sums.
+static size_t host_ledger_test_live_charged_bytes();
+#endif
+
+static size_t host_ledger_sat_sub(size_t a, size_t b) {
+    return a > b ? a - b : 0;
 }
 
-size_t host_ledger_store_budget(const host_budget_sample & sample) {
-    (void) sample;
-    return 0;
+static size_t host_ledger_sat_add(size_t a, size_t b) {
+    return a > SIZE_MAX - b ? SIZE_MAX : a + b;
+}
+
+// The bytes `ask` is short of fitting under `budget` with `committed` charged, without wrapping either way.
+static size_t host_ledger_deficit(size_t ask, size_t committed, size_t budget) {
+    if (committed > budget) {
+        return host_ledger_sat_add(ask, committed - budget);
+    }
+    return host_ledger_sat_sub(ask, budget - committed);
 }
 
 size_t host_ledger_budget() {
-    return 0;
+    return g_host_ledger_budget.load(std::memory_order_acquire);
 }
 
 size_t host_ledger_committed() {
-    return 0;
+    return g_host_ledger_committed.load(std::memory_order_acquire);
 }
 
 size_t host_ledger_yieldable_bytes() {
-    return 0;
+    return g_host_ledger_yieldable_bytes.load(std::memory_order_acquire);
 }
 
 void host_ledger_yieldable_add(size_t bytes) {
-    (void) bytes;
+    g_host_ledger_yieldable_bytes.fetch_add(bytes, std::memory_order_acq_rel);
+    g_host_ledger_yieldable_chunks.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void host_ledger_yieldable_sub(size_t bytes) {
-    (void) bytes;
+    size_t cur = g_host_ledger_yieldable_bytes.load(std::memory_order_acquire);
+    while (!g_host_ledger_yieldable_bytes.compare_exchange_weak(cur, host_ledger_sat_sub(cur, bytes),
+                                                                std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    size_t chunks = g_host_ledger_yieldable_chunks.load(std::memory_order_acquire);
+    while (!g_host_ledger_yieldable_chunks.compare_exchange_weak(
+        chunks, host_ledger_sat_sub(chunks, 1), std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+host_budget_sample host_ledger_sample() {
+    // The sample runs before any lock is taken (th32 §4.2): the pinned share takes the cache map's lock and each pool's
+    // mutex, which a growth holds across its drain, so a caller holding a lock would wait on that drain. The replan
+    // token is the one lock allowed: a staged load holds it, and it ranks above every lock the share takes.
+    GGML_SYCL_WITNESS(kv_lock_witness::held_count_besides(KV_LOCK_L0_REPLAN) == 0,
+                      "[HOST-LEDGER] host_ledger_sample ran with a witnessed lock held (th32 4.2)");
+    host_budget_sample sample{};
+    sample.reserve         = detail::parse_host_reserve_mb(std::getenv("GGML_SYCL_HOST_RESERVE_MB"));
+    sample.total_bytes     = ggml_sycl_get_total_system_memory_bytes();
+    sample.available_bytes = ggml_sycl_get_available_system_memory_bytes();
+    sample.budget_pct      = g_unified_cache_host_budget_pct;
+    sample.pinned_bytes    = host_ledger_pinned_share();
+    return sample;
+}
+
+size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed) {
+    // The sample term is clamped here, so an uncapped ledger is SIZE_MAX/4 and never a value a later sum can wrap.
+    const size_t cap              = SIZE_MAX / 4;
+    bool         detection_failed = false;
+    size_t       computed         = cap;
+    if (sample.total_bytes == 0 && sample.available_bytes == 0) {
+        detection_failed = true;
+    } else {
+        size_t pct_cap    = 0;
+        size_t os_reserve = 0;
+        if (sample.total_bytes > 0) {
+            const size_t pct = static_cast<size_t>(std::min(std::max(sample.budget_pct, 1), 100));
+            pct_cap          = sample.total_bytes / 100 * pct + sample.total_bytes % 100 * pct / 100;
+            os_reserve       = std::max<size_t>(8ull << 30, sample.total_bytes / 32);
+        } else {
+            pct_cap    = sample.available_bytes;
+            os_reserve = std::min<size_t>(8ull << 30, sample.available_bytes / 4);
+        }
+        // Each subtraction clamps to 0: a pinned share above the cap, or a reading at or below the reserve, leaves a
+        // budget at or below `committed`, which refuses by name. HOST_CPU bytes are locked and resident when charged,
+        // so a reading at or below the reserve grants no headroom.
+        const size_t share_term = host_ledger_sat_sub(pct_cap, sample.pinned_bytes);
+        const size_t sample_term =
+            std::min(cap, host_ledger_sat_add(committed, host_ledger_sat_sub(sample.available_bytes, os_reserve)));
+        computed = std::min(share_term, sample_term);
+    }
+    switch (sample.reserve.status) {
+        case detail::host_reserve_parse_status::OVERRIDE:
+            // The override is the whole budget: no percentage, sample or share term enters.
+            if (sample.reserve.bytes > computed) {
+                GGML_LOG_WARN(
+                    "[HOST-LEDGER] GGML_SYCL_HOST_RESERVE_MB=%zu is the host budget (%zu bytes) and exceeds the "
+                    "computed budget (%zu bytes)\n",
+                    sample.reserve.mb, sample.reserve.bytes, computed);
+            }
+            return sample.reserve.bytes;
+        case detail::host_reserve_parse_status::REJECTED:
+            GGML_LOG_WARN(
+                "[HOST-LEDGER] ignoring GGML_SYCL_HOST_RESERVE_MB: %s; the host budget is the computed "
+                "%zu bytes\n",
+                sample.reserve.reason ? sample.reserve.reason : "rejected", computed);
+            break;
+        case detail::host_reserve_parse_status::AUTO:
+        case detail::host_reserve_parse_status::UNSET:
+            break;
+    }
+    if (detection_failed) {
+        GGML_LOG_WARN(
+            "[HOST-ARENA] System RAM detection failed; the host ledger's budget is uncapped (%zu bytes) and only the "
+            "plan's host sum bounds it\n",
+            cap);
+    }
+    return computed;
+}
+
+size_t host_ledger_store_budget(const host_budget_sample & sample) {
+    const size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
+    const size_t budget    = host_ledger_compute_budget(sample, committed);
+    g_host_ledger_budget.store(budget, std::memory_order_release);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_test_host_ledger_stores.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    GGML_LOG_INFO(
+        "[HOST-LEDGER] stored budget=%zu committed=%zu total=%zu available=%zu pct=%d pinned=%zu reserve_mb=%zu\n",
+        budget, committed, sample.total_bytes, sample.available_bytes, sample.budget_pct, sample.pinned_bytes,
+        sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE ? sample.reserve.mb : (size_t) 0);
+    return budget;
+}
+
+// One yield round over the registered yielders, with this thread marked as yielding. Returns the bytes freed.
+static size_t host_ledger_yield_round(size_t deficit, uint64_t load_txn_id) {
+    struct in_yield_scope {
+        bool previous;
+
+        in_yield_scope() : previous(g_host_ledger_in_yield) { g_host_ledger_in_yield = true; }
+
+        ~in_yield_scope() { g_host_ledger_in_yield = previous; }
+    } in_yield;
+
+    size_t freed = 0;
+    for (int32_t i = 0; i < 2 * GGML_SYCL_MAX_DEVICES && freed < deficit; ++i) {
+        host_ledger_yielder_slot & slot = g_host_ledger_yielders[i];
+        if (!slot.claimed.load(std::memory_order_acquire)) {
+            continue;
+        }
+
+        struct in_flight_scope {
+            std::atomic<uint32_t> & n;
+
+            explicit in_flight_scope(std::atomic<uint32_t> & n_) : n(n_) { n.fetch_add(1, std::memory_order_seq_cst); }
+
+            ~in_flight_scope() { n.fetch_sub(1, std::memory_order_seq_cst); }
+        } in_flight(slot.in_flight);
+
+        (void) GGML_SYCL_HOST_LEDGER_HOOK(YIELD_AFTER_INFLIGHT, i);
+        const host_ledger_yield_fn fn = slot.fn.load(std::memory_order_seq_cst);
+        if (fn == nullptr) {
+            continue;
+        }
+        // the callback type is noexcept: a yield runs inside a charge, which has no failure path for a throw
+        freed = host_ledger_sat_add(freed, fn(slot.ctx.load(std::memory_order_acquire), deficit - freed, load_txn_id));
+    }
+    return freed;
 }
 
 host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_request & req) {
     host_ledger_charge_result result{};
-    result.ask = req.bytes;
+    result.ask           = req.bytes;
+    result.budget        = g_host_ledger_budget.load(std::memory_order_acquire);
+    // a charge a yielder makes never yields (th32 §4.2), whatever its request says
+    const bool may_yield = req.may_yield && !g_host_ledger_in_yield;
+    bool       counted   = false;
+    size_t     rounds    = 0;
+    for (;;) {
+        size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
+        // committed <= budget first, so budget - committed cannot wrap, and the ask is compared with what is left,
+        // so committed + ask is never formed
+        while (committed <= result.budget && req.bytes <= result.budget - committed) {
+            (void) GGML_SYCL_HOST_LEDGER_HOOK(CHARGE_BEFORE_CAS, 0);
+            if (g_host_ledger_committed.compare_exchange_weak(committed, committed + req.bytes,
+                                                              std::memory_order_acq_rel, std::memory_order_acquire)) {
+                result.charged   = true;
+                result.committed = committed + req.bytes;
+                result.deficit   = 0;
+                return result;
+            }
+        }
+        result.committed       = committed;
+        result.deficit         = host_ledger_deficit(req.bytes, committed, result.budget);
+        result.yieldable_bytes = g_host_ledger_yieldable_bytes.load(std::memory_order_acquire);
+        // A deficit the yielders cannot cover refuses at once, so a charge that can never fit empties no cache.
+        if (!may_yield || result.deficit > result.yieldable_bytes) {
+            break;
+        }
+        if (!counted) {
+            rounds  = g_host_ledger_yieldable_chunks.load(std::memory_order_acquire);
+            counted = true;
+        }
+        if (result.retries >= rounds) {
+            break;
+        }
+        result.retries++;
+        if (host_ledger_yield_round(result.deficit, req.load_txn_id) == 0) {
+            break;
+        }
+    }
+
+    if (req.warn_only) {
+        // Phase (a): the ledger logs what it would refuse and refuses nothing.
+        GGML_LOG_WARN(
+            "[HOST-LEDGER] would refuse: host-budget-exceeded ask=%zu committed=%zu budget=%zu deficit=%zu "
+            "yieldable_bytes=%zu retries=%u (charged anyway: the ledger is WARN-only)\n",
+            result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries);
+        size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
+        do {
+            (void) GGML_SYCL_HOST_LEDGER_HOOK(CHARGE_BEFORE_CAS, 1);
+        } while (!g_host_ledger_committed.compare_exchange_weak(committed, host_ledger_sat_add(committed, req.bytes),
+                                                                std::memory_order_acq_rel, std::memory_order_acquire));
+        result.charged     = true;
+        result.over_budget = true;
+        result.committed   = host_ledger_sat_add(committed, req.bytes);
+        return result;
+    }
+    GGML_LOG_WARN(
+        "[HOST-LEDGER] host-budget-exceeded ask=%zu committed=%zu budget=%zu deficit=%zu yieldable_bytes=%zu "
+        "retries=%u\n",
+        result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries);
     return result;
 }
 
 void host_ledger_credit(size_t bytes) {
-    (void) bytes;
+    if (bytes == 0) {
+        return;
+    }
+    size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
+    while (!g_host_ledger_committed.compare_exchange_weak(committed, host_ledger_sat_sub(committed, bytes),
+                                                          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    if (bytes > committed) {
+        // WARN only: a credit runs in a free path, where an abort would take a teardown down with it.
+        GGML_LOG_WARN(
+            "[HOST-PLAN-BUG] host ledger credit of %zu bytes exceeds the committed %zu bytes; committed "
+            "saturates at 0\n",
+            bytes, committed);
+    }
 }
 
 int host_ledger_register_yielder(host_ledger_yield_fn fn, void * ctx) {
-    (void) fn;
-    (void) ctx;
+    if (fn == nullptr) {
+        return -1;
+    }
+    for (int i = 0; i < 2 * GGML_SYCL_MAX_DEVICES; ++i) {
+        host_ledger_yielder_slot & slot     = g_host_ledger_yielders[i];
+        bool                       expected = false;
+        if (slot.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            slot.ctx.store(ctx, std::memory_order_release);
+            slot.fn.store(fn, std::memory_order_seq_cst);
+            return i;
+        }
+    }
+    GGML_LOG_WARN(
+        "[HOST-LEDGER] host-yielder-slots-exhausted: all %d slots are taken; this cache runs unregistered, "
+        "with no yieldable bytes\n",
+        2 * GGML_SYCL_MAX_DEVICES);
     return -1;
 }
 
-void host_ledger_unregister_yielder(int slot) {
-    (void) slot;
+void host_ledger_unregister_yielder(int slot_index) {
+    if (slot_index < 0 || slot_index >= 2 * GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    host_ledger_yielder_slot & slot = g_host_ledger_yielders[slot_index];
+    slot.fn.store(nullptr, std::memory_order_seq_cst);
+    // A yield that loaded the callback is counted here before this returns; none runs against a destroyed cache.
+    while (slot.in_flight.load(std::memory_order_seq_cst) != 0) {
+        std::this_thread::yield();
+    }
+    slot.ctx.store(nullptr, std::memory_order_release);
+    slot.claimed.store(false, std::memory_order_release);
 }
+
+// The charge the owner entry holds for one HOST_CPU request (th32 §4.2): the owner entry charges the ledger before any
+// allocation, the registry row takes the charge when unified_alloc records the mapping, and the row's one free credits
+// it. Until the row takes it, every exit of the owner entry credits it once.
+struct host_ledger_charge_token {
+    size_t charged_bytes = 0;
+    bool   taken         = false;  // the registry row holds the charge
+};
+
+// The token of the owner entry running on this thread: null outside one, and null for a request that is not HOST_CPU,
+// so a HOST_CPU request made any other way finds none and is refused, and no nested request spends an outer token.
+thread_local host_ledger_charge_token * g_allocating_charge = nullptr;
 
 }  // namespace ggml_sycl
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-// The host ledger's test seams (th32 §11 T2). Not implemented yet.
+// The host ledger's C test seams (ggml-sycl.h), beside the statics they read (th32 §11 T2).
 GGML_BACKEND_API bool ggml_sycl_test_host_ledger_hook(int32_t point, ggml_sycl_test_host_ledger_hook_fn fn) {
-    (void) point;
-    (void) fn;
-    return false;
+    if (point < 0 || point >= GGML_SYCL_TEST_HOST_LEDGER_POINT_COUNT) {
+        return false;
+    }
+    ggml_sycl::g_test_host_ledger_hooks[point].store(fn, std::memory_order_release);
+    return true;
 }
 
 GGML_BACKEND_API void ggml_sycl_test_host_ledger_store_budget(uint64_t budget) {
-    (void) budget;
+    ggml_sycl::g_host_ledger_budget.store(static_cast<size_t>(budget), std::memory_order_release);
 }
 
 GGML_BACKEND_API bool ggml_sycl_test_host_ledger_committed(uint64_t * committed) {
-    (void) committed;
-    return false;
+    if (committed == nullptr) {
+        return false;
+    }
+    *committed = ggml_sycl::host_ledger_committed();
+    return true;
 }
 
 GGML_BACKEND_API bool ggml_sycl_test_host_ledger_stores(uint64_t * stores) {
-    (void) stores;
-    return false;
+    if (stores == nullptr) {
+        return false;
+    }
+    *stores = ggml_sycl::g_test_host_ledger_stores.load(std::memory_order_acquire);
+    return true;
 }
 
 GGML_BACKEND_API bool ggml_sycl_test_host_cpu_live_bytes(uint64_t * live_bytes) {
-    (void) live_bytes;
-    return false;
+    if (live_bytes == nullptr) {
+        return false;
+    }
+    *live_bytes = ggml_sycl::host_ledger_test_live_charged_bytes();
+    return true;
 }
 #endif
 
@@ -1662,6 +1957,8 @@ struct runtime_alloc_record {
     std::optional<sycl::queue> queue_keepalive;
     // FILE_MAPPED only: the owner's dup of the loader's fd, closed by the release's one unmap.
     int                         file_fd           = -1;
+    // HOST_CPU only: the host-ledger charge the row took from the owner entry, credited by the row's one free.
+    size_t                      charged_bytes     = 0;
     bool                       uses_pinned_pool = false;
     bool                       zone_managed     = false;
     bool                       from_arena       = false;  // True if sub-allocated from arena (KV/RUNTIME/etc zone)
@@ -17774,6 +18071,25 @@ unified_cache * get_existing_unified_cache_for_device(int device_id) {
     return get_existing_cache_for_device(device_id);
 }
 
+// The pinned share of the host budget (th32 §4.2): the bytes the pinned pools hold, summed over the caches that exist,
+// each cache once. Derived on each read, never stored, and it creates no cache. The cache lock (L4) is taken once,
+// before each pool's own lock (L5), the rank order.
+static size_t host_ledger_pinned_share() {
+    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+    size_t                              share = 0;
+    for (auto it = g_device_caches.begin(); it != g_device_caches.end(); ++it) {
+        const unified_cache * cache = it->second.get();
+        bool                  known = cache == nullptr;
+        for (auto prev = g_device_caches.begin(); prev != it && !known; ++prev) {
+            known = prev->second.get() == cache;
+        }
+        if (!known) {
+            share = host_ledger_sat_add(share, cache->pinned_pool_committed());
+        }
+    }
+    return share;
+}
+
 // llama.cpp-wfsl: the cache whose queue_ every host task of this process has been submitted on so far, or null
 // before the first; and whether the MoE join queue is refused for the rest of the process. A join on the join
 // queue waits only the latest host task recorded on that one queue_, so a host task anywhere else could be
@@ -19153,7 +19469,9 @@ void unified_cache_test_free_branch_counts(uint64_t * malloc_free, uint64_t * sy
 }
 #endif
 
-static bool unified_free_record(const runtime_alloc_record & rec) {
+// Non-const because a successful free consumes the record's host-ledger charge: the object handed to the free is the
+// charge's one holder, and it holds none afterwards (th32 §11 T2).
+static bool unified_free_record(runtime_alloc_record & rec) {
     bool ok = true;
     // Arena zones handle their own accounting via zone_settle/zone_alloc.
     // No separate counter bookkeeping needed.
@@ -19175,8 +19493,14 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         // A HOST_CPU allocation is released by one munmap of its whole mapping, sized by the one function the wrapper
         // mapped with, and by nothing else; the same ordering argument holds as for the file mapping above.
         if (rec.handle.tier == alloc_tier::HOST_CPU) {
+            if (GGML_SYCL_HOST_LEDGER_HOOK(FREE_REFUSED, 0) != 0) {
+                return false;
+            }
             alloc_registry::instance().unregister_alloc(rec.handle.ptr);
             unified_cache_raw_free_host_cpu(rec.handle.ptr, host_cpu_mapped_size(rec.handle.size));
+            // the charge the row took for this mapping goes back to the host ledger with it (th32 §4.2)
+            host_ledger_credit(rec.charged_bytes);
+            rec.charged_bytes = 0;
             return true;
         }
         if (rec.handle.tier == alloc_tier::UNREGISTERED) {
@@ -19459,6 +19783,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // legacy callers continue to receive alloc_handle without gaining a way to
     // mint or mutate an intrusive control.
     alloc_owner_control * const owner_control = g_allocating_owner_control;
+    // The owner entry's charge for a HOST_CPU request: only the owner entry charges the host ledger (th32 §4.2).
+    host_ledger_charge_token * const charge        = g_allocating_charge;
     if (out == nullptr) {
         return false;
     }
@@ -19505,6 +19831,15 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     if (req.intent.constraints.must_host_cpu && req.alignment > HOST_CPU_MAX_ALIGNMENT) {
         GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid request: must_host_cpu with alignment=%zu (a mapping gives %zu)\n",
                        req.alignment, HOST_CPU_MAX_ALIGNMENT);
+        return false;
+    }
+    // A HOST_CPU mapping is charged to the host ledger before it is made, and only unified_allocate_owner charges
+    // (th32 §4.2): a request that reaches here with no charge held was never charged, so it is refused.
+    if (req.intent.constraints.must_host_cpu && charge == nullptr) {
+        GGML_LOG_ERROR(
+            "[HOST-CPU] unified_alloc refuses a HOST_CPU request with no charge held (device %d, %zu bytes): "
+            "HOST_CPU allocations go through unified_allocate_owner, which charges the host ledger\n",
+            req.device, req.size);
         return false;
     }
 
@@ -19562,6 +19897,32 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     if (req.intent.constraints.must_host_pinned) {
         tier = alloc_tier::HOST_PINNED;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    switch (GGML_SYCL_HOST_LEDGER_HOOK(FORCE_TIER_HOST_CPU, charge != nullptr ? 1 : 0)) {
+        case 1:
+            tier = alloc_tier::HOST_CPU;
+            break;
+        case 2:
+            tier = alloc_tier::DEVICE_VRAM;
+            break;
+        default:
+            break;
+    }
+#endif
+    // The tier and the charge agree (th32 §4.2): a HOST_CPU mapping is made only with the owner entry's charge held,
+    // and a held charge is spent only on a HOST_CPU mapping. A mismatch is a planner defect: nothing is allocated on
+    // any tier, and a strict run aborts.
+    if ((tier == alloc_tier::HOST_CPU) != (charge != nullptr)) {
+        GGML_LOG_WARN(
+            "[HOST-PLAN-BUG] unified_alloc refuses tier %s with %s host-ledger charge held (device %d, %zu "
+            "bytes): the tier and the charge must agree\n",
+            alloc_tier_name(tier), charge != nullptr ? "a" : "no", req.device, req.size);
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[HOST-PLAN-BUG] unified_alloc: the tier and the host-ledger charge disagree");
+        }
+        return false;
+    }
+    (void) GGML_SYCL_HOST_LEDGER_HOOK(NESTED_HOST_CPU, 0);
 
     const size_t alloc_size = std::max<size_t>(req.size, 1);
     // Reserve capability before any tier allocation. A failed physical
@@ -19688,8 +20049,15 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         // One locked anonymous mapping, made here and nowhere else. No lock is held across the call: mlock faults
         // every page in before it returns, which on a multi-GiB request is seconds. A refusal is final: the request
         // is never served from another tier.
-        host_cpu_mapping      mapping;
-        const host_cpu_status status = unified_cache_raw_alloc_host_cpu(alloc_size, &mapping);
+        host_cpu_mapping mapping;
+        host_cpu_status  status = host_cpu_status::OK;
+        if (GGML_SYCL_HOST_LEDGER_HOOK(HOST_CPU_MMAP_FAIL, 0) != 0) {
+            status = host_cpu_status::MMAP_FAILED;
+        } else if (GGML_SYCL_HOST_LEDGER_HOOK(HOST_CPU_MLOCK_FAIL, 0) != 0) {
+            status = host_cpu_status::LOCK_FAILED;
+        } else {
+            status = unified_cache_raw_alloc_host_cpu(alloc_size, &mapping);
+        }
         if (status != host_cpu_status::OK) {
             const std::string text = host_cpu_refusal_text(status, mapping);
             if (req.suppress_failure_log) {
@@ -19700,6 +20068,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             return false;
         }
         ptr = mapping.ptr;
+        // the bytes the owner entry charged are the bytes mapped: one sizing function for the charge and the credit
+        GGML_ASSERT(mapping.mapped_bytes == charge->charged_bytes);
         // the pointer-type registry, which resolves interior pointers
         alloc_registry::instance().register_alloc(ptr, alloc_size, -1, alloc_type::HOST_CPU);
     }
@@ -20056,9 +20426,17 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         rec.handle.cache_backing    = g_allocating_cache_backing;
         rec.handle.host_zone        = output_metadata.host_zone;
         rec.queue                   = req.queue;
+        if (tier == alloc_tier::HOST_CPU) {
+            // the row takes the owner entry's charge here; from now on the row's free credits it (th32 §4.2)
+            rec.charged_bytes = charge->charged_bytes;
+            charge->taken     = true;
+        }
         try {
             if (req.queue != nullptr) rec.queue_keepalive = *req.queue;
             if (req.intent.cohort_id && req.intent.cohort_id[0] != '\0') rec.cohort_id = req.intent.cohort_id;
+            if (GGML_SYCL_HOST_LEDGER_HOOK(COHORT_FAIL, 0) != 0) {
+                throw std::bad_alloc();
+            }
         } catch (...) {
             // Non-arena allocations have not published yet and can be released
             // directly through their selected physical owner.
@@ -20078,13 +20456,16 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         // The registry row is copied from the already-published control, never
         // the reverse. This makes metadata authority independent of the legacy
         // alloc_handle returned by the compatibility API.
-        if (!allocation_owner_internal_access::publish(owner_control, rec.handle)) {
+        if (GGML_SYCL_HOST_LEDGER_HOOK(PUBLISH_FAIL, 0) != 0 ||
+            !allocation_owner_internal_access::publish(owner_control, rec.handle)) {
             (void) unified_free_record(rec);
             return false;
         }
         if (owner_control) rec.handle = owner_control->metadata();
         bool               registered = false;
         stale_claim_report stale_claim;  // declared before the lock: logs after it is dropped
+        // read before the lock, so no test hook runs under the registry mutex
+        const bool         test_registry_fail = GGML_SYCL_HOST_LEDGER_HOOK(REGISTRY_FAIL, 0) != 0;
         {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
             // Epoch and row publication share this mutex with host settle.
@@ -20097,6 +20478,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     auto inserted = runtime_registry_emplace_locked(ptr, rec);
                     if (inserted.second) {
                         try {
+                            // the injected failure is the cohort-map insert's: the row exists, and is erased
+                            if (test_registry_fail) {
+                                throw std::bad_alloc();
+                            }
                             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = tier;
                             registered = true;
                         } catch (...) {
@@ -20580,14 +20965,48 @@ static allocation_result unified_allocate_owner_impl(const alloc_request & req, 
             (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned) ||
             (req.intent.constraints.must_host_cpu &&
              (req.intent.constraints.must_device || req.intent.constraints.must_host_pinned ||
+              req.intent.constraints.prefer_same_tier_as_cohort || req.intent.constraints.use_pinned_pool ||
+              req.intent.constraints.forbid_host_zone_growth || req.intent.constraints.require_host_usm_base ||
+              req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT ||
               req.alignment > HOST_CPU_MAX_ALIGNMENT)) ||
             (internal_cache_backing &&
              (!req.intent.constraints.require_host_usm_base || !req.intent.constraints.must_host_pinned))) {
             result.error = allocation_error::INVALID_REQUEST;
             return result;
         }
+        // The charge (th32 §4.2): HOST_CPU selects the tier and nothing else, so a request carrying a routing
+        // constraint was refused above, before it could be charged. A HOST_CPU request is charged here, before any
+        // allocation and with no allocator lock held, by the size its mapping will have. The token carries the charge
+        // to unified_alloc, whose registry row takes it; until the row does, the guard credits it once at whichever
+        // exit this function takes.
+        host_ledger_charge_token         token;
+        host_ledger_charge_token * const charge = req.intent.constraints.must_host_cpu ? &token : nullptr;
+
+        struct charge_guard {
+            host_ledger_charge_token * token;
+
+            ~charge_guard() {
+                if (token != nullptr && !token->taken) {
+                    host_ledger_credit(token->charged_bytes);
+                }
+            }
+        } guard{ charge };
+
+        if (charge != nullptr) {
+            host_ledger_charge_request ledger_req;
+            ledger_req.bytes       = host_cpu_mapped_size(req.size);
+            ledger_req.may_yield   = req.may_yield;
+            ledger_req.load_txn_id = req.load_txn_id;
+            // phase (a) of th32 T2: an over-budget charge logs what it would refuse and is charged anyway
+            ledger_req.warn_only   = true;
+            if (!host_ledger_try_charge(ledger_req).charged) {
+                result.error = allocation_error::PHYSICAL_ALLOCATION_FAILED;
+                return result;
+            }
+            token.charged_bytes = ledger_req.bytes;
+        }
         auto coordinator = unified_allocation_release_coordinator(device);
-        if (!coordinator) {
+        if (!coordinator || GGML_SYCL_HOST_LEDGER_HOOK(COORDINATOR_NULL, 0) != 0) {
             result.error = allocation_error::INVALID_REQUEST;
             return result;
         }
@@ -20606,28 +21025,40 @@ static allocation_result unified_allocate_owner_impl(const alloc_request & req, 
             cache_suballocation ? allocation_control_class::CACHE_SUBALLOCATION :
                                   allocation_control_class::EXTERNAL_EXACT;
         control = allocation_owner_internal_access::create(coordinator, ownership_class);
+        if (control != nullptr && GGML_SYCL_HOST_LEDGER_HOOK(CONTROL_NULL, 0) != 0) {
+            allocation_owner_internal_access::abandon(control);
+            control = nullptr;
+        }
         if (!control) {
             result.error = allocation_error::CONTROL_ALLOCATION_FAILED;
             return result;
         }
 
         struct adapter_scope {
-            alloc_owner_control * previous;
-            bool                  previous_cache_backing;
+            alloc_owner_control *      previous;
+            bool                       previous_cache_backing;
+            host_ledger_charge_token * previous_charge;
 
-            adapter_scope(alloc_owner_control * current, bool cache_backing) :
+            adapter_scope(alloc_owner_control * current, bool cache_backing, host_ledger_charge_token * charge) :
                 previous(g_allocating_owner_control),
-                previous_cache_backing(g_allocating_cache_backing) {
+                previous_cache_backing(g_allocating_cache_backing),
+                previous_charge(g_allocating_charge) {
                 g_allocating_owner_control = current;
                 g_allocating_cache_backing = cache_backing;
+                // null for a request that is not HOST_CPU, so a nested request never sees its caller's charge
+                g_allocating_charge        = charge;
             }
 
             ~adapter_scope() {
                 g_allocating_owner_control = previous;
                 g_allocating_cache_backing = previous_cache_backing;
+                g_allocating_charge        = previous_charge;
             }
-        } scope(control, internal_cache_backing);
+        } scope(control, internal_cache_backing, charge);
 
+        if (GGML_SYCL_HOST_LEDGER_HOOK(OWNER_THROW, 0) != 0) {
+            throw std::bad_alloc();
+        }
         alloc_handle legacy;
         if (!unified_alloc(req, &legacy) || !legacy.ptr) {
             const bool was_published = control->metadata().ptr != nullptr;
@@ -20637,9 +21068,12 @@ static allocation_result unified_allocate_owner_impl(const alloc_request & req, 
                                            allocation_error::PHYSICAL_ALLOCATION_FAILED;
             return result;
         }
+        if (GGML_SYCL_HOST_LEDGER_HOOK(OWNER_THROW, 1) != 0) {
+            throw std::bad_alloc();
+        }
         // No ownership is copied from the legacy token. It is merely the
         // bounded adapter output used to verify publication identity.
-        if (legacy.metadata() != control->metadata()) {
+        if (GGML_SYCL_HOST_LEDGER_HOOK(IDENTITY_MISMATCH, 0) != 0 || legacy.metadata() != control->metadata()) {
             (void) unified_free(legacy);
             allocation_owner_internal_access::abandon(control);
             control = nullptr;
@@ -21026,6 +21460,7 @@ static registered_release_status release_registered_allocation_owned(
         detached.queue = it->second.queue;
         detached.queue_keepalive = it->second.queue_keepalive;
         detached.file_fd                   = it->second.file_fd;
+        detached.charged_bytes             = it->second.charged_bytes;
         detached.uses_pinned_pool = it->second.uses_pinned_pool;
         detached.zone_managed = it->second.zone_managed;
         detached.from_arena = it->second.from_arena;
@@ -21696,6 +22131,19 @@ std::vector<void *> unified_alloc_registry_host_cpu_ptrs_for_test() {
         }
     }
     return ptrs;
+}
+
+// The charged bytes the live HOST_CPU rows hold: with every owner entry returned, the committed bytes are this sum
+// plus the bytes a refused free stranded with no row (th32 §11 T2, arm (k)).
+static size_t host_ledger_test_live_charged_bytes() {
+    size_t                      live = 0;
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    for (const auto & kv : g_runtime_alloc_registry) {
+        if (kv.second.handle.tier == alloc_tier::HOST_CPU) {
+            live += kv.second.charged_bytes;
+        }
+    }
+    return live;
 }
 #endif
 
@@ -32776,18 +33224,80 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
 host_zone_commit_terms placement_plan_host_zone_commit_terms(const placement_plan & plan,
                                                              size_t                 onednn_live_bytes,
                                                              size_t                 chunk_bytes) {
-    (void) plan;
-    (void) onednn_live_bytes;
-    (void) chunk_bytes;
-    return {};
+    constexpr size_t       k_min_kv_zone_bytes      = 64ull * 1024ull * 1024ull;
+    constexpr size_t       k_scratch_headroom_bytes = 32ull * 1024ull * 1024ull;
+    host_zone_commit_terms terms;
+    // configuring a plan with no entries commits nothing: the configure step returns before it sizes a zone
+    if (plan.entries.empty() || chunk_bytes == 0) {
+        return terms;
+    }
+    terms.weight  = plan.host_zone_weight_bytes;
+    terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
+    terms.staging = plan.host_zone_staging_bytes;
+    terms.scratch = std::max(
+        plan.host_zone_scratch_bytes,
+        host_ledger_sat_add(host_ledger_sat_add(onednn_live_bytes, plan.max_tensor_bytes), k_scratch_headroom_bytes));
+    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + plan.pp_pipeline_scratch_bytes +
+                    plan.pp_moe_onednn_scratch_bytes;
+    // The pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME chunks apart, in
+    // whole chunks, each backed by the chunk plus a header of that same alignment.
+    const size_t align    = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    const auto   align_up = [align](size_t bytes) {
+        return (bytes + align - 1) & ~(align - 1);
+    };
+    const auto chunks_for = [chunk_bytes](size_t bytes) {
+        return (bytes + chunk_bytes - 1) / chunk_bytes;
+    };
+    const size_t zone_bytes =
+        align_up(terms.weight) + align_up(terms.kv) + align_up(terms.staging) + align_up(terms.scratch);
+    const size_t n_chunks  = chunks_for(zone_bytes) + (terms.runtime > 0 ? chunks_for(terms.runtime) : 0);
+    const size_t committed = n_chunks * (chunk_bytes + align);
+    terms.rounding         = committed - terms.zones() - terms.runtime;
+    return terms;
 }
 
 bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_before, size_t committed_after) {
-    (void) device;
-    (void) planned_bytes;
-    (void) committed_before;
-    (void) committed_after;
-    return true;
+    const size_t committed = host_ledger_sat_sub(committed_after, committed_before);
+    if (committed <= planned_bytes) {
+        return true;
+    }
+    // Phase (a) checks the excess only: a pool that already held chunks commits less than the plan counts, and a
+    // pre-allocation that runs short is phase (b)'s check (th32 §4.2).
+    GGML_LOG_WARN(
+        "[HOST-PLAN-BUG] configuring the host zones on device=%d committed=%zu bytes, past the planned=%zu "
+        "bytes the plan counts: the plan's host figure is not what the sizing code commits\n",
+        device, committed, planned_bytes);
+    return false;
+}
+
+// Records the plan's host figures (th32 §4.2): the stored budget it was made under, its commit terms and their total,
+// read once populate_host_zone_sizing() has set every term. One INFO line names them. A plan whose host bytes exceed
+// the budget logs one would-refuse WARN carrying each term and is kept whole: phase (a) of th32 T2 refuses nothing.
+// The cache supplies the live oneDNN scratch and the chunk size; a plan made before any cache exists counts the default
+// chunk. A lookup before the device count is known would enumerate the devices, so it is skipped.
+static void record_host_ledger_plan(placement_plan & plan) {
+    unified_cache * cache =
+        g_total_gpu_count > 0 ? get_existing_unified_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
+    const size_t onednn_live =
+        cache ? cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() : 0;
+    const size_t chunk               = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+    plan.host_budget                 = host_ledger_budget();
+    plan.host_zone_terms             = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
+    plan.host_planned_bytes          = plan.host_zone_terms.total();
+    const host_zone_commit_terms & t = plan.host_zone_terms;
+    GGML_LOG_INFO(
+        "[HOST-LEDGER] device=%d plan host_budget=%zu host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu "
+        "scratch=%zu runtime=%zu rounding=%zu\n",
+        plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
+        t.rounding);
+    if (plan.host_planned_bytes > plan.host_budget) {
+        GGML_LOG_WARN(
+            "[HOST-LEDGER] device=%d would refuse: host-budget-exceeded host_budget=%zu "
+            "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu rounding=%zu (the "
+            "plan is kept: the ledger is WARN-only)\n",
+            plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
+            t.rounding);
+    }
 }
 
 static void populate_host_zone_sizing(placement_plan &                           plan,
@@ -34691,6 +35201,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         reject_moe_mmid_workspaces(plan);
     }
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    record_host_ledger_plan(plan);
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
@@ -36735,6 +37246,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         reject_moe_mmid_workspaces(plan);
     }
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    record_host_ledger_plan(plan);
 
     plan.build_index();
     publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);

@@ -7061,7 +7061,9 @@ struct alloc_constraints {
     bool         must_device                = false;
     bool         must_host_pinned           = false;
     // HOST_CPU (llama.cpp-th32 T1): host memory only the CPU reads, locked. Selects the tier and nothing else: the
-    // owner entry refuses it beside must_device or must_host_pinned, and no tier falls into or out of it.
+    // owner entry refuses it beside a routing constraint (must_device, must_host_pinned, prefer_same_tier_as_cohort,
+    // use_pinned_pool, forbid_host_zone_growth, require_host_usm_base, a prefer_vram_zone), charges the host ledger
+    // for it (th32 §4.2), and no tier falls into or out of it.
     bool         must_host_cpu              = false;
     bool         prefer_same_tier_as_cohort = false;
     bool         use_pinned_pool            = false;
@@ -7611,7 +7613,7 @@ struct host_budget_sample {
 };
 
 // Reads the inputs. Takes no allocator lock and creates no cache: the pinned share is summed over the caches that
-// exist.
+// exist. It runs before any lock is taken, and the lock witness aborts it when one is held other than the replan token.
 host_budget_sample host_ledger_sample();
 
 // The budget for `sample` with `committed` bytes already charged. Pure and saturating: no subtraction wraps, so a
