@@ -19,7 +19,8 @@
 //
 // HUGEPAGE arm. The lazy boundaries sit 1 MiB past a 2 MiB boundary (begin) and 1 MiB before the next one (end), so a
 // 2 MiB folio read for a fault next to an edge reaches 1 MiB into the range. The test faults the page next to each
-// edge through llama_mmap's own mapping (prefetch 0, the SYCL load):
+// edge through llama_mmap's own mapping (prefetch 0, the SYCL load, and prefetch -1, where the page next to the begin
+// edge faults cold and a window that were SEQUENTIAL would read forward into the range):
 //   * the folio band, the lazy bytes from the shared page + 1 page to the edge's 2 MiB boundary, reads 0
 //   * the VMAs there carry nh and not hg
 //   * the mutant re-advises the mapping's window MADV_HUGEPAGE and faults again: the band must read resident, or the
@@ -381,9 +382,10 @@ struct hugepage_result {
     std::string flags_after;         // VmFlags of the page next to the end edge
 };
 
-// Maps with prefetch 0 (a SYCL load), faults the page next to each edge, and reads the folio bands. `mutant` re-advises
-// the window MADV_HUGEPAGE on the mapping first.
-static hugepage_result run_hugepage(int fd, bool mutant) {
+// Maps with `prefetch`, faults the page next to each edge, and reads the folio bands. `mutant` re-advises the window
+// MADV_HUGEPAGE on the mapping first. At prefetch -1 the page next to the begin edge lies past the 512 KiB head that
+// WILLNEED reads, so it faults cold: a window that is SEQUENTIAL instead of RANDOM would read forward into the range.
+static hugepage_result run_hugepage(int fd, size_t prefetch, bool mutant) {
     hugepage_result res;
     if (!evict(fd, H_FILE_SIZE)) {
         return res;
@@ -399,7 +401,7 @@ static hugepage_result run_hugepage(int fd, bool mutant) {
     });
     {
         llama_file f(fixture_path(fd).c_str(), "rb");
-        llama_mmap m(&f, /*prefetch =*/0, /*numa =*/false, ranges);
+        llama_mmap m(&f, prefetch, /*numa =*/false, ranges);
         char *     base = (char *) m.addr();
 
         if (mutant) {
@@ -441,38 +443,44 @@ static int hugepage_arm(int * skip) {
         return 0;
     }
 
-    const hugepage_result prod = run_hugepage(fd, false);
-    if (!prod.ran) {
-        std::fprintf(stderr, "SKIP: HUGEPAGE arm: the fixture directory cannot be evicted\n");
-        ++*skip;
-    } else {
+    // prefetch 0 is the SYCL load, prefetch -1 the default load: the window must hold in both
+    const size_t prefetches[] = { 0, (size_t) -1 };
+    for (const size_t prefetch : prefetches) {
+        const char *          label = prefetch == 0 ? "prefetch 0" : "prefetch -1";
+        const hugepage_result prod  = run_hugepage(fd, prefetch, false);
+        if (!prod.ran) {
+            std::fprintf(stderr, "SKIP: HUGEPAGE arm: the fixture directory cannot be evicted\n");
+            ++*skip;
+            continue;
+        }
         std::printf(
-            "HUGEPAGE arm, THP %s: folio band at the begin edge %lld pages resident, at the end edge %lld "
+            "HUGEPAGE arm, THP %s, %s: folio band at the begin edge %lld pages resident, at the end edge %lld "
             "(want 0 0); the faulted pages %lld %lld (want 1 1)\n",
-            mode.c_str(), (long long) prod.band_begin, (long long) prod.band_end, (long long) prod.faulted_begin,
+            mode.c_str(), label, (long long) prod.band_begin, (long long) prod.band_end, (long long) prod.faulted_begin,
             (long long) prod.faulted_end);
-        std::printf("HUGEPAGE arm: VmFlags next to the begin edge '%s', next to the end edge '%s'\n",
+        std::printf("HUGEPAGE arm, %s: VmFlags next to the begin edge '%s', next to the end edge '%s'\n", label,
                     prod.flags_before.c_str(), prod.flags_after.c_str());
         if (prod.faulted_begin != 1 || prod.faulted_end != 1) {
-            std::fprintf(stderr, "FAIL: HUGEPAGE arm: the faulted page is not resident, so the probe saw nothing\n");
+            std::fprintf(stderr, "FAIL: HUGEPAGE arm, %s: the faulted page is not resident, so the probe saw nothing\n",
+                         label);
             ++fail;
         }
         if (prod.band_begin != 0 || prod.band_end != 0) {
-            std::fprintf(stderr, "FAIL: HUGEPAGE arm: a fault next to a lazy edge read lazy bytes (a folio)\n");
+            std::fprintf(stderr, "FAIL: HUGEPAGE arm, %s: a fault next to a lazy edge read lazy bytes\n", label);
             ++fail;
         }
         for (const std::string * flags : { &prod.flags_before, &prod.flags_after }) {
             if (flags->empty() || !has_flag(*flags, "nh") || has_flag(*flags, "hg")) {
                 std::fprintf(stderr,
-                             "FAIL: HUGEPAGE arm: the window next to a lazy edge is not advised NOHUGEPAGE "
+                             "FAIL: HUGEPAGE arm, %s: the window next to a lazy edge is not advised NOHUGEPAGE "
                              "and not hugepage: '%s'\n",
-                             flags->c_str());
+                             label, flags->c_str());
                 ++fail;
             }
         }
     }
 
-    const hugepage_result mut = run_hugepage(fd, true);
+    const hugepage_result mut = run_hugepage(fd, 0, true);
     if (mut.ran) {
         std::printf("HUGEPAGE arm, window left MADV_HUGEPAGE: folio band %lld %lld pages resident (want > 0 each)\n",
                     (long long) mut.band_begin, (long long) mut.band_end);
