@@ -184,7 +184,8 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot
     // host placement" for a plan that placed weights on host, which is how the
     // current-model tiering verdict kept answering from the PREVIOUS model
     // until commit.
-    snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;
+    snapshot->planned_host_bytes = snapshot->plan->placed_host_weight_bytes();
+    snapshot->charged_host_bytes = snapshot->plan->charged_host_weight_bytes();
     return snapshot;
 }
 
@@ -283,7 +284,8 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
         published->slot                                = slot;
         published->slot_generation                     = slot_generation;
         if (published->plan) {
-            published->planned_host_bytes  = published->plan->weight_host_bytes;
+            published->planned_host_bytes  = published->plan->placed_host_weight_bytes();
+            published->charged_host_bytes  = published->plan->charged_host_weight_bytes();
             published->actual_host_bytes   = have_actual ? actual_host_bytes : published->planned_host_bytes;
             const uint64_t reported_host   = published->actual_host_bytes;
             const uint64_t reported_device = have_actual ? actual_device_bytes : published->plan->weight_vram_bytes;
@@ -295,6 +297,7 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
             // no_alloc is an explicit successful UNKNOWN, never a stale DEVICE
             // verdict inherited from a prior model.
             published->planned_host_bytes = 0;
+            published->charged_host_bytes = 0;
             published->actual_host_bytes  = 0;
             published->verdict            = lifecycle_plan_verdict::UNKNOWN;
         }
@@ -31254,13 +31257,11 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
         } else {
             if (new_size > old_size) {
                 const size_t extra = new_size - old_size;
-                plan.weight_host_bytes += extra;
-                plan.host_bytes += extra;
+                plan.charge_host_weight(entry.host_backing, extra);
                 host_delta += static_cast<int64_t>(extra);
             } else if (old_size > new_size) {
-                const size_t freed     = old_size - new_size;
-                plan.weight_host_bytes = plan.weight_host_bytes > freed ? plan.weight_host_bytes - freed : 0;
-                plan.host_bytes        = plan.host_bytes > freed ? plan.host_bytes - freed : 0;
+                const size_t freed = old_size - new_size;
+                plan.uncharge_host_weight(entry.host_backing, freed);
                 host_delta -= static_cast<int64_t>(freed);
             }
             entry.vram_charge_size = placement_vram_charge_bytes(new_size);
@@ -34275,8 +34276,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         } else {
             entry.on_device     = false;
             entry.target_device = -1;
-            plan.weight_host_bytes += entry.dst_size;
-            plan.host_bytes += entry.dst_size;
+            plan.charge_host_weight(entry.host_backing, entry.dst_size);
         }
     }
 
@@ -34335,8 +34335,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 plan.weight_vram_bytes += weight_charge;
                 plan.vram_bytes += weight_charge;
             } else {
-                plan.weight_host_bytes += weight_bytes;
-                plan.host_bytes += weight_bytes;
+                plan.charge_host_weight_entries(indices, placement_size_basis::DST, weight_bytes);
             }
 
             // Proof-of-binding (llama.cpp-h8hw, required by lead review
@@ -34369,8 +34368,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 plan.weight_vram_bytes += weight_charge;
                 plan.vram_bytes += weight_charge;
             } else {
-                plan.weight_host_bytes += weight_bytes;
-                plan.host_bytes += weight_bytes;
+                plan.charge_host_weight_entries(indices, placement_size_basis::DST, weight_bytes);
             }
         }
 
@@ -34509,8 +34507,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                         host_bytes += plan.entries[idx].src_size;
                     }
                 }
-                plan.weight_host_bytes += host_bytes;
-                plan.host_bytes += host_bytes;
+                plan.charge_host_weight_entries(group.indices, placement_size_basis::SRC, host_bytes);
                 stats.host_groups++;
                 stats.host_entries += group.indices.size();
                 stats.host_bytes += host_bytes;
@@ -34663,12 +34660,17 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         "[PLACEMENT] KV sizing: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB\n",
         kv_info.n_layer, kv_info.n_embd_k_gqa, kv_info.n_embd_v_gqa, kv_info.n_ctx,
         kv_info.n_ctx_is_runtime ? "runtime" : "conservative", plan.kv_per_layer / (1024.0 * 1024.0));
+    // Every entry's residency is final here, so the staging sources are counted once from it.
+    plan.recount_host_mapped_source_bytes();
     GGML_LOG_INFO(
         "[PLACEMENT] Totals: weights=%.1f MB device + %.1f MB host, kv=%.1f MB device + %.1f MB host, optional "
-        "layouts=%.1f MB device (yield to KV)\n",
-        plan.weight_vram_bytes / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
+        "layouts=%.1f MB device (yield to KV), host weights by backing: pinned/host_cpu=%.1f MB cpu_owned=%.1f MB "
+        "mapped=%.1f MB, mapped sources=%.1f MB\n",
+        plan.weight_vram_bytes / (1024.0 * 1024.0), plan.placed_host_weight_bytes() / (1024.0 * 1024.0),
         plan.kv_vram_bytes / (1024.0 * 1024.0), plan.kv_host_bytes / (1024.0 * 1024.0),
-        plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0));
+        plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
+        plan.host_cpu_owned_bytes / (1024.0 * 1024.0), plan.host_mapped_bytes / (1024.0 * 1024.0),
+        plan.host_mapped_source_bytes / (1024.0 * 1024.0));
     GGML_LOG_INFO("[PLACEMENT] Total: %.1f MB device + %.1f MB host (budget=%.1f MB)\n",
                   plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0),
                   vram_budget / (1024.0 * 1024.0));
@@ -35741,7 +35743,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         }
     }
 
-    auto commit_bytes = [&](int target_dev_idx, size_t weight_bytes, size_t weight_charge, size_t kv_cost) {
+    // Charges a dense or MoE group to its device, or to host by each entry's backing. host_bytes takes the group's
+    // rounded charge, as the device side does.
+    auto commit_bytes = [&](int target_dev_idx, const std::vector<size_t> & indices, placement_size_basis basis,
+                            size_t weight_charge, size_t kv_cost) {
         const size_t total_cost = weight_charge + kv_cost;
         if (target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs &&
             remaining[target_dev_idx] >= total_cost) {
@@ -35753,9 +35758,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             return device_budgets[target_dev_idx].device_id;
         }
 
-        plan.weight_host_bytes += weight_bytes;
+        plan.charge_host_weight_entries(indices, basis, weight_charge);
         plan.kv_host_bytes += kv_cost;
-        plan.host_bytes += total_cost;
+        plan.host_bytes += kv_cost;
         return -1;
     };
 
@@ -35928,7 +35933,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             } else {
                 target_dev_idx = choose_dense_target_device(charge, &reason);
             }
-            const int target    = commit_bytes(target_dev_idx, entry.dst_size, charge, 0);
+            const int target    = commit_bytes(target_dev_idx, { idx }, placement_size_basis::DST, charge, 0);
             entry.on_device     = target >= 0;
             entry.target_device = target;
             if (target >= 0 && target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs) {
@@ -35997,9 +36002,20 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     dense_spill_groups++;
                 }
             } else {
-                plan.weight_host_bytes += dense_weight_bytes + moe_weight_bytes;
+                // The router (ffn_gate_inp, MOE_GATE priority) sits in both figures: its dst bytes are in the layer's
+                // dense figure and its src bytes in the MoE figure. Its index is only in the MoE list, so the terms
+                // charge it once, on src, while host_bytes takes both figures, a pre-existing double count of under
+                // 1 MB per layer (llama.cpp-4qdx). host_bytes matches the terms again only if a KV re-fit runs
+                // refresh_kv_byte_totals on this plan.
+                const auto                dense_host_it = dense_layer_indices.find(layer_id);
+                const std::vector<size_t> no_dense_entries;
+                plan.charge_host_weight_entries(
+                    dense_host_it != dense_layer_indices.end() ? dense_host_it->second : no_dense_entries,
+                    placement_size_basis::DST, dense_weight_charge);
+                plan.charge_host_weight_entries(moe_layer_indices[static_cast<size_t>(layer_id)],
+                                                placement_size_basis::SRC, moe_weight_charge);
                 plan.kv_host_bytes += kv_cost;
-                plan.host_bytes += total_charge;
+                plan.host_bytes += kv_cost;
                 cohesive_host_layers++;
                 dense_host_groups++;
                 dense_host_bytes += dense_weight_bytes;
@@ -36109,7 +36125,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
             const char * reason         = nullptr;
             int          target_dev_idx = choose_dense_target_device(charge, &reason);
-            const int    target         = commit_bytes(target_dev_idx, entry.dst_size, charge, 0);
+            const int    target         = commit_bytes(target_dev_idx, { idx }, placement_size_basis::DST, charge, 0);
             entry.on_device             = target >= 0;
             entry.target_device         = target;
             if (target >= 0 && target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs) {
@@ -36150,7 +36166,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             const char * reason         = nullptr;
             int          target_dev_idx = choose_dense_target_device(total_cost, &reason);
 
-            const int target            = commit_bytes(target_dev_idx, weight_bytes, weight_charge, kv_cost);
+            const int target = commit_bytes(target_dev_idx, indices, placement_size_basis::DST, weight_charge, kv_cost);
             plan.layer_device[layer_id] = target;
             plan.kv_device[layer_id]    = kv_cost > 0 ? target : -1;
             if (target >= 0 && target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs) {
@@ -36480,7 +36496,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     target_dev_idx = choose_moe_target_device(group, 0);
                 }
 
-                const int target = commit_bytes(target_dev_idx, group.bytes, group.charge_bytes, 0);
+                const int target =
+                    commit_bytes(target_dev_idx, group.indices, placement_size_basis::DST, group.charge_bytes, 0);
                 if (target >= 0) {
                     stats.device_groups++;
                     stats.device_entries += group.indices.size();
@@ -36731,12 +36748,17 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         "[PLACEMENT-MULTI] KV sizing: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB\n",
         kv_info.n_layer, kv_info.n_embd_k_gqa, kv_info.n_embd_v_gqa, kv_info.n_ctx,
         kv_info.n_ctx_is_runtime ? "runtime" : "conservative", plan.kv_per_layer / (1024.0 * 1024.0));
+    // Every entry's residency is final here, so the staging sources are counted once from it.
+    plan.recount_host_mapped_source_bytes();
     GGML_LOG_INFO(
         "[PLACEMENT-MULTI] Totals: weights=%.1f MB device + %.1f MB host, kv=%.1f MB device + %.1f MB host, optional "
-        "layouts=%.1f MB device (yield to KV)\n",
-        plan.weight_vram_bytes / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
+        "layouts=%.1f MB device (yield to KV), host weights by backing: pinned/host_cpu=%.1f MB cpu_owned=%.1f MB "
+        "mapped=%.1f MB, mapped sources=%.1f MB\n",
+        plan.weight_vram_bytes / (1024.0 * 1024.0), plan.placed_host_weight_bytes() / (1024.0 * 1024.0),
         plan.kv_vram_bytes / (1024.0 * 1024.0), plan.kv_host_bytes / (1024.0 * 1024.0),
-        plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0));
+        plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
+        plan.host_cpu_owned_bytes / (1024.0 * 1024.0), plan.host_mapped_bytes / (1024.0 * 1024.0),
+        plan.host_mapped_source_bytes / (1024.0 * 1024.0));
     GGML_LOG_INFO("[PLACEMENT-MULTI] Total: %.1f MB device + %.1f MB host (budget=%.1f MB)\n",
                   plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0),
                   plan.vram_budget / (1024.0 * 1024.0));

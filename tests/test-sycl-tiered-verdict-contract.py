@@ -182,10 +182,10 @@ def evaluate(backend, cache, test):
         "the planned-target query resolves through the same plan authority":
             "ggml_sycl_global_plan_owner()" in target,
         "a staged candidate carries the planned-host bytes its publication will":
-            "snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;" in make
+            "snapshot->planned_host_bytes = snapshot->plan->placed_host_weight_bytes();" in make
             and "lifecycle_make_candidate_snapshot(" in stage,
         "publication derives planned-host bytes from the same plan field":
-            "planned_host_bytes = published->plan->weight_host_bytes;" in cache,
+            "planned_host_bytes = published->plan->placed_host_weight_bytes();" in cache,
 
         # --- 3. the executable test is non-vacuous ---
         "the executable test registers inventory through the load bracket":

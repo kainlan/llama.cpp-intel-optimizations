@@ -673,12 +673,12 @@ The consumer contract that a model implements is §9.1.
 
 | fact | value |
 |---|---|
-| where the tables live | bcachefs `/models`: user data on two **USB** SSDs, NVMe holding promoted cached copies only |
+| where the tables live | bcachefs `/models`: user data on two **USB** SSDs, NVMe holding promoted cached copies only (bcachefs layout, history; see the §2.4 note) |
 | 4 KiB `O_DIRECT` random reads, Qwen table | **1389 / 7815 / 9124 IOPS** at QD 1 / 16 / 64 |
 | 4 KiB `O_DIRECT` random reads, DeepSeek Q2_K `blk.1` table | **4249 / 7070-7242 IOPS** at QD 16 / 64 (the same file read **4657** at QD64 minutes earlier, while bcachefs wrote 7.5 GB of promotions to the NVMe) |
 | bcachefs read amplification | **~56-62x** on every file: each 4 KiB read costs ~256 KiB of device reads, because `data_checksum=crc32c` is over whole 256 KiB extents |
 | mmap page faults (the upstream path) | 1555 rows/s with 1 thread, 7866 with 16 threads: the same device ceiling |
-| reference: ext4 on the root NVMe, same probe | 6019 / 82798 / 110110 IOPS (**~12x** bcachefs at QD64); the root disk has **33 GB free**, so moving the tables there is not an option (§13 D3) |
+| reference: ext4 on the root NVMe, same probe | 6019 / 82798 / 110110 IOPS (**~12x** bcachefs at QD64); the root disk has **33 GB free**, so moving the tables there is not an option (§13 D3) (bcachefs layout, history; see the §2.4 note) |
 | the pread pool against a same-session fio QD64 control | **7051 rows/s against 7070 / 7242 IOPS** (ratio 0.99) |
 | cold decode token, Qwen (16 rows) | 3.75 ms mean, 13.0 ms p99 |
 | cold decode token, DeepSeek Q2_K (24 + 24 rows, two files, one pool) | `blk.1`'s 24 rows land at **7.13 ms mean, 14.6 ms p99**; all 48 at 11.2 / 21.0 ms |
@@ -734,7 +734,7 @@ Plain NVMe is not an option here (D3), so for DeepSeek that filesystem is the
 operating point, and §8 scores against it. On that filesystem DeepSeek's
 "decent speed" is bounded by the cold experts' reads on the same devices, not
 by the engram rows: a PP512 ubatch reads the whole cold set once (§8.4,
-`9g22` §4.5.3).
+`9g22` §4.5.3) (bcachefs layout, history; see the §2.4 note).
 
 ---
 
@@ -1065,6 +1065,12 @@ shard 2 (tensors); Appendix A.1:
   direct-dispatched `MUL_MAT_ID` nodes (`:97186-97270`), and
   `GGML_SYCL_GRAPH_DIAG` counts both kinds (`:632-660`, printed at `:794-830`).
 ### 2.4 The storage under the table (measured)
+
+> **Dated note, 2026-11-01.** The figures in this section were measured on
+> bcachefs over USB. `/models` has since moved to XFS per drive under mergerfs,
+> with the Qwen3.8 Q8_0 files on the NVMe. The figures are history for the old
+> layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md`
+> re-pins them.
 
 `/models` is bcachefs with three members (sysfs
 `/sys/fs/bcachefs/118129b2-.../dev-*`, and `bcachefs fs usage`):
@@ -3129,7 +3135,8 @@ planner's (DLM, *lead ruling §T2*).
   `CpuExpertPool`'s compute workers in any measurable way. The pread workers
   sleep in the kernel.
 - **IO.** The cold experts and the engram tables live on the same bcachefs USB
-  members, and share the one IO engine (§5.2). How much that costs is in §8.4.
+  members (bcachefs layout, history; see the §2.4 note), and share the one IO
+  engine (§5.2). How much that costs is in §8.4.
 - **Later tenants.** A table's residency is immutable after the plan is
   published: a live HOST table is never demoted. Its **row cache** is
   different, because it holds only clean copies of file bytes: no lease, no
@@ -3380,8 +3387,9 @@ Both engines were measured over the table's byte range (Appendix A.2):
 
 **The device ceiling is the same for every engine.** On this filesystem the
 bottleneck is the 256 KiB extent bounce onto USB links, not the syscall
-mechanism. The choice of engine therefore rests on *timing*, *ownership* and
-*accounting*, and on all three `O_DIRECT` prefetch wins:
+mechanism (bcachefs layout, history; see the §2.4 note). The choice of engine
+therefore rests on *timing*, *ownership* and *accounting*, and on all three
+`O_DIRECT` prefetch wins:
 
 1. **Timing.** A fault happens inside `get_rows`, on a compute thread, *after*
    the graph reached the node, and at an effective QD of however many
@@ -5732,6 +5740,12 @@ is the one per-model hook. Model code is untouched apart from
 
 ## 8. Pre-registered speed targets (item 6)
 
+> **Dated note, 2026-11-01.** The targets below were derived from figures
+> measured on bcachefs over USB. `/models` has since moved to XFS per drive
+> under mergerfs, with the Qwen3.8 Q8_0 files on the NVMe. The targets are
+> history for the old layout. Task 27 of
+> `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` re-pins them.
+
 Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on
 this host, bcachefs as-is, under ambient load. The implementer measures against
 them with the counters in §10; the lead runs every GPU part, one run at a time,
@@ -6722,15 +6736,16 @@ client, `llama.cpp-yl3v`'s cold-expert slice reads, through the same pool
 - b) `io_uring` through raw syscalls only.
 - c) Add a liburing dependency.
 
-**D3. Where the tables live. A fact, not a choice** (*lead ruling §T1*, D3).
-Plain NVMe is **not** an option on this host. `/` (ext4 on NVMe) has
-**33-38 GiB free** at 97% use (34 GiB at 19:00 today), and the tables come in
-sets: **60.08 GiB** for the DeepSeek Q2_K pair, **78.68 GiB** for the Q3_K_M
-pair, and **50.66 GiB** for Qwen's table. None fits, and a per-table comparison
-would invite a half-measure on a nearly full system disk (M1). The tables stay
-on bcachefs as it is; every S target in §8 is that filesystem's. The one
-filesystem lever left, per-file bcachefs targets on the engram shards, is the
-owner's filesystem policy, and this design does not propose it for v1.
+**D3. Where the tables live. A fact, not a choice** (*lead ruling §T1*, D3)
+(bcachefs layout, history; see the §2.4 note). Plain NVMe is **not** an option
+on this host. `/` (ext4 on NVMe) has **33-38 GiB free** at 97% use (34 GiB at
+19:00 today), and the tables come in sets: **60.08 GiB** for the DeepSeek Q2_K
+pair, **78.68 GiB** for the Q3_K_M pair, and **50.66 GiB** for Qwen's table.
+None fits, and a per-table comparison would invite a half-measure on a nearly
+full system disk (M1). The tables stay on bcachefs as it is; every S target in
+§8 is that filesystem's. The one filesystem lever left, per-file bcachefs
+targets on the engram shards, is the owner's filesystem policy, and this design
+does not propose it for v1.
 
 **DLM. `--lazy-mode` under SYCL? Ruled (a)** (*lead ruling §T2*, where it is
 called D4; renamed here so that "§D4" means only the owner's decision).
