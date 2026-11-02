@@ -1994,8 +1994,8 @@ struct placement_plan {
 };
 
 // The host WEIGHT zone's size, term by term: the bytes the cache materializes for every host weight the zone holds,
-// plus one named term for each real extra, never a ratio over the weights. A ratio is slack nobody can name, a second source
-// for a fact the plan already knows, and over a large host-expert set it is more than the host budget holds.
+// plus one named term for each real extra, never a ratio over the weights. A ratio is slack nobody can name, a second
+// source for a fact the plan already knows, and over a large host-expert set it is more than the host budget holds.
 // populate_host_zone_sizing() sizes host_zone_weight_bytes as total() and prints every term on a [HOST-PLAN] line.
 //
 // One tenant of the zone is deliberately not a term: the model loader's SYCL_Host buffer, which holds every weight
