@@ -113,6 +113,14 @@ def without(text: str, bodies: list) -> str:
     return text
 
 
+_STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"')
+
+
+def blank_string_literals(text: str) -> str:
+    """Keeps each string literal's quotes and blanks its inside, so lengths and line numbers are unchanged."""
+    return _STRING_RE.sub(lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', text)
+
+
 def host_term_writes(text: str) -> list:
     """Every write to one of the host terms: `+=`, `-=`, a plain `=` and saturating_sub on it."""
     pat = rf"\b({'|'.join(HOST_TERMS)})\b\s*(\+=|-=|=(?!=))\s*([^;]*);"
@@ -126,7 +134,8 @@ def test_only_the_helpers_write_the_host_terms():
     hpp = read(HPP)
     cpp = read(CPP)
     for rel, text in ((HPP, without(hpp, helper_bodies(hpp))), (CPP, cpp)):
-        stray = [w for w in host_term_writes(text) if not (w[1] == "=" and w[2] == "0")]
+        # A printf label is not a write: the write scan blanks string-literal contents first.
+        stray = [w for w in host_term_writes(blank_string_literals(text)) if not (w[1] == "=" and w[2] == "0")]
         assert not stray, f"{rel}: a host term is written outside charge_host_weight/uncharge_host_weight: {stray}"
 
 
@@ -292,6 +301,18 @@ def test_the_write_scanner_sees_a_planted_write():
     assert ("host_cpu_owned_bytes", "=", "7") in found, found
     assert host_term_writes("plan.weight_host_bytes = 0;") == [("weight_host_bytes", "=", "0")]
     assert host_term_writes("if (a.weight_host_bytes == 0) {}") == []
+    # the blanking the real scan applies does not hide a write in code
+    assert host_term_writes(blank_string_literals(planted)) == found
+
+
+def test_the_write_scanner_ignores_a_label_inside_a_string():
+    quoted = 'snprintf(text, n, "weight_host_bytes=%zu", x); log("host_cpu_owned_bytes = 7");'
+    assert host_term_writes(blank_string_literals(quoted)) == []
+    bare = "weight_host_bytes=%zu; host_cpu_owned_bytes = 7;"
+    found = host_term_writes(blank_string_literals(bare))
+    assert ("weight_host_bytes", "=", "%zu") in found, found
+    assert ("host_cpu_owned_bytes", "=", "7") in found, found
+    assert blank_string_literals('a("x\\n")\nb').count("\n") == 1
 
 
 if __name__ == "__main__":
