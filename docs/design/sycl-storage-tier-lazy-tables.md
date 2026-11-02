@@ -2843,7 +2843,12 @@ IO pool registry of §3.3 is a different object):
   with the named `host-yielder-slots-exhausted`, and that cache runs
   unregistered with no yieldable bytes. `yieldable_bytes` is the one maintained
   global atomic, adjusted by each cache as its yieldable chunks come and go; no
-  per-slot byte count is kept, so there is one source. T4 builds the row-cache
+  per-slot byte count is kept, so there is one source. Beside it,
+  `g_host_ledger_yieldable_chunks` counts the yieldable chunks behind those
+  bytes, raised and lowered with them, because a yield makes at most one round
+  per yieldable chunk counted at its first shortfall and needs that count to
+  bound its loop; it holds no bytes, so the bytes keep one source.
+  T4 builds the row-cache
   chunks, owns each cache's chunk table as a cache member, and registers that
   cache's yielder through T2's hook; T4 adds no static. **Handshake**: a yield
   increments the slot's in-flight count (seq_cst) and then loads the callback,
