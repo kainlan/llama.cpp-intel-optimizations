@@ -1201,6 +1201,83 @@ arm_result fixture_over_budget_warns_and_loads() {
     return r;
 }
 
+// The owner entry's over-budget charge (th32 §4.2, T2 phase (a): no refusal). With a stored budget below one mapped
+// ask, unified_allocate_owner still returns a HOST_CPU owner; committed rises by exactly host_cpu_mapped_size of the
+// ask, through the WARN-only branch's forced CAS; the ledger logs one would-refuse line naming the ask, committed, the
+// budget and the deficit, and no refusal line; and releasing the owner credits the charge once.
+// Engagement: the budget left is below the mapped ask, so the CAS path cannot admit it, and the same request under a
+// roomy budget charges, logs no would-refuse line and credits once, so the WARN and the forced charge are the budget's
+// doing.
+// Mutants: warn_only false at the owner entry (no owner, a refusal line, committed unchanged); the forced CAS dropped
+// (an owner, but committed does not rise); the WARN dropped (no would-refuse line); a field missing from the WARN.
+arm_result fixture_over_budget_charge_is_made() {
+    arm_result r;
+    board_install();
+    const size_t  ask    = 64 * 1024;
+    const size_t  mapped = host_cpu_mapped_size(ask);
+    const reading prior  = read_ledger();
+    if (!prior.ok || mapped == 0) {
+        void_arm(r, "the ledger accessors are unavailable, or the ask maps to 0 bytes");
+        board_remove();
+        return r;
+    }
+
+    // the control: under a roomy budget the request charges through the CAS path and logs no WARN
+    ggml_sycl_test_host_ledger_store_budget(k_roomy_budget);
+    log_clear();
+    {
+        allocation_result roomy = unified_allocate_owner(host_cpu_request(ask));
+        if (!roomy || read_ledger().committed != prior.committed + mapped ||
+            log_count_with("would refuse: host-budget-exceeded") != 0) {
+            void_arm(r, "the control under a roomy budget did not charge its mapping without a WARN");
+        }
+    }
+    if (read_ledger().committed != prior.committed) {
+        void_arm(r, "the control's release did not credit once");
+    }
+
+    // the over-budget request: half a mapping left
+    const uint64_t budget  = prior.committed + mapped / 2;
+    const uint64_t deficit = mapped - mapped / 2;
+    ggml_sycl_test_host_ledger_store_budget(budget);
+    if (host_ledger_budget() - prior.committed >= mapped) {
+        void_arm(r, "the budget left " + num(host_ledger_budget() - prior.committed) + " is not below the mapping " +
+                        num(mapped));
+    }
+    log_clear();
+    arm_point(GGML_SYCL_TEST_HOST_LEDGER_POINT_CHARGE_BEFORE_CAS, /*arg_filter=*/1, /*times=*/1000);
+    {
+        allocation_result got    = unified_allocate_owner(host_cpu_request(ask));
+        const int         forced = fired(GGML_SYCL_TEST_HOST_LEDGER_POINT_CHARGE_BEFORE_CAS);
+        disarm_point(GGML_SYCL_TEST_HOST_LEDGER_POINT_CHARGE_BEFORE_CAS);
+        const reading                  with    = read_ledger();
+        const std::vector<std::string> warns   = log_lines_with("[HOST-LEDGER] would refuse: host-budget-exceeded");
+        const std::vector<std::string> refused = log_lines_with("[HOST-LEDGER] host-budget-exceeded");
+        expect(r, static_cast<bool>(got) && got.owner.metadata().tier == alloc_tier::HOST_CPU,
+               "phase (a) refused an over-budget HOST_CPU request");
+        expect(r, forced >= 1, "the charge did not go through the WARN-only branch's forced CAS");
+        expect(r, with.committed == prior.committed + mapped,
+               "committed " + num(with.committed) + ", want " + num(prior.committed) + " + the mapping " + num(mapped));
+        expect(r, with.live == prior.live + mapped, "the row's charged_bytes is not the mapping");
+        expect(r, warns.size() == 1, num(warns.size()) + " would-refuse lines, want 1");
+        expect(r, refused.empty(), "phase (a) logged a refusal line: " + (refused.empty() ? "" : refused[0]));
+        if (warns.size() == 1) {
+            const std::string & w = warns[0];
+            expect(r, printed(w, "ask") == mapped, "the WARN does not name the ask: " + w);
+            expect(r, printed(w, "committed") == prior.committed, "the WARN does not name committed: " + w);
+            expect(r, printed(w, "budget") == budget, "the WARN does not name the budget: " + w);
+            expect(r, printed(w, "deficit") == deficit, "the WARN does not name the deficit: " + w);
+        }
+    }
+    const reading after = read_ledger();
+    expect(r, after.committed == prior.committed,
+           "the release left committed " + num(after.committed) + ", want " + num(prior.committed) + " (one credit)");
+    expect(r, after.live == prior.live, "the release left a HOST_CPU row live");
+    ggml_sycl_test_host_ledger_store_budget(k_roomy_budget);
+    board_remove();
+    return r;
+}
+
 // The pool-commit leg of the plan-against-committed fixture (th32 §4.2, §10's ledger check). On device 0 the plan's
 // zone terms are the configure rules' bytes, its host_planned_bytes is their total, and configuring its zones commits
 // exactly that, with no [HOST-PLAN-BUG]; on device 1 the plan's runtime grows by one chunk after planning, so
@@ -1523,6 +1600,7 @@ int main(int argc, char ** argv) {
         { "(m) the must_host_cpu request rules",                       arm_m_request_rules                 },
         { "(o) the cohort and the tier backstop",                      arm_o_cohort_and_backstop           },
         { "over budget: one would-refuse WARN, and the load proceeds", fixture_over_budget_warns_and_loads },
+        { "over budget: a HOST_CPU charge is made, with one WARN",     fixture_over_budget_charge_is_made  },
         { "plan against committed, on the pool",                       fixture_plan_against_committed      },
         { "(j) the store order",                                       arm_j_store_order                   },
     };
