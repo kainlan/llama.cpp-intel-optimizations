@@ -7,8 +7,8 @@
 // under test. Both arms drive libllama's llama_mmap with lazy ranges taken from a llama_lazy_range_record, with no
 // backend and no device.
 //
-// Prefetch arm. An anonymous 64 MiB fixture in the build directory (not tmpfs): a small tensor A at the head, a 24 MiB lazy
-// range, then tensor B, every boundary 32 B aligned and not page aligned. The lazy range starts inside the first
+// Prefetch arm. An anonymous 64 MiB fixture in the build directory (not tmpfs): a small tensor A at the head, a
+// 24 MiB lazy range, then tensor B, every boundary 32 B aligned and not page aligned. The lazy range starts inside the first
 // 512 KiB of the file because a WILLNEED over a long range reads only its head on current kernels (a single
 // read-ahead chunk, 512 KiB here), so a mutant that prefetches from offset 0 only reaches a lazy byte if the range
 // begins there. llama_mmap(prefetch = -1) over the record's ranges, polled for up to 10 s. The poll ends early, one
