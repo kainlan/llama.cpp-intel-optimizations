@@ -1262,42 +1262,27 @@ created") describes a path that does not run.
     beside the host-KV figure is withdrawn.
 - **The demotion counts the indexer** (lead ruling on r3 B: the indexer is
   in the printed figure).
-  - Today the demotion's per-layer bytes come from
-    `placement_plan::kv_size_for_layer(l)` (`uch:1033`), at both the demotion
-    input (`gs:17089-17092`) and the residency re-fit (`gs:18037-18042`).
-    Its per-layer truth comes from `llama_model_sycl_build_kv_layer_arrays`
-    (`lm:350-365`) through the inventory's `kv_k_width_per_layer`,
-    `kv_v_width_per_layer` and `kv_layer_kind` (`ggml-sycl.h:323-326`). No
-    field carries the indexer, so the printed `X MB host KV` omits 768 MiB
-    that the load then pins.
-  - C4 adds **`uint32_t kv_idx_width`** to `ggml_sycl_tensor_inventory`,
-    filled from `hparams.indexer_head_size` when the model's memory is
-    `llama_memory_hybrid_idx` and 0 otherwise. Measured with a standalone
-    compile against this tree's header: the struct is 176 bytes, 8-aligned,
-    with `kv_layer_count` at offset 168, so a `uint32_t` after it lands at
-    offset 172, in the tail padding, and `sizeof` stays 176, so it never
-    shifts another field (memory:
-    extending-a-struct-that-crosses-the-backend-dlopen-boundary).
-    - **What is relied on** (r4 n-1). In-tree, `kv_idx_width` is a declared
-      member, zeroed by every construction (`lm:653`, `:705`,
-      `tests/test-tiered-dispatch.cpp:35`,
-      `tests/test-sycl-lifecycle-runtime-wrapper.cpp:1388`, `:1426`, each
-      `= {}`), and C4 sets it explicitly at both `lm` sites. That is the
-      whole guarantee.
-    - For a stale `libllama` the field is tail padding, whose value the
-      standard leaves unspecified, so rev 3e's "a stale libllama leaves the
-      byte zero" is withdrawn. That pairing is unsupported, as for the
-      notify below: the commit message states that both libraries rebuild
-      together.
-  - One accessor, `placement_plan::kv_demand_for_layer(l)` =
-    `kv_size_for_layer(l)` + `kv_idx_width` x the layer's cells x the K
-    element size, for every layer the plan counts as carrying KV. Both
-    demotion sites read it, and so does `rec.host_bytes`, the printed
-    figure. `kv_size_for_layer` itself, which sizes the device per-layer
-    slabs, is unchanged: on the device the `idx_` tensors are not remapped
-    into a layer slab (`[KV-REMAP]` matches only `cache_k_l`/`cache_v_l`,
-    `gs:38575-38583`). How the device accounts for them is outside 5efe's
-    scope, and is ticketed as llama.cpp-ka9c (addendum 11 (5); r4 m-11).
+  - The merge onto master replaced this section's scalar width with
+    master's per-layer one, so the indexer has a field. The inventory
+    carries `kv_idx_k_width_per_layer` (`ggml-sycl.h`), filled by
+    `llama_model_sycl_build_kv_layer_arrays` beside `kv_k_width_per_layer`,
+    `kv_v_width_per_layer` and `kv_layer_kind`, and the plan copies it into
+    `placement_plan::layer_idx_k_width`. The field was appended and grew
+    the struct from 176 to 184 bytes, so `libllama` and `libggml-sycl`
+    rebuild together; a stale pairing is unsupported.
+  - `placement_plan::kv_size_for_layer(l)` is the layer's K/V buffer
+    (`kv_main_size_for_layer(l)`) plus its indexer keys
+    (`kv_idx_size_for_layer(l)`, from that layer's width, and 0 on a layer
+    without one).
+  - One accessor, `placement_plan::kv_demand_for_layer(l)`, is what both
+    demotion sites read (the demotion input and the residency re-fit). It
+    delegates to `kv_size_for_layer(l)`, because a second indexer term
+    would count the indexer twice. The printed `X MB host KV` is the
+    demotion's own total of those bytes (`host_kv_bytes_added`), so it
+    counts the indexer. On the device the `idx_` tensors are not remapped
+    into a layer slab (`[KV-REMAP]` matches only `cache_k_l`/`cache_v_l`).
+    How the device accounts for them is outside 5efe's scope, and is
+    ticketed as llama.cpp-ka9c (addendum 11 (5); r4 m-11).
   - So the Qwen no-`-c` line prints 12 x (512 + 64) = **6912.0 MB** of host
     KV (§7 C4 step 3).
 - **One intent builder per host buft, shared by its `get_max_size` and its
@@ -3691,10 +3676,14 @@ The lead's GPU runs share one protocol (r1 I-7):
     remove it. **C4 amends that clause** to the narrowed form of §4.3
     (r2 m-8).
 - **The record** lands in C1, with these host-only tests (`host;lazy`,
-  `tests/`, libllama only, no device). C1 factors three pure functions out of
-  `load_tensors` so that a host test can drive them without a device:
-  - `llama_lazy_mode_resolve(mode, caps)`: the moved fallback block, over a
-    list of device caps;
+  `tests/`, libllama only, no device). A host test drives three pure
+  functions without a device:
+  - the AUTO resolver, `llama_lazy_auto_enabled(caps, n)`
+    (`src/llama-lazy-mode.h`): AUTO falls to `OFF` when a device has no
+    mmap support and does not own placement. The merge onto master
+    replaced the `llama_lazy_mode_resolve(mode, caps)` this design
+    factored out with master's resolver, which the loader's AUTO block
+    calls;
   - the pre-fill: (declaration, `weights_map`, `hparams`, `mode_pre`,
     `mode_post`, `taker`, `SUPPORTED`) to a record;
   - the early plan's inventory filter.
@@ -3720,10 +3709,11 @@ The lead's GPU runs share one protocol (r1 I-7):
       - `deferral != EAGER` iff `lazy_eligible`, asserted on every row of
         every cell.
     - **The required witness** (addendum 4). With `AUTO`, a caps list holding
-      one device with `mmap_support = false`, and `taker`, the sparse row's
-      bit is set, its `deferral` is `STORAGE`, and the early plan's filter
-      excludes it. `llama_lazy_mode_resolve` does turn `mode_post` to `OFF`,
-      which is what makes this cell discriminate. **RED mutant:** the fill
+      one device with `mmap_support = false` that does not own placement,
+      and `taker`, the sparse row's bit is set, its `deferral` is `STORAGE`,
+      and the early plan's filter excludes it. `llama_lazy_auto_enabled`
+      does turn `mode_post` to `OFF` for that device, which is what makes
+      this cell discriminate. **RED mutant:** the fill
       reads `mode_post` for the taker (a post-fallback fill). The bit is then
       clear and the filter includes the table.
     - **The `-ngl 0` witness** (addendum 5). A SYCL-registered load whose
@@ -3841,7 +3831,8 @@ The lead's GPU runs share one protocol (r1 I-7):
       a constant `true` wherever `_POSIX_MEMLOCK_RANGE` or `_WIN32` is
       defined (`src/llama-mmap.cpp:711-715`), so on Linux and Windows no
       runtime test can tell either mutant from GREEN;
-    - `mode_pre` is captured before the call to `llama_lazy_mode_resolve`, and
+    - `mode_pre` is captured before the AUTO block calls
+      `llama_lazy_auto_enabled`, and
       the pre-fill runs after the guard and before
       `llama_model_sycl_compute_early_plan`;
     - `create_tensor`'s `TENSOR_READ_LAZY` branch checks the record and does
@@ -4096,8 +4087,10 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - `runtime_bytes` in `ggml_sycl_configure_host_zones_for_plan` names
       neither `pp_pipeline_scratch_bytes` nor `pp_moe_onednn_scratch_bytes`
       (r3 m3).
-    - The inventory's `kv_idx_width` is declared after `kv_layer_count`,
-      and both demotion sites read `kv_demand_for_layer` (r3 B).
+    - The inventory carries the indexer width per layer, as master's
+      `kv_idx_k_width_per_layer` (the merge onto master replaced this
+      design's scalar `kv_idx_width` with it), and both demotion sites read
+      `kv_demand_for_layer` (r3 B).
     - The notify takes an opaque backend handle plus scalars and returns
       `bool`: no other pointer and no struct in its signature, in either the
       header or the `llama_context` function pointer type (the dlopen
@@ -4581,10 +4574,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
     <n> entry(ies) after the release of chunk <idx>, expected 0`.
   - `test-sycl-kv-demand-idx` (`sycl;host`, r3 B). A pure test of
     `kv_demand_for_layer` on a 48-layer plan with Qwen's shape: 12 FULL
-    layers of 512 MiB at 262144 cells, `kv_idx_width` 128. Each carries 576
-    MiB, and a 0 width gives 512. Fed to `plan_runtime_kv_demotion` with 287.8
-    MB of room, it demotes 12 layers, 3..47, with 6912.0 MB of host KV.
-    Mutant: the demotion input reading `kv_size_for_layer`, which prints
+    layers of 512 MiB at 262144 cells, an indexer width of 128 on each
+    (`layer_idx_k_width`). Each carries 576 MiB, `kv_demand_for_layer`
+    equals `kv_size_for_layer`, and a 0 width gives 512. Fed to
+    `plan_runtime_kv_demotion` with 287.8 MB of room, it demotes 12 layers,
+    3..47, with 6912.0 MB of host KV. Control and mutant: the demotion input
+    reading the K/V buffer alone (`kv_main_size_for_layer`), which prints
     6144.0.
   - `test-sycl-getrows-refusal-terminal` (`sycl;host`, a fake `stream_dma`,
     r2 m-5). One refusal gives one call, one counted refusal, no
