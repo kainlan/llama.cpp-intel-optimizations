@@ -1,30 +1,32 @@
 """Source contract for llama.cpp-5efe C4 (part b): the indexer width reaches the demotion's per-layer bytes.
 
-The runtime half is the pure host test `test-sycl-kv-demand-idx` (the accessor's arithmetic, the Qwen 6912.0 MB figure,
-the inventory's size and offsets). This gate pins the plumbing that test cannot see, end to end, so that no hop can be
-dropped and leave the printed host-KV figure short by the indexer:
+The width travels per layer: master's ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer (llama.cpp-8ecj) is the one
+source, and placement_plan::kv_size_for_layer already charges it, so the demotion's demand is that one figure. The
+runtime half is the pure host test `test-sycl-kv-demand-idx` (the accessor's arithmetic and the Qwen 6912.0 MB figure).
+This gate pins the plumbing that test cannot see, end to end, so that no hop can be dropped and leave the printed
+host-KV figure short by the indexer, and so that no second source of the width can come back:
 
-1. `ggml_sycl_tensor_inventory` declares `uint32_t kv_idx_width` as its last member, right after `kv_layer_count`
-   (the dlopen boundary: the field lands in tail padding, never between two existing fields);
-2. the llama layer fills it in ONE place, `llama_model_sycl_populate_inventory`, from a helper that answers
-   `hparams.indexer_head_size` for the architecture whose memory is `llama_memory_hybrid_idx` (QWEN4EXP, without SWA)
-   and 0 for every other model, and BOTH of its callers (early plan and late inventory) pass that helper's answer;
-3. `ggml_backend_sycl_stage_inventory_plan`'s apply step copies it into the planner's `g_placement_kv_info`
-   unconditionally (a model without per-layer arrays still carries an indexer width), and both plan builders mirror it
-   into the persisted plan, beside the per-layer truth;
-4. `placement_plan::kv_demand_for_layer` is `kv_size_for_layer` plus the indexer, and `kv_size_for_layer` itself, which
-   sizes the device per-layer slabs, does not read the width;
-5. both demotion sites (the runtime demotion input and the residency re-fit input) read `kv_demand_for_layer`, and
-   neither reads `kv_size_for_layer` into `layer_kv_bytes`.
+1. `ggml_sycl_tensor_inventory` carries the per-layer `kv_idx_k_width_per_layer` array and no scalar `kv_idx_width`;
+2. the llama layer fills the array in ONE place, `llama_model_sycl_populate_inventory`, from its parameter, and BOTH of
+   its callers (early plan and late inventory) pass `kv_layer_arrays.idx_k_width.get()`, which the memory's layer
+   owners fill; no helper derives the width from the architecture a second time;
+3. `ggml_backend_sycl_stage_inventory_plan`'s apply step copies the array into the planner's
+   `g_placement_kv_info.layer_idx_k_width`, and both plan builders mirror it into the persisted plan, beside the
+   per-layer truth;
+4. `placement_plan::kv_size_for_layer` adds `kv_idx_size_for_layer` on its per-layer branch, and
+   `kv_demand_for_layer` returns `kv_size_for_layer(layer_id)` and reads no width itself (a second sum would count the
+   indexer twice);
+5. both demotion sites (the runtime demotion input and the residency re-fit input) read `kv_demand_for_layer`, and no
+   `layer_kv_bytes` input reads `kv_main_size_for_layer` or `kv_idx_size_for_layer`, the figures that leave part of the
+   layer out.
 
-Plain file I/O, comment-stripped text.
+Plain file I/O, comment-stripped text, with planted-mutation witnesses.
 """
 
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SYCL = ROOT / "ggml/src/ggml-sycl"
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|//[^\n]*" r"|/\*.*?\*/",
@@ -70,10 +72,11 @@ BACKEND = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 CACHE_HPP = "ggml/src/ggml-sycl/unified-cache.hpp"
 CACHE_CPP = "ggml/src/ggml-sycl/unified-cache.cpp"
 
-HELPER = r"static\s+uint32_t\s+llama_model_sycl_kv_idx_width\s*\("
 POPULATE = r"static\s+void\s+llama_model_sycl_populate_inventory\s*\("
 EARLY = r"static\s+void\s+llama_model_sycl_compute_early_plan\s*\("
 LATE = r"static\s+void\s+llama_model_sycl_set_late_inventory\s*\("
+DEMAND = r"size_t\s+kv_demand_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const"
+SIZE = r"size_t\s+kv_size_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const"
 
 
 # ---- 1. the inventory field ----
@@ -87,108 +90,133 @@ def inventory_members() -> list:
     return [m.strip() for m in body.split(";") if m.strip()]
 
 
-def test_the_inventory_declares_kv_idx_width_last_after_kv_layer_count():
+def test_the_inventory_carries_the_per_layer_width_and_no_scalar():
     members = inventory_members()
     names = [re.split(r"\s+", m.replace("*", " ").strip())[-1] for m in members]
-    assert "kv_idx_width" in names, "ggml_sycl_tensor_inventory has no kv_idx_width"
-    assert names[-1] == "kv_idx_width", f"kv_idx_width is not the last member (last is {names[-1]!r})"
-    assert names[-2] == "kv_layer_count", "kv_idx_width must follow kv_layer_count (tail padding, no field moves)"
-    decl = members[-1]
-    assert re.match(r"uint32_t\s+kv_idx_width$", decl), f"kv_idx_width is not a plain uint32_t: {decl!r}"
+    assert "kv_idx_k_width_per_layer" in names, "ggml_sycl_tensor_inventory has no kv_idx_k_width_per_layer"
+    decl = members[names.index("kv_idx_k_width_per_layer")]
+    assert re.fullmatch(r"const\s+uint32_t\s*\*\s*kv_idx_k_width_per_layer", decl), f"not a per-layer array: {decl!r}"
+    assert "kv_idx_width" not in names, "a scalar kv_idx_width is a second source of the indexer width"
 
 
 # ---- 2. the llama layer ----
 
 
-def test_the_helper_answers_the_indexer_width_only_for_the_idx_memory_architecture():
-    body = function_body(read(LLAMA_MODEL), HELPER)
-    assert "LLM_ARCH_QWEN4EXP" in body, "the helper does not name the architecture whose memory is hybrid_idx"
-    assert re.search(
-        r"swa_type\s*==\s*LLAMA_SWA_TYPE_NONE", body
-    ), "the hybrid_idx branch is taken only without SWA (the iswa memory wins otherwise); the helper must match"
-    assert re.search(
-        r"return\s+hparams\s*\.\s*indexer_head_size\s*;", body
-    ), "the helper does not answer hparams.indexer_head_size"
-    assert re.search(
-        r"indexer_head_size\s*>\s*0", body
-    ), "a null filter_idx (no indexer tensors) builds no idx cache: the helper must answer 0 for width 0"
-    assert re.search(r"return\s+0\s*;", body), "the helper has no 0 answer for the other models"
-
-
-def test_populate_inventory_sets_the_field_once_from_its_parameter():
-    body = function_body(read(LLAMA_MODEL), POPULATE)
-    sets = re.findall(r"inventory\s*\.\s*kv_idx_width\s*=\s*([^;]+);", body)
-    assert len(sets) == 1, f"populate_inventory sets kv_idx_width {len(sets)} times"
-    assert re.fullmatch(r"kv_idx_width", sets[0].strip()), f"kv_idx_width is set from {sets[0].strip()!r}"
-    sig = re.search(POPULATE + r"[^{]*\{", read(LLAMA_MODEL), flags=re.DOTALL).group(0)
-    assert re.search(r"uint32_t\s+kv_idx_width", sig), "populate_inventory takes no kv_idx_width parameter"
-
-
-def test_both_callers_pass_the_helpers_answer():
+def test_no_helper_derives_the_width_from_the_architecture():
     text = read(LLAMA_MODEL)
+    assert not re.search(r"\bllama_model_sycl_kv_idx_width\b", text), (
+        "the width comes from the memory's layer owners (kv_layer_arrays.idx_k_width); an arch-keyed helper is a "
+        "second source"
+    )
+
+
+def test_populate_inventory_sets_the_array_once_from_its_parameter():
+    text = read(LLAMA_MODEL)
+    body = function_body(text, POPULATE)
+    sets = re.findall(r"inventory\s*\.\s*kv_idx_k_width_per_layer\s*=\s*([^;]+);", body)
+    assert len(sets) == 1, f"populate_inventory sets kv_idx_k_width_per_layer {len(sets)} times"
+    assert sets[0].strip() == "kv_idx_k_width_per_layer", f"the array is set from {sets[0].strip()!r}"
+    assert not re.search(r"\binventory\s*\.\s*kv_idx_width\b", body), "populate_inventory sets a scalar width"
+    sig = re.search(POPULATE + r"[^{]*\{", text, flags=re.DOTALL).group(0)
+    assert re.search(r"const\s+uint32_t\s*\*\s*kv_idx_k_width_per_layer", sig), (
+        "populate_inventory takes no kv_idx_k_width_per_layer parameter"
+    )
+    assert not re.search(r"uint32_t\s+kv_idx_width\b", sig), "populate_inventory still takes the scalar width"
+
+
+def callers_pass_the_owner_array(text: str) -> list:
+    bad = []
     for name, sig in (("early plan", EARLY), ("late inventory", LATE)):
         body = function_body(text, sig)
         call = re.search(r"llama_model_sycl_populate_inventory\s*\(([^;]*)\)\s*;", body, flags=re.DOTALL)
-        assert call, f"{name}: no populate_inventory call"
-        assert re.search(
-            r"llama_model_sycl_kv_idx_width\s*\(\s*ml\s*\.\s*get_arch\s*\(\s*\)\s*,\s*hparams\s*\)", call.group(1)
-        ), f"{name}: the call does not pass llama_model_sycl_kv_idx_width(ml.get_arch(), hparams)"
+        if not call:
+            bad.append(f"{name}: no populate_inventory call")
+            continue
+        if not re.search(r"kv_layer_arrays\s*\.\s*idx_k_width\s*\.\s*get\s*\(\s*\)", call.group(1)):
+            bad.append(f"{name}: the call does not pass kv_layer_arrays.idx_k_width.get()")
+    return bad
+
+
+def test_both_callers_pass_the_owner_array():
+    assert callers_pass_the_owner_array(read(LLAMA_MODEL)) == []
+
+
+def test_mutation_witness_a_caller_passing_null_is_caught():
+    code = read(LLAMA_MODEL)
+    mutated = code.replace("kv_layer_arrays.idx_k_width.get()", "nullptr", 1)
+    assert mutated != code, "mutation did not apply"
+    assert len(callers_pass_the_owner_array(mutated)) == 1
 
 
 # ---- 3. the planner ----
 
 
-def test_the_apply_step_copies_the_width_unconditionally():
+def test_the_apply_step_copies_the_array_into_the_planner():
     text = read(BACKEND)
-    hit = re.search(r"g_placement_kv_info\s*\.\s*kv_idx_width\s*=\s*inventory\s*->\s*kv_idx_width\s*;", text)
-    assert hit, "the apply step does not copy inventory->kv_idx_width into g_placement_kv_info"
-    before = text[: hit.start()].rstrip()
-    assert before.endswith((";", "}", "{")), "the copy is guarded by an if: it must be a plain statement"
-    # not inside the per-layer-arrays branch: a model without arrays still carries an indexer width
-    arrays = re.search(r"if\s*\(\s*inventory\s*->\s*kv_layer_count\s*>\s*0[^{]*\{", text)
-    assert arrays, "the per-layer arrays branch moved"
-    assert not (
-        arrays.end() < hit.start() < arrays.end() + len(balanced(text, arrays.end() - 1))
-    ), "the width is copied only when the per-layer arrays are present"
+    assert re.search(
+        r"g_placement_kv_info\s*\.\s*layer_idx_k_width\s*\.\s*assign\s*\("
+        r"\s*inventory\s*->\s*kv_idx_k_width_per_layer\s*,"
+        r"\s*inventory\s*->\s*kv_idx_k_width_per_layer\s*\+\s*inventory\s*->\s*kv_layer_count\s*\)",
+        text,
+    ), "the apply step does not copy inventory->kv_idx_k_width_per_layer into g_placement_kv_info.layer_idx_k_width"
+    assert not re.search(r"g_placement_kv_info\s*\.\s*kv_idx_width\b", text), "the planner still carries a scalar width"
 
 
 def test_both_plan_builders_mirror_the_width_beside_the_per_layer_truth():
     text = read(CACHE_CPP)
-    mirrors = re.findall(r"plan\s*\.\s*kv_idx_width\s*=\s*kv_info\s*\.\s*kv_idx_width\s*;", text)
-    assert len(mirrors) == 2, f"{len(mirrors)} plan builders mirror kv_idx_width, expected the 2 that mirror layer_kind"
+    mirrors = re.findall(r"plan\s*\.\s*layer_idx_k_width\s*=\s*kv_info\s*\.\s*layer_idx_k_width\s*;", text)
+    assert len(mirrors) == 2, (
+        f"{len(mirrors)} plan builders mirror layer_idx_k_width, expected the 2 that mirror layer_kind"
+    )
     kinds = re.findall(r"plan\s*\.\s*layer_kind\s*=\s*kv_info\s*\.\s*layer_kind\s*;", text)
     assert len(kinds) == 2, "the plan builders that mirror layer_kind changed"
+    assert not re.search(r"\bplan\s*\.\s*kv_idx_width\b", text), "a plan builder mirrors a scalar width"
 
 
-# ---- 4. the accessor ----
+# ---- 4. the accessors ----
 
 
-def test_kv_demand_for_layer_adds_the_indexer_to_kv_size_for_layer():
-    text = read(CACHE_HPP)
-    demand = function_body(text, r"size_t\s+kv_demand_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const")
-    assert re.search(
-        r"kv_size_for_layer\s*\(\s*layer_id\s*\)", demand
-    ), "the accessor does not start from kv_size_for_layer"
-    assert "kv_idx_width" in demand, "the accessor does not read the indexer width"
-    assert (
-        "planner_n_ctx" in demand
-    ), "the indexer cache holds every cell of the context; the accessor must use planner_n_ctx"
-    assert re.search(r"sizeof\s*\(\s*ggml_fp16_t\s*\)", demand), "the K element size is the planner's fp16"
-    assert re.search(
-        r"\bkv\s*==\s*0", demand
-    ), "a layer that carries no KV has no indexer either: the accessor needs a 0 early out"
+SIZE_WITHOUT_INDEXER = "kv_size_for_layer does not add kv_idx_size_for_layer: the budgets would leave the indexer out"
+DEMAND_SECOND_SUM = "kv_demand_for_layer is not exactly kv_size_for_layer(layer_id): a second sum counts the indexer twice"
 
 
-def test_kv_size_for_layer_does_not_read_the_width():
-    text = read(CACHE_HPP)
-    size = function_body(text, r"size_t\s+kv_size_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const")
-    assert "kv_idx_width" not in size, "kv_size_for_layer sizes the device slabs; the indexer is not remapped into one"
+def accessor_problems(text: str) -> list:
+    bad = []
+    size = function_body(text, SIZE)
+    if not re.search(r"\+\s*kv_idx_size_for_layer\s*\(\s*layer_id\s*\)", size):
+        bad.append(SIZE_WITHOUT_INDEXER)
+    demand = function_body(text, DEMAND)
+    if not re.fullmatch(r"\s*return\s+kv_size_for_layer\s*\(\s*layer_id\s*\)\s*;\s*", demand):
+        bad.append(DEMAND_SECOND_SUM)
+    return bad
+
+
+def test_the_demand_is_the_size_and_the_size_charges_the_indexer():
+    assert accessor_problems(read(CACHE_HPP)) == []
+
+
+def test_mutation_witness_a_second_indexer_sum_is_caught():
+    code = read(CACHE_HPP)
+    good = "return kv_size_for_layer(layer_id); }"
+    assert code.count(good) == 1, "the delegating body moved"
+    mutated = code.replace(good, "return kv_size_for_layer(layer_id) + kv_idx_size_for_layer(layer_id); }", 1)
+    assert accessor_problems(mutated) == [DEMAND_SECOND_SUM]
+
+
+def test_mutation_witness_a_size_without_the_indexer_is_caught():
+    code = read(CACHE_HPP)
+    size = function_body(code, SIZE)
+    mutated_size = re.sub(r"\s*\+\s*kv_idx_size_for_layer\s*\(\s*layer_id\s*\)", "", size, count=1)
+    assert mutated_size != size, "mutation did not apply"
+    mutated = code.replace(size, mutated_size, 1)
+    assert accessor_problems(mutated) == [SIZE_WITHOUT_INDEXER]
 
 
 # ---- 5. the two demotion sites ----
 
 SITE_RUNTIME = r"kv_demotion_in\s*\.\s*layer_kv_bytes\s*\[\s*l\s*\]\s*=\s*([^;]+);"
 SITE_REFIT = r"\bin\s*\.\s*layer_kv_bytes\s*\[\s*l\s*\]\s*=\s*([^;]+);"
+PARTIAL = re.compile(r"\bkv_(main|idx)_size_for_layer\b")
 
 
 def test_both_demotion_sites_read_the_demand_accessor():
@@ -201,23 +229,21 @@ def test_both_demotion_sites_read_the_demand_accessor():
         ), f"{name}: layer_kv_bytes is read from {hits[0].strip()!r}, not {plan}.kv_demand_for_layer(l)"
 
 
-def test_no_layer_kv_bytes_input_reads_kv_size_for_layer():
+def test_no_layer_kv_bytes_input_reads_a_partial_figure():
     text = read(BACKEND)
     for m in re.finditer(r"layer_kv_bytes\s*\[[^\]]*\]\s*=\s*([^;]+);", text):
-        assert "kv_size_for_layer" not in m.group(
-            1
-        ), f"a demotion input reads kv_size_for_layer: {m.group(0).strip()!r}"
+        assert not PARTIAL.search(m.group(1)), f"a demotion input reads part of the layer: {m.group(0).strip()!r}"
 
 
 # ---- the readers have a positive control ----
 
 
-def test_planted_size_reader_is_seen():
-    planted = "kv_demotion_in.layer_kv_bytes[l] = plan.kv_size_for_layer(static_cast<uint32_t>(l));"
+def test_planted_partial_reader_is_seen():
+    planted = "kv_demotion_in.layer_kv_bytes[l] = plan.kv_main_size_for_layer(static_cast<uint32_t>(l));"
     hits = re.findall(SITE_RUNTIME, planted)
-    assert (
-        len(hits) == 1 and "kv_size_for_layer" in hits[0]
-    ), "the site reader cannot see a planted kv_size_for_layer read"
+    assert len(hits) == 1 and PARTIAL.search(hits[0]), (
+        "the site reader cannot see a planted kv_main_size_for_layer read"
+    )
 
 
 if __name__ == "__main__":
