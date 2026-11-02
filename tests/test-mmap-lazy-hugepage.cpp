@@ -8,7 +8,7 @@
 // so this maps a small file with one unaligned lazy range and checks each
 // region: far before and far after the range carry "hg", and the range itself,
 // including the pages holding its unaligned ends and the 2 MiB-aligned window
-// round it (llama.cpp-5efe C4 part d: the MADV_RANDOM window of 2 MiB on each
+// round it (docs/design/sycl-mmap-host-tier.md §4.6: the MADV_RANDOM window of 2 MiB on each
 // side, widened outward to 2 MiB), does not.
 //
 // Whether THP is available is decided by a positive control that does not go

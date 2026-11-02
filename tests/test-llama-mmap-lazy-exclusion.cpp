@@ -1,4 +1,4 @@
-// llama_mmap leaves the record's lazy ranges cold (llama.cpp-5efe C4 part d, docs/design/sycl-mmap-host-tier.md §4.6).
+// llama_mmap leaves the record's lazy ranges cold (docs/design/sycl-mmap-host-tier.md §4.6 and §7 C4).
 //
 // The loader maps every model file whole. A lazy (deferred) range of it is read on demand by someone else, so the
 // mapping must not bring those bytes into the page cache: no WILLNEED/SEQUENTIAL over a page that holds a lazy byte,
