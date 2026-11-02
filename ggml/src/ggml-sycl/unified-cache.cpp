@@ -33241,19 +33241,20 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
     return false;
 }
 
-// Records the plan's host figures (th32 §4.2): the stored budget it was made under, its commit terms and their total,
-// read once populate_host_zone_sizing() has set every term. One INFO line names them. A plan whose host bytes exceed
-// the budget logs one would-refuse WARN carrying each term and is kept whole: phase (a) of th32 T2 refuses nothing.
-// The cache supplies the live oneDNN scratch and the chunk size, which the terms keep so a re-plan re-records from the
-// same inputs; a plan made before any cache exists counts the default chunk. A lookup before the device count is known
-// would enumerate the devices, so it is skipped.
-static void record_host_ledger_plan(placement_plan & plan) {
+// Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms and their
+// total, read once populate_host_zone_sizing() has set every term. The budget is an input, never read here: a load
+// passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
+// line names them. A plan whose host bytes exceed the budget logs one would-refuse WARN carrying each term and is kept
+// whole: phase (a) of th32 T2 refuses nothing. The cache supplies the live oneDNN scratch and the chunk size, which
+// the terms keep so a re-plan re-records from the same inputs; a plan made before any cache exists counts the default
+// chunk. A lookup before the device count is known would enumerate the devices, so it is skipped.
+static void record_host_ledger_plan(placement_plan & plan, size_t host_budget) {
     unified_cache * cache =
         g_total_gpu_count > 0 ? get_existing_unified_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
     const size_t onednn_live =
         cache ? cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() : 0;
     const size_t chunk               = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
-    plan.host_budget                 = host_ledger_budget();
+    plan.host_budget                 = host_budget;
     plan.host_zone_terms             = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
     plan.host_planned_bytes          = plan.host_zone_terms.total();
     const host_zone_commit_terms & t = plan.host_zone_terms;
@@ -34090,9 +34091,10 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                       int                                                 device_id,
                                       const placement_kv_info &                           kv_info,
                                       const ggml_sycl_placement_envelope *                envelope,
-                                      int                                                 n_experts) {
+                                      int                                                 n_experts,
+                                      size_t                                              host_budget) {
     return compute_placement_plan(placement_tensor_inventory_from_pairs(tensor_inventory), vram_budget, device_id,
-                                  kv_info, envelope, n_experts);
+                                  kv_info, envelope, n_experts, host_budget);
 }
 
 // The KV phase's per-layer charge (llama.cpp-8ecj): each layer whose dense weights the dense pass put on `device_id`
@@ -34639,7 +34641,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                                       int                                        device_id,
                                       const placement_kv_info &                  kv_info,
                                       const ggml_sycl_placement_envelope *       envelope,
-                                      int                                        n_experts) {
+                                      int                                        n_experts,
+                                      size_t                                     host_budget) {
     if (envelope != nullptr) {
         GGML_LOG_INFO(
             "[PLACEMENT] envelope (from sycl-snapshot): n_ctx=%u n_ubatch=%u n_seq_max=%u flash_attn_type=%s\n",
@@ -35173,7 +35176,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         reject_moe_mmid_workspaces(plan);
     }
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan);
+    record_host_ledger_plan(plan, host_budget);
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
@@ -36087,9 +36090,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          multi_gpu_mode                                      mode,
                                          const placement_kv_info &                           kv_info,
                                          const ggml_sycl_placement_envelope *                envelope,
-                                         int                                                 n_experts) {
+                                         int                                                 n_experts,
+                                         size_t                                              host_budget) {
     return compute_multi_device_plan(device_budgets, placement_tensor_inventory_from_pairs(tensor_inventory), n_layers,
-                                     mode, kv_info, envelope, n_experts);
+                                     mode, kv_info, envelope, n_experts, host_budget);
 }
 
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &         device_budgets,
@@ -36098,12 +36102,13 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          multi_gpu_mode                             mode,
                                          const placement_kv_info &                  kv_info,
                                          const ggml_sycl_placement_envelope *       envelope,
-                                         int                                        n_experts) {
+                                         int                                        n_experts,
+                                         size_t                                     host_budget) {
     // Single device: delegate to existing P4 path
     if (device_budgets.size() <= 1) {
         const int    dev    = device_budgets.empty() ? 0 : device_budgets[0].device_id;
         const size_t budget = device_budgets.empty() ? 0 : device_budgets[0].vram_budget;
-        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, envelope, n_experts);
+        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, envelope, n_experts, host_budget);
     }
 
     const size_t n_devs = device_budgets.size();
@@ -37218,7 +37223,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         reject_moe_mmid_workspaces(plan);
     }
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan);
+    record_host_ledger_plan(plan, host_budget);
 
     plan.build_index();
     publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);

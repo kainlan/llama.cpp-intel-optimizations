@@ -412,7 +412,8 @@ static bool run_moe_triplet_planner_test() {
     const size_t                 bias_bytes               = 3 * 256;
     const size_t                 triplet_bytes_per_expert = 256 + 512 + 768;
     const size_t                 budget                   = bias_bytes + 2 * triplet_bytes_per_expert + 1;
-    auto       plan    = ggml_sycl::compute_placement_plan(inventory, budget, 0, kv_info, nullptr, n_experts);
+    auto       plan    = ggml_sycl::compute_placement_plan(inventory, budget, 0, kv_info, nullptr, n_experts,
+                                                           ggml_sycl::host_ledger_budget());
     const auto summary = plan.summarize_expert_placements(1, n_experts);
 
     if (summary.expected != 12 || summary.planned != summary.expected || summary.duplicates != 0 ||
@@ -470,7 +471,7 @@ static bool run_moe_triplet_planner_test() {
     ggml_sycl::set_expert_popularity_rank(/*layer_id=*/0, /*expert_id=*/1, /*rank=*/3);
 
     auto balanced_plan = ggml_sycl::compute_placement_plan(balanced_inventory, 4 * triplet_bytes_per_expert, 0, kv_info,
-                                                           nullptr, n_experts);
+                                                           nullptr, n_experts, ggml_sycl::host_ledger_budget());
     auto triplet_on_device = [&](int layer_id, int expert_id) {
         const auto gate =
             balanced_plan.lookup_expert_placement(layer_id, expert_id, ggml_sycl::expert_tensor_role::GATE);
@@ -493,7 +494,8 @@ static bool run_moe_triplet_planner_test() {
         { "blk.2.ffn_up_exps.weight",   257 * 2 },
         { "blk.2.ffn_down_exps.weight", 257 * 2 },
     };
-    auto   unaligned_plan = ggml_sycl::compute_placement_plan(unaligned_inventory, 257 * 3 * 2, 0, kv_info, nullptr, 2);
+    auto   unaligned_plan = ggml_sycl::compute_placement_plan(unaligned_inventory, 257 * 3 * 2, 0, kv_info, nullptr, 2,
+                                                              ggml_sycl::host_ledger_budget());
     size_t unaligned_device_triplets = 0;
     for (int e = 0; e < 2; ++e) {
         const auto gate = unaligned_plan.lookup_expert_placement(2, e, ggml_sycl::expert_tensor_role::GATE);
@@ -576,7 +578,8 @@ static bool run_kv_context_room_before_experts_test() {
         return false;
     }
     const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + 2 * kv_extra_layer + 2 * triplet_bytes;
-    const auto   plan   = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
+    const auto   plan   = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts,
+                                                            ggml_sycl::host_ledger_budget());
 
     const size_t placed = plan.weight_vram_bytes + plan.kv_vram_bytes;
     const size_t left   = budget > placed ? budget - placed : 0;
@@ -610,7 +613,8 @@ static bool run_kv_context_room_before_experts_test() {
     }
 
     // No context known: no room, and the same budget puts every expert that fits on the device.
-    const auto unknown = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts);
+    const auto unknown = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts,
+                                                           ggml_sycl::host_ledger_budget());
     if (unknown.kv_context_reserve_bytes != 0 || device_triplets(unknown) != 6 ||
         unknown.kv_context_room_displaced_bytes != 0) {
         printf("FAIL: with no context known the planner holds no room: held %zu, %zu device triplets, want 0 and 6\n",
@@ -621,7 +625,8 @@ static bool run_kv_context_room_before_experts_test() {
     // A context whose KV does not fit beside the dense weights: the room is what is left, and no expert is on the
     // device; the context's overflow is the runtime transaction's to re-place.
     const size_t tight    = 2 * dense_bytes + 2 * kv_at_512 + kv_extra_layer;
-    const auto short_plan = ggml_sycl::compute_placement_plan(inventory(), tight, 0, kv_info(4096), nullptr, n_experts);
+    const auto short_plan = ggml_sycl::compute_placement_plan(inventory(), tight, 0, kv_info(4096), nullptr, n_experts,
+                                                              ggml_sycl::host_ledger_budget());
     if (short_plan.kv_context_reserve_bytes != kv_extra_layer || device_triplets(short_plan) != 0 ||
         short_plan.get_kv_device(1) != 0) {
         printf(
@@ -675,7 +680,8 @@ static ggml_sycl::placement_plan plan(size_t expert_bytes_left, size_t runtime_z
     kv.n_ubatch_context             = 2048;
     kv.explicit_ubatch              = room_with_zone(runtime_zone_bytes);
     const size_t budget             = 2 * dense_bytes + 2 * kv_at_512 + expert_bytes_left;
-    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_experts);
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_experts,
+                                             ggml_sycl::host_ledger_budget());
 }
 
 // Every dense layer, its KV and every routed-expert role on the same device in both plans.
@@ -772,7 +778,7 @@ static bool run_explicit_ubatch_ring_placement_test() {
     // layers, their KV and its bytes are where they were, and the device weights differ by the six moved triplets.
     const auto baseline = ggml_sycl::compute_placement_plan(
         kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
-        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts, ggml_sycl::host_ledger_budget());
     bool dense_kv_same = baseline.kv_vram_bytes == grow.kv_vram_bytes && baseline.kv_host_bytes == grow.kv_host_bytes &&
                          baseline.weight_vram_bytes == grow.weight_vram_bytes + 6 * triplet;
     for (int l = 0; l < 2; ++l) {
@@ -822,7 +828,7 @@ static bool run_explicit_ubatch_ring_placement_test() {
     ggml_sycl::placement_kv_info plain   = kv_order_case::kv_info(0);
     const auto                   unnamed = ggml_sycl::compute_placement_plan(
         kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
-        plain, nullptr, kv_order_case::n_experts);
+        plain, nullptr, kv_order_case::n_experts, ggml_sycl::host_ledger_budget());
     if (unnamed.explicit_ubatch.n_ubatch != 0 || unnamed.explicit_ubatch.action != action::NONE ||
         unnamed.explicit_ubatch.hold_bytes != 0 || kv_order_case::device_triplets(unnamed) != 8) {
         printf("FAIL: no named micro-batch makes no decision: n_ubatch %u, action %s, %zu device triplets\n",
@@ -911,7 +917,7 @@ static bool run_explicit_ubatch_ring_kept_for_smaller_contexts_test() {
     const auto none    = plan(0, zone_default);
     const auto unnamed = ggml_sycl::compute_placement_plan(
         kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
-        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts, ggml_sycl::host_ledger_budget());
     // The rule reads the decision, so each plan must make the one this case names, or the case proves nothing.
     if (placed.explicit_ubatch.action != action::PLACE || placed.explicit_ubatch.n_ubatch != 2048 ||
         grow.explicit_ubatch.action != action::GROW_ZONE || partial.explicit_ubatch.action != action::REFUSE ||
@@ -988,7 +994,8 @@ static bool run_kv_context_room_cost_is_net_test() {
     }
     const size_t left   = triplet_bytes + 2 * small_triplet;
     const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + room_bytes + left;
-    const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv_info(1088), nullptr, n_experts);
+    const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv_info(1088), nullptr, n_experts,
+                                                            ggml_sycl::host_ledger_budget());
     for (int l = 0; l < 2; ++l) {
         for (int e = 0; e < n_experts; ++e) {
             ggml_sycl::set_expert_popularity_rank(l, e, prior_rank[l][e]);
@@ -1070,7 +1077,8 @@ static bool run_explicit_ubatch_cost_is_net_test() {
     }
     const size_t left   = triplet_bytes + 2 * small_triplet;
     const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + left;
-    const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv, nullptr, n_experts);
+    const auto   plan =
+        ggml_sycl::compute_placement_plan(inv, budget, 0, kv, nullptr, n_experts, ggml_sycl::host_ledger_budget());
     for (int l = 0; l < 2; ++l) {
         for (int e = 0; e < n_experts; ++e) {
             ggml_sycl::set_expert_popularity_rank(l, e, prior_rank[l][e]);
@@ -1133,7 +1141,8 @@ static bool run_kv_context_room_follows_the_requested_context_test() {
     const size_t left   = room_2304 + 3 * triplet_bytes + triplet_bytes / 2;
     const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + left;
 
-    const auto requested = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(2304), nullptr, n_experts);
+    const auto requested = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(2304), nullptr, n_experts,
+                                                             ggml_sycl::host_ledger_budget());
     if (requested.kv_context_reserve_bytes != room_2304 || device_triplets(requested) != 3) {
         printf("FAIL: a requested n_ctx 2304 holds %zu bytes (want %zu), %zu device triplets (want 3)\n",
                requested.kv_context_reserve_bytes, room_2304, device_triplets(requested));
@@ -1147,7 +1156,8 @@ static bool run_kv_context_room_follows_the_requested_context_test() {
     }
 
     const size_t no_room_triplets = left / triplet_bytes;  // every triplet that fits what is left: 5 of the 8
-    const auto   none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts);
+    const auto   none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts,
+                                                          ggml_sycl::host_ledger_budget());
     if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 ||
         device_triplets(none) != no_room_triplets) {
         printf(
@@ -1159,9 +1169,10 @@ static bool run_kv_context_room_follows_the_requested_context_test() {
 
     // A hint of 4000 reaches the planner as libllama pads it: 4096, the same room and the same pack as a hint of 4096.
     const uint32_t padded_4000 = GGML_PAD(4000u, 256u);
-    const auto     plan_4000 =
-        ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(padded_4000), nullptr, n_experts);
-    const auto plan_4096 = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
+    const auto     plan_4000 = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(padded_4000), nullptr,
+                                                                 n_experts, ggml_sycl::host_ledger_budget());
+    const auto plan_4096 = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts,
+                                                             ggml_sycl::host_ledger_budget());
     const size_t unpadded_room_4000 = 2 * kv_info(4000).kv_context_extra_bytes_for_layer(0);
     if (padded_4000 != 4096 || plan_4000.kv_context_reserve_bytes != plan_4096.kv_context_reserve_bytes ||
         plan_4000.kv_context_reserve_bytes != 2 * kv_extra_layer ||
@@ -1283,8 +1294,8 @@ static bool run_kv_context_room_is_cost_based_test() {
     //     A = 4096 x 512 B / 30 GB/s = 69.9 us and B = 1.75 MiB x 1/4 / 40 GB/s = 11.5 us on each layer: A > B, both
     //     rooms held (2 x 1.75 MiB), two triplets fit beside them and six without them, so four are displaced. The
     //     fixture's four experts make 1/4 its smallest p_hit; Qwen's 10/512 is smaller still and holds by more.
-    const auto qwen =
-        ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 100.0, 1), nullptr, n_experts);
+    const auto qwen = ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 100.0, 1), nullptr, n_experts,
+                                                        ggml_sycl::host_ledger_budget());
     if (qwen.kv_context_reserve_bytes != 2 * full_room || device_triplets(qwen) != 2 ||
         qwen.kv_context_room_displaced_bytes != 4 * triplet_bytes) {
         printf(
@@ -1299,7 +1310,8 @@ static bool run_kv_context_room_is_cost_based_test() {
 
     // (e) No request: no room, decided before any cost is weighed. Six triplets fit what the dense weights and their KV
     //     leave (2 x 1.75 MiB + 2 x 768 KiB = 5 MiB: six 768 KiB triplets). (b) compares against this plan's set.
-    const auto none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(0, 1.0, 1), nullptr, n_experts);
+    const auto none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(0, 1.0, 1), nullptr, n_experts,
+                                                        ggml_sycl::host_ledger_budget());
     if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 || device_triplets(none) != 6) {
         printf(
             "FAIL: (e) with no requested context no room is held: held %zu, displaced %zu, %zu device triplets "
@@ -1313,8 +1325,8 @@ static bool run_kv_context_room_is_cost_based_test() {
     // (b) GPT-OSS-shaped: a short chat in a large context. F = floor(4096 x 1 / 100) = 40 cells, so
     //     A = 40 x 512 B / 30 GB/s = 0.68 us against B = 11.5 us on each layer: every room is refused, nothing is
     //     held or displaced, and the experts take exactly what they take with no request.
-    const auto gptoss =
-        ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 1.0, 1), nullptr, n_experts);
+    const auto gptoss = ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 1.0, 1), nullptr, n_experts,
+                                                          ggml_sycl::host_ledger_budget());
     if (gptoss.kv_context_reserve_bytes != 0 || gptoss.kv_context_room_displaced_bytes != 0 ||
         device_triplet_set(gptoss) != device_triplet_set(none) || gptoss.get_kv_device(0) != 0 ||
         gptoss.get_kv_device(1) != 0) {
@@ -1347,7 +1359,8 @@ static bool run_kv_context_room_is_cost_based_test() {
         ok = false;
     }
     const size_t mixed_budget = 2 * dense_bytes + 2 * kv_at_512 + swa_room + full_room + 2 * triplet_bytes;
-    const auto   mixed = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, mixed_kv, nullptr, n_experts);
+    const auto   mixed = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, mixed_kv, nullptr, n_experts,
+                                                           ggml_sycl::host_ledger_budget());
     if (mixed.kv_context_reserve_bytes != swa_room || device_triplets(mixed) != 4 ||
         mixed.kv_context_room_displaced_bytes != triplet_bytes || mixed.get_kv_device(0) != 0 ||
         mixed.get_kv_device(1) != 0) {
@@ -1369,7 +1382,8 @@ static bool run_kv_context_room_is_cost_based_test() {
         { "blk.1.attn_q.weight", dense_bytes },
     };
     const size_t dense_budget = 2 * dense_bytes + 2 * kv_at_512 + 2 * full_room;
-    const auto   dense = ggml_sycl::compute_placement_plan(dense_only, dense_budget, 0, moe(4096, 0.01, 1), nullptr, 0);
+    const auto   dense = ggml_sycl::compute_placement_plan(dense_only, dense_budget, 0, moe(4096, 0.01, 1), nullptr, 0,
+                                                           ggml_sycl::host_ledger_budget());
     if (dense.kv_context_reserve_bytes != 2 * full_room) {
         printf("FAIL: (d) a dense model holds every layer's room: held %zu, want %zu\n", dense.kv_context_reserve_bytes,
                2 * full_room);
@@ -1391,7 +1405,8 @@ static bool run_kv_context_room_is_cost_based_test() {
                capped_kv.kv_bytes_for_layer_at(0, 4096), 1536 * cell_bytes);
         ok = false;
     }
-    const auto capped = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, capped_kv, nullptr, n_experts);
+    const auto capped = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, capped_kv, nullptr, n_experts,
+                                                          ggml_sycl::host_ledger_budget());
     if (capped.kv_context_reserve_bytes != 0 || device_triplets(capped) != 5 ||
         capped.kv_context_room_displaced_bytes != 0 || capped.get_kv_device(0) != 0 || capped.get_kv_device(1) != 0) {
         printf(
@@ -1409,17 +1424,20 @@ static bool run_kv_context_room_is_cost_based_test() {
     //     is refused and the six triplets of no request fit. IQ3_XXS reads at 22 GB/s, so B = 20.9 us: held as in
     //     (a). GGML_SYCL_PLAN_CPU_EXPERT_GBPS (cpu_expert_gbps_set) prices every type, so at 40 GB/s the MXFP4 rooms
     //     are held as in (a).
-    const auto mxfp4 = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0,
-                                                         moe(4096, 100.0, 1), nullptr, n_experts);
+    const auto mxfp4 =
+        ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0, moe(4096, 100.0, 1), nullptr,
+                                          n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(g) MXFP4 experts read at 5.6 GB/s refuse every KV context room", mxfp4, 0, 6, 0);
-    const auto iq3 = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0,
-                                                       moe(4096, 100.0, 1), nullptr, n_experts);
+    const auto iq3 =
+        ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0, moe(4096, 100.0, 1), nullptr,
+                                          n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(g) IQ3_XXS experts read at 22 GB/s hold every KV context room", iq3, 2 * full_room, 2,
                 4 * triplet_bytes);
     ggml_sycl::placement_kv_info overridden_kv = moe(4096, 100.0, 1);
     overridden_kv.cpu_expert_gbps_set          = true;
-    const auto overridden = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0,
-                                                              overridden_kv, nullptr, n_experts);
+    const auto overridden =
+        ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0, overridden_kv, nullptr,
+                                          n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(g) the override prices MXFP4 experts at 40 GB/s and holds every KV context room", overridden,
                 2 * full_room, 2, 4 * triplet_bytes);
 
@@ -1445,8 +1463,8 @@ static bool run_kv_context_room_is_cost_based_test() {
         ok = false;
     }
     const size_t indexed_budget = 2 * dense_bytes + kv_at_512 + idx_kv_at_512 + idx_room + 2 * triplet_bytes;
-    const auto   indexed =
-        ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr, n_experts);
+    const auto   indexed        = ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr,
+                                                                    n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(h) the indexer layer pays three splits and holds its KV context room, the other refuses", indexed,
                 idx_room, 2, 3 * triplet_bytes);
     if (indexed.get_kv_device(0) != 0 || indexed.get_kv_device(1) != 0) {
@@ -1454,8 +1472,8 @@ static bool run_kv_context_room_is_cost_based_test() {
         ok = false;
     }
     indexed_kv.host_split_us = 0.0;
-    const auto unsplit =
-        ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr, n_experts);
+    const auto unsplit       = ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr,
+                                                                 n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(h) with no split cost both layers refuse their KV context rooms", unsplit, 0, 5, 0);
 
     // (i) The model's default context (llama.cpp-7fmt). n_ctx_context_is_default prices no expert type without a
@@ -1466,20 +1484,20 @@ static bool run_kv_context_room_is_cost_based_test() {
     //     weighed and held too.
     ggml_sycl::placement_kv_info default_kv = moe(4096, 100.0, 1);
     default_kv.n_ctx_context_is_default     = true;
-    const auto untyped_default =
-        ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr, n_experts);
+    const auto untyped_default = ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr,
+                                                                   n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(i) without -c, unpriced untyped experts refuse every KV context room", untyped_default, 0, 6, 0);
-    const auto q8_default =
-        ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_Q8_0), budget, 0, default_kv, nullptr, n_experts);
+    const auto q8_default = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_Q8_0), budget, 0, default_kv,
+                                                              nullptr, n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(i) without -c, Q8_0 experts (no measured rate) refuse every KV context room", q8_default, 0, 6,
                 0);
-    const auto iq3_default = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0,
-                                                               default_kv, nullptr, n_experts);
+    const auto iq3_default = ggml_sycl::compute_placement_plan(
+        typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0, default_kv, nullptr, n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(i) without -c, measured IQ3_XXS experts are weighed and hold every KV context room", iq3_default,
                 2 * full_room, 2, 4 * triplet_bytes);
     default_kv.cpu_expert_gbps_set = true;
-    const auto overridden_default =
-        ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr, n_experts);
+    const auto overridden_default  = ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr,
+                                                                       n_experts, ggml_sycl::host_ledger_budget());
     expect_room(ok, "(i) without -c, the override prices untyped experts and holds every KV context room",
                 overridden_default, 2 * full_room, 2, 4 * triplet_bytes);
     return ok;
@@ -1531,7 +1549,8 @@ static ggml_sycl::placement_kv_info kv_info(uint64_t staged_types, size_t group_
 }
 
 static ggml_sycl::placement_plan plan_for(size_t budget, uint64_t staged_types, size_t group_cap = 0) {
-    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(staged_types, group_cap), nullptr, n_exps);
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(staged_types, group_cap), nullptr, n_exps,
+                                             ggml_sycl::host_ledger_budget());
 }
 
 static size_t device_triplets(const ggml_sycl::placement_plan & plan) {
@@ -1797,7 +1816,8 @@ static bool run_dense_weights_before_kv_test() {
         { "blk.1.attn_q.weight", dense_bytes },
     };
     const size_t budget = 2 * dense_bytes + kv_at_512;
-    const auto   plan   = ggml_sycl::compute_placement_plan(dense_only, budget, 0, kv_info(0), nullptr, 0);
+    const auto   plan   = ggml_sycl::compute_placement_plan(dense_only, budget, 0, kv_info(0), nullptr, 0,
+                                                            ggml_sycl::host_ledger_budget());
     if (plan.get_layer_device(0) != 0 || plan.get_layer_device(1) != 0) {
         printf("FAIL: KV must never push a dense layer to the host: layer devices %d/%d\n", plan.get_layer_device(0),
                plan.get_layer_device(1));
@@ -1830,7 +1850,7 @@ static bool run_multi_device_layer_block_plan_test() {
     ggml_sycl::placement_kv_info kv_info{};
     kv_info.n_ubatch = 512;
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::LAYER, kv_info,
-                                                     nullptr, 0);
+                                                     nullptr, 0, ggml_sycl::host_ledger_budget());
 
     if (plan.fastest_dense_device != 1 || plan.fastest_dense_score != 4.0) {
         printf("FAIL: expected raw fastest dense device 1, got device=%d score=%.2f\n", plan.fastest_dense_device,
@@ -1896,7 +1916,7 @@ static bool run_multi_device_layer_boundary_metadata_test() {
     ggml_sycl::placement_kv_info kv_info{};
     kv_info.n_ubatch = tokens;
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::LAYER, kv_info,
-                                                     nullptr, 0);
+                                                     nullptr, 0, ggml_sycl::host_ledger_budget());
 
     if (plan.layer_blocks.size() != 2) {
         printf("FAIL: expected two layer blocks after fastest-device capacity spill, got %zu\n",
@@ -1971,7 +1991,7 @@ static bool run_multi_device_moe_i8_executor_support_test() {
     ggml_sycl::placement_kv_info kv_info{};
     kv_info.n_ubatch = 512;
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
-                                                     nullptr, n_experts);
+                                                     nullptr, n_experts, ggml_sycl::host_ledger_budget());
 
     for (int e = 0; e < n_experts; ++e) {
         const auto down = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
@@ -2082,7 +2102,7 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
     kv_info.n_ubatch      = 512;
     kv_info.n_expert_used = 4;
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
-                                                     nullptr, moe_pp_n_experts);
+                                                     nullptr, moe_pp_n_experts, ggml_sycl::host_ledger_budget());
 
     auto has_layout_on_target = [](const ggml_sycl::expert_placement_result & placement, ggml_layout_mode layout) {
         if (placement.layout == layout) {
@@ -2192,8 +2212,9 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
     const std::vector<ggml_sycl::device_budget> tight_devices  = {
         { 0, planned_charge - mib, planned_charge - mib, 4.0, true },
     };
-    auto tight_plan = ggml_sycl::compute_multi_device_plan(
-        tight_devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info, nullptr, moe_pp_n_experts);
+    auto tight_plan =
+        ggml_sycl::compute_multi_device_plan(tight_devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                             nullptr, moe_pp_n_experts, ggml_sycl::host_ledger_budget());
     if (!check_plan_totals(tight_plan, tight_devices[0].vram_budget, "tight")) {
         return false;
     }
@@ -2409,7 +2430,7 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
             { 0, budget, budget, 4.0, true },
         };
         return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
-                                                    nullptr, moe_pp_n_experts);
+                                                    nullptr, moe_pp_n_experts, ggml_sycl::host_ledger_budget());
     };
     auto vram_composed = [](const ggml_sycl::placement_plan & p) {
         return p.weight_vram_bytes + p.kv_vram_bytes + p.kv_context_reserve_bytes + p.moe_mmid_device_pool_bytes;
@@ -2670,7 +2691,7 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
     ggml_sycl::placement_kv_info kv_info{};
     kv_info.n_ubatch = 512;
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
-                                                     nullptr, n_experts);
+                                                     nullptr, n_experts, ggml_sycl::host_ledger_budget());
 
     if (plan.fastest_dense_device != 1) {
         printf("FAIL: expected fastest dense device 1, got %d\n", plan.fastest_dense_device);
@@ -2733,7 +2754,7 @@ static bool run_multi_device_mmid_owner_exposure_test() {
         info.device_count          = exposed;  // total_gpu_count stays 2
         ggml_sycl::test_sycl_info_override_guard info_guard(info);
         return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
-                                                    nullptr, moe_pp_n_experts);
+                                                    nullptr, moe_pp_n_experts, ggml_sycl::host_ledger_budget());
     };
     // Expert entries whose on-device placement, or one of whose alternates, targets `device`.
     auto experts_on = [](const ggml_sycl::placement_plan & plan, int device) {
@@ -3969,8 +3990,8 @@ static bool run_planned_layout_materializable_test() {
         const std::vector<ggml_sycl::placement_tensor_info> inventory = { tensor };
 
         ggml_sycl::placement_kv_info kv_info{};
-        const auto                   plan = ggml_sycl::compute_placement_plan(
-            inventory, 64ull * 1024ull * 1024ull * 1024ull, 0, kv_info, nullptr, (int) n_experts);
+        const auto plan = ggml_sycl::compute_placement_plan(inventory, 64ull * 1024ull * 1024ull * 1024ull, 0, kv_info,
+                                                            nullptr, (int) n_experts, ggml_sycl::host_ledger_budget());
         size_t n_entries = 0;
         for (const ggml_sycl::placement_entry & entry : plan.entries) {
             if (entry.expert_id < 0) {

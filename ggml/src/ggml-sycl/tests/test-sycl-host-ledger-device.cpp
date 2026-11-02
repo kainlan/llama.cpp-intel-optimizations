@@ -1158,12 +1158,14 @@ arm_result fixture_over_budget_warns_and_loads() {
 
     ggml_sycl_test_host_ledger_store_budget(k_roomy_budget);
     log_clear();
-    const placement_plan           roomy       = compute_placement_plan(inventory, 1 * MiB, 0, kv, nullptr, k_experts);
+    const placement_plan roomy =
+        compute_placement_plan(inventory, 1 * MiB, 0, kv, nullptr, k_experts, host_ledger_budget());
     const std::vector<std::string> roomy_warns = log_lines_with("would refuse: host-budget-exceeded");
 
     ggml_sycl_test_host_ledger_store_budget(tiny);
     log_clear();
-    const placement_plan           plan    = compute_placement_plan(inventory, 1 * MiB, 0, kv, nullptr, k_experts);
+    const placement_plan plan =
+        compute_placement_plan(inventory, 1 * MiB, 0, kv, nullptr, k_experts, host_ledger_budget());
     const std::vector<std::string> warns   = log_lines_with("would refuse: host-budget-exceeded");
     const std::vector<std::string> refused = log_lines_with("host-budget-exceeded");
     const std::vector<std::string> lines   = log_lines_with(" plan host_budget=");
@@ -1314,8 +1316,8 @@ arm_result fixture_plan_against_committed() {
             continue;
         }
         placement_kv_info kv{};
-        placement_plan    plan =
-            compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, device, kv, nullptr, k_experts);
+        placement_plan plan = compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, device, kv, nullptr, k_experts,
+                                                     host_ledger_budget());
         if (plan.entries.empty() || plan.weight_host_bytes == 0) {
             void_arm(r, name + ": the starved plan placed nothing on the host");
             continue;
@@ -1430,7 +1432,9 @@ std::string list(const std::vector<size_t> & v) {
 // device loop (the transaction stores at least once per stage run, so twice, and the late plans read the early value
 // less the injected bytes); no current_active_token() check (the direct entry inside the transaction stores); id 0
 // writing the stored transaction (the second direct entry skips its store). A dry run is not in this tree, so the
-// last leg is the planner called outside any scope, which must read B0 and store nothing.
+// last leg is the planner called outside any scope with a budget other than the stored B0: the planner takes the
+// budget as an input (design §4.2), so the plan records the one it was passed and nothing is stored. Mutant: the
+// planner's record reading the stored budget instead of its input (the plan records B0).
 arm_result arm_j_store_order() {
     arm_result   r;
     const size_t n_dev = static_cast<size_t>(ggml_backend_sycl_get_device_count());  // the stage runs' device loop
@@ -1544,12 +1548,15 @@ arm_result arm_j_store_order() {
     expect(r, stores() == s0 + 1, "the second transaction stored " + num(stores() - s0) + " times, want 1");
     (void) ggml_backend_sycl_model_load_end(txn2, false, nullptr);
 
-    // the planner outside any scope reads B0 and stores nothing
+    // the planner outside any scope records the budget it is passed, not the stored B0, and stores nothing
     ggml_sycl_test_host_ledger_store_budget(B0);
     s0 = stores();
     placement_kv_info    kv{};
-    const placement_plan bare = compute_placement_plan(planner_inventory(), 1 * MiB, 0, kv, nullptr, k_experts);
-    expect(r, bare.host_budget == B0, "the planner outside a scope recorded " + num(bare.host_budget) + ", not B0");
+    const uint64_t       passed = 2 * B0;  // a budget other than the stored one
+    const placement_plan bare = compute_placement_plan(planner_inventory(), 1 * MiB, 0, kv, nullptr, k_experts, passed);
+    expect(r, bare.host_budget == passed,
+           "the planner outside a scope recorded " + num(bare.host_budget) + ", not the " + num(passed) +
+               " it was passed (the stored B0 is " + num(B0) + ")");
     expect(r, stores() == s0 && host_ledger_budget() == B0, "the planner outside a scope stored a budget");
     return r;
 }

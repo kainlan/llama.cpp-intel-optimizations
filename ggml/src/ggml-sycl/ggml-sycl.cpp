@@ -17753,9 +17753,9 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 info.device_count, info.total_gpu_count);
         }
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
-        plan_candidate =
-            ggml_sycl::compute_multi_device_plan(budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer),
-                                                 gpu_mode, g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
+        plan_candidate                                    = ggml_sycl::compute_multi_device_plan(
+            budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
+            envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget());
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
             size_t moe_entries = 0;
             size_t xmx_entries = 0;
@@ -17827,7 +17827,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 g_placement_kv_info.explicit_ubatch = {};
             }
             return ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
-                                                     g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
+                                                     g_placement_kv_info, envelope_arg, g_moe_n_experts_total,
+                                                     ggml_sycl::host_ledger_budget());
         };
         // An explicit micro-batch's PP MoE oneDNN scratch ring: the planner holds the RUNTIME room the ring needs
         // against the routed experts. Every stage of the load re-publishes the ring and the dense scratch at the load's

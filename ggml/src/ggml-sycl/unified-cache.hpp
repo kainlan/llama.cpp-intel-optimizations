@@ -2297,18 +2297,24 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
 // planner annotate its log output with explicit source attribution and
 // is the entry point for future planner decisions that need the raw
 // envelope (n_seq_max, flash_attn_type) rather than the derived snapshot.
+// `host_budget` is the host ledger's budget the plan records and is weighed
+// against (th32 §4.2): a load passes host_ledger_budget(), the value its
+// transaction stored, and a caller planning against another budget passes
+// that one. The planner never reads the stored budget itself.
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
                                       const placement_kv_info &                           kv_info,
                                       const ggml_sycl_placement_envelope *                envelope,
-                                      int                                                 n_experts = 0);
+                                      int                                                 n_experts,
+                                      size_t                                              host_budget);
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,
                                       size_t                                     vram_budget,
                                       int                                        device_id,
                                       const placement_kv_info &                  kv_info,
                                       const ggml_sycl_placement_envelope *       envelope,
-                                      int                                        n_experts = 0);
+                                      int                                        n_experts,
+                                      size_t                                     host_budget);
 
 // P4.5: Compute multi-device placement plan for hybrid parallelism.
 // Dense layers use layer parallelism (contiguous ranges per device, proportional to VRAM).
@@ -2322,13 +2328,16 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 // n_experts: experts per MoE layer (0 for dense models).  When > 0,
 //            MoE tensors are split into per-expert entries for fine-grained
 //            per-expert device assignment.
+// host_budget: the host ledger's budget the plan records, as for
+//            compute_placement_plan() above (th32 §4.2).
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &                  device_budgets,
                                          const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                          int                                                 n_layers,
                                          multi_gpu_mode                                      mode,
                                          const placement_kv_info &                           kv_info,
                                          const ggml_sycl_placement_envelope *                envelope,
-                                         int                                                 n_experts = 0);
+                                         int                                                 n_experts,
+                                         size_t                                              host_budget);
 // Recomputes MMID demand against updated planner capacity. If every owner fits
 // the immutable published pools, retains their exact geometry/accounting.
 // Otherwise publishes exact new geometry and checked accounting in `plan`.
@@ -2344,7 +2353,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          multi_gpu_mode                             mode,
                                          const placement_kv_info &                  kv_info,
                                          const ggml_sycl_placement_envelope *       envelope,
-                                         int                                        n_experts = 0);
+                                         int                                        n_experts,
+                                         size_t                                     host_budget);
 
 void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
