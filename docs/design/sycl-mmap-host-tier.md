@@ -3275,8 +3275,9 @@ lifts it into `host_ledger_budget()`.
     Under `-lm mmap+mlock` it stays.
   - "Other host weights (`token_embd`)" moves the same way.
   - The WEIGHT zone term shrinks to the reordered experts' exact bytes plus
-    rnh3's named terms: the 64 MiB `host_compute_reserve` and the TLSF bound. Non-weight host requests move to
-    SCRATCH (§4.4). For Qwen the WEIGHT zone is 64.0 MB (§4.4).
+    rnh3's named terms: the 64 MiB `host_compute_reserve` and the TLSF bound.
+    Non-weight host requests move to SCRATCH (§4.4). For Qwen the WEIGHT zone
+    is 64.0 MB (§4.4).
   - Every "`MemAvailable_pre` needed" row drops by the moved bytes.
     - For Qwen after (s), a HOST table would need about
       180.9 - 99.3 = 81.6 GiB of `MemAvailable_pre` for step 2 plus the table,

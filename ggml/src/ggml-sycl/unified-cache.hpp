@@ -1884,7 +1884,8 @@ struct host_weight_zone_terms {
 
 // The bytes S1-PRELOAD materializes for a host-resident entry. A host weight is copied once, in AOS, with no layout
 // padding: a dense weight's copy is ggml_nbytes(tensor) and an expert's is tensor->nb[2], which are the entry's
-// src_size (the inventory's size is ggml_nbytes, and an expert's is that over ne[2]).
+// src_size (the inventory's size is ggml_nbytes, and an expert's is that over ne[2]), except an unshaped expert row
+// whose own expert count is not the model-wide one (llama.cpp-y5x9).
 size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 
 // The terms over `plan`'s host-resident entries. The one function both planner builders size the WEIGHT zone
