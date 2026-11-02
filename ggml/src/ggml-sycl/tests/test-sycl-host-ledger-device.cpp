@@ -339,8 +339,9 @@ struct ledger_baseline {
 // yielder. Class C is every caller that may hold a lock, so its request carries may_yield = false, the default.
 // Engagement: the same charge with may_yield = true and no lock held does call the yielder and fits, so the refusal is
 // the class's, not an empty yielder's. Mutant: class C passing may_yield = true calls the yielder from under the lock.
-// The witnessed-lock assert of th32 §4.2 is not in this tree, so the lock here is a plain mutex and the arm scores the
-// call count alone.
+// Only the host sample asserts the lock witness (th32 §4.2); the charge path does not, and the lock a class-C charge
+// runs under, g_tensor_inventory_mutex, is a plain mutex the witness never sees. So the lock here is a plain mutex and
+// the arm scores the call count alone.
 arm_result arm_l_class_c_never_yields() {
     arm_result      r;
     ledger_baseline base;
