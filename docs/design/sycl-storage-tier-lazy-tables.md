@@ -2924,8 +2924,9 @@ estimate of it. Its zone terms are the bytes `populate_host_zone_sizing()`
 and `ggml_sycl_configure_host_zones_for_plan()` produce, term for term (§2.3):
 
   the WEIGHT zone: the host weights at their **exact** materialized bytes
-  (`rnh3`: the same function as `ggml_sycl_weight_alloc_bytes`, including
-  layout padding, with **no** ratio), plus `rnh3`'s named terms (the 64 MiB
+  (`rnh3`: `placement_entry_host_weight_bytes()`, the one AOS copy
+  S1-PRELOAD makes of each `PINNED` or `HOST_CPU` host entry, with no
+  layout padding and **no** ratio), plus `rnh3`'s named terms (the 64 MiB
   WEIGHT runtime reserve, `HOST_COMPUTE` requests such as `output_reserve`'s
   logits and the server's prompt-checkpoint reads, and a TLSF fragmentation
   bound derived from the block count)

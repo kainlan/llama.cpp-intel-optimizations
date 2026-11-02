@@ -2842,8 +2842,10 @@ created") describes a path that does not run.
   experts only: 61671 host tensors = 20557 groups x 3 (`run2.log:2824`).
 - `host_zone_weight_bytes = host_weights + host_compute_reserve +
   layout_copies + tlsf_bound` (`placement_plan_host_weight_zone_terms()`).
-  Once its walk counts only pinned-backed entries (th32 Task 2's backing),
-  host_weights is 0 and no host blocks remain, so the zone is the 64 MiB
+  Its walk counts the entries `weight_host_bytes` charges, those backed
+  `PINNED` or `HOST_CPU`
+  (`placement_plan::host_backing_sizes_weight_zone()`). Here that is none,
+  so host_weights is 0 and no host blocks remain: the zone is the 64 MiB
   `host_compute_reserve` plus a TLSF bound of 0, and nothing else reaches
   WEIGHT. So `[HOST-ARENA] configured zones: WEIGHT=` reads **64.0 MB**,
   against 122924.2 MB in the baseline (`run2.log:2893`).
