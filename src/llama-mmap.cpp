@@ -25,6 +25,10 @@
     #endif
 #endif
 
+#ifdef __linux__
+#    include <sys/sysmacros.h>
+#endif
+
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
     #ifndef NOMINMAX
@@ -460,6 +464,38 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 
     return res;
 }
+
+// The width of the MADV_RANDOM window on each side of a lazy range: at least twice the reach of a synchronous mmap
+// read-around, which is centred on the fault, reaches ra_pages/2 each way, and is doubled by POSIX_FADV_SEQUENTIAL.
+// ra_pages is the backing device's read_ahead_kb. On Linux that is read from /sys (a whole disk or a filesystem with
+// its own bdi is /sys/class/bdi/MAJ:MIN, a partition shares its disk's, one directory up). Where it cannot be read
+// the window is 2 MiB, which is already sixteen times the 128 KiB default.
+static size_t lazy_window_bytes(int fd) {
+    const size_t floor_bytes = 2u * 1024 * 1024;
+#    ifdef __linux__
+    struct stat st = {};
+    if (fstat(fd, &st) == 0) {
+        char paths[2][160];
+        snprintf(paths[0], sizeof(paths[0]), "/sys/class/bdi/%u:%u/read_ahead_kb", major(st.st_dev), minor(st.st_dev));
+        snprintf(paths[1], sizeof(paths[1]), "/sys/dev/block/%u:%u/../bdi/read_ahead_kb", major(st.st_dev),
+                 minor(st.st_dev));
+        for (const char * path : paths) {
+            FILE *     f  = fopen(path, "r");
+            long       kb = -1;
+            const bool ok = f != nullptr && fscanf(f, "%ld", &kb) == 1 && kb >= 0;
+            if (f != nullptr) {
+                fclose(f);
+            }
+            if (ok) {
+                return std::max(floor_bytes, 2u * (size_t) kb * 1024);
+            }
+        }
+    }
+#    else
+    (void) fd;
+#    endif
+    return floor_bytes;
+}
 #endif
 
 struct llama_mmap::impl {
@@ -485,7 +521,7 @@ struct llama_mmap::impl {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
-        // page-aligned madvise over [beg, end), clamped to the file
+        // page-aligned madvise over [beg, end), clamped to the file: outward, for advice that may cover a whole page
         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
             const size_t page_size = sysconf(_SC_PAGESIZE);
             beg = beg & ~(page_size - 1);
@@ -498,17 +534,53 @@ struct llama_mmap::impl {
             }
         };
 
+        // the same, inward: only the whole pages of [beg, end). A page that holds a byte outside the range is not
+        // touched, so a range that ends at a lazy byte never advises the page it shares with it. The end of the file
+        // is the one end that stays.
+        auto advise_inward = [&](size_t beg, size_t end, int advice, const char * name) {
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            beg                    = (beg + page_size - 1) & ~(page_size - 1);
+            end                    = end >= file->size() ? file->size() : end & ~(page_size - 1);
+            if (beg >= end) {
+                return;
+            }
+            if (posix_madvise((char *) addr + beg, end - beg, advice)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., %s) failed: %s\n", name, strerror(errno));
+            }
+        };
+
+        // A lazy range is read on demand by someone else, so nothing here may bring it into the page cache. Each one
+        // gets a window [lazy_begin - W, lazy_end + W) clamped to the file: the whole window is POSIX_MADV_RANDOM,
+        // because a mmap read-around is centred on the fault and a neighbouring page's fault would read into the
+        // range from either side. The window widened outward to 2 MiB alignment is kept off MADV_HUGEPAGE and
+        // advised MADV_NOHUGEPAGE: a fault in a VM_HUGEPAGE area reads a whole 2 MiB folio, and the kernel tests
+        // VM_HUGEPAGE before VM_RAND_READ, so a RANDOM window inside a hugepage area does nothing.
+        const size_t window   = lazy_window_bytes(fd);
+        const size_t thp_size = 2u * 1024 * 1024;
+        ranges       random_windows;
+        ranges       huge_windows;
+        for (const auto & range : lazy_ranges) {
+            if (range.first >= range.second || range.first >= file->size()) {
+                continue;
+            }
+            const size_t beg = range.first > window ? range.first - window : 0;
+            const size_t end = std::min(range.second + window, file->size());
+            random_windows.emplace_back(beg, end);
+            huge_windows.emplace_back(beg & ~(thp_size - 1),
+                                      std::min((end + thp_size - 1) & ~(thp_size - 1), file->size()));
+        }
+
 #ifdef __linux__
         // Async readahead: trigger kernel page cache population without blocking.
         // MADV_SEQUENTIAL optimizes VM for sequential access (aggressive readahead,
         // early page reclaim). MADV_WILLNEED initiates async read of pages into cache.
         // Together they eliminate on-demand page faults during tensor data access.
-        // Lazy ranges (TENSOR_READ_LAZY) are excluded: they are read on demand,
-        // and are advised POSIX_MADV_RANDOM below.
+        // Lazy ranges (TENSOR_READ_LAZY) are excluded, rounded inward so that the page a lazy range shares with its
+        // neighbour is not read either: they are read on demand, and are advised POSIX_MADV_RANDOM below.
         if (prefetch && !numa) {
             for (const auto & range : ranges_complement(lazy_ranges, file->size())) {
-                advise(range.first, range.second, POSIX_MADV_SEQUENTIAL, "POSIX_MADV_SEQUENTIAL");
-                advise(range.first, range.second, POSIX_MADV_WILLNEED,   "POSIX_MADV_WILLNEED");
+                advise_inward(range.first, range.second, POSIX_MADV_SEQUENTIAL, "POSIX_MADV_SEQUENTIAL");
+                advise_inward(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
 
@@ -516,17 +588,22 @@ struct llama_mmap::impl {
         // With 2MB pages, a 3.9GB model needs ~2000 pages (fits in L2 TLB) vs ~1M 4KB pages.
         // Requires THP in "madvise" or "always" mode. Returns EINVAL when THP is "never".
         // Skip for NUMA: THP can merge pages across NUMA boundaries, defeating locality.
-        // Not over the lazy ranges either: a fault in a VM_HUGEPAGE area reads a whole
-        // 2 MiB folio before POSIX_MADV_RANDOM is honoured, so each on-demand row read
-        // would pull 2 MiB. Each range is shrunk to whole pages so that no page holding
-        // lazy bytes is advised.
+        // Not over the lazy windows: the complement of the 2 MiB-aligned windows starts and ends on a 2 MiB boundary
+        // (or the file's ends), and the windows themselves are advised MADV_NOHUGEPAGE, which also holds where THP
+        // is "always" and a VMA is huge unless told otherwise.
         if (!numa) {
             const size_t page_size = sysconf(_SC_PAGESIZE);
-            for (const auto & range : ranges_complement(lazy_ranges, file->size())) {
+            for (const auto & range : ranges_complement(huge_windows, file->size())) {
                 const size_t beg = (range.first + page_size - 1) & ~(page_size - 1);
                 const size_t end = range.second == file->size() ? range.second : range.second & ~(page_size - 1);
                 if (beg < end && madvise((char *) addr + beg, end - beg, MADV_HUGEPAGE)) {
                     LLAMA_LOG_WARN("warning: madvise(MADV_HUGEPAGE) failed: %s\n", strerror(errno));
+                    break;
+                }
+            }
+            for (const auto & range : huge_windows) {
+                if (madvise((char *) addr + range.first, range.second - range.first, MADV_NOHUGEPAGE)) {
+                    LLAMA_LOG_WARN("warning: madvise(MADV_NOHUGEPAGE) failed: %s\n", strerror(errno));
                     break;
                 }
             }
@@ -535,10 +612,10 @@ struct llama_mmap::impl {
 
         if (prefetch > 0) {
             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
-                advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
+                advise_inward(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
-        for (const auto & range : lazy_ranges) {
+        for (const auto & range : random_windows) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
         if (numa) {

@@ -6,8 +6,10 @@
 //
 // The kernel reports the advice per VMA in /proc/self/smaps ("hg" in VmFlags),
 // so this maps a small file with one unaligned lazy range and checks each
-// region: before and after the range carry "hg", and the range itself,
-// including the pages holding its unaligned ends, does not.
+// region: far before and far after the range carry "hg", and the range itself,
+// including the pages holding its unaligned ends and the 2 MiB-aligned window
+// round it (llama.cpp-5efe C4 part d: the MADV_RANDOM window of 2 MiB on each
+// side, widened outward to 2 MiB), does not.
 //
 // Whether THP is available is decided by a positive control that does not go
 // through llama_mmap: the test maps the file itself and advises it
@@ -35,7 +37,8 @@
 #include <string>
 #include <vector>
 
-static const size_t MiB = 1024 * 1024;
+static const size_t MiB       = 1024 * 1024;
+static const size_t FILE_SIZE = 20 * MiB;
 
 // VmFlags of the VMA that contains `p`, or "" when no VMA or no VmFlags line
 // for it was found
@@ -64,30 +67,30 @@ static bool has_hugepage(const std::string & flags) {
 int main() {
     char      path[] = "/tmp/test-mmap-lazy-hugepage-XXXXXX";
     const int fd     = mkstemp(path);
-    if (fd < 0 || ftruncate(fd, 8 * MiB) != 0) {
-        fprintf(stderr, "FAIL: could not create an 8 MiB temp file\n");
+    if (fd < 0 || ftruncate(fd, FILE_SIZE) != 0) {
+        fprintf(stderr, "FAIL: could not create a 20 MiB temp file\n");
         return 1;
     }
 
     // positive control: can this kernel mark a file mapping VM_HUGEPAGE at all?
     {
-        void * ctl = mmap(nullptr, 8 * MiB, PROT_READ, MAP_SHARED, fd, 0);
+        void * ctl = mmap(nullptr, FILE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
         if (ctl == MAP_FAILED) {
             fprintf(stderr, "FAIL: could not map the temp file for the THP control\n");
             close(fd);
             unlink(path);
             return 1;
         }
-        if (madvise(ctl, 8 * MiB, MADV_HUGEPAGE) != 0) {
+        if (madvise(ctl, FILE_SIZE, MADV_HUGEPAGE) != 0) {
             printf("SKIP: madvise(MADV_HUGEPAGE) failed on the control mapping (THP unavailable): %s\n",
                    strerror(errno));
-            munmap(ctl, 8 * MiB);
+            munmap(ctl, FILE_SIZE);
             close(fd);
             unlink(path);
             return LLAMA_TEST_EXIT_SKIP;
         }
         const std::string ctl_flags = vm_flags_at(ctl);
-        munmap(ctl, 8 * MiB);
+        munmap(ctl, FILE_SIZE);
         if (ctl_flags.empty()) {
             fprintf(stderr, "FAIL: no VmFlags line for the control mapping in /proc/self/smaps\n");
             close(fd);
@@ -103,8 +106,9 @@ int main() {
     }
     close(fd);
 
-    const size_t lazy_beg = 2 * MiB + 100;
-    const size_t lazy_end = 5 * MiB + 7;
+    // the window is [4 MiB + 100, 11 MiB + 7) widened to [4 MiB, 12 MiB)
+    const size_t lazy_beg = 6 * MiB + 100;
+    const size_t lazy_end = 9 * MiB + 7;
 
     int n_failures = 0;
     {
@@ -123,11 +127,17 @@ int main() {
         };
 
         const probe probes[] = {
-            { "before the lazy range",        0,            true  },
-            { "first byte of the lazy range", lazy_beg,     false },
-            { "middle of the lazy range",     3 * MiB,      false },
-            { "last byte of the lazy range",  lazy_end - 1, false },
-            { "after the lazy range",         6 * MiB,      true  },
+            { "before the window",            0,               true  },
+            { "just before the window",       4 * MiB - 4096,  true  },
+            { "window start",                 4 * MiB,         false },
+            { "next to the lazy start",       lazy_beg - 4096, false },
+            { "first byte of the lazy range", lazy_beg,        false },
+            { "middle of the lazy range",     7 * MiB,         false },
+            { "last byte of the lazy range",  lazy_end - 1,    false },
+            { "next to the lazy end",         lazy_end + 4096, false },
+            { "last page of the window",      12 * MiB - 4096, false },
+            { "just after the window",        12 * MiB,        true  },
+            { "after the window",             15 * MiB,        true  },
         };
         for (const probe & pr : probes) {
             const std::string flags = vm_flags_at(base + pr.off);
