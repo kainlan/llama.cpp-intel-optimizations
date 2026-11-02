@@ -18,7 +18,7 @@ neither does a transaction store of the fact; F4 pins their absence, and F1, F6 
 replace it (set at both populate sites, read by the planner).
 
 The fact and the ABI
-  F1. ggml_sycl_tensor_inventory carries use_mmap_resolved, use_mlock_resolved and host_dense_repacked in the padding
+  F1. ggml_sycl_tensor_inventory carries use_mmap_resolved, use_mlock_resolved and host_weight_layout_cpu in the padding
       after n_ctx_context_is_default (offsets 185-187, so the struct stays 192 bytes and n_ubatch_context stays at
       188), and both static_assert blocks pin the three offsets;
   F2. the four new exports (the renamed staging proc ggml_backend_sycl_stage_load_inventory_plan, planned_host_backing,
@@ -35,7 +35,7 @@ The fact and the ABI
       test does not require the staging proc, so that backend is refused instead of loaded as a non-SYCL model;
   F6. the staging path derives the fact once: populate_inventory_globals sets load_maps_files =
       inventory->use_mmap_resolved && file_mapping_supported(), load_locks_files = load_maps_files &&
-      inventory->use_mlock_resolved, and copies host_dense_repacked; nothing else reads use_mmap_resolved;
+      inventory->use_mlock_resolved, and copies host_weight_layout_cpu; nothing else reads use_mmap_resolved;
   F7. planned_host_backing answers from the bound load's staged plan only: the plan's fact first
       (host_backing_maps_files), then the dense entry's backing, then the transaction default FILE_MAPPED. A plan
       another model published never answers for this load;
@@ -191,10 +191,10 @@ def struct_body(text: str, name: str) -> str:
 # ---- the fact and the ABI ----
 
 
-INVENTORY_FIELDS = ("use_mmap_resolved", "use_mlock_resolved", "host_dense_repacked")
-INVENTORY_OFFSETS = {"use_mmap_resolved": 185, "use_mlock_resolved": 186, "host_dense_repacked": 187}
+INVENTORY_FIELDS = ("use_mmap_resolved", "use_mlock_resolved", "host_weight_layout_cpu")
+INVENTORY_OFFSETS = {"use_mmap_resolved": 185, "use_mlock_resolved": 186, "host_weight_layout_cpu": 187}
 # The fact as the builders read it: derived by the staging path, never published.
-KV_FACT_FIELDS = ("load_maps_files", "load_locks_files", "host_dense_repacked")
+KV_FACT_FIELDS = ("load_maps_files", "load_locks_files", "host_weight_layout_cpu")
 # A second source for the fact: the hook and the transaction store the ruled ABI does without.
 SECOND_SOURCE_NAMES = ("set_load_maps_files", "lifecycle_publish_load_host_backing", "lifecycle_find_load_host_backing",
                        "lifecycle_load_host_backing", "g_lifecycle_load_host_backings")
@@ -324,9 +324,9 @@ def clause_f6_fact_derived_once(t: dict) -> list:
     if not re.search(r"g_placement_kv_info\s*\.\s*load_locks_files\s*=\s*g_placement_kv_info\s*\.\s*load_maps_files\s*"
                      r"&&\s*inventory\s*->\s*use_mlock_resolved\s*;", pop):
         problems.append("the staging path does not derive load_locks_files = load_maps_files && use_mlock_resolved")
-    if not re.search(r"g_placement_kv_info\s*\.\s*host_dense_repacked\s*=\s*inventory\s*->\s*host_dense_repacked\s*;",
-                     pop):
-        problems.append("the staging path does not copy libllama's resolved host_dense_repacked")
+    if not re.search(r"g_placement_kv_info\s*\.\s*host_weight_layout_cpu\s*=\s*"
+                     r"inventory\s*->\s*host_weight_layout_cpu\s*;", pop):
+        problems.append("the staging path does not copy libllama's resolved host_weight_layout_cpu")
     readers = len(re.findall(r"\buse_mmap_resolved\b", t[GS]))
     asserts = len(re.findall(r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)", t[GS]))
     if readers - asserts != 1:
@@ -407,7 +407,7 @@ def clause_l2_inputs_reach_both_inventories(t: dict) -> list:
     for needle, why in (
         (r"inventory\s*\.\s*use_mmap_resolved\s*=\s*ml\s*\.\s*use_mmap\s*;", "the resolved use_mmap"),
         (r"inventory\s*\.\s*use_mlock_resolved\s*=\s*use_mlock\s*;", "the resolved use_mlock"),
-        (r"inventory\s*\.\s*host_dense_repacked\s*=\s*llama_model_loader::host_dense_repacked\s*\(\s*\)\s*;",
+        (r"inventory\s*\.\s*host_weight_layout_cpu\s*=\s*llama_model_loader::host_weight_layout_cpu\s*\(\s*\)\s*;",
          "the resolved host weight layout"),
     ):
         if not re.search(needle, setter):
@@ -660,7 +660,7 @@ def clause_p1_derivation_sites(t: dict) -> list:
         if not re.search(r"plan\s*\.\s*host_mapped_locked\s*=", body):
             problems.append(f"{builder} does not copy the lock into the plan")
     rule = body_of(ucc, r"static\s+placement_host_backing\s+placement_host_backing_when_host\s*\(")
-    for needle in ("load_maps_files", "host_dense_repacked", "placement_host_backing::CPU_OWNED",
+    for needle in ("load_maps_files", "host_weight_layout_cpu", "placement_host_backing::CPU_OWNED",
                    "placement_host_backing::FILE_MAPPED", "placement_host_backing::PINNED"):
         if needle not in rule:
             problems.append(f"placement_host_backing_when_host does not read {needle}")

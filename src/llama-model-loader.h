@@ -92,6 +92,14 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+
+    // Set once load_tensors() has staged this load's early SYCL plan, which holds the host-backing fact (design 5efe
+    // §4.3). false on a load with no SYCL transaction, or before the plan, which keeps today's use_mmap answers.
+    bool sycl_load_plan_staged = false;
+
+    // Each SYCL_Mapped buffer's base file offset: a tensor at file offset offs lives at base + (offs - this).
+    std::unordered_map<ggml_backend_buffer_t, uint64_t> sycl_mapped_base_offsets;
+
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
@@ -286,6 +294,19 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // Whether this SYCL load maps its model files: the fact on the bound load's staged plan, which the staging proc
+    // derived from the inventory's resolved use_mmap (design 5efe §4.3). false before the plan is staged.
+    bool sycl_load_maps_files() const;
+
+    // Whether a weight in `buft` is served from the model file's mapping: the staged plan's fact for a SYCL buffer
+    // type, use_mmap otherwise. create_tensor never consults use_mmap for a SYCL weight (design 5efe §4.3).
+    bool weight_maps_files(ggml_backend_buffer_type_t buft) const;
+
+    // Whether GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu, the default, where a planner-host dense weight is repacked
+    // into a CPU-owned buffer rather than read in the file layout (=plain, =off). Carried in the inventory, so the
+    // planner charges the backing this loader binds instead of reading the variable itself.
+    static bool host_weight_layout_cpu();
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

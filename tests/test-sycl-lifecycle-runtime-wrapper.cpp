@@ -1063,7 +1063,7 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_execution_context_finish_drain)
     LOAD_SYCL(ggml_backend_sycl_execution_session_begin_reset)
     LOAD_SYCL(ggml_backend_sycl_execution_session_finish_reset)
-    LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
+    LOAD_SYCL(ggml_backend_sycl_stage_load_inventory_plan)
     using stage_inventory_failpoint_fn = void (*)();
     auto ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn =
         reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
@@ -1403,7 +1403,7 @@ int main() {
     poisoned_envelope.n_seq_max       = 1;
     poisoned_envelope.flash_attn_type = -1;
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&poisoned_abort) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&poisoned_inventory, &poisoned_envelope, false) !=
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&poisoned_inventory, &poisoned_envelope, false) !=
             GGML_SYCL_LIFECYCLE_OK) {
         std::fprintf(stderr, "poisoned abort setup failed\n");
         return 1;
@@ -1445,7 +1445,7 @@ int main() {
         return 1;
     }
     fail_stage_early_after_first_device();
-    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) == GGML_SYCL_LIFECYCLE_OK ||
+    if (CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, true) == GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
         std::fprintf(stderr, "early stage_inventory_plan did not fail closed\n");
         return 1;
@@ -1459,7 +1459,8 @@ int main() {
         return 1;
     }
     fail_stage_late_after_first_device();
-    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK ||
+    if (CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) ==
+            GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
         std::fprintf(stderr, "late stage_inventory_plan did not fail closed\n");
         return 1;
@@ -1509,8 +1510,10 @@ int main() {
                          "L4 ledger: a transaction that is not the open load compared against another load's term\n");
             return 1;
         }
-        if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
-            CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        if (CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, true) !=
+                GGML_SYCL_LIFECYCLE_OK ||
+            CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) !=
+                GGML_SYCL_LIFECYCLE_OK ||
             CALL_SYCL(ggml_backend_sycl_model_load_end)(l4_commit, true, &l4_token) != GGML_SYCL_LIFECYCLE_OK ||
             l4_token.model_id == 0) {
             std::fprintf(stderr, "L4 ledger: the commit failed\n");
@@ -1567,8 +1570,9 @@ int main() {
     ggml_sycl_load_txn    committed{};
     ggml_sycl_model_token token{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&committed) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) !=
+            GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_model_load_end)(committed, true, &token) != GGML_SYCL_LIFECYCLE_OK ||
         token.model_id == 0) {
         std::fprintf(stderr, "runtime no-allocation commit failed\n");
@@ -1611,7 +1615,8 @@ int main() {
     ggml_sycl_load_txn quarantine_txn{};
     ggml_sycl_model_token quarantine_token{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&quarantine_txn) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) !=
+            GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_model_load_end)(quarantine_txn, true, &quarantine_token) !=
             GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_model_quarantine_token)(quarantine_token) != GGML_SYCL_LIFECYCLE_OK ||
@@ -1700,8 +1705,8 @@ int main() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_end"));
     auto unload_again = reinterpret_cast<decltype(&ggml_backend_sycl_model_unloaded_token)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token"));
-    auto stage_again = reinterpret_cast<decltype(&ggml_backend_sycl_stage_inventory_plan)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_inventory_plan"));
+    auto stage_again = reinterpret_cast<decltype(&ggml_backend_sycl_stage_load_inventory_plan)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_load_inventory_plan"));
     auto authority_again = reinterpret_cast<decltype(&ggml_backend_sycl_has_active_placement_plan)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_has_active_placement_plan"));
     ggml_sycl_load_txn reload_txn{};

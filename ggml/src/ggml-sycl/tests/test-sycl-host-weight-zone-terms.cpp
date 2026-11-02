@@ -25,7 +25,8 @@
 // One tenant of the zone is not a term: unplanned loader residency, the model loader's SYCL_Host buffer, which holds
 // every weight the loader reads (role WEIGHT, category HOST_COMPUTE, from the buffer type the loader adds to a SYCL
 // device's list when weights are evictable). Planning it would plan a duplicate copy of the weights, the defect the
-// mapped host tier (SYCL_Mapped) removes, so the class is expected to read zero once that tier lands.
+// mapped host tier (SYCL_Mapped) removes: where that tier exists the default load binds SYCL_Mapped, whose bytes are
+// the file's pages outside every host zone, so the class reads zero there.
 //
 // Arm 1 (no model, no device: the real planner over a synthetic Q2_K-shaped inventory, under a mocked device table)
 // asserts, for both planner builders, that the WEIGHT size is exactly the sum of those terms and is not the 1.2x
@@ -747,17 +748,23 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
     check(census.used() - used_before <= plan.host_zone_weight_bytes, "the terms fit the planned WEIGHT zone");
 
     // The unplanned class: the loader's own buffer, through that same buffer type, sized as the loader sizes it,
-    // every weight it reads. Once the mapped host tier replaces that buffer type, the buffer no longer lands in WEIGHT
-    // and this class reads zero.
-    const size_t          loader_requested = tensors.total();
-    ggml_backend_buffer_t loader_buf       = nullptr;
-    size_t                loader_grew_by   = 0;
-    if (host_buft != nullptr) {
+    // every weight it reads. Where the mapped host tier exists, the default load binds SYCL_Mapped instead
+    // (sycl-host-memory-design §4.3): the weights are the file's pages, SYCL_Host never takes them, and the class
+    // reads zero without an allocation. A load under -lm none still takes the SYCL_Host buffer, which this arm
+    // measures where the tier does not exist.
+    const bool            loader_maps_files = file_mapping_supported();
+    const size_t          loader_requested  = tensors.total();
+    ggml_backend_buffer_t loader_buf        = nullptr;
+    size_t                loader_grew_by    = 0;
+    if (host_buft != nullptr && !loader_maps_files) {
         const size_t capacity_pre = cache.host_zone_capacity(host_zone_id::WEIGHT);
         loader_buf                = take_buffer(weight_class::LOADER_RESIDENCY, host_buft, loader_requested);
         loader_grew_by            = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
     }
     const size_t loader_bytes = census.bytes(weight_class::LOADER_RESIDENCY);
+    if (loader_maps_files) {
+        check_eq("unplanned loader residency where the loader binds SYCL_Mapped", loader_bytes, 0);
+    }
 
     check_eq("WEIGHT bytes in neither a named term nor unplanned loader residency", census.unclassed_bytes, 0);
     check_eq("every WEIGHT byte gained is accounted to a class", census.used() - used_before,
@@ -766,7 +773,10 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         "  census terms: host_weights=%zu (term %zu + tlsf %zu) host_compute_reserve=%zu (term %zu) blocks=%zu\n",
         host_weights_bytes, t.host_weights, t.blocks * k_tlsf_grain, reserve_bytes, k_host_compute_reserve_bytes,
         t.blocks);
-    if (host_buft == nullptr) {
+    if (loader_maps_files) {
+        std::printf("  unplanned loader_residency=0 B (the loader binds SYCL_Mapped: %zu B of file pages)\n",
+                    loader_requested);
+    } else if (host_buft == nullptr) {
         std::printf("  unplanned loader_residency=0 B (the loader adds no SYCL_Host buffer type here)\n");
     } else if (loader_buf == nullptr) {
         std::printf("  unplanned loader_residency=0 B (the loader's %zu B buffer was refused)\n", loader_requested);

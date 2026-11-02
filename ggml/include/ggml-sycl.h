@@ -104,6 +104,46 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(v
 // NULL for foreign/stale devices; never falls back to a default device.
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev);
 
+// The mapped host buffer type for a SYCL device (design 5efe §4.3), named "SYCL_Mapped". A weight in it lives in the
+// model file's mapping: is_host is true so the CPU backend executes ops on it, it is read-only (set_tensor,
+// memset_tensor and clear abort, naming the tensor), and its buffers come only from
+// ggml_backend_sycl_mapped_buffer_from_file; alloc_buffer serves only the zero-size dummy of a memory-fit pass.
+// NULL for a device that is not a current SYCL device.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_mapped_buffer_type_for_device(ggml_backend_dev_t dev);
+
+// A weight tensor's byte range in a model file, as the loader read it from the GGUF.
+struct ggml_sycl_mapped_tensor_range {
+    const char * name;
+    uint64_t     file_offset;
+    uint64_t     size;
+};
+
+// A range of a model file, [file_offset, file_offset + length).
+struct ggml_sycl_file_range {
+    uint64_t file_offset;
+    uint64_t length;
+};
+
+// Maps one model file's slice for a SYCL_Mapped context through the unified cache's file-mapping tier
+// (design 5efe §4.3, §5.1). The reservation spans the tensors' ranges; the mapped segments are their page-aligned
+// union with every lazy range left out (lazy_ranges is the loader's excluded_for_file(file_idx)), and a tensor that
+// overlaps a lazy range is refused. Host-executed tensors are advised WILLNEED, the lazy edges RANDOM, and under
+// -lm mmap+mlock the host-executed segments are locked; a lock failure refuses the load, naming errno, the bytes and
+// RLIMIT_MEMLOCK. fd is the loader's descriptor, which the tier duplicates. The buffer's base is the address of file
+// offset *out_base_file_offset (the reservation's first page), so a tensor at file offset offs lives at
+// base + (offs - *out_base_file_offset). NULL when the build has no tier, the bound load's staged plan does not map
+// files, or the mapping is refused (the reason is logged).
+GGML_BACKEND_API ggml_backend_buffer_t
+ggml_backend_sycl_mapped_buffer_from_file(ggml_backend_dev_t                           dev,
+                                          uint32_t                                     file_idx,
+                                          int                                          fd,
+                                          uint64_t                                     file_size,
+                                          const struct ggml_sycl_mapped_tensor_range * tensor_ranges,
+                                          size_t                                       n_tensor_ranges,
+                                          const struct ggml_sycl_file_range *          lazy_ranges,
+                                          size_t                                       n_lazy_ranges,
+                                          uint64_t *                                   out_base_file_offset);
+
 // Dedicated pinned-host buffer type for runtime-demoted KV layers (distinct
 // identity/name "SYCL_KV_Host" from the generic host buft above, so the
 // structural residency decline and diagnostics key on exactly this buft
@@ -377,10 +417,30 @@ struct ggml_sycl_tensor_inventory {
     // before this field passes a 184-byte object, and libggml-sycl would read this byte past its end. libllama and
     // libggml-sycl must be rebuilt together.
     bool                           n_ctx_context_is_default;
+    // What only libllama knows about this load's storage (design 5efe §4.3), as libllama resolved it: these are inputs,
+    // not the load's host-backing fact. use_mmap_resolved: libllama's use_mmap after -lm and the device caps (an iGPU
+    // in the device set forces it off). use_mlock_resolved: -lm mlock or mmap+mlock. The staging proc derives the fact
+    // from them once, load_maps_files = use_mmap_resolved && the file-mapping tier exists in this build, and the plan
+    // holds it.
+    // host_weight_layout_cpu: true iff libllama resolved GGML_SYCL_HOST_WEIGHT_LAYOUT to cpu, its default, where
+    // ggml-cpu repacks a planner-host dense weight into a buffer of its own, the state the planner backs CPU_OWNED
+    // (§4.4); false is plain or off. It mirrors libllama's three-valued resolver, host_weight_layout() in
+    // llama-model-loader.cpp, which is that variable's only reader, so the planner takes libllama's answer instead of
+    // reading the environment a second time. A bool suffices: the planner tells apart only a dense weight ggml-cpu
+    // repacks from one the CPU reads in the file layout, and plain and off both read the file layout. They differ only
+    // in the buffer libllama binds on a load that maps no files, where the plan backs every host weight PINNED.
+    // The three sit in the padding after n_ctx_context_is_default (offsets 185-187), so the struct stays 192 bytes. A
+    // libllama built before them leaves those bytes unspecified, which is safe only because the staging proc that reads
+    // them is exported under a new name (ggml_backend_sycl_stage_load_inventory_plan): such a libllama resolves the old
+    // name, whose stub refuses the load, and never reaches a reader of these bytes. libllama and libggml-sycl must be
+    // rebuilt together.
+    bool                           use_mmap_resolved;
+    bool                           use_mlock_resolved;
+    bool                           host_weight_layout_cpu;
     // The micro-batch the caller named for the context it is about to create (llama_model_params::n_ubatch_hint);
     // 0 = none named, which includes a micro-batch the backend picks itself. When it is above n_ubatch, the planner
     // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
-    // host tier for the room, as it re-places KV that does not fit. It sits in the padding after the bool above, so the
+    // host tier for the room, as it re-places KV that does not fit. It sits in the padding after the bools, so the
     // struct stays 192 bytes (pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
     // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
     // still be rebuilt together for the planner to see it.
@@ -393,6 +453,10 @@ struct ggml_sycl_tensor_inventory {
 // being read from the wrong place.
 static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
+              "host_weight_layout_cpu left the padding");
 #endif
 
 // SYCL-side projection of the four placement-envelope fields the llama
@@ -428,7 +492,7 @@ typedef struct ggml_sycl_host_create_record {
 // Must be called after model metadata parsing, before tensor allocation.
 // This enables automatic VRAM/host placement based on tensor priority.
 // Direct calls retain legacy planning/late side effects; they do not guarantee
-// eager host-zone provisioning. The loader uses stage_inventory_plan(..., false)
+// eager host-zone provisioning. The loader uses stage_load_inventory_plan(..., false)
 // to attempt that provisioning before buffer allocation, under lifecycle guards.
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
@@ -457,6 +521,20 @@ GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
 // expert entries are not name-indexed and are not returned by this query;
 // they continue to use the per-expert dispatch path.
 GGML_BACKEND_API int ggml_backend_sycl_planned_target_device(const char * tensor_name);
+
+// The host backing a weight is planned with (design 5efe §4.4); the values mirror the planner's.
+enum ggml_sycl_host_backing {
+    GGML_SYCL_HOST_BACKING_PINNED      = 0,  // a copy in the cache's pinned host pool
+    GGML_SYCL_HOST_BACKING_FILE_MAPPED = 1,  // served from the model file's mapping
+    GGML_SYCL_HOST_BACKING_HOST_CPU    = 2,  // a copy in a cache-owned pageable host allocation
+    GGML_SYCL_HOST_BACKING_CPU_OWNED   = 3,  // a copy ggml-cpu makes in a buffer of its own (repacked)
+};
+
+// The backing the loader binds a weight's buffer type from (design 5efe §4.3), read from the bound load's staged plan,
+// which holds the load's fact: the plan's dense entry for a name-indexed weight, otherwise the transaction default
+// (FILE_MAPPED when the load maps files, PINNED when it does not). tensor_name NULL asks for that default alone, which is
+// how the loader reads the fact. PINNED when no plan is staged for the bound load.
+GGML_BACKEND_API enum ggml_sycl_host_backing ggml_backend_sycl_planned_host_backing(const char * tensor_name);
 
 // Set the placement envelope (snapshot of llama_model_params capacity inputs)
 // for this backend.  Must be called at model load alongside set_tensor_inventory.
@@ -1366,14 +1444,24 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
     // Synthesised by a CALLER that resolved no proc address for an entry point
     // the backend predates (see ggml_backend_sycl_set_runtime_context_desc).
-    // The backend never returns it. Appended last for the same reason.
+    // The backend returns it from one place only: the stub its proc table
+    // answers for the staging proc's old name, which refuses a libllama that
+    // predates this backend's inventory. Appended last for the same reason.
     GGML_SYCL_LIFECYCLE_UNSUPPORTED,
 };
 
 // Registry-resolved static/DL parity entry point. Applies the exact inventory
 // and placement envelope to every current SYCL device and stages the same
-// immutable load candidate used by direct static calls.
-GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(
+// immutable load candidate used by direct static calls. It derives the load's
+// host-backing fact from the inventory's resolved inputs (design 5efe §4.3)
+// and the staged plan holds it.
+//
+// Exported under this name since the inventory began carrying those inputs.
+// The registry answers the old name, ggml_backend_sycl_stage_inventory_plan,
+// with a stub that logs why and returns GGML_SYCL_LIFECYCLE_UNSUPPORTED, so a
+// libllama built before the inputs is refused by name instead of handing over
+// an inventory whose bytes 185-187 it never set.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(
     const struct ggml_sycl_tensor_inventory *   inventory,
     const struct ggml_sycl_placement_envelope * envelope,
     bool                                        early);

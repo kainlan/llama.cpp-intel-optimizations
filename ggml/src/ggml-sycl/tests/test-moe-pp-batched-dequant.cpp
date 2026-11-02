@@ -245,7 +245,8 @@ struct lifecycle_fixture {
             require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
             load_open = true;
             expert_inventory fixture(type);
-            const auto stage = ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false);
+            const auto       stage =
+                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
             require(stage == GGML_SYCL_LIFECYCLE_OK,
                     "inventory staging result=" + std::to_string(static_cast<int>(stage)));
             // Staging uses temporary backends; the retained backend is created after it, so load_end's exact-queue

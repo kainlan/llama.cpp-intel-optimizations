@@ -52,8 +52,12 @@
 #if !defined(_WIN32)
 #    include <dlfcn.h>
 #    include <sys/mman.h>
+#    include <sys/resource.h>
 #    include <sys/stat.h>
 #    include <unistd.h>
+#endif
+#if defined(__linux__)
+#    include <sys/sysmacros.h>
 #endif
 #if defined(__GLIBC__)
 #    include <malloc.h>
@@ -17102,7 +17106,7 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
     return GGML_SYCL_DEQUANT_F16_ARM != 0;
 }
 
-// llama.cpp-45qo: the owner of the load effect ggml_backend_sycl_stage_inventory_plan holds while it runs on this
+// llama.cpp-45qo: the owner of the load effect ggml_backend_sycl_stage_load_inventory_plan holds while it runs on this
 // thread, set and restored by its scope together with g_sycl_plan_load_effect_txn; empty outside a staged load. The
 // load's dense scratch plan is keyed by it. The stage holds that effect across the whole stage, so the stores land
 // under it and the load's end, which waits load effects out, cannot run its rollback's drop before they do; no second
@@ -17111,13 +17115,18 @@ static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owne
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), the context's provenance appended
-// after it (llama.cpp-7fmt), and the micro-batch the caller named, in the provenance's padding.
+// after it (llama.cpp-7fmt), and libllama's resolved storage inputs and the micro-batch the caller named, both in the
+// provenance's padding.
 static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184, "n_ctx_context_is_default moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "resolved use_mmap left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "resolved use_mlock left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
+              "host_weight_layout_cpu left the padding");
 
 // llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
 // host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,
@@ -17408,6 +17417,12 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // The micro-batch the caller named, whose PP MoE oneDNN scratch ring the planner plans in the RUNTIME zone (0:
     // none named, so the ring keeps the load's planning shape).
     g_placement_kv_info.n_ubatch_context         = inventory->n_ubatch_context;
+    // The load's host-backing fact (design 5efe §4.3-4.4), derived here and nowhere else from what only libllama knows:
+    // the file-mapping tier maps the model when libllama resolved use_mmap and this build has the tier. The plan copies
+    // it, and every entry's host backing, planned_host_backing and the from-file hook read it from the plan.
+    g_placement_kv_info.load_maps_files          = inventory->use_mmap_resolved && ggml_sycl::file_mapping_supported();
+    g_placement_kv_info.load_locks_files         = g_placement_kv_info.load_maps_files && inventory->use_mlock_resolved;
+    g_placement_kv_info.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
     // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
     // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
     g_placement_kv_info.explicit_ubatch          = {};
@@ -18246,7 +18261,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
 
 void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
     // Preserve the pre-091afc direct-setter contract. Eager host provisioning
-    // belongs to stage_inventory_plan(), which owns the necessary lifetime guards.
+    // belongs to stage_load_inventory_plan(), which owns the necessary lifetime guards.
     (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory);
 }
 
@@ -18274,9 +18289,25 @@ static std::atomic<bool> g_test_fail_next_stage_inventory_plan_early_after_first
 static std::atomic<bool> g_test_fail_next_stage_inventory_plan_late_after_first_device{ false };
 #endif
 
-ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
-                                                                  const ggml_sycl_placement_envelope * envelope,
-                                                                  bool                                 early) {
+// What the registry answers for the staging proc's old name (design 5efe §4.3). The inventory has carried libllama's
+// resolved storage inputs since the proc was renamed, in what used to be padding; a libllama that resolves the old
+// name predates them and never set those bytes. Refuse its load by name, before anything reads the inventory, so the
+// loader's "SYCL inventory planning failed" follows a line that says why.
+static ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan_stale_libllama(
+    const ggml_sycl_tensor_inventory *   inventory,
+    const ggml_sycl_placement_envelope * envelope,
+    bool                                 early) {
+    GGML_UNUSED(inventory);
+    GGML_UNUSED(envelope);
+    GGML_UNUSED(early);
+    GGML_LOG_ERROR("%s: %s\n", "ggml_backend_sycl_stage_inventory_plan",
+                   "libllama predates this backend's inventory; rebuild libllama and libggml-sycl together");
+    return GGML_SYCL_LIFECYCLE_UNSUPPORTED;
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
+                                                                       const ggml_sycl_placement_envelope * envelope,
+                                                                       bool                                 early) {
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
@@ -18312,7 +18343,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
             bool released = false;
             ~owner_rollback_guard() noexcept {
                 if (started && !released) {
-                    (void) ggml_sycl_abort_owner_effects_noexcept(owner, "stage_inventory_plan/rollback-guard-dtor");
+                    (void) ggml_sycl_abort_owner_effects_noexcept(owner,
+                                                                  "stage_load_inventory_plan/rollback-guard-dtor");
                 }
             }
         } rollback{ effect.owner, false, false };
@@ -18368,7 +18400,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
 #if defined(GGML_SYCL_PRIVATE_TESTING)
             if ((early && g_test_fail_next_stage_inventory_plan_early_after_first_device.exchange(false, std::memory_order_acq_rel)) ||
                 (!early && g_test_fail_next_stage_inventory_plan_late_after_first_device.exchange(false, std::memory_order_acq_rel))) {
-                throw std::runtime_error("deterministic stage_inventory_plan failure");
+                throw std::runtime_error("deterministic stage_load_inventory_plan failure");
             }
 #endif
         }
@@ -42643,6 +42675,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
     return cached > 0 || host_registered > 0;
 }
 
+static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_sycl::mem_handle * out);
+
 static void ggml_sycl_preload_model_weights() {
     // Finisher authority keeps B's candidate immutable for the whole preload;
     // first load must not require a global plan and A->B must never route by A.
@@ -43304,11 +43338,24 @@ static void ggml_sycl_preload_model_weights() {
                             return false;
                         }
 
-                        // The owner handle frees the storage on every early return.
-                        ggml_sycl::mem_handle host_owner = ggml_sycl_host_expert_alloc(device, expert_size);
-                        void *                host_ptr   = host_owner.valid() ? host_owner.resolve().ptr : nullptr;
+                        // A SYCL_Mapped source is served in place: the CPU executes the file layout (host experts
+                        // are AOS), and the entry holds the mapping's owner (design 5efe §4.3-4.4). Nothing is copied
+                        // into memory the plan does not charge.
+                        ggml_sycl::mem_handle host_owner;
+                        const bool            served_in_place =
+                            !tensor_source_is_device && ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner);
+                        void * host_ptr = nullptr;
+                        if (served_in_place) {
+                            host_ptr = const_cast<uint8_t *>(expert_aos);
+                        } else {
+                            // The owner handle frees the storage on every early return.
+                            host_owner = ggml_sycl_host_expert_alloc(device, expert_size);
+                            host_ptr   = host_owner.valid() ? host_owner.resolve().ptr : nullptr;
+                        }
 
-                        if (host_ptr) {
+                        if (served_in_place) {
+                            // registered below with the mapping's owner
+                        } else if (host_ptr) {
                             if (tensor_source_is_device) {
                                 sycl::queue * source_queue =
                                     ggml_sycl_owner_queue_for_ptr(expert_aos, tensor_source_device, stream);
@@ -43825,7 +43872,40 @@ static void ggml_sycl_preload_model_weights() {
                             if (tensor->data) {
                                 ggml_sycl_cache_id host_key = ggml_backend_sycl_get_weight_cache_key(tensor, device);
                                 if (host_key.valid) {
-                                    const size_t             nbytes = ggml_nbytes(tensor);
+                                    const size_t          nbytes = ggml_nbytes(tensor);
+                                    ggml_sycl::mem_handle mapped_owner;
+                                    if (ggml_sycl_mapped_buffer_owner(tensor->buffer, &mapped_owner)) {
+                                        // A SYCL_Mapped weight is served in place: the CPU executes the file layout,
+                                        // and the entry holds the mapping's owner (design 5efe §4.3, the host-planned
+                                        // copy row). A weight that needs a reorder is planned PINNED and never reaches
+                                        // a mapping.
+                                        auto storage_owner =
+                                            std::make_shared<ggml_sycl::mem_handle>(std::move(mapped_owner));
+                                        ggml_sycl::mem_handle handle;
+                                        if (!cache->register_host_weight(
+                                                host_key, tensor->data, nbytes, GGML_LAYOUT_AOS, &handle,
+                                                std::shared_ptr<void>(storage_owner, tensor->data))) {
+                                            throw std::runtime_error(
+                                                "SYCL mapped host weight registration failed during preload");
+                                        }
+                                        // The CPU's resolution: a device is never handed a file mapping.
+                                        auto resolved = handle.resolve();
+                                        if (!resolved.ptr) {
+                                            throw std::runtime_error(
+                                                "SYCL mapped host weight registration returned no ownership handle");
+                                        }
+                                        if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+                                            extra->data_handle[device]      = std::move(handle);
+                                            extra->data_device[device]      = resolved.ptr;
+                                            extra->data_device_size[device] = nbytes;
+                                        }
+                                        GGML_SYCL_DEBUG("[S1-PRELOAD] mapped host weight: %s (%.1f MB)\n", tensor->name,
+                                                        nbytes / (1024.0f * 1024.0f));
+                                        weight_host_bytes[device] += nbytes;
+                                        weight_host_count[device]++;
+                                        dense_host_placed++;
+                                        continue;
+                                    }
                                     ggml_sycl::alloc_request dn_req{};
                                     dn_req.queue                               = s1_preload_q ? s1_preload_q : &stream;
                                     dn_req.device                              = device;
@@ -53007,6 +53087,382 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_ba
         }
     });
     return per_device[index].device == dev ? &per_device[index] : nullptr;
+}
+
+// SYCL_Mapped: host weights served in place from the model file's mapping (design 5efe §4.3). A buffer of it is one
+// FILE_MAPPED reservation over one file's slice; it comes only from ggml_backend_sycl_mapped_buffer_from_file, never
+// from alloc_buffer, and nothing writes it.
+struct sycl_mapped_buf_ctx {
+    // The FILE_MAPPED owner. The reservation lives until this handle and every cache entry that took a copy of it is
+    // released (mem_handle's destructor is the only release).
+    ggml_sycl::mem_handle owner;
+    void *                base             = nullptr;
+    size_t                size             = 0;
+    uint64_t              base_file_offset = 0;  // the file offset `base` stands for, page aligned
+};
+
+static const char * ggml_backend_sycl_mapped_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_SYCL_NAME "_Mapped";
+}
+
+static void ggml_backend_sycl_mapped_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    delete static_cast<sycl_mapped_buf_ctx *>(buffer->context);
+}
+
+static void * ggml_backend_sycl_mapped_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return static_cast<sycl_mapped_buf_ctx *>(buffer->context)->base;
+}
+
+static enum ggml_status ggml_backend_sycl_mapped_buffer_init_tensor(ggml_backend_buffer_t buffer,
+                                                                    ggml_tensor *         tensor) {
+    // The loader registered the weight when create_tensor chose this buffer type; the registration is idempotent, so a
+    // view, or a tensor another path allocates here, is registered the same way.
+    ggml_backend_sycl_register_host_weight_tensor(ggml_backend_buft_get_device(buffer->buft), tensor);
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_sycl_mapped_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+                                                          ggml_tensor *         tensor,
+                                                          uint8_t               value,
+                                                          size_t                offset,
+                                                          size_t                size) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(value);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    GGML_ABORT("SYCL_Mapped is read-only: memset_tensor on %s, whose bytes are the model file's mapping", tensor->name);
+}
+
+static void ggml_backend_sycl_mapped_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                       ggml_tensor *         tensor,
+                                                       const void *          data,
+                                                       size_t                offset,
+                                                       size_t                size) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    GGML_ABORT("SYCL_Mapped is read-only: set_tensor on %s, whose bytes are the model file's mapping", tensor->name);
+}
+
+static void ggml_backend_sycl_mapped_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                       const ggml_tensor *   tensor,
+                                                       void *                data,
+                                                       size_t                offset,
+                                                       size_t                size) {
+    GGML_UNUSED(buffer);
+    std::memcpy(data, static_cast<const char *>(tensor->data) + offset, size);
+}
+
+static bool ggml_backend_sycl_mapped_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+                                                       const ggml_tensor *   src,
+                                                       ggml_tensor *         dst) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(src);
+    GGML_UNUSED(dst);
+    return false;  // read-only: nothing is copied into a mapping
+}
+
+static void ggml_backend_sycl_mapped_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    GGML_UNUSED(value);
+    GGML_ABORT("SYCL_Mapped is read-only: clear of a %zu-byte buffer of the model file's mapping",
+               ggml_backend_buffer_get_size(buffer));
+}
+
+static ggml_backend_buffer_t ggml_backend_sycl_mapped_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+                                                                               size_t                     size) {
+    // A memory-fit pass sizes nothing and asks for a zero-size dummy; any real buffer is a file's mapping, which only
+    // ggml_backend_sycl_mapped_buffer_from_file makes.
+    if (size == 0) {
+        return ggml_backend_buffer_init(buft, {}, nullptr, 0);
+    }
+    GGML_ABORT(
+        "%s cannot allocate %zu bytes: its buffers are file mappings from ggml_backend_sycl_mapped_buffer_from_file",
+        ggml_backend_buft_name(buft), size);
+}
+
+static size_t ggml_backend_sycl_mapped_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    // One reservation maps a whole file slice: no Level Zero or pinned-chunk cap applies. The device is the buft's own,
+    // never a default.
+    const int device = ggml_sycl_device_id_from_backend_dev(buft->device);
+    GGML_ASSERT(device >= 0 && "SYCL_Mapped buffer type without a SYCL device");
+    return SIZE_MAX;
+}
+
+ggml_backend_buffer_type_t ggml_backend_sycl_mapped_buffer_type_for_device(ggml_backend_dev_t dev) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return nullptr;
+    }
+    const int index = ggml_sycl_device_id_from_backend_dev(dev);
+    if (index < 0 || index >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
+
+    static std::once_flag                                              initialized;
+    static std::array<ggml_backend_buffer_type, GGML_SYCL_MAX_DEVICES> per_device{};
+    std::call_once(initialized, [&] {
+        const size_t count = std::min(ggml_backend_reg_dev_count(reg), (size_t) GGML_SYCL_MAX_DEVICES);
+        for (size_t i = 0; i < count; ++i) {
+            per_device[i].iface.get_name       = ggml_backend_sycl_mapped_buffer_type_name;
+            per_device[i].iface.alloc_buffer   = ggml_backend_sycl_mapped_buffer_type_alloc_buffer;
+            per_device[i].iface.get_alignment  = ggml_backend_cpu_buffer_type()->iface.get_alignment;
+            per_device[i].iface.get_max_size   = ggml_backend_sycl_mapped_buffer_type_get_max_size;
+            per_device[i].iface.get_alloc_size = ggml_backend_cpu_buffer_type()->iface.get_alloc_size;
+            // is_host: the CPU backend executes an op on a weight it holds (placement decides the executor)
+            per_device[i].iface.is_host        = ggml_backend_cpu_buffer_type()->iface.is_host;
+            per_device[i].device               = ggml_backend_reg_dev_get(reg, i);
+            per_device[i].context              = nullptr;
+        }
+    });
+    return per_device[index].device == dev ? &per_device[index] : nullptr;
+}
+
+// The FILE_MAPPED owner behind a SYCL_Mapped buffer, so a consumer that registers one of its weights takes a copy of
+// the owner instead of copying the bytes (design 5efe §4.3, the preload rows). false for any other buffer.
+static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_sycl::mem_handle * out) {
+    if (!buffer || buffer->iface.free_buffer != ggml_backend_sycl_mapped_buffer_free_buffer || !buffer->context) {
+        return false;
+    }
+    const auto * ctx = static_cast<const sycl_mapped_buf_ctx *>(buffer->context);
+    if (!ctx->owner.valid()) {
+        return false;
+    }
+    if (out) {
+        *out = ctx->owner;
+    }
+    return true;
+}
+
+// The backing device's read-ahead in bytes, from /sys as the loader's own lazy window reads it; 0 when it cannot be
+// read, which file_mapping_random_window() floors at 2 MiB.
+static uint64_t ggml_sycl_mapped_read_ahead_bytes(int fd) {
+#if defined(__linux__)
+    struct stat st = {};
+    if (fstat(fd, &st) == 0) {
+        char paths[2][160];
+        snprintf(paths[0], sizeof(paths[0]), "/sys/class/bdi/%u:%u/read_ahead_kb", major(st.st_dev), minor(st.st_dev));
+        snprintf(paths[1], sizeof(paths[1]), "/sys/dev/block/%u:%u/../bdi/read_ahead_kb", major(st.st_dev),
+                 minor(st.st_dev));
+        for (const char * path : paths) {
+            FILE *     f  = fopen(path, "r");
+            long       kb = -1;
+            const bool ok = f != nullptr && fscanf(f, "%ld", &kb) == 1 && kb >= 0;
+            if (f != nullptr) {
+                fclose(f);
+            }
+            if (ok) {
+                return static_cast<uint64_t>(kb) * 1024;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(fd);
+#endif
+    return 0;
+}
+
+ggml_backend_buffer_t ggml_backend_sycl_mapped_buffer_from_file(ggml_backend_dev_t                    dev,
+                                                                uint32_t                              file_idx,
+                                                                int                                   fd,
+                                                                uint64_t                              file_size,
+                                                                const ggml_sycl_mapped_tensor_range * tensor_ranges,
+                                                                size_t                                n_tensor_ranges,
+                                                                const ggml_sycl_file_range *          lazy_ranges,
+                                                                size_t                                n_lazy_ranges,
+                                                                uint64_t * out_base_file_offset) {
+#if defined(_WIN32)
+    // No tier here (file_mapping_supported() is false): the fact is false, and libllama never asks.
+    GGML_UNUSED(dev);
+    GGML_UNUSED(file_idx);
+    GGML_UNUSED(fd);
+    GGML_UNUSED(file_size);
+    GGML_UNUSED(tensor_ranges);
+    GGML_UNUSED(n_tensor_ranges);
+    GGML_UNUSED(lazy_ranges);
+    GGML_UNUSED(n_lazy_ranges);
+    GGML_UNUSED(out_base_file_offset);
+    GGML_LOG_ERROR("%s: this build has no file-mapping tier\n", __func__);
+    return nullptr;
+#else
+    static_assert(ggml_sycl::file_mapping_supported(), "a POSIX build has the file-mapping tier");
+    ggml_backend_buffer_type_t buft = ggml_backend_sycl_mapped_buffer_type_for_device(dev);
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard || !buft || fd < 0 || out_base_file_offset == nullptr || n_tensor_ranges == 0 ||
+        tensor_ranges == nullptr || (n_lazy_ranges != 0 && lazy_ranges == nullptr)) {
+        return nullptr;
+    }
+    const int device = ggml_sycl_device_id_from_backend_dev(dev);
+
+    // The bound load's staged plan holds the fact (design 5efe §4.3): only a load whose plan maps files binds
+    // SYCL_Mapped. Another model's plan never answers for this load.
+    const auto candidate = ggml_sycl_bound_load_candidate();
+    const auto plan      = candidate ? candidate->plan : nullptr;
+    if (!plan || !plan->host_backing_maps_files) {
+        GGML_LOG_ERROR("%s: file %u: the bound load's staged plan does not map files\n", __func__, file_idx);
+        return nullptr;
+    }
+
+    // Which tensors the CPU reads (WILLNEED, and locked under -lm mmap+mlock) and which only stage through the mapping
+    // to a device, from the plan (design 5efe §4.6). An expert tensor is split per expert.
+    std::vector<ggml_sycl::file_tensor_range> ranges;
+    ranges.reserve(n_tensor_ranges);
+    uint64_t first = UINT64_MAX;
+    uint64_t last  = 0;
+    for (size_t i = 0; i < n_tensor_ranges; ++i) {
+        const ggml_sycl_mapped_tensor_range & t = tensor_ranges[i];
+        if (t.size == 0) {
+            continue;
+        }
+        first = std::min(first, t.file_offset);
+        last  = std::max(last, t.file_offset + t.size);
+
+        const char * name = t.name ? t.name : "";
+        if (const ggml_sycl::placement_entry * dense = plan->find_dense_entry(name)) {
+            ranges.push_back({ t.file_offset, t.size, !dense->on_device });
+            continue;
+        }
+        int n_experts = 0;
+        while (plan->find_expert_entry(name, n_experts) != nullptr) {
+            ++n_experts;
+        }
+        if (n_experts == 0 || t.size % static_cast<uint64_t>(n_experts) != 0) {
+            // Not in the plan: the CPU may read it.
+            ranges.push_back({ t.file_offset, t.size, true });
+            continue;
+        }
+        const uint64_t slice = t.size / static_cast<uint64_t>(n_experts);
+        for (int e = 0; e < n_experts; ++e) {
+            const ggml_sycl::placement_entry * expert = plan->find_expert_entry(name, e);
+            ranges.push_back({ t.file_offset + slice * static_cast<uint64_t>(e), slice, !expert->on_device });
+        }
+    }
+    if (ranges.empty()) {
+        return nullptr;
+    }
+
+    std::vector<ggml_sycl::file_map_range> lazy;
+    lazy.reserve(n_lazy_ranges);
+    for (size_t i = 0; i < n_lazy_ranges; ++i) {
+        lazy.push_back({ lazy_ranges[i].file_offset, lazy_ranges[i].length });
+    }
+    const long     page_size = sysconf(_SC_PAGESIZE);
+    const uint64_t page      = page_size > 0 ? static_cast<uint64_t>(page_size) : 4096;
+    const uint64_t window    = ggml_sycl::file_mapping_random_window(ggml_sycl_mapped_read_ahead_bytes(fd), page);
+    const ggml_sycl::file_segment_plan segments = ggml_sycl::file_mapping_segments(ranges, lazy, page, window);
+    if (!segments.ok() || segments.map.empty()) {
+        GGML_LOG_ERROR("%s: file %u: segment plan refused: %s\n", __func__, file_idx,
+                       segments.ok() ? "no segment" : segments.error);
+        return nullptr;
+    }
+
+    const uint64_t                  reservation_first = first / page * page;
+    ggml_sycl::file_mapping_request req{};
+
+    req.device      = device;
+    req.fd          = fd;
+    req.file_size   = file_size;
+    req.reservation = { reservation_first, last - reservation_first };
+    req.segments    = segments.map;
+    req.role        = ggml_sycl::alloc_role::WEIGHT;
+    req.cohort_id   = "sycl_mapped_weights";
+
+    ggml_sycl::allocation_result mapped = ggml_sycl::unified_allocate_file_mapping(req);
+    if (!mapped) {
+        GGML_LOG_ERROR("%s: file %u: the file-mapping tier refused %.1f MB on device %d\n", __func__, file_idx,
+                       req.reservation.length / (1024.0 * 1024.0), device);
+        return nullptr;
+    }
+    const ggml_sycl::alloc_metadata meta  = mapped.owner.metadata();
+    ggml_sycl::mem_handle           owner = ggml_sycl::mem_handle::from_owned_alloc(std::move(mapped.owner));
+
+    // The advice and the lock name the reservation by its base and file offset; the owner keeps the descriptor.
+    ggml_sycl::file_mapping view{};
+    view.base        = meta.ptr;
+    view.length      = meta.size;
+    view.file_offset = reservation_first;
+    if (!segments.willneed.empty()) {
+        (void) ggml_sycl::unified_cache_raw_advise_file_segments(view, segments.willneed,
+                                                                 ggml_sycl::file_advice::WILLNEED);
+    }
+    if (!segments.random_windows.empty()) {
+        (void) ggml_sycl::unified_cache_raw_advise_file_segments(view, segments.random_windows,
+                                                                 ggml_sycl::file_advice::RANDOM);
+    }
+    if (plan->host_mapped_locked && !segments.willneed.empty()) {
+        const ggml_sycl::file_map_status locked =
+            ggml_sycl::unified_cache_raw_lock_file_segments(view, segments.willneed);
+        if (locked != ggml_sycl::file_map_status::OK) {
+            const int err   = errno;
+            uint64_t  bytes = 0;
+            for (const ggml_sycl::file_map_range & r : segments.willneed) {
+                bytes += r.length;
+            }
+            struct rlimit limit = {};
+            std::string   soft  = "unknown";
+            if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
+                soft = limit.rlim_cur == RLIM_INFINITY ? "unlimited" : std::to_string(limit.rlim_cur) + " bytes";
+            }
+            GGML_LOG_ERROR(
+                "%s: file %u: -lm mmap+mlock cannot lock the %.1f MB of host-executed weights: %s (%s); "
+                "RLIMIT_MEMLOCK soft limit %s, refusing the load (design 5efe §4.5)\n",
+                __func__, file_idx, bytes / (1024.0 * 1024.0), std::strerror(err),
+                ggml_sycl::file_map_status_name(locked), soft.c_str());
+            return nullptr;
+        }
+    }
+
+    auto * ctx            = new sycl_mapped_buf_ctx{};
+    ctx->owner            = std::move(owner);
+    ctx->base             = meta.ptr;
+    ctx->size             = meta.size;
+    ctx->base_file_offset = reservation_first;
+
+    ggml_backend_buffer_i iface{};
+    iface.free_buffer   = ggml_backend_sycl_mapped_buffer_free_buffer;
+    iface.get_base      = ggml_backend_sycl_mapped_buffer_get_base;
+    iface.init_tensor   = ggml_backend_sycl_mapped_buffer_init_tensor;
+    iface.memset_tensor = ggml_backend_sycl_mapped_buffer_memset_tensor;
+    iface.set_tensor    = ggml_backend_sycl_mapped_buffer_set_tensor;
+    iface.get_tensor    = ggml_backend_sycl_mapped_buffer_get_tensor;
+    iface.cpy_tensor    = ggml_backend_sycl_mapped_buffer_cpy_tensor;
+    iface.clear         = ggml_backend_sycl_mapped_buffer_clear;
+
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, iface, ctx, ctx->size);
+    if (!buffer) {
+        delete ctx;
+        return nullptr;
+    }
+    *out_base_file_offset = reservation_first;
+    return buffer;
+#endif
+}
+
+static_assert(GGML_SYCL_HOST_BACKING_PINNED == static_cast<int>(ggml_sycl::placement_host_backing::PINNED) &&
+                  GGML_SYCL_HOST_BACKING_FILE_MAPPED ==
+                      static_cast<int>(ggml_sycl::placement_host_backing::FILE_MAPPED) &&
+                  GGML_SYCL_HOST_BACKING_HOST_CPU == static_cast<int>(ggml_sycl::placement_host_backing::HOST_CPU) &&
+                  GGML_SYCL_HOST_BACKING_CPU_OWNED == static_cast<int>(ggml_sycl::placement_host_backing::CPU_OWNED),
+              "the exported host backing mirrors the planner's");
+
+ggml_sycl_host_backing ggml_backend_sycl_planned_host_backing(const char * tensor_name) {
+    // Only the bound load's staged plan answers (design 5efe §4.3): it holds the one fact, and a plan published by
+    // another load never binds SYCL_Mapped on this one. No staged plan, or a plan that maps nothing, is PINNED.
+    const auto candidate = ggml_sycl_bound_load_candidate();
+    const auto plan      = candidate ? candidate->plan : nullptr;
+    if (!plan || !plan->host_backing_maps_files) {
+        return GGML_SYCL_HOST_BACKING_PINNED;
+    }
+    if (tensor_name != nullptr) {
+        if (const ggml_sycl::placement_entry * dense = plan->find_dense_entry(tensor_name)) {
+            return static_cast<ggml_sycl_host_backing>(dense->host_backing);
+        }
+    }
+    // The transaction default (tensor_name NULL, or a routed expert the plan does not index by name): the planner
+    // derived every entry's backing from the same fact, so a mapping load defaults to FILE_MAPPED.
+    return GGML_SYCL_HOST_BACKING_FILE_MAPPED;
 }
 
 // Host compute buffer type - uses SYCL host memory with SYCL buffer interface
@@ -62900,6 +63356,23 @@ static bool ggml_sycl_tensor_slice_identity(const ggml_tensor *              ten
         }
         const size_t off = static_cast<size_t>(data - base);
         if (!ggml_sycl_narrow_storage_identity(ctx->buffer_handle.identity(), ctx->size, off, span, out)) {
+            *out = {};
+            return false;
+        }
+        return true;
+    }
+
+    // SYCL_Mapped tensor: the slice of its buffer's FILE_MAPPED owner (design 5efe §4.3).
+    if (owner_buffer_tensor && owner_buffer_tensor->buffer && owner_buffer_tensor->buffer->context &&
+        owner_buffer_tensor->buffer->iface.free_buffer == ggml_backend_sycl_mapped_buffer_free_buffer && tensor->data) {
+        const auto * ctx  = static_cast<const sycl_mapped_buf_ctx *>(owner_buffer_tensor->buffer->context);
+        const char * data = static_cast<const char *>(tensor->data);
+        const char * base = static_cast<const char *>(ctx->base);
+        if (!ctx->owner.valid() || !base || data < base) {
+            return false;
+        }
+        const size_t off = static_cast<size_t>(data - base);
+        if (!ggml_sycl_narrow_storage_identity(ctx->owner.identity(), ctx->size, off, span, out)) {
             *out = {};
             return false;
         }
@@ -110192,6 +110665,12 @@ static uint64_t moe_segment_buffer_identity(ggml_backend_buffer_t buffer) {
         if (hctx && hctx->buffer_handle.valid() && hctx->buffer_handle.has_stable_owner_identity()) {
             return moe_segment_handle_identity(hctx->buffer_handle);
         }
+    } else if (buffer && buffer->iface.free_buffer == ggml_backend_sycl_mapped_buffer_free_buffer) {
+        // SYCL_Mapped: its FILE_MAPPED owner's identity (design 5efe §4.3)
+        const auto * mctx = static_cast<const sycl_mapped_buf_ctx *>(buffer->context);
+        if (mctx && mctx->owner.valid() && mctx->owner.has_stable_owner_identity()) {
+            return moe_segment_handle_identity(mctx->owner);
+        }
     }
     return 1 + 31 * static_cast<uint64_t>(ggml_backend_buffer_get_size(buffer)) +
            static_cast<uint64_t>(ggml_backend_buffer_get_usage(buffer));
@@ -124197,6 +124676,12 @@ static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_
         return true;
     }
 
+    // The mapped host buffer type: host weights served in place from the model file's mapping, accepted as SYCL_Host
+    // is (design 5efe §4.3); the CPU executes their ops
+    if (buft->iface.get_name == ggml_backend_sycl_mapped_buffer_type_name) {
+        return true;
+    }
+
     // Host compute buffer type (SYCL interface) - all SYCL devices can access host memory
     // This is used for TP compute buffers to allow cross-device data sharing
     if (buft->iface.get_name == ggml_backend_sycl_host_compute_buffer_type_name) {
@@ -125446,6 +125931,15 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     // backend's repacking buft instead of SYCL_Host. Exported here rather than linked
     // directly because the loader reaches this backend only through proc addresses
     // under GGML_BACKEND_DL.
+    if (strcmp(name, "ggml_backend_sycl_planned_host_backing") == 0) {
+        return (void *) ggml_backend_sycl_planned_host_backing;
+    }
+    if (strcmp(name, "ggml_backend_sycl_mapped_buffer_type_for_device") == 0) {
+        return (void *) ggml_backend_sycl_mapped_buffer_type_for_device;
+    }
+    if (strcmp(name, "ggml_backend_sycl_mapped_buffer_from_file") == 0) {
+        return (void *) ggml_backend_sycl_mapped_buffer_from_file;
+    }
     if (strcmp(name, "ggml_backend_sycl_planned_target_device") == 0) {
         return (void *) ggml_backend_sycl_planned_target_device;
     }
@@ -125473,8 +125967,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_try_register_weight_usage") == 0) {
         return (void *) ggml_backend_sycl_try_register_weight_usage;
     }
+    if (strcmp(name, "ggml_backend_sycl_stage_load_inventory_plan") == 0) {
+        return (void *) ggml_backend_sycl_stage_load_inventory_plan;
+    }
+    // The staging proc's old name: only a libllama that predates the inventory's storage inputs resolves it.
     if (strcmp(name, "ggml_backend_sycl_stage_inventory_plan") == 0) {
-        return (void *) ggml_backend_sycl_stage_inventory_plan;
+        return (void *) ggml_backend_sycl_stage_inventory_plan_stale_libllama;
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_begin") == 0) {
         return (void *) ggml_backend_sycl_model_load_begin;

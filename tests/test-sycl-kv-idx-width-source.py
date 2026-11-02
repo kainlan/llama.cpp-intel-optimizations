@@ -10,7 +10,7 @@ host-KV figure short by the indexer, and so that no second source of the width c
 2. the llama layer fills the array in ONE place, `llama_model_sycl_populate_inventory`, from its parameter, and BOTH of
    its callers (early plan and late inventory) pass `kv_layer_arrays.idx_k_width.get()`, which the memory's layer
    owners fill; no helper derives the width from the architecture a second time;
-3. `ggml_backend_sycl_stage_inventory_plan`'s apply step copies the array into the planner's
+3. `ggml_backend_sycl_stage_load_inventory_plan`'s apply step copies the array into the planner's
    `g_placement_kv_info.layer_idx_k_width`, and both plan builders mirror it into the persisted plan, beside the
    per-layer truth;
 4. `placement_plan::kv_size_for_layer` adds `kv_idx_size_for_layer` on its per-layer branch, and

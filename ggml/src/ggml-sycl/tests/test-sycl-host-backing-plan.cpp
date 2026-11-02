@@ -232,16 +232,16 @@ void capture_log(ggml_log_level level, const char * text, void * user) {
 
 // The fact as the planner reads it: placement_kv_info's three fields, which the staging proc derives.
 struct fact {
-    bool maps_files     = false;
-    bool locks_files    = false;
-    bool dense_repacked = true;  // GGML_SYCL_HOST_WEIGHT_LAYOUT's default, cpu
+    bool maps_files  = false;
+    bool locks_files = false;
+    bool layout_cpu  = true;  // GGML_SYCL_HOST_WEIGHT_LAYOUT's default, cpu
 };
 
 placement_kv_info kv_for(const fact & f) {
     placement_kv_info kv{};
-    kv.load_maps_files     = f.maps_files;
-    kv.load_locks_files    = f.locks_files;
-    kv.host_dense_repacked = f.dense_repacked;
+    kv.load_maps_files        = f.maps_files;
+    kv.load_locks_files       = f.locks_files;
+    kv.host_weight_layout_cpu = f.layout_cpu;
     return kv;
 }
 
@@ -482,7 +482,7 @@ void arm4_host_dense(const std::vector<placement_tensor_info> & inv) {
 
     fact plain;
     plain.maps_files        = true;
-    plain.dense_repacked    = false;
+    plain.layout_cpu        = false;
     const placement_plan pp = plan_single(inv, 1 * MiB, plain);
     const census         pc = take_census(pp);
     check_eq("host dense entries (token_embd aside) that are FILE_MAPPED under =plain", pc.host_file_mapped_dense,

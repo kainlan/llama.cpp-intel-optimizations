@@ -32,7 +32,7 @@ The fix this gate pins: the inputs are terms in the owner table llama.cpp-ihk6 b
       after which the plan may fall;
   D6. no device-global merge remains: no zone_dense_scratch_merge_input, no other_model_live, no
       ggml_sycl_other_backend_context_live;
-  D7. the load-time plan is keyed by the owner of the load effect stage_inventory_plan holds on this thread, passed
+  D7. the load-time plan is keyed by the owner of the load effect the staging proc holds on this thread, passed
       down beside its transaction id, so the stores land under that held effect and no second lease is taken;
   D8. the runtime-context transaction re-plans the published model's own plan for its own context, logs the context's
       published n_ubatch beside the model's and each half's, and its guard restores only the hold;
@@ -178,8 +178,8 @@ Q8_ENSURE_SIG = "static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sy
 F16_ENSURE_SIG = "static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & ctx,"
 POPULATE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
                 "const ggml_sycl_tensor_inventory * inventory)")
-STAGE_SIG = ("ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory * "
-             "inventory,")
+STAGE_SIG = ("ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory "
+             "* inventory,")
 STORE_HELPER_SIG = ("template <typename F> static bool planned_load_terms_store(int device_id, lifecycle::SlotToken "
                     "owner, F && store_locked)")
 REJECTED_LOCKED_SIG = ("static bool planned_dense_scratch_owner_rejected_locked(int device_id, lifecycle::SlotToken "
@@ -470,7 +470,7 @@ DENSE_HELPER_SIG = "static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_d
 
 
 def claim_load_plan_is_keyed_by_the_open_load(sycl: str) -> bool:
-    """populate_inventory_globals keys both plan stores by the owner of the load effect stage_inventory_plan holds on
+    """populate_inventory_globals keys both plan stores by the owner of the load effect the staging proc holds on
     this thread, which the stage's scope sets beside the transaction id and restores with it; with no staged load it
     stores nothing. No second lease is taken, so a failed acquire cannot read as "no open load". Both stores sit in
     one helper (ggml_sycl_plan_load_dense_scratch), keyed by the owner its caller passes: populate passes this owner,

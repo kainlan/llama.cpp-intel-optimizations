@@ -94,11 +94,11 @@ void run_placement_case(ggml_backend_t backend,
     }
     // Register through the real load bracket, not ggml_backend_sycl_set_tensor_inventory()
     // directly.  The planner only STAGES its plan onto the bound load-effect
-    // transaction, and only ggml_backend_sycl_stage_inventory_plan() acquires
+    // transaction, and only ggml_backend_sycl_stage_load_inventory_plan() acquires
     // one; a direct call computes a plan and drops it, leaving every
     // ggml_backend_sycl_planned_target_device() query answering NO_PLAN and
     // this whole case passing or failing on nothing.
-    check(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
+    check(ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
           "inventory staging through the load bracket failed");
 
     const bool oracle  = planner_target_oracle(fixture, label);
