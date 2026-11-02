@@ -1347,9 +1347,6 @@ struct placement_plan {
 
     // The inverse of charge_host_weight, saturating at 0 per term.
     void uncharge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
-        auto saturating_sub = [](size_t & value, size_t delta) {
-            value = value > delta ? value - delta : 0;
-        };
         switch (backing) {
             case placement_host_backing::FILE_MAPPED:
                 saturating_sub(host_mapped_bytes, bytes);
@@ -1524,10 +1521,6 @@ struct placement_plan {
         if (e.on_device == on_device && e.target_device == target) {
             return true;
         }
-
-        auto saturating_sub = [](size_t & value, size_t delta) {
-            value = value > delta ? value - delta : 0;
-        };
 
         const size_t charge = e.vram_charge_size != 0 ? e.vram_charge_size : placement_vram_charge_bytes(e.dst_size);
 
@@ -1882,6 +1875,9 @@ struct placement_plan {
     }
 
   private:
+    // The plan's byte terms are unsigned and never go below 0, so every un-charge subtracts through this.
+    static void saturating_sub(size_t & value, size_t delta) noexcept { value = value > delta ? value - delta : 0; }
+
     // Computed in unsigned arithmetic: a name without "blk." parses to layer -1,
     // and left-shifting a negative signed value is undefined before C++20.
     static uint64_t expert_residency_group_key(int layer_id, expert_tensor_role role) {
