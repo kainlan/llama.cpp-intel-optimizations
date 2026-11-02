@@ -2981,9 +2981,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    // A SYCL load maps with prefetch 0, whatever use_mmap says: its weights are placed by the unified cache, the
-    // mapping is only a source for them, and WILLNEED/SEQUENTIAL over the whole file would read the lazy tables and
-    // the device-only weights into the page cache for nothing. Off SYCL the mapping prefetches as before.
+    // A SYCL load maps with prefetch 0: its weights are placed by the unified cache, the mapping is only a source for
+    // them, and WILLNEED/SEQUENTIAL over the whole file would read the lazy tables and the device-only weights into
+    // the page cache for nothing. use_mmap is already cleared above on this path, which gave prefetch 0 as a side
+    // effect; the flag keeps it 0 if a later change re-enables mmap for SYCL. Off SYCL the mapping prefetches as before.
     bool prefetch_mappings = true;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     if (sycl_model_backend) {
