@@ -173,6 +173,24 @@
       "reason": "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM bytes: cache_guard_allocator backs the cache's own hash maps when the guard env is set and falls back to std::allocator; the cache cannot allocate its own map nodes through itself. Permanent; canonical contract section 9.1 (the cache_guard_allocator row)"
     },
     {
+      "id": "E-LIBC-FILE-MAPPED-RAW",
+      "code": "E-LIBC",
+      "file": "file-mapping.cpp",
+      "function": "unified_cache_raw_map_file",
+      "name": "mmap",
+      "count": 2,
+      "reason": "the FILE_MAPPED tier's raw layer, a device-free translation unit: unified_cache_raw_map_file's two mmap calls are the one PROT_NONE reservation and the MAP_FIXED read-only file segments mapped over it from a dup of the loader's fd. Its only caller is the owner-first front door unified_allocate_file_mapping, so the mapping has an owner before it exists. Permanent; canonical contract section 3 (Allocator Entry Points, unified_cache_raw_map_file) and section 9.1 (the file-mapping.cpp and host-cpu-mapping.cpp row)"
+    },
+    {
+      "id": "E-LIBC-HOST-CPU-RAW",
+      "code": "E-LIBC",
+      "file": "host-cpu-mapping.cpp",
+      "function": "unified_cache_raw_alloc_host_cpu",
+      "name": "mmap",
+      "count": 1,
+      "reason": "the HOST_CPU tier's raw layer, a device-free translation unit: unified_cache_raw_alloc_host_cpu's one anonymous mmap is the fully locked, huge-page-advised mapping a HOST_CPU owner holds. Its only caller is the HOST_CPU branch of unified_alloc, reached through unified_allocate_owner, so the mapping has an owner before it exists. Permanent; canonical contract section 3 (Allocator Entry Points, unified_cache_raw_alloc_host_cpu) and section 9.1 (the file-mapping.cpp and host-cpu-mapping.cpp row)"
+    },
+    {
       "id": "E-KV-RELEASE-CATCH",
       "code": "G-CATCH",
       "file": "kv-region-registry.hpp",
@@ -229,6 +247,14 @@
       "reason": "ggml_sycl_graph_compute_exception_exit is noexcept and runs from the cleanup of an exception already in flight: its three catch-all handlers each guard one best-effort drop (the two per-graph caches and the staged-owner retention), because a second exception out of a cleanup would std::terminate and mask the first. None of the three bodies raises a planned refusal. Permanent."
     },
     {
+      "id": "E-GRAPH-COMPUTE-FALLBACK-CLEAR",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_graph_compute_fallback_clear_graphs",
+      "count": 1,
+      "reason": "ggml_sycl_graph_compute_fallback_clear_graphs is noexcept and runs from graph_compute's ggml_sycl_fallback_error handler, after its queue waits and drains: its catch-all guards the one best-effort clear of the untrusted cached graph state (sycl_exec_graph_clear_active, or invalidate_moe_segments when no execution graph is live), because a second exception out of that handler would cross the backend boundary and skip the unpin and release that follow. The try body destroys recorded executables and retires their retention; nothing in it raises a planned refusal, and the refusal that reached the handler is reported there. Permanent."
+    },
+    {
       "id": "E-LIFECYCLE-PROBE-FIND",
       "code": "G-CATCH",
       "file": "unified-cache.cpp",
@@ -259,6 +285,22 @@
       "function": "allocation_registry_test_publish_raw",
       "count": 1,
       "reason": "allocation_registry_test_publish_raw is a noexcept test hook (llama.cpp-kpjw hold-ledger tests, under GGML_SYCL_PRIVATE_TESTING): its try body builds a registry record and emplaces it under the registry mutex, with no physical allocation, and the catch-all returns false (the row was not published). A rethrow would std::terminate a test process through the noexcept boundary, and nothing in the body raises a planned refusal. Permanent; test-only."
+    },
+    {
+      "id": "E-FILE-MAPPED-FRONT-DOOR-CATCH",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "unified_allocate_file_mapping",
+      "count": 1,
+      "reason": "unified_allocate_file_mapping is noexcept, the FILE_MAPPED owner's front door: its catch-all undoes a partial reservation (the interior-pointer registry entry, the raw file mapping with its dup of the fd, the unadopted owner control) and answers CONTROL_ALLOCATION_FAILED, because a rethrow out of a noexcept function would std::terminate with the mapping still held. The try body reports every refusal through its allocation_error (the raw layer answers a file_map_status) and raises no planned refusal; what it can throw is std::bad_alloc and a registry lock's std::system_error. Permanent; canonical contract section 3 (Allocator Entry Points, the FILE_MAPPED front door)."
+    },
+    {
+      "id": "E-ROLE-BYTES-TEST-CATCH",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_role_bytes_for_testing",
+      "count": 1,
+      "reason": "unified_cache_role_bytes_for_testing is the noexcept read-only query behind ggml_backend_sycl_role_bytes_for_testing: its try body takes the cache map's shared lock to see whether the device has a cache (it never creates one) and sums one role's live registry records under the registry mutex, with no allocation of backend memory and no planned-refusal path. The catch-all turns a lock failure into false with the figure zeroed, the answer the caller already reads as no figure; a rethrow out of a noexcept function would std::terminate a test process. Permanent; test-only."
     },
     {
       "id": "E-L4-CABI-SET-RUNTIME-CONTEXT",

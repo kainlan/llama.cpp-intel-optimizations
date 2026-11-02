@@ -844,6 +844,8 @@ bool ggml_sycl_device_query_host_unified(const sycl::device & dev, bool & known)
         const bool host_unified = dev.get_info<sycl::info::device::host_unified_memory>();
         known                   = true;
         return host_unified;
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
     } catch (...) {
         known = false;
         return false;

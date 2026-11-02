@@ -11,11 +11,14 @@ skipped op, which is wrong tokens, not a refusal. This gate pins the fix:
    literal (the type stores the pointer, and the catch prints `what()` after the unwind). It never asserts, aborts or
    returns on a refusal: a refusal is a capability refusal and the throw is what reaches `graph_compute`'s cleanup;
 3. `moe_graph_record_segments` refuses to record over a context that still holds segments after a failed retire (its
-   entry guard), and wraps its record loop so the executables it has recorded move into the context before the throw
-   rather than being destroyed in the unwind while their submission may be outstanding;
+   entry guard), and scopes its record loop under a handover whose destructor, only while an exception leaves the
+   block, moves the executables it has recorded into the context rather than letting the unwind destroy them while
+   their submission may be outstanding. A destructor, not a rethrowing `catch (...)`: the alloc-zone contract's
+   no-swallow rule counts every catch-all, and its rethrow-first clause would let the refusal skip the move;
 4. `graph_compute`'s `ggml_sycl_fallback_error` catch has a cleanup step immediately after the MMID recovery and
-   before the transient-lease unpin, in its own `try { ... } catch (...) {}`, which clears the cached whole-graph
-   state (or just the segments) after the queue waits and the staging drain.
+   before the transient-lease unpin, a call of the noexcept `ggml_sycl_graph_compute_fallback_clear_graphs`, whose
+   own `try { ... } catch (...) {}` clears the cached whole-graph state (or just the segments) after the queue waits
+   and the staging drain.
 
 The runtime counterpart is the lead-run device test `test-sycl-seg-refusal-cleanup`. Plain file I/O, comment-stripped
 text.
@@ -73,6 +76,11 @@ def code() -> str:
 RECORD = r"static\s+bool\s+moe_graph_record_segments\s*\("
 REPLAY = r"static\s+void\s+moe_graph_replay_segments\s*\("
 HELPER = r"static\s+void\s+ggml_sycl_segment_forward_or_throw\s*\("
+CLEAR_STEP = (
+    r"static\s+void\s+ggml_sycl_graph_compute_fallback_clear_graphs\s*\(\s*ggml_backend_sycl_context\s*\*\s*ctx\s*\)"
+    r"\s*noexcept\b"
+)
+CLEAR_CALL = re.compile(r"\bggml_sycl_graph_compute_fallback_clear_graphs\s*\(\s*cleanup_ctx\s*\)\s*;")
 
 # the six sites, by function and role, in source order
 RECORD_ROLES = [
@@ -191,26 +199,41 @@ def test_the_record_function_refuses_a_context_that_still_holds_segments():
 def test_the_record_loop_moves_its_executables_into_the_context_before_the_throw_leaves():
     body = function_body(code(), RECORD)
     locals_end = body.index("recorded_moe_graphs.reserve")
-    wrapped = re.search(r"\btry\s*\{\s*for\s*\(\s*size_t\s+seg_idx\s*=\s*0\s*;", body[locals_end:])
-    assert wrapped, "the record loop is not wrapped in a try right after the locals are declared"
-    try_open = body.index("{", locals_end + wrapped.start())
-    after = body[block_end(body, try_open) :]
-    handler = re.match(r"\s*catch\s*\(\s*\.\.\.\s*\)\s*\{", after)
-    assert handler, "the record loop's try has no catch (...) handler"
-    handler_text = balanced(after, handler.end() - 1)
+    rest = body[locals_end:]
+    # the instance opens the block that holds the record loop, bound to this context and these two vectors
+    scoped = re.search(
+        r"\{\s*(\w+)\s+\w+\s*\{\s*sycl_ctx\s*,\s*recorded_segments\s*,\s*recorded_moe_graphs\s*\}\s*;\s*"
+        r"for\s*\(\s*size_t\s+seg_idx\s*=\s*0\s*;",
+        rest,
+    )
+    assert scoped, "the record loop is not the first statement of a block opened by a handover instance"
+    name = scoped.group(1)
+    # its type: a destructor that moves both vectors only while an exception is leaving the block
+    decl = re.search(r"\bstruct\s+" + name + r"\s*\{", rest[: scoped.start()])
+    assert decl, f"the handover type {name} is not declared between the locals and the record loop"
+    struct_text = balanced(rest, rest.index("{", decl.start()))
     assert re.search(
-        r"sycl_ctx\s*->\s*moe_segments\s*=\s*std::move\s*\(\s*recorded_segments\s*\)", handler_text
-    ), "the handler does not move the recorded segments into the context"
+        r"int\s+uncaught\s*=\s*std::uncaught_exceptions\s*\(\s*\)\s*;", struct_text
+    ), "the handover does not record the exceptions in flight when it is constructed"
+    dtor = re.search(r"~\s*" + name + r"\s*\(\s*\)\s*\{", struct_text)
+    assert dtor, "the handover type has no destructor"
+    dtor_text = balanced(struct_text, struct_text.index("{", dtor.start()))
+    cond = re.match(r"\s*if\s*\(\s*std::uncaught_exceptions\s*\(\s*\)\s*>\s*uncaught\s*\)\s*\{", dtor_text)
+    assert cond, "the handover's destructor does not act only while an exception leaves the block"
+    moved = balanced(dtor_text, cond.end() - 1)
     assert re.search(
-        r"sycl_ctx\s*->\s*moe_dispatch_graphs\s*=\s*std::move\s*\(\s*recorded_moe_graphs\s*\)", handler_text
-    ), "the handler does not move the recorded MoE graphs into the context"
+        r"ctx\s*->\s*moe_segments\s*=\s*std::move\s*\(\s*segments\s*\)", moved
+    ), "the handover does not move the recorded segments into the context"
     assert re.search(
-        r"sycl_ctx\s*->\s*moe_segments_valid\s*=\s*false\s*;", handler_text
-    ), "the handler does not mark the segments invalid (the flag may be stale-true after a refused retire)"
-    assert re.search(r"\bthrow\s*;", handler_text), "the handler does not rethrow"
-    assert not re.search(
-        r"\bwait\s*\(|wait_and_throw", handler_text
-    ), "the handler waits: that would precede the cleanup step"
+        r"ctx\s*->\s*moe_dispatch_graphs\s*=\s*std::move\s*\(\s*moe_graphs\s*\)", moved
+    ), "the handover does not move the recorded MoE graphs into the context"
+    assert re.search(
+        r"ctx\s*->\s*moe_segments_valid\s*=\s*false\s*;", moved
+    ), "the handover does not mark the segments invalid (the flag may be stale-true after a refused retire)"
+    assert not re.search(r"\bwait\s*\(|wait_and_throw", struct_text), "the handover waits: that would precede the cleanup step"
+    block_open = locals_end + scoped.start()
+    after = body[block_end(body, block_open) :]
+    assert not re.match(r"\s*catch\b", after), "the record loop's block is a try again: a catch-all there is a G-CATCH finding"
 
 
 # ---- 4. graph_compute's fallback catch ----
@@ -227,34 +250,41 @@ def test_the_catch_cleanup_follows_the_mmid_recovery_and_precedes_the_unpin():
     body = fallback_catch()
     recover = body.index("ggml_sycl_recover_exact_mmid_after_drain")
     unpin = body.index("graph_unpin_transient_leases_after_direct_execution")
-    clear = re.search(r'sycl_exec_graph_clear_active\s*\(\s*cleanup_ctx\s*,\s*"fallback-error"\s*\)', body)
-    assert clear, "the catch has no cleanup step that clears the active execution graph"
+    clear = CLEAR_CALL.search(body)
+    assert clear, "the catch has no cleanup step that clears the cached graph state"
+    assert len(CLEAR_CALL.findall(body)) == 1, "the catch clears the cached graph state more than once"
     assert (
         recover < clear.start() < unpin
     ), "the cleanup step is not between the MMID recovery and the transient-lease unpin"
+
+
+def test_the_clear_step_clears_the_live_graph_or_the_handed_over_segments():
+    step = function_body(code(), CLEAR_STEP)
+    clear = re.search(r'sycl_exec_graph_clear_active\s*\(\s*ctx\s*,\s*"fallback-error"\s*\)', step)
+    assert clear, "the clear step does not clear the active execution graph"
     assert re.search(
-        r"cleanup_ctx\s*->\s*invalidate_moe_segments\s*\(\s*\)", body[recover:unpin]
-    ), "the cleanup step does not invalidate the MoE segments when no execution graph is live"
+        r"exec_graph\b[^;{]*\|\|[^;{]*active_exec_graph\s*\.\s*valid", step[: clear.start()]
+    ), "the step does not clear the active graph when an execution graph is live or marked valid"
+    assert re.search(
+        r"ctx\s*->\s*invalidate_moe_segments\s*\(\s*\)", step
+    ), "the clear step does not invalidate the MoE segments when no execution graph is live"
 
 
 def test_the_catch_cleanup_runs_after_every_wait_and_in_its_own_guard():
     body = fallback_catch()
-    clear = re.search(r'sycl_exec_graph_clear_active\s*\(\s*cleanup_ctx\s*,\s*"fallback-error"\s*\)', body).start()
+    clear = CLEAR_CALL.search(body).start()
     for wait in ("wait_and_throw", "wait_pending_secondary_scatter_events", "ggml_sycl_cpu_staging_drain"):
         assert body.index(wait) < clear, f"the cleanup step runs before {wait}: an executable could still be in flight"
-    # its own try { ... } catch (...) {}: an exception inside a handler is not caught by the same try's other handlers
-    tries = [m.start() for m in re.finditer(r"\btry\s*\{", body[:clear])]
-    assert tries, "the cleanup step is not inside a try block"
-    try_open = body.index("{", tries[-1])
-    end = block_end(body, try_open)
-    assert end > clear, "the cleanup step is not inside its own try block"
-    assert re.match(
-        r"\s*catch\s*\(\s*\.\.\.\s*\)\s*\{\s*\}", body[end:]
-    ), "the cleanup step's try has no catch (...) {}"
-    cond = body[try_open:clear]
-    assert re.search(
-        r"exec_graph\b[^;{]*\|\|[^;{]*active_exec_graph\s*\.\s*valid", cond
-    ), "the step does not clear the active graph when an execution graph is live or marked valid"
+    # its own try { ... } catch (...) {} in a noexcept function: an exception out of the handler would cross the boundary
+    step = function_body(code(), CLEAR_STEP)
+    opened = re.match(r"\s*try\s*\{", step)
+    assert opened, "the clear step's body is not one try block"
+    try_open = step.index("{", opened.start())
+    end = block_end(step, try_open)
+    assert end > step.index("sycl_exec_graph_clear_active"), "the clear is not inside the step's try block"
+    assert re.fullmatch(
+        r"\s*catch\s*\(\s*\.\.\.\s*\)\s*\{\s*\}\s*", step[end:]
+    ), "the clear step's try has no catch (...) {}, or the step does more after it"
 
 
 if __name__ == "__main__":

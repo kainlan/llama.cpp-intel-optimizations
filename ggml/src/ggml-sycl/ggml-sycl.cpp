@@ -110514,6 +110514,22 @@ struct moe_segmented_dispatch_scope {
     ~moe_segmented_dispatch_scope() { g_moe_segmented_graph_dispatch_active = previous; }
 };
 
+// A node the backend refuses inside the segmented record and replay paths fails the graph, as the ordinary node loop's
+// GGML_ASSERT does. It throws rather than asserting or returning: a refusal is a capability refusal, not a terminal
+// plan bug, and a return from a recording site would destroy the local command graph while the queue still records into
+// it. The throw reaches graph_compute's fallback catch, which drains, releases the cached graph state and returns
+// GGML_STATUS_FAILED. The argument is a string literal because the exception stores the pointer and the catch prints
+// what() after the unwind; the node is named in the line above it.
+static void ggml_sycl_segment_forward_or_throw(ggml_backend_sycl_context & ctx, ggml_tensor * node, const char * role) {
+    if (ggml_sycl_compute_forward(ctx, node)) {
+        return;
+    }
+    fprintf(stderr, "[SYCL] graph compute unsupported node name=%s op=%s type=%s (segmented %s)\n",
+            node && node->name ? node->name : "", node ? ggml_op_name(node->op) : "(null)",
+            node ? ggml_type_name(node->type) : "(null)", role);
+    throw ggml_sycl_fallback_error("segmented graph node refused");
+}
+
 // Records one decode split into `slot` and runs it, so the split has executed when this returns. A run that fails
 // to record runs directly and stays direct in the slot. Everything a recorded graph baked a pointer to is retained
 // in the slot: what the recording sink collected, the pool scratch freed while recording, the Q8 activation
@@ -110722,22 +110738,6 @@ static void moe_graph_replay_segment_slot(ggml_backend_sycl_context *           
 // Record segmented graphs for a MoE compute graph.
 // Called after warmup when we know the graph topology is stable.
 // Returns true on success, false on failure (caller should fall back).
-// A node the backend refuses inside the segmented record and replay paths fails the graph, as the ordinary node loop's
-// GGML_ASSERT does. It throws rather than asserting or returning: a refusal is a capability refusal, not a terminal
-// plan bug, and a return from a recording site would destroy the local command graph while the queue still records into
-// it. The throw reaches graph_compute's fallback catch, which drains, releases the cached graph state and returns
-// GGML_STATUS_FAILED. The argument is a string literal because the exception stores the pointer and the catch prints
-// what() after the unwind; the node is named in the line above it.
-static void ggml_sycl_segment_forward_or_throw(ggml_backend_sycl_context & ctx, ggml_tensor * node, const char * role) {
-    if (ggml_sycl_compute_forward(ctx, node)) {
-        return;
-    }
-    fprintf(stderr, "[SYCL] graph compute unsupported node name=%s op=%s type=%s (segmented %s)\n",
-            node && node->name ? node->name : "", node ? ggml_op_name(node->op) : "(null)",
-            node ? ggml_type_name(node->type) : "(null)", role);
-    throw ggml_sycl_fallback_error("segmented graph node refused");
-}
-
 static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
                                       ggml_cgraph *               cgraph,
                                       bool                        is_decode_phase,
@@ -110854,11 +110854,30 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
     };
 
     // The executables recorded so far are moved into the context when a segment throws, not destroyed in the unwind:
-    // destroying one while its submission is outstanding is the heap corruption sycl_exec_graph_clear_active records
-    // (llama.cpp-dkw0 defect #4). graph_compute's fallback catch destroys them after its queue waits. The vectors
-    // are empty here (the entry guard), so the moves destroy nothing. No wait at the throw site: it would precede
-    // that catch's own drain and cleanup ordering.
-    try {
+    // destroying one while its submission is outstanding is the heap corruption sycl_exec_graph_clear_active records.
+    // graph_compute's fallback catch destroys them after its queue waits. The vectors are empty here (the entry
+    // guard), so the moves destroy nothing. No wait at the throw site: it would precede that catch's own drain and
+    // cleanup ordering. A destructor that acts only while an exception leaves the block, not a catch-all that
+    // rethrows: the no-swallow rule cannot tell a rethrowing catch-all from a swallowing one, and the rethrow-first
+    // clause it asks for would let a planned refusal, the throw this handover exists for, skip the move. Declared
+    // after the vectors, so it runs before they are destroyed.
+    struct recorded_handover {
+        ggml_backend_sycl_context *     ctx;
+        decltype(recorded_segments) &   segments;
+        decltype(recorded_moe_graphs) & moe_graphs;
+        int                             uncaught = std::uncaught_exceptions();
+
+        ~recorded_handover() {
+            if (std::uncaught_exceptions() > uncaught) {
+                ctx->moe_segments        = std::move(segments);
+                ctx->moe_dispatch_graphs = std::move(moe_graphs);
+                ctx->moe_segments_valid  = false;
+            }
+        }
+    };
+
+    {
+        recorded_handover handover{ sycl_ctx, recorded_segments, recorded_moe_graphs };
         for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
             const auto &  seg                  = segments[seg_idx];
             const int     seg_size             = seg.end - seg.start;
@@ -111020,12 +111039,6 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
                 return false;
             }
         }
-
-    } catch (...) {
-        sycl_ctx->moe_segments        = std::move(recorded_segments);
-        sycl_ctx->moe_dispatch_graphs = std::move(recorded_moe_graphs);
-        sycl_ctx->moe_segments_valid  = false;
-        throw;
     }
     // 4. Store in context
     sycl_ctx->moe_segments           = std::move(recorded_segments);
@@ -122592,6 +122605,22 @@ static void ggml_sycl_graph_compute_exception_exit() noexcept {
     }
 }
 
+// The clear step of graph_compute's ggml_sycl_fallback_error handler. noexcept, with its own try, for the reason each
+// sibling step has one: an exception out of a handler is not caught by that try's other handlers and would cross the
+// backend boundary. A function of its own because the no-swallow rule exempts a catch-all by the function that holds
+// it, and the handler's other catch-alls are counted as they stand. With a live execution graph the whole cached state
+// goes; without one, only the segments the record function handed over.
+static void ggml_sycl_graph_compute_fallback_clear_graphs(ggml_backend_sycl_context * ctx) noexcept {
+    try {
+        if (ctx->exec_graph || ctx->active_exec_graph.valid) {
+            sycl_exec_graph_clear_active(ctx, "fallback-error");
+        } else {
+            ctx->invalidate_moe_segments();
+        }
+    } catch (...) {
+    }
+}
+
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
                                                                const char *                what) noexcept {
@@ -122757,17 +122786,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             // A failed graph leaves the cached whole-graph and segment state untrusted, and the transient leases are
             // not released while an execution graph is live (the unpin below returns early), so clear it here: after
             // every wait and drain above, which is what makes destroying the executables safe, and before the unpin.
-            // Its own try, like each sibling: an exception inside a handler is not caught by the same try's other
-            // handlers and would cross the backend boundary. Without a live execution graph only the segments the
-            // record function handed over need to go.
-            try {
-                if (cleanup_ctx->exec_graph || cleanup_ctx->active_exec_graph.valid) {
-                    sycl_exec_graph_clear_active(cleanup_ctx, "fallback-error");
-                } else {
-                    cleanup_ctx->invalidate_moe_segments();
-                }
-            } catch (...) {
-            }
+            ggml_sycl_graph_compute_fallback_clear_graphs(cleanup_ctx);
             try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
             try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
             cleanup_ctx->last_graph_event.reset();

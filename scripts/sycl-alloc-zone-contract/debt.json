@@ -233,7 +233,6 @@
     {"code": "G-CATCH", "key": "ccl-comm.cpp::ggml_sycl_ccl_init::catch_clause:exception#0"},
     {"code": "G-CATCH", "key": "ccl-comm.cpp::ggml_sycl_ccl_init_multiprocess::catch_clause:exception#0"},
     {"code": "G-CATCH", "key": "chunk-manager.cpp::ChunkManager::detect_optimal_chunk_size::catch_clause:all#0"},
-    {"code": "G-CATCH", "key": "common.cpp::ggml_sycl_device_is_host_unified::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "common.cpp::ggml_sycl_get_device_id_from_device::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "common.cpp::ggml_sycl_get_device_id_from_queue::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "common.cpp::query_xmx_capabilities::catch_clause:all#0"},

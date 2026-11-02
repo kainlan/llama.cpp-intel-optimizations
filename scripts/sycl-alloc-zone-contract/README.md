@@ -49,11 +49,12 @@ None of them can swallow a planned refusal, and none is lane code:
 
 Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
 `pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
-(`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Five allowlist entries
-cover seven sites: the vendored `dpct/helper.hpp` hits (`E-LIBC-DPCT-MMGR-MMAP`, `E-LIBC-DPCT-MMGR-VIRTUALALLOC`,
+(`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Seven allowlist entries
+cover ten sites: the vendored `dpct/helper.hpp` hits (`E-LIBC-DPCT-MMGR-MMAP`, `E-LIBC-DPCT-MMGR-VIRTUALALLOC`,
 `E-LIBC-DPCT-HOSTBUF-MALLOC`, `E-LIBC-DPCT-DEVMEM-MALLOC`; reason "vendored dpct, unreachable from the backend"; canonical contract section 9.1) and
 `cache_guard_allocator`'s `mmap` (`E-LIBC-CACHE-GUARD`; permanent, "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM
-bytes"). The dead `weight_cache_allocator`'s `mmap` and `posix_memalign` are E-LIBC debt with fate `deleted-by-step-7` (S7's zero-caller
+bytes"), and the raw layers of the two device-free tiers, `unified_cache_raw_map_file`'s two `mmap` calls (`E-LIBC-FILE-MAPPED-RAW`) and
+`unified_cache_raw_alloc_host_cpu`'s one (`E-LIBC-HOST-CPU-RAW`; canonical contract sections 3 and 9.1). The dead `weight_cache_allocator`'s `mmap` and `posix_memalign` are E-LIBC debt with fate `deleted-by-step-7` (S7's zero-caller
 step 7's "dead weight_cache_allocator, whole" bullet in the 23mk design). The S2c control that used to pin `std::malloc` as a PASS flipped
 to a FAIL on purpose when this clause landed.
 
