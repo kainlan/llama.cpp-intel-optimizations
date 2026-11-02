@@ -35960,6 +35960,11 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     dense_spill_groups++;
                 }
             } else {
+                // The router (ffn_gate_inp, MOE_GATE priority) sits in both figures: its dst bytes are in the layer's
+                // dense figure and its src bytes in the MoE figure. Its index is only in the MoE list, so the terms
+                // charge it once, on src, while host_bytes takes both figures, a pre-existing double count of under
+                // 1 MB per layer (llama.cpp-4qdx). host_bytes matches the terms again only if a KV re-fit runs
+                // refresh_kv_byte_totals on this plan.
                 const auto                dense_host_it = dense_layer_indices.find(layer_id);
                 const std::vector<size_t> no_dense_entries;
                 plan.charge_host_weight_entries(
