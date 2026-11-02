@@ -7,11 +7,14 @@
 // under test. Both arms drive libllama's llama_mmap with lazy ranges taken from a llama_lazy_range_record, with no
 // backend and no device.
 //
-// Prefetch arm. A 64 MiB fixture under the build directory (not tmpfs): a small tensor A at the head, a 24 MiB lazy
+// Prefetch arm. An anonymous 64 MiB fixture in the build directory (not tmpfs): a small tensor A at the head, a 24 MiB lazy
 // range, then tensor B, every boundary 32 B aligned and not page aligned. The lazy range starts inside the first
 // 512 KiB of the file because a WILLNEED over a long range reads only its head on current kernels (a single
 // read-ahead chunk, 512 KiB here), so a mutant that prefetches from offset 0 only reaches a lazy byte if the range
-// begins there. llama_mmap(prefetch = -1) over the record's ranges, polled for up to 10 s:
+// begins there. llama_mmap(prefetch = -1) over the record's ranges, polled for up to 10 s. The poll ends early, one
+// second after the neighbours are prefetched, because WILLNEED has by then read everything it will read (its work is a
+// single bounded chunk per range); the design's full 10 s wait would only add idle time. The empty-record mutant must
+// show resident lazy pages within the 10 s:
 //   * the lazy pages (the lazy range less the two pages it shares with a neighbour) read 0 resident
 //   * the two shared pages read 0 resident: WILLNEED rounds inward, so it never reaches a page holding a lazy byte
 //   * the neighbours are prefetched up to the shared pages, so the zero is not "nothing was prefetched"
@@ -254,7 +257,7 @@ struct prefetch_result {
 
 // Maps with prefetch = -1 over `ranges` and polls the file's residency for up to 10 s. `stop_on_interior` ends the
 // poll when the interior first reads resident (the mutant); otherwise the poll runs until the neighbours are
-// prefetched and one more second has passed, so that read that arrives late is seen.
+// prefetched and one more second has passed, so that a read that arrives late is seen.
 static prefetch_result run_prefetch(int fd, const llama_mmap::ranges & ranges, bool stop_on_interior) {
     prefetch_result res;
     if (!evict(fd, P_FILE_SIZE)) {
