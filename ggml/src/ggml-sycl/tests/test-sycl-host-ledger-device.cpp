@@ -20,7 +20,8 @@
 // are not configured yet, and arm (j)'s late stage configures them, so (j) runs last.
 //
 // --strict-child A|B is the abort leg of arm (o), run by the parent in a child process with
-// GGML_SYCL_STRICT_LEASES=1: it makes the backstop's request in mode A or B and must die by SIGABRT.
+// GGML_SYCL_STRICT_LEASES=1: it makes the backstop's request in mode A or B and must die by SIGABRT with the
+// backstop's abort message on stderr.
 
 #include "../common.hpp"
 #include "../kv-region-registry.hpp"
@@ -30,12 +31,15 @@
 #include "host-ledger-commit-oracle.hpp"
 #include "sycl-test-skip.hpp"
 
+#include <poll.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -839,14 +843,95 @@ allocation_result backstop_request(char mode) {
     return got;
 }
 
+// The text the backstop's strict abort carries, the probe the abort leg scores by. The backstop's WARN, printed just
+// before it, reads "the tier and the charge must agree", so the WARN alone cannot satisfy the probe.
+constexpr const char * k_backstop_abort = "[HOST-PLAN-BUG] unified_alloc: the tier and the host-ledger charge disagree";
+
+// How long a strict child may run: it initialises one backend and makes one request.
+constexpr std::chrono::seconds k_child_bound{ 60 };
+
+struct child_run {
+    bool        ran    = false;  // started, and exited or was signalled within the bound
+    int         status = 0;
+    std::string err;             // everything the child wrote to stderr
+};
+
+// The last part of a child's stderr, for a failure message: its backend start-up lines come first.
+std::string tail_of(const std::string & err) {
+    constexpr size_t k_tail = 600;
+    return err.size() <= k_tail ? err : "..." + err.substr(err.size() - k_tail);
+}
+
+// Runs this binary as `--strict-child <mode>` with `envp` and collects its stderr within k_child_bound. The caller
+// builds envp before the fork, so the child calls only dup2, close and execve (this process has threads, and only
+// async-signal-safe calls are legal between fork and exec).
+child_run run_strict_child(const char * mode, char * const * envp) {
+    child_run   r;
+    char        arg0[] = "test-sycl-host-ledger-device";
+    char        arg1[] = "--strict-child";
+    std::string arg2   = mode;
+    char *      argv[] = { arg0, arg1, arg2.data(), nullptr };
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return r;
+    }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        dup2(fds[1], STDERR_FILENO);
+        close(fds[0]);
+        close(fds[1]);
+        execve("/proc/self/exe", argv, envp);
+        _exit(127);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return r;
+    }
+    const auto deadline  = std::chrono::steady_clock::now() + k_child_bound;
+    bool       timed_out = false;
+    char       buf[512];
+    for (;;) {
+        const auto left =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) {
+            timed_out = true;
+            kill(pid, SIGKILL);
+            break;
+        }
+        pollfd    p     = { fds[0], POLLIN, 0 };
+        const int ready = poll(&p, 1, static_cast<int>(left));
+        if (ready <= 0) {
+            continue;  // EINTR, or the bound passed: the loop's top decides
+        }
+        const ssize_t got = read(fds[0], buf, sizeof(buf));
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            break;  // end of file: the child has exited
+        }
+        r.err.append(buf, static_cast<size_t>(got));
+    }
+    close(fds[0]);
+    if (waitpid(pid, &r.status, 0) != pid) {
+        return r;
+    }
+    r.ran = !timed_out;
+    return r;
+}
+
 // (o) A cohort that holds a HOST_CPU row does not hand HOST_CPU to a prefer_same_tier_as_cohort request; the tier
 // backstop refuses a tier that disagrees with the charge, in both directions, and aborts under strict.
 // Engagement: the cohort's HOST_CPU row is live; the FORCE_TIER point fired with the expected charge argument and the
-// [HOST-PLAN-BUG] line was printed; in mode B the request was charged (the charge hook was seen).
+// [HOST-PLAN-BUG] line was printed; in mode B the request was charged (the charge hook was seen); each strict child
+// ran to its end within the bound.
 // Mutants: the cohort branch returns HOST_CPU (a variant build; it would refuse the follower at the backstop, so the
 // follower's success and tier score it); the backstop dropped (mode A allocates a HOST_CPU mapping with no charge,
 // mode B a device allocation with a charge held); the guard not crediting on the backstop's refusal (mode B leaves
-// committed high).
+// committed high); the backstop's strict abort dropped while a later check aborts the child (it dies by SIGABRT
+// without the backstop's message).
 arm_result arm_o_cohort_and_backstop() {
     arm_result r;
     board_install();
@@ -897,9 +982,8 @@ arm_result arm_o_cohort_and_backstop() {
                    " (mode B credits its charge once)");
     }
 
-    // the abort leg: the same request in a strict child process. The environment and argv are built before the fork,
-    // so the child calls nothing but execve (this process has threads, and only async-signal-safe calls are legal
-    // between fork and exec).
+    // the abort leg: the same request in a strict child process, which must die by SIGABRT with the backstop's abort
+    // message on stderr, so an abort from anywhere else does not pass. The environment is built here, before any fork.
     std::vector<std::string> env_strings;
     for (char ** e = environ; *e != nullptr; ++e) {
         if (std::strncmp(*e, "GGML_SYCL_STRICT_LEASES=", 24) != 0 && std::strncmp(*e, "GGML_NO_BACKTRACE=", 18) != 0) {
@@ -914,22 +998,16 @@ arm_result arm_o_cohort_and_backstop() {
     }
     envp.push_back(nullptr);
     for (const char * mode : { "A", "B" }) {
-        char        arg0[] = "test-sycl-host-ledger-device";
-        char        arg1[] = "--strict-child";
-        std::string arg2   = mode;
-        char *      argv[] = { arg0, arg1, arg2.data(), nullptr };
-        const pid_t pid    = fork();
-        if (pid == 0) {
-            execve("/proc/self/exe", argv, envp.data());
-            _exit(127);
-        }
-        int status = 0;
-        if (pid < 0 || waitpid(pid, &status, 0) != pid) {
-            void_arm(r, std::string("the strict child for mode ") + mode + " could not be run");
+        const std::string name = std::string("the strict child for mode ") + mode;
+        const child_run   c    = run_strict_child(mode, envp.data());
+        if (!c.ran) {
+            void_arm(r, name + " could not be run within " + num(k_child_bound.count()) + " s: " + tail_of(c.err));
             continue;
         }
-        expect(r, WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
-               std::string("the strict child for mode ") + mode + " did not abort (status " + num(status) + ")");
+        expect(r, WIFSIGNALED(c.status) && WTERMSIG(c.status) == SIGABRT,
+               name + " did not abort (status " + num(c.status) + "): " + tail_of(c.err));
+        expect(r, c.err.find(k_backstop_abort) != std::string::npos,
+               name + " did not print the backstop's abort message: " + tail_of(c.err));
     }
     board_remove();
     return r;
