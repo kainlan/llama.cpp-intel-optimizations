@@ -32653,10 +32653,11 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     // The plan has no figure for those request sizes, so this one reserve is the HOST_COMPUTE term.
     constexpr size_t k_host_compute_reserve_bytes = 64ull * 1024ull * 1024ull;
 
-    // The host weights are summed here and nowhere else: which entries count is this loop's predicate alone.
+    // The host weights are summed here and nowhere else. Which entries count is the plan's own charge rule, so this
+    // sum and weight_host_bytes cover the same entries.
     host_weight_zone_terms terms;
     for (const placement_entry & entry : plan.entries) {
-        if (entry.on_device) {
+        if (entry.on_device || !placement_plan::host_backing_sizes_weight_zone(entry.host_backing)) {
             continue;
         }
         terms.host_weights += placement_entry_host_weight_bytes(entry);
@@ -33253,7 +33254,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     const host_weight_zone_terms weight_terms = placement_plan_host_weight_zone_terms(plan);
     if (weight_terms.host_weights != plan.weight_host_bytes) {
         GGML_LOG_WARN(
-            "[HOST-PLAN-BUG] device=%d host-resident entries hold %zu B but the plan's weight_host_bytes is %zu B; "
+            "[HOST-PLAN-BUG] device=%d the WEIGHT zone's entries hold %zu B but the plan's weight_host_bytes is %zu B; "
             "the WEIGHT zone is sized from the entries\n",
             plan.device_id, weight_terms.host_weights, plan.weight_host_bytes);
     }
