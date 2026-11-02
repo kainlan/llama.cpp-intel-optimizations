@@ -8,15 +8,18 @@
 //
 // These arms touch only the ledger functions, a fake yielder and the budget function. Two more legs score the plan's
 // host bytes through the two pure functions behind them, the commit terms and the zone commit check, on hand-built
-// plans, and a third runs the host sample in child processes to score its lock check. None constructs a cache or a pool
-// and none initialises SYCL, so the binary needs no device. Arms (j)-(o), the over-budget fixture and the
-// plan-against-committed fixture run a planner, a pool or the HOST_CPU tier and are in
-// test-sycl-host-ledger-device.cpp, which the lead runs.
+// plans. Two score the re-record of a plan's terms by the re-plans that grow a term after the record, the KV refresh
+// and the runtime MMID re-plan, on hand-built plans; the MMID re-plan reads its owner bound from a mocked device table.
+// One runs the host sample in child processes to score its lock check. None constructs a cache or a pool and none
+// initialises SYCL, so the binary needs no device. Arms (j)-(o), the over-budget fixture and the plan-against-committed
+// fixture run a planner, a pool or the HOST_CPU tier and are in test-sycl-host-ledger-device.cpp, which the lead runs.
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
 // runs, so one failure does not hide the rest, except a charge that never returns: the binary stops at that one.
 
+#include "../common.hpp"
+#include "../ggml-sycl-test.hpp"
 #include "../kv-region-registry.hpp"
 #include "../unified-cache.hpp"
 #include "host-ledger-commit-oracle.hpp"
@@ -894,6 +897,171 @@ arm_result leg_c() {
     return r;
 }
 
+// --- a re-plan after the record (th32 §4.2, §10's zone check) ---
+
+constexpr size_t KiB = 1024ull;
+
+// The chunk the re-plan legs record with: small, so a growth of a few chunks crosses chunk boundaries and a stale
+// record undercounts the pool by whole chunks.
+constexpr size_t k_record_chunk = 64 * KiB;
+
+// Records the plan's host figures as the planner's record does: the commit terms from the record's inputs (no live
+// oneDNN scratch, the small chunk) and their total.
+void record_terms(placement_plan & plan) {
+    plan.host_zone_terms    = placement_plan_host_zone_commit_terms(plan, 0, k_record_chunk);
+    plan.host_planned_bytes = plan.host_zone_terms.total();
+}
+
+// A plan the commit terms price: one entry, the four host zones above their floors, and no runtime bytes.
+placement_plan replan_fixture_plan() {
+    placement_plan plan{};
+    plan.entries.emplace_back();
+    plan.host_zone_weight_bytes  = 256 * MiB;
+    plan.host_zone_kv_bytes      = 64 * MiB;
+    plan.host_zone_staging_bytes = 16 * MiB;
+    plan.host_zone_scratch_bytes = 64 * MiB;
+    return plan;
+}
+
+// After a re-plan that grew a term: the re-plan logged no plan line and no would-refuse line, the plan holds the commit
+// terms its own sizing gives from the record's inputs, term by term, and configuring it (on paper: the pool grows by
+// those terms' total from an empty pool) logs no [HOST-PLAN-BUG]. The caller cleared the log before the re-plan.
+void expect_rerecorded(arm_result & r, const std::string & name, const placement_plan & plan) {
+    const std::string at = name + ": ";
+    expect(r, log_count_with("would refuse") == 0,
+           at + "the re-plan logged a would-refuse line: " + log_line_with("would refuse"));
+    expect(r, log_count_with(" plan host_budget=") == 0,
+           at + "the re-plan logged a plan line: " + log_line_with(" plan host_budget="));
+
+    const host_zone_commit_terms   sized = placement_plan_host_zone_commit_terms(plan, 0, k_record_chunk);
+    const host_zone_commit_terms & held  = plan.host_zone_terms;
+    expect(r,
+           held.weight == sized.weight && held.kv == sized.kv && held.staging == sized.staging &&
+               held.scratch == sized.scratch && held.runtime == sized.runtime && held.rounding == sized.rounding,
+           at + "the plan holds kv=" + num(held.kv) + " scratch=" + num(held.scratch) +
+               " rounding=" + num(held.rounding) + ", its sizing gives kv=" + num(sized.kv) +
+               " scratch=" + num(sized.scratch) + " rounding=" + num(sized.rounding));
+    expect(r, plan.host_planned_bytes == sized.total(),
+           at + "host_planned_bytes " + num(plan.host_planned_bytes) + ", its sizing's total " + num(sized.total()));
+
+    log_clear();
+    const bool configured_ok = host_zone_commit_check(0, held.total(), 0, sized.total());
+    expect(r, configured_ok && log_count_with("[HOST-PLAN-BUG]") == 0,
+           at + "configuring the re-planned plan names bytes it counts: " + log_line_with("[HOST-PLAN-BUG]"));
+}
+
+// The runtime transaction's KV update re-records the terms it grows (th32 §4.2). update_runtime_kv_sizes() and the KV
+// refresh run on a recorded plan whose KV is on the host tier, as the runtime context transaction runs them on its copy
+// of the published plan: the host KV grows past the KV zone the plan recorded, the refresh raises the zone, and the
+// plan's terms and host_planned_bytes follow, so configuring it commits nothing the plan does not count.
+// Engagement: the update raises the host KV zone past the recorded KV term by more than two chunks, so a stale record
+// undercounts the pool by whole chunks.
+// Mutants: the refresh not re-recording (the plan holds the old kv term and the check names the bytes); a re-record
+// from the default or the cache's chunk instead of the record's (the rounding differs); a re-record through the
+// planner's record (a plan line).
+arm_result leg_k() {
+    arm_result r;
+    ggml_sycl_test_host_ledger_store_budget(64 * GiB);
+    placement_plan plan = replan_fixture_plan();
+    for (int layer = 0; layer < 4; ++layer) {
+        plan.kv_device[layer] = -1;  // every layer's KV on the host tier
+    }
+    plan.kv_per_layer = 16 * MiB;
+    plan.refresh_kv_byte_totals();  // 64 MiB of host KV, the KV zone the load plan sized
+    record_terms(plan);
+    const size_t recorded_kv = plan.host_zone_terms.kv;
+
+    log_clear();
+    plan.update_runtime_kv_sizes(/*n_ctx=*/8192, /*full_kv_per_layer=*/64 * MiB, /*swa_kv_per_layer=*/0);
+    if (plan.kv_host_bytes != 256 * MiB || plan.host_zone_kv_bytes != plan.kv_host_bytes ||
+        plan.host_zone_kv_bytes < recorded_kv + 2 * k_record_chunk) {
+        void_arm(r, "the KV update did not raise the host KV zone past the recorded kv term " + num(recorded_kv) +
+                        " by two chunks: host KV " + num(plan.kv_host_bytes) + ", zone " +
+                        num(plan.host_zone_kv_bytes));
+        ledger_settle();
+        return r;
+    }
+    expect_rerecorded(r, "the KV refresh", plan);
+    ledger_settle();
+    return r;
+}
+
+// The runtime MMID re-plan re-records the terms its host pool grows (th32 §4.2). The re-plan runs on a recorded plan
+// with one executing expert and no workspace yet, at the context's micro-batch: its demand's host pool goes into the
+// SCRATCH zone (the growth tail of replan_moe_mmid_workspaces_for_runtime), and the plan's terms follow. Then the same
+// zone grown by hand, outside any re-plan, is the positive control: configuring it names the bytes the plan does not
+// count, so the silence after the re-plan is the re-record's and not the paper configure's.
+// Engagement: the re-plan succeeds and grows SCRATCH by exactly its host pool, more than two chunks; the control's
+// growth moves the same term.
+// Mutants: the re-plan not re-recording, or re-recording before its write (the plan holds the old scratch term and the
+// check names the bytes); a re-record from another chunk (the rounding differs); a re-record through the planner's
+// record (a plan line). The configure step checking against its own recomputation instead of the recorded terms is the
+// device fixture's mutant (plan-against-committed, device 1), since the configure step needs a cache.
+arm_result leg_m() {
+    arm_result r;
+    ggml_sycl_test_host_ledger_store_budget(64 * GiB);
+    static const char * k_expert = "blk.0.ffn_up_exps.weight";
+    placement_plan      plan     = replan_fixture_plan();
+    placement_entry &   expert   = plan.entries.back();
+    expert.name                  = k_expert;
+    expert.expert_id             = 0;
+    expert.on_device             = true;
+    expert.target_device         = 0;
+    plan.device_id               = 0;
+    plan.vram_budget             = 64 * GiB;
+    plan.vram_bytes              = 1 * GiB;
+    plan.planner_n_ubatch        = 4096;
+    plan.planner_n_seq_max       = 1;
+    record_terms(plan);
+    const size_t scratch_before = plan.host_zone_scratch_bytes;
+
+    placement_tensor_info info(k_expert, 4096ull * 1024ull * 8ull / 2ull);
+    info.type                                          = GGML_TYPE_Q4_0;
+    info.ne[0]                                         = 4096;
+    info.ne[1]                                         = 1024;
+    info.ne[2]                                         = 8;
+    info.ne[3]                                         = 1;
+    const std::vector<placement_tensor_info> inventory = { info };
+
+    // The re-plan bounds the workspace owners by the device table's count: one mocked device, so SYCL stays untouched.
+    ggml_sycl_device_info devices{};
+    devices.device_count            = 1;
+    devices.total_gpu_count         = 1;
+    moe_mmid_runtime_reason reason  = moe_mmid_runtime_reason::OK;
+    bool                    planned = false;
+    log_clear();
+    {
+        test_sycl_info_override_guard                devices_guard(devices);
+        test_moe_mmid_route_reachable_override_guard route_guard(/*reachable=*/true);
+        planned = replan_moe_mmid_workspaces_for_runtime(plan, inventory, /*n_expert_used=*/4, &reason);
+    }
+    const size_t growth = plan.host_zone_scratch_bytes - scratch_before;
+    if (!planned || plan.moe_mmid_host_pool_bytes == 0 || growth != plan.moe_mmid_host_pool_bytes ||
+        growth < 2 * k_record_chunk) {
+        void_arm(r, std::string("the re-plan did not grow SCRATCH by its host pool of at least two chunks: ok=") +
+                        (planned ? "1" : "0") + " reason=" + moe_mmid_runtime_reason_name(reason) +
+                        " host_pool=" + num(plan.moe_mmid_host_pool_bytes) + " growth=" + num(growth));
+        ledger_settle();
+        return r;
+    }
+    expect_rerecorded(r, "the MMID re-plan", plan);
+
+    const size_t held_total = plan.host_zone_terms.total();
+    plan.host_zone_scratch_bytes += 3 * k_record_chunk;  // outside any re-plan
+    const size_t committed = placement_plan_host_zone_commit_terms(plan, 0, k_record_chunk).total();
+    log_clear();
+    const bool        control_ok = host_zone_commit_check(0, plan.host_zone_terms.total(), 0, committed);
+    const size_t      lines      = log_count_with("[HOST-PLAN-BUG]");
+    const std::string line       = log_line_with("[HOST-PLAN-BUG]");
+    expect(r, !control_ok && lines == 1,
+           "the control: a SCRATCH growth outside any re-plan gave " + num(lines) + " [HOST-PLAN-BUG] lines, want 1");
+    expect(r, printed(line, "planned") == held_total && printed(line, "committed") == committed,
+           "the control's line does not name the plan's " + num(held_total) + " and the pool's " + num(committed) +
+               " bytes: " + line);
+    ledger_settle();
+    return r;
+}
+
 // --- the host sample's lock check (th32 §4.2) ---
 
 // The text the witness abort carries, the probe the aborting case scores by.
@@ -1077,6 +1245,8 @@ int main(int argc, char ** argv) {
         { "i: the budget function saturates and the override is the whole budget",                arm_i },
         { "plan terms: the commit terms are what configuring the zones commits",                  leg_t },
         { "zone check: growth past the plan logs one [HOST-PLAN-BUG] naming both numbers",        leg_c },
+        { "re-plan, KV: the KV refresh re-records the terms it grows",                            leg_k },
+        { "re-plan, MMID: the runtime MMID re-plan re-records its host pool growth",              leg_m },
         { "sample: host_ledger_sample aborts with a witnessed lock held, the replan token aside", leg_w },
     };
 

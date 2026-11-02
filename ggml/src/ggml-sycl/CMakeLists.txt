@@ -7864,10 +7864,11 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         TIMEOUT 60)
 
     # The process-global host ledger (th32 §11 T2), arms (a)-(i): the lock-free charge protocol, the yield and its
-    # unregister handshake, the credit and the saturating budget function, plus the plan's commit terms and the zone
-    # commit check on hand-built plans. Host-only: the arms call the ledger functions, a fake yielder, the budget
-    # function and those two pure functions, and none constructs a cache or a pool or touches a device, so it carries
-    # none of the OOM-family labels. RUN_SERIAL: the ledger is process-global.
+    # unregister handshake, the credit and the saturating budget function, plus the plan's commit terms, the zone
+    # commit check and the re-record of the terms by the KV refresh and the runtime MMID re-plan, on hand-built plans.
+    # Host-only: the arms call the ledger functions, a fake yielder, the budget function, those two pure functions and
+    # the two re-plans (the MMID re-plan under a mocked device table), and none constructs a cache or a pool or touches
+    # a device, so it carries none of the OOM-family labels. RUN_SERIAL: the ledger is process-global.
     add_executable(test-sycl-host-ledger
         tests/test-sycl-host-ledger.cpp)
     target_link_libraries(test-sycl-host-ledger PRIVATE
