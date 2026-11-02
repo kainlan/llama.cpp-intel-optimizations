@@ -379,15 +379,20 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(const std::vector<placemen
 
     // The fallback the planner takes for an expert row whose inventory shape was not populated: it splits the row by
     // the model-wide expert count. Here that count is the tensor's own ne[2], as it is for every architecture but
-    // one, so the fallback still meets nb[2].
-    std::vector<placement_tensor_info> unshaped = inventory;
+    // one, so the fallback still meets nb[2]; the check on each row below pins that equality.
+    std::vector<placement_tensor_info> unshaped        = inventory;
+    size_t                             n_unshaped_rows = 0;
     for (placement_tensor_info & row : unshaped) {
         if (row.name.find("_exps") != std::string::npos) {
+            check_eq("the model-wide expert count plan_q2k passes equals the unshaped row's own ne[2]",
+                     static_cast<size_t>(k_experts), static_cast<size_t>(row.ne[2]));
+            n_unshaped_rows++;
             for (int64_t & n : row.ne) {
                 n = 0;
             }
         }
     }
+    check(n_unshaped_rows > 0, "the fallback case has expert rows to unshape");
     const placement_plan fallback_plan = plan_q2k(unshaped);
     ggml_log_set(prev_cb, prev_data);
 
