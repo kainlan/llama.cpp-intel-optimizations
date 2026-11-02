@@ -1268,8 +1268,9 @@ created") describes a path that does not run.
     `llama_model_sycl_build_kv_layer_arrays` beside `kv_k_width_per_layer`,
     `kv_v_width_per_layer` and `kv_layer_kind`, and the plan copies it into
     `placement_plan::layer_idx_k_width`. The field was appended and grew
-    the struct from 176 to 184 bytes, so `libllama` and `libggml-sycl`
-    rebuild together; a stale pairing is unsupported.
+    the struct from 176 to 184 bytes (192 bytes with master's later
+    fields; `ggml-sycl.h` pins the size), so `libllama` and
+    `libggml-sycl` rebuild together; a stale pairing is unsupported.
   - `placement_plan::kv_size_for_layer(l)` is the layer's K/V buffer
     (`kv_main_size_for_layer(l)`) plus its indexer keys
     (`kv_idx_size_for_layer(l)`, from that layer's width, and 0 on a layer
