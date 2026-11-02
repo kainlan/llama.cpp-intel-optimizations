@@ -20656,8 +20656,10 @@ allocation_result unified_allocate_file_mapping(const file_mapping_request & req
         stale_claim_report stale_claim;  // declared before the lock: logs after it is dropped
         {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+            // Through the helper, never the map: it gives the row its containment-index entry and its settle-counter
+            // contribution, and the release path erases both, so a row the map holds without them aborts that release.
             if (runtime_registry_claim_ptr_locked(mapping.base, stale_claim)) {
-                registered = g_runtime_alloc_registry.emplace(mapping.base, rec).second;
+                registered = runtime_registry_emplace_locked(mapping.base, rec).second;
             }
         }
         if (!registered) {
