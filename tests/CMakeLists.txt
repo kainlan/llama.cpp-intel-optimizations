@@ -4061,9 +4061,9 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-backing-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
-    # llama.cpp-5efe C4 (part e): host-resident weights are one published fact, and the loader binds SYCL_Mapped from
-    # it. A plain script: --self-test requires each witness mutant to be caught, so an anchor that stops matching
-    # fails instead of passing vacuously.
+    # Host-resident weights are one published fact, and the loader binds SYCL_Mapped from it (design 5efe §4.3). A
+    # plain script: --self-test requires each witness mutant to be caught, so an anchor that stops matching fails
+    # instead of passing vacuously.
     add_test(NAME test-sycl-mapped-loader-source
         COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mapped-loader-source.py --self-test)
     set_tests_properties(test-sycl-mapped-loader-source PROPERTIES

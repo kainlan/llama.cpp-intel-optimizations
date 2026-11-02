@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Source contract for llama.cpp-5efe C4 (part e): host-resident weights are one published fact, and the loader binds
-SYCL_Mapped from it (design 5efe §4.3, §4.4, §5.3; docs/design/sycl-mmap-host-tier.md).
+"""Source contract: host-resident weights are one published fact, and the loader binds SYCL_Mapped from it (design 5efe
+§4.3, §4.4, §5.3; docs/design/sycl-mmap-host-tier.md).
 
 The runtime half is the lead-run planner test `test-sycl-host-backing-plan` (the Qwen-shaped inventory under the fact
 true, false and locked). This gate pins what that test cannot see: where the fact comes from and where it lives, the ABI
