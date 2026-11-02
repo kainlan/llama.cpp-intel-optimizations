@@ -22,6 +22,7 @@
 // --strict-child A|B is the abort leg of arm (o), run by the parent in a child process with
 // GGML_SYCL_STRICT_LEASES=1: it makes the backstop's request in mode A or B and must die by SIGABRT.
 
+#include "../common.hpp"
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
@@ -1108,8 +1109,11 @@ arm_result fixture_over_budget_warns_and_loads() {
 // recomputation instead of the plan's recorded terms (no line on device 1).
 arm_result fixture_plan_against_committed() {
     arm_result r;
-    if (ggml_backend_sycl_get_device_count() < 2) {
-        void_arm(r, "the leg needs two SYCL devices (selector level_zero:0,1)");
+    // Two cards, counted before the scheduler hides any: the scheduler exposes device 0 alone unless a split is asked
+    // for, and the leg plans and configures each card's own cache, as the multi-device planner does for a hidden card.
+    const int  n_gpu = ggml_sycl_info().total_gpu_count;
+    if (n_gpu < 2) {
+        void_arm(r, "the leg needs two SYCL GPUs (selector level_zero:0,1), found " + num(n_gpu));
         return r;
     }
     const std::vector<placement_tensor_info> inventory = planner_inventory();
@@ -1211,24 +1215,22 @@ std::string list(const std::vector<size_t> & v) {
 }
 
 // (j) The store order. A planner pass stores before it plans, so its plan records the new budget; one load
-// transaction stores once across its early and late stage runs and every device's plan; a second transaction stores
+// transaction stores once across its early and late stage runs and every plan they build; a second transaction stores
 // again; a direct entry outside a transaction stores, and one while a transaction is open only reads.
-// Engagement: every leg's plans were built (their [HOST-LEDGER] plan lines are counted), the stage runs returned OK,
-// and the pinned commit injected between the early and the late run moves a fresh computation by at least its bytes,
-// so a second store would have recorded a different number.
+// A stage run builds one plan per device the scheduler exposes. On a multi-GPU host that is device 0 alone unless a
+// split is asked for, and its plan is the multi-device plan over every card, so the arm runs on any number of cards.
+// Engagement: every leg's plans were built (their [HOST-LEDGER] plan lines are counted, one per exposed device in a
+// stage run), the stage runs returned OK, and the pinned commit injected between the early and the late run moves a
+// fresh computation by at least its bytes, so a second store would have recorded a different number.
 // Mutants: the store after the plan call (the first leg's plan records B0); a store per stage call (stores reads 2
-// and the late plans read the early value less the injected bytes); a store per planner call (the second device's
-// late plan, built after the first device's zones were committed, records a different number); no
-// current_active_token() check (the direct entry inside the transaction stores); id 0 writing the stored transaction
-// (the second direct entry skips its store). A dry run is not in this tree, so the last leg is the planner called
-// outside any scope, which must read B0 and store nothing.
+// and the late plans read the early value less the injected bytes); a store per planner call, inside the stage run's
+// device loop (the transaction stores at least once per stage run, so twice, and the late plans read the early value
+// less the injected bytes); no current_active_token() check (the direct entry inside the transaction stores); id 0
+// writing the stored transaction (the second direct entry skips its store). A dry run is not in this tree, so the
+// last leg is the planner called outside any scope, which must read B0 and store nothing.
 arm_result arm_j_store_order() {
-    arm_result r;
-    const int  n_dev = ggml_backend_sycl_get_device_count();
-    if (n_dev < 2) {
-        void_arm(r, "the two-device legs need two SYCL devices (selector level_zero:0,1)");
-        return r;
-    }
+    arm_result   r;
+    const size_t n_dev = static_cast<size_t>(ggml_backend_sycl_get_device_count());  // the stage runs' device loop
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_sycl_init(0), ggml_backend_free);
     if (!backend) {
         void_arm(r, "backend 0 did not initialise");
@@ -1277,8 +1279,9 @@ arm_result arm_j_store_order() {
     const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, true);
     const std::vector<size_t>        early    = plan_budgets();
     const size_t                     S1       = host_ledger_budget();
-    if (early_rc != GGML_SYCL_LIFECYCLE_OK || early.size() < 2) {
-        void_arm(r, "the early stage run returned " + num(early_rc) + " with " + num(early.size()) + " plans");
+    if (early_rc != GGML_SYCL_LIFECYCLE_OK || early.size() < n_dev) {
+        void_arm(r, "the early stage run returned " + num(early_rc) + " with " + num(early.size()) +
+                        " plans, want one per exposed device (" + num(n_dev) + ")");
     }
     expect(r, stores() == s0 + 1, "the early stage run stored " + num(stores() - s0) + " times, want 1");
     expect(r, all_equal(early, S1), "the early plans recorded " + list(early) + ", stored " + num(S1));
@@ -1298,8 +1301,9 @@ arm_result arm_j_store_order() {
     log_clear();
     const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, false);
     const std::vector<size_t>        late    = plan_budgets();
-    if (late_rc != GGML_SYCL_LIFECYCLE_OK || late.size() < 2) {
-        void_arm(r, "the late stage run returned " + num(late_rc) + " with " + num(late.size()) + " plans");
+    if (late_rc != GGML_SYCL_LIFECYCLE_OK || late.size() < n_dev) {
+        void_arm(r, "the late stage run returned " + num(late_rc) + " with " + num(late.size()) +
+                        " plans, want one per exposed device (" + num(n_dev) + ")");
     }
     expect(r, stores() == s0 + 1, "the transaction stored " + num(stores() - s0) + " times across its runs, want 1");
     expect(r, all_equal(late, S1), "the late plans recorded " + list(late) + ", not the early value " + num(S1));
