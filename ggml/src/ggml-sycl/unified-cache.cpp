@@ -32631,11 +32631,11 @@ static void publish_moe_host_scatter_term(const placement_plan &                
     }
 }
 
-size_t placement_host_weight_bytes(const placement_entry & entry) {
+size_t placement_entry_host_weight_bytes(const placement_entry & entry) {
     return entry.src_size;
 }
 
-host_weight_zone_terms placement_host_weight_zone_terms(const placement_plan & plan) {
+host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {
     // llama.cpp-glkg: the WEIGHT zone is where every runtime HOST_COMPUTE
     // request lands (unified_alloc_host_zone() routes role==WEIGHT OR
     // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
@@ -32649,23 +32649,25 @@ host_weight_zone_terms placement_host_weight_zone_terms(const placement_plan & p
     // pool budget, allocation phase, and contiguous/aligned chunk capacity.
     // Retained-weight/post-load tests must establish sufficiency for each
     // qualified workload; the observed request sizes alone do not prove it.
-    constexpr size_t k_host_runtime_reserve_bytes = 64ull * 1024ull * 1024ull;
+    // The plan has no figure for those request sizes, so this one reserve is the HOST_COMPUTE term.
+    constexpr size_t k_host_compute_reserve_bytes = 64ull * 1024ull * 1024ull;
 
+    // The host weights are summed here and nowhere else: which entries count is this loop's predicate alone.
     host_weight_zone_terms terms;
     for (const placement_entry & entry : plan.entries) {
         if (entry.on_device) {
             continue;
         }
-        terms.host_weights += placement_host_weight_bytes(entry);
+        terms.host_weights += placement_entry_host_weight_bytes(entry);
         terms.blocks++;
     }
-    terms.runtime_reserve = k_host_runtime_reserve_bytes;
-    // S1-PRELOAD materializes a host-planned weight once, in AOS (the planner rewrites every host entry to AOS), so
-    // the plan keeps no second, converted copy of any host weight in this zone.
-    terms.layout_copies   = 0;
+    terms.host_compute_reserve = k_host_compute_reserve_bytes;
+    // S1-PRELOAD copies a host-planned weight once, in AOS, so the plan keeps no second, converted copy of any host
+    // weight in this zone.
+    terms.layout_copies        = 0;
     // The pinned pool's TLSF hands out whole grains and keeps its metadata outside the managed region, so a block
     // occupies at most its bytes plus one grain.
-    terms.tlsf_bound      = terms.blocks * tlsf_allocator::block_grain;
+    terms.tlsf_bound           = terms.blocks * tlsf_allocator::block_grain;
     return terms;
 }
 
@@ -33245,7 +33247,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     // WEIGHT: exact bytes plus named terms. The host weights are summed from the entries, the bytes the cache
     // materializes; weight_host_bytes is the plan's running total of the same bytes, so a difference means a writer
     // charged something the entries do not hold, and the zone is sized from the entries.
-    const host_weight_zone_terms weight_terms = placement_host_weight_zone_terms(plan);
+    const host_weight_zone_terms weight_terms = placement_plan_host_weight_zone_terms(plan);
     if (weight_terms.host_weights != plan.weight_host_bytes) {
         GGML_LOG_WARN(
             "[HOST-PLAN-BUG] device=%d host-resident entries hold %zu B but the plan's weight_host_bytes is %zu B; "
@@ -33254,9 +33256,10 @@ static void populate_host_zone_sizing(placement_plan &                          
     }
     plan.host_zone_weight_bytes = weight_terms.total();
     GGML_LOG_INFO(
-        "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu runtime_reserve=%zu layout_copies=%zu "
-        "tlsf_bound=%zu total=%zu (%.1f MB)\n",
-        plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.runtime_reserve,
+        "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu host_compute_reserve=%zu layout_copies=%zu "
+        "tlsf_bound=%zu total=%zu (%.1f MB); unplanned: loader_residency (the loader's SYCL_Host buffer, not a "
+        "term)\n",
+        plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.host_compute_reserve,
         weight_terms.layout_copies, weight_terms.tlsf_bound, weight_terms.total(),
         weight_terms.total() / (1024.0 * 1024.0));
     plan.host_zone_kv_bytes             = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);

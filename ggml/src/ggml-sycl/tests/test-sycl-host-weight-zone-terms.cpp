@@ -9,24 +9,34 @@
 // pinned WEIGHT allocation of tensor->nb[2] bytes, a host-planned dense weight one of ggml_nbytes(tensor). Both are
 // the entry's AOS src_size: the inventory's size is ggml_nbytes, and an expert's is that over ne[2]. The terms:
 //
-//   host_weights     the sum of those bytes over the host-resident entries, one pinned block per entry
-//   runtime_reserve  64 MiB for the runtime HOST_COMPUTE requests that also land in WEIGHT (the context's logits and
-//                    embeddings host buffer, the server's prompt-checkpoint reads)
-//   layout_copies    a second, converted copy of a host weight the plan keeps beside the first: none today
-//   tlsf_bound       the TLSF rounding of each block to its grain, so the block count times the grain
+//   host_weights          the sum of those bytes over the host-resident entries, one pinned block per entry
+//   host_compute_reserve  64 MiB for the runtime HOST_COMPUTE requests that also land in WEIGHT (the context's
+//                         logits and embeddings host buffer, the server's prompt-checkpoint reads); the plan has no
+//                         figure for those sizes, so the reserve is the term
+//   layout_copies         a second, converted copy of a host weight the plan keeps beside the first: none today
+//   tlsf_bound            the TLSF rounding of each block to its grain, so the block count times the grain
+//
+// One tenant of the zone is not a term: unplanned loader residency, the model loader's SYCL_Host buffer, which holds
+// every weight the loader reads (role WEIGHT, category HOST_COMPUTE, from the buffer type the loader adds to a SYCL
+// device's list when weights are evictable). Planning it would plan a duplicate copy of the weights, the defect the
+// mapped host tier (SYCL_Mapped) removes, so the class is expected to read zero once that tier lands.
 //
 // Arm 1 (no model, no device: the real planner over a synthetic Q2_K-shaped inventory, under a mocked device table)
-// asserts the WEIGHT size is exactly the sum of those terms and is not the 1.2x ratio, and that the plan prints
-// each term by name on a [HOST-PLAN] line.
+// asserts, for both planner builders, that the WEIGHT size is exactly the sum of those terms and is not the 1.2x
+// ratio, and that the plan prints each term by name, and the unplanned class, on a [HOST-PLAN] line.
 //
-// Arm 2 (the census) constructs a cache, configures the host zones from that plan, and makes every planned WEIGHT-zone
-// allocation through the request shapes the materialization paths use. Each one that lands in host_zone_id::WEIGHT is
-// attributed to a named term by its role and category, each term's bytes stay within the term, and the zone never
-// grows. It needs a device, so a host without one exits 77 after arm 1 has passed.
+// Arm 2 (the census) constructs device 0's cache, configures the host zones from that plan, and makes every planned
+// WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through
+// the loader's own buffer type. Each allocation is classed by the call that made it, and its owner metadata must
+// agree with that class. Every byte the zone gains belongs to a named term or to unplanned loader residency, which
+// is reported on its own line; any other byte fails. The terms stay within their bytes and the zone does not grow for
+// them. It needs a device, so a host without one exits 77 after arm 1 has passed.
 
 #include "../common.hpp"
 #include "../ggml-sycl-test.hpp"
 #include "../unified-cache.hpp"
+#include "ggml-backend.h"
+#include "ggml-sycl.h"
 #include "sycl-test-skip.hpp"
 
 #include <cinttypes>
@@ -45,8 +55,8 @@ namespace {
 constexpr size_t MiB = 1024ull * 1024ull;
 
 // The terms the test derives on its own, from the plan's entries, independent of the code under test.
-constexpr size_t k_runtime_reserve_bytes = 64ull * MiB;
-constexpr size_t k_tlsf_grain            = 256;
+constexpr size_t k_host_compute_reserve_bytes = 64ull * MiB;
+constexpr size_t k_tlsf_grain                 = 256;
 
 int g_checks = 0;
 int g_fail   = 0;
@@ -175,7 +185,7 @@ struct derived_terms {
     size_t host_weights = 0;
     size_t blocks       = 0;
 
-    size_t total() const { return host_weights + k_runtime_reserve_bytes + blocks * k_tlsf_grain; }
+    size_t total() const { return host_weights + k_host_compute_reserve_bytes + blocks * k_tlsf_grain; }
 };
 
 derived_terms derive_terms(const placement_plan & plan) {
@@ -234,16 +244,17 @@ void check_weight_zone(const char *           builder,
                     plan.weight_host_bytes);
     }
 
-    const size_t ratio_size = static_cast<size_t>(static_cast<double>(t.host_weights) * 1.2) + k_runtime_reserve_bytes;
+    const size_t ratio_size =
+        static_cast<size_t>(static_cast<double>(t.host_weights) * 1.2) + k_host_compute_reserve_bytes;
     // Vacuity guard: the two answers must differ on this inventory, or "not 1.2x" would prove nothing.
     check(ratio_size != t.total(), "the fixture separates exact-plus-terms from the 1.2x ratio");
-    check_eq("host_zone_weight_bytes == host_weights + runtime_reserve + layout_copies + tlsf_bound",
+    check_eq("host_zone_weight_bytes == host_weights + host_compute_reserve + layout_copies + tlsf_bound",
              plan.host_zone_weight_bytes, t.total());
     check(plan.host_zone_weight_bytes != ratio_size, "host_zone_weight_bytes is not the 1.2x ratio");
 
     // The builder sized the zone through the one terms function.
-    const host_weight_zone_terms terms = placement_host_weight_zone_terms(plan);
-    check_eq("placement_host_weight_zone_terms().total() is the planned size", terms.total(),
+    const host_weight_zone_terms terms = placement_plan_host_weight_zone_terms(plan);
+    check_eq("placement_plan_host_weight_zone_terms().total() is the planned size", terms.total(),
              plan.host_zone_weight_bytes);
     check_eq("terms.host_weights", terms.host_weights, t.host_weights);
     check_eq("terms.blocks", terms.blocks, t.blocks);
@@ -253,10 +264,13 @@ void check_weight_zone(const char *           builder,
         std::printf("  logged: %s", line.c_str());
         check_eq("[HOST-PLAN] host_weights", printed_term(line, "host_weights"), t.host_weights);
         check_eq("[HOST-PLAN] blocks", printed_term(line, "blocks"), t.blocks);
-        check_eq("[HOST-PLAN] runtime_reserve", printed_term(line, "runtime_reserve"), k_runtime_reserve_bytes);
+        check_eq("[HOST-PLAN] host_compute_reserve", printed_term(line, "host_compute_reserve"),
+                 k_host_compute_reserve_bytes);
         check_eq("[HOST-PLAN] layout_copies", printed_term(line, "layout_copies"), 0);
         check_eq("[HOST-PLAN] tlsf_bound", printed_term(line, "tlsf_bound"), t.blocks * k_tlsf_grain);
         check_eq("[HOST-PLAN] total", printed_term(line, "total"), t.total());
+        check(line.find("unplanned: loader_residency") != std::string::npos,
+              "[HOST-PLAN] names unplanned loader residency as outside the terms");
     }
 }
 
@@ -284,17 +298,38 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(placement_plan & out_plan)
 
 // --- arm 2: the census ---
 
-enum class weight_term { HOST_WEIGHTS, RUNTIME_RESERVE, UNATTRIBUTED };
+// The classes a WEIGHT-zone allocation can belong to: one per named term it comes from, and the one tenant the plan
+// deliberately does not size.
+enum class weight_class { HOST_WEIGHTS, HOST_COMPUTE_RESERVE, LOADER_RESIDENCY, COUNT };
 
-// Which named term an allocation that landed in WEIGHT belongs to, from its owner's role and category alone.
-weight_term attribute(const alloc_metadata & md) {
-    if (md.role == alloc_role::WEIGHT && md.category != runtime_category::HOST_COMPUTE) {
-        return weight_term::HOST_WEIGHTS;
+const char * weight_class_name(weight_class cls) {
+    switch (cls) {
+        case weight_class::HOST_WEIGHTS:
+            return "host_weights";
+        case weight_class::HOST_COMPUTE_RESERVE:
+            return "host_compute_reserve";
+        case weight_class::LOADER_RESIDENCY:
+            return "loader_residency";
+        case weight_class::COUNT:
+            break;
     }
-    if (md.category == runtime_category::HOST_COMPUTE) {
-        return weight_term::RUNTIME_RESERVE;
+    return "?";
+}
+
+// Whether an allocation's owner metadata is what its origin's request makes. The class comes from the call the census
+// made; metadata that disagrees with it means the allocation is not what that origin allocates, and it has no class.
+bool metadata_fits(weight_class cls, const alloc_metadata & md) {
+    switch (cls) {
+        case weight_class::HOST_WEIGHTS:
+            return md.role == alloc_role::WEIGHT && md.category != runtime_category::HOST_COMPUTE;
+        case weight_class::HOST_COMPUTE_RESERVE:
+            return md.category == runtime_category::HOST_COMPUTE;
+        case weight_class::LOADER_RESIDENCY:
+            return md.role == alloc_role::WEIGHT && md.category == runtime_category::HOST_COMPUTE;
+        case weight_class::COUNT:
+            break;
     }
-    return weight_term::UNATTRIBUTED;
+    return false;
 }
 
 // The request S1-PRELOAD makes for a host-planned weight (ggml_sycl_host_expert_alloc for an expert, the dense copy's
@@ -310,8 +345,8 @@ alloc_request host_weight_request(sycl::queue & q, size_t bytes) {
     return req;
 }
 
-// The request a SYCL_Host buffer makes after the model load (the context's output buffer): role STAGING, category
-// HOST_COMPUTE, which routes to WEIGHT.
+// The request a SYCL_Host buffer makes after the model load (the context's output buffer): category HOST_COMPUTE,
+// which routes to WEIGHT whatever the role.
 alloc_request host_compute_request(sycl::queue & q, size_t bytes) {
     alloc_request req{};
     req.queue                               = &q;
@@ -325,92 +360,159 @@ alloc_request host_compute_request(sycl::queue & q, size_t bytes) {
     return req;
 }
 
+struct weight_census {
+    static constexpr int n_classes = static_cast<int>(weight_class::COUNT);
+
+    unified_cache * cache                  = nullptr;
+    size_t          class_bytes[n_classes] = {};
+    size_t          unclassed_bytes = 0;  // bytes the zone gained from an allocation whose metadata fits no class
+    size_t          not_in_weight   = 0;  // allocations of a term that did not land in WEIGHT
+    size_t          failed          = 0;  // allocations of a term that were refused
+
+    // Classes one allocation that has already been made: `landed` is what the WEIGHT zone gained for it.
+    void record(weight_class cls, const alloc_metadata & md, size_t landed) {
+        if (md.host_zone != host_zone_id::WEIGHT) {
+            unclassed_bytes += landed;  // the zone grew for something that is not in it
+            if (cls != weight_class::LOADER_RESIDENCY) {
+                not_in_weight++;
+            }
+            return;
+        }
+        if (!metadata_fits(cls, md)) {
+            unclassed_bytes += landed;
+            std::printf("  FAIL detail: a %s allocation carries role=%d category=%d\n", weight_class_name(cls),
+                        static_cast<int>(md.role), static_cast<int>(md.category));
+            return;
+        }
+        class_bytes[static_cast<int>(cls)] += landed;
+    }
+
+    size_t bytes(weight_class cls) const { return class_bytes[static_cast<int>(cls)]; }
+
+    size_t used() const { return cache->host_zone_used(host_zone_id::WEIGHT); }
+};
+
 bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan) {
-    std::printf("(2) census: every WEIGHT-zone allocation is attributed to a named term, and the zone never grows\n");
+    std::printf("(2) census: every WEIGHT-zone byte belongs to a named term or to unplanned loader residency\n");
     std::optional<sycl::device> dev_opt =
         sycl_test_require_gpu("the WEIGHT-zone census (arm 1, the sizing, DID run and its result stands)");
     if (!dev_opt) {
         return false;
     }
-    sycl::queue     q(*dev_opt, sycl::property::queue::in_order{});
-    unified_cache * cache = get_unified_cache(q);
-    check(cache != nullptr, "the unified cache is available");
-    if (!cache) {
+    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
+    check(reg != nullptr && ggml_backend_reg_dev_count(reg) > 0, "the SYCL backend registers a device");
+    if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
         return true;
     }
-    if (!cache->host_zones_configured()) {
-        cache->configure_host_zones(plan.host_zone_weight_bytes, 2 * MiB, 2 * MiB, 2 * MiB);
+    ggml_backend_dev_t dev0 = ggml_backend_reg_dev_get(reg, 0);
+
+    // Device 0's cache, the one the loader's buffer type allocates from, so every allocation below shares one zone.
+    weight_census census;
+    census.cache = get_unified_cache_for_device(0);
+    check(census.cache != nullptr, "device 0's unified cache is available");
+    if (!census.cache) {
+        return true;
     }
-    check(cache->host_zones_configured(), "host zones configured from the plan");
-    if (!cache->host_zones_configured()) {
+    unified_cache & cache = *census.cache;
+    sycl::queue &   q     = cache.get_queue();
+    if (!cache.host_zones_configured()) {
+        cache.configure_host_zones(plan.host_zone_weight_bytes, 2 * MiB, 2 * MiB, 2 * MiB);
+    }
+    check(cache.host_zones_configured(), "host zones configured from the plan");
+    if (!cache.host_zones_configured()) {
         return true;
     }
 
-    const size_t capacity_before = cache->host_zone_capacity(host_zone_id::WEIGHT);
-    const size_t used_before     = cache->host_zone_used(host_zone_id::WEIGHT);
+    const size_t capacity_before = cache.host_zone_capacity(host_zone_id::WEIGHT);
+    const size_t used_before     = census.used();
     check(capacity_before >= plan.host_zone_weight_bytes, "the WEIGHT zone holds at least the plan's size");
 
     const derived_terms     t = derive_terms(plan);
     std::vector<mem_handle> held;
-    size_t                  attributed_weights = 0;
-    size_t                  attributed_runtime = 0;
-    size_t                  unattributed       = 0;
-    size_t                  not_in_weight      = 0;
 
-    auto take = [&](const alloc_request & req) -> size_t {
-        const size_t before = cache->host_zone_used(host_zone_id::WEIGHT);
+    auto take = [&](weight_class cls, const alloc_request & req) {
+        const size_t before = census.used();
         mem_handle   h      = unified_allocate(req);
         if (!h.valid()) {
-            return SIZE_MAX;
+            census.failed++;
+            return;
         }
         alloc_metadata md{};
-        if (!h.owner_metadata(&md) || md.host_zone != host_zone_id::WEIGHT) {
-            not_in_weight++;
-        } else {
-            const size_t landed = cache->host_zone_used(host_zone_id::WEIGHT) - before;
-            switch (attribute(md)) {
-                case weight_term::HOST_WEIGHTS:
-                    attributed_weights += landed;
-                    break;
-                case weight_term::RUNTIME_RESERVE:
-                    attributed_runtime += landed;
-                    break;
-                case weight_term::UNATTRIBUTED:
-                    unattributed++;
-                    break;
-            }
+        if (!h.owner_metadata(&md)) {
+            md.host_zone = host_zone_id::COUNT;
         }
+        census.record(cls, md, census.used() - before);
         held.push_back(std::move(h));
-        return 0;
     };
 
-    size_t failed = 0;
+    // The terms: every planned host weight, then a logits-sized HOST_COMPUTE request the reserve covers.
     for (const placement_entry & e : plan.entries) {
-        if (!e.on_device && take(host_weight_request(q, e.src_size)) == SIZE_MAX) {
-            failed++;
+        if (!e.on_device) {
+            take(weight_class::HOST_WEIGHTS, host_weight_request(q, e.src_size));
         }
     }
-    // The runtime HOST_COMPUTE requests the reserve covers: a logits-sized output buffer.
-    if (take(host_compute_request(q, 8 * MiB)) == SIZE_MAX) {
-        failed++;
+    take(weight_class::HOST_COMPUTE_RESERVE, host_compute_request(q, 8 * MiB));
+
+    check_eq("planned WEIGHT allocations that failed", census.failed, 0);
+    check_eq("planned WEIGHT allocations that landed outside WEIGHT", census.not_in_weight, 0);
+    const size_t host_weights_bytes = census.bytes(weight_class::HOST_WEIGHTS);
+    const size_t reserve_bytes      = census.bytes(weight_class::HOST_COMPUTE_RESERVE);
+    check(host_weights_bytes >= t.host_weights, "the host_weights term's allocations hold at least its exact bytes");
+    check(host_weights_bytes <= t.host_weights + t.blocks * k_tlsf_grain,
+          "the host_weights allocations stay within host_weights + tlsf_bound");
+    check(reserve_bytes <= k_host_compute_reserve_bytes,
+          "the HOST_COMPUTE allocations stay within host_compute_reserve");
+    check_eq("the WEIGHT zone did not grow for the terms", cache.host_zone_capacity(host_zone_id::WEIGHT),
+             capacity_before);
+    check(census.used() - used_before <= plan.host_zone_weight_bytes, "the terms fit the planned WEIGHT zone");
+
+    // The unplanned class: the loader's own buffer, through the buffer type the loader adds to a SYCL device's list
+    // (weights evictable), sized as the loader sizes it, every weight it reads. Once the mapped host tier replaces
+    // that buffer type, the buffer no longer lands in WEIGHT and this class reads zero.
+    size_t loader_requested = 0;
+    for (const placement_entry & e : plan.entries) {
+        loader_requested += e.src_size;
+    }
+    ggml_backend_buffer_type_t loader_buft =
+        ggml_backend_sycl_weights_evictable() ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
+    ggml_backend_buffer_t loader_buf     = nullptr;
+    size_t                loader_grew_by = 0;
+    if (loader_buft != nullptr) {
+        const size_t used_pre     = census.used();
+        const size_t capacity_pre = cache.host_zone_capacity(host_zone_id::WEIGHT);
+        loader_buf                = ggml_backend_buft_alloc_buffer(loader_buft, loader_requested);
+        if (loader_buf != nullptr) {
+            alloc_metadata md{};
+            if (!unified_lookup_runtime_allocation(ggml_backend_buffer_get_base(loader_buf), &md)) {
+                md.host_zone = host_zone_id::COUNT;
+            }
+            census.record(weight_class::LOADER_RESIDENCY, md, census.used() - used_pre);
+            loader_grew_by = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
+        }
+    }
+    const size_t loader_bytes = census.bytes(weight_class::LOADER_RESIDENCY);
+
+    check_eq("WEIGHT bytes in neither a named term nor unplanned loader residency", census.unclassed_bytes, 0);
+    check_eq("every WEIGHT byte gained is accounted to a class", census.used() - used_before,
+             host_weights_bytes + reserve_bytes + loader_bytes);
+    std::printf(
+        "  census terms: host_weights=%zu (term %zu + tlsf %zu) host_compute_reserve=%zu (term %zu) blocks=%zu\n",
+        host_weights_bytes, t.host_weights, t.blocks * k_tlsf_grain, reserve_bytes, k_host_compute_reserve_bytes,
+        t.blocks);
+    if (loader_buft == nullptr) {
+        std::printf("  unplanned loader_residency=0 B (the loader adds no SYCL_Host buffer type here)\n");
+    } else if (loader_buf == nullptr) {
+        std::printf("  unplanned loader_residency=0 B (the loader's %zu B buffer was refused)\n", loader_requested);
+    } else {
+        std::printf("  unplanned loader_residency=%zu B (loader buffer %zu B; WEIGHT grew %zu B for it)\n",
+                    loader_bytes, loader_requested, loader_grew_by);
     }
 
-    check_eq("planned WEIGHT allocations that failed", failed, 0);
-    check_eq("planned WEIGHT allocations that landed outside WEIGHT", not_in_weight, 0);
-    check_eq("WEIGHT allocations with no named term", unattributed, 0);
-    check(attributed_weights >= t.host_weights, "the host_weights term's allocations hold at least its exact bytes");
-    check(attributed_weights <= t.host_weights + t.blocks * k_tlsf_grain,
-          "the host_weights allocations stay within host_weights + tlsf_bound");
-    check(attributed_runtime <= k_runtime_reserve_bytes, "the HOST_COMPUTE allocations stay within runtime_reserve");
-    check_eq("the WEIGHT zone did not grow", cache->host_zone_capacity(host_zone_id::WEIGHT), capacity_before);
-    check(cache->host_zone_used(host_zone_id::WEIGHT) - used_before <= plan.host_zone_weight_bytes,
-          "the census fits the planned WEIGHT zone");
-    std::printf("  census: host_weights=%zu (term %zu + tlsf %zu) runtime=%zu (term %zu) blocks=%zu\n",
-                attributed_weights, t.host_weights, t.blocks * k_tlsf_grain, attributed_runtime,
-                k_runtime_reserve_bytes, t.blocks);
-
+    if (loader_buf != nullptr) {
+        ggml_backend_buffer_free(loader_buf);
+    }
     held.clear();
-    check_eq("the census released every WEIGHT allocation", cache->host_zone_used(host_zone_id::WEIGHT), used_before);
+    check_eq("the census released every WEIGHT allocation", census.used(), used_before);
     return true;
 }
 

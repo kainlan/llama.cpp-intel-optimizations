@@ -123,7 +123,7 @@ texts = {
         window=45000),
     "weight_zone_terms_fn": function_window(
         cache_cpp,
-        "host_weight_zone_terms placement_host_weight_zone_terms(const placement_plan & plan) {"),
+        "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"),
     # llama.cpp-16el: 3200 chars, not the 1400 default -- the strict-parse
     # switch (four cases, two log lines) sits after the glkg comment block and
     # the default window ended inside it.
@@ -279,23 +279,23 @@ def witness_b_alloc_buffer_category(t):
 # --- C: the WEIGHT zone (where every runtime HOST_COMPUTE request lands,
 # per B/unified_alloc_host_zone above) reserves headroom for the context's own host
 # buffers (llama_context::output_reserve() et al.), not just weight bytes. The
-# zone is sized as the named terms of placement_host_weight_zone_terms(), the
-# reserve is one of them, and no ratio over the weights stands in for a term.
+# zone is sized as the named terms of placement_plan_host_weight_zone_terms(),
+# the HOST_COMPUTE reserve is one of them, and no ratio over the weights stands in for a term.
 WEIGHT_ZONE_FROM_TERMS = "plan.host_zone_weight_bytes = weight_terms.total();"
-RESERVE_TERM = "terms.runtime_reserve = k_host_runtime_reserve_bytes;"
+RESERVE_TERM = "terms.host_compute_reserve = k_host_compute_reserve_bytes;"
 
 
 def check_c_headroom(t):
     terms_fn = t["weight_zone_terms_fn"]
     return (
         bool(terms_fn)
-        and "k_host_runtime_reserve_bytes = 64ull * 1024ull * 1024ull;" in terms_fn
+        and "k_host_compute_reserve_bytes = 64ull * 1024ull * 1024ull;" in terms_fn
         and RESERVE_TERM in terms_fn
     )
 
 
 def witness_c_headroom(t):
-    t["weight_zone_terms_fn"] = t["weight_zone_terms_fn"].replace(RESERVE_TERM, "terms.runtime_reserve = 0;")
+    t["weight_zone_terms_fn"] = t["weight_zone_terms_fn"].replace(RESERVE_TERM, "terms.host_compute_reserve = 0;")
     return t
 
 
@@ -307,7 +307,7 @@ def check_c2_weight_zone_is_terms(t):
     terms_fn = t["weight_zone_terms_fn"]
     return (
         bool(fn) and bool(terms_fn)
-        and "placement_host_weight_zone_terms(plan)" in fn
+        and "placement_plan_host_weight_zone_terms(plan)" in fn
         and WEIGHT_ZONE_FROM_TERMS in fn
         and fn.count("plan.host_zone_weight_bytes =") == 1
         and "_ratio" not in terms_fn
