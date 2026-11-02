@@ -442,8 +442,12 @@ def clause_l3_select_weight_buft(t: dict) -> list:
 def clause_l4_weight_buft_supported(t: dict) -> list:
     body = body_of(t[LML], r"static\s+bool\s+weight_buft_supported\s*\(")
     short = between(body, "llama_model_loader_sycl_hooks_for(dev)", "ggml_init_params")
-    if "mapped_buffer_type_for_device(" not in short:
+    asked = re.search(r"(\w+)\s*=\s*[^;]*mapped_buffer_type_for_device\s*\(\s*dev\s*\)[^;]*;", short)
+    if not asked:
         return ["weight_buft_supported's SYCL_Host short-circuit does not accept SYCL_Mapped"]
+    var = asked.group(1)
+    if not re.search(rf"if\s*\(\s*{var}\s*&&\s*buft\s*==\s*{var}\s*\)\s*\{{\s*return\s+true\s*;", short):
+        return ["weight_buft_supported's short-circuit does not return true for SYCL_Mapped"]
     return []
 
 
@@ -569,8 +573,13 @@ def clause_l11_preload_serves_mapped_in_place(t: dict) -> list:
     gs = t[GS]
     problems = []
     aos = between(gs, "auto register_host_aos_expert = [&]", "bool any_cached = false;")
+    in_place = re.search(r"(\w+)\s*=\s*(?:!\s*tensor_source_is_device\s*&&\s*)?ggml_sycl_mapped_buffer_owner\s*\(", aos)
     if "ggml_sycl_mapped_buffer_owner(" not in aos:
         problems.append("register_host_aos_expert copies a SYCL_Mapped expert instead of registering it in place")
+    elif not in_place or not re.search(rf"if\s*\(\s*{in_place.group(1)}\s*\)\s*\{{\s*\w+\s*=\s*[^;]*\bexpert_aos\b",
+                                       aos):
+        problems.append("register_host_aos_expert's in-place test does not serve the AOS source when it owns the "
+                        "mapping")
     dense = between(gs, "if (!dense_planned_on_this_device && !dense_alternate_on_this_device) {",
                     "dense_host_placed++;")
     if "ggml_sycl_mapped_buffer_owner(" not in dense:
@@ -601,6 +610,8 @@ def clause_l12_mapped_buft(t: dict) -> list:
     alloc = body_of(gs, r"static\s+ggml_backend_buffer_t\s+ggml_backend_sycl_mapped_buffer_type_alloc_buffer\s*\(")
     if not re.search(r"if\s*\(\s*size\s*==\s*0\s*\)", alloc) or "GGML_ABORT(" not in alloc:
         problems.append("SYCL_Mapped's alloc_buffer does not return a dummy for 0 and abort otherwise")
+    elif "ggml_backend_buft_alloc_buffer" not in alloc or "ggml_backend_sycl_mapped_buffer_from_file" not in alloc:
+        problems.append("SYCL_Mapped's alloc_buffer abort does not name the entry point and the from-file hook")
     init = body_of(gs, r"static\s+enum\s+ggml_status\s+ggml_backend_sycl_mapped_buffer_init_tensor\s*\(")
     if "ggml_backend_sycl_register_host_weight_tensor(" not in init:
         problems.append("SYCL_Mapped's init_tensor does not register the host weight")
@@ -610,6 +621,8 @@ def clause_l12_mapped_buft(t: dict) -> list:
     getter = body_of(gs, r"ggml_backend_buffer_type_t\s+ggml_backend_sycl_mapped_buffer_type_for_device\s*\(")
     if "ggml_backend_sycl_mapped_buffer_type_name" not in getter or "is_host" not in getter:
         problems.append("the per-device SYCL_Mapped buft does not carry its own name and is_host")
+    elif not re.search(r"\.iface\.is_host\s*=(?!\s*nullptr\b)[^;]+;", getter):
+        problems.append("the per-device SYCL_Mapped buft's is_host is not a predicate")
     return problems
 
 
@@ -814,6 +827,10 @@ def _mut_all(t: dict, rel: str, pattern: str, repl: str) -> dict:
     return m
 
 
+# The SYCL_Mapped alloc_buffer definition up to a point in its body: group 1 for a witness that rewrites what follows.
+MAPPED_ALLOC_BODY_RE = (r"(static\s+ggml_backend_buffer_t\s+ggml_backend_sycl_mapped_buffer_type_alloc_buffer\s*"
+                        r"\([^)]*\)\s*\{.*?)")
+
 MUTANTS = [
     # (label, clause label prefix, builder)
     ("the old stage name returns the staging proc", "F3",
@@ -878,6 +895,43 @@ MUTANTS = [
                     r"\1 }")),
     ("load_all_data reads a SYCL_Mapped tensor through the loader's mapping", "L10",
      lambda t: _mut(t, LML, r"sycl_mapped_base_offsets\s*\.\s*find\s*\(", "sycl_mapped_bases_unused(")),
+    ("the proc table drops planned_host_backing's entry", "F2",
+     lambda t: _mut(t, GS, r'if\s*\(\s*strcmp\s*\(\s*name\s*,\s*"ggml_backend_sycl_planned_host_backing"\s*\)'
+                           r"\s*==\s*0\s*\)\s*\{[^}]*\}", "")),
+    ("the loader hooks drop LOAD_SYCL_PROC for the mapped buft", "L1",
+     lambda t: _mut(t, LML, r'LOAD_SYCL_PROC\s*\(\s*mapped_buffer_type_for_device\s*,\s*'
+                            r'"ggml_backend_sycl_mapped_buffer_type_for_device"\s*\)\s*;', "")),
+    ("weight_buft_supported drops the SYCL_Mapped short-circuit", "L4",
+     lambda t: _mut(t, LML, r"if\s*\(\s*mapped_buft\s*&&\s*buft\s*==\s*mapped_buft\s*\)\s*\{\s*return\s+true\s*;\s*\}",
+                    "")),
+    ("make_cpu_buft_list nulls the SYCL_Mapped buft", "L5",
+     lambda t: _mut(t, LM, r"(ggml_backend_buffer_type_t\s+buft\s*=\s*)hooks\s*\.\s*mapped_buffer_type_for_device\s*\("
+                           r"\s*dev\s*\.\s*dev\s*\)", r"\1nullptr")),
+    ("a SYCL load maps with prefetch on", "L9",
+     lambda t: _mut(t, LM, r"(if\s*\(\s*sycl_model_backend\s*\)\s*\{\s*prefetch_mappings\s*=\s*)false", r"\1true")),
+    ("the SYCL_Mapped branch grows the loader's lock", "L10",
+     lambda t: _mut(t, LML, r"(ggml_backend_tensor_alloc\s*\(\s*buf_mapped\s*,\s*cur\s*,[^;]*;)",
+                    r"\1 lmlock->lock_range(weight->offs, n_size, 0);")),
+    ("the SYCL_Mapped branch grows mmaps_used", "L10",
+     lambda t: _mut(t, LML, r"(ggml_backend_tensor_alloc\s*\(\s*buf_mapped\s*,\s*cur\s*,[^;]*;)",
+                    r"\1 mmaps_used[weight->idx].first = 0;")),
+    ("register_host_aos_expert's in-place test is false", "L11",
+     lambda t: _mut(t, GS, r"!\s*tensor_source_is_device\s*&&\s*"
+                           r"(ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer)", r"false && \1")),
+    ("SYCL_Mapped's alloc_buffer drops the zero-size branch", "L12",
+     lambda t: _mut(t, GS, MAPPED_ALLOC_BODY_RE + r"if\s*\(\s*size\s*==\s*0\s*\)", r"\1if (false)")),
+    ("SYCL_Mapped's alloc_buffer warns instead of aborting", "L12",
+     lambda t: _mut(t, GS, MAPPED_ALLOC_BODY_RE + r"GGML_ABORT\s*\(", r"\1GGML_LOG_WARN(")),
+    ("SYCL_Mapped's alloc_buffer abort stops naming the from-file hook", "L12",
+     lambda t: _mut(t, GS, r'("dummy of a memory-fit pass; a weight binds to %s only through the from-file hook, "\s*)'
+                           r'"ggml_backend_sycl_mapped_buffer_from_file"', r'\1"the loader"')),
+    ("SYCL_Mapped drops is_host", "L12",
+     lambda t: _mut(t, GS, r"per_device\s*\[\s*i\s*\]\s*\.\s*iface\s*\.\s*is_host\s*=[^;]*;", "")),
+    ("SYCL_Mapped's is_host is null", "L12",
+     lambda t: _mut(t, GS, r"(per_device\s*\[\s*i\s*\]\s*\.\s*iface\s*\.\s*is_host\s*=)[^;]*;", r"\1 nullptr;")),
+    ("supports_buft stops listing SYCL_Mapped", "L12",
+     lambda t: _mut(t, GS, r"(buft->iface\.get_name\s*==\s*ggml_backend_sycl_mapped_buffer_type_name\s*\)\s*\{\s*"
+                           r"return\s+)true", r"\1false")),
     ("the from-file hook never locks", "L13",
      lambda t: _mut(t, GS, r"unified_cache_raw_lock_file_segments\s*\(", "unified_cache_raw_skip_lock(")),
     ("a stream_dma caller drops the refusal", "C2",
