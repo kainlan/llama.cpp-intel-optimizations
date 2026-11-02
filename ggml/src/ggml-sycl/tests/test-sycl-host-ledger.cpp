@@ -684,8 +684,10 @@ arm_result arm_h() {
 // GGML_SYCL_HOST_RESERVE_MB is exactly the budget; total and available both 0 give SIZE_MAX/4 with the WARN; total
 // known and available 0 give committed, which refuses by name.
 // Engagement: a positive control sample gives the formula's exact value, and each stored budget counts one store.
+// Each refusing case is scored at its exact value, not at or below committed: a pinned share above the cap gives 0, and
+// an available reading at or below the reserve gives committed, so the next charge refuses with nothing granted.
 // Mutants: unsigned subtraction (either term) admits; the override replacing os_reserve only gives a sample-shaped
-// budget instead of X.
+// budget instead of X; a failed sample treated as no budget at all (0, not committed) on a host whose total is known.
 arm_result arm_i() {
     arm_result r;
     ledger_settle();
@@ -710,16 +712,16 @@ arm_result arm_i() {
         void_arm(r, "the store counter could not be read");
     }
 
-    // Each refusing case: seed a budget, charge `committed`, store the computed budget, and charge one more byte.
-    auto stored_refuses = [&](const host_budget_sample & s, const char * what) {
+    // Each refusing case: seed a budget, charge `committed`, store the computed budget, which must be `want`, and
+    // charge one more byte.
+    auto stored_refuses = [&](const host_budget_sample & s, size_t want, const char * what) {
         ledger_settle();
         ggml_sycl_test_host_ledger_store_budget(UINT64_MAX / 2);
         if (!charge(committed).charged) {
             void_arm(r, std::string(what) + ": could not charge committed");
         }
         const size_t stored = host_ledger_store_budget(s);
-        expect(r, stored <= committed,
-               std::string(what) + ": budget " + num(stored) + " is at or below committed " + num(committed));
+        expect(r, stored == want, std::string(what) + ": budget " + num(stored) + ", want " + num(want));
         expect(r, host_ledger_budget() == stored, std::string(what) + ": the computed budget is the stored one");
         const host_ledger_charge_result c = charge(1);
         expect(r, !c.charged, std::string(what) + ": the next charge refuses");
@@ -728,15 +730,18 @@ arm_result arm_i() {
 
     host_budget_sample pinned_over = control;
     pinned_over.pinned_bytes       = 80 * GiB;  // above pct_cap
-    stored_refuses(pinned_over, "a pinned share above total x pct");
+    // min(64 - 80 saturating to 0, committed + 32 GiB)
+    stored_refuses(pinned_over, 0, "a pinned share above total x pct");
 
     host_budget_sample avail_low = control;
     avail_low.available_bytes    = 6 * GiB;  // at or below os_reserve
-    stored_refuses(avail_low, "an available reading at or below os_reserve");
+    // min(64 GiB, committed + (6 - 8 saturating to 0))
+    stored_refuses(avail_low, committed, "an available reading at or below os_reserve");
 
     host_budget_sample avail_zero = control;
     avail_zero.available_bytes    = 0;  // total known, the sample failed: not headroom
-    stored_refuses(avail_zero, "total known and available 0");
+    // min(64 GiB, committed + (0 - 8 saturating to 0))
+    stored_refuses(avail_zero, committed, "total known and available 0");
 
     uint64_t stores_after = 0;
     (void) ggml_sycl_test_host_ledger_stores(&stores_after);
