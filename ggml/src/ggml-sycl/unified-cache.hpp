@@ -417,19 +417,19 @@ enum class placement_size_basis : uint8_t {
 
 // Single entry in the placement plan: one weight tensor's placement decision.
 struct placement_entry {
-    std::string        name;  // Tensor name (for logging and S1-PRELOAD lookup)
-    ggml_type          type              = GGML_TYPE_COUNT;
-    int64_t            ne[GGML_MAX_DIMS] = {};
-    size_t             src_size          = 0;  // AOS source bytes
-    size_t             dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
+    std::string            name;  // Tensor name (for logging and S1-PRELOAD lookup)
+    ggml_type              type              = GGML_TYPE_COUNT;
+    int64_t                ne[GGML_MAX_DIMS] = {};
+    size_t                 src_size          = 0;  // AOS source bytes
+    size_t                 dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
     // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It
     // is the cost, not the placement: kv_device[layer_id] says where that KV lives, which can differ from on_device.
-    size_t             kv_size           = 0;
-    placement_priority priority          = placement_priority::COUNT;  // Sort key
-    int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
-    int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
-    expert_tensor_role expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
-    ggml_layout_mode   layout            = GGML_LAYOUT_AOS;         // Materialized device layout planned for this entry
+    size_t                 kv_size           = 0;
+    placement_priority     priority          = placement_priority::COUNT;  // Sort key
+    int                    layer_id          = -1;  // Layer number (earlier = higher priority within same level)
+    int                    expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
+    expert_tensor_role     expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
+    ggml_layout_mode       layout            = GGML_LAYOUT_AOS;  // Materialized device layout planned for this entry
     placement_host_backing host_backing = placement_host_backing::PINNED;  // which host term this entry's bytes reach
     // Two meanings, two fields (llama.cpp-21jd). alternate_layouts: layouts a device
     // holds as a REPLICA, materialized there instead of the primary (multi-device
