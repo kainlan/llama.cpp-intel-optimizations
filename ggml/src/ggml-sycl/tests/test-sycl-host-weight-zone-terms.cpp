@@ -349,13 +349,15 @@ alloc_request host_weight_request(sycl::queue & q, size_t bytes) {
 }
 
 // The request a SYCL_Host buffer makes after the model load (the context's output buffer): category HOST_COMPUTE,
-// which routes to WEIGHT whatever the role.
+// which routes to WEIGHT whatever the role. Its role is the buffer type's: WEIGHT while weights are evictable (the
+// default), STAGING otherwise, the same choice ggml_backend_sycl_host_buffer_type_alloc_buffer makes outside a load.
 alloc_request host_compute_request(sycl::queue & q, size_t bytes) {
-    alloc_request req{};
+    const alloc_role role = ggml_backend_sycl_weights_evictable() ? alloc_role::WEIGHT : alloc_role::STAGING;
+    alloc_request    req{};
     req.queue                               = &q;
     req.device                              = 0;
     req.size                                = bytes;
-    req.intent.role                         = alloc_role::STAGING;
+    req.intent.role                         = role;
     req.intent.category                     = runtime_category::HOST_COMPUTE;
     req.intent.cohort_id                    = "backend_host_buffer";
     req.intent.constraints.must_host_pinned = true;
