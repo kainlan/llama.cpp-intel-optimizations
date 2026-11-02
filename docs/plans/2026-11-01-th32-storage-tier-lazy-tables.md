@@ -61,7 +61,7 @@ look for, never where it is.
   and th32 T2-T8 with T9q acceptance (Qwen, §8.2-8.3). T9d waits for 9g22, yl3v, s4ip.
 - **Merge unit** (th32 c-0elm, 5efe c-q50c): 5efe C1-C4 and th32 T6 and T7 reach master in **one merge**. Nothing in this
   plan lands on master before Task 30. The integration branch merges master in at every wave boundary instead.
-- **Owner's uncommitted loader edit** (`src/llama-model-loader.cpp`, +24/-3: `selected_layer_dev`, hooks resolved from the
+- **Owner's loader edit, COMMITTED on master as 5eb8407fc on 2026-11-01 after the lead's B50 gate at the default and 40 % budgets (ir18 ticket); the paragraph below is the state at plan-writing time, kept for the record. integ/th32 merges master at the Task 1 review boundary to carry it.** (`src/llama-model-loader.cpp`, +24/-3: `selected_layer_dev`, hooks resolved from the
   layer device, OUTPUT-duplicated to TOKEN_EMBD op mapping, `register_host_weight` guarded on the final device's hooks;
   the ir18 SIGBUS fix). It is one of the nine owner-dirty paths nobody but the owner touches. The lane changes the same
   file (C1, C3, T6), so `git merge` into the main checkout refuses while that file is dirty. **The owner commits it
@@ -98,6 +98,20 @@ look for, never where it is.
   `/mnt/models-nvme`, displacing gpt-oss-120b and the three Qwen1.5-MoE files to the UGREEN (the lead's
   `04-move-qwen38-to-nvme.sh`, run after the restore's `RESTORE_RC=0`, before Task 27). The lead re-measures (Task 27)
   before any T9q arm and the design's figures are re-pinned; T9q's row already requires the §4.5 re-pin.
+
+- **R-K, the C4c compile-RED and the build criterion (lead, 2026-11-01, during Task 1):** the lane's
+  `test-sycl-host-backing-accounting` (fb473daa2) is a deliberate compile failure until Task 2 adds
+  `placement_host_backing` and the four plan terms. Until Task 2 is merged into `integ/th32`, every full build on that
+  branch runs `./scripts/sycl-build.sh -- -k 0` and is green when the only `FAILED:` line names that target's object and
+  every other target links; the RED's registration is not changed, excluded or stubbed. Task 2's acceptance adds: the
+  full build exits 0 again.
+
+- **R-L, the archs gate is known-red on master (lead, 2026-11-01, during Task 1):** `ONEAPI_DEVICE_SELECTOR=level_zero:0,1
+  ./build/bin/test-llama-archs -a llama` exits 255 on master 5eb8407fc itself with `[LOAD-PLAN] compute-slot measure failed
+  at probe on device 0: plan override nested (refused)` (llama.cpp-37na), so Task 1 cannot be held to rc 0. Until 37na is
+  fixed on master and merged into `integ/th32`, every lead-run archs gate on the branch is scored "same failure text as
+  master, no worse" and the exact stderr is kept in the gate log; a different failure text, a hang, or a Shmem climb is a
+  finding. Task 30's acceptance re-runs it and must either be green or carry this ruling explicitly with the 37na state.
 
 ## Rules for every task (the brief repeats them)
 
@@ -234,11 +248,13 @@ files under rulings R-B and R-C, then build and make every lane-t test and every
 pass. This is the base for every other task; nothing else starts until it is merged and the lead's gates are green.
 
 **Acceptance Criteria:**
-- [ ] `git merge-base --is-ancestor master integ/th32` is true and `impl/lane-t` is an ancestor too.
+- [ ] `git merge-base --is-ancestor master integ/th32` is true and `impl/lane-t` is an ancestor too. Master moved to
+  5eb8407fc (the owner's loader commit) during the task, so the implementer merges it into `integ/th32` before review
+  (lead ruling, 6djp c-m0q7); the review covers that merged state.
 - [ ] `src/llama-model.cpp`: master's `llama_model_sycl_compute_early_plan` call under the guard **and** lane-t's `lazy_taker = sycl_model_loading_guard.active` both survive; the AUTO block keeps master's `llama_lazy_auto_enabled(...)` resolver and lane-t's `lazy_mode_pre` capture before it; the planner call sites take master's `(n_ctx_hint, n_ubatch_hint)` signature and master's per-layer `kv_layer_arrays.idx_k_width`, dropping lane-t's scalar `kv_idx_width` parameter.
 - [ ] `unified-cache.hpp/.cpp`: master's `layer_idx_k_width` vector and `kv_idx_size_for_layer` stay; lane-t's `kv_demand_for_layer` either delegates to `kv_size_for_layer` (if master already charges the indexer there) or sums the per-layer indexer width; `test-sycl-kv-demand-idx` and `tests/test-sycl-kv-idx-width-source.py` are re-pointed accordingly, with the reason in the commit subject.
 - [ ] The CSV is regenerated with `python3 scripts/audit-sycl-static-storage.py --regenerate --repo .` (read the script's own flag names first) and both `--check-classification` and `--check` pass.
-- [ ] Build: `./scripts/sycl-build.sh` (full; this is a new path so the device links run, 20-40 min) exits 0 and `grep -E '^GGML_SYCL:' build/CMakeCache.txt` reads `BOOL=ON`.
+- [ ] Build: `./scripts/sycl-build.sh -- -k 0` (full; this is a new path so the device links run, 20-40 min) leaves exactly one `FAILED:` line, the C4c compile-RED `test-sycl-host-backing-accounting` (ruling R-K), every other target linked, and `grep -E '^GGML_SYCL:' build/CMakeCache.txt` reads `BOOL=ON`.
 - [ ] Host tests green in the tree: `ctest --test-dir build -R 'test-llama-lazy-eligible|test-llama-lazy-range-record|test-llama-lazy-range-prefill|test-llama-mlock-ranged|test-lazy-mode-resolve|test-mmap-lazy-hugepage|test-sycl-file-mapping-host|test-sycl-file-mapping-unsupported|test-sycl-file-mapping-segments|test-sycl-file-mapping-residency|test-sycl-host-cpu-mapping|test-sycl-host-cpu-unsupported|test-sycl-file-mapped-tier|test-sycl-host-cpu-tier|sycl-kv-demand-idx|sycl-getrows-refusal-terminal|sycl-runtime-registry-containment' --output-on-failure -j 1` all pass (`sycl-host-backing-accounting` is C4c's RED and stays red until Task 2); every lane-t Python gate under `tests/test-*-source*.py` touching lazy, mmap, host-cpu, file-mapped, kv-idx, seg-forward, stream-dma, raw-mmap-allowlist and alloc-tier-census passes under `python3 -I`; `tests/test-llama-model-lazy-auto-source.py` (master, z5fn) passes.
 - [ ] The four per-commit gates pass; `clang-format-19 --dry-run -Werror` clean on every file the resolution touched.
 
@@ -264,7 +280,7 @@ git diff --name-only --diff-filter=U                         # must print exactl
 **Lead-run after merge (GPU, serial, `GPU.lock`, Shmem sampled):** `ONEAPI_DEVICE_SELECTOR=level_zero:1` Mistral gate
 (`1, 2, 3, 4, 5, 6, 7, 8, 9, 10`), the same on `level_zero:0`; the GPT-OSS 20B `llama-cli` gate on `level_zero:1`
 (`grep -cx '1, 2, 3, 4, 5'` = 1); `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/test-llama-archs -a llama; echo rc=$?`
-(rc 0); `ctest -R '^test-sycl-file-mapped-tier$'` and the `cache|mem-handle` tests the lane added, one at a time. Also
+(rc 0, or under ruling R-L the same refusal text as master); `ctest -R '^test-sycl-file-mapped-tier$'` and the `cache|mem-handle` tests the lane added, one at a time. Also
 `llama-cli` must be among the built targets (merge-gate rule).
 
 **Commit:** the merge commit plus fix-forward commits; paths as resolved. **Gotchas:** the owner's dirty
@@ -785,7 +801,7 @@ fires on a real load (the lead's Mistral, GPT-OSS both arms and Qwen both arms i
 
 **Track:** L **Depends on:** 25, 26, 27, 28, 29 **Who:** the lead, serially, `GPU.lock` held, `holder` file written,
 selector pinned, `Shmem`/`MemAvailable` sampled before and about 5 s after every run, never two model loads at once.
-**Preconditions:** the owner's loader edit is committed on master (or the owner says how to carry it); `integ/th32` has
+**Preconditions:** the owner's loader edit is committed on master (met: 5eb8407fc, 2026-11-01); `integ/th32` has
 master merged in at this wave's start; a full build of the integration tree with `llama-cli`, `llama-completion`,
 `llama-bench` and every test target; `bash scripts/check-ctest-safety-net.sh --build-dir build` prints "safety net
 intact".
@@ -841,3 +857,7 @@ commit message; a step that prints nothing where a line is pre-registered is VOI
 - llama.cpp-9ils and llama.cpp-nuyh (th32 v1 limits, deferred by design).
 - llama.cpp-o01c (`MADV_DONTDUMP` on `HOST_CPU` mappings).
 - llama.cpp-zuze's bisect (llama.cpp-1vac), independent of this plan; its B50 benches queue behind this plan's lead arms.
+- llama.cpp-bzv5 (found during Task 1, 2026-11-01): master's keyed segment-slot record and replay go through
+  `moe_graph_dispatch_direct_node`, which discards `ggml_sycl_compute_forward`'s refusal, so on the keyed path a refused
+  node is still skipped silently (the defect class 5efe C4 part a fixed on the legacy path). Fixing it changes master's
+  helper and its pin; the lead ruled it outside the merge unit.
