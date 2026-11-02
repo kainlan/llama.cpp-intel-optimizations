@@ -1,0 +1,14 @@
+# verbatim lines of mtp_n2_chat_v.log from after round 19 to the end of round 20 (the divergence); format: draft candidates with MTP head probabilities, then the round summary
+2.04.226.842 D clear kv cache from any extra tokens, n_past = 99
+2.04.275.208 D spec        draft:  - seq_id 0, draft candidate   0, pos   0:    271 (   0.912) '
+
+'
+2.04.275.212 D spec        draft:  - seq_id 0, draft candidate   1, pos   0:    353 (   0.032) ' I'
+2.04.275.212 D spec        draft:  - seq_id 0, draft candidate   2, pos   0:    561 (   0.013) ' The'
+2.04.316.298 D spec        draft:  - seq_id 0, draft candidate   0, pos   1:  13962 (   0.962) '###'
+2.04.316.302 D spec        draft:  - seq_id 0, draft candidate   1, pos   1:   4277 (   0.023) '---'
+2.04.316.303 D spec        draft:  - seq_id 0, draft candidate   2, pos   1:    550 (   0.004) '##'
+2.04.316.311 D spec common_specu: called impl draft-mtp, hist size = 99, call_count = 20, gen = 2
+
+
+### **2.06.411.026 D accepted 2/2 draft tokens, the last target token is: (2972)

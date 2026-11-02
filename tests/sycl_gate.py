@@ -14,7 +14,23 @@ and `finish()` turns the record into the process exit status.
     finish("my gate: PASS")
 
 Not a pytest plugin: pytest-style gates (module-level test_* functions) are
-already independent, one result per function.
+already independent, one result per function; they use two kinds of helper
+from this module. First, the message helpers: a claim that returns a bare
+bool says nothing about WHICH token failed, so pass first_missing (names the
+first anchor the claim needs that its region lacks) or first_present (names
+the first forbidden text its region holds) as the message.
+
+    from sycl_gate import first_missing
+
+    assert claim_x(SYCL), first_missing(
+        "file: region", region, ANCHOR_A, ANCHOR_B)
+
+Second, the text helpers for source-contract pins, at the end of the module:
+ROOT (the repo root), strip_comments (source text with comments blanked, line
+breaks kept), norm (comment-stripped, whitespace-canonical text), read (a repo
+file's text, or empty when it is missing), body (the brace-balanced body of a
+definition), ordered (needles in order) and mutate (a normalised text with one
+replacement, for positive controls).
 """
 import contextlib
 import linecache
@@ -25,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from pathlib import Path
 
 _RESULTS = []
 
@@ -126,3 +143,127 @@ def run_without_source(script: str):
         shutil.copy(os.path.abspath(__file__), os.path.join(tests, "sycl_gate.py"))
         done = subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60)
         return done.returncode, done.stdout + done.stderr
+
+
+def _shown(text: str) -> str:
+    """`text` for a failure message: whole when short, else cut to 100 characters with a trailing "..."."""
+    return text if len(text) <= 100 else text[:97] + "..."
+
+
+def first_missing(where: str, text: str, *anchors: str, signature: str = "") -> str:
+    """The message for `assert claim(...), first_missing(...)`: names the first anchor the claim needs that `text`
+    does not contain, and where it looked, so a stale pin says what it expected instead of a bare AssertionError.
+    When every anchor is present the claim failed on an order, count or depth condition, and the message says so.
+    `signature`, when given, is the text that opens the region `text` was cut from (a function body); an empty
+    `text` then means the signature moved, and the message names the signature. Never empty, so the assert always
+    prints it."""
+    if signature and not text:
+        return "%s: missing %r" % (where, _shown(signature))
+    for anchor in anchors:
+        if anchor not in text:
+            return "%s: missing %r" % (where, _shown(anchor))
+    if len(anchors) == 1:
+        return "%s: the anchor is present; an order, count or depth condition failed" % where
+    return "%s: all %d anchors present; an order, count or depth condition failed" % (where, len(anchors))
+
+
+def first_present(where: str, text: str, *forbidden: str) -> str:
+    """The message for an absence claim: names the first forbidden text that `text` does contain, and where, or says
+    none of them is present (so the claim failed on an emptiness or count condition). Never empty."""
+    for found in forbidden:
+        if found in text:
+            return "%s: found %r" % (where, _shown(found))
+    if len(forbidden) == 1:
+        return "%s: the forbidden text is absent; an emptiness or count condition failed" % where
+    return "%s: none of %d forbidden texts present; an emptiness or count condition failed" % (where, len(forbidden))
+
+
+# ---- text helpers for source-contract pins ----------------------------------------------------------------------------
+
+# The repo root, resolved the way the pins resolved it from their own path: this file sits in tests/, so parents[1] of
+# it is the same directory as parents[1] of any pin beside it. The pins import it rather than define their own.
+ROOT = Path(__file__).resolve().parents[1]
+
+_LEXEME_RE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
+    re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    """`src` with comments blanked (their line breaks kept) and string and character literals left whole."""
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            return tok
+        return "\n" * tok.count("\n")
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+def norm(text: str) -> str:
+    """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
+    re-wrap nor a re-split format string can turn a claim red. Idempotent, so a mutant built on normalized text is
+    read the same way as the source."""
+    t = re.sub(r"\s+", " ", strip_comments(text))
+    t = re.sub(r"\( ", "(", t)
+    t = re.sub(r" \)", ")", t)
+    t = re.sub(r" ,", ",", t)
+    t = re.sub(r",(?! )", ", ", t)
+    t = re.sub(r'(?<!\\)" "', "", t)
+    return t
+
+
+def read(rel: str) -> str:
+    """The file's text, or empty when it does not exist yet, so a missing file fails a presence claim instead of
+    erroring. An absence claim passes vacuously on "", so it needs a non-empty region (or a check that this read is)."""
+    p = ROOT / rel
+    return p.read_text(errors="replace") if p.exists() else ""
+
+
+def body(text: str, signature: str) -> str:
+    """The brace-balanced body of the first definition whose text starts with `signature` (string literals skipped
+    while balancing). A signature ending in "{" opens the body itself. Empty when there is none."""
+    at = text.find(signature)
+    if at < 0:
+        return ""
+    open_at = at + len(signature) - 1 if signature.endswith("{") else text.find("{", at + len(signature))
+    if open_at < 0:
+        return ""
+    depth = 0
+    i = open_at
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at:i + 1]
+        i += 1
+    return ""
+
+
+def ordered(text: str, *needles: str) -> bool:
+    """Every needle is present, each after the one before it."""
+    at = 0
+    for needle in needles:
+        at = text.find(needle, at)
+        if at < 0:
+            return False
+        at += len(needle)
+    return True
+
+
+def mutate(text: str, old: str, new: str) -> str:
+    """`text` (normalized) with `old` replaced once; the mutant must exist, or it would prove nothing."""
+    n = norm(text)
+    assert old in n, f"mutant precondition: {old!r} is not in the text"
+    return n.replace(old, new, 1)

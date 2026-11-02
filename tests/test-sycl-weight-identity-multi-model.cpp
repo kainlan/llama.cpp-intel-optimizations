@@ -126,6 +126,7 @@
 #include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -136,7 +137,7 @@ int main() {
     // tested nothing as a pass -- see CLAUDE.md, "a SKIP line with status 0
     // is not a pass".
     fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about the lookup order.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

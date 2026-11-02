@@ -1,4 +1,5 @@
 #include "ggml-backend-impl.h"
+#include "ggml-sycl/fattn-onednn-chunk.hpp"
 #include "ggml-sycl/fattn-onednn.hpp"
 #include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -361,7 +363,55 @@ static bool run_case(ggml_backend_sycl_context & ctx, const case_shape & sh) {
     return true;
 }
 
-static int run_descriptor_tests() {
+// llama.cpp-jwjz: the --chunked mode lowers the DIRECT Graph-scratch cap to 1 MiB, so the dispatcher's
+// per-execute budget (half the cap) is 512 KiB and the production-scale cases split their query rows into
+// several executes. Same CPU reference, same tolerance: a chunk that read or wrote the wrong rows fails here.
+static constexpr const char * kChunkedCapMiB = "1";
+static constexpr size_t       kChunkedBudget = 512ull * 1024ull;
+
+// Positive control for --chunked: the planner the dispatcher calls must split this shape, or the mode's
+// green proves nothing about chunking. `want_ragged` also requires a last chunk shorter than the others,
+// so the second compiled partition is exercised.
+static bool expect_split(const char * name, int H_q, int n_q, int n_kv, bool want_ragged) {
+    const ggml_sycl::onednn_fa_row_chunks p =
+        ggml_sycl::onednn_fa_plan_row_chunks(n_q, n_kv, H_q, sizeof(sycl::half), kChunkedBudget);
+    std::printf("%s chunks=%lld rows=%lld tail=%lld\n", name, (long long) p.n_chunks, (long long) p.rows,
+                (long long) p.tail_rows);
+    TEST_ASSERT(p.n_chunks >= 2, (std::string(name) + " is not split at the --chunked budget").c_str());
+    TEST_ASSERT(!want_ragged || p.tail_rows != p.rows,
+                (std::string(name) + " has no shorter last chunk at the --chunked budget").c_str());
+    return true;
+}
+
+// expect_split() proves only that the PLANNER splits at kChunkedBudget. The dispatcher takes its budget
+// from the allocator's cap, so pin that the two agree: otherwise the cases run at some other budget and
+// the planner check describes nothing that executed.
+static bool expect_dispatch_budget(int device) {
+    const size_t budget = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device) / 2;
+    std::printf("dispatch budget=%zu KiB (half the DIRECT cap)\n", budget / 1024);
+    TEST_ASSERT(budget == kChunkedBudget, "the dispatcher's per-execute budget is not the --chunked budget");
+    return true;
+}
+
+// An unsplit dispatcher still passes the numerics: a request above the cap takes the allocator's
+// oversized early-out, is allocated anyway, executes and matches the CPU reference. What it cannot hide
+// is the live Graph scratch. With every execute within the budget, at most two buffers are live together
+// (a chunk's and the shorter last chunk's), so the high water stays within twice the budget. Unsplit, the
+// ragged cases ask for 1.73 MiB and 1.08 MiB in one request each.
+static bool expect_bounded_high_water(int device) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    TEST_ASSERT(cache != nullptr, "no unified cache for the test device");
+    const size_t high_water = cache->onednn_graph_scratch_high_water_bytes();
+    std::printf("Graph-scratch high water=%zu KiB (bound %zu KiB)\n", high_water / 1024, 2 * kChunkedBudget / 1024);
+    // Positive control: zero would mean the cases never reached the Graph allocator, and the bound below
+    // would hold vacuously.
+    TEST_ASSERT(high_water > 0, "the oneDNN Graph allocator served no scratch, so the bound proves nothing");
+    TEST_ASSERT(high_water <= 2 * kChunkedBudget,
+                "the Graph-scratch high water exceeds two chunk budgets: some execute was not chunked");
+    return true;
+}
+
+static int run_descriptor_tests(bool chunked) {
     // Keep progress/final markers deterministic even when CTest redirects output.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -374,6 +424,15 @@ static int run_descriptor_tests() {
         return 1;
     }
     std::printf("Bounded runtime: VRAM arena disabled, pinned chunks capped at 16 MiB\n");
+    // Before the backend exists: the cap is read once per process.
+    if (chunked) {
+        if (setenv("GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB", kChunkedCapMiB, 1) != 0) {
+            std::fprintf(stderr, "FAIL: could not set the --chunked DIRECT cap\n");
+            return 1;
+        }
+        std::printf("Chunked: DIRECT Graph-scratch cap %s MiB, per-execute budget %zu KiB\n", kChunkedCapMiB,
+                    kChunkedBudget / 1024);
+    }
 
     std::vector<sycl::device> gpus;
     try {
@@ -405,6 +464,11 @@ static int run_descriptor_tests() {
             return 1;
         }
         ggml_backend_sycl_context & ctx = owner.context();
+        // llama.cpp-kx2a: DIRECT cases need this device's unified cache; only the later materialize cases create it.
+        if (ggml_sycl::get_unified_cache_for_device(ctx.device) == nullptr) {
+            std::fprintf(stderr, "FAIL: no unified cache for the test device\n");
+            return 1;
+        }
         // kv_offset=0 + fill_profile::SMALL reproduce these four cases exactly as
         // they were before those fields existed.
         ok &= run_case(ctx, { "MHA-4D-direct", 2, 2, 16, 8, 8, 16, 16, 0, fill_profile::SMALL });
@@ -450,7 +514,21 @@ static int run_descriptor_tests() {
         // in tests/test-sycl-fattn-onednn-gates.cpp.
         ok &= run_case(ctx, { "GQA-prod-dense", 32, 8, 128, 16, 256, 128, 128, 240, fill_profile::PRODUCTION });
         ok &= run_case(ctx, { "GQA-prod-strided", 32, 8, 128, 16, 256, 131, 133, 240, fill_profile::PRODUCTION });
+
+        if (chunked) {
+            // The two production cases above split into two executes of 8 rows at this budget. The two
+            // below add a last chunk shorter than the rest, on the GQA (5-D) and the MHA (4-D) layouts.
+            ok &= expect_split("GQA-prod-dense", 32, 16, 256, false);
+            ok &= expect_split("GQA-prod-ragged", 32, 37, 256, true);
+            ok &= run_case(ctx, { "GQA-prod-ragged", 32, 8, 128, 37, 256, 128, 128, 219, fill_profile::PRODUCTION });
+            ok &= expect_split("MHA-prod-ragged", 8, 46, 512, true);
+            ok &= run_case(ctx, { "MHA-prod-ragged", 8, 8, 64, 46, 512, 64, 64, 466, fill_profile::PRODUCTION });
+            ok &= expect_dispatch_budget(ctx.device);
+        }
         ctx.stream()->wait_and_throw();
+        if (chunked) {
+            ok &= expect_bounded_high_water(ctx.device);
+        }
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "FAIL: SYCL exception: %s\n", e.what());
         ok = false;
@@ -462,8 +540,10 @@ static int run_descriptor_tests() {
     return ok ? 0 : 1;
 }
 
-int main(int, char ** argv) {
+int main(int argc, char ** argv) {
     sycl_test_selector_fallback(argv, "level_zero:0");
+
+    const bool chunked = argc > 1 && std::strcmp(argv[1], "--chunked") == 0;
 
     // Run SYCL in a fresh child so waitpid gives an unambiguous mutation proof:
     // the numerical failure must be WIFEXITED with status 1, never a signal.
@@ -476,7 +556,7 @@ int main(int, char ** argv) {
         // Return normally from main after run_descriptor_tests has destroyed
         // its backend owner. This also exercises child static/TLS/atexit
         // teardown; _exit would hide failures in exactly that lifetime tail.
-        return run_descriptor_tests();
+        return run_descriptor_tests(chunked);
     }
 
     int status = 0;

@@ -54,22 +54,32 @@ static std::atomic<uint64_t> g_layout_ptr_host_arena_miss{ 0 };
 static std::mutex                                   g_opt_feature_registry_mutex;
 static std::unordered_set<const optimize_feature *> g_opt_feature_registry;
 
+// Both helpers forward their caller's site to mem_ops (GGML_SYCL_MEMCPY_SITE_CENSUS, llama.cpp-th86).
 static sycl::event ggml_sycl_common_mem_copy_async(sycl::queue &                    queue,
                                                    void *                           dst,
                                                    const void *                     src,
                                                    size_t                           bytes,
-                                                   const std::vector<sycl::event> & deps = {}) {
+                                                   const std::vector<sycl::event> & deps     = {},
+                                                   const char *                     file     = __builtin_FILE(),
+                                                   int                              line     = __builtin_LINE(),
+                                                   const char *                     function = __builtin_FUNCTION()) {
     const int queue_device = ggml_sycl_get_device_id_from_queue(queue);
     auto      dst_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device);
     auto      src_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(src, queue_device);
-    return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps);
+    return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps, file, line, function);
 }
 
-static void ggml_sycl_common_mem_copy(sycl::queue & queue, void * dst, const void * src, size_t bytes) {
+static void ggml_sycl_common_mem_copy(sycl::queue & queue,
+                                      void *        dst,
+                                      const void *  src,
+                                      size_t        bytes,
+                                      const char *  file     = __builtin_FILE(),
+                                      int           line     = __builtin_LINE(),
+                                      const char *  function = __builtin_FUNCTION()) {
     const int queue_device = ggml_sycl_get_device_id_from_queue(queue);
     auto      dst_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device);
     auto      src_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(src, queue_device);
-    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue);
+    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue, {}, file, line, function);
 }
 
 bool ggml_sycl_is_optimize_feature_live(const optimize_feature * feature) {
@@ -659,9 +669,11 @@ static void ggml_sycl_cleanup_host_allocations() {
 // A few consecutive resets leave Level Zero in an unrecoverable state that
 // requires a reboot. This watchdog fires *before* the driver's cascade:
 // callers sprinkle ggml_sycl_watchdog_heartbeat() at natural progress points
-// (graph_compute exit, per-layer prestage loops, persistent TG dispatch), a
-// polling thread checks elapsed time since the last heartbeat, and if it
-// exceeds GGML_SYCL_OP_TIMEOUT_MS the process is _Exit(1)'d with a diagnostic.
+// (graph_compute exit, every whole-queue wait of the graph code that returns,
+// every CPU expert batch and host-recipe task, per-layer prestage loops,
+// persistent TG dispatch), a polling thread checks elapsed time since the last
+// heartbeat, and if it exceeds GGML_SYCL_OP_TIMEOUT_MS the process is _Exit(1)'d
+// with a diagnostic.
 //
 // Heartbeat cost is one relaxed atomic store (~1ns). The polling thread wakes
 // every 500ms so detection latency is bounded by a half-second on top of the
@@ -738,13 +750,16 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
             }
             fprintf(stderr,
                     "[SYCL-WATCHDOG] No GPU progress for %lld ms (timeout %lld ms, %d devices known).\n"
-                    "[SYCL-WATCHDOG] Most likely a SYCL submit is hung inside the Level Zero driver;\n"
-                    "[SYCL-WATCHDOG] the xe driver would otherwise reset the GT engine in ~10 s and\n"
-                    "[SYCL-WATCHDOG] accumulate state that requires a reboot. Forcing cleanup + _Exit(1).\n"
+                    "[SYCL-WATCHDOG] No queue wait of the graph code returned and no CPU expert matmul finished\n"
+                    "[SYCL-WATCHDOG] in that time: a hung submit, or one command or graph segment slower than\n"
+                    "[SYCL-WATCHDOG] the timeout. Forcing cleanup + _Exit(1).\n"
                     "[SYCL-WATCHDOG] Set GGML_SYCL_OP_TIMEOUT_MS=0 to disable, or raise the value for\n"
                     "[SYCL-WATCHDOG] known-slow workloads (large model prestage, cold warmup).\n",
                     elapsed_ms, (long long) timeout_ms, n_devices);
             fflush(stderr);
+            // llama.cpp-qwn5: _Exit runs no destructor, so a CPU expert job's event would stay unsignalled and a
+            // device command parked on it would outlive the process; the xe job timeout does not end such a wait.
+            ggml_sycl::cpu_job_signal_signal_all();
             ggml_sycl_cleanup_host_allocations();
             // _Exit bypasses atexit, so the zone-reset audit's exit report would
             // never run on exactly the runs most worth auditing. Flush it here.
@@ -1219,6 +1234,10 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
     if (prev > 1) {
         return;
     }
+    // No backend context's staged-ring payload record names this extra any more (llama.cpp-o9uw): each holds the extra
+    // without a reference, and the contexts that run a model go before its weights.
+    GGML_ASSERT(extra->weight_ext == nullptr ||
+                extra->weight_ext->moe_stream_payload_records.load(std::memory_order_acquire) == 0);
 
     for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
         // llama.cpp-h9uv: events/xmx/moe live behind the lazily-allocated
@@ -1292,6 +1311,8 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
             extra->weight_ext->moe_device_table_valid[i]        = false;
             extra->weight_ext->moe_expert_handles[i].clear();
             extra->weight_ext->moe_expert_ptrs_leases[i].clear();
+            extra->weight_ext->moe_hybrid_decode[i].reset();
+            extra->weight_ext->moe_hybrid_decode_stamp[i] = {};
 
             extra->weight_ext->moe_expert_ptrs_compact_handle[i]        = {};
             extra->weight_ext->moe_expert_ptrs_compact_size[i]          = 0;
@@ -2910,3 +2931,108 @@ void ggml_sycl_pp_reset_stats() {
     g_sycl_pp_config.total_stage_transfers = 0;
     g_sycl_pp_config.total_sync_waits      = 0;
 }
+
+// GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, read once (llama.cpp-wfsl): unset or non-zero lets an op skip the source ready
+// events its own in-order stream produced (the per-op source chain and ggml_sycl_chain_ready_event_if_needed's callers
+// that pass their queue's identity), 0 queries every one as before.
+bool ggml_sycl_chain_same_queue_skip_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_CHAIN_SAME_QUEUE_SKIP");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// One census per thread (llama.cpp-wfsl): a query is counted where it was asked, and only the submitting thread
+// prints and resets its own.
+ggml_sycl_ready_query_census & ggml_sycl_ready_query_census_this_thread() {
+    static thread_local ggml_sycl_ready_query_census census;
+    return census;
+}
+
+// --- Scratchpad decline seam (llama.cpp-23mk S3-3) ---
+namespace {
+const char * const g_scratchpad_site_names[GGML_SYCL_SCRATCHPAD_SITE_COUNT] = {
+    "dnnl_softmax",  "dnnl_eltwise",  "dnnl_binary_row", "dnnl_gemm",
+    "dnnl_woq_q8_0", "dnnl_woq_q4_0", "dnnl_gemm_batch", "dnnl_woq_mxfp4_batch",
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+struct scratchpad_site_state {
+    std::atomic<int32_t>  after_n{ 0 };  // 0 = disarmed: decline on the call that makes calls == after_n
+    std::atomic<uint64_t> calls{ 0 };
+    std::atomic<uint64_t> declined{ 0 };
+    std::atomic<uint64_t> engaged{ 0 };
+};
+scratchpad_site_state g_scratchpad_sites[GGML_SYCL_SCRATCHPAD_SITE_COUNT];
+
+scratchpad_site_state * scratchpad_site_find(const char * site) {
+    for (int i = 0; site && i < GGML_SYCL_SCRATCHPAD_SITE_COUNT; ++i) {
+        if (strcmp(site, g_scratchpad_site_names[i]) == 0) {
+            return &g_scratchpad_sites[i];
+        }
+    }
+    return nullptr;
+}
+#endif
+}  // namespace
+
+void ggml_sycl_dnnl_note_engaged(ggml_sycl_scratchpad_site site) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_scratchpad_sites[site].engaged.fetch_add(1, std::memory_order_relaxed);
+#endif
+    if (g_ggml_sycl_debug_forced_off.load(std::memory_order_relaxed) || !g_ggml_sycl_debug) {
+        return;
+    }
+    static std::atomic<unsigned> reported{ 0 };
+    const unsigned               bit = 1u << site;
+    if (reported.fetch_or(bit, std::memory_order_relaxed) & bit) {
+        return;
+    }
+    GGML_LOG_WARN("[ONEDNN][%s] wrapper engaged: the oneDNN primitive was submitted (first call in this process)\n",
+                  g_scratchpad_site_names[site]);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site) {
+    scratchpad_site_state & s = g_scratchpad_sites[site];
+    const uint64_t          n = s.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int32_t           a = s.after_n.load(std::memory_order_relaxed);
+    if (a > 0 && n == (uint64_t) a) {
+        s.declined.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline(const char * site, int32_t after_n) {
+    scratchpad_site_state * s = scratchpad_site_find(site);
+    if (!s || after_n < 0) {
+        return false;
+    }
+    s->calls.store(0, std::memory_order_relaxed);
+    s->after_n.store(after_n, std::memory_order_relaxed);
+    return true;
+}
+
+GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset(void) {
+    for (scratchpad_site_state & s : g_scratchpad_sites) {
+        s.after_n.store(0, std::memory_order_relaxed);
+        s.calls.store(0, std::memory_order_relaxed);
+        s.declined.store(0, std::memory_order_relaxed);
+        s.engaged.store(0, std::memory_order_relaxed);
+    }
+}
+
+GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts(const char * site, uint64_t * calls, uint64_t * declined,
+                                                            uint64_t * engaged) {
+    scratchpad_site_state * s = scratchpad_site_find(site);
+    if (!s) {
+        return false;
+    }
+    *calls    = s->calls.load(std::memory_order_relaxed);
+    *declined = s->declined.load(std::memory_order_relaxed);
+    *engaged  = s->engaged.load(std::memory_order_relaxed);
+    return true;
+}
+#endif

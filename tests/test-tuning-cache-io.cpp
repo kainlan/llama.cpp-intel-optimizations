@@ -22,6 +22,8 @@
 // to save_ubatch_cache()/load_ubatch_cache(), never through get_cache_dir().
 
 #include "../ggml/src/ggml-sycl/tuning-cache-io.hpp"
+#include "ggml.h"
+#include "test-skip.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -32,6 +34,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <locale>
+#include <sstream>
 #include <string>
 
 using namespace ggml_sycl_tuning;
@@ -1507,6 +1512,380 @@ TEST(ubatch_participating_devices_order) {
     return true;
 }
 
+// llama.cpp-36j0: the MoE executor's rates kind. One file per device, "<sanitized device>-moe-exec-rates.json",
+// under the same GGML_SYCL_TUNING_CACHE_DIR the ubatch kind uses, sharing CACHE_VERSION without bumping it.
+static std::string moe_exec_rates_test_dir(const char * leaf) {
+    const char * env = std::getenv("GGML_SYCL_TUNING_CACHE_DIR");
+    std::string  dir = (env && env[0]) ? std::string(env) + "/" : std::string("/tmp/llama_test_");
+    dir += std::string(leaf) + "_" + std::to_string(getpid());
+    return dir;
+}
+
+TEST(moe_exec_rates_cache_roundtrip) {
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates");
+    const std::string device_name = "Intel(R) Arc(TM) Pro B70 Graphics";
+
+    MoeExecRatesEntry b70;
+    b70.device_key         = "Intel(R) Arc(TM) Pro B70@26.31";
+    b70.h2d_gbps           = 26.5;
+    b70.reorder_gbps       = 187.25;
+    b70.dev_gflops_by_type = {
+        { static_cast<int>(GGML_TYPE_MXFP4), 18000.0            },
+        { static_cast<int>(GGML_TYPE_IQ3_S), 12345.678901234567 }
+    };
+    b70.created = "2026-10-19T12:34:56Z";
+    MoeExecRatesEntry b50;
+    b50.device_key   = "Intel(R) Arc(TM) Pro B50@26.31";
+    b50.h2d_gbps     = 27.1;
+    b50.reorder_gbps = 90.5;  // no per-type device rate measured yet
+    b50.created      = "2026-10-19T12:35:00Z";
+
+    const std::vector<MoeExecRatesEntry> entries{ b70, b50 };
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, entries));
+
+    const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
+    ASSERT(path == cache_dir + "/" + sanitize_device_name(device_name) + "-moe-exec-rates.json");
+    struct stat st;
+    ASSERT(stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
+
+    std::vector<MoeExecRatesEntry> loaded;
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 2);
+    for (size_t i = 0; i < 2; ++i) {
+        ASSERT(loaded[i].device_key == entries[i].device_key);
+        ASSERT(loaded[i].h2d_gbps == entries[i].h2d_gbps);
+        ASSERT(loaded[i].reorder_gbps == entries[i].reorder_gbps);
+        ASSERT(loaded[i].created == entries[i].created);
+        ASSERT(loaded[i].dev_gflops_by_type.size() == entries[i].dev_gflops_by_type.size());
+        for (size_t j = 0; j < entries[i].dev_gflops_by_type.size(); ++j) {
+            ASSERT(loaded[i].dev_gflops_by_type[j].first == entries[i].dev_gflops_by_type[j].first);
+            ASSERT(loaded[i].dev_gflops_by_type[j].second == entries[i].dev_gflops_by_type[j].second);
+        }
+    }
+
+    // a second save replaces the file wholesale
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, { b50 }));
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].device_key == b50.device_key);
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+TEST(moe_exec_rates_cache_other_version_is_a_miss) {
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_v5");
+    const std::string device_name = "TestMoeExecRatesV5Device";
+
+    create_dir_recursive(cache_dir);
+    const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
+    {
+        std::ofstream f(path);
+        f << "{\n  \"version\": 5,\n  \"device\": \"" << device_name << "\",\n  \"entries\": [\n"
+          << "    {\"device_key\":\"Dev@1\",\"h2d_gbps\":20,\"reorder_gbps\":200,"
+          << "\"dev_gflops_by_type\":[],\"created\":\"2026-10-19T00:00:00Z\"}\n  ]\n}\n";
+    }
+    std::vector<MoeExecRatesEntry> loaded;
+    loaded.resize(3);  // load must clear what the caller passed
+    ASSERT(!load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.empty());
+
+    // a missing file is a miss too
+    std::remove(path.c_str());
+    ASSERT(!load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.empty());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// The new kind is a new file, so CACHE_VERSION does not move and an ubatch file written before it still loads.
+TEST(moe_exec_rates_kind_leaves_the_ubatch_file_loadable) {
+    ASSERT(CACHE_VERSION == 6);
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_ubatch");
+    const std::string device_name = "TestMoeExecRatesUbatchDevice";
+
+    create_dir_recursive(cache_dir);
+    const std::string ubatch_path = get_ubatch_cache_file(cache_dir, device_name);
+    {
+        // byte-for-byte what save_ubatch_cache wrote at version 6, before the rates kind existed
+        std::ofstream f(ubatch_path);
+        f << "{\n  \"version\": 6,\n  \"device\": \"" << device_name << "\",\n  \"entries\": [\n"
+          << "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":4108931808,"
+          << "\"model_hash\":111,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,"
+          << "\"type_k\":1,\"type_v\":1,\"kv_unified\":false,\"swa_full\":false,\"n_ubatch\":1024,"
+          << "\"reason\":\"ladder\",\"created\":\"2026-09-11T12:34:56Z\"}\n  ]\n}\n";
+    }
+    // writing the rates kind for the same device must not touch it
+    MoeExecRatesEntry r;
+    r.device_key = "Dev@1.0";
+    r.h2d_gbps   = 20.0;
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, { r }));
+    ASSERT(get_moe_exec_rates_cache_file(cache_dir, device_name) != ubatch_path);
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].n_ubatch == 1024 && loaded[0].reason == "ladder");
+
+    std::remove(ubatch_path.c_str());
+    std::remove(get_moe_exec_rates_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// A corrupt or hand-edited file can hold more (type, rate) pairs than there are ggml types, repeats included. The
+// lookup's record holds one slot per type, so the pairs it keeps are bounded and distinct, first occurrence wins.
+TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct) {
+    const int         type_count  = static_cast<int>(GGML_TYPE_COUNT);
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_dup");
+    const std::string device_name = "TestMoeExecRatesDupDevice";
+
+    MoeExecRatesEntry e;
+    e.device_key   = "Dev@1.0";
+    e.h2d_gbps     = 20.0;
+    e.reorder_gbps = 200.0;
+    for (int i = 0; i < 5; ++i) {
+        e.dev_gflops_by_type.emplace_back(0, 1000.0 + i);  // type 0 five times
+    }
+    for (int t = 0; t < type_count; ++t) {
+        e.dev_gflops_by_type.emplace_back(t, 2000.0 + t);
+    }
+    e.dev_gflops_by_type.emplace_back(1, 9.0);
+    e.dev_gflops_by_type.emplace_back(type_count, 9.0);  // out of range
+    e.dev_gflops_by_type.emplace_back(2, -1.0);          // not a rate
+    ASSERT(static_cast<int>(e.dev_gflops_by_type.size()) == type_count + 8);
+
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, { e }));
+    std::vector<MoeExecRatesEntry> loaded;
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].dev_gflops_by_type.size() == e.dev_gflops_by_type.size());
+
+    const std::vector<std::pair<int, double>> kept = moe_exec_rates_distinct_types(loaded[0], type_count);
+    ASSERT(static_cast<int>(kept.size()) == type_count);  // every type once
+    std::vector<bool> seen(static_cast<size_t>(type_count), false);
+    for (const auto & tg : kept) {
+        ASSERT(tg.first >= 0 && tg.first < type_count);
+        ASSERT(!seen[static_cast<size_t>(tg.first)]);
+        seen[static_cast<size_t>(tg.first)] = true;
+        ASSERT(tg.second > 0.0);
+    }
+    ASSERT(kept[0].first == 0 && kept[0].second == 1000.0);  // the first occurrence wins
+
+    // a smaller bound stops the list there
+    ASSERT(moe_exec_rates_distinct_types(loaded[0], 3).size() == 3);
+
+    std::remove(get_moe_exec_rates_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// The same filter with a small bound and a list that BEGINS with the hostile pairs, so each rule has to reject its
+// own: out of range above and below, a negative and a zero rate, a non-finite rate, and a repeat of a kept type.
+TEST(moe_exec_rates_distinct_types_rejects_each_hostile_pair) {
+    MoeExecRatesEntry e;
+    e.dev_gflops_by_type = {
+        { 4,  5.0                                      },
+        { -1, 5.0                                      },
+        { 1,  -2.0                                     },
+        { 1,  0.0                                      },
+        { 3,  std::numeric_limits<double>::infinity()  },
+        { 0,  std::numeric_limits<double>::quiet_NaN() },
+        { 2,  3.0                                      },
+        { 1,  3.0                                      },
+        { 2,  7.0                                      }
+    };
+    const std::vector<std::pair<int, double>> kept = moe_exec_rates_distinct_types(e, 4);
+    const std::vector<std::pair<int, double>> want = {
+        { 2, 3.0 },
+        { 1, 3.0 }
+    };
+    ASSERT(kept == want);
+    ASSERT(moe_exec_rates_distinct_types(e, 0).empty());
+    return true;
+}
+
+// A persisted entry whose H2D rate is not finite and positive, or whose reorder rate is negative or not finite, must
+// never reach a caller: the executor asserts on it. A key the writer dropped, a "nan" the parser refuses, and a zero
+// H2D rate are all the same 0, and each is a miss; a store of such a record is refused and leaves the file's entries
+// alone. (A reorder rate of 0 is valid and means unmeasured: moe_exec_rates_unmeasured_reorder_is_a_valid_record.)
+TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store) {
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_invalid");
+    const std::string device_name = "TestMoeExecRatesInvalidDevice";
+    const int         type_count  = static_cast<int>(GGML_TYPE_COUNT);  // the bound the backend passes
+    create_dir_recursive(cache_dir);
+    const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
+    {
+        std::ofstream f(path);
+        f << "{\n  \"version\": 6,\n  \"device\": \"" << device_name
+          << "\",\n  \"entries\": [\n"
+          // good, with junk between and inside its pairs: only the well-formed pairs survive
+          << "    {\"device_key\":\"GOOD\",\"h2d_gbps\":20,\"reorder_gbps\":200,\"dev_gflops_by_type\":"
+          << "[[1,5.0], junk ,[2,6.0],[3,nan],[4,1.0,9],[5],[6,7.5]],\"created\":\"c\"},\n"
+          // no h2d key at all
+          << "    {\"device_key\":\"NOH2D\",\"reorder_gbps\":200,\"dev_gflops_by_type\":[],\"created\":\"c\"},\n"
+          // non-finite and zero rates
+          << "    {\"device_key\":\"NAN\",\"h2d_gbps\":nan,\"reorder_gbps\":200,\"dev_gflops_by_type\":[]},\n"
+          << "    {\"device_key\":\"ZERO\",\"h2d_gbps\":0,\"reorder_gbps\":200,\"dev_gflops_by_type\":[]},\n"
+          // a reorder rate read from the file: negative is refused; "nan" parses as 0, which is unmeasured and valid
+          << "    {\"device_key\":\"NEGR\",\"h2d_gbps\":20,\"reorder_gbps\":-1,\"dev_gflops_by_type\":[]},\n"
+          << "    {\"device_key\":\"NANR\",\"h2d_gbps\":20,\"reorder_gbps\":nan,\"dev_gflops_by_type\":[]},\n"
+          // cut off mid-pair: its braces never close, so it is not an entry
+          << "    {\"device_key\":\"CUT\",\"h2d_gbps\":20,\"reorder_gbps\":200,\"dev_gflops_by_type\":[[1,5.0],[2,";
+    }
+    std::vector<MoeExecRatesEntry> loaded;
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 6);
+    ASSERT(loaded[0].device_key == "GOOD" && loaded[1].device_key == "NOH2D" && loaded[2].device_key == "NAN" &&
+           loaded[3].device_key == "ZERO" && loaded[4].device_key == "NEGR" && loaded[5].device_key == "NANR");
+    ASSERT(loaded[4].reorder_gbps == -1.0 && loaded[5].reorder_gbps == 0.0);
+    const std::vector<std::pair<int, double>> good_pairs = {
+        { 1, 5.0 },
+        { 2, 6.0 },
+        { 6, 7.5 }
+    };
+    ASSERT(loaded[0].dev_gflops_by_type == good_pairs);
+    ASSERT(loaded[1].h2d_gbps == 0.0 && loaded[2].h2d_gbps == 0.0);
+
+    MoeExecRatesEntry got;
+    ASSERT(moe_exec_rates_find(loaded, "GOOD", type_count, got));
+    ASSERT(got.h2d_gbps == 20.0 && got.reorder_gbps == 200.0 && got.dev_gflops_by_type == good_pairs);
+    ASSERT(!moe_exec_rates_find(loaded, "NOH2D", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "NAN", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "ZERO", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "NEGR", type_count, got));  // a negative reorder read from a file is a miss
+    ASSERT(moe_exec_rates_find(loaded, "NANR", type_count, got) && got.h2d_gbps == 20.0 && got.reorder_gbps == 0.0);
+    ASSERT(!moe_exec_rates_find(loaded, "CUT", type_count, got));
+    ASSERT(!moe_exec_rates_find(loaded, "ABSENT", type_count, got));
+
+    // the store half
+    std::vector<MoeExecRatesEntry> entries;
+    MoeExecRatesEntry              rec;
+    rec.device_key         = "D";
+    rec.h2d_gbps           = 26.5;
+    rec.reorder_gbps       = 180.0;
+    rec.dev_gflops_by_type = {
+        { 1,  5.0 },
+        { 1,  6.0 },
+        { 99, 1.0 }
+    };
+    ASSERT(moe_exec_rates_upsert(entries, rec, type_count));
+    ASSERT(entries.size() == 1 && entries[0].dev_gflops_by_type == (std::vector<std::pair<int, double>>{
+                                                                       { 1, 5.0 }
+    }));
+    rec.h2d_gbps = 27.0;
+    ASSERT(moe_exec_rates_upsert(entries, rec, type_count));  // the same key replaces
+    ASSERT(entries.size() == 1 && entries[0].h2d_gbps == 27.0);
+
+    const double bad[] = { 0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity() };
+    for (double b : bad) {
+        MoeExecRatesEntry r = rec;
+        r.h2d_gbps          = b;
+        ASSERT(!moe_exec_rates_upsert(entries, r, type_count));
+        if (b == 0.0) {
+            continue;  // an unmeasured reorder rate, accepted below
+        }
+        r              = rec;
+        r.reorder_gbps = b;
+        ASSERT(!moe_exec_rates_upsert(entries, r, type_count));
+    }
+    ASSERT(entries.size() == 1 && entries[0].h2d_gbps == 27.0 && entries[0].reorder_gbps == 180.0);
+    MoeExecRatesEntry unset;  // a default entry has measured nothing
+    unset.device_key = "U";
+    ASSERT(!moe_exec_rates_upsert(entries, unset, type_count) && entries.size() == 1);
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// llama.cpp-kp1l: the H2D probe measures the H2D rate only, so its record says reorder is unmeasured with a 0, and the
+// store and the lookup accept that. A negative or non-finite reorder rate is still refused, a record stored before
+// this change (positive reorder) still loads unchanged, and a zero H2D rate is still a miss whatever reorder holds.
+TEST(moe_exec_rates_unmeasured_reorder_is_a_valid_record) {
+    const std::string cache_dir   = moe_exec_rates_test_dir("moe_exec_rates_unmeasured");
+    const std::string device_name = "TestMoeExecRatesUnmeasuredDevice";
+    const int         type_count  = static_cast<int>(GGML_TYPE_COUNT);
+    create_dir_recursive(cache_dir);
+    const std::string path = get_moe_exec_rates_cache_file(cache_dir, device_name);
+
+    std::vector<MoeExecRatesEntry> entries;
+    MoeExecRatesEntry              rec;
+    rec.device_key   = "D";
+    rec.h2d_gbps     = 26.5;
+    rec.reorder_gbps = 0.0;
+    ASSERT(moe_exec_rates_upsert(entries, rec, type_count));
+    ASSERT(entries.size() == 1 && entries[0].reorder_gbps == 0.0);
+    MoeExecRatesEntry r = rec;
+    r.device_key        = "NEG";
+    r.reorder_gbps      = -1.0;
+    ASSERT(!moe_exec_rates_upsert(entries, r, type_count));
+    r.reorder_gbps = std::numeric_limits<double>::quiet_NaN();
+    ASSERT(!moe_exec_rates_upsert(entries, r, type_count));
+    r              = rec;
+    r.device_key   = "NOH2D";
+    r.h2d_gbps     = 0.0;
+    r.reorder_gbps = 200.0;
+    ASSERT(!moe_exec_rates_upsert(entries, r, type_count));
+    ASSERT(entries.size() == 1);
+
+    // the file round trip: 0 is written and read back as 0, and the entry is a hit
+    MoeExecRatesEntry old_record;  // as an earlier build stored it: the seed persisted as a positive reorder rate
+    old_record.device_key   = "OLD";
+    old_record.h2d_gbps     = 24.0;
+    old_record.reorder_gbps = 200.0;
+    ASSERT(moe_exec_rates_upsert(entries, old_record, type_count));
+    ASSERT(save_moe_exec_rates(cache_dir, device_name, entries));
+    std::vector<MoeExecRatesEntry> loaded;
+    ASSERT(load_moe_exec_rates(cache_dir, device_name, loaded) && loaded.size() == 2);
+    MoeExecRatesEntry got;
+    ASSERT(moe_exec_rates_find(loaded, "D", type_count, got));
+    ASSERT(got.h2d_gbps == 26.5 && got.reorder_gbps == 0.0);
+    ASSERT(moe_exec_rates_find(loaded, "OLD", type_count, got));
+    ASSERT(got.h2d_gbps == 24.0 && got.reorder_gbps == 200.0);
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// The writer and the reader follow the classic locale whatever the global one is: a decimal-comma locale (the console
+// code calls setlocale(LC_ALL, "")) must not write "26,5" or read "26.5" as 26.
+TEST(moe_exec_rates_json_ignores_the_global_locale) {
+    struct comma_punct : std::numpunct<char> {
+      protected:
+        char do_decimal_point() const override { return ','; }
+    };
+
+    struct restore_locale {
+        std::locale saved;
+
+        ~restore_locale() { std::locale::global(saved); }
+    } restore{ std::locale() };
+
+    std::locale::global(std::locale(std::locale::classic(), new comma_punct));
+
+    // the premise: a default stream now writes a comma
+    std::ostringstream probe;
+    probe << 26.5;
+    ASSERT(probe.str() == "26,5");
+
+    MoeExecRatesEntry e;
+    e.device_key         = "Dev@1";
+    e.h2d_gbps           = 26.5;
+    e.reorder_gbps       = 187.25;
+    e.dev_gflops_by_type = {
+        { 3, 18000.5 }
+    };
+    const std::string json = moe_exec_rates_entry_to_json(e);
+    ASSERT(json.find("\"h2d_gbps\":26.5,") != std::string::npos);
+    ASSERT(json.find("[3,18000.5]") != std::string::npos);
+    const MoeExecRatesEntry back = moe_exec_rates_entry_from_json(json);
+    ASSERT(back.h2d_gbps == 26.5 && back.reorder_gbps == 187.25);
+    ASSERT(back.dev_gflops_by_type == e.dev_gflops_by_type);
+    ASSERT(parse_double("{\"x\":0.25}", "x") == 0.25);
+    return true;
+}
+
 // =============================================================================
 // Main test runner
 // =============================================================================
@@ -1527,7 +1906,7 @@ int main() {
                      "directly -- several of its tests fall back to the real $HOME/.cache/llama.cpp/sycl-tuning "
                      "otherwise. See tests/CMakeLists.txt's test-tuning-cache-io registration for the values "
                      "ctest itself uses.\n";
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     std::cout << "=== Tuning Cache I/O Tests ===\n\n";
@@ -1584,6 +1963,14 @@ int main() {
     RUN_TEST(ubatch_device_set_key_visible_subset_keys_every_planner_gpu);
     RUN_TEST(ubatch_device_set_key_missing_identity_is_no_key);
     RUN_TEST(ubatch_participating_devices_order);
+    RUN_TEST(moe_exec_rates_cache_roundtrip);
+    RUN_TEST(moe_exec_rates_cache_other_version_is_a_miss);
+    RUN_TEST(moe_exec_rates_kind_leaves_the_ubatch_file_loadable);
+    RUN_TEST(moe_exec_rates_cache_pairs_are_bounded_and_distinct);
+    RUN_TEST(moe_exec_rates_distinct_types_rejects_each_hostile_pair);
+    RUN_TEST(moe_exec_rates_invalid_rates_are_a_miss_and_a_refused_store);
+    RUN_TEST(moe_exec_rates_unmeasured_reorder_is_a_valid_record);
+    RUN_TEST(moe_exec_rates_json_ignores_the_global_locale);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";

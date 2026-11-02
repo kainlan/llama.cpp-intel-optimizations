@@ -247,7 +247,7 @@ void ggml_sycl_add_id(ggml_backend_sycl_context& ctx, ggml_sycl::sycl_tensor dst
           auto resolved = ggml_sycl_resolve(cur, ctx.device);
           if (resolved.has_ready_event) {
               try {
-                  if (ggml_sycl_should_add_dependency(resolved.ready_event)) {
+                  if (ggml_sycl_should_add_dependency(resolved.ready_event, GGML_SYCL_READY_QUERY_SITE_ADD_ID)) {
                       deps.push_back(resolved.ready_event);
                   }
               } catch (...) {
@@ -292,7 +292,7 @@ void ggml_sycl_add_id(ggml_backend_sycl_context& ctx, ggml_sycl::sycl_tensor dst
           });
   });
   if (!ggml_sycl_graph_recording_active()) {
-      ggml_sycl_set_tensor_ready_event(const_cast<ggml_tensor *>(dst.raw()), ctx.device, evt);
+      ggml_sycl_set_tensor_ready_event(const_cast<ggml_tensor *>(dst.raw()), ctx.device, evt, &q);
   }
   if (add_id_barrier_enabled() && !ggml_sycl_graph_recording_active()) {
       (void) q.ext_oneapi_submit_barrier({ evt });

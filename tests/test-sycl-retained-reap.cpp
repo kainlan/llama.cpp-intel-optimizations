@@ -11,8 +11,9 @@
 // hands, and a reap on another thread is known to be waiting on it when
 // retained_reap_test_yielding() says so -- no case orders threads by sleeping.
 // Every owner release, and every log line, checks that its thread does not
-// hold the retained-store mutex. Nothing here touches a GPU (the registration pins the selector to
-// the OpenCL CPU device).
+// hold the retained-store mutex. The CPU expert job gates a record carries need a
+// Level Zero ring, so test-sycl-cpu-job-signal-ring covers them. Nothing here
+// touches a GPU (the registration pins the selector to the OpenCL CPU device).
 //
 // Usage:
 //   ./build/bin/test-sycl-retained-reap                          # every case

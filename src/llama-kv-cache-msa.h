@@ -40,9 +40,12 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const override;
 
     void clear(bool data) override;
 
@@ -97,6 +100,11 @@ public:
     // used to create a full-cache context
     llama_kv_cache_msa_context(
             llama_kv_cache_msa * kv);
+
+    // used to create a worst-case context over exactly n_streams streams
+    llama_kv_cache_msa_context(
+            llama_kv_cache_msa * kv,
+            uint32_t n_streams);
 
     // used to create an update context
     llama_kv_cache_msa_context(

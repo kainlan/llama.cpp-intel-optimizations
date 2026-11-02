@@ -104,7 +104,7 @@ bool alloc_tracked(int                                  device,
                    size_t                               size,
                    const ggml_sycl::alloc_constraints & constraints,
                    alloc_handle *                       out) {
-    alloc_request req;
+    alloc_request req{};
     req.queue              = queue;
     req.device             = device;
     req.size               = size;

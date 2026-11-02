@@ -521,6 +521,87 @@ CLEAR_POOL_BODY_CODE = extract_function_body(
 RELEASE_COMPLETE_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_pool_entry_release_complete("
 )
+# llama.cpp-jwjz: the one predicate for "every Graph-scratch consumer submits
+# on the cache's in-order queue", which the ONEDNN zone free and the DIRECT
+# pool's reuse both read, and the DIRECT reuse policy built on it.
+CONSUMERS_IN_ORDER_CALL = "onednn_graph_scratch_consumers_in_order("
+IN_ORDER_REUSE_CALL = "onednn_graph_scratch_in_order_reuse_allowed("
+CONSUMERS_IN_ORDER_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_consumers_in_order("
+)
+IN_ORDER_REUSE_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_in_order_reuse_allowed("
+)
+# llama.cpp-jwjz: a pool hit's hand-out site, where the buffer takes the
+# request's in-order tag.
+TRY_POOL_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void * unified_cache::onednn_graph_scratch_try_pool_locked(")
+# The per-request tag onednn_graph_scratch_alloc() computes once, and the
+# condition under which entry_usable_locked() may skip the completion query.
+REQUESTER_IN_ORDER_INIT = "const bool requester_in_order = (*q == queue_) && " + IN_ORDER_REUSE_CALL + ");"
+IN_ORDER_SKIP_CONDITION = "!(requester_in_order && entry.in_order) && !" + RELEASE_COMPLETE_CALL + "entry)"
+
+
+# llama.cpp-jwjz: the predicate's two answers, as statements. A queue
+# without the in_order property returns false, and otherwise the result IS
+# "no TP queue for this device". Token presence alone passed with the TP
+# polarity inverted.
+CONSUMERS_IN_ORDER_GUARD = "if (!queue_.has_property<sycl::property::queue::in_order>()) { return false; }"
+CONSUMERS_TP_RETURN = "return ggml_sycl_get_tp_queue(ggml_sycl_get_device_id_from_queue(queue_)) == nullptr;"
+# free()'s marker chain: each marker depends on the slot's previous one, and
+# the slot then records this marker as its last. Without the update the
+# dependency never names anything and the chain is inert. The edge is pinned
+# with its guard: a bare depends_on(*last_marker) also matches the inverted
+# guard, which dereferences an empty optional on a slot's first park and
+# never chains afterwards.
+LAST_MARKER_GUARDED_EDGE = "if (last_marker) { h.depends_on(*last_marker); }"
+LAST_MARKER_UPDATE = "last_marker = std::move(marker);"
+# try_reuse_pool_locked()'s RESOLVE_FAILED release: the leaving owner waits
+# on that entry's own release event, not on any event.
+RESOLVE_FAILED_RELEASE = "retain_handles_until_event({ std::move(owner) }, std::move(leaving_release_event));"
+
+
+def _consumers_in_order_predicate_ok(body: str) -> bool:
+    """llama.cpp-jwjz: true iff `body` returns false for a queue without the
+    in_order property, before anything else, and otherwise returns exactly
+    whether the device has no TP queue."""
+    code = normalize_ws(strip_literals(body))
+    guard = code.find(CONSUMERS_IN_ORDER_GUARD)
+    tp_return = code.find(CONSUMERS_TP_RETURN)
+    return 0 <= guard < tp_return
+
+
+def _marker_chain_is_live(body: str) -> bool:
+    """llama.cpp-jwjz: true iff free() makes each marker depend on the slot's
+    previous marker when there is one, AND then records the new marker as the
+    slot's last, in that order."""
+    code = normalize_ws(strip_literals(body))
+    depends = code.find(LAST_MARKER_GUARDED_EDGE)
+    update = code.find(LAST_MARKER_UPDATE)
+    return "onednn_graph_scratch_flag_slot_last_marker_" in code and 0 <= depends < update
+
+
+def _entry_usable_requires_both_tags(body: str) -> bool:
+    """llama.cpp-jwjz: true iff `body` skips the completion query only when
+    BOTH the request and the entry's previous consumer were on the cache's
+    in-order queue, and does not consult the reuse policy itself (the
+    request's tag already carries it). Dropping either half of the
+    conjunction would hand an in-flight buffer across queues."""
+    code = normalize_ws(strip_literals(body))
+    return IN_ORDER_SKIP_CONDITION in code and IN_ORDER_REUSE_CALL not in code
+
+
+def _real_release_stays_completion_gated(body: str) -> bool:
+    """llama.cpp-jwjz: true iff `body` checks completion through the choke
+    point and never consults the in-order reuse policy. In-order reuse only
+    relaxes REUSE: a real release hands the bytes back to the general
+    allocator, whose next owner may run on any queue, so it must still wait
+    for the release to complete."""
+    code = strip_literals(body)
+    return (
+        RELEASE_COMPLETE_CALL in code
+        and IN_ORDER_REUSE_CALL not in code
+        and CONSUMERS_IN_ORDER_CALL not in code
+    )
 
 
 def test_onednn_graph_allocator_source_contract() -> None:
@@ -692,9 +773,9 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["pool_size_ready_locked() body calls the shared usability predicate"] = (
         "onednn_graph_scratch_entry_usable_locked(" in POOL_SIZE_READY_BODY_CODE
     )
-    checks["pool_size_ready_locked() declaration still takes alignment and device_id"] = (
-        "onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const;"
-        in normalize_ws(CACHE_HPP_CODE)
+    checks["pool_size_ready_locked() declaration still takes alignment, device_id and the request's in-order tag"] = (
+        "onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id, "
+        "bool requester_in_order) const;" in normalize_ws(CACHE_HPP_CODE)
     )
     # llama.cpp-0oxf round-6 finding H3: onednn_graph_scratch_entry_usable_locked()'s
     # own declaration now says callers must NOT call event_complete() on an
@@ -825,8 +906,13 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # ctx.stream() returns the TP shared-context queue ahead of the cache's
     # own queue, so the in-order-queue argument above no longer names the
     # real consumer and immediate zone reclaim would race a TP consumer.
+    # llama.cpp-jwjz: the TP query now lives in
+    # onednn_graph_scratch_consumers_in_order(), the predicate the zone free
+    # shares with the DIRECT pool's in-order reuse, so the check follows it.
     checks["TP-active free path checked and deferred"] = (
-        "ggml_sycl_get_tp_queue(" in FREE_BODY_CODE and "enqueue_deferred_zone_free(" in FREE_BODY_CODE
+        CONSUMERS_IN_ORDER_CALL in FREE_BODY_CODE
+        and "ggml_sycl_get_tp_queue(" in CONSUMERS_IN_ORDER_BODY_CODE
+        and "enqueue_deferred_zone_free(" in FREE_BODY_CODE
     )
 
     # reserve_onednn_scratch's growth guard must compare total_needed (the
@@ -1035,8 +1121,141 @@ def test_onednn_graph_allocator_source_contract() -> None:
         _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code)
     )
 
+    # llama.cpp-jwjz: a parked DIRECT entry is reusable while its release is
+    # still pending only when every consumer shares the in-order queue, and
+    # only for reuse. Eviction and the pool clear stay completion-gated, a
+    # RESOLVE_FAILED release waits on the entry's event, and a marker armed
+    # on a slot returned early is ordered after that slot's previous marker.
+    checks["in-order consumer predicate returns false without in_order and otherwise whether TP is absent"] = (
+        _consumers_in_order_predicate_ok(CONSUMERS_IN_ORDER_BODY_CODE)
+    )
+    checks["in-order reuse policy reads the shared consumer predicate"] = (
+        CONSUMERS_IN_ORDER_CALL in IN_ORDER_REUSE_BODY_CODE
+    )
+    # The skip needs both tags: the request's (computed once in alloc() from
+    # the queue identity and the policy) and the entry's (recorded when the
+    # buffer was handed out, copied at park). A DIRECT entry last used on
+    # another queue is never handed back while its release is pending.
+    checks["entry_usable_locked() skips the completion query only when the request and the entry are both in-order"] = (
+        _entry_usable_requires_both_tags(ENTRY_USABLE_BODY_CODE)
+    )
+    checks["alloc() derives the request's in-order tag from its queue and the reuse policy"] = (
+        REQUESTER_IN_ORDER_INIT in normalize_ws(strip_literals(ALLOC_BODY_CODE))
+    )
+    checks["DIRECT and pool entries both carry an in_order tag"] = (
+        normalize_ws(CACHE_HPP_CODE).count("bool in_order = false;") >= 2
+    )
+    checks["a pool hit records the request's in-order tag"] = (
+        "{ std::move(pooled_owner), size, requester_in_order }" in normalize_ws(TRY_POOL_BODY_CODE)
+    )
+    checks["a fresh DIRECT allocation records the request's in-order tag"] = (
+        "{ std::move(owner), size, requester_in_order }" in normalize_ws(DIRECT_BODY_CODE)
+    )
+    checks["free() copies the entry's in-order tag onto the parked pool entry"] = (
+        "flag_slot, flag_generation, entry.in_order }" in normalize_ws(FREE_BODY_CODE)
+    )
+    checks["evict_pool_until_fits_locked() stays completion-gated"] = _real_release_stays_completion_gated(
+        EVICT_UNTIL_FITS_BODY_CODE
+    )
+    checks["clear_pool_locked() stays completion-gated"] = _real_release_stays_completion_gated(CLEAR_POOL_BODY_CODE)
+    checks["try_reuse_pool_locked() RESOLVE_FAILED release waits on the entry's own release event"] = (
+        RESOLVE_FAILED_RELEASE in normalize_ws(strip_literals(TRY_REUSE_POOL_BODY_CODE))
+    )
+    checks["free() orders each slot's marker after that slot's previous marker, then records it"] = (
+        _marker_chain_is_live(FREE_BODY_CODE)
+    )
+
     failed = [name for name, ok in checks.items() if not ok]
     assert not failed, "onednn graph allocator source contract failed: " + ", ".join(failed)
+
+
+def test_real_release_completion_gate_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-jwjz: proves the two "stays
+    completion-gated" checks above would catch the in-order reuse relaxation
+    leaking into a real release -- the eviction sweep consulting the reuse
+    policy, and so returning an entry that is still in flight to the general
+    allocator."""
+    anchor = RELEASE_COMPLETE_CALL + "bucket[i])"
+    assert anchor in EVICT_UNTIL_FITS_BODY_CODE, "mutation target string not found -- update this witness"
+    mutated = EVICT_UNTIL_FITS_BODY_CODE.replace(anchor, IN_ORDER_REUSE_CALL + ") || " + anchor, 1)
+    assert mutated != EVICT_UNTIL_FITS_BODY_CODE
+    assert _real_release_stays_completion_gated(EVICT_UNTIL_FITS_BODY_CODE), (
+        "the real, unmutated eviction sweep should check completion and never consult the in-order reuse policy"
+    )
+    assert not _real_release_stays_completion_gated(mutated), (
+        "mutation witness is broken: the injected in-order reuse call was not detected"
+    )
+
+
+def test_consumers_in_order_predicate_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-jwjz: the predicate check must catch an
+    inverted TP polarity, a predicate that ignores TP, and a queue without
+    in_order reported as in-order. Each of these passed the earlier
+    token-presence check."""
+    body = normalize_ws(strip_literals(CONSUMERS_IN_ORDER_BODY_CODE))
+    assert _consumers_in_order_predicate_ok(body), "the real predicate should pass"
+    mutants = {
+        "TP polarity inverted": body.replace(") == nullptr;", ") != nullptr;", 1),
+        "TP ignored": body.replace(CONSUMERS_TP_RETURN, "(void) ggml_sycl_get_tp_queue(0); return true;", 1),
+        "no in_order reported as in-order": body.replace("{ return false; }", "{ return true; }", 1),
+        "in_order guard dropped": body.replace(CONSUMERS_IN_ORDER_GUARD, "", 1),
+    }
+    for name, mutated in mutants.items():
+        assert mutated != body, f"mutation target for {name!r} not found -- update this witness"
+        assert not _consumers_in_order_predicate_ok(mutated), f"mutation witness is broken: {name} was not detected"
+
+
+def test_marker_chain_and_resolve_failed_release_checks_have_mutation_witnesses() -> None:
+    """Mutation witness for llama.cpp-jwjz: deleting the slot's last-marker
+    update leaves the chain inert, inverting its guard dereferences an empty
+    optional on a slot's first park and never chains afterwards, and a
+    RESOLVE_FAILED release that waits on some other event could free a buffer
+    still in use. Each passed a check that pinned names or the bare edge."""
+    free_code = normalize_ws(strip_literals(FREE_BODY_CODE))
+    assert _marker_chain_is_live(free_code), "the real free() should keep the chain live"
+    dropped_update = free_code.replace(LAST_MARKER_UPDATE, "", 1)
+    assert dropped_update != free_code, "mutation target not found -- update this witness"
+    assert not _marker_chain_is_live(dropped_update), "mutation witness is broken: the dropped update was not detected"
+    dropped_edge = free_code.replace(LAST_MARKER_GUARDED_EDGE, "", 1)
+    assert dropped_edge != free_code, "mutation target not found -- update this witness"
+    assert not _marker_chain_is_live(dropped_edge), "mutation witness is broken: the dropped edge was not detected"
+    inverted_guard = free_code.replace("if (last_marker) {", "if (!last_marker) {", 1)
+    assert inverted_guard != free_code, "mutation target not found -- update this witness"
+    assert not _marker_chain_is_live(inverted_guard), (
+        "mutation witness is broken: the inverted last-marker guard was not detected"
+    )
+
+    reuse_code = normalize_ws(strip_literals(TRY_REUSE_POOL_BODY_CODE))
+    assert RESOLVE_FAILED_RELEASE in reuse_code, "mutation target not found -- update this witness"
+    wrong_event = reuse_code.replace("std::move(leaving_release_event)", "sycl::event{}", 1)
+    assert RESOLVE_FAILED_RELEASE not in wrong_event, (
+        "mutation witness is broken: a RESOLVE_FAILED release on a different event was not detected"
+    )
+
+
+def test_cross_queue_reuse_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-jwjz: proves the "both in-order" check
+    above would catch the skip losing the entry's half, which would let a
+    request on the cache's queue take a buffer whose previous consumer ran
+    on another queue and may still be using it."""
+    assert IN_ORDER_SKIP_CONDITION in normalize_ws(strip_literals(ENTRY_USABLE_BODY_CODE)), (
+        "mutation target string not found -- update this witness"
+    )
+    assert _entry_usable_requires_both_tags(ENTRY_USABLE_BODY_CODE), (
+        "the real, unmutated entry_usable_locked() should require both tags"
+    )
+    dropped_entry_half = normalize_ws(ENTRY_USABLE_BODY_CODE).replace(
+        "!(requester_in_order && entry.in_order)", "!requester_in_order", 1
+    )
+    assert not _entry_usable_requires_both_tags(dropped_entry_half), (
+        "mutation witness is broken: dropping the entry's tag was not detected"
+    )
+    per_cache_policy = normalize_ws(ENTRY_USABLE_BODY_CODE).replace(
+        "!(requester_in_order && entry.in_order)", "!" + IN_ORDER_REUSE_CALL + ")", 1
+    )
+    assert not _entry_usable_requires_both_tags(per_cache_policy), (
+        "mutation witness is broken: the per-cache policy form (before the cross-queue fix) was not detected"
+    )
 
 
 def test_no_blocking_wait_check_has_a_mutation_witness() -> None:

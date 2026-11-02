@@ -1,0 +1,9 @@
+pre: MemAvailable:   166554532 kB Shmem:          12239744 kB  load: 32.92 37.34 35.85 17:13:23
+mtp n1 code rc=0 17:16:40
+mtp n1 chat rc=0 17:20:19
+mtp n1 reasoning rc=0 17:23:50
+mtp n2 code_v rc=0 17:26:39
+mtp n2 chat_v rc=0 17:31:13
+mtp n2 reasoning_v rc=0 17:34:26
+post: MemAvailable:   167846684 kB Shmem:          12239688 kB  17:34:31
+rc=0

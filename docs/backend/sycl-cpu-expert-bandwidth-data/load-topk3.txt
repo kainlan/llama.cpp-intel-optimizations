@@ -1,0 +1,17 @@
+Sat Oct  3 02:11:27 PM EDT 2026
+ 14:11:27 up 24 days, 19:27, 23 users,  load average: 31.99, 35.90, 39.65
+top - 14:11:27 up 24 days, 19:27, 23 users,  load average: 31.99, 35.90, 39.65
+Tasks: 1212 total,   2 running, 1209 sleeping,   0 stopped,   1 zombie
+%Cpu(s):  4.9 us,  7.6 sy, 86.1 ni,  1.4 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st 
+MiB Mem : 252839.4 total, 123048.3 free,  92702.1 used,  50607.2 buff/cache     
+MiB Swap:   8192.0 total,     26.3 free,   8165.7 used. 160137.3 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+3286086 kainlan   20   0 2151.7g  33.5g   1.4g S  2133  13.6    28w+3d codesco+
+3822873 kainlan   20   0   19.0g   1.4g  42292 R  50.0   0.6 347:54.07 pi
+2916473 kainlan   20   0   11820   6928   4280 R  16.7   0.0   0:00.03 top
+2624452 kainlan   20   0   11.2g   1.1g  38296 S   8.3   0.4 274:24.04 pi
+2728797 kainlan   20   0 7768956   1.4g  87984 S   8.3   0.6      7,29 claude
+2797139 kainlan   20   0 7699336  93604  36336 S   8.3   0.0   0:03.97 rustdesk
+      1 root      20   0   28236  18272  10576 S   0.0   0.0  32:46.35 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:08.31 kthreadd

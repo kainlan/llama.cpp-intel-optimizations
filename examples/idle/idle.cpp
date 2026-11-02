@@ -34,6 +34,9 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = common_model_params_to_llama(params);
 
+    // the context below is 512 cells whatever -c says, so the load plans the KV room for that (llama.cpp-7fmt)
+    model_params.n_ctx_hint = 512;
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
 
     if (model == NULL) {

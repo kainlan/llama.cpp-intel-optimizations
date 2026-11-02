@@ -17,7 +17,13 @@ LIFECYCLE_TEST = ROOT / "tests/test-sycl-moe-handle-resolution.cpp"
 
 def function(text: str, signature: str) -> str:
     start = text.index(signature)
-    brace = text.index("{", start)
+    # A forward declaration ends in `;` before any `{`: skip to the definition.
+    while True:
+        brace = text.index("{", start)
+        semi = text.find(";", start)
+        if semi < 0 or brace < semi:
+            break
+        start = text.index(signature, start + 1)
     depth = 0
     state = "code"
     i = brace
@@ -58,8 +64,21 @@ def function(text: str, signature: str) -> str:
     raise AssertionError(f"unclosed function {signature}")
 
 
+def before(text: str, first: str, second: str, missing: list[str]) -> bool:
+    """True iff both anchors occur and `first` precedes `second`.
+
+    Fail closed: a missing anchor is a False claim (a named FAIL), never a
+    ValueError that would abort the whole requirements dict unevaluated.
+    """
+    a = text.find(first)
+    b = text.find(second)
+    missing.extend(anchor for anchor, at in ((first, a), (second, b)) if at < 0)
+    return a >= 0 and b >= 0 and a < b
+
+
 def violations(source: str) -> list[str]:
     failures: list[str] = []
+    missing_anchors: list[str] = []
     publish = function(source, "static bool ggml_sycl_publish_backend_aos_expert_handles")
     invalidate = function(source, "static void ggml_sycl_invalidate_backend_weight_mutation")
     invalidate_buffer = function(source, "static void ggml_sycl_invalidate_backend_buffer_weights")
@@ -67,7 +86,7 @@ def violations(source: str) -> list[str]:
     memsetter = function(source, "static void ggml_backend_sycl_buffer_memset_tensor")
     copier = function(source, "static bool ggml_backend_sycl_buffer_cpy_tensor")
     clearer = function(source, "static void ggml_backend_sycl_buffer_clear")
-    route = function(source, "static moe_expert_route ggml_sycl_resolve_moe_expert_route")
+    route = function(source, "static moe_expert_route ggml_sycl_resolve_moe_expert_route_core")
     storage_route = function(source, "static bool ggml_sycl_try_moe_storage_handle_route")
     common = COMMON.read_text()
     logical_resolver = function(common, "bool resolve_moe_storage_record")
@@ -107,11 +126,11 @@ def violations(source: str) -> list[str]:
         "copy invalidates": "ggml_sycl_invalidate_backend_weight_mutation(dst_ctx, dst)" in copier,
         "clear invalidates": "ggml_sycl_invalidate_backend_buffer_weights(ctx)" in clearer,
         "complete upload readiness": "is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)" in setter,
-        "withdraw before publish": setter.find("ggml_sycl_invalidate_backend_weight_mutation") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
-        "resolver checks plan before registered handles": route.index("lookup_expert_placement") < route.index("ggml_sycl_try_moe_storage_handle_route"),
+        "withdraw before publish": before(setter, "ggml_sycl_invalidate_backend_weight_mutation", "ggml_sycl_publish_backend_aos_expert_handles", missing_anchors),
+        "resolver checks plan before registered handles": before(route, "plan_owner->find_expert_entry(", "ggml_sycl_try_moe_storage_handle_route", missing_anchors),
         "active plan rejects unnamed tensors": "if (!src0->name || src0->name[0] == '\\0')" in route and "route.plan_missing = true" in route,
-        "resolver checks registered handles before requiring key": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("if (!base_key.valid)"),
-        "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("expert_resolve_result resolved = cache->resolve_expert(req);"),
+        "resolver checks registered handles before requiring key": before(route, "ggml_sycl_try_moe_storage_handle_route", "if (!base_key.valid)", missing_anchors),
+        "resolver requires key only for cache fallback": before(route, "if (!base_key.valid)", "expert_resolve_result resolved = cache->resolve_expert(req);", missing_anchors),
         # The call is anchored by its declaration, not by "cache->resolve_expert": the fast-path comment above
         # the key check (cd374e392, llama.cpp-iikr) names that call in prose and sat before the guard.
         "resolver retains canonical lease": "route.lease" in route and "logical.logical_handle" in storage_route,
@@ -123,9 +142,14 @@ def violations(source: str) -> list[str]:
             and "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated" in source,
         "Q1/NVFP4 recipe is decode-only": "phase == moe_route_phase::DECODE && rows == 1" in capability,
         "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
-        "Q1/NVFP4 recipe requires stable owner": "direct_recipe_candidate->has_stable_owner_identity()" in capability,
+        # The recipe asks the binder for an exact allocation identity, the test bind() applies; a handle-kind
+        # test refused every arena-slice lease (llama.cpp-1sxq).
+        "Q1/NVFP4 recipe requires exact identity":
+            "canonical_allocation_integration::exact_identity(*direct_recipe_candidate)" in capability,
     }
     failures.extend(name for name, ok in requirements.items() if not ok)
+    # A renamed anchor must read differently from a genuine reorder.
+    failures.extend(f"missing anchor: {anchor}" for anchor in dict.fromkeys(missing_anchors))
 
     forbidden = ("from_chunk_ptr", "from_direct", "query_registered_location", "unified_lookup", "register_ready")
     for token in forbidden:
@@ -141,6 +165,73 @@ def violations(source: str) -> list[str]:
 def test_canonical_backend_aos_expert_handle_contract() -> None:
     source = SOURCE.read_text()
     assert not violations(source), violations(source)
+
+
+def test_admission_pin_and_ordering_claims_reject_mutants() -> None:
+    source = SOURCE.read_text()
+    assert not violations(source), violations(source)
+    route_sig = "static moe_expert_route ggml_sycl_resolve_moe_expert_route_core"
+    route = function(source, route_sig)
+    plan = "plan_owner->find_expert_entry("
+    handle = "ggml_sycl_try_moe_storage_handle_route"
+    key = "if (!base_key.valid)"
+    fallback = "expert_resolve_result resolved = cache->resolve_expert(req);"
+
+    def swap(text: str, a: str, b: str) -> str:
+        tmp = "\0SWAP\0"
+        return text.replace(a, tmp, 1).replace(b, a, 1).replace(tmp, b, 1)
+
+    def respell(text: str, old: str, new: str) -> str:
+        assert old in text, f"anchor missing: {old}"
+        return text.replace(old, new, 1)
+
+    setter = function(source, "static void ggml_backend_sycl_buffer_set_tensor")
+    withdraw = "ggml_sycl_invalidate_backend_weight_mutation"
+    publish = "ggml_sycl_publish_backend_aos_expert_handles"
+
+    def in_route(mutated_route: str) -> str:
+        return source.replace(route, mutated_route, 1)
+
+    # claim -> [(label, mutant source, the one anchor the mutant removes, or None)]
+    mutants = {
+        "Q1/NVFP4 executor gate remains disabled": [
+            ("gate flipped on",
+             respell(source, "k_moe_mmid_direct_route_validated = false", "k_moe_mmid_direct_route_validated = true"),
+             None),
+            ("admission site re-spelled as a literal",
+             respell(source, "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated",
+                     "q1_nvfp4_direct_b70_validated = false"),
+             None),
+        ],
+        "resolver checks plan before registered handles": [
+            ("plan and handle anchors swapped", in_route(swap(route, plan, handle)), None),
+            ("plan anchor renamed", in_route(route.replace(plan, "plan_owner->renamed_lookup(", 1)), plan),
+        ],
+        "resolver checks registered handles before requiring key": [
+            ("handle and key anchors swapped", in_route(swap(route, handle, key)), None),
+            ("key anchor renamed", in_route(route.replace(key, "if (!base_key.ok)", 1)), key),
+        ],
+        "resolver requires key only for cache fallback": [
+            ("key and fallback anchors swapped", in_route(swap(route, key, fallback)), None),
+            ("fallback anchor renamed",
+             in_route(route.replace(fallback, "expert_resolve_result resolved = cache->resolve(req);", 1)), fallback),
+        ],
+        "withdraw before publish": [
+            ("withdraw and publish anchors swapped",
+             source.replace(setter, swap(setter, withdraw, publish), 1), None),
+            ("withdraw anchor renamed",
+             source.replace(setter, setter.replace(withdraw, "ggml_sycl_renamed_withdraw"), 1), withdraw),
+        ],
+    }
+    for claim, variants in mutants.items():
+        for label, mutant, removed_anchor in variants:
+            where = f"{claim} / {label}"
+            assert mutant != source, f"{where}: mutation did not change the source"
+            failures = violations(mutant)
+            assert claim in failures, f"{where}: mutant not rejected by that claim: {failures}"
+            reported = [f for f in failures if f.startswith("missing anchor: ")]
+            expected = [] if removed_anchor is None else [f"missing anchor: {removed_anchor}"]
+            assert reported == expected, f"{where}: missing-anchor report {reported} != {expected}"
 
 
 def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> None:
@@ -264,8 +355,12 @@ def test_host_reorder_establishes_source_dependencies_before_cpu_read() -> None:
 def test_private_production_route_has_graph_churn_regression() -> None:
     test_source = (ROOT / "ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp").read_text()
     churn = function(test_source, "void graph_churn_regression")
-    assert churn.count("successful_reuse_case(life, type, ne11)") == 2
-    assert "ggml_free(churn)" in churn
+    # Graph A runs before the allocator churn and graph B after it; each is tagged so their labels differ.
+    assert churn.count("successful_reuse_case(") == 2
+    graph_a = churn.find('successful_reuse_case(life, type, ne11, "A")')
+    freed = churn.find("ggml_free(churn)")
+    graph_b = churn.find('successful_reuse_case(life, type, ne11, "B")')
+    assert 0 <= graph_a < freed < graph_b
     main = function(test_source, "int main()")
     for type_name in ("GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4"):
         for ne11 in (1, 3):
@@ -323,6 +418,48 @@ def test_mandatory_ranges_reach_pointer_table_and_dpas_rollback() -> None:
     assert "/*logical_offset=*/0" in rollback
 
 
+# The full-local expert pointer table resolves every expert in
+# moe_fusion_build_full_local_ptr_table; moe_fusion_ensure_full_local_ptr_table
+# is its memoizing front end and must reach the table only through it
+# (llama.cpp-yx28 split the two).
+FULL_LOCAL_ENSURE = "static const void * const * moe_fusion_ensure_full_local_ptr_table("
+FULL_LOCAL_BUILD = "static const void * const * moe_fusion_build_full_local_ptr_table("
+
+
+def full_local_table_violations(source: str) -> list[str]:
+    for signature in (FULL_LOCAL_ENSURE, FULL_LOCAL_BUILD):
+        if signature not in source:
+            return [f"anchor missing (renamed or moved?): {signature}"]
+    ensure = function(source, FULL_LOCAL_ENSURE)
+    build = function(source, FULL_LOCAL_BUILD)
+    checks = {
+        "build resolves every expert record": "extra->resolve_moe_storage_record(" in build,
+        "build fails closed off-device": "!logical.on_device" in build,
+        "build never looks up a raw storage handle": "find_moe_storage_handle" not in build,
+        "ensure delegates to build": "return moe_fusion_build_full_local_ptr_table(" in ensure,
+        "ensure never looks up a raw storage handle": "find_moe_storage_handle" not in ensure,
+    }
+    return [name for name, ok in checks.items() if not ok]
+
+
+def test_full_local_table_contract_rejects_mutants() -> None:
+    source = SOURCE.read_text()
+    assert not full_local_table_violations(source)
+    ensure = function(source, FULL_LOCAL_ENSURE)
+    build = function(source, FULL_LOCAL_BUILD)
+    mutants = {
+        "ensure-renamed": source.replace(FULL_LOCAL_ENSURE, "static const void * const * moe_fusion_get_full_local_ptr_table(", 1),
+        "build-renamed": source.replace(FULL_LOCAL_BUILD, "static const void * const * moe_fusion_make_full_local_ptr_table(", 1),
+        "build-uses-raw-handle": source.replace(build, build.replace("extra->resolve_moe_storage_record(", "extra->find_moe_storage_handle(", 1), 1),
+        "build-accepts-off-device": source.replace(build, build.replace("!logical.on_device", "false", 1), 1),
+        "ensure-bypasses-build": source.replace(ensure, ensure.replace("return moe_fusion_build_full_local_ptr_table(", "return moe_fusion_full_local_ptr_table_unchecked(", 1), 1),
+        "ensure-uses-raw-handle": source.replace(ensure, ensure.replace("const void * const * cached =", "(void) extra_lookup.find_moe_storage_handle(0);\n    const void * const * cached =", 1), 1),
+    }
+    for name, mutant in mutants.items():
+        assert mutant != source, f"{name}: mutation did not change the source (anchor stale)"
+        assert full_local_table_violations(mutant), f"{name}: mutant was NOT rejected"
+
+
 def test_logical_consumers_and_publishers_fail_closed() -> None:
     source = SOURCE.read_text()
     common = COMMON.read_text()
@@ -353,11 +490,13 @@ def test_logical_consumers_and_publishers_fail_closed() -> None:
     for signature in (
         "static void moe_layer_executor_abi_add_full_role_storage",
         "static bool persistent_tg_collect_full_role_descriptor",
-        "static const void * const * moe_fusion_ensure_full_local_ptr_table(",
+        FULL_LOCAL_BUILD,
     ):
         consumer = function(source, signature)
         assert "resolve_moe_storage_record" in consumer, signature
         assert "find_moe_storage_handle" not in consumer, signature
+    failures = full_local_table_violations(source)
+    assert not failures, failures
 
     materialize = function(source, "static bool ggml_sycl_materialize_planned_expert_layout")
     assert "resolve_moe_storage_record" in materialize

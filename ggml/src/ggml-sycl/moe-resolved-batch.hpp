@@ -70,6 +70,7 @@ enum class moe_batch_reject_reason : uint8_t {
     RECIPE_MISMATCH,
     WORKSPACE_UNDERSIZED,
     WORKSPACE_LEASE_MISSING,
+    PLAN_OWNER_REFUSED,
 };
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason);
@@ -92,7 +93,9 @@ struct moe_route_request {
 };
 
 enum class moe_recipe_queue : uint8_t { NONE, SUBMIT, OWNER };
-enum class moe_recipe_transfer : uint8_t { NONE, HOST_ACTIVATION, PEER_DIRECT, HOST_BOUNCE };
+// STAGED_RING (llama.cpp-o9uw): the operand is a VRAM ring slot the prompt's stream phase copied a host expert into for
+// this micro-batch. It is the only transfer under which a plan-host expert answers PRIMARY_DEVICE.
+enum class moe_recipe_transfer : uint8_t { NONE, HOST_ACTIVATION, PEER_DIRECT, HOST_BOUNCE, STAGED_RING };
 
 struct moe_workspace_recipe {
     size_t alignment            = 64;
@@ -243,10 +246,20 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
     return h;
 }
 
+// Q1_0 and NVFP4 run on a device only through their direct kernel (DEVICE_MMVQ_Q1_NVFP4_AOS) and its admitted
+// workspace bundle, which validate_moe_execution_recipe checks and choose_moe_batch_executor keeps closed; any other
+// device recipe for them is refused. One answer for the validator, the executor choice and the staged route's
+// capability refusal (ggml_sycl_moe_staged_capability_refusal). The stream ring does not ask it: it stages windows
+// only for layers the library executor claims whole (W2 of docs/plans/2026-10-24-prefill-window-ring.md).
+inline bool moe_type_needs_direct_kernel(ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
+}
+
 inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
                                           size_t                       admitted_signature,
                                           const mem_handle &           lease,
                                           moe_batch_residency          residency,
+                                          bool                         has_ready_event,
                                           int                          submit_device,
                                           bool                         owning_queue_available,
                                           size_t                       reserved_workspace_bytes,
@@ -264,8 +277,7 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
     if (alignment == 0 || (alignment & (alignment - 1)) != 0 || recipe.request.rows == 0) {
         return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
     }
-    if (recipe.kind == moe_batch_executor::HOST_CPU &&
-        (recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4)) {
+    if (recipe.kind == moe_batch_executor::HOST_CPU && moe_type_needs_direct_kernel(recipe.request.type)) {
         moe_workspace_recipe expected;
         if (recipe.workspace.activation_q8_bytes % recipe.request.rows != 0 ||
             recipe.workspace.descriptor_bytes % recipe.request.rows != 0 ||
@@ -293,13 +305,21 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
     if (reserved_workspace_bytes < recipe.workspace.total_bytes) {
         return refuse(moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
     }
+    // A staged ring slot runs on the submit device and its in-order queue, behind the copy that filled it: the queue
+    // orders the slot's reuse after its readers (c-las5), and the ready event orders the readers after the copy.
+    if (recipe.transfer == moe_recipe_transfer::STAGED_RING &&
+        (recipe.kind != moe_batch_executor::PRIMARY_DEVICE || residency != moe_batch_residency::PRIMARY_DEVICE ||
+         !has_ready_event || !resolved.on_device || recipe.owner_device != submit_device ||
+         recipe.queue != moe_recipe_queue::SUBMIT)) {
+        return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
+    }
     if (recipe.kind == moe_batch_executor::HOST_CPU) {
         if (residency != moe_batch_residency::HOST || recipe.kernel != moe_route_kernel::HOST_CPU ||
             recipe.layout != GGML_LAYOUT_AOS || recipe.owner_device != mem_handle::HOST_DEVICE || resolved.on_device) {
             return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     } else {
-        const bool direct_q1_nvfp4 = recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4;
+        const bool direct_q1_nvfp4 = moe_type_needs_direct_kernel(recipe.request.type);
         if (direct_q1_nvfp4) {
             moe_workspace_recipe expected;
             if (recipe.kernel != moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS || recipe.layout != GGML_LAYOUT_AOS ||
@@ -501,6 +521,34 @@ struct moe_resolved_batch {
         return index < operands.size() ? &operands[index] : nullptr;
     }
 };
+
+// The experts of `batch` whose operand is a staged ring slot (STAGED_RING, llama.cpp-o9uw), each once, in first-seen
+// order; `ready_events`, when given, receives each one's ready event. Such a batch is valid for one micro-batch of one
+// layer: nothing may reuse it past the graph that built it or keep its slots in a persistent table.
+inline std::vector<int32_t> moe_batch_staged_ring_experts(const moe_resolved_batch & batch,
+                                                          std::vector<sycl::event> * ready_events = nullptr) {
+    std::vector<int32_t> out;
+    for (const moe_resolved_operand & operand : batch.operands) {
+        if (operand.recipe().transfer != moe_recipe_transfer::STAGED_RING ||
+            std::find(out.begin(), out.end(), operand.expert_id) != out.end()) {
+            continue;
+        }
+        out.push_back(operand.expert_id);
+        if (ready_events && operand.has_ready_event()) {
+            ready_events->push_back(operand.ready_event());
+        }
+    }
+    return out;
+}
+
+inline bool moe_batch_names_staged_ring(const moe_resolved_batch & batch) {
+    for (const moe_resolved_operand & operand : batch.operands) {
+        if (operand.recipe().transfer == moe_recipe_transfer::STAGED_RING) {
+            return true;
+        }
+    }
+    return false;
+}
 
 struct moe_batch_local_view {
     std::vector<int32_t>     expert_ids;
@@ -777,9 +825,8 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     size_t                       reserved_workspace_bytes,
     const moe_admitted_workspace_bundle * workspace_bundle = nullptr) {
     moe_batch_executor_choice out;
-    const bool                direct_q1_nvfp4 =
-        operand.recipe().kind != moe_batch_executor::HOST_CPU &&
-        (operand.recipe().request.type == GGML_TYPE_Q1_0 || operand.recipe().request.type == GGML_TYPE_NVFP4);
+    const bool                direct_q1_nvfp4 = operand.recipe().kind != moe_batch_executor::HOST_CPU &&
+                                 moe_type_needs_direct_kernel(operand.recipe().request.type);
     if (direct_q1_nvfp4) {
         // Production capability remains closed until all four B70 oracle cases
         // pass. A matching bundle is necessary but not sufficient to advertise.
@@ -794,8 +841,8 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
         return out;
     }
     if (!validate_moe_execution_recipe(operand.recipe(), operand.admitted_recipe_signature(), operand.lease(),
-                                       operand.residency(), submit_device, owning_queue_available,
-                                       reserved_workspace_bytes, &out.reject)) {
+                                       operand.residency(), operand.has_ready_event(), submit_device,
+                                       owning_queue_available, reserved_workspace_bytes, &out.reject)) {
         return out;
     }
     out.executor = operand.recipe().kind;
@@ -869,7 +916,11 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
                                                 route.planned_on_device && primary &&
                                                 route.owning_device == submit_device && route.planned_device >= 0 &&
                                                 route.planned_device != route.owning_device;
-        if (!primary_plan_matches && !explicit_alternate_matches) {
+        // A staged ring slot is the one way a plan-host expert answers PRIMARY_DEVICE (llama.cpp-o9uw).
+        const bool staged_ring_matches = route.recipe.transfer == moe_recipe_transfer::STAGED_RING && primary &&
+                                         !route.planned_on_device && route.planned_device == mem_handle::HOST_DEVICE &&
+                                         route.owning_device == submit_device;
+        if (!primary_plan_matches && !explicit_alternate_matches && !staged_ring_matches) {
             return moe_batch_reject_reason::PLAN_MISMATCH;
         }
     }

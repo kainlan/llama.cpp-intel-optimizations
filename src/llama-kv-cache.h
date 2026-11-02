@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +13,82 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+
+// The KV residency of every llama_kv_cache built on this thread while a tally is open (llama.cpp-p6i0): how many KV
+// layers a cache put in a device buffer, in the SYCL host-tier KV buffer, and in a CPU buffer because the layer is
+// not offloaded, in total and per device. It is load-bearing, not only a trace: the admitted fold
+// (llama_admitted_check_fold, llama-load-measure.h) admits a compute term above the probe bound only when the
+// probe's and the admitted measure's tallies differ, so retiring the trace must keep the tally. A real cache also
+// prints its count; a load-time measure's cache prints nothing (the measure-only context is quiet below ERROR), so the
+// measure reads its count here.
+// One device's share of a tally: the KV layers planned for it that sit in its own buffer, and those demoted to the
+// host KV tier.
+struct llama_kv_residency_device {
+    std::string device;  // the layer's device, by ggml_backend_dev_name
+    uint32_t    n_device = 0;
+    uint32_t    n_host   = 0;
+};
+
+struct llama_kv_residency_tally {
+    uint32_t                               n_device = 0;
+    uint32_t                               n_host   = 0;
+    uint32_t                               n_cpu    = 0;
+    std::vector<llama_kv_residency_device> devices;  // the same counts per device, in first-seen order
+};
+
+// Counts one KV layer: on `device` (its own buffer, or the host KV tier when on_host), or on the CPU for a null device
+// (a layer that is not offloaded).
+inline void llama_kv_residency_count(llama_kv_residency_tally & tally, const char * device, bool on_host) {
+    if (device == nullptr) {
+        tally.n_cpu++;
+        return;
+    }
+    (on_host ? tally.n_host : tally.n_device)++;
+    for (llama_kv_residency_device & d : tally.devices) {
+        if (d.device == device) {
+            (on_host ? d.n_host : d.n_device)++;
+            return;
+        }
+    }
+    llama_kv_residency_device d;
+    d.device                          = device;
+    (on_host ? d.n_host : d.n_device) = 1;
+    tally.devices.push_back(d);
+}
+
+// Adds `from` into `into`, the totals and each device's share.
+inline void llama_kv_residency_merge(llama_kv_residency_tally & into, const llama_kv_residency_tally & from) {
+    into.n_device += from.n_device;
+    into.n_host += from.n_host;
+    into.n_cpu += from.n_cpu;
+    for (const llama_kv_residency_device & f : from.devices) {
+        bool found = false;
+        for (llama_kv_residency_device & d : into.devices) {
+            if (d.device == f.device) {
+                d.n_device += f.n_device;
+                d.n_host += f.n_host;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            into.devices.push_back(f);
+        }
+    }
+}
+
+struct llama_kv_residency_tally_scope {
+    explicit llama_kv_residency_tally_scope(llama_kv_residency_tally & tally);
+    ~llama_kv_residency_tally_scope();
+
+    llama_kv_residency_tally_scope(const llama_kv_residency_tally_scope &)             = delete;
+    llama_kv_residency_tally_scope & operator=(const llama_kv_residency_tally_scope &) = delete;
+
+    // adds one cache's count to the innermost open tally of this thread, if any
+    static void add(const llama_kv_residency_tally & cache);
+
+    llama_kv_residency_tally * prev_;  // the tally this scope shadows, restored when it closes
+};
 
 //
 // llama_kv_cache
@@ -114,7 +191,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // create the tensors on size-0 dummy buffers: nothing is allocated (a load-time measure's memory)
+                         bool   no_alloc = false);
 
     ~llama_kv_cache() = default;
 
@@ -129,9 +208,12 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const override;
 
     void clear(bool data) override;
 
@@ -165,6 +247,11 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+
+    // The K and V tensors this cache itself created for model layer il. False when the layer has
+    // none here: it has no KV, another layer's tensors stand in for it (reuse), or another cache's
+    // do (share). V is null for an MLA layer.
+    bool get_layer_tensors(int32_t il, const ggml_tensor ** k, const ggml_tensor ** v) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -204,7 +291,8 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    // FAILED leaves the pending shift recorded, so the next call retries it
+    llama_memory_update_result update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -228,6 +316,11 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+
+    // the K-shift graph update() allocates, built into `res`; a planned reserve measures it
+    ggml_cgraph * build_graph_shift(
+               llm_graph_result * res,
+                  llama_context * lctx) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -260,9 +353,15 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // the tensors belong to another cache (layer_share_cb)
+        bool shared = false;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // the tensors sit on size-0 dummy buffers: the model's no_alloc, or the caller's (a measure)
+    bool no_alloc = false;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -332,10 +431,6 @@ private:
                           float   freq_scale,
                        uint32_t   il) const;
 
-    ggml_cgraph * build_graph_shift(
-               llm_graph_result * res,
-                  llama_context * lctx) const;
-
     struct cell_ranges_t {
         uint32_t strm;
 
@@ -364,6 +459,11 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a worst-case context over exactly n_streams streams (1 <= n_streams <= the cache's stream count)
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_streams);
 
     // used to create an update context
     llama_kv_cache_context(

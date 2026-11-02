@@ -16,6 +16,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sycl/sycl.hpp>
 #include <utility>
 #include <vector>
@@ -61,6 +62,15 @@ class alloc_owner {
     release_attempt reset() noexcept;
     class shared_alloc_owner into_shared() && noexcept;
 
+    // Tags the allocation as a context tenant of the named cohort (a string
+    // literal or other externally-owned stable string).  The tag lives on the
+    // intrusive control, so every copy and slice of the handle reads the same
+    // one through mem_handle::tenant_cohort().  Set by the tenant carve before
+    // the owner is shared, and only once: a second set with any cohort aborts
+    // ("[TENANT] allocation already tagged"), and a null cohort is ignored.
+    // Null (the default) means "not a tenant".
+    void set_tenant_cohort(const char * cohort) noexcept;
+
   private:
     friend struct allocation_owner_internal_access;
     explicit alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
@@ -83,6 +93,7 @@ class shared_alloc_owner {
     const alloc_metadata & metadata() const noexcept;
     uint32_t use_count() const noexcept;
     uint64_t control_id() const noexcept;
+    const char *           tenant_cohort() const noexcept;
     release_attempt reset() noexcept;
 
   private:
@@ -97,6 +108,20 @@ namespace detail {
 // conversion to unified_allocate_owner().
 mem_handle from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
 } // namespace detail
+
+// The identity of in-order queue `q`, in *out, for asking whether two commands were submitted on one in-order
+// queue (llama.cpp-wfsl); false for an out-of-order queue, whose commands are not ordered by submission. It is
+// std::hash<sycl::queue>, which SYCL requires to agree for every copy of one queue. In DPC++ 2026.1 it returns a
+// per-queue id field of the queue's implementation, not an address (libsycl.so.9, std::hash<queue>::operator()
+// loads queue_impl+0x1d8), so the compute streams, which live for the process, never share one. Any value,
+// including 0, is a valid identity; re-check the hash after a oneAPI upgrade.
+inline bool ready_queue_identity(const sycl::queue & q, size_t * out) {
+    if (!q.has_property<sycl::property::queue::in_order>()) {
+        return false;
+    }
+    *out = std::hash<sycl::queue>{}(q);
+    return true;
+}
 
 // === Resolved pointer ===
 // The result of resolving a mem_handle.  Contains the current pointer and
@@ -114,6 +139,12 @@ struct resolved_ptr {
     // Optional authority retained with a fallback resolution. Consumers that
     // outlive this value must transfer it to graph/event retention.
     std::shared_ptr<mem_handle> retention;
+    // The in-order queue whose command produced ready_event, as ready_queue_identity(), when has_ready_queue
+    // (llama.cpp-wfsl). Unset when the producer is unknown, out of order, or a host task. Only compared for
+    // equality with a consuming queue's identity: never dereferenced and never a key. mem_handle sets and clears
+    // it with ready_event. Last, so positional initialisers keep naming the fields above.
+    bool                        has_ready_queue = false;
+    size_t                      ready_queue     = 0;
 
     explicit operator bool() const { return ptr != nullptr; }
 };
@@ -265,6 +296,42 @@ class mem_handle_lock_guard {
     const mem_handle_spin_lock & lock_;
 };
 
+// A plain-value name for "this slice of that allocation", for caches that only
+// ever compare a source and must not keep it alive.  It holds no control, so a
+// cache keyed on it is never a holder of the allocation.  An owning handle held
+// only to compare identity is a holder to fix, not to exempt.
+//
+// It is built only from the allocator's monotonic retention id
+// (unified_cache_mint_retention_identity(): never an address, never reused, and
+// fail-closed on exhaustion), so a freed and reallocated source misses even at
+// the same address.  Valid iff allocation_id != 0; a handle with no allocator id
+// (a weight, an external pointer) yields an invalid identity, which a cache
+// treats as "do not cache".
+struct mem_handle_identity {
+    uint64_t allocation_id = 0;
+    uint64_t generation    = 0;
+    size_t   slice_offset  = 0;
+    size_t   size          = 0;
+
+    bool valid() const noexcept { return allocation_id != 0; }
+
+    // An invalid identity equals nothing, itself included.
+    friend bool operator==(const mem_handle_identity & a, const mem_handle_identity & b) noexcept {
+        return a.valid() && b.valid() && a.allocation_id == b.allocation_id && a.generation == b.generation &&
+               a.slice_offset == b.slice_offset && a.size == b.size;
+    }
+
+    friend bool operator!=(const mem_handle_identity & a, const mem_handle_identity & b) noexcept { return !(a == b); }
+
+    size_t hash() const noexcept {
+        size_t h = std::hash<uint64_t>()(allocation_id);
+        h ^= std::hash<uint64_t>()(generation) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>()(slice_offset) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>()(size) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
 class mem_handle {
   public:
     // Create an invalid handle.
@@ -400,7 +467,19 @@ class mem_handle {
     // every resolve, after the backing handle's generation/stale checks.
     mem_handle slice(size_t byte_offset, size_t byte_size) const;
 
+    // slice(), naming the layout the view's bytes hold (lead ruling c-o9uw-1):
+    // every resolve of the view, and of its copies and plain sub-slices, reports
+    // `layout`. Only an owned allocation (from_owned_alloc) may name one, since
+    // its owner decides what it writes there. Any other handle refuses with an
+    // invalid handle: a weight lease's layout is a cache-key fact, and a borrowed
+    // view's is its creator's.
+    mem_handle slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const;
+
+    // Sets the ready event with no recorded producer: every consumer queries it as before.
     void set_ready_event(const sycl::event & event);
+    // Sets the ready event of a command submitted on `producer` (llama.cpp-wfsl), recording the queue's identity
+    // when it is in-order, so the per-op source chain need not query it for an op on that same queue.
+    void set_ready_event(const sycl::event & event, const sycl::queue & producer);
     void clear_ready_event();
 
     // Resolve for a dispatch device. Device-resident pointers must belong to
@@ -446,6 +525,23 @@ class mem_handle {
         mem_handle_lock_guard g(lock_);
         return static_cast<bool>(owned_alloc_);
     }
+
+    // Read-only snapshot of how many references share this handle's intrusive
+    // allocation owner: every mem_handle copy, assignment and slice of it (all
+    // three copy owned_alloc_). 0 means the handle carries no intrusive owner,
+    // which says nothing about whether anyone else holds the storage.
+    // Never a release decision: release happens only through a handle.
+    uint32_t owner_use_count() const noexcept;
+
+    // Copies the retained allocation owner's metadata into *out and answers
+    // true: tier, device, host zone, role and category as the allocator fixed
+    // them, which is the allocation's provenance, never something read off the
+    // pointer. A weight lease answers with the host-pinned typed owner its
+    // cache entry was registered with (unified_cache_entry::direct_alloc_owner),
+    // which the lease retains from when it was taken. Answers false and leaves
+    // *out alone when the handle retains no owner (from_direct, from_chunk_ptr,
+    // or a lease on an entry without a host-pinned typed owner).
+    bool owner_metadata(alloc_metadata * out) const;
 
     // Identity of the allocation owner control this handle retains: the one
     // from_owned_alloc() adopted, shared by every copy and slice of it. It is
@@ -508,6 +604,19 @@ class mem_handle {
     // unified-cache/allocator identity rather than a raw external pointer.
     bool has_stable_owner_identity() const;
 
+    // The non-owning identity of this handle's slice (see mem_handle_identity).
+    // Invalid when the handle carries no allocator-minted id.
+    mem_handle_identity identity() const;
+
+    // True when `id` is valid and names exactly this handle's slice.  Compares
+    // the four fields only: no control is held and no pointer is resolved.
+    bool identity_equal(const mem_handle_identity & id) const;
+
+    // The cohort the tenant carve tagged this allocation with, or null when it
+    // is not a context tenant (or the handle has no owner).  Every copy and
+    // slice of a tenant reads the tag of its shared control.
+    const char * tenant_cohort() const;
+
     // Lightweight debug metadata for diagnostics.  Owner tags are expected to
     // be string literals or other externally-owned stable strings; mem_handle
     // deliberately does not allocate/copy strings on hot paths.
@@ -569,7 +678,14 @@ class mem_handle {
         int32_t               vram_chunk_idx    = -1;
         int                   chunk_device      = -1;
         std::shared_ptr<void> storage_owner;
+        shared_alloc_owner    leased_owner;
     };
+
+    // The typed owner a cache entry was registered with (its
+    // direct_alloc_owner), for a caller that holds a lease on entry; empty for
+    // a null entry, one registered without a typed owner, or one whose owner
+    // is not host-pinned.
+    static shared_alloc_owner leased_entry_alloc_owner(const unified_cache_entry * entry);
 
     // Detach this handle's lease state (caller holds lock_).  The handle no
     // longer owns the returned leases; the caller must release them.
@@ -609,6 +725,10 @@ class mem_handle {
     size_t         backing_offset_ = 0;  // physical arena offset of the allocation backing pointer
     size_t         slice_offset_   = 0;  // immutable-after-construction offset from backing pointer
     bool           is_slice_       = false;
+    // The layout a tagged slice names (slice(offset, size, layout)); every view
+    // resolves with it instead of the backing resolver's. Immutable after
+    // construction, like the range above.
+    std::optional<ggml_layout_mode>  view_layout_;
     uint64_t arena_gen_ = 0;  // Mint-time arena generation (checked against owner every resolve)
     std::shared_ptr<arena_authority> arena_authority_; // retained incarnation authority
     std::shared_ptr<void>            arena_lease_;     // admitted lease; releases without cache access
@@ -649,6 +769,15 @@ class mem_handle {
     // enforced in unified_cache::evict_one / remove / evict_and_flush.
     mutable unified_cache_entry * leased_entry_ = nullptr;  // GUARDED by lock_
     mutable std::shared_ptr<void> leased_storage_owner_;    // GUARDED by lock_
+    // A strong reference to the leased entry's allocation control, copied
+    // from its direct_alloc_owner when the lease was taken, and only when that
+    // owner is host-pinned (host experts and host-tier fallbacks); a device
+    // entry's lease retains nothing here. The lease's in_use_count pin already
+    // keeps that allocation alive, so this retain extends nothing beyond a
+    // leaked lease or the window between the in_use_count decrement and this
+    // lease state's destruction. It exists so owner_metadata() answers without
+    // a cache lookup; owns_allocation() and slice() still key off owned_alloc_.
+    mutable shared_alloc_owner    leased_alloc_owner_;  // GUARDED by lock_
 
     // llama.cpp-dyhdl: chunk-level lease backref.  Defense-in-depth beneath
     // the cache_entry refcount: this stops the underlying arena chunk from
@@ -817,6 +946,23 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
 // caller can drain the exact submission queue before releasing its owners.
 void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
                                               retained_handle_publish_ticket & ticket);
+
+// The drain worker's waits since the last take (llama.cpp-qwn5), for the hybrid MoE decode trace's per-token waits
+// line: the records it waited, the gates those records carried, its time asleep on the gates and its time in the
+// record events' waits after them.
+struct retained_handle_drain_census {
+    uint64_t records       = 0;
+    uint64_t gate_waits    = 0;
+    double   gate_sleep_us = 0.0;
+    double   driver_us     = 0.0;
+};
+
+// Starts the census. The trace (GGML_SYCL_MOE_IDS_COPY_TRACE) calls it once when it is on; until then the drain worker
+// reads no clock.
+void retained_handle_drain_census_enable() noexcept;
+
+// The census since the last take, which it zeroes.
+retained_handle_drain_census retained_handle_drain_census_take() noexcept;
 
 // Central resolve-to-submit handoff. Copies any authority carried by resolved
 // fallback pointers, appends explicit owners (scratch/staging), and publishes

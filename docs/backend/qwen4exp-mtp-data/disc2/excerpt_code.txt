@@ -1,0 +1,10 @@
+# verbatim lines of mtp_n2_code_v.log from after round 13 to the end of round 14 (the divergence); format: draft candidates with MTP head probabilities, then the round summary
+1.12.486.192 D clear kv cache from any extra tokens, n_past = 94
+1.12.531.291 D spec        draft:  - seq_id 0, draft candidate   0, pos   0:  10562 (   0.863) ' merge'
+1.12.531.295 D spec        draft:  - seq_id 0, draft candidate   1, pos   0:    460 (   0.072) ' return'
+1.12.531.296 D spec        draft:  - seq_id 0, draft candidate   2, pos   0:    411 (   0.033) ' this'
+1.12.557.302 D spec        draft:  - seq_id 0, draft candidate   0, pos   1:  48142 (   0.976) ' overlapping'
+1.12.557.305 D spec        draft:  - seq_id 0, draft candidate   1, pos   1:    866 (   0.009) ' any'
+1.12.557.306 D spec        draft:  - seq_id 0, draft candidate   2, pos   1:    660 (   0.007) ' all'
+1.12.557.310 D spec common_specu: called impl draft-mtp, hist size = 94, call_count = 14, gen = 2
+ merge all1.13.301.478 D accepted 1/2 draft tokens, the last target token is: (660)

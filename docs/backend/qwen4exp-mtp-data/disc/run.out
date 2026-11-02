@@ -1,0 +1,9 @@
+pre: MemAvailable:   167221140 kB Shmem:          12239880 kB  load: 31.93 31.38 32.60
+code       ub=512  rc=0 token= a n y \n \n
+chat       ub=512  rc=0 token= T h i s \n \n
+reasoning  ub=512  rc=0 token= \n \n \n
+code       ub=1    rc=0 token= a n y \n \n
+chat       ub=1    rc=0 token= T h i s \n \n
+reasoning  ub=1    rc=0 token= \n \n \n
+post: MemAvailable:   166512364 kB Shmem:          12239752 kB 
+rc=0

@@ -1,4 +1,10 @@
 // BUILD_TESTING-only live regression for the closed Q1/NVFP4 production MMID route.
+//
+// Scoring (llama.cpp-n8da): the registration pins one card, and on it the run must report Passed with Skipped=0. A skip
+// there is not an environment gap but a regression to read: SKIP[off-primary] means the plan moved a selected expert
+// off the primary card (to the host or another card), which the closed route cannot reach; SKIP[no-backend] means no
+// backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
+// the no-GPU skip.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "q1-nvfp4-production-route-test-seam.hpp"
 #include "ggml-quants.h"
@@ -6,8 +12,11 @@
 #include "unified-cache.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -18,9 +27,104 @@
 #include <sycl/sycl.hpp>
 
 namespace {
-constexpr int gate_output_n = 96;
+constexpr int     gate_output_n                       = 96;
+constexpr int     route_top_k                         = 3;
+constexpr int32_t route_selected_experts[route_top_k] = { 3, 1, 3 };  // repeated, non-monotonic
 
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
+
+// How far the route got between two counter reads, in stage order. `candidate` counts at the direct gate after the
+// batch query offered the DIRECT recipe; `executed` counts in the host task that runs after the kernel completed. The
+// first stage whose delta is short of the expected count names the blocker (llama.cpp-1sxq).
+std::string stage_deltas(const ggml_sycl_q1_nvfp4_test_counters & before,
+                         const ggml_sycl_q1_nvfp4_test_counters & now) {
+    const auto delta = [](uint64_t from, uint64_t to) {
+        return std::to_string(to - from);
+    };
+    return "candidate=+" + delta(before.candidate, now.candidate) + " admitted=+" + delta(before.admit, now.admit) +
+           " submitted=+" + delta(before.submit, now.submit) + " executed=+" + delta(before.terminal, now.terminal) +
+           " recycled=+" + delta(before.recycle, now.recycle) + " quarantined=+" +
+           delta(before.quarantine, now.quarantine);
+}
+
+[[noreturn]] void fail_stages(const std::string & message, const ggml_sycl_q1_nvfp4_test_counters & before) {
+    ggml_sycl_q1_nvfp4_test_counters now{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&now);
+    throw std::runtime_error(message + "; stages since case start: " + stage_deltas(before, now));
+}
+
+void require_stages(bool condition, const std::string & message, const ggml_sycl_q1_nvfp4_test_counters & before) {
+    if (!condition) {
+        fail_stages(message, before);
+    }
+}
+
+// The case running now and the last case that ended, for report_terminate(). Markers are only appended:
+// std::deque::push_back keeps references to existing elements valid, so a terminate on a SYCL worker thread never
+// reads a marker the main thread is rewriting.
+struct case_marker {
+    std::string                      name;
+    ggml_sycl_q1_nvfp4_test_counters before{};
+};
+
+std::deque<case_marker>          g_case_markers;
+std::atomic<const case_marker *> g_running_case{ nullptr };
+std::atomic<const case_marker *> g_ended_case{ nullptr };
+std::terminate_handler           g_previous_terminate = nullptr;
+
+// Publishes a case as the running one for as long as it is in scope. On scope exit, by return or by a throw, the case
+// becomes the last ended one, so a terminate in the code between cases (graph churn, the next case's fixture and graph
+// setup, teardown) is reported as after that case rather than during it.
+struct case_scope {
+    case_scope(std::string name, const ggml_sycl_q1_nvfp4_test_counters & before) {
+        g_case_markers.push_back({ std::move(name), before });
+        marker = &g_case_markers.back();
+        g_running_case.store(marker, std::memory_order_release);
+    }
+
+    ~case_scope() {
+        g_ended_case.store(marker, std::memory_order_release);
+        g_running_case.store(nullptr, std::memory_order_release);
+    }
+
+    case_scope(const case_scope &)             = delete;
+    case_scope & operator=(const case_scope &) = delete;
+
+    const case_marker * marker = nullptr;
+};
+
+// The seventh case, injected_async_terminal_failure_case, terminates instead of failing a check: its injected
+// host-task exception reaches the SYCL default async handler, which calls std::terminate, because the backend's
+// execution queues carry no async_handler (llama.cpp-kjoc). Name the running case, or the last one that ended when
+// none is running, and print its stage deltas first. Then hand over to the previous handler (ggml's, which prints a
+// backtrace), so the run still aborts red (rc 134).
+[[noreturn]] void report_terminate() {
+    if (const case_marker * running = g_running_case.load(std::memory_order_acquire)) {
+        ggml_sycl_q1_nvfp4_test_counters now{};
+        ggml_sycl_q1_nvfp4_test_counters_read(&now);
+        std::cerr << "FAIL: terminated during case " << running->name
+                  << "; stages since case start: " << stage_deltas(running->before, now) << std::endl;
+    } else if (const case_marker * ended = g_ended_case.load(std::memory_order_acquire)) {
+        ggml_sycl_q1_nvfp4_test_counters now{};
+        ggml_sycl_q1_nvfp4_test_counters_read(&now);
+        std::cerr << "FAIL: terminated after case " << ended->name
+                  << " ended; stages since that case started: " << stage_deltas(ended->before, now) << std::endl;
+    } else {
+        std::cerr << "FAIL: terminated before any case started" << std::endl;
+    }
+    if (g_previous_terminate) {
+        g_previous_terminate();
+    }
+    std::abort();
+}
+
+// The environment cannot exercise what this test covers; main() reports it as ctest's skip (77), never as a pass, on a
+// line prefixed SKIP[<tag>] so each cause stays distinguishable in a log.
+struct test_skip : std::runtime_error {
+    test_skip(const char * tag, const std::string & why) : std::runtime_error(why), tag(tag) {}
+
+    const char * tag;
+};
 
 struct synthetic_inventory {
     ggml_sycl_tensor_info tensors[3]{};
@@ -72,28 +176,73 @@ struct lifecycle_fixture {
             require(candidate && candidate->plan && !candidate->plan->moe_mmid_workspaces.empty(),
                     "inventory candidate has no MMID workspace owners");
 
-            // Inventory staging uses temporary backends. Create fresh retained
-            // backends afterwards, one per unique owner device, so load_end's
-            // exact-queue lookup cannot observe a transient context that was cleared.
+            // An MMID owner is a device the registry exposes (llama.cpp-n8da): admission names the submitting
+            // backend context's device, and ggml_backend_sycl_init takes only a registry index. With two cards the
+            // backend exposes device 0 alone while the planner budgets both, so an owner past the registry is a
+            // planner defect this test must report, not an index to hand to the registry.
+            const int    exposed_devices = ggml_backend_sycl_get_device_count();
+            // A multi-device plan carries device_id -1; its primary is the first planned device, the same rule
+            // plan_moe_mmid_workspaces() and the materialization's submit device use.
+            const auto & plan            = *candidate->plan;
+            const int    primary_device  = plan.device_id >= 0   ? plan.device_id :
+                                           !plan.devices.empty() ? plan.devices.front() :
+                                                                   -1;
+            require(primary_device >= 0 && primary_device < exposed_devices,
+                    "candidate plan has no primary device the registry exposes");
             std::unordered_set<int> owner_devices;
             for (const auto & workspace : candidate->plan->moe_mmid_workspaces) {
                 require(workspace.valid && workspace.owner_device >= 0, "invalid candidate MMID owner");
+                if (workspace.owner_device >= exposed_devices) {
+                    throw std::runtime_error("candidate MMID owner device " + std::to_string(workspace.owner_device) +
+                                             " is not a registry device (registry exposes " +
+                                             std::to_string(exposed_devices) + "): planner/registry owner contract");
+                }
                 owner_devices.insert(workspace.owner_device);
             }
+            // The closed route admits primary residency only; a selected expert the plan put elsewhere (a secondary
+            // card or the host) cannot reach it, so this environment cannot exercise the route.
+            for (int expert : route_selected_experts) {
+                bool found = false;
+                for (const auto & entry : candidate->plan->entries) {
+                    if (entry.expert_id != expert || entry.name != "blk.0.ffn_gate_exps.weight") {
+                        continue;
+                    }
+                    found = true;
+                    if (!entry.on_device || entry.target_device != primary_device) {
+                        throw test_skip("off-primary",
+                                        "selected expert " + std::to_string(expert) + " is planned on " +
+                                            (entry.on_device ? "device " + std::to_string(entry.target_device) :
+                                                               std::string("the host")) +
+                                            ", not primary device " + std::to_string(primary_device) +
+                                            "; the closed route covers primary residency only "
+                                            "(pin ONEAPI_DEVICE_SELECTOR to one card)");
+                    }
+                }
+                require(found, "selected expert has no gate placement entry in the candidate plan");
+            }
+
+            // Inventory staging uses temporary backends. Create fresh retained
+            // backends afterwards, one per unique owner device, so load_end's
+            // exact-queue lookup cannot observe a transient context that was cleared.
             retained_backends.reserve(owner_devices.size());
             for (int device : owner_devices) {
                 using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
                 backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
-                require(retained != nullptr, "candidate owner backend initialization failed");
+                if (retained == nullptr) {
+                    throw test_skip("no-backend", "no backend for candidate owner device " + std::to_string(device) +
+                                                      " (ggml_backend_sycl_init returned null)");
+                }
                 retained_backends.push_back(retained.get());
-                if (!backend || device == candidate->plan->device_id) backend = retained.get();
+                if (!backend || device == primary_device) {
+                    backend = retained.get();
+                }
                 retained.release();
             }
             require(backend != nullptr, "no primary candidate owner backend");
 
             // Same-device registry is a stack: a short-lived newer backend B
             // must not erase the retained backend A selected above.
-            ggml_backend_t shadow = ggml_backend_sycl_init(candidate->plan->device_id);
+            ggml_backend_t shadow = ggml_backend_sycl_init(primary_device);
             require(shadow != nullptr && shadow != backend, "same-device backend B initialization failed");
             ggml_backend_free(shadow);
 
@@ -192,7 +341,7 @@ struct graph_case {
 
 graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
                       std::vector<float> & oracle, size_t & output_count) {
-    constexpr int experts = 4, top_k = 3, tokens = 1;
+    constexpr int experts = 4, top_k = route_top_k, tokens = 1;
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
     graph_case c;
     c.ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true }); require(c.ctx, "ggml_init failed");
@@ -226,7 +375,7 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     }
     std::vector<float> activation(static_cast<size_t>(ne11) * K);
     for (size_t i = 0; i < activation.size(); ++i) activation[i] = 0.2f + float((i * 5) % 19) / 31.0f;
-    const int32_t selected[top_k] = { 3, 1, 3 }; // repeated, non-monotonic
+    const auto & selected = route_selected_experts;  // an array reference, so sizeof(selected) is the array's size
     ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
     ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
     ggml_backend_tensor_set(ids, selected, 0, sizeof(selected));
@@ -242,51 +391,60 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     return c;
 }
 
-void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
+// `graph` tags the graph in every label, so graph A and graph B of one churn regression stay distinguishable.
+void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, const char * graph) {
     std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, first{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    constexpr int no_pass = -1;
+    const auto    label   = [&](int pass) {
+        std::string text =
+            std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11) + " graph=" + graph;
+        if (pass != no_pass) {
+            text += " pass=" + std::to_string(pass);
+        }
+        return text + ")";
+    };
+    const case_scope scope("successful_reuse_case" + label(no_pass), before);
     for (int pass = 0; pass < 2; ++pass) {
-        require(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS, "production graph compute failed");
+        const std::string at = label(pass);
+        require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                       "production graph compute failed" + at, before);
         ggml_backend_synchronize(life.backend);
         std::vector<float> got(count); ggml_backend_tensor_get(c.out, got.data(), 0, count * sizeof(float));
         for (size_t i = 0; i < count; ++i) {
             const float tolerance = 0.08f * (1.0f + std::fabs(oracle[i]));
-            require(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance, "CPU oracle mismatch");
+            if (!(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance)) {
+                fail_stages("CPU oracle mismatch" + at + " at " + std::to_string(i) + ": got " +
+                                std::to_string(got[i]) + ", expected " + std::to_string(oracle[i]),
+                            before);
+            }
         }
         if (pass == 0) ggml_sycl_q1_nvfp4_test_counters_read(&first);
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
     const auto observed = [&]() {
-        return " observed first=(slot=" + std::to_string(first.workspace_slot) +
-               ", generation=" + std::to_string(first.workspace_generation) + ") after=(slot=" +
-               std::to_string(after.workspace_slot) + ", generation=" +
-               std::to_string(after.workspace_generation) + ") counters before/first/after=" +
-               std::to_string(before.candidate) + "/" + std::to_string(first.candidate) + "/" +
-               std::to_string(after.candidate) + " candidate, " + std::to_string(before.admit) + "/" +
-               std::to_string(first.admit) + "/" + std::to_string(after.admit) + " admit, " +
-               std::to_string(before.submit) + "/" + std::to_string(first.submit) + "/" +
-               std::to_string(after.submit) + " submit, " + std::to_string(before.terminal) + "/" +
-               std::to_string(first.terminal) + "/" + std::to_string(after.terminal) + " terminal, " +
-               std::to_string(before.recycle) + "/" + std::to_string(first.recycle) + "/" +
-               std::to_string(after.recycle) + " recycle";
+        return label(no_pass) + ": observed first=(slot=" + std::to_string(first.workspace_slot) +
+               ", generation=" + std::to_string(first.workspace_generation) +
+               ") after=(slot=" + std::to_string(after.workspace_slot) +
+               ", generation=" + std::to_string(after.workspace_generation) +
+               "); stages after pass 0: " + stage_deltas(before, first);
     };
     if (first.workspace_slot == UINT32_MAX || first.workspace_generation == 0 ||
         first.workspace_generation == std::numeric_limits<uint64_t>::max() ||
         after.workspace_slot != first.workspace_slot ||
         after.workspace_generation != first.workspace_generation + 1) {
-        throw std::runtime_error("second submission did not reuse the same workspace slot at generation+1;" +
-                                 observed());
+        fail_stages("second submission did not reuse the same workspace slot at generation+1" + observed(), before);
     }
     if (after.candidate < before.candidate + 2 || after.admit < before.admit + 2 ||
         after.submit < before.submit + 2 || after.terminal < before.terminal + 2 ||
         after.recycle < before.recycle + 2) {
-        throw std::runtime_error("two-submit lifecycle counters did not prove slot reuse;" + observed());
+        fail_stages("two-submit lifecycle counters did not prove slot reuse" + observed(), before);
     }
 }
 
 void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) {
     // Graph A publishes metadata, runs twice, and is destroyed by the helper.
-    successful_reuse_case(life, type, ne11);
+    successful_reuse_case(life, type, ne11, "A");
 
     // Force allocator/address churn before graph B reuses the same tensor name.
     // A persistent borrowed tensor/extra/data pointer is likely to become stale.
@@ -301,46 +459,54 @@ void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) 
     }
 
     // Graph B must resolve the canonical value key and run twice independently.
-    successful_reuse_case(life, type, ne11);
+    successful_reuse_case(life, type, ne11, "B");
 }
 
 void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_quarantine) {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const case_scope scope(failure == GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK ? "injected_failure_case (pre-mark)" :
+                                                                                 "injected_failure_case (post-mark)",
+                           before);
     ggml_sycl_q1_nvfp4_test_failure_once(failure);
-    require(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS, "injected failure was not reported");
+    require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
+                   "injected failure was not reported", before);
     ggml_sycl_execution_snapshot state{};
-    require(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
-            "failure context snapshot unavailable");
-    require(state.graph_state == GGML_SYCL_EXECUTION_GRAPH_QUARANTINED ||
-            state.graph_state == GGML_SYCL_EXECUTION_GRAPH_RETIRED, "failure graph was not terminal/quarantined");
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
+                   "failure context snapshot unavailable", before);
+    require_stages(state.graph_state == GGML_SYCL_EXECUTION_GRAPH_QUARANTINED ||
+                       state.graph_state == GGML_SYCL_EXECUTION_GRAPH_RETIRED,
+                   "failure graph was not terminal/quarantined", before);
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
-    require(after.failure_consumed == before.failure_consumed + 1, "failpoint was not consumed exactly once");
-    require(after.candidate == before.candidate + 1 && after.admit == before.admit + 1,
-            "failure admission deltas were not exact");
-    require(after.submit == before.submit, "injected failure reached kernel submit");
-    require(after.quarantine == before.quarantine + (expect_quarantine ? 1 : 0),
-            "failure quarantine delta was not exact");
+    require_stages(after.failure_consumed == before.failure_consumed + 1, "failpoint was not consumed exactly once",
+                   before);
+    require_stages(after.candidate == before.candidate + 1 && after.admit == before.admit + 1,
+                   "failure admission deltas were not exact", before);
+    require_stages(after.submit == before.submit, "injected failure reached kernel submit", before);
+    require_stages(after.quarantine == before.quarantine + (expect_quarantine ? 1 : 0),
+                   "failure quarantine delta was not exact", before);
 }
 
 void injected_async_terminal_failure_case() {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const case_scope scope("injected_async_terminal_failure_case", before);
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
-    require(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
-            "async terminal fixture failed before submission");
+    require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "async terminal fixture failed before submission", before);
     ggml_backend_synchronize(life.backend);
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
-    require(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
-            "async failpoint did not reach exactly one submitted terminal");
-    require(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
-            "failed asynchronous terminal recycled its workspace");
+    require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
+                   "async failpoint did not reach exactly one submitted terminal", before);
+    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
+                   "failed asynchronous terminal recycled its workspace", before);
 }
 } // namespace
 
 int main() {
+    g_previous_terminate = std::set_terminate(report_terminate);
     try {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
@@ -353,6 +519,14 @@ int main() {
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
         injected_async_terminal_failure_case();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
-    } catch (const sycl::exception & e) { std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n'; return LLAMA_TEST_EXIT_SKIP; }
-      catch (const std::exception & e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
+    } catch (const test_skip & e) {
+        std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';
+        return LLAMA_TEST_EXIT_SKIP;
+    } catch (const sycl::exception & e) {
+        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
+        return LLAMA_TEST_EXIT_SKIP;
+    } catch (const std::exception & e) {
+        std::cerr << "FAIL: " << e.what() << '\n';
+        return 1;
+    }
 }

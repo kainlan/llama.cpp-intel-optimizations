@@ -29,7 +29,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                     bool   no_alloc) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -48,7 +49,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        no_alloc
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -60,7 +62,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
+            : filter_recr,
+        no_alloc
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -131,6 +134,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_full() {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_iswa::init_reserve(uint32_t n_streams) {
+    return std::make_unique<llama_memory_hybrid_iswa_context>(this, n_streams);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this, lctx, optimize);
 }
@@ -138,6 +145,14 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * l
 bool llama_memory_hybrid_iswa::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();
+}
+
+void llama_memory_hybrid_iswa::get_shift_caches(std::vector<const llama_kv_cache *> & caches) const {
+    if (!get_can_shift()) {
+        return;
+    }
+
+    mem_attn->get_shift_caches(caches);
 }
 
 void llama_memory_hybrid_iswa::clear(bool data) {
@@ -219,6 +234,12 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_hybrid_iswa * mem) :
     ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_hybrid_iswa * mem, uint32_t n_streams) :
+    ctx_attn(mem->get_mem_attn()->init_reserve(n_streams)),
+    ctx_recr(mem->get_mem_recr()->init_reserve(n_streams)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 

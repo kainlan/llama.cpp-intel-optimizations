@@ -148,6 +148,11 @@ size_t ggml_backend_test_owner_close_attempts(void) {
     return g_owner_close_attempts.load(std::memory_order_acquire);
 }
 
+size_t ggml_backend_test_live_buffer_count(void) {
+    std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+    return g_live_buffers.size();
+}
+
 void ggml_backend_test_fail_next_buffer_wrapper(void) {
     g_fail_next_buffer_wrapper.store(true, std::memory_order_release);
 }
@@ -2791,6 +2796,14 @@ ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return sched->bufts[backend_index];
+}
+
+int ggml_backend_sched_get_reserved_chunk_peaks(ggml_backend_sched_t sched, ggml_backend_t backend, size_t * peak_out, int max, size_t * max_chunk_size_out) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    return ggml_gallocr_get_chunk_peaks(sched->galloc, backend_index, peak_out, max, max_chunk_size_out);
 }
 
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {

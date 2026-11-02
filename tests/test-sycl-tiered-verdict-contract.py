@@ -136,6 +136,9 @@ def evaluate(backend, cache, test):
     target = body_of(backend, "int ggml_backend_sycl_planned_target_device(")
     publish = body_of(backend, "static void ggml_sycl_publish_prepared_plan_locked(")
     stage = body_of(cache, "void lifecycle_stage_placement_plan(")
+    # The candidate's shape is built by one factored function, which staging
+    # calls and the measure backend reuses, so the planned-host bytes are set there.
+    make = body_of(cache, "std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(")
     case = body_of(test, "void run_placement_case(")
 
     # Anchors: every region the checks read must have been found. A rename that
@@ -146,6 +149,7 @@ def evaluate(backend, cache, test):
         "ggml_backend_sycl_planned_target_device body": target,
         "ggml_sycl_publish_prepared_plan_locked body": publish,
         "lifecycle_stage_placement_plan body": stage,
+        "lifecycle_make_candidate_snapshot body": make,
         "run_placement_case body": case,
     }
 
@@ -178,7 +182,8 @@ def evaluate(backend, cache, test):
         "the planned-target query resolves through the same plan authority":
             "ggml_sycl_global_plan_owner()" in target,
         "a staged candidate carries the planned-host bytes its publication will":
-            "snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;" in stage,
+            "snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;" in make
+            and "lifecycle_make_candidate_snapshot(" in stage,
         "publication derives planned-host bytes from the same plan field":
             "planned_host_bytes = published->plan->weight_host_bytes;" in cache,
 

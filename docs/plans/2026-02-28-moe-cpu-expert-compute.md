@@ -417,6 +417,7 @@ The current CPU expert path copies activation data D2H per expert via `stream->m
 1. **Single activation D2H**: The activation vector is the same for all experts in a given MUL_MAT_ID call (same `src1`). Copy it once, share across all CPU tasks.
 2. **Pre-quantize once**: The batched CPU dispatch (`ggml_sycl_cpu_expert_mul_mat_batched`) already deduplicates Q8_0 quantization by activation pointer. But if all experts share the same activation (batch=1), we can guarantee single quantization.
 3. **Use pinned staging from CpuExpertPool**: The existing `CpuExpertPool::acquire_staging()` provides pre-allocated pinned buffers. Use these instead of per-call `sycl::malloc_host`.
+   *(Superseded: llama.cpp-b2jc removed `acquire_staging()` and its ring, which never had callers. CPU expert staging comes from the PinnedBufferPool, with a per-dispatch managed fallback (llama.cpp-sfal).)*
 
 **Current activation flow** (per MUL_MAT_ID, lines 24606-24617):
 ```

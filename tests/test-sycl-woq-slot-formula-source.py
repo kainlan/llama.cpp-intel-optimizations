@@ -2,7 +2,7 @@
 """Host-only source contract: the WOQ scratch-slot byte formula must match,
 byte-for-byte, between the two independent sites that compute it --
 llama_model_sycl_populate_inventory (plan-time sizing, src/llama-model.cpp)
-and try_pp_mxfp4_soa_onednn_f16_batched (per-dispatch sizing,
+and try_pp_onednn_f16_batched (per-dispatch sizing,
 ggml-sycl.cpp). The two sites cannot share a helper (llama-model.cpp does
 not link the SYCL backend's device headers), so this test is the only
 thing that keeps them from silently drifting apart -- an under-sized plan
@@ -14,8 +14,9 @@ locally-named kMxfp4BlockSize in llama-model.cpp (which does not include
 ggml-common.h). llama.cpp-sr83, quality review coverage gap (a).
 
 Backend checks are anchored to the sizing region only (between the
-pp_woq_enabled declaration and the weight_slot_bytes assignment), not the
-whole 60k-line file: ggml-sycl.cpp reuses the exact expression
+experts_are_tiled declaration, the sizing block's first line, and the
+weight_slot_bytes assignment), not the whole 60k-line file: ggml-sycl.cpp
+reuses the exact expression
 "blocks_per_row = static_cast<int>(ne00 / QK_MXFP4)" (with different
 whitespace) at an unrelated call site further down (the f16 arm's repack
 call), so a whole-file substring/regex search on that text passes
@@ -39,7 +40,7 @@ args = parser.parse_args()
 model = Path(args.model).read_text()
 backend_full = Path(args.backend).read_text()
 
-REGION_START = "pp_woq_enabled    = ggml_sycl_moe_pp_woq_enabled();"
+REGION_START = "experts_are_tiled = route_layout == GGML_LAYOUT_XMX_TILED;"
 REGION_END = "weight_slot_bytes     = woq_nibble_slot_bytes + woq_scale_slot_bytes;"
 region_start_pos = backend_full.find(REGION_START)
 region_end_pos = backend_full.find(REGION_END)

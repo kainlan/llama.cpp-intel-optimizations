@@ -920,6 +920,95 @@ static bool test_decode_admission_is_route_mode_independent() {
     return true;
 }
 
+// STAGED_RING (llama.cpp-o9uw): a plan-host expert answers PRIMARY_DEVICE only as a staged ring slot. The route
+// matches the plan only under that transfer, and the recipe validator admits it only as PRIMARY_DEVICE on the submit
+// device and queue with a ready event.
+static ggml_sycl::moe_batch_route staged_route_for(void * ptr, int identity) {
+    auto route =
+        route_for(ptr, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS, identity);
+    route.planned_on_device    = false;
+    route.planned_device       = ggml_sycl::mem_handle::HOST_DEVICE;
+    route.has_ready_event      = true;
+    route.ready_event          = sycl::event{};
+    route.recipe.request.phase = ggml_sycl::moe_route_phase::PROMPT;
+    route.recipe.request.rows  = 2;
+    route.recipe.transfer      = ggml_sycl::moe_recipe_transfer::STAGED_RING;
+    route.recipe_reason        = "staged-ring";
+    return route;
+}
+
+// A two-token prompt build: expert 5 resolves to `staged`, expert 7 to `resident`.
+static ggml_sycl::moe_resolved_batch_result build_staged_pair(const ggml_sycl::moe_batch_route & staged,
+                                                              const ggml_sycl::moe_batch_route & resident) {
+    const int32_t ids[] = { 5, 7 };
+    return ggml_sycl::build_moe_resolved_batch(ids, 2, 1, 0, [&](int32_t id) { return id == 5 ? staged : resident; });
+}
+
+static bool test_staged_ring_route_contract() {
+    int  staged = 21, resident = 22;
+    auto resident_route =
+        route_for(&resident, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 22);
+    resident_route.recipe.request.phase = ggml_sycl::moe_route_phase::PROMPT;
+    resident_route.recipe.request.rows  = 2;
+
+    // Served: the staged expert is a PRIMARY_DEVICE operand with its ready event; the helpers name it alone.
+    auto served = build_staged_pair(staged_route_for(&staged, 21), resident_route);
+    CHECK(served);
+    CHECK(served.batch.operands.size() == 2);
+    const auto & op = served.batch.operands[0];
+    CHECK(op.expert_id == 5 && op.residency() == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE);
+    CHECK(op.recipe().transfer == ggml_sycl::moe_recipe_transfer::STAGED_RING && op.has_ready_event());
+    auto choice = ggml_sycl::choose_moe_batch_executor(op, 0, false, 0);
+    CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE);
+    std::vector<sycl::event> ready;
+    CHECK(ggml_sycl::moe_batch_staged_ring_experts(served.batch, &ready) == std::vector<int32_t>({ 5 }));
+    CHECK(ready.size() == 1);
+    CHECK(ggml_sycl::moe_batch_names_staged_ring(served.batch));
+
+    // A batch with no staged operand names none.
+    auto plain = build_staged_pair(resident_route, resident_route);
+    CHECK(plain && ggml_sycl::moe_batch_staged_ring_experts(plain.batch).empty());
+    CHECK(!ggml_sycl::moe_batch_names_staged_ring(plain.batch));
+
+    // A plan-host expert claiming PRIMARY_DEVICE under any other transfer is a plan mismatch.
+    auto unstaged            = staged_route_for(&staged, 21);
+    unstaged.recipe.transfer = ggml_sycl::moe_recipe_transfer::NONE;
+    CHECK(build_staged_pair(unstaged, resident_route).reject == ggml_sycl::moe_batch_reject_reason::PLAN_MISMATCH);
+
+    // The recipe validator refuses a staged slot without its ready event, on another executor, queue or owner.
+    auto refused_choice = [&](void (*spoil)(ggml_sycl::moe_batch_route &)) {
+        auto route = staged_route_for(&staged, 21);
+        spoil(route);
+        auto result = build_staged_pair(route, resident_route);
+        if (!result) {
+            return ggml_sycl::moe_batch_reject_reason::NONE;
+        }
+        return ggml_sycl::choose_moe_batch_executor(result.batch.operands[0], 0, true, 0).reject;
+    };
+    CHECK(refused_choice([](ggml_sycl::moe_batch_route & r) { r.has_ready_event = false; }) ==
+          ggml_sycl::moe_batch_reject_reason::RECIPE_MISMATCH);
+    CHECK(refused_choice([](ggml_sycl::moe_batch_route & r) {
+              r.recipe.kind = ggml_sycl::moe_batch_executor::SECONDARY_DEVICE;
+          }) == ggml_sycl::moe_batch_reject_reason::RECIPE_MISMATCH);
+    CHECK(refused_choice([](ggml_sycl::moe_batch_route & r) { r.recipe.queue = ggml_sycl::moe_recipe_queue::OWNER; }) ==
+          ggml_sycl::moe_batch_reject_reason::RECIPE_MISMATCH);
+    CHECK(refused_choice([](ggml_sycl::moe_batch_route & r) { r.recipe.owner_device = 1; }) ==
+          ggml_sycl::moe_batch_reject_reason::RECIPE_MISMATCH);
+    return true;
+}
+
+// The prompt admission cache's reuse predicate (llama.cpp-o9uw): a bundle naming a staged ring slot answers only in the
+// graph that built it, since the next micro-batch's copies overwrite its slots; any other entry answers as before,
+// whatever the graph.
+static bool test_admission_entry_reuse_is_graph_keyed_for_staged_bundles() {
+    CHECK(ggml_sycl::test_moe_admission_entry_reusable(true, false, 1, 2));
+    CHECK(ggml_sycl::test_moe_admission_entry_reusable(true, true, 7, 7));
+    CHECK(!ggml_sycl::test_moe_admission_entry_reusable(true, true, 7, 8));
+    CHECK(!ggml_sycl::test_moe_admission_entry_reusable(false, false, 1, 1));
+    CHECK(!ggml_sycl::test_moe_admission_entry_reusable(false, true, 3, 3));
+    return true;
+}
+
 int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
         !test_canonical_bind_is_zero_based_and_exact() || !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
@@ -928,6 +1017,9 @@ int main() {
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
         !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||
         !test_numerical_q1_nvfp4_host_executor() || !test_decode_admission_is_route_mode_independent()) {
+        return 1;
+    }
+    if (!test_staged_ring_route_contract() || !test_admission_entry_reuse_is_graph_keyed_for_staged_bundles()) {
         return 1;
     }
     std::puts("PASS: retained MoE route-batch host contract");

@@ -14,6 +14,10 @@
 #include "common.hpp"
 #include "moe-resolved-batch.hpp"
 
+namespace ggml_sycl {
+class CpuRowWorkers;  // cpu-row-workers.hpp
+}
+
 // Dispatch a single ggml operation to the CPU SYCL device.
 // Returns true if handled, false if the op is unsupported on CPU.
 bool ggml_sycl_compute_forward_cpu(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
@@ -161,6 +165,49 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
 void ggml_sycl_cpu_expert_mul_mat_batched(
     const cpu_expert_task * tasks, int n_tasks,
     int n_threads = 0);
+
+// The same computation, with the flattened row loop on row_workers, a
+// CpuExpertPool's own row-worker set, instead of the shared TBB arena
+// (llama.cpp-w4e9). For a type with no multi-row tile, such as every IQ type,
+// each row runs the same kernel either way. For Q4_0, Q6_K and MXFP4 a row's
+// tile, or the single-row remainder, follows the range it falls in, and the row
+// workers' 64-row chunks cut the rows differently from the arena's grain.
+void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task *    tasks,
+                                          int                        n_tasks,
+                                          ggml_sycl::CpuRowWorkers & row_workers);
+
+// Threads in one row loop: the TBB arena's size, which is GGML_SYCL_CPU_THREADS
+// (default hardware threads - 2, at most 32). A CpuExpertPool sizes its row
+// workers with it.
+int ggml_sycl_cpu_row_loop_threads();
+
+// Host-expert job timing (llama.cpp-b2jc), on under GGML_SYCL_MOE_IDS_COPY_TRACE
+// like the decode wait census. Off, it costs one cached flag test per call and
+// reads no clock.
+bool ggml_sycl_cpu_expert_trace_enabled();
+
+// Phases of the calling thread's last ggml_sycl_cpu_expert_mul_mat_batched()
+// call, written only while tracing is on.
+struct cpu_expert_batched_phase_times {
+    double quant_us   = 0.0;  // serial activation quantize on the calling thread
+    double setup_us   = 0.0;  // grouping and row metadata before the parallel loop
+    double fanout_us  = 0.0;  // parallel loop entry to the first row range starting on any thread
+    double compute_us = 0.0;  // first row range start to the parallel loop's return
+    int    rows       = 0;
+    int    threads    = 0;    // distinct threads that ran a row range
+    // Weight type of every row above, or GGML_TYPE_COUNT when the call's rows mix
+    // types or there are none, and their weight bytes (llama.cpp-y9i6): with
+    // compute_us they give the in-model rate of one quant type's kernel.
+    ggml_type type       = GGML_TYPE_COUNT;
+    uint64_t  bytes      = 0;
+
+    // When compute_us began and ended, in steady_clock ns since its epoch (llama.cpp-j6jf);
+    // 0 when the call ran no row loop.
+    int64_t t_compute_start_ns = 0;
+    int64_t t_compute_end_ns   = 0;
+};
+
+cpu_expert_batched_phase_times ggml_sycl_cpu_expert_batched_last_phase_times();
 
 // ---------------------------------------------------------------------------
 // CPU PP GEMM — batched GEMM on host-resident quantized weights for PP

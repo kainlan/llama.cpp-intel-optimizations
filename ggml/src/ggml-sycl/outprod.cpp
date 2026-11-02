@@ -77,10 +77,13 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
         // Use DnnlGemmWrapper::gemm for the outer product
         // C = A * B^T when src1 is not transposed, C = A * B when src1 is transposed
-        DnnlGemmWrapper::gemm(ctx, ne0, ne1, ne01, src0_d,
-                              DnnlGemmWrapper::to_dt<float>(), str_a0, str_a1, str_a2,
-                              src1_d, DnnlGemmWrapper::to_dt<float>(), str_b0, str_b1, str_b2,
-                              dst_d, DnnlGemmWrapper::to_dt<float>(), stream, 1, 1);
+        // A declined scratchpad submitted nothing, and a DNNL build compiles no other arm here (the oneMath arm below
+        // exists only without GGML_SYCL_DNNL): the op fails by name (llama.cpp-23mk S3-4).
+        if (!DnnlGemmWrapper::gemm(ctx, ne0, ne1, ne01, src0_d, DnnlGemmWrapper::to_dt<float>(), str_a0, str_a1, str_a2,
+                                   src1_d, DnnlGemmWrapper::to_dt<float>(), str_b0, str_b1, str_b2, dst_d,
+                                   DnnlGemmWrapper::to_dt<float>(), stream, 1, 1)) {
+            throw ggml_sycl_fallback_error("dnnl_gemm declined in out_prod: no other arm in a DNNL build");
+        }
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         // Fallback to oneAPI Math (MKL/oneMath) for GEMM
         const float alpha = 1.0f;

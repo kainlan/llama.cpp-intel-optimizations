@@ -104,7 +104,7 @@ has four named zones distinct from `vram_zone_id`:
 
 | Zone (`host_zone_id`) | Purpose |
 |---|---|
-| `WEIGHT` | Host-resident model weights (overflow from VRAM) |
+| `WEIGHT` | Host-resident model weights (overflow from VRAM). It also holds cache-lifetime owners that no graph boundary checks: `HOST_COMPUTE` host buffer type buffers such as the logits, the `EXPERT_CACHE` pinned-buffer pool, and the CPU job input marker's word, which asks for it through `alloc_constraints::persistent_owner`. Each is freed per allocation through `unified_free_record` (llama.cpp-nqbe). |
 | `KV` | KV cache host fallback |
 | `STAGING` | DMA staging / expert bias D2H |
 | `SCRATCH` | Host-side quantization / CPU compute scratch |
@@ -337,6 +337,7 @@ these or be migrated (see §9 for temporary allowlisted sites):
 | `unified_allocate(req)` | Handle-returning wrapper around `unified_alloc` | `mem_handle` |
 | `unified_allocate_owner(req)` | **Owner-first allocator** (`unified-cache.hpp:4330`). The intrusive `alloc_owner_control` is created *before* any physical allocation, so an allocation can never exist without an owner | `allocation_result` (`alloc_owner` + typed `allocation_error`) |
 | `unified_cache_zone_allocate_owner(device_id, zone, size, align = 256)` | Owner-first VRAM-zone variant (`unified-cache.hpp:5064`); control and exact registry identity exist before the zone pointer can escape | `allocation_result` |
+| `moe_stream_ring::reserve` → `unified_cache_zone_allocate_owner`, then `unified_allocate_owner` when the zone call is refused | Prompt expert ring (llama.cpp-36j0), cohort `moe_stream_ring`: one WEIGHT-zone allocation per slot, two regions of one executor window each (`window_slots`), at most a tenth of the expert set left after the loan; a partial reservation keeps the slots it got while a loan can still fund it, and gives them back at once otherwise (llama.cpp-am87 c-zgrd) | one `alloc_owner` per slot (wrapped with `mem_handle::from_owned_alloc`), then each slot's `mem_handle` from `moe_stream_ring::acquire_slot` |
 | `unified_allocate_owner_backing(req, cache_backing_token)` | **Private, token-gated** (`allocation-provenance.hpp:56`). Classifies the owner `CACHE_BACKING`. Only `pinned_chunk_pool` can construct the token, and the header may be included only by `unified-cache.cpp` and `pinned-pool.cpp`. This is **one of two** `CACHE_BACKING` mint paths — see §3.1 | `allocation_result` |
 | `detail::promote_legacy_alloc_owner(handle)` | Allocator-private bridge (`unified-cache.hpp:4337`) promoting an existing legacy `alloc_handle` row to intrusive ownership. Not a caller entry point | `allocation_result` |
 | `unified_cache_allocate(device, size, category, queue)` | Bulk weight/arena slot allocator | `unified_alloc_result` (`unified-cache.hpp:2374`) |
@@ -547,7 +548,7 @@ completes and shared by its contexts:
 | `g_placement_publication` | `ggml-sycl.cpp:2189` | Model-scoped: an immutable published snapshot, not a mutable plan (see below) |
 | `g_placement_kv_info` | `ggml-sycl.cpp:12351` | Model-scoped: per-layer KV sizing |
 | `g_model_n_layer` | `ggml-sycl.cpp:12350` | Model-scoped |
-| `unified_cache` WEIGHT zone | `unified-cache.cpp` | Model-scoped: weight entries survive across requests |
+| `unified_cache` WEIGHT zone | `unified-cache.cpp` | Model-scoped: weight entries survive across requests. The host `WEIGHT` zone also holds cache-lifetime owners that no graph boundary checks (`HOST_COMPUTE` logits, the `EXPERT_CACHE` pinned-buffer pool, the CPU job input marker's word through `persistent_owner`), each freed per allocation through `unified_free_record` (llama.cpp-nqbe) |
 | `placement_plan::entries` | `unified-cache.hpp` | Model-scoped |
 | `placement_plan::layer_device`, `expert_device`, `kv_device` | `unified-cache.hpp` | Model-scoped |
 
@@ -745,6 +746,13 @@ Setting `GGML_SYCL_DISABLE_GRAPH=1` in the `test-thread-safety` registration
 a workaround for the defect above, not a statement about it, and the green
 result in §11.2 must not be read as though it were. Once the pairing is fixed,
 the pin is removable and its removal is the regression test.
+
+The prompt expert ring (llama.cpp-36j0) is per backend context (one device each)
+and per prompt phase. It is owned through the context's `moe_stream` member,
+reserved slot by slot at the first layer the batched prompt executor claims, and
+released by `moe_stream_phase::end_prompt`. Its loan and its refill are plan
+transactions that republish the expert plan, not direct edits to the plan. A lent
+triplet's host copy keeps its owner until the refill retires it.
 
 ---
 
@@ -988,6 +996,9 @@ are grouped by subsystem:
 | `fused-moe-esimd.hpp`, `gpu-sampler.hpp` | ~10 | `llama.cpp-32dg8.6` | Migrate to `unified_allocate` |
 | `ggml-sycl.cpp` MoE + TP paths | ~30 | `llama.cpp-32dg8.6` | Migrate to planner + `unified_allocate` |
 | `unified-cache.cpp` internals | all | — | Allowed permanently as raw-malloc gateway |
+| `dpct/helper.hpp` (vendored upstream) | 3, pinned by function, raw name and count 1 each: `dpct_malloc` / `malloc_device`; `device_memory::allocate_device` / `malloc_shared` and / `malloc_device`; and, as libc sites pinned by clause (q) (code `E-LIBC`, function, name and count): `mem_mgr`'s constructor `mmap` (Linux) and `VirtualAlloc` (`_WIN64`), the two `host_buffer` constructors' `std::malloc`, and the two `device_memory` initializer-list constructors' host-staging `std::malloc` | — (sanctioned-vendored; disposition carried by `llama.cpp-23mk`) | Allowed permanently, not edited (rebase churn). `test-sycl-alloc-zone-contract` clause (e) pins the three sites and forbids `dpct_malloc`, `dpct_memcpy`, `async_dpct_memcpy` (the 3-D host-staged paths are `host_buffer`'s only users) and the `dpct::device_memory`, `global_memory`, `constant_memory` and `shared_memory` names everywhere outside `dpct/helper.hpp`; clause (q) pins the libc sites. The vendored allocations are ruled unreachable from the backend; clause (e) forbids the entry points that allocate or stage through them (`dpct_malloc`, the memory classes and the memcpy paths). Any transient intent for these sites belongs to `llama.cpp-6lfq` |
+| `unified-cache.hpp` `cache_guard_allocator` | 1 `mmap`, pinned by function, name and count (clause (q), `E-LIBC-CACHE-GUARD`) | — | Allowed permanently: it backs the cache's own hash maps in the guard-page debug mode and falls back to `std::allocator`; it holds no tensor, KV, scratch, pinned or USM bytes, and the cache cannot allocate its own map nodes through itself |
+| `ggml-sycl.cpp` `weight_cache_allocator` | 1 `mmap` and 1 `posix_memalign`, shrink-only debt (clause (q), fate `deleted-by-step-7`) | `llama.cpp-23mk` | Never instantiated; deleted whole at step 7 of the 23mk design (the dead `weight_cache_allocator` bullet) |
 | Test files under `tests/` | all | — | Allowed permanently (see §8) |
 
 ### 9.2 Host-residency predicates (caller-side "is on host?" checks)
@@ -1474,6 +1485,8 @@ Every reset/clear/free operation must take an explicit owner tuple and match it:
 | Resource | Minimum reset key | Required behavior |
 |---|---|---|
 | Model load scratch | `LoadTxnId` | Clear/rollback only the attempt; committed model state is immutable |
+| Planned load terms (compute, state) | `(slot, SlotGeneration)`, minted when the load transaction begins, so the load in flight and the model it commits to share one key; only the open `LoadTxnId` (its load-effect lease) may write | The device reads the largest contribution of the owners on it; a re-measure replaces that owner's own value; rollback and slot release remove only that owner's contribution; no whole-table clear |
+| Planned dense scratch inputs (Q8_1 src1 bytes per token, f16 dequant weight and src1 maxima, their `n_ubatch`, the rejected-figure flags; `llama.cpp-45qo`) | `(slot, SlotGeneration)`, the same owner table and key as the planned load terms; the load-time plan writes under the open `LoadTxnId`'s load-effect lease, the runtime re-plan under the published model's live-update lease | The device plans each dense scratch buffer from the largest of each input over the owners on it whose figure for that buffer was accepted, so a rejected owner contributes nothing, leaves the other owners' plans valid and re-plannable, refuses only its own re-plan while it is live, and has its context refused by name (`llama.cpp-kpjw`); the owner plans at the largest `n_ubatch` its live backend contexts last published (each context's own publish replaces its own record, a destroyed context's record leaves, and with none live the load's `n_ubatch` stands); a re-plan replaces only that owner's inputs; rollback and slot release remove only that owner's inputs; no device-global merge and no replace-when-no-context-is-live (`zone_dense_scratch_merge_input` is removed) |
 | Weight/cache owner | `ModelId` plus `(slot, SlotGeneration)` during slot migration | Remove only that owner; shared/deduplicated entries survive while any owner/lease remains |
 | KV and context arenas | `ContextId` (and `SessionId` for sequence rows) | Never reset every context on the device |
 | Recorded graph | `(ContextId, GraphEpoch)` | Clear only the matching epoch; stale clear/callback is ignored/rejected |

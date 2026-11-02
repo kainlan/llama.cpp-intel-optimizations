@@ -110,7 +110,8 @@ def test_new_sidecar_publishes_retry_identity_before_injected_throw() -> None:
     assert "packed.D == GGML_SYCL_FATTN_XMX_PACKED_K_D && packed.H_kv == H_kv" in update
     assert "packed.batch == batch && packed.n_kv >= n_kv && packed.n_blocks >= n_blocks" in update
     assert "packed.total_bytes >= total_bytes" in update
-    assert "add_prev_dep = ggml_sycl_should_add_dependency(packed.ready_event)" in update
+    assert ("add_prev_dep =\n                    ggml_sycl_should_add_dependency(packed.ready_event, GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_PREV)"
+            in update)
 
 
 def test_sidecar_propagates_prior_event_and_replaces_each_accepted_submit() -> None:
@@ -131,7 +132,7 @@ def test_sidecar_propagates_prior_event_and_replaces_each_accepted_submit() -> N
     )
     ordered(
         update,
-        "add_prev_dep = ggml_sycl_should_add_dependency(packed.ready_event)",
+        "add_prev_dep =\n                    ggml_sycl_should_add_dependency(packed.ready_event, GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_PREV)",
         "ggml_sycl_fattn_xmx_submit_set_rows_update",
     )
     assert "packed.ready_event,\n                        add_zero_dep, add_prev_dep" in update
@@ -154,7 +155,7 @@ def test_forced_materializer_propagates_prior_event_and_replaces_success() -> No
     ordered(
         body,
         "const sycl::event previous_use = out->ready_event",
-        "add_prev_dep = ggml_sycl_should_add_dependency(previous_use)",
+        "add_prev_dep = ggml_sycl_should_add_dependency(previous_use, GGML_SYCL_READY_QUERY_SITE_FATTN_PREV_USE)",
         "zero_deps.push_back(previous_use)",
         "ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps)",
         "out->ready_event = zero_event",
@@ -174,7 +175,7 @@ def test_packed_consumer_propagates_prior_event_then_replaces_first_and_merge() 
     ordered(
         leaf,
         "const sycl::event packed_ready_event",
-        "ggml_sycl_should_add_dependency(packed_ready_event)",
+        "ggml_sycl_should_add_dependency(packed_ready_event, GGML_SYCL_READY_QUERY_SITE_FATTN_XMX_PACKED_K)",
         "cgh.depends_on(packed_ready_event)",
         "*packed_k_ready_event = first_event",
         'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("packed-first-to-merge")',

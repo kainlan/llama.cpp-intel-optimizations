@@ -7,13 +7,16 @@
 #ifndef GGML_SYCL_UNIFIED_CACHE_HPP
 #define GGML_SYCL_UNIFIED_CACHE_HPP
 
+#include "cpu-job-signal.hpp"
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
 #include "file-mapping.hpp"
 #include "ggml-sycl.h"
 #include "host-cpu-mapping.hpp"
+#include "kv-room-cost.hpp"
 #include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
+#include "model-lifecycle.hpp"
 #include "moe-control-plan.hpp"
 #include "moe-mmid-workspace.hpp"
 #include "moe-scratch-admission.hpp"
@@ -35,8 +38,10 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -86,6 +91,15 @@ enum class vram_zone_id : uint8_t {
     RUNTIME = 3,  // Runtime allocations (KV buffers, staging, MoE pools)
     SCRATCH = 4,  // Per-token scratch, bump-right, reset between tokens
     COUNT   = 5,
+};
+
+// What backs a device's zones. Fixed when the cache is constructed and never
+// changes, so it is valid before any plan; whether the zones are backed yet is
+// the separate fact ggml_sycl_device_has_zones() answers.
+enum ggml_sycl_arena_backing_type {
+    GGML_SYCL_ARENA_BACKING_TYPE_NONE = 0,  // GGML_SYCL_VRAM_ARENA=0: no arena exists
+    GGML_SYCL_ARENA_BACKING_TYPE_USM  = 1,
+    GGML_SYCL_ARENA_BACKING_TYPE_VM   = 2,
 };
 
 struct vram_zone {
@@ -391,7 +405,9 @@ struct placement_entry {
     int64_t            ne[GGML_MAX_DIMS] = {};
     size_t             src_size          = 0;  // AOS source bytes
     size_t             dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
-    size_t             kv_size           = 0;  // KV bytes charged by this entry (usually 0)
+    // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It
+    // is the cost, not the placement: kv_device[layer_id] says where that KV lives, which can differ from on_device.
+    size_t             kv_size           = 0;
     placement_priority priority          = placement_priority::COUNT;  // Sort key
     int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
     int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
@@ -550,50 +566,23 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
                                       uint32_t n_seq_max,
                                       bool     kv_unified,
                                       bool     swa_full) {
-    if (kind == GGML_SYCL_KV_LAYER_SHARED) {
-        return 0;
-    }
-    if (kind == GGML_SYCL_KV_LAYER_SWA && !swa_full) {
-        if (n_swa == 0) {
-            return 0;
-        }
-        const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;
-        uint32_t       n_ctx_seq;    // cells per stream in the non-SWA (base) cache
-        uint32_t       n_stream;     // number of independent KV streams
-        uint32_t       window_seqs;  // the "unified ? n_seq_max : 1" term, llama_kv_cache_iswa::llama_kv_cache_iswa()
-        if (kv_unified) {
-            // llama_context::llama_context() sets cparams.n_ctx_seq =
-            // cparams.n_ctx.
-            n_ctx_seq   = n_ctx;
-            n_stream    = 1;
-            window_seqs = seqs;
-        } else {
-            // llama_context::llama_context() computes n_ctx_seq =
-            // GGML_PAD(n_ctx / n_seq_max, 256), and n_ctx itself is then
-            // adjusted to n_ctx_seq * n_seq_max exactly -- so dividing the
-            // (already-adjusted) n_ctx this function receives back out by
-            // seqs reproduces llama's own n_ctx_seq exactly (no remainder,
-            // and re-padding an already-256-aligned value is a no-op).
-            n_ctx_seq   = GGML_PAD(n_ctx / seqs, 256);
-            n_stream    = seqs;
-            window_seqs = 1;
-        }
-        // llama_kv_cache_iswa::llama_kv_cache_iswa()'s size_swa =
-        // GGML_PAD(min(size_base, n_swa*(unified?n_seq_max:1) + n_ubatch),
-        // 256), one size PER STREAM; llama_kv_cache::llama_kv_cache()'s
-        // per-stream K/V tensor creation allocates n_stream such streams.
-        const uint32_t swa_cells_per_stream = GGML_PAD(std::min(n_ctx_seq, n_swa * window_seqs + n_ubatch), 256);
-        const uint32_t swa_cells            = swa_cells_per_stream * n_stream;
-        return static_cast<size_t>(swa_cells) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
-    }
-    // GGML_SYCL_KV_LAYER_FULL (and GGML_SYCL_KV_LAYER_SWA under swa_full --
-    // llama.cpp-uajm, see above): the whole context window, every cell. Total
-    // cells across streams is n_ctx_seq * n_stream, which by the same
-    // llama_context::llama_context()'s n_ctx_seq invariant equals n_ctx
-    // exactly in both modes (kv_unified==true: n_stream=1, n_ctx_seq=n_ctx;
-    // kv_unified==false: n_ctx already adjusted to n_ctx_seq * n_seq_max)
-    // -- so this branch needs no unified/non-unified split.
-    return static_cast<size_t>(n_ctx) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
+    // The cell arithmetic, and the K/V byte rule, are the one pair of functions
+    // the region fit's slots use too (kv-runtime-demotion.hpp); this is the
+    // load-time estimate, which has no context to ask: an f16 shape, unpadded.
+    static_assert(static_cast<int>(KV_CELLS_FULL) == static_cast<int>(GGML_SYCL_KV_LAYER_FULL) &&
+                      static_cast<int>(KV_CELLS_SWA) == static_cast<int>(GGML_SYCL_KV_LAYER_SWA) &&
+                      static_cast<int>(KV_CELLS_SHARED) == static_cast<int>(GGML_SYCL_KV_LAYER_SHARED),
+                  "kv_cells_kind must mirror ggml_sycl_kv_layer_kind");
+    kv_layer_desc layer;
+    layer.n_embd_k_gqa = k_width;
+    layer.n_embd_v_gqa = v_width;
+    layer.has_kv       = 1;
+    const size_t cells = kv_layer_cells(kind, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, n_swa);
+    // The row-size lambda restates ggml_row_size for f16 so this header needs no
+    // ggml-base; test-sycl-kv-layer-sizing sweeps it against the real ggml_row_size.
+    return kv_layer_tensor_bytes(
+        layer, GGML_TYPE_F16, GGML_TYPE_F16, cells, /*pad_to=*/1,
+        [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });
 }
 
 // Explicit planner inputs used for KV sizing and placement.
@@ -649,6 +638,40 @@ struct placement_kv_info {
     // this is threaded to next.
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
+    // llama.cpp-8ecj: the context the model opens with, from ggml_sycl_tensor_inventory::n_ctx_context: the caller's
+    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
+    // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
+    uint32_t              n_ctx_context    = 0;
+    // llama.cpp-7fmt: n_ctx_context is the model's default context (the training context, which a caller that names
+    // no n_ctx creates) rather than one the caller named; from ggml_sycl_tensor_inventory::n_ctx_context_is_default.
+    // The room's lines say so, and it enters the decision in one direction only: for the default context a routed-
+    // expert type with no measured CPU rate refuses the room for every layer instead of being priced at
+    // cpu_expert_gbps (kv_room_expert_rate_for, kv-room-cost.hpp). It never makes a room held.
+    bool                  n_ctx_context_is_default = false;
+    // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
+    // is held for a layer only when the attention it keeps on the device is worth more per decode token than the
+    // routed experts it displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at
+    // host_attn_gbps and pay host_split_us for each CPU split the layer adds, and the displaced experts would be read
+    // at their type's measured CPU rate (cpu_expert_gbps for a type with none), each with probability
+    // n_expert_used / n_expert (kv-room-cost.hpp). The backend fills these once, where it copies the inventory in, from
+    // GGML_SYCL_PLAN_CTX_FILL_PCT, GGML_SYCL_PLAN_HOST_ATTN_GBPS, GGML_SYCL_PLAN_CPU_EXPERT_GBPS and
+    // GGML_SYCL_PLAN_HOST_SPLIT_US; a test sets them directly. The two rates must be finite and > 0 and the split cost
+    // finite and >= 0 (the planner asserts it, since the rates divide and the split cost adds); the fill is clamped
+    // to [0, 100] where it is used.
+    double                ctx_fill_pct             = PLACEMENT_CTX_FILL_PCT_DEFAULT;
+    double                host_attn_gbps           = PLACEMENT_HOST_ATTN_GBPS_DEFAULT;
+    double                cpu_expert_gbps          = PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
+    double                host_split_us            = PLACEMENT_HOST_SPLIT_US_DEFAULT;
+    // GGML_SYCL_PLAN_CPU_EXPERT_GBPS was given, so cpu_expert_gbps prices every routed-expert type (llama.cpp-7fmt).
+    bool                  cpu_expert_gbps_set      = false;
+    // What sizes the prompt phase's window ring at plan time, so the planner can hold the ring's room in the WEIGHT
+    // zone before it packs the routed experts. moe_stream_staged_types has bit t set when the batched prompt
+    // executor takes a host-staged expert of ggml_type t, which is the type half of its staged claim: only a claimed
+    // matrix takes a ring slot. moe_stream_group_cap is the executor's group cap
+    // (GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX, 0 = none), which bounds the ring's window. The backend fills both
+    // where it copies the inventory in; a test sets them directly. Mask 0 sizes no ring and holds no room.
+    uint64_t              moe_stream_staged_types  = 0;
+    size_t                moe_stream_group_cap     = 0;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention
@@ -666,12 +689,22 @@ struct placement_kv_info {
     std::vector<uint8_t>  layer_kind;     // enum ggml_sycl_kv_layer_kind per layer
     std::vector<uint32_t> layer_k_width;  // Per-layer K width (elements); 0 for SHARED layers
     std::vector<uint32_t> layer_v_width;  // Per-layer V width (elements); symmetric
-    // llama.cpp-5efe C4: width (elements) of the indexer key cached beside the attention KV, mirrored from
-    // ggml_sycl_tensor_inventory::kv_idx_width (ggml-sycl.h); 0 = no indexer cache. Not part of a layer's device slab:
-    // read only through placement_plan::kv_demand_for_layer().
-    uint32_t              kv_idx_width = 0;
+    // llama.cpp-8ecj: ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, the key width of each layer's indexer
+    // key cache (a second buffer over the layer's cells, K only); empty or 0 where a layer has none.
+    std::vector<uint32_t> layer_idx_k_width;
+
+    // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
+    // above stays the load's planning shape.
+    uint32_t                           n_ubatch_context = 0;
+    // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone. The
+    // backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
+    // when no micro-batch above n_ubatch was named, the model has no ring, or there is no arena. The planner weighs it
+    // against the routed experts (placement_plan::explicit_ubatch).
+    pp_moe_onednn_explicit_ubatch_room explicit_ubatch;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
+
+    uint32_t idx_k_width(uint32_t il) const { return il < layer_idx_k_width.size() ? layer_idx_k_width[il] : 0; }
 
     bool has_per_layer_kv_truth(uint32_t il) const {
         return il < layer_kind.size() && il < layer_k_width.size() && il < layer_v_width.size();
@@ -691,20 +724,27 @@ struct placement_kv_info {
         return swa_layer_mask[layer_id];
     }
 
-    size_t kv_bytes_per_layer() const {
-        if (!valid()) {
+    size_t kv_bytes_per_layer() const { return kv_bytes_per_layer(n_ctx); }
+
+    // A representative full-attention layer at a context of `ctx` tokens, at the global width. The uniform fallback
+    // of kv_bytes_for_layer_at() forwards here, so this formula is the only one for it (llama.cpp-8ecj).
+    size_t kv_bytes_per_layer(uint32_t ctx) const {
+        if (!valid() || ctx == 0) {
             return 0;
         }
         // llama.cpp-3aos: routed through kv_layer_bytes_for_kind()'s FULL
         // branch (numerically identical -- that branch does not consult
         // n_swa/n_ubatch/n_seq_max/kv_unified/swa_full) so the arithmetic
         // lives in exactly one place, matching kv_bytes_per_swa_layer() below.
-        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
                                        n_seq_max, kv_unified, swa_full);
     }
 
-    size_t kv_bytes_per_swa_layer() const {
-        if (!valid() || n_swa == 0) {
+    size_t kv_bytes_per_swa_layer() const { return kv_bytes_per_swa_layer(n_ctx); }
+
+    // A representative SWA layer at a context of `ctx` tokens; 0 when the model has no window.
+    size_t kv_bytes_per_swa_layer(uint32_t ctx) const {
+        if (!valid() || ctx == 0 || n_swa == 0) {
             return 0;
         }
         // Must match the actual SWA KV size from llama_kv_cache_iswa:
@@ -719,7 +759,7 @@ struct placement_kv_info {
         // kv_bytes_for_layer() below once layer_kind/layer_k_width/
         // layer_v_width are populated.
         // Tensor per layer: K=[n_embd_k_gqa, size_swa] + V=[n_embd_v_gqa, size_swa], both fp16.
-        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
                                        n_seq_max, kv_unified, swa_full);
     }
 
@@ -733,15 +773,40 @@ struct placement_kv_info {
     // aggregate split when layer_kind/layer_k_width/layer_v_width are not
     // populated (an inventory built before this ticket, or a homogeneous
     // model that never needed per-layer truth).
-    size_t kv_bytes_for_layer(uint32_t il) const {
-        if (!valid()) {
+    size_t kv_bytes_for_layer(uint32_t il) const { return kv_bytes_for_layer_at(il, n_ctx); }
+
+    // Layer `il`'s KV at a context of `ctx` tokens, every other input of the shape as this struct carries it. The
+    // planner sizes the KV room of the context the model opens with from it (llama.cpp-8ecj), so that room and the
+    // per-layer charge above come from the same rule.
+    size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
+        if (!valid() || ctx == 0) {
             return 0;
         }
         if (has_per_layer_kv_truth(il)) {
-            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,
-                                           n_seq_max, kv_unified, swa_full);
+            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,
+                                           n_seq_max, kv_unified, swa_full) +
+                   kv_idx_bytes_for_layer_at(il, ctx);
         }
-        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer() : kv_bytes_per_layer();
+        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);
+    }
+
+    // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
+    // kv_bytes_for_layer_at(), which is what every budget charges. The allocator sizes the indexer buffer apart from
+    // the K/V one through placement_plan::kv_idx_size_for_layer(), not through this helper (llama.cpp-8ecj).
+    size_t kv_idx_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
+        if (!valid() || ctx == 0 || !has_per_layer_kv_truth(il) || idx_k_width(il) == 0) {
+            return 0;
+        }
+        return kv_layer_bytes_for_kind(layer_kind[il], idx_k_width(il), 0, ctx, n_swa, n_ubatch, n_seq_max, kv_unified,
+                                       swa_full);
+    }
+
+    // What the context the model opens with needs on top of the KV charged at n_ctx for layer `il`: 0 when that
+    // context is unknown or no larger.
+    size_t kv_context_extra_bytes_for_layer(uint32_t il) const {
+        const size_t at_context = kv_bytes_for_layer_at(il, n_ctx_context);
+        const size_t charged    = kv_bytes_for_layer(il);
+        return at_context > charged ? at_context - charged : 0;
     }
 };
 
@@ -756,6 +821,125 @@ struct moe_mmid_owner_workspace_plan {
     size_t                      device_pool_bytes = 0;
     size_t                      host_pool_bytes   = 0;
 };
+
+// llama.cpp-5tdy: residency counts for one group of expert entries -- one
+// (layer, role) of the semantic expert index, or one tensor name of the
+// name-keyed fallback index -- so the per-op residency predicates read a count
+// instead of sweeping every expert through lookup_expert_placement(). The plan
+// stays the authority: placement_plan::build_index() derives the groups from
+// the entries, and placement_plan::update_expert_placement() moves an entry
+// between counts. Nothing else may change an indexed entry's on_device or
+// target_device without calling build_index() again (the same contract the
+// indexes themselves already carry).
+struct expert_residency_group {
+    int32_t                              n_entries   = 0;      // experts indexed in the group
+    int32_t                              expert_span = 0;      // max expert_id + 1 over the group
+    int32_t                              n_host      = 0;      // entries with on_device == false
+    std::vector<std::pair<int, int32_t>> on_device_by_target;  // on_device entries per target_device
+
+    int32_t n_on_device() const { return n_entries - n_host; }
+
+    int32_t n_on_target(int target) const {
+        for (const auto & [dev, count] : on_device_by_target) {
+            if (dev == target) {
+                return count;
+            }
+        }
+        return 0;
+    }
+
+    void count_residency(bool on_device, int target, int32_t delta) {
+        if (!on_device) {
+            n_host += delta;
+            return;
+        }
+        for (auto & [dev, count] : on_device_by_target) {
+            if (dev == target) {
+                count += delta;
+                return;
+            }
+        }
+        on_device_by_target.emplace_back(target, delta);
+    }
+
+    void add_entry(const placement_entry & e) {
+        n_entries++;
+        expert_span = std::max(expert_span, static_cast<int32_t>(e.expert_id) + 1);
+        count_residency(e.on_device, e.target_device, 1);
+    }
+};
+
+// Counts over experts [0, n) of one (layer, role), semantic index only.
+struct expert_residency_counts {
+    int64_t found     = 0;  // experts with a semantic entry
+    int64_t host      = 0;  // found and on_device == false
+    int64_t on_device = 0;  // found and on_device (any target)
+    int64_t on_target = 0;  // found, on_device and target_device == the queried device
+};
+
+// The planner's decision on an explicit micro-batch's PP MoE oneDNN scratch ring (docs/backend/sycl-memory-design.md,
+// "Explicit micro-batch placement"). The ring is planned in the RUNTIME zone for the micro-batch the caller named, and
+// routed experts give up the device room it needs, as KV that does not fit is re-placed rather than refused. A load
+// fact the runtime context transaction reads: PLACE announces the experts the room moved to the host tier, REFUSE
+// refuses the context with the largest -ub that fits.
+struct placement_explicit_ubatch {
+    uint32_t                             n_ubatch                 = 0;  // the micro-batch decided for; 0 = no decision
+    pp_moe_onednn_explicit_ubatch_action action                   = pp_moe_onednn_explicit_ubatch_action::NONE;
+    size_t                               ring_bytes               = 0;  // the whole ring at n_ubatch
+    size_t                               room_bytes               = 0;  // its RUNTIME zone over the default ring's
+    size_t                               room_reserved_bytes      = 0;  // of that room, what the zone already holds
+    // The device bytes left to the routed experts when the room was decided. They still count bytes the window ring's
+    // room may later hold: that room is sized over the pack it predicts, so it is held last, once every group's
+    // charge is final, and this room is decided before it.
+    size_t                               expert_budget_bytes      = 0;
+    // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
+    // first-fit pack puts there with the held room added back (all 0 when nothing was held). The room moved the
+    // difference. Counting instead the triplets that fit the second budget and not the real one over-states it, as
+    // for the KV context room: the larger budget can take a larger triplet and then skip smaller ones the real pack
+    // did place. The layers are the ones that keep fewer triplets on the device.
+    size_t                               expert_bytes             = 0;
+    size_t                               expert_groups            = 0;
+    size_t                               expert_bytes_without     = 0;
+    size_t                               expert_groups_without    = 0;
+    size_t                               moved_layers             = 0;
+    // REFUSE: the most the ring could have with every device-resident routed expert on the host tier, and the largest
+    // micro-batch whose ring fits that.
+    size_t                               max_ring_runtime_bytes   = 0;
+    uint32_t                             largest_fitting_n_ubatch = 0;
+    // The named hold on the routed-expert budget: what it is for, and the bytes the expert pack saw subtracted (the
+    // whole room on PLACE and GROW_ZONE, 0 otherwise).
+    const char *                         hold_reason              = nullptr;
+    size_t                               hold_bytes               = 0;
+    // Set on the plan the context that announced the placement at WARN published. Every later context's plan copies
+    // it, so a load announces its placement once, whatever micro-batch each context runs.
+    bool                                 announced                = false;
+
+    size_t moved_bytes() const { return expert_bytes_without > expert_bytes ? expert_bytes_without - expert_bytes : 0; }
+};
+
+// The compute room the RUNTIME zone of a placed explicit micro-batch holds for that micro-batch's compute buffers, for
+// the hold-spill fit to credit (zone_hold_fit_inputs): `compute_term`, the planned compute term the zone holds beside
+// the micro-batch's ring and dense scratch, with xub.n_ubatch in *n_ubatch. Only PLACE sized the zone for the
+// micro-batch. GROW_ZONE plans again and reads PLACE, a growth that failed plans with no decision, and REFUSE and NONE
+// sized nothing, so each of those gives 0 with *n_ubatch 0.
+size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
+                                              size_t                            compute_term,
+                                              uint32_t *                        n_ubatch);
+
+// Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
+// since the load whose plan PLACED the micro-batch and whose room cost device bytes of routed experts. The bytes
+// decide, not the count of triplets: with triplets of unequal size the device can keep as many triplets and still hold
+// fewer bytes. The context's own micro-batch does not enter, because the line names the micro-batch the load placed,
+// and a context whose micro-batch differs (llama-bench's -p below -ub) would otherwise leave a load that moved experts
+// unannounced.
+bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode);
+
+// The micro-batch the runtime context transaction re-plans the PP MoE oneDNN scratch ring for: the one the load placed
+// when its plan PLACED it and the context's own micro-batch is no larger, else the context's own. The load decided the
+// ring's size, and a smaller context deriving a smaller ring would be a second source for that fact; the ring it
+// released would then have to be re-admitted by the next context of the same load. A context at 0 names no micro-batch,
+// so it keeps its own and the re-plan reports it.
+uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch);
 
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
@@ -772,6 +956,22 @@ struct placement_plan {
     bool                         multi_device;       // True if plan spans multiple GPUs
     size_t                       kv_per_layer     = 0;
     size_t                       kv_per_swa_layer = 0;
+    // llama.cpp-8ecj: device room the load plan held, after the dense weights and their KV and before the routed
+    // experts, for the KV the context the model opens with adds on top of the KV charged at planner_n_ctx. Counted in
+    // vram_bytes until the runtime context transaction re-derives the KV totals for its real shape.
+    size_t                                     kv_context_reserve_bytes        = 0;
+    // The device bytes of routed experts that room cost: the stored bytes a first-fit pack with the room added back
+    // puts on the device, minus those the real pack put there (net). A load fact, for the log and the planner tests;
+    // the runtime never promotes the experts back (fkpg).
+    size_t                                     kv_context_room_displaced_bytes = 0;
+    // The explicit micro-batch's PP MoE oneDNN scratch ring decision (single-device plans; see the struct).
+    placement_explicit_ubatch                  explicit_ubatch;
+    // Device room the load plan held in the WEIGHT zone, after the KV room and before the routed experts, for the
+    // prompt phase's window ring: the bytes moe_stream_plan_ring_geometry gives for this plan, so the ring's first
+    // reserve finds its slots there and the expert loan is only the fallback. Counted in vram_bytes, and kept there
+    // when the runtime context transaction re-derives the KV totals, because the ring is reserved again at every
+    // prompt. 0 when the plan stages nothing, has no host expert, or is a multi-device plan.
+    size_t                                     moe_stream_ring_reserve_bytes = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     // llama.cpp-3aos: mirrors placement_kv_info::layer_kind/layer_k_width/
     // layer_v_width -- see that struct's field comments. Copied in at plan
@@ -784,9 +984,8 @@ struct placement_plan {
     std::vector<uint8_t>                       layer_kind;
     std::vector<uint32_t>                      layer_k_width;
     std::vector<uint32_t>                      layer_v_width;
-    // llama.cpp-5efe C4: mirrors placement_kv_info::kv_idx_width -- see that field's comment. Read only by
-    // kv_demand_for_layer() below.
-    uint32_t                                   kv_idx_width             = 0;
+    // llama.cpp-8ecj: mirrors placement_kv_info::layer_idx_k_width, the indexer key cache's width per layer.
+    std::vector<uint32_t>                      layer_idx_k_width;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
@@ -1055,7 +1254,8 @@ struct placement_plan {
         if (has_per_layer_kv_truth(layer_id)) {
             return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],
                                            planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,
-                                           planner_kv_unified, planner_swa_full);
+                                           planner_kv_unified, planner_swa_full) +
+                   kv_idx_size_for_layer(layer_id);
         }
         // Fallback: legacy uniform-per-class split (no per-layer truth populated).
         if (kv_per_swa_layer > 0 && layer_id < swa_layer_mask.size() && swa_layer_mask[layer_id]) {
@@ -1064,19 +1264,27 @@ struct placement_plan {
         return kv_per_layer;
     }
 
-    // llama.cpp-5efe C4: what a layer asks of the tier that holds its KV -- kv_size_for_layer() plus the indexer keys
-    // cached beside it (kv_idx_width elements per cell, every cell of the context, at the planner's fp16 K size).
-    // A layer that carries no KV carries no indexer either. Both runtime demotion sites read this, so the printed
-    // host-KV figure counts what the load pins. kv_size_for_layer() itself sizes the device per-layer slab and is
-    // deliberately unchanged: on the device the idx_ tensors are not remapped into a layer slab ([KV-REMAP] matches
-    // only cache_k_l / cache_v_l), and how the device accounts for them is llama.cpp-ka9c's.
-    size_t kv_demand_for_layer(uint32_t layer_id) const {
-        const size_t kv = kv_size_for_layer(layer_id);
-        if (kv == 0 || kv_idx_width == 0) {
-            return kv;
+    // The layer's indexer keys (llama.cpp-8ecj): part of kv_size_for_layer(), the layer's KV every budget charges;
+    // kv_tier_manager::configure_from_plan() sizes the indexer buffer from it alone.
+    size_t kv_idx_size_for_layer(uint32_t layer_id) const {
+        const uint32_t width = layer_id < layer_idx_k_width.size() ? layer_idx_k_width[layer_id] : 0;
+        if (width == 0 || !has_per_layer_kv_truth(layer_id)) {
+            return 0;
         }
-        return kv + static_cast<size_t>(planner_n_ctx) * static_cast<size_t>(kv_idx_width) * sizeof(ggml_fp16_t);
+        return kv_layer_bytes_for_kind(layer_kind[layer_id], width, 0, planner_n_ctx, planner_n_swa, planner_n_ubatch,
+                                       planner_n_seq_max, planner_kv_unified, planner_swa_full);
     }
+
+    // The layer's K/V buffer alone: its KV without the indexer keys, which llama allocates in a buffer of their own.
+    size_t kv_main_size_for_layer(uint32_t layer_id) const {
+        return kv_size_for_layer(layer_id) - kv_idx_size_for_layer(layer_id);
+    }
+
+    // What a layer asks of the tier that holds its KV, read by both runtime demotion sites so the printed host-KV
+    // figure counts what the load pins. kv_size_for_layer() already charges the indexer keys cached beside the K/V
+    // (kv_idx_size_for_layer(), from the per-layer width), so the demand is that one figure: a second sum here would
+    // count the indexer twice.
+    size_t kv_demand_for_layer(uint32_t layer_id) const { return kv_size_for_layer(layer_id); }
 
     size_t kv_layer_count() const {
         size_t n = swa_layer_mask.size();
@@ -1110,8 +1318,12 @@ struct placement_plan {
             }
         }
 
-        vram_bytes = weight_vram_bytes + kv_vram_bytes;
-        host_bytes = weight_host_bytes + kv_host_bytes;
+        // The KV of this shape replaces the room the load plan held for the context it expected.
+        kv_context_reserve_bytes = 0;
+        vram_bytes               = weight_vram_bytes + kv_vram_bytes;
+        host_bytes               = weight_host_bytes + kv_host_bytes;
+        // The window ring's room is not KV: it stays held, since the ring is reserved again at every prompt.
+        vram_bytes += moe_stream_ring_reserve_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
         }
@@ -1141,19 +1353,34 @@ struct placement_plan {
         refresh_kv_byte_totals();
     }
 
+    // Non-copying view of one expert's planned entry, or nullptr when the
+    // semantic index has none. Per-op callers use this (llama.cpp-5tdy):
+    // lookup_expert_placement() below returns a copy, std::string and
+    // std::vector included, and is kept for planner and diagnostic paths.
+    const placement_entry * find_expert_entry(int layer_id, int expert_id, expert_tensor_role role) const {
+        auto it = expert_placement_index_.find(expert_placement_key{ layer_id, expert_id, role });
+        return it == expert_placement_index_.end() ? nullptr : &entries[it->second];
+    }
+
+    // Parses the tensor name on every call: a caller asking about several
+    // experts of one tensor parses once and uses the 3-arg overload.
+    const placement_entry * find_expert_entry(const char * tensor_name, int expert_id) const {
+        return find_expert_entry(expert_layer_from_tensor_name(tensor_name), expert_id,
+                                 expert_tensor_role_from_tensor_name(tensor_name));
+    }
+
     expert_placement_result lookup_expert_placement(int layer_id, int expert_id, expert_tensor_role role) const {
         expert_placement_result result;
         result.layer_id  = layer_id;
         result.expert_id = expert_id;
         result.role      = role;
 
-        const expert_placement_key key{ layer_id, expert_id, role };
-        auto                       it = expert_placement_index_.find(key);
-        if (it == expert_placement_index_.end()) {
+        const placement_entry * found = find_expert_entry(layer_id, expert_id, role);
+        if (!found) {
             return result;
         }
 
-        const auto & e           = entries[it->second];
+        const auto & e           = *found;
         result.status            = expert_placement_status::FOUND;
         result.tensor_name       = e.name;
         result.on_device         = e.on_device;
@@ -1201,6 +1428,19 @@ struct placement_plan {
             saturating_sub(host_bytes, e.dst_size + e.kv_size);
             weight_vram_bytes += charge;
             vram_bytes += charge + e.kv_size;
+        }
+
+        auto group_it = expert_groups_.find(expert_residency_group_key(layer_id, role));
+        if (group_it != expert_groups_.end()) {
+            group_it->second.count_residency(e.on_device, e.target_device, -1);
+            group_it->second.count_residency(on_device, target, 1);
+        }
+        if (expert_fallback_entries_.count(it->second) != 0) {
+            auto fallback_it = expert_fallback_groups_.find(e.name);
+            if (fallback_it != expert_fallback_groups_.end()) {
+                fallback_it->second.count_residency(e.on_device, e.target_device, -1);
+                fallback_it->second.count_residency(on_device, target, 1);
+            }
         }
 
         e.on_device     = on_device;
@@ -1374,55 +1614,101 @@ struct placement_plan {
     // tensor_name: the composite MoE tensor name (e.g. "blk.0.ffn_down_exps")
     // expert_id: individual expert index (0..n_experts-1)
     // device_id: if >= 0, checks assignment to a specific device; -1 checks any device
+    bool expert_on_device(const char * tensor_name, int expert_id, int device_id = -1) const {
+        const placement_entry * e = find_expert_entry(tensor_name, expert_id);
+        if (!e) {
+            // Missing/unclassified entries are explicit host/miss, never implicit device.
+            e = find_fallback_expert_entry(tensor_name, expert_id);
+        }
+        return e && e->on_device && (device_id < 0 || e->target_device == device_id);
+    }
+
     bool expert_on_device(const std::string & tensor_name, int expert_id, int device_id = -1) const {
-        const auto placement = lookup_expert_placement(tensor_name, expert_id);
-        if (placement.found()) {
-            if (!placement.on_device) {
-                return false;
+        return expert_on_device(tensor_name.c_str(), expert_id, device_id);
+    }
+
+    // Counts over experts [0, n_experts) of one (layer, role), semantic index
+    // only. O(1) when the range covers the group (n_experts >= the group's
+    // expert span, which holds whenever n_experts is the tensor's expert count).
+    expert_residency_counts count_planned_experts(int                layer_id,
+                                                  expert_tensor_role role,
+                                                  int64_t            n_experts,
+                                                  int                device_id) const {
+        expert_residency_counts        counts;
+        const expert_residency_group * group = find_expert_group(layer_id, role);
+        if (!group || n_experts <= 0) {
+            return counts;
+        }
+        if (n_experts >= group->expert_span) {
+            counts.found     = group->n_entries;
+            counts.host      = group->n_host;
+            counts.on_device = group->n_on_device();
+            counts.on_target = group->n_on_target(device_id);
+            return counts;
+        }
+        // A prefix of the group: walk it through the non-copying view.
+        for (int64_t e = 0; e < n_experts; ++e) {
+            const placement_entry * p = find_expert_entry(layer_id, static_cast<int>(e), role);
+            if (!p) {
+                continue;
             }
-            if (device_id >= 0) {
-                return placement.target_device == device_id;
+            counts.found++;
+            if (!p->on_device) {
+                counts.host++;
+                continue;
             }
+            counts.on_device++;
+            if (p->target_device == device_id) {
+                counts.on_target++;
+            }
+        }
+        return counts;
+    }
+
+    expert_residency_counts count_planned_experts(const char * tensor_name, int64_t n_experts, int device_id) const {
+        return count_planned_experts(expert_layer_from_tensor_name(tensor_name),
+                                     expert_tensor_role_from_tensor_name(tensor_name), n_experts, device_id);
+    }
+
+    // True when every expert in [0, n_experts) has a semantic entry planned on
+    // device_id. Same answer as looping lookup_expert_placement(tensor_name, e)
+    // and requiring found && on_device && target_device == device_id.
+    bool all_experts_on_device(const char * tensor_name, int64_t n_experts, int device_id) const {
+        if (n_experts <= 0) {
             return true;
         }
+        const expert_residency_counts counts =
+            count_planned_experts(expert_layer_from_tensor_name(tensor_name),
+                                  expert_tensor_role_from_tensor_name(tensor_name), n_experts, device_id);
+        return counts.on_target == n_experts;
+    }
 
-        const std::string key = tensor_name + ":e" + std::to_string(expert_id);
-        auto              it  = expert_index_.find(key);
-        if (it == expert_index_.end()) {
-            return false;  // Missing/unclassified entries are explicit host/miss, never implicit device.
-        }
-        const auto & e = entries[it->second];
-        if (!e.on_device) {
-            return false;
-        }
-        if (device_id >= 0) {
-            return e.target_device == device_id;
-        }
-        return true;
+    // How many experts in [0, n_experts) expert_on_device(tensor_name, e, device_id) holds for.
+    int64_t count_experts_on_device(const char * tensor_name, int64_t n_experts, int device_id = -1) const {
+        const int                     layer_id = expert_layer_from_tensor_name(tensor_name);
+        const expert_tensor_role      role     = expert_tensor_role_from_tensor_name(tensor_name);
+        const expert_residency_counts counts   = count_planned_experts(layer_id, role, n_experts, device_id);
+        return (device_id >= 0 ? counts.on_target : counts.on_device) +
+               count_fallback_experts_on_device(tensor_name, layer_id, role, n_experts, device_id);
     }
 
     // Returns true if any expert of the given MoE tensor is planned for host (not device).
-    // Replaces the static plan_has_cpu_cache map in ggml_sycl_mul_mat_id: the expert_index_
-    // already provides O(1) per-expert lookup, so a separate memoization layer is redundant.
+    // Replaces the static plan_has_cpu_cache map in ggml_sycl_mul_mat_id. Reads the
+    // per-(layer, role) residency summary that build_index() and
+    // update_expert_placement() maintain, so it is O(1) per call (llama.cpp-5tdy).
     // device_id: if >= 0, checks residency for that specific device; -1 checks any device.
-    bool has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
+    bool has_host_experts(const char * tensor_name, int64_t n_experts, int device_id = -1) const {
         (void) device_id;
-        for (int64_t e = 0; e < n_experts; ++e) {
-            const auto placement = lookup_expert_placement(tensor_name, static_cast<int>(e));
-            if (placement.found()) {
-                if (!placement.on_device) {
-                    return true;
-                }
-                continue;
-            }
-
-            const std::string key = tensor_name + ":e" + std::to_string(e);
-            auto              it  = expert_index_.find(key);
-            if (it != expert_index_.end() && !entries[it->second].on_device) {
-                return true;
-            }
+        const int                layer_id = expert_layer_from_tensor_name(tensor_name);
+        const expert_tensor_role role     = expert_tensor_role_from_tensor_name(tensor_name);
+        if (count_planned_experts(layer_id, role, n_experts, -1).host > 0) {
+            return true;
         }
-        return false;
+        return fallback_has_host_experts(tensor_name, layer_id, role, n_experts);
+    }
+
+    bool has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
+        return has_host_experts(tensor_name.c_str(), n_experts, device_id);
     }
 
     // Build the name->index lookup after entries are populated.
@@ -1457,15 +1743,125 @@ struct placement_plan {
                 name_index_[e.name] = i;
             }
         }
+
+        // Residency summary (llama.cpp-5tdy). One group per (layer, role) of
+        // the semantic index. The fallback groups hold the name-keyed entries
+        // a by-name query falls back to: those whose own name does not reach a
+        // semantic entry (unclassified roles, a layer the name does not carry).
+        expert_groups_.clear();
+        expert_fallback_groups_.clear();
+        expert_fallback_entries_.clear();
+        for (const auto & [key, index] : expert_placement_index_) {
+            expert_groups_[expert_residency_group_key(key.layer_id, key.role)].add_entry(entries[index]);
+        }
+        for (const auto & [key, index] : expert_index_) {
+            const placement_entry & e = entries[index];
+            if (find_expert_entry(e.name.c_str(), e.expert_id)) {
+                continue;
+            }
+            expert_fallback_groups_[e.name].add_entry(e);
+            expert_fallback_entries_.insert(index);
+        }
     }
 
   private:
+    // Computed in unsigned arithmetic: a name without "blk." parses to layer -1,
+    // and left-shifting a negative signed value is undefined before C++20.
+    static uint64_t expert_residency_group_key(int layer_id, expert_tensor_role role) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(layer_id)) << 8) |
+               static_cast<uint64_t>(static_cast<uint8_t>(role));
+    }
+
+    const expert_residency_group * find_expert_group(int layer_id, expert_tensor_role role) const {
+        auto it = expert_groups_.find(expert_residency_group_key(layer_id, role));
+        return it == expert_groups_.end() ? nullptr : &it->second;
+    }
+
+    // The name-keyed entry a by-name query falls back to when the semantic
+    // index misses ("tensor_name:eN"). Such an entry is named tensor_name and
+    // missed the semantic index when build_index() ran, so build_index() put it
+    // in tensor_name's fallback group: without that group there is nothing to
+    // find, and the key string is never built.
+    const placement_entry * find_fallback_expert_entry(const char * tensor_name, int expert_id) const {
+        if (expert_index_.empty() || !find_fallback_group(tensor_name)) {
+            return nullptr;
+        }
+        const std::string key = std::string(tensor_name) + ":e" + std::to_string(expert_id);
+        auto              it  = expert_index_.find(key);
+        return it == expert_index_.end() ? nullptr : &entries[it->second];
+    }
+
+    const expert_residency_group * find_fallback_group(const char * tensor_name) const {
+        if (expert_fallback_groups_.empty() || !tensor_name) {
+            return nullptr;
+        }
+        auto it = expert_fallback_groups_.find(tensor_name);  // std::less<>: no std::string temporary
+        return it == expert_fallback_groups_.end() ? nullptr : &it->second;
+    }
+
+    // The fallback half of has_host_experts(): an expert in [0, n_experts)
+    // that the semantic index misses and whose name-keyed entry is on host.
+    bool fallback_has_host_experts(const char *       tensor_name,
+                                   int                layer_id,
+                                   expert_tensor_role role,
+                                   int64_t            n_experts) const {
+        const expert_residency_group * group = find_fallback_group(tensor_name);
+        if (!group || group->n_host == 0 || n_experts <= 0) {
+            return false;
+        }
+        if (n_experts >= group->expert_span) {
+            return true;
+        }
+        for (int64_t e = 0; e < n_experts; ++e) {
+            if (find_expert_entry(layer_id, static_cast<int>(e), role)) {
+                continue;
+            }
+            const placement_entry * p = find_fallback_expert_entry(tensor_name, static_cast<int>(e));
+            if (p && !p->on_device) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The fallback half of count_experts_on_device().
+    int64_t count_fallback_experts_on_device(const char *       tensor_name,
+                                             int                layer_id,
+                                             expert_tensor_role role,
+                                             int64_t            n_experts,
+                                             int                device_id) const {
+        const expert_residency_group * group = find_fallback_group(tensor_name);
+        if (!group || n_experts <= 0) {
+            return 0;
+        }
+        if (n_experts >= group->expert_span) {
+            return device_id >= 0 ? group->n_on_target(device_id) : group->n_on_device();
+        }
+        int64_t count = 0;
+        for (int64_t e = 0; e < n_experts; ++e) {
+            if (find_expert_entry(layer_id, static_cast<int>(e), role)) {
+                continue;
+            }
+            const placement_entry * p = find_fallback_expert_entry(tensor_name, static_cast<int>(e));
+            if (p && p->on_device && (device_id < 0 || p->target_device == device_id)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     std::unordered_map<std::string, size_t> name_index_;    // Dense weights: name -> index
     std::unordered_map<std::string, size_t> expert_index_;  // MoE experts: "name:eN" -> index
     std::unordered_map<expert_placement_key, size_t, expert_placement_key_hash>
            expert_placement_index_;                         // MoE experts: (layer, expert, role) -> index
     size_t expert_placement_duplicate_count_    = 0;
     size_t expert_placement_unclassified_count_ = 0;
+    std::unordered_map<uint64_t, expert_residency_group>       expert_groups_;  // (layer, role) -> residency
+    // name -> fallback residency. An ordered map with a transparent comparator,
+    // because unordered_map's heterogeneous find() is C++20: a by-name query
+    // looks a const char * up here per op without building a std::string.
+    std::map<std::string, expert_residency_group, std::less<>> expert_fallback_groups_;
+    std::unordered_set<size_t>                                 expert_fallback_entries_;  // entries counted there
 };
 
 struct moe_mmid_queue_binding {
@@ -1568,6 +1964,21 @@ std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const 
 placement_cache_read                  cache_placement_coherence(const unified_cache * cache) noexcept;
 uint64_t                              lifecycle_next_plan_publication_id() noexcept;
 
+// The one builder of a candidate-shaped snapshot (model_id 0, the load's transaction,
+// version 0).  Staging calls it and stores the result; the load-time measure's plan
+// override calls it and never stores.
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
+                                                                                 placement_plan            plan,
+                                                                                 const placement_kv_info & kv_info = {},
+                                                                                 uint32_t model_n_layer            = 0);
+// The (a)-stage probe placement's plan for a load: the plan the pack would emit if it demoted nothing, owned
+// by the load until aborted, and read by no one outside the measure.
+void                                           lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
+                                                                                    placement_plan            plan,
+                                                                                    const placement_kv_info & kv_info = {},
+                                                                                    uint32_t                  model_n_layer = 0);
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept;
+void                                           lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept;
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
                                     const placement_kv_info & kv_info       = {},
@@ -1673,37 +2084,95 @@ void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense MMQ/MMVQ Q8_1 src1 buffer from the inventory's
 // bytes-per-token (zone_scoped_maxima().mmq_src1_bytes_per_token) at n_ubatch. Folded into
-// unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
-// `other_model_live`: the inputs are device-global, so while another model is live on the device the larger of
-// the old and the new input is kept (a draft loaded beside a target must not shrink the target's plan). The
-// figure is validated BEFORE anything is stored: a rejected one leaves the stored inputs alone, publishes a zero
-// plan and marks the dense scratch invalid, so the fit check refuses instead of trusting stale inputs.
-bool         unified_cache_set_planned_mmq_src1_scratch(int      device_id,
-                                                        size_t   bytes_per_token,
-                                                        uint32_t n_ubatch,
-                                                        bool     other_model_live = false);
+// unified_cache_get_planned_runtime_zone_requirement(). False on overflow or a refused owner.
+// llama.cpp-45qo: the inputs are `owner`'s own contribution (its model slot and slot generation, canonical contract
+// 12.4), replacing what that owner stored before; another model live on the device keeps its own, the published plan
+// is sized from the merge of the owners' inputs, and an owner's inputs leave with it (unified_cache_drop_planned_load_
+// terms). The figure is validated on that merge BEFORE anything is stored. A rejected one overwrites the owner's
+// earlier input for the buffer with 0 and raises its flag, keeping its n_ubatch. The buffer is sized from the owners
+// whose figure was accepted, so the rejected owner contributes nothing and another live model's plan stays valid
+// (llama.cpp-kpjw); the plan is marked invalid only when the accepted inputs themselves cannot be sized.
+bool     unified_cache_set_planned_mmq_src1_scratch(int                  device_id,
+                                                    lifecycle::SlotToken owner,
+                                                    size_t               bytes_per_token,
+                                                    uint32_t             n_ubatch);
 size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense f16 dequant buffers (src0 copy + src1 copy) from
 // the inventory maxima (zone_scoped_maxima().dequant_f16_weight_bytes / _src1_bytes_per_token) at
-// n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow.
-bool         unified_cache_set_planned_dequant_f16_scratch(int      device_id,
-                                                           size_t   max_weight_bytes,
-                                                           size_t   src1_bytes_per_token,
-                                                           uint32_t n_ubatch,
-                                                           bool     other_model_live = false);
+// n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow or a refused owner.
+// Owner-keyed and validated like the Q8_1 plan (llama.cpp-45qo).
+bool     unified_cache_set_planned_dequant_f16_scratch(int                  device_id,
+                                                       lifecycle::SlotToken owner,
+                                                       size_t               max_weight_bytes,
+                                                       size_t               src1_bytes_per_token,
+                                                       uint32_t             n_ubatch);
 // Both buffers' bytes together (what the RUNTIME zone requirement folds in), and each alone: the graph walk
 // ensures each buffer at max(its own plan, the graph's demand).
 size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
 size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1);
-// llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch` from the inputs the load-time setters were last
-// given. The runtime-context transaction calls it with the runtime n_ubatch (auto-ubatch picks it after load).
-// False when nothing was planned for the device or a figure overflowed.
-// `other_model_live`: another context is live on THIS device, so the plan's n_ubatch is the larger of the stored
-// and the new one (a rollback that restores an exact earlier value passes false).
-bool     unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch, bool other_model_live = false);
-uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id);
+// llama.cpp-kpjw: re-derive both dense scratch plans when backend context `context` (its minted planned-scratch id)
+// publishes `n_ubatch`. The runtime-context transaction calls it with the runtime n_ubatch (auto-ubatch picks it after
+// load). llama.cpp-45qo: from `owner`'s own inputs, at the owner's planned n_ubatch, the largest of the values its live
+// contexts last published. The context's own earlier value is replaced, so the auto-ubatch ladder's settle lowers what
+// a losing rung raised, and another live context of the model keeps its own. Another live model's contribution is left
+// as it is. `owner_n_ubatch` (optional) receives the owner's planned n_ubatch. False when the owner planned nothing on
+// the device, when the owner's own figure for either buffer was rejected (its inputs for that buffer read 0, so it
+// refuses while it is live; another owner's rejection does not refuse it), when the model has no room for another
+// context's value (unified_cache_planned_dense_scratch_context_room), or when a figure overflows.
+bool     unified_cache_replan_planned_dense_scratch(int                  device_id,
+                                                    lifecycle::SlotToken owner,
+                                                    uint64_t             context,
+                                                    uint32_t             n_ubatch,
+                                                    uint32_t *           owner_n_ubatch);
+// Remove backend context `context`'s published n_ubatch on `device_id` (the context is destroyed, releasing its hold)
+// and re-derive its model's plan, which may fall: to the largest of the model's remaining live contexts, or to the
+// load's n_ubatch when none is left. True when the context had published one.
+bool     unified_cache_release_planned_dense_scratch_context(int device_id, uint64_t context);
+// Whether backend context `context` can record a published n_ubatch for `owner` on `device_id`: it has one already,
+// the model has room for another (planned_context_capacity contexts per model per device), or the model holds nothing
+// there. The runtime-context transaction refuses a context without room by name rather than leave it out of the plan.
+bool     unified_cache_planned_dense_scratch_context_room(int device_id, lifecycle::SlotToken owner, uint64_t context);
+// The n_ubatch one half of the published plan is sized at (f16 false: the Q8_1 src1 half; true: the f16 dequant half):
+// the largest of the owners' on the device whose figure for that half was accepted. Each owner's own value is the
+// largest of its live contexts' last published values, or the load's when none is live.
+uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id, bool f16);
+// Whether `owner`'s own figure for either half of the dense scratch plan on `device_id` was rejected, and which (either
+// out may be null). Such an owner has no dense scratch planned, so the runtime-context transaction refuses its context
+// by name (llama.cpp-kpjw: an overflowing figure must not become a small plan). Another owner's rejection is not this
+// owner's. False when the owner holds nothing on the device.
+bool     unified_cache_planned_dense_scratch_owner_rejected(int                  device_id,
+                                                            lifecycle::SlotToken owner,
+                                                            bool *               q8_rejected,
+                                                            bool *               f16_rejected);
 // The plan's total bytes at `n_ubatch` without changing the published plan (a probe asks this).
 bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
+// llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME
+// zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
+// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
+// It is measured at the load's measure shape (n_ctx_train and ubatch 512 until fkpg (a) transports the caller's
+// -c and -ub), so it is the planned term for that shape, not for every context. moua L6 retires it into the
+// FIRST_CONTEXT head slot.
+// Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): `owner` is the model slot and slot generation of the load
+// that measured it, and the setter replaces that owner's term on the device. The getter answers the merge, the largest
+// term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model
+// slot (buffer_owner_slot, no_model_slot), generation 0, or an owner older than the slot's current one
+// (planned_load_terms::set).
+bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
+size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
+// llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the
+// device's plain buffer type occupies in the RUNTIME zone (the recurrent state: the real context allocates it there,
+// RUNTIME-first and outside the compute scope, before the compute buffer, so a compute term alone does not hold the
+// buffer). Folded into unified_cache_get_planned_runtime_zone_requirement() beside the compute term, keyed by owner
+// and merged the same way, with the same refusals.
+bool             unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
+size_t           unified_cache_get_planned_state_term_bytes(int device_id);
+// Drops `owner`'s compute and state terms on every device and republishes the merge; every other owner's stay
+// (llama.cpp-ihk6). Called where the owner ends: its load's rollback and its slot's release. True when something was
+// dropped. noexcept, so the rollback calls it outside any try stage and no failed stage before it can skip it: it
+// takes one leaf mutex and stores atomics, and allocates nothing. std::mutex::lock() is not itself noexcept, so a lock
+// failure here terminates; that is acceptable because a leaf lock, under which nothing is called, can fail only on a
+// self-deadlock.
+bool             unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept;
 // Whether the dense scratch at `n_ubatch` fits the RUNTIME zone's CAPACITY beside the other n_ubatch-independent
 // planned consumers. Capacity, not free space: free space depends on which compute buffers are live, capacity is
 // the fact the plan can be held to. `largest_ubatch` (optional) receives n_ubatch when it fits, else the largest
@@ -2121,12 +2590,12 @@ void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_
 uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
 
 // Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
-// align256(n_ubatch * per_row) for both activation and output, through the
-// same pp_moe_onednn_checked_align_slot_bytes() (moe-scratch-admission.hpp)
-// the ring's own admission uses, so the two cannot round or overflow-check
-// differently. Returns false (leaving the output params untouched) when the
-// per-row bytes are 0 (dense model, no ring planned) or the multiply/align
-// would overflow.
+// align256(n_ubatch * per_row) for both activation and output, through
+// pp_moe_onednn_slots_at() (moe-scratch-admission.hpp), the helper the ring's
+// admission and the explicit micro-batch's room size their slots with, so the
+// three cannot round or overflow-check differently. Returns false (leaving the
+// output params untouched) when the per-row bytes are 0 (dense model, no ring
+// planned) or the multiply/align would overflow.
 bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
                                                   uint32_t n_ubatch,
                                                   size_t * activation_slot_bytes,
@@ -2162,11 +2631,32 @@ uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capac
 void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement);
 moe_control_requirement unified_cache_get_planned_moe_control_requirement(int device_id);
 
+// llama.cpp-cre6: the per-context device scratch the host-expert MoE result scatter copies its compact block into
+// before one kernel places the rows (moe_host_scatter_scratch_bytes: a decode gate/up pair's rows, capped at one
+// kernel launch). Published by populate_host_zone_sizing beside the CONTROL requirement, folded into
+// unified_cache_get_planned_runtime_zone_requirement(), and claimed whole when the runtime-context transaction
+// publishes. It does not follow n_ubatch: a larger flush goes through it in chunks.
+void   unified_cache_set_planned_moe_host_scatter_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
+
 // pp_pipeline + pp_moe_onednn + MoE CONTROL for one device, with every addition
 // checked. Returns false without writing *out when the device's CONTROL
 // requirement could not be computed, which is what stops an unsizable plan from
 // silently becoming a smaller RUNTIME zone.
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out);
+
+// The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()
+// reserves at least this, and an explicit micro-batch's room is measured against the same floor.
+size_t unified_cache_runtime_zone_floor_bytes();
+
+// The RUNTIME zone room the PP MoE oneDNN scratch ring of the explicit micro-batch `n_ubatch` needs on `device_id`
+// above the zone the ring of the load's `n_ubatch_default` needs. Composed from the published plan: the ring geometry,
+// the requirement less its ring and dense scratch parts, the dense scratch at both micro-batches, the floor, and the
+// RUNTIME zone as the arena holds it now. Invalid when the device has no active arena or no ring, n_ubatch is not above
+// n_ubatch_default, or a planned term is unanswerable.
+pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      device_id,
+                                                                      uint32_t n_ubatch,
+                                                                      uint32_t n_ubatch_default);
 
 // Parse GGML_SYCL_MULTI_GPU_MODE env var.
 // Returns HYBRID for MoE models, LAYER for dense-only, unless overridden.
@@ -2497,6 +2987,61 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
     return status == expert_retire_status::WITHDRAWN || status == expert_retire_status::DEFERRED ||
            status == expert_retire_status::NOT_FOUND;
 }
+
+// One member of a resident expert triplet lent to the host for a prompt phase (llama.cpp-mwmr). key is the cache id the
+// member's AOS device entry was direct-staged under. host_keys are the ids the host copy is registered under, the set
+// S1-PRELOAD registers a host-planned expert under; the first must equal key, and its lease is the one returned.
+// host_owner is pinned host storage minted owner-first (unified_allocate_owner) by the caller before it took any listed
+// lock, so no allocation runs under one; its size must hold the device entry's (loan_copy_bytes()).
+struct expert_loan_member {
+    expert_placement_key            placement;
+    ggml_sycl_cache_id              key;
+    std::vector<ggml_sycl_cache_id> host_keys;
+    mem_handle                      host_owner;
+};
+
+// What one loan did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
+// loan carries the device storage it returns, the three device entries' sizes (llama.cpp-pu8v: an entry can exceed the
+// plan's charge by the quantized tail direct staging pads), a lease on each member's host entry (whose bytes are valid
+// once copy_events[i] completes; the entry carries that event as its ready event) and each device entry's retire
+// status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after the entry's
+// leases are gone and behind the copy, which is the entry's last write. device_keys[i] is the key that device entry
+// was retired under: the caller drops every view it holds on the entry by that key, since a retired entry refuses the
+// resolve a view would otherwise be matched by once the cache generation moves (llama.cpp-6aj4).
+struct expert_loan_record {
+    bool                 accepted    = false;
+    const char *         reason      = "none";
+    size_t               bytes_freed = 0;
+    mem_handle           host_handles[3];
+    sycl::event          copy_events[3];
+    expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
+                                              expert_retire_status::INVALID };
+    unified_cache_key    device_keys[3]   = {};
+};
+
+// One member of a lent triplet re-admitted to the device after a prompt phase (llama.cpp-sif1), the loan's member
+// inverted. key is the cache id the member's AOS device entry was staged under and its host copy is published under;
+// host_keys are every id the loan published the host copy under, key first. device_owner is the member's device
+// storage, minted owner-first by the caller from the WEIGHT zone before it took any listed lock, so no allocation for
+// the bytes runs under one; its size must be the host copy's (refill_copy_bytes()).
+struct expert_refill_member {
+    expert_placement_key            placement;
+    ggml_sycl_cache_id              key;
+    std::vector<ggml_sycl_cache_id> host_keys;
+    mem_handle                      device_owner;
+};
+
+// What one refill did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
+// refill carries the device storage it takes, the three host copies' sizes, and a lease on each member's new device
+// entry, whose bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its
+// last write).
+struct expert_refill_record {
+    bool         accepted         = false;
+    const char * reason           = "none";
+    size_t       bytes_readmitted = 0;
+    mem_handle   device_handles[3];
+    sycl::event  copy_events[3];
+};
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Deterministic publication/lifecycle controls exist only in private fixtures.
@@ -3087,6 +3632,56 @@ class unified_cache {
     // event_complete() query for that one entry.
     sycl::queue * get_event_watch_queue();
 
+    // --- MoE join queue: the host-task joins of CPU expert jobs (llama.cpp-wfsl) ---
+    // In-order and non-profiling, on queue_'s context and device, created on first use and drained with the
+    // other queues. The hybrid MoE decode route joins each CPU expert job with a host task, submitted here
+    // instead of on queue_. A host task's command has no queue of its own, so before posting it the SYCL
+    // runtime queries the status of each device event it depends on, and the Level Zero driver answers a
+    // query on an unsignaled event with a sched_yield on the submitting thread. On queue_ every join depended
+    // that way on the device-expert kernel just submitted. Here a join's in-order predecessor is the previous
+    // join, a host-task event with no native handle, which the runtime never queries. So this queue holds
+    // joins only: a device command submitted here would become a join's predecessor. Returns nullptr if
+    // construction failed (logged once); the joins then stay on queue_.
+    sycl::queue * get_moe_join_queue();
+
+    // The join queue, with the latest host task note_compute_host_task() recorded in *after (and *has_after
+    // set) when there is one, which the join must depend on (llama.cpp-wfsl). A join on the join queue is
+    // posted as soon as its predecessors complete, before its job's inputs are ready, and holds the runtime's
+    // host-task thread until the job ends; a host task those inputs waited on that was posted after it could
+    // never run. The latest one suffices: queue_ is in-order, so every earlier host task on it runs on the
+    // worker before the latest, and a job's inputs are submitted before its join, so every host task they
+    // reach was submitted, and recorded, before the join reads the record. The record is written on the
+    // submitting thread right after each submit returns, so a later join on that thread cannot read a stale
+    // event. Reached through unified_cache_moe_join_queue_for(), which checks that no host task is anywhere
+    // else.
+    sycl::queue * moe_join_queue_after(sycl::event * after, bool * has_after);
+
+    // Records `e`, a host task just submitted on queue_ (llama.cpp-wfsl). Reached through
+    // unified_cache_note_host_task().
+    void note_compute_host_task(const sycl::event & e);
+
+    // --- CPU expert job device signals (llama.cpp-qwn5) ---
+    // The ring of host-signalled Level Zero events for the CPU expert jobs whose scatter goes on queue_, created on
+    // queue_'s context on first use (see cpu-job-signal.hpp). Null when the ring cannot be made (logged once): the
+    // jobs then keep their host-task joins. Shut down after the queues drain, abandoned with the other driver state
+    // when SYCL is already gone. Reached through unified_cache_cpu_job_signal_acquire().
+    std::shared_ptr<cpu_job_signal_ring> get_cpu_job_signal_ring();
+
+    // The ring if one was made, else null; never makes one. For a host wait on queue_ that sleeps on the ring's gates
+    // first (unified_cache_cpu_job_gates()), which must not create driver state as a side effect.
+    std::shared_ptr<cpu_job_signal_ring> existing_cpu_job_signal_ring();
+
+    // --- CPU expert job input markers (llama.cpp-42zj) ---
+    // Arms *out on queue_ after `after` (see cpu_job_input_marker in cpu-job-signal.hpp). The host-pinned word is
+    // made on first use; the serial is the next one, and the marker's device task is submitted under the same lock,
+    // so on the in-order queue_ the word only advances. False, leaving *out unarmed and *why naming the reason, when
+    // queue_ is not in order, the word cannot be made (tried once) or was let go at teardown, or the submit throws;
+    // the word's creation and the first throw in the process are logged once the lock is released. Never waits.
+    // Reached through unified_cache_cpu_job_input_marker_arm().
+    bool arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
+                                  cpu_job_input_marker *           out,
+                                  cpu_job_input_marker_refusal *   why);
+
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
     //
@@ -3172,6 +3767,44 @@ class unified_cache {
                                                    ggml_layout_mode   layout,
                                                    const char *       reason = nullptr);
 
+    // Lend one resident expert triplet to the host (llama.cpp-mwmr). Each member's device entry must own its storage
+    // exactly: an AOS entry (c-n4gw) on the device, not retired, whose direct_alloc_owner is its whole allocation and
+    // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. What
+    // the host registration would refuse for is checked too, and a host id that already has an entry, idle or not,
+    // refuses the triplet as "host entry exists": the registration never replaces one, since a failed loan could not
+    // put a replaced entry back (c-mwmr-3). One member that fails refuses the triplet with a reason and leaves no state
+    // behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
+    // owners until it completes; each device entry's last write becomes its copy, so its storage is freed behind the
+    // copy; each device entry is retired exactly; then each host copy is registered with register_host_expert_owned
+    // carrying its copy as the ready event. A registration that fails anyway puts the device entries back. Nothing
+    // here waits and nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of
+    // the device lease, and flips the plan.
+    bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
+
+    // The size each direction's copy must be minted at (llama.cpp-pu8v): the size of the entry it will hold, which
+    // the transaction compares it with. loan_copy_bytes() is the AOS device entry direct staging filed under key, which
+    // a loan copies whole; refill_copy_bytes() is the host copy a loan published under key, which a refill's device
+    // storage must equal. Each can exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to
+    // MATRIX_ROW_PADDING columns, and the plan does not count it. Read under direct_stage_mutex_ and rw_mutex_, shared;
+    // the transaction checks again under its own locks, so an entry that changes in between is refused there. 0 when
+    // there is no such entry, or it is retired.
+    size_t loan_copy_bytes(ggml_sycl_cache_id key) const;
+    size_t refill_copy_bytes(ggml_sycl_cache_id key) const;
+
+    // Re-admit one lent triplet to the device (llama.cpp-sif1), the inverse of loan_expert_triplet(). Each member's
+    // host copy must be the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is
+    // its whole pinned storage, which the direct mirror and the id mapping both name, with no device entry under the
+    // member's direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry
+    // exists", so a later boundary retries). One member that fails refuses the triplet with a reason and leaves no
+    // state behind. Otherwise the three H2D copies go on the BCS queue behind the host copy's writes, each retaining
+    // its two owners until it completes, so the pinned storage outlives the read whatever happens to its entry. Under
+    // direct_stage_mutex_ and rw_mutex_, all three or none, each device entry is published IN_PROGRESS behind its copy
+    // and takes over the direct mirror and the id mapping, then each host copy is retired exactly under every host id
+    // still naming its storage; what follows the device entries' insertion allocates nothing. Nothing here waits and
+    // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the host lease,
+    // remembers the device lease, and flips the plan.
+    bool refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out);
+
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
     // A yield can release the device-resident, non-retired copies
@@ -3226,6 +3859,27 @@ class unified_cache {
                               mem_handle *       out_handle = nullptr) {
         return register_host_expert(key, ptr, size, layout, out_handle, {});
     }
+
+    // Same, for host storage minted owner-first (unified_allocate_owner).  The
+    // entry keeps allocation_owner as its direct_alloc_owner, so every lease on
+    // it reports that allocation's provenance through owner_metadata(): the
+    // copy path trusts a host source for a direct USM copy only on that
+    // evidence (llama.cpp-36j0).  It also retains allocation_owner as the
+    // entry's storage owner, so release is unchanged.  An invalid
+    // allocation_owner registers ptr as unowned external storage.  A non-null
+    // ready_event publishes the entry IN_PROGRESS behind it: a loan registers
+    // its host copy while the D2H copy that fills it is still in flight.
+    // replace_existing = false refuses when the key already has an entry, of
+    // any state, instead of replacing an idle one with its storage: a loan
+    // must be able to undo every registration it made (c-mwmr-3).
+    bool register_host_expert_owned(ggml_sycl_cache_id  key,
+                                    void *              ptr,
+                                    size_t              size,
+                                    ggml_layout_mode    layout,
+                                    mem_handle *        out_handle,
+                                    const mem_handle &  allocation_owner,
+                                    const sycl::event * ready_event      = nullptr,
+                                    bool                replace_existing = true);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -3616,6 +4270,22 @@ class unified_cache {
         return std::atomic_load_explicit(&placement_plan_snapshot_, std::memory_order_acquire);
     }
 
+    // A hint in front of the locked republish-into-empty: the key of the owning
+    // load, bound to the plan publication epoch, for which a locked pass found this
+    // cache is not one of the plan's devices (0: none).  It only lets a later call for
+    // the same owner skip the inventory lock; the locked pass stays the authority, a
+    // different owner never matches, and any later publication changes the epoch, so a
+    // re-plan that adds this device cannot be hidden by it.  Written under
+    // g_tensor_inventory_mutex.
+    uint64_t into_empty_skip_key() const { return into_empty_skip_key_.load(std::memory_order_acquire); }
+
+    void set_into_empty_skip_key(uint64_t key) { into_empty_skip_key_.store(key, std::memory_order_release); }
+
+    // The owner a foreign-plan notice was last logged for, so it prints once per owner.
+    uint64_t into_empty_foreign_key() const { return into_empty_foreign_key_.load(std::memory_order_acquire); }
+
+    void set_into_empty_foreign_key(uint64_t key) { into_empty_foreign_key_.store(key, std::memory_order_release); }
+
     // Access the internal SYCL queue (for deferred free of temp allocations
     // made on this queue's context, e.g. GPU-side reorder temp buffers).
     sycl::queue & get_queue() { return queue_; }
@@ -3646,7 +4316,13 @@ class unified_cache {
     bool ensure_planned_arena_zones();
 
     // Is arena active?
-    bool arena_active() const { return arena_base_ != nullptr; }
+    bool arena_active() const { return zone_backed(); }
+
+    // The zones have backing and zone routing applies.
+    bool zone_backed() const { return arena_base_ != nullptr; }
+
+    // The device's backing kind, fixed at construction.
+    ggml_sycl_arena_backing_type arena_backing() const { return arena_backing_; }
 
     // Base pointer.
     void * arena_base() const { return arena_base_; }
@@ -3671,9 +4347,27 @@ class unified_cache {
 
     // Zone capacity and usage.
     size_t zone_capacity(vram_zone_id zone) const;
+    // The committed planned capacity only, never a bound load's view. Read off
+    // a VM device it is a plan defect.
+    size_t zone_capacity_committed(vram_zone_id zone) const;
+    // The calling thread's bound load transaction's to-commit capacity. Read
+    // off a VM device it is a plan defect.
+    size_t zone_capacity_to_commit(vram_zone_id zone) const;
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
+    // Both free-space figures of one zone, read together under its allocator group's mutex: the
+    // allocators' figures are only coherent under it (zone_available and zone_largest_free read
+    // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
+    // own allocator (RUNTIME, SCRATCH, ONEDNN: the zones the reports print) the four figures satisfy
+    // used + available == capacity; WEIGHT in single-chunk mode takes its availability from the KV
+    // allocator, so that identity is not promised for it. Takes the group mutex, so a caller already
+    // inside the group (an allocation, a refusal) must not call it. False when no arena is active.
+    bool   zone_free_figures(vram_zone_id zone,
+                             size_t &     capacity,
+                             size_t &     used,
+                             size_t &     available,
+                             size_t &     largest_free);
     void   dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries = 32) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
@@ -3748,6 +4442,16 @@ class unified_cache {
     void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
     bool     test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
     uint64_t test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const;
+    // The lease count of the AOS device entry direct staging published for key, in *in_use; false when there is none
+    // (erased, or never staged). A retired entry still answers until the deferred-free pass erases it.
+    bool     test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint32_t * in_use) const;
+    // The lease count and retired flag of the host entry register_host_expert published for key, and, in *owner, the
+    // allocation metadata of the owner it holds (empty without one); false when there is none. The owner's provenance
+    // is what the copy path reads to decide whether a copy from the entry is direct (llama.cpp-sif1).
+    bool     test_expert_host_entry_state(ggml_sycl_cache_id key,
+                                          uint32_t *         in_use,
+                                          bool *             retired,
+                                          alloc_metadata *   owner = nullptr) const;
     // Retain a reference to a staged weight's allocation owner until `event`,
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
@@ -3868,7 +4572,13 @@ class unified_cache {
                                  dma_stream_slice_fn              slice_fn,
                                  const void *                     ctx,
                                  const std::vector<sycl::event> & deps,
-                                 dma_stream_copy_fn               copy_fn = nullptr);
+                                 dma_stream_copy_fn               copy_fn     = nullptr,
+                                 // The caller's own file and function, defaulted at the call site, name the
+                                 // caller in the stream_dma_non_device_arrivals dump key (two callers in
+                                 // one file, the mul_mat stream and the MoE expert stream, stay apart).
+                                 // Pass nothing.
+                                 const char *                     caller_file = __builtin_FILE(),
+                                 const char *                     caller_func = __builtin_FUNCTION());
 
     // Defer freeing host allocations until the associated event completes.
     void defer_host_free(void * ptr, size_t size, const sycl::event & event);
@@ -3950,8 +4660,12 @@ class unified_cache {
     // symmetric: ONEDNN-zone with TP inactive reclaims immediately
     // (in-order-queue safety), ONEDNN-zone with TP active defers via
     // enqueue_deferred_zone_free() (the in-order-queue argument does not
-    // hold under TP), and DIRECT-fallback always defers via
-    // retain_handles_until_event().
+    // hold under TP), and DIRECT-fallback parks in the reuse pool (a real
+    // release past the per-size depth goes through
+    // retain_handles_until_event()). A parked DIRECT entry is reusable at
+    // once under the same in-order-queue argument, and only after its
+    // release completes otherwise (llama.cpp-jwjz; see
+    // onednn_graph_scratch_in_order_reuse_allowed()).
     void   onednn_graph_scratch_free(void * ptr, const sycl::event * event);
 
     // Peak bytes concurrently outstanding across every onednn_graph_scratch_alloc()
@@ -3960,6 +4674,13 @@ class unified_cache {
     // log answer "did N MiB actually fit in the planned zone" for a run that
     // already finished. Zero if the allocator was never used this process.
     size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
+
+    // llama.cpp-jwjz: the cap on outstanding DIRECT Graph-scratch bytes that
+    // onednn_graph_scratch_alloc() enforces for this cache, read the same way
+    // the allocator reads it. The oneDNN SDPA dispatcher sizes its query-row
+    // chunks to half of it (fattn-onednn-chunk.hpp), so a full chunk's buffer
+    // and the last chunk's buffer fit under it together.
+    size_t onednn_graph_scratch_direct_cap() const;
 
     // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to
     // wait for headroom to free up under the cap before it was allowed to
@@ -4060,6 +4781,12 @@ class unified_cache {
     // return) to the free list, rather than inferring it from whether a
     // later park happened to get armed.
     size_t   onednn_graph_scratch_flag_slot_free_list_size_for_test();
+    // llama.cpp-jwjz: makes this cache's DIRECT pool hand back only entries
+    // whose release has completed, the policy it applies under TP, so a test
+    // on a TP-less process can still exercise the skip-an-in-flight-entry
+    // paths. A no-op unless GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS is set, like
+    // every other hook in this file.
+    void     onednn_graph_scratch_force_completion_gated_reuse_for_test(bool force);
 
     // Public, self-locking entry point: releases (for real) every pooled
     // DIRECT Graph-scratch buffer, then logs the pool summary -- clear
@@ -4666,6 +5393,24 @@ class unified_cache {
     uint32_t                     onednn_graph_scratch_flag_generation_counter_     = 0;
     bool                         onednn_graph_scratch_flag_slab_warned_            = false;
     bool                         onednn_graph_scratch_flag_slots_exhausted_warned_ = false;
+
+    // llama.cpp-jwjz: the last marker kernel armed on each slab slot, sized
+    // with the slab and cleared with it. In-order reuse can return a slot to
+    // the free list while its marker is still pending, so the next marker on
+    // that slot also depends on this one; see
+    // onednn_graph_scratch_pool_entry::flag_slot. Accessed only under
+    // onednn_graph_scratch_mutex_. std::optional, not a default-constructed
+    // sycl::event for "no marker yet": that event is complete, but SYCL 2020
+    // constructs it as if from a default-constructed queue, so it carries the
+    // default device's default context, while the watch queue runs in this
+    // cache queue's own context (ensure_single_device_context_queue() builds
+    // queue_ on a fresh sycl::context(dev)). Depending on it would be a
+    // cross-context dependency on a slot's first park.
+    std::vector<std::optional<sycl::event>> onednn_graph_scratch_flag_slot_last_marker_;
+    // llama.cpp-jwjz: set only through
+    // onednn_graph_scratch_force_completion_gated_reuse_for_test().
+    std::atomic<bool>                       onednn_graph_scratch_force_completion_gated_reuse_{ false };
+
     // llama.cpp-c6ah: see the public accessor's own comment above.
     // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
     // removal site that can retire an armed-but-incomplete entry's slot.
@@ -4674,6 +5419,29 @@ class unified_cache {
     // get_event_watch_queue().
     std::unique_ptr<sycl::queue> event_watch_queue_;
     std::once_flag               event_watch_queue_once_;
+    // llama.cpp-wfsl: see get_moe_join_queue(). last_host_task_, last_host_task_valid_ and
+    // moe_join_queue_announced_ are read and written only under moe_join_mutex_.
+    std::unique_ptr<sycl::queue> moe_join_queue_;
+    std::once_flag               moe_join_queue_once_;
+    std::mutex                   moe_join_mutex_;
+    sycl::event                  last_host_task_;
+    bool                         last_host_task_valid_     = false;
+    bool                         moe_join_queue_announced_ = false;
+    // llama.cpp-qwn5: see get_cpu_job_signal_ring(). Both are read and written only under cpu_job_signal_mutex_,
+    // because shutdown_resources() reads the ring on the tearing-down thread.
+    std::mutex                           cpu_job_signal_mutex_;
+    std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_;
+    bool                                 cpu_job_signal_ring_tried_ = false;
+
+    // llama.cpp-42zj: see arm_cpu_job_input_marker(). All four are read and written only under
+    // cpu_job_input_marker_mutex_, because shutdown_resources() lets the word go on the tearing-down thread. The
+    // owner is the word's allocation; the jobs share only cpu_job_input_marker_word_, never the owner.
+    std::mutex                                 cpu_job_input_marker_mutex_;
+    mem_handle                                 cpu_job_input_marker_owner_;
+    std::shared_ptr<cpu_job_input_marker_word> cpu_job_input_marker_word_;
+    uint32_t                                   cpu_job_input_marker_serial_ = 0;
+    bool                                       cpu_job_input_marker_tried_  = false;
+
     size_t                       budget_;                   // Total GPU memory budget (after reservations)
     size_t                       base_budget_;              // Raw cache budget before reservations
     size_t                       reserved_;                 // Runtime reservation applied to budget_
@@ -4741,6 +5509,11 @@ class unified_cache {
     // Gated by GGML_SYCL_VRAM_ARENA=1 env var.
     void * arena_base_ = nullptr;
     size_t arena_size_ = 0;
+
+    // Set by the member initialiser, so it is fixed before the constructor body
+    // reserves the arena and survives a failed reserve and arena_destroy().
+    const ggml_sycl_arena_backing_type arena_backing_ =
+        vram_arena_enabled() ? GGML_SYCL_ARENA_BACKING_TYPE_USM : GGML_SYCL_ARENA_BACKING_TYPE_NONE;
 
     struct arena_chunk {
         void *              ptr  = nullptr;
@@ -4898,9 +5671,16 @@ class unified_cache {
     // onednn_graph_scratch_direct_outstanding_bytes_ by, so those bytes
     // stayed charged forever. A single map makes that state unreachable by
     // construction: an entry is found with its size or not found at all.
+    //
+    // in_order (llama.cpp-jwjz): the buffer was handed out to a request on
+    // this cache's own queue while every consumer shared that in-order queue.
+    // free() copies it onto the pool entry, and only such an entry may be
+    // reused while its release is still pending, and only by a request that
+    // satisfies the same condition (see onednn_graph_scratch_alloc()).
     struct onednn_graph_scratch_direct_entry {
         mem_handle owner;
-        size_t     size = 0;
+        size_t     size     = 0;
+        bool       in_order = false;
     };
 
     std::unordered_map<void *, onednn_graph_scratch_direct_entry> onednn_graph_scratch_direct_owners_;
@@ -5017,9 +5797,11 @@ class unified_cache {
     // onednn_graph_scratch_free() releases is no longer hoisted back into
     // the general unified_alloc() pool via retain_handles_until_event(). It
     // is instead PARKED HERE, bucketed by its exact size and gated on its
-    // release event, so a future request of the identical size (the common
-    // case across ubatches within one generation, and across `-r N` reps of
-    // the same benchmark) is served by reuse instead of a fresh
+    // release event (not under in-order reuse, llama.cpp-jwjz: see
+    // onednn_graph_scratch_in_order_reuse_allowed()), so a future request of
+    // the identical size (the common case across ubatches within one
+    // generation, and across `-r N` reps of the same benchmark) is served
+    // by reuse instead of a fresh
     // unified_alloc()/zeMemAllocDevice round trip. Implicitly bounded by
     // onednn_graph_scratch_direct_outstanding_bytes_'s cap: a pooled entry's
     // bytes stay charged against that cap (see the field's own comment
@@ -5056,14 +5838,17 @@ class unified_cache {
         // pool_entry_release_complete() compares the slab's CURRENT value
         // against THIS entry's own generation, so a stale write carrying
         // an older generation cannot be misread as a newer entry's
-        // completion. In the current design a slot is only ever returned
-        // to the free list once its own marker kernel has ALREADY fired
-        // (see onednn_graph_scratch_try_reuse_pool_locked(),
-        // onednn_graph_scratch_evict_pool_until_fits_locked(), and
-        // onednn_graph_scratch_clear_pool_locked(), which retires an
-        // incomplete entry's slot permanently rather than returning it),
-        // so this pairing is defense-in-depth against a future change to
-        // that invariant, not something normal operation exercises today.
+        // completion. In-order reuse (llama.cpp-jwjz) does exercise that:
+        // onednn_graph_scratch_try_reuse_pool_locked() can hand an entry
+        // back while its marker is still pending, and returns the slot to
+        // the free list then. The generation pairing alone is not enough
+        // for that, because the out-of-order watch queue could run the
+        // stale marker AFTER the next occupant's and leave the older value
+        // in the slot. onednn_graph_scratch_flag_slot_last_marker_ closes
+        // it: every marker on a slot also depends on that slot's previous
+        // marker. Eviction returns a slot only once its entry is complete,
+        // and onednn_graph_scratch_clear_pool_locked() still retires an
+        // incomplete entry's slot rather than returning it.
         //
         // History: an earlier version of this design armed a
         // std::shared_ptr<std::atomic<bool>> flag via a host_task instead.
@@ -5084,6 +5869,10 @@ class unified_cache {
         // one instead of a host_task.
         int32_t     flag_slot       = -1;
         uint32_t    flag_generation = 0;
+        // llama.cpp-jwjz: copied from onednn_graph_scratch_direct_entry::in_order
+        // at park time. False for a buffer last used on any other queue, which
+        // then waits for its release like under TP.
+        bool        in_order        = false;
     };
 
     std::unordered_map<size_t, std::vector<onednn_graph_scratch_pool_entry>> onednn_graph_scratch_reuse_pool_;
@@ -5099,8 +5888,8 @@ class unified_cache {
     size_t onednn_graph_scratch_pool_hit_count_      = 0;
     // How many times a DIRECT request found no entry of its exact size in
     // the pool that onednn_graph_scratch_entry_usable_locked() reported
-    // USABLE (event complete, device-resident, and correctly aligned -- not
-    // merely event-complete) -- the request then went through the
+    // USABLE (reusable, device-resident, and correctly aligned -- not
+    // merely reusable) -- the request then went through the
     // cap/eviction path and, ultimately, a real allocation. Logged at
     // teardown alongside the hit count so a run's log answers "how well is
     // the pool actually working" without extra instrumentation.
@@ -5165,6 +5954,32 @@ class unified_cache {
     // member functions, which cannot call a non-const one on `this`.
     bool onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry) const;
 
+    // llama.cpp-jwjz: true when every consumer of a Graph-scratch buffer
+    // submits on this cache's own queue_ and queue_ is in-order: TP is
+    // inactive for this device, and queue_ carries the in_order property.
+    // The queue a device's kernels go to is
+    // ggml_sycl_execution_queue_for_device() (common.hpp), which
+    // ggml_backend_sycl_context::stream() caches: the TP shared-context queue
+    // when TP is enabled, else this cache's queue_. A buffer freed with a
+    // pending release event can then go to the next request at once, because
+    // the next consumer's kernels queue behind the previous consumer's. The
+    // ONEDNN zone free and the DIRECT pool's reuse both read this one
+    // predicate.
+    bool onednn_graph_scratch_consumers_in_order() const;
+
+    // llama.cpp-jwjz: whether the DIRECT pool may hand back an entry whose
+    // release has not completed. It is onednn_graph_scratch_consumers_in_order(),
+    // unless a test forced completion-gated reuse
+    // (onednn_graph_scratch_force_completion_gated_reuse_for_test()).
+    // onednn_graph_scratch_alloc() evaluates it once per request and also
+    // requires the request to be on this cache's queue; the result is the
+    // `requester_in_order` the pool lookups below take. Only
+    // REUSE relaxes. A real release (eviction under the cap, the per-size
+    // depth overflow, the pool clear) still waits for completion, because it
+    // returns the bytes to the general allocator, whose next owner may run
+    // on any queue.
+    bool onednn_graph_scratch_in_order_reuse_allowed() const;
+
     // llama.cpp-c6ah: lazily allocates
     // onednn_graph_scratch_flag_slab_ (a plain already-allocated check, NOT
     // std::call_once like get_event_watch_queue()'s own lazy pattern --
@@ -5193,11 +6008,15 @@ class unified_cache {
     // owner would not resolve -- an anomaly worth a hard stop") without a
     // second, redundant event_complete() query -- see the function's own
     // comment.
+    //
+    // "Reusable" below means the release completed, or in-order reuse is
+    // allowed (onednn_graph_scratch_in_order_reuse_allowed()), in which case
+    // the completion query is skipped and EVENT_PENDING is never returned.
     enum class onednn_graph_scratch_entry_fit {
-        USABLE,              // event complete, resolves on device, and aligned -- ready to reuse
+        USABLE,              // reusable, resolves on device, and aligned -- ready to reuse
         EVENT_PENDING,       // release_event has not completed yet (resolve() was not attempted)
-        RESOLVE_FAILED,      // event complete, but owner.resolve() did not return a device-resident pointer
-        ALIGNMENT_MISMATCH,  // event complete and resolved fine, but not at the requested alignment
+        RESOLVE_FAILED,      // reusable, but owner.resolve() did not return a device-resident pointer
+        ALIGNMENT_MISMATCH,  // reusable and resolved fine, but not at the requested alignment
     };
 
     // Tests pool entry `entry` against a request of `alignment` bytes on
@@ -5223,12 +6042,16 @@ class unified_cache {
     // request -- a caller must NOT query completion on the same entry
     // itself first; doubling the query here would double that cost per
     // candidate entry for no benefit, since EVENT_PENDING already reports
-    // exactly that outcome. Callers must hold
+    // exactly that outcome. It makes no completion query at all when both
+    // `requester_in_order` and entry.in_order hold (llama.cpp-jwjz): the
+    // entry's previous consumer and this request then share the cache's
+    // in-order queue, which orders them. Callers must hold
     // onednn_graph_scratch_mutex_.
     onednn_graph_scratch_entry_fit onednn_graph_scratch_entry_usable_locked(
         const onednn_graph_scratch_pool_entry & entry,
         size_t                                  alignment,
         int                                     device_id,
+        bool                                    requester_in_order,
         resolved_ptr *                          out_resolved = nullptr) const;
 
     // Try to serve `size` bytes from onednn_graph_scratch_reuse_pool_: if a
@@ -5249,6 +6072,7 @@ class unified_cache {
     bool onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
                                                     size_t       alignment,
                                                     int          device_id,
+                                                    bool         requester_in_order,
                                                     mem_handle * out_owner,
                                                     void **      out_ptr);
 
@@ -5266,7 +6090,10 @@ class unified_cache {
     // through onednn_graph_scratch_entry_usable_locked()) -- see that
     // function's comment for why a laxer peek is a silent fail-open of the
     // DIRECT cap. Callers must hold onednn_graph_scratch_mutex_.
-    bool onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const;
+    bool onednn_graph_scratch_pool_size_ready_locked(size_t size,
+                                                     size_t alignment,
+                                                     int    device_id,
+                                                     bool   requester_in_order) const;
 
     // Single entry point for a DIRECT request's pool lookup: looks up
     // `size`/`alignment` for `device_id` via onednn_graph_scratch_try_reuse_pool_locked()
@@ -5287,7 +6114,7 @@ class unified_cache {
     // miss. Miss accounting lives at
     // onednn_graph_scratch_alloc_direct_locked()'s own tail, past every
     // re-check, not here. Callers must hold onednn_graph_scratch_mutex_.
-    void * onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id);
+    void * onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id, bool requester_in_order);
 
     // The DIRECT (non-arena) allocation tail of onednn_graph_scratch_alloc()
     // -- request setup, the forced-fail test hook, the unlock/drain/relock/
@@ -5301,6 +6128,7 @@ class unified_cache {
                                                     size_t                         alignment,
                                                     sycl::queue *                  q,
                                                     int                            device_id,
+                                                    bool                           requester_in_order,
                                                     std::unique_lock<std::mutex> & lock);
 
     // Evict completed (onednn_graph_scratch_pool_entry_release_complete()
@@ -5329,6 +6157,7 @@ class unified_cache {
     // onednn_graph_scratch_pool_size_ready_locked()'s per-iteration peek --
     // see that function's comment for why a peek that ignored them could
     // report "ready" for an entry the post-wait re-check would still miss.
+    // `requester_in_order` is threaded the same way (llama.cpp-jwjz).
     // `out_was_oversized` is set true only when the returned false came from
     // the size>cap early-out (no wait was attempted -- that branch already
     // logs its own latched WARN), false in every other case including a
@@ -5338,6 +6167,7 @@ class unified_cache {
     bool onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
                                                               size_t                         alignment,
                                                               int                            device_id,
+                                                              bool                           requester_in_order,
                                                               std::unique_lock<std::mutex> & lock,
                                                               bool &                         out_was_oversized);
 
@@ -5612,6 +6442,8 @@ class unified_cache {
 
     // === Placement Plan (P4) ===
     mutable std::shared_ptr<const lifecycle_plan_snapshot> placement_plan_snapshot_;
+    std::atomic<uint64_t>                                  into_empty_skip_key_{ 0 };
+    std::atomic<uint64_t>                                  into_empty_foreign_key_{ 0 };
     std::atomic<int>                                       planned_materialization_depth_{ 0 };
 
     bool planned_materialization_allowed(const char *                 op,
@@ -5619,6 +6451,48 @@ class unified_cache {
                                          ggml_layout_mode             layout,
                                          const char *                 caller,
                                          const placement_cache_read * retained_read = nullptr) const;
+
+    // The body of register_host_expert() and register_host_expert_owned():
+    // storage_owner keeps the storage alive, typed_owner (when valid) becomes
+    // the entry's direct_alloc_owner. A non-null ready_event publishes the
+    // entry IN_PROGRESS behind that event (the copy still filling it).
+    // replace_existing = false refuses any key that already has an entry.
+    bool register_host_expert(ggml_sycl_cache_id    key,
+                              void *                ptr,
+                              size_t                size,
+                              ggml_layout_mode      layout,
+                              mem_handle *          out_handle,
+                              std::shared_ptr<void> storage_owner,
+                              const mem_handle &    typed_owner,
+                              const sycl::event *   ready_event      = nullptr,
+                              bool                  replace_existing = true);
+
+    // What retire_expert_entry_at_locked() takes out of the lookup maps, kept as the maps' own nodes, so that
+    // restore_expert_entry_at_locked() puts them back without building new ones and a loan's rollback allocates no
+    // node (llama.cpp-mwmr). Either may be empty: the mirror when it named other storage, the mapping when the id was
+    // mapped to another entry or handed to one.
+    struct expert_retire_nodes {
+        direct_entry_map::node_type mirror;
+        id_map::node_type           mapping;
+    };
+
+    // remap_or_erase_id_mapping_locked(), except that a mapping it would erase moves to *erased instead.
+    void remap_or_extract_id_mapping_locked(const ggml_sycl_cache_id & id,
+                                            const unified_cache_key &  removed_key,
+                                            id_map::node_type *        erased);
+
+    // Retire exactly the entry at `exact`, never another entry under the same id. The direct mirror goes only when it
+    // names that entry's storage, and the id mapping only when it names that entry and no other entry takes the id
+    // over. Each moves to *released as its node, for the caller to drop with no lock held or to hand back to
+    // restore_expert_entry_at_locked(). Allocates nothing. Callers hold direct_stage_mutex_ and rw_mutex_.
+    expert_retire_status retire_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes * released);
+
+    // Undo retire_expert_entry_at_locked() for an entry the caller still holds a lease on: live again, counted out of
+    // the retired entries, and each node retire took re-inserted unless another entry has published its own under the
+    // id since. Re-inserting a node allocates no node; it can grow a map's bucket array only when the map holds more
+    // entries than it did when the node came out. Callers hold direct_stage_mutex_ and rw_mutex_; a node not taken
+    // stays with the caller.
+    void restore_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes & released);
 
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };
@@ -5726,6 +6600,76 @@ unified_cache * get_unified_cache_for_device(int device_id);
 // Use from destructors and shutdown paths where creating a new cache would
 // re-enter allocator/static teardown.
 unified_cache * get_existing_unified_cache_for_device(int device_id);
+
+// The MoE join queue for a CPU expert job whose scatter goes on `stream`, or nullptr to join on `stream`
+// (llama.cpp-wfsl); see unified_cache::get_moe_join_queue() and moe_join_queue_after() for *after. It is used
+// only while every host task of the process has been submitted on one cache's queue_, so that the latest one
+// recorded covers them all. A join or host task on any other queue, or on a second cache's queue_, refuses it
+// for the rest of the process. Creates no cache.
+sycl::queue * unified_cache_moe_join_queue_for(sycl::queue & stream, sycl::event * after, bool * has_after);
+
+// Records `e`, a host task just submitted on `q`, for the join queue's guard (llama.cpp-wfsl). Every host task
+// the backend submits, other than the joins on the join queue, is recorded here.
+void unified_cache_note_host_task(sycl::queue & q, const sycl::event & e);
+
+// --- CPU expert job device signals (llama.cpp-qwn5); see cpu-job-signal.hpp ---
+// Takes an entry of the ring of the cache whose queue_ is `stream`: *job is the half the job signals, *ref the half
+// the pending scatter keeps. False, leaving both empty, when `stream` is not a cache's queue_ (logged once), the ring
+// cannot be made, or it is full; the job is then joined by a host task. Never blocks on the device. Creates no cache.
+bool unified_cache_cpu_job_signal_acquire(sycl::queue & stream, cpu_job_signal * job, cpu_job_signal_ref * ref);
+
+// Makes a fresh sycl::event wrapping the entry's native event, for the flush's device commands to depend on, and
+// records in `mark` the flush that waits on it: the first wrap of a flush sets mark's ring and serial, and a later
+// one must name the same ring. On success *ref is consumed. A fresh wrapper per use is required: the SYCL runtime
+// caches a completed status on an event, so a wrapper kept across a recycle would read complete for the next job.
+// So the wrapper must never be stored past the flush that submits its commands. False leaves *ref unchanged, and the
+// caller joins the job with a host task instead.
+bool cpu_job_signal_wrap(cpu_job_signal_ref & ref, cpu_job_signal_mark & mark, sycl::event * out);
+
+// Frees the entries the device waited on in flushes up to mark's serial, resetting their native events, drops the
+// ring's gates up to mark's gate_serial, and clears `mark`. Call it only after the host has waited an event of mark's
+// flush on the ring's stream: on that in-order stream it completes after every command that waited on those entries.
+void cpu_job_signal_recycle(cpu_job_signal_mark & mark) noexcept;
+
+// The flush makes the device wait on the job whose future is `gate` (cpu_job_gate_list): adds it to the gates of
+// mark's ring and records its serial in mark.gate_serial. Only after a cpu_job_signal_wrap() set `mark`, for the job
+// it wrapped; with an empty mark it keeps nothing. Never waits.
+void cpu_job_signal_gate_push(cpu_job_signal_mark & mark, std::shared_future<void> gate);
+
+// The gates of mark's ring, or null for a mark without one. The pointer shares the ring's ownership.
+std::shared_ptr<cpu_job_gate_list> cpu_job_signal_gates(const cpu_job_signal_mark & mark);
+
+// The gates of the ring of the cache whose queue_ is `stream`, or null when `stream` is not a cache's queue_ or that
+// cache made no ring. Creates no ring and no cache, and holds no lock once it returns.
+std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & stream);
+
+// Arms a CPU expert job's input marker on `stream` after `after` (llama.cpp-42zj), through the cache whose queue_ is
+// `stream`; see unified_cache::arm_cpu_job_input_marker(). False, with *out unarmed and *why naming the reason, when
+// `stream` is not a cache's queue_ or that cache refuses; the caller then waits `after` itself. Never waits. Creates
+// no cache.
+bool unified_cache_cpu_job_input_marker_arm(sycl::queue &                    stream,
+                                            const std::vector<sycl::event> & after,
+                                            cpu_job_input_marker *           out,
+                                            cpu_job_input_marker_refusal *   why);
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// A ring on `q`'s context outside any cache, for the device test; null when the ring cannot be made.
+std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_create_for_testing(sycl::queue & q);
+bool                        cpu_job_signal_acquire_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring,
+                                                               cpu_job_signal *                             job,
+                                                               cpu_job_signal_ref *                         ref);
+cpu_job_signal_book::counts cpu_job_signal_ring_counts_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring);
+void                        cpu_job_signal_ring_shutdown_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring);
+
+// Arms *out on `q` after `after` with `serial`, against `word`, a word the test made and keeps alive past every wait,
+// through the device task the cache's arm submits. The cache, its lock and its word are not used. False when the
+// submit throws.
+bool cpu_job_input_marker_arm_for_testing(sycl::queue &                                      q,
+                                          const std::shared_ptr<cpu_job_input_marker_word> & word,
+                                          uint32_t                                           serial,
+                                          const std::vector<sycl::event> &                   after,
+                                          cpu_job_input_marker *                             out);
+#endif
 
 #if GGML_SYCL_DNNL
 // oneDNN Graph SYCL allocator callbacks (llama.cpp-gwno). Free functions, not
@@ -5921,6 +6865,16 @@ struct alloc_constraints {
     // slice.  Some Level Zero copy paths need the host pointer to be a
     // driver-visible USM allocation base, not an interior TLSF suballocation.
     bool         require_host_usm_base      = false;
+    // The allocation's owner outlives every graph: it is released at model or cache teardown, never by the graph that
+    // first asked for it. A host-zone request carrying it goes to the WEIGHT host zone, which no graph boundary checks
+    // and host_zone_settle() never settles. It must carry neither role KV nor role EXPERT_STAGING (nor be a KV spill):
+    // those choose the KV and SCRATCH zones before WEIGHT is considered, so unified_alloc_host_zone() asserts against
+    // the combination. The host STAGING and SCRATCH zones must be empty at every graph boundary, so one row that lives
+    // for the process there makes every boundary check refuse (llama.cpp-nqbe). Role alone cannot say this: CONTROL
+    // also names scoped host transients, which belong in STAGING so a leaked one is still caught at the boundary. Set
+    // on such a transient, the flag would hide exactly that leak, so its setters are pinned
+    // (tests/test-sycl-host-zone-boundary-owner-source.py).
+    bool         persistent_owner           = false;
     // When arena is active and prefer_vram_zone != COUNT, unified_alloc routes
     // through that VRAM zone (zone_alloc) instead of raw device malloc.
     // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.
@@ -5939,6 +6893,17 @@ struct alloc_constraints {
     // crashed mid-prefill with UR_RESULT_ERROR_OUT_OF_RESOURCES instead of
     // refusing at context init.
     bool         forbid_vram_zone_spill     = false;
+    // Miss classes of the zone chokepoint (unified_cache_zone_refusal). Both are
+    // request parameters, never inferred from the calling function: the request
+    // says whether its refusal has a declared next path in the caller.
+    //   cascade_step        the request's next path is planned (a later step of
+    //                       the same chain, or the caller's own fallback), so a
+    //                       refusal is a counted cascade miss, not a plan bug.
+    //   unconverted_ticket  a literal naming the ticket whose exact term still
+    //                       owns this row's capacity; a refusal is an
+    //                       interim-floor miss reported against that ticket.
+    bool         cascade_step               = false;
+    const char * unconverted_ticket         = nullptr;
     // llama.cpp-kpjw: a compute buffer (the scheduler's backend buffers) that the RUNTIME zone will not serve --
     // held back by the planned dense scratch's hold, or larger than the zone's free bytes -- is placed in the arena's
     // KV zone first, and falls to raw device memory outside the arena only when that has no room. Raw spill eats the
@@ -5948,11 +6913,22 @@ struct alloc_constraints {
     bool         spill_to_kv_zone_before_raw = false;
 };
 
+// Construction-site label. Each type a site builds and hands to an allocator
+// carries the file and line of that construction as default member
+// initialisers, so the raw-exit trace and the chokepoint name the row that asked.
+// The initialisers evaluate where the object is brace-initialised (`T x{}`, a
+// designated initialiser, a helper's default arguments); a braceless `T x;`
+// reports the class definition, so every such declaration is written `T x{}`.
+// An allocator reads the site of the object it receives, never the nested
+// `intent`'s, and a wrapper that builds one request type from another copies
+// the site explicitly.
 struct alloc_intent {
     alloc_role        role      = alloc_role::OTHER;
     runtime_category  category  = runtime_category::OTHER;
     const char *      cohort_id = nullptr;
     alloc_constraints constraints;
+    const char *      site_file = __builtin_FILE();
+    int               site_line = __builtin_LINE();
 };
 
 struct alloc_request {
@@ -5962,6 +6938,8 @@ struct alloc_request {
     size_t        alignment            = 0;  // 0 = allocator default; otherwise power-of-two
     bool          suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
     alloc_intent  intent;
+    const char *  site_file            = __builtin_FILE();
+    int           site_line            = __builtin_LINE();
 };
 
 // Copyable, non-owning exact allocation identity and geometry. Registry rows,
@@ -6075,7 +7053,13 @@ class alloc_owner_control final {
     uint32_t use_count() const noexcept { return refs_.load(std::memory_order_acquire); }
     // Minted once per control from a process-wide counter: never 0, never
     // reused, so it cannot name a later control at a recycled address.
-    uint64_t control_id() const noexcept { return control_id_; }
+    uint64_t                 control_id() const noexcept { return control_id_; }
+
+    // The context-tenant cohort this allocation was tagged with by the carve
+    // (null: not a tenant).  Set once, by alloc_owner::set_tenant_cohort, which
+    // aborts on a second set; written before the owner is shared and read
+    // thereafter.
+    const char * tenant_cohort() const noexcept { return tenant_cohort_.load(std::memory_order_acquire); }
 
   private:
     friend class alloc_owner;
@@ -6093,6 +7077,7 @@ class alloc_owner_control final {
     void abandon() noexcept;
 
     std::atomic<uint32_t> refs_{ 1 };
+    std::atomic<const char *>                       tenant_cohort_{ nullptr };
     uint64_t control_id_ = 0;
     alloc_metadata metadata_{};
     allocation_control_class ownership_class_ = allocation_control_class::EXTERNAL_EXACT;
@@ -6245,6 +7230,8 @@ struct offload_buffer_request {
     size_t              alignment = 64;
     offload_buffer_role role      = offload_buffer_role::OTHER;
     alloc_intent        intent{};
+    const char *        site_file = __builtin_FILE();
+    int                 site_line = __builtin_LINE();
 };
 
 struct offload_buffer_lease {
@@ -6324,6 +7311,47 @@ allocation_result allocation_registry_test_promote(
     const alloc_metadata & metadata,
     const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 bool allocation_registry_test_contains(void * ptr) noexcept;
+// llama.cpp-ii25: the registry's containment index holds exactly the rows that qualify, with their geometry
+// (runtime_registry_index_consistent_locked()). O(n).
+bool allocation_registry_test_index_consistent() noexcept;
+// llama.cpp-ii25: replace-or-insert a host-only LIVE device-VRAM row (what the adopt_raw_* paths do); true when published.
+bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) noexcept;
+// llama.cpp-rriv: what host_zone_settle() / zone_settle() ask of the registry, without a device or an arena.
+//   publish_host / assign_host: a host-pinned row of `bytes` in `zone` (LIVE or RELEASING / replace-or-insert).
+//   publish_irregular: a row whose KEY is not the base the index holds it at (`handle_ptr` differs from `key`, may be
+//   null, and `bytes` may be 0); true when published.
+//   host_zone_rows / host_zone_live: the per-host-zone live-row counter, and the question host_zone_settle() asks.
+//   span_live: "does any row's key fall in [lo, hi)", the question zone_settle() asks; span_irregular_rows: how many rows
+//   make it fall back to scanning the registry.
+//   rows_scanned: registry rows those questions have visited since the last reset (0 on every clean, regular path).
+bool   allocation_registry_test_publish_host(void *       ptr,
+                                             int          device,
+                                             size_t       bytes,
+                                             host_zone_id zone,
+                                             bool         releasing) noexcept;
+bool   allocation_registry_test_assign_host(void * ptr, int device, size_t bytes, host_zone_id zone) noexcept;
+bool   allocation_registry_test_publish_irregular(void * key, void * handle_ptr, size_t bytes) noexcept;
+size_t allocation_registry_test_host_zone_rows(host_zone_id zone) noexcept;
+bool   allocation_registry_test_host_zone_live(host_zone_id zone) noexcept;
+bool   allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept;
+size_t allocation_registry_test_span_irregular_rows() noexcept;
+size_t allocation_registry_test_rows_scanned() noexcept;
+void   allocation_registry_test_reset_rows_scanned() noexcept;
+
+// llama.cpp-nqbe: what `refusals` successive refusals of one host zone report, from a fresh count, through the helper
+// host_zone_settle() takes each refusal's report from: how many name their rows, print the WARN and enumerate the
+// registry, and the zone's count after them.
+struct host_zone_refusal_census {
+    size_t refusals_named    = 0;
+    size_t refusals_warning  = 0;
+    size_t refusals_scanning = 0;
+    int    count             = 0;
+};
+
+host_zone_refusal_census allocation_registry_test_host_zone_refusals(int refusals, bool audit_active) noexcept;
+
+// llama.cpp-ii25: rewrite a registered row's size behind the index's back (the next lookup inside that range must abort).
+bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
@@ -6412,6 +7440,15 @@ registered_release_status release_registered_allocation(const alloc_metadata & e
 // metadata-bearing callers must use release_registered_allocation_exact().
 registered_release_status release_registered_pointer(void * ptr, int expected_device = -1);
 bool       unified_lookup(void * ptr, alloc_metadata * out);
+// The registered allocation that contains `ptr` (any byte of [handle.ptr, handle.ptr + handle.size)), not only one that
+// starts there. O(log n) through the registry's containment index (range-index.hpp).
+//
+// PRECEDENCE: ranges nest (a cache or arena chunk is registered alongside the suballocations carved from it), so several
+// rows can contain `ptr`. The answer is the INNERMOST: the row with the greatest base, which is the smallest enclosing
+// range in a properly nested family. Every caller wants the allocation that is the authority for its pointer (its tier,
+// device, queue and the extent a view may address), and a containing chunk is physical lifetime ownership, not authority
+// over a suballocation inside it. It is deterministic; the scan this replaced returned whichever row unordered_map
+// iteration reached first. A row that is RELEASING is still a row here, as before.
 bool       unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, sycl::queue ** queue_out = nullptr);
 alloc_tier unified_select_tier(const alloc_request & req);
 bool       unified_alloc_validate_registry(int device = -1, const char * where = nullptr);
@@ -6597,6 +7634,121 @@ void                   offload_stats_note_host_fallback_attempt(size_t bytes);
 offload_stats_snapshot offload_stats_get();
 void                   offload_stats_log_summary(const char * tag, int device);
 void                   zero_alloc_check(const char * tag, int device);
+
+// ---------------------------------------------------------------------------
+// L0, the process-global re-plan transaction mutex, and the always-compiled
+// witness (llama.cpp-moua's L0 token, defined in this file's companion unified-cache.cpp).
+//
+// Declared here, beside offload_stats_phase(), because pinned-pool.cpp sits
+// below ggml-sycl.cpp in the layering and reaches this header through
+// common.hpp.  Defined in unified-cache.cpp, together with g_replan_txn_mutex
+// and the thread-local held state.  The token's constructor and destructor are
+// the only writers of that state: there is no setter and no hook, so nothing can
+// mark a thread as holding L0 without locking it.
+// ---------------------------------------------------------------------------
+
+// The outermost token's kind.  ANY is a query value only: an acquire names a
+// concrete kind.  The pool phase gates ask for TRANSACTION, the preload's check
+// asks for LOAD, and a caller that only needs to know whether L0 is held asks ANY.
+enum ggml_sycl_replan_kind : int {
+    GGML_SYCL_REPLAN_KIND_ANY         = 0,
+    GGML_SYCL_REPLAN_KIND_TRANSACTION = 1,  // a context's own planned transaction
+    GGML_SYCL_REPLAN_KIND_LOAD        = 2,  // load_begin, stage_inventory_plan, load_end
+    GGML_SYCL_REPLAN_KIND_LIFECYCLE   = 3,  // every other holder
+};
+
+const char * ggml_sycl_replan_kind_name(ggml_sycl_replan_kind kind);
+
+// True when this thread holds L0 and, unless `kind` is ANY, the OUTERMOST token
+// has that kind.  The one accessor: no second flag exists.
+bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind = GGML_SYCL_REPLAN_KIND_ANY);
+
+struct ggml_sycl_replan_outermost_only_t {
+    explicit ggml_sycl_replan_outermost_only_t() = default;
+};
+
+constexpr ggml_sycl_replan_outermost_only_t ggml_sycl_replan_outermost_only{};
+
+// RAII holder of L0.  An acquire on a thread that already holds L0 is a nested
+// hold: it does not lock and never changes the outermost kind.  An acquire on
+// another thread blocks.  The outermost token unlocks.
+class ggml_sycl_replan_token {
+  public:
+    // Blocking form.
+    explicit ggml_sycl_replan_token(ggml_sycl_replan_kind kind);
+    // Try-lock form (can_unload): owns() is false, and nothing was changed, when
+    // another thread holds L0.
+    ggml_sycl_replan_token(ggml_sycl_replan_kind kind, std::try_to_lock_t);
+    // Outermost-only form (the teardown release proc): entered with L0 already
+    // held on this thread it fails the witness `[REPLAN-TOKEN] release proc
+    // entered with L0 held`, where a nested acquire would not deadlock.
+    ggml_sycl_replan_token(ggml_sycl_replan_kind kind, ggml_sycl_replan_outermost_only_t);
+
+    ~ggml_sycl_replan_token();
+
+    ggml_sycl_replan_token(const ggml_sycl_replan_token &)             = delete;
+    ggml_sycl_replan_token & operator=(const ggml_sycl_replan_token &) = delete;
+
+    bool owns() const { return owns_; }
+
+  private:
+    void acquire(ggml_sycl_replan_kind kind, bool try_only);
+
+    bool owns_ = false;
+};
+
+// A watchdog for a wait that has no timeout of its own (a queue wait, the L0
+// acquire).  It never abandons or forces anything: after the interval it logs a
+// WARN naming the wait now in progress, and again each further interval, while
+// the wait itself carries on; under GGML_SYCL_STRICT_LEASES=1 it aborts at the first
+// interval instead.  The interval is 60 s, or GGML_SYCL_REPLAN_WAIT_WARN_MS.
+// site() names the wait that follows (a string literal, or storage that outlives
+// the watch).  One watch covers a whole sequence of waits, so a rare path pays
+// for one thread, not one per wait.
+uint32_t ggml_sycl_replan_wait_warn_ms();
+
+class ggml_sycl_wait_watch {
+  public:
+    explicit ggml_sycl_wait_watch(const char * what);
+    ~ggml_sycl_wait_watch();
+
+    ggml_sycl_wait_watch(const ggml_sycl_wait_watch &)             = delete;
+    ggml_sycl_wait_watch & operator=(const ggml_sycl_wait_watch &) = delete;
+
+    void site(const char * where) { site_.store(where, std::memory_order_release); }
+
+    // How many warnings have been logged: a test reads it.
+    uint32_t warnings() const { return warnings_.load(std::memory_order_acquire); }
+
+  private:
+    const char *              what_;
+    std::atomic<const char *> site_{ "" };
+    std::atomic<uint32_t>     warnings_{ 0 };
+    std::mutex                mutex_;
+    std::condition_variable   cv_;
+    bool                      done_ = false;
+    std::thread               thread_;
+};
+
+// GGML_SYCL_WITNESS(cond, message): a check that is compiled in every build and
+// does not depend on NDEBUG (the tests build Release, where an assert compiles
+// out and a test that relies on one passes on the mutant it exists to catch).
+// It is evaluated in a GGML_SYCL_PRIVATE_TESTING build unless the environment
+// sets GGML_SYCL_WITNESS_CHECKS=0, and in any other build only when it sets
+// GGML_SYCL_WITNESS_CHECKS=1.  A failure aborts with `message`, so a death arm
+// scores by message.  The switch is a namespace-scope const bool initialised
+// once at library load and tested before `cond` is evaluated: a disabled check
+// is one plain load and one predictable branch.
+extern const bool g_sycl_witness_enabled;
+
+[[noreturn]] void ggml_sycl_witness_failed(const char * message);
+
+#define GGML_SYCL_WITNESS(cond, message)                      \
+    do {                                                      \
+        if (::ggml_sycl::g_sycl_witness_enabled && !(cond)) { \
+            ::ggml_sycl::ggml_sycl_witness_failed(message);   \
+        }                                                     \
+    } while (0)
 
 bool arena_pp_profile_enabled();
 bool arena_pp_profile_active();
@@ -7497,6 +8649,190 @@ void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue);
 void * unified_cache_raw_malloc_host(size_t size, const sycl::context & ctx);
 bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 
+// === Counter dump (GGML_SYCL_COUNTER_DUMP=1) ===
+//
+// Every counter below counts whether or not the dump is armed, and the table,
+// the printer and every registration compile into the ggml-sycl library with
+// no GGML_SYCL_PRIVATE_TESTING gate: that macro is defined only on test
+// targets, so a counter behind it would never print in llama-cli,
+// llama-completion, llama-server or llama-bench. An increment may sit under a
+// build switch (the onednn_* counters' under GGML_SYCL_DNNL); a registration
+// never does. scripts/check-sycl-counter-dump.py gates both facts.
+//
+// The two lists are the dump's fixed field list and snapshot list, in print
+// order. A field prints on every tree from the step that registered it, zeros
+// included, until its retiring step; the gate carries each entry's lands and
+// retired step. Add a new entry here and in the gate together.
+//
+// A keyed counter (a cohort, a site, a ticket) prints its unlabelled total in
+// the fixed list and one `name=<counter>{<key>}` line per key that has counted.
+//
+// moe_table_reach_zero_gpu_expert is the one counter whose total is a SUM OF NOTES: a reach is noted at
+// the callee's ensure site and again at each caller above it, so the total double-counts a reach that
+// came through a caller. Its reach count is the `ensure:` keys (one per ensure_moe_ptr_table call site);
+// the `update:` and `upload:` keys say which caller it came through. It also evaluates only in an armed
+// run, so it prints not_captured unless the report flag read armed.
+#define GGML_SYCL_DUMP_COUNTERS(X)            \
+    X(ext_alloc_count)                        \
+    X(ext_alloc_arena)                        \
+    X(zone_cascade_miss)                      \
+    X(zone_unconverted_miss)                  \
+    X(zone_plan_refusal)                      \
+    X(refusal_unattributed)                   \
+    X(refusal_late)                           \
+    X(onednn_scratchpad_over_plan_declined)   \
+    X(late_term_shrink_admitted)              \
+    X(arena_policy_refusal)                   \
+    X(stream_dma_non_device_arrivals)         \
+    X(onednn_pp_record_mode_acquires)         \
+    X(set_rows_stage_arrivals)                \
+    X(set_rows_stage_record_mode_acquires)    \
+    X(load_row_op_time_arrivals)              \
+    X(onednn_sdpa_admitted)                   \
+    X(onednn_sdpa_executed)                   \
+    X(onednn_sdpa_fallback_after_admit)       \
+    X(moe_table_reach_zero_gpu_expert)        \
+    X(onednn_graph_compile_live_draws)        \
+    X(onednn_graph_callback_unmarked_mallocs) \
+    X(onednn_fa_plan_calls)                   \
+    X(onednn_graph_mask_declined)             \
+    X(onednn_graph_route_declined)            \
+    X(onednn_graph_decline_at_entry)          \
+    X(onednn_graph_scratch_barrier_failed)
+
+// A byte figure an arm scores that is not a counter: captured at a named point
+// and printed at exit after the key lines as `name=<figure>@<point>`. An entry
+// whose point was never reached prints the value `not_captured`.
+//   first_decode  the entry of the device's first graph_compute whose batch is
+//                 one token, captured once
+//   context_txn   the commit of the device's last context transaction
+//   last_load_end the end of the device's last model load, one entry per live
+//                 model keyed load_1 and load_2 by load order
+#define GGML_SYCL_DUMP_SNAPSHOTS(X)                                                            \
+    X(zone_available_weight_first_decode, "zone_available{WEIGHT}@first_decode")               \
+    X(zone_largest_free_weight_first_decode, "zone_largest_free{WEIGHT}@first_decode")         \
+    X(zone_available_runtime_context_txn, "zone_available{RUNTIME}@context_txn")               \
+    X(zone_largest_free_runtime_context_txn, "zone_largest_free{RUNTIME}@context_txn")         \
+    X(zone_capacity_onednn_context_txn, "zone_capacity{ONEDNN}@context_txn")                   \
+    X(onednn_pp_a_bytes_context_txn, "onednn_pp_a_bytes@context_txn")                          \
+    X(weight_host_tiered_bytes_load_1, "weight_host_tiered_bytes{load_1}@last_load_end")       \
+    X(weight_host_tiered_bytes_load_2, "weight_host_tiered_bytes{load_2}@last_load_end")       \
+    X(weight_planned_device_bytes_load_1, "weight_planned_device_bytes{load_1}@last_load_end") \
+    X(weight_planned_device_bytes_load_2, "weight_planned_device_bytes{load_2}@last_load_end") \
+    X(weight_live_bytes_last_load_end, "weight_live_bytes@last_load_end")
+
+// The enumerator lists are one object-like macro each, defined and undefined OUTSIDE the braces, so the enum body is a
+// single identifier: the static-storage audit's parser proves that shape, and fails closed on a macro call (or a
+// directive) between the braces (llama.cpp-y8w5).
+#define GGML_SYCL_DUMP_COUNTER_ENUM(name)  name,
+#define GGML_SYCL_DUMP_COUNTER_ENUMERATORS GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_ENUM) COUNT
+enum class dump_counter : uint8_t { GGML_SYCL_DUMP_COUNTER_ENUMERATORS };
+#undef GGML_SYCL_DUMP_COUNTER_ENUMERATORS
+#undef GGML_SYCL_DUMP_COUNTER_ENUM
+
+#define GGML_SYCL_DUMP_SNAPSHOT_ENUM(id, printed) id,
+#define GGML_SYCL_DUMP_SNAPSHOT_ENUMERATORS       GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_ENUM) COUNT
+enum class dump_snapshot : uint8_t { GGML_SYCL_DUMP_SNAPSHOT_ENUMERATORS };
+#undef GGML_SYCL_DUMP_SNAPSHOT_ENUMERATORS
+#undef GGML_SYCL_DUMP_SNAPSHOT_ENUM
+
+// Lock-free, relaxed; safe under any caller's lock. `dev` is the in-process
+// index after ONEAPI_DEVICE_SELECTOR filtering; an index outside the table is
+// ignored. add_key also adds to the total, so the two cannot drift.
+void unified_cache_dump_counter_add(dump_counter counter, int dev, uint64_t n = 1) noexcept;
+void unified_cache_dump_counter_add_key(dump_counter counter, int dev, const char * key, uint64_t n = 1) noexcept;
+void unified_cache_dump_snapshot_set(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
+// Captures only the first time per device (the first_decode point).
+void unified_cache_dump_snapshot_set_once(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
+// Back to not_captured: a point that no longer holds (load_2 once only one model is live).
+void unified_cache_dump_snapshot_clear(dump_snapshot snapshot, int dev) noexcept;
+// True until set_once has claimed the entry on `dev`, so a once-only capture can skip its reads.
+bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexcept;
+
+// The points a zone figure is captured at. FIRST_DECODE: the entry of the device's first graph_compute
+// whose batch is one token (WEIGHT free and largest-free, captured once). CONTEXT_TXN: the commit of a
+// context transaction (RUNTIME free and largest-free, ONEDNN capacity, overwritten at each commit).
+// Nothing is captured while the device has no arena, so the entry stays not_captured rather than 0.
+enum class dump_point : uint8_t { FIRST_DECODE, CONTEXT_TXN };
+void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept;
+
+// Recorded once by the report sites' per-process armed flag (ggml_sycl_dump_report_armed) when it first
+// reads the environment. A counter evaluated only in an armed run (moe_table_reach_zero_gpu_expert, whose
+// zero test walks the plan per call) prints value=not_captured unless that flag read armed, so a 0 from a
+// process that never evaluated it cannot read as a measured 0.
+void unified_cache_dump_note_armed(bool armed) noexcept;
+
+// Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide. The SDPA compile
+// brackets it so a draw that outlives compile() is counted (onednn_graph_compile_live_draws).
+int64_t unified_cache_onednn_graph_live_draws() noexcept;
+
+#if GGML_SYCL_DNNL
+// llama.cpp-jwjz: unified_cache::onednn_graph_scratch_direct_cap() for the cache the oneDNN Graph
+// allocator callback resolves for `device_id`. A device with no cache yet reports the allocator's
+// unplanned default.
+size_t unified_cache_onednn_graph_scratch_direct_cap_bytes(int device_id);
+#endif
+
+// === G0 report lines (GGML_SYCL_COUNTER_DUMP=1) ===
+//
+// A figure G0 reads that is a line at its instant rather than a counter or a snapshot entry. Each
+// prints as `[SYCL-REPORT] <kind> key=value ...` on stderr, only while the dump is armed, and never
+// takes part in the counter table or its gate. The kinds, and where each is produced:
+//   landing         ggml_backend_sycl_buffer_publish: one per backend buffer, with the path that took it
+//   zone_figures    capacity, used, free and largest-free of one zone, read under its group mutex: the
+//                   RUNTIME and SCRATCH rooms after each backend buffer, the ONEDNN room after each load
+//   row73_own_alloc ggml_sycl_ensure_moe_ptr_table's own-allocation fallback, with the table_index
+//   arm_a_kernel    ggml_sycl_dispatch_mul_mat_kernel: the kernel the selector chose for the LM head
+//                   (output.weight), with its type and ne11, the layout the operand was MATERIALIZED in
+//                   (src0_layout, from its handle) beside the layout the kernel consumes
+//                   (kernel_layout), and layout_mismatch=1 when the two differ (the l9i1 shape); once
+//                   per distinct reading
+//   planned_host    unified_cache_dump_capture_load_end: the plan's own weight_host_bytes, once per load
+//                   (host-tiered bytes are plan-wide, never credited to each device)
+//   moe_zero_gpu_expert_tensors
+//                   unified_cache_dump_capture_load_end: per device, the plan's MoE tensors and how many
+//                   of them have zero GPU-executed experts there (G0's VOID test for the preload arm)
+bool unified_cache_dump_report_enabled() noexcept;
+void unified_cache_dump_report(const char * text) noexcept;
+// Prints `text` the first time `key` is seen on this process, nothing after; false once the table of
+// 64 keys is full, so a flood of distinct readings is bounded rather than silent: the first key refused
+// prints one `[SYCL-REPORT] (report-once-full)` line while the dump is armed.
+bool unified_cache_dump_report_once(const char * key, const char * text) noexcept;
+void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zone_id zone) noexcept;
+// Recorded once by ggml_sycl_init, the post-selector count; the printer's loop
+// and its `end` line read it, never a query at exit.
+void unified_cache_dump_set_device_count(int device_count) noexcept;
+// Registered with std::atexit; prints only when GGML_SYCL_COUNTER_DUMP=1.
+void unified_cache_test_counter_dump();
+
+// The raw exit's accounting, split out of unified_cache_raw_malloc_device so a host test can run it
+// without a device. Counts ext_alloc_count, and ext_alloc_arena while the device's arena is active;
+// under GGML_SYCL_EXT_ALLOC_TRACE=1 also prints the [EXT-ALLOC] line.
+void unified_cache_note_raw_exit(int dev, size_t size) noexcept;
+// Sets the arena-active mirror the raw exit reads, without an arena, for a host test.
+void unified_cache_dump_arena_active_for_testing(int dev, bool active) noexcept;
+
+uint64_t unified_cache_dump_counter_for_testing(dump_counter counter, int dev) noexcept;
+uint64_t unified_cache_ext_alloc_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_ext_alloc_arena_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_cascade_miss_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_unconverted_miss_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_plan_refusal_count_for_testing(int dev) noexcept;
+
+// The one chokepoint for a forbid refusal: called where unified_alloc refuses a
+// request whose preferred zone could not hold it. It classifies the miss by the
+// request alone (cascade_step, unconverted_ticket, else terminal), counts it,
+// and prints its line under GGML_SYCL_EXT_ALLOC_TRACE=1 only; it changes no
+// outcome -- the caller still returns its own refusal. It takes only a counter
+// table's leaf spin lock, and under the trace the dedupe table's; it reads the
+// zone's atomic `used` and fixed capacity through `cache` (null prints no
+// figures), never the allocator's free-space figures, which need the zone's
+// group mutex that a refusal does not hold.
+void unified_cache_zone_refusal(const alloc_request & req,
+                                vram_zone_id          zone,
+                                size_t                bytes,
+                                const unified_cache * cache) noexcept;
+
 // === Shutdown API ===
 
 // Shutdown the unified cache system before SYCL runtime destruction
@@ -7519,6 +8855,13 @@ void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
 void unified_cache_test_pause_zone_settle(bool pause);
 bool unified_cache_test_zone_settle_reached();
 bool unified_cache_test_arena_destroy_closing_reached();
+// Whether g_device_caches holds an entry for the device; creates nothing.
+bool unified_cache_test_cache_exists(int device);
+// Called from cache destruction once arena_destroy() has returned, with the
+// members the cache still holds then. Pass nullptr to remove it.
+using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,
+                                                     bool zone_backed);
+void unified_cache_test_set_destroy_observer(unified_cache_test_destroy_observer observer);
 #endif
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
 // Private direct-source fixture seam; never compiled into the ordinary backend DSO.
@@ -7537,6 +8880,23 @@ bool ggml_sycl_is_shutting_down();
 // ownership, lifetime or plan defect -- a leaked lease, a [CONTEXT-PLAN-BUG]
 // -- into an abort instead of a WARN. Each family keeps its own log tag.
 bool ggml_sycl_strict_enabled();
+
+// The device's backing kind. Resolves the cache through the creating getter, so
+// the value exists before any plan; a device with no cache is a plan defect
+// (NONE, or an abort under strict).
+ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device);
+
+// The device's zones have backing and zone routing applies. Never creates a
+// cache: a device with none has no zones.
+bool ggml_sycl_device_has_zones(int device);
+
+// The device's compute-arena size: the one source for what the model load
+// reserves in the SCRATCH zone and for what the load-time probe (stage (a))
+// sizes the compute chunks against.  512 MB, or GGML_SYCL_COMPUTE_ARENA_MB
+// (0 turns the reservation off).  A second reader of that variable is a second
+// source for one fact; gate 36 pins that there is none.  moua's accessor of this
+// name replaces this definition.
+size_t ggml_sycl_compute_arena_bytes(int device);
 
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,

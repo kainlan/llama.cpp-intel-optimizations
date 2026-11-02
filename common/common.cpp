@@ -1281,6 +1281,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        // the load plans for the context the fit left in cparams, which is the one the context is created with: a fit
+        // may shrink a requested context, and without -c it resolves the default context itself (n_ctx_train per
+        // sequence, possibly shrunk). A fit that resolved none (cparams.n_ctx still 0; the SYCL build's fit is a
+        // no-op) keeps LLAMA_N_CTX_HINT_DEFAULT from common_model_params_to_llama rather than overwriting it with 0,
+        // so the load still holds the default context's room (llama.cpp-7fmt, llama.cpp-ak0p). A negative -c keeps the
+        // 0 it asked for: cparams.n_ctx holds its unsigned wrap (-1 wraps to LLAMA_N_CTX_HINT_DEFAULT itself), so the
+        // signed -c gates the refresh. On a non-SYCL build with an active fit, a default context the fit resolved
+        // arrives as a number, so the load reads it as named (n_ctx_context_is_default false); under GGML_USE_SYCL the
+        // fit returns before it touches cparams, so the flag is exact on the one backend that reads it.
+        if (params.n_ctx >= 0 && cparams.n_ctx > 0) {
+            mparams.n_ctx_hint = cparams.n_ctx;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1670,6 +1683,27 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    // the context the caller will create (llama.cpp-ak0p): -c, or without it (or with -c 0) the model's default
+    // context, which llama_context creates as n_ctx_train, so the SYCL load holds that context's KV room as it does
+    // for an explicit -c (llama.cpp-7fmt). A negative -c names no context, so it asks for no room (0). The hint is the
+    // context's whole cell count, which llama_context divides among the slots when the KV is not unified
+    // (llama-server --parallel), so it is never multiplied by n_parallel.
+    mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;
+
+    // the micro-batch the caller will create the context with: an n_ubatch of 0 is n_batch, and n_batch is at most -c
+    // when -c is set (the default context, n_ctx 0, is the training context and bounds nothing here). The clamp by -c
+    // is unconditional, while llama_context clamps n_batch by n_ctx only for a causal context, so a non-causal context
+    // with -c below -b runs a larger micro-batch than the one named here, and its ring is re-planned when the context
+    // opens. Without -ub the SYCL backend picks the micro-batch itself (n_ubatch_auto), so no micro-batch is named (0)
+    // and the load keeps its planning shape. The SYCL load plans the PP MoE scratch ring for a named one and moves
+    // routed experts to the host tier for its room.
+    mparams.n_ubatch_hint = 0;
+    if (!params.n_ubatch_auto && params.n_batch > 0) {
+        const uint32_t n_batch =
+            params.n_ctx > 0 ? std::min((uint32_t) params.n_batch, (uint32_t) params.n_ctx) : (uint32_t) params.n_batch;
+        mparams.n_ubatch_hint = params.n_ubatch > 0 ? std::min(n_batch, (uint32_t) params.n_ubatch) : n_batch;
+    }
 
     return mparams;
 }

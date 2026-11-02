@@ -114,8 +114,28 @@ def claim_fit_flag_needs_the_fit_exception(ctx: str, header: str) -> bool:
         "rung_fit_refused = dynamic_cast<const llama_auto_ubatch_fit_refusal *>(&e) != nullptr;" not in c
     ):
         return False
-    # the dedicated type is thrown for the compute-buffer failures and the PLAN_REJECTED recheck, nowhere else
-    if c.count("throw llama_auto_ubatch_fit_refusal(") != 4:
+    # the dedicated type is thrown from two places and nowhere else: the PLAN_REJECTED recheck, and sched_reserve()
+    # for a transaction result that carries the fit verdict (the compute-buffer failures and the tenant section's
+    # refusal return {status, reason, true}; the lifecycle failures return no verdict)
+    if c.count("throw llama_auto_ubatch_fit_refusal(") != 2:
+        return False
+    if not re.search(
+        r"if \(result\.fit_refusal\) \{ throw llama_auto_ubatch_fit_refusal\(result\.reason\); \} "
+        r"throw std::runtime_error\(result\.reason\);",
+        c,
+    ):
+        return False
+    # each carries the fit verdict; the reason is the refusal text plus the backend's by-name advice (master's mmi1,
+    # pinned by test-sycl-compute-refusal-source.py)
+    for what in ("pp", "tg"):
+        if not re.search(
+            r'\{ sched_reserve_status::FAILED, "failed to allocate compute %s buffers" '
+            r"\+ llama_context_sycl_compute_refusal_text\([^()]*\), true \}" % what,
+            c,
+        ):
+            return False
+    # the tenant section's builder refuses a plan inconsistency, never a capacity shortfall: no fit verdict
+    if "return { sched_reserve_status::REFUSED, tenant_reason };" not in c or "tenant_reason, true" in c:
         return False
     return bool(
         re.search(
@@ -130,7 +150,7 @@ def claim_pinned_ub_refreshes_epoch_before_reserve(ctx: str) -> bool:
     c = norm(ctx)
     m = re.search(
         r"if \(llama_context_has_sycl_backend\(backends\)\) \{ llama_context_sycl_hold_epoch_refresh\(backends\); \} "
-        r"#endif if \(sycl_auto_ubatch_trial\) \{ sycl_select_auto_ubatch\(params\.type_k, params\.type_v\); \} "
+        r"#endif if \(sycl_auto_ubatch_trial\) \{ sycl_select_auto_ubatch\(\); \} "
         r"else \{ sched_reserve\(\); \}",
         c,
     )
@@ -225,8 +245,14 @@ def claim_rung_record_truncation_is_loud(cache_cpp: str) -> bool:
 
 def claim_every_scheduler_allocation_goes_through_the_helpers(ctx: str, kv: str, ctx_h: str) -> bool:
     c = norm(ctx)
-    # exactly one bare call of each, inside its own helper
-    if c.count("ggml_backend_sched_alloc_graph(") != 1 or c.count("ggml_backend_sched_reserve(") != 1:
+    # exactly one bare alloc call, inside its own helper; the one bare reserve besides the helper's is a MEASURE
+    # state's, which reserves on a scheduler of its own that no plan scope or hold record covers
+    if c.count("ggml_backend_sched_alloc_graph(") != 1 or c.count("ggml_backend_sched_reserve(") != 2:
+        return False
+    if (
+        "const bool reserved = state.measure ? ggml_backend_sched_reserve(state.sched.get(), gf) : sched_reserve_graph(gf);"
+        not in c
+    ):
         return False
     if not re.search(
         r"bool llama_context::sched_alloc_graph\(ggml_cgraph \* gf\) \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); "
@@ -483,8 +509,8 @@ def test_mutant_pinned_ub_refreshes_after_reserve_fails_the_claim():
     moved = _once(CTX, "            llama_context_sycl_hold_epoch_refresh(backends);\n", "")
     moved = _once(
         moved,
-        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch(params.type_k, params.type_v);\n        } else {\n            sched_reserve();\n        }\n",
-        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch(params.type_k, params.type_v);\n        } else {\n            sched_reserve();\n            llama_context_sycl_hold_epoch_refresh(backends);\n        }\n",
+        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch();\n        } else {\n            sched_reserve();\n        }\n",
+        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch();\n        } else {\n            sched_reserve();\n            llama_context_sycl_hold_epoch_refresh(backends);\n        }\n",
     )
     assert not claim_pinned_ub_refreshes_epoch_before_reserve(moved)
 
@@ -723,6 +749,38 @@ def test_a_rewrapped_credit_filter_still_satisfies_its_claim():
         "if (\n                row.scheduler_compute && row.state == runtime_alloc_state::LIVE ) {",
     )
     assert claim_raw_rows_are_credited_by_origin(rewrapped)
+
+
+# --- the typed fit refusal is capacity only; the MEASURE bare reserve is that state's own scheduler ----------------
+
+
+def test_mutant_tenant_builder_refusal_as_a_fit_verdict_fails_the_claim():
+    mutated = _once(CTX, "return { sched_reserve_status::REFUSED, tenant_reason };", "return { sched_reserve_status::REFUSED, tenant_reason, true };")
+    assert not claim_fit_flag_needs_the_fit_exception(mutated, UBATCH_H)
+
+
+def test_mutant_a_publish_result_other_than_plan_rejected_as_a_fit_verdict_is_pinned_by_the_publish_gate():
+    # the publish's fit flag is pinned in test-sycl-publish-status-source.py (rc == PLAN_REJECTED only); this gate
+    # pins that a transaction result without the flag never throws the typed refusal
+    mutated = _once(CTX, "if (result.fit_refusal) { throw llama_auto_ubatch_fit_refusal(result.reason); }", "throw llama_auto_ubatch_fit_refusal(result.reason);")
+    assert not claim_fit_flag_needs_the_fit_exception(mutated, UBATCH_H)
+
+
+def test_mutant_the_contexts_own_scheduler_reserves_bare_fails_the_claim():
+    mutated = _once(CTX, ": sched_reserve_graph(gf);", ": ggml_backend_sched_reserve(sched.get(), gf);")
+    assert not claim_every_scheduler_allocation_goes_through_the_helpers(mutated, KV, CTX_H)
+
+
+def test_mutant_every_graph_reserve_bare_fails_the_claim():
+    mutated = _once(CTX, "state.measure ? ggml_backend_sched_reserve(state.sched.get(), gf)", "true ? ggml_backend_sched_reserve(state.sched.get(), gf)")
+    assert not claim_every_scheduler_allocation_goes_through_the_helpers(mutated, KV, CTX_H)
+
+
+def test_mutant_a_measure_state_through_the_helper_fails_the_claim():
+    # the helper reserves on the context's `sched`, never a MEASURE state's own: routing it there would reserve the
+    # wrong scheduler
+    mutated = _once(CTX, "state.measure ? ggml_backend_sched_reserve(state.sched.get(), gf) : sched_reserve_graph(gf)", "sched_reserve_graph(gf)")
+    assert not claim_every_scheduler_allocation_goes_through_the_helpers(mutated, KV, CTX_H)
 
 
 if __name__ == "__main__":

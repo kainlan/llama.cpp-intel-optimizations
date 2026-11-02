@@ -10,11 +10,21 @@
 
 namespace ggml_sycl {
 
+// mem_copy_async and mem_copy default-capture their CALLER's file, line and
+// function (llama.cpp-th86). Every copy below reaches mem_copy_direct_submit
+// from inside mem-ops.cpp, so a site captured there would always name
+// mem-ops.cpp; capturing it here names the code that asked for the copy, which
+// is what the GGML_SYCL_MEMCPY_SITE_CENSUS table and the kernel profiler's
+// callsite need. A wrapper that copies on behalf of its own callers should take
+// the same three defaulted parameters and pass them on.
 sycl::event mem_copy_async(const mem_handle &               dst,
                            const mem_handle &               src,
                            size_t                           size,
                            sycl::queue &                    queue,
-                           const std::vector<sycl::event> & deps = {});
+                           const std::vector<sycl::event> & deps     = {},
+                           const char *                     file     = __builtin_FILE(),
+                           int                              line     = __builtin_LINE(),
+                           const char *                     function = __builtin_FUNCTION());
 
 // Async copy over raw transient views (canonical contract: raw pointers are
 // ABI views resolved from a mem_handle for immediate submission only). The
@@ -33,7 +43,10 @@ sycl::event mem_copy_async(const mem_handle &               dst,
                            size_t                           src_offset,
                            size_t                           size,
                            sycl::queue &                    queue,
-                           const std::vector<sycl::event> & deps = {});
+                           const std::vector<sycl::event> & deps     = {},
+                           const char *                     file     = __builtin_FILE(),
+                           int                              line     = __builtin_LINE(),
+                           const char *                     function = __builtin_FUNCTION());
 
 sycl::event mem_fill_async(const mem_handle &               h,
                            int                              value,
@@ -57,7 +70,10 @@ void mem_copy(const mem_handle &               dst,
               const mem_handle &               src,
               size_t                           size,
               sycl::queue &                    queue,
-              const std::vector<sycl::event> & deps = {});
+              const std::vector<sycl::event> & deps     = {},
+              const char *                     file     = __builtin_FILE(),
+              int                              line     = __builtin_LINE(),
+              const char *                     function = __builtin_FUNCTION());
 
 void mem_copy(const mem_handle &               dst,
               size_t                           dst_offset,
@@ -65,7 +81,10 @@ void mem_copy(const mem_handle &               dst,
               size_t                           src_offset,
               size_t                           size,
               sycl::queue &                    queue,
-              const std::vector<sycl::event> & deps = {});
+              const std::vector<sycl::event> & deps     = {},
+              const char *                     file     = __builtin_FILE(),
+              int                              line     = __builtin_LINE(),
+              const char *                     function = __builtin_FUNCTION());
 
 void mem_fill(const mem_handle &               h,
               int                              value,
@@ -91,6 +110,74 @@ void mem_fill(const mem_handle &               h,
 // No-op and allocation-free when tracing is disabled.
 void stage_trace_mark(const char * tag);
 
+// Diagnostic for llama.cpp-th86, off unless GGML_SYCL_MEMCPY_SITE_CENSUS=1.
+//
+// Print the per-call-site copy census to stderr: one row per (caller
+// file:line, direction, profile path) with its call and byte counts, sorted by
+// calls. Every copy that reaches mem_copy_direct_submit is counted, including
+// the host-host std::memcpy branch (direction H2H), which the kernel profiler
+// never sees. The table is cumulative over the process. The SYCL backend's free
+// path calls this right after the kernel-profile flush, and the first recorded
+// copy registers an exit printer that prints again only if copies were
+// recorded since the last print. No-op when the census is disabled.
+void mem_copy_site_census_flush(const char * reason);
+
+// The synchronous waits mem_copy_submit makes on the calling thread, by kind (llama.cpp-qwn5): the staged
+// host->device copy's wait for its deps (H2D_DEPS), for the previous chunk before it refills the stage (H2D_CHUNK)
+// and for the last chunk when the caller does not retain the copy (H2D_FINAL); the staged device->host copy's wait
+// for each chunk (D2H); the host->host copy's wait for its deps (H2H_DEPS); and the cross-device copy's waits
+// (CROSS). Each one holds the thread until the device or the dependency has caught up.
+enum mem_copy_staged_wait_kind {
+    MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS = 0,
+    MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK,
+    MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL,
+    MEM_COPY_STAGED_WAIT_KIND_D2H,
+    MEM_COPY_STAGED_WAIT_KIND_H2H_DEPS,
+    MEM_COPY_STAGED_WAIT_KIND_CROSS,
+    MEM_COPY_STAGED_WAIT_KIND_COUNT,
+};
+
+// One (copy caller's file, line, kind) row of the census. `file` is the caller's __builtin_FILE() literal, which
+// lives for the process; null marks a free slot.
+struct mem_copy_staged_wait_site {
+    const char * file  = nullptr;
+    int          line  = 0;
+    int          kind  = MEM_COPY_STAGED_WAIT_KIND_COUNT;
+    uint64_t     count = 0;
+    double       us    = 0.0;
+};
+
+constexpr size_t k_mem_copy_staged_wait_site_slots = 16;
+
+// The calling thread's waits inside mem_copy_submit while ggml_sycl_cpu_expert_trace_enabled() (llama.cpp-qwn5): how
+// many of each kind and their summed wall time, the same per copy-caller site in a fixed table (a site that finds no
+// free slot counts into overflow). Off, a wait costs one cached flag test and reads no clock. staged_d2h and
+// staged_h2d, how many copies took the staged branch in each direction, count with the trace off too (llama.cpp-36j0):
+// a caller reads its own thread's delta around its own copies to learn whether they were direct. The submitting
+// thread prints its own on each [MOE-HOSTPATH-WAITS] line and then resets it.
+struct mem_copy_staged_wait_census {
+    uint64_t                  count[MEM_COPY_STAGED_WAIT_KIND_COUNT]   = {};
+    double                    us[MEM_COPY_STAGED_WAIT_KIND_COUNT]      = {};
+    mem_copy_staged_wait_site sites[k_mem_copy_staged_wait_site_slots] = {};
+    uint64_t                  overflow_count                           = 0;
+    double                    overflow_us                              = 0.0;
+    uint64_t                  staged_d2h                               = 0;
+    uint64_t                  staged_h2d                               = 0;
+};
+
+mem_copy_staged_wait_census & mem_copy_staged_wait_census_this_thread();
+
+// The census as the [MOE-HOSTPATH-WAITS] line prints it: `copies` is d2h:N,h2d:N; `waits` is kind:N/USus for each
+// kind that waited, comma separated; `sites` is file:line:kind=N/USus for each site that waited, then
+// overflow=N/USus when the table was full. `waits` and `sites` read none when nothing waited.
+struct mem_copy_staged_wait_text {
+    char copies[64];
+    char waits[256];
+    char sites[1024];
+};
+
+void mem_copy_staged_wait_census_format(const mem_copy_staged_wait_census & census, mem_copy_staged_wait_text & out);
+
 // Allocate a host-pinned staging buffer for a TERMINAL attempt -- one whose
 // caller has no further fallback and will abort or fail if it returns false.
 //
@@ -111,7 +198,8 @@ void stage_trace_mark(const char * tag);
 // submission-completion authority, not allocation attempts.  Same English word,
 // different subsystem; there is no relationship to infer.
 //
-// ONLY THE ggml-sycl.cpp PAYLOAD-STAGING SITE USES THIS.  The four staging
+// ONLY ggml-sycl.cpp CALLS THIS: the payload-staging site, the block-exec
+// dense host stage and the per-call MoE ids stage.  The staging
 // sites inside mem-ops.cpp still call the static alloc_pinned_stage_handle()
 // directly with k_stage_alloc_retries, and that is deliberate rather than a
 // half-finished migration: they are in the same TU as the static, so routing

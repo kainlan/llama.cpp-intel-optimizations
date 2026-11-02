@@ -126,9 +126,12 @@ class kv_tier_manager {
     // explicit layer mask -- the plan is a file-scope global and can carry a
     // stale cross-model value, whereas the mask describes *this* buffer.
     //
-    // Per-layer sizes come from plan.kv_size_for_layer() whenever the plan
-    // carries per-layer truth (llama.cpp-7yv9); the uniform slice is then only
-    // the total-bytes sanity bound for the layers in buffer_layer_mask.
+    // Per-layer sizes come from the plan's per-layer truth whenever the plan
+    // carries it (llama.cpp-7yv9), for the one cache this buffer holds:
+    // plan.kv_main_size_for_layer() for a K/V buffer, kv_idx_size_for_layer()
+    // for the indexer-key buffer of a llama_memory_hybrid_idx (llama.cpp-8ecj).
+    // The uniform slice is then only the total-bytes sanity bound for the
+    // layers in buffer_layer_mask.
     // buffer_layer_mask: which model layers this KV buffer holds (non-zero =
     //   member), as llama_kv_cache pushes it; nullptr means every layer.
     void configure_from_plan(int                          device,

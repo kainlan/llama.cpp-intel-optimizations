@@ -8,6 +8,8 @@
 
 #include "zone-sizing.hpp"
 
+#include "tlsf-allocator.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -123,6 +125,16 @@ bool zone_is_per_layer_weight(const zone_tensor_desc & tensor, size_t group_card
 // settles it. Do not pre-emptively widen the predicate, and above all do not
 // add a name check to special-case the LM head — a name predicate is exactly
 // what this unit exists to replace.
+//
+// This TU's classifier stays name-free. One decision about the head IS made, but
+// by the adapter, from classifiers that exist already (infer_tensor_usage's
+// OUTPUT_WEIGHT and the tied-embedding classifier), and it concerns a different
+// reservation: the f16 dequant buffers for a type whose PP route is the dequant
+// arm (the IQ family) leave the head out, because a completion runs the head on
+// one row per ubatch and its f16 copy (1.2 GB at a 248k vocabulary) would
+// otherwise size the whole plan. The Q4_0 / MXFP4 head stays planned (owner
+// decision, llama.cpp-8ony) until llama.cpp-fkpg delivers n_outputs; that gate
+// reinstates both. See aos_dequant_f16_plan_claims in unified-types.hpp.
 bool zone_is_moe_expert_tensor(const zone_tensor_desc & tensor) {
     // Without a shape there is no evidence either way, and the zeros must not
     // be allowed to vote — same rule as zone_is_per_layer_weight. Returning
@@ -486,6 +498,16 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
     return hold <= available && size <= available - hold;
 }
 
+bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement) {
+    // The reserved zone already carries the arena's rounding, so every byte above it was grown.
+    size_t reserved = 0;
+    return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
+}
+
+// A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
+// linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
+// request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a
+// micro-batch nobody measured: the spill bound and the fit's request scale a rung's record with it.
 static size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
     if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
         return request;
@@ -544,14 +566,28 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
     return scaled;
 }
 
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request) {
+    return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;
+}
+
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
-    if (n_ubatch == 0 || !in.plan_of) {
+    if (n_ubatch == 0) {
         return 0;
     }
-    const size_t plan = in.plan_of(in.plan_ctx, n_ubatch);
-    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch.
-    return zone_hold_spill_raw_demand(
-        zone_hold_spill_bound(plan, zone_hold_fit_request(in, n_ubatch), n_ubatch, n_ubatch), in.kv_room);
+    // No plan function, no hold: the ring is still a demand.
+    const size_t plan    = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
+    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch. One
+    // the zone was planned to serve is not held back, so it spills nothing; the plan stays in the bound as it is.
+    size_t       request = zone_hold_fit_request(in, n_ubatch);
+    if (zone_hold_fit_rung_has_compute_room(in, n_ubatch, request)) {
+        request = 0;
+    }
+    const size_t spill =
+        zone_hold_spill_raw_demand(zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);
+    // The ring's slots are the planned room's bytes and lent bytes, so only the part neither the planned room nor a
+    // loan covers is a demand on free memory (llama.cpp-kjef). The one place it is added, so every consumer of the fit
+    // reads it. Saturating, so a wrapped sum never reads as a fit.
+    return in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
 }
 
 bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
@@ -642,8 +678,26 @@ bool zone_route_draws_scratch(bool decision_valid,
     return fallback_valid && fallback_draws;
 }
 
-size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live) {
-    return other_model_live && prev > next ? prev : next;
+bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out) {
+    if (out == nullptr || (chunk_bytes == nullptr && n_chunks != 0)) {
+        return false;
+    }
+    size_t sum = 0;
+    for (size_t i = 0; i < n_chunks; ++i) {
+        if (chunk_bytes[i] == 0) {
+            continue;
+        }
+        if (static_cast<uint64_t>(static_cast<size_t>(chunk_bytes[i])) != chunk_bytes[i]) {
+            return false;  // a chunk a size_t cannot carry
+        }
+        const size_t occupied = tlsf_allocator::round_request(static_cast<size_t>(chunk_bytes[i]), alignment);
+        if (occupied == 0 || occupied > SIZE_MAX - sum) {
+            return false;
+        }
+        sum += occupied;
+    }
+    *out = sum;
+    return true;
 }
 
 namespace {

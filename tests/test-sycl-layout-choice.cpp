@@ -16,6 +16,8 @@
 #endif
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/moe-stream-plan.hpp"
+#include "ggml-sycl/soa-reorder-types.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml-sycl/vram-headroom.hpp"
 
@@ -511,6 +513,1308 @@ static bool run_moe_triplet_planner_test() {
     return true;
 }
 
+// llama.cpp-8ecj: the single-device planner places in the order dense weights, then KV, then routed experts. The
+// synthetic model has two layers, each with one dense attention weight and four routed experts, and a KV of two FULL
+// layers planned at n_ctx 512 for a model that opens at n_ctx 4096.
+namespace kv_order_case {
+constexpr int    n_experts      = 4;
+constexpr size_t dense_bytes    = 64 * 1024;
+constexpr size_t expert_bytes   = 256 * 1024;                       // one role of one expert
+constexpr size_t triplet_bytes  = 3 * expert_bytes;
+constexpr size_t kv_width       = 128;                              // K and V elements per cell
+constexpr size_t kv_at_512      = 512 * (kv_width + kv_width) * 2;  // f16
+constexpr size_t kv_at_4096     = 4096 * (kv_width + kv_width) * 2;
+constexpr size_t kv_extra_layer = kv_at_4096 - kv_at_512;
+
+static std::vector<std::pair<std::string, size_t>> inventory() {
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk = "blk." + std::to_string(l) + ".";
+        inv.push_back({ blk + "attn_q.weight", dense_bytes });
+        inv.push_back({ blk + "ffn_gate_exps.weight", n_experts * expert_bytes });
+        inv.push_back({ blk + "ffn_up_exps.weight", n_experts * expert_bytes });
+        inv.push_back({ blk + "ffn_down_exps.weight", n_experts * expert_bytes });
+    }
+    return inv;
+}
+
+static ggml_sycl::placement_kv_info kv_info(uint32_t n_ctx_context) {
+    ggml_sycl::placement_kv_info kv{};
+    kv.n_layer       = 2;
+    kv.n_embd_k_gqa  = kv_width;
+    kv.n_embd_v_gqa  = kv_width;
+    kv.n_ctx         = 512;
+    kv.n_ubatch      = 512;
+    kv.n_ctx_context = n_ctx_context;
+    kv.layer_kind    = { GGML_SYCL_KV_LAYER_FULL, GGML_SYCL_KV_LAYER_FULL };
+    kv.layer_k_width = { kv_width, kv_width };
+    kv.layer_v_width = { kv_width, kv_width };
+    return kv;
+}
+
+static size_t device_triplets(const ggml_sycl::placement_plan & plan) {
+    size_t n = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            const auto gate = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::GATE);
+            const auto up   = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::UP);
+            const auto down = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::DOWN);
+            n += gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device;
+        }
+    }
+    return n;
+}
+}  // namespace kv_order_case
+
+// Dense weights, their KV, the room of the context the model opens with, then two triplets fill the budget exactly:
+// the experts take what is left after the context's KV room, not the room itself.
+static bool run_kv_context_room_before_experts_test() {
+    using namespace kv_order_case;
+    if (kv_info(4096).kv_context_extra_bytes_for_layer(0) != kv_extra_layer) {
+        printf("FAIL: the context's extra KV for a FULL layer is %zu bytes, want %zu\n",
+               kv_info(4096).kv_context_extra_bytes_for_layer(0), kv_extra_layer);
+        return false;
+    }
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + 2 * kv_extra_layer + 2 * triplet_bytes;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
+
+    const size_t placed = plan.weight_vram_bytes + plan.kv_vram_bytes;
+    const size_t left   = budget > placed ? budget - placed : 0;
+    if (plan.get_layer_device(0) != 0 || plan.get_layer_device(1) != 0 || plan.get_kv_device(0) != 0 ||
+        plan.get_kv_device(1) != 0) {
+        printf("FAIL: dense weights and their KV must be on the device first, got layer %d/%d kv %d/%d\n",
+               plan.get_layer_device(0), plan.get_layer_device(1), plan.get_kv_device(0), plan.get_kv_device(1));
+        return false;
+    }
+    if (plan.kv_context_reserve_bytes != 2 * kv_extra_layer || left < 2 * kv_extra_layer) {
+        printf(
+            "FAIL: the planner must hold %zu bytes for the n_ctx 4096 KV before the experts, held %zu and left "
+            "%zu\n",
+            2 * kv_extra_layer, plan.kv_context_reserve_bytes, left);
+        return false;
+    }
+    if (device_triplets(plan) != 2) {
+        printf("FAIL: the experts must fill only what the context's KV room leaves: %zu device triplets, want 2\n",
+               device_triplets(plan));
+        return false;
+    }
+    if (plan.kv_context_room_displaced_bytes != 4 * triplet_bytes) {
+        printf("FAIL: the room displaced 4 triplets (6 fit without it, 2 with it): logged %zu bytes, want %zu\n",
+               plan.kv_context_room_displaced_bytes, 4 * triplet_bytes);
+        return false;
+    }
+    if (plan.vram_bytes != placed + plan.kv_context_reserve_bytes) {
+        printf("FAIL: the held room must count in the plan's device bytes: vram=%zu weights+kv=%zu room=%zu\n",
+               plan.vram_bytes, placed, plan.kv_context_reserve_bytes);
+        return false;
+    }
+
+    // No context known: no room, and the same budget puts every expert that fits on the device.
+    const auto unknown = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts);
+    if (unknown.kv_context_reserve_bytes != 0 || device_triplets(unknown) != 6 ||
+        unknown.kv_context_room_displaced_bytes != 0) {
+        printf("FAIL: with no context known the planner holds no room: held %zu, %zu device triplets, want 0 and 6\n",
+               unknown.kv_context_reserve_bytes, device_triplets(unknown));
+        return false;
+    }
+
+    // A context whose KV does not fit beside the dense weights: the room is what is left, and no expert is on the
+    // device; the context's overflow is the runtime transaction's to re-place.
+    const size_t tight    = 2 * dense_bytes + 2 * kv_at_512 + kv_extra_layer;
+    const auto short_plan = ggml_sycl::compute_placement_plan(inventory(), tight, 0, kv_info(4096), nullptr, n_experts);
+    if (short_plan.kv_context_reserve_bytes != kv_extra_layer || device_triplets(short_plan) != 0 ||
+        short_plan.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: a room larger than what is left holds all of it and keeps both layers' KV on the device: held "
+            "%zu, %zu device triplets, kv layer 1 on %d\n",
+            short_plan.kv_context_reserve_bytes, device_triplets(short_plan), short_plan.get_kv_device(1));
+        return false;
+    }
+    // Without the room, the extra KV of one layer (1.75 MiB) would hold two triplets.
+    if (short_plan.kv_context_room_displaced_bytes != 2 * triplet_bytes) {
+        printf("FAIL: the tight room displaced 2 triplets: logged %zu bytes, want %zu\n",
+               short_plan.kv_context_room_displaced_bytes, 2 * triplet_bytes);
+        return false;
+    }
+
+    printf("PASS: the planner holds the opening context's KV room before the routed experts\n");
+    return true;
+}
+
+// An explicit micro-batch's PP MoE oneDNN scratch ring that the RUNTIME zone planned for the load's own micro-batch
+// cannot hold is placed, not refused: the routed experts give up the room, and only when moving every device-resident
+// expert would not free it is the context refused, with the largest -ub that fits. The ring here has a 256 KiB weight
+// slot, 1 KiB of activation and 512 B of output per row, and depth 2; the rest of the RUNTIME requirement is 1 MiB, and
+// no floor. So the ring is 2 MiB at the default 512 and 6.5 MiB at 2048, and the zone grows from 3 MiB to 7.5 MiB: a
+// 4.5 MiB room, exactly six of the synthetic model's 768 KiB triplets.
+namespace explicit_ubatch_case {
+constexpr size_t mib           = 1024 * 1024;
+constexpr size_t zone_default  = 3 * mib;
+constexpr size_t zone_explicit = 7 * mib + mib / 2;
+constexpr size_t room          = zone_explicit - zone_default;
+constexpr size_t ring_explicit = 6 * mib + mib / 2;
+constexpr size_t runtime_fixed = 1 * mib;
+
+static ggml_sycl::pp_moe_onednn_explicit_ubatch_room room_with_zone(size_t runtime_zone_bytes) {
+    ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch                 = 2048;
+    in.n_ubatch_default         = 512;
+    in.weight_slot_bytes        = 256 * 1024;
+    in.activation_bytes_per_row = 1024;
+    in.output_bytes_per_row     = 512;
+    in.ring_depth               = 2;
+    in.runtime_fixed_bytes      = runtime_fixed;
+    in.runtime_floor_bytes      = 0;
+    in.runtime_zone_bytes       = runtime_zone_bytes;
+    return ggml_sycl::pp_moe_onednn_explicit_ubatch_plan_room(in);
+}
+
+static ggml_sycl::placement_plan plan(size_t expert_bytes_left, size_t runtime_zone_bytes) {
+    using namespace kv_order_case;
+    ggml_sycl::placement_kv_info kv = kv_info(0);
+    kv.n_ubatch_context             = 2048;
+    kv.explicit_ubatch              = room_with_zone(runtime_zone_bytes);
+    const size_t budget             = 2 * dense_bytes + 2 * kv_at_512 + expert_bytes_left;
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_experts);
+}
+
+// Every dense layer, its KV and every routed-expert role on the same device in both plans.
+static bool same_device_placement(const ggml_sycl::placement_plan & a, const ggml_sycl::placement_plan & b) {
+    using namespace kv_order_case;
+    for (int l = 0; l < 2; ++l) {
+        if (a.get_layer_device(l) != b.get_layer_device(l) || a.get_kv_device(l) != b.get_kv_device(l)) {
+            return false;
+        }
+        for (int e = 0; e < n_experts; ++e) {
+            for (auto role : { ggml_sycl::expert_tensor_role::GATE, ggml_sycl::expert_tensor_role::UP,
+                               ggml_sycl::expert_tensor_role::DOWN }) {
+                const auto pa = a.lookup_expert_placement(l, e, role);
+                const auto pb = b.lookup_expert_placement(l, e, role);
+                if (pa.found() != pb.found() || pa.on_device != pb.on_device) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+}  // namespace explicit_ubatch_case
+
+static bool run_explicit_ubatch_ring_placement_test() {
+    using namespace explicit_ubatch_case;
+    using action         = ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
+    const size_t triplet = kv_order_case::triplet_bytes;
+    bool         ok      = true;
+
+    const auto room0 = room_with_zone(zone_default);
+    if (!room0.valid || room0.ring_bytes != ring_explicit || room0.zone_default_bytes != zone_default ||
+        room0.zone_bytes != zone_explicit || room0.room_bytes != room || room0.room_reserved_bytes != 0 ||
+        room != 6 * triplet) {
+        printf(
+            "FAIL: the n_ubatch=2048 ring is %zu bytes in a %zu-byte zone over %zu (room %zu, held %zu), want %zu in "
+            "%zu over %zu (room %zu, held 0)\n",
+            room0.ring_bytes, room0.zone_bytes, room0.zone_default_bytes, room0.room_bytes, room0.room_reserved_bytes,
+            ring_explicit, zone_explicit, zone_default, room);
+        ok = false;
+    }
+
+    // The experts have the room to give, but the zone has not grown: the plan says so, and already holds the whole
+    // room against them, so two triplets stay on the device and six move. The backend grows the zone (which takes the
+    // room from the weight capacity) and plans again.
+    const auto   grow = plan(8 * triplet, zone_default);
+    const auto & gxub = grow.explicit_ubatch;
+    if (gxub.action != action::GROW_ZONE || gxub.n_ubatch != 2048 || gxub.expert_budget_bytes != 8 * triplet ||
+        gxub.hold_bytes != room || gxub.hold_reason == nullptr || kv_order_case::device_triplets(grow) != 2 ||
+        gxub.expert_groups != 2 || gxub.expert_groups_without != 8 || gxub.moved_layers != 2 ||
+        gxub.moved_bytes() != 6 * triplet) {
+        printf(
+            "FAIL: an unreserved room the experts can give asks to grow the zone and holds the room: action %s, "
+            "budget %zu, hold %zu, %zu device triplets, %zu against %zu with the hold added back; want grow-zone, "
+            "%zu, %zu, 2, 2 against 8\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(gxub.action), gxub.expert_budget_bytes,
+            gxub.hold_bytes, kv_order_case::device_triplets(grow), gxub.expert_groups, gxub.expert_groups_without,
+            8 * triplet, room);
+        ok = false;
+    }
+
+    // The zone holds the room, which came out of the weight capacity: two triplets stay on the device, and the six the
+    // room displaced are the ones the decision line names, with their bytes. The dense weights and their KV stay put.
+    const auto   placed = plan(2 * triplet, zone_explicit);
+    const auto & xub    = placed.explicit_ubatch;
+    if (xub.action != action::PLACE || xub.room_reserved_bytes != room || xub.hold_bytes != room ||
+        kv_order_case::device_triplets(placed) != 2 || xub.expert_groups != 2 || xub.expert_groups_without != 8 ||
+        xub.moved_layers != 2 || xub.moved_bytes() != 6 * triplet || xub.ring_bytes != ring_explicit ||
+        placed.get_layer_device(0) != 0 || placed.get_layer_device(1) != 0 || placed.get_kv_device(0) != 0 ||
+        placed.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: a held room places the ring and moves the experts it displaced: action %s, held %zu, hold %zu, %zu "
+            "device triplets, %zu against %zu with the hold added back, moved %zu bytes from %zu layers; want place, "
+            "%zu, %zu, 2, 2 against 8, %zu from 2\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.room_reserved_bytes, xub.hold_bytes,
+            kv_order_case::device_triplets(placed), xub.expert_groups, xub.expert_groups_without, xub.moved_bytes(),
+            xub.moved_layers, room, room, 6 * triplet);
+        ok = false;
+    }
+
+    // Growing the zone does not change the plan: the hold is the whole room before and after, so the plan the backend
+    // grows the zone for is the plan it keeps, triplet for triplet.
+    if (!same_device_placement(grow, placed) || grow.weight_vram_bytes != placed.weight_vram_bytes ||
+        grow.weight_host_bytes != placed.weight_host_bytes || grow.kv_vram_bytes != placed.kv_vram_bytes) {
+        printf(
+            "FAIL: the plans before and after the zone grows differ: weights %zu/%zu device, %zu/%zu host, kv %zu/%zu, "
+            "same placement %d\n",
+            grow.weight_vram_bytes, placed.weight_vram_bytes, grow.weight_host_bytes, placed.weight_host_bytes,
+            grow.kv_vram_bytes, placed.kv_vram_bytes, same_device_placement(grow, placed) ? 1 : 0);
+        ok = false;
+    }
+
+    // The hold comes after the dense and KV phases: against the same budget with no micro-batch named, the dense
+    // layers, their KV and its bytes are where they were, and the device weights differ by the six moved triplets.
+    const auto baseline = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+    bool dense_kv_same = baseline.kv_vram_bytes == grow.kv_vram_bytes && baseline.kv_host_bytes == grow.kv_host_bytes &&
+                         baseline.weight_vram_bytes == grow.weight_vram_bytes + 6 * triplet;
+    for (int l = 0; l < 2; ++l) {
+        dense_kv_same = dense_kv_same && baseline.get_layer_device(l) == grow.get_layer_device(l) &&
+                        baseline.get_kv_device(l) == grow.get_kv_device(l);
+    }
+    if (!dense_kv_same || kv_order_case::device_triplets(baseline) != 8) {
+        printf(
+            "FAIL: the hold must leave the dense and KV phases as they were: kv %zu/%zu device, %zu/%zu host, weights "
+            "%zu vs %zu + 6 triplets, %zu baseline device triplets\n",
+            baseline.kv_vram_bytes, grow.kv_vram_bytes, baseline.kv_host_bytes, grow.kv_host_bytes,
+            baseline.weight_vram_bytes, grow.weight_vram_bytes, kv_order_case::device_triplets(baseline));
+        ok = false;
+    }
+
+    // The two device triplets give 1.5 MiB, less than the room: refused, and the largest micro-batch whose ring fits
+    // the zone plus those bytes, less the fixed rest (3 + 1.5 - 1 = 3.5 MiB), is 1024 (its ring is exactly 3.5 MiB).
+    const auto partial = plan(2 * triplet, zone_default);
+    if (partial.explicit_ubatch.action != action::REFUSE ||
+        partial.explicit_ubatch.max_ring_runtime_bytes != 3 * mib + mib / 2 ||
+        partial.explicit_ubatch.largest_fitting_n_ubatch != 1024 || kv_order_case::device_triplets(partial) != 2 ||
+        partial.explicit_ubatch.moved_bytes() != 0 || partial.explicit_ubatch.hold_bytes != 0) {
+        printf(
+            "FAIL: a room the device experts cannot give is refused with the largest fit: action %s, ring room %zu, "
+            "largest -ub %u, %zu device triplets; want refuse, %zu, 1024, 2\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(partial.explicit_ubatch.action),
+            partial.explicit_ubatch.max_ring_runtime_bytes, partial.explicit_ubatch.largest_fitting_n_ubatch,
+            kv_order_case::device_triplets(partial), 3 * mib + mib / 2);
+        ok = false;
+    }
+
+    // Nothing to demote (no expert fits beside the dense weights and their KV): refused, and the largest fit is the
+    // load's own 512, whose 2 MiB ring is what the zone holds beside the fixed rest.
+    const auto none = plan(0, zone_default);
+    if (none.explicit_ubatch.action != action::REFUSE || none.explicit_ubatch.max_ring_runtime_bytes != 2 * mib ||
+        none.explicit_ubatch.largest_fitting_n_ubatch != 512 || kv_order_case::device_triplets(none) != 0 ||
+        none.explicit_ubatch.hold_bytes != 0) {
+        printf(
+            "FAIL: with nothing to demote the context is refused with the largest fit: action %s, ring room %zu, "
+            "largest -ub %u; want refuse, %zu, 512\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(none.explicit_ubatch.action),
+            none.explicit_ubatch.max_ring_runtime_bytes, none.explicit_ubatch.largest_fitting_n_ubatch, 2 * mib);
+        ok = false;
+    }
+
+    // No micro-batch named: no decision, and the plan is the one the load always made.
+    ggml_sycl::placement_kv_info plain   = kv_order_case::kv_info(0);
+    const auto                   unnamed = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        plain, nullptr, kv_order_case::n_experts);
+    if (unnamed.explicit_ubatch.n_ubatch != 0 || unnamed.explicit_ubatch.action != action::NONE ||
+        unnamed.explicit_ubatch.hold_bytes != 0 || kv_order_case::device_triplets(unnamed) != 8) {
+        printf("FAIL: no named micro-batch makes no decision: n_ubatch %u, action %s, %zu device triplets\n",
+               unnamed.explicit_ubatch.n_ubatch,
+               ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(unnamed.explicit_ubatch.action),
+               kv_order_case::device_triplets(unnamed));
+        ok = false;
+    }
+
+    // The compute room the hold-spill fit credits is the planned compute term at the micro-batch the PLACE plan placed.
+    // The GROW_ZONE plan is planned again once the zone grows and is never the published one, and the two refusals and
+    // the unnamed plan sized no room, so each gives none.
+    constexpr size_t compute_term = 256 * 1024;
+    uint32_t         room_n       = 0;
+    const size_t     room_placed =
+        ggml_sycl::placement_explicit_ubatch_compute_room(placed.explicit_ubatch, compute_term, &room_n);
+    size_t room_others = 0;
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        uint32_t other_n = 1;
+        room_others +=
+            ggml_sycl::placement_explicit_ubatch_compute_room(other->explicit_ubatch, compute_term, &other_n);
+        room_others += other_n;
+    }
+    if (room_placed != compute_term || room_n != 2048 || room_others != 0 ||
+        ggml_sycl::placement_explicit_ubatch_compute_room(placed.explicit_ubatch, compute_term, nullptr) !=
+            compute_term) {
+        printf(
+            "FAIL: the compute room is the planned term at the placed micro-batch only: %zu at n_ubatch %u for the "
+            "placed plan, %zu summed over grow-zone, both refusals and no decision; want %zu at 2048, 0\n",
+            room_placed, room_n, room_others, compute_term);
+        ok = false;
+    }
+
+    // The first non-probe context since the load announces the placement at WARN. The rule reads the plan alone, so a
+    // context whose micro-batch differs (-p 512 under -ub 2048) still announces it. The plan that context publishes
+    // carries the mark and the next context copies it, so none announces again. A probe never announces, and neither
+    // does a plan that placed nothing or a room that cost no device bytes.
+    ggml_sycl::placement_plan published = placed;
+    const bool                fresh     = !published.explicit_ubatch.announced;
+
+    const bool first_announces = ggml_sycl::placement_explicit_ubatch_announces(published.explicit_ubatch, false);
+    const bool probe_announces = ggml_sycl::placement_explicit_ubatch_announces(published.explicit_ubatch, true);
+
+    published.explicit_ubatch.announced   = true;
+    const ggml_sycl::placement_plan later = published;
+    const bool later_announces = ggml_sycl::placement_explicit_ubatch_announces(later.explicit_ubatch, false);
+
+    ggml_sycl::placement_explicit_ubatch slack = placed.explicit_ubatch;
+    slack.expert_bytes_without                 = slack.expert_bytes;
+    bool others_announce                       = ggml_sycl::placement_explicit_ubatch_announces(slack, false);
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        others_announce =
+            others_announce || ggml_sycl::placement_explicit_ubatch_announces(other->explicit_ubatch, false);
+    }
+    if (!fresh || !first_announces || probe_announces || later_announces || others_announce) {
+        printf(
+            "FAIL: a load announces its placement once, at the first non-probe context: fresh plan unmarked %d, first "
+            "context %d, probe %d, a context after the mark %d, a plan with nothing to announce %d; want 1, 1, 0, 0, "
+            "0\n",
+            fresh ? 1 : 0, first_announces ? 1 : 0, probe_announces ? 1 : 0, later_announces ? 1 : 0,
+            others_announce ? 1 : 0);
+        ok = false;
+    }
+
+    if (ok) {
+        printf(
+            "PASS: an explicit micro-batch's ring room comes out of the routed experts, refused with the largest fit "
+            "only when they cannot give it\n");
+    }
+    return ok;
+}
+
+// The ring each context re-plans for. A load that PLACED the micro-batch keeps the ring at that size for every context
+// whose own micro-batch is no larger (llama-bench's -p 512 and -n 128 contexts under -ub 2048), so none of them
+// releases the placed ring for the next context to re-admit. A larger context, a context that names no micro-batch, and
+// every plan that placed nothing re-plan for the context's own micro-batch. The plans are the ring-placement case's.
+static bool run_explicit_ubatch_ring_kept_for_smaller_contexts_test() {
+    using namespace explicit_ubatch_case;
+    using action         = ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
+    const auto   name    = ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name;
+    const size_t triplet = kv_order_case::triplet_bytes;
+
+    const auto placed  = plan(2 * triplet, zone_explicit);
+    const auto grow    = plan(8 * triplet, zone_default);
+    const auto partial = plan(2 * triplet, zone_default);
+    const auto none    = plan(0, zone_default);
+    const auto unnamed = ggml_sycl::compute_placement_plan(
+        kv_order_case::inventory(), 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512 + 8 * triplet, 0,
+        kv_order_case::kv_info(0), nullptr, kv_order_case::n_experts);
+    // The rule reads the decision, so each plan must make the one this case names, or the case proves nothing.
+    if (placed.explicit_ubatch.action != action::PLACE || placed.explicit_ubatch.n_ubatch != 2048 ||
+        grow.explicit_ubatch.action != action::GROW_ZONE || partial.explicit_ubatch.action != action::REFUSE ||
+        none.explicit_ubatch.action != action::REFUSE || unnamed.explicit_ubatch.action != action::NONE) {
+        printf(
+            "FAIL: the ring-keep plans decide %s at %u, %s, %s, %s and %s; want place at 2048, grow-zone, refuse, "
+            "refuse and none\n",
+            name(placed.explicit_ubatch.action), placed.explicit_ubatch.n_ubatch, name(grow.explicit_ubatch.action),
+            name(partial.explicit_ubatch.action), name(none.explicit_ubatch.action),
+            name(unnamed.explicit_ubatch.action));
+        return false;
+    }
+
+    const auto &   xub        = placed.explicit_ubatch;
+    const uint32_t kept_128   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 128);
+    const uint32_t kept_512   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 512);
+    const uint32_t kept_2048  = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 2048);
+    const uint32_t own_4096   = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 4096);
+    const uint32_t own_0      = ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(xub, 0);
+    bool           others_own = true;
+    for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none, &unnamed }) {
+        for (const uint32_t n_ubatch : { 128u, 512u, 2048u }) {
+            const uint32_t ring_n_ubatch =
+                ggml_sycl::placement_explicit_ubatch_ring_n_ubatch(other->explicit_ubatch, n_ubatch);
+            others_own = others_own && ring_n_ubatch == n_ubatch;
+        }
+    }
+    if (kept_128 != 2048 || kept_512 != 2048 || kept_2048 != 2048 || own_4096 != 4096 || own_0 != 0 || !others_own) {
+        printf(
+            "FAIL: a placed load keeps its ring for every context no larger than its micro-batch: contexts at 128, 512 "
+            "and 2048 re-plan for %u, %u and %u, at 4096 for %u, at 0 for %u, and plans that placed nothing for the "
+            "context's own %d; want 2048, 2048, 2048, 4096, 0 and 1\n",
+            kept_128, kept_512, kept_2048, own_4096, own_0, others_own ? 1 : 0);
+        return false;
+    }
+    printf("PASS: a placed explicit micro-batch keeps its ring for every context of the load no larger than it\n");
+    return true;
+}
+
+// Layer 0's triplets are four times layer 1's. The room's cost is net: with the room added back, the first-fit pack
+// takes a second large triplet and then has no space for the small ones the real pack placed, so counting only the
+// triplets that fit the larger budget and not the real one (one large triplet) over-states what the room cost.
+static bool run_kv_context_room_cost_is_net_test() {
+    using namespace kv_order_case;
+    constexpr size_t small_bytes   = expert_bytes / 4;
+    constexpr size_t small_triplet = 3 * small_bytes;
+    constexpr size_t room_bytes    = 2 * 576 * (kv_width + kv_width) * 2;  // n_ctx 1088 over 512, two layers
+
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk  = "blk." + std::to_string(l) + ".";
+        const size_t      role = l == 0 ? expert_bytes : small_bytes;
+        inv.push_back({ blk + "attn_q.weight", dense_bytes });
+        inv.push_back({ blk + "ffn_gate_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_up_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_down_exps.weight", n_experts * role });
+    }
+    if (2 * kv_info(1088).kv_context_extra_bytes_for_layer(0) != room_bytes) {
+        printf("FAIL: the n_ctx 1088 room is %zu bytes, want %zu\n",
+               2 * kv_info(1088).kv_context_extra_bytes_for_layer(0), room_bytes);
+        return false;
+    }
+    // Left for the experts: one large triplet and two small ones. With the room added back: two large and one small.
+    // That holds in (layer, expert) order. The expert popularity ranks are process-global and an earlier case in this
+    // binary ranks layer 1's experts 0 and 1 first, which changes what each pack takes (the real pack takes s0 s1 g0,
+    // the second s0 s1 g0 s2 s3: 384 KiB net). So the case ranks its own eight triplets in (layer, expert) order, and
+    // puts the earlier ranks back after the plan.
+    int prior_rank[2][n_experts];
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            prior_rank[l][e] = ggml_sycl::get_expert_popularity_rank(l, e);
+            ggml_sycl::set_expert_popularity_rank(l, e, l * n_experts + e);
+        }
+    }
+    const size_t left   = triplet_bytes + 2 * small_triplet;
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + room_bytes + left;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv_info(1088), nullptr, n_experts);
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            ggml_sycl::set_expert_popularity_rank(l, e, prior_rank[l][e]);
+        }
+    }
+    if (plan.kv_context_reserve_bytes != room_bytes) {
+        printf("FAIL: the planner must hold the whole %zu byte room, held %zu\n", room_bytes,
+               plan.kv_context_reserve_bytes);
+        return false;
+    }
+    if (device_triplets(plan) != 3) {
+        printf("FAIL: the real pack places one large and two small triplets: %zu device triplets, want 3\n",
+               device_triplets(plan));
+        return false;
+    }
+    // Net: (2 large + 1 small) - (1 large + 2 small) = the room's bytes. The gross count would be one large triplet.
+    if (plan.kv_context_room_displaced_bytes != triplet_bytes - small_triplet) {
+        printf("FAIL: the room cost %zu device bytes of routed experts net, logged %zu (gross would be %zu)\n",
+               triplet_bytes - small_triplet, plan.kv_context_room_displaced_bytes, triplet_bytes);
+        return false;
+    }
+    printf("PASS: the KV context room's cost is the net device bytes of routed experts\n");
+    return true;
+}
+
+// The explicit micro-batch's cost is net too, on the same unequal triplets: layer 0's are four times layer 1's. The
+// ring here has a 256 KiB weight slot, 192 B of activation and 96 B of output per row, and depth 1, so the ring at 2560
+// is 576 KiB more than at the default 512. The RUNTIME zone already holds that room, which it took from the weight
+// capacity when it grew, so the budget the planner is given is what is left beside the zone, as for the placed plan
+// above. The hold credits what the zone holds before it charges the room, so it takes nothing more from that budget.
+// Left for the experts: one large triplet and two small ones; with the hold added back, two large and one small. The
+// device keeps as many triplets and 576 KiB less, and only layer 0 keeps fewer. Counting the triplets that fit the
+// larger budget and not the real one would say one large triplet, 768 KiB, moved.
+static bool run_explicit_ubatch_cost_is_net_test() {
+    using namespace kv_order_case;
+    constexpr size_t small_bytes   = expert_bytes / 4;
+    constexpr size_t small_triplet = 3 * small_bytes;
+    constexpr size_t room_bytes    = 2048 * (192 + 96);
+    constexpr size_t fixed_bytes   = 1024 * 1024;
+
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk  = "blk." + std::to_string(l) + ".";
+        const size_t      role = l == 0 ? expert_bytes : small_bytes;
+        inv.push_back({ blk + "attn_q.weight", dense_bytes });
+        inv.push_back({ blk + "ffn_gate_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_up_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_down_exps.weight", n_experts * role });
+    }
+
+    ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch                 = 2560;
+    in.n_ubatch_default         = 512;
+    in.weight_slot_bytes        = 256 * 1024;
+    in.activation_bytes_per_row = 192;
+    in.output_bytes_per_row     = 96;
+    in.ring_depth               = 1;
+    in.runtime_fixed_bytes      = fixed_bytes;
+    in.runtime_floor_bytes      = 0;
+    in.runtime_zone_bytes       = fixed_bytes + 256 * 1024 + 2560 * (192 + 96);
+
+    ggml_sycl::placement_kv_info kv = kv_info(0);
+    kv.n_ubatch_context             = 2560;
+    kv.explicit_ubatch              = ggml_sycl::pp_moe_onednn_explicit_ubatch_plan_room(in);
+    if (!kv.explicit_ubatch.valid || kv.explicit_ubatch.room_bytes != room_bytes ||
+        kv.explicit_ubatch.room_reserved_bytes != room_bytes || room_bytes != triplet_bytes - small_triplet) {
+        printf("FAIL: the n_ubatch=2560 room is %zu bytes, %zu of them held; want %zu, all held\n",
+               kv.explicit_ubatch.room_bytes, kv.explicit_ubatch.room_reserved_bytes, room_bytes);
+        return false;
+    }
+
+    // The packs take triplets in (layer, expert) order; see the KV room's case above for why the ranks are set here.
+    int prior_rank[2][n_experts];
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            prior_rank[l][e] = ggml_sycl::get_expert_popularity_rank(l, e);
+            ggml_sycl::set_expert_popularity_rank(l, e, l * n_experts + e);
+        }
+    }
+    const size_t left   = triplet_bytes + 2 * small_triplet;
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + left;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv, nullptr, n_experts);
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            ggml_sycl::set_expert_popularity_rank(l, e, prior_rank[l][e]);
+        }
+    }
+
+    const auto & xub = plan.explicit_ubatch;
+    // The experts are packed into what the dense weights and their KV leave of the budget; the zone's room is
+    // not in it.
+    if (xub.action != ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE || xub.expert_budget_bytes != left ||
+        xub.hold_bytes != room_bytes || device_triplets(plan) != 3) {
+        printf(
+            "FAIL: the held room places the ring: action %s, expert budget %zu, hold %zu, %zu device triplets; want "
+            "place, %zu, %zu, 3\n",
+            ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.expert_budget_bytes, xub.hold_bytes,
+            device_triplets(plan), left, room_bytes);
+        return false;
+    }
+    // Net: (2 large + 1 small) - (1 large + 2 small) = the room's bytes, in the one layer that keeps fewer triplets.
+    if (xub.expert_groups != 3 || xub.expert_groups_without != 3 || xub.expert_bytes != left ||
+        xub.expert_bytes_without != 2 * triplet_bytes + small_triplet || xub.moved_bytes() != room_bytes ||
+        xub.moved_layers != 1) {
+        printf(
+            "FAIL: the room moves %zu device bytes of routed experts net from 1 layer: %zu bytes (%zu triplets) on the "
+            "device against %zu (%zu) with the hold added back, %zu moved from %zu layers; want %zu (3) against %zu "
+            "(3), not the gross %zu\n",
+            room_bytes, xub.expert_bytes, xub.expert_groups, xub.expert_bytes_without, xub.expert_groups_without,
+            xub.moved_bytes(), xub.moved_layers, left, 2 * triplet_bytes + small_triplet, triplet_bytes);
+        return false;
+    }
+    // The bytes decide the announcement: the device keeps as many triplets, and the room still cost 576 KiB of them.
+    if (!ggml_sycl::placement_explicit_ubatch_announces(xub, false)) {
+        printf("FAIL: a room that cost device bytes with the triplet count unchanged must still be announced\n");
+        return false;
+    }
+    printf("PASS: the explicit micro-batch room's cost is the net device bytes of routed experts\n");
+    return true;
+}
+
+// llama.cpp-ak0p: the room is for the context the caller asked for, and there is none without a request. A requested
+// n_ctx 2304 (a room unlike the 4096 one above: 1792 cells a layer, and three and a half triplets left after it)
+// holds exactly what that context's KV needs beyond the planner's n_ctx 512 on each device layer, and the experts keep
+// what is left. With no request (n_ctx_context 0) the planner holds nothing, and the experts take every byte the
+// dense weights and their KV leave, as they did before the room existed. libllama pads the hint as llama_context pads
+// n_ctx before it reaches the planner (populate_inventory, pinned by test-sycl-kv-before-experts-source), so a hint of
+// 4000 arrives as 4096 and holds the 4096 room, which an unpadded 4000 would fall short of.
+static bool run_kv_context_room_follows_the_requested_context_test() {
+    using namespace kv_order_case;
+    const ggml_sycl::placement_kv_info hint_2304 = kv_info(2304);
+    size_t                             room_2304 = 0;
+    for (uint32_t il = 0; il < 2; ++il) {
+        room_2304 += hint_2304.kv_bytes_for_layer_at(il, 2304) - hint_2304.kv_bytes_for_layer_at(il, 512);
+    }
+    constexpr size_t cell_bytes = (kv_width + kv_width) * 2;  // f16 K and V of one cell of one layer
+    if (room_2304 != 2 * (2304 - 512) * cell_bytes || room_2304 == 2 * kv_extra_layer) {
+        printf("FAIL: the n_ctx 2304 room is %zu bytes, want %zu (1792 cells on 2 layers)\n", room_2304,
+               2 * (2304 - 512) * cell_bytes);
+        return false;
+    }
+    const size_t left   = room_2304 + 3 * triplet_bytes + triplet_bytes / 2;
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + left;
+
+    const auto requested = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(2304), nullptr, n_experts);
+    if (requested.kv_context_reserve_bytes != room_2304 || device_triplets(requested) != 3) {
+        printf("FAIL: a requested n_ctx 2304 holds %zu bytes (want %zu), %zu device triplets (want 3)\n",
+               requested.kv_context_reserve_bytes, room_2304, device_triplets(requested));
+        return false;
+    }
+    // Without the room the same budget holds five triplets (5.83 fit), with it three (3.5 fit): two displaced.
+    if (requested.kv_context_room_displaced_bytes != 2 * triplet_bytes) {
+        printf("FAIL: the n_ctx 2304 room displaced 2 triplets: logged %zu bytes, want %zu\n",
+               requested.kv_context_room_displaced_bytes, 2 * triplet_bytes);
+        return false;
+    }
+
+    const size_t no_room_triplets = left / triplet_bytes;  // every triplet that fits what is left: 5 of the 8
+    const auto   none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts);
+    if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 ||
+        device_triplets(none) != no_room_triplets) {
+        printf(
+            "FAIL: with no requested context the planner holds %zu bytes (want 0) and keeps %zu device triplets "
+            "(want %zu)\n",
+            none.kv_context_reserve_bytes, device_triplets(none), no_room_triplets);
+        return false;
+    }
+
+    // A hint of 4000 reaches the planner as libllama pads it: 4096, the same room and the same pack as a hint of 4096.
+    const uint32_t padded_4000 = GGML_PAD(4000u, 256u);
+    const auto     plan_4000 =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(padded_4000), nullptr, n_experts);
+    const auto plan_4096 = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
+    const size_t unpadded_room_4000 = 2 * kv_info(4000).kv_context_extra_bytes_for_layer(0);
+    if (padded_4000 != 4096 || plan_4000.kv_context_reserve_bytes != plan_4096.kv_context_reserve_bytes ||
+        plan_4000.kv_context_reserve_bytes != 2 * kv_extra_layer ||
+        device_triplets(plan_4000) != device_triplets(plan_4096) ||
+        unpadded_room_4000 >= plan_4000.kv_context_reserve_bytes) {
+        printf(
+            "FAIL: a hint of 4000 pads to %u and holds %zu bytes with %zu device triplets; 4096 holds %zu with %zu; "
+            "unpadded 4000 would hold %zu\n",
+            padded_4000, plan_4000.kv_context_reserve_bytes, device_triplets(plan_4000),
+            plan_4096.kv_context_reserve_bytes, device_triplets(plan_4096), unpadded_room_4000);
+        return false;
+    }
+    printf("PASS: the KV context room follows the requested context, and there is none without one\n");
+    return true;
+}
+
+// llama.cpp-w013: the room is cost-based (owner ruling 2026-10-10). A layer's room is held only when the attention it
+// keeps on the device is worth more per decode token than the routed experts it displaces:
+//   A = host attention    = kv_bytes_for_layer_at(layer, F) / host_attn_gbps + n_splits x host_split_us,
+//                           F = n_ctx_context x ctx_fill_pct / 100
+//   B = displaced experts = the layer's room x n_expert_used / n_expert / the experts' CPU rate
+// llama.cpp-7fmt added the split term (n_splits 3 for a layer with an indexer key cache, else 1) and the per-type CPU
+// rate. Cases (a) to (f) pin w013's arithmetic, not 7fmt's constants: moe() sets host_split_us to 0, and their experts
+// are untyped in a context the caller named, so B reads at cpu_expert_gbps, which moe() sets to 40. Cases (g) to (i)
+// pin what 7fmt added through the real planner; test-kv-room-cost pins the measured shapes.
+// Every number below comes from the kv_order_case constants: one cell of one layer is 512 bytes (128 + 128 f16
+// elements), a FULL layer's room at n_ctx 4096 over the planner's 512 is 3584 cells (1.75 MiB), and GB/s is 1e3 bytes
+// per microsecond. The triplets are all one size, so the popularity ranks earlier cases left behind decide which
+// triplets a pack takes but not how many: the case sets no rank, and compares counts and the hint-0 plan's set.
+namespace kv_cost_case {
+using namespace kv_order_case;
+constexpr size_t cell_bytes = (kv_width + kv_width) * 2;
+constexpr size_t full_room  = (4096 - 512) * cell_bytes;  // kv_extra_layer
+constexpr size_t swa_room   = (1536 - 512) * cell_bytes;  // window n_swa 1024 + n_ubatch 512 = 1536 cells
+// Case (h)'s layer 1 also keeps an indexer key cache of kv_width f16 K elements per cell (llama.cpp-7fmt).
+constexpr size_t idx_cell_bytes = cell_bytes + kv_width * 2;      // 768
+constexpr size_t idx_room       = (4096 - 512) * idx_cell_bytes;  // 2.625 MiB
+constexpr size_t idx_kv_at_512  = 512 * idx_cell_bytes;
+// Dense weights, their KV at 512, and a budget whose experts get two triplets with both FULL rooms held, six without.
+constexpr size_t budget     = 2 * dense_bytes + 2 * kv_at_512 + 2 * full_room + 2 * triplet_bytes;
+
+static ggml_sycl::placement_kv_info moe(uint32_t n_ctx_context, double fill_pct, int n_expert_used) {
+    ggml_sycl::placement_kv_info kv = kv_info(n_ctx_context);
+    kv.ctx_fill_pct                 = fill_pct;
+    kv.host_attn_gbps               = 30.0;
+    // w013's arithmetic, not llama.cpp-7fmt's defaults: no split cost, and the rate an untyped expert reads at in a
+    // context the caller named.
+    kv.host_split_us                = 0.0;
+    kv.cpu_expert_gbps              = 40.0;
+    kv.n_expert_used                = n_expert_used;
+    return kv;
+}
+
+// inventory() with every routed-expert tensor typed `type` and given no shape: has_shape() stays false, so every
+// layout keeps the expert's size and only the room's CPU rate reads the type (llama.cpp-7fmt).
+static std::vector<ggml_sycl::placement_tensor_info> typed_inventory(ggml_type type) {
+    std::vector<ggml_sycl::placement_tensor_info> inv;
+    for (const auto & item : inventory()) {
+        ggml_sycl::placement_tensor_info tensor{ item.first, item.second };
+        if (item.first.find("_exps") != std::string::npos) {
+            tensor.type = type;
+        }
+        inv.push_back(tensor);
+    }
+    return inv;
+}
+
+// Layer 0 slides a 1024-token window; layer 1 attends to the whole context.
+static ggml_sycl::placement_kv_info swa_then_full(uint32_t n_ctx_context, double fill_pct, int n_expert_used) {
+    ggml_sycl::placement_kv_info kv = moe(n_ctx_context, fill_pct, n_expert_used);
+    kv.n_swa                        = 1024;
+    kv.n_swa_layers                 = 1;
+    kv.swa_layer_mask               = { true, false };
+    kv.layer_kind                   = { GGML_SYCL_KV_LAYER_SWA, GGML_SYCL_KV_LAYER_FULL };
+    return kv;
+}
+
+static std::vector<std::pair<int, int>> device_triplet_set(const ggml_sycl::placement_plan & plan) {
+    std::vector<std::pair<int, int>> set;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            const auto gate = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::GATE);
+            const auto up   = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::UP);
+            const auto down = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::DOWN);
+            if (gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device) {
+                set.push_back({ l, e });
+            }
+        }
+    }
+    return set;
+}
+
+// One sub-case's held room, device triplets and displaced expert bytes; a mismatch clears `ok`.
+static void expect_room(bool &                            ok,
+                        const char *                      what,
+                        const ggml_sycl::placement_plan & plan,
+                        size_t                            held,
+                        size_t                            triplets,
+                        size_t                            displaced) {
+    if (plan.kv_context_reserve_bytes != held || device_triplets(plan) != triplets ||
+        plan.kv_context_room_displaced_bytes != displaced) {
+        printf("FAIL: %s: held %zu (want %zu), %zu device triplets (want %zu), displaced %zu (want %zu)\n", what,
+               plan.kv_context_reserve_bytes, held, device_triplets(plan), triplets,
+               plan.kv_context_room_displaced_bytes, displaced);
+        ok = false;
+        return;
+    }
+    printf("PASS: %s\n", what);
+}
+}  // namespace kv_cost_case
+
+static bool run_kv_context_room_is_cost_based_test() {
+    using namespace kv_cost_case;
+    bool ok = true;
+    // The sub-cases run a, e, b, c, d, f, g, h, i: (b) compares against the triplet set (e) plans, so (e) runs before
+    // it.
+
+    // (a) Qwen-shaped: the context is expected full and a token uses few experts. F = 4096 cells, so
+    //     A = 4096 x 512 B / 30 GB/s = 69.9 us and B = 1.75 MiB x 1/4 / 40 GB/s = 11.5 us on each layer: A > B, both
+    //     rooms held (2 x 1.75 MiB), two triplets fit beside them and six without them, so four are displaced. The
+    //     fixture's four experts make 1/4 its smallest p_hit; Qwen's 10/512 is smaller still and holds by more.
+    const auto qwen =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 100.0, 1), nullptr, n_experts);
+    if (qwen.kv_context_reserve_bytes != 2 * full_room || device_triplets(qwen) != 2 ||
+        qwen.kv_context_room_displaced_bytes != 4 * triplet_bytes) {
+        printf(
+            "FAIL: (a) a full context with p_hit 1/4 holds every layer's room: held %zu (want %zu), %zu device "
+            "triplets (want 2), displaced %zu (want %zu)\n",
+            qwen.kv_context_reserve_bytes, 2 * full_room, device_triplets(qwen), qwen.kv_context_room_displaced_bytes,
+            4 * triplet_bytes);
+        ok = false;
+    } else {
+        printf("PASS: (a) a full context with p_hit 1/4 holds every layer's KV context room\n");
+    }
+
+    // (e) No request: no room, decided before any cost is weighed. Six triplets fit what the dense weights and their KV
+    //     leave (2 x 1.75 MiB + 2 x 768 KiB = 5 MiB: six 768 KiB triplets). (b) compares against this plan's set.
+    const auto none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(0, 1.0, 1), nullptr, n_experts);
+    if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 || device_triplets(none) != 6) {
+        printf(
+            "FAIL: (e) with no requested context no room is held: held %zu, displaced %zu, %zu device triplets "
+            "(want 0, 0, 6)\n",
+            none.kv_context_reserve_bytes, none.kv_context_room_displaced_bytes, device_triplets(none));
+        ok = false;
+    } else {
+        printf("PASS: (e) with no requested context no KV context room is held before any cost is weighed\n");
+    }
+
+    // (b) GPT-OSS-shaped: a short chat in a large context. F = floor(4096 x 1 / 100) = 40 cells, so
+    //     A = 40 x 512 B / 30 GB/s = 0.68 us against B = 11.5 us on each layer: every room is refused, nothing is
+    //     held or displaced, and the experts take exactly what they take with no request.
+    const auto gptoss =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 1.0, 1), nullptr, n_experts);
+    if (gptoss.kv_context_reserve_bytes != 0 || gptoss.kv_context_room_displaced_bytes != 0 ||
+        device_triplet_set(gptoss) != device_triplet_set(none) || gptoss.get_kv_device(0) != 0 ||
+        gptoss.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: (b) a 1%% fill refuses every layer's room: held %zu, displaced %zu (want 0, 0), %zu device "
+            "triplets against %zu with no request, kv %d/%d (want 0/0)\n",
+            gptoss.kv_context_reserve_bytes, gptoss.kv_context_room_displaced_bytes, device_triplets(gptoss),
+            device_triplets(none), gptoss.get_kv_device(0), gptoss.get_kv_device(1));
+        ok = false;
+    } else {
+        printf("PASS: (b) a 1%% fill refuses every layer's KV context room and packs the experts of no request\n");
+    }
+
+    // (c) Mixed: with no split cost and one CPU rate, as moe() sets, every full-attention layer decides alike: a
+    //     layer's KV per cell is in both A and B and cancels (A/B = F / (4096 - 512) x 40 / (30 x p_hit) for every
+    //     FULL layer). A split cost does not scale with the layer's KV, so it can split two FULL layers, which (h)
+    //     shows. Here a SWA layer, whose room and host read are capped by its window, decides otherwise, so the case
+    //     flips between a SWA and a FULL layer. Fill 25%: F = 1024; p_hit 2/4. Layer 1 (FULL, latest, demoted
+    //     first): A = 1024 x 512 B / 30 GB/s = 17.5 us, B = 1.75 MiB x 1/2 / 40 GB/s = 22.9 us: refused. Layer 0
+    //     (SWA): its room is the window, 1536 - 512 = 1024 cells = 512 KiB, and the host reads min(1024, 1536) = 1024
+    //     cells, so A = 17.5 us against B = 512 KiB x 1/2 / 40 GB/s = 6.6 us: held.
+    //     The budget leaves both rooms and two triplets: held 512 KiB, so the experts get 1.75 MiB + 1.5 MiB = 4.33
+    //     triplets (4), and 5 with the SWA room added back: one displaced.
+    const ggml_sycl::placement_kv_info mixed_kv = swa_then_full(4096, 25.0, 2);
+    if (mixed_kv.kv_context_extra_bytes_for_layer(0) != swa_room ||
+        mixed_kv.kv_context_extra_bytes_for_layer(1) != full_room) {
+        printf("FAIL: (c) the fixture's rooms are %zu (SWA) and %zu (FULL), want %zu and %zu\n",
+               mixed_kv.kv_context_extra_bytes_for_layer(0), mixed_kv.kv_context_extra_bytes_for_layer(1), swa_room,
+               full_room);
+        ok = false;
+    }
+    const size_t mixed_budget = 2 * dense_bytes + 2 * kv_at_512 + swa_room + full_room + 2 * triplet_bytes;
+    const auto   mixed = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, mixed_kv, nullptr, n_experts);
+    if (mixed.kv_context_reserve_bytes != swa_room || device_triplets(mixed) != 4 ||
+        mixed.kv_context_room_displaced_bytes != triplet_bytes || mixed.get_kv_device(0) != 0 ||
+        mixed.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: (c) the latest (FULL) layer's room is refused and the SWA layer's held: held %zu (want %zu), %zu "
+            "device triplets (want 4), displaced %zu (want %zu), kv %d/%d (want 0/0)\n",
+            mixed.kv_context_reserve_bytes, swa_room, device_triplets(mixed), mixed.kv_context_room_displaced_bytes,
+            triplet_bytes, mixed.get_kv_device(0), mixed.get_kv_device(1));
+        ok = false;
+    } else {
+        printf("PASS: (c) the latest (FULL) layer's KV context room is refused and the SWA layer's held\n");
+    }
+
+    // (d) Dense (n_expert 0): no expert to displace, so the room is held as before, even at a fill so small that
+    //     F = floor(4096 x 0.01 / 100) = 0 and the host attention it saves is 0 us. The n_expert_used the kv info
+    //     carries does not make it MoE; n_expert decides.
+    const std::vector<std::pair<std::string, size_t>> dense_only = {
+        { "blk.0.attn_q.weight", dense_bytes },
+        { "blk.1.attn_q.weight", dense_bytes },
+    };
+    const size_t dense_budget = 2 * dense_bytes + 2 * kv_at_512 + 2 * full_room;
+    const auto   dense = ggml_sycl::compute_placement_plan(dense_only, dense_budget, 0, moe(4096, 0.01, 1), nullptr, 0);
+    if (dense.kv_context_reserve_bytes != 2 * full_room) {
+        printf("FAIL: (d) a dense model holds every layer's room: held %zu, want %zu\n", dense.kv_context_reserve_bytes,
+               2 * full_room);
+        ok = false;
+    } else {
+        printf("PASS: (d) a dense model holds every layer's KV context room, even at a zero expected fill\n");
+    }
+
+    // (f) The SWA window caps the host read, and the cap decides. Fill 100%: F = 4096 cells, past layer 0's window of
+    //     1536; p_hit 4/4; the host reads at 80 GB/s. Layer 1 (FULL): A = 4096 x 512 B / 80 GB/s = 26.2 us against
+    //     B = 1.75 MiB x 1 / 40 GB/s = 45.9 us: refused. Layer 0 (SWA): the host reads min(4096, 1536) = 1536 cells,
+    //     so A = 1536 x 512 B / 80 GB/s = 9.8 us against B = 512 KiB x 1 / 40 GB/s = 13.1 us: refused. Read uncapped,
+    //     A would be 26.2 us and the SWA room held (512 KiB, four triplets, one displaced, as in (c)). With (c)'s
+    //     budget and nothing held, the experts get 512 KiB + 1.75 MiB + 1.5 MiB = 3.75 MiB: five 768 KiB triplets.
+    ggml_sycl::placement_kv_info capped_kv = swa_then_full(4096, 100.0, n_experts);
+    capped_kv.host_attn_gbps               = 80.0;
+    if (capped_kv.kv_bytes_for_layer_at(0, 4096) != 1536 * cell_bytes) {
+        printf("FAIL: (f) the fixture's SWA layer reads %zu bytes at 4096 cells, want %zu (its 1536-cell window)\n",
+               capped_kv.kv_bytes_for_layer_at(0, 4096), 1536 * cell_bytes);
+        ok = false;
+    }
+    const auto capped = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, capped_kv, nullptr, n_experts);
+    if (capped.kv_context_reserve_bytes != 0 || device_triplets(capped) != 5 ||
+        capped.kv_context_room_displaced_bytes != 0 || capped.get_kv_device(0) != 0 || capped.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: (f) past its window a SWA layer's room is refused by the capped read: held %zu (want 0; read "
+            "uncapped it would be %zu), %zu device triplets (want 5), displaced %zu (want 0), kv %d/%d (want 0/0)\n",
+            capped.kv_context_reserve_bytes, swa_room, device_triplets(capped), capped.kv_context_room_displaced_bytes,
+            capped.get_kv_device(0), capped.get_kv_device(1));
+        ok = false;
+    } else {
+        printf("PASS: (f) past its window a SWA layer's host read is capped, so its KV context room is refused\n");
+    }
+
+    // (g) The experts' type sets B's rate (llama.cpp-7fmt). (a)'s shape: F = 4096 cells and p_hit 1/4, so A = 69.9 us
+    //     on each layer. MXFP4 reads at its measured 5.6 GB/s, so B = 1.75 MiB x 1/4 / 5.6 GB/s = 81.9 us: every room
+    //     is refused and the six triplets of no request fit. IQ3_XXS reads at 22 GB/s, so B = 20.9 us: held as in
+    //     (a). GGML_SYCL_PLAN_CPU_EXPERT_GBPS (cpu_expert_gbps_set) prices every type, so at 40 GB/s the MXFP4 rooms
+    //     are held as in (a).
+    const auto mxfp4 = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0,
+                                                         moe(4096, 100.0, 1), nullptr, n_experts);
+    expect_room(ok, "(g) MXFP4 experts read at 5.6 GB/s refuse every KV context room", mxfp4, 0, 6, 0);
+    const auto iq3 = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0,
+                                                       moe(4096, 100.0, 1), nullptr, n_experts);
+    expect_room(ok, "(g) IQ3_XXS experts read at 22 GB/s hold every KV context room", iq3, 2 * full_room, 2,
+                4 * triplet_bytes);
+    ggml_sycl::placement_kv_info overridden_kv = moe(4096, 100.0, 1);
+    overridden_kv.cpu_expert_gbps_set          = true;
+    const auto overridden = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_MXFP4), budget, 0,
+                                                              overridden_kv, nullptr, n_experts);
+    expect_room(ok, "(g) the override prices MXFP4 experts at 40 GB/s and holds every KV context room", overridden,
+                2 * full_room, 2, 4 * triplet_bytes);
+
+    // (h) The split term follows the indexer key cache (llama.cpp-7fmt). Two FULL layers at a 1% fill, F = 40 cells,
+    //     p_hit 1/4, 8 us per split. Layer 1 also keeps an indexer key cache, so its cell is 768 bytes and its room
+    //     3584 cells = 2.625 MiB. Layer 1 (3 splits): A = 40 x 768 B / 30 GB/s + 3 x 8 us = 25.0 us against
+    //     B = 2.625 MiB x 1/4 / 40 GB/s = 17.2 us: held. Layer 0 (1 split): A = 0.68 + 8 = 8.7 us against
+    //     B = 11.5 us: refused. The budget leaves the KV at 512, layer 1's room and two triplets: two triplets on the
+    //     device and five with the room added back, so three are displaced. Layer 1 holds and layer 0 refuses for
+    //     any split cost between 5.4 and 10.8 us. With the mapping flipped, layer 0's room would be held instead
+    //     (A = 24.7 us against 11.5). With no split cost both are refused (A = 1.0 and 0.68 us) and five triplets fit.
+    ggml_sycl::placement_kv_info indexed_kv = moe(4096, 1.0, 1);
+    indexed_kv.layer_idx_k_width            = { 0, kv_width };
+    indexed_kv.host_split_us                = 8.0;
+    if (indexed_kv.kv_context_extra_bytes_for_layer(1) != idx_room ||
+        indexed_kv.kv_bytes_for_layer(1) != idx_kv_at_512 ||
+        indexed_kv.kv_context_extra_bytes_for_layer(0) != full_room) {
+        printf(
+            "FAIL: (h) the fixture's rooms are %zu (indexer) and %zu, want %zu and %zu; its indexer KV at 512 is "
+            "%zu, want %zu\n",
+            indexed_kv.kv_context_extra_bytes_for_layer(1), indexed_kv.kv_context_extra_bytes_for_layer(0), idx_room,
+            full_room, indexed_kv.kv_bytes_for_layer(1), idx_kv_at_512);
+        ok = false;
+    }
+    const size_t indexed_budget = 2 * dense_bytes + kv_at_512 + idx_kv_at_512 + idx_room + 2 * triplet_bytes;
+    const auto   indexed =
+        ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr, n_experts);
+    expect_room(ok, "(h) the indexer layer pays three splits and holds its KV context room, the other refuses", indexed,
+                idx_room, 2, 3 * triplet_bytes);
+    if (indexed.get_kv_device(0) != 0 || indexed.get_kv_device(1) != 0) {
+        printf("FAIL: (h) kv %d/%d, want 0/0\n", indexed.get_kv_device(0), indexed.get_kv_device(1));
+        ok = false;
+    }
+    indexed_kv.host_split_us = 0.0;
+    const auto unsplit =
+        ggml_sycl::compute_placement_plan(inventory(), indexed_budget, 0, indexed_kv, nullptr, n_experts);
+    expect_room(ok, "(h) with no split cost both layers refuse their KV context rooms", unsplit, 0, 5, 0);
+
+    // (i) The model's default context (llama.cpp-7fmt). n_ctx_context_is_default prices no expert type without a
+    //     measured rate, so the room is refused for every layer without being weighed, even at (a)'s shape, where
+    //     A = 69.9 us is six times B = 11.5 us; a context the caller names prices those experts at 40 GB/s and holds,
+    //     which is (a). Untyped experts and Q8_0 ones are refused, and the six triplets of no request fit. IQ3_XXS
+    //     ones are measured, so they are weighed and held. The override prices every type, so untyped experts are
+    //     weighed and held too.
+    ggml_sycl::placement_kv_info default_kv = moe(4096, 100.0, 1);
+    default_kv.n_ctx_context_is_default     = true;
+    const auto untyped_default =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, unpriced untyped experts refuse every KV context room", untyped_default, 0, 6, 0);
+    const auto q8_default =
+        ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_Q8_0), budget, 0, default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, Q8_0 experts (no measured rate) refuse every KV context room", q8_default, 0, 6,
+                0);
+    const auto iq3_default = ggml_sycl::compute_placement_plan(typed_inventory(GGML_TYPE_IQ3_XXS), budget, 0,
+                                                               default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, measured IQ3_XXS experts are weighed and hold every KV context room", iq3_default,
+                2 * full_room, 2, 4 * triplet_bytes);
+    default_kv.cpu_expert_gbps_set = true;
+    const auto overridden_default =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, default_kv, nullptr, n_experts);
+    expect_room(ok, "(i) without -c, the override prices untyped experts and holds every KV context room",
+                overridden_default, 2 * full_room, 2, 4 * triplet_bytes);
+    return ok;
+}
+
+// The prompt phase's window ring reserves its slots in the WEIGHT zone, which the routed experts fill at default
+// placement. The planner holds the ring's bytes there before it packs the experts, so the first reserve finds them
+// and the expert loan is only the fallback. The synthetic model has two layers of Q4_0 gate/up/down experts, 32
+// experts each, every matrix 256 x 128: 18432 bytes, a whole number of the ring's 256-byte slot alignment. The
+// executor's planned f16 weight slot holds six f16 experts, so a phase holds three (its two-buffer rule), and the ring
+// is two regions of three slots: two triplets' bytes.
+namespace ring_room_case {
+constexpr int      n_exps       = 32;
+constexpr int      n_triplets   = 2 * n_exps;
+constexpr int      ncols        = 256;
+constexpr int      nrows        = 128;
+constexpr size_t   matrix_bytes = 18432;  // ggml_row_size(Q4_0, 256) * 128 = 144 * 128
+constexpr size_t   f16_expert   = static_cast<size_t>(ncols) * nrows * 2;
+constexpr size_t   weight_slot  = 6 * f16_expert;
+constexpr size_t   ring_bytes   = 2 * 3 * matrix_bytes;
+constexpr uint64_t q4_0_bit     = uint64_t(1) << GGML_TYPE_Q4_0;
+// Dense weights and their KV at the planner's n_ctx, as kv_order_case plans them; no context room is requested.
+constexpr size_t   base         = 2 * kv_order_case::dense_bytes + 2 * kv_order_case::kv_at_512;
+
+static std::vector<ggml_sycl::placement_tensor_info> inventory() {
+    std::vector<ggml_sycl::placement_tensor_info> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk = "blk." + std::to_string(l) + ".";
+        inv.push_back(ggml_sycl::placement_tensor_info(blk + "attn_q.weight", kv_order_case::dense_bytes));
+        for (const char * role : { "gate", "up", "down" }) {
+            ggml_sycl::placement_tensor_info tensor(blk + "ffn_" + role + "_exps.weight", 0);
+            tensor.type  = GGML_TYPE_Q4_0;
+            tensor.ne[0] = ncols;
+            tensor.ne[1] = nrows;
+            tensor.ne[2] = n_exps;
+            tensor.ne[3] = 1;
+            tensor.size  = ggml_row_size(GGML_TYPE_Q4_0, ncols) * static_cast<size_t>(nrows) * n_exps;
+            inv.push_back(tensor);
+        }
+    }
+    return inv;
+}
+
+static ggml_sycl::placement_kv_info kv_info(uint64_t staged_types, size_t group_cap) {
+    ggml_sycl::placement_kv_info kv = kv_order_case::kv_info(0);
+    kv.moe_stream_staged_types      = staged_types;
+    kv.moe_stream_group_cap         = group_cap;
+    return kv;
+}
+
+static ggml_sycl::placement_plan plan_for(size_t budget, uint64_t staged_types, size_t group_cap = 0) {
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(staged_types, group_cap), nullptr, n_exps);
+}
+
+static size_t device_triplets(const ggml_sycl::placement_plan & plan) {
+    size_t n = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_exps; ++e) {
+            const auto gate = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::GATE);
+            const auto up   = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::UP);
+            const auto down = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::DOWN);
+            n += gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device;
+        }
+    }
+    return n;
+}
+
+// What one device triplet charges the budget: the device layout's bytes, rounded as the planner charges them. Read
+// from a plan that put layer 0's expert 0 on the device.
+static size_t triplet_charge(const ggml_sycl::placement_plan & plan) {
+    size_t charge = 0;
+    for (const auto & e : plan.entries) {
+        if (e.layer_id == 0 && e.expert_id == 0 && e.on_device) {
+            charge += e.vram_charge_size;
+        }
+    }
+    return charge;
+}
+
+// The test's own claims hook: a (layer, role) is claimed when its type's bit is in the mask, read from the plan's
+// entries. It is written here, not borrowed from the planner, so the ring the case expects comes from the shared
+// geometry function and the mask alone.
+struct claims_ctx {
+    const ggml_sycl::placement_plan * plan;
+    uint64_t                          staged_types;
+};
+
+static bool claims_by_type(void * graph_ctx, int layer, ggml_sycl::expert_tensor_role role) {
+    const auto * ctx = static_cast<const claims_ctx *>(graph_ctx);
+    for (const auto & e : ctx->plan->entries) {
+        if (e.layer_id == layer && e.expert_id >= 0 && e.expert_role == role) {
+            return e.type >= 0 && e.type < 64 && ((ctx->staged_types >> e.type) & 1) != 0;
+        }
+    }
+    return false;
+}
+
+// The ring the prompt phase would reserve for `plan` on device 0, sized by moe_stream_plan_ring_geometry, the function
+// the phase and the auto-ubatch fit size it with, under this case's planned weight slot and no loan.
+static ggml_sycl::moe_stream_ring_geometry ring_of(const ggml_sycl::placement_plan & plan,
+                                                   uint64_t                          staged_types,
+                                                   size_t                            group_cap,
+                                                   size_t                            slot_bytes = weight_slot) {
+    claims_ctx                         ctx{ &plan, staged_types };
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes = slot_bytes;
+    hints.group_cap         = group_cap;
+    hints.lent_bytes        = 0;
+    return ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, &ctx, claims_by_type, hints);
+}
+
+static size_t left_over(size_t budget, const ggml_sycl::placement_plan & plan) {
+    const size_t placed = plan.weight_vram_bytes + plan.kv_vram_bytes + plan.kv_context_reserve_bytes;
+    return budget > placed ? budget - placed : 0;
+}
+
+// What one device triplet adds to the bytes the ring's cap reads (the resident entries' dst_size), read like
+// triplet_charge from a plan that put layer 0's expert 0 on the device.
+static size_t triplet_dst(const ggml_sycl::placement_plan & plan) {
+    size_t dst = 0;
+    for (const auto & e : plan.entries) {
+        if (e.layer_id == 0 && e.expert_id == 0 && e.on_device) {
+            dst += e.dst_size;
+        }
+    }
+    return dst;
+}
+}  // namespace ring_room_case
+
+// A budget whose experts fill the zone exactly (40 of 64 triplets) without the room: the planner holds the window
+// ring's bytes before the experts, the zone keeps exactly those bytes unfilled (to the pack's granularity, one
+// triplet), the plan counts them, and they survive the runtime transaction's KV re-derivation.
+static bool run_moe_stream_ring_room_before_experts_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+
+    // Every expert fits: no expert is on the host, so no ring is reserved and no room is held.
+    const auto   roomy  = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, q4_0_bit);
+    const size_t charge = triplet_charge(roomy);
+    if (charge == 0 || device_triplets(roomy) != n_triplets || roomy.moe_stream_ring_reserve_bytes != 0) {
+        printf("FAIL: a budget every expert fits holds no ring room: %zu device triplets of %d, room %zu, charge %zu\n",
+               device_triplets(roomy), n_triplets, roomy.moe_stream_ring_reserve_bytes, charge);
+        ok = false;
+    }
+
+    const size_t budget = base + 40 * charge;
+    // Nothing staged (mask 0): no ring, so no room, and the experts fill the zone.
+    const auto   none   = plan_for(budget, 0);
+    if (none.moe_stream_ring_reserve_bytes != 0 || device_triplets(none) != 40 || left_over(budget, none) != 0) {
+        printf(
+            "FAIL: with no staged type the planner holds no ring room: room %zu, %zu device triplets (want 40), "
+            "%zu bytes left (want 0)\n",
+            none.moe_stream_ring_reserve_bytes, device_triplets(none), left_over(budget, none));
+        ok = false;
+    }
+
+    const auto                                plan = plan_for(budget, q4_0_bit);
+    const ggml_sycl::moe_stream_ring_geometry ring = ring_of(plan, q4_0_bit, 0);
+    const size_t                              left = left_over(budget, plan);
+    if (plan.moe_stream_ring_reserve_bytes != ring_bytes || ring.bytes != ring_bytes) {
+        printf(
+            "FAIL: the planner must hold the window ring's %zu bytes (2 x 3 slots x %zu): held %zu, and the plan's "
+            "own ring is %zu bytes\n",
+            ring_bytes, matrix_bytes, plan.moe_stream_ring_reserve_bytes, ring.bytes);
+        ok = false;
+    }
+    if (left < plan.moe_stream_ring_reserve_bytes || left - plan.moe_stream_ring_reserve_bytes >= charge ||
+        device_triplets(plan) >= 40) {
+        printf(
+            "FAIL: the experts must leave exactly the ring's room unfilled: %zu bytes left for a %zu-byte room "
+            "(one triplet charges %zu), %zu device triplets (40 without the room)\n",
+            left, plan.moe_stream_ring_reserve_bytes, charge, device_triplets(plan));
+        ok = false;
+    }
+    if (plan.vram_bytes != plan.weight_vram_bytes + plan.kv_vram_bytes + plan.kv_context_reserve_bytes +
+                               plan.moe_stream_ring_reserve_bytes) {
+        printf(
+            "FAIL: the ring's room must count in the plan's device bytes: vram=%zu weights=%zu kv=%zu kv room=%zu "
+            "ring room=%zu\n",
+            plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes,
+            plan.moe_stream_ring_reserve_bytes);
+        ok = false;
+    }
+    ggml_sycl::placement_plan runtime = plan;
+    runtime.refresh_kv_byte_totals();
+    if (runtime.vram_bytes != runtime.weight_vram_bytes + runtime.kv_vram_bytes + plan.moe_stream_ring_reserve_bytes ||
+        runtime.moe_stream_ring_reserve_bytes != plan.moe_stream_ring_reserve_bytes) {
+        printf(
+            "FAIL: the runtime KV re-derivation must keep the ring's room in the device bytes: vram=%zu "
+            "weights=%zu kv=%zu room=%zu\n",
+            runtime.vram_bytes, runtime.weight_vram_bytes, runtime.kv_vram_bytes,
+            runtime.moe_stream_ring_reserve_bytes);
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: the planner holds the window ring's room in the WEIGHT zone before the routed experts\n");
+    }
+    return ok;
+}
+
+// The room's own displacement changes the ring it is for: the planner iterates to the room that equals the ring of
+// the plan it produces. A weight slot of 128 f16 experts makes the window the host experts per role (up to 64), and
+// a budget of 63 triplets leaves one triplet on the host without the room, so the first ring is 2 x 1 slots. Holding
+// it moves a second triplet to the host, which widens the window to 2 slots, and holding that moves a third; three
+// host triplets need 2 x 3 slots, which the room for them does not change. A group cap of 2 stops the window at 2.
+static bool run_moe_stream_ring_room_converges_test() {
+    using namespace ring_room_case;
+    bool             ok        = true;
+    constexpr size_t wide_slot = 128 * f16_expert;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, wide_slot, 0, 0, 1);
+
+    const size_t charge = triplet_charge(plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, 0));
+    const size_t budget = base + 63 * charge;
+
+    const auto   no_room = plan_for(budget, 0);
+    const size_t first   = ring_of(no_room, q4_0_bit, 0, wide_slot).bytes;
+    const auto   plan    = plan_for(budget, q4_0_bit);
+    const size_t ring    = ring_of(plan, q4_0_bit, 0, wide_slot).bytes;
+    if (first != 2 * matrix_bytes || plan.moe_stream_ring_reserve_bytes != ring ||
+        plan.moe_stream_ring_reserve_bytes != 2 * 3 * matrix_bytes) {
+        printf(
+            "FAIL: the room must grow from the first ring (%zu bytes, want %zu) to the ring of the plan it makes: "
+            "held %zu, that plan's ring %zu, want %zu\n",
+            first, 2 * matrix_bytes, plan.moe_stream_ring_reserve_bytes, ring, 2 * 3 * matrix_bytes);
+        ok = false;
+    }
+
+    const auto   capped      = plan_for(budget, q4_0_bit, 2);
+    const size_t capped_ring = ring_of(capped, q4_0_bit, 2, wide_slot).bytes;
+    if (capped.moe_stream_ring_reserve_bytes != capped_ring ||
+        capped.moe_stream_ring_reserve_bytes != 2 * 2 * matrix_bytes) {
+        printf(
+            "FAIL: a group cap of 2 bounds the window, so the room stops at 2 x 2 slots: held %zu, that plan's "
+            "ring %zu, want %zu\n",
+            capped.moe_stream_ring_reserve_bytes, capped_ring, 2 * 2 * matrix_bytes);
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: the ring's room converges to the ring of the plan it produces\n");
+    }
+    return ok;
+}
+
+// The ring's cap refuses a ring over an eleventh of the device's resident expert bytes, and the room itself displaces
+// experts, so a ring the cap passes without its room can fail it with the room held. The planner then holds nothing
+// and keeps the pack it had without the room: the experts the room would displace stay on the device, and the phase's
+// reserve asks for a loan. With Q4_0 at 18432 bytes a matrix a triplet is 55296 bytes, and 11 x 110592 (the 2 x 3
+// ring) is 1216512 = 22 x 55296, so at 22 device triplets the ring sits exactly at the cap. Holding its 110592 bytes
+// moves two triplets (2 x 55296) to the host and leaves 20 x 55296 = 1105920 < 1216512, which the cap refuses. The
+// case derives both counts from the plan's own dst and charge figures, so the budget follows the planned layout.
+static bool run_moe_stream_ring_room_cap_refuses_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+
+    const auto   roomy  = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, 0);
+    const size_t charge = triplet_charge(roomy);
+    const size_t dst    = triplet_dst(roomy);
+    if (charge == 0 || dst == 0) {
+        printf("FAIL: the cap case needs a device triplet's charge and dst bytes: charge %zu, dst %zu\n", charge, dst);
+        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+        return false;
+    }
+    // The fewest device triplets whose dst bytes the 2 x 3 ring's cap passes, and the triplets its room displaces
+    // from a pack of whole triplets.
+    const size_t n_dev     = (11 * ring_bytes + dst - 1) / dst;
+    const size_t displaced = (ring_bytes + charge - 1) / charge;
+    const size_t budget    = base + n_dev * charge;
+
+    const auto none = plan_for(budget, 0);
+    if (device_triplets(none) != n_dev || ring_of(none, q4_0_bit, 0).bytes != ring_bytes) {
+        printf(
+            "FAIL: without the room the 2 x 3 ring must pass the cap: %zu device triplets (want %zu), ring %zu "
+            "bytes (want %zu)\n",
+            device_triplets(none), n_dev, ring_of(none, q4_0_bit, 0).bytes, ring_bytes);
+        ok = false;
+    }
+    // The planner's second round: the pack with the room held, which the cap must refuse.
+    const auto held = plan_for(budget - ring_bytes, 0);
+    if (device_triplets(held) != n_dev - displaced || ring_of(held, q4_0_bit, 0).bytes != 0) {
+        printf(
+            "FAIL: with the room held the cap must refuse the ring: %zu device triplets (want %zu), ring %zu bytes "
+            "(want 0)\n",
+            device_triplets(held), n_dev - displaced, ring_of(held, q4_0_bit, 0).bytes);
+        ok = false;
+    }
+
+    const auto plan = plan_for(budget, q4_0_bit);
+    if (plan.moe_stream_ring_reserve_bytes != 0 || device_triplets(plan) != device_triplets(none)) {
+        printf(
+            "FAIL: a room the ring's cap refuses must not be held: room %zu (want 0), %zu device triplets (want "
+            "%zu, the pack without the room)\n",
+            plan.moe_stream_ring_reserve_bytes, device_triplets(plan), device_triplets(none));
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: the planner holds no ring room the ring's cap refuses once the room displaces experts\n");
+    }
+    return ok;
+}
+
+// A budget that fits both dense weights and one layer's KV: the dense weights are placed first, so the second layer
+// keeps its weights on the device and only its KV goes to the host tier.
+static bool run_dense_weights_before_kv_test() {
+    using namespace kv_order_case;
+    const std::vector<std::pair<std::string, size_t>> dense_only = {
+        { "blk.0.attn_q.weight", dense_bytes },
+        { "blk.1.attn_q.weight", dense_bytes },
+    };
+    const size_t budget = 2 * dense_bytes + kv_at_512;
+    const auto   plan   = ggml_sycl::compute_placement_plan(dense_only, budget, 0, kv_info(0), nullptr, 0);
+    if (plan.get_layer_device(0) != 0 || plan.get_layer_device(1) != 0) {
+        printf("FAIL: KV must never push a dense layer to the host: layer devices %d/%d\n", plan.get_layer_device(0),
+               plan.get_layer_device(1));
+        return false;
+    }
+    if (plan.get_kv_device(0) != 0 || plan.get_kv_device(1) != -1 || plan.kv_vram_bytes != kv_at_512 ||
+        plan.kv_host_bytes != kv_at_512) {
+        printf(
+            "FAIL: the KV that does not fit beside the dense weights goes to the host tier: kv %d/%d vram=%zu "
+            "host=%zu\n",
+            plan.get_kv_device(0), plan.get_kv_device(1), plan.kv_vram_bytes, plan.kv_host_bytes);
+        return false;
+    }
+    printf("PASS: dense weights are placed before KV\n");
+    return true;
+}
+
 static bool run_multi_device_layer_block_plan_test() {
     constexpr size_t mib = 1024u * 1024u;
 
@@ -700,39 +2004,76 @@ static bool run_multi_device_moe_i8_executor_support_test() {
     return true;
 }
 
-static bool run_single_device_moe_pp_complete_soa_layout_test() {
-    const auto & info = ggml_sycl_info();
-    if (info.device_count <= 0 ||
-        !xmx_capabilities_match_int8_tile(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_M,
-                                          GGML_SYCL_MXFP4_MOE_XMX_N, GGML_SYCL_MXFP4_MOE_XMX_K) ||
-        !xmx_capabilities_support_sub_group(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
-        printf("PASS: single-device XMX PP alternate test skipped on non-XMX device\n");
-        return true;
-    }
+// The synthetic MoE layer both halves of the single-device MoE PP layout test plan and probe: one layer of MXFP4
+// gate/up/down at GPT-OSS's 2880x2880, two experts.
+static constexpr int moe_pp_n_experts = 2;
+static constexpr int moe_pp_ncols     = 2880;
+static constexpr int moe_pp_nrows     = 2880;
 
-    constexpr size_t mib       = 1024u * 1024u;
-    constexpr int    n_experts = 2;
-    constexpr int    ncols     = 2880;
-    constexpr int    nrows     = 2880;
-
-    auto make_mxfp4 = [&](const char * name) {
+static std::vector<ggml_sycl::placement_tensor_info> moe_pp_inventory() {
+    auto make_mxfp4 = [](const char * name) {
         ggml_sycl::placement_tensor_info tensor;
         tensor.name  = name;
         tensor.type  = GGML_TYPE_MXFP4;
-        tensor.ne[0] = ncols;
-        tensor.ne[1] = nrows;
-        tensor.ne[2] = n_experts;
+        tensor.ne[0] = moe_pp_ncols;
+        tensor.ne[1] = moe_pp_nrows;
+        tensor.ne[2] = moe_pp_n_experts;
         tensor.ne[3] = 1;
-        tensor.size =
-            ggml_row_size(GGML_TYPE_MXFP4, ncols) * static_cast<size_t>(nrows) * static_cast<size_t>(n_experts);
+        tensor.size  = ggml_row_size(GGML_TYPE_MXFP4, moe_pp_ncols) * static_cast<size_t>(moe_pp_nrows) *
+                      static_cast<size_t>(moe_pp_n_experts);
         return tensor;
     };
-
-    const std::vector<ggml_sycl::placement_tensor_info> inventory = {
+    return {
         make_mxfp4("blk.0.ffn_gate_exps.weight"),
         make_mxfp4("blk.0.ffn_up_exps.weight"),
         make_mxfp4("blk.0.ffn_down_exps.weight"),
     };
+}
+
+// The single-device MoE plan's layout contract for MXFP4 gate/up/down, under one state of the planner's XMX_TILED
+// grouped-DPAS PP route. Each expectation names the function that decides it; the test asserts what the planner
+// materializes, one layout owner per weight (CLAUDE.md "THE LOADED LAYOUT IS THE ANSWER").
+//
+// - Gate/up start XMX_TILED on this mock: planner_default_device_layout() takes planner_mxfp4_xmx_tiled_supported(),
+//   whose capability chokepoint (ggml_sycl_select_mxfp4_moe_layout) picks XMX_TILED for an int8-XMX device and a
+//   QK_MXFP4-aligned shape.
+// - Down starts SOA: planner_mxfp4_xmx_tiled_supported() admits only GATE/UP, so down falls to
+//   layout_policy::get_optimal(MXFP4, MOE_EXPERT_WEIGHT), which is SOA.
+// - Route active: planner_moe_layout_needs_pp_soa_on_device() returns !pp_supported for an XMX_TILED primary, and
+//   planner_moe_primary_executor_supports_pp_layout_on_device() proves PP here (the mock caps can chunk the grouped-DPAS
+//   row list), so prepare_single_moe_pp_gate_up_primary_layouts_for_pack() promotes nothing and
+//   add_single_moe_pp_executable_alternates() reserves no SOA copy. A duplicate SOA reservation next to an XMX_TILED
+//   primary would give the weight two layout owners.
+// - Route inactive: the same predicate returns true, so gate/up primaries are rewritten to SOA before packing and the
+//   plan records moe_pp_soa_promoted.
+// - Down under ggml_sycl_moe_pp_onednn_batched_route_selected() (default on, pinned below):
+//   maybe_upgrade_moe_down_layouts_to_i8() returns before upgrading, so down keeps its SOA primary and carries no
+//   MXFP4_I8 copy. With that route opted out (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=0), the same function upgrades down
+//   to an MXFP4_I8 primary and keeps the SOA bytes as its PP alternate. That arm is derived from the code and does not
+//   run at default.
+//
+// Ambient env the route override does not neutralize, each of which changes these expectations:
+// - GGML_SYCL_XMX_TILED_PP_PROOF=1 keeps XMX_TILED in the inactive arm.
+// - GGML_SYCL_MOE_GATEUP_BUNDLE4=1 starts gate/up as XMX_TILED_BUNDLE4.
+// - GGML_SYCL_XMX_MOE_TILED=0 starts gate/up as SOA.
+// - GGML_SYCL_XMX_MOE=1 skips the pre-pack SOA promotion (planner_xmx_moe_forced()). Together with
+//   GGML_SYCL_MOE_GATEUP_SINGLE_XMX and GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP=1 it admits the single-XMX gate/up policy
+//   (planner_single_xmx_gateup_policy(), which reads the same variable through planner_moe_xmx_moe_forced()), and
+//   that policy reserves no SOA in either arm.
+static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_active) {
+    constexpr size_t mib = 1024u * 1024u;
+
+    const char * route_name = xmx_tiled_pp_route_active ? "on" : "off";
+
+    ggml_sycl::test_xmx_tiled_pp_route_override_guard route_guard(xmx_tiled_pp_route_active);
+
+    // The MMID direct route is closed in an ordinary build, so these plans are made as production makes them. This
+    // binary is a route-testing build, where the route compiles in; run_single_device_moe_mmid_pool_charge_test()
+    // plans the open state.
+    ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
+
     const std::vector<ggml_sycl::device_budget> devices = {
         { 0, 1024u * mib, 1024u * mib, 4.0, true },
     };
@@ -741,7 +2082,7 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     kv_info.n_ubatch      = 512;
     kv_info.n_expert_used = 4;
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
-                                                     nullptr, n_experts);
+                                                     nullptr, moe_pp_n_experts);
 
     auto has_layout_on_target = [](const ggml_sycl::expert_placement_result & placement, ggml_layout_mode layout) {
         if (placement.layout == layout) {
@@ -756,75 +2097,177 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
         return false;
     };
 
-    for (int e = 0; e < n_experts; ++e) {
+    const ggml_layout_mode want_gate_up     = xmx_tiled_pp_route_active ? GGML_LAYOUT_XMX_TILED : GGML_LAYOUT_SOA;
+    const bool             down_batched     = ggml_sycl_moe_pp_onednn_batched_route_selected();
+    const ggml_layout_mode want_down        = down_batched ? GGML_LAYOUT_SOA : GGML_LAYOUT_MXFP4_I8;
+    const size_t           want_down_n_alts = down_batched ? 0 : 1;
+
+    // The down expectation follows the predicate the planner branches on, so pin its default here: a flipped default
+    // must fail, not be followed silently into the unexecuted I8 arm.
+    if (std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED") == nullptr && !down_batched) {
+        printf("FAIL: route %s: the oneDNN batched MoE PP route is no longer selected by default\n", route_name);
+        return false;
+    }
+
+    for (int e = 0; e < moe_pp_n_experts; ++e) {
         const auto gate = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
         const auto up   = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
         const auto down = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
         if (!gate.found() || !up.found() || !down.found() || !gate.on_device || !up.on_device || !down.on_device ||
             gate.target_device != 0 || up.target_device != 0 || down.target_device != 0) {
-            printf("FAIL: expected complete local MoE triplet for expert %d, gate=%d/%d/%d up=%d/%d/%d down=%d/%d/%d\n",
-                   e, gate.found() ? 1 : 0, gate.on_device ? 1 : 0, gate.target_device, up.found() ? 1 : 0,
-                   up.on_device ? 1 : 0, up.target_device, down.found() ? 1 : 0, down.on_device ? 1 : 0,
-                   down.target_device);
+            printf(
+                "FAIL: route %s: expected complete local MoE triplet for expert %d, gate=%d/%d/%d up=%d/%d/%d "
+                "down=%d/%d/%d\n",
+                route_name, e, gate.found() ? 1 : 0, gate.on_device ? 1 : 0, gate.target_device, up.found() ? 1 : 0,
+                up.on_device ? 1 : 0, up.target_device, down.found() ? 1 : 0, down.on_device ? 1 : 0,
+                down.target_device);
             return false;
         }
-        if (gate.layout != GGML_LAYOUT_SOA || up.layout != GGML_LAYOUT_SOA) {
-            printf("FAIL: prompt gate/up expert %d must use PP-safe SOA primaries, gate=%d up=%d\n", e,
-                   (int) gate.layout, (int) up.layout);
+        if (gate.layout != want_gate_up || up.layout != want_gate_up) {
+            printf("FAIL: route %s: gate/up expert %d primaries must be layout %d, gate=%d up=%d\n", route_name, e,
+                   (int) want_gate_up, (int) gate.layout, (int) up.layout);
             return false;
         }
-        if (!has_layout_on_target(gate, GGML_LAYOUT_SOA) || !has_layout_on_target(up, GGML_LAYOUT_SOA) ||
+        if (!gate.alternate_layouts.empty() || !up.alternate_layouts.empty()) {
+            printf(
+                "FAIL: route %s: gate/up expert %d must have one layout owner, got %zu/%zu alternates (gate SOA=%d "
+                "up SOA=%d)\n",
+                route_name, e, gate.alternate_layouts.size(), up.alternate_layouts.size(),
+                has_layout_on_target(gate, GGML_LAYOUT_SOA) ? 1 : 0, has_layout_on_target(up, GGML_LAYOUT_SOA) ? 1 : 0);
+            return false;
+        }
+        if (down.layout != want_down || down.alternate_layouts.size() != want_down_n_alts ||
             !has_layout_on_target(down, GGML_LAYOUT_SOA)) {
-            printf("FAIL: expert %d is missing complete SOA PP executable coverage, gate=%d up=%d down=%d\n", e,
-                   (int) gate.layout, (int) up.layout, (int) down.layout);
+            printf(
+                "FAIL: route %s: down expert %d must be layout %d with %zu alternate(s) and SOA PP coverage "
+                "(oneDNN batched route=%d), got layout=%d alternates=%zu soa=%d\n",
+                route_name, e, (int) want_down, want_down_n_alts, down_batched ? 1 : 0, (int) down.layout,
+                down.alternate_layouts.size(), has_layout_on_target(down, GGML_LAYOUT_SOA) ? 1 : 0);
             return false;
         }
-        if (down.layout != GGML_LAYOUT_MXFP4_I8) {
-            printf("FAIL: down expert %d should retain MXFP4_I8 TG primary after reserving SOA PP alternate, got %d\n",
-                   e, (int) down.layout);
+    }
+    // Totals both the roomy and the tight plan must satisfy. The layout charge is the sum of every on-device layout the
+    // plan holds, so with no gate/up alternates it excludes any SOA copy of an XMX_TILED primary, and it must equal
+    // weight_vram_bytes. vram_bytes is the single-device total: weights, KV and the KV context room. No MoE MMID
+    // workspace pool is planned or charged, because no route of this build state can consume one (llama.cpp-84ck).
+    // The pre-pack promotion runs before packing, so both plans carry the arm's moe_pp_soa_promoted.
+    auto check_plan_totals = [&](const ggml_sycl::placement_plan & p, size_t budget, const char * arm) {
+        const size_t charge    = planned_weight_charge_for_device(p, 0);
+        const size_t vram_want = p.weight_vram_bytes + p.kv_vram_bytes + p.kv_context_reserve_bytes;
+        if (p.weight_vram_bytes != charge || p.vram_bytes != vram_want) {
+            printf(
+                "FAIL: route %s, %s plan: planner under/over-counted MoE layout charge, plan weight=%zu actual=%zu; "
+                "vram=%zu want weight+kv=%zu+room=%zu (mmid pool=%zu)\n",
+                route_name, arm, p.weight_vram_bytes, charge, p.vram_bytes, p.kv_vram_bytes, p.kv_context_reserve_bytes,
+                p.moe_mmid_device_pool_bytes);
             return false;
         }
-    }
-    const size_t planned_charge = planned_weight_charge_for_device(plan, 0);
-    if (plan.weight_vram_bytes != planned_charge || plan.vram_bytes != planned_charge) {
-        printf("FAIL: planner under/over-counted PP-safe MoE layout charge, plan weight=%zu vram=%zu actual=%zu\n",
-               plan.weight_vram_bytes, plan.vram_bytes, planned_charge);
-        return false;
-    }
-    if (planned_charge > devices[0].vram_budget) {
-        printf("FAIL: planner charged beyond device budget, charged=%zu budget=%zu\n", planned_charge,
-               devices[0].vram_budget);
-        return false;
-    }
-    if (!plan.moe_pp_soa_promoted) {
-        printf("FAIL: planner should record PP SOA promotion for prompt-incompatible gate/up primaries\n");
+        if (p.moe_mmid_device_pool_bytes != 0 || p.moe_mmid_host_pool_bytes != 0 || !p.moe_mmid_workspaces.empty()) {
+            printf(
+                "FAIL: route %s, %s plan: closed MMID route still planned a workspace pool, device=%zu host=%zu "
+                "workspaces=%zu\n",
+                route_name, arm, p.moe_mmid_device_pool_bytes, p.moe_mmid_host_pool_bytes,
+                p.moe_mmid_workspaces.size());
+            return false;
+        }
+        if (p.moe_pp_soa_promoted != !xmx_tiled_pp_route_active) {
+            printf("FAIL: route %s, %s plan: moe_pp_soa_promoted=%d, want %d\n", route_name, arm,
+                   p.moe_pp_soa_promoted ? 1 : 0, xmx_tiled_pp_route_active ? 0 : 1);
+            return false;
+        }
+        if (p.vram_bytes > budget) {
+            printf("FAIL: route %s, %s plan: planner charged beyond device budget, charged=%zu budget=%zu\n",
+                   route_name, arm, p.vram_bytes, budget);
+            return false;
+        }
+        return true;
+    };
+
+    if (!check_plan_totals(plan, devices[0].vram_budget, "roomy")) {
         return false;
     }
 
-    const std::vector<ggml_sycl::device_budget> tight_devices = {
+    // One MiB short of the layout charge: the expert pack cannot hold every triplet, so the pack boundary is hit.
+    const size_t                                planned_charge = planned_weight_charge_for_device(plan, 0);
+    const std::vector<ggml_sycl::device_budget> tight_devices  = {
         { 0, planned_charge - mib, planned_charge - mib, 4.0, true },
     };
     auto tight_plan = ggml_sycl::compute_multi_device_plan(
-        tight_devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info, nullptr, n_experts);
-    const size_t tight_charge = planned_weight_charge_for_device(tight_plan, 0);
-    if (tight_plan.weight_vram_bytes != tight_charge || tight_plan.vram_bytes != tight_charge) {
-        printf(
-            "FAIL: tight-budget planner under/over-counted PP-safe MoE layout charge, plan weight=%zu vram=%zu "
-            "actual=%zu\n",
-            tight_plan.weight_vram_bytes, tight_plan.vram_bytes, tight_charge);
+        tight_devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info, nullptr, moe_pp_n_experts);
+    if (!check_plan_totals(tight_plan, tight_devices[0].vram_budget, "tight")) {
         return false;
     }
-    if (tight_charge > tight_devices[0].vram_budget) {
-        printf("FAIL: tight-budget planner exceeded budget, charged=%zu budget=%zu\n", tight_charge,
-               tight_devices[0].vram_budget);
+    const size_t tight_charge = planned_weight_charge_for_device(tight_plan, 0);
+    if (tight_charge == 0 || tight_charge >= planned_charge) {
+        printf("FAIL: route %s: tight budget did not reach the pack boundary, charged=%zu roomy=%zu\n", route_name,
+               tight_charge, planned_charge);
+        return false;
+    }
+    // At the boundary the pack keeps exactly one complete triplet on device (each triplet is half the layout charge)
+    // and the other wholly on host, and the device triplet keeps the roomy plan's gate/up contract. Its down is SOA with
+    // no alternates in either batched-route state: maybe_upgrade_moe_down_layouts_to_i8() skips a down tensor unless
+    // every expert of it is on device, and this plan holds one of two.
+    int tight_device_triplets = 0;
+    for (int e = 0; e < moe_pp_n_experts; ++e) {
+        const auto gate      = tight_plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
+        const auto up        = tight_plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
+        const auto down      = tight_plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
+        const int  on_device = (gate.on_device ? 1 : 0) + (up.on_device ? 1 : 0) + (down.on_device ? 1 : 0);
+        if (!gate.found() || !up.found() || !down.found() || (on_device != 0 && on_device != 3)) {
+            printf("FAIL: route %s: tight-budget expert %d is not one placement domain, found=%d/%d/%d on_device=%d\n",
+                   route_name, e, gate.found() ? 1 : 0, up.found() ? 1 : 0, down.found() ? 1 : 0, on_device);
+            return false;
+        }
+        if (on_device == 0) {
+            continue;
+        }
+        tight_device_triplets++;
+        if (gate.target_device != 0 || up.target_device != 0 || down.target_device != 0 ||
+            gate.layout != want_gate_up || up.layout != want_gate_up || !gate.alternate_layouts.empty() ||
+            !up.alternate_layouts.empty() || down.layout != GGML_LAYOUT_SOA || !down.alternate_layouts.empty()) {
+            printf(
+                "FAIL: route %s: tight-budget device expert %d must keep gate/up layout %d and down SOA with no "
+                "alternates, got target=%d/%d/%d layout=%d/%d/%d alternates=%zu/%zu/%zu\n",
+                route_name, e, (int) want_gate_up, gate.target_device, up.target_device, down.target_device,
+                (int) gate.layout, (int) up.layout, (int) down.layout, gate.alternate_layouts.size(),
+                up.alternate_layouts.size(), down.alternate_layouts.size());
+            return false;
+        }
+    }
+    if (tight_device_triplets != 1) {
+        printf("FAIL: route %s: tight budget should keep exactly one complete triplet on device, got %d\n", route_name,
+               tight_device_triplets);
+        return false;
+    }
+
+    printf("PASS: single-device MoE plan with the XMX_TILED PP route %s: gate/up %s, %s\n", route_name,
+           xmx_tiled_pp_route_active ? "stay XMX_TILED with no SOA copy" : "promoted to SOA primaries",
+           down_batched ? "down SOA with no I8 copy" : "down MXFP4_I8 with an SOA PP alternate");
+    return true;
+}
+
+static bool run_single_device_moe_pp_layout_test() {
+    const auto & info = ggml_sycl_info();
+    if (info.device_count <= 0 ||
+        !xmx_capabilities_match_int8_tile(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_M,
+                                          GGML_SYCL_MXFP4_MOE_XMX_N, GGML_SYCL_MXFP4_MOE_XMX_K) ||
+        !xmx_capabilities_support_sub_group(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
+        printf("PASS: single-device XMX PP alternate test skipped on non-XMX device\n");
+        return true;
+    }
+
+    // Both route states run, each reporting its own line, before either result decides this case.
+    const bool route_on_ok  = run_single_device_moe_pp_plan_route_test(/*xmx_tiled_pp_route_active=*/true);
+    const bool route_off_ok = run_single_device_moe_pp_plan_route_test(/*xmx_tiled_pp_route_active=*/false);
+    if (!route_on_ok || !route_off_ok) {
         return false;
     }
 
     ggml_tensor down_tensor{};
     down_tensor.type  = GGML_TYPE_MXFP4;
-    down_tensor.ne[0] = ncols;
-    down_tensor.ne[1] = nrows;
-    down_tensor.ne[2] = n_experts;
+    down_tensor.ne[0] = moe_pp_ncols;
+    down_tensor.ne[1] = moe_pp_nrows;
+    down_tensor.ne[2] = moe_pp_n_experts;
     down_tensor.ne[3] = 1;
     ggml_set_name(&down_tensor, "blk.0.ffn_down_exps.weight");
 
@@ -833,7 +2276,8 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     } probe_guard;
 
     ggml_sycl::test_clear_moe_planned_layout_probe_overrides();
-    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8, n_experts, 0, 0, 0);
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8, moe_pp_n_experts, 0, 0,
+                                                          0);
     if (ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8,
                                                               /*n_tokens=*/512)) {
         printf("FAIL: prompt-down I8 should not be proven without complete SOA fallback coverage\n");
@@ -846,7 +2290,7 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
         return false;
     }
 
-    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_SOA, n_experts, 0, 0, 0);
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_SOA, moe_pp_n_experts, 0, 0, 0);
     if (!ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8,
                                                                /*n_tokens=*/512)) {
         printf("FAIL: prompt-down I8 should be proven when I8 and SOA coverage are both complete\n");
@@ -860,7 +2304,8 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     }
 
     ggml_sycl::test_clear_moe_planned_layout_probe_overrides();
-    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS, n_experts, 0, 0, 0);
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS, moe_pp_n_experts, 0,
+                                                          0, 0);
     if (ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS,
                                                               /*n_tokens=*/512)) {
         printf("FAIL: prompt-down DPAS should not be proven without complete SOA fallback coverage\n");
@@ -873,7 +2318,7 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
         return false;
     }
 
-    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_SOA, n_experts, 0, 0, 0);
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_SOA, moe_pp_n_experts, 0, 0, 0);
     if (!ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS,
                                                                /*n_tokens=*/512)) {
         printf("FAIL: prompt-down DPAS should be proven when DPAS and SOA coverage are both complete\n");
@@ -888,14 +2333,17 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
 
     ggml_tensor gate_tensor{};
     gate_tensor.type  = GGML_TYPE_MXFP4;
-    gate_tensor.ne[0] = ncols;
-    gate_tensor.ne[1] = nrows;
-    gate_tensor.ne[2] = n_experts;
+    gate_tensor.ne[0] = moe_pp_ncols;
+    gate_tensor.ne[1] = moe_pp_nrows;
+    gate_tensor.ne[2] = moe_pp_n_experts;
     gate_tensor.ne[3] = 1;
     ggml_set_name(&gate_tensor, "blk.0.ffn_gate_exps.weight");
 
+    // test_xmx_moe_allow_unsafe_pp_from_env() is only the two legacy names' lookup. The production default is decided
+    // by ggml_sycl_xmx_moe_allow_unsafe_pp(), which reads GGML_SYCL_XMX_TILED_PP first and is ON when all three names
+    // are unset, so these checks pin the legacy names' precedence, not the route's default.
     if (ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env(nullptr, nullptr)) {
-        printf("FAIL: prompt XMX MoE PP must be disabled by default\n");
+        printf("FAIL: the legacy unsafe-PP name lookup must return false when both names are unset\n");
         return false;
     }
     if (ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env("0", "1")) {
@@ -904,19 +2352,23 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     }
     if (!ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env("1", nullptr) ||
         !ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env(nullptr, "1")) {
-        printf("FAIL: prompt XMX MoE PP should remain opt-in through explicit or legacy env\n");
+        printf("FAIL: the legacy unsafe-PP name lookup should honor either name set to 1\n");
         return false;
     }
 
+    // Prompt gate XMX_TILED keeps XMX only when the prompt route is on AND an authoritative planner residency proves a
+    // complete XMX cover (ggml_sycl_moe_layout_for_selected_rows). This process has no planner residency, and the
+    // opt-outs below apply if the route's latched env read has not happened yet, so either way prompt falls to SOA.
     setenv("GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP", "0", 1);
     setenv("GGML_SYCL_XMX_MOE_PP", "0", 1);
     ggml_sycl::test_clear_moe_planned_layout_probe_overrides();
-    ggml_sycl::test_set_moe_planned_layout_probe_override(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED, n_experts, 0, 0, 0);
-    ggml_sycl::test_set_moe_planned_layout_probe_override(&gate_tensor, 0, GGML_LAYOUT_SOA, n_experts, 0, 0, 0);
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED, moe_pp_n_experts, 0,
+                                                          0, 0);
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&gate_tensor, 0, GGML_LAYOUT_SOA, moe_pp_n_experts, 0, 0, 0);
     if (ggml_sycl::test_moe_layout_for_selected_rows(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED,
                                                      /*selected_rows=*/512, /*exact_override=*/false,
                                                      /*n_tokens=*/512) != GGML_LAYOUT_SOA) {
-        printf("FAIL: prompt gate XMX_TILED should fall back to planned SOA by default\n");
+        printf("FAIL: prompt gate XMX_TILED without a proven planned XMX cover should fall back to planned SOA\n");
         return false;
     }
     if (ggml_sycl::test_moe_layout_for_selected_rows(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED,
@@ -926,8 +2378,187 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
         return false;
     }
 
-    printf("PASS: single-device MoE planner budgets and proves complete PP-safe SOA executable layouts\n");
+    printf("PASS: single-device MoE prompt layout selection is proof-gated on complete planned SOA coverage\n");
     return true;
+}
+
+// The MoE MMID workspace pool is planned, charged and re-planned only where the MMID direct route can run
+// (llama.cpp-84ck). Every pool byte the planner charges is a byte no expert can use, so a pool for a closed route moves
+// experts to the host for nothing, and a pool the plan rejected must not drive the runtime re-plan into a growth refusal
+// (which the runtime transaction answers by demoting KV or refusing the context). The fixture is the MXFP4 GPT-OSS-shaped
+// layer of the PP layout test, planned with n_expert_used set, under both answers of
+// ggml_sycl_moe_mmid_route_reachable_in_build().
+static bool run_single_device_moe_mmid_pool_charge_test() {
+    constexpr size_t mib = 1024u * 1024u;
+
+    const auto & info = ggml_sycl_info();
+    if (info.device_count <= 0) {
+        printf("PASS: single-device MoE MMID pool charge test skipped with no device\n");
+        return true;
+    }
+
+    constexpr int n_expert_used = 4;
+
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
+    ggml_sycl::placement_kv_info                        kv_info{};
+    kv_info.n_ubatch      = 512;
+    kv_info.n_expert_used = n_expert_used;
+
+    auto plan_on = [&](size_t budget) {
+        const std::vector<ggml_sycl::device_budget> devices = {
+            { 0, budget, budget, 4.0, true },
+        };
+        return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                                    nullptr, moe_pp_n_experts);
+    };
+    auto vram_composed = [](const ggml_sycl::placement_plan & p) {
+        return p.weight_vram_bytes + p.kv_vram_bytes + p.kv_context_reserve_bytes + p.moe_mmid_device_pool_bytes;
+    };
+    // The runtime re-plan of a plan whose KV did not change. It must accept, and leave the plan's charge and pool alone.
+    auto expect_stable_replan = [&](const ggml_sycl::placement_plan & p, const char * arm) {
+        ggml_sycl::placement_plan          replanned = p;
+        ggml_sycl::moe_mmid_runtime_reason reason    = ggml_sycl::moe_mmid_runtime_reason::OK;
+        const bool ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, &reason);
+        if (!ok || reason != ggml_sycl::moe_mmid_runtime_reason::OK || replanned.vram_bytes != p.vram_bytes ||
+            replanned.moe_mmid_device_pool_bytes != p.moe_mmid_device_pool_bytes ||
+            replanned.moe_mmid_workspaces.size() != p.moe_mmid_workspaces.size()) {
+            printf(
+                "FAIL: %s: runtime MMID re-plan of an unchanged plan must accept it as is, got ok=%d reason=%s "
+                "vram=%zu->%zu pool=%zu->%zu workspaces=%zu->%zu\n",
+                arm, ok ? 1 : 0, ggml_sycl::moe_mmid_runtime_reason_name(reason), p.vram_bytes, replanned.vram_bytes,
+                p.moe_mmid_device_pool_bytes, replanned.moe_mmid_device_pool_bytes, p.moe_mmid_workspaces.size(),
+                replanned.moe_mmid_workspaces.size());
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = true;
+
+    // Route open: the pool is planned and charged on top of weights, KV and room. This is the positive control that
+    // the closed arm's zero is not vacuous: the same fixture does carry a pool when a route can consume it.
+    size_t roomy_charge = 0;
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
+        const auto plan = plan_on(1024u * mib);
+        roomy_charge    = planned_weight_charge_for_device(plan, 0);
+        bool arm_ok     = true;
+        if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes == 0 ||
+            plan.moe_mmid_workspaces.empty() || plan.vram_bytes != vram_composed(plan)) {
+            printf(
+                "FAIL: open MMID route, roomy plan: expected a charged workspace pool, valid=%d pool=%zu "
+                "workspaces=%zu vram=%zu want weight=%zu+kv=%zu+room=%zu+mmid=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_workspaces.size(),
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes,
+                plan.moe_mmid_device_pool_bytes);
+            arm_ok = false;
+        }
+        arm_ok = expect_stable_replan(plan, "open MMID route, roomy plan") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: open MMID route, roomy plan (positive control): pool=%zu charged, vram=%zu = weight %zu + kv "
+                "%zu + room %zu + pool, and the runtime re-plan keeps it\n",
+                plan.moe_mmid_device_pool_bytes, plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes,
+                plan.kv_context_reserve_bytes);
+        }
+        ok = arm_ok && ok;
+    }
+
+    // Route closed (an ordinary build): nothing is planned, so nothing is charged, and the plan stays valid.
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+
+        const auto plan   = plan_on(1024u * mib);
+        bool       arm_ok = true;
+        if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes != 0 ||
+            plan.moe_mmid_host_pool_bytes != 0 || !plan.moe_mmid_workspaces.empty() ||
+            plan.vram_bytes != vram_composed(plan)) {
+            printf(
+                "FAIL: closed MMID route, roomy plan: expected no workspace pool, valid=%d device pool=%zu host "
+                "pool=%zu workspaces=%zu vram=%zu want weight=%zu+kv=%zu+room=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_host_pool_bytes,
+                plan.moe_mmid_workspaces.size(), plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes,
+                plan.kv_context_reserve_bytes);
+            arm_ok = false;
+        }
+        arm_ok = expect_stable_replan(plan, "closed MMID route, roomy plan") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: closed MMID route, roomy plan: valid with no pool, vram=%zu = weight %zu + kv %zu + room %zu, "
+                "and the runtime re-plan keeps it\n",
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
+        }
+        ok = arm_ok && ok;
+    }
+
+    if (roomy_charge <= mib) {
+        printf("FAIL: MMID pool charge fixture: roomy layout charge %zu is too small to build the tight budget\n",
+               roomy_charge);
+        return false;
+    }
+    // One MiB short of the layout charge: the pack keeps part of the experts on device and leaves far less than the
+    // pool free, so with the route open the plan rejects the pool (reject_moe_mmid_workspaces()).
+    const size_t tight_budget = roomy_charge - mib;
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
+        const auto   plan         = plan_on(tight_budget);
+        const size_t tight_charge = planned_weight_charge_for_device(plan, 0);
+        bool         arm_ok       = true;
+        // Precondition of the case: the pool was rejected with experts still on device. Without it the re-plan below
+        // proves nothing about a rejected pool, so it is not run.
+        if (tight_charge == 0 || tight_charge >= roomy_charge || plan.moe_mmid_workspace_valid ||
+            plan.moe_mmid_device_pool_bytes != 0 || !plan.moe_mmid_workspaces.empty()) {
+            printf(
+                "FAIL: open MMID route, tight plan: expected a rejected pool with some experts on device, charged=%zu "
+                "roomy=%zu valid=%d pool=%zu workspaces=%zu\n",
+                tight_charge, roomy_charge, plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes,
+                plan.moe_mmid_workspaces.size());
+            arm_ok = false;
+        } else {
+            // The rejected pool stays rejected: the re-plan must not ask the growth admission for it, so it must not
+            // return GROWTH_BUDGET_EXCEEDED.
+            arm_ok = expect_stable_replan(plan, "open MMID route, tight plan with a rejected pool");
+        }
+        if (arm_ok) {
+            printf(
+                "PASS: open MMID route, tight plan: pool rejected with %zu of %zu layout bytes on device, and the "
+                "runtime re-plan accepts the plan without asking the growth admission\n",
+                tight_charge, roomy_charge);
+        }
+        ok = arm_ok && ok;
+    }
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+
+        const auto plan   = plan_on(tight_budget);
+        bool       arm_ok = true;
+        if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes != 0 ||
+            !plan.moe_mmid_workspaces.empty() || plan.vram_bytes != vram_composed(plan)) {
+            printf(
+                "FAIL: closed MMID route, tight plan: expected no workspace pool, valid=%d pool=%zu workspaces=%zu "
+                "vram=%zu want weight=%zu+kv=%zu+room=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_workspaces.size(),
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
+            arm_ok = false;
+        }
+        arm_ok = expect_stable_replan(plan, "closed MMID route, tight plan") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: closed MMID route, tight plan: valid with no pool (not rejected), vram=%zu = weight %zu + "
+                "kv %zu + room %zu, and the runtime re-plan keeps it\n",
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
+        }
+        ok = arm_ok && ok;
+    }
+
+    if (ok) {
+        printf(
+            "PASS: MoE MMID workspace pool is charged only for a reachable route, and a rejected pool stays out of the "
+            "runtime re-plan\n");
+    }
+    return ok;
 }
 
 static bool run_moe_decode_down_phase_split_policy_test() {
@@ -989,6 +2620,7 @@ static bool run_moe_decode_down_phase_split_policy_test() {
         return false;
     }
 
+    printf("PASS: MoE decode down layout policy requires the explicit DPAS env and keeps an I8 candidate\n");
     return true;
 }
 
@@ -1074,6 +2706,134 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
 
     printf("PASS: no-P2P multi-device MoE planner keeps dense/KV/experts cohesive by layer block\n");
     return true;
+}
+
+// llama.cpp-n8da: with two physical GPUs the backend exposes only device 0 to the registry by default, yet the
+// multi-device planner budgets both, so experts (or their decode alternates) may land on device 1. An MMID workspace is
+// admitted only by a backend context on its owner, and no backend context can exist for a hidden device, so the plan
+// must not carry a workspace for device 1, nor refuse the pool because device 1's experts have no owner. The second arm
+// exposes both devices (a split mode) and is the control that the rule keys on exposure, not on "secondary".
+static bool run_multi_device_mmid_owner_exposure_test() {
+    constexpr size_t mib           = 1024u * 1024u;
+    constexpr int    n_expert_used = 4;
+
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
+    const std::vector<ggml_sycl::device_budget>         devices   = {
+        { 0, 1024u * mib, 1024u * mib, 4.0, true },
+        { 1, 1024u * mib, 1024u * mib, 4.0, true },
+    };
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch      = 512;
+    kv_info.n_expert_used = n_expert_used;
+
+    ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
+    auto plan_with_exposed = [&](int exposed) {
+        ggml_sycl_device_info info = make_mock_sycl_info(2);
+        info.device_count          = exposed;  // total_gpu_count stays 2
+        ggml_sycl::test_sycl_info_override_guard info_guard(info);
+        return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                                    nullptr, moe_pp_n_experts);
+    };
+    // Expert entries whose on-device placement, or one of whose alternates, targets `device`.
+    auto experts_on = [](const ggml_sycl::placement_plan & plan, int device) {
+        size_t count = 0;
+        for (const auto & entry : plan.entries) {
+            if (entry.expert_id < 0) {
+                continue;
+            }
+            bool on = entry.on_device && entry.target_device == device;
+            for (const auto & alternate : entry.alternate_layouts) {
+                const int target = alternate.target_device >= 0 ? alternate.target_device : entry.target_device;
+                on               = on || target == device;
+            }
+            count += on ? 1 : 0;
+        }
+        return count;
+    };
+    auto has_owner = [](const ggml_sycl::placement_plan & plan, int device) {
+        for (const auto & workspace : plan.moe_mmid_workspaces) {
+            if (workspace.valid && workspace.owner_device == device) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Re-runs the planner's workspace pass (the runtime re-plan reuses plan_moe_mmid_workspaces) on `replanned` with
+    // every device exposed. When it succeeds, a workspace on a device means the placement gives that device an
+    // executable expert owner, so a tree that ignored exposure would have planned one at load. The re-plan also
+    // re-checks the budgets, so a refusal says nothing about ownership; the caller reports it on its own.
+    auto replan_all_exposed = [&](ggml_sycl::placement_plan & replanned, ggml_sycl::moe_mmid_runtime_reason * reason) {
+        ggml_sycl_device_info info = make_mock_sycl_info(2);
+        info.device_count          = 2;
+        ggml_sycl::test_sycl_info_override_guard info_guard(info);
+        return ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, reason);
+    };
+
+    bool ok = true;
+    {
+        const auto                         plan          = plan_with_exposed(1);
+        const size_t                       on0           = experts_on(plan, 0);
+        const size_t                       on1           = experts_on(plan, 1);
+        bool                               arm           = true;
+        // Positive control: this placement gives device 1 an EXECUTABLE expert owner (an on-device expert or an
+        // executable alternate there), not just an entry naming it, so a tree that ignored exposure would plan a
+        // workspace on device 1 and fail below.
+        ggml_sycl::placement_plan          replanned     = plan;
+        ggml_sycl::moe_mmid_runtime_reason replan_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
+        if (!replan_all_exposed(replanned, &replan_reason)) {
+            printf(
+                "FAIL: MMID owner exposure, 1 of 2 exposed: the all-exposed re-plan refused (reason=%s), so whether "
+                "device 1 has an executable expert owner is unknown\n",
+                ggml_sycl::moe_mmid_runtime_reason_name(replan_reason));
+            arm = false;
+        } else if (on1 == 0 || !has_owner(replanned, 1)) {
+            printf(
+                "FAIL: MMID owner exposure, 1 of 2 exposed: vacuous fixture, no executable expert owner on device 1 "
+                "(entries targeting device1=%zu, all-exposed re-plan owner1=%d)\n",
+                on1, has_owner(replanned, 1) ? 1 : 0);
+            arm = false;
+        }
+        for (const auto & workspace : plan.moe_mmid_workspaces) {
+            if (workspace.owner_device != 0) {
+                printf(
+                    "FAIL: MMID owner exposure, 1 of 2 exposed: workspace planned for hidden device %d "
+                    "(no backend context can bind or admit it)\n",
+                    workspace.owner_device);
+                arm = false;
+            }
+        }
+        if (!plan.moe_mmid_workspace_valid || (on0 > 0 && !has_owner(plan, 0))) {
+            printf(
+                "FAIL: MMID owner exposure, 1 of 2 exposed: primary pool not planned, valid=%d owner0=%d "
+                "experts on device0=%zu device1=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, has_owner(plan, 0) ? 1 : 0, on0, on1);
+            arm = false;
+        }
+        if (arm) {
+            printf(
+                "PASS: MMID owner exposure, 1 of 2 exposed: %zu expert entries on hidden device 1, an executable "
+                "owner there, and no workspace there; %zu workspace(s), primary owner=%d\n",
+                on1, plan.moe_mmid_workspaces.size(), has_owner(plan, 0) ? 1 : 0);
+        }
+        ok = arm && ok;
+    }
+    {
+        const auto plan = plan_with_exposed(2);
+        const bool arm  = experts_on(plan, 1) > 0 && plan.moe_mmid_workspace_valid && has_owner(plan, 1);
+        if (arm) {
+            printf(
+                "PASS: MMID owner exposure, 2 of 2 exposed (control): device 1 is an exposed owner and keeps its "
+                "workspace\n");
+        } else {
+            printf(
+                "FAIL: MMID owner exposure, 2 of 2 exposed (control): expected a workspace for device 1, "
+                "experts on device1=%zu valid=%d owner1=%d\n",
+                experts_on(plan, 1), plan.moe_mmid_workspace_valid ? 1 : 0, has_owner(plan, 1) ? 1 : 0);
+        }
+        ok = arm && ok;
+    }
+    return ok;
 }
 
 static bool run_regression_guard_policy_test() {
@@ -2150,6 +3910,135 @@ static bool run_resource_exhaustion_message_test() {
     return true;
 }
 
+// llama.cpp-76os: one fact, two sources. The planner took its layout from
+// layout_policy::get_optimal, whose default is "SOA is safe for all quantized
+// types", while the runtime clamps SOA to AOS for every type without an AOS->SOA
+// reorder (ggml_sycl_layout_supports_soa). The planner then charged and placed
+// IQ*/Q2_0 expert weights as SOA, a layout the fill cannot materialize. For every
+// quantized type, whatever layout the planner picks must be one the fill can
+// build: SOA only for a type in the reorder table, COALESCED only for a type
+// with a coalesced reorder, tiled MXFP4 layouts only for MXFP4.
+static bool planned_layout_materializable(ggml_type type, ggml_layout_mode layout) {
+    switch (layout) {
+        case GGML_LAYOUT_AOS:
+            return true;
+        case GGML_LAYOUT_SOA:
+            return ggml_sycl_soa_reorder_supported_type(type);
+        case GGML_LAYOUT_COALESCED:
+            return is_coalesced_supported(type);
+        default:
+            return type == GGML_TYPE_MXFP4;
+    }
+}
+
+static bool run_planned_layout_materializable_test() {
+    constexpr int64_t  n_experts = 2;
+    int                checked   = 0;
+    int                soa_seen  = 0;
+    int                aos_iq    = 0;
+    const tensor_usage usages[]  = { tensor_usage::UNKNOWN,    tensor_usage::ATTENTION_WEIGHT,
+                                     tensor_usage::FFN_WEIGHT, tensor_usage::MOE_EXPERT_WEIGHT,
+                                     tensor_usage::MOE_GATE,   tensor_usage::MOE_INTERMEDIATE,
+                                     tensor_usage::EMBEDDING,  tensor_usage::OUTPUT_WEIGHT,
+                                     tensor_usage::NORM };
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = (ggml_type) t;
+        if (!ggml_is_quantized(type) || ggml_blck_size(type) <= 0) {
+            continue;
+        }
+        // layout_policy::get_optimal is the planner's layout source.
+        for (const tensor_usage usage : usages) {
+            const layout_mode layout = layout_policy::get_optimal(type, usage);
+            if (!planned_layout_materializable(type, layout)) {
+                printf("FAIL: get_optimal(%s, usage %d) = layout %d, which the fill cannot materialize\n",
+                       ggml_type_name(type), (int) usage, (int) layout);
+                return false;
+            }
+            ++checked;
+        }
+
+        // The real planner, per-expert entries of a routed expert tensor.
+        const int64_t ne0 = (int64_t) ggml_blck_size(type) * 8;
+        const int64_t ne1 = 64;
+        ggml_sycl::placement_tensor_info tensor{ "blk.0.ffn_gate_exps.weight", 1 };
+        tensor.type  = type;
+        tensor.ne[0] = ne0;
+        tensor.ne[1] = ne1;
+        tensor.ne[2] = n_experts;
+        tensor.size  = ggml_row_size(type, ne0) * (size_t) ne1 * (size_t) n_experts;
+        const std::vector<ggml_sycl::placement_tensor_info> inventory = { tensor };
+
+        ggml_sycl::placement_kv_info kv_info{};
+        const auto                   plan = ggml_sycl::compute_placement_plan(
+            inventory, 64ull * 1024ull * 1024ull * 1024ull, 0, kv_info, nullptr, (int) n_experts);
+        size_t n_entries = 0;
+        for (const ggml_sycl::placement_entry & entry : plan.entries) {
+            if (entry.expert_id < 0) {
+                continue;
+            }
+            ++n_entries;
+            if (!planned_layout_materializable(type, entry.layout)) {
+                printf("FAIL: planner placed %s expert entry in layout %d, which the fill cannot materialize\n",
+                       ggml_type_name(type), (int) entry.layout);
+                return false;
+            }
+            soa_seen += entry.layout == GGML_LAYOUT_SOA ? 1 : 0;
+            aos_iq += (entry.layout == GGML_LAYOUT_AOS && !ggml_sycl_soa_reorder_supported_type(type)) ? 1 : 0;
+        }
+        if (n_entries != (size_t) n_experts) {
+            printf("FAIL: planner produced %zu expert entries for %s, expected %lld\n", n_entries,
+                   ggml_type_name(type), (long long) n_experts);
+            return false;
+        }
+    }
+    // The other direction: the clamp must not demote a type that HAS a reorder. A sweep that only
+    // asks "is the planned layout materializable" passes if SOA is withdrawn from a table type too
+    // (AOS is always materializable), so pin the table types that plan SOA today. Q4_0 MoE experts are
+    // AOS by design (the MMVQ _id kernels are AoS-only) and Q4_K is AOS everywhere; both are pinned as
+    // such so a change to either is a decision, not a drift.
+    const struct {
+        ggml_type    type;
+        tensor_usage usage;
+        layout_mode  want;
+        const char * name;
+    } pinned[] = {
+        { GGML_TYPE_Q6_K,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_SOA, "q6_K moe" },
+        { GGML_TYPE_Q6_K,  tensor_usage::OUTPUT_WEIGHT,     GGML_LAYOUT_SOA, "q6_K output" },
+        { GGML_TYPE_Q6_K,  tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "q6_K unknown" },
+        { GGML_TYPE_Q8_0,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_SOA, "q8_0 moe" },
+        { GGML_TYPE_Q8_0,  tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "q8_0 unknown" },
+        { GGML_TYPE_MXFP4, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_SOA, "mxfp4 moe" },
+        { GGML_TYPE_MXFP4, tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "mxfp4 unknown" },
+        { GGML_TYPE_Q4_0,  tensor_usage::OUTPUT_WEIGHT,     GGML_LAYOUT_SOA, "q4_0 output" },
+        { GGML_TYPE_Q4_0,  tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "q4_0 unknown" },
+        { GGML_TYPE_Q4_0,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "q4_0 moe (AoS-only _id)" },
+        { GGML_TYPE_Q4_K,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "q4_K moe (AoS-only)" },
+        { GGML_TYPE_Q4_K,  tensor_usage::UNKNOWN,           GGML_LAYOUT_AOS, "q4_K unknown (AoS-only)" },
+        { GGML_TYPE_IQ3_XXS, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq3_xxs moe (no reorder)" },
+        { GGML_TYPE_IQ2_XXS, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq2_xxs moe (no reorder)" },
+        { GGML_TYPE_IQ2_XS, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq2_xs moe (no reorder)" },
+        { GGML_TYPE_IQ2_S, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq2_s moe (no reorder)" },
+        { GGML_TYPE_IQ3_S, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq3_s moe (no reorder)" },
+        { GGML_TYPE_IQ3_S, tensor_usage::UNKNOWN,           GGML_LAYOUT_AOS, "iq3_s unknown (no reorder)" },
+        { GGML_TYPE_Q5_K,  tensor_usage::OUTPUT_WEIGHT,     GGML_LAYOUT_AOS, "q5_K output (no reorder)" },
+    };
+    for (const auto & pin : pinned) {
+        const layout_mode got = layout_policy::get_optimal(pin.type, pin.usage);
+        if (got != pin.want) {
+            printf("FAIL: get_optimal for %s = layout %d, want %d\n", pin.name, (int) got, (int) pin.want);
+            return false;
+        }
+    }
+    // Positive controls: the sweep saw SOA entries (so the SOA arm is not vacuous)
+    // and AOS entries for types outside the reorder table (the clamp's effect).
+    if (checked == 0 || soa_seen == 0 || aos_iq == 0) {
+        printf("FAIL: vacuous sweep checked=%d soa_entries=%d aos_nonreorder_entries=%d\n", checked, soa_seen, aos_iq);
+        return false;
+    }
+    printf("PASS: planner layouts are materializable for every quantized type (%d get_optimal cases)\n", checked);
+    return true;
+}
+
 int main() {
     if (!run_fused_gate_up_role_test()) {
         return 1;
@@ -2169,43 +4058,42 @@ int main() {
     if (!run_vram_budget_authority_test()) {
         return 1;
     }
+    // Every case in the mocked-device block prints its own PASS or FAIL, and a failure does not stop the run: a stale
+    // expectation in one case once hid every case after it. The binary still fails at the end.
+    bool mock_ok = true;
     {
         const ggml_sycl_device_info              mock_info = make_mock_sycl_info();
         ggml_sycl::test_sycl_info_override_guard info_guard(mock_info);
 
-        if (!run_mxfp4_moe_policy_test()) {
-            return 1;
-        }
-        if (!run_mxfp4_grouped_dpas_policy_test()) {
-            return 1;
-        }
-        if (!run_moe_device_policy_mock_test()) {
-            return 1;
-        }
-        if (!run_moe_triplet_planner_test()) {
-            return 1;
-        }
-        if (!run_multi_device_layer_block_plan_test()) {
-            return 1;
-        }
-        if (!run_multi_device_layer_boundary_metadata_test()) {
-            return 1;
-        }
-        if (!run_multi_device_moe_i8_executor_support_test()) {
-            return 1;
-        }
-        if (!run_single_device_moe_pp_complete_soa_layout_test()) {
-            return 1;
-        }
-        if (!run_moe_decode_down_phase_split_policy_test()) {
-            return 1;
-        }
-        if (!run_multi_device_no_p2p_cohesive_moe_layer_test()) {
-            return 1;
-        }
-        if (!run_regression_guard_policy_test()) {
-            return 1;
-        }
+        mock_ok = run_planned_layout_materializable_test() && mock_ok;
+        mock_ok = run_mxfp4_moe_policy_test() && mock_ok;
+        mock_ok = run_mxfp4_grouped_dpas_policy_test() && mock_ok;
+        mock_ok = run_moe_device_policy_mock_test() && mock_ok;
+        mock_ok = run_moe_triplet_planner_test() && mock_ok;
+        mock_ok = run_kv_context_room_before_experts_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_ring_placement_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_ring_kept_for_smaller_contexts_test() && mock_ok;
+        mock_ok = run_kv_context_room_cost_is_net_test() && mock_ok;
+        mock_ok = run_explicit_ubatch_cost_is_net_test() && mock_ok;
+        mock_ok = run_kv_context_room_follows_the_requested_context_test() && mock_ok;
+        mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;
+        mock_ok = run_dense_weights_before_kv_test() && mock_ok;
+        mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
+        mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;
+        mock_ok = run_multi_device_moe_i8_executor_support_test() && mock_ok;
+        mock_ok = run_single_device_moe_pp_layout_test() && mock_ok;
+        mock_ok = run_single_device_moe_mmid_pool_charge_test() && mock_ok;
+        mock_ok = run_moe_decode_down_phase_split_policy_test() && mock_ok;
+        mock_ok = run_multi_device_no_p2p_cohesive_moe_layer_test() && mock_ok;
+        mock_ok = run_regression_guard_policy_test() && mock_ok;
+    }
+    // Its own device-info overrides (1 and 2 exposed of 2 physical), so it runs outside the shared mock's guard.
+    mock_ok = run_multi_device_mmid_owner_exposure_test() && mock_ok;
+    if (!mock_ok) {
+        return 1;
     }
 
     const char * run_backend_layout_test = std::getenv("GGML_SYCL_TEST_LAYOUT_CHOICE_BACKEND");

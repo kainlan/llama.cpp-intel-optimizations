@@ -20,11 +20,19 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
+#include "moe-host-scatter.hpp"
 #include "moe-resolved-batch.hpp"
+#include "moe-stream-plan.hpp"
+#include "onednn-woq.hpp"
+#include "planned-load-terms.hpp"
+#include "range-index.hpp"
 #include "sycl-timeline.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
 #include "zone-sizing.hpp"
+
+#include <dlfcn.h>
+#include <level_zero/ze_api.h>
 
 #include <algorithm>
 #include <array>
@@ -41,8 +49,11 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -125,6 +136,8 @@ void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & 
 
 std::mutex                                                                   g_lifecycle_plan_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
+// Unpublished probe-placement plans (the load-time measure's (a) stage), keyed by the load's transaction.
+std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_probe_plans;
 std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
     g_lifecycle_plan_models;
 std::atomic<uint64_t> g_lifecycle_plan_next_version{ 1 };
@@ -151,14 +164,16 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
 }
 #endif
 
-void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
-                                    placement_plan            plan,
-                                    const placement_kv_info & kv_info,
-                                    uint32_t                  model_n_layer) {
-    if (load_txn_id == 0) {
-        return;
-    }
-    auto snapshot         = std::make_shared<lifecycle_plan_snapshot>();
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
+                                                                                 placement_plan            plan,
+                                                                                 const placement_kv_info & kv_info,
+                                                                                 uint32_t model_n_layer) {
+    // A candidate's shape: model_id 0, the load's transaction, version 0 and the
+    // slot fields at their defaults.  The load's own token is derived from the
+    // active transaction, so every identity reader sees the same owner whether the
+    // snapshot is staged (and later stored) or only measured against (the measure
+    // builds one and never stores it).
+    auto snapshot                = std::make_shared<lifecycle_plan_snapshot>();
     snapshot->load_txn_id   = load_txn_id;
     snapshot->model_n_layer = model_n_layer;
     snapshot->kv_info       = kv_info;
@@ -170,6 +185,17 @@ void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
     // current-model tiering verdict kept answering from the PREVIOUS model
     // until commit.
     snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;
+    return snapshot;
+}
+
+void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
+                                    placement_plan            plan,
+                                    const placement_kv_info & kv_info,
+                                    uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
     std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
     g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
 }
@@ -199,10 +225,41 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placemen
     }
 }
 
+void lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
+                                          placement_plan            plan,
+                                          const placement_kv_info & kv_info,
+                                          uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    g_lifecycle_probe_plans[load_txn_id] = std::move(snapshot);
+}
+
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        const auto                  probe = g_lifecycle_probe_plans.find(load_txn_id);
+        return probe == g_lifecycle_probe_plans.end() ? nullptr : probe->second;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        g_lifecycle_probe_plans.erase(load_txn_id);
+    } catch (...) {
+    }
+}
+
 void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         g_lifecycle_plan_candidates.erase(load_txn_id);
+        g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
     } catch (...) {
     }
 }
@@ -244,11 +301,13 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
         published->version = lifecycle_next_plan_publication_id();
         if (published->version == 0) {
             g_lifecycle_plan_candidates.erase(candidate);
+            g_lifecycle_probe_plans.erase(load_txn_id);
             return false;
         }
         std::shared_ptr<const lifecycle_plan_snapshot> immutable = std::move(published);
         g_lifecycle_plan_models[model_id][load_txn_id] = immutable;
         g_lifecycle_plan_candidates.erase(candidate);
+        g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
         if (published_out) {
             *published_out = std::move(immutable);
         }
@@ -762,18 +821,46 @@ static size_t onednn_pp_pair_bound_for(int device_id, size_t capacity_bytes) {
 // llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
 // RUNTIME zone requirement so the zone the buffer lives in is sized for it.
+// llama.cpp-45qo: this and every dense scratch value below is PUBLISHED from the owner table (g_planned_load_terms
+// below): the plan sized from the merge of the accepted owners' inputs on the device.
+// planned_dense_scratch_publish_locked is their only writer.
 static std::atomic<size_t>   g_planned_mmq_src1_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-479i: planned bytes of the per-context dense f16 dequant buffers (the src0 copy
 // plus the src1 copy, see zone_dequant_f16_*), folded into the same RUNTIME zone requirement.
 static std::atomic<size_t>   g_planned_dequant_f16_src0_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-kpjw: the INPUTS the two plan setters were last given (per-token and weight maxima, n_ubatch),
-// kept so the runtime-context transaction can re-derive the plan at the runtime n_ubatch (auto-ubatch picks it
-// after load) without the load-time inventory.
+// llama.cpp-kpjw: the INPUTS the plan is sized from (per-token and weight maxima, n_ubatch), the merge over the
+// accepted owners on the device (llama.cpp-45qo), read by the fit check and the plan-at-n_ubatch query. Each owner's
+// own inputs stay in the owner table, which is what a re-plan at the runtime n_ubatch re-derives from. The n_ubatch
+// is each half's own, [0] the Q8_1 half and [1] the f16 half, because each half is merged over its own accepted
+// owners.
 static std::atomic<size_t>   g_planned_mmq_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_weight_bytes_max[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
-static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES][2]{};
+// llama.cpp-p6i0: the load's planned compute term (the scheduler's compute buffer, measured at the load's measure
+// shape and rounded to the RUNTIME TLSF's grain), folded into the same RUNTIME zone requirement.
+// llama.cpp-ihk6: this is the MERGE over the owners on the device (g_planned_load_terms below), published there; it is
+// what every reader loads.
+static std::atomic<size_t>   g_planned_compute_term_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-p6i0: the load's planned state term (the context memory the measure placed on the device's plain buffer
+// type, the recurrent state, which takes the RUNTIME zone before the compute buffer), at the same grain. The merge
+// over the owners on the device, like the compute term.
+static std::atomic<size_t>   g_planned_state_term_bytes[GGML_SYCL_MAX_DEVICES]{};
+
+// llama.cpp-ihk6: the planned load terms by owner (canonical contract 12.4): each live model's contribution, and the
+// load in flight's, per device, keyed by model slot and slot generation. Since llama.cpp-45qo they include the dense
+// scratch plan's inputs. A set or a drop and the republish of the merge above happen under `mutex`, so a merge cannot
+// be published over by one computed before a later contribution landed. The writers run on different threads (the
+// loader thread reserves and rolls back, the unloading thread or the quarantine reaper releases a slot) and their call
+// sites share no exclusive lock, which is why this has its own.
+// The mutex is a leaf: nothing is called while it is held, and readers never take it.
+struct planned_load_terms_state {
+    std::mutex         mutex;
+    planned_load_terms owners;
+};
+
+static planned_load_terms_state g_planned_load_terms;
 
 // llama.cpp-kpjw: everything about the hold that must move together, per device, behind one mutex: the held bytes and
 // the context that published them (a context id, never an address: an address is reused after a free), the
@@ -825,9 +912,10 @@ struct planned_scratch_hold_state {
 
 static planned_scratch_hold_state g_planned_scratch_hold_state[GGML_SYCL_MAX_DEVICES];
 static std::atomic<uint64_t>      g_planned_scratch_owner_next{ 1 };
-// llama.cpp-kpjw: the last figure a setter REJECTED (overflow) for each half of the dense scratch plan, [0] the Q8
-// half and [1] the f16 half. A rejected figure leaves the stored inputs untouched, so without this flag a re-plan
-// would quietly re-derive a plan from the previous (stale) inputs.
+// llama.cpp-kpjw: a half of the dense scratch plan that cannot be sized, [0] the Q8 half and [1] the f16 half, so the
+// fit check refuses it by name rather than trusting a wrapped figure. llama.cpp-45qo: published from the owner table,
+// set only when the merged inputs of the owners whose figure was accepted cannot be sized. A rejected owner's figure
+// does not set it: that owner contributes nothing to the half, and its own re-plan refuses while it is live.
 static std::atomic<bool>         g_planned_dense_scratch_invalid[GGML_SYCL_MAX_DEVICES][2]{};
 // llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) known at
@@ -892,6 +980,7 @@ static std::atomic<uint32_t> g_test_arena_drain_timeout_ms{ 5000 };
 static std::atomic<bool>     g_test_pause_zone_settle{ false };
 static std::atomic<bool>     g_test_zone_settle_reached{ false };
 static std::atomic<bool>     g_test_arena_destroy_closing_reached{ false };
+static std::atomic<unified_cache_test_destroy_observer> g_test_destroy_observer{ nullptr };
 static std::atomic<uint32_t> g_test_fail_control_allocations{ 0 };
 static std::atomic<bool>     g_test_pause_control_publication{ false };
 static std::atomic<bool>     g_test_control_publication_reached{ false };
@@ -994,6 +1083,26 @@ const alloc_metadata & alloc_owner::metadata() const noexcept {
     static const alloc_metadata empty{};
     return control_ ? control_->metadata() : empty;
 }
+
+// No production code sets a tenant cohort yet.  The two hazards at the graph_compute exit
+// that making it live would have exposed are closed there: a call that recorded OR replayed
+// a graph keeps its tenant staging entries (the graph has their addresses baked in), so the
+// exit's release runs only for a call that did neither; and the entries a recording call
+// parks are named by the re-plan's recorded-state predicate, so its invalidation clears them
+// even when the recording that parked them produced no graph.
+void alloc_owner::set_tenant_cohort(const char * cohort) noexcept {
+    if (!control_ || cohort == nullptr) {
+        return;
+    }
+    // Set once: the tag is read through every copy and slice of the handle, so
+    // a second write would re-classify an allocation other holders already
+    // treat as one cohort's.  A second set is a defect, not an update.
+    const char * expected = nullptr;
+    if (!control_->tenant_cohort_.compare_exchange_strong(expected, cohort, std::memory_order_acq_rel,
+                                                          std::memory_order_acquire)) {
+        GGML_ABORT("[TENANT] allocation already tagged with cohort '%s'; refusing to re-tag it '%s'", expected, cohort);
+    }
+}
 release_attempt alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);
     return control ? control->release_ref() : release_attempt{};
@@ -1029,6 +1138,10 @@ uint32_t shared_alloc_owner::use_count() const noexcept {
 }
 uint64_t shared_alloc_owner::control_id() const noexcept {
     return control_ ? control_->control_id() : 0;
+}
+
+const char * shared_alloc_owner::tenant_cohort() const noexcept {
+    return control_ ? control_->tenant_cohort() : nullptr;
 }
 release_attempt shared_alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);
@@ -1480,6 +1593,28 @@ struct runtime_alloc_record {
 };
 
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
+
+// Containment index over the registry's rows: [handle.ptr, handle.ptr + handle.size) -> the row's key, for every row with
+// a non-null pointer and a non-zero size. It answers "which allocation contains this address" in O(log n), where the
+// registry itself can only scan (llama.cpp-ii25). Guarded by g_runtime_alloc_mutex, and in step with the registry only
+// because EVERY mutation of the registry goes through the runtime_registry_*_locked helpers below; no other code may
+// emplace, erase or assign a row (tests/test-sycl-runtime-registry-index-source.py enforces it). A registered row's
+// handle.ptr and handle.size must not change, since the index keeps the geometry it was given at insertion.
+// Declared before g_device_caches for the reason given there: the caches' destructors erase rows.
+static address_range_index g_runtime_alloc_index;
+
+// Settle-side counters over the same rows, guarded by g_runtime_alloc_mutex and written ONLY by
+// runtime_registry_count_row_locked(), which only the registry mutation helpers call (llama.cpp-rriv;
+// tests/test-sycl-runtime-registry-settle-source.py enforces both). A clean zone settle used to scan every row to learn that
+// nothing in its zone was live; these make that O(1) and leave the enumeration to the refusal that needs it.
+//   g_runtime_host_zone_rows[z]     rows whose handle.host_zone is z, in any state (RELEASING rows included: the scan this
+//                                   replaces counted them, and a host zone is not reusable while one holds its bytes).
+//   g_runtime_span_irregular_rows   rows the index cannot answer a key-in-span question for: the key is not the base the
+//                                   row is indexed at (no extent, or handle.ptr != key). Always 0 in practice; while it is
+//                                   not, runtime_registry_span_live_locked() scans, so it keeps the old answer.
+static size_t g_runtime_host_zone_rows[static_cast<size_t>(host_zone_id::COUNT)];
+static size_t g_runtime_span_irregular_rows = 0;
+
 // Keep cache owners later in declaration order than the registry they call from
 // unified_cache::~unified_cache(). Reverse static destruction then tears caches
 // down first instead of asking release_registered_allocation_owned() to access
@@ -1502,6 +1637,216 @@ struct arena_runtime_publication_context {
 static std::atomic<bool> g_test_fail_next_arena_registry_commit{ false };
 static std::atomic<bool> g_test_pause_arena_registry_commit{ false };
 static std::atomic<bool> g_test_arena_registry_commit_reached{ false };
+#endif
+
+using runtime_registry_iterator = std::unordered_map<void *, runtime_alloc_record>::iterator;
+
+static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
+    return h.ptr != nullptr && h.size != 0;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static size_t g_test_registry_rows_scanned = 0;  // guarded by g_runtime_alloc_mutex
+#endif
+
+// Registry rows visited by the settle queries and their refusal enumerations; only the tests read it, to pin that a clean
+// settle visits none.
+static void runtime_registry_note_row_scanned_locked() noexcept {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_test_registry_rows_scanned++;
+#endif
+}
+
+// The index holds the row at its own key, so "is this row's key in [lo, hi)" is "is its indexed base in [lo, hi)".
+// A row with a null key is irregular too: the index never holds one, so it cannot answer for it.
+static bool runtime_registry_row_span_regular(const void * key, const alloc_metadata & h) noexcept {
+    return runtime_registry_row_indexed(h) && h.ptr == key;
+}
+
+// Adds (or removes) one row's contribution to the counters above. The ONLY writer of them; the caller holds
+// g_runtime_alloc_mutex and passes the row exactly as it is registered.
+static void runtime_registry_count_row_locked(const void * key, const alloc_metadata & h, bool add) noexcept {
+    if (static_cast<size_t>(h.host_zone) < static_cast<size_t>(host_zone_id::COUNT)) {
+        size_t & rows = g_runtime_host_zone_rows[static_cast<size_t>(h.host_zone)];
+        if (add) {
+            rows++;
+        } else {
+            GGML_ASSERT(rows > 0 && "host-zone row counter lost a registered row");
+            rows--;
+        }
+    }
+    if (!runtime_registry_row_span_regular(key, h)) {
+        if (add) {
+            g_runtime_span_irregular_rows++;
+        } else {
+            GGML_ASSERT(g_runtime_span_irregular_rows > 0 && "irregular-row counter lost a registered row");
+            g_runtime_span_irregular_rows--;
+        }
+    }
+}
+
+// Is any registry row in host zone `zone`? What host_zone_settle() decides on. O(1); see the counters' comment.
+static bool runtime_registry_host_zone_live_locked(host_zone_id zone) noexcept {
+    return static_cast<size_t>(zone) < static_cast<size_t>(host_zone_id::COUNT) &&
+           g_runtime_host_zone_rows[static_cast<size_t>(zone)] != 0;
+}
+
+// Is any registry row's key in [lo, hi)? What zone_settle() decides on. The index answers in O(log n) while every row is
+// held at its own key; an irregular row (see the counters' comment) makes the index's answer differ from the key test, so
+// the registry is scanned for as long as one exists.
+static bool runtime_registry_span_live_locked(uintptr_t lo, uintptr_t hi) noexcept {
+    if (g_runtime_span_irregular_rows == 0) {
+        return g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);
+    }
+    for (const auto & kv : g_runtime_alloc_registry) {
+        runtime_registry_note_row_scanned_locked();
+        const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
+        if (p >= lo && p < hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The only ways to add, remove or replace a registry row (runtime_registry_emplace_locked, runtime_registry_erase_locked
+// and runtime_registry_assign_locked below); the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index in
+// step. runtime_registry_emplace_locked has the contract of unordered_map::emplace: {row, true} on success,
+// {existing row, false} when `ptr` already has one. An allocation failure leaves registry and index unchanged and
+// propagates.
+//
+// DEFENSIVE: the refusal further down, when the index already has a range starting at this row's handle.ptr, cannot
+// happen while a row's key is its handle.ptr, because the registry cannot hold two rows at one pointer. It exists so a
+// future row whose key and handle.ptr differ is refused ({end(), false}) instead of silently sharing a base with another
+// row; the answer for two live allocations at one address is the one runtime_registry_claim_ptr_locked gives.
+static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locked(void *               ptr,
+                                                                                  runtime_alloc_record rec) {
+    auto inserted = g_runtime_alloc_registry.emplace(ptr, std::move(rec));
+    if (!inserted.second) {
+        return inserted;
+    }
+    const alloc_metadata & h = inserted.first->second.handle;
+    if (runtime_registry_row_indexed(h)) {
+        bool indexed = false;
+        try {
+            indexed = g_runtime_alloc_index.insert(reinterpret_cast<uintptr_t>(h.ptr), h.size, ptr);
+        } catch (...) {
+            g_runtime_alloc_registry.erase(inserted.first);
+            throw;
+        }
+        if (!indexed) {
+            g_runtime_alloc_registry.erase(inserted.first);
+            return { g_runtime_alloc_registry.end(), false };
+        }
+    }
+    runtime_registry_count_row_locked(ptr, h, /*add=*/true);
+    return inserted;
+}
+
+// The geometry a row carries is the geometry the index was given for it (end clamped as insert clamps it).
+static bool runtime_registry_row_matches_index_entry(const alloc_metadata &             h,
+                                                     const address_range_index::entry & e) noexcept {
+    return reinterpret_cast<uintptr_t>(h.ptr) == e.base && address_range_index::end_of(e.base, h.size) == e.end;
+}
+
+static void runtime_registry_erase_locked(runtime_registry_iterator it) noexcept {
+    const alloc_metadata & h = it->second.handle;
+    if (runtime_registry_row_indexed(h)) {
+        const bool unindexed = g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(h.ptr), it->first);
+        GGML_ASSERT(unindexed && "runtime allocation index lost a registered row");
+        (void) unindexed;
+    }
+    runtime_registry_count_row_locked(it->first, h, /*add=*/false);
+    g_runtime_alloc_registry.erase(it);
+}
+
+static void runtime_registry_erase_locked(void * ptr) noexcept {
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it != g_runtime_alloc_registry.end()) {
+        runtime_registry_erase_locked(it);
+    }
+}
+
+static_assert(std::is_nothrow_move_assignable<runtime_alloc_record>::value,
+              "runtime_registry_assign_locked relies on a nothrow row replacement");
+
+// Replace-or-insert, the semantics of `registry[ptr] = rec`, and like it a replace of an existing row allocates nothing
+// that can fail after the old row has been touched: the copy of `rec` and any new index node are made first, and what
+// follows (resizing or dropping the old range, moving the copy over the row) cannot throw. So a bad_alloc leaves the old
+// row and its range as they were, never a live allocation with no row. The adopt callers hand out a live handle for this
+// row, so a row that did not land would be an unowned allocation; hence the assertion.
+static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_record & rec) {
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end()) {
+        const bool published = runtime_registry_emplace_locked(ptr, rec).second;
+        GGML_ASSERT(published && "runtime allocation registry refused an adopted row");
+        (void) published;
+        return;
+    }
+    runtime_alloc_record fresh = rec;  // may throw; nothing has changed yet
+    const alloc_metadata old_h = it->second.handle;
+    const bool           was   = runtime_registry_row_indexed(old_h);
+    const bool           now   = runtime_registry_row_indexed(fresh.handle);
+    if (now) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(fresh.handle.ptr);
+        if (was && old_h.ptr == fresh.handle.ptr) {
+            const bool resized = g_runtime_alloc_index.resize(base, ptr, fresh.handle.size);
+            GGML_ASSERT(resized && "runtime allocation index lost a registered row");
+            (void) resized;
+        } else {
+            // A row whose key is not its handle.ptr, or one that had no extent: the new range goes in before the old one
+            // goes out, so a failed insert leaves the old range in place.
+            const bool indexed = g_runtime_alloc_index.insert(base, fresh.handle.size, ptr);
+            GGML_ASSERT(indexed && "runtime allocation index refused an adopted row");
+            (void) indexed;
+            if (was) {
+                g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
+            }
+        }
+    } else if (was) {
+        g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
+    }
+    runtime_registry_count_row_locked(ptr, old_h, /*add=*/false);
+    runtime_registry_count_row_locked(ptr, fresh.handle, /*add=*/true);
+    it->second = std::move(fresh);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Every registry row is indexed exactly when it qualifies, with the geometry the row carries (end clamped as insert
+// clamps it), and the index holds nothing else. O(n); only the test seam uses it.
+static bool runtime_registry_index_consistent_locked() noexcept {
+    size_t indexed = 0;
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const alloc_metadata & h = kv.second.handle;
+        if (!runtime_registry_row_indexed(h)) {
+            continue;
+        }
+        indexed++;
+        address_range_index::entry e;
+        if (!g_runtime_alloc_index.find_exact(reinterpret_cast<uintptr_t>(h.ptr), &e) || e.key != kv.first ||
+            e.end != address_range_index::end_of(reinterpret_cast<uintptr_t>(h.ptr), h.size)) {
+            return false;
+        }
+    }
+    if (indexed != g_runtime_alloc_index.size() || !g_runtime_alloc_index.check_invariants()) {
+        return false;
+    }
+    // The settle counters equal a recount of the registry (llama.cpp-rriv).
+    size_t zone_rows[static_cast<size_t>(host_zone_id::COUNT)] = {};
+    size_t irregular                                           = 0;
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const alloc_metadata & h = kv.second.handle;
+        if (static_cast<size_t>(h.host_zone) < static_cast<size_t>(host_zone_id::COUNT)) {
+            zone_rows[static_cast<size_t>(h.host_zone)]++;
+        }
+        irregular += runtime_registry_row_span_regular(kv.first, h) ? 0 : 1;
+    }
+    for (size_t z = 0; z < static_cast<size_t>(host_zone_id::COUNT); z++) {
+        if (zone_rows[z] != g_runtime_host_zone_rows[z]) {
+            return false;
+        }
+    }
+    return irregular == g_runtime_span_irregular_rows;
+}
 #endif
 
 static bool unified_alloc_lifetime_trace_enabled();
@@ -1570,7 +1915,7 @@ static bool runtime_registry_claim_ptr_locked(void * ptr, stale_claim_report & r
         } catch (...) {
         }
     }
-    g_runtime_alloc_registry.erase(it);
+    runtime_registry_erase_locked(it);
     return true;
 }
 
@@ -1604,12 +1949,12 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
         if (!runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
             return false;
         }
-        auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+        auto inserted = runtime_registry_emplace_locked(ptr, rec);
         if (!inserted.second) return false;
         try {
             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = rec.handle.tier;
         } catch (...) {
-            g_runtime_alloc_registry.erase(inserted.first);
+            runtime_registry_erase_locked(inserted.first);
             throw;
         }
         context.published = true;
@@ -1755,6 +2100,22 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id) {
 // round would make an unplanned device poison its own RUNTIME zone sizing.
 static std::atomic<size_t> g_planned_moe_control_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>   g_planned_moe_control_invalid[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-cre6: planned bytes of the host-expert MoE scatter scratch (RUNTIME zone).
+static std::atomic<size_t> g_planned_moe_host_scatter_bytes[GGML_SYCL_MAX_DEVICES]{};
+
+void unified_cache_set_planned_moe_host_scatter_scratch_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_moe_host_scatter_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_moe_host_scatter_bytes[device_id].load(std::memory_order_acquire);
+}
 
 void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
@@ -1778,39 +2139,6 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 
 static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id);
 
-bool unified_cache_set_planned_mmq_src1_scratch(int      device_id,
-                                                size_t   bytes_per_token,
-                                                uint32_t n_ubatch,
-                                                bool     other_model_live) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return false;
-    }
-    // The inputs are device-global: while another model is live on the device its larger input stays.
-    const size_t merged_bytes_per_token =
-        zone_dense_scratch_merge_input(g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
-                                       bytes_per_token, other_model_live);
-    const uint32_t merged_n_ubatch = static_cast<uint32_t>(zone_dense_scratch_merge_input(
-        g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire), n_ubatch, other_model_live));
-    size_t         bytes           = 0;
-    // Validate first, store after: a rejected figure must not become the stored inputs a re-plan reads back.
-    if (!zone_mmq_src1_scratch_bytes(merged_bytes_per_token, merged_n_ubatch, &bytes)) {
-        // An overflowing figure must not become a SMALL plan. With no other model live, publish nothing and mark
-        // the plan invalid; the fit check then refuses by name instead of the zone being sized for a wrapped
-        // number. With another model live its plan and inputs are left standing: one model's overflow does not
-        // invalidate the plan of the model that is already running.
-        if (!other_model_live) {
-            g_planned_mmq_src1_scratch_bytes[device_id].store(0, std::memory_order_release);
-            g_planned_dense_scratch_invalid[device_id][0].store(true, std::memory_order_release);
-        }
-        return false;
-    }
-    g_planned_mmq_src1_bytes_per_token[device_id].store(merged_bytes_per_token, std::memory_order_release);
-    g_planned_dense_scratch_n_ubatch[device_id].store(merged_n_ubatch, std::memory_order_release);
-    g_planned_mmq_src1_scratch_bytes[device_id].store(bytes, std::memory_order_release);
-    g_planned_dense_scratch_invalid[device_id][0].store(false, std::memory_order_release);
-    return true;
-}
-
 size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return 0;
@@ -1818,43 +2146,239 @@ size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
     return g_planned_mmq_src1_scratch_bytes[device_id].load(std::memory_order_acquire);
 }
 
-bool unified_cache_set_planned_dequant_f16_scratch(int      device_id,
-                                                   size_t   max_weight_bytes,
-                                                   size_t   src1_bytes_per_token,
-                                                   uint32_t n_ubatch,
-                                                   bool     other_model_live) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return false;
+// The dense scratch plan on `device_id` from the owner table (llama.cpp-45qo), sized by the same two formulas the
+// setters validate with. Each half is the largest of each input over the owners whose figure for that half was
+// accepted (merged_accepted), so one model's overflow does not invalidate the plan of a model already running
+// (llama.cpp-kpjw): the rejected owner contributes nothing to the half, its n_ubatch included. Merged inputs the
+// formulas still reject publish a zero plan for that half and mark it invalid, so the fit check refuses by name rather
+// than trusting a wrapped figure. Called with g_planned_load_terms.mutex held.
+static void planned_dense_scratch_publish_locked(int device_id) {
+    const planned_load_terms & owners   = g_planned_load_terms.owners;
+    const planned_load_term    q8_flag  = planned_load_term::MMQ_SRC1_REJECTED;
+    const planned_load_term    f16_flag = planned_load_term::DEQUANT_F16_REJECTED;
+    const size_t q8_per_tok  = owners.merged_accepted(device_id, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, q8_flag);
+    const size_t q8_n_ubatch = owners.merged_accepted(device_id, planned_load_term::DENSE_SCRATCH_N_UBATCH, q8_flag);
+    const size_t f16_weights = owners.merged_accepted(device_id, planned_load_term::DEQUANT_F16_WEIGHT_BYTES, f16_flag);
+    const size_t f16_per_tok =
+        owners.merged_accepted(device_id, planned_load_term::DEQUANT_F16_SRC1_BYTES_PER_TOKEN, f16_flag);
+    const size_t f16_n_ubatch = owners.merged_accepted(device_id, planned_load_term::DENSE_SCRATCH_N_UBATCH, f16_flag);
+    size_t       q8_bytes     = 0;
+    size_t       src0_bytes   = 0;
+    size_t       src1_bytes   = 0;
+    const bool   q8_valid     = q8_n_ubatch <= UINT32_MAX &&
+                          zone_mmq_src1_scratch_bytes(q8_per_tok, static_cast<uint32_t>(q8_n_ubatch), &q8_bytes);
+    const bool f16_valid = f16_n_ubatch <= UINT32_MAX &&
+                           zone_dequant_f16_plan_bytes(f16_weights, f16_per_tok, static_cast<uint32_t>(f16_n_ubatch),
+                                                       &src0_bytes, &src1_bytes);
+    g_planned_mmq_src1_bytes_per_token[device_id].store(q8_per_tok, std::memory_order_release);
+    g_planned_dequant_f16_weight_bytes_max[device_id].store(f16_weights, std::memory_order_release);
+    g_planned_dequant_f16_src1_bytes_per_token[device_id].store(f16_per_tok, std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id][0].store(
+        q8_n_ubatch <= UINT32_MAX ? static_cast<uint32_t>(q8_n_ubatch) : 0, std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id][1].store(
+        f16_n_ubatch <= UINT32_MAX ? static_cast<uint32_t>(f16_n_ubatch) : 0, std::memory_order_release);
+    g_planned_mmq_src1_scratch_bytes[device_id].store(q8_valid ? q8_bytes : 0, std::memory_order_release);
+    g_planned_dequant_f16_src0_bytes[device_id].store(f16_valid ? src0_bytes : 0, std::memory_order_release);
+    g_planned_dequant_f16_src1_bytes[device_id].store(f16_valid ? src1_bytes : 0, std::memory_order_release);
+    g_planned_dense_scratch_invalid[device_id][0].store(!q8_valid, std::memory_order_release);
+    g_planned_dense_scratch_invalid[device_id][1].store(!f16_valid, std::memory_order_release);
+}
+
+// The merge over the owners on every device, published with release semantics for the readers. Every device, because
+// a store can sweep a stale contribution off devices other than the one it stores on, and a drop removes an owner from
+// every device. Called with g_planned_load_terms.mutex held.
+static void planned_load_terms_publish_locked() {
+    for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {
+        g_planned_compute_term_bytes[device_id].store(
+            g_planned_load_terms.owners.merged(device_id, planned_load_term::COMPUTE), std::memory_order_release);
+        g_planned_state_term_bytes[device_id].store(
+            g_planned_load_terms.owners.merged(device_id, planned_load_term::STATE), std::memory_order_release);
+        planned_dense_scratch_publish_locked(device_id);
     }
-    const size_t merged_weight_bytes = zone_dense_scratch_merge_input(
-        g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire), max_weight_bytes,
-        other_model_live);
-    const size_t merged_src1_per_token = zone_dense_scratch_merge_input(
-        g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire), src1_bytes_per_token,
-        other_model_live);
-    const uint32_t merged_n_ubatch = static_cast<uint32_t>(zone_dense_scratch_merge_input(
-        g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire), n_ubatch, other_model_live));
-    size_t         src0_bytes      = 0;
-    size_t         src1_bytes      = 0;
-    // Validate first, store after (see the Q8 setter).
-    if (!zone_dequant_f16_plan_bytes(merged_weight_bytes, merged_src1_per_token, merged_n_ubatch, &src0_bytes,
-                                     &src1_bytes)) {
-        // Same rule as the Q8 figure: an overflow must not become a SMALL plan, and must not invalidate another
-        // live model's plan.
-        if (!other_model_live) {
-            g_planned_dequant_f16_src0_bytes[device_id].store(0, std::memory_order_release);
-            g_planned_dequant_f16_src1_bytes[device_id].store(0, std::memory_order_release);
-            g_planned_dense_scratch_invalid[device_id][1].store(true, std::memory_order_release);
+}
+
+// Names each device a store swept a stale contribution of `owner`'s slot off. Called after the lock is released.
+static void planned_load_terms_name_replaced(lifecycle::SlotToken                owner,
+                                             int                                 device_id,
+                                             const planned_load_terms_replaced & replaced) {
+    for (int stale_device = 0; stale_device < GGML_SYCL_MAX_DEVICES; ++stale_device) {
+        if (replaced.generation[stale_device] == 0) {
+            continue;
         }
+        // A contribution can leave only by its owner's key, so one still standing when the slot's next generation
+        // reserves is one its owner's rollback or release did not drop. It is removed, and named, never merged.
+        GGML_LOG_WARN(
+            "[LOAD-PLAN] planned load terms of slot %u generation %llu were still standing on device %d when "
+            "generation %llu reserved on device %d; replaced (the owner ended without dropping them)\n",
+            owner.slot, (unsigned long long) replaced.generation[stale_device], stale_device,
+            (unsigned long long) owner.generation, device_id);
+    }
+}
+
+// The owner store every planned load term setter shares (llama.cpp-45qo): `store_locked(&replaced)` stores the
+// owner's terms under the table's leaf mutex (false: the table refused the owner and nothing was stored). The merge the
+// readers load is republished for every device in the same locked step, so a merge computed before a later
+// contribution cannot be published over it, and each device the store swept a stale contribution off is named after
+// the lock is released.
+template <typename F>
+static bool planned_load_terms_store(int device_id, lifecycle::SlotToken owner, F && store_locked) {
+    planned_load_terms_replaced replaced;
+    {
+        std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+        if (!store_locked(&replaced)) {
+            return false;
+        }
+        planned_load_terms_publish_locked();
+    }
+    planned_load_terms_name_replaced(owner, device_id, replaced);
+    return true;
+}
+
+// One owner's term on one device (llama.cpp-ihk6): replaces that owner's earlier value, so a draft loaded beside its
+// target adds its own contribution and leaves the target's standing, and the device reads the larger of the two.
+static bool unified_cache_set_planned_load_term(int                  device_id,
+                                                lifecycle::SlotToken owner,
+                                                planned_load_term    term,
+                                                size_t               bytes) {
+    return planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
+        return g_planned_load_terms.owners.set(device_id, owner, term, bytes, replaced);
+    });
+}
+
+bool unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes) {
+    return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::COMPUTE, bytes);
+}
+
+size_t unified_cache_get_planned_compute_term_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes) {
+    return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::STATE, bytes);
+}
+
+size_t unified_cache_get_planned_state_term_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_state_term_bytes[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept {
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    if (!g_planned_load_terms.owners.drop(owner)) {
         return false;
     }
-    g_planned_dequant_f16_weight_bytes_max[device_id].store(merged_weight_bytes, std::memory_order_release);
-    g_planned_dequant_f16_src1_bytes_per_token[device_id].store(merged_src1_per_token, std::memory_order_release);
-    g_planned_dense_scratch_n_ubatch[device_id].store(merged_n_ubatch, std::memory_order_release);
-    g_planned_dequant_f16_src0_bytes[device_id].store(src0_bytes, std::memory_order_release);
-    g_planned_dequant_f16_src1_bytes[device_id].store(src1_bytes, std::memory_order_release);
-    g_planned_dense_scratch_invalid[device_id][1].store(false, std::memory_order_release);
+    planned_load_terms_publish_locked();
     return true;
+}
+
+// The owner's Q8_1 src1 plan inputs on `device_id` (llama.cpp-45qo). The figure is validated BEFORE it is stored, on
+// the merge the device will read once it is (merged_accepted_if_set). A rejected figure overwrites the owner's earlier
+// Q8_1 input with 0 and raises its flag, keeping its n_ubatch: the half is then sized from the other owners' accepted
+// inputs, which stay valid, and only this owner's re-plan refuses while it is live. *planned: whether the figure was
+// accepted. False, storing nothing: the table refused the owner. Called with g_planned_load_terms.mutex held.
+static bool planned_mmq_src1_scratch_store_locked(int                           device_id,
+                                                  lifecycle::SlotToken          owner,
+                                                  size_t                        bytes_per_token,
+                                                  uint32_t                      n_ubatch,
+                                                  bool *                        planned,
+                                                  planned_load_terms_replaced * replaced) {
+    planned_load_terms & owners = g_planned_load_terms.owners;
+    const size_t         merged_per_token =
+        owners.merged_accepted_if_set(device_id, owner, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, bytes_per_token,
+                                      planned_load_term::MMQ_SRC1_REJECTED);
+    const size_t merged_n_ubatch = owners.merged_accepted_if_set(
+        device_id, owner, planned_load_term::DENSE_SCRATCH_N_UBATCH, n_ubatch, planned_load_term::MMQ_SRC1_REJECTED);
+    size_t bytes = 0;
+    *planned     = merged_n_ubatch <= UINT32_MAX &&
+               zone_mmq_src1_scratch_bytes(merged_per_token, static_cast<uint32_t>(merged_n_ubatch), &bytes);
+    if (!*planned) {
+        const planned_load_term_value rejected[] = {
+            { planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, 0 },
+            { planned_load_term::MMQ_SRC1_REJECTED,        1 },
+        };
+        return owners.set(device_id, owner, rejected, 2, replaced);
+    }
+    const planned_load_term_value accepted[] = {
+        { planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, bytes_per_token },
+        { planned_load_term::DENSE_SCRATCH_N_UBATCH,   n_ubatch        },
+        { planned_load_term::MMQ_SRC1_REJECTED,        0               },
+    };
+    return owners.set(device_id, owner, accepted, 3, replaced);
+}
+
+// The owner's f16 dequant plan inputs on `device_id`, validated and stored the way the Q8_1 inputs are: a rejected
+// figure overwrites the owner's earlier f16 inputs with 0 and raises its flag, keeping its n_ubatch.
+static bool planned_dequant_f16_scratch_store_locked(int                           device_id,
+                                                     lifecycle::SlotToken          owner,
+                                                     size_t                        max_weight_bytes,
+                                                     size_t                        src1_bytes_per_token,
+                                                     uint32_t                      n_ubatch,
+                                                     bool *                        planned,
+                                                     planned_load_terms_replaced * replaced) {
+    planned_load_terms & owners = g_planned_load_terms.owners;
+    const size_t         merged_weights =
+        owners.merged_accepted_if_set(device_id, owner, planned_load_term::DEQUANT_F16_WEIGHT_BYTES, max_weight_bytes,
+                                      planned_load_term::DEQUANT_F16_REJECTED);
+    const size_t merged_per_token =
+        owners.merged_accepted_if_set(device_id, owner, planned_load_term::DEQUANT_F16_SRC1_BYTES_PER_TOKEN,
+                                      src1_bytes_per_token, planned_load_term::DEQUANT_F16_REJECTED);
+    const size_t merged_n_ubatch = owners.merged_accepted_if_set(
+        device_id, owner, planned_load_term::DENSE_SCRATCH_N_UBATCH, n_ubatch, planned_load_term::DEQUANT_F16_REJECTED);
+    size_t src0_bytes = 0;
+    size_t src1_bytes = 0;
+    *planned          = merged_n_ubatch <= UINT32_MAX &&
+               zone_dequant_f16_plan_bytes(merged_weights, merged_per_token, static_cast<uint32_t>(merged_n_ubatch),
+                                           &src0_bytes, &src1_bytes);
+    if (!*planned) {
+        const planned_load_term_value rejected[] = {
+            { planned_load_term::DEQUANT_F16_WEIGHT_BYTES,         0 },
+            { planned_load_term::DEQUANT_F16_SRC1_BYTES_PER_TOKEN, 0 },
+            { planned_load_term::DEQUANT_F16_REJECTED,             1 },
+        };
+        return owners.set(device_id, owner, rejected, 3, replaced);
+    }
+    const planned_load_term_value accepted[] = {
+        { planned_load_term::DEQUANT_F16_WEIGHT_BYTES,         max_weight_bytes     },
+        { planned_load_term::DEQUANT_F16_SRC1_BYTES_PER_TOKEN, src1_bytes_per_token },
+        { planned_load_term::DENSE_SCRATCH_N_UBATCH,           n_ubatch             },
+        { planned_load_term::DEQUANT_F16_REJECTED,             0                    },
+    };
+    return owners.set(device_id, owner, accepted, 4, replaced);
+}
+
+bool unified_cache_set_planned_mmq_src1_scratch(int                  device_id,
+                                                lifecycle::SlotToken owner,
+                                                size_t               bytes_per_token,
+                                                uint32_t             n_ubatch) {
+    // The load's n_ubatch is also recorded on its own: the owner plans at it again once no context of the model is
+    // live.
+    bool       planned = false;
+    const bool stored  = planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
+        return planned_mmq_src1_scratch_store_locked(device_id, owner, bytes_per_token, n_ubatch, &planned, replaced) &&
+               g_planned_load_terms.owners.set(device_id, owner, planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH,
+                                                n_ubatch);
+    });
+    return stored && planned;
+}
+
+bool unified_cache_set_planned_dequant_f16_scratch(int                  device_id,
+                                                   lifecycle::SlotToken owner,
+                                                   size_t               max_weight_bytes,
+                                                   size_t               src1_bytes_per_token,
+                                                   uint32_t             n_ubatch) {
+    bool       planned = false;
+    const bool stored  = planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
+        return planned_dequant_f16_scratch_store_locked(device_id, owner, max_weight_bytes, src1_bytes_per_token,
+                                                         n_ubatch, &planned, replaced) &&
+               g_planned_load_terms.owners.set(device_id, owner, planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH,
+                                                n_ubatch);
+    });
+    return stored && planned;
 }
 
 size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1) {
@@ -1872,41 +2396,145 @@ size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id) {
     return src0 > SIZE_MAX - src1 ? SIZE_MAX : src0 + src1;
 }
 
-bool unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch, bool other_model_live) {
+// Whether `owner`'s own figure for either half of the dense scratch plan on `device_id` was rejected, and which
+// (either out may be null). Reads only the owner's own flags: another owner's rejection is not this owner's. False
+// when the owner holds nothing on the device. Called with g_planned_load_terms.mutex held.
+static bool planned_dense_scratch_owner_rejected_locked(int                  device_id,
+                                                        lifecycle::SlotToken owner,
+                                                        bool *               q8_rejected,
+                                                        bool *               f16_rejected) {
+    size_t q8  = 0;
+    size_t f16 = 0;
+    (void) g_planned_load_terms.owners.get(device_id, owner, planned_load_term::MMQ_SRC1_REJECTED, &q8);
+    (void) g_planned_load_terms.owners.get(device_id, owner, planned_load_term::DEQUANT_F16_REJECTED, &f16);
+    if (q8_rejected != nullptr) {
+        *q8_rejected = q8 != 0;
+    }
+    if (f16_rejected != nullptr) {
+        *f16_rejected = f16 != 0;
+    }
+    return q8 != 0 || f16 != 0;
+}
+
+// Re-derive `owner`'s dense scratch plan on `device_id` from the owner's OWN inputs (llama.cpp-45qo), fed to the same
+// two plan stores as the load-time plan: one formula, two callers. It is sized at the owner's planned n_ubatch (the
+// largest value its live backend contexts last published, the load's when none is live), so another model live on the
+// device keeps its own contribution and the device reads the merge. An owner that planned nothing here (no n_ubatch:
+// every accepted figure stores one) has nothing to re-derive. `*stored`: whether a store changed the table, which the
+// caller publishes even when the other store was refused. Called with g_planned_load_terms.mutex held, for an owner
+// whose own figure was not rejected.
+static bool planned_dense_scratch_replan_locked(int device_id, lifecycle::SlotToken owner, bool * stored) {
+    *stored               = false;
+    size_t owner_n_ubatch = 0;
+    size_t q8_per_token   = 0;
+    size_t f16_weights    = 0;
+    size_t f16_per_token  = 0;
+    if (!g_planned_load_terms.owners.get(device_id, owner, planned_load_term::DENSE_SCRATCH_N_UBATCH,
+                                         &owner_n_ubatch) ||
+        owner_n_ubatch == 0 ||
+        !g_planned_load_terms.owners.get(device_id, owner, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN,
+                                         &q8_per_token) ||
+        !g_planned_load_terms.owners.get(device_id, owner, planned_load_term::DEQUANT_F16_WEIGHT_BYTES, &f16_weights) ||
+        !g_planned_load_terms.owners.get(device_id, owner, planned_load_term::DEQUANT_F16_SRC1_BYTES_PER_TOKEN,
+                                         &f16_per_token)) {
+        return false;
+    }
+    // Every recorded value came from a uint32_t, so the largest of them fits one.
+    const size_t planned_n_ubatch = g_planned_load_terms.owners.planned_n_ubatch(device_id, owner);
+    if (planned_n_ubatch == 0 || planned_n_ubatch > UINT32_MAX) {
+        return false;
+    }
+    const uint32_t next_n_ubatch = static_cast<uint32_t>(planned_n_ubatch);
+    bool           q8            = false;
+    bool           f16           = false;
+    const bool     q8_stored =
+        planned_mmq_src1_scratch_store_locked(device_id, owner, q8_per_token, next_n_ubatch, &q8, nullptr);
+    const bool f16_stored =
+        q8_stored && planned_dequant_f16_scratch_store_locked(device_id, owner, f16_weights, f16_per_token,
+                                                              next_n_ubatch, &f16, nullptr);
+    *stored = q8_stored;
+    return f16_stored && q8 && f16;
+}
+
+bool unified_cache_replan_planned_dense_scratch(int                  device_id,
+                                                lifecycle::SlotToken owner,
+                                                uint64_t             context,
+                                                uint32_t             n_ubatch,
+                                                uint32_t *           owner_n_ubatch) {
+    if (owner_n_ubatch != nullptr) {
+        *owner_n_ubatch = 0;
+    }
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || n_ubatch == 0) {
         return false;
     }
-    // A figure a setter rejected left the previous inputs in place; re-deriving from them would publish a plan for
-    // a model that is no longer the one being planned.
-    if (g_planned_dense_scratch_invalid[device_id][0].load(std::memory_order_acquire) ||
-        g_planned_dense_scratch_invalid[device_id][1].load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    // An owner whose figure was rejected had its inputs for that half overwritten with 0, so re-deriving from them
+    // would plan nothing for a model that needs scratch: its re-plan refuses while it is live (llama.cpp-kpjw). Only
+    // its own flags count. Another owner's rejection leaves this owner's plan valid and re-plannable.
+    if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) {
         return false;
     }
-    // The same two setters as the load-time plan, fed the inputs they were last given: one formula, two callers.
-    // With another context live on the device the plan's n_ubatch is the larger of the two: a draft context at a
-    // small n_ubatch must not shrink the plan the live target's buffers were sized from.
-    const bool q8 = unified_cache_set_planned_mmq_src1_scratch(
-        device_id, g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch,
-        other_model_live);
-    const bool f16 = unified_cache_set_planned_dequant_f16_scratch(
-        device_id, g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire),
-        g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch,
-        other_model_live);
-    return q8 && f16;
+    // The context's own entry is replaced, so the auto-ubatch ladder's settle lowers what a losing rung raised, and
+    // another live context of the model keeps its own: the model plans at the largest (lead ruling on llama.cpp-45qo).
+    if (!g_planned_load_terms.owners.set_context_n_ubatch(device_id, owner, context, n_ubatch)) {
+        return false;
+    }
+    bool       stored  = false;
+    const bool planned = planned_dense_scratch_replan_locked(device_id, owner, &stored);
+    // A store that changed the table is published even when the other one was refused, so the table and the
+    // atomics the readers load never disagree.
+    if (stored) {
+        planned_load_terms_publish_locked();
+    }
+    if (owner_n_ubatch != nullptr) {
+        *owner_n_ubatch = static_cast<uint32_t>(g_planned_load_terms.owners.planned_n_ubatch(device_id, owner));
+    }
+    return planned;
 }
 
-uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id) {
+bool unified_cache_release_planned_dense_scratch_context(int device_id, uint64_t context) {
+    lifecycle::SlotToken        owner{};
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    if (!g_planned_load_terms.owners.drop_context(device_id, context, &owner)) {
+        return false;
+    }
+    // The model now plans at its remaining live contexts' largest, or at its load's n_ubatch, so its plan may fall.
+    // A rejected owner's plan is left as the rejection stored it.
+    bool stored = false;
+    if (!planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) {
+        (void) planned_dense_scratch_replan_locked(device_id, owner, &stored);
+    }
+    if (stored) {
+        planned_load_terms_publish_locked();
+    }
+    return true;
+}
+
+bool unified_cache_planned_dense_scratch_context_room(int device_id, lifecycle::SlotToken owner, uint64_t context) {
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    return g_planned_load_terms.owners.context_room(device_id, owner, context);
+}
+
+uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id, bool f16) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return 0;
     }
-    return g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+    return g_planned_dense_scratch_n_ubatch[device_id][f16 ? 1 : 0].load(std::memory_order_acquire);
+}
+
+bool unified_cache_planned_dense_scratch_owner_rejected(int                  device_id,
+                                                        lifecycle::SlotToken owner,
+                                                        bool *               q8_rejected,
+                                                        bool *               f16_rejected) {
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    return planned_dense_scratch_owner_rejected_locked(device_id, owner, q8_rejected, f16_rejected);
 }
 
 bool unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || !out) {
         return false;
     }
-    // A rejected figure left stale inputs behind: no zone can hold a plan nobody could compute.
+    // The accepted owners' merged inputs could not be sized: no zone can hold a plan nobody could compute.
     if (g_planned_dense_scratch_invalid[device_id][0].load(std::memory_order_acquire) ||
         g_planned_dense_scratch_invalid[device_id][1].load(std::memory_order_acquire)) {
         return false;
@@ -1957,6 +2585,9 @@ bool unified_cache_dense_scratch_runtime_fit(int        device_id,
                                               unified_cache_get_planned_moe_control_requirement(device_id), &other)) {
         other = 0;  // unanswerable: the zone sizing keeps its default and so does this check
     }
+    // The host-expert MoE scatter scratch (llama.cpp-cre6) does not follow n_ubatch either.
+    const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);
+    other                         = moe_host_scatter > SIZE_MAX - other ? SIZE_MAX : other + moe_host_scatter;
     if (capacity) {
         *capacity = zone_bytes;
     }
@@ -2349,16 +2980,76 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
                                               unified_cache_get_planned_moe_control_requirement(device_id), &base)) {
         return false;
     }
+    // The host-expert MoE scatter scratch lives in this zone (llama.cpp-cre6), checked the same way.
+    const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);
+    if (moe_host_scatter > SIZE_MAX - base) {
+        return false;
+    }
+    base += moe_host_scatter;
     // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
     // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
     const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
     // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i), checked the same way.
     const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
-    if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1) {
+    // The scheduler's compute buffer lives in this zone too (llama.cpp-p6i0), checked the same way.
+    const size_t compute     = unified_cache_get_planned_compute_term_bytes(device_id);
+    // The context memory the load measured on the device's plain buffer type (the recurrent state) is allocated in
+    // this zone before the compute buffer (llama.cpp-p6i0), checked the same way.
+    const size_t state       = unified_cache_get_planned_state_term_bytes(device_id);
+    if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1 ||
+        compute > SIZE_MAX - base - mmq_src1 - dequant_f16 ||
+        state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute) {
         return false;
     }
-    *out = base + mmq_src1 + dequant_f16;
+    *out = base + mmq_src1 + dequant_f16 + compute + state;
     return true;
+}
+
+size_t unified_cache_runtime_zone_floor_bytes() {
+    size_t floor_bytes = 512 * 1024 * 1024;
+    if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
+        floor_bytes = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
+    }
+    return floor_bytes;
+}
+
+pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      device_id,
+                                                                      uint32_t n_ubatch,
+                                                                      uint32_t n_ubatch_default) {
+    pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch         = n_ubatch;
+    in.n_ubatch_default = n_ubatch_default;
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || !vram_arena_enabled()) {
+        return pp_moe_onednn_explicit_ubatch_plan_room(in);  // no ring geometry: invalid
+    }
+    unified_cache * cache = get_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return pp_moe_onednn_explicit_ubatch_plan_room(in);
+    }
+    in.weight_slot_bytes        = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id);
+    in.activation_bytes_per_row = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device_id);
+    in.output_bytes_per_row     = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device_id);
+    in.ring_depth               = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
+    // The requirement as ensure_planned_arena_zones() reads it, less the two terms that follow the micro-batch: the
+    // ring's RUNTIME part and the dense scratch, both as published now. What is left is the same at any micro-batch.
+    size_t       requirement    = 0;
+    const size_t ring_bytes     = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
+    const size_t ring_kv_bytes  = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device_id);
+    const size_t ring_runtime   = ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0;
+    const size_t mmq_src1       = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
+    const size_t dequant_f16    = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
+    if (!unified_cache_get_planned_runtime_zone_requirement(device_id, &requirement) ||
+        !unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch_default, &in.dense_scratch_default_bytes) ||
+        !unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch, &in.dense_scratch_bytes) ||
+        mmq_src1 > SIZE_MAX - dequant_f16 || ring_runtime > SIZE_MAX - mmq_src1 - dequant_f16 ||
+        requirement < ring_runtime + mmq_src1 + dequant_f16) {
+        in.weight_slot_bytes = 0;  // an unanswerable term plans no room
+        return pp_moe_onednn_explicit_ubatch_plan_room(in);
+    }
+    in.runtime_fixed_bytes = requirement - ring_runtime - mmq_src1 - dequant_f16;
+    in.runtime_floor_bytes = unified_cache_runtime_zone_floor_bytes();
+    in.runtime_zone_bytes  = cache->zone_capacity(vram_zone_id::RUNTIME);
+    return pp_moe_onednn_explicit_ubatch_plan_room(in);
 }
 
 void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes) {
@@ -3104,17 +3795,10 @@ bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
     if (act_per_row == 0 || out_per_row == 0) {
         return false;  // dense model: no MoE PP ring planned
     }
-    if (n_ubatch != 0 && (act_per_row > std::numeric_limits<size_t>::max() / n_ubatch ||
-                          out_per_row > std::numeric_limits<size_t>::max() / n_ubatch)) {
-        return false;  // n_ubatch * per_row would overflow
-    }
-    const size_t act_raw     = static_cast<size_t>(n_ubatch) * act_per_row;
-    const size_t out_raw     = static_cast<size_t>(n_ubatch) * out_per_row;
-    size_t       act_aligned = 0;
-    size_t       out_aligned = 0;
-    if (!pp_moe_onednn_checked_align_slot_bytes(act_raw, &act_aligned) ||
-        !pp_moe_onednn_checked_align_slot_bytes(out_raw, &out_aligned)) {
-        return false;  // align256() would overflow
+    size_t act_aligned = 0;
+    size_t out_aligned = 0;
+    if (!pp_moe_onednn_slots_at(n_ubatch, act_per_row, out_per_row, &act_aligned, &out_aligned)) {
+        return false;  // n_ubatch * per_row, or its rounding, would overflow
     }
     if (activation_slot_bytes != nullptr) {
         *activation_slot_bytes = act_aligned;
@@ -3386,6 +4070,220 @@ offload_phase offload_stats_phase() {
             return offload_phase::TG;
         default:
             return offload_phase::UNKNOWN;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L0 and the witness.  Declarations and the contract: unified-cache.hpp, beside
+// the offload stats.  The depth and the outermost kind are one thread-local
+// state, written only by ggml_sycl_replan_token's constructor and destructor.
+//
+// The audit of the fourteen public C entries that hold L0 (ggml-sycl.cpp), and
+// the acquisition order every one of them follows.  A lock may be taken only
+// while holding locks that are EARLIER in this list:
+//
+//   1. L0                              g_replan_txn_mutex (this file)
+//   2. the tensor inventory            g_tensor_inventory_mutex
+//   3. the execution-binding locks     g_execution_backend_binding_mutex, then the
+//                                      backend context's execution_state_mutex
+//   4. the unified-cache locks         the allocation registry and the zone locks,
+//                                      then mem_handle's leaf spin lock
+//
+// A wait, a callback, a queue drain or the destruction of an owner happens after
+// the locks of 2-4 are released (the H8 rule at ggml_sycl_execution_backend_binding);
+// L0 alone is held across them, which is the point of L0.
+//
+// Entries by token kind (the outermost kind decides; a nested hold of any kind
+// takes no lock):
+//   TRANSACTION  set_runtime_context, set_runtime_context_for_model (the second
+//                calls the first: a same-kind nested hold)
+//   LOAD         model_load_begin, stage_inventory_plan, model_load_end
+//   LIFECYCLE    model_unloaded_token, activate_model_plan,
+//                probe_runtime_context_for_model,
+//                recheck_runtime_context_flash_attn, can_unload (try-lock: it
+//                reports busy instead of waiting), complete_unload,
+//                commit_reactivate, rollback_reactivate, shutdown
+// Locks the entries take under L0: model_load_end, activate_model_plan,
+// set_runtime_context_for_model and recheck_runtime_context_flash_attn take the
+// inventory lock (2); set_runtime_context_for_model nests the binding lock and
+// then the execution-state lock inside it (2, then 3).  No entry calls an entry
+// of another kind, so the only nesting is that same-kind one.  graph_compute and
+// the backend's execution-bound paths take no L0 (witnessed at graph_compute's
+// entry), so a decode never waits behind a re-plan's L0.
+//
+// Illegal nestings are witnessed (acquire(), below): a TRANSACTION under a LOAD
+// or LIFECYCLE hold, and a LOAD under a TRANSACTION hold.  GGML_SYCL_WITNESS_CHECKS=1
+// is set in the ctest environment of the lifecycle, replan and plan tests, so the
+// order is enforced on every test run.  A static census of the order is
+// llama.cpp-jg25.
+// ---------------------------------------------------------------------------
+static std::timed_mutex g_replan_txn_mutex;
+
+// Who holds L0, for the diagnostic of a long wait.  Written by the holder right
+// after it locks and cleared right before it unlocks; read only to name a holder.
+static std::atomic<int>      g_replan_holder_kind{ GGML_SYCL_REPLAN_KIND_ANY };
+static std::atomic<uint64_t> g_replan_holder_thread{ 0 };
+
+static uint64_t ggml_sycl_this_thread_tag() {
+    return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+uint32_t ggml_sycl_replan_wait_warn_ms() {
+    uint32_t     ms  = 60000;
+    const char * env = std::getenv("GGML_SYCL_REPLAN_WAIT_WARN_MS");
+    if (env != nullptr) {
+        const long v = std::strtol(env, nullptr, 10);
+        if (v > 0) {
+            ms = static_cast<uint32_t>(v);
+        }
+    }
+    return ms;
+}
+
+ggml_sycl_wait_watch::ggml_sycl_wait_watch(const char * what) : what_(what) {
+    thread_ = std::thread([this]() {
+        const auto                   interval = std::chrono::milliseconds(ggml_sycl_replan_wait_warn_ms());
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!cv_.wait_for(lock, interval, [this]() { return done_; })) {
+            const uint32_t n = warnings_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            GGML_LOG_WARN("[REPLAN-WAIT] %s has waited %u x %u ms, now at: %s (the wait continues)\n", what_, n,
+                          static_cast<unsigned>(interval.count()), site_.load(std::memory_order_acquire));
+            if (ggml_sycl_strict_enabled()) {
+                GGML_ABORT("[REPLAN-WAIT] %s exceeded %u ms under GGML_SYCL_STRICT_LEASES=1, now at: %s", what_,
+                           static_cast<unsigned>(interval.count()), site_.load(std::memory_order_acquire));
+            }
+        }
+    });
+}
+
+ggml_sycl_wait_watch::~ggml_sycl_wait_watch() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        done_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+}
+
+static thread_local int                   g_replan_token_depth = 0;
+static thread_local ggml_sycl_replan_kind g_replan_token_outer = GGML_SYCL_REPLAN_KIND_ANY;
+
+static bool ggml_sycl_witness_switch() {
+    const char * env = std::getenv("GGML_SYCL_WITNESS_CHECKS");
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    return !(env != nullptr && std::strcmp(env, "0") == 0);
+#else
+    return env != nullptr && std::strcmp(env, "1") == 0;
+#endif
+}
+
+const bool g_sycl_witness_enabled = ggml_sycl_witness_switch();
+
+void ggml_sycl_witness_failed(const char * message) {
+    GGML_ABORT("%s", message);
+}
+
+const char * ggml_sycl_replan_kind_name(ggml_sycl_replan_kind kind) {
+    switch (kind) {
+        case GGML_SYCL_REPLAN_KIND_TRANSACTION:
+            return "TRANSACTION";
+        case GGML_SYCL_REPLAN_KIND_LOAD:
+            return "LOAD";
+        case GGML_SYCL_REPLAN_KIND_LIFECYCLE:
+            return "LIFECYCLE";
+        default:
+            return "ANY";
+    }
+}
+
+bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind) {
+    if (g_replan_token_depth == 0) {
+        return false;
+    }
+    return kind == GGML_SYCL_REPLAN_KIND_ANY || g_replan_token_outer == kind;
+}
+
+void ggml_sycl_replan_token::acquire(ggml_sycl_replan_kind kind, bool try_only) {
+    GGML_SYCL_WITNESS(kind != GGML_SYCL_REPLAN_KIND_ANY, "[REPLAN-TOKEN] acquire without a concrete kind");
+    if (g_replan_token_depth > 0) {
+        // A nested hold: no lock, and the outermost kind stays. Loads never nest
+        // inside a transaction and a transaction never triggers a load, so
+        // either order is a code defect.
+        const ggml_sycl_replan_kind outer   = g_replan_token_outer;
+        const bool                  illegal = (kind == GGML_SYCL_REPLAN_KIND_TRANSACTION &&
+                              (outer == GGML_SYCL_REPLAN_KIND_LOAD || outer == GGML_SYCL_REPLAN_KIND_LIFECYCLE)) ||
+                             (kind == GGML_SYCL_REPLAN_KIND_LOAD && outer == GGML_SYCL_REPLAN_KIND_TRANSACTION);
+        if (g_sycl_witness_enabled && illegal) {
+            char message[128];
+            std::snprintf(message, sizeof(message), "[REPLAN-TOKEN] illegal nesting: %s under %s",
+                          ggml_sycl_replan_kind_name(kind), ggml_sycl_replan_kind_name(outer));
+            ggml_sycl_witness_failed(message);
+        }
+        ++g_replan_token_depth;
+        owns_ = true;
+        return;
+    }
+    if (try_only) {
+        if (!g_replan_txn_mutex.try_lock()) {
+            return;
+        }
+    } else if (!g_replan_txn_mutex.try_lock()) {
+        // Another thread holds L0.  Keep waiting, but say who holds it each
+        // interval, and under STRICT stop at the first one.
+        const auto     interval = std::chrono::milliseconds(ggml_sycl_replan_wait_warn_ms());
+        const uint64_t start    = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        uint32_t waited = 0;
+        while (!g_replan_txn_mutex.try_lock_for(interval)) {
+            ++waited;
+            const uint64_t now    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                           std::chrono::steady_clock::now().time_since_epoch())
+                                                              .count());
+            const int      holder = g_replan_holder_kind.load(std::memory_order_acquire);
+            GGML_LOG_WARN(
+                "[REPLAN-WAIT] a %s acquire of L0 has waited %llu ms (interval %u): held by a %s token on thread "
+                "%llu; this is thread %llu (the wait continues)\n",
+                ggml_sycl_replan_kind_name(kind), static_cast<unsigned long long>(now - start), waited,
+                ggml_sycl_replan_kind_name(static_cast<ggml_sycl_replan_kind>(holder)),
+                static_cast<unsigned long long>(g_replan_holder_thread.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(ggml_sycl_this_thread_tag()));
+            if (ggml_sycl_strict_enabled()) {
+                GGML_ABORT("[REPLAN-WAIT] a %s acquire of L0 exceeded %u ms under GGML_SYCL_STRICT_LEASES=1",
+                           ggml_sycl_replan_kind_name(kind), static_cast<unsigned>(interval.count()));
+            }
+        }
+    }
+    g_replan_token_depth = 1;
+    g_replan_token_outer = kind;
+    g_replan_holder_kind.store(kind, std::memory_order_release);
+    g_replan_holder_thread.store(ggml_sycl_this_thread_tag(), std::memory_order_release);
+    owns_ = true;
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind) {
+    acquire(kind, false);
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind, std::try_to_lock_t) {
+    acquire(kind, true);
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind, ggml_sycl_replan_outermost_only_t) {
+    GGML_SYCL_WITNESS(g_replan_token_depth == 0, "[REPLAN-TOKEN] release proc entered with L0 held");
+    acquire(kind, false);
+}
+
+ggml_sycl_replan_token::~ggml_sycl_replan_token() {
+    if (!owns_) {
+        return;
+    }
+    if (--g_replan_token_depth == 0) {
+        g_replan_token_outer = GGML_SYCL_REPLAN_KIND_ANY;
+        g_replan_holder_kind.store(GGML_SYCL_REPLAN_KIND_ANY, std::memory_order_release);
+        g_replan_txn_mutex.unlock();
     }
 }
 
@@ -4786,6 +5684,589 @@ static bool ext_alloc_trace_enabled() {
     return enabled != 0;
 }
 
+// ---------------------------------------------------------------------------
+// Counter dump (GGML_SYCL_COUNTER_DUMP=1) and the zone chokepoint.
+//
+// The table, its printer and every registration are compiled unconditionally:
+// GGML_SYCL_PRIVATE_TESTING is defined only on test targets, so a counter
+// behind it would never print in a shipped tool (see the hpp comment above
+// GGML_SYCL_DUMP_COUNTERS). The tables are static storage of trivially
+// destructible types, so nothing is allocated on first use (a refusal can arrive
+// under a cache lock) and no destructor has run on them when the atexit printer
+// runs. Their two small locks are local leaf spin locks, not the per-handle
+// MEM_HANDLE lock class: they guard only a table's own bytes, and nothing that
+// allocates, logs or takes another lock runs under either.
+// ---------------------------------------------------------------------------
+static const char * vram_zone_name(vram_zone_id zone);
+
+namespace {
+
+constexpr int    k_dump_devices  = GGML_SYCL_MAX_DEVICES;
+constexpr size_t k_dump_max_keys = 32;
+constexpr size_t k_dump_key_len  = 64;
+
+// The defines sit outside the braces: the static-storage audit's parser proves an initializer list with no directive in
+// it, and rejects one with (llama.cpp-y8w5).
+#define GGML_SYCL_DUMP_COUNTER_NAME(name) #name,
+const char * const k_dump_counter_names[] = { GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_NAME) };
+#undef GGML_SYCL_DUMP_COUNTER_NAME
+static_assert(sizeof(k_dump_counter_names) / sizeof(k_dump_counter_names[0]) ==
+                  static_cast<size_t>(dump_counter::COUNT),
+              "every dump counter needs its printed name");
+
+#define GGML_SYCL_DUMP_SNAPSHOT_NAME(id, printed) printed,
+const char * const k_dump_snapshot_names[] = { GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_NAME) };
+#undef GGML_SYCL_DUMP_SNAPSHOT_NAME
+static_assert(sizeof(k_dump_snapshot_names) / sizeof(k_dump_snapshot_names[0]) ==
+                  static_cast<size_t>(dump_snapshot::COUNT),
+              "every dump snapshot needs its printed name");
+
+struct dump_key_slot {
+    char                  name[k_dump_key_len] = {};
+    std::atomic<uint64_t> value[k_dump_devices];
+};
+
+struct dump_leaf_lock {
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+
+    void lock() {
+        while (flag.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+
+    void unlock() { flag.clear(std::memory_order_release); }
+};
+
+struct dump_leaf_guard {
+    dump_leaf_lock & lock_;
+
+    explicit dump_leaf_guard(dump_leaf_lock & l) : lock_(l) { lock_.lock(); }
+
+    ~dump_leaf_guard() { lock_.unlock(); }
+
+    dump_leaf_guard(const dump_leaf_guard &)             = delete;
+    dump_leaf_guard & operator=(const dump_leaf_guard &) = delete;
+};
+
+struct dump_counter_state {
+    std::atomic<uint64_t> total[k_dump_devices];
+    dump_leaf_lock        key_lock;
+    std::atomic<uint32_t> key_count{ 0 };
+    dump_key_slot         keys[k_dump_max_keys];
+};
+
+// A snapshot is published value first: `captured` is stored with release after the value, and the
+// printer reads it with acquire before the value. `claimed` decides which set_once caller writes.
+struct dump_snapshot_state {
+    std::atomic<uint64_t> value[k_dump_devices];
+    std::atomic<bool>     claimed[k_dump_devices];
+    std::atomic<bool>     captured[k_dump_devices];
+};
+
+struct dump_table {
+    std::atomic<int>    device_count{ 0 };
+    dump_counter_state  counters[static_cast<size_t>(dump_counter::COUNT)];
+    dump_snapshot_state snapshots[static_cast<size_t>(dump_snapshot::COUNT)];
+    // Per device: whether an arena was active when a raw exit happened. Written
+    // where the arena is created or released, read lock-free by the raw layer,
+    // which can run under the cache's own locks.
+    std::atomic<bool>   arena_active[k_dump_devices];
+};
+
+dump_table & dump_tbl() {
+    static dump_table t;  // zero-initialised static storage: every member starts at 0 / false
+    return t;
+}
+
+bool dump_dev_valid(int dev) {
+    return dev >= 0 && dev < k_dump_devices;
+}
+
+// The key slot for `key`, claimed under the counter's leaf spin lock on first
+// use. A full table folds into its last slot so a count is never dropped.
+dump_key_slot & dump_key_for(dump_counter_state & c, const char * key) {
+    const uint32_t seen = c.key_count.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < seen; ++i) {
+        if (std::strncmp(c.keys[i].name, key, k_dump_key_len - 1) == 0) {
+            return c.keys[i];
+        }
+    }
+    dump_leaf_guard guard(c.key_lock);
+    uint32_t        n = c.key_count.load(std::memory_order_relaxed);
+    for (uint32_t i = seen; i < n; ++i) {
+        if (std::strncmp(c.keys[i].name, key, k_dump_key_len - 1) == 0) {
+            return c.keys[i];
+        }
+    }
+    if (n + 1 >= k_dump_max_keys) {
+        dump_key_slot & overflow = c.keys[k_dump_max_keys - 1];
+        if (overflow.name[0] == '\0') {
+            std::snprintf(overflow.name, sizeof(overflow.name), "(overflow)");
+            c.key_count.store(static_cast<uint32_t>(k_dump_max_keys), std::memory_order_release);
+        }
+        return overflow;
+    }
+    std::snprintf(c.keys[n].name, sizeof(c.keys[n].name), "%s", key);
+    c.key_count.store(n + 1, std::memory_order_release);
+    return c.keys[n];
+}
+
+// GGML_SYCL_COUNTER_DUMP=1. Read live, not cached, so a test can flip it.
+bool counter_dump_requested() {
+    const char * env = std::getenv("GGML_SYCL_COUNTER_DUMP");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+const char * dump_site_basename(const char * file) {
+    if (file == nullptr) {
+        return "-";
+    }
+    const char * slash = std::strrchr(file, '/');
+    return slash ? slash + 1 : file;
+}
+
+// A counter whose producer cannot land on this tree prints the not_captured sentinel instead of a
+// zero: load_row_op_time_arrivals counts a request from the four load rows that carries no
+// pending_owner, and the request has no such field until moua L4L6 / 23mk S4a. A zero printed here
+// would read as "predicted 0, observed 0" on a dump that never counted. scripts/check-sycl-counter-dump.py
+// pins the set against any increment, so landing the producer means flipping this predicate.
+//
+// onednn_graph_callback_unmarked_mallocs is the same case: it counts a Graph-callback malloc with no
+// compute marker set, and the marker (design §5.4(b), g_sycl_compute_marker) lands at step 3 with the
+// late-refusal channel, so nothing on this tree can say whether a marker is set. Step 3 flips it.
+//
+// (moe_table_reach_zero_gpu_expert's printed total is a sum of notes, not a count of reaches; its reach
+// count is the `ensure:` key lines. See the table's comment in unified-cache.hpp.)
+//
+// moe_table_reach_zero_gpu_expert has a producer but evaluates only when the report sites' armed flag read
+// armed (its zero test walks the plan once per expert per call), so it reads not_captured unless that flag
+// has been read and read armed: an unarmed or never-evaluated 0 is not a measured 0.
+std::atomic<int> g_dump_armed_state{ 0 };  // 0 never read, 1 read armed, 2 read unarmed
+
+bool dump_counter_captured(size_t c) {
+    if (c == static_cast<size_t>(dump_counter::moe_table_reach_zero_gpu_expert)) {
+        return g_dump_armed_state.load(std::memory_order_relaxed) == 1;
+    }
+    return c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals) &&
+           c != static_cast<size_t>(dump_counter::onednn_graph_callback_unmarked_mallocs);
+}
+
+// How a request is named in a line or a key: `site` is its construction site, `cohort` its cohort,
+// or the site when it has none, so every cohort-less request is distinct. Written once, for the raw
+// exit and the chokepoint alike.
+struct request_label {
+    char         site[96];
+    const char * cohort;
+};
+
+void request_label_fill(const alloc_request & req, request_label & out) {
+    std::snprintf(out.site, sizeof(out.site), "%s:%d", dump_site_basename(req.site_file), req.site_line);
+    out.cohort = (req.intent.cohort_id != nullptr && req.intent.cohort_id[0] != '\0') ? req.intent.cohort_id : out.site;
+}
+
+// One record per (device, ownership slot) of what the last load of that model planned, so the
+// load-end snapshot can name every live model by load order. Static storage, trivially destructible,
+// guarded by its own leaf spin lock: it is read and written from the load-end and slot-release paths
+// and nowhere under an allocation.
+struct dump_load_model {
+    bool     live;
+    uint64_t order;
+    uint64_t host_tiered_bytes;
+    uint64_t planned_device_bytes;
+    // The plan spans devices, so its host-tiered bytes belong to no single device: the entry reads
+    // not_captured and the figure is the one planned_host report line. Also set for a device the
+    // single-device plan does not name.
+    bool     host_plan_wide;
+};
+
+struct dump_load_models {
+    dump_leaf_lock  lock;
+    uint64_t        next_order;
+    dump_load_model models[k_dump_devices][MODEL_SLOT_COUNT];
+};
+
+dump_load_models & dump_load_models_table() {
+    static dump_load_models t;
+    return t;
+}
+
+}  // namespace
+
+void unified_cache_dump_counter_add(dump_counter counter, int dev, uint64_t n) noexcept {
+    if (!dump_dev_valid(dev) || counter >= dump_counter::COUNT) {
+        return;
+    }
+    dump_tbl().counters[static_cast<size_t>(counter)].total[dev].fetch_add(n, std::memory_order_relaxed);
+}
+
+void unified_cache_dump_counter_add_key(dump_counter counter, int dev, const char * key, uint64_t n) noexcept {
+    if (!dump_dev_valid(dev) || counter >= dump_counter::COUNT) {
+        return;
+    }
+    dump_counter_state & c = dump_tbl().counters[static_cast<size_t>(counter)];
+    c.total[dev].fetch_add(n, std::memory_order_relaxed);
+    dump_key_for(c, key != nullptr && key[0] != '\0' ? key : "-").value[dev].fetch_add(n, std::memory_order_relaxed);
+}
+
+void unified_cache_dump_snapshot_set(dump_snapshot snapshot, int dev, uint64_t value) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return;
+    }
+    dump_snapshot_state & s = dump_tbl().snapshots[static_cast<size_t>(snapshot)];
+    s.value[dev].store(value, std::memory_order_relaxed);
+    s.claimed[dev].store(true, std::memory_order_relaxed);
+    s.captured[dev].store(true, std::memory_order_release);
+}
+
+void unified_cache_dump_snapshot_set_once(dump_snapshot snapshot, int dev, uint64_t value) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return;
+    }
+    dump_snapshot_state & s        = dump_tbl().snapshots[static_cast<size_t>(snapshot)];
+    bool                  expected = false;
+    // The claim picks the one writer; the value is stored before `captured` is released, so a
+    // reader that sees `captured` sees the value.
+    if (s.claimed[dev].compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        s.value[dev].store(value, std::memory_order_relaxed);
+        s.captured[dev].store(true, std::memory_order_release);
+    }
+}
+
+void unified_cache_dump_snapshot_clear(dump_snapshot snapshot, int dev) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return;
+    }
+    dump_snapshot_state & s = dump_tbl().snapshots[static_cast<size_t>(snapshot)];
+    s.captured[dev].store(false, std::memory_order_release);
+    s.claimed[dev].store(false, std::memory_order_relaxed);
+}
+
+bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return false;
+    }
+    return !dump_tbl().snapshots[static_cast<size_t>(snapshot)].claimed[dev].load(std::memory_order_relaxed);
+}
+
+bool unified_cache_dump_report_enabled() noexcept {
+    return counter_dump_requested();
+}
+
+void unified_cache_dump_note_armed(bool armed) noexcept {
+    g_dump_armed_state.store(armed ? 1 : 2, std::memory_order_relaxed);
+}
+
+void unified_cache_dump_report(const char * text) noexcept {
+    if (text == nullptr || !counter_dump_requested()) {
+        return;
+    }
+    std::fprintf(stderr, "[SYCL-REPORT] %s\n", text);
+}
+
+namespace {
+constexpr size_t k_report_once_capacity = 64;
+constexpr size_t k_report_once_key_len  = 96;
+
+struct report_once_table {
+    dump_leaf_lock lock;
+    size_t         count;
+    bool           full_announced;
+    char           keys[k_report_once_capacity][k_report_once_key_len];
+};
+
+report_once_table & report_once_tbl() {
+    static report_once_table t;  // static storage, trivially destructible: nothing allocates on first use
+    return t;
+}
+}  // namespace
+
+bool unified_cache_dump_report_once(const char * key, const char * text) noexcept {
+    if (key == nullptr || text == nullptr || !counter_dump_requested()) {
+        return false;
+    }
+    bool refused  = false;
+    bool announce = false;
+    {
+        report_once_table & t = report_once_tbl();
+        dump_leaf_guard     guard(t.lock);
+        for (size_t i = 0; i < t.count; ++i) {
+            if (std::strncmp(t.keys[i], key, k_report_once_key_len - 1) == 0) {
+                return true;
+            }
+        }
+        if (t.count >= k_report_once_capacity) {
+            refused          = true;
+            announce         = !t.full_announced;
+            t.full_announced = true;
+        } else {
+            std::snprintf(t.keys[t.count++], k_report_once_key_len, "%s", key);
+        }
+    }
+    if (refused) {
+        // Said once, by the raw path every report uses, so a flood past the bound is never silent.
+        if (announce) {
+            std::fprintf(stderr, "[SYCL-REPORT] (report-once-full) capacity=%zu first_refused_key=%s\n",
+                         k_report_once_capacity, key);
+        }
+        return false;
+    }
+    std::fprintf(stderr, "[SYCL-REPORT] %s\n", text);
+    return true;
+}
+
+void unified_cache_dump_set_device_count(int device_count) noexcept {
+    dump_tbl().device_count.store(device_count, std::memory_order_relaxed);
+}
+
+uint64_t unified_cache_dump_counter_for_testing(dump_counter counter, int dev) noexcept {
+    if (!dump_dev_valid(dev) || counter >= dump_counter::COUNT) {
+        return 0;
+    }
+    return dump_tbl().counters[static_cast<size_t>(counter)].total[dev].load(std::memory_order_relaxed);
+}
+
+void unified_cache_dump_arena_active_for_testing(int dev, bool active) noexcept {
+    if (dump_dev_valid(dev)) {
+        dump_tbl().arena_active[dev].store(active, std::memory_order_release);
+    }
+}
+
+uint64_t unified_cache_ext_alloc_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::ext_alloc_count, dev);
+}
+
+uint64_t unified_cache_ext_alloc_arena_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::ext_alloc_arena, dev);
+}
+
+uint64_t unified_cache_zone_cascade_miss_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::zone_cascade_miss, dev);
+}
+
+uint64_t unified_cache_zone_unconverted_miss_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::zone_unconverted_miss, dev);
+}
+
+uint64_t unified_cache_zone_plan_refusal_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::zone_plan_refusal, dev);
+}
+
+// Writes with fprintf(stderr), not the log, so neither log-drop mechanism
+// (llama-bench's null callback, common's INFO-to-TRACE mapping) drops it and no
+// log callback has to survive to exit. abort() and _Exit() skip atexit, so an
+// aborting run prints no `end` line and no dump-scored reading of it counts.
+void unified_cache_test_counter_dump() {
+    if (!counter_dump_requested()) {
+        return;
+    }
+    dump_table & t       = dump_tbl();
+    const int    devices = std::min(t.device_count.load(std::memory_order_relaxed), k_dump_devices);
+    for (int dev = 0; dev < devices; ++dev) {
+        for (size_t c = 0; c < static_cast<size_t>(dump_counter::COUNT); ++c) {
+            if (!dump_counter_captured(c)) {
+                std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s value=not_captured\n", dev,
+                             k_dump_counter_names[c]);
+                continue;
+            }
+            std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s value=%llu\n", dev, k_dump_counter_names[c],
+                         static_cast<unsigned long long>(t.counters[c].total[dev].load(std::memory_order_relaxed)));
+        }
+        for (size_t c = 0; c < static_cast<size_t>(dump_counter::COUNT); ++c) {
+            if (!dump_counter_captured(c)) {
+                continue;
+            }
+            const uint32_t keys = t.counters[c].key_count.load(std::memory_order_acquire);
+            for (uint32_t k = 0; k < keys; ++k) {
+                const uint64_t v = t.counters[c].keys[k].value[dev].load(std::memory_order_relaxed);
+                if (v == 0) {
+                    continue;
+                }
+                std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s{%s} value=%llu\n", dev, k_dump_counter_names[c],
+                             t.counters[c].keys[k].name, static_cast<unsigned long long>(v));
+            }
+        }
+        for (size_t s = 0; s < static_cast<size_t>(dump_snapshot::COUNT); ++s) {
+            if (t.snapshots[s].captured[dev].load(std::memory_order_acquire)) {
+                std::fprintf(
+                    stderr, "[SYCL-COUNTER] dev=%d name=%s value=%llu\n", dev, k_dump_snapshot_names[s],
+                    static_cast<unsigned long long>(t.snapshots[s].value[dev].load(std::memory_order_relaxed)));
+            } else {
+                std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s value=not_captured\n", dev,
+                             k_dump_snapshot_names[s]);
+            }
+        }
+    }
+    std::fprintf(stderr, "[SYCL-COUNTER] end devices=%d\n", devices);
+}
+
+// The raw exit's view of the request that caused it. unified_alloc sets the
+// request around its raw call and the tracked wrapper sets the tag; a raw exit
+// reached without either (ensure_cached, allocate(tag)) prints cohort=- with
+// its own tag. Thread-local, so a concurrent allocation never sees another's.
+namespace {
+thread_local const alloc_request * g_ext_alloc_request = nullptr;
+thread_local const char *          g_ext_alloc_tag     = nullptr;
+
+struct ext_alloc_request_scope {
+    const alloc_request * saved;
+
+    explicit ext_alloc_request_scope(const alloc_request * req) : saved(g_ext_alloc_request) {
+        g_ext_alloc_request = req;
+    }
+
+    ~ext_alloc_request_scope() { g_ext_alloc_request = saved; }
+
+    ext_alloc_request_scope(const ext_alloc_request_scope &)             = delete;
+    ext_alloc_request_scope & operator=(const ext_alloc_request_scope &) = delete;
+};
+
+struct ext_alloc_tag_scope {
+    const char * saved;
+
+    explicit ext_alloc_tag_scope(const char * tag) : saved(g_ext_alloc_tag) { g_ext_alloc_tag = tag; }
+
+    ~ext_alloc_tag_scope() { g_ext_alloc_tag = saved; }
+
+    ext_alloc_tag_scope(const ext_alloc_tag_scope &)             = delete;
+    ext_alloc_tag_scope & operator=(const ext_alloc_tag_scope &) = delete;
+};
+
+// The arena-active mirror the raw exit reads lock-free: arena_base_ is a plain pointer the raw layer
+// cannot read without the cache's lock. Set where an arena is created and cleared where it is
+// destroyed or abandoned (scripts/check-sycl-counter-dump.py pins that pairing). arena_abandon runs
+// at shutdown with the SYCL context possibly gone, so the device lookup cannot be allowed to throw.
+void ext_alloc_note_arena_state(const sycl::queue & queue, bool active) {
+    int dev = -1;
+    try {
+        dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
+    } catch (...) {
+        return;
+    }
+    if (dump_dev_valid(dev)) {
+        dump_tbl().arena_active[dev].store(active, std::memory_order_release);
+    }
+}
+
+// One dedupe table serves the TERMINAL and UNCONVERTED classes: the key is the tuple (class, dev,
+// zone, cohort, site_file, site_line). cohort and site_file are held truncated to 47 characters, so
+// two long names that differ only past that can share a key; the cost is one muted duplicate line
+// (the counters still count both), never a wrong count. The leaf spin lock guards only the table's
+// bytes. A full table says so.
+enum class zone_refusal_class : uint8_t { TERMINAL = 0, UNCONVERTED = 1 };
+
+struct zone_refusal_key {
+    zone_refusal_class cls;
+    int                dev;
+    vram_zone_id       zone;
+    int                site_line;
+    char               cohort[48];
+    char               site_file[48];
+};
+
+constexpr size_t k_zone_refusal_dedupe_capacity = 128;
+
+struct zone_refusal_dedupe {
+    dump_leaf_lock   lock;
+    size_t           count = 0;
+    zone_refusal_key keys[k_zone_refusal_dedupe_capacity];
+};
+
+zone_refusal_dedupe & zone_refusal_dedupe_table() {
+    static zone_refusal_dedupe t;  // static storage, trivially destructible: nothing allocates on first use
+    return t;
+}
+
+enum class dedupe_result : uint8_t { FIRST, SEEN, FULL };
+
+dedupe_result zone_refusal_dedupe_note(const zone_refusal_key & key) {
+    zone_refusal_dedupe & t = zone_refusal_dedupe_table();
+    dump_leaf_guard       guard(t.lock);
+    for (size_t i = 0; i < t.count; ++i) {
+        const zone_refusal_key & k = t.keys[i];
+        if (k.cls == key.cls && k.dev == key.dev && k.zone == key.zone && k.site_line == key.site_line &&
+            std::strcmp(k.cohort, key.cohort) == 0 && std::strcmp(k.site_file, key.site_file) == 0) {
+            return dedupe_result::SEEN;
+        }
+    }
+    if (t.count >= k_zone_refusal_dedupe_capacity) {
+        return dedupe_result::FULL;
+    }
+    t.keys[t.count++] = key;
+    return dedupe_result::FIRST;
+}
+
+}  // namespace
+
+// Every class counts always; its line prints only under GGML_SYCL_EXT_ALLOC_TRACE=1. Until the
+// requests carry cascade_step / unconverted_ticket (their writers land later), every refusal
+// classifies TERMINAL, including a planned forbid, so a line at default verbosity would be a false
+// alarm. The default-verbosity ERROR line for a terminal miss lands with those writers.
+//
+// The counting path reads the request and takes only the counter table's leaf lock. The room the
+// zone had is read only under the trace, and only the zone's atomic `used` and its capacity (fixed
+// at arena creation): the zone allocator's own free-space figures are guarded by the zone's group
+// mutex, and a refusal does not hold it.
+void unified_cache_zone_refusal(const alloc_request & req,
+                                vram_zone_id          zone,
+                                size_t                bytes,
+                                const unified_cache * cache) noexcept {
+    request_label label;
+    request_label_fill(req, label);
+    const char * cohort    = label.cohort;
+    const char * site      = label.site;
+    const char * site_file = dump_site_basename(req.site_file);
+
+    const alloc_constraints & constraints = req.intent.constraints;
+    if (constraints.cascade_step) {
+        // The next path is planned, so this is not a plan bug: counted, and a line only under the trace.
+        unified_cache_dump_counter_add_key(dump_counter::zone_cascade_miss, req.device, cohort);
+        if (ext_alloc_trace_enabled()) {
+            std::fprintf(stderr, "[ZONE-CASCADE] dev=%d zone=%s cohort=%s site=%s bytes=%zu\n", req.device,
+                         vram_zone_name(zone), cohort, site, bytes);
+        }
+        return;
+    }
+
+    const bool unconverted = constraints.unconverted_ticket != nullptr;
+    if (unconverted) {
+        // An interim-floor row whose exact term another ticket still owns.
+        unified_cache_dump_counter_add_key(dump_counter::zone_unconverted_miss, req.device,
+                                           constraints.unconverted_ticket);
+    } else {
+        unified_cache_dump_counter_add(dump_counter::zone_plan_refusal, req.device);
+    }
+    if (!ext_alloc_trace_enabled()) {
+        return;
+    }
+
+    zone_refusal_key key{};
+    key.cls       = unconverted ? zone_refusal_class::UNCONVERTED : zone_refusal_class::TERMINAL;
+    key.dev       = req.device;
+    key.zone      = zone;
+    key.site_line = req.site_line;
+    std::snprintf(key.cohort, sizeof(key.cohort), "%s", cohort);
+    std::snprintf(key.site_file, sizeof(key.site_file), "%s", site_file);
+    const dedupe_result seen = zone_refusal_dedupe_note(key);
+    if (seen == dedupe_result::SEEN) {
+        return;
+    }
+    const char * full = seen == dedupe_result::FULL ? " (dedupe-full)" : "";
+    if (unconverted) {
+        std::fprintf(stderr, "[ZONE-UNCONVERTED] dev=%d zone=%s cohort=%s site=%s bytes=%zu ticket=%s%s\n", req.device,
+                     vram_zone_name(zone), cohort, site, bytes, constraints.unconverted_ticket, full);
+        return;
+    }
+    if (cache != nullptr) {
+        std::fprintf(stderr,
+                     "[ZONE-PLAN-BUG] dev=%d zone=%s cohort=%s site=%s bytes=%zu zone_used=%zu zone_capacity=%zu%s\n",
+                     req.device, vram_zone_name(zone), cohort, site, bytes, cache->zone_used(zone),
+                     cache->zone_capacity(zone), full);
+    } else {
+        std::fprintf(stderr, "[ZONE-PLAN-BUG] dev=%d zone=%s cohort=%s site=%s bytes=%zu%s\n", req.device,
+                     vram_zone_name(zone), cohort, site, bytes, full);
+    }
+}
+
 // llama.cpp-2gag bisection: trace every allocation that lands in a host
 // zone (pointer, byte range, zone, role/category, cohort tag) so a run can
 // be checked for address overlap between the persistent attn-host staging
@@ -4870,6 +6351,9 @@ unified_cache::unified_cache(sycl::queue & queue,
     bool expected = false;
     if (g_atexit_registered.compare_exchange_strong(expected, true)) {
         std::atexit(unified_cache_atexit_handler);
+        // Registered after the shutdown handler, so it runs before it; it prints only under
+        // GGML_SYCL_COUNTER_DUMP=1 and the table it reads is leaked, so no destructor has run on it.
+        std::atexit(unified_cache_test_counter_dump);
     }
 
     // Allocate staging buffer (pinned host memory)
@@ -4937,6 +6421,14 @@ unified_cache::unified_cache(sycl::queue & queue,
     // Even if the runtime routes both queues to CCS, having separate queues still
     // enables pipelining: H2D copies and reorder kernels interleave via event deps
     // instead of serializing on a single command list.
+    //
+    // The queue has no profiling at any trace level. Built with profiling for the stream ring's window timing line
+    // under GGML_SYCL_MOE_EXEC_TRACE=2, its copy events were counter-based timestamp events, and a traced Qwen3.8
+    // prefill on the B70 stalled in its first micro-batch, at a window that varied from run to run, until the watchdog
+    // ended the run; the same prefill untraced finishes. The stall is below this backend, in the runtime or the
+    // driver, and tied to no copy count or layer, nor to the first three-phase layer or the first region reuse. The
+    // window line times marker kernels on a queue of the ring's own instead (moe_stream_phase::timing_queue), which
+    // wait on these copies from outside, so no copy is read for its device times or asked for its status.
     try {
         bcs_queue_ =
             std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});
@@ -5167,11 +6659,9 @@ bool unified_cache::ensure_planned_arena_zones() {
         safe_max_alloc = max_alloc;
     }
 
-    size_t       scratch_zone = 512 * 1024 * 1024;
-    const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
-    if (arena_mb_env) {
-        scratch_zone = static_cast<size_t>(std::max(0, std::atoi(arena_mb_env))) * 1024 * 1024;
-    }
+    // The zone is sized by the one function the model-load reservation and the
+    // chunk cap's probe set also call, so the three cannot disagree.
+    size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);
     // llama.cpp-oyfl: raise the SCRATCH zone for the non-FA batched mul_mat
     // floor the same way onednn_zone is raised below for its own planned
     // estimate. Best-effort and, for the standard model-load flow, NOT
@@ -5324,10 +6814,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     }
 #endif
 
-    size_t runtime_zone = 512 * 1024 * 1024;
-    if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
-        runtime_zone = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
-    }
+    const size_t                  runtime_floor         = unified_cache_runtime_zone_floor_bytes();
     const size_t                  planned_pp_pipeline   = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
     const size_t                  planned_pp_moe_onednn = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id);
     const moe_control_requirement planned_moe_control   = unified_cache_get_planned_moe_control_requirement(dev_id);
@@ -5336,22 +6823,32 @@ bool unified_cache::ensure_planned_arena_zones() {
     // The addition is checked because a plan whose CONTROL sizing failed must
     // not quietly become a SMALLER runtime zone than one that succeeded --
     // which is exactly what an unchecked `a + b + c` on a poisoned term does.
+    //
+    // The zone is the one every RUNTIME plan counts on
+    // (zone_runtime_reserved_bytes): the explicit micro-batch's room and the
+    // check for a zone an earlier load grew ask the same function. A
+    // requirement whose rounding overflows is as unanswerable as one whose
+    // sum did.
     size_t planned_runtime_scratch = 0;
-    if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch)) {
+    size_t runtime_zone            = runtime_floor;
+    if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) ||
+        !zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {
         planned_runtime_scratch = 0;
+        runtime_zone            = runtime_floor;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Runtime zone requirement for device %d is unanswerable "
             "(pipeline=%zu moe_onednn=%zu control_valid=%d); keeping the %.1f MB default\n",
             dev_id, planned_pp_pipeline, planned_pp_moe_onednn, static_cast<int>(planned_moe_control.valid),
-            runtime_zone / (1024.0 * 1024.0));
+            runtime_floor / (1024.0 * 1024.0));
     }
-    if (planned_runtime_scratch > 0 && runtime_zone < planned_runtime_scratch) {
-        runtime_zone = planned_runtime_scratch;
+    if (planned_runtime_scratch > runtime_floor) {
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
-            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB)\n",
+            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
             runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
-            planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0));
+            planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0),
+            unified_cache_get_planned_compute_term_bytes(dev_id) / (1024.0 * 1024.0),
+            unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
 
     auto bind_compute_arena = [&]() {
@@ -5460,6 +6957,11 @@ bool unified_cache::ensure_planned_arena_zones() {
     return true;
 }
 
+// llama.cpp-qwn5: shuts the cache's CPU expert job signal ring down (after the queues drained) or abandons it (SYCL
+// already gone); defined with the ring below.
+static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept;
+static void cpu_job_input_marker_end(std::shared_ptr<cpu_job_input_marker_word> & word, mem_handle & owner) noexcept;
+
 unified_cache::~unified_cache() {
     if (!shutdown_resources()) {
         GGML_LOG_ERROR(
@@ -5483,9 +6985,11 @@ bool unified_cache::drain_all_queues_noexcept() noexcept {
     // mem_handle has already been destroyed and its host-USM freed --
     // writing through a dangling pointer. Every caller of this function
     // must run it before any member destructor of this class can run.
-    std::array<sycl::queue *, 5> queues{ &queue_, compute_queue_, dma_queue_.get(), bcs_queue_.get(),
-                                         event_watch_queue_.get() };
-    std::array<const char *, 5>  names{ "main", "compute", "DMA", "BCS", "event-watch" };
+    // llama.cpp-wfsl: moe_join_queue_ holds the CPU expert jobs' joins; draining it waits every job the backend
+    // still joins.
+    std::array<sycl::queue *, 6> queues{ &queue_,          compute_queue_,           dma_queue_.get(),
+                                         bcs_queue_.get(), event_watch_queue_.get(), moe_join_queue_.get() };
+    std::array<const char *, 6>  names{ "main", "compute", "DMA", "BCS", "event-watch", "MoE-join" };
     for (size_t i = 0; i < queues.size(); ++i) {
         sycl::queue * q = queues[i];
         if (!q) continue;
@@ -5615,6 +7119,18 @@ bool unified_cache::shutdown_resources() {
         // Leak host_arena_ to prevent pinned_chunk_pool destructor calling sycl::free
         // on an invalid SYCL context (safe shutdown pattern).
         (void) host_arena_.release();
+        // llama.cpp-qwn5: no driver call on an invalid context; the ring keeps only its book.
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+            cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
+        }
+        // llama.cpp-42zj: no device write will come, so a job still waiting is released to compute on inputs that
+        // may never have landed, acceptable only because the process is exiting. The ring ended first, so that
+        // job's signal makes no driver call. The word's release is shutdown-safe (mem_handle).
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+            cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
+        }
         // llama.cpp-0oxf: onednn_graph_scratch_reuse_pool_
         // is not touched here, unlike the owner members just above -- it does
         // not need to be. Its entries are destroyed the same way any other
@@ -5665,6 +7181,18 @@ bool unified_cache::shutdown_resources() {
 #endif
         // Leak host_arena_ to avoid sycl::free on an invalid context.
         (void) host_arena_.release();
+        // llama.cpp-qwn5: same as the g_sycl_shutting_down branch above.
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+            cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
+        }
+        // llama.cpp-42zj: no device write will come, so a job still waiting is released to compute on inputs that
+        // may never have landed, acceptable only because the process is exiting. The ring ended first, so that
+        // job's signal makes no driver call. The word's release is shutdown-safe (mem_handle).
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+            cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
+        }
         // llama.cpp-0oxf: same reasoning as the
         // g_sycl_shutting_down branch above -- onednn_graph_scratch_reuse_pool_'s
         // entries are mem_handles, whose own destructor is already
@@ -5680,6 +7208,18 @@ bool unified_cache::shutdown_resources() {
     // before releasing scratch, staging, canonical, or arena owners. A failure
     // on one queue never prevents the remaining queues from being drained.
     if (!drain_all_queues_noexcept()) return false;
+
+    // llama.cpp-qwn5: after the drain no device command waits on a CPU expert job's event, so the ring's driver
+    // objects can go. The halves jobs and pending scatters still hold then only update its book.
+    {
+        std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+        cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/false);
+    }
+    // llama.cpp-42zj: after the drain every armed input marker has been written, so the word can go.
+    {
+        std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+        cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
+    }
 
 #if GGML_SYCL_DNNL
     // llama.cpp-0oxf: real release of every pooled DIRECT Graph-scratch
@@ -5998,6 +7538,10 @@ bool unified_cache::shutdown_resources() {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         onednn_graph_scratch_flag_slab_ = nullptr;
         onednn_graph_scratch_flag_slot_free_list_.clear();
+        // llama.cpp-jwjz: every marker has completed after the drain above.
+        // The two abandon paths leave these events to member destruction,
+        // the same as the pool entries' own release events.
+        onednn_graph_scratch_flag_slot_last_marker_.clear();
         onednn_graph_scratch_flag_slab_owner_ = {};
     }
 #endif
@@ -6094,6 +7638,11 @@ bool unified_cache::shutdown_resources() {
     if (!arena_destroy()) {
         return false;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (auto * observer = g_test_destroy_observer.load(std::memory_order_acquire)) {
+        observer(ggml_sycl_get_device_id_from_queue(queue_), arena_backing(), zone_backed());
+    }
+#endif
     resources_shutdown_ = true;
     return true;
 }
@@ -6806,6 +8355,12 @@ bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired)
 
 void unified_cache::remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id,
                                                      const unified_cache_key &  removed_key) {
+    remap_or_extract_id_mapping_locked(id, removed_key, nullptr);
+}
+
+void unified_cache::remap_or_extract_id_mapping_locked(const ggml_sycl_cache_id & id,
+                                                       const unified_cache_key &  removed_key,
+                                                       id_map::node_type *        erased) {
     auto mapped = id_to_key_.find(id);
     if (mapped == id_to_key_.end() || !(mapped->second == removed_key)) {
         return;
@@ -6853,6 +8408,8 @@ void unified_cache::remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & 
 
     if (have_replacement) {
         mapped->second = replacement;
+    } else if (erased) {
+        *erased = id_to_key_.extract(mapped);
     } else {
         id_to_key_.erase(mapped);
     }
@@ -8059,10 +9616,16 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
         auto                                entry_it = entries_.end();
         const unified_cache_key explicit_key{ cache_entry_type::MOE_EXPERT, req.key, req.layer_id, req.expert_id };
         entry_it = entries_.find(explicit_key);
-        if (entry_it == entries_.end()) {
+        // A retired entry under the explicit key does not shadow what the id maps to now. A refill leaves one there,
+        // the lent host copy it withdrew, until the deferred-free pass finalizes it, while the id already maps to the
+        // device entry that replaced it (llama.cpp-sif1).
+        if (entry_it == entries_.end() || entry_it->second.retired) {
             auto id_it = id_to_key_.find(req.key);
             if (id_it != id_to_key_.end() && id_it->second.type == cache_entry_type::MOE_EXPERT) {
-                entry_it = entries_.find(id_it->second);
+                const auto mapped = entries_.find(id_it->second);
+                if (mapped != entries_.end()) {
+                    entry_it = mapped;
+                }
             }
         }
 
@@ -8524,6 +10087,612 @@ expert_retire_status unified_cache::retire_expert_entry_exact(ggml_sycl_cache_id
                                                   expert_retire_status::NOT_FOUND;
 }
 
+expert_retire_status unified_cache::retire_expert_entry_at_locked(const unified_cache_key & exact,
+                                                                  expert_retire_nodes *     released) {
+    GGML_ASSERT(released != nullptr);
+    auto it = entries_.find(exact);
+    if (exact.type != cache_entry_type::MOE_EXPERT || it == entries_.end()) {
+        return expert_retire_status::NOT_FOUND;
+    }
+    // The mirror belongs to this entry only while it names the same storage. Once another entry under the same id
+    // (a loan's host copy) has published its own, that one stays.
+    auto direct = direct_expert_entries_.find(exact.id);
+    if (direct != direct_expert_entries_.end() && direct->second.ptr == it->second.device_ptr &&
+        direct->second.location == it->second.location && direct->second.layout == it->second.layout) {
+        released->mirror = direct_expert_entries_.extract(direct);
+    }
+    (void) transition_to_retired_locked(it->second);
+    remap_or_extract_id_mapping_locked(exact.id, exact, &released->mapping);
+    return expert_retire_status::DEFERRED;
+}
+
+void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes & released) {
+    auto it = entries_.find(exact);
+    if (it == entries_.end() || !it->second.retired) {
+        return;
+    }
+    it->second.retired    = false;
+    const size_t previous = retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);
+    GGML_ASSERT(previous != 0 && "restored entry without a matching retirement count");
+    if (!released.mapping.empty() && id_to_key_.find(exact.id) == id_to_key_.end()) {
+        id_to_key_.insert(std::move(released.mapping));
+    }
+    if (!released.mirror.empty() && direct_expert_entries_.find(exact.id) == direct_expert_entries_.end()) {
+        direct_expert_entries_.insert(std::move(released.mirror));
+    }
+}
+
+// llama.cpp-pu8v: one source for each copy's size, the entry the copy will hold. A copy minted from the plan's dst_size
+// is short of an entry whose quantized tail direct staging padded, and the transaction refuses it.
+size_t unified_cache::loan_copy_bytes(ggml_sycl_cache_id key) const {
+    std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
+    const auto it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
+    return it != entries_.end() && !it->second.retired ? it->second.size : 0;
+}
+
+size_t unified_cache::refill_copy_bytes(ggml_sycl_cache_id key) const {
+    std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
+    const auto it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });
+    return it != entries_.end() && !it->second.retired ? it->second.size : 0;
+}
+
+// llama.cpp-mwmr, c-tdra: lend one resident expert triplet to the host for a prompt phase. The order keeps every
+// reader correct and every byte owned. The copies go first. Each device entry's last write then becomes its copy,
+// which ran behind every earlier write, so release_entry_allocation_locked() queues the storage's free behind the copy
+// that reads it. The device entry is withdrawn exactly, its host copy is published behind the copy event, and only
+// then does the transaction drop the lease that held the withdrawn entry in place. Nothing here waits or asks an
+// event's status.
+bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out) {
+    out = expert_loan_record{};
+    if (!members) {
+        out.reason = "invalid arguments";
+        return false;
+    }
+    const int cache_device = get_device_id_from_queue(queue_);
+
+    // The host registration must not refuse once the device entries are withdrawn, so what it checks is checked here
+    // first, while nothing has changed. Inside the planned materialization session the registration runs in, it
+    // refuses only for the load effect and for a plan the cache does not hold, and neither can change while the
+    // caller holds the inventory mutex. A host id's existing entry is checked under the locks below.
+    if (acquire_bound_load_effect().failed()) {
+        out.reason = "load effect unavailable";
+        return false;
+    }
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        out.reason = "plan not coherent";
+        return false;
+    }
+
+    mem_handle               src_owner[3];
+    uint64_t                 src_control[3] = { 0, 0, 0 };
+    size_t                   bytes[3]       = { 0, 0, 0 };
+    std::vector<sycl::event> deps[3];
+    alloc_metadata           host_md[3];
+    const char *             refusal = nullptr;
+    for (int i = 0; i < 3 && !refusal; ++i) {
+        const expert_loan_member & m = members[i];
+        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key)) {
+            refusal = "invalid member";
+        } else if (!m.host_owner.valid() || !m.host_owner.owner_metadata(&host_md[i]) ||
+                   host_md[i].tier != alloc_tier::HOST_PINNED) {
+            refusal = "host storage not pinned";
+        }
+        deps[i].reserve(2);
+    }
+
+    // 1. The exact-owner check, all three members before anything changes.
+    if (!refusal) {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const auto it =
+                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS));
+            if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
+                it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
+                refusal = "not resident";
+                break;
+            }
+            const unified_cache_entry & e = it->second;
+            // c-n4gw: v1 copies AOS bytes only. An SOA entry copied as AOS would hand the host garbage.
+            if (e.layout != GGML_LAYOUT_AOS) {
+                refusal = "layout";
+                break;
+            }
+            if (e.location != cache_location::DEVICE || e.host_resident || e.owner_device != cache_device) {
+                refusal = "not on device";
+                break;
+            }
+            // c-sepd: the entry must be the exact owner of its storage. A bulk-staged tensor's experts are views
+            // into one allocation (storage_owner), so retiring one frees nothing and copying it from the owner's
+            // base would copy another expert. The owner must be this entry's whole allocation and EXTERNAL_EXACT or
+            // CACHE_SUBALLOCATION: cache_backing is set exactly for the CACHE_BACKING class. Whole means the same
+            // base and the same size: an owner's size is the size it was requested at, which is the entry's for a
+            // direct-staged expert, so an owner wider than the entry (expert 0 of a bulk allocation starts at the
+            // owner's base) is refused here as shared rather than left to the use count below.
+            alloc_metadata md{};
+            if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) ||
+                md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) {
+                refusal = "shared storage";
+                break;
+            }
+            // Held by the entry alone: anything else retaining the owner shares the storage with the loan.
+            if (e.direct_alloc_owner.owner_use_count() != 1) {
+                refusal = "storage still referenced";
+                break;
+            }
+            if (host_md[i].size < e.size) {
+                refusal = "host storage too small";
+                break;
+            }
+            // c-mwmr-3: a host id that already has an entry, idle or not, refuses the triplet. Replacing it would free
+            // its storage with it, and a loan that then failed could not put it back. The registration below refuses
+            // the same, so an entry that appears after this check fails the loan whole instead of being replaced.
+            for (const ggml_sycl_cache_id & host_key : members[i].host_keys) {
+                if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) {
+                    refusal = "host entry exists";
+                    break;
+                }
+            }
+            if (refusal) {
+                break;
+            }
+            src_owner[i]   = e.direct_alloc_owner;
+            src_control[i] = e.direct_alloc_owner.owner_control_id();
+            bytes[i]       = e.size;
+            if (e.has_write_event) {
+                deps[i].push_back(e.last_write_event);
+            }
+            if (e.has_ready_event) {
+                deps[i].push_back(e.ready_event);
+            }
+        }
+    }
+    if (refusal) {
+        out.reason = refusal;
+        return false;
+    }
+
+    // 2. The copies, on the DMA queue behind what wrote each entry. mem_copy_async retains each copy's two owners
+    // until it completes, so the device storage outlives the read and the host storage the write, whatever happens
+    // to either entry afterwards.
+    try {
+        sycl::queue & dq = get_dma_queue();
+        for (int i = 0; i < 3; ++i) {
+            out.copy_events[i] = mem_copy_async(members[i].host_owner, src_owner[i], bytes[i], dq, deps[i]);
+        }
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (...) {
+        out        = expert_loan_record{};
+        out.reason = "copy submit failed";
+        return false;
+    }
+
+    // 3. All three or none, under the locks: each device entry is still the one checked. The transaction takes a lease
+    // that holds the entry in place until its host copy is published. Its last write becomes its copy, which ran behind
+    // the fill, so its storage is freed behind the copy, and it is withdrawn exactly, leaving any other entry under its
+    // id alone. DEFERRED is the expected status: that lease alone defers the free. The leases are minted in the check
+    // loop, before any entry changes: minting allocates, so a throw leaves every entry as it was, and the leases
+    // already minted go with the unwinding. What changes the entries after it allocates nothing: each retire moves its
+    // entry's mirror and id mapping out as nodes, into device_nodes, for a rollback to put back. The rollback after
+    // step 4 collects the host copies a failed registration left published into `host_nodes`, sized here, before any
+    // entry changes, so collecting them cannot throw.
+    std::shared_ptr<mem_handle>      held[3];
+    expert_retire_nodes              device_nodes[3];
+    std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
+                                                members[2].host_keys.size());
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        unified_cache_entry * device_entry[3] = { nullptr, nullptr, nullptr };
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const unified_cache_key device_key =
+                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+            const auto it = entries_.find(device_key);
+            if (it == entries_.end() || it->second.retired ||
+                it->second.direct_alloc_owner.owner_control_id() != src_control[i]) {
+                refusal = "entry changed";
+                break;
+            }
+            device_entry[i] = &it->second;
+            held[i]         = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");
+        }
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const unified_cache_key device_key =
+                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+            device_entry[i]->last_write_event = out.copy_events[i];
+            device_entry[i]->has_write_event  = true;
+            out.retire_status[i]              = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
+            out.device_keys[i]                = device_key;
+        }
+    }
+    if (refusal) {
+        out        = expert_loan_record{};
+        out.reason = refusal;
+        return false;
+    }
+
+    // 4. Publish each host copy under every id it is resolved by, behind its copy event.
+    scoped_planned_materialization materialization(this, "expert loan");
+    int                            registered[3] = { 0, 0, 0 };
+    bool                           failed        = false;
+    for (int i = 0; i < 3 && !failed; ++i) {
+        const expert_loan_member & m        = members[i];
+        void *                     host_ptr = m.host_owner.resolve().ptr;
+        for (size_t k = 0; k < m.host_keys.size(); ++k) {
+            // The registration undoes and reports its own failures. Anything it throws (the typed wrapper's owner
+            // copy, which comes before anything is registered, is the one allocation it does not catch) fails the
+            // registration like a refusal, and the rollback below runs, with the device entries already withdrawn.
+            bool published = false;
+            try {
+                published = host_ptr && register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
+                                                                   k == 0 ? &out.host_handles[i] : nullptr,
+                                                                   m.host_owner, &out.copy_events[i],
+                                                                   /*replace_existing=*/false);
+            } catch (const ggml_sycl_fallback_error &) {
+                // G-CATCH requires this clause before catch (...). Nothing in a host registration throws the op
+                // fallback (dispatch control flow), so no loan is stranded by it (llama.cpp-mwmr).
+                throw;
+            } catch (...) {
+                published = false;
+            }
+            if (!published) {
+                failed = true;
+                break;
+            }
+            registered[i]++;
+        }
+    }
+    if (failed) {
+        // What the checks above could not foresee (an allocation failed, or an entry appeared under a host id since
+        // they ran, which the registration refuses rather than replaces): withdraw the host copies already published
+        // and put each device entry back as it was, so a refused loan leaves the cache as it found it. A host copy is
+        // withdrawn only while its entry is still the one this loan registered, so another registrant's entry under
+        // the id is never touched. The held leases kept every withdrawn entry in place, and the copies stay retained
+        // until they complete. Every host copy is withdrawn before any device entry goes back, so at each restore no
+        // lookup map holds more entries than it did before step 3 took the nodes out, and the restores, which re-insert
+        // those nodes, allocate nothing unless other registrations filled a map while the locks were released.
+        {
+            std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+            std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+            std::lock(direct_lock, cache_lock);
+            size_t r = 0;
+            for (int i = 0; i < 3; ++i) {
+                const uint64_t host_control = members[i].host_owner.owner_control_id();
+                for (int k = 0; k < registered[i]; ++k) {
+                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 };
+                    const auto              host = entries_.find(host_key);
+                    if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) {
+                        (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
+                    }
+                }
+            }
+            for (int i = 0; i < 3; ++i) {
+                restore_expert_entry_at_locked(
+                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS),
+                    device_nodes[i]);
+            }
+        }
+        host_nodes.clear();
+        for (std::shared_ptr<mem_handle> & lease : held) {
+            lease.reset();
+        }
+        out        = expert_loan_record{};
+        out.reason = "host registration failed";
+        return false;
+    }
+
+    // 5. Every host copy is published: the leases that held the withdrawn device entries go, with no lock held, and
+    // the deferred-free pass reclaims each entry once the caller's own lease is gone too.
+    for (std::shared_ptr<mem_handle> & lease : held) {
+        lease.reset();
+    }
+    for (expert_retire_nodes & nodes : device_nodes) {
+        if (!nodes.mirror.empty()) {
+            nodes.mirror.mapped().handle.reset();
+        }
+    }
+
+    out.accepted = true;
+    out.reason   = "OK";
+    for (int i = 0; i < 3; ++i) {
+        out.bytes_freed += bytes[i];
+    }
+    return true;
+}
+
+// llama.cpp-sif1: re-admit one lent triplet to the device after a prompt phase, loan_expert_triplet() inverted. The
+// copies go first, from each host copy's typed pinned owner into the caller's device owner, so the copy path takes the
+// direct DMA and both owners stay retained until it completes. Each device entry is then published behind its copy and
+// takes over the direct mirror and the id mapping from the host copy, which is withdrawn exactly; a host copy still
+// leased (an extra's record, a ring copy reading it) stays retired until its last lease goes, and its pinned storage
+// until the copies reading it complete. Nothing here waits or asks an event's status.
+bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out) {
+    out = expert_refill_record{};
+    if (!members) {
+        out.reason = "invalid arguments";
+        return false;
+    }
+    const int cache_device = get_device_id_from_queue(queue_);
+
+    // The device entries are published as direct staging publishes one, so they are refused for what refuses direct
+    // staging: a load effect this thread cannot take and a plan the cache does not hold. Outside a model load (the
+    // decode boundary that runs a refill) the load effect is NONE and passes.
+    const cache_load_effect load_effect = acquire_bound_load_effect();
+    if (load_effect.failed()) {
+        out.reason = "load effect unavailable";
+        return false;
+    }
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        out.reason = "plan not coherent";
+        return false;
+    }
+
+    void *                   device_ptr[3]  = { nullptr, nullptr, nullptr };
+    size_t                   device_size[3] = { 0, 0, 0 };
+    mem_handle               src_owner[3];
+    uint64_t                 src_control[3] = { 0, 0, 0 };
+    size_t                   bytes[3]       = { 0, 0, 0 };
+    std::vector<sycl::event> deps[3];
+    const char *             refusal = nullptr;
+    for (int i = 0; i < 3 && !refusal; ++i) {
+        const expert_refill_member & m = members[i];
+        alloc_metadata               md{};
+        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key)) {
+            refusal = "invalid member";
+        } else if (!m.device_owner.valid() || !m.device_owner.owner_metadata(&md) || !md.ptr ||
+                   md.tier != alloc_tier::DEVICE_VRAM || md.cache_backing || md.device != cache_device) {
+            refusal = "device storage not owned";
+        } else {
+            device_ptr[i]  = md.ptr;
+            device_size[i] = md.size;
+        }
+        deps[i].reserve(2);
+    }
+
+    // 1. Each member's host copy is the one a loan published, all three members before anything changes.
+    if (!refusal) {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const ggml_sycl_cache_id & key = members[i].key;
+            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const auto                 it = entries_.find(host_key);
+            if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
+                it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
+                refusal = "not lent";
+                break;
+            }
+            const unified_cache_entry & e = it->second;
+            // c-n4gw: a loan copies AOS bytes only, so a lent copy is AOS.
+            if (e.layout != GGML_LAYOUT_AOS) {
+                refusal = "layout";
+                break;
+            }
+            // A loan's host copy owns its whole pinned storage (register_host_expert_owned's typed owner). A host
+            // copy S1-PRELOAD registered over planner-placed storage is not lent and stays where the planner put it.
+            alloc_metadata md{};
+            if (e.location != cache_location::HOST_PINNED || !e.host_resident ||
+                !e.direct_alloc_owner.owner_metadata(&md) || md.ptr != e.device_ptr ||
+                md.tier != alloc_tier::HOST_PINNED || md.size < e.size) {
+                refusal = "not a lent copy";
+                break;
+            }
+            // What resolves the id today: the mirror and the id mapping both name this host copy.
+            const auto mirror = direct_expert_entries_.find(key);
+            const auto mapped = id_to_key_.find(key);
+            if (mirror == direct_expert_entries_.end() || mirror->second.ptr != e.device_ptr ||
+                mirror->second.location != e.location || mirror->second.layout != e.layout ||
+                mapped == id_to_key_.end() || !(mapped->second == host_key)) {
+                refusal = "host copy not published";
+                break;
+            }
+            if (entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
+                entries_.end()) {
+                refusal = "device entry exists";
+                break;
+            }
+            // Exact: a loan that later lends this entry again requires its owner to be its whole allocation.
+            if (device_size[i] != e.size) {
+                refusal = "device storage size";
+                break;
+            }
+            src_owner[i]   = e.direct_alloc_owner;
+            src_control[i] = e.direct_alloc_owner.owner_control_id();
+            bytes[i]       = e.size;
+            if (e.has_write_event) {
+                deps[i].push_back(e.last_write_event);
+            }
+            if (e.has_ready_event) {
+                deps[i].push_back(e.ready_event);
+            }
+        }
+    }
+    if (refusal) {
+        out.reason = refusal;
+        return false;
+    }
+
+    // 2. The copies, on the BCS queue (the copy engine, off the compute engine the decode graph runs on) behind what
+    // wrote each host copy: the loan's D2H copy. Both endpoints are typed owners, so the copy is a direct DMA, and
+    // mem_copy_async retains both until it completes.
+    try {
+        sycl::queue & bq = get_bcs_queue();
+        for (int i = 0; i < 3; ++i) {
+            out.copy_events[i] = mem_copy_async(members[i].device_owner, src_owner[i], bytes[i], bq, deps[i]);
+        }
+    } catch (const ggml_sycl_fallback_error &) {
+        // G-CATCH requires this clause before catch (...). A copy submission never throws the op fallback (dispatch
+        // control flow), so no refill is stranded by it (llama.cpp-sif1).
+        throw;
+    } catch (...) {
+        out        = expert_refill_record{};
+        out.reason = "copy submit failed";
+        return false;
+    }
+
+    // 3. Everything the publication allocates, built before the locks: each device entry and its mirror record, and
+    // the nodes the host retires hand back. Under the locks, the device entries' insertion and their lease minting
+    // are the only allocations, and they come before anything already published changes.
+    unified_cache_entry device_entry[3];
+    weight_entry        device_mirror[3];
+    for (int i = 0; i < 3; ++i) {
+        unified_cache_entry & entry = device_entry[i];
+        entry.device_ptr            = device_ptr[i];
+        entry.src_ptr               = nullptr;
+        entry.content_hash          = 0;
+        entry.size                  = bytes[i];
+        entry.type                  = cache_entry_type::MOE_EXPERT;
+        entry.layer_id              = -1;
+        entry.expert_id             = -1;
+        entry.layout                = GGML_LAYOUT_AOS;
+        entry.access_count          = 0;
+        entry.pinned                = false;
+        entry.hot                   = true;
+        entry.state                 = cache_entry_state::IN_PROGRESS;
+        entry.has_ready_event       = true;
+        entry.ready_event           = out.copy_events[i];
+        entry.host_resident         = false;
+        entry.location              = cache_location::DEVICE;
+        entry.owner_device          = cache_device;
+        entry.pool_allocated        = false;
+        entry.direct_alloc_owner    = members[i].device_owner;
+        entry.last_write_event      = out.copy_events[i];
+        entry.has_write_event       = true;
+        stamp_pending_owner(entry, load_effect);
+
+        weight_entry & mirror      = device_mirror[i];
+        mirror.ptr                 = device_ptr[i];
+        mirror.size                = bytes[i];
+        mirror.layout              = GGML_LAYOUT_AOS;
+        mirror.location            = cache_location::DEVICE;
+        mirror.has_ready_event     = true;
+        mirror.ready_event         = out.copy_events[i];
+        mirror.pending_load_txn_id = load_effect.load_txn_id();
+    }
+    // The publication runs inside a planned materialization session, as the loan's host registration does: the plan,
+    // not a runtime miss, asked for these device copies (llama.cpp-sif1).
+    scoped_planned_materialization   materialization(this, "expert refill");
+    std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
+                                                members[2].host_keys.size());
+    int                              inserted = 0;
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        // Each host copy is still the one checked and still what resolves its id, and no device entry has appeared.
+        for (int i = 0; i < 3 && !refusal; ++i) {
+            const ggml_sycl_cache_id & key = members[i].key;
+            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const auto                 it     = entries_.find(host_key);
+            const auto                 mirror = direct_expert_entries_.find(key);
+            const auto                 mapped = id_to_key_.find(key);
+            if (it == entries_.end() || it->second.retired ||
+                it->second.direct_alloc_owner.owner_control_id() != src_control[i] ||
+                mirror == direct_expert_entries_.end() || mirror->second.ptr != it->second.device_ptr ||
+                mapped == id_to_key_.end() || !(mapped->second == host_key) ||
+                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
+                    entries_.end()) {
+                refusal = "entry changed";
+            }
+        }
+        // The allocations: insert each device entry, then mint its mirror's lease and the caller's. A throw withdraws
+        // the entries already inserted (nothing resolves them yet), and their storage goes back to its zone behind
+        // the copy, through the deferred-free pass, once the leases minted so far are gone.
+        if (!refusal) {
+            try {
+                for (int i = 0; i < 3; ++i) {
+                    const unified_cache_key device_key =
+                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    device_entry[i].last_access = time_++;
+                    entries_.emplace(device_key, device_entry[i]);
+                    ++inserted;
+                }
+                for (int i = 0; i < 3; ++i) {
+                    const unified_cache_key device_key =
+                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    unified_cache_entry & stored = entries_.find(device_key)->second;
+                    device_mirror[i].handle =
+                        make_direct_entry_handle(device_key, cache_device, stored, "expert_refill/mirror");
+                    stored.in_use_count.fetch_add(1);
+                    stored.debug_last_lease_site = "expert_refill/out_handle";
+                    stored.record_lease_event(true, "expert_refill/out_handle");
+                    out.device_handles[i] = mem_handle::from_weight_lease_locked(
+                        device_key, cache_device, stored.device_ptr, stored.layout, true, &stored);
+                }
+            } catch (const ggml_sycl_fallback_error &) {
+                // G-CATCH requires this clause before catch (...). Nothing here throws the op fallback (dispatch
+                // control flow) (llama.cpp-sif1).
+                throw;
+            } catch (...) {
+                for (int i = 0; i < inserted; ++i) {
+                    (void) transition_to_retired_locked(
+                        entries_
+                            .find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS))
+                            ->second);
+                }
+                refusal = "publication failed";
+            }
+        }
+        // Allocation-free from here: each device entry takes over its id's mirror (a swap, which hands the host
+        // copy's record, and its lease, back to device_mirror for release with no lock held) and its id mapping, then
+        // each host copy is retired exactly under every id still naming its storage. The mirror and the mapping under
+        // key name the device entry by then, so the retire there takes neither; under the loan's other host ids it
+        // takes both, into host_nodes.
+        if (!refusal) {
+            size_t r = 0;
+            for (int i = 0; i < 3; ++i) {
+                const ggml_sycl_cache_id & key = members[i].key;
+                std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);
+                id_to_key_.find(key)->second =
+                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);
+                for (const ggml_sycl_cache_id & id : members[i].host_keys) {
+                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+                    const auto              host = entries_.find(host_key);
+                    if (host != entries_.end() && !host->second.retired &&
+                        host->second.direct_alloc_owner.owner_control_id() == src_control[i]) {
+                        (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. With no lock held: the host copies' mirror leases go (swapped into device_mirror, or taken by a retire), and
+    // on a refusal the leases minted on the withdrawn device entries.
+    for (weight_entry & mirror : device_mirror) {
+        mirror.handle.reset();
+    }
+    for (expert_retire_nodes & nodes : host_nodes) {
+        if (!nodes.mirror.empty()) {
+            nodes.mirror.mapped().handle.reset();
+        }
+    }
+    host_nodes.clear();
+    if (refusal) {
+        for (mem_handle & lease : out.device_handles) {
+            lease = {};
+        }
+        out        = expert_refill_record{};
+        out.reason = refusal;
+        return false;
+    }
+
+    out.accepted = true;
+    out.reason   = "OK";
+    for (int i = 0; i < 3; ++i) {
+        out.bytes_readmitted += bytes[i];
+    }
+    return true;
+}
+
 bool unified_cache::mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout) {
     if (!key.valid) {
         return false;
@@ -8916,6 +11085,37 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                                          ggml_layout_mode      layout,
                                          mem_handle *          out_handle,
                                          std::shared_ptr<void> allocation_owner) {
+    return register_host_expert(key, ptr, size, layout, out_handle, std::move(allocation_owner), mem_handle{});
+}
+
+bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id  key,
+                                               void *              ptr,
+                                               size_t              size,
+                                               ggml_layout_mode    layout,
+                                               mem_handle *        out_handle,
+                                               const mem_handle &  allocation_owner,
+                                               const sycl::event * ready_event,
+                                               bool                replace_existing) {
+    if (!allocation_owner.valid()) {
+        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event,
+                                    replace_existing);
+    }
+    // The storage owner is a copy of the typed owner, aliased to ptr as the
+    // legacy owner wrapper was, so the entry releases exactly as before.
+    auto storage_owner = std::make_shared<mem_handle>(allocation_owner);
+    return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>(storage_owner, ptr),
+                                allocation_owner, ready_event, replace_existing);
+}
+
+bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
+                                         void *                ptr,
+                                         size_t                size,
+                                         ggml_layout_mode      layout,
+                                         mem_handle *          out_handle,
+                                         std::shared_ptr<void> allocation_owner,
+                                         const mem_handle &    typed_owner,
+                                         const sycl::event *   ready_event,
+                                         bool                  replace_existing) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -8954,6 +11154,10 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         unified_cache_entry cache_entry{};
         auto                old = entries_.find(cache_key);
         if (old != entries_.end()) {
+            // A caller that must be able to undo this registration leaves an existing entry alone (c-mwmr-3).
+            if (!replace_existing) {
+                return false;
+            }
             if (old->second.device_ptr == ptr && old->second.size == size && old->second.layout == layout &&
                 !old->second.retired) {
                 if (old->second.owner_device != dev) {
@@ -8965,6 +11169,9 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                 if (allocation_owner && !old->second.storage_owner) {
                     old->second.storage_owner = allocation_owner;
                     old->second.non_owning_external_host = !allocation_owner;
+                    if (typed_owner.valid() && !old->second.direct_alloc_owner.valid()) {
+                        old->second.direct_alloc_owner = typed_owner;
+                    }
                 }
                 old->second.access_count++;
                 old->second.last_access = time_++;
@@ -8997,16 +11204,18 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.last_access      = time_++;
         cache_entry.pinned           = true;
         cache_entry.hot              = true;
-        cache_entry.state            = cache_entry_state::READY;
-        cache_entry.has_ready_event  = false;
+        cache_entry.state                    = ready_event ? cache_entry_state::IN_PROGRESS : cache_entry_state::READY;
+        cache_entry.has_ready_event          = ready_event != nullptr;
+        cache_entry.ready_event              = ready_event ? *ready_event : sycl::event{};
         cache_entry.host_resident    = cache_loc != cache_location::DEVICE;
         cache_entry.location         = cache_loc;
         cache_entry.owner_device     = dev;
         cache_entry.pool_allocated   = false;
-        cache_entry.last_write_event = {};
-        cache_entry.has_write_event  = false;
+        cache_entry.last_write_event         = ready_event ? *ready_event : sycl::event{};
+        cache_entry.has_write_event          = ready_event != nullptr;
         cache_entry.storage_owner            = allocation_owner;
         cache_entry.non_owning_external_host = !allocation_owner;
+        cache_entry.direct_alloc_owner       = typed_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
@@ -9045,6 +11254,8 @@ publish_host_expert_direct:
         entry.size                  = size;
         entry.layout                = layout;
         entry.location              = cache_loc;
+        entry.has_ready_event       = ready_event != nullptr;
+        entry.ready_event           = ready_event ? *ready_event : sycl::event{};
         entry.handle                = std::move(direct_handle);
         entry.pending_load_txn_id = load_effect_guard.load_txn_id();
         auto old_direct = direct_expert_entries_.find(key);
@@ -10550,6 +12761,50 @@ sycl::queue * unified_cache::get_event_watch_queue() {
     return event_watch_queue_.get();
 }
 
+sycl::queue * unified_cache::get_moe_join_queue() {
+    // llama.cpp-wfsl: created on first use, in-order so the joins keep their jobs' order, and non-profiling
+    // because a status query on a profiling queue's in-flight event busy-waits (see event_complete()).
+    // std::call_once for the same reason as get_event_watch_queue(): this getter takes no lock of its own.
+    std::call_once(moe_join_queue_once_, [this]() {
+        try {
+            moe_join_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),
+                                                            sycl::property::queue::in_order{});
+        } catch (const sycl::exception & e) {
+            GGML_LOG_WARN(
+                "[MOE-JOIN-QUEUE] Failed to create the CPU expert join queue; the joins stay on the compute "
+                "stream: %s (llama.cpp-wfsl)\n",
+                e.what());
+            moe_join_queue_.reset();
+        }
+    });
+    return moe_join_queue_.get();
+}
+
+sycl::queue * unified_cache::moe_join_queue_after(sycl::event * after, bool * has_after) {
+    sycl::queue * q = get_moe_join_queue();
+    if (!q) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(moe_join_mutex_);
+    if (last_host_task_valid_) {
+        *after     = last_host_task_;
+        *has_after = true;
+    }
+    if (!moe_join_queue_announced_) {
+        moe_join_queue_announced_ = true;
+        GGML_LOG_INFO(
+            "[MOE-JOIN-QUEUE] CPU expert joins go on a join-only queue (GGML_SYCL_MOE_JOIN_QUEUE=1) "
+            "(llama.cpp-wfsl)\n");
+    }
+    return q;
+}
+
+void unified_cache::note_compute_host_task(const sycl::event & e) {
+    std::lock_guard<std::mutex> lock(moe_join_mutex_);
+    last_host_task_       = e;
+    last_host_task_valid_ = true;
+}
+
 // get_or_wait REMOVED — legacy synchronous blocking pattern
 // get_by_data_ptr REMOVED — O(N) scan with zero callers
 
@@ -11732,6 +13987,15 @@ bool unified_cache::event_complete(const sycl::event & evt) {
     }
 }
 
+// Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide: a live count, not
+// a drawn count. Counted in the callbacks themselves (below, GGML_SYCL_DNNL only), read by the SDPA
+// compile's bracket.
+static std::atomic<int64_t> g_onednn_graph_live_draws{ 0 };
+
+int64_t unified_cache_onednn_graph_live_draws() noexcept {
+    return g_onednn_graph_live_draws.load(std::memory_order_relaxed);
+}
+
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: default cap on outstanding DIRECT (non-arena) Graph-scratch
 // bytes, and the timeouts around it. See onednn_graph_scratch_wait_for_direct_headroom_locked()
@@ -11759,6 +14023,18 @@ static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_b
         return kOneGiB;
     }
     return std::min(kOneGiB, plan_time_available_bytes / 4);
+}
+
+size_t unified_cache::onednn_graph_scratch_direct_cap() const {
+    return onednn_graph_scratch_direct_cap_bytes(
+        onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
+}
+
+size_t unified_cache_onednn_graph_scratch_direct_cap_bytes(int device_id) {
+    // The same cache lookup onednn_graph_sycl_malloc() makes, so the bound matches the allocator that
+    // serves the request.
+    const unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    return cache ? cache->onednn_graph_scratch_direct_cap() : onednn_graph_scratch_direct_cap_bytes(0);
 }
 
 static constexpr uint32_t kOnednnGraphDirectFailureDrainTimeoutMs = 2000;
@@ -11884,6 +14160,28 @@ bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(
     return event_complete(entry.release_event);
 }
 
+// llama.cpp-jwjz: see the declaration's comment in unified-cache.hpp.
+bool unified_cache::onednn_graph_scratch_consumers_in_order() const {
+    if (!queue_.has_property<sycl::property::queue::in_order>()) {
+        return false;
+    }
+    return ggml_sycl_get_tp_queue(ggml_sycl_get_device_id_from_queue(queue_)) == nullptr;
+}
+
+bool unified_cache::onednn_graph_scratch_in_order_reuse_allowed() const {
+    if (onednn_graph_scratch_force_completion_gated_reuse_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    return onednn_graph_scratch_consumers_in_order();
+}
+
+void unified_cache::onednn_graph_scratch_force_completion_gated_reuse_for_test(bool force) {
+    if (!onednn_graph_scratch_test_hooks_enabled()) {
+        return;
+    }
+    onednn_graph_scratch_force_completion_gated_reuse_.store(force, std::memory_order_release);
+}
+
 // llama.cpp-c6ah: lazily allocates the host-USM slab backing
 // every pooled entry's completion flag_slot. See the declaration's own
 // comment in unified-cache.hpp for the fixed-capacity/never-reallocated
@@ -11951,6 +14249,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     for (size_t i = kOnednnGraphScratchFlagSlabCapacity; i > 0; --i) {
         onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(i - 1));
     }
+    onednn_graph_scratch_flag_slot_last_marker_.assign(kOnednnGraphScratchFlagSlabCapacity, std::nullopt);
     return true;
 }
 
@@ -12098,8 +14397,13 @@ unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratc
     const onednn_graph_scratch_pool_entry & entry,
     size_t                                  alignment,
     int                                     device_id,
+    bool                                    requester_in_order,
     resolved_ptr *                          out_resolved) const {
-    if (!onednn_graph_scratch_pool_entry_release_complete(entry)) {
+    // llama.cpp-jwjz: when this request and the entry's previous consumer
+    // were both on the cache's in-order queue, the next consumer queues
+    // behind the previous one, so the release need not have completed and no
+    // completion query is made. Any other pairing waits for the release.
+    if (!(requester_in_order && entry.in_order) && !onednn_graph_scratch_pool_entry_release_complete(entry)) {
         return onednn_graph_scratch_entry_fit::EVENT_PENDING;
     }
     const auto resolved = entry.owner.resolve(device_id);
@@ -12118,6 +14422,7 @@ unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratc
 bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
                                                                size_t       alignment,
                                                                int          device_id,
+                                                               bool         requester_in_order,
                                                                mem_handle * out_owner,
                                                                void **      out_ptr) {
     auto pool_it = onednn_graph_scratch_reuse_pool_.find(size);
@@ -12136,7 +14441,7 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
         // block rather than poll.
         resolved_ptr                         resolved{};
         const onednn_graph_scratch_entry_fit fit =
-            onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, &resolved);
+            onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, requester_in_order, &resolved);
         // switch over every enumerator, no default: a fifth
         // onednn_graph_scratch_entry_fit value added later without a case
         // here warns under -Wswitch instead of silently falling through to
@@ -12159,16 +14464,20 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
             case onednn_graph_scratch_entry_fit::RESOLVE_FAILED:
                 break;
         }
-        mem_handle    owner             = std::move(bucket[i].owner);
+        mem_handle    owner                 = std::move(bucket[i].owner);
         // llama.cpp-c6ah: capture the LEAVING entry's slot
         // before the move-assign below overwrites bucket[i] with a
         // DIFFERENT entry (bucket.back()) -- reading bucket[i].flag_slot
         // after that assignment would return the wrong entry's slot. The
         // entry is leaving the pool either way here (reused below, or
-        // destructed via the RESOLVE_FAILED branch further down), so its
-        // slot (if any) always returns to the free list.
-        const int32_t leaving_flag_slot = bucket[i].flag_slot;
-        bucket[i]                       = std::move(bucket.back());
+        // released via the RESOLVE_FAILED branch further down), so its
+        // slot (if any) always returns to the free list. Under in-order
+        // reuse its marker may still be pending; the next marker armed on
+        // the slot depends on it (llama.cpp-jwjz, see
+        // onednn_graph_scratch_flag_slot_last_marker_).
+        const int32_t leaving_flag_slot     = bucket[i].flag_slot;
+        sycl::event   leaving_release_event = std::move(bucket[i].release_event);
+        bucket[i]                           = std::move(bucket.back());
         bucket.pop_back();
         if (leaving_flag_slot >= 0) {
             onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(leaving_flag_slot));
@@ -12180,11 +14489,14 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
         // it is checked out again).
         onednn_graph_scratch_pool_bytes_ -= std::min(size, onednn_graph_scratch_pool_bytes_);
         if (fit == onednn_graph_scratch_entry_fit::RESOLVE_FAILED) {
-            // Should not happen for a still-owned handle -- fall through and
-            // let `owner` destruct here (a real, immediate release), same as
-            // any other unusable resolution. Do not retry another bucket
-            // entry: something is wrong with this specific handle, not with
-            // pooling in general.
+            // Should not happen for a still-owned handle -- release `owner`
+            // for real, same as any other unusable resolution. The release
+            // waits on the entry's own event, because under in-order reuse
+            // (llama.cpp-jwjz) the entry may still be in flight; for a
+            // completed event the drain worker releases it at once. Do not
+            // retry another bucket entry: something is wrong with this
+            // specific handle, not with pooling in general.
+            retain_handles_until_event({ std::move(owner) }, std::move(leaving_release_event));
             onednn_graph_scratch_direct_outstanding_bytes_ -=
                 std::min(size, onednn_graph_scratch_direct_outstanding_bytes_);
             // A real release, same as the cap-eviction and depth-limit
@@ -12208,13 +14520,16 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
     return false;
 }
 
-bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const {
+bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size,
+                                                                size_t alignment,
+                                                                int    device_id,
+                                                                bool   requester_in_order) const {
     auto it = onednn_graph_scratch_reuse_pool_.find(size);
     if (it == onednn_graph_scratch_reuse_pool_.end()) {
         return false;
     }
     for (const auto & entry : it->second) {
-        if (onednn_graph_scratch_entry_usable_locked(entry, alignment, device_id) ==
+        if (onednn_graph_scratch_entry_usable_locked(entry, alignment, device_id, requester_in_order) ==
             onednn_graph_scratch_entry_fit::USABLE) {
             return true;
         }
@@ -12222,14 +14537,14 @@ bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size, siz
     return false;
 }
 
-bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
-                                                                         size_t                         alignment,
-                                                                         int                            device_id,
+bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t size,
+                                                                         size_t alignment,
+                                                                         int    device_id,
+                                                                         bool   requester_in_order,
                                                                          std::unique_lock<std::mutex> & lock,
                                                                          bool & out_was_oversized) {
     out_was_oversized = false;
-    const size_t cap  = onednn_graph_scratch_direct_cap_bytes(
-        onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
+    const size_t cap  = onednn_graph_scratch_direct_cap();
 
     // llama.cpp-c6ah: entry point of this call -- the timing reference the
     // poll loop's deadline below is computed from.
@@ -12314,7 +14629,7 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
         // OTHER sizes' pool entries for no reason. The caller's post-wait
         // re-check (onednn_graph_scratch_try_pool_locked()) is what actually
         // consumes this entry -- this is only "does the wait get to stop".
-        fits = onednn_graph_scratch_pool_size_ready_locked(size, alignment, device_id) ||
+        fits = onednn_graph_scratch_pool_size_ready_locked(size, alignment, device_id, requester_in_order) ||
                onednn_graph_scratch_evict_pool_until_fits_locked(size, cap);
     } while (!fits && std::chrono::steady_clock::now() < deadline);
     return fits;
@@ -12435,13 +14750,19 @@ void unified_cache::onednn_graph_scratch_log_pool_summary_locked(const char * co
 // onednn_graph_scratch_alloc_direct_locked()'s own miss-counting site for
 // where the miss half of that invariant is kept. Callers must hold
 // onednn_graph_scratch_mutex_.
-void * unified_cache::onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id) {
+void * unified_cache::onednn_graph_scratch_try_pool_locked(size_t size,
+                                                           size_t alignment,
+                                                           int    device_id,
+                                                           bool   requester_in_order) {
     mem_handle pooled_owner;
     void *     pooled_ptr = nullptr;
-    if (!onednn_graph_scratch_try_reuse_pool_locked(size, alignment, device_id, &pooled_owner, &pooled_ptr)) {
+    if (!onednn_graph_scratch_try_reuse_pool_locked(size, alignment, device_id, requester_in_order, &pooled_owner,
+                                                    &pooled_ptr)) {
         return nullptr;
     }
-    onednn_graph_scratch_direct_owners_[pooled_ptr] = { std::move(pooled_owner), size };
+    // llama.cpp-jwjz: the buffer's consumer is now this request, so it takes
+    // this request's in-order tag.
+    onednn_graph_scratch_direct_owners_[pooled_ptr] = { std::move(pooled_owner), size, requester_in_order };
     ++onednn_graph_scratch_pool_hit_count_;
     note_onednn_graph_scratch_alloc_locked(size);
     // Gated on the FIRST hit for THIS size, not print_this_request in the
@@ -12550,6 +14871,15 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // request device).
     const int device_id = ggml_sycl_get_device_id_from_queue(*q);
 
+    // llama.cpp-jwjz: evaluated once per request, like device_id. A pool
+    // entry whose release is still in flight may be handed back only when
+    // its previous consumer and this request share the cache's in-order
+    // queue_. onednn_graph_sycl_malloc() always passes queue_; the
+    // TP-active case, where the execute runs on another queue, is caught by
+    // onednn_graph_scratch_in_order_reuse_allowed(). A caller that passes
+    // any other queue gets completion-gated reuse only.
+    const bool requester_in_order = (*q == queue_) && onednn_graph_scratch_in_order_reuse_allowed();
+
     // llama.cpp-0oxf: try the size-bucketed reuse pool BEFORE the cap-wait
     // mechanism below -- reusing an already-resident buffer needs no
     // headroom check at all (its bytes are already charged against
@@ -12560,11 +14890,11 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // counted on a miss here -- see onednn_graph_scratch_try_pool_locked()'s
     // own comment for why miss accounting waits until every re-check has
     // also had its chance.
-    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
+    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id, requester_in_order)) {
         return p;
     }
 
-    return onednn_graph_scratch_alloc_direct_locked(size, alignment, q, device_id, lock);
+    return onednn_graph_scratch_alloc_direct_locked(size, alignment, q, device_id, requester_in_order, lock);
 }
 
 // llama.cpp-0oxf: the DIRECT (non-arena) allocation tail of
@@ -12581,6 +14911,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
                                                                size_t                         alignment,
                                                                sycl::queue *                  q,
                                                                int                            device_id,
+                                                               bool                           requester_in_order,
                                                                std::unique_lock<std::mutex> & lock) {
     // llama.cpp-0oxf: bound outstanding DIRECT bytes before allocating
     // another one -- see onednn_graph_scratch_wait_for_direct_headroom_locked()
@@ -12598,7 +14929,8 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // this ERROR describing a wait that never actually happened for that
     // call (llama.cpp-pqgl).
     bool was_oversized = false;
-    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, lock, was_oversized) &&
+    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, requester_in_order, lock,
+                                                              was_oversized) &&
         !was_oversized) {
         if (!onednn_graph_scratch_gave_up_waiting_logged_) {
             onednn_graph_scratch_gave_up_waiting_logged_ = true;
@@ -12608,10 +14940,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
                 "so a one-off spike is not refused pre-emptively; unified_alloc() below still fails loudly rather "
                 "than handing oneDNN a null scratch pointer.\n",
                 size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
-                onednn_graph_scratch_direct_cap_bytes(
-                    onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
-                    (1024.0 * 1024.0),
-                onednn_graph_scratch_direct_wait_count_);
+                onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_);
         }
     }
 
@@ -12620,7 +14949,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // could have parked (or, on the depth-overflow path, evicted and thereby
     // freed room for) this exact size while the lock was released. Check the
     // pool once more before paying for a fresh unified_alloc().
-    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
+    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id, requester_in_order)) {
         return p;
     }
 
@@ -12674,7 +15003,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
         // Re-check the pool after reacquiring the lock: a concurrent
         // onednn_graph_scratch_free() could have parked an entry of this
         // exact size while it was dropped.
-        if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
+        if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id, requester_in_order)) {
             return p;
         }
 
@@ -12691,10 +15020,8 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
             "hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
             "page-fault/segfault this used to cause. Aborting instead.\n",
             size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_cap_bytes(
-                onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
-                (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_wait_count_, zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
+            onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,
+            zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
                                                       shape.n_ubatch, shape.n_ctx) /
@@ -12719,7 +15046,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
         GGML_ABORT("oneDNN Graph scratch DIRECT allocation resolved off-device");
     }
     void * direct_ptr                               = resolved.ptr;
-    onednn_graph_scratch_direct_owners_[direct_ptr] = { std::move(owner), size };
+    onednn_graph_scratch_direct_owners_[direct_ptr] = { std::move(owner), size, requester_in_order };
     onednn_graph_scratch_direct_outstanding_bytes_ += size;
     note_onednn_graph_scratch_alloc_locked(size);
     // The ONE place this request's outcome is counted as a miss: every pool
@@ -12883,18 +15210,32 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                             // entry's own check cannot spuriously read
                             // complete before its own marker kernel has run.
                             // Same system-scope atomic_ref as every other
-                            // slab access (never a plain store); relaxed
-                            // suffices here specifically because this slot
-                            // could only have been popped from the free
-                            // list after its previous occupant's marker was
-                            // already observed complete, under this same
-                            // mutex, so no reader can be racing this write.
+                            // slab access (never a plain store). Relaxed
+                            // suffices: no reader compares this slot against
+                            // any generation but `gen` from here on, because
+                            // the previous occupant has left the pool. Under
+                            // in-order reuse (llama.cpp-jwjz) that
+                            // occupant's marker may still be pending and can
+                            // store its older generation after this reset.
+                            // Either order leaves a value other than `gen`
+                            // until this park's own marker, chained after
+                            // that one below, stores `gen`.
                             sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system>
                                 flag_reset_atomic(onednn_graph_scratch_flag_slab_[slot]);
                             flag_reset_atomic.store(0, sycl::memory_order::relaxed);
-                            int32_t * flag_ptr = onednn_graph_scratch_flag_slab_ + slot;
-                            watch_q->submit([&](sycl::handler & h) {
+                            int32_t *                    flag_ptr = onednn_graph_scratch_flag_slab_ + slot;
+                            std::optional<sycl::event> & last_marker =
+                                onednn_graph_scratch_flag_slot_last_marker_[slot];
+                            sycl::event marker = watch_q->submit([&](sycl::handler & h) {
                                 h.depends_on(*event);
+                                // llama.cpp-jwjz: the watch queue is
+                                // out-of-order, so without this edge the
+                                // slot's previous marker could run after
+                                // this one and leave its older generation in
+                                // the slot for good.
+                                if (last_marker) {
+                                    h.depends_on(*last_marker);
+                                }
                                 // System-scope release store, paired with
                                 // the host-side acquire load in
                                 // onednn_graph_scratch_pool_entry_release_complete().
@@ -12921,6 +15262,7 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                             onednn_graph_scratch_flag_slot_free_list_.pop_back();
                             flag_slot       = static_cast<int32_t>(slot);
                             flag_generation = gen;
+                            last_marker     = std::move(marker);
                         } catch (const sycl::exception & e) {
                             // Leave flag_slot at -1: onednn_graph_scratch_pool_entry_release_complete()
                             // falls back to the old (blocking, but correct)
@@ -12952,7 +15294,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // these bytes for as long as they sit in the pool -- see that
         // field's own comment for why (it is still real resident VRAM).
         auto & bucket = onednn_graph_scratch_reuse_pool_[freed_size];
-        bucket.push_back({ std::move(entry.owner), std::move(release_event_copy), flag_slot, flag_generation });
+        bucket.push_back(
+            { std::move(entry.owner), std::move(release_event_copy), flag_slot, flag_generation, entry.in_order });
         onednn_graph_scratch_pool_bytes_ += freed_size;
         if (onednn_graph_scratch_pool_bytes_ > onednn_graph_scratch_pool_peak_bytes_) {
             onednn_graph_scratch_pool_peak_bytes_ = onednn_graph_scratch_pool_bytes_;
@@ -12966,7 +15309,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         return;
     }
 
-    // Zone-backed suballocation, TP inactive: return it to the ONEDNN zone's
+    // Zone-backed suballocation, every consumer on one in-order queue (TP
+    // inactive and the cache queue in-order): return it to the ONEDNN zone's
     // TLSF free list IMMEDIATELY, with no event wait or completion check of
     // any kind. Safe by construction, not by omission: the ONLY consumer of
     // a Graph-scratch buffer is a dnnl::graph::sycl_interop::execute() call
@@ -13010,8 +15354,14 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // have; enqueue_deferred_zone_free() is the primitive
     // reserve_onednn_scratch's own defer_published_zone_release already uses
     // for the same "zone pointer, need an event-gated release" shape).
-    const int device_id_for_tp_check = ggml_sycl_get_device_id_from_queue(queue_);
-    if (ggml_sycl_get_tp_queue(device_id_for_tp_check) != nullptr) {
+    //
+    // A cache queue without the in_order property breaks it the same way:
+    // nothing then orders the next consumer after the previous one.
+    //
+    // onednn_graph_scratch_consumers_in_order() is that check (TP inactive
+    // and the queue in-order), and the DIRECT pool's in-order reuse reads the
+    // same predicate (llama.cpp-jwjz).
+    if (!onednn_graph_scratch_consumers_in_order()) {
         const size_t deferred_size = zone_it->second;
         note_onednn_graph_scratch_free_locked(deferred_size);
         onednn_graph_scratch_zone_sizes_.erase(zone_it);
@@ -13031,16 +15381,18 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
             // the map entry above is already erased, so this block is no
             // longer tracked as ours either way; the difference is whether
             // its bytes go back to the TLSF free list where a same-race
-            // zone_alloc() could hand them to a new TP consumer (zone_free,
-            // reopening exactly the race this branch exists to close) or
-            // stay held out of the zone until arena teardown (leak). A
-            // permanently smaller ONEDNN zone degrades gracefully -- future
-            // requests that no longer fit it fall through to the DIRECT path
-            // above -- corrupting a TP consumer's in-flight read does not.
+            // zone_alloc() could hand them to a new, unordered consumer
+            // (zone_free, reopening exactly the race this branch exists to
+            // close) or stay held out of the zone until arena teardown
+            // (leak). A permanently smaller ONEDNN zone degrades gracefully
+            // -- future requests that no longer fit it fall through to the
+            // DIRECT path above -- corrupting an unordered consumer's
+            // in-flight read does not.
             GGML_LOG_WARN(
-                "[UNIFIED-CACHE] oneDNN Graph allocator: TP active for device %d and no event/barrier available "
-                "to defer ptr=%p -- leaking rather than risking a race with an in-flight TP consumer\n",
-                device_id_for_tp_check, ptr);
+                "[UNIFIED-CACHE] oneDNN Graph allocator: consumers not on one in-order queue for device %d (TP "
+                "active, or the cache queue is not in-order) and no event/barrier available to defer ptr=%p -- "
+                "leaking rather than risking a race with an in-flight consumer\n",
+                ggml_sycl_get_device_id_from_queue(queue_), ptr);
         }
         return;
     }
@@ -13106,7 +15458,11 @@ void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev,
             }
             return nullptr;
         }
-        return cache->onednn_graph_scratch_alloc(size, alignment, &cache->get_queue());
+        void * drawn = cache->onednn_graph_scratch_alloc(size, alignment, &cache->get_queue());
+        if (drawn != nullptr) {
+            g_onednn_graph_live_draws.fetch_add(1, std::memory_order_relaxed);
+        }
+        return drawn;
     } catch (...) {
         return nullptr;
     }
@@ -13149,6 +15505,9 @@ void onednn_graph_sycl_free(void * buf, const void * dev, const void * ctx, void
             }
             return;
         }
+        // Counted before the free: oneDNN considers the draw returned once it called us, whether or not the
+        // cache's free then throws (swallowed below), so the count must not depend on that outcome.
+        g_onednn_graph_live_draws.fetch_sub(1, std::memory_order_relaxed);
         cache->onednn_graph_scratch_free(buf, ev);
     } catch (...) {
     }
@@ -14065,6 +16424,40 @@ bool unified_cache::test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_l
     return true;
 }
 
+bool unified_cache::test_expert_device_entry_in_use(ggml_sycl_cache_id key, uint32_t * in_use) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    const auto it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
+    if (it == entries_.end()) {
+        return false;
+    }
+    if (in_use) {
+        *in_use = it->second.in_use_count.load();
+    }
+    return true;
+}
+
+bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key,
+                                                 uint32_t *         in_use,
+                                                 bool *             retired,
+                                                 alloc_metadata *   owner) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    const auto                          it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });
+    if (it == entries_.end()) {
+        return false;
+    }
+    if (in_use) {
+        *in_use = it->second.in_use_count.load();
+    }
+    if (retired) {
+        *retired = it->second.retired;
+    }
+    if (owner) {
+        *owner = alloc_metadata{};
+        (void) it->second.direct_alloc_owner.owner_metadata(owner);
+    }
+    return true;
+}
+
 uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     for (const auto & pair : entries_) {
@@ -14847,7 +17240,9 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
                                                            dma_stream_slice_fn              slice_fn,
                                                            const void *                     ctx,
                                                            const std::vector<sycl::event> & deps,
-                                                           dma_stream_copy_fn               copy_fn) {
+                                                           dma_stream_copy_fn               copy_fn,
+                                                           const char *                     caller_file,
+                                                           const char *                     caller_func) {
     dma_stream_result result{};
     result.queue = &queue_;
     if (!src.ptr || !slice_fn) {
@@ -14893,6 +17288,19 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
         result.ok             = true;
         result.slices         = 1;
         return result;
+    }
+
+    // A source that is not device-resident reached a device executor: placement is predicted to leave
+    // none, and the arena must exist for the count to mean that (before its first publish a zero is
+    // zero by construction). G0 reads this total, and its voiding rule voids G1-G5 when it is not 0.
+    if (arena_active()) {
+        // The key is `<file>:<function>`: two callers in one file (the mul_mat stream and the MoE expert
+        // stream are both in ggml-sycl.cpp) stay apart. A name that overflows the key is truncated.
+        char caller_key[k_dump_key_len];
+        std::snprintf(caller_key, sizeof(caller_key), "%s:%s", dump_site_basename(caller_file),
+                      caller_func != nullptr ? caller_func : "-");
+        unified_cache_dump_counter_add_key(dump_counter::stream_dma_non_device_arrivals,
+                                           ggml_sycl_get_device_id_from_queue(queue_), caller_key);
     }
 
     if (src.location == cache_location::HOST_MMAP) {
@@ -15274,6 +17682,907 @@ unified_cache * get_existing_unified_cache_for_device(int device_id) {
     return get_existing_cache_for_device(device_id);
 }
 
+// llama.cpp-wfsl: the cache whose queue_ every host task of this process has been submitted on so far, or null
+// before the first; and whether the MoE join queue is refused for the rest of the process. A join on the join
+// queue waits only the latest host task recorded on that one queue_, so a host task anywhere else could be
+// posted behind a join whose job's inputs wait on it. See unified_cache_moe_join_queue_for().
+static std::atomic<unified_cache *> g_moe_join_queue_owner{ nullptr };
+static std::atomic<bool>            g_moe_join_queue_refused{ false };
+
+// Returns the CPU expert joins to the compute streams for the rest of the process, logging `why` once.
+static void unified_cache_moe_join_queue_refuse(const char * why) {
+    if (!g_moe_join_queue_refused.exchange(true, std::memory_order_acq_rel)) {
+        GGML_LOG_WARN(
+            "[MOE-JOIN-QUEUE] CPU expert joins go on the compute stream for the rest of the process: %s "
+            "(llama.cpp-wfsl)\n",
+            why);
+    }
+}
+
+// The cache whose queue_ is `q`, or null. Creates no cache.
+static unified_cache * moe_join_queue_cache_of(sycl::queue & q) {
+    const int       device = get_effective_mode() == unified_cache_mode::GLOBAL ? 0 : get_device_id_from_queue(q);
+    unified_cache * cache  = get_existing_unified_cache_for_device(device);
+    return cache && cache->get_queue() == q ? cache : nullptr;
+}
+
+// True when every host task so far was on `cache`'s queue_, or there was none, claiming them for it.
+static bool moe_join_queue_claim(unified_cache * cache) {
+    unified_cache * expected = nullptr;
+    return g_moe_join_queue_owner.compare_exchange_strong(expected, cache, std::memory_order_acq_rel) ||
+           expected == cache;
+}
+
+void unified_cache_note_host_task(sycl::queue & q, const sycl::event & e) {
+    if (g_moe_join_queue_refused.load(std::memory_order_acquire)) {
+        return;
+    }
+    // A host task submitted while `q` records is a graph node: no join outside the graph may depend on its event,
+    // and it runs at each replay of the graph, which no record covers.
+    if (q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
+        unified_cache_moe_join_queue_refuse("a host task was recorded into a command graph");
+        return;
+    }
+    unified_cache * cache = moe_join_queue_cache_of(q);
+    if (!cache) {
+        unified_cache_moe_join_queue_refuse(
+            "a host task was submitted on a queue that is not a cache's compute stream");
+        return;
+    }
+    if (!moe_join_queue_claim(cache)) {
+        unified_cache_moe_join_queue_refuse("host tasks were submitted on two devices' compute streams");
+        return;
+    }
+    cache->note_compute_host_task(e);
+}
+
+sycl::queue * unified_cache_moe_join_queue_for(sycl::queue & stream, sycl::event * after, bool * has_after) {
+    if (g_moe_join_queue_refused.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        unified_cache_moe_join_queue_refuse("a CPU expert job's stream is not a cache's compute stream");
+        return nullptr;
+    }
+    if (!moe_join_queue_claim(cache)) {
+        unified_cache_moe_join_queue_refuse("CPU expert jobs or host tasks are on two devices' compute streams");
+        return nullptr;
+    }
+    return cache->moe_join_queue_after(after, has_after);
+}
+
+// --- CPU expert job device signals (llama.cpp-qwn5); see cpu-job-signal.hpp ---
+
+// The Level Zero entry points the ring uses, resolved once from the loader the SYCL runtime has already loaded
+// (RTLD_NOLOAD: no library is loaded here, and ggml-sycl does not link ze_loader), as vmem-kv.cpp does.
+struct cpu_job_signal_l0 {
+    decltype(&zeEventPoolCreate)  pool_create   = nullptr;
+    decltype(&zeEventPoolDestroy) pool_destroy  = nullptr;
+    decltype(&zeEventCreate)      event_create  = nullptr;
+    decltype(&zeEventDestroy)     event_destroy = nullptr;
+    decltype(&zeEventHostSignal)  host_signal   = nullptr;
+    decltype(&zeEventHostReset)   host_reset    = nullptr;
+
+    bool ok() const {
+        return pool_create && pool_destroy && event_create && event_destroy && host_signal && host_reset;
+    }
+};
+
+static const cpu_job_signal_l0 & cpu_job_signal_l0_get() {
+    static const cpu_job_signal_l0 fns = []() {
+        cpu_job_signal_l0 f;
+        void *            lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+        if (!lib) {
+            lib = dlopen("libze_loader.so", RTLD_NOW | RTLD_NOLOAD);
+        }
+        if (!lib) {
+            return f;
+        }
+        f.pool_create   = reinterpret_cast<decltype(&zeEventPoolCreate)>(dlsym(lib, "zeEventPoolCreate"));
+        f.pool_destroy  = reinterpret_cast<decltype(&zeEventPoolDestroy)>(dlsym(lib, "zeEventPoolDestroy"));
+        f.event_create  = reinterpret_cast<decltype(&zeEventCreate)>(dlsym(lib, "zeEventCreate"));
+        f.event_destroy = reinterpret_cast<decltype(&zeEventDestroy)>(dlsym(lib, "zeEventDestroy"));
+        f.host_signal   = reinterpret_cast<decltype(&zeEventHostSignal)>(dlsym(lib, "zeEventHostSignal"));
+        f.host_reset    = reinterpret_cast<decltype(&zeEventHostReset)>(dlsym(lib, "zeEventHostReset"));
+        return f;
+    }();
+    return fns;
+}
+
+static void cpu_job_signal_registry_add(const std::shared_ptr<cpu_job_signal_ring> & ring);
+static void cpu_job_signal_registry_prune();
+
+// One device's events: pools of block_events host-visible events with host signal and wait scopes, on the context of
+// the stream whose device commands wait on them, with the book of what each entry is doing. Every member but gates_ and
+// those fixed at construction (ctx_, zctx_, l0_) is read and written only under mutex_. live_ is false once the ring is
+// shut down or abandoned: no driver call is made after that, and the halves still held only update the book.
+//
+// The job's own signal takes mutex_, so a driver call that may block must not run under it: a host wait on another
+// thread may hold the driver's device lock behind that very job (llama.cpp-42zj). wrap() makes its event, recycle()
+// resets its events and grow() creates a block's pool and events (cpu_job_signal_grow, llama.cpp-q0xu) with mutex_
+// released, each counted in outside_calls_. gates_ holds the futures of the jobs whose events the device waits
+// (cpu_job_gate_list) under its own lock, so a host thread sleeping on one never holds mutex_ and never keeps a job's
+// own signal from taking it.
+class cpu_job_signal_ring {
+  public:
+    static constexpr uint32_t block_events = 64;
+    // A Qwen3.8 decode token takes 72 entries (24 host-expert layers times gate, up and down) and the graph-boundary
+    // drain frees them every graph. Past this many entries something is not recycling; the jobs then take host-task
+    // joins rather than the ring growing without bound.
+    static constexpr uint32_t max_events   = 1024;
+
+    static std::shared_ptr<cpu_job_signal_ring> create(const sycl::queue & q, const char ** why) {
+        const cpu_job_signal_l0 & l0 = cpu_job_signal_l0_get();
+        if (!l0.ok()) {
+            *why = "the Level Zero loader's event entry points are not available";
+            return nullptr;
+        }
+        sycl::context ctx = q.get_context();
+        if (ctx.get_backend() != sycl::backend::ext_oneapi_level_zero) {
+            *why = "the stream is not on the Level Zero backend";
+            return nullptr;
+        }
+        ze_context_handle_t zctx = nullptr;
+        try {
+            zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+        } catch (const sycl::exception &) {
+            zctx = nullptr;
+        }
+        if (!zctx) {
+            *why = "the stream's context has no native Level Zero context";
+            return nullptr;
+        }
+        std::shared_ptr<cpu_job_signal_ring> ring(new cpu_job_signal_ring(std::move(ctx), zctx, l0));
+        {
+            std::unique_lock<std::timed_mutex> lock(ring->mutex_);
+            if (ring->grow(lock) != cpu_job_signal_grow_result::GREW) {
+                ring->live_ = false;
+                *why        = "creating the first host-visible event pool failed";
+                return nullptr;
+            }
+        }
+        cpu_job_signal_registry_add(ring);
+        return ring;
+    }
+
+    cpu_job_signal_ring(const cpu_job_signal_ring &)             = delete;
+    cpu_job_signal_ring & operator=(const cpu_job_signal_ring &) = delete;
+
+    // The last half let go. A cache shuts its ring down before this; a ring that was not (the device test's) is shut
+    // down here unless the SYCL runtime is already going away.
+    ~cpu_job_signal_ring() {
+        if (ggml_sycl_is_shutting_down()) {
+            abandon();
+        } else {
+            shutdown();
+        }
+        cpu_job_signal_registry_prune();
+    }
+
+    // The hot path takes a free entry under mutex_. With none free the ring grows by one block, made with mutex_
+    // released (see the class comment); grow() returns with mutex_ held again and nothing taken since its publish.
+    bool acquire(uint32_t * id, uint32_t * generation) {
+        std::unique_lock<std::timed_mutex> lock(mutex_);
+        if (!live_) {
+            return false;
+        }
+        if (book_.acquire(id, generation)) {
+            return true;
+        }
+        switch (grow(lock)) {
+            case cpu_job_signal_grow_result::GREW:
+                return book_.acquire(id, generation);
+            case cpu_job_signal_grow_result::FULL:
+                if (!full_warned_) {
+                    full_warned_ = true;
+                    GGML_LOG_WARN(
+                        "[MOE-DEVSIG] the CPU expert job signal ring cannot grow past %zu entries; jobs past that are "
+                        "joined by host tasks (llama.cpp-qwn5)\n",
+                        book_.size());
+                }
+                return false;
+            case cpu_job_signal_grow_result::FAILED:
+                // A driver failure, not the cap: the next acquire with no free entry tries to grow again.
+                if (!grow_warned_) {
+                    grow_warned_ = true;
+                    GGML_LOG_WARN(
+                        "[MOE-DEVSIG] creating a block of host-visible events for the CPU expert job signal ring "
+                        "failed at %zu entries; a job that finds no free entry is joined by a host task "
+                        "(llama.cpp-q0xu)\n",
+                        book_.size());
+                }
+                return false;
+            case cpu_job_signal_grow_result::BUSY:
+                // Another thread is making the next block; waiting for it would be a host wait on that driver call.
+                if (!busy_warned_) {
+                    busy_warned_ = true;
+                    GGML_LOG_WARN(
+                        "[MOE-DEVSIG] a CPU expert job found its signal ring growing on another thread; such jobs are "
+                        "joined by host tasks (llama.cpp-q0xu)\n");
+                }
+                return false;
+            case cpu_job_signal_grow_result::GONE:
+                return false;
+        }
+        return false;
+    }
+
+    void signal(uint32_t id, uint32_t generation) noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        if (book_.signal(id, generation) && live_) {
+            signal_native_locked(id);
+        }
+    }
+
+    void drop(uint32_t id, uint32_t generation) noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        book_.drop(id, generation);
+    }
+
+    // *serial is the flush's serial, or 0 for the first wrap of a flush, which takes a new one. The event is made with
+    // mutex_ released (see the class comment); the caller's live slot half keeps the entry from being recycled meanwhile.
+    bool wrap(uint32_t id, uint32_t generation, uint64_t * serial, sycl::event * out) {
+        ze_event_handle_t native = nullptr;
+        {
+            std::lock_guard<std::timed_mutex> lock(mutex_);
+            if (!live_ || id >= book_.size()) {
+                return false;
+            }
+            const cpu_job_signal_book::entry & e = book_.at(id);
+            if (e.generation != generation || !e.ref_live) {
+                return false;
+            }
+            native = events_[id];
+            outside_calls_ += 1;
+        }
+        sycl::event ev;
+        std::string failure;
+        bool        made = false;
+        try {
+            ev = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
+                { native, sycl::ext::oneapi::level_zero::ownership::keep }, *ctx_);
+            made = true;
+        } catch (const sycl::exception & ex) {
+            failure = ex.what();
+        }
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        outside_calls_ -= 1;
+        if (!made) {
+            if (!wrap_warned_) {
+                wrap_warned_ = true;
+                GGML_LOG_WARN(
+                    "[MOE-DEVSIG] wrapping a CPU expert job's event failed; that job is joined by a host "
+                    "task: %s (llama.cpp-qwn5)\n",
+                    failure.c_str());
+            }
+            return false;
+        }
+        if (!live_) {
+            return false;
+        }
+        const uint64_t s = *serial != 0 ? *serial : book_.begin_flush();
+        if (!book_.consume(id, generation, s)) {
+            return false;
+        }
+        *serial = s;
+        *out    = std::move(ev);
+        return true;
+    }
+
+    // The native resets run with mutex_ released (see the class comment); the book holds the entries RESETTING
+    // meanwhile, so no other recycle or acquire takes them.
+    size_t recycle(uint64_t upto) noexcept {
+        std::vector<uint32_t>          ids;
+        std::vector<ze_event_handle_t> natives;
+        {
+            std::lock_guard<std::timed_mutex> lock(mutex_);
+            if (book_.recycle_begin(upto, &ids) == 0) {
+                return 0;
+            }
+            if (!live_) {
+                // Shut down: no driver call, the entries only go back to the book.
+                size_t n = 0;
+                for (uint32_t id : ids) {
+                    n += book_.recycle_finish(id, true) ? 1 : 0;
+                }
+                return n;
+            }
+            for (uint32_t id : ids) {
+                natives.push_back(events_[id]);
+            }
+            outside_calls_ += 1;
+        }
+        std::vector<ze_result_t> results(natives.size(), ZE_RESULT_SUCCESS);
+        for (size_t i = 0; i < natives.size(); ++i) {
+            results[i] = l0_->host_reset(natives[i]);
+        }
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        outside_calls_ -= 1;
+        size_t n = 0;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const bool reset = results[i] == ZE_RESULT_SUCCESS;
+            if (!reset && !reset_warned_) {
+                reset_warned_ = true;
+                GGML_LOG_ERROR(
+                    "[MOE-DEVSIG] zeEventHostReset failed (%d); the entry is retired rather than reused signalled, "
+                    "which would let the next job's scatter read its outputs early (llama.cpp-qwn5)\n",
+                    (int) results[i]);
+            }
+            n += book_.recycle_finish(ids[i], reset) ? 1 : 0;
+        }
+        return n;
+    }
+
+    // Bounded lock: this runs from the abort callback, possibly on a thread that already holds mutex_.
+    size_t signal_all() noexcept {
+        std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+        if (!lock.try_lock_for(std::chrono::milliseconds(200))) {
+            return 0;
+        }
+        return book_.signal_all([this](uint32_t id) {
+            if (live_) {
+                signal_native_locked(id);
+            }
+        });
+    }
+
+    // After the cache's queues drained, no device command waits on an entry. Signals what is still acquired (a job
+    // that has not run releases nothing then), destroys the driver objects and keeps only the book. Idempotent. A wrap
+    // or a recycle still in a driver call with mutex_ released holds some of those objects, so then they are left to
+    // the process exit, as abandon() leaves them. So are they while a growth makes a block outside mutex_, and so is
+    // that block, which the growth's publish then refuses.
+    void shutdown() noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        if (!live_) {
+            return;
+        }
+        book_.signal_all([this](uint32_t id) { signal_native_locked(id); });
+        if (outside_calls_ == 0) {
+            for (ze_event_handle_t ev : events_) {
+                (void) l0_->event_destroy(ev);
+            }
+            for (ze_event_pool_handle_t pool : pools_) {
+                (void) l0_->pool_destroy(pool);
+            }
+        } else {
+            GGML_LOG_WARN(
+                "[MOE-DEVSIG] the CPU expert job signal ring was shut down while %u of its driver calls ran outside "
+                "its lock; its %zu events are left to the process exit (llama.cpp-42zj)\n",
+                outside_calls_, events_.size());
+        }
+        events_.clear();
+        pools_.clear();
+        live_ = false;
+        gates_.clear();
+    }
+
+    // The SYCL runtime is gone: no driver call, the handles are left to the process exit.
+    void abandon() noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        events_.clear();
+        pools_.clear();
+        live_ = false;
+        gates_.clear();
+    }
+
+    cpu_job_signal_book::counts counts() {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        return book_.count();
+    }
+
+    // Not under mutex_: the list has its own lock (see the class comment).
+    cpu_job_gate_list & gates() { return gates_; }
+
+  private:
+    cpu_job_signal_ring(sycl::context ctx, ze_context_handle_t zctx, const cpu_job_signal_l0 & l0) :
+        ctx_(std::move(ctx)),
+        zctx_(zctx),
+        l0_(&l0) {}
+
+    // The release fence orders the job's host writes before the device can observe the signal.
+    void signal_native_locked(uint32_t id) noexcept {
+        std::atomic_thread_fence(std::memory_order_release);
+        const ze_result_t r = l0_->host_signal(events_[id]);
+        if (r != ZE_RESULT_SUCCESS && !signal_warned_) {
+            signal_warned_ = true;
+            GGML_LOG_ERROR(
+                "[MOE-DEVSIG] zeEventHostSignal failed (%d): a device command waiting on this CPU expert job stays "
+                "parked (llama.cpp-qwn5)\n",
+                (int) r);
+        }
+    }
+
+    // Grows the ring by one block of block_events entries, up to max_events, through cpu_job_signal_grow: the pool and
+    // its events are created with mutex_ released and counted in outside_calls_, and published under it. `lock` holds
+    // mutex_ on entry and on return. zctx_ and l0_ are fixed at construction, so the creation reads them unlocked.
+    cpu_job_signal_grow_result grow(std::unique_lock<std::timed_mutex> & lock) {
+        // The room a publish needs, reserved under mutex_ before the growth, so the publish cannot throw. Only a
+        // publish adds to these vectors, and one growth is in flight at a time; shutdown()'s clear() keeps the
+        // capacity.
+        pools_.reserve(pools_.size() + 1);
+        events_.reserve(events_.size() + block_events);
+        ze_event_pool_handle_t         pool = nullptr;
+        std::vector<ze_event_handle_t> made;
+        return cpu_job_signal_grow(
+            lock, book_, &outside_calls_, block_events, max_events,
+            [this, &pool, &made]() {
+                made.reserve(block_events);
+                ze_event_pool_desc_t pd{};
+                pd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+                pd.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+                pd.count = block_events;
+                if (l0_->pool_create(zctx_, &pd, 0, nullptr, &pool) != ZE_RESULT_SUCCESS || !pool) {
+                    return false;
+                }
+                for (uint32_t i = 0; i < block_events; ++i) {
+                    ze_event_desc_t ed{};
+                    ed.stype             = ZE_STRUCTURE_TYPE_EVENT_DESC;
+                    ed.index             = i;
+                    ed.signal            = ZE_EVENT_SCOPE_FLAG_HOST;
+                    ed.wait              = ZE_EVENT_SCOPE_FLAG_HOST;
+                    ze_event_handle_t ev = nullptr;
+                    if (l0_->event_create(pool, &ed, &ev) != ZE_RESULT_SUCCESS || !ev) {
+                        // No one else knows this block yet, so it is destroyed here, still with mutex_ released.
+                        for (ze_event_handle_t m : made) {
+                            (void) l0_->event_destroy(m);
+                        }
+                        (void) l0_->pool_destroy(pool);
+                        return false;
+                    }
+                    made.push_back(ev);
+                }
+                return true;
+            },
+            [this, &pool, &made]() {
+                if (!live_) {
+                    // Shut down or abandoned meanwhile: no driver call, the block is left to the process exit.
+                    return false;
+                }
+                pools_.push_back(pool);
+                events_.insert(events_.end(), made.begin(), made.end());
+                return true;
+            });
+    }
+
+    std::timed_mutex                    mutex_;
+    cpu_job_signal_book                 book_;
+    std::vector<ze_event_pool_handle_t> pools_;
+    std::vector<ze_event_handle_t>      events_;  // index = book entry
+    std::optional<sycl::context>        ctx_;
+    ze_context_handle_t                 zctx_          = nullptr;
+    const cpu_job_signal_l0 *           l0_            = nullptr;
+    bool                                live_          = true;
+    bool                                full_warned_   = false;
+    bool                                busy_warned_   = false;
+    bool                                grow_warned_   = false;
+    bool                                wrap_warned_   = false;
+    bool                                reset_warned_  = false;
+    bool                                signal_warned_ = false;
+    uint32_t                            outside_calls_ = 0;  // wraps, recycles, growths in a driver call, unlocked
+    cpu_job_gate_list                   gates_;
+};
+
+// One gate per wrapped entry, and a recycle clears its entries' gates: at most max_events gates, so the list never
+// drops one a host wait still needs (llama.cpp-42zj).
+static_assert(cpu_job_gate_list::max_gates >= cpu_job_signal_ring::max_events,
+              "a gate list must hold a gate for every entry its ring can have in use");
+
+// The live rings, for cpu_job_signal_signal_all(), and the ggml abort callback they install. Made once and never
+// destroyed: a ring can be released during static destruction (a CPU expert pool, a static of ggml-sycl.cpp, can still
+// hold a job's half then), after this TU's statics would be gone.
+struct cpu_job_signal_registry {
+    std::timed_mutex                                mutex;
+    std::vector<std::weak_ptr<cpu_job_signal_ring>> rings;
+    std::atomic<ggml_abort_callback_t>              previous{ nullptr };
+    bool                                            installed = false;
+};
+
+static cpu_job_signal_registry & cpu_job_signal_registry_get() {
+    static cpu_job_signal_registry * registry = new cpu_job_signal_registry();
+    return *registry;
+}
+
+// GGML_ABORT and GGML_ASSERT end the process with abort(), and no destructor runs: release every device command
+// parked on a CPU expert job first, then do what the abort would have done without this callback.
+static void cpu_job_signal_abort_callback(const char * message) {
+    cpu_job_signal_signal_all();
+    const ggml_abort_callback_t previous = cpu_job_signal_registry_get().previous.load(std::memory_order_acquire);
+    if (previous) {
+        previous(message);
+    } else {
+        fprintf(stderr, "%s\n", message);
+        ggml_print_backtrace();
+    }
+}
+
+static void cpu_job_signal_registry_add(const std::shared_ptr<cpu_job_signal_ring> & ring) {
+    cpu_job_signal_registry &         r = cpu_job_signal_registry_get();
+    std::lock_guard<std::timed_mutex> lock(r.mutex);
+    r.rings.push_back(ring);
+    if (!r.installed) {
+        r.previous.store(ggml_set_abort_callback(cpu_job_signal_abort_callback), std::memory_order_release);
+        r.installed = true;
+    }
+}
+
+// Drops the expired rings. With none left, puts the previous abort callback back, unless something replaced this
+// one meanwhile: then that one stays, so the library can be unloaded with no callback of its own installed only when
+// nothing else took over.
+static void cpu_job_signal_registry_prune() {
+    cpu_job_signal_registry &         r = cpu_job_signal_registry_get();
+    std::lock_guard<std::timed_mutex> lock(r.mutex);
+    r.rings.erase(std::remove_if(r.rings.begin(), r.rings.end(),
+                                 [](const std::weak_ptr<cpu_job_signal_ring> & w) { return w.expired(); }),
+                  r.rings.end());
+    if (r.rings.empty() && r.installed) {
+        const ggml_abort_callback_t current = ggml_set_abort_callback(r.previous.load(std::memory_order_acquire));
+        if (current != cpu_job_signal_abort_callback) {
+            (void) ggml_set_abort_callback(current);
+        }
+        r.installed = false;
+    }
+}
+
+void cpu_job_signal_signal_all() noexcept {
+    cpu_job_signal_registry &          r = cpu_job_signal_registry_get();
+    std::unique_lock<std::timed_mutex> lock(r.mutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(200))) {
+        return;
+    }
+    // Released after the registry lock: dropping the last owner of a ring prunes the registry under that lock.
+    std::vector<std::shared_ptr<cpu_job_signal_ring>> live;
+    live.reserve(r.rings.size());
+    for (const std::weak_ptr<cpu_job_signal_ring> & w : r.rings) {
+        if (std::shared_ptr<cpu_job_signal_ring> ring = w.lock()) {
+            live.push_back(std::move(ring));
+        }
+    }
+    lock.unlock();
+    for (const std::shared_ptr<cpu_job_signal_ring> & ring : live) {
+        (void) ring->signal_all();
+    }
+}
+
+std::vector<std::shared_future<void>> cpu_job_signal_gates_outstanding() {
+    cpu_job_signal_registry & r = cpu_job_signal_registry_get();
+
+    // Released after the registry lock: dropping the last owner of a ring prunes the registry under that lock. A cache
+    // shuts its ring down before it lets go of it, so a last owner dropped here makes no driver call.
+    std::vector<std::shared_ptr<cpu_job_signal_ring>> live;
+    {
+        std::lock_guard<std::timed_mutex> lock(r.mutex);
+        live.reserve(r.rings.size());
+        for (const std::weak_ptr<cpu_job_signal_ring> & w : r.rings) {
+            if (std::shared_ptr<cpu_job_signal_ring> ring = w.lock()) {
+                live.push_back(std::move(ring));
+            }
+        }
+    }
+    std::vector<std::shared_future<void>> gates;
+    for (const std::shared_ptr<cpu_job_signal_ring> & ring : live) {
+        ring->gates().append_outstanding(&gates);
+    }
+    return gates;
+}
+
+static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept {
+    if (!ring) {
+        return;
+    }
+    if (sycl_gone) {
+        ring->abandon();
+    } else {
+        ring->shutdown();
+    }
+}
+
+void cpu_job_signal::signal() noexcept {
+    if (ring_) {
+        ring_->signal(id_, generation_);
+        ring_.reset();
+    }
+}
+
+void cpu_job_signal_ref::reset() noexcept {
+    if (ring_) {
+        ring_->drop(id_, generation_);
+        ring_.reset();
+    }
+}
+
+std::shared_ptr<cpu_job_signal_ring> unified_cache::get_cpu_job_signal_ring() {
+    std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+    if (!cpu_job_signal_ring_tried_) {
+        cpu_job_signal_ring_tried_ = true;
+        const char * why           = "unknown";
+        cpu_job_signal_ring_       = cpu_job_signal_ring::create(queue_, &why);
+        if (cpu_job_signal_ring_) {
+            GGML_LOG_INFO(
+                "[MOE-DEVSIG] CPU expert jobs release the device with host-signalled events on device %d "
+                "(llama.cpp-qwn5)\n",
+                get_device_id_from_queue(queue_));
+        } else {
+            GGML_LOG_WARN("[MOE-DEVSIG] CPU expert jobs keep their host-task joins on device %d: %s (llama.cpp-qwn5)\n",
+                          get_device_id_from_queue(queue_), why);
+        }
+    }
+    return cpu_job_signal_ring_;
+}
+
+std::shared_ptr<cpu_job_signal_ring> unified_cache::existing_cpu_job_signal_ring() {
+    std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+    return cpu_job_signal_ring_;
+}
+
+// Set once a CPU expert job asked for a ring on a stream that is not a cache's queue_; that is logged once.
+static std::atomic<bool> g_cpu_job_signal_foreign_stream_logged{ false };
+
+bool unified_cache_cpu_job_signal_acquire(sycl::queue & stream, cpu_job_signal * job, cpu_job_signal_ref * ref) {
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        if (!g_cpu_job_signal_foreign_stream_logged.exchange(true, std::memory_order_acq_rel)) {
+            GGML_LOG_WARN(
+                "[MOE-DEVSIG] a CPU expert job's stream is not a cache's compute stream; such jobs are joined by host "
+                "tasks (llama.cpp-qwn5)\n");
+        }
+        return false;
+    }
+    std::shared_ptr<cpu_job_signal_ring> ring = cache->get_cpu_job_signal_ring();
+    uint32_t                             id   = 0;
+    uint32_t                             gen  = 0;
+    if (!ring || !ring->acquire(&id, &gen)) {
+        return false;
+    }
+    *job = cpu_job_signal(ring, id, gen);
+    *ref = cpu_job_signal_ref(std::move(ring), id, gen);
+    return true;
+}
+
+bool cpu_job_signal_wrap(cpu_job_signal_ref & ref, cpu_job_signal_mark & mark, sycl::event * out) {
+    if (!ref || (mark.ring && mark.ring != ref.ring())) {
+        return false;
+    }
+    uint64_t serial = mark.ring ? mark.serial : 0;
+    if (!ref.ring()->wrap(ref.id(), ref.generation(), &serial, out)) {
+        return false;
+    }
+    mark.ring   = ref.ring();
+    mark.serial = serial;
+    ref.release();
+    return true;
+}
+
+void cpu_job_signal_recycle(cpu_job_signal_mark & mark) noexcept {
+    if (mark) {
+        (void) mark.ring->recycle(mark.serial);
+        // The boundary slept on these gates before it waited the flush's events (pending_cpu_scatter_wait_prev_events).
+        mark.ring->gates().clear_upto(mark.gate_serial);
+    }
+    mark = cpu_job_signal_mark{};
+}
+
+void cpu_job_signal_gate_push(cpu_job_signal_mark & mark, std::shared_future<void> gate) {
+    if (!mark) {
+        return;
+    }
+    const uint64_t serial = mark.ring->gates().push(std::move(gate));
+    if (serial != 0) {
+        mark.gate_serial = serial;
+    }
+}
+
+std::shared_ptr<cpu_job_gate_list> cpu_job_signal_gates(const cpu_job_signal_mark & mark) {
+    if (!mark.ring) {
+        return nullptr;
+    }
+    return std::shared_ptr<cpu_job_gate_list>(mark.ring, &mark.ring->gates());
+}
+
+std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & stream) {
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        return nullptr;
+    }
+    std::shared_ptr<cpu_job_signal_ring> ring = cache->existing_cpu_job_signal_ring();
+    if (!ring) {
+        return nullptr;
+    }
+    return std::shared_ptr<cpu_job_gate_list>(ring, &ring->gates());
+}
+
+// --- CPU expert job input markers (llama.cpp-42zj); see cpu-job-signal.hpp ---
+
+// The marker's device task: once every event in `after` has completed (and, on the in-order `q`, every command
+// submitted before it), it makes the device's earlier writes visible to the host and stores `serial` into `word`.
+// Discrete BMG has no host-USM atomics, so the store is a plain one after a system-scope release fence, and the host
+// reads it with an acquire load. Throws what submit throws.
+static void cpu_job_input_marker_submit(sycl::queue &                    q,
+                                        uint32_t *                       word,
+                                        uint32_t                         serial,
+                                        const std::vector<sycl::event> & after) {
+    q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(after);
+        cgh.single_task([word, serial]() {
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            *word = serial;
+        });
+    });
+}
+
+// A job still waiting on the word stops, and the cache's allocation is released here, on the tearing-down thread. The
+// jobs keep only the view and the flag, and hold no handle, so the word is abandoned first: no waiter's load of it can
+// follow the release (cpu_job_input_marker_abandon).
+static void cpu_job_input_marker_end(std::shared_ptr<cpu_job_input_marker_word> & word, mem_handle & owner) noexcept {
+    if (word) {
+        cpu_job_input_marker_abandon(*word);
+        word.reset();
+    }
+    owner = {};
+}
+
+// The word's slow-wait report (cpu_job_input_marker_word::slow): one WARN, on the pool worker, and no driver call.
+// A job is named by its marker's serial, which is unique on its device.
+static void cpu_job_input_marker_report_slow(const cpu_job_input_marker_word & w, uint32_t serial, double waited_s) {
+    GGML_LOG_WARN(
+        "[MOE-INPUT-MARKER] CPU expert job %u on device %d has waited %.0f s for its inputs' marker; the SYCL watchdog "
+        "fires if it never arrives, and with GGML_SYCL_OP_TIMEOUT_MS=0 the job spins on one core until it does "
+        "(llama.cpp-42zj)\n",
+        serial, w.device, waited_s);
+}
+
+// The word's creation report, made by the arm that made it (w is that word) once the arm has released
+// cpu_job_input_marker_mutex_: a log callback may take a lock of its own, and an arm on another thread would wait on it
+// behind the mutex. Null when the arm made no word.
+static void cpu_job_input_marker_report_made(const cpu_job_input_marker_word * w) {
+    if (w) {
+        GGML_LOG_INFO(
+            "[MOE-INPUT-MARKER] CPU expert jobs wait their inputs on a device-written word on device %d "
+            "(llama.cpp-42zj)\n",
+            w->device);
+    }
+}
+
+// Set by the first input marker whose submit threw, in any cache: that throw is logged, the later ones are not.
+static std::atomic<bool> g_cpu_job_input_marker_submit_threw_logged{ false };
+
+bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
+                                             cpu_job_input_marker *           out,
+                                             cpu_job_input_marker_refusal *   why) {
+    std::unique_lock<std::mutex> lock(cpu_job_input_marker_mutex_);
+    // The word this arm makes, if it makes one, reported once the mutex is released.
+    std::shared_ptr<cpu_job_input_marker_word> made;
+    if (!cpu_job_input_marker_word_) {
+        if (cpu_job_input_marker_tried_) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NO_WORD;
+            return false;
+        }
+        cpu_job_input_marker_tried_ = true;
+        if (!queue_.has_property<sycl::property::queue::in_order>()) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_IN_ORDER;
+            return false;
+        }
+        const int     device = get_device_id_from_queue(queue_);
+        alloc_request req{};
+        req.queue                               = &queue_;
+        req.device                              = device;
+        // A cache line of its own: the device's write shares it with no host data.
+        req.size                                = 64;
+        req.intent.role                         = alloc_role::CONTROL;
+        req.intent.category                     = runtime_category::CONTROL;
+        req.intent.cohort_id                    = "cpu_job_input_marker";
+        req.intent.constraints.must_host_pinned = true;
+        // The word lives as long as the cache, so it must not sit in a host zone every graph boundary checks for
+        // emptiness (llama.cpp-nqbe).
+        req.intent.constraints.persistent_owner = true;
+        allocation_result allocation            = unified_allocate_owner(req);
+        if (!allocation) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED;
+            return false;
+        }
+        mem_handle owner    = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = owner.resolve(device);
+        if (!resolved.ptr || resolved.on_device) {
+            *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_HOST;
+            return false;
+        }
+        // The word is zeroed before any arm: a reused block may hold any value, and one at or past a serial would
+        // release that job before its inputs land.
+        auto word                   = std::make_shared<cpu_job_input_marker_word>();
+        word->ptr                   = static_cast<uint32_t *>(resolved.ptr);
+        word->device                = device;
+        word->slow                  = cpu_job_input_marker_report_slow;
+        *word->ptr                  = 0;
+        made                        = word;
+        cpu_job_input_marker_owner_ = std::move(owner);
+        cpu_job_input_marker_word_  = std::move(word);
+    }
+    const uint32_t serial = cpu_job_input_marker_serial_ + 1;
+    try {
+        cpu_job_input_marker_submit(queue_, cpu_job_input_marker_word_->ptr, serial, after);
+    } catch (const sycl::exception & e) {
+        // Logged with the mutex released, so an arm on another thread does not wait on the log's lock, and once per
+        // process: a stream that throws once throws on every job.
+        lock.unlock();
+        cpu_job_input_marker_report_made(made.get());
+        if (!g_cpu_job_input_marker_submit_threw_logged.exchange(true, std::memory_order_acq_rel)) {
+            GGML_LOG_WARN(
+                "[MOE-INPUT-MARKER] submitting a CPU expert job's input marker threw: %s; later throws are not "
+                "logged (llama.cpp-42zj)\n",
+                e.what());
+        }
+        *why = CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW;
+        return false;
+    }
+    cpu_job_input_marker_serial_ = serial;
+    out->word                    = cpu_job_input_marker_word_;
+    out->serial                  = serial;
+    lock.unlock();
+    cpu_job_input_marker_report_made(made.get());
+    return true;
+}
+
+bool unified_cache_cpu_job_input_marker_arm(sycl::queue &                    stream,
+                                            const std::vector<sycl::event> & after,
+                                            cpu_job_input_marker *           out,
+                                            cpu_job_input_marker_refusal *   why) {
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        *why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_CACHE_STREAM;
+        return false;
+    }
+    return cache->arm_cpu_job_input_marker(after, out, why);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+bool cpu_job_input_marker_arm_for_testing(sycl::queue &                                      q,
+                                          const std::shared_ptr<cpu_job_input_marker_word> & word,
+                                          uint32_t                                           serial,
+                                          const std::vector<sycl::event> &                   after,
+                                          cpu_job_input_marker *                             out) {
+    try {
+        cpu_job_input_marker_submit(q, word->ptr, serial, after);
+    } catch (const sycl::exception &) {
+        return false;
+    }
+    out->word   = word;
+    out->serial = serial;
+    return true;
+}
+
+std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_create_for_testing(sycl::queue & q) {
+    const char * why = "unknown";
+    auto         r   = cpu_job_signal_ring::create(q, &why);
+    if (!r) {
+        GGML_LOG_WARN("[MOE-DEVSIG] test ring not created: %s\n", why);
+    }
+    return r;
+}
+
+bool cpu_job_signal_acquire_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring,
+                                        cpu_job_signal *                             job,
+                                        cpu_job_signal_ref *                         ref) {
+    uint32_t id  = 0;
+    uint32_t gen = 0;
+    if (!ring || !ring->acquire(&id, &gen)) {
+        return false;
+    }
+    *job = cpu_job_signal(ring, id, gen);
+    *ref = cpu_job_signal_ref(ring, id, gen);
+    return true;
+}
+
+cpu_job_signal_book::counts cpu_job_signal_ring_counts_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring) {
+    return ring ? ring->counts() : cpu_job_signal_book::counts{};
+}
+
+void cpu_job_signal_ring_shutdown_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring) {
+    if (ring) {
+        ring->shutdown();
+    }
+}
+#endif
+
 // Direct arena zone query — caller MUST hold g_cache_rw_mutex.
 // Accesses g_device_caches without re-acquiring the lock.
 static size_t arena_non_weight_used_locked(int device_id) {
@@ -15634,6 +18943,39 @@ unified_cache * get_unified_cache_for_device(int    device_id,
     return get_unified_cache_for_device_impl(device_id, &hint);
 }
 
+ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device) {
+    unified_cache * cache = get_unified_cache_for_device(device);
+    if (cache == nullptr) {
+        GGML_LOG_ERROR("[VM-PLAN-BUG] ggml_sycl_arena_backing read with no cache for device %d\n", device);
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[VM-PLAN-BUG] ggml_sycl_arena_backing read with no cache for device %d", device);
+        }
+        return GGML_SYCL_ARENA_BACKING_TYPE_NONE;
+    }
+    return cache->arena_backing();
+}
+
+size_t ggml_sycl_compute_arena_bytes(int device) {
+    (void) device;
+    // Read on every call, not latched: the model-load reservation and the chunk
+    // cap's probe set both come through here, and a test moves the variable
+    // between loads.  GGML_SYCL_COMPUTE_ARENA_MB=0 turns the reservation off, and
+    // then the probe's scratch is 0 as well.
+    size_t       mb  = 512;
+    const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    if (env != nullptr) {
+        mb = static_cast<size_t>(std::max(0, std::atoi(env)));
+    }
+    return mb * 1024ULL * 1024ULL;
+}
+
+bool ggml_sycl_device_has_zones(int device) {
+    // Never creates: a device with no cache (before its lazy creation, during
+    // shutdown, after destruction) has no zones.
+    unified_cache * cache = get_existing_cache_for_device(device);
+    return cache != nullptr && cache->zone_backed();
+}
+
 void set_unified_cache_budget(size_t bytes) {
     std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
     if (g_cache_mode_locked) {
@@ -15986,6 +19328,40 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
     return total;
 }
 
+// The host zone a zone-managed host-pinned request lands in, by its owner's lifetime. KV spills and KV go to KV.
+// Owners that outlive a graph go to WEIGHT, which host_zone_settle() never sweeps: permanent weight data, persistent
+// host-compute owners, expert-cache pools, and any request that declares a persistent owner
+// (alloc_constraints::persistent_owner, llama.cpp-nqbe). Transient EXPERT_STAGING goes to SCRATCH and must be released
+// by its scoped smart-handle owner before the graph boundary. Everything else goes to STAGING, which must be empty at
+// every graph boundary. The KV and EXPERT_STAGING choices come first, so a persistent owner with either role would never
+// reach WEIGHT: that combination is asserted against rather than routed.
+//
+// Role decides before category: role == EXPERT_STAGING must route to SCRATCH even when category == HOST_COMPUTE
+// (e.g. a MoE CPU fallback's expert staging slab, which is both). The WEIGHT branch's category disjuncts were added to
+// route persistent host-compute/expert-cache owners to WEIGHT (9a0670712), but being checked first meant they shadowed
+// EXPERT_STAGING's role for any request that also carried HOST_COMPUTE/EXPERT_CACHE, silently overriding the "must be
+// released by scoped smart-handle owners before reset" contract above with a zone that is *not* swept by
+// host_zone_settle() -- llama.cpp-0igs / llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
+static host_zone_id unified_alloc_host_zone(const alloc_request & req,
+                                            runtime_category      cat,
+                                            bool                  kv_spill_to_host) noexcept {
+    // persistent_owner is a lifetime claim, not a routing preference. WEIGHT is the one host zone that holds an owner
+    // outliving every graph, so a persistent request that would land in KV or SCRATCH is a defect.
+    GGML_ASSERT(!req.intent.constraints.persistent_owner || (!kv_spill_to_host && req.intent.role != alloc_role::KV &&
+                                                             req.intent.role != alloc_role::EXPERT_STAGING));
+    if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
+        return host_zone_id::KV;
+    }
+    if (req.intent.role == alloc_role::EXPERT_STAGING) {
+        return host_zone_id::SCRATCH;
+    }
+    if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
+        cat == runtime_category::EXPERT_CACHE || req.intent.constraints.persistent_owner) {
+        return host_zone_id::WEIGHT;
+    }
+    return host_zone_id::STAGING;
+}
+
 bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // Non-null only for the narrow allocator-internal owner adapter. Broad
     // legacy callers continue to receive alloc_handle without gaining a way to
@@ -16334,6 +19710,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // ever ran, not that one failed -- forbid_vram_zone_spill
                 // must not fire on that case.
                 if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {
+                    unified_cache_zone_refusal(req, zid, alloc_size, cache);
                     return false;
                 }
             }
@@ -16382,18 +19759,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             }
         }
         if (!ptr && !kv_spill_to_host) {
+            // The raw exit prints and counts itself; this scope hands it the
+            // request that caused it (see unified_cache_raw_malloc_device).
+            ext_alloc_request_scope raw_exit_request(&req);
             ptr = unified_cache_malloc_device_tracked(alloc_size, *req.queue, "unified_alloc:device");
-            if (ptr && ext_alloc_trace_enabled()) {
-                static std::atomic<size_t> total_external_bytes{ 0 };
-                const size_t               total_now =
-                    total_external_bytes.fetch_add(alloc_size, std::memory_order_relaxed) + alloc_size;
-                fprintf(stderr,
-                        "[EXT-ALLOC] device=%d bytes=%zu cohort=%s role=%d category=%d prefer_vram_zone=%d "
-                        "total_external=%zu\n",
-                        req.device, alloc_size, req.intent.cohort_id ? req.intent.cohort_id : "?",
-                        static_cast<int>(req.intent.role), static_cast<int>(req.intent.category),
-                        static_cast<int>(req.intent.constraints.prefer_vram_zone), total_now);
-            }
         }
         // KV arena spill: redirect to host-pinned path.
         if (!ptr && kv_spill_to_host) {
@@ -16417,37 +19786,6 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         auto * ucache =
             !req.intent.constraints.require_host_usm_base ? get_unified_cache_for_device(req.device) : nullptr;
         if (!ptr && ucache) {
-            // Route to the correct host zone based on lifetime. KV spills go to
-            // KV; permanent weight data, persistent host-compute owners, and
-            // expert-cache pools go to WEIGHT so graph-boundary STAGING/SCRATCH
-            // resets cannot reclaim live owners. Transient EXPERT_STAGING
-            // remains SCRATCH and must be released by scoped smart-handle
-            // owners before reset.
-            //
-            // role decides before category: role == EXPERT_STAGING must route
-            // to SCRATCH even when category == HOST_COMPUTE (e.g. a MoE CPU
-            // fallback's expert staging slab, which is both). The WEIGHT
-            // branch's category disjuncts were added to route persistent
-            // host-compute/expert-cache owners to WEIGHT (9a0670712), but
-            // being checked first meant they shadowed EXPERT_STAGING's role
-            // for any request that also carried HOST_COMPUTE/EXPERT_CACHE,
-            // silently overriding the "must be released by scoped smart-
-            // handle owners before reset" contract above with a zone that is
-            // *not* swept by host_zone_settle() -- llama.cpp-0igs /
-            // llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
-            auto select_zone = [&]() {
-                if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
-                    return host_zone_id::KV;
-                }
-                if (req.intent.role == alloc_role::EXPERT_STAGING) {
-                    return host_zone_id::SCRATCH;
-                }
-                if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
-                    cat == runtime_category::EXPERT_CACHE) {
-                    return host_zone_id::WEIGHT;
-                }
-                return host_zone_id::STAGING;
-            };
             // CRITICAL: unified_alloc() must return a pointer whose [ptr, ptr+size)
             // is fully mapped and contiguous in the process address space.
             // `sycl::malloc_host` chunks are NOT guaranteed to be adjacent in
@@ -16517,7 +19855,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     ptr = ucache->host_pool_alloc(
                         alloc_size, req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT);
                 } else {
-                    host_zone_id pool_zone = select_zone();
+                    host_zone_id pool_zone = unified_alloc_host_zone(req, cat, kv_spill_to_host);
                     ptr                    = try_zone_alloc_contiguous(pool_zone);
                     if (ptr) {
                         zone_managed                = true;
@@ -16539,7 +19877,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     uses_pinned_pool = true;
                 }
             } else if (ucache->host_zones_configured()) {
-                host_zone_id zone = select_zone();
+                host_zone_id zone = unified_alloc_host_zone(req, cat, kv_spill_to_host);
                 ptr               = try_zone_alloc_contiguous(zone);
                 zone_managed      = (ptr != nullptr);
                 if (zone_managed) {
@@ -16664,13 +20002,13 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             }
             try {
                 if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
-                    auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+                    auto inserted = runtime_registry_emplace_locked(ptr, rec);
                     if (inserted.second) {
                         try {
                             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = tier;
                             registered = true;
                         } catch (...) {
-                            g_runtime_alloc_registry.erase(inserted.first);
+                            runtime_registry_erase_locked(inserted.first);
                         }
                     }
                 }
@@ -16726,6 +20064,10 @@ bool acquire_offload_buffer(const offload_buffer_request & req_in, offload_buffe
     areq.device = req.device;
     areq.size   = alloc_size;
     areq.intent = req.intent;
+    // The allocator reads the site of the object it receives, so the wrapper reports its
+    // caller's construction (`req` is a copy of `req_in`), never this line.
+    areq.site_file = req_in.site_file;
+    areq.site_line = req_in.site_line;
     if (areq.intent.role == alloc_role::OTHER) {
         areq.intent.role = alloc_role::STAGING;
     }
@@ -17401,7 +20743,7 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         if (binding == bindings.end() || binding->queue == nullptr || bytes == 0) {
             return {};
         }
-        alloc_request request;
+        alloc_request request{};
         request.queue                = binding->queue;
         request.device               = device;
         request.size                 = bytes;
@@ -17538,25 +20880,25 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
 
     const uintptr_t             addr = reinterpret_cast<uintptr_t>(ptr);
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    for (const auto & kv : g_runtime_alloc_registry) {
-        const runtime_alloc_record & rec = kv.second;
-        const alloc_metadata &       h   = rec.handle;
-        if (h.ptr == nullptr || h.size == 0) {
-            continue;
-        }
-        const uintptr_t base = reinterpret_cast<uintptr_t>(h.ptr);
-        if (addr < base || addr >= base + h.size) {
-            continue;
-        }
-        if (out != nullptr) {
-            *out = h;
-        }
-        if (queue_out != nullptr) {
-            *queue_out = rec.queue;
-        }
-        return true;
+    address_range_index::entry  hit;
+    if (!g_runtime_alloc_index.find_innermost(addr, &hit)) {
+        return false;
     }
-    return false;
+    const auto it = g_runtime_alloc_registry.find(hit.key);
+    // Index and registry are kept in step by the emplace/erase/assign helpers, holding g_runtime_alloc_mutex;
+    // if the index found a key that the registry does not have, that is a defect in the mutation helpers.
+    GGML_ASSERT(it != g_runtime_alloc_registry.end());
+    // Backstop for the index's one assumption, that a registered row's geometry never changes: if anything rewrote it
+    // (the source gate is only a tripwire), fail here, loudly, instead of answering from a stale extent.
+    GGML_ASSERT(runtime_registry_row_matches_index_entry(it->second.handle, hit) &&
+                "runtime allocation containment index disagrees with its registry row");
+    if (out != nullptr) {
+        *out = it->second.handle;
+    }
+    if (queue_out != nullptr) {
+        *queue_out = it->second.queue;
+    }
+    return true;
 }
 
 static registered_release_status release_registered_allocation_owned(
@@ -17647,7 +20989,7 @@ static registered_release_status release_registered_allocation_owned(
     if (it != g_runtime_alloc_registry.end() && it->second.handle.key() == detached.handle.key() &&
         it->second.release_generation == detached.release_generation &&
         it->second.state == runtime_alloc_state::RELEASING) {
-        g_runtime_alloc_registry.erase(it);
+        runtime_registry_erase_locked(it);
     }
     return registered_release_status::RELEASED;
 }
@@ -17750,7 +21092,7 @@ bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intr
         rec.ownership = intrusive ? runtime_alloc_ownership::INTRUSIVE : runtime_alloc_ownership::LEGACY;
         rec.test_no_physical_release = true;
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        return g_runtime_alloc_registry.emplace(metadata.ptr, std::move(rec)).second;
+        return runtime_registry_emplace_locked(metadata.ptr, std::move(rec)).second;
     } catch (...) {
         return false;
     }
@@ -17767,6 +21109,139 @@ allocation_result allocation_registry_test_promote(
 bool allocation_registry_test_contains(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     return g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end();
+}
+
+// llama.cpp-ii25: the registry's replace-or-insert helper, which the adopt_raw_* paths publish through: a LIVE device-VRAM
+// row of `bytes` at `ptr`, replacing any row already there. No physical allocation.
+bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::DEVICE_VRAM;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        runtime_registry_assign_locked(ptr, rec);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// llama.cpp-ii25: rewrite a registered row's size WITHOUT telling the index, to prove the lookup's backstop assertion fires.
+bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end() || bytes == 0) {
+        // A zero size would turn the row irregular behind the settle counters (llama.cpp-rriv); no test needs it.
+        return false;
+    }
+    it->second.handle.size = bytes;
+    return true;
+}
+
+bool allocation_registry_test_index_consistent() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_index_consistent_locked();
+}
+
+bool allocation_registry_test_publish_host(void *       ptr,
+                                           int          device,
+                                           size_t       bytes,
+                                           host_zone_id zone,
+                                           bool         releasing) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::HOST_PINNED;
+        rec.handle.host_zone         = zone;
+        rec.handle.zone_managed      = zone != host_zone_id::COUNT;
+        rec.state                    = releasing ? runtime_alloc_state::RELEASING : runtime_alloc_state::LIVE;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return runtime_registry_emplace_locked(ptr, std::move(rec)).second;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool allocation_registry_test_assign_host(void * ptr, int device, size_t bytes, host_zone_id zone) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::HOST_PINNED;
+        rec.handle.host_zone         = zone;
+        rec.handle.zone_managed      = zone != host_zone_id::COUNT;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        runtime_registry_assign_locked(ptr, rec);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool allocation_registry_test_publish_irregular(void * key, void * handle_ptr, size_t bytes) noexcept {
+    if (!key) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = handle_ptr;
+        rec.handle.size              = bytes;
+        rec.handle.tier              = alloc_tier::DEVICE_VRAM;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return runtime_registry_emplace_locked(key, std::move(rec)).second;
+    } catch (...) {
+        return false;
+    }
+}
+
+size_t allocation_registry_test_host_zone_rows(host_zone_id zone) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return static_cast<size_t>(zone) < static_cast<size_t>(host_zone_id::COUNT) ?
+               g_runtime_host_zone_rows[static_cast<size_t>(zone)] :
+               0;
+}
+
+bool allocation_registry_test_host_zone_live(host_zone_id zone) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_host_zone_live_locked(zone);
+}
+
+bool allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_span_live_locked(lo, hi);
+}
+
+size_t allocation_registry_test_span_irregular_rows() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_runtime_span_irregular_rows;
+}
+
+size_t allocation_registry_test_rows_scanned() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_test_registry_rows_scanned;
+}
+
+void allocation_registry_test_reset_rows_scanned() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    g_test_registry_rows_scanned = 0;
 }
 
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept {
@@ -17856,7 +21331,7 @@ bool allocation_registry_test_claim_ptr(void * ptr) noexcept {
 
 void allocation_registry_test_erase(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    g_runtime_alloc_registry.erase(ptr);
+    runtime_registry_erase_locked(ptr);
 }
 
 bool allocation_registry_test_publish_raw(void * ptr,
@@ -17880,7 +21355,7 @@ bool allocation_registry_test_publish_raw(void * ptr,
         rec.state                    = releasing ? runtime_alloc_state::RELEASING : runtime_alloc_state::LIVE;
         rec.test_no_physical_release = true;
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        return g_runtime_alloc_registry.emplace(ptr, std::move(rec)).second;
+        return runtime_registry_emplace_locked(ptr, std::move(rec)).second;
     } catch (...) {
         return false;
     }
@@ -20217,15 +23692,8 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
         row_start > std::numeric_limits<int64_t>::max() - row_count) {
         return nullptr;
     }
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-            break;
-        default:
-            return nullptr;
+    if (!ggml_sycl_soa_reorder_supported_type(type)) {
+        return nullptr;
     }
 
     partial_rows_key key{ tensor_id, device_idx, type, ncols, row_start, row_count };
@@ -20486,6 +23954,48 @@ const weight_entry * unified_cache_lookup_expert(int device_id, ggml_sycl_cache_
 // All consumer code must route through these functions (or higher-level cache APIs).
 // unified-cache.cpp owns raw sycl::malloc_* and sycl::free calls.
 
+// The raw exit's accounting, split from the allocation so a host test can run it without a device:
+// counts, unconditionally, ext_alloc_count (and ext_alloc_arena while the device's arena is active) and, under
+// GGML_SYCL_EXT_ALLOC_TRACE=1, prints one [EXT-ALLOC] line. Lock-free, because the raw layer runs
+// under the cache's own locks.
+void unified_cache_note_raw_exit(int dev, size_t size) noexcept {
+    // Counted at every raw exit, whatever GGML_SYCL_COUNTER_DUMP and GGML_SYCL_EXT_ALLOC_TRACE say:
+    // the variables select the printers, and a fixture that reads the counter without setting either
+    // must see it move. (scripts/check-sycl-counter-dump.py pins that nothing returns before this.)
+    const bool trace = ext_alloc_trace_enabled();
+    const bool arena = dump_dev_valid(dev) && dump_tbl().arena_active[dev].load(std::memory_order_acquire);
+    unified_cache_dump_counter_add(dump_counter::ext_alloc_count, dev);
+    if (arena) {
+        unified_cache_dump_counter_add(dump_counter::ext_alloc_arena, dev);
+    }
+    if (trace) {
+        static std::atomic<size_t> total_external_bytes{ 0 };
+        const size_t               total_now = total_external_bytes.fetch_add(size, std::memory_order_relaxed) + size;
+        const alloc_request *      req       = g_ext_alloc_request;
+        const char *               tag       = g_ext_alloc_tag != nullptr ? g_ext_alloc_tag : "raw";
+        if (req != nullptr) {
+            request_label label;
+            request_label_fill(*req, label);
+            std::fprintf(stderr,
+                         "[EXT-ALLOC] dev=%d arena=%d bytes=%zu tag=%s cohort=%s site=%s role=%d category=%d "
+                         "prefer_vram_zone=%d total_external=%zu\n",
+                         dev, arena ? 1 : 0, size, tag, label.cohort, label.site, static_cast<int>(req->intent.role),
+                         static_cast<int>(req->intent.category),
+                         static_cast<int>(req->intent.constraints.prefer_vram_zone), total_now);
+        } else {
+            // Class (d): a raw exit with no request behind it prints its tag alone.
+            std::fprintf(stderr,
+                         "[EXT-ALLOC] dev=%d arena=%d bytes=%zu tag=%s cohort=- site=-:0 role=-1 category=-1 "
+                         "prefer_vram_zone=-1 total_external=%zu\n",
+                         dev, arena ? 1 : 0, size, tag, total_now);
+        }
+    }
+}
+
+// Every raw device exit except the arena backing passes through here: unified_alloc
+// (through the tracked wrapper), ensure_cached, ensure_cached_alloc and allocate(tag).
+// The arena backing calls sycl_aligned_malloc_device directly and is in neither the
+// line nor the counter.
 void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
     void * ptr = nullptr;
     try {
@@ -20493,6 +24003,22 @@ void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
     } catch (...) {
         return nullptr;
     }
+    if (ptr == nullptr) {
+        return ptr;
+    }
+
+    // The device id is resolved on every raw exit, trace or not. The lookup takes the dpct
+    // device-manager mutexes under whatever cache lock the caller holds; that is acceptable here
+    // (a raw exit is the slow path that already crossed into the driver) and is what lets the
+    // counter be unconditional. It must not throw out of an allocator, so a failure is dev -1,
+    // which the counter table ignores.
+    int dev = -1;
+    try {
+        dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
+    } catch (...) {
+        dev = -1;
+    }
+    unified_cache_note_raw_exit(dev, size);
     return ptr;
 }
 
@@ -20530,7 +24056,8 @@ bool unified_cache_raw_free_device(void * ptr, const sycl::queue & queue) {
 }
 
 static void * unified_cache_malloc_device_tracked(size_t size, const sycl::queue & queue, const char * tag) {
-    void * ptr = unified_cache_raw_malloc_device(size, queue);
+    ext_alloc_tag_scope raw_exit_tag(tag);
+    void *              ptr = unified_cache_raw_malloc_device(size, queue);
     if (!ptr) {
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] malloc_device failed (%zu bytes, %s)\n", size, tag ? tag : "unknown");
         return nullptr;
@@ -20599,7 +24126,7 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     rec.cohort_id        = cohort_id ? cohort_id : "";
 
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    g_runtime_alloc_registry[ptr] = rec;
+    runtime_registry_assign_locked(ptr, rec);
     if (cohort_id && cohort_id[0] != '\0') {
         g_runtime_cohort_tier[cohort_id] = alloc_tier::HOST_PINNED;
     }
@@ -20648,9 +24175,9 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
         if (!dup->second.cohort_id.empty()) {
             g_runtime_cohort_tier.erase(dup->second.cohort_id);
         }
-        g_runtime_alloc_registry.erase(dup);
+        runtime_registry_erase_locked(dup);
     }
-    g_runtime_alloc_registry[ptr] = rec;
+    runtime_registry_assign_locked(ptr, rec);
     if (cohort_id && cohort_id[0] != '\0') {
         g_runtime_cohort_tier[cohort_id] = alloc_tier::DEVICE_VRAM;
     }
@@ -21189,6 +24716,10 @@ bool shutdown_unified_cache() {
         // unregister/free pinned backing exactly once.
         g_device_caches.clear();
         g_cache_mode_locked.store(false, std::memory_order_release);
+        // The join queue's owner was one of these caches, and a refusal was about their streams (llama.cpp-wfsl):
+        // a rebuilt backend starts the join queue's guard afresh rather than keeping a stale owner or refusal.
+        g_moe_join_queue_owner.store(nullptr, std::memory_order_release);
+        g_moe_join_queue_refused.store(false, std::memory_order_release);
     }
     // Cache destruction tears down host_arena_/pinned_chunk_pool while their
     // SYCL queues and single-device contexts are still valid. Only after every
@@ -21572,6 +25103,84 @@ void unified_cache::host_pool_free(void * ptr, size_t size) {
     host_arena_->deallocate(ptr, size);
 }
 
+// What a REFUSED host-zone settle reports: every registry row in `zone`, logged (the first few) and recorded for the zone
+// audit (all of them), plus the oldest epoch among them. Walks the whole registry, so a settle calls it only after
+// runtime_registry_host_zone_live_locked() has said a row exists. Caller holds g_runtime_alloc_mutex.
+static size_t runtime_registry_scan_host_zone_locked(host_zone_id            zone,
+                                                     bool                    log_detail,
+                                                     bool                    epoch_tracked,
+                                                     zone_audit_site_visit & audit,
+                                                     uint64_t &              oldest_epoch) {
+    size_t detail_lines     = 0;
+    size_t live_allocations = 0;
+    for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
+        runtime_registry_note_row_scanned_locked();
+        if (it->second.handle.host_zone == zone) {
+            if (log_detail && detail_lines < 8) {
+                runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
+                detail_lines++;
+            }
+            if (audit.active()) {
+                // The audit collects EVERY live record, uncapped -- the
+                // refusal dump is capped at 4 refusals x 8 lines per
+                // zone, which cannot produce an inventory. Collected here so
+                // it sees exactly what the refusal saw, under the same lock.
+                // Attribution is READ from the handle (post-f9tg), never
+                // re-derived.
+                const alloc_metadata & h = it->second.handle;
+                audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                       static_cast<int>(h.tier), it->second.cohort_id });
+            }
+            if (epoch_tracked) {
+                oldest_epoch = std::min(oldest_epoch, it->second.handle.epoch_id);
+            }
+            live_allocations++;
+        }
+    }
+    return live_allocations;
+}
+
+// What one refused host-zone settle reports, from the count of the zone's earlier refusals.
+struct host_zone_refusal_report {
+    bool log_detail = false;  // name the zone's rows: the first 4 refusals of the zone
+    bool warn       = false;  // print the refusal WARN, with the oldest live epoch: the first 8
+    bool scan       = false;  // enumerate the registry, for either of those or for an active zone audit
+};
+
+// Takes the report of a zone's next refusal and counts it. The per-allocation dump names the owner, which is the
+// diagnostic that matters, but it is one stderr line each and a refusal returns rather than aborting, so it is kept to
+// the first few refusals, and the WARN to a few more. Past both, a refusal reports nothing, so it does not enumerate
+// the registry unless a zone audit wants the inventory (llama.cpp-nqbe). The count stops at the WARN budget: past it
+// the count decides nothing, and one bumped at every graph boundary for the life of the process would wrap.
+static host_zone_refusal_report host_zone_refusal_take(std::atomic<int> & refusals, bool audit_active) noexcept {
+    constexpr int detail_budget = 4;
+    constexpr int warn_budget   = 8;
+    int           index         = refusals.load(std::memory_order_relaxed);
+    if (index < warn_budget) {
+        index = refusals.fetch_add(1, std::memory_order_relaxed);
+    }
+    host_zone_refusal_report report{};
+    report.log_detail = index < detail_budget;
+    report.warn       = index < warn_budget;
+    report.scan       = report.log_detail || report.warn || audit_active;
+    return report;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+host_zone_refusal_census allocation_registry_test_host_zone_refusals(int refusals, bool audit_active) noexcept {
+    std::atomic<int>         count{ 0 };
+    host_zone_refusal_census census{};
+    for (int i = 0; i < refusals; i++) {
+        const host_zone_refusal_report report = host_zone_refusal_take(count, audit_active);
+        census.refusals_named += report.log_detail ? 1 : 0;
+        census.refusals_warning += report.warn ? 1 : 0;
+        census.refusals_scanning += report.scan ? 1 : 0;
+    }
+    census.count = count.load(std::memory_order_relaxed);
+    return census;
+}
+#endif
+
 void unified_cache::host_zone_settle(host_zone_id zone) {
     // Phase 0 escape audit. Declared FIRST, ahead of the reservation
     // early-return just below, so the RAII destructor still records a visit
@@ -21645,41 +25254,23 @@ void unified_cache::host_zone_settle(host_zone_id zone) {
         // zone's first-ever refusal -- and a first occurrence is exactly what has
         // to be visible.  Not hypothetical: STAGING alone reaches 7 refusals in one
         // multi-model run, so it would exhaust a shared budget by itself.
-        static std::atomic<int>     refusal_logs[static_cast<int>(host_zone_id::COUNT)]{};
-        std::atomic<int> &          zone_logs        = refusal_logs[static_cast<int>(zone)];
-        // The per-allocation dump names the owner, which is the diagnostic that
-        // matters -- but it is one stderr line each and this path now returns
-        // instead of aborting, so keep it only for the first few refusals, and
-        // bound it within a single refusal too.
-        const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      detail_lines     = 0;
-        size_t                      live_allocations = 0;
-        uint64_t                    oldest_epoch     = new_epoch;
-        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
-            if (it->second.handle.host_zone == zone) {
-                if (log_detail && detail_lines < 8) {
-                    runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
-                    detail_lines++;
-                }
-                if (audit.active()) {
-                    // The audit collects EVERY live record, uncapped -- the
-                    // refusal dump above is capped at 4 refusals x 8 lines per
-                    // zone, which cannot produce an inventory. Collected here so
-                    // it sees exactly what the refusal saw, under the same lock.
-                    // Attribution is READ from the handle (post-f9tg), never
-                    // re-derived.
-                    const alloc_metadata & h = it->second.handle;
-                    audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
-                                           static_cast<int>(h.tier), it->second.cohort_id });
-                }
-                if (epoch_tracked) {
-                    oldest_epoch = std::min(oldest_epoch, it->second.handle.epoch_id);
-                }
-                live_allocations++;
+        static std::atomic<int> refusal_logs[static_cast<int>(host_zone_id::COUNT)]{};
+        std::atomic<int> &      zone_refusals = refusal_logs[static_cast<int>(zone)];
+        uint64_t                oldest_epoch  = new_epoch;
+        // A clean settle (the normal case: once per graph) is one counter read, and so is a refusal once its
+        // diagnostics are spent. The registry is enumerated only for what a refusal reports (host_zone_refusal_take):
+        // a row that never leaves the zone would otherwise make every graph boundary walk the whole registry under
+        // its mutex, on the submitting thread (llama.cpp-nqbe). The counter is non-zero exactly when the zone has a
+        // row, so the refusal itself needs no enumeration.
+        if (runtime_registry_host_zone_live_locked(zone)) {
+            const host_zone_refusal_report report           = host_zone_refusal_take(zone_refusals, audit.active());
+            // The row count the WARN prints. The scan gives it, and the scan runs whenever the WARN is due.
+            size_t                         live_allocations = 0;
+            if (report.scan) {
+                live_allocations =
+                    runtime_registry_scan_host_zone_locked(zone, report.log_detail, epoch_tracked, audit, oldest_epoch);
             }
-        }
-        if (live_allocations > 0) {
-            if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            if (report.warn) {
                 if (epoch_tracked) {
                     GGML_LOG_WARN(
                         "[UNIFIED-CACHE] refusing %s host_zone_boundary_check with %zu live registered allocations "
@@ -23452,11 +27043,180 @@ bool unified_cache_note_model_load_abort(uint64_t load_txn_id) noexcept {
     }
 }
 
+// The zone_figures report line for a cache the caller already holds, so a caller inside the cache
+// registry's shared lock (the load-end path) does not take it a second time.
+static void dump_report_zone_figures_for(unified_cache * cache, int dev, const char * point, vram_zone_id zone) {
+    size_t capacity  = 0;
+    size_t used      = 0;
+    size_t available = 0;
+    size_t largest   = 0;
+    if (cache == nullptr || !counter_dump_requested() ||
+        !cache->zone_free_figures(zone, capacity, used, available, largest)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[SYCL-REPORT] zone_figures dev=%d point=%s zone=%s capacity=%zu used=%zu available=%zu "
+                 "largest_free=%zu\n",
+                 dev, point != nullptr ? point : "-", vram_zone_name(zone), capacity, used, available, largest);
+}
+
+// The load-end snapshot entries of `dev`: this model's planned bytes from its candidate plan, recorded
+// against its ownership slot with a load order; then the first two live models by load order publish as
+// load_1 and load_2 (load_2 reads not_captured while one model is live), beside the device's live WEIGHT
+// bytes (not_captured when an arena holds the weights, see below). A model with no plan leaves its
+// entries not_captured, never zero. The load-end call runs before
+// the plan publishes, so the plan is still the candidate. A third live model is recorded but not printed.
+//
+// weight_planned_device_bytes means one thing for every plan: the sum, over the plan's primary weight
+// entries placed on `dev`, of the plan's own charge (vram_charge_size, else
+// placement_vram_charge_bytes(dst_size), the rule every plan edit uses). Alternate and extra layout
+// copies are not entries and are not in it, so the figure is comparable between a single-device and a
+// multi-device load. Host-tiered bytes are the plan's recorded weight_host_bytes, plan-wide: a
+// multi-device plan, or a device a single-device plan does not name, reads not_captured and the figure
+// is reported once as `planned_host`, not credited to each device.
+//
+// It also prints, per device, the plan's MoE tensors and how many have zero GPU-executed experts on it:
+// G0's VOID test for the preload arm of the row-134 reach counts.
+static void unified_cache_dump_capture_load_end(int             dev,
+                                                unified_cache * cache,
+                                                uint32_t        slot,
+                                                uint64_t        load_txn_id) noexcept {
+    if (!dump_dev_valid(dev) || cache == nullptr || slot >= MODEL_SLOT_COUNT) {
+        return;
+    }
+    bool     have_plan      = false;
+    bool     host_plan_wide = false;
+    uint64_t host           = 0;
+    uint64_t planned        = 0;
+    try {
+        const auto snap = lifecycle_find_candidate_placement_plan(load_txn_id);
+        if (snap && snap->plan) {
+            const placement_plan & plan = *snap->plan;
+            have_plan                   = true;
+            // Host bytes are plan-wide: a device the plan does not name has no host figure of its own.
+            host_plan_wide              = plan.multi_device || plan.device_id != dev;
+            if (!plan.multi_device && plan.device_id == dev) {
+                host = plan.weight_host_bytes;
+            }
+            for (const placement_entry & e : plan.entries) {
+                if (e.on_device && (e.target_device >= 0 ? e.target_device : plan.device_id) == dev) {
+                    planned += e.vram_charge_size != 0 ? e.vram_charge_size : placement_vram_charge_bytes(e.dst_size);
+                }
+            }
+            if (counter_dump_requested()) {
+                // Once per load (the first device to reach it), not once per device.
+                char key[64];
+                char text[160];
+                std::snprintf(key, sizeof(key), "planned_host:%llu", static_cast<unsigned long long>(load_txn_id));
+                std::snprintf(text, sizeof(text), "planned_host load_txn=%llu weight_host_bytes=%zu multi_device=%d",
+                              static_cast<unsigned long long>(load_txn_id), plan.weight_host_bytes,
+                              plan.multi_device ? 1 : 0);
+                (void) unified_cache_dump_report_once(key, text);
+
+                // MoE tensors are the composite names of the plan's expert entries; one has zero GPU-executed
+                // experts on `dev` when expert_on_device(name, e, dev) is false for every expert e of it:
+                // the predicate the runtime reach counter asks (ggml_sycl_moe_plan_gpu_expert_count), not a
+                // second derivation of "on device".
+                std::map<std::string, int> n_experts;
+                for (const placement_entry & e : plan.entries) {
+                    if (e.expert_id >= 0) {
+                        int & n = n_experts[e.name];
+                        n       = std::max(n, e.expert_id + 1);
+                    }
+                }
+                size_t zero = 0;
+                for (const auto & kv : n_experts) {
+                    bool any = false;
+                    for (int e = 0; e < kv.second && !any; ++e) {
+                        any = plan.expert_on_device(kv.first, e, dev);
+                    }
+                    zero += any ? 0 : 1;
+                }
+                std::fprintf(stderr,
+                             "[SYCL-REPORT] moe_zero_gpu_expert_tensors dev=%d load_txn=%llu moe_tensors=%zu "
+                             "zero_gpu_expert_tensors=%zu\n",
+                             dev, static_cast<unsigned long long>(load_txn_id), n_experts.size(), zero);
+            }
+        }
+    } catch (...) {
+        have_plan = false;
+    }
+
+    dump_load_models & t = dump_load_models_table();
+    dump_load_model    first{};
+    dump_load_model    second{};
+    int                live_with_plan = 0;  // 0, 1 or 2: how many of load_1 / load_2 hold a model
+    {
+        dump_leaf_guard guard(t.lock);
+        t.models[dev][slot] = { have_plan, ++t.next_order, host, planned, host_plan_wide };
+        // The two live models with the smallest load orders: `first`, then the smallest order above it.
+        for (uint32_t i = 0; i < MODEL_SLOT_COUNT; ++i) {
+            const dump_load_model & m = t.models[dev][i];
+            if (m.live && (live_with_plan == 0 || m.order < first.order)) {
+                first          = m;
+                live_with_plan = 1;
+            }
+        }
+        bool have_second = false;
+        for (uint32_t i = 0; live_with_plan >= 1 && i < MODEL_SLOT_COUNT; ++i) {
+            const dump_load_model & m = t.models[dev][i];
+            if (m.live && m.order > first.order && (!have_second || m.order < second.order)) {
+                second      = m;
+                have_second = true;
+            }
+        }
+        live_with_plan = have_second ? 2 : live_with_plan;
+    }
+    if (live_with_plan >= 1) {
+        if (first.host_plan_wide) {
+            unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_1, dev);
+        } else {
+            unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_1, dev,
+                                            first.host_tiered_bytes);
+        }
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_1, dev,
+                                        first.planned_device_bytes);
+    } else {
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_1, dev);
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_planned_device_bytes_load_1, dev);
+    }
+    if (live_with_plan >= 2) {
+        if (second.host_plan_wide) {
+            unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_2, dev);
+        } else {
+            unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_2, dev,
+                                            second.host_tiered_bytes);
+        }
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, dev,
+                                        second.planned_device_bytes);
+    } else {
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_2, dev);
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_planned_device_bytes_load_2, dev);
+    }
+    // weight_live_bytes counts what cache->weight_bytes() counts: the budget-charged cache entries. A
+    // weight placed in the VRAM arena is a zone allocation and is NOT in that figure (G0 read 0 against
+    // 4.1, 12.1 and 7.2 GB planned on every arena run), so with an arena active this reads not_captured
+    // rather than a zero that means "not counted". The arena's live weight bytes are the WEIGHT zone's
+    // used figure; no snapshot takes it, because in single-chunk mode WEIGHT shares the KV allocator and
+    // that counter is not verified to be weight-only.
+    if (cache->arena_active()) {
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_live_bytes_last_load_end, dev);
+    } else {
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_live_bytes_last_load_end, dev, cache->weight_bytes());
+    }
+    // G0 prints the ONEDNN room after each load, beside the model's W; this tree has no W term yet.
+    try {
+        dump_report_zone_figures_for(cache, dev, "load_end", vram_zone_id::ONEDNN);
+    } catch (...) {
+    }
+}
+
 void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
             cache->note_model_load_end(slot, load_txn_id);
+            unified_cache_dump_capture_load_end(device_id, cache.get(), slot, load_txn_id);
         }
     }
 }
@@ -23467,6 +27227,12 @@ size_t unified_cache_release_model_slot(uint32_t slot) {
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
             reclaimed += cache->release_model_slot(slot);
+            if (dump_dev_valid(device_id) && slot < MODEL_SLOT_COUNT) {
+                // A released model is no longer live: the next load end must not name it.
+                dump_load_models & t = dump_load_models_table();
+                dump_leaf_guard    guard(t.lock);
+                t.models[device_id][slot].live = false;
+            }
         }
     }
     return reclaimed;
@@ -23818,6 +27584,11 @@ bool device_pool_arena_owns(const unified_cache * cache, const void * ptr) {
     return cache->vram_owns(ptr);
 }
 
+// The arena reserves every zone in whole grains of k_zone_arena_alignment, and the zone allocator places every block
+// on its block grain. Both name one figure, so they are held equal here, where both headers are visible.
+static_assert(k_zone_arena_alignment == tlsf_allocator::block_grain,
+              "zone-sizing.hpp's arena grain must be the zone allocator's block grain");
+
 bool unified_cache::arena_reserve(sycl::queue & queue,
                                   size_t        budget_bytes,
                                   size_t        max_alloc_size,
@@ -23864,10 +27635,15 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_queue_ = &queue;
 
-    // Align zone sizes to 256 bytes.
-    scratch_bytes = (scratch_bytes + 255) & ~size_t(255);
-    onednn_bytes  = (onednn_bytes + 255) & ~size_t(255);
-    runtime_bytes = (runtime_bytes + 255) & ~size_t(255);
+    // Align zone sizes to the arena's grain. The RUNTIME zone is rounded by the function every RUNTIME plan counts on,
+    // with no floor: the callers apply it.
+    scratch_bytes = (scratch_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    onednn_bytes  = (onednn_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {
+        GGML_LOG_ERROR("[VRAM-ARENA] RUNTIME zone of %zu bytes cannot be rounded to the arena's grain\n",
+                       runtime_bytes);
+        return false;
+    }
 
     // Try single-chunk first.  All zones share one contiguous allocation.
     // Falls back to N-chunk (tail zones in last chunk, weights spread across
@@ -23974,6 +27750,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
             arena_base_ = ptr;
             arena_size_ = alloc_size;
+            ext_alloc_note_arena_state(queue, true);
 
             // Single-chunk zone layout:
             //   [KV→ ...free... ←WEIGHT] [ONEDNN] [RUNTIME] [SCRATCH]
@@ -24175,6 +27952,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_base_ = arena_chunks_.front().ptr;
     arena_size_ = alloc_size;
+    ext_alloc_note_arena_state(queue, true);
 
     // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
     //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
@@ -24324,7 +28102,7 @@ void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr
         auto runtime = g_runtime_alloc_registry.find(ptr);
         if (runtime != g_runtime_alloc_registry.end() && runtime->second.handle.alloc_id == exact_id) {
             if (!runtime->second.cohort_id.empty()) g_runtime_cohort_tier.erase(runtime->second.cohort_id);
-            g_runtime_alloc_registry.erase(runtime);
+            runtime_registry_erase_locked(runtime);
         }
     }
 }
@@ -24561,6 +28339,37 @@ static const char * vram_zone_name(vram_zone_id zone) {
     }
 }
 
+// What a REFUSED zone settle reports: every registry row whose key is in [lo, hi), logged (the first few) and recorded for
+// the zone audit (all of them). Walks the whole registry, so a settle calls it only after
+// runtime_registry_span_live_locked() has said a row exists. Caller holds g_runtime_alloc_mutex.
+static size_t runtime_registry_scan_span_locked(uintptr_t               lo,
+                                                uintptr_t               hi,
+                                                bool                    log_detail,
+                                                zone_audit_site_visit & audit) {
+    size_t detail_lines     = 0;
+    size_t live_allocations = 0;
+    for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
+        runtime_registry_note_row_scanned_locked();
+        const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
+        if (p >= lo && p < hi) {
+            if (log_detail && detail_lines < 8) {
+                runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
+                detail_lines++;
+            }
+            if (audit.active()) {
+                // Uncapped, unlike the bounded refusal dump; collected
+                // under the same lock so it sees exactly what the refusal
+                // saw. Attribution is READ from the handle (post-f9tg).
+                const alloc_metadata & h = it->second.handle;
+                audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                       static_cast<int>(h.tier), it->second.cohort_id });
+            }
+            live_allocations++;
+        }
+    }
+    return live_allocations;
+}
+
 // Shared implementation for zone_boundary_check() / zone_reclaim() (below) --
 // see the doc comment on zone_settle()'s declaration in unified-cache.hpp for
 // why this is genuinely internal and not called directly outside this class.
@@ -24670,25 +28479,11 @@ void unified_cache::zone_settle(vram_zone_id zone) {
         // aborting now, so identify owners only for the first few refusals, and
         // bound the dump within a single refusal too.
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
-        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
-            const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
-            if (p >= zone_lo && p < zone_hi) {
-                if (log_detail && detail_lines < 8) {
-                    runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
-                    detail_lines++;
-                }
-                if (audit.active()) {
-                    // Uncapped, unlike the bounded refusal dump above; collected
-                    // under the same lock so it sees exactly what the refusal
-                    // saw. Attribution is READ from the handle (post-f9tg).
-                    const alloc_metadata & h = it->second.handle;
-                    audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
-                                           static_cast<int>(h.tier), it->second.cohort_id });
-                }
-                live_allocations++;
-            }
+        // A clean settle (the normal case: once per graph per device) is one index query. Only a zone that has a row
+        // pays for the enumeration, which exists to explain the refusal.
+        if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {
+            live_allocations = runtime_registry_scan_span_locked(zone_lo, zone_hi, log_detail, audit);
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -25000,6 +28795,34 @@ size_t unified_cache::zone_capacity(vram_zone_id zone) const {
     return arena_zones_[static_cast<int>(zone)].size;
 }
 
+size_t unified_cache::zone_capacity_committed(vram_zone_id zone) const {
+    if (arena_backing() != GGML_SYCL_ARENA_BACKING_TYPE_VM) {
+        const int device = ggml_sycl_get_device_id_from_queue(queue_);
+        GGML_LOG_ERROR("[VM-PLAN-BUG] zone_capacity_committed read on a non-VM device (device %d, zone %d)\n", device,
+                       static_cast<int>(zone));
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[VM-PLAN-BUG] zone_capacity_committed read on a non-VM device (device %d, zone %d)", device,
+                       static_cast<int>(zone));
+        }
+    }
+    return zone_capacity(zone);
+}
+
+size_t unified_cache::zone_capacity_to_commit(vram_zone_id zone) const {
+    if (arena_backing() != GGML_SYCL_ARENA_BACKING_TYPE_VM) {
+        const int device = ggml_sycl_get_device_id_from_queue(queue_);
+        GGML_LOG_ERROR("[VM-PLAN-BUG] zone_capacity_to_commit read on a non-VM device (device %d, zone %d)\n", device,
+                       static_cast<int>(zone));
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[VM-PLAN-BUG] zone_capacity_to_commit read on a non-VM device (device %d, zone %d)", device,
+                       static_cast<int>(zone));
+        }
+        return zone_capacity(zone);
+    }
+    // No VM backing exists yet, so nothing can reach this; the VM arm lands with it.
+    GGML_ABORT("zone_capacity_to_commit: no VM backing exists to read a load's to-commit capacity from");
+}
+
 size_t unified_cache::zone_used(vram_zone_id zone) const {
     return arena_zones_[static_cast<int>(zone)].used.load(std::memory_order_relaxed);
 }
@@ -25159,6 +28982,71 @@ size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     return zone_available(zone);
 }
 
+bool unified_cache::zone_free_figures(vram_zone_id zone,
+                                      size_t &     capacity,
+                                      size_t &     used,
+                                      size_t &     available,
+                                      size_t &     largest_free) {
+    if (!arena_active()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    capacity     = zone_capacity(zone);
+    used         = zone_used(zone);
+    available    = zone_available(zone);
+    largest_free = zone_largest_free(zone);
+    return true;
+}
+
+void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zone_id zone) noexcept {
+    if (!counter_dump_requested()) {
+        return;
+    }
+    try {
+        dump_report_zone_figures_for(get_existing_cache_for_device(dev), dev, point, zone);
+    } catch (...) {
+    }
+}
+
+// Reads happen here and only here for the zone-figure snapshots: under the zone's group mutex, at a
+// point no allocation or refusal is inside (the first decode's entry, a context transaction's commit),
+// never from the chokepoint. Without an arena nothing is captured, so the entry reads not_captured.
+void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept {
+    if (!dump_dev_valid(dev)) {
+        return;
+    }
+    if (point == dump_point::FIRST_DECODE &&
+        !unified_cache_dump_snapshot_pending(dump_snapshot::zone_available_weight_first_decode, dev)) {
+        return;
+    }
+    try {
+        // Through the device resolution every other cache lookup uses: GLOBAL mode keys the map by 0.
+        unified_cache * cache = get_existing_cache_for_device(dev);
+        if (cache == nullptr) {
+            return;
+        }
+        size_t capacity  = 0;
+        size_t used      = 0;
+        size_t available = 0;
+        size_t largest   = 0;
+        if (point == dump_point::FIRST_DECODE) {
+            if (cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest)) {
+                unified_cache_dump_snapshot_set_once(dump_snapshot::zone_available_weight_first_decode, dev, available);
+                unified_cache_dump_snapshot_set_once(dump_snapshot::zone_largest_free_weight_first_decode, dev,
+                                                     largest);
+            }
+            return;
+        }
+        if (cache->zone_free_figures(vram_zone_id::RUNTIME, capacity, used, available, largest)) {
+            unified_cache_dump_snapshot_set(dump_snapshot::zone_available_runtime_context_txn, dev, available);
+            unified_cache_dump_snapshot_set(dump_snapshot::zone_largest_free_runtime_context_txn, dev, largest);
+            unified_cache_dump_snapshot_set(dump_snapshot::zone_capacity_onednn_context_txn, dev,
+                                            cache->zone_capacity(vram_zone_id::ONEDNN));
+        }
+    } catch (...) {
+    }
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_test_fail_next_arena_free() {
     g_test_fail_next_arena_free.store(true, std::memory_order_release);
@@ -25186,6 +29074,14 @@ bool unified_cache_test_zone_settle_reached() {
 
 bool unified_cache_test_arena_destroy_closing_reached() {
     return g_test_arena_destroy_closing_reached.load(std::memory_order_acquire);
+}
+
+bool unified_cache_test_cache_exists(int device) {
+    return get_existing_cache_for_device(device) != nullptr;
+}
+
+void unified_cache_test_set_destroy_observer(unified_cache_test_destroy_observer observer) {
+    g_test_destroy_observer.store(observer, std::memory_order_release);
 }
 #endif
 
@@ -25365,6 +29261,7 @@ bool unified_cache::arena_destroy() {
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
+    ext_alloc_note_arena_state(queue_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
@@ -25530,6 +29427,7 @@ void unified_cache::arena_abandon() {
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
+    ext_alloc_note_arena_state(queue_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
@@ -25997,6 +29895,13 @@ static bool planner_moe_xmx_tiled_pp_proof_enabled() {
     return enabled;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Test-only: the env read in planner_xmx_tiled_pp_route_active() is latched once per process, so a test that must
+// plan under both values of the route sets it here instead. -1 means no override (the env decides), 0 forces the route
+// off, 1 forces it on.
+static std::atomic<int> g_test_xmx_tiled_pp_route_override{ -1 };
+#endif
+
 // llama.cpp-rzy7: mirrors ggml_sycl_xmx_moe_allow_unsafe_pp() in ggml-sycl.cpp
 // (not visible from this TU, so replicated rather than shared). The XMX_TILED
 // grouped-DPAS PP route for MXFP4 gate/up is default ON (measured
@@ -26004,6 +29909,12 @@ static bool planner_moe_xmx_tiled_pp_proof_enabled() {
 // GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP / GGML_SYCL_XMX_MOE_PP names are honored as
 // a compatibility fallback when the new variable is unset.
 static bool planner_xmx_tiled_pp_route_active() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const int forced = g_test_xmx_tiled_pp_route_override.load(std::memory_order_acquire);
+    if (forced >= 0) {
+        return forced != 0;
+    }
+#endif
     static const bool active = [] {
         if (const char * tiled_env = std::getenv("GGML_SYCL_XMX_TILED_PP")) {
             return std::atoi(tiled_env) != 0;
@@ -26018,6 +29929,16 @@ static bool planner_xmx_tiled_pp_route_active() {
     }();
     return active;
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+int test_set_xmx_tiled_pp_route_override(bool active) {
+    return g_test_xmx_tiled_pp_route_override.exchange(active ? 1 : 0, std::memory_order_acq_rel);
+}
+
+void test_restore_xmx_tiled_pp_route_override(int previous) {
+    g_test_xmx_tiled_pp_route_override.store(previous, std::memory_order_release);
+}
+#endif
 
 static bool planner_moe_xmx_moe_forced_from_env(const char * env) {
     return env != nullptr && std::atoi(env) != 0;
@@ -26068,11 +29989,13 @@ static bool planner_moe_gateup_bundle4_enabled() {
     return enabled;
 }
 
-// GGML_SYCL_KV_PIN_DEVICE=1 (diagnostic, default off, llama.cpp-h8hw): decouple
-// the weight/KV co-assignment in the dense-layer packing loop below so an
-// attention layer's KV can be charged and placed independently of that same
-// layer's dense weights, instead of the two being summed into one on/off-device
-// decision. Default off reproduces today's combined-charge behavior exactly.
+// GGML_SYCL_KV_PIN_DEVICE=1 (diagnostic, default off, llama.cpp-h8hw): changes which charge claims `remaining` first
+// in the single-device planner. By default the dense pass charges every layer's weights, and the KV phase after it
+// charges each device layer's KV and holds the opening context's room before the routed experts (llama.cpp-8ecj).
+// Pinned, the dense pass charges each attention layer's KV ahead of that layer's weights, so the weight decision sees
+// what the KV left; the KV phase does nothing, and no context room is held. By default a layer's KV is on the device
+// only with its weights, and KV that does not fit goes to the host tier without moving them; pinned, KV and weights
+// each go to the host tier on their own when they do not fit.
 static bool planner_kv_pin_device_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_KV_PIN_DEVICE");
@@ -26210,6 +30133,9 @@ static size_t planner_layout_bytes_for_dims(ggml_type        type,
         case GGML_LAYOUT_AOS:
         case GGML_LAYOUT_SOA:
         default:
+            // Unpadded: a direct-staged AOS expert's entry can exceed this by the MATRIX_ROW_PADDING tail
+            // (ggml_sycl_get_padded_weight_bytes), so expert loans and refills size copies from the entry
+            // (llama.cpp-pu8v).
             return ggml_row_size(type, ncols) * static_cast<size_t>(nrows);
     }
 }
@@ -28244,9 +32170,12 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. Q8_0 is planned
         // UNCONDITIONALLY: ONEDNN_SOA / ONEDNN_COALESCED are the route for its materialized layouts and are selected
         // whatever GGML_SYCL_ONEDNN_PP says, so they were the consumer observed minting per-op copies. Q4_0 and MXFP4
-        // are planned CONDITIONALLY, in the next block (llama.cpp-8ony). Any other type reaching the arm (an AOS-layout
-        // fallback) is not planned: the graph-entry walk finds it from the graph's own nodes and grows the buffer
-        // inside the RUNTIME zone, or refuses by name. Experts are excluded by the same role function as above.
+        // are planned CONDITIONALLY, in the next block (llama.cpp-8ony), as is a quantized type no MMQ, coalesced or
+        // unified kernel serves, the IQ family (llama.cpp-gldu): at PP batch the router has no kernel for it but this
+        // arm, so for it the arm is the planned route and not a fallback. So are the MMQ types the router moves to the
+        // arm at PP batch (llama.cpp-h9c8). A mis-predicted node is still found by the
+        // graph-entry walk from the graph's own nodes, which grows the buffer inside the RUNTIME zone or refuses by
+        // name. Experts are excluded by the same role function as above.
         if (item.has_shape() && item.type == GGML_TYPE_Q8_0 &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;
@@ -28272,8 +32201,45 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // The head's copy is reserved UNCONDITIONALLY otherwise (owner decision) until llama.cpp-fkpg delivers
         // n_outputs to the planner: whether the head runs on many rows (perplexity, embeddings) or on the last row
         // only (chat, llama-bench) is not known here, and an unused plan is bounded by that one weight's f16 copy.
-        if (item.has_shape() && unified_kernel_serves_type(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type) &&
-            expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+        //
+        // llama.cpp-gldu: a quantized type no MMQ, coalesced or unified kernel serves takes the same fields, from the
+        // router's own type lists (aos_dequant_f16_plan_claims in unified-types.hpp composes them: !coalesced && !MMQ,
+        // a type SYCL executes as a dense MUL_MAT, not an expert stack, not the LM head; ggml_sycl_supports_mmq,
+        // is_coalesced_supported and ggml_sycl_mul_mat_type_supported read the same lists). The one term a SYCL-free
+        // header cannot compute is whether the router can dequantize the type at all, so it is asked here through the
+        // function the router asks (onednn_woq::supports_dequant_fp16). The head is recognised by
+        // ggml_sycl_weight_is_output_head (its usage classification and the tied-embedding classifier, the same two the
+        // layout planner uses), which the router's helper asks too, not by a name of its own. Unlike the unified
+        // kernel's types this mark does not need the PP admission to reach
+        // the arm: the legacy oneDNN kernel runs with GGML_SYCL_ONEDNN_PP=0 too. The scratch supplies its copies only
+        // when the PP admission holds AND the scratch is enabled for the type, so that is what pp_scratch_type_enabled
+        // says (for the unified kernel's types the admission already held, so their answer is unchanged). The loader's
+        // get_rows_only role excludes a gather-only table (per_layer_token_embd) in the classifier, for every mark.
+        const bool shaped    = item.has_shape();
+        const bool is_expert = expert_tensor_role_from_tensor_name(item.name.c_str()) != expert_tensor_role::UNKNOWN;
+        // The unified kernel's types carry no expert exclusion of their own (the claim below does), so it is here.
+        const bool unified_dequant_type = shaped && !is_expert && unified_kernel_serves_type(item.type) &&
+                                          ggml_sycl_onednn_pp_type_admitted(item.type);
+        const bool lm_head           = ggml_sycl_weight_is_output_head(item.name.c_str());
+        const bool quantized         = shaped && ggml_is_quantized(item.type);
+        const bool dequant_supported = quantized && onednn_woq::supports_dequant_fp16(item.type);
+        const bool aos_dequant_type =
+            aos_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, dequant_supported);
+        // llama.cpp-h9c8: the MMQ types dense_pp_route_prefers_f16_dequant_arm lists take the arm at PP batch too. The
+        // claim is the one the router's helper (ggml_sycl_dense_f16_arm_serves_pp) asks, with the same head, expert,
+        // 2-D and dequant terms, so the weight the router sends to the arm is one this plan reserved for. Its
+        // admission is GGML_SYCL_ONEDNN_PP_MMQ_TYPES AND the oneDNN PP type admission, the gates the router's helper
+        // and the op's candidate take: unlike the IQ family, these types keep MMQ when oneDNN PP is off, so nothing
+        // would draw the buffers. By default the oneDNN PP scratch is not enabled for them
+        // (onednn_pp_unified_scratch_enabled; GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=1 enables it for every type), so
+        // pp_scratch_type_enabled below is false and the classifier plans them; with the scratch enabled they are
+        // planned only where it cannot supply the pair, as for the other marks. 2-D only: a 3-D operand stays on MMQ
+        // (ne[2] / ne[3] are 0 when the inventory gave no extent, hence <= 1).
+        const bool is_matrix = item.ne[2] <= 1 && item.ne[3] <= 1;
+        const bool mmq_dequant_type =
+            mmq_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, is_matrix, dequant_supported) &&
+            ggml_sycl_onednn_pp_mmq_types_admitted(item.type);
+        if (unified_dequant_type || aos_dequant_type || mmq_dequant_type) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;
             if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&
@@ -28281,12 +32247,22 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                                                       item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
                 desc.dequant_f16_if_unsupplied_weight_bytes         = weight_bytes;
                 desc.dequant_f16_if_unsupplied_src1_bytes_per_token = src1_bytes;
-                desc.pp_scratch_type_enabled                        = onednn_pp_unified_scratch_enabled(item.type);
+                desc.pp_scratch_type_enabled =
+                    onednn_pp_unified_scratch_enabled(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);
             }
         }
         zone_inventory.push_back(std::move(desc));
     }
     return zone_inventory;
+}
+
+// The bound on MMID workspace owners (llama.cpp-n8da). Owners are planner (logical GPU) indices, and the multi-GPU
+// planner budgets every physical GPU (ggml_sycl_info().total_gpu_count), so an expert may sit on a device the registry
+// does not expose. A workspace there could never be bound or admitted: ggml_backend_sycl_init() refuses any index at or
+// past the registry's count. That count is ggml_sycl_info().device_count, the one ggml_backend_sycl_reg() builds its
+// device list from, so it is the bound; the physical count is wrong here.
+static int moe_mmid_exposed_owner_count() {
+    return ggml_sycl_info().device_count;
 }
 
 static void plan_moe_mmid_workspaces(placement_plan &                           plan,
@@ -28299,8 +32275,15 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
     if (n_expert_used <= 0) {
         return;
     }
+    // llama.cpp-84ck: plan a pool only for a route that can consume one. Its device bytes are charged into vram_bytes
+    // (account_moe_mmid_workspaces), so a pool for a closed route takes VRAM that experts and KV could use and that
+    // nothing ever touches. The runtime re-plan computes its demand here too, so a closed route never grows a pool.
+    if (!ggml_sycl_moe_mmid_route_reachable_in_build()) {
+        return;
+    }
 
     const int primary_device = plan.device_id >= 0 ? plan.device_id : (plan.devices.empty() ? -1 : plan.devices.front());
+    const int exposed_devices = moe_mmid_exposed_owner_count();
     std::map<int, moe_mmid_workspace_geometry> maxima;
     for (const placement_tensor_info & item : tensor_inventory) {
         if (!item.has_shape() || expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN ||
@@ -28348,6 +32331,9 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
         for (const auto & owner_entry : actual_owners) {
             const int  owner     = owner_entry.first;
             const bool secondary = owner_entry.second;
+            if (!moe_mmid_owner_admissible(owner, exposed_devices)) {
+                continue;
+            }
             moe_mmid_shape shape;
             shape.ne10  = static_cast<size_t>(item.ne[0]);
             shape.ne01  = static_cast<size_t>(item.ne[1]);
@@ -28443,9 +32429,22 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
     };
     if (reason) *reason = moe_mmid_runtime_reason::OK;
     try {
-        placement_plan demand = plan;
-        plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);
-        if (!demand.moe_mmid_workspace_valid) return refuse(moe_mmid_runtime_reason::DEMAND_INVALID);
+        // A pool the load plan rejected stays rejected for the plan's lifetime. A plan is invalid from either of two
+        // sources: reject_moe_mmid_workspaces() (it did not fit the budget the experts left, an owner or a size was
+        // invalid, or the host scratch zone overflowed), which also clears the workspaces, or a host staging-zone
+        // sizing overflow in populate_host_zone_sizing(), which keeps them. Nothing materializes either, so its demand
+        // is not re-planned, and above all not sent to the growth admission below: GROWTH_BUDGET_EXCEEDED there makes the
+        // runtime transaction demote KV or refuse the context for a pool that was never going to exist
+        // (llama.cpp-84ck). The stable budget check still runs, because it is the KV refresh's own check. A closed
+        // route needs no case of its own: plan_moe_mmid_workspaces() plans no demand for it.
+        const bool     pool_rejected = !plan.moe_mmid_workspace_valid;
+        placement_plan demand        = plan;
+        if (!pool_rejected) {
+            plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);
+            if (!demand.moe_mmid_workspace_valid) {
+                return refuse(moe_mmid_runtime_reason::DEMAND_INVALID);
+            }
+        }
         // Runtime KV refresh has already restored the existing global MMID
         // charge. Stable geometry is not a budget bypass: validate before the
         // early return, accepting the exact boundary and rejecting budget+1.
@@ -28457,6 +32456,9 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
                 return refuse(verdict == moe_mmid_runtime_reason::OK ? moe_mmid_runtime_reason::BUDGET_EXCEEDED :
                                                                        verdict);
             }
+        }
+        if (pool_rejected) {
+            return true;
         }
         bool fits = demand.moe_mmid_workspaces.size() == plan.moe_mmid_workspaces.size();
         for (const auto & required : demand.moe_mmid_workspaces) {
@@ -28515,7 +32517,8 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
         plan.moe_mmid_device_pool_bytes = demand.moe_mmid_device_pool_bytes;
         plan.moe_mmid_host_pool_bytes = demand.moe_mmid_host_pool_bytes;
-        plan.moe_mmid_workspace_valid = true;
+        // A rejected pool never reaches this growth tail (the pool_rejected return above), so it is never revived here.
+        GGML_ASSERT(plan.moe_mmid_workspace_valid);
         plan.vram_bytes = new_vram;
         plan.per_device_vram = std::move(new_per_device);
         return true;
@@ -28535,22 +32538,31 @@ static void reject_moe_mmid_workspaces(placement_plan & plan) {
 }
 
 static void validate_moe_mmid_execution_owners(placement_plan & plan) {
+    // An owner workspace is what MMID admission needs on a device. With no route to admit, no device needs one, and
+    // plan_moe_mmid_workspaces() planned none (llama.cpp-84ck).
+    if (!ggml_sycl_moe_mmid_route_reachable_in_build()) {
+        return;
+    }
     auto has_owner = [&](int device) {
         return std::any_of(plan.moe_mmid_workspaces.begin(), plan.moe_mmid_workspaces.end(),
                            [&](const moe_mmid_owner_workspace_plan & workspace) {
                                return workspace.valid && workspace.owner_device == device;
                            });
     };
+    // An expert on a device the registry does not expose needs no owner: no admission can name that device, and
+    // plan_moe_mmid_workspaces() planned none there (same bound).
+    const int exposed_devices = moe_mmid_exposed_owner_count();
     for (const placement_entry & entry : plan.entries) {
         if (entry.expert_id < 0) {
             continue;
         }
-        if (entry.on_device && entry.target_device >= 0 && !has_owner(entry.target_device)) {
+        if (entry.on_device && moe_mmid_owner_admissible(entry.target_device, exposed_devices) &&
+            !has_owner(entry.target_device)) {
             plan.moe_mmid_workspace_valid = false;
         }
         for (const placement_alternate_layout & alternate : entry.alternate_layouts) {
             const int target = alternate.target_device >= 0 ? alternate.target_device : entry.target_device;
-            if (target < 0) {
+            if (!moe_mmid_owner_admissible(target, exposed_devices)) {
                 continue;
             }
             const bool primary = target == plan.device_id;
@@ -28565,6 +32577,58 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
     }
 }
 
+// llama.cpp-cre6: the host-expert MoE scatter scratch, published per device. One flush places one op's rows, or a
+// decode gate/up pair's when the layer splits gate and up (the sibling slot then flushes both through one copy and
+// one kernel); each expert matrix's row is its ne[1] floats, plus the int32 flag the event-chained decode route
+// stages per row, and that route also uploads the tensor's ne[2]-entry expert pointer table here (llama.cpp-7pvo).
+// Only a tensor whose MUL_MAT_ID takes the host path scatters anything, and only on the device whose layer runs it,
+// so a dense model or an all-VRAM placement plans 0 there and nothing is claimed or reported. Whether a tensor takes
+// the host path is the plan's own has_host_experts(), the query the MUL_MAT_ID dispatch asks, which is why this runs
+// after build_index() and not inside populate_host_zone_sizing().
+static void publish_moe_host_scatter_term(const placement_plan &                     plan,
+                                          const std::vector<placement_tensor_info> & tensor_inventory,
+                                          int                                        n_experts,
+                                          int                                        n_expert_used) {
+    std::vector<moe_host_scatter_tensor> scattered;
+    if (n_experts > 0 && n_expert_used > 0) {
+        for (const auto & item : tensor_inventory) {
+            const expert_tensor_role role = expert_tensor_role_from_tensor_name(item.name.c_str());
+            if (role == expert_tensor_role::UNKNOWN || !item.has_shape() || item.ne[1] <= 0) {
+                continue;
+            }
+            const int               layer = expert_layer_from_tensor_name(item.name.c_str());
+            moe_host_scatter_tensor t;
+            t.device           = plan.devices.empty() ? plan.device_id : plan.get_layer_device(layer);
+            t.has_host_experts = plan.has_host_experts(item.name, item.ne[2] > 0 ? item.ne[2] : 1, t.device);
+            t.split_gate_up    = role == expert_tensor_role::GATE || role == expert_tensor_role::UP ||
+                              role == expert_tensor_role::CHUNK_GATE || role == expert_tensor_role::CHUNK_UP;
+            t.row_elems = static_cast<size_t>(item.ne[1]);
+            t.n_experts = static_cast<size_t>(item.ne[2] > 0 ? item.ne[2] : 1);
+            scattered.push_back(t);
+        }
+    }
+    std::vector<int> devices = plan.devices;
+    if (devices.empty()) {
+        devices.push_back(plan.device_id);
+    }
+    for (int device : devices) {
+        size_t moe_host_scatter_bytes = 0;
+        if (!moe_host_scatter_scratch_bytes_for_device(scattered, device, static_cast<size_t>(n_expert_used),
+                                                       &moe_host_scatter_bytes)) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE host scatter scratch on device %d overflows; none is planned and "
+                "host-expert results scatter with one copy per run of rows (llama.cpp-cre6)\n",
+                device);
+            moe_host_scatter_bytes = 0;
+        }
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, moe_host_scatter_bytes);
+        if (moe_host_scatter_bytes != 0) {
+            GGML_LOG_INFO("[SYCL-PLAN] MoE host scatter scratch on device %d: %.1f KB (RUNTIME zone)\n", device,
+                          moe_host_scatter_bytes / 1024.0);
+        }
+    }
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -28574,7 +32638,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     constexpr size_t k_scratch_headroom      = 32ull * 1024ull * 1024ull;
     constexpr double k_weight_headroom_ratio = 1.2;
     // llama.cpp-glkg: the WEIGHT zone is where every runtime HOST_COMPUTE
-    // request lands (select_zone() in unified_alloc routes role==WEIGHT OR
+    // request lands (unified_alloc_host_zone() routes role==WEIGHT OR
     // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
     // that includes llama_context::output_reserve()'s logits/embd host
     // buffer plus the server's prompt-checkpoint reads after model load.
@@ -29385,6 +33449,545 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                   kv_info, envelope, n_experts);
 }
 
+// The KV phase's per-layer charge (llama.cpp-8ecj): each layer whose dense weights the dense pass put on `device_id`
+// gets its KV there, in layer order, while `remaining` holds it. A layer whose KV does not fit keeps its weights on the
+// device and has its KV on the host tier; a host layer's KV is on the host tier with it.
+static void plan_single_device_layer_kv(placement_plan &            plan,
+                                        const placement_kv_info &   kv_info,
+                                        const std::map<int, bool> & layer_has_attention,
+                                        int                         device_id,
+                                        size_t &                    remaining) {
+    for (const auto & [layer_id, has_attention] : layer_has_attention) {
+        const size_t kv_cost = has_attention ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+        if (kv_cost == 0) {
+            continue;
+        }
+        const bool kv_on_device = plan.get_layer_device(layer_id) == device_id && kv_cost <= remaining;
+        if (kv_on_device) {
+            remaining -= kv_cost;
+            plan.kv_vram_bytes += kv_cost;
+            plan.vram_bytes += kv_cost;
+        } else {
+            plan.kv_host_bytes += kv_cost;
+            plan.host_bytes += kv_cost;
+        }
+        plan.kv_device[layer_id] = kv_on_device ? device_id : -1;
+    }
+}
+
+// The KV phase's room for the context the model opens with (kv_info.n_ctx_context, llama.cpp-8ecj): what that
+// context's KV adds over the KV charged at the planning n_ctx, for every layer whose KV is on `device_id` and whose
+// room is worth its cost, held out of `remaining` before the routed experts are packed, and capped at what the dense
+// weights and their KV left. A context whose KV does not fit beside the dense weights still opens: the runtime context
+// transaction re-places the overflow to the host tier.
+//
+// The context is the one the caller asked for (llama_model_params::n_ctx_hint, llama.cpp-ak0p). With no request no room
+// is held, and the KV beyond the planning n_ctx is placed when the context is created. A context created smaller than
+// the request leaves the rest of the room unused, and the experts it displaced stay on the host tier, because experts
+// are placed once, at load, and nothing promotes them when the context turns out smaller.
+//
+// The room is weighed layer by layer (llama.cpp-w013, owner ruling 2026-10-10). A layer whose room is refused keeps its
+// KV at the planning n_ctx on the device, and its room's bytes go to the routed experts; when the context opens, the
+// runtime demotes whole layers to the host tier until the KV fits. So the trade is the layer's attention on the host
+// against the experts its room would push to the host, and it is judged per decode token by weigh_kv_context_room().
+// The terms are kv_room_cost_terms (kv-room-cost.hpp): A, what running the layer's attention on the host costs a
+// decode token, and B, what the routed experts the layer's room displaces cost it.
+struct kv_context_room_cost : kv_room_cost_terms {
+    int      layer_id = -1;
+    uint32_t n_splits = 0;  // the CPU splits A charged the layer (placement_host_attn_splits)
+};
+
+struct kv_context_room {
+    size_t wanted       = 0;  // the extra KV of every device layer whose room passed the cost test
+    size_t held         = 0;  // min(wanted, what was left)
+    size_t n_layers     = 0;  // device layers with extra KV
+    size_t n_held       = 0;  // of those, the ones whose room passed the cost test
+    size_t n_refused    = 0;  // and the ones whose room was refused by cost
+    size_t refused      = 0;  // the extra KV of the refused layers
+    // The SWA layers among n_layers and n_held; the rest are full-attention layers.
+    size_t n_swa_layers = 0;
+    size_t n_swa_held   = 0;
+
+    // The rate every layer's B was read at, and whether the room was weighed at all (llama.cpp-7fmt).
+    kv_room_expert_rate expert_rate;
+
+    // The layer the line reports A and B for: the first refused one in the runtime's demotion order, or the first
+    // held one when none was refused.
+    kv_context_room_cost decision;
+
+    // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
+    // first-fit pack puts there with the room added back. The room's cost is the difference. Counting instead the
+    // triplets that fit the second budget and not the real one over-states it: the larger budget can take a larger
+    // triplet and then skip smaller ones the real pack did place.
+    size_t expert_bytes          = 0;
+    size_t expert_groups         = 0;
+    size_t expert_bytes_without  = 0;
+    size_t expert_groups_without = 0;
+
+    size_t displaced_bytes() const {
+        return expert_bytes_without > expert_bytes ? expert_bytes_without - expert_bytes : 0;
+    }
+};
+
+// One layer's room, weighed per decode token (llama.cpp-w013, llama.cpp-7fmt). The arithmetic is kv_room_weigh
+// (kv-room-cost.hpp), where test-kv-room-cost reaches it with the measured shapes:
+//   A = the host reads the layer's KV at the expected fill, F = n_ctx_context x ctx_fill_pct / 100 cells (a SWA layer
+//       reads at most its window), at host_attn_gbps, and the token pays the layer's CPU splits, host_split_us each:
+//       3 for a layer with an indexer key cache, 1 for any other (placement_host_attn_splits);
+//   B = the room displaces as many bytes of routed experts, and a token reads each with probability
+//       n_expert_used / n_expert, at the device's expert rate (kv_room_expert_rate_for). Uniform: first-fit displaces
+//       the least popular triplets, so this is an upper bound on their hit rate.
+// Held iff A > B; a room that is not priced is refused. The device bandwidth is in neither: holding the room and
+// refusing it both lose one device read per token, so it cancels to first order. A dense model displaces no expert,
+// so its room is held as before, whatever the fill.
+static kv_context_room_cost weigh_kv_context_room(const placement_kv_info &   kv_info,
+                                                  int                         layer_id,
+                                                  size_t                      extra,
+                                                  int                         n_experts,
+                                                  const kv_room_expert_rate & rate) {
+    // Both rates divide, so each must be finite and positive: a zero would make A or B inf or NaN, and NaN > B is
+    // false, so the room would be refused without a word. The split cost adds, so it must be finite and not negative.
+    // The backend's parser keeps its default for such a value; a test that sets the fields directly must do the same.
+    GGML_ASSERT(std::isfinite(kv_info.host_attn_gbps) && kv_info.host_attn_gbps > 0.0);
+    GGML_ASSERT(std::isfinite(rate.gbps) && rate.gbps > 0.0);
+    GGML_ASSERT(std::isfinite(kv_info.host_split_us) && kv_info.host_split_us >= 0.0);
+    const uint32_t      il     = static_cast<uint32_t>(layer_id);
+    const uint32_t      filled = kv_room_filled_cells(kv_info.n_ctx_context, kv_info.ctx_fill_pct);
+    kv_room_cost_inputs in;
+    in.host_read_bytes = kv_info.kv_bytes_for_layer_at(il, filled);
+    in.n_host_splits   = placement_host_attn_splits(kv_info.idx_k_width(il) > 0);
+    in.room_bytes      = extra;
+    in.n_experts       = n_experts;
+    in.n_expert_used   = kv_info.n_expert_used;
+    in.host_attn_gbps  = kv_info.host_attn_gbps;
+    in.host_split_us   = kv_info.host_split_us;
+    in.cpu_expert_gbps = rate.gbps;
+    in.priced          = rate.priced;
+    return { kv_room_weigh(in), layer_id, in.n_host_splits };
+}
+
+static kv_context_room hold_kv_context_room(placement_plan &            plan,
+                                            const placement_kv_info &   kv_info,
+                                            int                         device_id,
+                                            int                         n_experts,
+                                            const kv_room_expert_rate & expert_rate,
+                                            size_t &                    remaining) {
+    kv_context_room room;
+    if (kv_info.n_ctx_context == 0) {
+        return room;
+    }
+    room.expert_rate = expert_rate;
+    // Each layer is decided on its own. The split term does not scale with the layer's KV per cell, so full-attention
+    // layers of different widths, or with and without an indexer key cache, can decide differently (llama.cpp-7fmt);
+    // a SWA layer's room and host read are both capped by its window. The bound below applies to the sum of the held
+    // rooms, so what is held does not depend on the order. The order is the runtime's KV demotion order
+    // (plan_runtime_kv_demotion, kv-runtime-demotion.cpp: full attention latest first, then SWA latest first; the
+    // source gate reads it there), and it only picks the deciding layer the line reports: the first refused, else the
+    // first held.
+    std::vector<int> layers;
+    for (const auto & [layer_id, owner] : plan.kv_device) {
+        if (layer_id >= 0 && owner == device_id) {
+            layers.push_back(layer_id);
+        }
+    }
+    std::sort(layers.begin(), layers.end());
+    for (const bool swa_pass : { false, true }) {
+        for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+            const int layer_id = *it;
+            if (kv_info.is_swa_layer(layer_id) != swa_pass) {
+                continue;
+            }
+            const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));
+            if (extra == 0) {
+                continue;
+            }
+            const kv_context_room_cost cost =
+                weigh_kv_context_room(kv_info, layer_id, extra, n_experts, room.expert_rate);
+            room.n_layers++;
+            if (swa_pass) {
+                room.n_swa_layers++;
+                room.n_swa_held += cost.held ? 1 : 0;
+            }
+            if (cost.held) {
+                room.wanted += std::min(extra, SIZE_MAX - room.wanted);
+                room.n_held++;
+            } else {
+                room.refused += std::min(extra, SIZE_MAX - room.refused);
+                room.n_refused++;
+            }
+            if (room.decision.layer_id < 0 || (room.decision.held && !cost.held)) {
+                room.decision = cost;
+            }
+        }
+    }
+    room.held = std::min(room.wanted, remaining);
+    remaining -= room.held;
+    plan.kv_context_reserve_bytes = room.held;
+    plan.vram_bytes += room.held;
+    return room;
+}
+
+// One attention class's part of the room's line. The mixed form prints when the class's layers decided differently,
+// which the split term allows (llama.cpp-7fmt; see hold_kv_context_room).
+static std::string kv_context_room_class_summary(size_t n_held, size_t n_layers, const char * kind) {
+    char text[128];
+    if (n_layers == 0) {
+        snprintf(text, sizeof(text), "no %s layer with a room", kind);
+    } else if (n_held == n_layers) {
+        snprintf(text, sizeof(text), "held all %zu %s layer(s)", n_layers, kind);
+    } else if (n_held == 0) {
+        snprintf(text, sizeof(text), "refused all %zu %s layer(s) by cost", n_layers, kind);
+    } else {
+        snprintf(text, sizeof(text), "held %zu of %zu %s layer(s), refused %zu by cost", n_held, n_layers, kind,
+                 n_layers - n_held);
+    }
+    return text;
+}
+
+// The room's line, after the experts are packed, so it can say what the room cost: the full-attention and SWA layers
+// held and refused by cost, the deciding layer's A and B with each term's source, and the device bytes
+// of routed experts the pack placed against those the same pack places with the room added back. A WARN when it cost
+// experts, could not hold all it wanted or refused a layer, so a default run shows it; a fully refused room is one
+// WARN. With no requested context, one INFO line says no room is held. When the context is the model's default (the
+// caller named no n_ctx, so its context opens at the training context), both lines say so right after the contexts
+// they compare, so a room the size of the training context reads as the context llama creates (llama.cpp-7fmt). A
+// default context whose routed experts include a type with no measured CPU rate is not weighed
+// (kv_room_expert_rate_for): one WARN names the types and the override that would price them.
+static void log_kv_context_room(const kv_context_room & room, const placement_kv_info & kv_info, int device_id) {
+    if (kv_info.n_ctx_context == 0) {
+        GGML_LOG_INFO(
+            "[PLACEMENT] no KV context room on device %d: no requested n_ctx reached the load "
+            "(planner n_ctx=%u); KV beyond it is placed at context creation\n",
+            device_id, kv_info.n_ctx);
+        return;
+    }
+    if (room.n_layers == 0) {
+        return;
+    }
+    const double      mb   = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
+    const std::string full = kv_context_room_class_summary(room.n_held - room.n_swa_held,
+                                                           room.n_layers - room.n_swa_layers, "full-attention");
+    const std::string swa  = kv_context_room_class_summary(room.n_swa_held, room.n_swa_layers, "SWA");
+    // The note names its subject, n_ctx_context, so it does not read as qualifying the planner's n_ctx before it.
+    const char * ctx_source = kv_info.n_ctx_context_is_default ? " (n_ctx_context is the model's default, training "
+                                                                 "context: the caller named no n_ctx)" :
+                                                                 "";
+    if (!room.expert_rate.priced && room.n_held == 0) {
+        const std::string unmeasured = kv_room_type_names(room.expert_rate.types.unmeasured_mask, ggml_type_name);
+        GGML_LOG_WARN(
+            "[PLACEMENT] KV context room on device %d: refused for every layer without weighing: the routed experts "
+            "include %s, with no measured CPU rate, so none of the %.1f MB for n_ctx_context=%u over planner "
+            "n_ctx=%u%s is held, the routed experts keep it, and the runtime re-places the overflow at context "
+            "creation; GGML_SYCL_PLAN_CPU_EXPERT_GBPS=<GB/s> prices every type, and a context the caller names prices "
+            "these at %.4g GB/s. n_ctx_context is the requested n_ctx.\n",
+            device_id, unmeasured.c_str(), room.refused / mb, kv_info.n_ctx_context, kv_info.n_ctx, ctx_source,
+            kv_info.cpu_expert_gbps);
+        return;
+    }
+    const std::string rate_source = kv_room_rate_source(room.expert_rate, ggml_type_name);
+    if (room.n_held == 0) {
+        GGML_LOG_WARN(
+            "[PLACEMENT] KV context room on device %d: %s, %s: every layer's room was refused by cost, so none of "
+            "the %.1f MB for n_ctx_context=%u over planner n_ctx=%u%s is held, the routed experts keep it, and the "
+            "runtime re-places the overflow at context creation; deciding layer %d: host attention %.1f us/token "
+            "(%.1f fill at %.4g%% and host-attn %.4g GB/s + %u split(s) x %.4g us) vs displaced experts %.1f "
+            "us/token (cpu-expert %.4g GB/s, %s). n_ctx_context is the requested n_ctx.\n",
+            device_id, full.c_str(), swa.c_str(), room.refused / mb, kv_info.n_ctx_context, kv_info.n_ctx, ctx_source,
+            room.decision.layer_id, room.decision.host_attn_us, room.decision.fill_us, kv_info.ctx_fill_pct,
+            kv_info.host_attn_gbps, room.decision.n_splits, kv_info.host_split_us, room.decision.expert_us,
+            room.expert_rate.gbps, rate_source.c_str());
+        return;
+    }
+    char refused_note[64] = "";  // the refused bytes only when a layer was refused
+    if (room.refused > 0) {
+        snprintf(refused_note, sizeof(refused_note), " (%.1f MB refused by cost)", room.refused / mb);
+    }
+    const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted || room.n_refused > 0;
+    const char * short_note = room.held < room.wanted ? ", all that was left; the context's overflow is re-placed" : "";
+    // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
+    // once.
+    ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[PLACEMENT] KV context room on device %d: %s, %s%s; "
+                      "held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u%s, before the "
+                      "routed experts%s; deciding layer %d %s: host attention %.1f us/token (%.1f fill at %.4g%% "
+                      "and host-attn %.4g GB/s + %u split(s) x %.4g us) vs displaced experts %.1f us/token "
+                      "(cpu-expert %.4g GB/s, %s); it cost %.1f MB of "
+                      "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
+                      "with the room added back. n_ctx_context is the requested n_ctx.\n",
+                      device_id, full.c_str(), swa.c_str(), refused_note, room.held / mb, room.wanted / mb,
+                      kv_info.n_ctx_context, kv_info.n_ctx, ctx_source, short_note, room.decision.layer_id,
+                      room.decision.held ? "held" : "refused", room.decision.host_attn_us, room.decision.fill_us,
+                      kv_info.ctx_fill_pct, kv_info.host_attn_gbps, room.decision.n_splits, kv_info.host_split_us,
+                      room.decision.expert_us, room.expert_rate.gbps, rate_source.c_str(), room.displaced_bytes() / mb,
+                      room.expert_bytes / mb, room.expert_groups, room.expert_bytes_without / mb,
+                      room.expert_groups_without);
+}
+
+// The compute room a placed explicit micro-batch gives the hold-spill fit; unified-cache.hpp describes it.
+size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,
+                                              size_t                            compute_term,
+                                              uint32_t *                        n_ubatch) {
+    const bool placed = xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.n_ubatch != 0;
+    if (n_ubatch != nullptr) {
+        *n_ubatch = placed ? xub.n_ubatch : 0;
+    }
+    return placed ? compute_term : 0;
+}
+
+// The announce rule for a placed explicit micro-batch; unified-cache.hpp describes it.
+bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, bool probe_mode) {
+    return !probe_mode && xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.moved_bytes() > 0 &&
+           !xub.announced;
+}
+
+// The ring micro-batch of a placed explicit micro-batch; unified-cache.hpp describes it.
+uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch) {
+    const bool kept =
+        xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && n_ubatch != 0 && n_ubatch <= xub.n_ubatch;
+    return kept ? xub.n_ubatch : n_ubatch;
+}
+
+// The explicit micro-batch's ring decision, for the plan's log. INFO: it is printed for every stage of the load, and
+// the runtime context transaction announces the outcome once, at WARN, when the context opens.
+static void log_explicit_ubatch_decision(const placement_explicit_ubatch & xub, int device_id) {
+    if (xub.n_ubatch == 0) {
+        return;
+    }
+    const double mb = 1024.0 * 1024.0;
+    GGML_LOG_INFO(
+        "[PLACEMENT] explicit n_ubatch=%u PP MoE oneDNN scratch ring: %s (ring %.1f MB, "
+        "RUNTIME room %.1f MB of which %.1f MB already in the zone, expert budget %.1f MB, hold '%s' %.1f MB, "
+        "moved %.1f MB of routed experts from %zu layers: %.1f MB (%zu triplets) on the device, "
+        "against %.1f MB (%zu) with the hold added back) on device %d\n",
+        xub.n_ubatch, pp_moe_onednn_explicit_ubatch_action_name(xub.action), xub.ring_bytes / mb, xub.room_bytes / mb,
+        xub.room_reserved_bytes / mb, xub.expert_budget_bytes / mb, xub.hold_reason != nullptr ? xub.hold_reason : "",
+        xub.hold_bytes / mb, xub.moved_bytes() / mb, xub.moved_layers, xub.expert_bytes / mb, xub.expert_groups,
+        xub.expert_bytes_without / mb, xub.expert_groups_without, device_id);
+}
+
+// The routed-expert budget's hold for an explicit micro-batch's PP MoE oneDNN scratch ring: the ring is planned in the
+// RUNTIME zone for the micro-batch the caller named, and its room comes out of the routed experts, the last tier of
+// device residency, as the KV context room does. It is weighed against `remaining` once the dense weights, their KV and
+// the KV context room are placed, so it never moves a dense layer or KV. The planner's own layer-ordered pack decides
+// which experts give the room, not the loan's popularity order: the micro-batch is known at load, before any graph, so
+// the plan is made with fewer device experts instead of being patched after it (bulk-staged experts are not lendable
+// either).
+//
+// The hold is the whole room at every stage of the load. The part the RUNTIME zone already holds (a zone an earlier
+// stage grew for it) was taken from the weight capacity `remaining` was read from, so it is returned before the room
+// is held: before the zone grows (GROW_ZONE) and after (PLACE), the experts see the same budget. A REFUSE holds
+// nothing, and the context is refused by name. Returns the bytes held; `plan.explicit_ubatch` records the decision.
+static size_t hold_explicit_ubatch_room(placement_plan & plan, const placement_kv_info & kv_info, size_t & remaining) {
+    if (!kv_info.explicit_ubatch.valid) {
+        return 0;
+    }
+    const pp_moe_onednn_explicit_ubatch_room &   room     = kv_info.explicit_ubatch;
+    const pp_moe_onednn_explicit_ubatch_decision decision = pp_moe_onednn_explicit_ubatch_decide(room, remaining);
+    placement_explicit_ubatch &                  xub      = plan.explicit_ubatch;
+    xub.n_ubatch                                          = room.in.n_ubatch;
+    xub.action                                            = decision.action;
+    xub.ring_bytes                                        = room.ring_bytes;
+    xub.room_bytes                                        = room.room_bytes;
+    xub.room_reserved_bytes                               = room.room_reserved_bytes;
+    xub.expert_budget_bytes                               = remaining;
+    xub.max_ring_runtime_bytes                            = decision.max_ring_runtime_bytes;
+    xub.largest_fitting_n_ubatch                          = decision.largest_fitting_n_ubatch;
+    xub.hold_reason                                       = "PP MoE oneDNN scratch ring RUNTIME room";
+    if (decision.action == pp_moe_onednn_explicit_ubatch_action::PLACE ||
+        decision.action == pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {
+        // decide() admits the room only when room - reserved fits `remaining`, so neither step wraps.
+        remaining += room.room_reserved_bytes;
+        xub.hold_bytes = room.room_bytes;
+        remaining -= xub.hold_bytes;
+    }
+    return xub.hold_bytes;
+}
+
+// The prompt phase's window ring reserves 2 x window_slots slots of the largest staged host matrix in the WEIGHT zone
+// (moe_stream_ring::reserve), and the routed experts fill that zone at default placement, so without room held here
+// the first reserve is short and only an expert loan can fund the ring. The room is the ring's own size:
+// moe_stream_plan_ring_geometry, the function the phase and the auto-ubatch fit size the ring with, over the plan the
+// expert pack is about to produce, since the window and the slot are read from the host experts and the pack decides
+// which those are. The claim the geometry asks is the type half of the executor's staged claim, as a mask the backend
+// fills (placement_kv_info::moe_stream_staged_types).
+static_assert(GGML_TYPE_COUNT <= 64, "the staged-type mask holds one bit per ggml_type");
+// The room is n_slots x slot_bytes with no padding: a WEIGHT-zone block takes round_request(slot_bytes, alignment), which
+// is slot_bytes exactly when the slot alignment is the zone allocator's grain (slot_bytes is a multiple of it, and the
+// allocator keeps no header in the zone). Another alignment would need the room padded for it.
+static_assert(MOE_STREAM_RING_SLOT_ALIGN == tlsf_allocator::block_grain,
+              "the window ring's room counts whole slots: a slot alignment other than the zone's grain needs padding");
+
+struct moe_stream_room_claims {
+    std::unordered_map<uint64_t, ggml_type> types;  // (layer, role) keyed with expert 0 -> the role's expert type
+    uint64_t                                staged_types = 0;
+};
+
+static bool moe_stream_room_claims_by_type(void * graph_ctx, int layer, expert_tensor_role role) {
+    const auto * claims = static_cast<const moe_stream_room_claims *>(graph_ctx);
+    const auto   it     = claims->types.find(moe_stream_table_key(layer, 0, role));
+    if (it == claims->types.end()) {
+        return false;
+    }
+    const int type = static_cast<int>(it->second);
+    return type >= 0 && type < GGML_TYPE_COUNT && ((claims->staged_types >> type) & 1u) != 0;
+}
+
+// The expert pack's first-fit (compute_placement_plan: a group goes on the device when its charge fits what is left)
+// over `avail` bytes, written into the entries' placement so the ring's geometry can read the split. The pack itself
+// rewrites every group entry after this. Returns the device bytes it placed, and the groups in *n_groups.
+static size_t moe_stream_room_dry_pack(placement_plan &                       plan,
+                                       const std::vector<moe_triplet_group> & groups,
+                                       int                                    device_id,
+                                       size_t                                 avail,
+                                       size_t *                               n_groups) {
+    size_t placed = 0;
+    size_t n      = 0;
+    for (const auto & group : groups) {
+        const bool fits = group.charge_bytes <= avail;
+        if (fits) {
+            avail -= group.charge_bytes;
+            placed += group.bytes;
+            ++n;
+        }
+        for (size_t idx : group.indices) {
+            if (idx < plan.entries.size()) {
+                plan.entries[idx].on_device     = fits;
+                plan.entries[idx].target_device = fits ? device_id : -1;
+            }
+        }
+    }
+    *n_groups = n;
+    return placed;
+}
+
+// Holds the window ring's room out of `remaining`, the last term before the expert pack, and counts it in the plan.
+// Holding room moves experts to the host, which can widen the window or raise the slot, so the room is iterated to the
+// ring of the plan it produces: R starts at 0 and takes the ring of the pack with R held while that ring is larger.
+// R only grows, and it is bounded by two windows of G_plan slots of the largest claimable matrix, so it settles in a
+// few rounds; the loop stops at max_rounds. A run that has not settled by then holds the last round's ring, which no
+// pack with that room held was checked against: the phase's ring can then be larger, and the loan funds the rest. The
+// line's cost figures are taken from one more dry pack with the held room, so they describe the room the plan holds.
+// A ring that shrinks below R without reaching 0 settles with R still held, so the line names the ring R was taken
+// from, whose slots make up R, not the last round's smaller one.
+// R is held whole or not at all, never min(R, remaining). In a settled run R > remaining cannot happen: with nothing
+// left for the experts the geometry is 0 and the cap answers first. In a run that has not settled, a partial room
+// would send every expert to the host for a ring the cap then refuses.
+// No room is held when no ring would exist (nothing staged, no host expert, no planned weight slot), or when the
+// ring's cap, an eleventh of the device's expert bytes, refuses the ring once its room displaces experts. The phase,
+// the ring and the loan are unchanged: a reserve this room cannot fund still asks for a loan.
+static void hold_moe_stream_ring_room(placement_plan &                       plan,
+                                      const std::vector<moe_triplet_group> & groups,
+                                      const placement_kv_info &              kv_info,
+                                      int                                    device_id,
+                                      size_t &                               remaining) {
+    plan.moe_stream_ring_reserve_bytes = 0;
+    if (kv_info.moe_stream_staged_types == 0 || plan.pp_moe_onednn_weight_slot_bytes == 0 || groups.empty()) {
+        return;
+    }
+    moe_stream_room_claims claims;
+    claims.staged_types = kv_info.moe_stream_staged_types;
+    for (const auto & e : plan.entries) {
+        if (e.expert_id >= 0 && e.layer_id >= 0) {
+            claims.types.emplace(moe_stream_table_key(e.layer_id, 0, e.expert_role), e.type);
+        }
+    }
+    moe_stream_window_hints hints;
+    hints.weight_slot_bytes = plan.pp_moe_onednn_weight_slot_bytes;
+    hints.group_cap         = kv_info.moe_stream_group_cap;
+    hints.lent_bytes        = 0;  // the phase reads the published plan with nothing lent when this room funds it
+
+    // The pack rewrites every group entry, but the entries go back as they were, so this pass changes only the room.
+    std::vector<std::pair<bool, int>> saved;
+    for (const auto & group : groups) {
+        for (size_t idx : group.indices) {
+            if (idx < plan.entries.size()) {
+                saved.push_back({ plan.entries[idx].on_device, plan.entries[idx].target_device });
+            }
+        }
+    }
+
+    constexpr int            max_rounds     = 8;
+    size_t                   room           = 0;
+    size_t                   groups_without = 0;
+    size_t                   placed_without = 0;
+    size_t                   groups_with    = 0;
+    size_t                   placed_with    = 0;
+    moe_stream_ring_geometry geo;       // the ring of the last round's pack
+    moe_stream_ring_geometry held_geo;  // the ring `room` was taken from
+    bool                     settled = false;
+    int                      rounds  = 0;
+    while (rounds < max_rounds) {
+        const size_t avail = remaining > room ? remaining - room : 0;
+        placed_with        = moe_stream_room_dry_pack(plan, groups, device_id, avail, &groups_with);
+        if (rounds == 0) {
+            placed_without = placed_with;
+            groups_without = groups_with;
+        }
+        geo = moe_stream_plan_ring_geometry(plan, device_id, &claims, moe_stream_room_claims_by_type, hints);
+        ++rounds;
+        if (geo.bytes <= room) {
+            settled = true;
+            break;
+        }
+        room     = geo.bytes;
+        held_geo = geo;
+    }
+    if (!settled) {
+        // The last round packed with the previous round's room: pack once more with the room this run holds, so the
+        // cost the line prints is that room's.
+        const size_t held_avail = remaining > room ? remaining - room : 0;
+        placed_with             = moe_stream_room_dry_pack(plan, groups, device_id, held_avail, &groups_with);
+    }
+
+    size_t i = 0;
+    for (const auto & group : groups) {
+        for (size_t idx : group.indices) {
+            if (idx < plan.entries.size()) {
+                plan.entries[idx].on_device     = saved[i].first;
+                plan.entries[idx].target_device = saved[i].second;
+                ++i;
+            }
+        }
+    }
+
+    const double mb = 1024.0 * 1024.0;  // MB as the sibling [SYCL-PLAN] lines print it
+    if (room == 0) {
+        return;  // no ring would exist with all of `remaining` for the experts: nothing to hold, nothing to say
+    }
+    if (settled && geo.bytes == 0) {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] MoE window ring room on device %d: none held: the ring's cap (an eleventh of the device's "
+            "expert bytes) refuses the %.1f MB ring once its room displaces experts, so the prompt phase's reserve "
+            "asks for an expert loan\n",
+            device_id, room / mb);
+        return;
+    }
+    if (room > remaining) {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] MoE window ring room on device %d: none held: the %.1f MB ring exceeds the %.1f MB left "
+            "after the dense weights and the KV, so the prompt phase's reserve asks for an expert loan\n",
+            device_id, room / mb, remaining / mb);
+        return;
+    }
+    remaining -= room;
+    plan.moe_stream_ring_reserve_bytes = room;
+    plan.vram_bytes += room;
+    const size_t displaced = placed_without > placed_with ? placed_without - placed_with : 0;
+    const bool   warn      = displaced > 0 || !settled;
+    const char * unsettled =
+        settled ? "" : " (not settled: the phase's ring may be larger, and an expert loan funds the rest)";
+    // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
+    // once.
+    ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[SYCL-PLAN] MoE window ring room on device %d: held %.1f MB in the WEIGHT zone before the "
+                      "routed experts for the prompt phase's window ring (%u slots x %.2f MB, %u per region, sized "
+                      "in %d round(s))%s; it cost %.1f MB of device-resident routed experts: %.1f MB (%zu "
+                      "triplet(s)) on the device, against %.1f MB (%zu) without the room. An expert loan funds a "
+                      "reserve this room cannot.\n",
+                      device_id, room / mb, held_geo.n_slots, held_geo.slot_bytes / mb, held_geo.region_slots, rounds,
+                      unsettled, displaced / mb, placed_with / mb, groups_with, placed_without / mb, groups_without);
+}
+
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,
                                       size_t                                     vram_budget,
                                       int                                        device_id,
@@ -29415,7 +34018,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.layer_kind                          = kv_info.layer_kind;
     plan.layer_k_width                       = kv_info.layer_k_width;
     plan.layer_v_width                       = kv_info.layer_v_width;
-    plan.kv_idx_width                        = kv_info.kv_idx_width;
+    plan.layer_idx_k_width                   = kv_info.layer_idx_k_width;
     plan.planner_n_ctx                       = kv_info.n_ctx;
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
@@ -29450,6 +34053,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // MoE expert tensors (n_experts > 0, name contains "_exps") are split into
     // per-expert entries so each expert competes individually for VRAM.
     plan.entries.reserve(tensor_inventory.size() + (n_experts > 0 ? tensor_inventory.size() * n_experts : 0));
+    // The routed-expert weights by type: B's rate is their byte-weighted harmonic mean (llama.cpp-7fmt).
+    kv_room_expert_types room_expert_types;
     for (const placement_tensor_info & tensor : tensor_inventory) {
         const std::string & name     = tensor.name;
         const size_t        src_size = tensor.size;
@@ -29479,6 +34084,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             // zeroed otherwise -- in which case falling back to n_experts
             // reproduces the previous behaviour exactly.
             const int n_tensor_experts = tensor.ne[2] > 0 ? static_cast<int>(tensor.ne[2]) : n_experts;
+            room_expert_types.add(tensor.type, src_size);
 
             const int                layer_id    = p4_extract_layer_id(name.c_str());
             const size_t             expert_size = src_size / static_cast<size_t>(n_tensor_experts);
@@ -29557,8 +34163,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // Planner contract:
     //   - dense non-layer tensors (embeddings/output/etc.) may pack individually
     //   - dense per-layer tensors move as a single execution unit
-    //   - KV for a layer is charged alongside that dense layer
-    //   - MoE experts remain individually placeable
+    //   - device residency goes dense weights, then KV, then routed experts: the dense pass charges weights only;
+    //     the KV phase (plan_single_device_layer_kv) then puts a layer's KV on the device only when its dense layer
+    //     is there and the KV fits, and holds the room the opening context adds (hold_kv_context_room), so KV that
+    //     does not fit goes to the host tier and never moves a dense layer there
+    //   - the GGML_SYCL_KV_PIN_DEVICE diagnostic charges each layer's KV ahead of its weights inside the dense pass
+    //     and holds no context room
+    //   - MoE experts remain individually placeable, packed (as whole triplets) into what the KV phase leaves
     //
     // When the VRAM arena is active, subtract compute scratch and oneDNN
     // scratch zone capacities from the budget BEFORE packing weights.
@@ -29703,20 +34314,19 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                     kv_cost / (1024.0 * 1024.0));
             }
         } else {
-            const size_t total_cost = weight_charge + kv_cost;
-            on_device               = total_cost <= remaining;
-            target                  = on_device ? device_id : -1;
-            kv_on_device            = on_device;
+            // Weights only: this layer's KV is charged by the KV phase below, once every dense layer has had its
+            // claim, so KV that does not fit costs the layer its device KV and never its dense weights.
+            on_device    = weight_charge <= remaining;
+            target       = on_device ? device_id : -1;
+            kv_on_device = false;
 
             if (on_device) {
-                remaining -= total_cost;
+                remaining -= weight_charge;
                 plan.weight_vram_bytes += weight_charge;
-                plan.kv_vram_bytes += kv_cost;
-                plan.vram_bytes += total_cost;
+                plan.vram_bytes += weight_charge;
             } else {
                 plan.weight_host_bytes += weight_bytes;
-                plan.kv_host_bytes += kv_cost;
-                plan.host_bytes += total_cost;
+                plan.host_bytes += weight_bytes;
             }
         }
 
@@ -29741,6 +34351,21 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         }
     }
 
+    // The KV phase: device residency goes dense weights, then KV, then routed experts. Every dense layer has had its
+    // claim above; each device layer's KV is charged here, then the room the context the model opens with needs on
+    // top of that is held, and only then are the experts packed into what is left. With the KV pinned ahead of the
+    // weights (GGML_SYCL_KV_PIN_DEVICE) the per-layer charge already ran inside the dense loop and no room is held:
+    // the diagnostic keeps the placement it had before the room. The room's expert rate is read once, before it is
+    // held (llama.cpp-7fmt): the fallback rate divides in it, so it must be finite and positive.
+    GGML_ASSERT(std::isfinite(kv_info.cpu_expert_gbps) && kv_info.cpu_expert_gbps > 0.0);
+    const kv_room_expert_rate room_expert_rate = kv_room_expert_rate_for(
+        room_expert_types, kv_info.cpu_expert_gbps, kv_info.cpu_expert_gbps_set, kv_info.n_ctx_context_is_default);
+    kv_context_room room;
+    if (!planner_kv_pin_device_enabled()) {
+        plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);
+        room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);
+    }
+
     // MoE expert entries: budget-aware placement at (layer, expert) triplet
     // granularity.  A layer executor consumes gate/up/down for the same routed
     // expert together; splitting the roles across device and host creates the
@@ -29748,6 +34373,11 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // same routed expert).  Under pressure, keep a complete triplet on one
     // domain or mark the triplet as an explicit host/CPU domain.
     {
+        // A named hold on the routed-expert budget: the explicit micro-batch's PP MoE oneDNN scratch ring room in the
+        // RUNTIME zone. The pack below sees the budget less it, and a parallel first-fit with it added back says which
+        // triplets it moved to the host tier.
+        const size_t ubatch_hold_bytes = hold_explicit_ubatch_room(plan, kv_info, remaining);
+
         const char * hotness_source = nullptr;
         if (!planner_xmx_moe_forced()) {
             prepare_single_moe_pp_gate_up_primary_layouts_for_pack(plan, device_id, kv_info, envelope);
@@ -29780,9 +34410,20 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 "no_layout_bytes=%zu\n",
                 device_id, pp_alt_groups, pp_alt_entries, pp_alt_charge / (1024.0 * 1024.0), pp_alt_no_layout_bytes);
         }
+        // The window ring's room, the last term held before the pack: the ring is sized over the host experts the pack
+        // leaves, so the room is sized over the pack it predicts, after every group's charge is final.
+        hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining);
         moe_triplet_pack_stats stats;
         stats.groups  = moe_groups.size();
         stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
+        // The same first-fit pack with the KV context room added back, so the room's line can say what it cost.
+        size_t without_room = remaining + room.held;
+
+        // And with the explicit micro-batch's hold added back. The room moved the difference between that pack's device
+        // triplets and the real one's, as for the KV context room, and the layers it moved them out of are the ones
+        // whose device triplets that pack counts above the real one's.
+        size_t                       without_ubatch_room = remaining + ubatch_hold_bytes;
+        std::unordered_map<int, int> ubatch_layer_drop;  // per layer: device triplets without the hold, less with it
         for (const auto & group : moe_groups) {
             if (moe_triplet_complete(group)) {
                 stats.complete_groups++;
@@ -29792,6 +34433,24 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 
             const bool on_device = group.charge_bytes <= remaining;
             const int  target    = on_device ? device_id : -1;
+            if (group.charge_bytes <= without_room) {
+                without_room -= group.charge_bytes;
+                room.expert_bytes_without += group.bytes;
+                room.expert_groups_without++;
+            }
+            if (ubatch_hold_bytes > 0) {
+                if (group.charge_bytes <= without_ubatch_room) {
+                    without_ubatch_room -= group.charge_bytes;
+                    plan.explicit_ubatch.expert_bytes_without += group.bytes;
+                    plan.explicit_ubatch.expert_groups_without++;
+                    ubatch_layer_drop[group.layer_id]++;
+                }
+                if (on_device) {
+                    plan.explicit_ubatch.expert_bytes += group.bytes;
+                    plan.explicit_ubatch.expert_groups++;
+                    ubatch_layer_drop[group.layer_id]--;
+                }
+            }
             if (on_device) {
                 remaining -= group.charge_bytes;
                 plan.weight_vram_bytes += group.charge_bytes;
@@ -29824,6 +34483,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
+        room.expert_bytes  = stats.device_bytes;
+        room.expert_groups = stats.device_groups;
+
+        for (const auto & [layer_id, drop] : ubatch_layer_drop) {
+            GGML_UNUSED(layer_id);
+            plan.explicit_ubatch.moved_layers += drop > 0;
+        }
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.
@@ -29842,6 +34508,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
+    plan.kv_context_room_displaced_bytes = room.displaced_bytes();
+    log_kv_context_room(room, kv_info, device_id);
+    log_explicit_ubatch_decision(plan.explicit_ubatch, device_id);
 
     // llama.cpp-21jd: dense WOQ extra copies for this single-device plan
     // (compute_multi_device_plan makes the same per-device call).
@@ -29865,6 +34534,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
+    publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     log_moe_placement_diagnostics("PLACEMENT-MOE", plan, n_experts);
 
     // Log placement summary per priority level
@@ -30808,7 +35478,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.layer_kind               = kv_info.layer_kind;
     plan.layer_k_width            = kv_info.layer_k_width;
     plan.layer_v_width            = kv_info.layer_v_width;
-    plan.kv_idx_width             = kv_info.kv_idx_width;
+    plan.layer_idx_k_width        = kv_info.layer_idx_k_width;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
@@ -31887,6 +36557,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
 
     plan.build_index();
+    publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     log_moe_placement_diagnostics("PLACEMENT-MOE", plan, n_experts);
 
     // Build runtime query maps for multi-device inference routing.

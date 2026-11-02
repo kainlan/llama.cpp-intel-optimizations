@@ -122,6 +122,11 @@ function(llama_test_pytest target)
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
     endif()
+    # Every pytest-run script is a python gate: `ctest -L python` is the census of them, and a registration without the
+    # label is invisible to it (llama.cpp-gogg). test-sycl-gate-registration-audit.py --census enforces it.
+    if (NOT "python" IN_LIST LLAMA_TEST_LABEL)
+        list(APPEND LLAMA_TEST_LABEL python)
+    endif()
     if (NOT DEFINED LLAMA_TEST_WORKING_DIRECTORY)
         set(LLAMA_TEST_WORKING_DIRECTORY .)
     endif()
@@ -247,6 +252,11 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+# llama.cpp-7fmt: the context a load holds KV room for, resolved from llama_model_params::n_ctx_hint: 0 no room, a
+# named hint as given (padded), and LLAMA_N_CTX_HINT_DEFAULT the model's default context, n_ctx_train padded as
+# llama_context pads it. Header-only (src/llama-n-ctx-hint.h), so it needs no internal export. No model, no device.
+llama_build_and_test(test-n-ctx-hint-resolve.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
@@ -256,6 +266,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-lazy-mode-resolve.cpp)
+    llama_build_and_test(test-cpu-dispatch-buffers.cpp)
+    llama_build_and_test(test-host-mem-plan.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -373,6 +386,26 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # H5 of llama.cpp-zhcn (structural arm): init_reserve(s) spans s streams in every memory class.
+    # Loads tiny models, so it carries `model`, the label the ctest sweep (form 2 in CLAUDE.md) excludes,
+    # and is run by hand pinned to the discrete cards. Inside this block for the same reason as
+    # test-llama-archs: it uses internal symbols.
+    llama_build_and_test(test-context-measure-h5.cpp LABEL model)
+
+    # H3i (2) and (3) of llama.cpp-zhcn: a refused allocation during a memory update reaches the
+    # caller as FAILED and as llama_decode() == -2. Loads tiny models and swaps the CPU device's buffer
+    # type for a refusing wrapper, so it is `model`-labelled and lead-run like the one above.
+    llama_build_and_test(test-context-update-failure.cpp LABEL model)
+    # H3i (4): a failed reserve reaches decode and encode as -2; loads a tiny model, so `model` as above.
+    llama_build_and_test(test-context-reserve-failure.cpp LABEL model)
+    # L6 of the layer shapes (zhcn C7g): the shapes llama publishes equal the tensors each memory kind
+    # creates, on tiny CPU models. `model` as above.
+    llama_build_and_test(test-layer-shapes.cpp LABEL model)
+
+    # The measure-only llama_context (zhcn C7h): one MEASURE on a scheduler of its own, no allocation, no
+    # log lines, the real context's compute peak. CPU only, tiny synthetic models. `model` as above.
+    llama_build_and_test(test-measure-context.cpp LABEL model)
+
     llama_build(test-fusion.cpp)
 endif()
 
@@ -436,6 +469,91 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-sycl-vram-headroom.cpp)
     set_tests_properties(test-sycl-vram-headroom PROPERTIES LABELS "sycl;vram-arena;headroom")
     target_include_directories(test-sycl-vram-headroom PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# MoE batch-1 decode host path (llama.cpp-yx28): the direct-dispatch admission
+# and stamp decisions. ggml-sycl/moe-decode-hostpath.hpp includes only
+# <cstdint>, so like test-sycl-vram-headroom it needs no SYCL wiring.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-decode-hostpath.cpp)
+    set_tests_properties(test-sycl-moe-decode-hostpath PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-decode-hostpath PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# The CPU expert pool trace's per-job stamp sums and per-job line (llama.cpp-j6jf).
+# ggml-sycl/cpu-expert-pool-stamps.hpp includes only the standard library, so the
+# test links nothing: no SYCL runtime is loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-cpu-expert-pool-stamps test-sycl-cpu-expert-pool-stamps.cpp)
+    target_include_directories(test-sycl-cpu-expert-pool-stamps PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-sycl-cpu-expert-pool-stamps COMMAND test-sycl-cpu-expert-pool-stamps)
+    set_tests_properties(test-sycl-cpu-expert-pool-stamps PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
+endif()
+
+# The book of the CPU expert job signal ring (llama.cpp-qwn5): an entry's host-signalled device event is reset and
+# reused only after its job signalled it, the pending scatter's half is gone, and the host waited a flush at least as
+# late as the one that made the device wait on it. ggml-sycl/cpu-job-signal.hpp includes only the standard library,
+# so the test links nothing: no SYCL runtime is loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-cpu-job-signal-book test-sycl-cpu-job-signal-book.cpp)
+    target_include_directories(test-sycl-cpu-job-signal-book PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-sycl-cpu-job-signal-book COMMAND test-sycl-cpu-job-signal-book)
+    set_tests_properties(test-sycl-cpu-job-signal-book PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
+endif()
+
+# Host-expert MoE result scatter (llama.cpp-cre6): the compact form (one copy into the planned scratch, one kernel
+# placing rows by slot) against the per-run copies it replaces, on synthetic routings. ggml-sycl/moe-host-scatter.hpp
+# includes only the standard library, so this needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-host-scatter.cpp)
+    set_tests_properties(test-sycl-moe-host-scatter PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-host-scatter PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
+# no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
+# graphs on a no-alloc ggml context, so it needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-graph-phase.cpp)
+    set_tests_properties(test-sycl-graph-phase PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-graph-phase PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# Per-split segmented-graph slots (llama.cpp-7pm2): the slot key (signature, names, storage identity) and the
+# warmup/record/replay/direct state machine with LRU retirement and the churn guard.
+# ggml-sycl/graph-segment-cache.hpp includes only standard headers, so the test needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-graph-segment-cache.cpp)
+    set_tests_properties(test-sycl-graph-segment-cache PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-graph-segment-cache PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# MoE graph preload memo (llama.cpp-7pm2): per-tensor, per-device stamps of the preload outcome, and the verdict that
+# lets an all-host expert tensor stay a direct node. ggml-sycl/moe-graph-preload-stamp.hpp includes only
+# <cstddef>/<cstdint>, so the test needs no SYCL wiring.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-graph-preload-stamp.cpp)
+    set_tests_properties(test-sycl-moe-graph-preload-stamp PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-graph-preload-stamp PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# KV cache tensor name -> layer id (llama.cpp-4ot7): the tiered KV buffer remaps each tensor onto its
+# layer's allocation by this id, and a name-tagged cache ("cache_idx_k_l3") used to parse as no layer.
+# ggml-sycl/kv-cache-tensor-name.hpp includes only <climits>/<cstring>: no SYCL, no ggml, no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-kv-cache-tensor-name.cpp)
+    set_tests_properties(test-sycl-kv-cache-tensor-name PROPERTIES LABELS "sycl;kv;hostonly")
+    target_include_directories(test-sycl-kv-cache-tensor-name PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# oneDNN SDPA query-row chunking (llama.cpp-jwjz): one execute's Graph scratch is H_q x rows x n_kv x 6 bytes,
+# so the route splits an op's query rows to keep every execute under a budget. ggml-sycl/fattn-onednn-chunk.hpp
+# includes only standard headers, so the test needs no device. test-sycl-fattn-onednn-chunk-source (registered
+# with the other oneDNN source gates below) pins that the dispatcher uses it at half the DIRECT cap.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-fattn-onednn-chunk.cpp)
+    set_tests_properties(test-sycl-fattn-onednn-chunk PROPERTIES LABELS "sycl;onednn;hostonly")
+    target_include_directories(test-sycl-fattn-onednn-chunk PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
 # WOQ-MXFP4 capability spike: does this device's oneDNN build a matmul with
@@ -550,6 +668,37 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         RUN_SERIAL TRUE
         TIMEOUT 300
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
+
+# The staging probe's verdict table, host-only: the classification is a pure function in
+# tests/sycl-staging-probe-verdict.h of three host clocks (busy, return, done), driven here over the
+# readings that separate its outcomes and every threshold edge, so a change to the verdict's reading
+# fails on a host with no device.
+llama_build_and_test(test-sycl-staging-probe-verdict.cpp)
+set_tests_properties(test-sycl-staging-probe-verdict PROPERTIES LABELS "sycl;host-only")
+
+# Cross-device staging probe (llama.cpp-23mk, design row 113 / G0): does the submit of a leg that
+# depends on another queue's event return before that event completes? Needs two devices and the
+# backend's own queues, so it links the real ggml-sycl library like test-sycl-profiling-queue-property
+# above. Lead-run only (two-device GPU work, one at a time); it exits 77 with fewer than two devices.
+# `mem-handle` keeps it out of the full-sweep form of "Running Tests", and the default selector pins the
+# two discrete cards. It carries no ONEAPI_DEVICE_SELECTOR of its own beyond that pin.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-staging-probe.cpp)
+    set_tests_properties(test-sycl-staging-probe PROPERTIES LABELS "sycl;gpu-serial;mem-handle")
+    target_include_directories(test-sycl-staging-probe PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-staging-probe PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-staging-probe PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-staging-probe PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-staging-probe PRIVATE "-fsycl")
+        target_link_options(test-sycl-staging-probe PRIVATE "-fsycl")
+    endif()
+    set_tests_properties(test-sycl-staging-probe PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 
 # WOQ repack kernel microbench (perf-recovery epic, track D, llama.cpp-0vqt):
@@ -687,7 +836,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-backend-count-get-null-census
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-count-get-null-census.py)
     set_tests_properties(test-backend-count-get-null-census PROPERTIES
-        LABELS "backend;lifecycle;source;host" TIMEOUT 30)
+        LABELS "backend;lifecycle;source;host;python" TIMEOUT 30)
     # llama.cpp-ttws: the host-weight registry must classify a name collision
     # (tied token_embd/output alias vs a genuine conflict) before it warns.
     # Structural gate on the print site in ggml-sycl.cpp; the classifier's own
@@ -695,41 +844,224 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-host-weight-alias-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-weight-alias-source.py)
     set_tests_properties(test-sycl-host-weight-alias-source PROPERTIES
-        LABELS "sycl;registry;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;registry;source;source-contract;hostonly;python" TIMEOUT 30)
     # llama.cpp-qeld: this gate sat unregistered, so nothing noticed when the h9uv
     # weight_ext split (ed8ef61b3) moved the fields it pins. Text-only, no device.
     add_test(NAME test-sycl-moe-ptr-table-retention-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-ptr-table-retention-source.py)
     set_tests_properties(test-sycl-moe-ptr-table-retention-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # An over-capacity CPU expert dispatch must fall back, not abort (llama.cpp-sfal).
     # Run WITH --self-test: a text-only check whose anchors stop matching real code
     # passes vacuously, and --self-test requires its 5 mutants to still be caught.
     add_test(NAME test-sycl-cpu-expert-pool-capacity-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-capacity-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-capacity-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # CpuExpertPool is a thread pool and owns no memory: its four staging ring
+    # slots had no callers and were removed (llama.cpp-b2jc). Run WITH --self-test
+    # so each ring name, allocation and init() parameter is proven to be caught.
+    add_test(NAME test-sycl-cpu-expert-pool-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-expert-pool-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # CpuExpertPool defaults to one worker: every job's row loop shares the pool's
+    # one row-worker set, and the layer chain already orders the jobs (llama.cpp-w4e9).
+    # Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-cpu-expert-pool-default-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-default-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-expert-pool-default-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # A CpuExpertPool job runs its row loop on the pool's own row workers, which poll for a
+    # bounded spin budget (GGML_SYCL_CPU_ROW_SPIN_US) between jobs and then block
+    # (llama.cpp-w4e9). WITH --self-test.
+    add_test(NAME test-sycl-cpu-row-workers-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-row-workers-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-row-workers-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # Every CPU expert pool job stamp is taken inside a trace guard, the trace line
+    # carries the six per-token sums, and =2 is the only per-job printer
+    # (llama.cpp-j6jf). Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-cpu-expert-pool-stamps-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-stamps-source.py --self-test)
+    # TIMEOUT: its mutant self-test took 29.5 s wall at host load 43, against the old 30 s.
+    set_tests_properties(test-sycl-cpu-expert-pool-stamps-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # CPU expert job joins go on the cache's join-only queue behind GGML_SYCL_MOE_JOIN_QUEUE, after the latest
+    # recorded host task, and the scatter still depends on them (llama.cpp-wfsl). Run WITH --self-test so each
+    # pin is proven to catch its mutant.
+    add_test(NAME test-sycl-moe-join-queue-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-join-queue-source.py --self-test)
+    set_tests_properties(test-sycl-moe-join-queue-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The host-expert scatter waits on the CPU job's own device event where the device may, every way a job ends
+    # signals it, and no wrapper outlives its flush or is reset before its stream was waited (llama.cpp-qwn5). Run
+    # WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-moe-cpu-job-device-signal-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-job-device-signal-source.py --self-test)
+    set_tests_properties(test-sycl-moe-cpu-job-device-signal-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # A returning whole-queue wait of the graph code, every CPU expert batch and every host-recipe expert task tick
+    # the [SYCL-WATCHDOG], so a slow prompt graph is not stopped while it advances (llama.cpp-ff00). Run WITH
+    # --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-watchdog-progress-tick-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-watchdog-progress-tick-source.py --self-test)
+    set_tests_properties(test-sycl-watchdog-progress-tick-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # Every retained-handle record takes the gates of every live ring's CPU expert jobs from one snapshot that waits on
+    # nothing, and a gate list cannot drop a running job's gate: the drain worker must not reach a driver wait in front
+    # of a job that has not started (llama.cpp-42zj). Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-retained-record-gates-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-retained-record-gates-source.py --self-test)
+    set_tests_properties(test-sycl-retained-record-gates-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The CPU expert pool worker waits a job's inputs on a device-written marker with host loads and makes no driver
+    # call but the job's device signal; a refused arm is waited on the submitting thread (llama.cpp-42zj). Run WITH
+    # --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-cpu-job-input-wait-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-job-input-wait-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-job-input-wait-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The input marker's word is a persistent owner in the WEIGHT host zone, never in the boundary-swept STAGING or
+    # SCRATCH zones, and a refused host-zone boundary check walks the allocation registry only for the diagnostics it
+    # still prints or an active zone audit (llama.cpp-nqbe). Run WITH --self-test so each pin is proven to catch its
+    # mutant.
+    add_test(NAME test-sycl-host-zone-boundary-owner-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-zone-boundary-owner-source.py --self-test)
+    set_tests_properties(test-sycl-host-zone-boundary-owner-source PROPERTIES
+        LABELS "sycl;allocator;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The per-op source chain skips the ready events its own in-order stream produced, behind
+    # GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, and queries every other one as before (llama.cpp-wfsl). Run WITH
+    # --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-chain-same-queue-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-chain-same-queue-source.py --self-test)
+    set_tests_properties(test-sycl-chain-same-queue-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # Every synchronous wait mem_copy_submit makes is counted by kind and by the copy's caller under the MoE trace,
+    # and the [MOE-HOSTPATH-WAITS] line prints the census (llama.cpp-qwn5). Run WITH --self-test so each pin is
+    # proven to catch its mutant.
+    add_test(NAME test-sycl-mem-ops-staged-wait-census-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mem-ops-staged-wait-census-source.py --self-test)
+    set_tests_properties(test-sycl-mem-ops-staged-wait-census-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # mem_copy_submit asks a host endpoint's retained owner whether it is host USM before the pointer registry,
+    # which never sees pinned-pool chunks, and the MoE ids stage is fresh per call because its H2D now reads it in
+    # place (llama.cpp-qwn5). Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-mem-ops-host-provenance-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mem-ops-host-provenance-source.py --self-test)
+    set_tests_properties(test-sycl-mem-ops-host-provenance-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
     add_test(NAME test-sycl-moe-cpu-activation-row-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
+    # TIMEOUT: the 79-mutant self-test took 37 s wall at host load 9.5.
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-exec-knobs-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-knobs-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
+    # llama.cpp-8epx (Task 3 of llama.cpp-a2xb): the batched prompt executor reads a claimed layer's host experts from
+    # ring windows, one window per phase, bracketed by window_begin and window_done.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-exec-window-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-window-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
+    # The ring windows' timing line is printed only at GGML_SYCL_MOE_EXEC_TRACE=2. Its device times come from marker
+    # kernels on a queue the ring builds only at that level, not from the copies: copy events read for their times made
+    # the unified cache's copy queue a profiling queue, and a traced prefill stalled in the runtime below this backend.
+    # The pin guards that the copy queue is never profiled, the marks' placement and figures (readers_wait_us as the
+    # gate's command_end minus the free mark's, start_lag_us as the start mark's minus the gate's), and that below
+    # level 2 the cost stays one branch per site.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-exec-window-timing-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-window-timing-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
+    # llama.cpp-348c: the batched oneDNN prompt executor is type-keyed: one support table that the device test
+    # covers, claimed prompts reaching the executor ahead of the Q4_K D2H fallback by route precedence (the fallback
+    # itself unchanged), one refusal enum whose post-claim causes warn by default, one [PP-MOE] line per (device,
+    # type, layout), byte-identical MXFP4 labels.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-pp-batched-types-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-pp-batched-types-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
     # staging allocation fails, and the registry must not fail an allocation on a
     # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.
     add_test(NAME test-sycl-moe-cpu-dispatch-fail-closed-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-fail-closed-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-dispatch-fail-closed-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # The opt-in per-call-site memcpy census (llama.cpp-th86,
+    # GGML_SYCL_MEMCPY_SITE_CENSUS): gated on the env through one static bool,
+    # the caller's file:line forwarded from mem_copy_async/mem_copy and the
+    # generic copy wrappers into mem_copy_direct_submit, the host-host branch
+    # tagged H2H, printed to stderr at backend free and at exit. A second pytest
+    # case runs the self-test (25 mutants, 1 harmless probe).
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-memcpy-site-census-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-memcpy-site-census-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;source;source-contract;hostonly;python"
+        TIMEOUT 120)
+    # The host-expert MoE decode levers (llama.cpp-z4kd): the GLU of a host-expert
+    # layer asks moe_glu_input_host_produced (not the stale MUL_MAT_ID walk), the
+    # wait census times B1 around the id readback and classifies only when on,
+    # pending_any reads every scatter slot, the graph-entry drain resets a slot's
+    # job future only while the slot is inactive, and the retired
+    # GGML_SYCL_PIPELINE_CPU warns at init. WITH --self-test (26 mutants and
+    # 1 harmless probe, ~28 s at load 16-20).
+    add_test(NAME test-sycl-moe-hostpath-levers-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hostpath-levers-source.py --self-test)
+    set_tests_properties(test-sycl-moe-hostpath-levers-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # After the ids readback, the hybrid MUL_MAT_ID branch and the CPU scatter
+    # flushes it calls must not block the submitting thread: the CPU jobs' input
+    # waits run on the pool worker and their joins are host_tasks on the queue
+    # (llama.cpp-z4kd). WITH --self-test so each anchor is proven load-bearing.
+    add_test(NAME test-sycl-moe-hostpath-no-host-wait-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hostpath-no-host-wait-source.py --self-test)
+    # The self-test re-scans the whole backend, callees included, for each of 47 mutants (~27 s at load 4-10).
+    set_tests_properties(test-sycl-moe-hostpath-no-host-wait-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # TOP_K runs on the device for every k <= ncols: one shape selector decides the
+    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). A pytest case runs
+    # the mutant self-test.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-topk-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-topk-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;source;source-contract;hostonly;python"
+        TIMEOUT 120)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
     # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
     # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
     add_test(NAME test-sycl-xmx-tiled-partial-cover-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-xmx-tiled-partial-cover-source.py --self-test)
     set_tests_properties(test-sycl-xmx-tiled-partial-cover-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # A prompt-phase MoE layout over a MIXED tensor (a few experts in VRAM, the
     # rest host-planned) is admitted by the loaded layout plus the host entries
     # the CPU runs, at every prompt admission site (llama.cpp-f6zo: the
@@ -738,7 +1070,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-prompt-hybrid-layout-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-prompt-hybrid-layout-source.py --self-test)
     set_tests_properties(test-sycl-moe-prompt-hybrid-layout-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # A MoE host-expert dispatch must bridge a storage-handle miss, not kill the
     # graph (llama.cpp-srti). Also runs WITH --self-test: the per-site checks are
     # anchored on refusal-message text, so a renamed site would silently stop
@@ -746,7 +1078,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-cpu-dispatch-storage-bridge-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-storage-bridge-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-dispatch-storage-bridge-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # Consumer-side half of the MMVQ coverage invariant (llama.cpp-gx30). The C++
     # gate checks capability against the launchers that EXIST; this checks it
     # against what each consumer's own switch ENUMERATES. Census 9b died in the
@@ -754,7 +1086,22 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-mmvq-consumer-coverage
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-mmvq-consumer-coverage.py)
     set_tests_properties(test-sycl-moe-mmvq-consumer-coverage PROPERTIES
-        LABELS "sycl;moe;source;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;hostonly;python" TIMEOUT 30)
+    # Q2_0 has every SYCL piece it is admitted on: dequant, vec_dot, the dense and _id MMVQ arms,
+    # the MUL_MAT allowlist entry, and a GET_ROWS predicate that still declines it (llama.cpp-s36q
+    # phase 4). The numerics are test-sycl-q2-0-kernels; this is the structural half.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-q2-0-wiring-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-q2-0-wiring-source.py
+        LABEL "sycl;quant;source;hostonly;python"
+        TIMEOUT 30)
+    # The opt-in ESIMD Q4_0 mmq kernels crash ocloc 26.35 / IGC 2.41 and are compiled out unless the CMake option
+    # GGML_SYCL_MMQ_ESIMD is ON (llama.cpp-xtvl). Structural half; the proof is that the device link succeeds.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mmq-esimd-compile-out-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmq-esimd-compile-out-source.py
+        LABEL "sycl;quant;source;hostonly;python"
+        TIMEOUT 30)
     add_test(NAME test-sycl-lifecycle-g1-harness
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
     set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES
@@ -785,7 +1132,7 @@ if (Python3_Interpreter_FOUND)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-woq-slot-formula-source.py
     )
     set_tests_properties(test-sycl-woq-slot-formula-source PROPERTIES
-        LABELS "sycl;moe;woq;source;hostonly"
+        LABELS "sycl;moe;woq;source;hostonly;python"
         TIMEOUT 30)
 endif()
 
@@ -907,7 +1254,19 @@ if (NOT WIN32)
     )
     # The script exits 77 (skip) when neither ripgrep nor GNU grep is available
     # (e.g. macOS BSD grep runners); treat that as a skip, not a failure.
-    set_tests_properties(test-sycl-alloc-policy PROPERTIES SKIP_RETURN_CODE 77)
+    #
+    # This wrapper is the registration of scripts/check-sycl-alloc-usage.sh: it
+    # runs the checker on ggml/src/ggml-sycl, then on every planted fixture. With
+    # only the default "main" label, lane sets that select policy or host-only
+    # gates by label never ran it, so a violation merged unseen. Labels match
+    # test-sycl-handle-policy plus "hostonly": it is bash and grep, no device.
+    # Setting LABELS replaces the default "main", so `ctest -L main` no longer
+    # selects it; host-only tests in this fork do not carry "main".
+    set_tests_properties(test-sycl-alloc-policy PROPERTIES
+        LABELS "sycl;policy;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 if (NOT WIN32)
@@ -1021,6 +1380,21 @@ if (NOT WIN32)
         LABELS "sycl;source"
         SKIP_RETURN_CODE 77
     )
+
+    # MoE executor gate script (llama.cpp-x6zo, plan Task 15 of llama.cpp-36j0): the scoring of
+    # scripts/sycl-moe-exec-gate.sh against fixture logs and csv (Q_pp pass / fail / ring-refused, the staged-ring
+    # trace, the decode arms, the GPT-OSS echo-line control), --dry-run, --help and the refusals. Pure bash: it
+    # loads no model, touches no device and takes no GPU.lock, so it is safe at any parallelism.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-moe-exec-gate-script
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-exec-gate-script.sh
+    )
+    set_tests_properties(test-sycl-moe-exec-gate-script PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT WIN32)
@@ -1107,7 +1481,7 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
     add_test(NAME test-sycl-device-link-routing
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-routing.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-sycl-device-link-routing PROPERTIES
-        LABELS "sycl;build;hostonly"
+        LABELS "sycl;build;hostonly;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -1117,7 +1491,7 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
     add_test(NAME test-sycl-source-root-anchor
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-source-root-anchor.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-sycl-source-root-anchor PROPERTIES
-        LABELS "sycl;build;hostonly;source-contract"
+        LABELS "sycl;build;hostonly;source-contract;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -1130,7 +1504,7 @@ if (CMAKE_GENERATOR STREQUAL "Ninja" AND NOT LLAMA_USE_SYSTEM_GGML AND Python3_I
     add_test(NAME test-build-info-scope
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-build-info-scope.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-build-info-scope PROPERTIES
-        LABELS "build;hostonly"
+        LABELS "build;hostonly;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -1429,7 +1803,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-static-storage-audit.py
     )
     set_tests_properties(test-sycl-static-storage-audit PROPERTIES
-        LABELS "sycl;policy;audit"
+        LABELS "sycl;policy;audit;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 3600
     )
@@ -1459,7 +1833,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-zone-reset-audit-source.py --self-test
     )
     set_tests_properties(test-sycl-zone-reset-audit-source PROPERTIES
-        LABELS "sycl;policy;audit"
+        LABELS "sycl;policy;audit;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
@@ -1483,7 +1857,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-execution-abort-source.py
     )
     set_tests_properties(test-sycl-execution-abort-source PROPERTIES
-        LABELS "sycl;execution;policy"
+        LABELS "sycl;execution;policy;python"
         TIMEOUT 120
     )
 
@@ -1606,7 +1980,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-timeline-gap-class-conservation.py
     )
     set_tests_properties(test-sycl-timeline-gap-class-conservation PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1622,8 +1996,96 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gap-causes.py
     )
     set_tests_properties(test-sycl-gap-causes PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
+    )
+
+    # Scorer gate for the `[GRAPH-DIAG] phase=final` line that
+    # ggml_backend_sycl_free prints. scripts/sycl-graph-diag-score.sh is the one
+    # authority GW7 and GRP read their counts through; this test runs that script
+    # over a synthetic log formatted from the real literal in ggml-sycl.cpp
+    # (last qualifying line, left-anchored keys, VOID instead of a zero).
+    # Pure Python and host-only: it allocates nothing and loads no model.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-graph-diag-final-scorer
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-graph-diag-final-scorer.py
+    )
+    set_tests_properties(test-sycl-graph-diag-final-scorer PROPERTIES
+        LABELS "sycl;profiling;tdd;python"
+        TIMEOUT 120
+    )
+
+    # cpu-dispatch.cpp functions are host executors inside a device dispatch;
+    # their resolver calls must sit inside a ggml_sycl_host_executor_region or
+    # the resolver host-return counter reads host execution as device reads.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-cpu-dispatch-resolver-region
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-dispatch-resolver-region.py
+    )
+    set_tests_properties(test-sycl-cpu-dispatch-resolver-region PROPERTIES
+        LABELS "sycl;profiling;tdd;python"
+        TIMEOUT 60
+    )
+
+    # ggml core clauses of the context-tenant planning path: the scheduler tests
+    # every gallocr reserve, and a failed reserve invalidates the node layout so
+    # the next same-shape alloc_graph reserves again instead of using a NULL buffer.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-context-tenant-plan-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-context-tenant-plan-source.py
+    )
+    # The mutant sweep of gate 22 reads every tracked file; ~20 s idle, and this host is never idle.
+    set_tests_properties(test-sycl-context-tenant-plan-source PROPERTIES
+        LABELS "sycl;tdd;python"
+        TIMEOUT 180
+    )
+
+    # Gate 27 (llama.cpp-zhcn): the holder census, producer half.  A cache that only
+    # compares a source holds a mem_handle_identity, never a mem_handle (§B.2); the
+    # gate pins the producer fixes and proves itself on mutants of the real source.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-holder-census-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-holder-census-source.py
+    )
+    set_tests_properties(test-sycl-holder-census-source PROPERTIES
+        LABELS "sycl;tdd;python"
+        TIMEOUT 180
+    )
+
+    # Gates 3, 23, 29, 30, 31, 36 and 37 (llama.cpp-zhcn): the backend half of the
+    # re-plan protocol (chunk cap, graph clear, host_task and queue censuses, the L0
+    # token and its witnesses, the plan override, the measure backend, the pool gates).
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-replan-census-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-replan-census-source.py
+    )
+    set_tests_properties(test-sycl-replan-census-source PROPERTIES
+        LABELS "sycl;tdd;python"
+        TIMEOUT 400
+    )
+
+    # llama.cpp-5tdy: the placement plan's per-op read path reads the residency
+    # summary -- has_host_experts and mul_mat_id's residency predicates do not
+    # sweep every expert through lookup_expert_placement.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-placement-read-path-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-placement-read-path-source.py
+    )
+    set_tests_properties(test-sycl-placement-read-path-source PROPERTIES
+        LABELS "sycl;tdd;python"
+        TIMEOUT 60
     )
 
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
@@ -1647,7 +2109,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gap-device-split.py
     )
     set_tests_properties(test-sycl-gap-device-split PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1665,7 +2127,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-sched-census.py
     )
     set_tests_properties(test-sycl-sched-census PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1681,10 +2143,30 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-qwen4exp-vehicle-rewrite.py
     )
     set_tests_properties(test-sycl-qwen4exp-vehicle-rewrite PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
         SKIP_RETURN_CODE 77
     )
+
+    # Arithmetic gate for scripts/moe-cache-sim.py (llama.cpp-05mh), the
+    # expert-routing cache simulator fed by examples/moe-trace. Pytest-style, so
+    # it goes through llama_test_pytest. Hand-built synthetic traces only: no
+    # model, no device. Two of its tests skip on their own (the gguf-py size
+    # reader without numpy, the C++ trace cross-check without the built tool).
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-moe-cache-sim.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "python"
+        TIMEOUT 120
+    )
+    # Hand the gate the tracer built beside it so its C++/Python format
+    # cross-check runs instead of skipping. The binary is not a test dependency
+    # (ctest does not build it); an unbuilt one still skips.
+    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
+        set_property(TEST test-moe-cache-sim APPEND PROPERTY ENVIRONMENT
+            "LLAMA_MOE_TRACE_BIN=$<TARGET_FILE:llama-moe-trace>")
+    endif()
 
     # ---------------------------------------------------------------------
     # RESTORED COVERAGE, batch 1/N (llama.cpp-0igs): 37 pytest-style gates for
@@ -1974,6 +2456,23 @@ if (NOT WIN32)
     )
 
     # ---------------------------------------------------------------------
+    # New gate, not part of the llama.cpp-0igs restoration above or below
+    # (llama.cpp-0rhb): the parser and the dry-run argument handling for the
+    # qwen4exp MTP acceptance measurement (scripts/parse-qwen4exp-mtp-
+    # acceptance.py, scripts/qwen4exp-mtp-acceptance.sh).  Pure text and
+    # `bash --dry-run`: no model load, no device, no oneAPI.  Pytest-style, so
+    # it is registered through llama_test_pytest like its neighbours; it is
+    # labelled `python` (the audit's R8) and not `sycl`, because it has nothing
+    # to do with the SYCL backend.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-qwen4exp-mtp-acceptance-parser.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "python;script-gate"
+        TIMEOUT 120
+    )
+
+    # ---------------------------------------------------------------------
     # RESTORED COVERAGE, batch 2/N (llama.cpp-0igs): 26 pytest-style SOURCE
     # assertions over ggml-sycl/ and tools/, same unregistered-so-vacuous
     # situation as batch 1 above.
@@ -2033,6 +2532,14 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;onednn;allocator"
         TIMEOUT 120
     )
+    # llama.cpp-jwjz: the oneDNN SDPA dispatcher splits an op's query rows into executes whose Graph scratch fits
+    # half the allocator's own DIRECT cap, so no chunk takes the allocator's oversized early-out. Host-only, needs
+    # no build. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-fattn-onednn-chunk-source
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-onednn-chunk-source.py --self-test
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-fattn-onednn-chunk-source PROPERTIES
+        LABELS "sycl;python;source-assert;onednn;hostonly" TIMEOUT 120)
     # llama.cpp-o3a0: keeps src/llama-model.cpp's replicated oneDNN SDPA
     # head-dim eligibility rule (it cannot include the SYCL-only
     # fattn-onednn.cpp to share the real predicate) in sync with the rule it
@@ -2080,6 +2587,31 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # llama.cpp-36j0: a pinned-pool WEIGHT-role host owner is a trusted USM copy endpoint, so a copy from a
+    # host-planned expert is a direct DMA; the qwn5 graph-recording exclusion stays verbatim. Text only.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mem-ops-host-scope-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
+    # llama.cpp-z5fn: load_tensors must feed planner_owns_placement (SYCL) into the lazy AUTO decision.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-model-lazy-auto-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "python;source-assert"
+        TIMEOUT 120
+    )
+    # llama.cpp-z5fn: the default [HOSTMEM] path must not reach smaps/mallinfo2.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-hostmem-default-cheap-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-supports-op-foreign-buffer-source.py
@@ -2092,6 +2624,15 @@ if (NOT WIN32)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmid-admission-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;placement"
+        TIMEOUT 120
+    )
+    # llama.cpp-9qjy: a BF16 dense weight runs natively from the BF16 bytes the planner placed; the
+    # lazily allocated, unplanned F32 copy is gone and the executor allocates and waits on nothing.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-bf16-native-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;placement;hostonly"
         TIMEOUT 120
     )
     llama_test_pytest(
@@ -2344,6 +2885,13 @@ if (NOT WIN32)
     )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-dpas-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;fa;mutation"
+        TIMEOUT 120
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-pool-legacy-release-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;graph;mutation"
@@ -2460,6 +3008,14 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
+    )
+    # The staging probe's skip counts PHYSICAL devices (the scheduler exposes one); pinned from its source.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-staging-probe-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 60
     )
     # Registered by llama.cpp-qeld: both were declined as red (see the DECLINED note below), were repaired,
     # and then sat unregistered. Host-only text scans.
@@ -2923,6 +3479,27 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
+    # test-sycl-moe-stream-ring-room: the window ring's planned room, n_slots x slot_bytes free in the WEIGHT zone,
+    # funds every slot of moe_stream_ring::reserve, and one grain less funds one slot fewer -- on a real device cache,
+    # with no model loaded. It allocates a 64 MB arena and fills its WEIGHT zone, so it carries `cache` and stays out of
+    # the throttled sweep (run it by name, one at a time).
+    llama_build(test-sycl-moe-stream-ring-room.cpp)
+    target_include_directories(test-sycl-moe-stream-ring-room PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-moe-stream-ring-room PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-moe-stream-ring-room PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-moe-stream-ring-room PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-moe-stream-ring-room PRIVATE "-fsycl")
+        target_link_options(test-sycl-moe-stream-ring-room PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-moe-stream-ring-room LABEL "main")
+    set_tests_properties(test-sycl-moe-stream-ring-room PROPERTIES
+        LABELS "sycl;cache;moe"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
+
     # test-sycl-model-lifecycle-hooks: the weight-ownership hooks must actually
     # be INVOKED on a real llama_model load and teardown (llama.cpp-viga).
     #
@@ -3207,6 +3784,20 @@ if(GGML_SYCL)
     )
 endif()
 
+# test-tlsf-allocator: the arena sub-allocator's bookkeeping, including the
+# position-anchored placement calls the lifetime-segregated KV layout uses
+# (llama.cpp-moua). tlsf-allocator.hpp is standard C++ with host-side
+# metadata only, so this links nothing and touches no device. Gated on
+# GGML_SYCL only because the header uses GCC/Clang builtins.
+if(GGML_SYCL)
+    add_executable(test-tlsf-allocator test-tlsf-allocator.cpp)
+    add_test(NAME test-tlsf-allocator COMMAND $<TARGET_FILE:test-tlsf-allocator>)
+    set_tests_properties(test-tlsf-allocator PROPERTIES
+        LABELS "sycl;tlsf;hostonly"
+        TIMEOUT 60
+    )
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
@@ -3258,6 +3849,12 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # test drifting -- which is exactly why a restored block has to be built
     # and not just pasted back. Same remedy as test-alloc below.
     target_include_directories(test-q4-0-q8-0-vec-dot-regression PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    # llama.cpp-tjg8: ggml_vec_dot_q2_0_q8_0 against an independent oracle, plus a
+    # check that on x86 AVX2 the registered kernel is not the scalar reference.
+    # Same include-path remedy as above (the source includes ggml-cpu/quants.h).
+    llama_build_and_test(test-q2-0-q8-0-vec-dot.cpp)
+    set_tests_properties(test-q2-0-q8-0-vec-dot PROPERTIES LABELS "main;quant")
+    target_include_directories(test-q2-0-q8-0-vec-dot PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 # libmtmd
@@ -3301,6 +3898,15 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # The scheduler's chunk query and its clean failure on a refused buffer.
+    # Both need ggml-backend-impl.h for the dummy backend's interface structs
+    # and host-only: no device, no model.
+    llama_build_and_test(test-sched-reserve-chunks.cpp)
+    llama_build_and_test(test-sched-alloc-failure.cpp)
+    # llama.cpp-pmzl: the classifier resolve_fused_ops() uses to say "placement" or "does not support it" for a fused
+    # op that landed on the CPU. Fake device/buffers/tensors only: no backend, no model, no device.
+    llama_build_and_test(test-llama-fused-landing.cpp)
 endif()
 
 # -------------------------------------------------------------------------
@@ -3667,6 +4273,46 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-76os: source gate -- the SOA-reorder type table
+# (ggml/src/ggml-sycl/soa-reorder-types.hpp) is the one list of types whose
+# AOS->SOA reorder exists. The six per-type fill switches (reorder_aos_to_soa_device,
+# reorder_rows_to_soa, reorder_data_internal_, ggml_sycl_reorder_weight_gpu,
+# ggml_sycl_reorder_weight_cpu, ggml_sycl_reorder_expected_size) must carry exactly
+# its types; the runtime clamp, reorder_tensor_to_soa, the partial-row fill and
+# layout_policy::get_optimal (the planner's layout source) must read it; and a chain
+# comparing against all five types is flagged. Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-soa-reorder-types-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-soa-reorder-types-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
+# llama.cpp-s36q: source gate -- the legacy standard-PP MUL_MAT_ID route's
+# device_weight_cpu_fallback flag (ggml-sycl.cpp) must not name a type the MoE MMVQ
+# capability table advertises (it D2H-streams device-resident experts to the CPU per
+# dispatch and makes the _id kernel unreachable), except the ticketed exemptions.
+# Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-device-weight-cpu-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-device-weight-cpu-fallback-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
+# llama.cpp-s36q: source gate -- the MUL_MAT_ID dispatch publishes AoS expert handles with its
+# consumer named (a single-expert, name-unclassified src0 has no other trigger), and the
+# publication decision is the host-tested predicate in moe-mmvq-tables.hpp. Host-only.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-expert-publication-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-publication-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-2lxw: source gate for the dense split executor's host-side trims
 # (moved-only input refresh on a plan-cache hit and the staging generation it
 # relies on). Host-only, reads the sources as text.
@@ -3807,6 +4453,45 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-mmi1: source gate for the by-name refusal of a scheduler compute buffer no tier of the SYCL device could
+# hold: the allocator's refused-request record, ggml_backend_sycl_compute_refusal_advice() and its proc registration,
+# llama_context::sched_reserve() appending the text to its three refusals, and the host-pinned fallback's refusal saying
+# what it is. The arithmetic is test-compute-refusal-advice (ggml/src/ggml-sycl/CMakeLists.txt). Host-only, reads the
+# sources as text. Same registration shape as test-sycl-compute-buffer-fallback-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-compute-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-compute-refusal-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-ii25: source gate for the runtime allocation registry's containment index: g_runtime_alloc_registry is
+# mutated only through the helpers that keep the index in step, a row's geometry is never rewritten, neither object
+# leaves unified-cache.cpp, and unified_lookup_runtime_allocation() queries the index instead of scanning. The index
+# logic itself is test-address-range-index; the registry wiring is test-sycl-runtime-registry-containment (both in
+# ggml/src/ggml-sycl/CMakeLists.txt). Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-runtime-registry-index-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-runtime-registry-index-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-rriv: source gate for the clean zone settle: host_zone_settle() / zone_settle() answer "is anything live in
+# this zone" from a per-host-zone row counter and the registry index's first-base-in-span query instead of walking every
+# registry row (37.3% + 20.0% of Qwen3.8 decode CPU), enumerate rows only to explain a refusal, and the counters are
+# written only by the registry mutation helpers. Host-only, reads the sources as text. The counters against a full scan
+# are test-sycl-runtime-registry-containment (ggml/src/ggml-sycl/CMakeLists.txt).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-runtime-registry-settle-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-runtime-registry-settle-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-xojq: source gate for nphx Task 4b -- the SYCL auto micro-batch
 # selection trial (llama_context::sycl_select_auto_ubatch()) and its one
 # call site in the llama_context constructor. Pins the four-condition gate
@@ -3836,6 +4521,175 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7b: the planned auto-ubatch ladder (design gate 34, partial). The
+# constructor decides the trial with llama_auto_ubatch_trial_runs(), the
+# trial's cap is written once by llama_auto_ubatch_cap(), and the ladder
+# loop iterates only the ladder members of llama_auto_ubatch_rung_set().
+# Source-only; the helpers themselves run in test-auto-ubatch-ladder below.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-planned-ladder-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-planned-ladder-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7c: the sched_reserve split (design gate 6, and the type and
+# compute-print clauses of gate 37, as far as ALLOC-only code can satisfy
+# them). sched_reserve_impl, the state overload of graph_reserve and
+# resolve_fused_ops touch the scheduler, graph-result arenas, cparams and
+# n_input_tensors only through sched_reserve_state; the status type has no
+# BUSY; the compute line is printed once, in the impl.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-reserve-state-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-reserve-state-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7f: the MEASURE reserve and the plan scopes (design gates 6, 19 and 25,
+# as far as the llama side can satisfy them before the fixpoint acquires the
+# chunk-cap copy). sched_measure_impl touches only its state, opens a MEASURE
+# scope before its scheduler, plans the chunks through the pure helper; the
+# ALLOC reserve opens its own scope; training aborts under a copy.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-measure-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-measure-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7f: the K-shift graphs of the measured set (design section 2.3). A memory
+# reports the sub-caches whose update() allocates a K-shift graph, the one cache
+# that builds it filters on can-shift/shared-cells/rope, and the MEASURE reserves
+# each through graph_reserve_shift and reads its chunk layout.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kshift-measure-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kshift-measure-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7g: the tenant section of a planned reserve (design 2.2, 2.5, 3.3). The
+# transaction builds it from the measured compute caps between the MEASURE and the
+# publish, refuses by name when the builder does, and prints one plan line per device.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-tenant-section-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-tenant-section-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn step 4 (inert prep): source gate for the non-FA staging route and size shared by the dispatch and the
+# measure visitor, and for the visitor's row (host test: test-context-nonfa-stage).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-nonfa-stage-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-nonfa-stage-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-7gno: source gate for the auto n_ubatch trial's hoisted block (the decisions the planned ladder's rung set
+# depends on are made before the memory module exists; the [SYCL-PLAN] lines stay in the ladder, byte for byte).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-auto-ubatch-hoist-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-auto-ubatch-hoist-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-txho: llama-context.cpp must compile with neither GGML_USE_SYCL nor GGML_BACKEND_DL (syntax-only, no build
+# directory needed), and the SYCL-only helper the shared code calls keeps a non-SYCL definition.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-llama-context-cpu-only-compile
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-context-cpu-only-compile.py
+        LABEL "python;source-assert"
+        TIMEOUT 300)
+endif()
+
+# llama.cpp-7gno (RED): source gate for the constructor's planned-reserve wiring (hoisted ladder block, the
+# plan_caps decision and acquisition, the fixpoint before create_memory). Production-unreachable until 7gno.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-fixpoint-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fixpoint-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-71hq: source gate for the residency probe's failure channel (one probe call in ask, the status read
+# before the residency, the three call sites refusing, the helper refusing every status but OK).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-residency-fixpoint-status-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-residency-fixpoint-status-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7h-3: source gate for the load-time measure (the unwind order of its locals, the CPU backend last,
+# the one refusal text) and the loader's single late-check call between the dev_layer sync and the mappings.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-measure-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-measure-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7f: setter classification (design gate 16, section 2.3). Every
+# llama_context::set_* definition is classified as reserving, measured or none,
+# and the row's contract is pinned on its body; set_warmup reserves on change.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-setter-classification-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-setter-classification-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7f: the fused-op resolution report (design gate 37, the report-site
+# clauses). resolve_fused_ops records and never logs; one member prints the
+# record through the pure emit function under !measure_only, in two call forms
+# plus the unwind guard's; the printed marks are a context data member.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-fused-resolution-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fused-resolution-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7h-2: the measure-only context prints nothing (design gate 37, the log-silence clauses): every
+# log statement reachable from the constructor body, the destructor and the reserve is guarded, in a
+# function every reached call site of which is guarded, or allow-listed with its reason.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-measure-log-silence-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-measure-log-silence-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 300)
+endif()
+
+# zhcn C7d: the runtime-context publish returns a status and never waits
+# (design gate 22b, and the publish clauses of gate 37). No BUSY retry loop or
+# sleep_for in llama-context.cpp, the shared BUSY-retry constant gone from
+# src/ and tests/, the publish's BUSY arm in the form moua's L0 (E) selects.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-publish-status-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-publish-status-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-kpjw (review r7): the hold ledger's wiring -- settle release ordering, the fit-refusal exception type, the
 # pinned -ub's epoch refresh, the non-FA check's ledger free, and the scoped scheduler-allocation helpers (K-shift and
 # the projector included) -- with a mutant per claim. Text only: no device, no model.
@@ -3843,6 +4697,216 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-hold-ledger-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-hold-ledger-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-g6yk: the planned dense Q8_1 src1 buffer is claimed at its whole plan when the runtime-context transaction
+# publishes it (after the commit, before the hold is recomputed), so it holds its planned bytes before the first graph
+# instead of growing on first use; and the RUNTIME zone accounting the PP MoE ring is admitted against still counts
+# both dense plans. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mmq-src1-plan-claim-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmq-src1-plan-claim-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-p6i0: the load's planned compute term is a named RUNTIME consumer. The reservation sizes it from the probe
+# measure's chunks at the RUNTIME TLSF's grain and writes only the planner term; the RUNTIME zone requirement folds it
+# in; the ring re-plan leaves it room; the compute buffer's landing line names it; and it is dropped where no model is
+# live. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-compute-term-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-compute-term-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-45qo: the dense scratch plan's inputs (Q8_1 src1, f16 dequant, their n_ubatch, the rejected-figure
+# flags) are owner terms in the planned load terms table, keyed by (slot, generation) per canonical contract 12.4:
+# stored by the open load's owner, validated on the merge before they land, published by one writer from the merge of
+# the accepted owners, re-planned per owner, and dropped with the owner; the device-global live-flag merge is gone.
+# A mutant per claim.
+# Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-dense-scratch-owner-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-dense-scratch-owner-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-cre6: the host-expert MoE result scatter scratch is the third planned RUNTIME-zone buffer, in the g6yk
+# shape: a planned term published with the MoE control requirement and folded into the RUNTIME zone requirement and
+# the dense fit, claimed whole at publish (after the Q8_1 claim, before the hold is recomputed), charged to the ring
+# re-plan, and never allocated by the scatter itself. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-host-scatter-plan-claim-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-scatter-plan-claim-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-8ecj: the SYCL inventory charges KV only for the layers the KV cache holds. The per-layer KV kind comes
+# from the memory a default context builds (llama_kv_layer_owners_default), so a hybrid model's recurrent layers cost
+# nothing; has_kv() stays only for a memory kind the shapes do not model. A mutant per claim, the has_kv() rule among
+# them. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-layer-owners-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-layer-owners-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-8ecj: the single-device planner places dense weights, then KV (each device layer's KV, then the room the
+# context the model opens with needs on top of it), then routed experts, and logs what the room displaced. The room is
+# for the context the caller asked for (llama_model_params::n_ctx_hint, from -c in common, or without it the model's
+# default context (llama.cpp-7fmt), and from the test's context in llama-bench, padded as llama_context pads n_ctx for a
+# single sequence; a non-unified multi-slot context can exceed it, and the runtime transaction re-places the
+# overflow); none is held when no request reached the load (llama.cpp-ak0p). A mutant per claim, experts-first among
+# them. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-before-experts-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-before-experts-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# The window ring's room is held in the WEIGHT zone before the routed experts: the ring reserves its slots from that
+# zone at every prompt, and an expert loan cannot fund a slot larger than every lendable matrix, so a room the planner
+# left is what lets the ring engage at default placement. The room is the shared ring geometry over the pack the
+# planner predicts, counted in vram_bytes and kept in the plan's accounting through the runtime KV re-derivation. The
+# auto-ubatch fit credits the room in whole slots and probes the loan only for the slots the room leaves short. A
+# mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-stream-ring-room-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-stream-ring-room-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-w013: the KV context room is cost-based (owner ruling 2026-10-10). Each device layer's room is weighed in
+# the runtime's demotion order and held only when its host attention cost outweighs the routed experts it displaces;
+# the three cost parameters are read once at the inventory fill site and catalogued. A mutant per claim. Text only: no
+# device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-room-cost-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-room-cost-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-xod7 (plan Task 7b of llama.cpp-36j0): a prompt layer's host experts are weighed at its first MUL_MAT_ID and
+# the next layer's are copied on the BCS queue and reordered on the compute queue a layer ahead, event-chained, with no
+# wait added and no status query. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-stream-enqueue-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-stream-enqueue-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-o9uw (plan Task 8 of llama.cpp-36j0): STAGED_RING is the one route by which a staged host expert answers
+# PRIMARY_DEVICE: one writer in the resolver, served only as a plain MMVQ_COMPAT kernel on the submit queue, layout from
+# the stage-table entry, no persistent handle, one device barrier and no host wait. A mutant per claim. Text only: no
+# device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-staged-ring-route-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-staged-ring-route-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device probes its pinned host-to-device rate once and keeps it in
+# the tuning cache. Both buffers go through unified_allocate with the literal tier flags, the copy is chunked
+# mem_copy_async with one wait per iteration, the WARN line and the GGML_SYCL_H2D_PROBE switch each appear once, and
+# one consumer reads the rate. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-h2d-probe-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-h2d-probe-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-mwmr: the expert loan transaction (lend resident expert triplets to the prefill ring) never waits or asks an
+# event's status, retires each device entry exactly and only after its copy is submitted reading the entry's own owner,
+# takes the inventory mutex before the cache locks, refuses shared storage and SOA, registers the host copy typed, and
+# publishes once, also when lending throws. It runs only at a graph boundary from a lock-free request that a BUSY
+# refusal re-posts, never replaces an existing host entry ("host entry exists"), undoes a failed registration, and the
+# CPU expert consumer orders on the host copy's ready event. The full claim list is the gate's docstring. Host-only:
+# reads sources, no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-expert-loan-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-loan-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-7fmt: without -c, common asks for the model's default context (LLAMA_N_CTX_HINT_DEFAULT), the load
+# resolves it once (src/llama-n-ctx-hint.h) to n_ctx_train padded as llama_context pads it and holds that context's KV
+# room, no backend names the sentinel, and the KV context room line says when its context is the default. A mutant per
+# claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-ctx-hint-default-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ctx-hint-default-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-n8da: the two MMID owner checks in the planner bound owners by the registry's exposed count
+# (ggml_sycl_info().device_count), never the physical total_gpu_count. test-moe-mmid-workspace-plan pins the predicate;
+# this pins which count the call sites pass. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mmid-owner-exposed-count-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmid-owner-exposed-count-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-1sxq: the Q1_0/NVFP4 DIRECT recipe asks canonical_allocation_integration::exact_identity() whether a lease
+# can be bound, the same test retain() and bind() apply, instead of testing the handle kind. A DIRECT-only test refused
+# every arena-slice expert lease. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-direct-recipe-identity-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-direct-recipe-identity-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-8ecj: a memory that holds one layer in two KV buffers (qwen4exp's llama_memory_hybrid_idx: attention K/V
+# and indexer keys) is budgeted and allocated buffer by buffer. The tiered allocator's backstop counts the buffer it is
+# allocating at its own layer sizes, not the plan's per-layer KV. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-indexer-buffer-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-indexer-buffer-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# An explicit -ub whose PP MoE oneDNN scratch ring does not fit the RUNTIME zone planned for the load's own micro-batch
+# is placed, not refused: the load moves routed experts to the host tier for the ring's room and the context prints one
+# WARN line; only when the experts cannot give the room is it refused, with the largest -ub that fits. The caller names
+# no micro-batch for -ub auto, so the trial never places. A mutant per claim. Text only.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-explicit-ubatch-placement-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-explicit-ubatch-placement-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()
@@ -3855,6 +4919,34 @@ endif()
 # landing on some devices. Header-only and pure integers: no device, no
 # model, no allocation, so it builds and runs in every configuration.
 llama_build_and_test(test-auto-ubatch-ladder.cpp)
+
+# zhcn C7f: executes the pure helpers in src/llama-measure-plan.h -- the graph
+# set one planned reserve measures ((3 + S) * 2 * N graphs: the allocating
+# reserve's own pp, tg and closing pp, then one decode graph per stream count)
+# and the per-chunk slot caps from the measured chunk peaks. Header-only and
+# pure integers: no device, no model, no allocation.
+llama_build_and_test(test-measure-plan.cpp)
+
+# zhcn C7f (H5r): executes the pure helpers in src/llama-fused-resolution.h --
+# the fused-op resolution record, its once-per-resolution emit with per-entry
+# printed marks (empty, partial, repeated, changed, A/B/B), and the unwind guard
+# that reports only while an exception leaves its scope. Header-only: no device.
+llama_build_and_test(test-fused-resolution-report.cpp)
+
+# zhcn C7g-1: executes the pure helpers in src/llama-context-tenant.h -- the L4 procs'
+# fail-closed readers (null and out-of-range answers), the tenant section built from the
+# measured compute caps and merged with the backend's demands, the tenant key digest and
+# the plan line's head. Header-only over ggml-sycl.h's wire structs: no device.
+llama_build_and_test(test-context-tenant-section.cpp)
+
+# llama.cpp-7gno (RED): the plan_caps decision and the demote-only residency fixpoint, pure host over stubs
+# (src/llama-residency-fixpoint.h). No model, no device.
+llama_build_and_test(test-residency-fixpoint.cpp)
+
+# zhcn C7h-3: the load-time measure's plan-override guard (installs once, clears once on every exit, names a
+# missing or refused install) and its size-0 weight stand-ins (set on the tensors that have no buffer,
+# removed again, a real buffer left alone). Header-only over src/llama-load-measure.h: no device, no model.
+llama_build_and_test(test-load-measure-guards.cpp)
 
 # llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
 # (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE
@@ -3954,3 +5046,16 @@ endif()
 llama_build_and_test(test-tuning-cache-io.cpp)
 set_tests_properties(test-tuning-cache-io PROPERTIES
     ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-home;GGML_SYCL_TUNING_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-dir")
+
+# The runtime witnesses (GGML_SYCL_WITNESS) enforce the L0 lock order and the
+# nesting rules (unified-cache.cpp, the audit above g_replan_txn_mutex).  A test
+# that links the production backend does not turn them on by itself, so every
+# lifecycle, replan and plan test registered in this directory sets
+# GGML_SYCL_WITNESS_CHECKS=1 too (ggml/src/ggml-sycl/CMakeLists.txt does the same
+# for its own directory; get_property(TESTS) sees only the calling directory).
+get_property(_witness_candidate_tests DIRECTORY PROPERTY TESTS)
+foreach (_witness_test IN LISTS _witness_candidate_tests)
+    if (_witness_test MATCHES "lifecycle|replan|plan")
+        set_property(TEST ${_witness_test} APPEND PROPERTY ENVIRONMENT "GGML_SYCL_WITNESS_CHECKS=1")
+    endif()
+endforeach()

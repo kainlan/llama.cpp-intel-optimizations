@@ -25,7 +25,7 @@ device_event_sync = slice_between(sycl, "static void ggml_backend_sycl_device_ev
 for_each = slice_between(sycl, "template<typename F>\nstatic void ggml_sycl_execution_for_each_bound_backend", "static void ggml_sycl_execution_unbind_backend")
 extract_body = slice_between(sycl, "ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs", "ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain")
 claim_body = slice_between(sycl, "static bool pp_moe_onednn_claim_scratch_slot", "static void pp_moe_onednn_bind_scratch_slot_generation")
-destructor_body = slice_between(sycl, "ggml_backend_sycl_context::~ggml_backend_sycl_context()", "// Release cached MoE ids buffers")
+destructor_body = slice_between(sycl, "ggml_backend_sycl_context::~ggml_backend_sycl_context()", "// Release cached MoE ids")
 shutdown_body = slice_between(sycl, "void ggml_backend_sycl_shutdown(void)", "// backend reg")
 cleanup_helper = slice_between(sycl, "static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,\n                                                               const char *                stage,\n                                                               const char *                what) noexcept {", "static ggml_status ggml_backend_sycl_graph_compute")
 

@@ -11,6 +11,11 @@
 #include <sstream>
 #include <unordered_set>
 
+#ifndef _WIN32
+#    include <sys/wait.h>
+#    include <unistd.h>
+#endif
+
 #undef NDEBUG
 #include <cassert>
 
@@ -374,6 +379,86 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    // llama.cpp-ak0p: -c reaches the model load as llama_model_params::n_ctx_hint, so the SYCL load holds that
+    // context's KV room. llama.cpp-7fmt: without -c (or with -c 0) the hint asks for the model's default context, the
+    // training context llama_context creates for n_ctx 0, so the load holds that context's room instead of none; a
+    // negative -c names no context and asks for no room.
+    {
+        common_params ctx_params;
+        argv = { "binary_name", "-m", "model_file.gguf", "-c", "2048" };
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ctx_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(ctx_params).n_ctx_hint == 2048);
+
+        common_params no_ctx_params;
+        argv = { "binary_name", "-m", "model_file.gguf" };
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), no_ctx_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(no_ctx_params).n_ctx_hint == LLAMA_N_CTX_HINT_DEFAULT);
+
+        common_params zero_ctx_params;
+        argv = { "binary_name", "-m", "model_file.gguf", "-c", "0" };
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), zero_ctx_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(zero_ctx_params).n_ctx_hint == LLAMA_N_CTX_HINT_DEFAULT);
+
+        common_params negative_ctx_params;
+        argv = { "binary_name", "-m", "model_file.gguf", "-c", "-1" };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), negative_ctx_params,
+                                           LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(negative_ctx_params).n_ctx_hint == 0);
+    }
+
+    // An explicit -ub reaches the model load as llama_model_params::n_ubatch_hint, resolved as llama_context resolves
+    // it (n_batch bounds it, and a causal context's n_ctx bounds n_batch), so the SYCL load plans the PP MoE scratch
+    // ring for it and moves routed experts to the host tier for its room. "-ub auto" names none (0), so the SYCL
+    // backend's own trial is unchanged; without -ub a SYCL build picks the micro-batch itself and names none too.
+    {
+        const auto ubatch_hint = [&](std::vector<std::string> args) {
+            common_params ub_params;
+            assert(true ==
+                   common_params_parse(args.size(), list_str_to_char(args).data(), ub_params, LLAMA_EXAMPLE_COMMON));
+            return common_model_params_to_llama(ub_params).n_ubatch_hint;
+        };
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-c", "4096", "-ub", "2048" }) == 2048);
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-b", "1024", "-ub", "2048" }) == 1024);
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-c", "1024", "-ub", "2048" }) == 1024);
+        assert(ubatch_hint({ "binary_name", "-m", "model_file.gguf", "-ub", "auto" }) == 0);
+
+        common_params default_params;
+        argv = { "binary_name", "-m", "model_file.gguf" };
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), default_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(default_params).n_ubatch_hint ==
+               (default_params.n_ubatch_auto ? 0u : (uint32_t) default_params.n_ubatch));
+    }
+
+#ifndef _WIN32
+    // --help and --version stay metadata-only with -c given: they exit inside the parse, so nothing after it (the
+    // model parameters, the load) runs. Each runs in a child, because both call exit(0).
+    for (const char * flag : { "--help", "--version" }) {
+        // the child inherits unflushed stdio buffers and would print them again on exit
+        fflush(stdout);
+        fflush(stderr);
+        const pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            alarm(30);  // a child that hangs on its way out (e.g. joining a logger thread) dies, and the assert fires
+            if (freopen("/dev/null", "w", stdout) == nullptr || freopen("/dev/null", "w", stderr) == nullptr) {
+                _exit(2);
+            }
+            common_params            meta_params;
+            std::vector<std::string> meta_argv = { "binary_name", "-c", "2048", flag };
+            common_params_parse(meta_argv.size(), list_str_to_char(meta_argv).data(), meta_params,
+                                LLAMA_EXAMPLE_COMMON);
+            _exit(3);  // the parse returned instead of exiting
+        }
+        int status = 0;
+        assert(waitpid(pid, &status, 0) == pid);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+#endif
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

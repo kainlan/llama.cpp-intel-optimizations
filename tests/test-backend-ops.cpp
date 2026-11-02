@@ -9599,6 +9599,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    // Qwen3.8-Flash-Next (qwen4exp): n_embd 2560, 4 streams, one decode token and a short prefill
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 37, true));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
@@ -9610,6 +9613,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 37, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -10547,6 +10552,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // SYCL sends a dense 2-D weight of these MMQ types to its oneDNN f16 dequant arm instead of MMQ at
+    // prompt-processing batch (src1 columns >= GGML_SYCL_ONEDNN_PP_MIN_BATCH, default 16). n = 16 is the first batch
+    // the arm takes, 129 an odd count past a power of two, and k = 14336 the FFN width of a 7B model. n = 15 (below
+    // the floor) and a {3, 2}-batched src0 are the shapes that stay on MMQ, so the same types are compared on both
+    // routes.
+    for (ggml_type type_a : { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                              GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (int64_t k : { 1024, 14336 }) {
+            for (int64_t n : { 15, 16, 32, 64, 129 }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, n, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 32, 1024, { 3, 2 }, { 1, 1 }));
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
@@ -10763,6 +10783,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    // The same single-expert, single-row shape for the other types the SYCL _id path serves. The shape
+    // needs the MUL_MAT_ID dispatch to publish expert handles for a src0 that is ne[2] == 1 and
+    // unclassified by name (llama.cpp-s36q); a type without a case here would not show a gap.
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0 }) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    }
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
@@ -10818,7 +10844,51 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // llama.cpp-s36q: the iq* types the SYCL backend serves through its MUL_MAT_ID _id kernels get the
+    // sweep base_types gets (n up to 129 is the first n > 128 odd batch, llama.cpp-mn70) instead of the
+    // n = {1, 32} that other_types gets, so the loop after this one skips them. Added shapes:
+    //  - m = 66 and 70: not multiples of the _id work-group's rows (GGML_SYCL_MOE_MMV_Y = 4), so the
+    //    kernel's `row >= nrows_per_expert` guard is exercised, at n = 1 and n > 1, with b false and true;
+    //  - m = 64, k = 768: a k that is not a power of two (3 x 256), at n > 1.
+    // Types move into mmid_sweep_types as their _id kernels land.
+    // Q2_0 (phase 4) is in base_types, which already ran the n_mats x n_used x n sweep for it above, so
+    // that sweep is skipped for it here and only the added shapes below (m = 66/70, k = 768, n_mats = 1) run.
+    static const ggml_type mmid_sweep_types[] = { GGML_TYPE_IQ4_NL,  GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                                                  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,  GGML_TYPE_IQ2_S,
+                                                  GGML_TYPE_Q2_0 };
+    for (ggml_type type_a : mmid_sweep_types) {
+        const bool in_base_types =
+            std::find(std::begin(base_types), std::end(base_types), type_a) != std::end(base_types);
+        if (!in_base_types) {
+            for (int n_mats : {4, 8}) {
+                for (int n_used : {1, 2, 4}) {
+                    for (bool b : {false, true}) {
+                        for (int n : {1, 4, 5, 17, 32, 129}) {
+                            test_cases.emplace_back(
+                                new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, 512, n, 256));
+                        }
+                    }
+                }
+            }
+        }
+        for (int m : {66, 70}) {
+            for (bool b : {false, true}) {
+                for (int n : {1, 17, 129}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, b, m, n, 256));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 768));
+        // n_mats = 1: a single-expert src0 (ne[2] == 1), as in the issue-27873 case above.
+        for (int n : {1, 17}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 1, 1, false, 66, n, 256));
+        }
+    }
+
     for (ggml_type type_a : other_types) {
+        if (std::find(std::begin(mmid_sweep_types), std::end(mmid_sweep_types), type_a) != std::end(mmid_sweep_types)) {
+            continue;  // covered by the wider sweep above
+        }
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4}) {
                 for (int n_used : {2}) {
@@ -11193,7 +11263,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 256, 64, 1, 1}, 8, false, n_finite));
     }
     // k = 1 leaves no room to order anything, and k = 32 is the largest k the
-    // SYCL path accepts before it hands off to the CPU.
+    // SYCL MoE-gating kernel takes before the bitonic and radix paths do.
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {256, 64, 1, 1},  1, false, 0));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {256, 64, 1, 1}, 32, false, 0));
     // control: exactly k values above -inf, so the surplus-slot path is unreachable
@@ -11208,6 +11278,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
+
+    // llama.cpp-1b6u: the SYCL k > 32 paths. The sparse-attention indexer asks
+    // for k = min(n_kv, indexer_top_k + r - 1) of n_kv columns, so k = ncols is
+    // its short-context shape. 256 and 4096 columns fit SLM (bitonic), 262144
+    // does not (multi-work-group radix select), and 262144 + 11 is not a power of two.
+    for (int k : { 64, 256, 2048 }) {
+        for (int64_t ncols : { 256, 4096, 262144, 262144 + 11 }) {
+            if (k > ncols) {
+                continue;
+            }
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { ncols, 1, 1, 1 }, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { ncols, 3, 1, 1 }, k, true));
+        }
+    }
+    // fewer finite values than k (a causal mask over the cells): the -inf ties fill
+    // the surplus, on the bitonic path and on the radix path
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096, 1, 1, 1 }, 2051, false, 1000));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 262144, 1, 1, 1 }, 2051, false, 1000));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 65536 + 3, 2, 1, 1 }, 2051, false, 3000));
 
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));

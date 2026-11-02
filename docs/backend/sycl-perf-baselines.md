@@ -482,6 +482,388 @@ rather than from their own logs.
 
 ---
 
+## MoE executor: Qwen3.8 B70 prefill and the GPT-OSS B50 control (2026-10, llama.cpp-36j0)
+
+The executor cost model and the prefill expert ring (epic `llama.cpp-36j0`) exist to move prompt
+processing for a MoE model with host-resident experts off the CPU. The case that motivated them is
+Qwen3.8-Flash-Next IQ3_XXS on the Arc Pro B70, where half the experts live on the host. This section
+is where the gate's recorded run goes, and what it needs to be read correctly.
+
+**Status: the table below is a record, not a baseline.** It is run 2 of `scripts/sycl-moe-exec-gate.sh` at
+8c44f3b3c (`llama.cpp-x6zo`), taken under `--no-head-check`, with `build_commit` reading 8c44f3b3c in every csv
+standing in for the head check and the sha checked by hand. The ring did not engage (`llama.cpp-bcre`,
+`llama.cpp-pu8v`, `llama.cpp-6aj4`) and `Q_pp` and `GO_pp` FAIL, so no row is a gate floor, and none of the
+figures in the plan is a baseline either. It becomes a baseline when a run under the final script's head
+check engages the ring.
+
+### Method
+
+- **Script.** `scripts/sycl-moe-exec-gate.sh <merge sha>`, run by the lead only, detached, one run at a
+  time, under `GPU.lock`. The lead form runs a snapshot copy of the script against a build whose source
+  tree is the merge tree:
+  `cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snapshot>/scripts/`,
+  then `bash <snapshot>/scripts/sycl-moe-exec-gate.sh --build-dir <merge-tree>/build --out-dir <fresh dir> <sha>`.
+  The prompts resolve next to the script (the snapshot); the head check and the binary-newer-than-head
+  check read the build's own source tree, `--src-dir`, which defaults to the parent of `--build-dir`. The
+  sha is checked against that tree's `HEAD`. `--no-head-check` is only an explicit escape. It skips the
+  head comparison and the newer-than-head check, so it gives up the guarantee that the binaries were built
+  from the sha, and it still validates the sha format and still refuses a missing binary. A table taken
+  under it is not a baseline.
+  The script refuses unless the host has settled (`Shmem` under 30 GB, `MemAvailable` over 150 GB) and the
+  builders (ninja plus icpx) clear. A running build is waited out, before the lock at the start and before
+  every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem` and
+  `MemAvailable` before every arm and 5 s after it, with builders also sampled every 5 s during the arm.
+  The log ends `verdicts_pass=N GATE_DONE`.
+- **Repeats and spread.** Every `llama-bench` arm uses `-r 3` except `Q_staged`, which uses `-r 1`: it
+  counts staged slots, not throughput, so a repeat adds nothing. A cell is the mean of the three, with the
+  standard deviation `llama-bench` prints beside it (`stddev_ts`). Three repeats make a spread, not a
+  confidence interval, and the B70 token-generation axis is the noisy one (see "Current baselines" above).
+- **Micro-batch.** The Qwen prefill arms pass no `-ub`: the auto micro-batch trial chooses it, and the
+  verdict line carries the value it chose (`ub=`). The table records that value. A number taken at a
+  different `-ub` is not comparable.
+- **Decode arms.** `Q_tg` and `Q_noc` are the q0xu `Q_c4096` and `Q_noc` arms verbatim (`code.txt`,
+  `-n 60 -ub 256 -t 4`), so their floors (11.0 and 9.5 tok/s) and reference output (md5 `25b7738a`) carry over.
+  A changed md5 is a regression only when it shares fewer than 128 bytes with the reference text
+  (`flip=no`); a later divergence is the greedy near-tie flip and passes with `flip=yes`.
+- **Driver and load.** Driver `26.35.39758.11` (libze-intel-gpu1 26.35.39758.11-1~26.04~ppa1), built with
+  `GGML_SYCL_MMQ_ESIMD=OFF` (the plan's end-to-end section). Ambient host load 35.7-48.1, the per-arm
+  load range: the minimum and maximum of the one-minute load the gate logs in each arm's pre line. It is
+  recorded for the reader and never deferred for a quiet host. Every verdict line carries `builders_pre=`
+  and `builders_post=`; an arm whose `builders_post` is above 0 is `NOT_SCORED(tainted=builders,...)` and
+  its row is not a baseline.
+- **Tuning cache.** The gate does not redirect `GGML_SYCL_TUNING_CACHE_DIR` unless `--tuning-dir` is
+  given, so a run writes the real cache, including the H2D rate the executor reads.
+
+### Table
+
+One row per verdict-bearing arm and per recorded metric, filled by the lead from the gate's log, with the
+columns arm, metric, value, floor, verdict, builders_post and notes.
+
+Taken 2026-10-23 at 8c44f3b3c from the merge tree's build (its `build_commit` column reads 8c44f3b3c in every
+csv), by the lead from a snapshot of the gate script as of d92a4e632 with `--no-head-check`, because that
+version read the lead checkout's HEAD rather than `--src-dir` (fixed since). The sha was checked by hand, and
+the row values were re-scored with the final script's `--score-arm`. Seven arms were re-run after a teammate's
+build overlapped their first run (six at 16:18-16:39: Q_pp, Q_pp_cpu, GO_pp, MI_b70, MI_b50 and resets; GO_noc
+at 16:50). `builders_post` is derived from the builds' timestamps (15:29-15:42 and 16:10-16:17; no arm kept
+overlaps either), because that script version did not sample builders during an arm. The Qwen placement lines
+were `MoE experts: 38004 on device, 35724 on host` (`Q_tg`) and `MoE experts: 25950 on device, 47778 on host`
+(`Q_noc`). Summary: `verdicts_pass=8` of 15 arms scored (8 PASS, 4 RECORDED, 1 NOT_EXERCISED, 2 FAIL: `Q_pp`
+and `GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`, gate exit 1.
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
+| Q_pp | pp512 t/s | 13.3 ± 0.70 | 500 | FAIL | 0 | ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no; the 10 % cap refuses the ring (llama.cpp-bcre) |
+| Q_pp | pp2048 t/s | 30.7 ± 0.60 | 800 | FAIL | 0 | same run |
+| Q_pp_cpu | pp512 t/s | 14.0 | - | RECORDED | 0 | forced_cpu_lines=24 rc=0 |
+| Q_pp_cpu | pp2048 t/s | 31.8 | - | RECORDED | 0 | same run |
+| Q_staged | ring_layers | 0 | - | NOT_EXERCISED | 0 | ring_engaged=no |
+| Q_tok | md5 | 9577403b | - | RECORDED | 0 | auto load 1 |
+| Q_tok_2 | md5 | 2a6c2cf6 | - | RECORDED | 0 | auto load 2 |
+| Q_tok_cpu_1 | md5 | 199c6905 | - | RECORDED | 0 | cpu load 1 |
+| Q_tok_cpu | md5 | 9577403b | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=1 min_prefix=115 auto_flip=yes cpu_flip=yes (auto load 1 equals cpu load 2) |
+| Q_tg | tg t/s | 11.16 | 11.0 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised |
+| Q_noc | tg t/s | 11.54 | 9.5 | PASS | 0 | md5=25b7738a (the reference) prefix=277 place=unscored refill=not_exercised |
+| GO_gate | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| GO_noc | count | 1 | 1 | PASS | 0 | layer_lines=0 recorded |
+| GO_pp | pp512 t/s | 764.1 ± 9.3 | 827.4 (95 % of 871) | FAIL | 0 | llama.cpp-zuze: master regression, expected until it lands |
+| GO_pp | tg128 t/s | 32.6 ± 0.46 | 31.0 (97 % of 32.0) | PASS | 0 | same run |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | journalctl -k since 15:25:03; its resets.out was taken at 16:38:56 and does not cover the kept GO_noc run (16:50:59-16:51:21), so the reviewer also ran `journalctl -k --since "2026-10-23 16:38:50" --until "2026-10-23 16:53:00"`: rc 0, 26 lines, 0 reset matches |
+
+#### Record at 660a34602 (2026-10-24 02:03-02:32 EDT)
+
+The same gate, run from the merge tree whose HEAD is 660a34602, under the head check (no `--no-head-check`), by the
+lead. Summary: `verdicts_pass=8` of 15 arms scored (8 PASS, 4 RECORDED, 1 NOT_EXERCISED, 2 FAIL: `Q_pp` and
+`GO_pp`), `ring_engaged_any=no`, `loan_exercised_any=no`. The gate's exit code is 1: the log does not record it, and
+the script returns 1 whenever an arm FAILs. The Qwen placement lines were `MoE experts: 42693 on device, 31035 on
+host` (`Q_tg`) and `MoE experts: 29637 on device, 44091 on host` (`Q_noc`). `builders_post` is 0 in every arm,
+`Shmem` stayed flat at 1.42 GB, and the per-arm load average read 8.93-20.32, from the arms' pre lines as the Method
+section defines. This is a record, not a baseline: the ring did not engage, so the Qwen numbers are the CPU-executor
+numbers.
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
+| Q_pp | pp512 t/s | 17.7 ± 0.65 | 500 | FAIL | 0 | ub=512 layers=24 summary=2 pp_moe_refused=0 ring_engaged=no ring_layer_ubatches=0 loan_exercised=no; the ring stays short and the 10 % cap refuses it (llama.cpp-bcre) |
+| Q_pp | pp2048 t/s | 48.5 ± 0.38 | 800 | FAIL | 0 | same run |
+| Q_pp_cpu | pp512 t/s | 17.70 | - | RECORDED | 0 | forced_cpu_lines=24 |
+| Q_pp_cpu | pp2048 t/s | 48.40 | - | RECORDED | 0 | same run |
+| Q_staged | ring_layers | 0 | - | NOT_EXERCISED | 0 | ring_engaged=no |
+| Q_tok | md5 | 9577403b | - | RECORDED | 0 | auto load 1 |
+| Q_tok_2 | md5 | 199c6905 | - | RECORDED | 0 | auto load 2 |
+| Q_tok_cpu_1 | md5 | 199c6905 | - | RECORDED | 0 | cpu load 1 |
+| Q_tok_cpu | md5 | - | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=2 min_prefix=153 |
+| Q_tg | tg t/s | 18.52 | 11.0 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 |
+| Q_noc | tg t/s | 17.66 | 9.5 | PASS | 0 | md5=25b7738a (the reference) |
+| GO_gate | count | 1 | 1 | PASS | 0 | |
+| GO_noc | count | 1 | 1 | PASS | 0 | |
+| GO_pp | pp512 t/s | 814.3 ± 7.9 | 827.4 (95 % of 871) | FAIL | 0 | llama.cpp-zuze: master regression |
+| GO_pp | tg128 t/s | 39.0 ± 0.09 | 31.0-33.0 (32.0 ± 3 %) | FAIL | 0 | above the band; the gate's tg check is two-sided; B50 GPT-OSS decode 22 % above the ~32 reference here and 6 % above it (33.96) at f14082f2b, both above the 33.0 band edge, unexplained, owner flag |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | |
+
+An earlier run at f14082f2b (2026-10-23 22:51:52-23:34:52 EDT, same gate and head check) read:
+
+- `Q_pp` 12.9 ± 0.73 pp512 and 31.4 ± 1.80 pp2048, FAIL.
+- `Q_pp_cpu` 13.57 and 29.97, RECORDED.
+- `Q_tg` 12.79 and `Q_noc` 10.84, both PASS.
+- `GO_pp` pp512 782.8 ± 13.9, FAIL (llama.cpp-zuze), and tg128 33.96 ± 0.65, also above the 31.0-33.0 band, so FAIL.
+- `verdicts_pass=8`.
+
+Its md5s partly differ from the 660a34602 run. `Q_tok` and `Q_tok_cpu_1` read 2a6c2cf6 (9577403b and 199c6905 at
+660a34602), while `Q_tok_2` 199c6905, `Q_tg` 3ce606c1 and `Q_noc` 25b7738a match. Its `Q_tok_cpu` passed with
+distinct_cpu=1 pairs_equal=2 min_prefix=105. The Qwen figures differ between the three runs although the ring engaged
+in none of them, so they move with the host's load and the tree. Compare them only with each other in a paired arm,
+never as baselines.
+
+#### Record at 0f1d9172c, the window ring (2026-10-25 00:59-02:31 EDT, Task 10 of `llama.cpp-a2xb`)
+
+The first run with the window ring (`llama.cpp-qov5`, comments c-bg4s, c-2w7h, c-vu9s and c-xkq4), by the lead, from a
+snapshot of `scripts/sycl-moe-exec-gate.sh` taken from the merge tree, `--pp512-min 200 --pp2048-min 500`. Host load
+31-38, `builders_post` 0 in every arm, `Shmem` flat at 1.44-1.49 GB, no GT-reset events. **This is a record, not a
+baseline**: the ring arms FAIL at this build, and the ring was re-run on master 4229a205d (rows at the end of the
+table, `llama.cpp-8ucb` owns the attribution). The Qwen3.8 placement is the B70's, 23 host layers.
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
+| Q_pp | pp512 t/s | 14.3 ± 1.12 | 200 | FAIL | 0 | ub=512 layers=23 summary=2 ring_engaged=yes ring_layer_ubatches=207 loan_exercised=yes windows=1554 exposed=207 misses=0. Context 1 (n_ctx 512) never got a ring (92 layer-ubatches "cpu (ring-unavailable)"), so this is the CPU path: `moe_stream_ring::reserve` needed one contiguous block and the loans lent scattered triplets (`llama.cpp-am87`, merged after this run) |
+| Q_pp | pp2048 t/s | 56.4 ± 18.30 | 500 | FAIL | 0 | same run. Context 2 had the ring for 9 of 12 ubatches; 50223 MiB streamed, 0 declines, 0 PP-MOE refusals. The decision log priced a ring layer-ubatch at 40-88 ms, the measured wall is about 0.4 s per host layer-ubatch (attribution pending, Task 12) |
+| Q_staged | ring_layers | - | - | NOT_EXERCISED | 0 | ring_engaged=no (one context, 107 triplets lent, the ring never reserved) |
+| Q_pp_ub2048 | pp2048 t/s | - | - | FAIL | 0 | rc=1: a planner refusal at context creation, unrelated to the ring (the PP MoE oneDNN scratch ring for n_ubatch=2048 needs 15785 MB RUNTIME, 4237 available, result=19) |
+| Q_pp_cpu | pp512 t/s | 15.77 | - | RECORDED | 0 | forced_cpu_lines=23 rc=0 |
+| Q_pp_cpu | pp2048 t/s | 32.52 | - | RECORDED | 0 | same run; the ring-engaged pp2048 above is +73 % over this |
+| Q_tok | md5 | 2a6c2cf6 | - | RECORDED | 0 | auto load 1: the ring served 217 of 248 layer-ubatches with no loan, 2670 windows, 217 exposed, 0 misses |
+| Q_tok_2 | md5 | 199c6905 | - | RECORDED | 0 | auto load 2 |
+| Q_tok_cpu_1 | md5 | 199c6905 | - | RECORDED | 0 | cpu load 1 |
+| Q_tok_cpu | md5 | - | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=2 min_prefix=153 auto_flip=yes cpu_flip=yes: the window path's text equals the CPU path's, pairwise |
+| Q_tg | tg t/s | 4.91 | 11.0 | FAIL | 0 | md5=3ce606c1 flip=yes prefix=173 refill=balanced(9/9) loan_exercised=yes ring_engaged=no; a second run read 4.32. The 9 most popular triplets were lent at the prompt-to-decode boundary and not returned (`llama.cpp-i4ny`) |
+| Q_noc | tg t/s | 11.91 | 9.5 | PASS | 0 | md5=25b7738a flip=no prefix=277 loan_exercised=no ring_engaged=yes; a second run read 11.95 |
+| GO_gate | count | 1 | 1 | PASS | 0 | |
+| GO_noc | count | 1 | 1 | PASS | 0 | |
+| GO_pp | pp512 t/s | 792.0 | 827.4 | FAIL | 0 | `llama.cpp-zuze`, the known master regression; tg128 36.3 passes |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | |
+| Q_decline | md5 | 9577403b | md5 equals Q_tok or Q_tok_2 | PASS | 0 | taken apart from the run above, at 4229a205d on the B70 (`llama.cpp-ny6i` c-pvhl, `GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20`): decline_lines=1 declined_layers=1 summary_cpu=35 ref_layer20=ring, with the two auto loads reading 2a6c2cf6 and 9577403b |
+| Q_pp (4229a205d) | pp512 t/s | 30.9 ± 29.39 | 200 | FAIL | 0 | ub=512 layers=23 summary=2 ring_engaged=yes ring_layer_ubatches=391 loan_exercised=yes windows=2880 exposed=391 misses=0. The ring engaged at the fourth ubatch (reserve held 11, 135, 135, then 136 of 136 slots; loans of 62, 1, 1 triplets), so the two pp512 repetitions straddle the engagement, hence the spread |
+| Q_pp (4229a205d) | pp2048 t/s | 66.5 ± 1.03 | 500 | FAIL | 0 | same run; the pp2048 phase ran all-ring: 368 layer-ubatches ring, 0 cpu, 86576 MiB streamed, 2706 windows, 368 exposed, 0 misses. Q_pp_cpu on the same tree is 32.5, so the ring is 2.0x the CPU executor (`llama.cpp-8ucb` c-t791 has the attribution data) |
+| Q_staged (4229a205d) | ring_layers | - | - | NOT_EXERCISED | 0 | ring_engaged=no: two ubatches, reserve held 11 then 135 of 136 slots (loans 62 then 1 triplets), the context ended one slot short. The loan is sized in bytes, not slots: `llama.cpp-9x8t` |
+| Q_pp_ub2048 (4229a205d) | pp2048 t/s | - | 500 | FAIL | 0 | rc=1, the same planner refusal as at 0f1d9172c ("PP MoE oneDNN scratch ring for n_ubatch=2048 needs 15785.0 MB ... RUNTIME zone has 4237.5 MB", `llama.cpp-86bl`) |
+| Q_tg (4229a205d) | tg t/s | 4.10 | 11.0 | FAIL | 0 | md5 3ce606c1 flip=yes prefix=173 refill=balanced(9/9) loan_exercised=yes ring_engaged=no; reserve held 119 of 136 slots at the pp-to-tg boundary, 9 triplets / 15 MiB lent, returned only at exit (`llama.cpp-i4ny` c-789n) |
+| Q_noc (4229a205d) | tg t/s | 11.63 | 9.5 | PASS | 0 | md5 25b7738a flip=no prefix=277 refill=not_exercised loan_exercised=no ring_engaged=yes (7 ring layer-ubatches, no loan) |
+
+Re-run on master 4229a205d (2026-10-25 06:35-07:15 EDT, merge-tree build, B70 `level_zero:0`, load 31-33, builders 0 in
+every arm, `Shmem` flat at 1.45 GB; `llama.cpp-qov5` c-c774). A record, not a baseline. The 0f1d9172c and 4229a205d rows
+differ by Tasks 5, 11 and 8 (`llama.cpp-a64a`, `llama.cpp-am87`, `llama.cpp-ny6i`): the per-slot reserve moved the
+ring's engagement from the twelfth boundary to the fourth and pp2048 from 56.4 to 66.5; the floors remain unmet.
+
+#### Record at 671279356, the window ring with 8p5x/384v/86bl merged (2026-10-31 03:44-04:11 EDT, Task 10 run r7)
+
+The gate re-run for Task 10 (`llama.cpp-qov5`, comments c-1hc8, c-7vb3 and c-4m7d), by the lead, from the merge tree
+at master 671279356 with a build made after that commit. "r7" is the seventh Task 10 gate launch of this session: r1
+to r4 are the 0f1d9172c record, r5 is the 4229a205d record, and r6 was refused for a stale binary and is not a run.
+The tree contains the three merges that landed since 4229a205d: `llama.cpp-8p5x`, `llama.cpp-384v` and
+`llama.cpp-86bl`. All arms ran with the gate's defaults, 200 and 500 for the PP floors. The Qwen3.8 arms and `MI_b70`
+ran on the Arc Pro B70 (`level_zero:0`), and `GO_gate`, `GO_pp`, `GO_noc` and `MI_b50` on the Arc Pro B50
+(`level_zero:1`) (c-4tfx corrects c-4m7d). Host load read 13.4-21.8, `builders_pre` and `builders_post` were 0 in
+every arm, `Shmem` went 0.58 -> 0.61 GB, and the kernel log shows 0 GT-reset/guc_id/CAT-error lines (`journalctl -k`
+since 03:40, read 04:20). The Qwen placement lines were `MoE experts: 42633 on device, 31095 on host` (first context)
+and `37962 on device, 35766 on host` (second), 23 host layers in the default-ub Qwen arms (`Q_pp_ub2048` reports
+layers=38, because the explicit `-ub 2048` placement demotes more experts to the host; c-4tfx). The gate's own summary
+reads `verdicts_pass=10 verdicts_fail=3 not_exercised_or_unscored=0`, with four arms RECORDED and not scored; every
+arm returned rc=0 and the script itself exits 1 because arms FAILed. The ring engaged on every layer-ubatch in every
+PP arm with 0 refusals, and with 0 misses where the arm's line reports them (not `Q_staged`, which reports
+`trace_misses=0`). The explicit `-ub 2048` arm placed without a refusal (`llama.cpp-86bl`).
+
+**This is a record, not a baseline for the Qwen prefill figures**: the 200/500 floors are unmet with the ring fully
+engaged, and the attribution is `llama.cpp-8ucb`'s (see "Attribution at 3eb28b301" below). The three FAILs are `Q_pp`,
+`Q_pp_ub2048` and `GO_pp`. `GO_pp` failed on both items: pp512 is the `llama.cpp-zuze` master regression, and tg128
+39.2 is above the 31.0-33.0 band, which is a baseline question for that ticket's neighbourhood and not a Task 10
+defect (c-4m7d). Q_pp_cpu reads 16.0 and 47.5 on this tree, so the ring is 4.8x and 1.6x over the CPU executor.
+
+### Attribution at 3eb28b301 (`llama.cpp-8ucb`, 2026-10-31)
+
+Lead-run on the merge tree at master 3eb28b301 (`llama.cpp-ivb6` merged), Arc Pro B70 (`level_zero:0`),
+Qwen3.8-Flash-Next-GSQ-RCO IQ3_XXS, `llama-bench -p 2048 -n 0 -r 3 -fa 1`; every arm rc=0, `builders` 0, `Shmem`
+0.58 GB flat, kernel log 0 GT-reset/guc_id/CAT-error lines; comments c-w5fg and c-3xqg on the task, outputs in the
+session scratchpad `8ucb-roundD/`. The ring engaged on all 368 layer-ubatches in every arm with 0 refusals, 0 loans
+and 0 misses.
+
+Trace perturbation (U T T U, `GGML_SYCL_MOE_EXEC_TRACE=2` on the T arms): pp2048 74.20 / 75.20 / 75.28 / 76.83 t/s;
+traced and untraced agree within the untraced spread, so the window lines describe the untraced path.
+
+Per-window budget of one engaged layer-ubatch (2688 windows over 368 layer-ubatches): 232.9 MiB copied in 9.30 ms
+(26.3 GB/s against the probe's 25.6; pinned source), `readers_wait_us` 0 on 2677 of 2688 windows, host submit 7.8 ms,
+420 launches, exposed-window start lag 17.8 ms median, MoE op host time ~32 ms; the cost model predicted
+`t_ring` 69-88 ms per layer-ubatch. Candidates (b) pageable source, (c) readers_done serialisation and (d) copy
+granularity are dead by measurement; (a) launch overhead is real but small.
+
+**The largest contributor is not the ring.** The per-layer-embedding table `per_layer_token_embd.weight` (IQ4_NL
+[160, 320001536], 27466 MiB, 16 random 90-byte rows per token) stays mmap-backed under upstream's lazy-read AUTO
+mode ("lazy read enabled", `CPU_Mapped model buffer size = 27465.95 MiB`) and the CPU scheduler split page-faults it
+from the degraded bcachefs array on every ubatch: a state+wchan sampler put the bench main thread in D state on
+`bch2_read_single_folio` for 90 of 138 samples in ~4.7 s bursts per ~6.8 s ubatch, the DWARF stack runs
+`ggml_compute_forward_get_rows` -> `dequantize_row_iq4_nl` -> page fault -> bcachefs read, and the GT idle sampler
+shows the B70 busy ~2 s then idle for the rest of each ubatch. Same-binary ABBA on `llama-bench -lzm`:
+
+| arm | lazy mode | pp2048 t/s | sd |
+|---|---|---:|---:|
+| lzm_auto_1 | auto (default) | 76.95 | 0.43 |
+| lzm_off_1 | off | 265.82 | 3.44 |
+| lzm_off_2 | off | 266.42 | 4.68 |
+| lzm_auto_2 | auto (default) | 76.57 | 0.58 |
+
+3.46x from the load mode alone; with the table read into RAM the device is 99 % busy through the pp phases and the
+ring executes at or under its predicted `t_ring` (a 512-token ubatch takes 1.93 s for 47 MoE layers). The follow-up
+is `llama.cpp-th32` (planner-decided placement of lazy n-gram tables). The remaining gap to the 500 floor is device
+time the kernel profiler does not attribute (434 ms of ~1930 ms per ubatch are labelled; the `moe.pp.dequant` label
+records ~100 ns per launch): `llama.cpp-qmen`, then the dequant/GEMM work under `llama.cpp-36j0`. **These are
+records, not baselines**; at the default load mode every Qwen3.8 prefill figure on this host measures the disk, not
+the executor, and the 200/500 floors were set for the executor.
+
+Against the 4229a205d record (c-4m7d): Q_pp pp512 30.9 ± 29.39 -> 76.5 ± 0.17, because the straddle is gone and the
+ring engages on the first context with no loan (`llama.cpp-86bl`, `llama.cpp-384v`); pp2048 66.5 -> 75.7; Q_pp_ub2048
+planner refusal -> 87.8 with the ring on all 152 layer-ubatches; Q_staged NOT_EXERCISED -> PASS; Q_tg 4.10 (with a
+loan) -> 18.43 (no loan); Q_noc 11.63 -> 17.81; Q_pp_cpu pp2048 32.5 -> 47.5, which is host state and not a change
+this record can attribute. The floors in the table are the gate's defaults as carried in the earlier records in this
+file: c-c774 and c-xkq4 for 200/500, 11.0 and 9.5, and the `Q_tok_cpu` and `Q_decline` rules as in the earlier tables.
+The `Q_staged` cell is the plan's `ring_engaged=yes` and `trace_misses=0` criterion (c-7vb3), and the control arms'
+count rules (`GO_gate`, `GO_noc`, `MI_b70`, `MI_b50`, `resets`) are as in the earlier tables. The `GO_pp` reference
+figures (827.4, 871, the 31.0-33.0 band, 32.0) come from the gate's own `GO_pp` line (c-7vb3) and c-4m7d.
+
+| arm | metric | value | floor | verdict | builders_post | notes |
+|-----|--------|-------|-------|---------|---------------|-------|
+| Q_pp | pp512 t/s | 76.5 ± 0.17 | 200 | FAIL | 0 | ub=512 layers=23 summary=2 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=460 loan_exercised=no windows=3393 exposed=460 misses=0 trace_misses=NA |
+| Q_pp | pp2048 t/s | 75.7 ± 0.28 | 500 | FAIL | 0 | same run |
+| Q_pp_ub2048 | pp2048 t/s | 87.8 ± 0.67 | 500 | FAIL | 0 | ub=2048 layers=38 summary=1 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=152 loan_exercised=no windows=1644 exposed=152 misses=0 trace_misses=NA; pp512=NA; placed with no refusal (`llama.cpp-86bl`) |
+| Q_staged | ring_layers | 23 | ring_engaged=yes and trace_misses=0 | PASS | 0 | executor_dispatches=282 ring_layer_dispatches=138 pp_moe_arm_f16_lines=7 pp_moe_refused=0 ring_engaged=yes ring_layer_ubatches=46 trace_misses=0 |
+| Q_pp_cpu | pp512 t/s | 16.02 | - | RECORDED | 0 | layers=23 forced_cpu_lines=23 rc=0 |
+| Q_pp_cpu | pp2048 t/s | 47.49 | - | RECORDED | 0 | same run |
+| Q_tok | md5 | 2a6c2cf6 | - | RECORDED | 0 | auto load 1, rc=0 |
+| Q_tok_2 | md5 | 9577403b | - | RECORDED | 0 | auto load 2, rc=0 |
+| Q_tok_cpu_1 | md5 | 2a6c2cf6 | - | RECORDED | 0 | cpu load 1, rc=0 |
+| Q_tok_cpu | md5 | - | pairs_equal >= 1, min_prefix >= 64 | PASS | 0 | distinct_auto=2 distinct_cpu=2 pairs_equal=2 min_prefix=154 auto_md5=2a6c2cf6,9577403b cpu_md5=2a6c2cf6,9577403b auto_flip=yes cpu_flip=yes |
+| Q_tg | tg t/s | 18.43 | 11.0 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised loan_exercised=no ring_engaged=yes bulk_refill=not_owed |
+| Q_noc | tg t/s | 17.81 | 9.5 | PASS | 0 | md5=3ce606c1 flip=yes prefix=173 place=unscored refill=not_exercised loan_exercised=no ring_engaged=yes bulk_refill=not_owed |
+| Q_decline | md5 | 9577403b | md5 equals Q_tok or Q_tok_2 | PASS | 0 | decline_lines=1 declined_layers=1 summary_cpu=35 ref_md5=2a6c2cf6,9577403b ref_layer20=ring layers=31 kv_rejected=0 wrong_device=0 rc=0 |
+| GO_gate | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| GO_pp | pp512 t/s | 813.8 ± 5.78 | 827.4 (95 % of 871) | FAIL | 0 | `llama.cpp-zuze`: master regression; ref_pp512=871 |
+| GO_pp | tg128 t/s | 39.2 ± 0.11 | 31.0-33.0 (32.0 ± 3 %) | FAIL | 0 | above the band; the gate's tg check is two-sided and it reported `tg128=39.2>33.0` inside the GO_pp FAIL line (c-4m7d corrects c-7vb3's reading); ref_tg128=32.0 |
+| GO_noc | count | 1 | 1 | PASS | 0 | layer_lines=0 |
+| MI_b70 | digits | 1 | 1 | PASS | 0 | |
+| MI_b50 | digits | 1 | 1 | PASS | 0 | |
+| resets | count | 0 | 0 | PASS | 0 | |
+
+#### Copy overlap: does a cache-queue H2D copy overlap a compute kernel? (`llama.cpp-efck`, 2026-10-24)
+
+`test-sycl-copy-overlap` times 16 x 4 MiB pinned H2D copies alone and then concurrent with a spin kernel on the compute
+queue, on the cache's BCS queue and on its compute queue. Lead run, binary from 98c496ae7 (`llama.cpp-efck` c-0cu6),
+Level Zero v2 adapter, under `GPU.lock`, builders 7, load about 32, `Shmem` 1.45 GB before and after, rc=0 and
+`staged_h2d=0` on every row. **A record, not a baseline.** Every row reads `overlap=yes`: a copy that ends in 2.5-3.5 ms
+under a spin kernel of 89-131 ms is not queued behind it. Later runs on 4d1362427 (c-2oac) and 483449621 (c-os3q, whose
+`resolved=` field confirms each arm timed the queue it names) read the same timing. The engine counters of the first run
+(c-0cu6) were uninformative: both classes read busy for the whole window. After the window fix, c-2oac shows the BCS
+class busy for the whole copy window with the CCS class at 0 on five of eight rows, for either cache queue, so the
+copies are blitter work. This is why the ring and the probe share the BCS queue and
+no copy-engine queue was built (`llama.cpp-a64a`).
+
+| card | queue | spin | alone_ms | with_kernel_ms | kernel_ms | overlap |
+|------|-------|------|---------:|---------------:|----------:|---------|
+| B50 (`level_zero:1`) | bcs | 1wg | 2.6 | 2.5 | 95.8 | yes |
+| B50 (`level_zero:1`) | compute | 1wg | 2.5 | 3.3 | 95.8 | yes |
+| B50 (`level_zero:1`) | bcs | full | 2.5 | 3.5 | 131.3 | yes |
+| B50 (`level_zero:1`) | compute | full | 2.6 | 2.6 | 131.3 | yes |
+| B70 (`level_zero:0`) | bcs | 1wg | 2.6 | 2.6 | 88.9 | yes |
+| B70 (`level_zero:0`) | compute | 1wg | 2.7 | 2.6 | 88.9 | yes |
+| B70 (`level_zero:0`) | bcs | full | 2.6 | 2.6 | 109.4 | yes |
+| B70 (`level_zero:0`) | compute | full | 2.7 | 2.6 | 109.4 | yes |
+
+### How to read the verdict fields
+
+- **`ring_engaged=no`.** (Written before the window ring. The ring now holds one executor window per region, not a
+  whole layer, so the whole-layer 10 % cap refusal described here is history; why a run may still not engage is in
+  the 0f1d9172c record above.) No layer-ubatch used the ring: the `[MOE-EXEC] summary: K layer-ubatches ring`
+  lines add up to 0 (`ring_layer_ubatches=0`). In the 8c44f3b3c era that was the expected answer until
+  `llama.cpp-bcre` was decided, because the 10 % cap refused the ring on both canonical models under
+  whole-layer host placement. The gate does not read it from the `stream ring unavailable` WARN, because
+  `auto` at default verbosity does not print that line. `Q_staged` then reports `NOT_EXERCISED`, which is
+  neither a pass nor a fail. The summary line says `ring_engaged_any=no` and the gate's exit code is 3 rather
+  than 0, even when `Q_pp` passed its floors and nothing failed. Do not read it as green.
+  A second reason the ring did not engage is the loan. A model that passes the cap (Qwen1.5 at a 33-35 % VRAM budget)
+  finds the ring short and asks for a loan. At `8c44f3b3c` the loan was refused with "host storage too small"
+  (`llama.cpp-pu8v`, the host copy sized from dst_size). The pu8v fix (`5d0727255`) got the loan accepted (41
+  triplets, 190 MiB), but lent room was not returned on reclaim (`llama.cpp-6aj4`). Both tickets are closed, and the
+  660a34602 and f14082f2b records are the runs after both fixes. The ring still did not engage in them: only 41 of
+  about 1301 triplets are lendable, since `moe_loan_triplet_is_lendable` refuses bulk-staged tensors (`llama.cpp-bcre`
+  c-aerm), and on Qwen3.8 the 10 % cap refused before any loan. The 8c44f3b3c table predates both fixes.
+- **`Q_staged`.** The executor prints its `[MOE-EXEC-TRACE] executor device` line for every dispatch,
+  resident layers included, and `staged=0` is correct for those. The arm scores only the layers the ring
+  served: a layer with a `[MOE-EXEC] layer N: ring` line is a host layer, and every `blk.N.*` dispatch of it
+  needs `staged` above 0 and `arm=f16`. It also needs a `[PP-MOE] ... arm=f16` line and zero
+  `[PP-MOE] refused`. `ring_layers=` and `ring_layer_dispatches=` in the verdict say how much it scored.
+- **`layers=` and `summary=`.** `Q_pp` needs at least one `[MOE-EXEC] layer N:` line and at least one summary.
+  The layer count is the number of layers that have host experts under the chosen placement (24 on the
+  3460 run, not the 48 the plan wrote), and `llama-bench` prints one summary per context, so `-p 512,2048`
+  prints two. The table records both; `--q-layers N` makes the layer count exact.
+- **`loan_exercised=no` and `refill=not_exercised`.** Nothing lent experts to the ring in that arm, so the
+  "re-admitted equals lent" check had nothing to count. Production only originates a loan at a short
+  reserve under `auto` (`llama.cpp-3460`), and a loan can still be refused (the `8c44f3b3c` runs saw it refused
+  by `llama.cpp-pu8v`, since fixed).
+- **`place=unscored` and `place=unchanged`.** The references `--place-ref-tg` and `--place-ref-noc` default to
+  `-`, so the `MoE experts: N on device, M on host` line is recorded and `place=unscored`. The lead passes the
+  values of this table; `place=unchanged` then means the line equals them, and a different line is a `FAIL`.
+  This tree's values (run 2 on `8c44f3b3c`): `Q_tg` is `MoE experts: 38004 on device, 35724 on host` (equal to
+  the q0xu reference), and `Q_noc` is `MoE experts: 25950 on device, 47778 on host`. The q0xu `Q_noc` reference
+  (38163 on device, 35565 on host) is stale for this tree: the cost-based KV room (`llama.cpp-w013`) demotes more
+  experts at the default context.
+- **`rc=` and `builders_post=`.** Every arm scores a non-zero exit status as a `FAIL` naming it (`rc=124` is
+  the timeout, `rc=137` a kill, `rc=134` an abort, including one in teardown after the right answer was
+  printed). The `resets` arm keeps `journalctl`'s own status, so a failed `journalctl` is a `FAIL` rather
+  than a clean log. A `PASS` with `builders_post` above 0 is reported as
+  `NOT_SCORED(tainted=builders,was=PASS)` and the exit code is 3.
+- **`Q_pp_cpu`.** Recorded, not gated. It is the before-number, taken with `GGML_SYCL_MOE_EXEC=cpu`. The
+  plan records the before-number from the q0xu gate as 13.5-14.4 tok/s for pp512 at `-ub 256`; at the auto
+  micro-batch it may read higher.
+- **`Q_tok_cpu` and the greedy flip.** Qwen3.8 greedy decoding on the B70 has a near-tie that flips from load to
+  load, in both policies, and the flip cascades after its token. Run 2 gave four loads and three distinct 32-token
+  outputs: auto load 1 equals cpu load 2 byte for byte, and every other pair diverges at byte 106-116, after the
+  identical prefix `<think> The user wants me to summarize the document about GPT-OSS Testing & Prompt Template
+  Rationale.` Two loads per arm cannot enumerate that. `Q_tok`, `Q_tok_2`, `Q_tok_cpu_1` and `Q_tok_cpu` each
+  load the model once and write stdout to its own file (the log goes to stderr). `Q_tok_cpu` passes when at least
+  one auto md5 equals at least one cpu md5 (identical 32-token text across the policies is the evidence the math
+  agrees) and every auto output is identical to a cpu output or shares a prefix of at least 64 bytes with its
+  best-matching cpu output. It prints `distinct_auto=`, `distinct_cpu=`, `pairs_equal=` (the number of equal
+  auto/cpu pairs, of 4) and `min_prefix=` (the shortest best-match prefix, in bytes). **A defect shows as
+  `pairs_equal=0` with an early `min_prefix`; a flip shows as `pairs_equal` of 1 or more with a late one.**
+- **`Q_tg` and `Q_noc`: `md5=`, `flip=`, `prefix=`.** An md5 equal to the reference `25b7738a` is a `PASS` with
+  `flip=no`. A different md5 is the same greedy near-tie flip: `PASS` with `flip=yes` when the output shares at
+  least 128 bytes with the reference text (`scripts/sycl-moe-exec-prompts/code-ref-25b7738a.txt`, taken from run
+  2's `Q_noc` output), and `FAIL` with `flip=no` below that. `prefix=` is the shared byte count. In run 2 `Q_noc`
+  reproduced the reference and `Q_tg` diverged at byte 174 (`prefix=173`, a flip).
+
+### Caveats
+
+- **The GPT-OSS B50 control compares against 871 / 32.0.** `GO_pp` fails a pp512 outside 5 % of 871 and a
+  tg128 outside 3 % of 32.0 (the B50 is steady, cv 0.7 %, and the table above states B50 GPT-OSS TG128 as about
+  32). Master already reads pp512 about 770 on the B50 (`llama.cpp-zuze`), so a `GO_pp` pp512 below the window but
+  within 15 % below 871 is that open regression: it is expected to `FAIL` until zuze lands, and the verdict names
+  it (`see=llama.cpp-zuze`). Its decode and count gates are unaffected.
+- **`GO_noc` records its layer count.** GPT-OSS without `-c` keeps every expert on the device, and what overflows
+  at the default context is KV, which the planner demotes to host tiers (`llama.cpp-uize`), so no executor
+  decision prints and `layer_lines=0` is the expected answer. `--go-noc-layers N` makes it an exact check.
+- **A complete run takes about 45 minutes** on this host with the ring off: `Q_pp` 9.5 min, `Q_pp_cpu` 9.3,
+  `Q_staged` 3.5, each `Q_tok` load about 2, `Q_tg` and `Q_noc` about 2.5 each, the GPT-OSS and Mistral arms about
+  1 each. `Q_pp` and `Q_pp_cpu` carry a 1500 s timeout, the other Qwen arms 900 s.
+- **`llama-bench` has no `-c`.** Its context is `n_prompt + n_gen`, so `GO_pp` runs at 640, not at the
+  `-c 4096` the plan's table wrote.
+- **Cold load.** The Qwen model is about 70 GB read from `/models`; a cold first arm takes minutes and
+  the Qwen arms carry `timeout 900` (`Q_pp` and `Q_pp_cpu` 1500).
+- **The numbers are this build, on this host's drivers and load.** A table from another driver, card
+  pairing or load is not a baseline for this one.
+
+---
+
 ## The production TG path is MMVQ with q8_1 activations — not DMMV
 
 **For a batch=1 quantized `MUL_MAT` whose weight resolved to a non-AoS layout, a

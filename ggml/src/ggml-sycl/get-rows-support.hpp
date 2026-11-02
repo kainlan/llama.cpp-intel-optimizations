@@ -18,6 +18,10 @@
 
 #include "ggml.h"
 
+// Q2_0 is deliberately NOT here although the backend now runs it for MUL_MAT / MUL_MAT_ID (llama.cpp-s36q phase 4):
+// it has no GET_ROWS arm, and nothing needs one. A Q2_0 tensor is an expert or dense weight matrix, never an
+// embedding table (Qwen3.8's token_embd is IQ3_S and its per_layer_token_embd IQ4_NL, which also stay declined).
+// Add the arm and this case together if a Q2_0 embedding ever appears.
 inline bool ggml_sycl_get_rows_type_supported(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F16:

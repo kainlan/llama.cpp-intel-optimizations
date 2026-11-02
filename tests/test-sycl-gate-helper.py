@@ -2,12 +2,20 @@
 
 A helper that can pass vacuously or blame the wrong needle undermines every gate that uses it, so pin both:
 zero recorded checks must fail, and a failing generator expression must be annotated without naming a stale
-module-level variable that shares a comprehension variable's name.
+module-level variable that shares a comprehension variable's name. The message helpers the pytest-style pins pass
+as assert messages, first_missing and first_present, are pinned here too: what each names, the singular and plural
+wording, and the 100-character cut. The text helpers the three MoE source-contract pins share are pinned last: norm
+(comment stripping, whitespace canonicalisation, idempotence), read (text, or empty for a missing file), ROOT (the repo
+root beside tests/), body (brace balancing, string literals, a signature ending in "{", an empty result), ordered (each
+needle after the one before) and mutate (one replacement on normalised text, and a missing old text is refused).
 """
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
+
+import sycl_gate
+from sycl_gate import body, first_missing, first_present, mutate, norm, ordered, read
 
 TESTS = Path(__file__).resolve().parent
 
@@ -128,9 +136,160 @@ def test_plain_frame_failure_still_names_its_operands() -> None:
     assert "token='missing'" in result.stderr
 
 
-if __name__ == "__main__":
-    import sys
+def test_first_missing_names_the_absent_anchor_and_where_it_looked() -> None:
+    assert first_missing("W", "a", "a", "b") == "W: missing 'b'"
 
+
+def test_first_missing_names_the_first_of_two_missing_anchors() -> None:
+    assert first_missing("W", "zzz", "a", "b") == "W: missing 'a'"
+
+
+def test_first_missing_with_every_anchor_present_says_an_order_count_or_depth_condition_failed() -> None:
+    message = first_missing("W", "a b c", "a", "b", "c")
+    assert message == "W: all 3 anchors present; an order, count or depth condition failed"
+
+
+def test_first_missing_with_one_anchor_present_reads_in_the_singular() -> None:
+    assert first_missing("W", "a", "a") == "W: the anchor is present; an order, count or depth condition failed"
+
+
+def test_first_missing_shows_an_anchor_of_exactly_100_characters_whole() -> None:
+    assert first_missing("W", "", "x" * 100) == "W: missing %r" % ("x" * 100)
+
+
+def test_first_missing_cuts_an_anchor_of_101_characters_to_97_and_dots() -> None:
+    assert first_missing("W", "", "x" * 101) == "W: missing %r" % ("x" * 97 + "...")
+    assert len(first_missing("W", "", "x" * 300)) < 160
+
+
+def test_first_missing_is_never_empty() -> None:
+    assert first_missing("W", "")
+    assert first_missing("W", "t")
+    assert first_missing("", "", "a")
+
+
+def test_first_missing_with_a_signature_and_empty_text_names_the_signature() -> None:
+    assert first_missing("W", "", "a", "b", signature="void f()") == "W: missing 'void f()'"
+
+
+def test_first_missing_with_a_signature_and_text_behaves_as_without_it() -> None:
+    assert first_missing("W", "a", "a", "b", signature="void f()") == first_missing("W", "a", "a", "b")
+    assert first_missing("W", "a b", "a", "b", signature="void f()") == first_missing("W", "a b", "a", "b")
+
+
+def test_first_missing_shows_a_signature_of_exactly_100_characters_whole() -> None:
+    assert first_missing("W", "", "a", signature="x" * 100) == "W: missing %r" % ("x" * 100)
+
+
+def test_first_missing_cuts_a_signature_of_101_characters_to_97_and_dots() -> None:
+    assert first_missing("W", "", "a", signature="x" * 101) == "W: missing %r" % ("x" * 97 + "...")
+
+
+def test_first_present_names_the_forbidden_text_and_where_it_looked() -> None:
+    assert first_present("W", "x bad y", "good", "bad") == "W: found 'bad'"
+
+
+def test_first_present_names_the_first_of_two_forbidden_texts() -> None:
+    assert first_present("W", "b a", "a", "b") == "W: found 'a'"
+
+
+def test_first_present_with_none_present_names_how_many_were_searched() -> None:
+    message = first_present("W", "xyz", "a", "b", "c")
+    assert message == "W: none of 3 forbidden texts present; an emptiness or count condition failed"
+
+
+def test_first_present_with_one_forbidden_text_reads_in_the_singular() -> None:
+    assert first_present("W", "xyz", "a") == "W: the forbidden text is absent; an emptiness or count condition failed"
+
+
+def test_first_present_shows_a_text_of_exactly_100_characters_whole() -> None:
+    assert first_present("W", "x" * 100, "x" * 100) == "W: found %r" % ("x" * 100)
+
+
+def test_first_present_cuts_a_text_of_101_characters_to_97_and_dots() -> None:
+    assert first_present("W", "x" * 101, "x" * 101) == "W: found %r" % ("x" * 97 + "...")
+
+
+def test_first_present_is_never_empty() -> None:
+    assert first_present("W", "")
+    assert first_present("W", "t", "t")
+    assert first_present("", "t", "t")
+
+
+def test_norm_strips_comments_and_canonicalises_whitespace() -> None:
+    assert norm("a  (\n b ,c ) // gone\n/* gone */ d") == "a (b, c) d"
+    assert norm("f(\"x\"\n   \"y\")") == 'f("xy")'
+    assert norm('s = "// kept";') == 's = "// kept";'
+
+
+def test_strip_comments_keeps_a_quote_character_literal_whole() -> None:
+    assert norm("c = '\"'; /* x */ d = \"y\";") == "c = '\"'; d = \"y\";"
+
+
+def test_norm_does_not_join_literals_across_an_escaped_quote() -> None:
+    assert norm('s = "a\\" ";') == 's = "a\\" ";'
+    assert norm('s = "a" "b";') == 's = "ab";'
+
+
+def test_norm_is_idempotent() -> None:
+    once = norm("if ( a ,b ) {\n  f( \"p\" \"q\" ) ; // c\n}")
+    assert norm(once) == once
+
+
+def test_read_returns_text_or_empty(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)  # a cwd-relative read would find nothing here
+    assert "def read(" in read("tests/sycl_gate.py")
+    assert read("tests/no-such-file-anywhere.txt") == ""
+
+
+def test_root_is_the_repo_root_beside_tests() -> None:
+    assert sycl_gate.ROOT == Path(sycl_gate.__file__).resolve().parents[1]
+    assert (sycl_gate.ROOT / "tests" / "sycl_gate.py").is_file()
+
+
+def test_body_balances_braces_and_skips_literals() -> None:
+    text = 'void f() { if (x) { g("}"); } } void h() { }'
+    assert body(text, "void f()") == '{ if (x) { g("}"); } }'
+    assert body(text, "void h()") == "{ }"
+
+
+def test_body_skips_an_escaped_quote_inside_a_literal() -> None:
+    text = 'void f() { g("a\\"}"); } void h() { }'
+    assert body(text, "void f()") == '{ g("a\\"}"); }'
+
+
+def test_body_signature_ending_in_brace_opens_the_body_itself() -> None:
+    text = "struct s { int a; struct t { int b; } u; };"
+    assert body(text, "struct s {") == "{ int a; struct t { int b; } u; }"
+    assert body(text, "struct t {") == "{ int b; }"
+
+
+def test_body_is_empty_when_signature_or_closing_brace_is_missing() -> None:
+    assert body("void f() { x", "void f()") == ""
+    assert body("void f() { }", "void g()") == ""
+    assert body("void f();", "void f()") == ""
+
+
+def test_ordered_requires_every_needle_after_the_previous_one() -> None:
+    assert not ordered("x", "x", "x")
+    assert not ordered("aa", "aa", "a")
+    assert ordered("a b c", "a", "b", "c")
+    assert not ordered("a b c", "b", "a")
+    assert not ordered("a b c", "a", "z")
+    assert ordered("abc")
+
+
+def test_mutate_replaces_once_on_normalised_text_and_demands_the_old_text() -> None:
+    assert mutate("x  =  1; // c\nx = 1;", "x = 1;", "x = 2;") == "x = 2; x = 1;"
+    try:
+        mutate("a", "zzz", "b")
+    except AssertionError as error:
+        assert "mutant precondition" in str(error)
+    else:
+        raise AssertionError("mutate accepted a missing old text")
+
+
+if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))

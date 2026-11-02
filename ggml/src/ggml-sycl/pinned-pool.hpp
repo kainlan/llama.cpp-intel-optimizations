@@ -136,7 +136,7 @@ class pinned_chunk_pool {
 
     // Runtime allocation: uses a separate pool of chunks that are not part of
     // the zone layout.  Suitable for large contiguous allocations (e.g., 615 MB
-    // reorder buffers) that don't fit within a single 256 MB zone chunk.
+    // reorder buffers) that don't fit within a single zone chunk (CHUNK_SIZE is 2 GiB).
     // Falls back to growing the runtime pool if no existing chunk has space.
     void * allocate_runtime(size_t size, size_t alignment = DEFAULT_ALIGNMENT);
 
@@ -271,10 +271,11 @@ class pinned_chunk_pool {
 
     void * allocate_from_chunks(std::vector<chunk> & chunks, size_t size, size_t alignment, bool runtime_pool);
     bool   deallocate_from_chunks(std::vector<chunk> & chunks, void * ptr);
-    bool   grow_into(std::vector<chunk> & chunks, size_t min_size, bool runtime_pool);
+    // `site` names the caller; the inference-phase gate's WARN prints it.
+    bool   grow_into(std::vector<chunk> & chunks, size_t min_size, bool runtime_pool, const char * site);
 
     // Allocate a new chunk (>= min_size). Returns false if over budget or allocation fails.
-    bool grow(size_t min_size);
+    bool grow(size_t min_size, const char * site);
 
     // Byte footprint of ONE new chunk able to hold `min_size` usable bytes.
     // `usable` is what the chunk's TLSF arena manages (max(chunk_size_,

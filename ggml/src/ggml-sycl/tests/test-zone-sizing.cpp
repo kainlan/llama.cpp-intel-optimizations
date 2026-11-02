@@ -22,6 +22,8 @@
 //
 
 #include "compute-alloc-scope.hpp"
+#include "tlsf-allocator.hpp"
+#include "unified-types.hpp"
 #include "zone-sizing.hpp"
 
 #include <cstdio>
@@ -991,6 +993,203 @@ int main() {
               "a Q8_0 head beside it still is");
     }
 
+    // ---- Case 14k: a quantized type no kernel but the f16 dequant arm serves takes it as its PP route (llama.cpp-gldu) ----
+    // The router walks its priority list: a type an MMQ kernel serves is taken by MMQ at PP batch unless the MMQ claim
+    // moves it to the arm (Case 14l), a type with a coalesced layout by its coalesced / unified kernel, and what is
+    // left (the IQ family) has only the oneDNN dequant arm. The planner asks the SAME two type lists the router's
+    // eligibility terms are built from
+    // (unified-types.hpp), so it claims exactly that remainder; claiming an MMQ type sized the whole plan from the
+    // 1.2 GB f16 copy of a Q5_K LM head on a device run.
+    {
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_XS), "IQ4_XS draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ3_S), "IQ3_S draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_NL), "IQ4_NL draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ3_XXS), "IQ3_XXS draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ2_XS), "IQ2_XS draws the dequant arm");
+        const ggml_type mmq_types[] = { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K,
+                                        GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K };
+        for (ggml_type ty : mmq_types) {
+            CHECK(ggml_sycl::mmq_capable_type(ty), "the MMQ list carries the type the router's use_mmq asks about");
+            CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty),
+                  "an MMQ type is not the AOS claim's (the MMQ claim of Case 14l covers the measured ones)");
+        }
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q8_0), "Q8_0 keeps its own unconditional mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_0), "Q4_0 keeps the unified-kernel mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_MXFP4),
+              "MXFP4 is coalesced-capable (and keeps the unified-kernel mark)");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q6_K),
+              "Q6_K is materialized COALESCED and routed to MMQ_COALESCED");
+        // The composition the adapter calls: type lists, dense-MUL_MAT support, dequant support, head and expert.
+        auto claims = [](ggml_type ty, bool head, bool expert, bool dequant) {
+            return ggml_sycl::aos_dequant_f16_plan_claims(ty, true, head, expert, dequant);
+        };
+        CHECK(claims(GGML_TYPE_IQ3_S, false, false, true), "a dense IQ3_S weight is claimed");
+        CHECK(claims(GGML_TYPE_IQ4_NL, false, false, true), "a dense IQ4_NL weight is claimed");
+        CHECK(!claims(GGML_TYPE_IQ4_XS, true, false, true), "the LM head is not claimed");
+        CHECK(!claims(GGML_TYPE_IQ3_S, false, true, true), "an expert stack is not claimed");
+        CHECK(!claims(GGML_TYPE_IQ3_S, false, false, false), "a type the router cannot dequantize is not claimed");
+        CHECK(!ggml_sycl::aos_dequant_f16_plan_claims(GGML_TYPE_IQ3_S, false, false, false, true),
+              "a non-quantized operand is not claimed");
+        CHECK(!claims(GGML_TYPE_Q5_K, false, false, true) && !claims(GGML_TYPE_Q4_K, false, false, true) &&
+                  !claims(GGML_TYPE_Q2_K, false, false, true) && !claims(GGML_TYPE_Q4_1, false, false, true) &&
+                  !claims(GGML_TYPE_Q5_0, false, false, true),
+              "an MMQ type is not claimed");
+        CHECK(!claims(GGML_TYPE_Q8_0, false, false, true) && !claims(GGML_TYPE_Q4_0, false, false, true) &&
+                  !claims(GGML_TYPE_MXFP4, false, false, true) && !claims(GGML_TYPE_Q6_K, false, false, true),
+              "a coalesced-capable type is not claimed");
+        // SYCL refuses a dense MUL_MAT for these although the router can dequantize them: no copy is reserved.
+        CHECK(!claims(GGML_TYPE_NVFP4, false, false, true), "NVFP4 is refused by SYCL's dense MUL_MAT, so not claimed");
+        CHECK(!claims(GGML_TYPE_Q1_0, false, false, true), "Q1_0 is refused by SYCL's dense MUL_MAT, so not claimed");
+        // Q2_0 left that group when it gained its SYCL kernels (llama.cpp-s36q phase 4): dense Q2_0 is executed, is
+        // neither MMQ-served nor coalesced, and has a to_fp16 converter, so its PP route is the f16 dequant arm.
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q2_0), "Q2_0 draws the dequant arm");
+        CHECK(claims(GGML_TYPE_Q2_0, false, false, true), "a dense Q2_0 weight is claimed");
+        CHECK(!claims(GGML_TYPE_Q2_0, false, true, true), "a Q2_0 expert stack is not claimed");
+        CHECK(ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_IQ4_XS) &&
+                  !ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_NVFP4),
+              "the dense MUL_MAT list carries the IQ family and not NVFP4");
+        // The set is disjoint from the unified kernel's, so the two marks never double-count one weight.
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const ggml_type ty = static_cast<ggml_type>(t);
+            CHECK(!(ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty) && ggml_sycl::unified_kernel_serves_type(ty)),
+                  "no type is both a unified-kernel type and an AOS dequant-arm type");
+        }
+
+        // The adapter marks such a weight through the if-unsupplied fields (scratch off for its type by default),
+        // so it sizes the dequant plan; a gather-only IQ4_NL (per_layer_token_embd, 26.8 GiB) never does.
+        const size_t layer_w = 50331648;  // 4096 x 6144 f16
+        auto         marked  = [&](const char * name, int type, int64_t ne0, int64_t ne1, size_t f16_w, bool gather) {
+            zone_tensor_desc d                               = desc(name, 1000, type, ne0, ne1, 1, 1);
+            d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
+            d.dequant_f16_if_unsupplied_src1_bytes_per_token = static_cast<size_t>(ne0) * F16_BYTES;
+            d.pp_scratch_type_enabled                        = false;
+            d.get_rows_only                                  = gather;
+            return d;
+        };
+        std::vector<zone_tensor_desc> iq;
+        for (int i = 0; i < 4; i++) {
+            iq.push_back(marked("blk.0.ffn_gate_shexp.weight", GGML_TYPE_IQ4_XS, 4096, 6144, layer_w, false));
+        }
+        CHECK(zone_scoped_maxima(iq).dequant_f16_weight_bytes == layer_w,
+              "a dense IQ4_XS weight sizes the dequant plan");
+        const size_t                  per_layer_embd_w = 160ull * 320001536ull * F16_BYTES;
+        std::vector<zone_tensor_desc> with_embd        = iq;
+        with_embd.push_back(
+            marked("per_layer_token_embd.weight", GGML_TYPE_IQ4_NL, 160, 320001536, per_layer_embd_w, true));
+        CHECK(zone_scoped_maxima(with_embd).dequant_f16_weight_bytes == layer_w,
+              "a gather-only IQ4_NL table never sizes the dequant plan");
+    }
+
+    // ---- Case 14l: the MMQ types the oneDNN f16 dequant arm serves at PP batch (llama.cpp-h9c8) ------------------
+    // At PP batch the MMQ kernel ran these types at ~3.8 TOPS where the oneDNN f16 GEMM runs the same shapes at
+    // ~133 TFLOPS, so they take the arm. The planner and the router ask ONE list and ONE claim (unified-types.hpp),
+    // so the plan reserves what the arm draws. The list is explicit rather than "MMQ minus Q4_0 / Q8_0": a type added
+    // to the MMQ list later does not join the arm before it is measured.
+    {
+        auto prefers = [](ggml_type ty) {
+            return ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(ty);
+        };
+        const ggml_type listed[] = { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K,
+                                     GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
+        for (ggml_type ty : listed) {
+            CHECK(prefers(ty), "a measured MMQ type is listed");
+        }
+        int n_listed = 0;
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const ggml_type ty = static_cast<ggml_type>(t);
+            if (!prefers(ty)) {
+                continue;
+            }
+            n_listed++;
+            CHECK(ggml_sycl::mmq_capable_type(ty), "a listed type is one an MMQ kernel serves");
+            CHECK(ggml_sycl::dense_mul_mat_type_supported(ty), "a listed type is a dense MUL_MAT SYCL executes");
+            CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty), "the list is disjoint from the AOS claim's types");
+            CHECK(!ggml_sycl::unified_kernel_serves_type(ty), "the list is disjoint from the unified kernel's types");
+        }
+        CHECK(n_listed == 8, "exactly the eight measured types are listed");
+        CHECK(!prefers(GGML_TYPE_Q4_0) && !prefers(GGML_TYPE_Q8_0) && !prefers(GGML_TYPE_MXFP4),
+              "Q4_0, Q8_0 and MXFP4 keep their own oneDNN routes and plan marks");
+        CHECK(!prefers(GGML_TYPE_IQ4_XS) && !prefers(GGML_TYPE_IQ2_XXS) && !prefers(GGML_TYPE_F16) &&
+                  !prefers(GGML_TYPE_F32),
+              "the IQ family (the AOS claim's) and the float types are not listed");
+
+        // The composition the adapter and the router helper call.
+        auto claims = [](ggml_type ty, bool head, bool expert, bool matrix, bool dequant) {
+            return ggml_sycl::mmq_dequant_f16_plan_claims(ty, true, head, expert, matrix, dequant);
+        };
+        for (ggml_type ty : listed) {
+            CHECK(claims(ty, false, false, true, true), "a dense 2-D weight of a listed type is claimed");
+        }
+        CHECK(!claims(GGML_TYPE_Q6_K, true, false, true, true), "the LM head stays on MMQ and is not claimed");
+        CHECK(!claims(GGML_TYPE_Q4_K, false, true, true, true), "an expert stack is not claimed");
+        CHECK(!claims(GGML_TYPE_Q4_K, false, false, false, true), "a 3-D weight stays on MMQ and is not claimed");
+        CHECK(!claims(GGML_TYPE_Q5_K, false, false, true, false), "a type the router cannot dequantize is not claimed");
+        CHECK(!ggml_sycl::mmq_dequant_f16_plan_claims(GGML_TYPE_Q4_K, false, false, false, true, true),
+              "a non-quantized operand is not claimed");
+        CHECK(!claims(GGML_TYPE_Q4_0, false, false, true, true) && !claims(GGML_TYPE_Q8_0, false, false, true, true) &&
+                  !claims(GGML_TYPE_MXFP4, false, false, true, true) &&
+                  !claims(GGML_TYPE_IQ4_XS, false, false, true, true),
+              "a type the list leaves out is not claimed");
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const ggml_type ty = static_cast<ggml_type>(t);
+            CHECK(!(claims(ty, false, false, true, true) &&
+                    ggml_sycl::aos_dequant_f16_plan_claims(ty, true, false, false, true)),
+                  "no weight is claimed by both the AOS claim and the MMQ claim");
+        }
+
+        // Mistral 7B Q4_K_M as the adapter marks it: the claim decides, the adapter's own arithmetic sizes the marks,
+        // and by default the scratch is not enabled for these types, so every mark is planned. Two layers suffice: the
+        // plan is a maximum over the marked weights, not a sum.
+        auto marked = [&](const char * name, ggml_type type, int64_t ne0, int64_t ne1, bool head) {
+            zone_tensor_desc d = desc(name, 1000, type, ne0, ne1, 1, 1);
+            size_t           w = 0;
+            size_t           s = 0;
+            if (claims(type, head, false, true, true) && ggml_sycl::zone_dequant_f16_weight_bytes(ne0, ne1, &w) &&
+                ggml_sycl::zone_dequant_f16_src1_bytes_per_token(ne0, 1, 1, &s)) {
+                d.dequant_f16_if_unsupplied_weight_bytes         = w;
+                d.dequant_f16_if_unsupplied_src1_bytes_per_token = s;
+            }
+            d.pp_scratch_type_enabled = false;
+            return d;
+        };
+        std::vector<zone_tensor_desc> mistral;
+        for (int il = 0; il < 2; il++) {
+            mistral.push_back(marked("blk.N.attn_q.weight", GGML_TYPE_Q4_K, 4096, 4096, false));
+            mistral.push_back(marked("blk.N.attn_k.weight", GGML_TYPE_Q4_K, 4096, 1024, false));
+            mistral.push_back(marked("blk.N.attn_v.weight", GGML_TYPE_Q6_K, 4096, 1024, false));
+            mistral.push_back(marked("blk.N.attn_output.weight", GGML_TYPE_Q4_K, 4096, 4096, false));
+            mistral.push_back(marked("blk.N.ffn_gate.weight", GGML_TYPE_Q4_K, 4096, 14336, false));
+            mistral.push_back(marked("blk.N.ffn_up.weight", GGML_TYPE_Q4_K, 4096, 14336, false));
+            mistral.push_back(marked("blk.N.ffn_down.weight", GGML_TYPE_Q6_K, 14336, 4096, false));
+        }
+        std::vector<zone_tensor_desc> with_head = mistral;
+        mistral.push_back(marked("output.weight", GGML_TYPE_Q6_K, 4096, 32000, true));
+        const path_scoped_maxima plan = zone_scoped_maxima(mistral);
+        CHECK(plan.dequant_f16_weight_bytes == 117440512, "the plan is the largest FFN weight's f16 copy (112 MiB)");
+        CHECK(plan.dequant_f16_src1_bytes_per_token == 28672,
+              "the activation row per token is ffn_down's 14336-wide input in f16");
+        // Had the head been claimed, its f16 copy (250 MiB) would have sized the whole plan.
+        with_head.push_back(marked("output.weight", GGML_TYPE_Q6_K, 4096, 32000, false));
+        CHECK(zone_scoped_maxima(with_head).dequant_f16_weight_bytes == 262144000,
+              "a claimed head would size the plan, which is why the claim leaves it out");
+
+        // Negative controls, so the two figures above are read from the inventory and not passed by any plan. A
+        // claimed weight one row wider than ffn_up is still claimed (the claim asks for a 2-D weight, not a shape) and
+        // moves the plan off 112 MiB; the head marked as the adapter marks it carries no mark and sizes nothing.
+        std::vector<zone_tensor_desc> wider = mistral;
+        wider.push_back(marked("blk.N.ffn_up.weight", GGML_TYPE_Q4_K, 4096, 14337, false));
+        const size_t wider_w = zone_scoped_maxima(wider).dequant_f16_weight_bytes;
+        CHECK(wider_w != 117440512 && wider_w == 4096ull * 14337ull * F16_BYTES,
+              "a one-row-wider FFN weight moves the plan off the 112 MiB figure");
+        const zone_tensor_desc head = marked("output.weight", GGML_TYPE_Q6_K, 4096, 32000, true);
+        CHECK(head.dequant_f16_if_unsupplied_weight_bytes == 0 &&
+                  head.dequant_f16_if_unsupplied_src1_bytes_per_token == 0,
+              "the head as the adapter marks it carries no dequant mark");
+        CHECK(zone_scoped_maxima({ head }).dequant_f16_weight_bytes == 0 &&
+                  zone_scoped_maxima({ head }).dequant_f16_src1_bytes_per_token == 0,
+              "an inventory of only the head plans nothing");
+    }
+
     // ---- Case 14h: the figures a zone is described by outlive a later plan (llama.cpp-8ony) -----------------------
     // A draft model loaded beside the target overwrites the planner's live (bare plan, Graph floor) with its own
     // smaller figures. The arena's zones are found sufficient and kept, so the zone is still the target's: the
@@ -1285,14 +1484,8 @@ int main() {
               "a decline with no valid legacy fallback draws nothing");
         CHECK(!ggml_sycl::zone_route_draws_scratch(false, false, true, true, true), "an invalid decision draws nothing");
 
-        // Plan inputs are device-global. A second model on the device must not shrink the first one's plan.
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, true) == 19584,
-              "another live model's larger plan input survives the load of a smaller one (draft + target)");
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(4096, 19584, true) == 19584,
-              "the larger of two live models wins either way");
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, false) == 4096,
-              "with no other live model the new inputs replace the old: a model swap shrinks the plan");
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(0, 0, true) == 0, "nothing planned stays nothing");
+        // The plan inputs' merge across live models is the owner table's (planned-load-terms.hpp, llama.cpp-45qo),
+        // unit-tested in tests/test-planned-load-terms.cpp.
     }
 
     // ---- Case 16: review r2/r3 (hardware): a rung is refused for its hold-induced spill only when that spill is
@@ -1445,6 +1638,295 @@ int main() {
         in.rungs                                = big;
         in.n_rungs                              = 1;
         CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) != 1024, "a rung whose own request cannot fit is not named");
+    }
+
+    // ---- Case 24b (llama.cpp-kjef, ring fit term): the prefill ring is lent bytes, so it costs the card nothing
+    // EXCEPT the part a loan cannot supply; that remainder is a demand on free memory and is part of the ONE demand
+    // every fit consumer reads. The Case 24 inputs (512: plan 76 MiB + request 495 MiB - 100 MiB of room = 471 MiB,
+    // 626 MiB left of 1097 MiB) with 400 MiB of the ring uncovered leave 226 MiB against a 256 MiB headroom. -------
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t {
+            return 76 * 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 512,  495 * MiB },
+            { 1024, 990 * MiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1097 * MiB;
+        in.kv_room                         = 100 * MiB;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 2;
+        in.plan_of                         = plan;
+        CHECK(in.ring_bytes == 0, "no uncovered ring unless a caller says so");
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "baseline: 512 fits with no ring bytes to charge");
+        const size_t base = ggml_sycl::zone_hold_fit_demand(in, 512);
+        in.ring_bytes     = 400 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == base + 400 * MiB,
+              "demand = today's value + the uncovered ring");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 512), "512 does not fit once 400 MiB of the ring is uncovered");
+        CHECK(ggml_sycl::zone_hold_fit(in, 256), "256 passes under the same inputs");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 512) == 256, "the -ub the refusal names is 256");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 256) == 256, "a rung that fits is returned unchanged");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "an unknown n_ubatch still names no demand");
+        // A ring a loan covers is no demand at all, so the verdict is today's.
+        in.ring_bytes = 0;
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "a fully covered ring changes nothing");
+        // Saturating: a huge figure never wraps to a small demand that reads as a fit.
+        in.ring_bytes = SIZE_MAX;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == SIZE_MAX, "a huge ring saturates the demand");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 512), "and the rung is refused, never fitted by a wrapped sum");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 512) == 0, "no rung fits an unbounded ring: nothing is named");
+        // No plan function, no hold: the ring is still a demand, and the only one.
+        in.plan_of    = nullptr;
+        in.ring_bytes = 400 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 400 * MiB, "with no plan the demand is the ring alone");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "an unknown n_ubatch names no demand, plan or not");
+        in.ring_bytes = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 0, "no plan and no ring is no demand");
+    }
+
+    // ---- Case 24c (compute room): the RUNTIME zone of an explicit micro-batch the load placed holds the planned
+    // compute term beside that micro-batch's ring and dense scratch, so at that rung a compute buffer no larger than
+    // the term is served by the zone and the hold cannot keep it out. The B70 / Qwen3.8 IQ3_XXS context at -ub 2048:
+    // plan 98 MiB, one 1960 MiB compute buffer, 64 MiB of KV-zone room, 1946 MiB free outside the arena, and the
+    // 2055 MiB compute term the load measured at its planning shape (n_ctx_train, ubatch 512). Without the room the
+    // bound charges the whole buffer as a spill and refuses the context, although no request was held out. ------------
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t {
+            return 98 * 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 2048, 1960 * MiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1946 * MiB;
+        in.kv_room                         = 64 * MiB;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 1;
+        in.plan_of                         = plan;
+        CHECK(in.compute_room_n_ubatch == 0 && in.compute_room_bytes == 0, "no compute room unless a caller says so");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB + 1960 * MiB - 64 * MiB,
+              "without a room: plan + the whole buffer - KV room, 1994 MiB");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 2048), "and 2048 is refused against 1946 MiB free");
+        const uint32_t largest_without = ggml_sycl::zone_hold_fit_largest_ub(in, 2048);
+        const size_t   room            = 2055 * MiB;
+        in.compute_room_n_ubatch       = 2048;
+        in.compute_room_bytes          = room;
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 1960 * MiB), "the buffer fits the room");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB - 64 * MiB,
+              "with the room the buffer spills nothing; the plan stays in the bound");
+        CHECK(ggml_sycl::zone_hold_fit(in, 2048), "so 2048 fits: 1912 MiB stay free");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 2048) == 2048, "and a refusal would name 2048 itself");
+        // The ring no loan covers is still a demand beside the credited buffer.
+        in.ring_bytes = 100 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB - 64 * MiB + 100 * MiB,
+              "the uncovered ring is charged with the room as without it");
+        in.ring_bytes         = 0;
+        // Whole or nothing: a room one MiB short of the buffer gives no part of itself.
+        in.compute_room_bytes = 1959 * MiB;
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 1960 * MiB), "a buffer above the room");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB + 1960 * MiB - 64 * MiB,
+              "is charged whole, not less the room");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 2048), "and refused as without a room");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 2048) == largest_without, "with the advice given without one");
+        // A buffer above the term the zone holds is held back whole, so it is charged whole: the case the kpjw refusal
+        // and its largest -ub advice still answer.
+        in.compute_room_bytes                     = room;
+        ggml_sycl::zone_hold_rung_request above[] = {
+            { 2048, 2100 * MiB }
+        };
+        in.rungs = above;
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 2100 * MiB),
+              "a 2100 MiB buffer above the term");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB + 2100 * MiB - 64 * MiB, "is charged whole");
+        in.rungs   = rungs;
+        // Before the rung's buffers exist (no record at all) the credit changes nothing: the demand is the plan alone.
+        in.n_rungs = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB - 64 * MiB, "no record: the plan alone");
+        in.n_rungs            = 1;
+        // Only the rung the room was planned for: 1024, scaled from the 2048 record, is judged as before.
+        in.compute_room_bytes = room;
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 980 * MiB), "another rung has no room");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 98 * MiB + 980 * MiB - 64 * MiB,
+              "1024 is charged its scaled buffer whole");
+        // An unknown micro-batch never matches a room, not even a room for micro-batch 0.
+        in.compute_room_n_ubatch = 0;
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 0, 0), "n_ubatch 0 has no room");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "and no demand");
+        // The scaler, through the spill bound that adds a 1-byte plan to it: rounded up, unchanged for an unknown or
+        // equal micro-batch, saturating on overflow.
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 3, 2, 3) == 1 + 5, "4.5 rounds up to 5");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 7 * MiB, 0, 2048) == 1 + 7 * MiB, "an unknown source micro-batch");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 7 * MiB, 2048, 0) == 1 + 7 * MiB, "an unknown target micro-batch");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, 7 * MiB, 512, 512) == 1 + 7 * MiB, "an equal one");
+        CHECK(ggml_sycl::zone_hold_spill_bound(1, SIZE_MAX / 2, 512, 2048) == SIZE_MAX, "an overflowing product");
+    }
+
+    // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
+    // cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound
+    // over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even
+    // with a room of SIZE_MAX, and every rung but the named one does when one is. So a load that names no micro-batch,
+    // the auto trial included, and every other rung of one that does are judged as before. ----------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+
+        // The demand without the room: zone_hold_fit_demand as it was before the room fields existed.
+        auto demand_before_room = [](const ggml_sycl::zone_hold_fit_inputs & in, uint32_t n_ubatch) -> size_t {
+            if (n_ubatch == 0) {
+                return 0;
+            }
+            const size_t plan    = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
+            const size_t request = ggml_sycl::zone_hold_fit_request(in, n_ubatch);
+            const size_t spill   = ggml_sycl::zone_hold_spill_raw_demand(
+                ggml_sycl::zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);
+            return in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
+        };
+        auto plan_76 = [](void *, uint32_t) -> size_t {
+            return 76 * 1024 * 1024;
+        };
+        auto plan_98 = [](void *, uint32_t) -> size_t {
+            return 98 * 1024 * 1024;
+        };
+        auto plan_10 = [](void *, uint32_t) -> size_t {
+            return 10 * 1024 * 1024;
+        };
+        auto plan_var = [](void *, uint32_t n_ubatch) -> size_t {
+            return n_ubatch < 32 ? 400 * 1024 * 1024 : 1024 * 1024;
+        };
+        const ggml_sycl::zone_hold_plan_fn      plans[]  = { plan_76, plan_98, plan_10, plan_var, nullptr };
+        const ggml_sycl::zone_hold_rung_request set_g7[] = {
+            { 512,  495 * MiB },
+            { 1024, 990 * MiB }
+        };
+        const ggml_sycl::zone_hold_rung_request set_big[] = {
+            { 1024, 1200 * MiB }
+        };
+        const ggml_sycl::zone_hold_rung_request set_qwen[] = {
+            { 2048, 1960 * MiB }
+        };
+        const ggml_sycl::zone_hold_rung_request set_three[] = {
+            { 512,  495 * MiB  },
+            { 1024, 990 * MiB  },
+            { 2048, 4000 * MiB }
+        };
+        const ggml_sycl::zone_hold_rung_request set_sparse[] = {
+            { 512,  495 * MiB  },
+            { 2048, 1980 * MiB }
+        };
+        const ggml_sycl::zone_hold_rung_request set_600[] = {
+            { 600, 600 * MiB }
+        };
+        const ggml_sycl::zone_hold_rung_request set_huge[] = {
+            { 600, 6000 * MiB }
+        };
+        const ggml_sycl::zone_hold_rung_request set_tiny[] = {
+            { 32, 1 * MiB }
+        };
+
+        struct record_set {
+            const ggml_sycl::zone_hold_rung_request * rungs;
+            size_t                                    n;
+        };
+
+        const record_set sets[] = {
+            { nullptr,    0 },
+            { set_g7,     2 },
+            { set_big,    1 },
+            { set_qwen,   1 },
+            { set_three,  3 },
+            { set_sparse, 2 },
+            { set_600,    1 },
+            { set_huge,   1 },
+            { set_tiny,   1 },
+        };
+        const size_t kv_rooms[] = { 0, 64 * MiB, 100 * MiB };
+        const size_t rings[]    = { 0, 400 * MiB };
+        size_t       mismatches = 0;
+        size_t       asked      = 0;
+        for (const record_set & set : sets) {
+            for (ggml_sycl::zone_hold_plan_fn plan : plans) {
+                for (size_t kv_room : kv_rooms) {
+                    for (size_t ring : rings) {
+                        ggml_sycl::zone_hold_fit_inputs before  = {};
+                        before.headroom_target                  = 256 * MiB;
+                        before.free_before                      = 1946 * MiB;
+                        before.kv_room                          = kv_room;
+                        before.rungs                            = set.rungs;
+                        before.n_rungs                          = set.n;
+                        before.plan_of                          = plan;
+                        before.ring_bytes                       = ring;
+                        // No rung named: a room of any size is inert.
+                        ggml_sycl::zone_hold_fit_inputs unnamed = before;
+                        unnamed.compute_room_bytes              = SIZE_MAX;
+                        // The rung the Qwen3.8 load placed named: every other rung is judged as before.
+                        ggml_sycl::zone_hold_fit_inputs named   = unnamed;
+                        named.compute_room_n_ubatch             = 2048;
+                        for (uint32_t n = 32; n <= 8192; n += 32) {
+                            const size_t want = demand_before_room(before, n);
+                            ++asked;
+                            if (ggml_sycl::zone_hold_fit_demand(before, n) != want ||
+                                ggml_sycl::zone_hold_fit_demand(unnamed, n) != want ||
+                                ggml_sycl::zone_hold_fit(unnamed, n) != ggml_sycl::zone_hold_fit(before, n) ||
+                                (n != 2048 && ggml_sycl::zone_hold_fit_demand(named, n) != want)) {
+                                ++mismatches;
+                            }
+                        }
+                        if (ggml_sycl::zone_hold_fit_largest_ub(unnamed, 8192) !=
+                            ggml_sycl::zone_hold_fit_largest_ub(before, 8192)) {
+                            ++mismatches;
+                        }
+                    }
+                }
+            }
+        }
+        CHECK(asked == 9 * 5 * 3 * 2 * 256, "the sweep asked every rung of every configuration");
+        CHECK(mismatches == 0, "no rung but the named one is judged differently from the fit before the room");
+    }
+
+    // ---- Case 24e (a RUNTIME zone an earlier load grew): the arena reserves the larger of the floor and the
+    // requirement, rounded up to 256 bytes, so a zone a load sized for itself is never reported as kept above its
+    // plan, and only a zone above that reservation is. The second instance of a -ub 2048,512 sweep plans 512
+    // against the zone the 2048 load grew. -------------------------------------------------------------------------
+    {
+        const size_t MiB   = 1024 * 1024;
+        const size_t floor = 64 * MiB;
+
+        // The reservation itself, against figures written out by hand.
+        size_t zone = 0;
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, 10 * MiB, &zone) && zone == floor, "the floor wins");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, 18050 * MiB, &zone) && zone == 18050 * MiB,
+              "an aligned requirement is reserved as it is");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, 18050 * MiB + 1, &zone) && zone == 18050 * MiB + 256,
+              "one byte over rounds up to the next 256-byte grain");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(0, 0, &zone) && zone == 0, "nothing reserves nothing");
+        zone = 7;
+        CHECK(!ggml_sycl::zone_runtime_reserved_bytes(floor, SIZE_MAX - 254, &zone) && zone == 7,
+              "a rounding that overflows fails and leaves the output alone");
+        CHECK(ggml_sycl::zone_runtime_reserved_bytes(floor, SIZE_MAX - 255, &zone) && zone == SIZE_MAX - 255,
+              "the largest aligned requirement is reserved");
+
+        // The live zones below are the reservations above, written out: 18050 MiB, 18050 MiB + 256, the floor.
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB, floor, 18050 * MiB),
+              "a zone the load sized for its own requirement is not kept above its plan");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB + 256, floor, 18050 * MiB + 1),
+              "nor is one rounded up to the arena's 256-byte grain (255 bytes above)");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(floor, floor, 10 * MiB),
+              "nor one the floor sized, far above a small requirement");
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB, floor, 2264 * MiB),
+              "a zone a 2048 load grew is kept above the plan of a later 512 load");
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(2264 * MiB + 256, floor, 2264 * MiB),
+              "one grain above the plan is kept above it");
+        CHECK(ggml_sycl::zone_runtime_kept_above_plan(18050 * MiB + 512, floor, 18050 * MiB + 1),
+              "and one grain above a rounded plan is too");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(2264 * MiB, floor, 18050 * MiB),
+              "a zone below the plan is not kept above it");
+        CHECK(!ggml_sycl::zone_runtime_kept_above_plan(SIZE_MAX, floor, SIZE_MAX),
+              "a saturated plan never wraps into a kept zone");
     }
 
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
@@ -1625,6 +2107,40 @@ int main() {
         CHECK(ggml_sycl::compute_alloc_scope_active(), "nested: still open after the inner leave");
         ggml_sycl::compute_alloc_scope_leave();
         CHECK(!ggml_sycl::compute_alloc_scope_active(), "closed after the matching leaves");
+    }
+
+    // ---- Case 33: the compute term is the RUNTIME allocator's occupancy of each chunk, summed (llama.cpp-p6i0) ----
+    // The scheduler's compute buffer arrives as one allocation per gallocr chunk, so the zone must hold each chunk as
+    // the TLSF rounds it, and nothing more: no headroom.
+    {
+        const size_t grain = ggml_sycl::tlsf_allocator::block_grain;
+        // the rule is the allocator's: a 128-aligned request rounds to the 256 B grain
+        CHECK(ggml_sycl::tlsf_allocator::round_request(1, 128) == grain, "the grain is not the TLSF's");
+        // the Qwen3.8 B70 no -c ub512 buffer: a 1543.1 MB chunk and a 512 MB chunk
+        const uint64_t qwen[] = { 1618052864ull, 536870912ull };
+        size_t         term   = 0;
+        CHECK(ggml_sycl::zone_compute_term_bytes(qwen, 2, 128, &term), "a two-chunk term was refused");
+        CHECK(term == ggml_sycl::tlsf_allocator::round_request(1618052864ull, 128) +
+                          ggml_sycl::tlsf_allocator::round_request(536870912ull, 128),
+              "the term is not the sum of the allocator's per-chunk occupancy");
+        // each chunk rounds on its own: two odd chunks take two grains each, not the rounding of their sum
+        const uint64_t odd[] = { grain + 1, grain + 1 };
+        CHECK(ggml_sycl::zone_compute_term_bytes(odd, 2, 128, &term) && term == 4 * grain,
+              "chunks were summed before rounding");
+        // an exact multiple of the grain takes exactly itself: no headroom
+        const uint64_t exact[] = { 4 * grain };
+        CHECK(ggml_sycl::zone_compute_term_bytes(exact, 1, 128, &term) && term == 4 * grain, "headroom was added");
+        // a zero chunk allocates nothing; no chunks is a zero term
+        const uint64_t zero[] = { 0, grain };
+        CHECK(ggml_sycl::zone_compute_term_bytes(zero, 2, 128, &term) && term == grain, "a zero chunk was charged");
+        CHECK(ggml_sycl::zone_compute_term_bytes(nullptr, 0, 128, &term) && term == 0, "no chunks is not zero");
+        // a wrap refuses, and leaves the answer untouched: never a smaller term
+        term                 = 12345;
+        const uint64_t big[] = { SIZE_MAX - grain, SIZE_MAX - grain };
+        CHECK(!ggml_sycl::zone_compute_term_bytes(big, 2, 128, &term) && term == 12345, "a wrapped sum was accepted");
+        const uint64_t top[] = { SIZE_MAX };
+        CHECK(!ggml_sycl::zone_compute_term_bytes(top, 1, 128, &term), "a chunk the rounding wraps was accepted");
+        CHECK(!ggml_sycl::zone_compute_term_bytes(nullptr, 1, 128, &term), "a null chunk list was accepted");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");

@@ -1,0 +1,477 @@
+// Host test for L0, the re-plan transaction mutex, and the always-compiled
+// witness (llama.cpp-moua's token, defined by llama.cpp-zhcn; H9's real-object
+// half).  The mechanics under test are the REAL ggml_sycl_replan_token and
+// GGML_SYCL_WITNESS of unified-cache.cpp, built into the private fixture carrier:
+//
+//   * one outermost lock; a nested acquire does not lock and never changes the
+//     outermost kind; the outermost destructor unlocks;
+//   * the held state is per thread; another thread's try form fails while L0 is
+//     held and succeeds once it is released; a blocking acquire waits;
+//   * the accessor answers ANY / TRANSACTION / LOAD / LIFECYCLE against the
+//     OUTERMOST token only;
+//   * the three illegal nestings and the outermost-only form are witness
+//     failures, each scored by its message in a re-exec'd child (the test builds
+//     Release with -DNDEBUG, so a death arm that passes here is not an assert);
+//   * with GGML_SYCL_WITNESS_CHECKS=0 the same illegal nesting runs unchecked and
+//     the witness does not evaluate its condition;
+//   * the public scope (ggml_backend_sycl_replan_scope_open/_close) is L0 for a caller
+//     outside the backend: TRANSACTION kind only, nested holds are no-ops, and
+//     `require_outermost` is a witness naming the token it found;
+//   * a blocked acquire logs a WARN naming the holder at each interval and still
+//     enters once L0 is released, and aborts at the first interval under
+//     GGML_SYCL_STRICT_LEASES=1; the wait watch logs the site it is told about.
+//
+// Nothing here touches a device: the registration pins the selector to the
+// OpenCL CPU device and no queue is created.
+//
+// Usage:
+//   ./build/bin/test-sycl-replan-token             # every case
+//   ./build/bin/test-sycl-replan-token <child>     # one death child (see main)
+
+#include "ggml-sycl.h"
+#include "ggml.h"
+#include "unified-cache.hpp"
+
+#include <sys/wait.h>
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
+#include <mutex>
+#include <string>
+#include <thread>
+
+using namespace ggml_sycl;
+
+namespace {
+
+int g_failures = 0;
+
+#define CHECK(cond, msg)                                                        \
+    do {                                                                        \
+        if (!(cond)) {                                                          \
+            std::fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, msg); \
+            ++g_failures;                                                       \
+        }                                                                       \
+    } while (0)
+
+constexpr ggml_sycl_replan_kind TXN  = GGML_SYCL_REPLAN_KIND_TRANSACTION;
+constexpr ggml_sycl_replan_kind LOAD = GGML_SYCL_REPLAN_KIND_LOAD;
+constexpr ggml_sycl_replan_kind LIFE = GGML_SYCL_REPLAN_KIND_LIFECYCLE;
+constexpr ggml_sycl_replan_kind ANY  = GGML_SYCL_REPLAN_KIND_ANY;
+
+void test_single() {
+    CHECK(!ggml_sycl_replan_token_held(), "free: not held (ANY)");
+    CHECK(!ggml_sycl_replan_token_held(TXN), "free: not held (TRANSACTION)");
+    {
+        ggml_sycl_replan_token t(TXN);
+        CHECK(t.owns(), "a blocking acquire owns");
+        CHECK(ggml_sycl_replan_token_held(), "held: ANY");
+        CHECK(ggml_sycl_replan_token_held(ANY), "held: ANY spelled out");
+        CHECK(ggml_sycl_replan_token_held(TXN), "held: TRANSACTION");
+        CHECK(!ggml_sycl_replan_token_held(LOAD), "held: not LOAD");
+        CHECK(!ggml_sycl_replan_token_held(LIFE), "held: not LIFECYCLE");
+    }
+    CHECK(!ggml_sycl_replan_token_held(), "released: not held");
+    CHECK(!ggml_sycl_replan_token_held(TXN), "released: kind forgotten");
+}
+
+// Every legal (outer, inner) pair: the inner is a no-op, the outermost kind
+// stays, and only the outermost destructor releases.
+void test_legal_nesting() {
+    const ggml_sycl_replan_kind kinds[3] = { TXN, LOAD, LIFE };
+    for (const ggml_sycl_replan_kind outer : kinds) {
+        for (const ggml_sycl_replan_kind inner : kinds) {
+            const bool illegal = (inner == TXN && (outer == LOAD || outer == LIFE)) || (inner == LOAD && outer == TXN);
+            if (illegal) {
+                continue;
+            }
+            const std::string name =
+                std::string(ggml_sycl_replan_kind_name(inner)) + " under " + ggml_sycl_replan_kind_name(outer);
+            {
+                ggml_sycl_replan_token o(outer);
+                {
+                    ggml_sycl_replan_token i(inner);
+                    CHECK(i.owns(), (name + ": the nested acquire owns").c_str());
+                    CHECK(ggml_sycl_replan_token_held(outer), (name + ": the outermost kind stays").c_str());
+                    CHECK(inner == outer || !ggml_sycl_replan_token_held(inner),
+                          (name + ": the inner kind is not reported").c_str());
+                }
+                CHECK(ggml_sycl_replan_token_held(outer), (name + ": still held after the inner drops").c_str());
+            }
+            CHECK(!ggml_sycl_replan_token_held(), (name + ": released with the outermost").c_str());
+        }
+    }
+    // A three-deep stack releases once, at the outermost.
+    {
+        ggml_sycl_replan_token a(TXN);
+        {
+            ggml_sycl_replan_token b(LIFE);
+            {
+                ggml_sycl_replan_token c(TXN);
+            }
+            CHECK(ggml_sycl_replan_token_held(TXN), "depth 3 -> 2: held");
+        }
+        CHECK(ggml_sycl_replan_token_held(TXN), "depth 2 -> 1: held");
+    }
+    CHECK(!ggml_sycl_replan_token_held(), "depth 0: released");
+}
+
+void test_threads() {
+    std::atomic<bool> other_try_owned{ true };
+    std::atomic<bool> other_saw_held{ true };
+    {
+        ggml_sycl_replan_token t(LOAD);
+        std::thread            th([&] {
+            other_saw_held.store(ggml_sycl_replan_token_held());
+            ggml_sycl_replan_token probe(LIFE, std::try_to_lock);
+            other_try_owned.store(probe.owns());
+            // a failed try changed nothing on that thread
+            if (ggml_sycl_replan_token_held()) {
+                other_saw_held.store(true);
+            }
+        });
+        th.join();
+    }
+    CHECK(!other_saw_held.load(), "the held state is per thread: another thread holds nothing");
+    CHECK(!other_try_owned.load(), "the try form fails while another thread holds L0");
+
+    // After the release the try form owns, and takes the outermost kind.
+    {
+        ggml_sycl_replan_token t(LIFE, std::try_to_lock);
+        CHECK(t.owns(), "the try form owns a free L0");
+        CHECK(ggml_sycl_replan_token_held(LIFE), "the try form records its kind");
+    }
+    CHECK(!ggml_sycl_replan_token_held(), "the try form releases");
+
+    // A try under a hold of this thread is a nested hold, not a failure.
+    {
+        ggml_sycl_replan_token o(TXN);
+        ggml_sycl_replan_token t(LIFE, std::try_to_lock);
+        CHECK(t.owns(), "the try form nests under this thread's own hold");
+    }
+
+    // A blocking acquire on another thread waits for the release and then runs.
+    std::atomic<bool> entered{ false };
+    std::thread       waiter;
+    {
+        ggml_sycl_replan_token t(TXN);
+        waiter                  = std::thread([&] {
+            ggml_sycl_replan_token w(TXN);
+            entered.store(true);
+        });
+        // The waiter cannot enter while this thread holds L0; a try on a third
+        // thread proves the mutex is locked, which is what the waiter queues on.
+        bool        third_owned = true;
+        std::thread third([&] {
+            ggml_sycl_replan_token p(TXN, std::try_to_lock);
+            third_owned = p.owns();
+        });
+        third.join();
+        CHECK(!third_owned, "L0 is locked while the waiter is queued");
+    }
+    waiter.join();
+    CHECK(entered.load(), "the waiter ran after the release");
+}
+
+// A re-exec'd child that takes `args`, with `env` prefixed, and returns its
+// merged output and exit status.
+bool run_child(const char * self, const char * env, const char * child, std::string & out, int & status) {
+    const std::string cmd = std::string("GGML_NO_BACKTRACE=1 ") + env + " " + self + " " + child + " 2>&1";
+    FILE *            p   = popen(cmd.c_str(), "r");
+    if (!p) {
+        return false;
+    }
+    char buf[512];
+    while (std::fgets(buf, sizeof(buf), p)) {
+        out += buf;
+    }
+    status = pclose(p);
+    return true;
+}
+
+void test_death(const char * self, const char * child, const char * message) {
+    std::string out;
+    int         status = 0;
+    CHECK(run_child(self, "GGML_SYCL_WITNESS_CHECKS=1", child, out, status), "death child started");
+    // popen runs the child under a shell, which reports a signal as 128 + signo.
+    const bool aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+                         (WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGABRT);
+    const bool printed = out.find(message) != std::string::npos;
+    CHECK(aborted, (std::string(child) + ": the child aborted").c_str());
+    CHECK(printed, (std::string(child) + ": the child printed its own message").c_str());
+    CHECK(out.find("returned without aborting") == std::string::npos,
+          (std::string(child) + ": the child did not run past the witness").c_str());
+    if (!aborted || !printed) {
+        std::fprintf(stderr, "%s printed:\n%s", child, out.c_str());
+    }
+}
+
+// A child that must print `needles` (and, unless `aborts`, run to its marker).
+void test_waits(const char *                        self,
+                const char *                        env,
+                const char *                        child,
+                bool                                aborts,
+                std::initializer_list<const char *> needles) {
+    std::string out;
+    int         status = 0;
+    CHECK(run_child(self, env, child, out, status), "wait child started");
+    const bool aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+                         (WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGABRT);
+    CHECK(aborted == aborts, (std::string(child) + (aborts ? ": the child aborted" : ": the child ran on")).c_str());
+    if (!aborts) {
+        CHECK(status == 0, (std::string(child) + ": exited 0").c_str());
+        CHECK(out.find("returned without aborting") != std::string::npos,
+              (std::string(child) + ": reached its marker").c_str());
+    }
+    for (const char * needle : needles) {
+        const bool seen = out.find(needle) != std::string::npos;
+        CHECK(seen, (std::string(child) + ": printed '" + needle + "'").c_str());
+        if (!seen) {
+            std::fprintf(stderr, "%s printed:\n%s", child, out.c_str());
+        }
+    }
+}
+
+void test_unchecked(const char * self, const char * child) {
+    std::string out;
+    int         status = 0;
+    CHECK(run_child(self, "GGML_SYCL_WITNESS_CHECKS=0", child, out, status), "unchecked child started");
+    CHECK(status == 0, (std::string(child) + ": runs to the end with the witness off").c_str());
+    CHECK(out.find("returned without aborting") != std::string::npos,
+          (std::string(child) + ": reached its marker").c_str());
+    if (status != 0) {
+        std::fprintf(stderr, "%s printed:\n%s", child, out.c_str());
+    }
+}
+
+int child_marker() {
+    std::printf("returned without aborting\n");
+    return 0;
+}
+
+int nest_txn_under_load() {
+    ggml_sycl_replan_token o(LOAD);
+    ggml_sycl_replan_token i(TXN);
+    return child_marker();
+}
+
+int nest_txn_under_lifecycle() {
+    ggml_sycl_replan_token o(LIFE);
+    ggml_sycl_replan_token i(TXN);
+    return child_marker();
+}
+
+int nest_load_under_txn() {
+    ggml_sycl_replan_token o(TXN);
+    ggml_sycl_replan_token i(LOAD);
+    return child_marker();
+}
+
+int outermost_only_held() {
+    ggml_sycl_replan_token o(TXN);
+    ggml_sycl_replan_token i(LIFE, ggml_sycl_replan_outermost_only);
+    return child_marker();
+}
+
+int outermost_only_free() {
+    ggml_sycl_replan_token i(LIFE, ggml_sycl_replan_outermost_only);
+    CHECK(ggml_sycl_replan_token_held(LIFE), "the outermost-only form locks when free");
+    return g_failures == 0 ? child_marker() : 1;
+}
+
+// Another thread blocks on L0 for longer than three warning intervals (300 ms
+// each, set by the registration of this child); it must still enter afterwards.
+int blocked_acquire() {
+    std::atomic<bool> entered{ false };
+    std::thread       waiter;
+    {
+        ggml_sycl_replan_token holder(LIFE);
+        waiter = std::thread([&] {
+            ggml_sycl_replan_token w(TXN);
+            entered.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        CHECK(!entered.load(), "the waiter has not entered while L0 is held");
+    }
+    waiter.join();
+    CHECK(entered.load(), "the waiter entered once L0 was released");
+    return g_failures == 0 ? child_marker() : 1;
+}
+
+int watch_names_site() {
+    {
+        ggml_sycl_wait_watch watch("probe wait");
+        watch.site("the probe's second queue");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        CHECK(watch.warnings() >= 2, "the watch warned at each interval while the wait ran");
+    }
+    return g_failures == 0 ? child_marker() : 1;
+}
+
+int witness_false() {
+    GGML_SYCL_WITNESS(1 + 1 == 3, "[REPLAN-TOKEN] test witness fired");
+    return child_marker();
+}
+
+int witness_lazy() {
+    int evaluated = 0;
+    GGML_SYCL_WITNESS((++evaluated, false), "[REPLAN-TOKEN] test witness fired");
+    if (evaluated != 0) {
+        std::fprintf(stderr, "the condition was evaluated with the witness off\n");
+        return 1;
+    }
+    return child_marker();
+}
+
+int scope_not_outermost_txn() {
+    ggml_sycl_replan_token o(TXN);
+    void *                 scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, true);
+    ggml_backend_sycl_replan_scope_close(scope);
+    return child_marker();
+}
+
+int scope_not_outermost_load() {
+    ggml_sycl_replan_token o(LOAD);
+    void *                 scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, true);
+    ggml_backend_sycl_replan_scope_close(scope);
+    return child_marker();
+}
+
+void test_public_scope() {
+    CHECK(!ggml_sycl_replan_token_held(), "scope: free at the start");
+    void * scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, true);
+    CHECK(scope != nullptr, "scope: a TRANSACTION scope opens on a free thread");
+    CHECK(ggml_sycl_replan_token_held(TXN), "scope: it holds L0 as a TRANSACTION token");
+    {
+        // The backend's own entries nest under it.
+        ggml_sycl_replan_token inner(LIFE);
+        CHECK(ggml_sycl_replan_token_held(TXN) && !ggml_sycl_replan_token_held(LIFE),
+              "scope: a nested backend token never changes the outermost kind");
+    }
+    // A second scope without require_outermost is a nested hold.
+    void * nested = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, false);
+    CHECK(nested != nullptr && ggml_sycl_replan_token_held(TXN), "scope: a nested scope is a no-op hold");
+    ggml_backend_sycl_replan_scope_close(nested);
+    CHECK(ggml_sycl_replan_token_held(TXN), "scope: closing the nested scope keeps the hold");
+    ggml_backend_sycl_replan_scope_close(scope);
+    CHECK(!ggml_sycl_replan_token_held(), "scope: closing the outermost scope releases L0");
+
+    // Another thread can take L0 only after the close.
+    scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, false);
+    std::atomic<bool> got{ false };
+    std::thread       t([&] {
+        ggml_sycl_replan_token try_it(LIFE, std::try_to_lock);
+        got.store(try_it.owns());
+    });
+    t.join();
+    CHECK(!got.load(), "scope: another thread cannot take L0 while the scope is open");
+    ggml_backend_sycl_replan_scope_close(scope);
+    std::thread t2([&] {
+        ggml_sycl_replan_token try_it(LIFE, std::try_to_lock);
+        got.store(try_it.owns());
+    });
+    t2.join();
+    CHECK(got.load(), "scope: another thread can take L0 after the scope closes");
+
+    // Only the TRANSACTION kind is open to a caller.
+    CHECK(ggml_backend_sycl_replan_scope_open((enum ggml_sycl_replan_scope_kind) 2, false) == nullptr,
+          "scope: the LOAD kind is refused");
+    CHECK(ggml_backend_sycl_replan_scope_open((enum ggml_sycl_replan_scope_kind) 3, false) == nullptr,
+          "scope: the LIFECYCLE kind is refused");
+    CHECK(ggml_backend_sycl_replan_scope_open((enum ggml_sycl_replan_scope_kind) 0, false) == nullptr,
+          "scope: the ANY kind is refused");
+    CHECK(!ggml_sycl_replan_token_held(), "scope: a refused open holds nothing");
+    ggml_backend_sycl_replan_scope_close(nullptr);
+
+    // The registry serves both procs.
+    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
+    CHECK(reg && ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_replan_scope_open") ==
+                     (void *) ggml_backend_sycl_replan_scope_open,
+          "scope: the open proc is the exported function");
+    CHECK(reg && ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_replan_scope_close") ==
+                     (void *) ggml_backend_sycl_replan_scope_close,
+          "scope: the close proc is the exported function");
+}
+
+}  // namespace
+
+int main(int argc, char ** argv) {
+    if (argc > 1) {
+        const char * c = argv[1];
+        if (std::strcmp(c, "nest-txn-under-load") == 0) {
+            return nest_txn_under_load();
+        }
+        if (std::strcmp(c, "nest-txn-under-lifecycle") == 0) {
+            return nest_txn_under_lifecycle();
+        }
+        if (std::strcmp(c, "nest-load-under-txn") == 0) {
+            return nest_load_under_txn();
+        }
+        if (std::strcmp(c, "outermost-only-held") == 0) {
+            return outermost_only_held();
+        }
+        if (std::strcmp(c, "outermost-only-free") == 0) {
+            return outermost_only_free();
+        }
+        if (std::strcmp(c, "scope-not-outermost-txn") == 0) {
+            return scope_not_outermost_txn();
+        }
+        if (std::strcmp(c, "scope-not-outermost-load") == 0) {
+            return scope_not_outermost_load();
+        }
+        if (std::strcmp(c, "blocked-acquire") == 0) {
+            return blocked_acquire();
+        }
+        if (std::strcmp(c, "watch-names-site") == 0) {
+            return watch_names_site();
+        }
+        if (std::strcmp(c, "witness-false") == 0) {
+            return witness_false();
+        }
+        if (std::strcmp(c, "witness-lazy") == 0) {
+            return witness_lazy();
+        }
+        std::fprintf(stderr, "unknown child %s\n", c);
+        return 2;
+    }
+    test_single();
+    test_legal_nesting();
+    test_threads();
+    test_public_scope();
+    test_death(argv[0], "nest-txn-under-load", "[REPLAN-TOKEN] illegal nesting: TRANSACTION under LOAD");
+    test_death(argv[0], "nest-txn-under-lifecycle", "[REPLAN-TOKEN] illegal nesting: TRANSACTION under LIFECYCLE");
+    test_death(argv[0], "nest-load-under-txn", "[REPLAN-TOKEN] illegal nesting: LOAD under TRANSACTION");
+    test_death(argv[0], "outermost-only-held", "[REPLAN-TOKEN] release proc entered with L0 held");
+    test_death(argv[0], "witness-false", "[REPLAN-TOKEN] test witness fired");
+    test_death(argv[0], "scope-not-outermost-txn", "[REPLAN-TOKEN] growth scope not outermost: under TRANSACTION");
+    test_death(argv[0], "scope-not-outermost-load", "[REPLAN-TOKEN] growth scope not outermost: under LOAD");
+    // A blocked acquire warns with the holder's kind at each interval and still enters; under STRICT it aborts at
+    // the first interval; the watch names the wait it is told about.
+    test_waits(argv[0], "GGML_SYCL_WITNESS_CHECKS=1 GGML_SYCL_REPLAN_WAIT_WARN_MS=300", "blocked-acquire", false,
+               { "[REPLAN-WAIT] a TRANSACTION acquire of L0 has waited", "held by a LIFECYCLE token",
+                 "(the wait continues)" });
+    test_waits(argv[0], "GGML_SYCL_WITNESS_CHECKS=1 GGML_SYCL_REPLAN_WAIT_WARN_MS=300 GGML_SYCL_STRICT_LEASES=1",
+               "blocked-acquire", true, { "[REPLAN-WAIT] a TRANSACTION acquire of L0 exceeded 300 ms" });
+    test_waits(argv[0], "GGML_SYCL_REPLAN_WAIT_WARN_MS=300", "watch-names-site", false,
+               { "[REPLAN-WAIT] probe wait has waited", "now at: the probe's second queue" });
+    // The same arms with the switch off reach the unchecked path.
+    test_unchecked(argv[0], "nest-txn-under-load");
+    test_unchecked(argv[0], "nest-load-under-txn");
+    test_unchecked(argv[0], "outermost-only-held");
+    test_unchecked(argv[0], "witness-false");
+    test_unchecked(argv[0], "scope-not-outermost-txn");
+    test_unchecked(argv[0], "witness-lazy");
+    // Controls: the outermost-only form is legal on a free thread.
+    test_unchecked(argv[0], "outermost-only-free");
+    if (g_failures != 0) {
+        std::fprintf(stderr, "test-sycl-replan-token: %d failure(s)\n", g_failures);
+        return 1;
+    }
+    std::printf("test-sycl-replan-token: all ok\n");
+    return 0;
+}

@@ -66,6 +66,8 @@ else()
         add_subdirectory(sycl-mxfp4-moe-bench)
         add_subdirectory(onednn-woq-repro)
     endif()
+    # Host-only STREAM bench: no SYCL dependency, so it is outside the SYCL guard.
+    add_subdirectory(cpu-expert-bench)
     add_subdirectory(fit-params)
     if (GGML_METAL)
         add_subdirectory(tuning)

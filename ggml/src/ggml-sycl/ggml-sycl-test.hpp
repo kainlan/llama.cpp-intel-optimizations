@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct ggml_sycl_device_info;
 
@@ -50,6 +51,54 @@ bool               test_moe_ptr_table_cached_reuse_is_tensor_specific();
 bool               test_moe_ptr_table_does_not_persist_pointer_cache();
 bool               test_moe_ptr_table_lease_covers_populated_slots();
 bool               test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+struct moe_resolved_batch;
+struct moe_resolved_batch_result;
+
+// The staged ring route (llama.cpp-o9uw). insert_staged puts one entry in the backend's stream-phase stage table
+// (making the phase when it has none), read by the staged route, or by the batched prompt executor when
+// executor_consumer is set (llama.cpp-3460); staged_ring_build runs the resolver on the backend's device and queue as a
+// prompt MUL_MAT_ID does; staged_route_counts, staged_route_handed_off and staged_route_refusals read the phase's tally
+// of the resolver's lookups (the refusals as the trace prints them); admission_entry_reusable is the prompt admission
+// cache's reuse predicate.
+bool                      test_moe_stream_insert_staged(ggml_backend_t     backend,
+                                                        int                layer,
+                                                        int                expert_id,
+                                                        expert_tensor_role role,
+                                                        mem_handle         aos,
+                                                        sycl::event        ready,
+                                                        ggml_layout_mode   layout,
+                                                        bool               executor_consumer = false);
+bool test_moe_stream_begin_ubatch(ggml_backend_t backend, uint32_t n_tokens);
+bool test_moe_stream_end_prompt(ggml_backend_t backend);
+bool test_moe_stream_staged_route_counts(ggml_backend_t backend, size_t * served, size_t * refused);
+bool test_moe_stream_staged_route_handed_off(ggml_backend_t backend, size_t * handed_off);
+bool test_moe_stream_staged_route_refusals(ggml_backend_t backend, std::string * refusals);
+moe_resolved_batch_result test_moe_staged_ring_build(ggml_backend_t      backend,
+                                                     const ggml_tensor * src0,
+                                                     const int32_t *     ids,
+                                                     size_t              count,
+                                                     size_t              slots_per_token,
+                                                     ggml_layout_mode    requested_layout);
+bool                      test_moe_admission_entry_reusable(bool     valid,
+                                                            bool     names_staged_ring,
+                                                            uint64_t entry_graph_seq,
+                                                            uint64_t graph_seq);
+// A staged slot's lifetime (llama.cpp-o9uw). reserve_ring gives the backend's phase (making it when it has none) a ring
+// of n_slots slots of slot_bytes, in two regions, its barriers on the backend's queue, as the first claimed layer's
+// ring_ready() reserves one; acquire_slot takes a slot of it as stage_window() does; staged_ring_upload uploads
+// `batch`'s pointer table for src0 as a prompt MUL_MAT_ID does, recording each payload slot it gives a staged pointer;
+// payload_records is the number of weights the backend holds a record for. test_moe_stream_end_prompt gives the ring
+// back.
+bool                      test_moe_stream_reserve_ring(ggml_backend_t backend, size_t slot_bytes, uint32_t n_slots);
+mem_handle                test_moe_stream_acquire_slot(ggml_backend_t backend, ggml_layout_mode layout);
+const void * const *      test_moe_staged_ring_upload(ggml_backend_t             backend,
+                                                      const ggml_tensor *        src0,
+                                                      const moe_resolved_batch & batch,
+                                                      ggml_layout_mode           layout);
+size_t                    test_moe_stream_payload_records(ggml_backend_t backend);
+#endif
 
 // Exact test seam for the staged IDs ABI. The pointer, allocation lease, ready
 // event, and normalized strides are one receipt and must be consumed together.
@@ -484,8 +533,22 @@ bool test_plan_publication_prepare_failure_is_caught();
 bool test_provisional_placement_id_exhaustion_is_caught();
 void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer);
 void test_clear_kv_placement_plan();
+// The executor-deciding latch read (override-aware), the process latch itself, and the
+// writer's plan condition.
+bool test_moe_multi_gpu_for_executor();
+bool test_moe_multi_gpu_latch();
+bool test_moe_multi_gpu_wanted(const placement_plan & plan);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
+// Forces the planner's XMX_TILED grouped-DPAS PP route predicate on or off (its env read is latched per process).
+// The setter returns the override it replaced (-1 none, 0 off, 1 on), for
+// test_restore_xmx_tiled_pp_route_override() to put back.
+int  test_set_xmx_tiled_pp_route_override(bool active);
+void test_restore_xmx_tiled_pp_route_override(int previous);
+// Forces ggml_sycl_moe_mmid_route_reachable_in_build() (defined in ggml-sycl.cpp) on or off. The setter returns the
+// override it replaced (-1 none, 0 closed, 1 open), for test_restore_moe_mmid_route_reachable_override() to put back.
+int  test_set_moe_mmid_route_reachable_override(bool reachable);
+void test_restore_moe_mmid_route_reachable_override(int previous);
 #endif
 int test_physical_device_count();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -510,6 +573,86 @@ struct test_sycl_info_override_guard {
     explicit test_sycl_info_override_guard(const ggml_sycl_device_info & info) { test_set_sycl_info_override(info); }
     ~test_sycl_info_override_guard() { test_clear_sycl_info_override(); }
 };
+
+// Restores the override it replaced, so guards nest.
+struct test_xmx_tiled_pp_route_override_guard {
+    explicit test_xmx_tiled_pp_route_override_guard(bool active) :
+        previous(test_set_xmx_tiled_pp_route_override(active)) {}
+
+    ~test_xmx_tiled_pp_route_override_guard() { test_restore_xmx_tiled_pp_route_override(previous); }
+
+    test_xmx_tiled_pp_route_override_guard(const test_xmx_tiled_pp_route_override_guard &)             = delete;
+    test_xmx_tiled_pp_route_override_guard & operator=(const test_xmx_tiled_pp_route_override_guard &) = delete;
+
+    const int previous;
+};
+
+// Restores the override it replaced, so guards nest.
+struct test_moe_mmid_route_reachable_override_guard {
+    explicit test_moe_mmid_route_reachable_override_guard(bool reachable) :
+        previous(test_set_moe_mmid_route_reachable_override(reachable)) {}
+
+    ~test_moe_mmid_route_reachable_override_guard() { test_restore_moe_mmid_route_reachable_override(previous); }
+
+    test_moe_mmid_route_reachable_override_guard(const test_moe_mmid_route_reachable_override_guard &) = delete;
+    test_moe_mmid_route_reachable_override_guard & operator=(const test_moe_mmid_route_reachable_override_guard &) =
+        delete;
+
+    const int previous;
+};
+#endif
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an
+// empty string on a pass and otherwise names the first failed assertion. The shared-storage case reserves a WEIGHT
+// arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
+// Without host zones the loan refuses by name and lends nothing (llama.cpp-sif1). Host zones cannot be unconfigured
+// and every other case configures them, so run it first.
+std::string test_expert_loan_refuses_without_host_zones();
+std::string test_expert_loan_lends_two_triplets();
+std::string test_expert_loan_probe_changes_nothing();
+std::string test_expert_loan_refuses_replacing_a_host_entry();
+std::string test_expert_loan_refuses_shared_storage();
+// The refill's design evidence (llama.cpp-sif1): outside a load, under a published plan and a planned materialization
+// scope, direct staging takes one expert from a pinned host copy, and its copy takes the staged branch. It reserves the
+// WEIGHT arena itself.
+std::string test_expert_direct_stage_outside_a_load_copies_through_staging();
+// The refill (llama.cpp-sif1): after the loan, two calls re-admit one triplet each, the bytes and the device's zone
+// room come back and no host entry is left; a loan between two calls cancels the second; two boundaries after one
+// decode graph re-admit once; a lent triplet no boundary could prepare leaves the ledger, and a full zone keeps its;
+// two triplets per call both move, and the third stays lent.
+std::string test_expert_refill_readmits_one_triplet_per_call();
+std::string test_expert_refill_cancelled_by_a_loan();
+std::string test_expert_refill_runs_once_per_decode_graph();
+std::string test_expert_refill_drops_an_unpreparable_triplet();
+std::string test_expert_refill_moves_two_triplets_per_call();
+// The loan and the refill size their copies from the cache entry, which can exceed the plan's dst_size by the tail
+// S1-PRELOAD pads, and a host copy smaller than its entry is still refused (llama.cpp-pu8v).
+std::string test_expert_loan_sizes_its_copies_from_the_entry();
+// With no entry to size a copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
+// ledger's back, and either moves and publishes nothing (llama.cpp-pu8v).
+std::string test_expert_loan_and_refill_stop_on_a_missing_entry();
+// A loan leaves no lease on a withdrawn device entry in the pointer tables a prompt graph's preload built, and marks
+// each such table stale, one whose leases are the entry's only view included: the loan's own boundary drains the views
+// it dropped, so the one deferred-free pass after it erases the entry and returns its zone room, and the first decode
+// boundary re-admits it (llama.cpp-6aj4).
+std::string test_expert_loan_reclaims_pointer_table_leases();
+// The same loan with the boundary's drain timed out on a held drain worker: the entry survives that boundary's pass,
+// and the pass after the worker goes erases it and returns its room (llama.cpp-6aj4).
+std::string test_expert_loan_reclaims_after_a_timed_out_boundary_drain();
+// A prompt whose ring did not engage returns its whole loan at the first decode graph's boundary, in one transaction,
+// with one WARN that names the position (llama.cpp-i4ny).
+std::string test_expert_refill_returns_an_unengaged_prompts_loan_at_once();
+// A prompt whose ring engaged owes no bulk refill: the first decode boundary is the per-graph refill alone.
+std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt();
+// A context that ends with its loan lent owes it to the next context: its free copies nothing and its report says
+// how many it owes, and the next context's first graph entry returns it in one transaction (llama.cpp-i4ny).
+std::string test_expert_refill_returns_a_loan_an_ended_context_owes();
+// The bulk refill with WEIGHT zone room for one of three lent triplets re-admits that one with one "1 of 3" line; with
+// room for none it is refused with no line. Either way the debt is spent, and once the room is back the per-graph
+// refill re-admits the rest, one per decode graph, with no second bulk line (llama.cpp-i4ny).
+std::string test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph();
+std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph();
 #endif
 
 }  // namespace ggml_sycl

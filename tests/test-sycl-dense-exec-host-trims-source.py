@@ -89,8 +89,18 @@ def sycl_sources():
 GENERATION = "graph_input_staging_generation"
 
 # The members that write or replace an entry, and the one that only reads.
-STAGING_WRITERS = ("graph_input_stage(", "graph_input_refresh(", "graph_input_staging_clear(")
-STAGING_READERS = ("graph_input_stage_lookup(",)
+STAGING_WRITERS = (
+    "graph_input_stage(",
+    "graph_input_refresh(",
+    "graph_input_staging_clear(",
+    "graph_input_staging_release_tenants(",
+    "graph_input_staging_adopt_for_test(",
+)
+STAGING_READERS = (
+    "graph_input_stage_lookup(",
+    "graph_input_staging_tenant_count(",
+    "graph_input_staging_has_tenants(",
+)
 
 
 def matching_brace(text, open_idx):
@@ -214,6 +224,7 @@ def test_no_other_code_touches_the_staging_map():
 LOOKUP_HANDLE_TAKERS = Counter({
     ("getrows.cpp", "&out_handle"): 1,  # pre-staged get_rows indices, read by the kernel
     ("ggml-sycl.cpp", "&moved_dst"): 1,  # the executor's moved-only copy
+    ("ggml-sycl.cpp", "&staged"): 1,  # a keyed segment slot retains the copies its graphs read and compares identity
 })
 
 

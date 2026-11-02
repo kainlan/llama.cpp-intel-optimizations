@@ -1217,8 +1217,30 @@ struct cmd_params_instance {
     size_t             fit_target;
     uint32_t           fit_min_ctx;
 
+    // the context every test of this instance creates: the prompt, the generated tokens and the depth
+    uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }
+
+    // the micro-batch this instance names to the load: -ub, at most -b (an n_ubatch of 0 is n_batch). It is read from
+    // -b and -ub alone, not clamped by the context as llama_context clamps it, so the prompt and generation tests of
+    // one -b/-ub pair name the same micro-batch and share one model (see equal_mparams); a context smaller than the
+    // micro-batch runs on the placement made for it. 0 for "-ub auto", where the SYCL backend picks the micro-batch
+    // itself, and 0 without the SYCL backend, the only one whose load reads it.
+    uint32_t n_ubatch_hint() const {
+        if (n_ubatch < 0 || n_batch <= 0 || ggml_backend_reg_by_name("SYCL") == nullptr) {
+            return 0;
+        }
+        return n_ubatch > 0 ? std::min((uint32_t) n_batch, (uint32_t) n_ubatch) : (uint32_t) n_batch;
+    }
+
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
+
+        // llama.cpp-ak0p: the SYCL load holds this context's KV room ahead of the routed experts (see equal_mparams).
+        mparams.n_ctx_hint = n_ctx();
+
+        // The load plans the PP MoE scratch ring for this micro-batch and moves routed experts to the host tier for its
+        // room (see equal_mparams).
+        mparams.n_ubatch_hint = n_ubatch_hint();
 
         mparams.n_gpu_layers = n_gpu_layers;
         if (!devices.empty()) {
@@ -1271,19 +1293,28 @@ struct cmd_params_instance {
         return mparams;
     }
 
+    // n_ctx_hint is left out, so a context change does not reload the model: a reused model keeps the first
+    // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p). n_ubatch_hint
+    // depends on -b and -ub alone, so it does not reload on a context change either, and it is compared: the routed
+    // experts the load moved to the host tier for one micro-batch's PP MoE scratch ring stay there, so a reused model
+    // would measure a smaller micro-batch with experts it did not need to move, and a larger one would find no room for
+    // its ring. The reload re-plans the experts but not the arena's zones: the arena outlives the model and keeps the
+    // RUNTIME zone an earlier, larger micro-batch grew, so a later instance plans against that zone and keeps fewer
+    // experts on the device than a fresh process would. "-ub auto" names none, and neither does a build without the
+    // SYCL backend, so neither reloads.
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
-               split_mode == other.split_mode &&
-               main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
-               devices == other.devices && no_host == other.no_host && repack == other.repack &&
+               n_ubatch_hint() == other.n_ubatch_hint() && split_mode == other.split_mode &&
+               main_gpu == other.main_gpu && tensor_split == other.tensor_split && load_mode == other.load_mode &&
+               lazy_mode == other.lazy_mode && devices == other.devices && no_host == other.no_host &&
+               repack == other.repack &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        cparams.n_ctx           = n_ctx();
         cparams.n_batch         = n_batch;
         // llama.cpp-nphx: n_ubatch < 0 is the "-ub auto" sentinel. Leave
         // cparams.n_ubatch at whatever llama_context_default_params() just
@@ -2348,8 +2379,7 @@ int llama_bench(int argc, char ** argv) {
 
             std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
 
-            uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
-            cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
+            cparams.n_ctx = std::max(cparams.n_ctx, inst.n_ctx());
 
             common_fit_params(inst.model.c_str(), &mparams, &cparams,
                 fit_tensor_split.data(),
@@ -2358,6 +2388,9 @@ int llama_bench(int argc, char ** argv) {
                 inst.fit_min_ctx,
                 nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+            // the load plans for the context the fit chose
+            mparams.n_ctx_hint = cparams.n_ctx;
        }
 
         // keep the same model between tests when possible

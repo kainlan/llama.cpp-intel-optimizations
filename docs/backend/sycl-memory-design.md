@@ -75,6 +75,15 @@ re-litigates it at op time. Two symmetric failure modes are therefore forbidden:
   (~9.7 µs cross-device latency). If a VRAM-starved configuration is too slow on
   CPU, the fix is placement (budget, eviction priority), never a streaming path.
 
+**Amendment, 2026-10-19.** The owner amended the "no weight streaming" bullet
+above for prompt processing: *"Our unified cache is meant to intelligently
+handle everything automatically, if it's faster to stream host pinned weights to
+vram it should do that. No idea is too complicated for us to consider."* The
+amendment lets a host-pinned expert be streamed to VRAM for a prompt when the
+cost model says that is faster, and the unified cache is meant to decide
+automatically. Which path runs today is set out under "Two regimes" in the
+subsection below. The 2026-08-16 ruling still stands for where weights live.
+
 Scope boundary, so the rule is not over-applied: staging that converts the
 *format* of **device-resident** data (e.g. on-device dequant of MXFP4 into an
 f16 scratch for oneDNN) is not a placement violation — the bytes never cross the
@@ -87,6 +96,227 @@ audit that no dispatch route can receive a host-resident operand and stage it to
 device (the routes themselves carry no residency branch — the diversion must be
 proven structural, upstream, where `requires_host_staging` and the HOST tier are
 modelled).
+
+### The executor cost model and the prefill ring (owner ruling 2026-10-19)
+
+The 2026-08-16 ruling still decides where weights live. Placement assigns each
+expert to a device or to host-pinned memory, and a prompt does not move that
+assignment. The 2026-10-19 amendment governs how a host-resident expert is
+computed, and the executor cost model decides that per layer.
+
+**Decision unit.** The decision is made per layer per micro-batch.
+`moe_exec_weigh` (`moe-exec-cost.hpp`) prices two options for the layer's
+host-resident experts: `t_cpu`, computing them on the CPU where they live, and
+`t_ring`, staging them through the prefill ring and computing them on the
+device. `moe_exec_decision_log` prints one `[MOE-EXEC]` line when a layer's
+recorded choice changes. The regimes below say what each choice does.
+
+**Two regimes.** In decode, host-resident experts compute on the CPU. In prompt
+processing, the path depends on `GGML_SYCL_MOE_EXEC`. Under `auto`, the default,
+a layer's host-resident experts are staged through the ring when the cost model
+chooses the ring. Under `ring`, they are staged on every layer the batched
+executor claims whole, whatever the cost model prices. Under `cpu`, nothing is
+staged. `moe_stream_stage_now` is the one predicate. Task 10
+(llama.cpp-3460) lifted ruling c-3skf (llama.cpp-xod7), under which `auto` only
+recorded the choice. The ring serves one consumer, the batched prompt executor
+(llama.cpp-348c), and only a layer that executor claims whole. The ring's index
+build asks the library claim once per (layer, role) and records the answer on
+each host item: it stages as one AOS slot, and its consumer is the executor.
+`moe_stream_executor_claims` holds for a layer when every host matrix of it is
+such an item and a ring can exist. `begin_layer` gives a RING decision only to
+such a layer, and `executor_claims` asks again once the ring is reserved. A
+layer that the executor does not claim, or whose ring cannot exist, stays whole
+in the hybrid world and runs its host experts on the CPU from their host leases.
+The ring never serves some of a layer's host matrices while the rest stay
+hybrid, so no staged copy is wasted on a layer that does not run on the device.
+The `STAGED_RING` resolver route is kept, but the ring stages nothing for it:
+every staged entry's consumer is the executor, so the resolver counts a lookup
+as a handoff (`handed_off` on the trace line) when the executor takes the
+weight, and as a CLAIMED refusal otherwise. Under `ring`, a prompt that refused
+any entry logs one WARN (`report_staged_routes`).
+`GGML_SYCL_MOE_EXEC_DECLINE_LAYER` (llama.cpp-ny6i) forces one layer off the
+executor, with the reason `declined`, so a gate can prove that hybrid fallback
+on a layer the executor would claim.
+
+**The ring.** The ring holds one executor window per region, not a layer. The
+executor dequantizes a phase of one role (gate, up or down) at a time, and a
+phase holds `G_plan` experts: the planned f16 weight slot over one expert's f16
+bytes, halved when two fit (the executor's own two-buffer rule, capped by
+`GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX`). `moe_stream_ring_size` is given
+`window_slots`, the smaller of `G_plan` and the most host matrices one role of
+one layer has (`role_items_max`), and sizes two regions of that many slots, each
+slot one matrix of the largest streamable size. `host_matrices_per_layer_max`,
+the slot need of the heaviest whole layer, sizes nothing; it selects the
+ring-unavailable rule for a layer with no host matrix of a streamable type and appears in the ring-unavailable WARN
+beside `window_slots`. The sizing refuses the ring,
+leaving none, when its bytes exceed an eleventh of the device's expert bytes
+counted with the bytes lent to the ring (`bytes > (resident_expert_bytes +
+lent_bytes) / 11`). That is a tenth of what the device's expert set keeps once the
+ring's own loan has left it, and it is the same before the loan and after it.
+Every slot is AOS: the ring does no SOA staging and no reorder.
+
+The windows are the epochs. `moe_stream_phase::window_begin` stages the window the
+executor is about to dequantize, unless the previous call prefetched it, into the
+current region, and then prefetches the next window into the other region, so
+that copy overlaps this window's dequants. A layer's first window of a
+micro-batch is *exposed*: no earlier window hides its copy, and no window
+prefetches across layers. Reuse of a region is ordered on the device behind the
+dequants of the window it last held (`window_done`, the region's read gate) and
+behind the event that ended its previous use, chained through
+`current_region_gate`, so the host never waits.
+
+`moe_stream_ring::reserve` takes the ring's slots from the WEIGHT zone, one
+allocation per slot. Each slot first calls `unified_cache_zone_allocate_owner`.
+If the zone refuses, a second attempt goes through `unified_allocate_owner`, as
+an `EXPERT_STAGING` allocation in the `moe_stream_ring` cohort that prefers the
+WEIGHT zone and forbids a spill. Each resulting `alloc_owner` is wrapped with
+`mem_handle::from_owned_alloc`, and `moe_stream_ring::acquire_slot` hands out
+each slot as its own `mem_handle`, so no raw pointer is kept.
+
+**The copy queue.** The ring copies on the cache's BCS queue
+(`unified_cache::get_bcs_queue`, which falls back to the DMA queue and then to
+the compute queue), and the load-time H2D probe times the same queue, so the rate
+that prices the ring's copy term is the rate the ring sees. No Level Zero
+copy-engine queue was built. The Task 4 spike (llama.cpp-efck, c-0cu6) timed a
+64 MiB pinned copy on either cache queue at 2.5 to 3.5 ms while a one-work-group
+or full-EU spin kernel held the compute queue for 89 to 131 ms, on both cards:
+every row `overlap=yes` and `staged_h2d=0`. The corrected engine counters of a
+later run (c-2oac) show the BCS class busy and the CCS class at 0 on five of eight
+rows, for either queue: under the v2 Level Zero adapter the copies from either
+queue already run on the blitter and overlap compute, so the
+`GGML_SYCL_COPY_ENGINE` knob was descoped (llama.cpp-a64a).
+
+**The planned room.** At default placement the routed experts fill the WEIGHT
+zone, and a loan cannot fund a slot larger than every lendable matrix, so the
+ring's room is planned and the loan is the fallback. The single-device planner
+holds the room before it packs the routed experts (`hold_moe_stream_ring_room`,
+the last term after the KV room and the PP-alternate charges). The room is the
+ring's own size: `moe_stream_plan_ring_geometry`, which the phase and the fit
+size the ring with, under the planned f16 weight slot, the executor's group cap
+and nothing lent, over the host experts the pack is predicted to leave. Holding
+the room can push more experts to the host and widen the ring, so the planner
+packs again with the room held until the ring fits in it, for at most 8 rounds.
+A run that has not settled by then holds the 8th round's ring, which no pack
+with that room held was checked against; the line says so, the phase's ring can
+then be larger, and the loan funds the rest. The room is held whole or not at
+all. In a settled run it cannot exceed what is left, because with nothing left
+for the experts the ring's cap refuses the ring first. In a run that has not
+settled, a partial room would send every expert to the host for a ring the cap
+then refuses. The room comes out of the WEIGHT zone's remaining bytes and
+counts in the plan's `vram_bytes`, which the WOQ guard keeps free. It is
+accounting, not an allocation: the ring still reserves its slots at each prompt
+and releases them at its end. The runtime KV re-derivation keeps the room in
+the plan's accounting (`refresh_kv_byte_totals`), and the oneDNN scratch ring's
+budget room, which reads `vram_bytes`, leaves it alone. The runtime KV fit does
+not: it reads the zone's live free bytes (`ggml_sycl_kv_capacity_live`), and
+the ring holds no slots between prompts, so there the room counts as KV
+headroom. KV has priority at runtime, as in the planner's order of dense
+weights, then KV, then experts. A context whose KV exceeds the load plan's KV
+plus its KV room therefore takes the ring's room. The prompt's reserve is then
+refused, and the loan and the "reserve refused" line are what remain; no
+plan-time line says why, and on Qwen3.8 the loan finds nothing to lend. The
+room needs no padding: the ring allocates each slot at
+`MOE_STREAM_RING_SLOT_ALIGN`, which is the zone allocator's 256-byte grain, the
+slot is a multiple of it, and the allocator keeps no header in the zone. Only
+the single-device planner holds a room. A multi-device plan holds none, so there
+the ring still depends on the loan. One
+`[SYCL-PLAN] MoE window ring room` line per placement pass that sizes a ring
+names the room and the experts it displaced, as a WARN when it displaced any or
+did not settle. None is held, with a WARN, when the eleventh-of-the-expert-bytes
+cap above refuses the ring once the room is held, or when the room exceeds what
+is left; the ring then needs the loan below. The staged-type mask the room is
+sized over is the type half of the executor's staged claim: the mask and the
+claim ask one helper, `ggml_sycl_moe_pp_batched_claims_staged_type`, and the
+backend fills the mask, with the group cap, where it copies the inventory in.
+
+**The loan and the refill.** A loan lends resident expert triplets to the ring
+when the planned room is not held or falls short.
+`moe_expert_loan_select` picks whole (gate, up, down) triplets from the
+published plan. The cache copies each to pinned host storage and withdraws its
+device copy, and the WEIGHT-zone bytes it frees are the ring's slots. The loan
+and the refill are plan transactions: `ggml_sycl_expert_txn_run` runs them in
+the LOAN and REFILL directions, and each one republishes the expert plan. A
+loan originates in the prompt phase (llama.cpp-3460). The ring reserves its
+slots one by one, so room a loan frees in holes a slot wide still funds it.
+When the WEIGHT zone cannot give every slot, `moe_stream_ring::reserve` keeps
+the slots it got and reports the shortfall: the bytes of the slots it still has
+to allocate (llama.cpp-am87). `ring_ready()` asks for a loan through the op's
+`request_loan` hook, which the backend wires to
+`ggml_sycl_request_expert_loan`. `moe_stream_loan_size_post_loan` sizes the
+request from the plan the loan would leave, not from the shortfall alone: lent
+triplets become host matrices, which can widen the executor window and so the
+ring. It selects the triplets a request takes, rebuilds the ring geometry with
+them read as host, and repeats until the ring it sized for is the ring the loan
+leaves, or a smaller one in the same slot size. The request then carries that
+ring's bytes in that ring's slot size, less the slots the reserve already holds
+while the slot size has not changed. The selector counts the whole slots each
+lent matrix frees, so a triplet whose matrices are each below a slot is not lent
+(llama.cpp-9x8t). When the sizing does not converge (the post-loan ring exceeds
+the cap, does not grow in another slot size, or the sizing spends its bound of
+G_plan + 1 steps), no loan is asked: the latch goes REFUSED for the rest of the
+prompt, and the phase prints one WARN at every verbosity. A sized loan is asked
+once per micro-batch, since the reserve latch stops later layers before the
+reserve. The loan runs at the next graph boundary, and the next micro-batch's
+reserve continues from the slots the refused one kept. The phase keeps that
+partial ring only while a loan can still fund it. A loan the boundary runner
+refuses stops the asking for the rest of the prompt, and from then on a refused
+reserve gives its slots back at once, because mid-prompt runtime allocations
+prefer the WEIGHT zone too. A BUSY refusal does not, because the runner re-posts
+that request itself. The auto-ubatch fit's ring term,
+`ggml_sycl_hold_ring_uncovered`, credits the planned room first: the room's
+whole slots of the ring's slot size, and only on the device the plan holds it
+for. A room that holds the whole ring charges nothing. Otherwise the term sizes
+the same loan for the slots the room leaves short, as a short reserve's held
+slots, and lends nothing: it charges the converged post-loan ring less the
+room's slots that ring keeps and what the probe of that loan would lend
+(`ggml_sycl_expert_loan_probe_bytes`). The room's slots count only while the
+slot size has not changed, the sizer's own rule for a reserve's held slots
+(`moe_stream_ring_slots_kept`). When the sizing does not converge, the term
+charges the slots the room leaves short. The room sits inside the arena, and the
+fit charges against free memory outside it, so the credit counts nothing twice.
+When a runtime context's KV takes the room (above), the credit is too large and
+the prompt's reserve and the loan decide. When a loan runs, the refill
+runs at the decode boundary through `ggml_sycl_expert_refill_transaction_run`.
+It re-admits lent triplets at most `GGML_SYCL_MOE_REFILL_PER_GRAPH` per decode
+graph, copying each lent host copy back owner to owner on the copy queue, behind
+its writes. A triplet that can never be prepared stays on the host, with one
+WARN. A prompt whose ring never engaged used none of its loan, so the first
+decode graph's boundary returns all of it in one refill transaction, whatever
+`GGML_SYCL_MOE_REFILL_PER_GRAPH` says, and one WARN names that decode graph
+(llama.cpp-i4ny). Each refill republishes the plan and forces a re-record, so
+one per triplet was the cost. A context that ends with triplets still lent
+owes them to the next context: its backend free marks the ledger and copies
+nothing, and its refill report adds how many it owes. The next context's
+first graph entry, before any MUL_MAT_ID, returns them in one transaction. A
+process that exits after its last context pays nothing. The fit's
+ring term charges the ring bytes that neither the room nor a loan would cover to
+the rung's demand, so a rung that needs them is refused with a figure.
+
+**Gates.** Three gates keep the rule enforceable.
+
+- A staged slot has one consumer, the batched prompt executor, which reads it
+  through the phase's `find()` after `window_begin` staged its window. The
+  `STAGED_RING` resolver route returns CLAIMED for every staged entry, which the
+  tally counts as a handoff when the executor takes the weight. No other
+  path leads from a host-resident entry to the device.
+  `tests/test-sycl-staged-ring-route-source.py` pins the route's single writer.
+  `tests/test-sycl-moe-stream-enqueue-source.py` guards the copy path.
+
+- Nothing allocates outside the unified cache. The ring's slots come only from
+  the unified cache allocation calls named above, and the alloc-zone contract in
+  § 3 of the canonical contract gates them.
+
+- The `[MOE-EXEC]` log formats are pinned. The per-change layer line, the
+  level-1 trace format and the teardown summary line each have one format
+  string, and `tests/test-sycl-moe-exec-knobs-source.py` counts exactly one
+  occurrence of each. The teardown summary is one line, printed by
+  `ggml_sycl_moe_exec_log_report` at backend free.
+
+The end-to-end numbers are in
+[sycl-perf-baselines.md](sycl-perf-baselines.md): the "Record at 671279356"
+subsection gives the window ring's measured prefill and decode, and the
+"Attribution at 3eb28b301" subsection says where the remaining prefill time
+goes. They are not restated here.
 
 ### Layout follows residency (owner ruling, 2026-08-16 — do not drift)
 
@@ -466,9 +696,14 @@ ticket reproduced on:
   (`onednn_graph_scratch_reuse_pool_`: `size -> {mem_handle, release event}`
   entries) instead of handing it to the shared background drain worker via
   `retain_handles_until_event()`, and `onednn_graph_scratch_alloc()` checks
-  that pool (for a completion-confirmed entry of the EXACT requested size --
-  see the completion-flag bullet below for what "confirmed" means)
-  before ever falling to a fresh `unified_alloc()`. This serves the common
+  that pool for an entry of the EXACT requested size before ever falling to
+  a fresh `unified_alloc()`. Which entries qualify depends on the queues.
+  When the request and the entry's previous consumer are both on the cache's
+  in-order queue and TP is inactive (the default), an entry qualifies while
+  its release is still in flight (see the in-order reuse bullet below,
+  llama.cpp-jwjz). Under TP, or for any other pairing of queues, only a
+  completion-confirmed entry qualifies (see the completion-flag bullet below
+  for what "confirmed" means). This serves the common
   case for free: SDPA calls of a fixed `(n_head, ncols, ne11)` shape repeat
   across `-r N` benchmark reps and across decode steps at a stable KV length.
   A pooled-but-idle entry's bytes stay charged against
@@ -506,6 +741,18 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
+- **The oneDNN SDPA execute is chunked to half the cap (llama.cpp-jwjz).**
+  One SDPA execute asks for `H_q x rows x n_kv x 6` bytes of Graph scratch,
+  1536 MB on Mistral at ubatch 2048 and n_kv 4096. That is above the 1 GiB
+  cap, so it took the oversized early-out above once per layer.
+  `ggml_sycl_flash_attn_ext_onednn()` now splits the op's query rows into
+  executes whose scratch fits half of
+  `unified_cache_onednn_graph_scratch_direct_cap_bytes()`, the cap this
+  allocator enforces (`fattn-onednn-chunk.hpp`). A full chunk's buffer and
+  the shorter last chunk's buffer then fit under the cap together, so each
+  chunk goes through the bounded wait rather than the early-out. The
+  early-out stays reachable when one query row alone exceeds the cap, and
+  at a cap of 0.
 - **Pool completion checks go through a host-visible flag written by a
   device marker kernel, not a direct SYCL event query, and not a
   host_task either (llama.cpp-c6ah).** `event_complete()`'s bare
@@ -578,6 +825,35 @@ ticket reproduced on:
   less either way. Every real pool release event in production is
   device-kernel-produced (oneDNN's own free callback), matching the case
   that actually blocks.
+- **Without TP, a parked entry is reused while its release is still in
+  flight (llama.cpp-jwjz).** Every Graph-scratch consumer submits on the
+  cache's own in-order queue when TP is inactive. That is the fact the
+  ONEDNN zone free already relies on, and
+  `onednn_graph_scratch_consumers_in_order()` is now the one predicate both
+  read: TP inactive for the device, and the queue carries the `in_order`
+  property. The decision is per request and per entry, not per cache.
+  `onednn_graph_scratch_alloc()` tags the request in-order when its queue is
+  the cache's queue and the predicate holds, and the buffer it hands out
+  carries that tag into the pool when it is freed. Only when both tags hold
+  does `onednn_graph_scratch_entry_usable_locked()` skip the completion
+  query, so a same-size request gets the parked buffer back at once and its
+  kernels queue behind the previous consumer's. A buffer last used on
+  another queue, or a request from another queue, waits for the release as
+  under TP. The oneDNN allocator callback always passes the cache's queue,
+  so in production the predicate's TP check is what covers an execute on
+  another queue. Gating reuse on
+  completion made each oneDNN SDPA execute of a repeated shape allocate a
+  second buffer, and the next one wait at the cap in 200 ms polls (Mistral
+  `-d 8192` at ubatch 2048). Only reuse relaxes. Eviction, the per-size
+  depth overflow and the pool clear still wait for completion, because they
+  return the bytes to the general allocator, whose next owner may run on any
+  queue. An early exit returns the entry's flag slot to the free list while
+  its marker may still be pending. Each marker therefore also depends on its
+  slot's previous marker (`onednn_graph_scratch_flag_slot_last_marker_`),
+  so the out-of-order watch queue cannot leave an older generation in the
+  slot. Under TP the pool keeps the completion-gated policy, and the device
+  test forces that policy for its older properties through
+  `onednn_graph_scratch_force_completion_gated_reuse_for_test()`.
 - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
@@ -2324,6 +2600,21 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
   them. It materializes them only for a route that can run them, the predicate
   `load_end` and the context-bind hook already use. In an ordinary build that
   route is closed, so this is 0.
+- The plan charges the MMID pools on the same fact. `plan_moe_mmid_workspaces()`
+  plans them, and `vram_bytes` carries their device bytes, only when
+  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`). So
+  in an ordinary build no pool bytes are charged. A pool rejected by the load
+  plan (budget, geometry or owner) stays rejected: the runtime re-plan neither
+  re-plans its demand nor asks the growth admission for it, so it cannot demote
+  KV or refuse a context.
+  A closed route is not a rejection. Its plan is valid and empty
+  (`moe_mmid_workspace_valid` stays true, and no owner check runs), because a
+  closed route is a fact about the build. A rejection is an outcome of one load
+  plan for a route that could run, and the runtime keeps it rejected.
+  `reject_moe_mmid_workspaces()` clears its workspaces, so the materialization
+  wrapper returns `NOT_APPLICABLE` before the implementation's `INVALID` check
+  is reached. A host staging-zone sizing overflow keeps the workspaces but
+  marks the plan invalid, and that check refuses it.
 - The KV-zone part may use only `headroom - reserve`. `headroom` is the device's
   KV capacity less the plan's device KV (with the allocator's per-layer slack).
   The capacity is `ggml_sycl_kv_capacity_live()`, the one number the KV re-fit
@@ -2420,6 +2711,155 @@ Host tests: `ggml/src/ggml-sycl/tests/test-pp-moe-ring-admission.cpp` pins the
 arithmetic. `tests/test-sycl-pp-moe-ring-kv-zone-source.py` pins the wiring, with
 a mutation witness per check.
 
+### Explicit micro-batch placement
+
+An explicit `-ub` whose ring needs more RUNTIME zone than the load's planning
+shape reserved is placed at load, the way KV that does not fit is re-placed
+rather than refused. The caller names the micro-batch in
+`llama_model_params::n_ubatch_hint`. Both `common` and `llama-bench` name none
+for an automatic micro-batch, so the auto-ubatch trial is unchanged.
+`llama-bench` names the micro-batch from `-b` and `-ub` alone, not clamped by
+each test's context, and names none on a build without the SYCL backend. So
+the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
+reloads the model only when the named micro-batch changes. A reload re-plans
+the experts but not the arena's zones. The arena outlives the model and keeps a
+zone that is larger than a new plan needs. It rebuilds only a zone that is too
+small, and only while it holds nothing, which the PP MoE ring a previous context
+left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
+instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
+experts on the device than a fresh process would. Such a load prints one WARN
+line after its plan, when the live zone is larger than the zone the arena
+reserves for its own plan (`zone_runtime_kept_above_plan()`):
+
+```
+[SYCL-PLAN] RUNTIME zone on device 0 holds <Z> MB where this plan requires <R> MB: an earlier load in this
+process grew it, and the routed experts are planned against the grown zone
+```
+
+The first load of a process never prints it, because its zone is the one its
+own plan sized. Re-planning the zone at such a load is future work.
+
+That reserved zone is one figure, from one function. The function
+`zone_runtime_reserved_bytes()` takes the larger of the floor and the
+requirement and rounds it up to the arena's 256-byte grain, with the addition
+checked. The arena's reserve, the zone `ensure_planned_arena_zones()` plans,
+the room the planner holds for an explicit micro-batch, the check above and its
+WARN all ask it. So the zone a plan counts on and the zone the arena holds
+cannot round apart.
+
+The planner computes the RUNTIME room the ring and the dense scratch need at
+that micro-batch (`pp_moe_onednn_explicit_ubatch_plan_room()`). It holds that
+room as a named term on the routed-expert budget, at the start of the MoE block.
+By then the dense weights, their KV and the KV context room are placed, so the
+room never moves a dense layer or KV. That answers the objection above to
+growing the zone at load: the requested context's KV room is now held first, so
+KV still wins. The window ring's room is held after it, as the last term before
+the expert pack. So the routed-expert budget the decision reads still counts
+bytes that room may later hold. The decision cannot see them: the window ring's
+room is sized over the pack it predicts, so it is held last, once every group's
+charge is final, and this room is decided before that. The experts are packed
+into the budget less the holds. The hold is the whole room both before and after
+the zone grows, so the plan the load grows the zone for is the plan it keeps.
+When the experts can give the room, the load grows the RUNTIME zone and plans
+again. The experts that no longer fit go to the host tier, where the CPU runs
+them. The first context after the load prints one WARN line, whatever
+micro-batch that context runs, because the line names the micro-batch the load
+placed (`placement_explicit_ubatch_announces()`). So a `-p` below `-ub` still
+announces it. The plan that context publishes carries a mark, and every later
+context's plan copies it, so a `-d` or `-fa` list that opens more contexts on
+the same model does not print it again:
+
+```
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=2048 needs <N> MB: it re-placed <X> MB of routed experts
+to the host tier, from <K> layers: <D> triplets on the device, against <W> without its room, on device 0
+```
+
+The figures are net, as for the KV context room. The planner packs the experts
+a second time with the hold added back, and the room moved the device bytes
+that pack places beyond the real one. The layers are the ones where the real
+pack keeps fewer triplets. Counting the triplets that fit the larger budget and
+not the real one would over-state the cost: that budget can take a larger
+triplet and then skip smaller ones the real pack placed. With triplets of
+unequal size the device can keep as many triplets and still hold fewer bytes,
+so the bytes, not the count, decide whether the line prints.
+
+Every context of the load whose micro-batch is at or below the placed one
+re-plans the ring for the placed micro-batch
+(`placement_explicit_ubatch_ring_n_ubatch()`), so it keeps the placed ring:
+the load decided the ring's size, and a ring released for a smaller context
+would have to be re-admitted by the next one, into a zone with no slack
+beyond its terms.
+
+The context is refused only when moving every device-resident routed expert
+would not free the room. The refusal names the largest `-ub` whose ring fits,
+from `pp_moe_onednn_admit_ring()`'s slot arithmetic:
+
+```
+[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=<N> needs <R> MB, more
+than the RUNTIME zone can hold with every device-resident expert re-placed to the host tier (<F> MB); the
+largest -ub that fits is <L> (device=0)
+```
+
+The arena can fail to grow for two reasons, and each prints its own line first:
+
+- **Another live model holds allocations in the arena.** Zones are rebuilt only
+  in an unused arena, so `ensure_planned_arena_zones()` refuses the rebuild with
+  an ERROR:
+
+  ```
+  [VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: need scratch=<S> MB
+  oneDNN=<O> MB runtime=<R> MB; have scratch=<S0> MB oneDNN=<O0> MB runtime=<R0> MB; live_zone=<L> MB chunk_leases=<C>
+  ```
+
+- **The tail chunk's cap.** The rebuilt arena's tail chunk holds the ONEDNN,
+  RUNTIME and SCRATCH zones plus a minimum KV carve-out, and the device's
+  per-allocation cap may be smaller than that sum. `arena_reserve()` then refuses
+  with `[VRAM-ARENA] Per-chunk cap <P> MB too small to hold tail zones (<T> MB) +
+  min KV (<K> MB); refusing reservation`.
+
+Either way the load keeps the planning shape: it re-publishes the ring and the
+dense scratch at the load's own micro-batch, sizes the zones for them, and plans
+without the room. So no expert leaves the device for a zone that did not grow.
+One WARN line, at every verbosity, says the named micro-batch was not placed:
+
+```
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=<N> needs <X> MB more RUNTIME zone, which the arena could
+not reserve on device 0; the ring is re-planned when the context opens
+```
+
+The context then re-plans the ring as described above.
+Only the single-device plan places. A multi-device plan makes no decision, so
+its context keeps the context-time path.
+
+The room does not grow for the compute buffers. The RUNTIME zone's fixed part
+holds the compute term the load measured at its planning shape, `n_ctx_train`
+and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
+scratch sit beside it. So once the plan has placed the micro-batch, the
+hold-spill fit credits a compute buffer of that rung no larger than the term,
+whole or nothing (`placement_explicit_ubatch_compute_room()` and
+`zone_hold_fit_rung_has_compute_room()`). Every other rung, the auto trial's
+included, is judged as before. Without the credit the fit charges the buffer as
+if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
+refused the context: 1993.8 MiB of worst-case spill against 1946.2 MiB free
+outside the arena, although the zone held the 1960 MiB buffer beside a term of
+about 2055 MiB. The 256 MiB driver headroom is not added to the hold. It is free
+memory outside the arena, which demoting experts does not change, and the fit
+still requires it there.
+
+The credit can over-credit a rung whose compute buffers span several chunks,
+because the fit compares the rung's largest single buffer with a term that is a
+sum of per-chunk peaks, which the other chunks draw on too. A buffer larger than
+the term at the placed micro-batch gets no credit, so the hold-spill refusal and
+its largest `-ub` advice still answer that case.
+
+Host tests: `test-pp-moe-ring-admission.cpp` pins the room and the decision,
+`test-zone-sizing.cpp` pins the fit's credit and that every other rung is judged
+as before, `tests/test-sycl-layout-choice.cpp` pins the planner's choice, the
+bytes it moves and the compute room it gives the fit, and
+`tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring, the fit's
+credit and the placement, refusal and failed-growth lines, with a mutant per
+claim.
+
 ### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
 
 The dense quantized `MUL_MAT` quantizes its F32 activations into one persistent Q8_1 src1 buffer per backend context
@@ -2463,8 +2903,9 @@ prompt, the last chunk of a long one), `GGML_SYCL_ONEDNN_PP=0`, and any node the
 GPU run on Qwen3.6-27B showed it (`cohort=mul-mat-dequant-f16-src0 uses=48`). Where the f16 arm is *unreachable* the plan
 is zero, and then the hold, the fit check and the ring's pending RUNTIME demand all count nothing, because all three read
 the same planned figures: a build without oneDNN or `GGML_SYCL_F16` plans no f16 bytes
-(`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no dense Q8_0 weight has no f16 candidate in the zone
-adapter. Where it is reachable all three count it.
+(`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no weight the zone adapter claims has no f16 candidate
+(the claimants are listed under "Who the dense f16 dequant plan covers" below). Where it is reachable all three count
+it.
 
 A compute buffer that the RUNTIME zone will not serve lands in the arena's KV zone, not in raw device memory. The
 zone is a fixed 512 MB by default (`GGML_SYCL_RUNTIME_ARENA_MB`, raised only to the planned PP/MoE/dense requirement),
@@ -2493,9 +2934,10 @@ the hold kept it out (`unified_cache_note_planned_hold_spill`, in-arena), in the
 one of each kind per context is a WARN naming the requester tag and the bytes; the counts are taken at teardown and
 printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
 line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
-prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). Each flagged scheduler compute buffer also prints one line as it is
-allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name> size=<MB> zone=<kv|runtime|...|raw|host-pinned>`
-(`ggml_sycl_log_compute_buffer_landing`), so a throughput difference between two builds can be attributed to where
+prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). Each flagged scheduler
+compute buffer also prints one line as it is allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name>
+size=<MB> zone=<kv|runtime|...|raw|host-pinned> planned_compute_term=<MiB>` (`ggml_sycl_log_compute_buffer_landing`), so
+a throughput difference between two builds can be attributed to where
 a buffer physically sits. A buffer the arena placed is logged where it is placed; one nothing in the arena placed is
 placed by the legacy path in the allocator, which logs the buffer it makes, so the line names the FINAL landing (raw
 device memory, or host-pinned) and never `none` for a buffer that then lives somewhere. A raw
@@ -2691,19 +3133,58 @@ cannot place the buffer and the graph is refused before submission, naming the z
 is not consulted: `largest_free_block()` is the head of the largest size class (approximate, by its own comment), so it
 would be a second heuristic beside the aggregate one rather than a contiguity proof.
 
-*Plan inputs are per device.* The per-token and weight maxima the setters keep are one set per device, and the last
-model loaded would win. While another backend context is live on the SAME device
-(`ggml_sycl_other_backend_context_live`, which reads the per-device context list, not the process-wide model registry),
-the larger of the old and the new input is kept (`zone_dense_scratch_merge_input`, tested on the host), so a draft loaded
-beside a target does not shrink the target's plan, and a model live on another device is no reason to merge; with no
-other context live the new inputs replace the old, so a model swap shrinks it. The runtime re-plan takes the same
-per-device answer, so a draft context at a small `n_ubatch` does not shrink a live target's plan either, and a rollback
-that restores an exact earlier value passes "none live". Two contexts on one device are
-still unsupported (canonical contract section 5), so the plan's `n_ubatch` is the last transaction's. A setter validates
-its figure before it stores anything: a rejected (overflowing) figure leaves the stored inputs alone and, with no other
-context live, publishes a zero plan and marks the plan invalid, so the fit check and a re-plan refuse instead of
-re-deriving a plan from stale inputs. With another context live the plan and its inputs are left standing: one model's
-overflow does not invalidate the plan of the model already running.
+*Plan inputs are per owner (llama.cpp-45qo).* The per-token and weight maxima and the `n_ubatch` are each model's own
+terms in the planned load terms' owner table (`planned-load-terms.hpp`, canonical contract 12.4), keyed by the model's
+slot and slot generation, which the load-time plan takes from the owner of the load effect the stage holds. The device
+plans each buffer from the largest of each input over the owners on it, so a draft loaded beside a target does not
+shrink the target's plan, and a model live on another device is no part of the merge. An owner's inputs leave with it,
+at its load's rollback or its slot's release, so a model that unloads while another stays live leaves nothing behind.
+(Until llama.cpp-45qo the inputs were device-global: `zone_dense_scratch_merge_input` kept the larger input while
+another backend context was live and replaced it when none was, so a larger model's inputs outlived it beside a live
+one, and a model loaded beside a live but contextless one shrank that one's plan.) The runtime re-plan changes only the
+published model's own `n_ubatch`, so a draft context at a small `n_ubatch` does not shrink a live target's plan either.
+A store validates its figure on the merge it will publish before it stores anything. A rejected (overflowing) figure
+overwrites that owner's earlier inputs for the buffer with 0 and raises the owner's flag for it, keeping the owner's
+`n_ubatch`.
+
+*One model's overflow does not invalidate the plan of a model already running (llama.cpp-kpjw, kept per owner).* Each
+buffer is sized from the owners whose figure for it was accepted (`planned_load_terms::merged_accepted`), so a rejected
+owner contributes nothing to that buffer's plan, its `n_ubatch` included. The other owners' plans stay valid and
+re-plannable. Only the rejected owner's own re-plan refuses while it is live, because its inputs for the buffer read 0
+and re-deriving from them would plan nothing for a model that needs scratch. The published plan is marked invalid, and
+the fit check refuses by name, only when the accepted owners' merged inputs cannot be sized. This replaced the first
+owner-keyed form, in which any live owner's flag marked the device's plan invalid and refused every owner's re-plan
+until the rejected owner dropped. That form undid the property llama.cpp-kpjw had pinned, by letting a model that
+failed to plan stop a running model from re-planning at its runtime `n_ubatch`.
+
+A model whose own figure was rejected has no dense scratch planned, and an overflowing figure must not become a small
+plan that the other owners' figures carry through the fit check. So the runtime-context transaction refuses that
+model's context by name (`unified_cache_planned_dense_scratch_owner_rejected`, a WARN naming the model's slot, slot
+generation and the rejected half; INFO for a probe, which still refuses). It checks before the fit check, and again
+after a re-plan that a rejection refused. A context the model has no room to record (below) is refused by name the
+same way, before the fit check, rather than left out of the plan its buffers are sized from.
+
+*A model plans at the largest `n_ubatch` its live contexts last published.* Each backend context records, in its
+model's row, the `n_ubatch` it last published (keyed by its minted planned-scratch id, never an address), and the model
+plans at the largest of those records (`planned_load_terms::planned_n_ubatch`). A context's own later publish replaces
+its own record, and another context can only add or replace its own, so a second context created at `-ub 512` while a
+first at `-ub 2048` is live does not shrink the plan the first context's buffers were sized from. The auto-ubatch
+ladder is the case that rules out a latch: it publishes each rung for real, ascending, so a rung that passes the
+transaction and then loses at `sched_reserve` or to the host fallback has already raised the plan. The settle
+republishes the winner from the same context, which replaces that context's record, so the plan falls back to the
+winner instead of holding the losing rung's f16 dequant and Q8_1 src1 bytes off the winner's compute buffers.
+
+A context's record leaves when the context is destroyed, releasing its hold
+(`unified_cache_release_planned_dense_scratch_context`), and the model is re-planned, so its plan may fall. With no
+context live the model plans at its load's `n_ubatch` again (`DENSE_SCRATCH_LOAD_N_UBATCH`). The load's value is no
+floor while a context is live: a context at `-ub 256` plans at 256, not at the load's 512. A model has room for
+`planned_context_capacity` records per device; a context past that is refused by name. A transaction that rolls back
+after its re-plan leaves the context's record until its next publish or its destruction, so the guard restores only
+the hold. Each half's published `n_ubatch` is its own accepted owners' largest. A successful re-plan logs, at INFO, the
+context's published `n_ubatch`, the model's planned `n_ubatch` and each half's (`[SYCL-PLAN] dense scratch re-planned
+on device`), so a run scores the settle's published value against the plan's. Before this rule, the latch kept the
+larger of the model's current and new values, the load's value included, which held the losing rung's plan after the
+ladder settled lower and held a context running below the load's `n_ubatch` to the load's value.
 
 **D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
 The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the
@@ -2714,8 +3195,8 @@ recording. The transaction refuses a rung whose plan the RUNTIME zone cannot hol
 (`unified_cache_dense_scratch_runtime_fit()`, against zone capacity, not free space, because free space depends on which
 compute buffers happen to be live) and names the largest `-ub` that fits, so the ladder keeps the last rung that fits
 and an explicit `-ub` fails context creation with the arithmetic. The ring admission is told the figure as pending
-RUNTIME demand and leaves it room. A probe changes nothing; a refused or rolled-back publish restores the plan and the
-hold (`ggml_sycl_dense_scratch_txn_guard`).
+RUNTIME demand and leaves it room. A probe changes nothing; a refused or rolled-back publish restores the hold
+(`ggml_sycl_dense_scratch_txn_guard`), and leaves the context's published `n_ubatch` in its model's plan (above).
 
 Why not make rung selection consult the plan separately: the probe *is* the transaction, so the ladder already asks
 the one source. No edit to `src/llama-auto-ubatch.h` or the ladder is needed, and none was made.
@@ -2739,6 +3220,171 @@ is a table lookup, and a per-node cache would need per-graph storage on this pat
 Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic and Case 15 the held-back branch,
 the route after a decline and the merged inputs;
 `tests/test-sycl-mmq-src1-plan-source.py` pins the wiring, with a mutation witness per check.
+
+### Who the dense f16 dequant plan covers (`llama.cpp-gldu`, `llama.cpp-h9c8`)
+
+The two f16 dequant buffers are sized from per-weight marks that `unified_cache_adapt_zone_inventory` sets; the plan is
+the maximum over the marked weights, not a sum. The planner has no graph node, no batch and no resolved layout, so each
+mark is a type-level claim built from the router's own type lists in `ggml/src/ggml-sycl/unified-types.hpp`, and each
+claim has a router-side twin that asks the same function. A weight the router sends to the arm without a mark is still
+found by the graph-entry walk, which grows the buffer inside the RUNTIME zone or refuses by name.
+
+| claimant | types | when marked | router side |
+|---|---|---|---|
+| Q8_0 (`llama.cpp-479i`) | Q8_0 | always | `ONEDNN_SOA` / `ONEDNN_COALESCED`, selected whatever `GGML_SYCL_ONEDNN_PP` says |
+| unified kernel (`llama.cpp-8ony`) | Q4_0, MXFP4 | oneDNN PP type admission | the unified kernel's oneDNN f16 route |
+| AOS claim (`llama.cpp-gldu`) | quantized types no MMQ, coalesced or unified kernel serves (the IQ family) | always | `ONEDNN_AOS`, the only PP route they have |
+| MMQ claim (`llama.cpp-h9c8`) | Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K | `GGML_SYCL_ONEDNN_PP_MMQ_TYPES` and the oneDNN PP type admission | `ggml_sycl_dense_f16_arm_serves_pp`, asked before `MMQ_AOS` and at `ONEDNN_SOA` |
+
+All four exclude expert stacks (`MUL_MAT_ID` keeps its own workspace). The AOS and MMQ claims also exclude the LM head
+(`ggml_sycl_weight_is_output_head`): a completion runs it on one row per ubatch, so it never reaches the arm there, and
+its f16 copy would size the whole plan. The MMQ claim alone is restricted to 2-D weights, because the arm converts an
+SOA-resident weight only as a whole tensor and a 3-D dense operand is dispatched per plane on row slices.
+
+The MMQ claim is the one whose router twin can refuse a weight the plan reserved for, so its terms are composed in one
+function, `mmq_dequant_f16_plan_claims`, which both sides call with the same head, expert, 2-D and dequant flags, and
+its admission in another, `ggml_sycl_onednn_pp_mmq_types_admitted` (`GGML_SYCL_ONEDNN_PP_MMQ_TYPES` and the oneDNN PP
+type admission), which both sides call too. The router asks the type list before either, so a type it does not name
+pays for no name scan. The router then narrows it with what only it knows: the oneDNN PP candidate (batch at or above
+`GGML_SYCL_ONEDNN_PP_MIN_BATCH`, the oneDNN PP and placement admissions), the node's accumulator precision (an op
+`ggml_prec_set_acc` set to F32 keeps MMQ, because the arm's F32 branch would draw an unplanned f32 copy;
+`llama.cpp-4bu9`), a weight in a row-split buffer (the arm's f16 branch converts a whole weight, and a split slice would
+take the same F32 branch) or a tensor-parallel one (refused with it, as the BF16 route refuses both), and a converter
+for the layout the weight is loaded in. `ggml_get_to_fp16_sycl_for_layout` returns no converter for a layout it has no
+kernel for, so a weight in such a layout keeps MMQ rather than being dequantized as if it were AOS (`llama.cpp-pzu9`).
+The arm takes the layout from the resolver and refuses by name a resolved layout it cannot convert; a weight the
+resolver does not know is converted as AOS, which rests on the op handing over the plain buffer (`llama.cpp-imwa` would
+refuse it by name). Mistral 7B Q4_K_M plans 112.0 MB of f16 weights (one `ffn_down`, 14336 x 4096) and 28 KB of f16
+activations per token; a claimed head would have been 250 MB (`test-zone-sizing`, Case 14l).
+
+### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)
+
+The scheduler's compute buffer is a named RUNTIME consumer. Before p6i0 nobody planned it. The weight pack filled the
+shared zone, and the buffer took whatever the allocator found. On the B70 with Qwen3.8 IQ3_XXS at `-ub 512` and no
+`-c`, its 1543.1 MB chunk landed raw and its 512 MB chunk fit no tier, so the context was refused.
+
+**How it is sized.** The load measures the compute buffer at three stages.
+
+- At the **probe** stage, after `create_tensor` and before the late plan packs the weights, the loader measures C-hat
+  over the weight stand-ins. It hands each SYCL device's per-chunk peaks to
+  `ggml_backend_sycl_load_reserve_compute_term`.
+- The backend sizes the term with `zone_compute_term_bytes`. Each chunk is rounded by the RUNTIME TLSF's own
+  `round_request` at the alignment the buffer type requests (`GGML_SYCL_BUFFER_BASE_ALIGNMENT`), and the rounded
+  chunks are summed. That is the allocator's grain and nothing more: there is no headroom in the term.
+- `unified_cache_get_planned_runtime_zone_requirement` adds the term, with the overflow checked, so
+  `ensure_planned_arena_zones` sizes RUNTIME for the buffer before `compute_placement_plan` packs the weights.
+- The compute buffer is not the only thing the context puts in RUNTIME first. A hybrid or recurrent model's state
+  (`cache_r_l*`, `cache_s_l*`) sits in the plain device buffer type, outside the compute scope, and the real context
+  allocates it after the load and before the compute buffer. On the B70, Qwen3.8's 112.6 MiB of state took that room
+  out of the term, so the 512 MB chunk landed raw beside a 2055.1 MiB term. So the probe also reads the context memory
+  the measure placed on each device's plain buffer type (its no_alloc size, from `memory_breakdown`) and hands it to
+  `ggml_backend_sycl_load_reserve_state_term` first. The backend sizes it as one allocation at the same grain and
+  stores it as its own planned **state term**, which the requirement adds after the compute term. A device whose state
+  is declined is not offered its compute term.
+- At the **admitted** stage, right after the pack, the loader measures c(P) at the packed placement. It compares c(P)
+  with C-hat in the reservation's units: both are sized by `ggml_backend_sycl_load_compute_term_bytes`, the reserve's
+  own rule, not as raw sums. c(P) above C-hat, or a device with no probe bound, refuses the load as
+  `compute-slot-exceeds-probe-bound`. Otherwise c(P) is recorded in the load's ledger, and the **late** check compares
+  the final placement against it.
+- One growth is admitted: the **KV-residency delta**. The probe re-fits the KV residency for the room left before the
+  term is carved, and the admitted measure re-fits it after RUNTIME grew by the term and the weights were packed, so KV
+  layers can move between device, host and CPU from one measure to the other, and the compute graph moves with them. A
+  graph's peak is not monotone in placement, so C-hat cannot be proven to bound c(P) then. GPT-OSS on the B50 moved from
+  3 device and 21 host KV layers at the probe to 1 and 23 at the admitted stage, and its 404.0 MiB term did not change.
+  When the residencies differ, c(P) above C-hat is admitted and recorded, and the loader WARNs `compute slot on device
+  N: admitted X MiB exceeds the probe bound by Y MiB because the KV residency moved`. That excess is not reserved,
+  because the arena is already packed, so that part of the buffer can land outside RUNTIME. With the same residency on
+  both sides, growth is still refused. A device the backend declined to reserve for is not compared and not recorded:
+  its compute buffer stays unplanned, as before p6i0.
+- A late check that matches prints one WARN per device and load:
+  `[LOAD-PLAN] late check on device N: compute term equal (X MiB), early reservation stands`. A pass that printed
+  nothing could not be told from a check that never ran.
+- The state term is recorded in the same ledger under its own name, never added to c(P), so the late check still
+  compares compute with compute. At the admitted stage each device whose state was reserved records the probe's state,
+  the value the reservation holds (`ggml_backend_sycl_load_record_state_term`). The state's own reservation decides, not
+  the compute term's: a state reserved beside a declined compute term is real RUNTIME memory the backend holds a term
+  for, so it is recorded and late-checked like any other. The late check compares the late measure's state with it under
+  the same rule (`ggml_backend_sycl_load_late_check_state`): larger refuses the load as `term state in zone RUNTIME`,
+  smaller is admitted with the shrink WARN, and equal WARNs `late state check on device N: state term equal`. That
+  catches a state that moves at the dev_layer sync, which can retier recurrent layers to the CPU. A late state with no
+  record WARNs `late state check on device N: no state term was recorded`, because that state is allocated in RUNTIME
+  unplanned. A device whose late state is zero is not asked, so a state that leaves a device entirely gives no shrink
+  WARN. The loader prints `state term on device N` on its own line beside the compute-slot line.
+
+**Invariant: every RUNTIME-first consumer at context time is named in the reserve.** The real context allocates
+some memory in the RUNTIME zone first, after the load and before its compute buffer. Each such consumer needs a planned
+term of its own, or it draws down the compute term and a compute chunk lands outside the zone. In the Qwen3.8 B70
+trace, the RUNTIME allocations between the KV placement and the compute buffer were the recurrent state (the state
+term) and the dense MMQ Q8_1 src1 scratch (`llama.cpp-g6yk`'s term). A new consumer of that kind must add its own term.
+`tests/test-sycl-load-measure-source.py` pins the recurrent state at every hop, from `memory_breakdown` in the measure
+through the probe reservation and the admitted record to the late check. A mutant that drops it at any hop fails.
+
+**How it is drawn and dropped.**
+
+- The compute buffer's first tier is already the RUNTIME zone, so the term is drawn by the path the buffer takes.
+- The ring re-plan counts the term, and the state term, as pending RUNTIME demand, beside the dense scratch, so the
+  ring does not take their room. A re-publish while they are live counts them twice, which is conservative.
+- Each model owns its own compute and state term per device, keyed by its model slot and slot generation (canonical
+  contract 12.4, `llama.cpp-ihk6`). The slot is reserved and its generation minted when the load transaction begins,
+  before the reserves run, so a load in flight and the model it commits to have one key and nothing moves at commit.
+  The reserve stores only while it holds the open transaction's load-effect lease.
+- A device reads the merge: the largest term of the owners on it. A re-measure within one owner replaces that owner's
+  term; it does not merge with itself.
+- An owner's terms leave only by its own key: the load's rollback, or the slot's release at teardown. Each drop
+  republishes the merge, so a model that stays live beside one that unloaded reads its own term again, not the larger
+  one that left. There is no whole-table clear and none at the load entry.
+- A newer generation of a slot that finds its predecessor's terms still standing removes them on every device, not only
+  the one it reserves on, and WARNs once per device
+  `[LOAD-PLAN] planned load terms of slot S generation G were still standing on device N`, because those are terms
+  that a rollback or a release did not drop. A slot is reserved again only after its release, so an older generation's
+  term on any device has no owner left to drop it.
+- The `[SCRATCH-STATS] ... compute_buffer=` landing line ends with `planned_compute_term=<MiB>`. That is the positive
+  control. A buffer that lands `zone=runtime` beside a nonzero term is the reservation at work. One that lands
+  `zone=raw` beside a nonzero term is a reservation that did not hold it.
+
+**What it costs, and where those bytes used to come from.** The compute buffer used to live raw, outside the arena,
+in the external headroom. zhcn D9 found that on the B50 with GPT-OSS, and the B70 logs for Qwen3.8 show the same.
+The external headroom is the driver's working memory, and it is kept whole and disjoint from this term. So the bytes
+the buffer used to borrow now come out of the weight zone, which can tier weights to host. `llama.cpp-gpdj` is the
+recovery path: it measures the driver's working set and sizes the headroom from it.
+
+**Limits.**
+
+- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub` do
+  not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
+  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
+  `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
+  climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
+  `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
+  (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the runtime-context
+  transaction is busy or not the published model's, when the probe refuses the rung, when the rung would demote KV, when
+  the candidate publish is refused, when the rung's compute buffers fail to allocate, when one falls back to host
+  memory, or when the rung would leave the card under the driver headroom (the hold-spill fit). A compute buffer that
+  does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
+  a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
+  of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
+  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
+- Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
+  and the late check all build their measure context from the default parameters. So the state term holds one sequence's
+  state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
+  allocates about `n_seq_max` times that state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME
+  room from the compute term, and the buffer's last chunk can land `zone=raw`. The context constructor names it. Right
+  after its memory exists, it compares each SYCL device's state with the planned state term the backend holds
+  (`ggml_backend_sycl_planned_state_term`). The state is the memory's bytes for that device's buffer type. When the
+  state is larger, it WARNs `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A
+  load that planned no state term at all (a model the measure cannot run, a backend without the load procs, or a
+  declined reservation) gets its own line instead, `[LOAD-PLAN] state term not planned on device N`, which does not
+  blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
+  placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
+  neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
+  measure, the same gap `llama.cpp-fkpg` records for `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
+  summed per buffer type, so a type holding several buffers can round up by one grain per extra buffer beyond the term.
+- A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
+  refused while the first model holds allocations, so that load reaches the abort in
+  `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.
+- This is a stepping stone. moua L6 retires both planned RUNTIME terms into the `FIRST_CONTEXT` head slot in the
+  shared zone: the compute term and the recurrent-state term, which the RUNTIME requirement adds after it. Then only
+  the bodies of `ggml_backend_sycl_load_reserve_compute_term` and `ggml_backend_sycl_load_reserve_state_term` change.
 
 ### Known limits (load-bearing — read before changing any of this)
 

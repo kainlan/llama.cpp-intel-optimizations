@@ -30,7 +30,8 @@ static bool test_invalid_device_returns_nullopt() {
     ggml_tensor * src1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 1);
 
     // Invalid device ID -1
-    auto result = ggml_sycl_select_preferred_kernel(src0, src1, -1, std::nullopt);
+    // No MUL_MAT node: a nullptr dst keeps the f16 dequant arm's MMQ types on MMQ (Q4_0 is not one of them).
+    auto result = ggml_sycl_select_preferred_kernel(src0, src1, -1, std::nullopt, nullptr);
 
     ggml_free(ctx);
 
@@ -66,7 +67,8 @@ static bool test_batch1_selects_dmmv_or_mmvq() {
     ggml_set_name(src0, "test_weight");
     ggml_set_name(src1, "test_input");
 
-    auto result = ggml_sycl_select_preferred_kernel(src0, src1, 0, std::nullopt);
+    // No MUL_MAT node: a nullptr dst keeps the f16 dequant arm's MMQ types on MMQ (Q4_0 is not one of them).
+    auto result = ggml_sycl_select_preferred_kernel(src0, src1, 0, std::nullopt, nullptr);
 
     ggml_free(ctx);
     ggml_backend_free(backend);
@@ -121,9 +123,9 @@ static bool test_force_kernel_override() {
     ggml_set_name(src1, "test_input_force");
 
     // Force MMQ_AOS (AOS layout works without buffer setup)
+    // No MUL_MAT node: a nullptr dst keeps the f16 dequant arm's MMQ types on MMQ (Q4_0 is not one of them).
     auto result = ggml_sycl_select_preferred_kernel(
-        src0, src1, 0,
-        std::optional<ggml_sycl_mul_mat_kernel>(ggml_sycl_mul_mat_kernel::MMQ_AOS));
+        src0, src1, 0, std::optional<ggml_sycl_mul_mat_kernel>(ggml_sycl_mul_mat_kernel::MMQ_AOS), nullptr);
 
     ggml_free(ctx);
     ggml_backend_free(backend);

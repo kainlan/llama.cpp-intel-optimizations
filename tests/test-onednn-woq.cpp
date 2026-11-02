@@ -335,9 +335,21 @@ static bool test_woq_gemm_q4_0() {
             return true;
         }
 
-        DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                  weights_f16_dev, DnnlGemmWrapper::to_dt<sycl::half>(), dst_fallback_dev,
-                                  DnnlGemmWrapper::to_dt<float>(), stream, out_rows);
+        if (!DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev, DnnlGemmWrapper::to_dt<sycl::half>(),
+                                       weights_f16_dev, DnnlGemmWrapper::to_dt<sycl::half>(), dst_fallback_dev,
+                                       DnnlGemmWrapper::to_dt<float>(), stream, out_rows)) {
+            // The test's own scratchpad is never declined, so a decline here is a defect, not a skip.
+            std::fprintf(stderr, "FAIL: the f16 row_gemm fallback declined its scratchpad\n");
+            sycl::free(weights_f16_dev, *stream);
+            sycl::free(dst_fallback_dev, *stream);
+            sycl::free(weights_dev, *stream);
+            sycl::free(scales_dev, *stream);
+            sycl::free(zp_dev, *stream);
+            sycl::free(act_dev, *stream);
+            sycl::free(dst_dev, *stream);
+            ggml_backend_free(backend);
+            return false;
+        }
 
         std::vector<float> out_raw(static_cast<size_t>(out_rows) * static_cast<size_t>(out_rows));
         stream->memcpy(out_raw.data(), dst_fallback_dev, dst_fallback_bytes).wait();

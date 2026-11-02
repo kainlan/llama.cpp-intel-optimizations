@@ -1,0 +1,381 @@
+// test-moe-exec-cost: the MoE executor's per-layer cost (moe-exec-cost.hpp; llama.cpp-36j0) on the measured shapes.
+// Host only: no device, no model, no SYCL.
+#include "moe-exec-cost.hpp"
+
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace ggml_sycl;
+
+static int g_cases = 0, g_failures = 0;
+#define CHECK(cond, msg)                                                       \
+    do {                                                                       \
+        ++g_cases;                                                             \
+        if (!(cond)) {                                                         \
+            ++g_failures;                                                      \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, msg); \
+        }                                                                      \
+    } while (0)
+
+// a and b agree to 1e-6 relative (absolute below 1).
+static bool near_rel(double a, double b) {
+    return std::fabs(a - b) <= 1e-6 * std::fmax(1.0, std::fabs(b));
+}
+
+static moe_exec_rates b70_rates() {
+    moe_exec_rates r;
+    r.h2d_gbps     = 26.5;     // measured, 8bgi c-nn1q
+    r.cpu_gbps     = 22.0;     // measured, 7fmt table (c-plz8 / c-ncj4)
+    r.dev_gflops   = 50000.0;  // seed (Task 9 / probes replace it)
+    r.cpu_gflops   = 1000.0;   // seed (Task 9 / probes replace it)
+    r.cpu_fixed_us = 500.0;    // seed (Task 9 / probes replace it)
+    r.dev_fixed_us = 800.0;    // seed (Task 9 / probes replace it)
+    return r;
+}
+
+static moe_exec_rates b50_rates() {
+    moe_exec_rates r = b70_rates();
+    r.h2d_gbps       = 27.1;     // measured, 8bgi c-nn1q
+    r.cpu_gbps       = 5.6;      // measured, 7fmt table (c-plz8 / c-ncj4)
+    r.dev_gflops     = 25000.0;  // seed (Task 9 / probes replace it)
+    return r;
+}
+
+static moe_exec_layer_inputs qwen_layer(uint32_t T) {
+    moe_exec_layer_inputs in;
+    in.n_tokens             = T;
+    in.n_expert             = 512;
+    in.n_expert_used        = 10;
+    in.host_expert_bytes    = 410ull << 20;
+    in.n_host_experts       = 212;
+    in.K                    = 2560;
+    in.N                    = 640;
+    in.ring_bytes_free      = 820ull << 20;
+    in.stage_unit_bytes_max = 2048 * 1024 / 3;  // one matrix of the largest host triplet, from the 410 MiB / 212 mean
+    return in;
+}
+
+static moe_exec_layer_inputs gptoss_layer(uint32_t T, bool host) {
+    moe_exec_layer_inputs in;
+    in.n_tokens      = T;
+    in.n_expert      = 32;
+    in.n_expert_used = 4;
+    in.host_expert_bytes =
+        host ? 19ull * 13200000ull : 0;  // 13.2 MB per expert triplet: 10152345600 B / (24 x 32), test-kv-room-cost
+    in.n_host_experts       = host ? 19 : 0;
+    in.K                    = 2880;
+    in.N                    = 2880;
+    in.ring_bytes_free      = 1500ull << 20;
+    in.stage_unit_bytes_max = 13200000ull / 3;  // one matrix of the 13.2 MB triplet
+    return in;
+}
+
+int main() {
+    // p_touch
+    CHECK(moe_exec_p_touch(10, 512, 0) == 0.0, "T=0 touches nothing");
+    CHECK(std::fabs(moe_exec_p_touch(10, 512, 256) - 0.993) < 1e-3, "T=256 touches 99.3 % (brief section 5)");
+    CHECK(std::fabs(moe_exec_p_touch(10, 512, 16) - 0.27) < 1e-2, "T=16 touches 27 %");
+
+    // Qwen3.8 on the B70
+    {
+        moe_exec_decision d = moe_exec_weigh(qwen_layer(256), b70_rates(), moe_exec_policy::AUTO);
+        CHECK(d.choice == moe_exec_choice::RING, "Qwen/B70 T=256 answers RING");
+        CHECK(d.regime == moe_exec_regime::STREAM_ALL, "Qwen/B70 T=256 streams every host expert");
+        CHECK(d.reason == moe_exec_reason::CHEAPER, "chosen on cost");
+    }
+    {
+        moe_exec_decision d = moe_exec_weigh(qwen_layer(4), b70_rates(), moe_exec_policy::AUTO);
+        CHECK(d.choice == moe_exec_choice::CPU, "Qwen/B70 T=4 answers CPU");
+        CHECK(d.regime == moe_exec_regime::ROUTED_ONLY, "T=4 is routed-only");
+    }
+    {
+        // stream_all_p_min boundary: p exactly at the threshold streams all, just above it is routed-only.
+        moe_exec_rates r   = b70_rates();
+        const double   p   = moe_exec_p_touch(10, 512, 256);
+        r.stream_all_p_min = p;
+        CHECK(moe_exec_weigh(qwen_layer(256), r, moe_exec_policy::AUTO).regime == moe_exec_regime::STREAM_ALL,
+              "p at the threshold is STREAM_ALL");
+        r.stream_all_p_min = p + 1e-9;
+        CHECK(moe_exec_weigh(qwen_layer(256), r, moe_exec_policy::AUTO).regime == moe_exec_regime::ROUTED_ONLY,
+              "p just below the threshold is ROUTED_ONLY");
+    }
+    {
+        // RING policy forces the ring even where the CPU is cheaper.
+        moe_exec_decision d = moe_exec_weigh(qwen_layer(4), b70_rates(), moe_exec_policy::RING);
+        CHECK(d.choice == moe_exec_choice::RING && d.reason == moe_exec_reason::FORCED, "RING policy forces RING");
+        // A ring smaller than the largest matrix cannot stage it.
+        moe_exec_layer_inputs in = qwen_layer(256);
+        in.ring_bytes_free       = 1024;
+        d                        = moe_exec_weigh(in, b70_rates(), moe_exec_policy::AUTO);
+        CHECK(d.choice == moe_exec_choice::CPU && d.reason == moe_exec_reason::RING_UNAVAILABLE,
+              "ring smaller than the largest matrix is unavailable");
+    }
+    {
+        // Compute-bound CPU: a slow CPU GEMM rate dominates its bandwidth term.
+        moe_exec_rates r            = b70_rates();
+        r.cpu_gflops                = 1.0;
+        moe_exec_layer_inputs in    = qwen_layer(256);
+        const double          gflop = moe_exec_layer_gflop(in) * (static_cast<double>(in.n_host_experts) / in.n_expert);
+        moe_exec_decision     d     = moe_exec_weigh(in, r, moe_exec_policy::AUTO);
+        CHECK(std::fabs(d.t_cpu_us - (gflop / r.cpu_gflops * 1e6 + r.cpu_fixed_us)) < 1e-6,
+              "compute-bound CPU cost is gflop / rate + fixed");
+    }
+    {
+        CHECK(moe_exec_rates_valid(b70_rates()), "the B70 rates are valid");
+        CHECK(!moe_exec_rates_valid(moe_exec_rates{}), "default-constructed (unmeasured) rates are invalid");
+        // each of the four rates the decision divides by, zeroed alone, invalidates the record
+        double moe_exec_rates::* const divisors[] = { &moe_exec_rates::h2d_gbps, &moe_exec_rates::cpu_gbps,
+                                                      &moe_exec_rates::dev_gflops, &moe_exec_rates::cpu_gflops };
+        for (double moe_exec_rates::* const field : divisors) {
+            moe_exec_rates r = b70_rates();
+            r.*field         = 0.0;
+            CHECK(!moe_exec_rates_valid(r), "a zero rate is invalid");
+        }
+    }
+    {
+        moe_exec_decision d = moe_exec_weigh(qwen_layer(1), b70_rates(), moe_exec_policy::AUTO);
+        CHECK(d.choice == moe_exec_choice::CPU && d.reason == moe_exec_reason::DECODE, "decode is untouched");
+    }
+    {
+        moe_exec_layer_inputs in = qwen_layer(256);
+        in.ring_bytes_free       = 0;
+        moe_exec_decision d      = moe_exec_weigh(in, b70_rates(), moe_exec_policy::AUTO);
+        CHECK(d.choice == moe_exec_choice::CPU && d.reason == moe_exec_reason::RING_UNAVAILABLE, "no ring: CPU");
+        d = moe_exec_weigh(in, b70_rates(), moe_exec_policy::RING);
+        CHECK(d.choice == moe_exec_choice::CPU, "RING policy cannot force a ring that does not exist");
+        CHECK(d.reason == moe_exec_reason::RING_UNAVAILABLE, "forced RING with no ring reports RING_UNAVAILABLE");
+    }
+    {
+        moe_exec_decision d = moe_exec_weigh(qwen_layer(256), b70_rates(), moe_exec_policy::CPU);
+        CHECK(d.choice == moe_exec_choice::CPU && d.reason == moe_exec_reason::FORCED, "CPU policy forces CPU");
+    }
+    // GPT-OSS 20B on the B50
+    {
+        moe_exec_decision d = moe_exec_weigh(gptoss_layer(512, true), b50_rates(), moe_exec_policy::AUTO);
+        CHECK(d.choice == moe_exec_choice::RING, "GPT-OSS/B50 default-context host layer at T=512 answers RING");
+        d = moe_exec_weigh(gptoss_layer(512, false), b50_rates(), moe_exec_policy::AUTO);
+        CHECK(d.choice == moe_exec_choice::NOT_CONSULTED && d.reason == moe_exec_reason::NO_HOST_EXPERTS,
+              "all-VRAM -c 4096 layer is not consulted");
+    }
+    // The ring cost is the copy, the GEMM and the fixed cost. The ring copies every byte it moves whole (a layer is
+    // weighed at its own first op and no copy hides under an earlier layer) and the executor reads each slot in place,
+    // so nothing is reordered: STREAM_ALL copies every host byte, ROUTED_ONLY the touched share.
+    {
+        const moe_exec_rates r   = b70_rates();
+        const uint32_t       t[] = { 256, 4 };
+        for (const uint32_t T : t) {
+            const moe_exec_layer_inputs in = qwen_layer(T);
+            const moe_exec_decision     d  = moe_exec_weigh(in, r, moe_exec_policy::AUTO);
+            const double bytes  = d.regime == moe_exec_regime::STREAM_ALL ? static_cast<double>(in.host_expert_bytes) :
+                                                                            d.p_touch * in.host_expert_bytes;
+            const double gflop  = moe_exec_layer_gflop(in) * (static_cast<double>(in.n_host_experts) / in.n_expert);
+            const double expect = bytes / (r.h2d_gbps * 1e3) + gflop / r.dev_gflops * 1e6 + r.dev_fixed_us;
+            CHECK(near_rel(d.t_ring_us, expect), "the ring cost is the whole copy, the GEMM and the fixed cost");
+        }
+    }
+    // seed: the Qwen GSQ-RCO mix (seven measured types at 22 GB/s) gives 22; a mix with an unmeasured type keeps
+    // the measured bytes' mean (the room refuses unmeasured types; the executor just prices them at the default)
+    {
+        std::vector<std::pair<ggml_type, size_t>> mix = {
+            { GGML_TYPE_IQ3_S,  218 },
+            { GGML_TYPE_IQ4_NL, 198 },
+            { GGML_TYPE_Q2_0,   165 },
+            { GGML_TYPE_IQ2_S,  125 }
+        };
+        moe_exec_rates r = moe_exec_rates_seed(mix);
+        CHECK(std::fabs(r.cpu_gbps - 22.0) < 1e-9, "Qwen mix seeds the mix's 22 GB/s");
+        CHECK(r.h2d_gbps == 20.0, "H2D carries its seed");
+        CHECK(moe_exec_rates_valid(r), "the seed passes the validity check weigh asserts");
+        mix.push_back({ GGML_TYPE_Q4_0, 1000 });
+        r = moe_exec_rates_seed(mix);
+        CHECK(std::fabs(r.cpu_gbps - 22.0) < 1e-9, "an unmeasured type does not move the measured mean");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_Q4_0, 1000 }
+        });
+        CHECK(r.cpu_gbps == PLACEMENT_CPU_EXPERT_GBPS_DEFAULT, "no measured type: the room's default");
+        CHECK(moe_exec_rates_valid(r), "the all-default seed is valid too");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 100 },
+            { GGML_TYPE_IQ3_S, 100 }
+        });
+        CHECK(std::fabs(r.cpu_gbps - 200.0 / (100.0 / 5.6 + 100.0 / 22.0)) < 1e-9, "two measured types: harmonic mean");
+    }
+    // dev_gflops seeds per type, byte-weighted harmonic mean over the mix: bytes / sum(bytes_i / rate_i). MXFP4 keeps
+    // the Task 9 measurement (llama.cpp-g4uy); Q4_0 and every other type the executor takes from a staged slot
+    // (moe_pp_batched_takes_staged_type) take the batched executor's rates measured on d52110c80 (llama.cpp-348c,
+    // re-seeded in llama.cpp-3460); any other type keeps the per-row 600. The fixtures above that call weigh set their
+    // own rates, so none of their expectations depended on a seed; the unset-variable check below pins the empty mix's
+    // 600.
+    {
+        moe_exec_rates r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 1000 }
+        });
+        CHECK(r.dev_gflops == 3990.0, "a pure MXFP4 mix seeds the batched XMX executor's 3990 GFLOP/s");
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_Q4_0, 1000 }
+        });
+        CHECK(r.dev_gflops == 9000.0, "a pure Q4_0 mix seeds the batched f16 executor's 9000 GFLOP/s");
+        // the Qwen3.8 GSQ-RCO expert types and the other types the staged claim takes share the f16 arm's 5000
+        const ggml_type f16_arm_types[] = { GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                                            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL,
+                                            GGML_TYPE_Q2_0,  GGML_TYPE_Q8_0,    GGML_TYPE_Q6_K };
+        for (ggml_type t : f16_arm_types) {
+            r = moe_exec_rates_seed({
+                { t, 1000 }
+            });
+            CHECK(r.dev_gflops == 5000.0, "a type the staged claim takes seeds the f16 arm's 5000 GFLOP/s");
+        }
+        // a type the batched executor does not claim keeps the per-row rate
+        const ggml_type per_row_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_F16 };
+        for (ggml_type t : per_row_types) {
+            r = moe_exec_rates_seed({
+                { t, 1000 }
+            });
+            CHECK(r.dev_gflops == 600.0, "a type with no batched executor seeds the per-row 600 GFLOP/s");
+        }
+        // the f16 arm dequantizes these, but they have no MMVQ-ID kernel, so the staged claim refuses them and the ring
+        // does not stage them: they keep the per-row rate until a kernel exists (llama.cpp-w4qk)
+        const ggml_type unstaged_f16_types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS };
+        for (ggml_type t : unstaged_f16_types) {
+            r = moe_exec_rates_seed({
+                { t, 1000 }
+            });
+            CHECK(r.dev_gflops == 600.0, "a type the staged claim refuses seeds the per-row 600 GFLOP/s");
+        }
+        // one type question (moe_pp_batched_takes_staged_type): apart from MXFP4, whose 3990 is the WOQ arm's Task 9
+        // measurement, a type is seeded above the per-row rate exactly when the staged claim takes it
+        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const ggml_type t = static_cast<ggml_type>(i);
+            if (t == GGML_TYPE_MXFP4) {
+                continue;
+            }
+            const bool executor_rate = moe_exec_dev_gflops_seed(t) > MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED;
+            CHECK(executor_rate == moe_pp_batched_takes_staged_type(t),
+                  "a type is seeded at an executor rate exactly when the staged claim takes it");
+        }
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 500 },
+            { GGML_TYPE_Q4_0,  500 }
+        });
+        CHECK(std::fabs(r.dev_gflops - 2.0 / (1.0 / 3990.0 + 1.0 / 9000.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 5528.9) < 0.1,
+              "equal MXFP4 and Q4_0 bytes seed the harmonic mean, 5528.9 (not the 6495 arithmetic mean)");
+        // unequal bytes tell the byte weighting from an unweighted harmonic mean (which would give the 5528.9 above):
+        // 400 / (100 / 3990 + 300 / 9000) = 400 / (0.025063 + 0.033333) = 6849.8
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 100 },
+            { GGML_TYPE_Q4_0,  300 }
+        });
+        CHECK(std::fabs(r.dev_gflops - 400.0 / (100.0 / 3990.0 + 300.0 / 9000.0)) < 0.1 &&
+                  std::fabs(r.dev_gflops - 6849.8) < 0.1,
+              "100 B MXFP4 + 300 B Q4_0 seed the byte-weighted harmonic mean, 6849.8");
+        r = moe_exec_rates_seed({});
+        CHECK(r.dev_gflops == 600.0, "an empty mix seeds 600 GFLOP/s");
+        CHECK(moe_exec_rates_valid(r), "the empty-mix seed is valid");
+        // the env override still wins over a per-type seed
+        auto env_fn = [](const char * name) -> const char * {
+            return std::string(name) == "GGML_SYCL_MOE_EXEC_DEV_GFLOPS" ? "777" : nullptr;
+        };
+        r = moe_exec_rates_seed({
+            { GGML_TYPE_MXFP4, 1000 }
+        });
+        moe_exec_rates_apply_env(r, env_fn);
+        CHECK(r.dev_gflops == 777.0, "the env override wins over the per-type seed");
+    }
+    // env overrides follow the w013 rule
+    {
+        static const char * fake_env_h2d = "31.5";
+        auto                getenv_fn    = [](const char * name) -> const char * {
+            return std::string(name) == "GGML_SYCL_MOE_EXEC_H2D_GBPS" ? fake_env_h2d : nullptr;
+        };
+        moe_exec_rates r = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 31.5, "H2D override applied");
+        CHECK(r.cpu_gbps == PLACEMENT_CPU_EXPERT_GBPS_DEFAULT && r.dev_gflops == 600.0,
+              "an unset variable keeps its seed (the empty mix's 600 GFLOP/s)");
+        fake_env_h2d = "-3";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "a negative override keeps the seed");
+        fake_env_h2d = "nan";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "a non-finite override keeps the seed");
+        fake_env_h2d = "fast";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "an unparsable override keeps the seed");
+        fake_env_h2d = "0";
+        r            = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, getenv_fn);
+        CHECK(r.h2d_gbps == 20.0, "a zero override keeps the seed");
+        auto all_fn = [](const char * name) -> const char * {
+            const std::string n(name);
+            return n == "GGML_SYCL_MOE_EXEC_H2D_GBPS"   ? "1" :
+                   n == "GGML_SYCL_MOE_EXEC_CPU_GBPS"   ? "2" :
+                   n == "GGML_SYCL_MOE_EXEC_DEV_GFLOPS" ? "3" :
+                                                          nullptr;
+        };
+        r = moe_exec_rates_seed({});
+        moe_exec_rates_apply_env(r, all_fn);
+        CHECK(r.h2d_gbps == 1.0 && r.cpu_gbps == 2.0 && r.dev_gflops == 3.0,
+              "each of the three variables overrides its own rate");
+        // the retired reorder knob moves no rate
+        auto reorder_fn = [](const char * name) -> const char * {
+            return std::string(name) == "GGML_SYCL_MOE_EXEC_REORDER_GBPS" ? "4" : nullptr;
+        };
+        moe_exec_rates       knob = moe_exec_rates_seed({});
+        const moe_exec_rates base = knob;
+        moe_exec_rates_apply_env(knob, reorder_fn);
+        CHECK(knob.h2d_gbps == base.h2d_gbps && knob.cpu_gbps == base.cpu_gbps && knob.dev_gflops == base.dev_gflops &&
+                  knob.cpu_gflops == base.cpu_gflops,
+              "GGML_SYCL_MOE_EXEC_REORDER_GBPS is not read");
+        moe_exec_rates_apply_env(r, nullptr);
+        CHECK(r.h2d_gbps == 1.0, "a null getenv keeps what the record holds");
+    }
+    // the H2D probe's aggregation (llama.cpp-xr4i): the max over iterations 2..n, so one slow window cannot drag the
+    // persisted rate down, and none when even that max is under half the seed
+    {
+        double       lo        = -1.0;
+        double       hi        = -1.0;
+        const double steady[8] = { 9.3, 25.1, 24.8, 26.0, 25.5, 24.9, 25.2, 25.0 };
+        double       r         = moe_exec_h2d_rate_from_iterations(steady, 8, 20.0, &lo, &hi);
+        CHECK(r == 26.0 && hi == 26.0, "the rate is the max over iterations 2..8");
+        CHECK(lo == 24.8, "the spread's low end is the min over iterations 2..8, not the slow first iteration");
+        const double one_slow[8] = { 25.0, 25.3, 9.4, 25.6, 25.1, 25.4, 25.2, 25.5 };
+        r                        = moe_exec_h2d_rate_from_iterations(one_slow, 8, 20.0, &lo, &hi);
+        CHECK(r == 25.6 && lo == 9.4 && hi == 25.6, "one slow window among 2..8 neither lowers the rate nor hides");
+        const double fast_first[8] = { 31.0, 24.0, 25.0, 24.5, 24.0, 24.2, 24.1, 24.4 };
+        r                          = moe_exec_h2d_rate_from_iterations(fast_first, 8, 20.0, &lo, &hi);
+        CHECK(r == 25.0 && hi == 25.0, "iteration 1 is a warm-up: a fast one is not the rate");
+        const double slow[8] = { 9.3, 9.8, 9.6, 9.5, 9.9, 9.7, 9.6, 9.4 };
+        r                    = moe_exec_h2d_rate_from_iterations(slow, 8, 20.0, &lo, &hi);
+        CHECK(r == 0.0, "a max under half the seed yields no rate, so the probe retries");
+        CHECK(lo == 9.4 && hi == 9.9, "the spread is still reported for a rejected window");
+        const double edge[3] = { 1.0, 10.0, 9.0 };
+        CHECK(moe_exec_h2d_rate_from_iterations(edge, 3, 20.0, &lo, &hi) == 10.0, "exactly half the seed is kept");
+        const double under[3] = { 1.0, 9.99, 9.0 };
+        CHECK(moe_exec_h2d_rate_from_iterations(under, 3, 20.0, &lo, &hi) == 0.0, "just under half the seed is not");
+        const double bad[8] = { 25.0, 0.0, -3.0, NAN, INFINITY, 12.0, 0.0, 14.0 };
+        r                   = moe_exec_h2d_rate_from_iterations(bad, 8, 20.0, &lo, &hi);
+        CHECK(r == 14.0 && lo == 12.0 && hi == 14.0, "zero, negative and non-finite iterations are skipped");
+        const double none[4] = { 25.0, 0.0, NAN, -1.0 };
+        r                    = moe_exec_h2d_rate_from_iterations(none, 4, 20.0, &lo, &hi);
+        CHECK(r == 0.0 && lo == 0.0 && hi == 0.0, "no valid iteration yields no rate and a zero spread");
+        const double two[2] = { 30.0, 22.0 };
+        CHECK(moe_exec_h2d_rate_from_iterations(two, 2, 20.0, nullptr, nullptr) == 22.0,
+              "two iterations use the second alone, and the spread outputs are optional");
+        CHECK(moe_exec_h2d_rate_from_iterations(two, 1, 20.0, &lo, &hi) == 0.0 && lo == 0.0 && hi == 0.0,
+              "a single iteration is only the warm-up");
+        CHECK(moe_exec_h2d_rate_from_iterations(nullptr, 0, 20.0, &lo, &hi) == 0.0, "no iterations yield no rate");
+        const moe_exec_rates seed = moe_exec_rates_seed({});
+        CHECK(moe_exec_h2d_rate_from_iterations(slow, 8, seed.h2d_gbps, nullptr, nullptr) == 0.0 &&
+                  moe_exec_h2d_rate_from_iterations(steady, 8, seed.h2d_gbps, nullptr, nullptr) == 26.0,
+              "the bimodal readings of llama.cpp-zujy c-vbf4: 9.x GB/s rejected, 24-26 GB/s kept, against the seed");
+    }
+    std::printf("test-moe-exec-cost: %d cases, %d failures\n", g_cases, g_failures);
+    return g_failures == 0 ? 0 : 1;
+}

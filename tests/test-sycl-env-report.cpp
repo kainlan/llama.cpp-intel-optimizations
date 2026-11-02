@@ -36,6 +36,9 @@
 // non-default. Keep in sync with ggml/src/ggml-sycl/ggml-sycl.cpp.
 #define REPORT_MARKER "non-default settings in effect"
 
+// The one WARN a retired GGML_SYCL_PIPELINE_CPU gets at init (llama.cpp-z4kd).
+#define RETIRED_MARKER "GGML_SYCL_PIPELINE_CPU is retired"
+
 static std::string g_log;
 
 static void capture_log(enum ggml_log_level level, const char * text, void * user_data) {
@@ -83,6 +86,10 @@ int main() {
     // this process goes on to do.
     set_env_var("GGML_SYCL_ASYNC_MEM", "1");
 
+    // GGML_SYCL_PIPELINE_CPU is retired (llama.cpp-z4kd): nothing reads its value, and the backend
+    // must say so once at init, not only when a host-expert decode reaches the CPU dispatch.
+    set_env_var("GGML_SYCL_PIPELINE_CPU", "1");
+
     // Must be installed before the first backend init: ggml_check_sycl() runs
     // once per process behind a static guard, so there is no second chance.
     ggml_log_set(capture_log, nullptr);
@@ -127,6 +134,12 @@ int main() {
     CHECK(async_reported || async_declined, "GGML_SYCL_ASYNC_MEM=1 was neither reported nor explained");
     std::fprintf(stderr, "INFO: GGML_SYCL_ASYNC_MEM=1 %s\n",
                  async_reported ? "reported in effect" : "declined with a reason");
+
+    size_t retired_count = 0;
+    for (size_t at = g_log.find(RETIRED_MARKER); at != std::string::npos; at = g_log.find(RETIRED_MARKER, at + 1)) {
+        ++retired_count;
+    }
+    CHECK(retired_count == 1, "GGML_SYCL_PIPELINE_CPU=1 did not log exactly one retired WARN at backend init");
 
     ggml_backend_free(backend);
 

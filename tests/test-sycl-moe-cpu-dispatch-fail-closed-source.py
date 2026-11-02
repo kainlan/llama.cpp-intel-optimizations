@@ -19,9 +19,10 @@ Four more paths in the same family drop rows the same way, and are closed here t
     expert gets no task, yet its scatter entry (zeroed output rows) is still published;
   * the planner CPU path (dispatch_cpu_entries_now) logs "Failed planner CPU dispatch staging
     alloc" and `return`s, leaving dst unwritten for every entry of that dispatch;
-  * flush_pending_cpu_scatter / flush_pending_cpu_pipeline wrap `future.get()` and the scatter
-    H2D submission in `catch (std::exception)` that only logs, so a throwing CPU worker or a
-    failed scatter submission clears the pending state and loses the rows.
+  * flush_pending_cpu_scatter wraps `future.get()` and the scatter H2D submission in
+    `catch (std::exception)` that only logs, so a throwing CPU worker or a failed scatter
+    submission clears the pending state and loses the rows.  (The opt-in pipeline slot's flush
+    had the same shape; that slot was removed by llama.cpp-z4kd.)
 
 THE CONTRACT (comments blanked).  Each of those sites ABORTS, naming the site and the failed
 request (GGML_ABORT), instead of returning, continuing or logging:
@@ -37,7 +38,7 @@ request (GGML_ABORT), instead of returning, continuing or logging:
      apply (the apply lambdas keep their own `if (!r.valid) return;` -- that is pinned by
      test-sycl-moe-cpu-activation-row-source.py and is now unreachable for a non-empty dispatch);
   5. dispatch_cpu_entries_now's staging-failure block aborts and contains no return;
-  6. the catch blocks in flush_pending_cpu_scatter and flush_pending_cpu_pipeline abort.
+  6. the catch block in flush_pending_cpu_scatter's per-slot flush aborts.
 
 THE CAUSE of the intermittent allocation failure (the other half of llama.cpp-93tw; observed
 with GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1, which logs each [UNIFIED-ALLOC-STALE-CLAIM]).  A
@@ -57,8 +58,8 @@ real corruption and still fails.
      refuses a LIVE one, and is the only registry-presence check before the emplace at either
      site; the claim is logged under the lifetime trace (stale_claim_report), and a release
      records its thread (release_tid, "release-begin" line);
-  8. flush_pending_cpu_scatter and flush_pending_cpu_pipeline assert a stream, an output buffer
-     and a destination for every entry instead of skipping quietly;
+  8. flush_pending_cpu_scatter asserts a stream, an output buffer and a CPU job for every slot it
+     flushes, and a destination for every entry, instead of skipping quietly;
   9. every expert_dispatch_entry the HYBRID branch builds (the region between the first and the
      second `std::vector<expert_dispatch_entry> cpu_entries;`) passes allow_cpu_fallback=false.
      That is what keeps dispatch_cpu_compute's allow_cpu_fallback=true arm of the `!host_weight`
@@ -203,8 +204,15 @@ def check_backend(backend_src: str) -> None:
         )
     if not re.search(r"if \(entries\.empty\(\)\) \{ return result; \}", lam_sq):
         raise ContractError(f"FAIL: dispatch_cpu_compute's first return is not the empty-entries guard ({TAG})")
-    if not re.search(r"result\.valid = true; return result; \}$", lam_sq):
-        raise ContractError(f"FAIL: dispatch_cpu_compute does not end with `result.valid = true; return result;` ({TAG})")
+    # `result.valid = true;` sits on the lambda's final straight-line run: after it come only plain
+    # `result.<field> = <expr>;` copies (llama.cpp-yx28 added the pool/row metadata there) and then the
+    # final `return result;`. A brace, a call statement or a second return in that run would put the
+    # valid flag under a condition or let an unset result escape, so the run admits none of them.
+    if not re.search(r"result\.valid = true;(?: result\.\w+ = [^;{}()]*(?:\([^;{}]*\))?[^;{}()]*;)* return result; \}$", lam_sq):
+        raise ContractError(
+            f"FAIL: dispatch_cpu_compute does not end with `result.valid = true;` followed only by plain "
+            f"`result.<field> = ...;` copies and `return result;` ({TAG})"
+        )
 
     # 3. a host expert without a host weight aborts for every entry, and never `continue`s.
     nohost = block_after(lam, r"if\s*\(\s*!host_weight\s*\)", "the `!host_weight` block")
@@ -215,7 +223,7 @@ def check_backend(backend_src: str) -> None:
     d_and_s = block_after(code, r"auto dispatch_cpu_and_scatter\s*=\s*\[&\]\s*\(", "dispatch_cpu_and_scatter")
     d_sq = squash(d_and_s)
     m = re.search(
-        r"if \(entries\.empty\(\)\) \{ return; \} auto r = dispatch_cpu_compute\(entries, pool_first_entry\); "
+        r"if \(entries\.empty\(\)\) \{ return; \} auto r = dispatch_cpu_compute\(entries, pool_first_entry(?:, \w+)*\); "
         r"GGML_ASSERT\(r\.valid &&",
         d_sq,
     )
@@ -224,11 +232,21 @@ def check_backend(backend_src: str) -> None:
             f"FAIL: dispatch_cpu_and_scatter must return on an empty list and otherwise GGML_ASSERT(r.valid && ...) "
             f"before apply_cpu_result_to_scatter ({TAG})"
         )
-    join = re.search(r"auto cpu_result = cpu_compute_future\.get\(\);\s*GGML_ASSERT\(\s*cpu_result\.valid\s*&&", code)
-    if not join:
+    # Every result of dispatch_cpu_compute is asserted valid straight after it is obtained. Since
+    # llama.cpp-yx28 the TG path calls it on the submitting thread (the std::async join is gone), so
+    # the check is over every call site, not one spelling: a new caller without the assert fails.
+    calls = [m.start() for m in re.finditer(r"\bdispatch_cpu_compute\(", code)]
+    asserted = list(re.finditer(
+        r"auto (\w+) = dispatch_cpu_compute\([^;]*\);\s*GGML_ASSERT\(\s*\1\.valid\s*&&", code))
+    if len(calls) < 2:
         raise ContractError(
-            f"FAIL: the async TG join does not GGML_ASSERT(cpu_result.valid && ...) straight after "
-            f"cpu_compute_future.get() ({TAG})"
+            f"FAIL: found {len(calls)} dispatch_cpu_compute call sites, expected at least 2 (the sequential "
+            f"path and the TG path) -- renamed or moved? ({TAG})"
+        )
+    if len(asserted) != len(calls):
+        raise ContractError(
+            f"FAIL: {len(calls) - len(asserted)} of {len(calls)} dispatch_cpu_compute call sites do not "
+            f"GGML_ASSERT(<result>.valid && ...) straight after the call ({TAG})"
         )
 
     # 5. the planner CPU path.
@@ -240,18 +258,33 @@ def check_backend(backend_src: str) -> None:
     forbid(planner, r"\breturn\b", "dispatch_cpu_entries_now's staging-failure block returns, leaving dst unwritten")
 
     # 6. the deferred flushes do not swallow a failed CPU future or scatter submission.
-    for fn, tagname in (("flush_pending_cpu_scatter", "[CPU-TG]"), ("flush_pending_cpu_pipeline", "[PIPELINE-CPU]")):
-        body = block_after(code, r"static void " + fn + r"\(\)\s*", fn)
-        catch = block_after(body, r"catch\s*\(\s*const std::exception\s*&\s*ex\s*\)", f"the catch block of {fn}")
-        require_abort(catch, f"the catch block of {fn} ({tagname})")
+    # Since llama.cpp-yx28 each pending CPU scatter lives in a slot (primary and sibling) and the
+    # per-slot flush carries the body; flush_pending_cpu_scatter only drains both slots.
+    fn = "flush_pending_cpu_scatter_slot"
+    body = block_after(code, r"static void " + fn + r"\(pending_cpu_scatter & slot\)\s*", fn)
+    catch = block_after(body, r"catch\s*\(\s*const std::exception\s*&\s*ex\s*\)", f"the catch block of {fn}")
+    require_abort(catch, f"the catch block of {fn} ([CPU-TG])")
 
     # 8. the scatter flush does not skip quietly.
-    scatter = block_after(code, r"static void flush_pending_cpu_scatter\(\)\s*", "flush_pending_cpu_scatter")
-    sc = squash(scatter)
-    if not re.search(r"GGML_ASSERT\(g_pending_scatter\.stream && g_pending_scatter\.out_pinned &&", sc):
+    drain = squash(block_after(code, r"static void flush_pending_cpu_scatter\(\)\s*", "flush_pending_cpu_scatter"))
+    if drain != "{ flush_pending_cpu_scatter_slot(g_pending_scatter_sibling); flush_pending_cpu_scatter_slot(g_pending_scatter); }":
         raise ContractError(
-            f"FAIL: flush_pending_cpu_scatter does not GGML_ASSERT a stream and an output buffer; a pending scatter "
-            f"without them would be skipped and its rows lost ({TAG})"
+            f"FAIL: flush_pending_cpu_scatter must flush exactly the sibling slot then the primary slot, "
+            f"unconditionally; a skipped slot loses its host-expert rows ({TAG})"
+        )
+    scatter = block_after(code, r"static void flush_pending_cpu_scatter_slot\(pending_cpu_scatter & slot\)\s*",
+                          "flush_pending_cpu_scatter_slot")
+    sc = squash(scatter)
+    # Every slot of the flush group (the slot and the partner it takes along) carries a stream, an output
+    # buffer and the CPU job its join waits for (llama.cpp-z4kd).
+    if not re.search(
+        r"for \(int k = 0; k < n_group; \+\+k\) \{ GGML_ASSERT\(group\[k\]->stream && group\[k\]->out_pinned && "
+        r"group\[k\]->future\.valid\(\) &&",
+        sc,
+    ):
+        raise ContractError(
+            f"FAIL: flush_pending_cpu_scatter does not GGML_ASSERT a stream, an output buffer and a CPU job for "
+            f"every slot it flushes; a pending scatter without them would be skipped and its rows lost ({TAG})"
         )
     if not re.search(r"GGML_ASSERT\(entries\[i\]\.dst_device &&", sc):
         raise ContractError(
@@ -260,24 +293,8 @@ def check_backend(backend_src: str) -> None:
         )
     if re.search(r"if \(!entries\[i\]\.dst_device\)", sc):
         raise ContractError(f"FAIL: flush_pending_cpu_scatter skips a destination-less entry again ({TAG})")
-    if re.search(r"if \(g_pending_scatter\.stream && g_pending_scatter\.out_pinned\)", sc):
+    if re.search(r"if \((slot\.|group\[k\]->)stream && (slot\.|group\[k\]->)out_pinned", sc):
         raise ContractError(f"FAIL: flush_pending_cpu_scatter makes the scatter conditional on a stream again ({TAG})")
-
-    # 8b. so does the (opt-in) pipeline flush.
-    pipe = squash(block_after(code, r"static void flush_pending_cpu_pipeline\(\)\s*", "flush_pending_cpu_pipeline"))
-    if not re.search(r"GGML_ASSERT\(g_pending_cpu_pipeline\.stream && g_pending_cpu_pipeline\.out_pinned &&", pipe):
-        raise ContractError(
-            f"FAIL: flush_pending_cpu_pipeline does not GGML_ASSERT a stream and an output buffer; a pending pipeline "
-            f"merge without them would be skipped and its rows lost ({TAG})"
-        )
-    if not re.search(r"GGML_ASSERT\(e\.dst_device &&", pipe):
-        raise ContractError(
-            f"FAIL: flush_pending_cpu_pipeline does not GGML_ASSERT every entry's destination ({TAG})"
-        )
-    if re.search(r"if \(e\.dst_device\)", pipe) or re.search(
-        r"if \(g_pending_cpu_pipeline\.stream && g_pending_cpu_pipeline\.out_pinned\)", pipe
-    ):
-        raise ContractError(f"FAIL: flush_pending_cpu_pipeline skips an entry or the merge quietly again ({TAG})")
 
     # 9. the hybrid branch builds only allow_cpu_fallback=false entries.
     decl = [m.start() for m in re.finditer(r"std::vector<expert_dispatch_entry>\s+cpu_entries\s*;", code)]
@@ -318,7 +335,9 @@ def check_cache(cache_src: str) -> None:
     h = squash(helper)
     if not re.search(r"state\s*!=\s*runtime_alloc_state::RELEASING\s*\)\s*\{\s*return false;", h):
         raise ContractError(f"FAIL: runtime_registry_claim_ptr_locked must refuse a row that is not RELEASING ({TAG})")
-    if not re.search(r"g_runtime_alloc_registry\.erase\(", h):
+    # Registry rows are erased through runtime_registry_erase_locked since llama.cpp-ii25 (it keeps the
+    # containment index in step); a raw unordered_map erase still counts, so a bypass is not a pass.
+    if not re.search(r"\b(?:g_runtime_alloc_registry\.erase|runtime_registry_erase_locked)\(", h):
         raise ContractError(f"FAIL: runtime_registry_claim_ptr_locked does not erase the stale RELEASING row ({TAG})")
 
     commit = block_after(code, r"static bool arena_runtime_registry_commit\s*\(", "arena_runtime_registry_commit")
@@ -334,7 +353,12 @@ def check_cache(cache_src: str) -> None:
     if reg_at < 0:
         raise ContractError(f"FAIL: unified_alloc's registration site was not found ({TAG})")
     site = squash(code[reg_at : reg_at + 2500])
-    if "runtime_registry_claim_ptr_locked(ptr, stale_claim)" not in site.split("g_runtime_alloc_registry.emplace(ptr, rec)")[0]:
+    # Registration inserts through runtime_registry_emplace_locked since llama.cpp-ii25. The emplace must be
+    # FOUND: splitting on an absent anchor returns the whole site and would pass on any claim anywhere in it.
+    emplace = "runtime_registry_emplace_locked(ptr, rec)"
+    if emplace not in site:
+        raise ContractError(f"FAIL: unified_alloc's registration emplace `{emplace}` was not found -- renamed or moved? ({TAG})")
+    if "runtime_registry_claim_ptr_locked(ptr, stale_claim)" not in site.split(emplace)[0]:
         raise ContractError(f"FAIL: unified_alloc's registration does not claim the pointer through the helper before its emplace ({TAG})")
     if re.search(r"g_runtime_alloc_registry\.find\(ptr\)\s*==\s*g_runtime_alloc_registry\.end\(\)", site):
         raise ContractError(
@@ -400,7 +424,18 @@ def mutants(backend: str, cache: str):
         backend, "if (entries.empty()) {\n                    return;\n                }\n                auto r = dispatch_cpu_compute",
         "auto r = dispatch_cpu_compute",
     ), cache
-    yield "async join drops the validity assert", mutate(
+    yield "the valid flag is set under a condition", mutate(
+        backend, "result.valid             = true;", "if (n_cpu > 0) { result.valid = true; }"
+    ), cache
+    yield "a trailing call runs after the valid flag", mutate(
+        backend, "result.valid             = true;", "result.valid             = true;\n                flush_pending_cpu_scatter();"
+    ), cache
+    yield "a caller without the validity assert", mutate(
+        backend, "auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);",
+        "auto spare_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n"
+        "                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);"
+    ), cache
+    yield "TG-path caller drops the validity assert", mutate(
         backend, "GGML_ASSERT(cpu_result.valid &&", "GGML_ASSERT(true &&"
     ), cache
     planner = 'GGML_ABORT(\n                        "[MoE] Failed planner CPU dispatch staging alloc'
@@ -414,19 +449,17 @@ def mutants(backend: str, cache: str):
         backend, 'GGML_ABORT("[CPU-TG] Deferred scatter failed', 'GGML_LOG_ERROR("[CPU-TG] Deferred scatter failed'
     ), cache
     yield "scatter flush skips a missing stream quietly again", mutate(
-        backend, "GGML_ASSERT(g_pending_scatter.stream && g_pending_scatter.out_pinned &&", "GGML_ASSERT(true &&"
+        backend, "GGML_ASSERT(group[k]->stream && group[k]->out_pinned &&", "GGML_ASSERT(true &&"
+    ), cache
+    yield "scatter flush drains only one slot", mutate(
+        backend, "    flush_pending_cpu_scatter_slot(g_pending_scatter_sibling);\n", ""
+    ), cache
+    yield "scatter flush makes the stream conditional again", mutate(
+        backend, "GGML_ASSERT(group[k]->stream && group[k]->out_pinned &&",
+        "if (group[k]->stream && group[k]->out_pinned) GGML_ASSERT(true &&"
     ), cache
     yield "scatter flush skips a destination-less entry again", mutate(
         backend, "GGML_ASSERT(entries[i].dst_device &&", "if (!entries[i].dst_device) { i++; continue; } GGML_ASSERT(true &&"
-    ), cache
-    yield "pipeline flush skips a missing stream quietly again", mutate(
-        backend, "GGML_ASSERT(g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned &&", "GGML_ASSERT(true &&"
-    ), cache
-    yield "pipeline flush skips a destination-less entry again", mutate(
-        backend, "GGML_ASSERT(e.dst_device &&", "if (!e.dst_device) { continue; } GGML_ASSERT(true &&"
-    ), cache
-    yield "pipeline flush guards on dst_device again", mutate(
-        backend, "GGML_ASSERT(e.dst_device &&", "if (e.dst_device) GGML_ASSERT(true &&"
     ), cache
     yield "a hybrid-branch entry allows CPU fallback", mutate(
         backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",
@@ -436,20 +469,28 @@ def mutants(backend: str, cache: str):
         backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",
         "operand.actual_layout(), operand.lease());",
     ), cache
-    yield "deferred pipeline merge swallows exceptions again", mutate(
-        backend, 'GGML_ABORT("[PIPELINE-CPU] Deferred merge failed', 'GGML_LOG_ERROR("[PIPELINE-CPU] Deferred merge failed'
-    ), cache
     yield "claim helper accepts a LIVE row", backend, mutate(
         cache, "if (it->second.state != runtime_alloc_state::RELEASING) {", "if (false) {"
     )
     yield "claim helper no longer erases the stale row", backend, mutate(
-        cache, "    g_runtime_alloc_registry.erase(it);\n    return true;\n}\n\nstatic bool arena_runtime_registry_commit",
+        cache, "    runtime_registry_erase_locked(it);\n    return true;\n}\n\nstatic bool arena_runtime_registry_commit",
         "    return true;\n}\n\nstatic bool arena_runtime_registry_commit",
     )
     yield "unified_alloc registration is back to a bare find", backend, mutate(
         cache,
         "if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {\n                    auto inserted",
         "if (g_runtime_alloc_registry.find(ptr) == g_runtime_alloc_registry.end()) {\n                    auto inserted",
+    )
+    yield "unified_alloc registration emplace renamed (anchor must not pass vacuously)", backend, mutate(
+        cache,
+        "if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {\n                    auto inserted = runtime_registry_emplace_locked(ptr, rec);",
+        "if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {\n                    auto inserted = runtime_registry_insert_locked(ptr, rec);",
+    )
+    yield "unified_alloc registration claims only after its emplace", backend, mutate(
+        cache,
+        "if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {\n                    auto inserted = runtime_registry_emplace_locked(ptr, rec);",
+        "auto inserted = runtime_registry_emplace_locked(ptr, rec);\n"
+        "                if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {",
     )
     yield "claim helper stops recording the stale row", backend, mutate(
         cache, "report.claimed     = true;", "report.claimed     = false;"

@@ -1374,9 +1374,36 @@ static void materialize_reason_contract() {
           "NO_BACKEND_CONTEXT name changed -- the gate grep for it would fail open");
 }
 
+// llama.cpp-n8da: a workspace is admitted only by a backend context on its owner device, and a backend context exists
+// only for a device the registry exposes. With two physical GPUs the backend exposes device 0 alone by default, so the
+// planner may place experts on device 1 but must not plan an MMID workspace there: nothing can bind or admit it, and
+// materialization is all-or-nothing, so its missing binding also withheld device 0's pool.
+static void owner_admissible_only_on_an_exposed_device() {
+    // The predicate takes the registry's exposed count (ggml_sycl_info().device_count), never the physical count
+    // (total_gpu_count). Default two-GPU host: 2 physical, 1 exposed.
+    constexpr int physical_gpus   = 2;
+    constexpr int exposed_default = 1;
+    check(moe_mmid_owner_admissible(0, exposed_default), "the exposed primary must be an admissible MMID owner");
+    check(!moe_mmid_owner_admissible(1, exposed_default), "a hidden physical GPU must not be an admissible MMID owner");
+    // Passing the physical count instead would admit the hidden device: that is the wrong quantity. This case pins
+    // only the predicate; which count the planner call sites pass is pinned by
+    // tests/test-sycl-mmid-owner-exposed-count-source.py.
+    check(moe_mmid_owner_admissible(1, physical_gpus) != moe_mmid_owner_admissible(1, exposed_default),
+          "owner 1's answer must depend on whether the count is exposed or physical");
+    // Split modes expose every GPU (exposed == physical), so a secondary owner is a real backend device there.
+    constexpr int exposed_all = physical_gpus;
+    check(moe_mmid_owner_admissible(1, exposed_all), "an exposed secondary device must be an admissible MMID owner");
+    check(!moe_mmid_owner_admissible(2, exposed_all), "the index one past the exposed count must not be admissible");
+    // No registry device: no backend context can exist, so no owner can be admitted.
+    check(!moe_mmid_owner_admissible(0, 0), "no owner is admissible when the registry exposes nothing");
+    check(!moe_mmid_owner_admissible(0, -1), "a negative exposed count must not admit an owner");
+    check(!moe_mmid_owner_admissible(-1, 2), "a negative owner (host) must not be admissible");
+}
+
 int main() {
     try {
         materialize_reason_contract();
+        owner_admissible_only_on_an_exposed_device();
         geometry_exact_and_boundary();
         exact_256_slice_start_after_128_bytes();
         broadcast_and_occurrences();

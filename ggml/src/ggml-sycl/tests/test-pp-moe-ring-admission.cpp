@@ -24,8 +24,16 @@
 
 #include <cstdio>
 #include <limits>
+#include <string>
 
 using ggml_sycl::pp_moe_onednn_admit_ring;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_action;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_action_name;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_decide;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_decision;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_inputs;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_plan_room;
+using ggml_sycl::pp_moe_onednn_explicit_ubatch_room;
 using ggml_sycl::pp_moe_onednn_ring_admission;
 using ggml_sycl::pp_moe_onednn_ring_admission_inputs;
 
@@ -292,6 +300,191 @@ void test_degenerate_and_overflow() {
     check(rh.largest_fitting_n_ubatch == 256, "and the largest fit is the last rung before the overflow, 256");
 }
 
+// An explicit micro-batch (pp_moe_onednn_explicit_ubatch_plan_room/_decide). THE SHAPE THIS IS FIT TO (B70,
+// Qwen3.8-Flash-Next IQ3_XXS): weight slot 425 MiB, per row 2.5 MiB activation + 5 MiB output, ring depth 1, so the
+// ring is 4265 MiB at the default 512 and 15785 MiB at -ub 2048. Dense scratch 6912 + 12288 B/token plus a 60 MiB
+// weight copy; the rest of the RUNTIME requirement (compute and state terms, MoE control, host scatter) is about 2168
+// MiB. The experts were packed into about 18880 MiB of the WEIGHT zone. Every figure is a multiple of 256, so the
+// zone's rounding enters only the alignment case.
+constexpr size_t kQwenWeightSlot   = 425ull * kMiB;
+constexpr size_t kQwenActPerRow    = 2621440ull;
+constexpr size_t kQwenOutPerRow    = 5242880ull;
+constexpr size_t kQwenFixed        = 2168ull * kMiB;
+constexpr size_t kQwenExpertBudget = 18880ull * kMiB;
+
+constexpr size_t qwen_dense(uint32_t n_ubatch) {
+    return 6912ull * n_ubatch + 60ull * kMiB + 12288ull * n_ubatch;
+}
+
+constexpr size_t qwen_ring(uint32_t n_ubatch) {
+    return kQwenWeightSlot + static_cast<size_t>(n_ubatch) * (kQwenActPerRow + kQwenOutPerRow);
+}
+
+constexpr size_t qwen_zone(uint32_t n_ubatch) {
+    return kQwenFixed + qwen_dense(n_ubatch) + qwen_ring(n_ubatch);
+}
+
+pp_moe_onednn_explicit_ubatch_inputs qwen_inputs(uint32_t n_ubatch, size_t runtime_zone) {
+    pp_moe_onednn_explicit_ubatch_inputs in;
+    in.n_ubatch                    = n_ubatch;
+    in.n_ubatch_default            = 512;
+    in.weight_slot_bytes           = kQwenWeightSlot;
+    in.activation_bytes_per_row    = kQwenActPerRow;
+    in.output_bytes_per_row        = kQwenOutPerRow;
+    in.ring_depth                  = 1;
+    in.runtime_fixed_bytes         = kQwenFixed;
+    in.dense_scratch_default_bytes = qwen_dense(512);
+    in.dense_scratch_bytes         = qwen_dense(n_ubatch);
+    in.runtime_floor_bytes         = 512ull * kMiB;
+    in.runtime_zone_bytes          = runtime_zone;
+    return in;
+}
+
+void test_explicit_ubatch_room_qwen_b70() {
+    printf("explicit -ub 2048, Qwen3.8 on the B70:\n");
+    check(qwen_ring(512) == 4265ull * kMiB && qwen_ring(2048) == 15785ull * kMiB,
+          "the fixture reproduces the log's rings: 4265 MiB at 512, 15785 MiB at 2048");
+
+    // The load's first stage: the zone is the one the default micro-batch planned.
+    const pp_moe_onednn_explicit_ubatch_room room =
+        pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(2048, qwen_zone(512)));
+    check(room.valid, "an explicit 2048 above the default 512 with a ring is a room to plan");
+    check(room.ring_bytes == 15785ull * kMiB, "the ring at 2048 is 15785 MiB");
+    check(room.zone_default_bytes == qwen_zone(512), "the default zone is fixed + dense(512) + ring(512)");
+    check(room.zone_bytes == qwen_zone(2048), "the zone for 2048 is fixed + dense(2048) + ring(2048)");
+    check(room.room_bytes == 11520ull * kMiB + (qwen_dense(2048) - qwen_dense(512)),
+          "the room is the ring's 11520 MiB growth plus the dense scratch's");
+    check(room.room_reserved_bytes == 0, "the default zone holds none of it");
+
+    const pp_moe_onednn_explicit_ubatch_decision grow = pp_moe_onednn_explicit_ubatch_decide(room, kQwenExpertBudget);
+    check(grow.action == pp_moe_onednn_explicit_ubatch_action::GROW_ZONE,
+          "18880 MiB of device experts can give up the room: grow the zone, then re-plan");
+
+    // The re-plan, with the zone grown by exactly the room: placed.
+    const pp_moe_onednn_explicit_ubatch_room grown =
+        pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(2048, qwen_zone(2048)));
+    check(grown.room_bytes == room.room_bytes && grown.room_reserved_bytes == room.room_bytes,
+          "a zone grown to the 2048 size holds the whole room");
+    const size_t left = kQwenExpertBudget - room.room_bytes;
+    check(pp_moe_onednn_explicit_ubatch_decide(grown, left).action == pp_moe_onednn_explicit_ubatch_action::PLACE,
+          "and the experts packed beside it are placed");
+    check(pp_moe_onednn_explicit_ubatch_decide(grown, 0).action == pp_moe_onednn_explicit_ubatch_action::PLACE,
+          "a zone that already holds the room is placed whatever the experts were packed into");
+
+    // A zone a load stage grew for a smaller requirement: only the rest has to come from the experts.
+    const size_t                             short_by = 2000ull * kMiB;
+    const pp_moe_onednn_explicit_ubatch_room part =
+        pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(2048, qwen_zone(2048) - short_by));
+    check(part.room_reserved_bytes == room.room_bytes - short_by, "a part-grown zone holds the room less the rest");
+    check(
+        pp_moe_onednn_explicit_ubatch_decide(part, short_by).action == pp_moe_onednn_explicit_ubatch_action::GROW_ZONE,
+        "the experts can give the rest: grow");
+    check(
+        pp_moe_onednn_explicit_ubatch_decide(part, short_by - 1).action == pp_moe_onednn_explicit_ubatch_action::REFUSE,
+        "one byte short of the rest: refuse");
+}
+
+void test_explicit_ubatch_refusal_names_the_largest_fit() {
+    printf("explicit -ub the experts cannot make room for:\n");
+    // -ub 4096: the ring is 31145 MiB, more than the default zone plus every device expert.
+    const pp_moe_onednn_explicit_ubatch_room room =
+        pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(4096, qwen_zone(512)));
+    check(room.ring_bytes == 31145ull * kMiB, "the ring at 4096 is 31145 MiB");
+    const pp_moe_onednn_explicit_ubatch_decision d = pp_moe_onednn_explicit_ubatch_decide(room, kQwenExpertBudget);
+    check(d.action == pp_moe_onednn_explicit_ubatch_action::REFUSE, "a room above the expert budget is refused");
+    check(d.max_ring_runtime_bytes == qwen_zone(512) + kQwenExpertBudget - kQwenFixed - qwen_dense(4096),
+          "the ring could have the default zone plus every device expert, less the fixed rest and the dense scratch");
+    // 425 MiB + n * 7.5 MiB <= that: n <= 3020.6, so 3008 is the last multiple of 32.
+    check(d.largest_fitting_n_ubatch == 3008, "the largest -ub that fits is 3008");
+
+    // Nothing demotable: the figure is what the zone alone holds, the 480 the old refusal printed for this model.
+    const pp_moe_onednn_explicit_ubatch_room room2048 =
+        pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(2048, qwen_zone(512)));
+    const pp_moe_onednn_explicit_ubatch_decision none = pp_moe_onednn_explicit_ubatch_decide(room2048, 0);
+    check(none.action == pp_moe_onednn_explicit_ubatch_action::REFUSE, "with no device expert to move, refuse");
+    check(none.largest_fitting_n_ubatch == 480, "and the largest -ub that fits the default zone is 480");
+}
+
+void test_explicit_ubatch_none_and_floor() {
+    printf("explicit -ub at or below what the default zone holds:\n");
+    check(!pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(512, qwen_zone(512))).valid,
+          "the default micro-batch itself is no explicit room");
+    check(!pp_moe_onednn_explicit_ubatch_plan_room(qwen_inputs(256, qwen_zone(512))).valid,
+          "a smaller one is none either: the zone was planned for 512");
+    pp_moe_onednn_explicit_ubatch_inputs dense_model = qwen_inputs(2048, qwen_zone(512));
+    dense_model.weight_slot_bytes                    = 0;
+    check(!pp_moe_onednn_explicit_ubatch_plan_room(dense_model).valid, "a model with no ring has no room");
+    pp_moe_onednn_explicit_ubatch_inputs no_default = qwen_inputs(2048, qwen_zone(512));
+    no_default.n_ubatch_default                     = 0;
+    check(!pp_moe_onednn_explicit_ubatch_plan_room(no_default).valid, "nor a load with no default micro-batch");
+    check(pp_moe_onednn_explicit_ubatch_decide(pp_moe_onednn_explicit_ubatch_room{}, kMax).action ==
+              pp_moe_onednn_explicit_ubatch_action::NONE,
+          "an invalid room decides nothing");
+
+    // A small ring under the zone's floor: the floor holds rings up to its size, and only the excess is a room.
+    pp_moe_onednn_explicit_ubatch_inputs small;
+    small.n_ubatch_default                         = 512;
+    small.weight_slot_bytes                        = 1ull * kMiB;
+    small.activation_bytes_per_row                 = 64ull * 1024ull;
+    small.output_bytes_per_row                     = 128ull * 1024ull;
+    small.ring_depth                               = 1;
+    small.runtime_floor_bytes                      = 512ull * kMiB;
+    small.runtime_zone_bytes                       = 512ull * kMiB;
+    small.n_ubatch                                 = 2048;  // ring 385 MiB, under the floor
+    const pp_moe_onednn_explicit_ubatch_room under = pp_moe_onednn_explicit_ubatch_plan_room(small);
+    check(under.valid && under.zone_default_bytes == 512ull * kMiB && under.zone_bytes == 512ull * kMiB &&
+              under.room_bytes == 0,
+          "a 385 MiB ring under the 512 MiB floor needs no room");
+    check(pp_moe_onednn_explicit_ubatch_decide(under, kMax).action == pp_moe_onednn_explicit_ubatch_action::NONE,
+          "so nothing is decided");
+    small.n_ubatch                                = 4096;  // ring 769 MiB
+    const pp_moe_onednn_explicit_ubatch_room over = pp_moe_onednn_explicit_ubatch_plan_room(small);
+    check(over.zone_bytes == 769ull * kMiB && over.room_bytes == 257ull * kMiB,
+          "a 769 MiB ring needs 257 MiB above the floor, not above the 97 MiB default ring");
+}
+
+void test_explicit_ubatch_alignment_and_overflow() {
+    printf("explicit -ub rounding and overflow:\n");
+    // Per-row bytes that are not multiples of 256: each slot rounds up as the ring allocates it, and the zone rounds
+    // up as the arena reserves it.
+    pp_moe_onednn_explicit_ubatch_inputs odd;
+    odd.n_ubatch                               = 1000;
+    odd.n_ubatch_default                       = 512;
+    odd.weight_slot_bytes                      = 1000;
+    odd.activation_bytes_per_row               = 3;
+    odd.output_bytes_per_row                   = 5;
+    odd.ring_depth                             = 2;
+    odd.runtime_fixed_bytes                    = 7;
+    odd.runtime_floor_bytes                    = 0;
+    const pp_moe_onednn_explicit_ubatch_room r = pp_moe_onednn_explicit_ubatch_plan_room(odd);
+    // slots: align256(3000) = 3072, align256(5000) = 5120; ring = 2 * (1000 + 3072 + 5120) = 18384.
+    check(r.ring_bytes == 18384, "each ubatch-scaled slot rounds up to 256 and the ring multiplies by its depth");
+    // zone = align256(7 + 0 + 18384) = 18432
+    check(r.zone_bytes == 18432, "the zone rounds up to 256 like the arena's");
+
+    pp_moe_onednn_explicit_ubatch_inputs huge   = qwen_inputs(4096, qwen_zone(512));
+    huge.activation_bytes_per_row               = kMax / 1024;
+    const pp_moe_onednn_explicit_ubatch_room hr = pp_moe_onednn_explicit_ubatch_plan_room(huge);
+    check(hr.valid && hr.ring_bytes == kMax && hr.room_bytes == kMax,
+          "a ring that overflows size_t is a room no budget holds, not a wrapped small one");
+    check(pp_moe_onednn_explicit_ubatch_decide(hr, kQwenExpertBudget).action ==
+              pp_moe_onednn_explicit_ubatch_action::REFUSE,
+          "so it is refused");
+}
+
+void test_explicit_ubatch_action_names() {
+    printf("explicit -ub action names:\n");
+    check(
+        std::string(pp_moe_onednn_explicit_ubatch_action_name(pp_moe_onednn_explicit_ubatch_action::NONE)) == "none" &&
+            std::string(pp_moe_onednn_explicit_ubatch_action_name(pp_moe_onednn_explicit_ubatch_action::PLACE)) ==
+                "place" &&
+            std::string(pp_moe_onednn_explicit_ubatch_action_name(pp_moe_onednn_explicit_ubatch_action::GROW_ZONE)) ==
+                "grow-zone" &&
+            std::string(pp_moe_onednn_explicit_ubatch_action_name(pp_moe_onednn_explicit_ubatch_action::REFUSE)) ==
+                "refuse",
+        "the four actions print as none, place, grow-zone and refuse");
+}
+
 }  // namespace
 
 int main() {
@@ -306,6 +499,11 @@ int main() {
     test_kv_zone_part_must_fit_the_largest_free_block();
     test_kv_zone_part_is_charged_to_the_vram_budget();
     test_degenerate_and_overflow();
+    test_explicit_ubatch_room_qwen_b70();
+    test_explicit_ubatch_refusal_names_the_largest_fit();
+    test_explicit_ubatch_none_and_floor();
+    test_explicit_ubatch_alignment_and_overflow();
+    test_explicit_ubatch_action_names();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -589,14 +589,17 @@ inline const char * moe_route_phase_name(moe_route_phase phase) {
 }
 
 enum class moe_route_kernel : uint8_t {
-    NONE          = 0,
-    HOST_CPU      = 1,
-    MMVQ_COMPAT   = 2,
-    SECONDARY_SOA = 3,
-    XMX_TILED     = 4,
-    MXFP4_I8      = 5,
-    MXFP4_DPAS    = 6,
+    NONE                     = 0,
+    HOST_CPU                 = 1,
+    MMVQ_COMPAT              = 2,
+    SECONDARY_SOA            = 3,
+    XMX_TILED                = 4,
+    MXFP4_I8                 = 5,
+    MXFP4_DPAS               = 6,
     DEVICE_MMVQ_Q1_NVFP4_AOS = 7,
+    // llama.cpp-348c: the batched oneDNN prompt executor, for a prompt whose (type, layout) the MMVQ id table does
+    // not serve: a type with no MMVQ id kernel (IQ4_XS, IQ1_S, IQ1_M), or Q4_0, Q8_0, Q4_K or Q6_K loaded SOA.
+    ONEDNN_BATCHED_PROMPT    = 8,
 };
 
 inline const char * moe_route_kernel_name(moe_route_kernel kernel) {
@@ -617,6 +620,8 @@ inline const char * moe_route_kernel_name(moe_route_kernel kernel) {
             return "mxfp4-dpas";
         case moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS:
             return "device-mmvq-q1-nvfp4-aos";
+        case moe_route_kernel::ONEDNN_BATCHED_PROMPT:
+            return "onednn-batched-prompt";
     }
     return "unknown";
 }

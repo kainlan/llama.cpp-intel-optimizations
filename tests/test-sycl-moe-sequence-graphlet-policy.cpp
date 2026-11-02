@@ -663,7 +663,9 @@ static int test_sequence_graphlet_identity_requires_transient_safety_key() {
     const size_t identity_pos    = sequence_fn.find("moe_graph_sequence_dispatch_identity_signature(sycl_ctx, node)");
     const size_t record_pos      = sequence_fn.find("moe_graph_record_moe_dispatch_graph");
     const size_t deferred_pos    = sequence_fn.find("deferred=1");
-    const size_t submit_pos      = sequence_fn.find("ext_oneapi_graph(*exec_graph)");
+    // The replay submits through ggml_sycl::graph_exec_submit (graph-recorder-scope.hpp), which counts it so
+    // graph_compute's exit sees a replay-only call as one that submitted (zhcn C7a, cec4a5f10).
+    const size_t submit_pos      = sequence_fn.find("ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph)");
     CHECK(descriptor_pos != std::string::npos && incomplete_pos != std::string::npos &&
               ineligible_pos != std::string::npos && prewarm_pos != std::string::npos &&
               identity_pos != std::string::npos && record_pos != std::string::npos &&
@@ -905,7 +907,9 @@ static int test_sequence_graphlet_skip_marking_requires_safe_replay() {
         "                                                     uint64_t *                  graph_hash_cache) {",
         "// Record segmented graphs", "sequence graphlet implementation");
     const size_t safe_check_pos = sequence_fn.find("moe_sequence_graphlets_safe_mode_enabled()");
-    const size_t submit_pos     = sequence_fn.find("sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);");
+    // The replay submits through ggml_sycl::graph_exec_submit (graph-recorder-scope.hpp), which counts it so
+    // graph_compute's exit sees a replay-only call as one that submitted (zhcn C7a, cec4a5f10).
+    const size_t submit_pos     = sequence_fn.find("ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph);");
     const size_t replay_pos = sequence_fn.find("g_graph_diag_counters.sequence_graphlet_replay.fetch_add(1, std::memory_order_relaxed);");
     const size_t mark_pos   = sequence_fn.find("moe_graph_mark_fused_pair_skips_for_node(node, sycl_ctx->device);");
     CHECK(safe_check_pos != std::string::npos && submit_pos != std::string::npos && replay_pos != std::string::npos &&
@@ -1932,12 +1936,12 @@ static int test_default_ready_block_graphlet_safety_contract() {
     const std::string sycl   = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
     const std::string common = read_required_file("ggml/src/ggml-sycl/common.hpp");
 
-    const std::string block_region = required_region(sycl, "static uint64_t moe_graph_block_identity_signature",
-                                                     "static bool check_graph_compatibility",
-                                                     "block graphlet implementation");
-    const std::string try_fn = required_region(sycl, "static bool moe_graph_try_block_graphlets",
-                                               "static bool check_graph_compatibility",
-                                               "block graphlet try implementation");
+    const std::string block_region =
+        required_region(sycl, "static uint64_t moe_graph_block_identity_signature",
+                        "static ggml_sycl_graph_compat check_graph_compatibility", "block graphlet implementation");
+    const std::string try_fn =
+        required_region(sycl, "static bool moe_graph_try_block_graphlets",
+                        "static ggml_sycl_graph_compat check_graph_compatibility", "block graphlet try implementation");
     const std::string descriptor_capture = required_region(
         sycl, "static bool moe_block_graphlet_descriptor_capture_enabled",
         "static bool moe_descriptor_capture_probe_enabled", "block graphlet descriptor capture helper");

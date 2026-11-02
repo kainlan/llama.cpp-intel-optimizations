@@ -7,10 +7,13 @@ llama.cpp-dyi3 round 6 root cause: ggml_sycl_get_weight_layout_ptr() had a
 "device-resident source, no host preference needed" fast path (an already-
 device-resident, AOS-target pointer is directly usable) placed AFTER a
 recording-only early-return that consults nothing but the unified cache's
-name-keyed view lookup. gemma4's kmeq BF16->F32 materialization synthesizes
-an alias tensor (name "<name>.bf16_materialized_f32", extra=nullptr, data
-pointing at the already-materialized F32 device buffer) under a cache key
-that is DESIGNED to miss that name-keyed lookup. Under recording the early
+name-keyed view lookup. gemma4's kmeq BF16->F32 materialization (removed by
+llama.cpp-9qjy: BF16 weights now run natively, in the layout they were planned
+in) synthesized an alias tensor (name "<name>.bf16_materialized_f32",
+extra=nullptr, data pointing at the already-materialized F32 device buffer)
+under a cache key that was DESIGNED to miss that name-keyed lookup. No route
+builds such an alias any more, but the ordering below is still the general
+rule for any extra=nullptr device-resident tensor, so this gate stays. Under recording the early
 return therefore returned nullptr for that tensor -- never reaching the fast
 path that would have returned its data pointer correctly -- and the caller's
 generic BLAS fallback (the last route in the dispatch chain) then also
@@ -216,8 +219,9 @@ def weight_layout_violations(source: str) -> list[str]:
 
     # The fast path must still return the raw src pointer for a null-extra
     # alias tensor (extra->layout hit is only a cache-freshness shortcut, not
-    # a gate on the return) -- this is what makes it correct for kmeq's
-    # extra=nullptr materialized-weight alias specifically.
+    # a gate on the return) -- this is what makes it correct for any
+    # extra=nullptr device-resident alias (the removed kmeq materialization
+    # route built them; llama.cpp-9qjy).
     if device_idx != -1:
         aos_return = re.search(
             r"if \(resolved == GGML_LAYOUT_AOS\) \{.*?return const_cast<void \*>\(src_ptr\);\s*\}",

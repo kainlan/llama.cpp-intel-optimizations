@@ -48,7 +48,9 @@ FILES = (
     "ggml/src/ggml-sycl/unified-cache.cpp",
     "ggml/src/ggml-sycl/unified-cache.hpp",
     "ggml/src/ggml-sycl/fattn.cpp",
+    "ggml/src/ggml-sycl/fattn-dpas.cpp",
     "ggml/src/ggml-sycl/layer-streaming.cpp",
+    "ggml/src/ggml-sycl/kv-room-cost.hpp",
 )
 COLUMNS = (
     "file", "line", "symbol", "type", "scope", "mutability", "synchronization",

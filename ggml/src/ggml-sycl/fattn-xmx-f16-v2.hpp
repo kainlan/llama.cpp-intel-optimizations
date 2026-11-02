@@ -398,6 +398,13 @@ struct fattn_xmx_v2_device_cache {
     size_t                       split_partial_elems     = 0;
     size_t                       split_partial_out_elems = 0;
     int                          split_partial_device    = -1;
+
+    // DPAS split-K workspace (fattn-dpas.cpp): sized once per context, never resized
+    ggml_sycl::mem_handle dpas_parts_handle;
+    ggml_sycl::mem_handle dpas_meta_handle;
+    size_t                dpas_parts_elems     = 0;
+    size_t                dpas_meta_elems      = 0;
+    int                   dpas_workspace_state = 0;  // 0 not tried, 1 allocated, -1 allocation failed
 };
 
 // Bytes of SLM required for the fallback leaf's worst case (D=256, NCOLS=32).
@@ -2104,7 +2111,8 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
     const int64_t     nb33               = params.nb33;
     const sycl::event packed_ready_event = packed_k_ready_event ? *packed_k_ready_event : sycl::event{};
     const bool        add_packed_dep =
-        PACKED_K && packed_k_ready_event != nullptr && ggml_sycl_should_add_dependency(packed_ready_event);
+        PACKED_K && packed_k_ready_event != nullptr &&
+        ggml_sycl_should_add_dependency(packed_ready_event, GGML_SYCL_READY_QUERY_SITE_FATTN_XMX_PACKED_K);
 
     sycl::range<3> first_grid(params.ne12 * params.ne03, n_partitions, n_query_blocks);
     sycl::range<3> first_block(1, 1, nthreads);

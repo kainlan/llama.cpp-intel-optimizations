@@ -88,7 +88,7 @@ removing a same-named `clear()`/`reset()`/`store(false)` elsewhere in the same
 input can reclassify a row without touching its declaration. Review such a row and
 regenerate; it is the unscoped scan being honest about what it saw.
 
-A change that adds, removes or reclassifies a static in any of the five inputs
+A change that adds, removes or reclassifies a static in any of the seven inputs
 must regenerate the CSV in the same change. The gate parses the **working
 tree**, not a commit, so in a shared checkout an uncommitted edit that adds or
 reclassifies a static (anyone's) turns it red until that edit is committed
@@ -107,7 +107,7 @@ in a multi-object declaration becomes its own row. Actual
 function declarations are excluded by declarator binding shape, while
 pointer/reference-to-function and pointer-to-member function/data objects
 (including arrays) remain census objects. This is deliberately **not a general
-C++ frontend**: alias handling is a bounded proof for the five inputs listed
+C++ frontend**: alias handling is a bounded proof for the seven inputs listed
 below. It records declaration positions and lexical namespace/class/function/
 block identities, chooses the first nearest candidate and then its newest
 visible declaration, and treats relevant ordinary-name hiding conservatively.
@@ -131,16 +131,24 @@ explicitly labeled **unscoped lexical candidates**: they do not resolve C++
 bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
-At audited source commit `fefb929808417c662a1e976f018bfb783c0b6281`, the
-census emits **1,451 object rows**: 516 explicitly-static non-local objects,
-87 non-local objects with implicit static storage duration, 841 function-local
-static/thread-local objects, and 7 class static declarations. Per-file rows are 1,160
-(`ggml-sycl.cpp`), 231 (`unified-cache.cpp`), 11 (`unified-cache.hpp`), 47
+At audited source commit `ae57e884f2a6be0f079ef386043cc2759de4fff2`, the
+census emits **1,568 object rows**: 581 explicitly-static non-local objects,
+106 non-local objects with implicit static storage duration, 874 function-local
+static/thread-local objects, and 7 class static declarations. Per-file rows are 1,219
+(`ggml-sycl.cpp`), 280 (`unified-cache.cpp`), 16 (`unified-cache.hpp`), 51
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
 every input so this result can be tied to exact source bytes.
+`fattn-dpas.cpp` (the DPAS flash-attention kernels, llama.cpp-2szs) became the
+sixth input after that commit. It adds 3 rows, its three namespace-scope
+`constexpr` constants, and its 6 recovery nodes are all
+`function-body-storage-proven`.
+`kv-room-cost.hpp` (the KV context room's cost, llama.cpp-7fmt) became the
+seventh input when the `PLACEMENT_*_DEFAULT` constants moved there from
+`unified-cache.hpp`, so that the move kept them in the census. It adds 4 rows,
+its four namespace-scope `constexpr` constants, and parses without recovery.
 
 Regenerate from a **clean** tree. The census is bound to committed bytes: a
-generation run reads the working tree, so uncommitted edits to any of the five
+generation run reads the working tree, so uncommitted edits to any of the seven
 inputs produce per-file SHA-256 values that name blobs reachable from nobody's
 git history. When the checkout is dirty, extract the inputs at the audited
 commit into a scratch tree and pass `--repo` at it.
@@ -151,27 +159,30 @@ so a row-for-row comparison would be invented. Structurally, they expand in
 both directions: multi-object declarations produce multiple object rows,
 while static functions/prototypes are not storage objects; the parser also
 adds the objects a column-zero lexical pass does not cover (at the audited
-commit above: 87 implicit non-local objects, 841 function-local
+commit above: 106 implicit non-local objects, 874 function-local
 static/thread-local objects, and 7 class statics). No comparison is made to the
 historical 329 figure because it likewise lacks a source SHA and method.
 
 ### Parse coverage and fail-closed behavior
 
 Tree-sitter reports 50 raw recovery/missing nodes in `ggml-sycl.cpp`, 10 in
-`fattn.cpp`, 3 in `unified-cache.hpp`, and 2 in `unified-cache.cpp` (one
-function signature, one function body); `layer-streaming.cpp` parses without
-recovery. The `ggml-sycl.cpp` sites are
+`fattn.cpp`, 6 in `fattn-dpas.cpp` (all in function bodies), 5 in
+`unified-cache.hpp`, and 2 in `unified-cache.cpp` (one function signature, one
+function body); `layer-streaming.cpp` and `kv-room-cost.hpp` parse without recovery. The
+`ggml-sycl.cpp` sites are
 from nested preprocessor alternatives, declaration-prefix macros
 (`GGML_API`, `__dpct_inline__`), conditional `else` arms, and formatting-macro
 tokens such as `PRId64`; the `fattn.cpp` ones are dispatch macro invocations and a label
-next to a conditional compilation boundary; the three `unified-cache.hpp` sites are
+next to a conditional compilation boundary; the five `unified-cache.hpp` sites are
 defaulted const-reference parameters, which grammar ABI 15 misparses.
 These are **explicit raw-parser recovery sites**, not silently discarded
-regions. Each of the 65 nodes must receive a structural proof category. In the
+regions. Each of the 73 nodes must receive a structural proof category. In the
 current inputs, 24 are confined to parsed function signature/storage spans,
-35 are in parsed or unambiguously recovered function bodies, and 3 are the
+41 are in parsed or unambiguously recovered function bodies, 5 are the
 defaulted const-reference parameter shape, which is proved by an anchored
-spelling match and fails closed on every near miss. Recovered function
+spelling match and fails closed on every near miss, and 3 are
+preprocessor-condition non-declarations. The totals were 67 and 35 until 6e92e2e5e made
+`fattn-dpas.cpp` an input and added its 6 function-body nodes. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
 masked); an oversized `ERROR` node's tail must independently consist of parsed
 top-level constructs or the census fails. Parsed `function_definition` and `lambda_expression` nodes receive the same
@@ -185,8 +196,8 @@ functions, preventing later file-scope declarations from inheriting the
 recovered function's scope. Only the signature span exempts a function's own
 `static` storage-class marker. Body recovery is accepted only when every
 `static`/`thread_local` marker in it independently belongs to a parsed
-declaration; an unparsed marker fails the census. The remaining 3 sites are
-confined to `#if` condition lines, which cannot contain a declaration.
+declaration; an unparsed marker fails the census. The 3 preprocessor-condition
+sites are confined to `#if` condition lines, which cannot contain a declaration.
 Structural preprocessor recovery spanning a conditional body is not exempt. Any
 other namespace/file recovery is rejected because it could conceal an
 implicit-static object of a user-defined type or direct-initialization spelling.
@@ -323,6 +334,8 @@ awk 'NR>=4614 && NR<=4615 { print NR ":" $0 }' ggml/src/ggml-sycl/common.hpp
 | recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | retiring completion releases only old-epoch resources and cannot mutate current state |
 | async kernel/copy lifetime | exact mem/backing handles plus copied `(device, ModelId, ContextId, GraphEpoch, InvocationId)` token | one context/epoch; each device is OPEN→SEALED→COMPLETE or QUARANTINED with registered producer/submit counts; no root release while OPEN |
 | tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
+| planned load terms (compute, state; `g_planned_load_terms`, merged into `g_planned_compute_term_bytes`/`g_planned_state_term_bytes`) | `(slot, SlotGeneration)`, minted at `begin_outer` before the reserves run; the write needs the open `LoadTxnId`'s load-effect lease | decided in `llama.cpp-ihk6` (owner ruling 2026-10-10, owner-keyed): each owner keeps its own contribution per device and the device reads the max over live owners; rollback and slot release drop only that owner; the load-entry and last-model-out whole-table clears are removed |
+| planned dense scratch inputs (Q8_1 src1 bytes per token, f16 dequant weight and src1 maxima, `n_ubatch`, rejected-figure flags; terms of `g_planned_load_terms`, published into `g_planned_mmq_src1_*`, `g_planned_dequant_f16_*`, `g_planned_dense_scratch_n_ubatch` and `g_planned_dense_scratch_invalid`) | `(slot, SlotGeneration)`, the planned load terms' key; the load-time plan writes under the open `LoadTxnId`'s load-effect lease, the runtime re-plan under the published model's live-update lease | decided in `llama.cpp-45qo` (follow-up to `llama.cpp-ihk6`, same owner ruling): each owner keeps its own inputs per device and the device plans each buffer from the max of each input over the live owners whose figure for it was accepted, so a rejected owner contributes nothing, refuses only its own re-plan and has its context refused by name (`llama.cpp-kpjw`); an owner plans at the largest `n_ubatch` its live contexts last published, or the load's with none live; a re-plan replaces only that owner's inputs; rollback and slot release drop only that owner; the device-global `zone_dense_scratch_merge_input` merge, which kept the larger input while another backend context was live and replaced it when none was, is removed |
 
 IDs/generations, including `InvocationId` and `SessionResetEpoch`, are checked
 and nonwrapping. Slot 33 fails with typed `SLOT_EXHAUSTED` before LOADING and

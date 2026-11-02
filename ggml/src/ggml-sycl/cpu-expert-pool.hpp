@@ -7,29 +7,50 @@
 #pragma once
 
 #include "cpu-dispatch.hpp"
-#include "mem-handle.hpp"
-#include "unified-cache.hpp"
+#include "cpu-expert-pool-stamps.hpp"
+#include "cpu-job-signal.hpp"
+#include "cpu-row-workers.hpp"
 
 #include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace ggml_sycl {
 
+// A submitter's trace request for one job (llama.cpp-j6jf). While tracing is on,
+// submit_batch makes the job's stamp record, labels it with `tag` and hands it
+// back in `stamps`; the submitter gives the record to the job's join host_task.
+// While tracing is off it leaves `stamps` empty and touches nothing.
+struct cpu_expert_job_trace {
+    cpu_expert_job_tag                     tag;
+    std::shared_ptr<cpu_expert_job_stamps> stamps;
+};
+
 // Persistent thread pool for CPU expert computation.
-// Replaces per-call std::async with pre-spawned workers and ring-buffered
-// staging slots to avoid per-token allocation overhead.
+// Replaces per-call std::async with pre-spawned workers.
 //
-// Thread count default: hardware_concurrency - 2 (reserve for GPU driver).
+// Worker count default: 1 (each job's row loop already spans the pool's row
+// workers; see get_cpu_expert_thread_count()).
 // Override: GGML_SYCL_CPU_EXPERT_THREADS=N
 //
-// Ring buffer provides RING_SLOTS pre-allocated staging slots (pinned host
-// memory via unified_alloc) for activation inputs and output buffers.
+// The pool owns threads and a work queue, no memory. CPU expert staging comes
+// from the PinnedBufferPool, with a per-dispatch managed fallback
+// (llama.cpp-sfal).
+//
+// A job's row loop runs on the pool's row workers (llama.cpp-w4e9), not the
+// shared TBB arena: ggml_sycl_cpu_row_loop_threads() threads, the job's own
+// worker included, which keep polling for GGML_SYCL_CPU_ROW_SPIN_US
+// (default CpuRowWorkers::spin_us_default) after a job so that the next job of
+// a decode token starts on all of them. The jobs of one pool take the row
+// workers one at a time. Each pool has its own set, so pools of two devices
+// that both hold host experts run two such sets.
 class CpuExpertPool {
   public:
     CpuExpertPool() = default;
@@ -41,14 +62,10 @@ class CpuExpertPool {
     CpuExpertPool & operator=(CpuExpertPool &&)      = delete;
 
     // Initialize the pool. Must be called once (e.g. from moe_hybrid_init_once).
-    //   n_threads:    worker thread count (0 = auto: hardware_concurrency - 2)
-    //   max_experts:  max expert dispatches per MUL_MAT_ID (for ring sizing)
-    //   act_dim:      activation vector dimension (floats)
-    //   out_dim:      output vector dimension (floats)
-    //   q:            SYCL queue for pinned host allocation
-    void init(int n_threads, size_t max_experts, size_t act_dim, size_t out_dim, sycl::queue & q);
+    //   n_threads: worker thread count (0 = auto: get_cpu_expert_thread_count(), default 1)
+    void init(int n_threads);
 
-    // Shut down all workers and free ring buffer memory.
+    // Shut down all workers.
     void shutdown();
 
     // Submit a batch of CPU expert tasks. Takes ownership of the tasks
@@ -57,25 +74,61 @@ class CpuExpertPool {
     // completes. This closes a UAF where a raw pointer into caller-owned
     // storage was retained by the worker lambda while the caller
     // overwrote / moved / destroyed the backing vector.
-    std::future<void> submit_batch(std::vector<cpu_expert_task> tasks);
-
-    // Ring buffer: acquire a staging slot for up to max_experts_ experts.
-    struct StagingSlot {
-        float * act     = nullptr;  // Activation input buffer (pinned host)
-        float * out     = nullptr;  // Output buffer (pinned host)
-        int     slot_id = -1;
-    };
-
-    StagingSlot acquire_staging();
-    void        release_staging(int slot_id);
+    //
+    // `prologue`, when set, runs on the worker before the batch kernel
+    // (llama.cpp-z4kd): the waits a job needs before it may read its inputs
+    // and write its output run there, never on the submitting thread. Neither
+    // is expected to throw, and the worker catches nothing, so a throw from
+    // either ends the process on the worker. For the kernel that is how it has
+    // always been. For the input waits it is narrower than before: while they
+    // ran on the submitting thread, a sycl::exception from one reached
+    // ggml_sycl_mul_mat_id's catch and the compute_forward catch, which hand
+    // it to ggml_sycl_try_dispatch_resource_exhaustion_fallback and otherwise
+    // print the failing op and exit. On the worker that MUL_MAT_ID has already
+    // returned and later ops depend on the job, so no op is left to re-place.
+    // The copies the waits are for are still submitted on the submitting
+    // thread, inside those catches, and kernel-submission resource exhaustion
+    // is raised at submit (llama.cpp-o3h1). The worker's one pair of handlers
+    // does not change that: both rethrow, the first being the
+    // `catch (const ggml_sycl_fallback_error &) { throw; }` the alloc-zone
+    // contract's G-CATCH rule requires ahead of a catch-all. They exist so the
+    // throw unwinds the job's frame, which signals the job's device event (see
+    // `device_signal`) before the process ends; with no handler on the stack the
+    // runtime ends it without unwinding.
+    //
+    // `resolve`, when set, runs on the worker after the prologue and before the
+    // batch kernel, and may add to `tasks` (llama.cpp-7pvo). It is for a job
+    // submitted before its tasks can be known: the event-chained hybrid decode
+    // route's prologue waits for the expert-id copy, and resolve then reads the
+    // ids and builds a task per host slot. The kernel computes what resolve
+    // leaves in the vector. Like the prologue, it is not expected to throw.
+    //
+    // `job_trace`, when set, receives the job's stamp record while tracing is on
+    // (cpu_expert_job_trace). The record is shared by the worker, the token's
+    // trace list and the join host_task that holds a copy, so it lives until the
+    // last of them lets go: reading or writing it in the join is safe however long
+    // after the job the join runs.
+    //
+    // `device_signal`, when set, is the job half of the job's native device event
+    // (llama.cpp-qwn5). The worker signals it after the kernel's last host write
+    // and before the promise, so the device commands that wait on the event (the
+    // host-expert scatter's H2D copy) need no join host_task. A throw from the
+    // prologue, resolve or the kernel signals it while unwinding, and a job
+    // destroyed unrun signals it from the destructor: the xe job timeout does not
+    // end a device command parked on such an event.
+    std::future<void> submit_batch(std::vector<cpu_expert_task>                        tasks,
+                                   std::function<void()>                               prologue      = {},
+                                   std::function<void(std::vector<cpu_expert_task> &)> resolve       = {},
+                                   cpu_expert_job_trace *                              job_trace     = nullptr,
+                                   cpu_job_signal                                      device_signal = {});
 
     bool is_active() const { return active_.load(std::memory_order_acquire); }
 
   private:
     void worker_thread();
     // Signal and join the workers. Touches no unified-cache state, so it is
-    // safe during static destruction; shutdown() does this and then releases
-    // the ring buffer.
+    // safe during static destruction; shutdown() does this and then marks the
+    // pool inactive.
     void stop_workers();
 
     std::vector<std::thread>          threads_;
@@ -84,22 +137,116 @@ class CpuExpertPool {
     std::condition_variable           cv_;
     std::atomic<bool>                 active_{ false };
     std::atomic<bool>                 shutting_down_{ false };
+    CpuRowWorkers                     row_workers_;
+};
 
-    // Ring buffer for staging memory
-    static constexpr int RING_SLOTS = 4;
+// Totals over every pool's jobs since the last take (llama.cpp-b2jc), kept
+// only while ggml_sycl_cpu_expert_trace_enabled(). The decode wait census
+// takes them once per token. Times are sums over jobs:
+//   wake     submit to a worker starting the job
+//   quant/setup/fanout/compute  the job's batched-kernel phases
+//   wall     submit to the job's result being published, including the
+//            prologue's input waits (llama.cpp-z4kd)
+// joins counts joins of a pool job, which run on the host_task that orders the
+// job's scatter, not on the submitting thread (llama.cpp-z4kd); joins_ready
+// the ones that found the job already finished. job_stamps holds the stamp
+// records of the jobs that finished since the last take, in submission order
+// (llama.cpp-j6jf); a join that has not run by the take leaves its job's join
+// stamps unset there.
+struct cpu_expert_pool_trace_totals {
+    uint64_t jobs        = 0;
+    uint64_t tasks       = 0;
+    uint64_t rows        = 0;
+    uint64_t threads     = 0;
+    uint64_t joins       = 0;
+    uint64_t joins_ready = 0;
+    double   wake_us     = 0.0;
+    double   quant_us    = 0.0;
+    double   setup_us    = 0.0;
+    double   fanout_us   = 0.0;
+    double   compute_us  = 0.0;
+    double   wall_us     = 0.0;
 
-    struct RingEntry {
-        float * act    = nullptr;
-        float * out    = nullptr;
-        bool    in_use = false;
+    // The same jobs split by the weight type of their rows (llama.cpp-y9i6),
+    // indexed by type. by_type[slot_mixed] holds the jobs whose rows mix types,
+    // and by_type[slot_none] the jobs that ran no row loop: the batched kernel
+    // returned before it, or every task took the MXFP4 multi-activation path.
+    //   threads_max  most threads one job of the type ran on
+    //   overlapped   jobs that ran at the same time as another pool job at some
+    //                point (both jobs of an overlapping pair count): the pools
+    //                share one CPU arena, so those jobs' compute times overlap
+    //                and their sum overstates the time they took. Batched calls
+    //                that ggml-sycl.cpp makes directly share the arena too but
+    //                are not pool jobs, so they are not counted
+    struct type_totals {
+        uint64_t jobs        = 0;
+        uint64_t rows        = 0;
+        uint64_t bytes       = 0;
+        uint64_t threads     = 0;
+        uint64_t threads_max = 0;
+        uint64_t overlapped  = 0;
+        double   compute_us  = 0.0;
     };
 
-    RingEntry  ring_[RING_SLOTS] = {};
-    std::mutex ring_mutex_;
-    size_t     act_stride_  = 0;  // floats per expert activation
-    size_t     out_stride_  = 0;  // floats per expert output
-    size_t     max_experts_ = 0;
-    mem_handle ring_handle_;      // Single unified_alloc-backed owner for all ring buffers
+    static constexpr int slot_mixed = GGML_TYPE_COUNT;
+    static constexpr int slot_none  = GGML_TYPE_COUNT + 1;
+    static constexpr int n_slots    = GGML_TYPE_COUNT + 2;
+
+    type_totals by_type[n_slots];
+
+    std::vector<cpu_expert_job_stamps> job_stamps;
 };
+
+void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);
+void cpu_expert_pool_trace_note_join(bool was_ready);
+
+// The trace clock (steady_clock) in ns since its epoch, as the stamps hold it.
+int64_t cpu_expert_pool_trace_now_ns();
+
+// Stamps t_inputs_ready on the pool job the calling thread is running, if any.
+// The job's prologue calls it after its input wait returns; on any thread that is
+// not running a traced pool job it does nothing.
+void cpu_expert_pool_trace_stamp_inputs_ready();
+
+// Records a join's stamps on its job's record, under the trace lock, so a take on
+// another thread reads them whole.
+void cpu_expert_pool_trace_note_join_stamps(cpu_expert_job_stamps & stamps,
+                                            int64_t                 entry_ns,
+                                            int64_t                 exit_ns,
+                                            bool                    found_ready);
+
+// Whether a pool job ran at the same time as another at any point of its run
+// (llama.cpp-y9i6): another job was running when it began, or another began
+// before it ended. Both jobs of an overlapping pair see it (a near-simultaneous
+// start can rarely go uncounted). Used only while tracing.
+struct cpu_expert_pool_overlap_clock {
+    std::atomic<int>      running{ 0 };
+    std::atomic<uint64_t> starts{ 0 };
+};
+
+struct cpu_expert_pool_overlap_ticket {
+    bool     running_at_start = false;
+    uint64_t start            = 0;
+};
+
+cpu_expert_pool_overlap_ticket cpu_expert_pool_overlap_begin(cpu_expert_pool_overlap_clock & clock);
+bool cpu_expert_pool_overlap_end(cpu_expert_pool_overlap_clock & clock, const cpu_expert_pool_overlap_ticket & ticket);
+
+// Adds one finished job to `totals`, in the job's type slot as well (the
+// no-row slot when ph.rows is 0, whatever ph.type says).
+void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals,
+                                   size_t                                 n_tasks,
+                                   const cpu_expert_batched_phase_times & ph,
+                                   double                                 wake_us,
+                                   double                                 wall_us,
+                                   bool                                   overlapped);
+
+// The per-type summary: for each type with a job, in enum order, then "mixed"
+// and "none" for the two extra slots,
+// " <type>:jobs=J,rows=R,bytes=B,compute=Cus,gbps=G,thr=A/M,ovl=O",
+// where G is bytes over the summed compute time (decimal GB/s), A the mean and
+// M the most threads per job, and O the jobs that overlapped another pool job.
+// Empty when there were no jobs.
+std::string cpu_expert_pool_trace_format_types(const cpu_expert_pool_trace_totals & totals);
 
 }  // namespace ggml_sycl

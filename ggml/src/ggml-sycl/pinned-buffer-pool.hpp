@@ -10,6 +10,7 @@
 #include "unified-cache.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <sycl/sycl.hpp>
 
 namespace ggml_sycl {
@@ -68,17 +69,29 @@ class PinnedBufferPool {
     //       any pending scatter at op entry, consumed or not, ahead of that D2H); and
     //   (2) the caller does not write the region (zero it, or let the CPU kernels fill it)
     //       until that activation D2H has completed.  Completing an event on an in-order queue
-    //       completes every earlier command on it, the H2D included.
+    //       completes every earlier command on it, the H2D included.  The CPU job's prologue
+    //       waits that D2H and then zeroes, on the pool worker (llama.cpp-z4kd); and
+    //   (3) a scatter flushed AFTER that D2H, which the D2H does not order, is ordered by the job
+    //       itself: moe_cpu_job_order_decide (moe-decode-hostpath.hpp) adds that flush's H2D events,
+    //       or a queue barrier, to the waits the prologue runs (llama.cpp-z4kd).
     // (1) covers a scatter left pending by an op that nothing consumed (up's, with gate next)
     // (llama.cpp-3bww).  The same flush also keeps the shared activation staging buffer safe: the
     // pending CPU workers read it directly and the next op's D2H rewrites it.  A caller that kept
     // a scatter pending ACROSS a following reserve() would be outside this argument and would have
     // to retain its slice and its staging until the scatter event instead (llama.cpp-8k68).
     //
-    // Threading: one MUL_MAT_ID at a time, joined before the next.  It is not main-thread-only:
-    // the cpu_async_safe path calls it from the async CPU thread, which the main thread joins
-    // before the next op touches the pool.
+    // The one such caller is the decode sibling slot (llama.cpp-yx28): up is issued while gate's
+    // job is still pending, without a flush.  It is admitted only when up does no activation D2H
+    // (it reuses gate's staging, unrewritten), no scatter was enqueued since that D2H, so (1)
+    // to (3) still hold through it, and reserve_peek() shows up's span disjoint from gate's.  Gate
+    // keeps its own slice and staging until its scatter is flushed; see moe_sibling_pending_keep()
+    // in moe-decode-hostpath.hpp.
+    //
+    // Threading: one MUL_MAT_ID at a time, called on the thread that submits it.
     size_t reserve(size_t n_experts);
+
+    // The first entry reserve(n_experts) would return, without moving the cursor.
+    size_t reserve_peek(size_t n_experts) const;
 
     // Whether acquire(n_experts) would be served. The pool's capacity is fixed
     // at init() and the buffers really are max_experts_ * dim floats, so an
@@ -95,11 +108,24 @@ class PinnedBufferPool {
     mem_handle act_handle() const;
     mem_handle out_handle() const;
 
+    // One int32 per entry, addressed like act and out: entry i is ids() + i (llama.cpp-7pvo). The event-chained
+    // hybrid decode route copies a decode op's expert ids into its reserved entries asynchronously, and its CPU job
+    // overwrites them in place with the host-slot flags the flush reads back. The same ordering as act and out keeps
+    // it safe across ops: the job writes only after its ids copy completed, which completes every scatter enqueued
+    // before that copy. Optional: when it could not be allocated the pool still serves act and out, and has_ids()
+    // is false.
+    mem_handle ids_handle() const;
+
+    int32_t * ids() const { return ids_pool_; }
+
+    bool has_ids() const { return ids_pool_ != nullptr; }
+
     bool is_initialized() const { return act_pool_ != nullptr && out_pool_ != nullptr; }
 
   private:
     float *    act_pool_    = nullptr;
     float *    out_pool_    = nullptr;
+    int32_t *  ids_pool_    = nullptr;
     size_t     act_stride_  = 0;  // floats per expert (K)
     size_t     out_stride_  = 0;  // floats per expert (N)
     size_t     max_experts_ = 0;
@@ -107,6 +133,7 @@ class PinnedBufferPool {
     int        device_id_   = -1;
     mem_handle act_handle_;
     mem_handle out_handle_;
+    mem_handle ids_handle_;
 };
 
 }  // namespace ggml_sycl

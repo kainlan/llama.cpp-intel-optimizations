@@ -36,6 +36,10 @@
 
 #define LLAMA_DEFAULT_SEED 0xFFFFFFFF
 
+// llama_model_params::n_ctx_hint for the model's default context: the one a context created with n_ctx 0 opens with,
+// the training context (n_ctx_train). The load resolves it as llama_context resolves n_ctx 0 (llama.cpp-7fmt).
+#define LLAMA_N_CTX_HINT_DEFAULT 0xFFFFFFFFu
+
 #define LLAMA_TOKEN_NULL -1
 
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
@@ -353,6 +357,20 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // the context the caller is about to create (llama_context_params::n_ctx); 0 = unknown. A placement hint: a
+        // backend that places weights at load (SYCL) holds this context's KV room on the device ahead of the routed
+        // experts, and holds none for 0. LLAMA_N_CTX_HINT_DEFAULT names the model's default context, the one an n_ctx
+        // of 0 creates (n_ctx_train), without the caller reading the model first. The context itself may still be
+        // created at any size.
+        uint32_t n_ctx_hint;
+
+        // the micro-batch the caller is about to create its context with (llama_context_params::n_ubatch, as the
+        // context resolves it); 0 = none named, which includes a micro-batch the SYCL backend picks itself
+        // (n_ubatch_auto). A placement hint: a backend that places weights at load (SYCL) plans the PP MoE scratch
+        // ring for this micro-batch and moves routed experts to the host tier when the ring needs their room. The
+        // context may still be created with any n_ubatch.
+        uint32_t n_ubatch_hint;
     };
 
     struct llama_sampler_seq_config {

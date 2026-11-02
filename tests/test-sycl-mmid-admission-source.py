@@ -35,13 +35,16 @@ one above it. Every anchor below is resolved INSIDE the enclosing function and
 asserted unique. Same lesson as test-sycl-supports-op-foreign-buffer-source.py.
 """
 
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 
-FUNC_START = "static bool ggml_backend_sycl_device_supports_op"
+# The decisions live in the impl (the wrapper ggml_backend_sycl_device_supports_op is one line over it); the
+# DEFINITION is anchored, not the forward declaration that precedes it.
+IMPL_DEFINITION = re.compile(r"static\s+bool\s+ggml_sycl_device_supports_op_impl\s*\([^)]*\)\s*\{")
 FUNC_END = "\n    switch (op->op) {"
 BRANCH_START = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
 BRANCH_END = "        return true;\n    }"
@@ -70,8 +73,16 @@ def section(text: str, start: str, end: str, what: str) -> str:
     return text[begin : begin + text[begin:].index(end) + len(end)]
 
 
+def impl_start(text: str) -> str:
+    """The text of the impl's definition header, as the section anchor."""
+    found = IMPL_DEFINITION.findall(text)
+    if len(found) != 1:
+        raise AssertionError(f"supports_op impl definition occurs {len(found)} times, expected exactly 1")
+    return found[0]
+
+
 def admission_branch(text: str) -> str:
-    func = section(text, FUNC_START, FUNC_END, "supports_op body")
+    func = section(text, impl_start(text), FUNC_END, "supports_op body")
     return section(func, BRANCH_START, BRANCH_END, "ADD_ID/MUL_MAT_ID admission branch")
 
 

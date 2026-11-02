@@ -27,6 +27,7 @@
 
 #include "a7l5w-probe.hpp"
 #include "common.hpp"
+#include "cpu-row-workers.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -36,6 +37,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -153,23 +155,12 @@ static std::atomic<uint64_t> g_quant_cache_generation{ 0 };
 // Per-thread buffer pool for CPU dispatch quantization (defined here, declared in common.hpp)
 thread_local cpu_dispatch_buffers g_cpu_dispatch_buffers;
 
-// Initialize CPU dispatch buffers with reasonable max sizes
-// Called once at model load time to avoid per-token resize() calls
+// Initialize the always-needed CPU dispatch buffers (quantized activation + accumulators).
+// Safe to call from every TBB worker: the footprint is ~1 MiB per thread.
+// The weight-dequant buffer (scratch_nk) is NOT sized here; its two consumers call
+// ensure_scratch_nk(N * K) with the size they need (llama.cpp-z5fn).
 void ggml_sycl_cpu_dispatch_buffers_init() {
-    // Reasonable max sizes for typical model dimensions:
-    // - Max batch size for TG: 16 tokens
-    // - Max n_embd (embedding dimension): 4096 (typical 7B/13B models)
-    // - Max n_ff (feedforward hidden): 14336 (typical 7B; ~3.5x n_embd)
-    // - Max quantized row size (Q8_0): ~128 bytes per 256 elements
-    // - Max accumulator: 256 stack + 16 heap = 272 __m256 values = 8704 floats
-    // Total per-thread: ~224 MB (much more reasonable than 576 MB)
-
-    static constexpr size_t MAX_M      = 16;                      // batch size (TG)
-    static constexpr size_t MAX_N      = 4096;                    // n_embd (typical 7B)
-    static constexpr size_t MAX_K      = 14336;                   // n_ff (typical 7B; ~3.5x n_embd)
-    static constexpr size_t MAX_Q_SIZE = (MAX_K / 32 + 1) * 128;  // Safe upper bound for any quant type
-
-    g_cpu_dispatch_buffers.init(MAX_M, MAX_N, MAX_K, MAX_Q_SIZE);
+    g_cpu_dispatch_buffers.init();
 }
 
 void ggml_sycl_cpu_quant_cache_new_graph() {
@@ -183,7 +174,7 @@ enum class offload_wait_reason : uint8_t {
 
 static inline bool offload_event_waitable(const sycl::event & evt) {
     try {
-        return ggml_sycl_should_add_dependency(evt);
+        return ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH);
     } catch (...) {
         return false;
     }
@@ -218,7 +209,7 @@ static inline void wait_dependency_if_needed(const sycl::event & evt) {
 
 static inline void append_dependency(std::vector<sycl::event> & deps, const sycl::event & evt) {
     try {
-        if (ggml_sycl_should_add_dependency(evt)) {
+        if (ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH)) {
             deps.push_back(evt);
         }
     } catch (...) {
@@ -269,6 +260,11 @@ static sycl::event cpu_submit_async(sycl::queue * cpu_q, const std::vector<sycl:
         }
         fn(cgh);
     });
+    if (!submit_on_cpu_queue) {
+        // Off the CPU queue every caller submits a host task, which a CPU expert job's join on the MoE join
+        // queue must wait (llama.cpp-wfsl).
+        ggml_sycl::unified_cache_note_host_task(*cpu_q, evt);
+    }
     if (ggml_sycl_cpu_offload_async_enabled()) {
         g_cpu_chain_event        = evt;
         g_cpu_chain_event_valid  = true;
@@ -862,14 +858,14 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
                                         ggml_sycl::moe_batch_reject_reason * reject) {
     using namespace ggml_sycl;
     const resolved_ptr workspace_resolved = task.workspace_lease.resolve(mem_handle::HOST_DEVICE);
-    if (!task.activations || !task.output || !task.workspace || !workspace_resolved.ptr || workspace_resolved.on_device ||
-        workspace_resolved.ptr != task.workspace || task.recipe.request.K > INT_MAX ||
+    if (!task.activations || !task.output || !task.workspace || !workspace_resolved.ptr ||
+        workspace_resolved.on_device || workspace_resolved.ptr != task.workspace || task.recipe.request.K > INT_MAX ||
         task.recipe.request.N > INT_MAX || task.recipe.request.K <= 0 || task.recipe.request.N <= 0 ||
         task.recipe.workspace.alignment == 0 ||
         (reinterpret_cast<uintptr_t>(task.workspace) & (task.recipe.workspace.alignment - 1)) != 0 ||
         !validate_moe_execution_recipe(task.recipe, task.admitted_recipe_signature, task.weight_lease,
-                                       moe_batch_residency::HOST, task.recipe.request.submit, true,
-                                       task.workspace_bytes, reject)) {
+                                       moe_batch_residency::HOST, /*has_ready_event=*/false, task.recipe.request.submit,
+                                       true, task.workspace_bytes, reject)) {
         return false;
     }
     if ((task.recipe.request.type != GGML_TYPE_Q1_0 && task.recipe.request.type != GGML_TYPE_NVFP4) ||
@@ -924,20 +920,53 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
         }
     }
     std::memcpy(task.output, output, rows * static_cast<size_t>(N) * sizeof(float));
+    // The task's rows are written: host progress for the [SYCL-WATCHDOG] (llama.cpp-ff00). Q1_0/NVFP4 experts never
+    // reach cpu_expert_mul_mat_batched_run, and their producer runs this one task at a time on one thread, so it is
+    // the slowest CPU expert producer. Once per task, never per row.
+    ggml_sycl_watchdog_heartbeat();
     if (reject) *reject = moe_batch_reject_reason::NONE;
     return true;
 }
 
-void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_tasks, int n_threads) {
+bool ggml_sycl_cpu_expert_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static thread_local cpu_expert_batched_phase_times g_cpu_expert_batched_last;
+
+cpu_expert_batched_phase_times ggml_sycl_cpu_expert_batched_last_phase_times() {
+    return g_cpu_expert_batched_last;
+}
+
+using cpu_expert_trace_clock = std::chrono::steady_clock;
+
+static double cpu_expert_trace_us(cpu_expert_trace_clock::time_point a, cpu_expert_trace_clock::time_point b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
+
+// row_workers, when set, runs the flattened row loop (Phase 2) instead of the TBB arena (llama.cpp-w4e9).
+static void cpu_expert_mul_mat_batched_run(const cpu_expert_task *    tasks,
+                                           int                        n_tasks,
+                                           ggml_sycl::CpuRowWorkers * row_workers) {
     for (int i = 0; tasks && i < n_tasks; ++i) {
         GGML_ASSERT(tasks[i].type != GGML_TYPE_Q1_0 && tasks[i].type != GGML_TYPE_NVFP4 &&
                     "Q1_0/NVFP4 MoE must use its admitted host recipe");
     }
+    // Reset before any return, so a call that computes nothing reports no rows
+    // rather than the previous call's.
+    const bool                         trace = ggml_sycl_cpu_expert_trace_enabled();
+    cpu_expert_trace_clock::time_point trace_t0;
+    if (trace) {
+        g_cpu_expert_batched_last = {};
+        trace_t0                  = cpu_expert_trace_clock::now();
+    }
     if (n_tasks <= 0 || !tasks) {
         return;
     }
-
-    GGML_UNUSED(n_threads);  // TBB arena size set globally via ggml_sycl_cpu_threads_hint
 
     // --- Phase 1: Pre-quantize unique activation vectors ---
     // Multiple experts in the same layer share the same activation input.
@@ -996,6 +1025,11 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         if (it != act_q_map.end()) {
             task_act_q[i] = it->second.data();
         }
+    }
+    cpu_expert_trace_clock::time_point trace_t1;
+    if (trace) {
+        trace_t1                           = cpu_expert_trace_clock::now();
+        g_cpu_expert_batched_last.quant_us = cpu_expert_trace_us(trace_t0, trace_t1);
     }
 
     // --- Phase 1.5: Multi-activation GEMM for PP mode (MXFP4) ---
@@ -1165,260 +1199,322 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
     // Dynamic grain: ~2 tasks per thread for load balance without TBB overhead
     const int n_thr = ggml_sycl_cpu_threads_hint();
     const int grain = std::max(64, total_rows / std::max(1, n_thr * 2));
-    ggml_sycl_cpu_arena().execute([&] {
-        ggml_sycl_tbb::parallel_for(
-            ggml_sycl_tbb::blocked_range<int>(0, total_rows, grain),
-            [tasks_ptr, q8_ptrs, meta_ptr, n_tasks](const ggml_sycl_tbb::blocked_range<int> & range) {
-                // This lambda runs on a TBB arena worker thread, which is
-                // NOT necessarily the thread that called
-                // ggml_sycl_cpu_expert_mul_mat_batched() -- and the MXFP4
-                // large-chunk4 path below (chunk4 > 256) touches
-                // g_cpu_dispatch_buffers.accs directly. thread_local means
-                // each TBB worker has its own, separately-unsized instance;
-                // init here, not at the enclosing function's entry.
-                ggml_sycl_cpu_dispatch_buffers_init();
+    // Trace only: when the first row range starts, and which arena slots ran one.
+    std::atomic<int64_t>               trace_first_ns{ INT64_MAX };
+    std::atomic<uint64_t>              trace_slots{ 0 };
+    std::atomic<int64_t> *             trace_first_p = &trace_first_ns;
+    std::atomic<uint64_t> *            trace_slots_p = &trace_slots;
+    cpu_expert_trace_clock::time_point trace_t2;
+    if (trace) {
+        trace_t2                           = cpu_expert_trace_clock::now();
+        g_cpu_expert_batched_last.setup_us = cpu_expert_trace_us(trace_t1, trace_t2);
+        g_cpu_expert_batched_last.rows     = total_rows;
+        // The rows' weight type (GGML_TYPE_COUNT when they mix types) and bytes,
+        // over the tasks counted in total_rows: those given a row stride above.
+        bool first                         = true;
+        for (int i = 0; i < n_tasks; i++) {
+            if (meta[i].row_stride == 0) {
+                continue;
+            }
+            g_cpu_expert_batched_last.bytes += static_cast<uint64_t>(tasks[i].N) * meta[i].row_stride;
+            if (first) {
+                g_cpu_expert_batched_last.type = tasks[i].type;
+                first                          = false;
+            } else if (tasks[i].type != g_cpu_expert_batched_last.type) {
+                g_cpu_expert_batched_last.type = GGML_TYPE_COUNT;
+            }
+        }
+    }
+    // One range [range_begin, range_end) of the flattened rows. slot is the running thread's index in
+    // the loop's executor (a TBB arena slot, or a row-worker slot); only the trace reads it.
+    const auto rows_body = [tasks_ptr, q8_ptrs, meta_ptr, n_tasks, trace, trace_first_p, trace_slots_p](
+                               int range_begin, int range_end, int slot) {
+        if (trace) {
+            const int64_t ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_expert_trace_clock::now().time_since_epoch())
+                    .count();
+            int64_t seen = trace_first_p->load(std::memory_order_relaxed);
+            while (ns < seen && !trace_first_p->compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
+            }
+            if (slot >= 0 && slot < 64) {
+                trace_slots_p->fetch_or(uint64_t(1) << slot, std::memory_order_relaxed);
+            }
+        }
+        // This body runs on a TBB arena worker or a row worker, which is
+        // NOT necessarily the thread that called
+        // ggml_sycl_cpu_expert_mul_mat_batched() -- and the MXFP4
+        // large-chunk4 path below (chunk4 > 256) touches
+        // g_cpu_dispatch_buffers.accs directly. thread_local means
+        // each worker has its own, separately-unsized instance;
+        // init here, not at the enclosing function's entry.
+        ggml_sycl_cpu_dispatch_buffers_init();
 
-                // Binary search for starting task
-                int cur_task = 0;
-                {
-                    int lo = 0, hi = n_tasks;
-                    while (lo < hi) {
-                        int mid = (lo + hi) / 2;
-                        if (meta_ptr[mid].prefix_rows <= range.begin()) {
-                            cur_task = mid;
-                            lo       = mid + 1;
-                        } else {
-                            hi = mid;
-                        }
-                    }
+        // Binary search for starting task
+        int cur_task = 0;
+        {
+            int lo = 0, hi = n_tasks;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (meta_ptr[mid].prefix_rows <= range_begin) {
+                    cur_task = mid;
+                    lo       = mid + 1;
+                } else {
+                    hi = mid;
                 }
+            }
+        }
 
-                int flat_r = range.begin();
-                while (flat_r < range.end()) {
-                    while (cur_task + 1 < n_tasks && flat_r >= meta_ptr[cur_task + 1].prefix_rows) {
-                        cur_task++;
-                    }
-                    const auto & m = meta_ptr[cur_task];
-                    if (!m.cpu_traits) {
-                        flat_r++;
-                        continue;
-                    }
-                    const auto & t              = tasks_ptr[cur_task];
-                    int          local_r        = flat_r - m.prefix_rows;
-                    // How many consecutive rows remain in this task within this range?
-                    int          task_rows_left = t.N - local_r;
-                    int          range_left     = range.end() - flat_r;
-                    int          chunk          = std::min(task_rows_left, range_left);
+        int flat_r = range_begin;
+        while (flat_r < range_end) {
+            while (cur_task + 1 < n_tasks && flat_r >= meta_ptr[cur_task + 1].prefix_rows) {
+                cur_task++;
+            }
+            const auto & m = meta_ptr[cur_task];
+            if (!m.cpu_traits) {
+                flat_r++;
+                continue;
+            }
+            const auto & t              = tasks_ptr[cur_task];
+            int          local_r        = flat_r - m.prefix_rows;
+            // How many consecutive rows remain in this task within this range?
+            int          task_rows_left = t.N - local_r;
+            int          range_left     = range_end - flat_r;
+            int          chunk          = std::min(task_rows_left, range_left);
 
-                    // Multi-row SIMD fast path: process 4/8/16 rows at once,
-                    // loading each Q8 activation block once per group.
-                    int i = 0;
+            // Multi-row SIMD fast path: process 4/8/16 rows at once,
+            // loading each Q8 activation block once per group.
+            int i = 0;
 #    if defined(__AVX2__)
-                    if (t.type == GGML_TYPE_Q4_0 && chunk >= 4) {
-                        const char * wbase = (const char *) t.weight_host + (size_t) local_r * m.row_stride;
-                        const void * act_q = q8_ptrs[cur_task];
-                        float *      out   = t.output_host + local_r;
+            if (t.type == GGML_TYPE_Q4_0 && chunk >= 4) {
+                const char * wbase = (const char *) t.weight_host + (size_t) local_r * m.row_stride;
+                const void * act_q = q8_ptrs[cur_task];
+                float *      out   = t.output_host + local_r;
 
 #        if defined(__AVXVNNIINT8__)
-                        if (has_avxvnniint8()) {
-                            // 16-row VNNI kernel
-                            for (; i + 15 < chunk; i += 16) {
-                                const void * row_ptrs[16];
-                                for (int k = 0; k < 16; k++) {
-                                    row_ptrs[k] = wbase + (size_t) (i + k) * m.row_stride;
-                                }
-                                simd_mul_mat_q4_0_q8_0_16row(t.K, out + i, row_ptrs, (const uint8_t *) act_q);
-                                if (t.bias) {
-                                    for (int k = 0; k < 16; k++) {
-                                        out[i + k] += t.bias[local_r + i + k];
-                                    }
-                                }
-                            }
-                            // 8-row VNNI kernel
-                            for (; i + 7 < chunk; i += 8) {
-                                simd_mul_mat_q4_0_q8_0_8row(
-                                    t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride,
-                                    wbase + (size_t) (i + 1) * m.row_stride, wbase + (size_t) (i + 2) * m.row_stride,
-                                    wbase + (size_t) (i + 3) * m.row_stride, wbase + (size_t) (i + 4) * m.row_stride,
-                                    wbase + (size_t) (i + 5) * m.row_stride, wbase + (size_t) (i + 6) * m.row_stride,
-                                    wbase + (size_t) (i + 7) * m.row_stride, (const uint8_t *) act_q);
-                                if (t.bias) {
-                                    for (int k = 0; k < 8; k++) {
-                                        out[i + k] += t.bias[local_r + i + k];
-                                    }
-                                }
-                            }
-                        }  // has_avxvnniint8
-#        endif
-                        // 4-row AVX2 kernel
-                        for (; i + 3 < chunk; i += 4) {
-                            simd_mul_mat_q4_0_q8_0_4row(t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride,
-                                                        wbase + (size_t) (i + 1) * m.row_stride,
-                                                        wbase + (size_t) (i + 2) * m.row_stride,
-                                                        wbase + (size_t) (i + 3) * m.row_stride, act_q);
-                            if (t.bias) {
-                                for (int k = 0; k < 4; k++) {
-                                    out[i + k] += t.bias[local_r + i + k];
-                                }
-                            }
+                if (has_avxvnniint8()) {
+                    // 16-row VNNI kernel
+                    for (; i + 15 < chunk; i += 16) {
+                        const void * row_ptrs[16];
+                        for (int k = 0; k < 16; k++) {
+                            row_ptrs[k] = wbase + (size_t) (i + k) * m.row_stride;
                         }
-                    } else if (t.type == GGML_TYPE_Q6_K && chunk >= 4) {
-                        const char * wbase = (const char *) t.weight_host + (size_t) local_r * m.row_stride;
-                        const void * act_q = q8_ptrs[cur_task];
-                        float *      out   = t.output_host + local_r;
-
-                        for (; i + 3 < chunk; i += 4) {
-                            simd_mul_mat_q6_K_q8_K_4row(
-                                t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride,
-                                wbase + (size_t) (i + 1) * m.row_stride, wbase + (size_t) (i + 2) * m.row_stride,
-                                wbase + (size_t) (i + 3) * m.row_stride, (const uint8_t *) act_q);
-                            if (t.bias) {
-                                for (int k = 0; k < 4; k++) {
-                                    out[i + k] += t.bias[local_r + i + k];
-                                }
-                            }
-                        }
-                    } else if (t.type == GGML_TYPE_MXFP4 && chunk >= 4) {
-                        const char * wbase = (const char *) t.weight_host + (size_t) local_r * m.row_stride;
-                        const void * act_q = q8_ptrs[cur_task];
-                        float *      out   = t.output_host + local_r;
-
-#        if defined(__AVXVNNIINT8__)
-                        if (has_avxvnniint8()) {
-                            // VNNI fast path: 16-row → 8-row → 4-row tile fallback.
-                            // Self-contained kernels (no K-tiling needed: activation
-                            // for K=2880 is only 3060 bytes, fits L1 easily).
-                            for (; i + 15 < chunk; i += 16) {
-                                const void * row_ptrs[16];
-                                for (int k = 0; k < 16; k++) {
-                                    row_ptrs[k] = wbase + (size_t) (i + k) * m.row_stride;
-                                }
-                                simd_mxfp4_q8_0_16row(t.K, out + i, row_ptrs, act_q);
-                                if (t.bias) {
-                                    for (int k = 0; k < 16; k++) {
-                                        out[i + k] += t.bias[local_r + i + k];
-                                    }
-                                }
-                            }
-                            for (; i + 7 < chunk; i += 8) {
-                                simd_mxfp4_q8_0_8row(
-                                    t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride,
-                                    wbase + (size_t) (i + 1) * m.row_stride, wbase + (size_t) (i + 2) * m.row_stride,
-                                    wbase + (size_t) (i + 3) * m.row_stride, wbase + (size_t) (i + 4) * m.row_stride,
-                                    wbase + (size_t) (i + 5) * m.row_stride, wbase + (size_t) (i + 6) * m.row_stride,
-                                    wbase + (size_t) (i + 7) * m.row_stride, act_q);
-                                if (t.bias) {
-                                    for (int k = 0; k < 8; k++) {
-                                        out[i + k] += t.bias[local_r + i + k];
-                                    }
-                                }
-                            }
-                            // VNNI-native 4-row tiled for remainder after 16/8
-                            {
-                                static constexpr int TILE_BLOCKS = 16;
-                                const int            nb          = t.K / QK_MXFP4;
-                                const int            remaining   = chunk - i;
-                                const int            chunk4      = remaining & ~3;
-
-                                __m256   accs_stack[256];
-                                __m256 * accs;
-                                if (chunk4 <= 256) {
-                                    accs = accs_stack;
-                                } else {
-                                    const size_t buf_size = chunk4 * sizeof(__m256) / sizeof(float);
-                                    GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.accs.size());
-                                    accs = reinterpret_cast<__m256 *>(g_cpu_dispatch_buffers.accs.data());
-                                }
-                                for (int j = 0; j < chunk4; j++) {
-                                    accs[j] = _mm256_setzero_ps();
-                                }
-
-                                for (int ib_start = 0; ib_start < nb; ib_start += TILE_BLOCKS) {
-                                    int ib_end = std::min(ib_start + TILE_BLOCKS, nb);
-                                    for (int j = 0; j + 3 < chunk4; j += 4) {
-                                        simd_mxfp4_q8_0_4row_tile_vnni(
-                                            ib_start, ib_end, wbase + (size_t) (i + j + 0) * m.row_stride,
-                                            wbase + (size_t) (i + j + 1) * m.row_stride,
-                                            wbase + (size_t) (i + j + 2) * m.row_stride,
-                                            wbase + (size_t) (i + j + 3) * m.row_stride, act_q, accs[j + 0],
-                                            accs[j + 1], accs[j + 2], accs[j + 3]);
-                                    }
-                                }
-
-                                for (int j = 0; j < chunk4; j++) {
-                                    out[i + j] = ggml_sycl_hsum_float_8(accs[j]);
-                                    if (t.bias) {
-                                        out[i + j] += t.bias[local_r + i + j];
-                                    }
-                                }
-                                i += chunk4;
-                            }
-                        }  // has_avxvnniint8
-                        else {
-#        endif
-                            // 4-row K-tiled fallback (AVX2, no VNNI).
-                            {
-                                static constexpr int TILE_BLOCKS = 16;
-                                const int            nb          = t.K / QK_MXFP4;
-                                const int            remaining   = chunk - i;
-                                const int            chunk4      = remaining & ~3;
-
-                                __m256   accs_stack[256];
-                                __m256 * accs;
-                                if (chunk4 <= 256) {
-                                    accs = accs_stack;
-                                } else {
-                                    const size_t buf_size = chunk4 * sizeof(__m256) / sizeof(float);
-                                    GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.accs.size());
-                                    accs = reinterpret_cast<__m256 *>(g_cpu_dispatch_buffers.accs.data());
-                                }
-                                for (int j = 0; j < chunk4; j++) {
-                                    accs[j] = _mm256_setzero_ps();
-                                }
-
-                                for (int ib_start = 0; ib_start < nb; ib_start += TILE_BLOCKS) {
-                                    int ib_end = std::min(ib_start + TILE_BLOCKS, nb);
-                                    for (int j = 0; j + 3 < chunk4; j += 4) {
-                                        simd_mxfp4_q8_0_4row_tile(ib_start, ib_end,
-                                                                  wbase + (size_t) (i + j + 0) * m.row_stride,
-                                                                  wbase + (size_t) (i + j + 1) * m.row_stride,
-                                                                  wbase + (size_t) (i + j + 2) * m.row_stride,
-                                                                  wbase + (size_t) (i + j + 3) * m.row_stride, act_q,
-                                                                  accs[j + 0], accs[j + 1], accs[j + 2], accs[j + 3]);
-                                    }
-                                }
-
-                                for (int j = 0; j < chunk4; j++) {
-                                    out[i + j] = ggml_sycl_hsum_float_8(accs[j]);
-                                    if (t.bias) {
-                                        out[i + j] += t.bias[local_r + i + j];
-                                    }
-                                }
-                                i += chunk4;
-                            }
-#        if defined(__AVXVNNIINT8__)
-                        }  // !has_avxvnniint8
-#        endif
-                    }
-#    endif
-                    // Remainder: single-row generic vec_dot
-                    for (; i < chunk; i++) {
-                        int          row_idx = local_r + i;
-                        const void * row     = (const char *) t.weight_host + (size_t) row_idx * m.row_stride;
-                        float        dot     = 0.0f;
-                        m.cpu_traits->vec_dot(t.K, &dot, sizeof(float), row, 0, q8_ptrs[cur_task], 0, 1);
+                        simd_mul_mat_q4_0_q8_0_16row(t.K, out + i, row_ptrs, (const uint8_t *) act_q);
                         if (t.bias) {
-                            dot += t.bias[row_idx];
+                            for (int k = 0; k < 16; k++) {
+                                out[i + k] += t.bias[local_r + i + k];
+                            }
                         }
-                        t.output_host[row_idx] = dot;
                     }
-
-                    flat_r += chunk;
+                    // 8-row VNNI kernel
+                    for (; i + 7 < chunk; i += 8) {
+                        simd_mul_mat_q4_0_q8_0_8row(
+                            t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride,
+                            wbase + (size_t) (i + 1) * m.row_stride, wbase + (size_t) (i + 2) * m.row_stride,
+                            wbase + (size_t) (i + 3) * m.row_stride, wbase + (size_t) (i + 4) * m.row_stride,
+                            wbase + (size_t) (i + 5) * m.row_stride, wbase + (size_t) (i + 6) * m.row_stride,
+                            wbase + (size_t) (i + 7) * m.row_stride, (const uint8_t *) act_q);
+                        if (t.bias) {
+                            for (int k = 0; k < 8; k++) {
+                                out[i + k] += t.bias[local_r + i + k];
+                            }
+                        }
+                    }
+                }  // has_avxvnniint8
+#        endif
+                // 4-row AVX2 kernel
+                for (; i + 3 < chunk; i += 4) {
+                    simd_mul_mat_q4_0_q8_0_4row(
+                        t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride, wbase + (size_t) (i + 1) * m.row_stride,
+                        wbase + (size_t) (i + 2) * m.row_stride, wbase + (size_t) (i + 3) * m.row_stride, act_q);
+                    if (t.bias) {
+                        for (int k = 0; k < 4; k++) {
+                            out[i + k] += t.bias[local_r + i + k];
+                        }
+                    }
                 }
-            });
-    });
+            } else if (t.type == GGML_TYPE_Q6_K && chunk >= 4) {
+                const char * wbase = (const char *) t.weight_host + (size_t) local_r * m.row_stride;
+                const void * act_q = q8_ptrs[cur_task];
+                float *      out   = t.output_host + local_r;
+
+                for (; i + 3 < chunk; i += 4) {
+                    simd_mul_mat_q6_K_q8_K_4row(t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride,
+                                                wbase + (size_t) (i + 1) * m.row_stride,
+                                                wbase + (size_t) (i + 2) * m.row_stride,
+                                                wbase + (size_t) (i + 3) * m.row_stride, (const uint8_t *) act_q);
+                    if (t.bias) {
+                        for (int k = 0; k < 4; k++) {
+                            out[i + k] += t.bias[local_r + i + k];
+                        }
+                    }
+                }
+            } else if (t.type == GGML_TYPE_MXFP4 && chunk >= 4) {
+                const char * wbase = (const char *) t.weight_host + (size_t) local_r * m.row_stride;
+                const void * act_q = q8_ptrs[cur_task];
+                float *      out   = t.output_host + local_r;
+
+#        if defined(__AVXVNNIINT8__)
+                if (has_avxvnniint8()) {
+                    // VNNI fast path: 16-row → 8-row → 4-row tile fallback.
+                    // Self-contained kernels (no K-tiling needed: activation
+                    // for K=2880 is only 3060 bytes, fits L1 easily).
+                    for (; i + 15 < chunk; i += 16) {
+                        const void * row_ptrs[16];
+                        for (int k = 0; k < 16; k++) {
+                            row_ptrs[k] = wbase + (size_t) (i + k) * m.row_stride;
+                        }
+                        simd_mxfp4_q8_0_16row(t.K, out + i, row_ptrs, act_q);
+                        if (t.bias) {
+                            for (int k = 0; k < 16; k++) {
+                                out[i + k] += t.bias[local_r + i + k];
+                            }
+                        }
+                    }
+                    for (; i + 7 < chunk; i += 8) {
+                        simd_mxfp4_q8_0_8row(
+                            t.K, out + i, wbase + (size_t) (i + 0) * m.row_stride,
+                            wbase + (size_t) (i + 1) * m.row_stride, wbase + (size_t) (i + 2) * m.row_stride,
+                            wbase + (size_t) (i + 3) * m.row_stride, wbase + (size_t) (i + 4) * m.row_stride,
+                            wbase + (size_t) (i + 5) * m.row_stride, wbase + (size_t) (i + 6) * m.row_stride,
+                            wbase + (size_t) (i + 7) * m.row_stride, act_q);
+                        if (t.bias) {
+                            for (int k = 0; k < 8; k++) {
+                                out[i + k] += t.bias[local_r + i + k];
+                            }
+                        }
+                    }
+                    // VNNI-native 4-row tiled for remainder after 16/8
+                    {
+                        static constexpr int TILE_BLOCKS = 16;
+                        const int            nb          = t.K / QK_MXFP4;
+                        const int            remaining   = chunk - i;
+                        const int            chunk4      = remaining & ~3;
+
+                        __m256   accs_stack[256];
+                        __m256 * accs;
+                        if (chunk4 <= 256) {
+                            accs = accs_stack;
+                        } else {
+                            const size_t buf_size = chunk4 * sizeof(__m256) / sizeof(float);
+                            GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.accs.size());
+                            accs = reinterpret_cast<__m256 *>(g_cpu_dispatch_buffers.accs.data());
+                        }
+                        for (int j = 0; j < chunk4; j++) {
+                            accs[j] = _mm256_setzero_ps();
+                        }
+
+                        for (int ib_start = 0; ib_start < nb; ib_start += TILE_BLOCKS) {
+                            int ib_end = std::min(ib_start + TILE_BLOCKS, nb);
+                            for (int j = 0; j + 3 < chunk4; j += 4) {
+                                simd_mxfp4_q8_0_4row_tile_vnni(ib_start, ib_end,
+                                                               wbase + (size_t) (i + j + 0) * m.row_stride,
+                                                               wbase + (size_t) (i + j + 1) * m.row_stride,
+                                                               wbase + (size_t) (i + j + 2) * m.row_stride,
+                                                               wbase + (size_t) (i + j + 3) * m.row_stride, act_q,
+                                                               accs[j + 0], accs[j + 1], accs[j + 2], accs[j + 3]);
+                            }
+                        }
+
+                        for (int j = 0; j < chunk4; j++) {
+                            out[i + j] = ggml_sycl_hsum_float_8(accs[j]);
+                            if (t.bias) {
+                                out[i + j] += t.bias[local_r + i + j];
+                            }
+                        }
+                        i += chunk4;
+                    }
+                }  // has_avxvnniint8
+                else {
+#        endif
+                    // 4-row K-tiled fallback (AVX2, no VNNI).
+                    {
+                        static constexpr int TILE_BLOCKS = 16;
+                        const int            nb          = t.K / QK_MXFP4;
+                        const int            remaining   = chunk - i;
+                        const int            chunk4      = remaining & ~3;
+
+                        __m256   accs_stack[256];
+                        __m256 * accs;
+                        if (chunk4 <= 256) {
+                            accs = accs_stack;
+                        } else {
+                            const size_t buf_size = chunk4 * sizeof(__m256) / sizeof(float);
+                            GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.accs.size());
+                            accs = reinterpret_cast<__m256 *>(g_cpu_dispatch_buffers.accs.data());
+                        }
+                        for (int j = 0; j < chunk4; j++) {
+                            accs[j] = _mm256_setzero_ps();
+                        }
+
+                        for (int ib_start = 0; ib_start < nb; ib_start += TILE_BLOCKS) {
+                            int ib_end = std::min(ib_start + TILE_BLOCKS, nb);
+                            for (int j = 0; j + 3 < chunk4; j += 4) {
+                                simd_mxfp4_q8_0_4row_tile(ib_start, ib_end, wbase + (size_t) (i + j + 0) * m.row_stride,
+                                                          wbase + (size_t) (i + j + 1) * m.row_stride,
+                                                          wbase + (size_t) (i + j + 2) * m.row_stride,
+                                                          wbase + (size_t) (i + j + 3) * m.row_stride, act_q,
+                                                          accs[j + 0], accs[j + 1], accs[j + 2], accs[j + 3]);
+                            }
+                        }
+
+                        for (int j = 0; j < chunk4; j++) {
+                            out[i + j] = ggml_sycl_hsum_float_8(accs[j]);
+                            if (t.bias) {
+                                out[i + j] += t.bias[local_r + i + j];
+                            }
+                        }
+                        i += chunk4;
+                    }
+#        if defined(__AVXVNNIINT8__)
+                }  // !has_avxvnniint8
+#        endif
+            }
+#    endif
+            // Remainder: single-row generic vec_dot
+            for (; i < chunk; i++) {
+                int          row_idx = local_r + i;
+                const void * row     = (const char *) t.weight_host + (size_t) row_idx * m.row_stride;
+                float        dot     = 0.0f;
+                m.cpu_traits->vec_dot(t.K, &dot, sizeof(float), row, 0, q8_ptrs[cur_task], 0, 1);
+                if (t.bias) {
+                    dot += t.bias[row_idx];
+                }
+                t.output_host[row_idx] = dot;
+            }
+
+            flat_r += chunk;
+        }
+    };
+    if (row_workers) {
+        // A CpuExpertPool job: the pool's row workers stay awake between a token's jobs (llama.cpp-w4e9).
+        // std::cref keeps the body by reference, so the call allocates nothing.
+        row_workers->run(total_rows, std::cref(rows_body));
+    } else {
+        ggml_sycl_cpu_arena().execute([&] {
+            ggml_sycl_tbb::parallel_for(ggml_sycl_tbb::blocked_range<int>(0, total_rows, grain),
+                                        [&rows_body](const ggml_sycl_tbb::blocked_range<int> & range) {
+                                            rows_body(range.begin(), range.end(),
+                                                      ggml_sycl_tbb::this_task_arena::current_thread_index());
+                                        });
+        });
+    }
+    if (trace) {
+        const auto    trace_t3 = cpu_expert_trace_clock::now();
+        const int64_t first    = trace_first_ns.load(std::memory_order_relaxed);
+        const auto    t_first =
+            first == INT64_MAX ? trace_t3 : cpu_expert_trace_clock::time_point(std::chrono::nanoseconds(first));
+        g_cpu_expert_batched_last.fanout_us  = cpu_expert_trace_us(trace_t2, t_first);
+        g_cpu_expert_batched_last.compute_us = cpu_expert_trace_us(t_first, trace_t3);
+        g_cpu_expert_batched_last.threads    = __builtin_popcountll(trace_slots.load(std::memory_order_relaxed));
+        // The same two stamps as compute_us, for the pool job's critical-path record (llama.cpp-j6jf).
+        g_cpu_expert_batched_last.t_compute_start_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_first.time_since_epoch()).count();
+        g_cpu_expert_batched_last.t_compute_end_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(trace_t3.time_since_epoch()).count();
+    }
 #else
     // No-TBB fallback: sequential over flattened rows.
+    GGML_UNUSED(row_workers);
     int cur_task = 0;
     for (int flat_r = 0; flat_r < total_rows; flat_r++) {
         while (cur_task + 1 < n_tasks && flat_r >= meta[cur_task + 1].prefix_rows) {
@@ -1465,6 +1561,23 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
 
     GGML_SYCL_DEBUG("[EXPERT-CPU] Batched expert mul_mat: %d tasks, %d total_rows, %d unique activations\n", n_tasks,
                     total_rows, (int) act_q_map.size());
+    // The rows are written: host progress for the [SYCL-WATCHDOG], which a prompt graph's host-tiered experts
+    // otherwise show only when the graph ends (llama.cpp-ff00). The pool, the plain std::async producer and the inline
+    // sites run this function; Q1_0/NVFP4 experts run ggml_sycl_cpu_moe_host_aos_execute instead, which ticks per
+    // task. It ticks once per batch, never per row: rows_body is the hot loop. A batch runs only on inputs the device
+    // already produced, so a stalled device stops these ticks within one batch.
+    ggml_sycl_watchdog_heartbeat();
+}
+
+void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_tasks, int n_threads) {
+    GGML_UNUSED(n_threads);  // TBB arena size set globally via ggml_sycl_cpu_threads_hint
+    cpu_expert_mul_mat_batched_run(tasks, n_tasks, nullptr);
+}
+
+void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task *    tasks,
+                                          int                        n_tasks,
+                                          ggml_sycl::CpuRowWorkers & row_workers) {
+    cpu_expert_mul_mat_batched_run(tasks, n_tasks, &row_workers);
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,6 +1708,9 @@ void ggml_sycl_cpu_expert_mul_mat_adaptive(const cpu_expert_task * tasks, int n_
     // yield CPU to GPU work
     for (int i = 0; i < n_reduced; i++) {
         cpu_expert_mul_mat_int4(tasks[n_full + i]);
+    }
+    if (n_reduced > 0) {
+        ggml_sycl_watchdog_heartbeat();  // the reduced batch is written too (see cpu_expert_mul_mat_batched_run)
     }
 
     GGML_SYCL_DEBUG(
@@ -2215,6 +2331,7 @@ void * ggml_sycl_cpu_retained_alloc_output(const ggml_tensor * dst) {
 }
 
 void ggml_sycl_cpu_retained_flush_all(int device, sycl::queue * gpu_q) {
+    ggml_sycl_host_executor_region host_executor;
     if (g_retained_map.empty()) {
         return;
     }
@@ -2257,6 +2374,7 @@ void ggml_sycl_cpu_retained_flush_selective(int                         device,
                                             sycl::queue *               gpu_q,
                                             const ggml_tensor * const * gpu_nodes,
                                             int                         n_gpu_nodes) {
+    ggml_sycl_host_executor_region host_executor;
     if (g_retained_map.empty() || !gpu_nodes || n_gpu_nodes <= 0) {
         g_retained_map.clear();
         scratch_reset();
@@ -2545,7 +2663,7 @@ bool ggml_sycl_batched_mode_active() {
 
 static void staging_track_cpu_event(const sycl::event & evt) {
     try {
-        if (!ggml_sycl_should_add_dependency(evt)) {
+        if (!ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH)) {
             return;
         }
     } catch (...) {
@@ -2718,6 +2836,7 @@ static void * get_host_ptr(const ggml_tensor *     t,
                            sycl::queue *           gpu_q,
                            sycl::event *           out_event = nullptr,
                            ggml_sycl::mem_handle * out_lease = nullptr) {
+    ggml_sycl_host_executor_region host_executor;
     // Check retained activation map first — if this tensor's data was
     // produced by a prior CPU op in the same layer block, return the
     // host pointer directly without any D2H copy.
@@ -2993,6 +3112,7 @@ static void flush_output(ggml_tensor *       t,
                          sycl::queue *       gpu_q,
                          const sycl::event * dep_evt              = nullptr,
                          bool                dep_event_same_queue = false) {
+    ggml_sycl_host_executor_region host_executor;
     if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
         return;
     }
@@ -3046,6 +3166,7 @@ static void flush_output(ggml_tensor *       t,
 // Get host pointer for output tensor.
 // Uses staging slot 2 of the current bank.
 static void * get_host_output_ptr(ggml_tensor * t, int device, sycl::queue * gpu_q) {
+    ggml_sycl_host_executor_region host_executor;
     // Host-accessible buffer → use resolved host-visible storage.
     if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
         void * resolved = ggml_sycl_resolve_tensor_ptr(t, device);
@@ -3069,6 +3190,7 @@ static void * get_host_output_ptr(ggml_tensor * t, int device, sycl::queue * gpu
 // Helper: get output pointer from retained scratch or staging fallback.
 // Sets *retained to true if output goes to scratch, false for staging.
 static void * get_retained_or_staging_output(ggml_tensor * dst, int device, sycl::queue * gpu_q, bool * retained) {
+    ggml_sycl_host_executor_region host_executor;
     // Batched mode: output directly to host-pinned resolved storage.
     if (g_batched_mode) {
         void * dst_ptr = ggml_sycl_resolve_tensor_ptr(dst, device);
@@ -3137,6 +3259,10 @@ static int ggml_sycl_cpu_threads_hint() {
         return std::min(value, 32);
     }();
     return n_threads;
+}
+
+int ggml_sycl_cpu_row_loop_threads() {
+    return ggml_sycl_cpu_threads_hint();
 }
 
 #if GGML_SYCL_HAS_TBB
@@ -4405,9 +4531,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         // Pre-allocated buffer via g_cpu_dispatch_buffers.scratch_nk
         float * src0_f32_buf = nullptr;
         if (src0_quantized && !use_vec_dot) {
-            const size_t buf_size = static_cast<size_t>(N) * K;
-            GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.scratch_nk.size());
-            src0_f32_buf = g_cpu_dispatch_buffers.scratch_nk.data();
+            src0_f32_buf = g_cpu_dispatch_buffers.ensure_scratch_nk(static_cast<size_t>(N) * K);
         }
 
         for (int64_t i13 = 0; i13 < ne13; i13++) {
@@ -5878,6 +6002,7 @@ static bool cpu_cpy(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 // ---------------------------------------------------------------------------
 
 static bool cpu_rope(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    ggml_sycl_host_executor_region host_executor;
     const bool batched   = batched_mode_active();
     const bool host_task = !batched && host_task_mode_active();
 
@@ -6209,6 +6334,7 @@ bool ggml_sycl_compute_fused_rms_norm_mul(ggml_backend_sycl_context & ctx,
 bool ggml_sycl_compute_fused_add_rms_norm(ggml_backend_sycl_context & ctx,
                                           ggml_tensor *               add_dst,
                                           ggml_tensor *               rms_dst) {
+    ggml_sycl_host_executor_region host_executor;
     const ggml_tensor * add_src0 = add_dst->src[0];
     const ggml_tensor * add_src1 = add_dst->src[1];
     const ggml_tensor * rms_src0 = rms_dst->src[0];  // should == add_dst
@@ -6569,8 +6695,7 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
         }
 
         // Pre-allocated weight dequantization buffer via g_cpu_dispatch_buffers.scratch_nk
-        const size_t buf_size = static_cast<size_t>(N) * K;
-        GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.scratch_nk.size());
+        float * const scratch_nk = g_cpu_dispatch_buffers.ensure_scratch_nk(static_cast<size_t>(N) * K);
 
         // A7L5W Site 2a: validate the per-expert weight slab before dequant.
         // `weight_bytes` is `weight_host + i02*nb02 + i03*nb03` from the caller
@@ -6581,12 +6706,11 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
                                    static_cast<std::size_t>(N) * static_cast<std::size_t>(nb01));
         for (int64_t row = 0; row < N; row++) {
             const void * row_data = weight_bytes + row * nb01;
-            type_traits->to_float(row_data, g_cpu_dispatch_buffers.scratch_nk.data() + row * K, K);
+            type_traits->to_float(row_data, scratch_nk + row * K, K);
         }
 
         // A7L5W Site 2: validate A/B/C pointers passed into DNNL's CPU JIT GEMM.
-        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_A", "(cpu_pp_gemm_A)",
-                                   g_cpu_dispatch_buffers.scratch_nk.data(),
+        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_A", "(cpu_pp_gemm_A)", scratch_nk,
                                    static_cast<std::size_t>(N) * static_cast<std::size_t>(K) * sizeof(float));
         GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_B", "(cpu_pp_gemm_B)", src1_host,
                                    static_cast<std::size_t>(M) * static_cast<std::size_t>(K) * sizeof(float));
@@ -6594,8 +6718,8 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
                                    static_cast<std::size_t>(M) * static_cast<std::size_t>(ldc) * sizeof(float));
         dnnl_status_t status =
             dnnl_sgemm('T', 'N', static_cast<dnnl_dim_t>(N), static_cast<dnnl_dim_t>(M), static_cast<dnnl_dim_t>(K),
-                       1.0f, g_cpu_dispatch_buffers.scratch_nk.data(), static_cast<dnnl_dim_t>(K), src1_host,
-                       static_cast<dnnl_dim_t>(K), 0.0f, dst_host, static_cast<dnnl_dim_t>(ldc));
+                       1.0f, scratch_nk, static_cast<dnnl_dim_t>(K), src1_host, static_cast<dnnl_dim_t>(K), 0.0f,
+                       dst_host, static_cast<dnnl_dim_t>(ldc));
         if (status != dnnl_success) {
             return false;
         }

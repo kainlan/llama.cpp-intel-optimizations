@@ -138,7 +138,10 @@ ROUTING_INDICES_LEGACY_OWNERSHIP_PATTERN='(g_routing_indices_cache\.host_alloc|h
 MOE_IDS_LEGACY_OWNERSHIP_PATTERN='((entry|ids_entry)\.(device_alloc|staging_alloc)|ggml_sycl::alloc_handle[[:space:]]+(device_alloc|staging_alloc)([;{]|$)|device_ids_ptr\(\) const \{ return device_alloc\.ptr|staging_ids_ptr\(\) const \{ return staging_alloc\.ptr)'
 MOE_IDS_PACK_LEGACY_PATTERN='ids_pack_alloc'
 MOE_FUSION_LEGACY_PATTERN='fused_alloc'
-MOE_PTR_TABLE_LEGACY_PATTERN='table_alloc'
+# Word-anchored: the legacy form is an alloc_handle field or local named exactly table_alloc. A bare substring
+# also matched owner-first helpers such as ggml_sycl_moe_hybrid_decode_table_allocate, whose table is a
+# mem_handle built by unified_allocate_owner + mem_handle::from_owned_alloc (canonical contract 1.3, 3.1).
+MOE_PTR_TABLE_LEGACY_PATTERN='\btable_alloc\b'
 MOE_GPU_PROBE_LEGACY_PATTERN='\bprobe_alloc\b'
 GPU_REORDER_TEMP_LEGACY_PATTERN='(std::vector<ggml_sycl::alloc_handle>[[:space:]]+temp_vram_bufs|std::unordered_map<int, std::vector<ggml_sycl::alloc_handle>>[[:space:]]+sec_temp_bufs|alloc_handle[[:space:]]+temp_vram_h|arena_device_alloc\(.*alloc_handle)'
 REORDER_D2H_STAGE_LEGACY_PATTERN='\bsrc_stage_alloc\b'

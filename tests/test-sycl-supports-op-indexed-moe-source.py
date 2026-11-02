@@ -6,22 +6,31 @@ from collections import Counter
 from pathlib import Path
 from typing import Set, Tuple
 
+from sycl_dense_type_list import with_dense_type_list_inlined
+
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
-SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
-FUNCTION_START = "static bool ggml_backend_sycl_device_supports_op("
+SOURCE_RAW = SOURCE_PATH.read_text(encoding="utf-8")
+SOURCE = with_dense_type_list_inlined(SOURCE_RAW)
+# supports_op is the thin wrapper `impl(dev, op, true)`; the decisions live in the impl, whose `placement_declines`
+# parameter is what ggml_backend_sycl_supports_op_capability turns off.
+FUNCTION_START = "static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines) {"
 FUNCTION_END = "static bool ggml_backend_sycl_device_supports_buft("
 EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
 ROUTER_FLAG = "const bool is_multi_gpu_router_logits ="
-PLANNER_GUARD = "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
+PLANNER_GUARD = "if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
 OP_SWITCH = "switch (op->op) {"
 # The KV-host-tier residency decline (llama.cpp-uize/h56y, TKV-13 host attention dispatch) runs before the
 # indexed-MoE early return. It is pinned verbatim, comments aside, rather than waved through: it may only ever
 # return false (or `continue`) on an operand living in the dedicated KV-host buft, which no ADD_ID/MUL_MAT_ID
 # operand does, and anything else that appears ahead of the early return still fails the equality below.
+# Since zhcn C6k (20684475a) both acceptances ask ggml_sycl_node_is_host_dispatched(op) instead of re-deriving the
+# predicate inline. It is true only for a FLASH_ATTN_EXT with K or V in the KV-host buft and a SET_ROWS into a
+# KV-host dst, so it still cannot hold for ADD_ID/MUL_MAT_ID; the one narrowing (a KV-host Q or mask is declined,
+# as the funnel intercept already did) only removes acceptances.
 KV_HOST_RESIDENCY_BLOCK = """
-    if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
-        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled())) {
+    if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op)) {
+        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(op))) {
             if (g_ggml_sycl_debug) {
                 g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
                 GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\\n", ggml_op_name(op->op));
@@ -34,10 +43,8 @@ KV_HOST_RESIDENCY_BLOCK = """
         }
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
-            if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
-                ggml_sycl_attn_host_dispatch_enabled()) {
+        if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
+            if (ggml_sycl_node_is_host_dispatched(op)) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
                     GGML_SYCL_DEBUG(
@@ -64,7 +71,7 @@ EXPECTED_PRE_INDEXED_GUARD_PREFIX = (
 TYPE_HELPER_START = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {"
 TYPE_HELPER_END = FUNCTION_START
 MUL_MAT_TYPE_ORDER = (
-    "F32", "F16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "MXFP4",
+    "F32", "F16", "Q2_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "MXFP4",
     "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ1_M",
     "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS",
 )
@@ -95,6 +102,25 @@ def executable_body(body: str) -> str:
     without_block_comments = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
     without_comments = re.sub(r"//[^\n]*", "", without_block_comments)
     return re.sub(r"\s+", "", without_comments)
+
+
+EXECUTOR_HELPER_HEADER = "static bool ggml_sycl_moe_multi_gpu_for_executor() {"
+EXECUTOR_HELPER_BODY = (
+    "if(g_measure_plan_override){"
+    "returng_measure_plan_override->plan&&"
+    "ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);}"
+    "returng_moe_multi_gpu_active.load(std::memory_order_acquire);"
+)
+
+
+def executor_helper_reads_the_latch(text: str) -> bool:
+    """The call in supports_op is only as good as what the helper reads: the measure
+    override's plan under a measure, the process latch otherwise, and nothing else."""
+    try:
+        _, _, body = braced_body(text, EXECUTOR_HELPER_HEADER)
+    except (ValueError):
+        return False
+    return text.count(EXECUTOR_HELPER_HEADER) == 1 and executable_body(body) == EXECUTOR_HELPER_BODY
 
 
 def matching_delimiter(text: str, opening: int, open_char: str, close_char: str) -> int:
@@ -162,11 +188,11 @@ def expected_pre_guard_decisions():
         ("if", "a_type==GGML_TYPE_Q4_1&&b->ne[1]==1", reject),
         ("if", "a_type==GGML_TYPE_IQ4_NL||a_type==GGML_TYPE_IQ4_XS||a_type==GGML_TYPE_IQ3_XXS||a_type==GGML_TYPE_IQ3_S||a_type==GGML_TYPE_IQ2_XXS||a_type==GGML_TYPE_IQ2_XS||a_type==GGML_TYPE_IQ2_S||a_type==GGML_TYPE_IQ1_S||a_type==GGML_TYPE_IQ1_M", (("if", "b->ne[1]==1&&ggml_nrows(b)>1", reject),)),
         ("statement", "ggml_typesrc0_type=op->src[0]->type"),
-        # llama.cpp-kmeq: a BF16 WEIGHT is materialised to F32 once and then runs the supported dense path, so
-        # BF16 is admitted exactly when that route is available for this tensor and refused otherwise. The
-        # admission reuses the dispatch-side predicate (same composed check), so the two cannot drift apart.
+        # llama.cpp-9qjy: a BF16 WEIGHT runs natively from the BF16 bytes the planner placed, so BF16 is admitted
+        # exactly when that route is available for this op and refused otherwise. The admission reuses the
+        # executor's own predicate (same composed check), so the two cannot drift apart.
         ("if", "src0_type==GGML_TYPE_BF16", (
-            ("if", "ggml_sycl_bf16_weight_materialize_route_available(op->src[0],device)", (("return", "true"),)),
+            ("if", "ggml_sycl_bf16_weight_native_route_available(op->src[0],op->src[1],op,device)", (("return", "true"),)),
             ("return", "false"),
         )),
         ("if", "ggml_is_permuted(a)&&!ggml_is_contiguous(a)&&a->ne[2]>1&&a->ne[3]>1&&src0_type==GGML_TYPE_F16", reject),
@@ -230,14 +256,23 @@ def contract(text: str) -> bool:
     router_residency_exception = executable_body(function[early_close + 1 : planner])
     later_indexed_case = re.search(r"\bcase\s+GGML_OP_MUL_MAT_ID\s*:", switch_body)
     return (
-        function_body_open < early < early_close < router_flag < planner < planner_close < switch
+        executor_helper_reads_the_latch(text)
+        and function_body_open < early < early_close < router_flag < planner < planner_close < switch
         and executable_body(function[function_body_open + 1 : early]) == EXPECTED_PRE_INDEXED_GUARD_PREFIX
-        and executable_body(early_body) == "constggml_typeindexed_a_type=op->src[0]->type;if(op->op==GGML_OP_MUL_MAT_ID){if(!moe_mmvq_admission_supports_type(indexed_a_type)){returnfalse;}}elseif(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}returntrue;"
+        and executable_body(early_body) == (
+            "constggml_typeindexed_a_type=op->src[0]->type;"
+            "if(op->op==GGML_OP_MUL_MAT_ID){"
+            "if(!moe_mmvq_admission_supports_type(indexed_a_type)&&!ggml_sycl_moe_pp_batched_admits_op(op,device)){"
+            "returnfalse;}}"
+            "elseif(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4"
+            "&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}"
+            "returntrue;"
+        )
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
         and router_residency_exception ==
             "constboolis_multi_gpu_router_logits="
-            "g_moe_multi_gpu_active.load(std::memory_order_acquire)&&"
+            "ggml_sycl_moe_multi_gpu_for_executor()&&"
             "ggml_sycl_op_is_moe_router_logits_matmul(op);"
         # The planner rejection may log under the supports_op debug switch before it returns false; the debug
         # branch carries no decision of its own (a single logging call), so the only outcome is still `false`.
@@ -337,11 +372,11 @@ def test_planner_guard_rejects_non_boolean_spelled_early_successes() -> None:
 def test_router_logits_control_flow_mutations_are_rejected() -> None:
     declaration = (
         "    const bool is_multi_gpu_router_logits =\n"
-        "        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "        ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op);\n\n"
     )
     old_early_success = (
-        "    if (g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "    if (ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op)) {\n"
         "        return true;\n"
         "    }\n\n"
@@ -357,11 +392,31 @@ def test_router_logits_control_flow_mutations_are_rejected() -> None:
 
     all_ops_bypass_planner = replace_in_supports_function(
         SOURCE,
-        "const bool is_multi_gpu_router_logits =\n        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "const bool is_multi_gpu_router_logits =\n        ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op);",
         "const bool is_multi_gpu_router_logits = true;",
     )
     assert not contract(all_ops_bypass_planner)
+
+
+def test_executor_helper_reads_are_pinned() -> None:
+    # Asserted on the clause itself, not through contract(): contract() carries an
+    # unrelated pre-existing prefix clause that is already false on this tree, so a
+    # "not contract(mutant)" here would pass whether or not the helper pin works.
+    assert executor_helper_reads_the_latch(SOURCE)
+    # the process latch read replaced by a constant, so every host answers "multi-GPU"
+    constant_latch = SOURCE.replace("return g_moe_multi_gpu_active.load(std::memory_order_acquire);",
+                                    "return true;", 1)
+    assert constant_latch != SOURCE and not executor_helper_reads_the_latch(constant_latch)
+    # the measure override's plan ignored: a measure would read the process latch
+    no_override = SOURCE.replace("if (g_measure_plan_override) {\n        return g_measure_plan_override->plan && "
+                                 "ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);\n    }\n"
+                                 "    return g_moe_multi_gpu_active", "    return g_moe_multi_gpu_active", 1)
+    assert no_override != SOURCE and not executor_helper_reads_the_latch(no_override)
+    # the override answered with the raw request instead of the plan's own condition
+    raw_request = SOURCE.replace("ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);",
+                                 "ggml_sycl_moe_multi_gpu_requested();", 1)
+    assert raw_request != SOURCE and not executor_helper_reads_the_latch(raw_request)
 
 
 def test_dense_mul_mat_type_policy_fails_closed() -> None:
@@ -457,7 +512,8 @@ def test_removing_only_early_return_is_rejected() -> None:
 
 def test_reopening_early_guard_to_unconditional_admission_is_rejected() -> None:
     # The pre-b10630 form admitted every expert type into the MoE executor;
-    # q2_0 MMID then computed ERR ~90 wrong answers. Stripping the type guard
+    # q2_0 MMID then computed ERR ~90 wrong answers (it had no SYCL kernel; it has
+    # one since llama.cpp-s36q phase 4, so tq2_0 stands in below). Stripping the type guard
     # back to a bare `return true;` body must fail the contract.
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
@@ -467,13 +523,14 @@ def test_reopening_early_guard_to_unconditional_admission_is_rejected() -> None:
 
 
 def test_widening_type_guard_exemptions_is_rejected() -> None:
-    # Adding another exempt type (here q2_0) reopens the wrong-answer path.
+    # Adding another exempt type (here tq2_0, which has no SYCL kernel) reopens the
+    # wrong-answer path.
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
     assert EARLY_TYPE_GUARD in early_body
     widened = early_body.replace(
         "indexed_a_type != GGML_TYPE_NVFP4",
-        "indexed_a_type != GGML_TYPE_NVFP4 && indexed_a_type != GGML_TYPE_Q2_0",
+        "indexed_a_type != GGML_TYPE_NVFP4 && indexed_a_type != GGML_TYPE_TQ2_0",
         1,
     )
     assert not contract(replace_in_supports_function(SOURCE, early_body, widened))
@@ -516,6 +573,39 @@ def test_reinserting_later_mul_mat_id_case_is_rejected() -> None:
         "        case GGML_OP_MUL_MAT:\n        case GGML_OP_MUL_MAT_ID:\n",
     )
     assert not contract(mutated)
+
+
+HOST_DISPATCH_PREDICATE = "static bool ggml_sycl_node_is_host_dispatched(const ggml_tensor * node) {"
+EXPECTED_HOST_DISPATCH_BODY = (
+    "if(!node||!ggml_sycl_attn_host_dispatch_enabled()){returnfalse;}"
+    "if(node->op==GGML_OP_FLASH_ATTN_EXT){"
+    "returnggml_sycl_tensor_is_in_kv_host_buft(node->src[1])||ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]);}"
+    "if(node->op==GGML_OP_SET_ROWS){returnggml_sycl_tensor_is_in_kv_host_buft(node);}"
+    "returnfalse;"
+)
+
+
+def host_dispatch_predicate_ok(text: str) -> bool:
+    try:
+        _, _, body = braced_body(text, HOST_DISPATCH_PREDICATE)
+    except ValueError:
+        return False
+    return executable_body(body) == EXPECTED_HOST_DISPATCH_BODY
+
+
+def test_host_dispatch_predicate_cannot_hold_for_indexed_moe() -> None:
+    # The supports_op KV-host acceptances above call this predicate (zhcn C6k). The early-return gate is only
+    # sound while it is true for nothing but FLASH_ATTN_EXT and SET_ROWS, so its body is pinned whole.
+    assert host_dispatch_predicate_ok(SOURCE)
+    widened = SOURCE.replace(
+        "    if (node->op == GGML_OP_SET_ROWS) {\n        return ggml_sycl_tensor_is_in_kv_host_buft(node);\n    }\n    return false;",
+        "    if (node->op == GGML_OP_SET_ROWS) {\n        return ggml_sycl_tensor_is_in_kv_host_buft(node);\n    }\n"
+        "    return node->op == GGML_OP_MUL_MAT_ID;",
+        1,
+    )
+    assert widened != SOURCE and not host_dispatch_predicate_ok(widened)
+    any_slot = SOURCE.replace("ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]);", "ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]) || true;", 1)
+    assert any_slot != SOURCE and not host_dispatch_predicate_ok(any_slot)
 
 
 if __name__ == "__main__":

@@ -349,6 +349,8 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-rpc.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h
+    include/ggml-sycl-cohort.h
+    include/ggml-sycl-l4-procs.h
     include/ggml-vulkan.h
     include/ggml-webgpu.h
     include/ggml-zendnn.h

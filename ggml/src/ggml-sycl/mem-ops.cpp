@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -133,6 +134,67 @@ static sycl::queue & queue_for_device_or_fallback(int device, sycl::queue & fall
 static bool host_ptr_is_usm_accessible(const void * ptr) {
     const sycl::usm::alloc alloc = ggml_sycl_get_alloc_type(ptr);
     return alloc == sycl::usm::alloc::host || alloc == sycl::usm::alloc::shared;
+}
+
+// Whether a copy endpoint's owner, by its provenance alone, is host USM in the
+// context of its device's cache queue. Only one provenance qualifies: a runtime
+// stage (role STAGING or EXPERT_STAGING), expert-path buffer (category
+// EXPERT_CACHE) or pinned-pool weight (role WEIGHT, tier HOST_PINNED) that is a
+// host-pinned slice of a device cache's host zone.
+//   - A host-zone slice comes from that cache's pinned arena, allocated on the
+//     cache's own queue, so its context is the one queue_for_device_or_fallback()
+//     names for its device. A standalone pinned base (require_host_usm_base) is
+//     allocated on the requesting queue, whose context the owner does not
+//     record, so it does not qualify. Nor does a pinned-pool allocation made
+//     before the host zones are configured: its metadata cannot be told from a
+//     standalone base's, so it keeps the registry answer.
+//   - SYCL device buffers' owners with roles KV and COMPUTE never qualify,
+//     even when the buffer fell back to host-pinned memory. The SYCL_Host
+//     buffer's owner (role STAGING outside model load, category HOST_COMPUTE)
+//     would, but the backend holds it only as the buffer's identity: its
+//     tensors' copies pass views without an owner, so they keep the registry
+//     answer.
+//   - A pinned-pool weight qualifies because host-planned experts are the
+//     prefill expert ring's copy source (llama.cpp-36j0): staged, every ring
+//     copy would hold the submitting thread on a host memcpy and a wait. A
+//     weight is written only while the model loads, so a direct copy reading
+//     it when the DMA runs sees what a staged copy would have snapshotted. A
+//     SYCL device buffer that fell back to host-pinned weight memory is in
+//     scope too: its set and get copies are host to host, and an async copy
+//     into it is complete only once the caller synchronises, as the backend
+//     API requires. HOST_MMAP and unregistered memory stay out: they are
+//     pageable, and the early return refuses them.
+static bool host_endpoint_owner_in_scope(const alloc_metadata & owner) {
+    if (owner.tier != alloc_tier::HOST_PINNED || owner.host_zone == host_zone_id::COUNT || owner.device < 0) {
+        return false;
+    }
+    return owner.role == alloc_role::STAGING || owner.role == alloc_role::EXPERT_STAGING ||
+           owner.category == runtime_category::EXPERT_CACHE ||
+           (owner.tier == alloc_tier::HOST_PINNED && owner.role == alloc_role::WEIGHT);
+}
+
+// Whether the host endpoint `h` of a copy on `copy_queue` can be read or written
+// by the device directly, so the copy needs no host bounce. The handle's retained
+// owner answers first: pinned-pool and host-zone memory is host USM but never
+// enters the pointer registry, so asking the registry alone sends every copy to
+// or from it down the synchronous staged path. The owner's answer is taken only
+// in scope (above) and when the owner device's cache queue shares a context with
+// copy_queue, because pinned memory is USM only in the context that allocated
+// it, and Level Zero may fault importing an interior pinned slice into another
+// device's copy (the require_host_usm_base note in unified_alloc). While any
+// thread records a command graph the owner is not asked: a recorded copy keeps
+// the endpoint's pointer for every replay, and an in-scope endpoint is a
+// host-zone slice the zone may reclaim between replays, so recorded copies keep
+// the registry answer and the branch they took before. Everything else falls
+// back to the registry, which still calls mmap and external host memory unknown
+// and keeps it staged.
+static bool host_endpoint_is_usm_accessible(const mem_handle & h, const void * ptr, sycl::queue & copy_queue) {
+    alloc_metadata owner{};
+    if (!ggml_sycl_graph_recording_active() && h.owner_metadata(&owner) && host_endpoint_owner_in_scope(owner) &&
+        queues_share_context(copy_queue, queue_for_device_or_fallback(owner.device, copy_queue))) {
+        return true;
+    }
+    return host_ptr_is_usm_accessible(ptr);
 }
 
 static bool mem_copy_trace_enabled() {
@@ -304,7 +366,7 @@ static std::atomic<uint64_t> g_stage_graph_self_seen{ 0 };
 // mistake silently.
 // WHICH ZONE THE REQUEST ACTUALLY USED (llama.cpp-13u6).  zone_used/zone_cap
 // sample STAGING, but every request traced here carries role == EXPERT_STAGING,
-// and select_zone() routes that role to SCRATCH before the WEIGHT/STAGING
+// and unified_alloc_host_zone() routes that role to SCRATCH before the WEIGHT/STAGING
 // disjuncts are even consulted (unified-cache.cpp, "role decides before
 // category").  So zone_used has been reporting occupancy of a zone these
 // allocations never touch: a zone that is FULL and a zone that is untouched
@@ -540,6 +602,353 @@ bool alloc_pinned_stage_handle_terminal(size_t        size,
     return alloc_pinned_stage_handle(size, queue, device, cohort_id, require_host_usm_base, out, k_stage_alloc_retries);
 }
 
+// llama.cpp-th86: opt-in census of every copy that reaches
+// mem_copy_direct_submit, keyed by the CALLER's file:line (forwarded from the
+// public mem_copy_async/mem_copy defaults), direction and profile path. The
+// kernel profiler's sycl.memcpy.mem_ops row carries no site, so this is what
+// attributes those launches to the code that issued them.
+//
+// Off unless GGML_SYCL_MEMCPY_SITE_CENSUS is set to a non-zero integer; when
+// off, a copy pays one static bool read. The table is a fixed array of host
+// memory under a mutex: recording a copy allocates nothing and cannot throw,
+// so the census never changes what a copy does. It stores the caller's
+// __builtin_FILE/__builtin_FUNCTION literals and the profile-name literal, and
+// no allocation pointer. A site that does not fit counts into the overflow
+// totals, which the table prints, so a full table under-attributes visibly
+// rather than silently.
+enum class mem_copy_site_dir : uint8_t {
+    H2D,
+    D2H,
+    D2D,
+    H2H,  // the host-host std::memcpy branch: never submitted, never profiled
+};
+
+static const char * mem_copy_site_dir_name(mem_copy_site_dir dir) {
+    switch (dir) {
+        case mem_copy_site_dir::H2D:
+            return "H2D";
+        case mem_copy_site_dir::D2H:
+            return "D2H";
+        case mem_copy_site_dir::D2D:
+            return "D2D";
+        case mem_copy_site_dir::H2H:
+            return "H2H";
+    }
+    return "?";
+}
+
+static bool mem_copy_site_census_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MEMCPY_SITE_CENSUS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+struct mem_copy_site_entry {
+    const char *      file;      // caller's __builtin_FILE() literal; nullptr = free slot
+    const char *      function;  // caller's __builtin_FUNCTION() literal
+    const char *      path;      // profile name literal (sycl.memcpy.mem_ops / sycl.memcpy.cross_device)
+    int               line;
+    mem_copy_site_dir dir;
+    uint64_t          calls;
+    uint64_t          bytes;
+};
+
+static constexpr size_t k_mem_copy_site_slots = 4096;  // power of two; a few hundred sites exist
+
+struct mem_copy_site_census_state {
+    std::mutex          mutex;
+    mem_copy_site_entry entries[k_mem_copy_site_slots];
+    size_t              used;
+    uint64_t            total_calls;
+    uint64_t            total_bytes;
+    uint64_t            overflow_calls;
+    uint64_t            overflow_bytes;
+    uint64_t            calls_at_last_print;
+};
+
+static mem_copy_site_census_state & mem_copy_site_census() {
+    static mem_copy_site_census_state state{};
+    return state;
+}
+
+// The same call site can reach here with different string addresses (an inline
+// header function expands in several TUs), so slots match on the text.
+static size_t mem_copy_site_hash(const char * file, int line, mem_copy_site_dir dir) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char * p = file; *p != '\0'; ++p) {
+        h = (h ^ static_cast<unsigned char>(*p)) * 1099511628211ull;
+    }
+    h = (h ^ static_cast<uint64_t>(line)) * 1099511628211ull;
+    h = (h ^ static_cast<uint64_t>(dir)) * 1099511628211ull;
+    return static_cast<size_t>(h);
+}
+
+static bool mem_copy_site_matches(const mem_copy_site_entry & e,
+                                  const char *                path,
+                                  mem_copy_site_dir           dir,
+                                  const char *                file,
+                                  int                         line) {
+    return e.line == line && e.dir == dir && (e.path == path || std::strcmp(e.path, path) == 0) &&
+           (e.file == file || std::strcmp(e.file, file) == 0);
+}
+
+// Trim a __builtin_FILE() path to its repo-relative tail ("ggml/src/..."), or
+// to its basename when it has none.
+//
+// With icpx 2026.1.1 the census prints bare basenames ("site=mem-ops.cpp:758"),
+// and it is the basename branch below that runs, returning the string whole.
+// The compile commands do carry a path (ninja passes the absolute source path,
+// which ccache's base_dir turns into "../ggml/src/..."), and __FILE__ keeps it,
+// but this compiler's __builtin_FILE() yields only the basename of the presumed
+// file, with or without -fsycl and for header call sites too (checked
+// 2026-10-15 by compiling probes and reading the literal from .rodata). So the
+// "ggml/src/" branch never matches here; it is kept for a toolchain whose
+// __builtin_FILE() returns a path. Rows are keyed on that string, so two files
+// with the same basename and the same line would share a row; the fn= column
+// tells them apart.
+static const char * mem_copy_site_short_file(const char * file) {
+    const char * best = nullptr;
+    for (const char * p = std::strstr(file, "ggml/src/"); p != nullptr; p = std::strstr(p + 1, "ggml/src/")) {
+        best = p;
+    }
+    if (best != nullptr) {
+        return best;
+    }
+    const char * slash = std::strrchr(file, '/');
+    return slash != nullptr ? slash + 1 : file;
+}
+
+void mem_copy_site_census_flush(const char * reason) {
+    if (!mem_copy_site_census_enabled()) {
+        return;
+    }
+    mem_copy_site_census_state & st = mem_copy_site_census();
+    std::lock_guard<std::mutex>  lock(st.mutex);
+
+    static uint16_t order[k_mem_copy_site_slots];  // flush runs under st.mutex
+    static_assert(k_mem_copy_site_slots <= 65536, "order[] holds slot indices as uint16_t");
+    size_t   n            = 0;
+    uint64_t mem_ops_dev  = 0;
+    uint64_t mem_ops_host = 0;
+    for (size_t i = 0; i < k_mem_copy_site_slots; ++i) {
+        const mem_copy_site_entry & e = st.entries[i];
+        if (e.file == nullptr) {
+            continue;
+        }
+        order[n++] = static_cast<uint16_t>(i);
+        if (std::strcmp(e.path, "sycl.memcpy.mem_ops") == 0) {
+            (e.dir == mem_copy_site_dir::H2H ? mem_ops_host : mem_ops_dev) += e.calls;
+        }
+    }
+    std::sort(order, order + n, [&st](uint16_t a, uint16_t b) {
+        const mem_copy_site_entry & ea = st.entries[a];
+        const mem_copy_site_entry & eb = st.entries[b];
+        return ea.calls != eb.calls ? ea.calls > eb.calls : ea.bytes > eb.bytes;
+    });
+
+    // mem_ops_device_calls is the figure to set against the kernel profiler's
+    // sycl.memcpy.mem_ops launches, which in its CSV are count + failed_timestamps:
+    // the count column leaves out launches whose timestamps could not be read.
+    // H2H copies never reach the profiler.
+    std::fprintf(stderr,
+                 "[SYCL-MEMCPY-SITE-CENSUS] %s: sites=%zu calls=%" PRIu64 " bytes=%" PRIu64
+                 " mem_ops_device_calls=%" PRIu64 " mem_ops_host_calls=%" PRIu64 " overflow_calls=%" PRIu64
+                 " overflow_bytes=%" PRIu64 "\n",
+                 reason != nullptr ? reason : "flush", n, st.total_calls, st.total_bytes, mem_ops_dev, mem_ops_host,
+                 st.overflow_calls, st.overflow_bytes);
+    for (size_t r = 0; r < n; ++r) {
+        const mem_copy_site_entry & e = st.entries[order[r]];
+        std::fprintf(stderr,
+                     "[SYCL-MEMCPY-SITE-CENSUS] rank=%zu calls=%" PRIu64 " bytes=%" PRIu64
+                     " dir=%s path=%s site=%s:%d fn=%s\n",
+                     r + 1, e.calls, e.bytes, mem_copy_site_dir_name(e.dir), e.path, mem_copy_site_short_file(e.file),
+                     e.line, e.function != nullptr ? e.function : "?");
+    }
+    std::fflush(stderr);
+    st.calls_at_last_print = st.total_calls;
+}
+
+static void mem_copy_site_census_print_at_exit() {
+    mem_copy_site_census_state & st = mem_copy_site_census();
+    bool                         unprinted;
+    {
+        std::lock_guard<std::mutex> lock(st.mutex);
+        unprinted = st.total_calls != st.calls_at_last_print;
+    }
+    if (unprinted) {
+        mem_copy_site_census_flush("exit");
+    }
+}
+
+static void mem_copy_site_census_record(const char *      path,
+                                        mem_copy_site_dir dir,
+                                        size_t            bytes,
+                                        const char *      file,
+                                        int               line,
+                                        const char *      function) {
+    // Registered after the state exists, so it runs before the state's own
+    // static teardown.
+    mem_copy_site_census_state & st         = mem_copy_site_census();
+    static const bool            registered = std::atexit(mem_copy_site_census_print_at_exit) == 0;
+    (void) registered;
+
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.total_calls += 1;
+    st.total_bytes += bytes;
+    size_t slot = mem_copy_site_hash(file, line, dir) & (k_mem_copy_site_slots - 1);
+    for (size_t probe = 0; probe < k_mem_copy_site_slots; ++probe) {
+        mem_copy_site_entry & e = st.entries[slot];
+        if (e.file == nullptr) {
+            if (st.used * 2 >= k_mem_copy_site_slots) {
+                break;  // keep probes short; the rest counts as overflow
+            }
+            e.file     = file;
+            e.function = function;
+            e.path     = path;
+            e.line     = line;
+            e.dir      = dir;
+            st.used += 1;
+        }
+        if (mem_copy_site_matches(e, path, dir, file, line)) {
+            e.calls += 1;
+            e.bytes += bytes;
+            return;
+        }
+        slot = (slot + 1) & (k_mem_copy_site_slots - 1);
+    }
+    st.overflow_calls += 1;
+    st.overflow_bytes += bytes;
+}
+
+// One census per thread (llama.cpp-qwn5): a wait is counted on the thread it held, and only the submitting thread
+// prints and resets its own.
+mem_copy_staged_wait_census & mem_copy_staged_wait_census_this_thread() {
+    static thread_local mem_copy_staged_wait_census census;
+    return census;
+}
+
+static const char * mem_copy_staged_wait_kind_name(int kind) {
+    switch (kind) {
+        case MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS:
+            return "h2d_deps";
+        case MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK:
+            return "h2d_chunk";
+        case MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL:
+            return "h2d_final";
+        case MEM_COPY_STAGED_WAIT_KIND_D2H:
+            return "d2h";
+        case MEM_COPY_STAGED_WAIT_KIND_H2H_DEPS:
+            return "h2h_deps";
+        case MEM_COPY_STAGED_WAIT_KIND_CROSS:
+            return "cross";
+    }
+    return "?";
+}
+
+// Called only under the trace. The table matches a site on its text, as mem_copy_site_matches does, since one call
+// site can reach here with different string addresses.
+static void staged_wait_record(mem_copy_staged_wait_kind kind, const char * file, int line, double us) {
+    mem_copy_staged_wait_census & c = mem_copy_staged_wait_census_this_thread();
+    c.count[kind] += 1;
+    c.us[kind] += us;
+    file = file != nullptr ? file : "?";
+    for (mem_copy_staged_wait_site & s : c.sites) {
+        if (s.file == nullptr) {
+            s.file = file;
+            s.line = line;
+            s.kind = kind;
+        }
+        if (s.line == line && s.kind == kind && (s.file == file || std::strcmp(s.file, file) == 0)) {
+            s.count += 1;
+            s.us += us;
+            return;
+        }
+    }
+    c.overflow_count += 1;
+    c.overflow_us += us;
+}
+
+static double staged_wait_us_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// mem_copy_submit's synchronous wait on one event, counted by kind and by the copy's caller under the trace.
+static void staged_wait_event(sycl::event & event, mem_copy_staged_wait_kind kind, const char * file, int line) {
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        event.wait_and_throw();
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    event.wait_and_throw();
+    staged_wait_record(kind, file, line, staged_wait_us_since(t0));
+}
+
+// mem_copy_submit's synchronous wait on a copy's deps, counted the same way. An empty list does not wait.
+static void staged_wait_deps(const std::vector<sycl::event> & deps,
+                             mem_copy_staged_wait_kind        kind,
+                             const char *                     file,
+                             int                              line) {
+    if (deps.empty()) {
+        return;
+    }
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        wait_deps(deps);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    wait_deps(deps);
+    staged_wait_record(kind, file, line, staged_wait_us_since(t0));
+}
+
+// A copy that took a staged branch, by direction. Unlike the waits above this counts with the trace off: a staged
+// copy is a fact callers act on (the H2D probe refuses to keep a rate measured through one, and every user runs
+// untraced), and the cost is one thread_local increment. The census is per thread, and a copy is noted on the thread
+// that submits it, so a caller that reads staged_h2d on its own thread before and after its own copies sees exactly
+// those copies in the difference. Only the wait timing and the site table, which read a clock, stay under the trace.
+static void staged_copy_note(bool device_to_host) {
+    mem_copy_staged_wait_census & c = mem_copy_staged_wait_census_this_thread();
+    if (device_to_host) {
+        c.staged_d2h += 1;
+    } else {
+        c.staged_h2d += 1;
+    }
+}
+
+void mem_copy_staged_wait_census_format(const mem_copy_staged_wait_census & census, mem_copy_staged_wait_text & out) {
+    std::snprintf(out.copies, sizeof(out.copies), "d2h:%" PRIu64 ",h2d:%" PRIu64, census.staged_d2h, census.staged_h2d);
+
+    int at = 0;
+    for (int kind = 0; kind < MEM_COPY_STAGED_WAIT_KIND_COUNT; ++kind) {
+        if (census.count[kind] == 0 || at >= (int) sizeof(out.waits)) {
+            continue;
+        }
+        at += std::snprintf(out.waits + at, sizeof(out.waits) - at, "%s%s:%" PRIu64 "/%.0fus", at > 0 ? "," : "",
+                            mem_copy_staged_wait_kind_name(kind), census.count[kind], census.us[kind]);
+    }
+    if (at == 0) {
+        std::snprintf(out.waits, sizeof(out.waits), "none");
+    }
+
+    at = 0;
+    for (const mem_copy_staged_wait_site & s : census.sites) {
+        if (s.file == nullptr || s.count == 0 || at >= (int) sizeof(out.sites)) {
+            continue;
+        }
+        at += std::snprintf(out.sites + at, sizeof(out.sites) - at, "%s%s:%d:%s=%" PRIu64 "/%.0fus", at > 0 ? "," : "",
+                            mem_copy_site_short_file(s.file), s.line, mem_copy_staged_wait_kind_name(s.kind), s.count,
+                            s.us);
+    }
+    if (census.overflow_count != 0 && at < (int) sizeof(out.sites)) {
+        at += std::snprintf(out.sites + at, sizeof(out.sites) - at, "%soverflow=%" PRIu64 "/%.0fus", at > 0 ? "," : "",
+                            census.overflow_count, census.overflow_us);
+    }
+    if (at == 0) {
+        std::snprintf(out.sites, sizeof(out.sites), "none");
+    }
+}
+
 static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
                                           size_t                           dst_offset,
                                           const mem_handle &               src,
@@ -547,12 +956,12 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
                                           size_t                           size,
                                           sycl::queue &                    queue,
                                           const std::vector<sycl::event> & deps,
-                                          const char *                     profile_name = "sycl.memcpy.mem_ops",
-                                          const char * profile_metadata = "role=memcpy;path=mem_ops",
-                                          const char * profile_queue_kind = "copy",
-                                          const char * file               = __builtin_FILE(),
-                                          int          line               = __builtin_LINE(),
-                                          const char * function           = __builtin_FUNCTION()) {
+                                          const char *                     profile_name,
+                                          const char *                     profile_metadata,
+                                          const char *                     profile_queue_kind,
+                                          const char *                     file,
+                                          int                              line,
+                                          const char *                     function) {
     // llama.cpp-dyi3 round 3b: census of copies that reach this NON-graph-
     // capturable path (profile label "sycl.memcpy.mem_ops", as opposed to
     // ggml_sycl_graph_safe_memcpy's "sycl.memcpy.graph_safe") while a SYCL
@@ -562,11 +971,12 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
     // during recording executes ONCE at record time and is never re-issued
     // on replay -- if its destination is read by any replayed kernel, that
     // kernel sees the record-time value forever. Warn once per call site
-    // (file:line default-captures the CALLER via __builtin_FILE/LINE, not
-    // this function's own location, for every caller that does not
-    // override those defaults) so this census does not have to be
-    // re-derived by hand; this does not fix anything by itself, it only
-    // names the suspects for round 3c to check individually.
+    // (file:line is the caller of the public mem_copy_async/mem_copy, whose
+    // __builtin defaults capture it and mem_copy_submit forwards it here; this
+    // function takes it with no default, so no copy can name mem-ops.cpp) so
+    // this census does not have to be re-derived by hand; this does not fix
+    // anything by itself, it only names the suspects for round 3c to check
+    // individually.
     // llama.cpp-dyi3 round 7: this census used to fire unconditionally, so any
     // model whose SYCL command graph engages at all printed it in ordinary
     // runs. Gate it behind an explicit opt-in -- it stays a WARN once enabled,
@@ -601,9 +1011,18 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
     const void * src_ptr = static_cast<const char *>(s.ptr) + src_offset;
 
     if (!d.on_device && !s.on_device) {
-        wait_deps(deps);
+        if (mem_copy_site_census_enabled()) {
+            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H, size, file, line, function);
+        }
+        staged_wait_deps(deps, MEM_COPY_STAGED_WAIT_KIND_H2H_DEPS, file, line);
         std::memcpy(dst_ptr, src_ptr, size);
         return sycl::event{};
+    }
+
+    if (mem_copy_site_census_enabled()) {
+        const mem_copy_site_dir dir =
+            d.on_device ? (s.on_device ? mem_copy_site_dir::D2D : mem_copy_site_dir::H2D) : mem_copy_site_dir::D2H;
+        mem_copy_site_census_record(profile_name, dir, size, file, line, function);
     }
 
     return ggml_sycl_memcpy_profile_submit(
@@ -622,7 +1041,10 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
                                    size_t                           size,
                                    sycl::queue &                    queue,
                                    const std::vector<sycl::event> & deps,
-                                   bool                             retain_until_event) {
+                                   bool                             retain_until_event,
+                                   const char *                     file,
+                                   int                              line,
+                                   const char *                     function) {
     auto         publish_ticket = retain_until_event ? begin_retained_handle_publish() : retained_handle_publish_ticket{};
     resolved_ptr d              = dst.resolve();
     resolved_ptr s = src.resolve();
@@ -651,24 +1073,26 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         }
 
         trace_mem_copy_submit("cross-d2h", src_stage, 0, src, src_offset, size, src_queue);
-        sycl::event d2h = mem_copy_direct_submit(src_stage, 0, src, src_offset, size, src_queue, deps,
-                                                 "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
+        sycl::event d2h =
+            mem_copy_direct_submit(src_stage, 0, src, src_offset, size, src_queue, deps, "sycl.memcpy.cross_device",
+                                   "role=memcpy;path=cross_device", "copy", file, line, function);
 
         if (queues_share_context(src_queue, dst_queue)) {
             std::vector<sycl::event> h2d_deps;
             h2d_deps.push_back(d2h);
             trace_mem_copy_submit("cross-h2d", dst, dst_offset, src_stage, 0, size, dst_queue);
             sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, src_stage, 0, size, dst_queue, h2d_deps,
-                                                     "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
+                                                     "sycl.memcpy.cross_device", "role=memcpy;path=cross_device",
+                                                     "copy", file, line, function);
             if (retain_until_event) {
                 retain_handles_until_event({ dst, src, src_stage }, h2d, std::move(publish_ticket));
             } else {
-                h2d.wait_and_throw();
+                staged_wait_event(h2d, MEM_COPY_STAGED_WAIT_KIND_CROSS, file, line);
             }
             return h2d;
         }
 
-        d2h.wait_and_throw();
+        staged_wait_event(d2h, MEM_COPY_STAGED_WAIT_KIND_CROSS, file, line);
 
         mem_handle dst_stage;
         if (!alloc_pinned_stage_handle(size, dst_queue, dst_device, "mem-copy-cross-device-dst",
@@ -684,12 +1108,13 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         std::memcpy(dst_stage_ptr.ptr, src_stage_ptr.ptr, size);
 
         trace_mem_copy_submit("cross-h2d", dst, dst_offset, dst_stage, 0, size, dst_queue);
-        sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, dst_stage, 0, size, dst_queue, {},
-                                                 "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
+        sycl::event h2d =
+            mem_copy_direct_submit(dst, dst_offset, dst_stage, 0, size, dst_queue, {}, "sycl.memcpy.cross_device",
+                                   "role=memcpy;path=cross_device", "copy", file, line, function);
         if (retain_until_event) {
             retain_handles_until_event({ dst, src, src_stage, dst_stage }, h2d, std::move(publish_ticket));
         } else {
-            h2d.wait_and_throw();
+            staged_wait_event(h2d, MEM_COPY_STAGED_WAIT_KIND_CROSS, file, line);
         }
         return h2d;
     }
@@ -704,7 +1129,8 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         copy_queue = requested_queue_device == dst_device ? &queue : &queue_for_device_or_fallback(dst_device, queue);
     }
 
-    if (d.on_device && !s.on_device && !host_ptr_is_usm_accessible(s.ptr)) {
+    if (d.on_device && !s.on_device && !host_endpoint_is_usm_accessible(src, s.ptr, *copy_queue)) {
+        staged_copy_note(/*device_to_host=*/false);
         constexpr size_t max_stage_bytes = 64ull * 1024ull * 1024ull;
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
@@ -713,18 +1139,20 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for host -> device %d copy",
                        stage_bytes, dst_device);
         }
-        wait_deps(deps);
+        staged_wait_deps(deps, MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS, file, line);
         resolved_ptr stage_ptr = stage.resolve();
         GGML_ASSERT(stage_ptr && !stage_ptr.on_device);
         sycl::event event;
         size_t      copied = 0;
         while (copied < size) {
             if (copied != 0) {
-                event.wait_and_throw();
+                staged_wait_event(event, MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK, file, line);
             }
             const size_t cur = std::min(stage_bytes, size - copied);
             std::memcpy(stage_ptr.ptr, static_cast<const char *>(s.ptr) + src_offset + copied, cur);
-            event = mem_copy_direct_submit(dst, dst_offset + copied, stage, 0, cur, *copy_queue, {});
+            event =
+                mem_copy_direct_submit(dst, dst_offset + copied, stage, 0, cur, *copy_queue, {}, "sycl.memcpy.mem_ops",
+                                       "role=memcpy;path=mem_ops", "copy", file, line, function);
             copied += cur;
         }
         if (retain_until_event) {
@@ -733,12 +1161,13 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             retain_handles_until_event({ dst, src, stage }, event, std::move(publish_ticket));
         } else {
             g_stage_waited.fetch_add(1, std::memory_order_relaxed);
-            event.wait_and_throw();
+            staged_wait_event(event, MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL, file, line);
         }
         return event;
     }
 
-    if (!d.on_device && s.on_device && !host_ptr_is_usm_accessible(d.ptr)) {
+    if (!d.on_device && s.on_device && !host_endpoint_is_usm_accessible(dst, d.ptr, *copy_queue)) {
+        staged_copy_note(/*device_to_host=*/true);
         constexpr size_t max_stage_bytes = 64ull * 1024ull * 1024ull;
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
@@ -752,17 +1181,19 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         size_t copied = 0;
         while (copied < size) {
             const size_t cur = std::min(stage_bytes, size - copied);
-            sycl::event event =
-                mem_copy_direct_submit(stage, 0, src, src_offset + copied, cur, *copy_queue,
-                                       copied == 0 ? deps : std::vector<sycl::event>{});
-            event.wait_and_throw();
+            sycl::event  event = mem_copy_direct_submit(
+                stage, 0, src, src_offset + copied, cur, *copy_queue, copied == 0 ? deps : std::vector<sycl::event>{},
+                "sycl.memcpy.mem_ops", "role=memcpy;path=mem_ops", "copy", file, line, function);
+            staged_wait_event(event, MEM_COPY_STAGED_WAIT_KIND_D2H, file, line);
             std::memcpy(static_cast<char *>(d.ptr) + dst_offset + copied, stage_ptr.ptr, cur);
             copied += cur;
         }
         return sycl::event{};
     }
 
-    sycl::event event = mem_copy_direct_submit(dst, dst_offset, src, src_offset, size, *copy_queue, deps);
+    sycl::event event =
+        mem_copy_direct_submit(dst, dst_offset, src, src_offset, size, *copy_queue, deps, "sycl.memcpy.mem_ops",
+                               "role=memcpy;path=mem_ops", "copy", file, line, function);
     if (retain_until_event) {
         retain_handles_until_event({ dst, src }, event, std::move(publish_ticket));
     }
@@ -774,8 +1205,11 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
                                    size_t                           size,
                                    sycl::queue &                    queue,
                                    const std::vector<sycl::event> & deps,
-                                   bool                             retain_until_event) {
-    return mem_copy_submit(dst, 0, src, 0, size, queue, deps, retain_until_event);
+                                   bool                             retain_until_event,
+                                   const char *                     file,
+                                   int                              line,
+                                   const char *                     function) {
+    return mem_copy_submit(dst, 0, src, 0, size, queue, deps, retain_until_event, file, line, function);
 }
 
 static sycl::event mem_fill_direct_submit(const mem_handle &               h,
@@ -859,8 +1293,11 @@ sycl::event mem_copy_async(const mem_handle &               dst,
                            const mem_handle &               src,
                            size_t                           size,
                            sycl::queue &                    queue,
-                           const std::vector<sycl::event> & deps) {
-    return mem_copy_submit(dst, src, size, queue, deps, true);
+                           const std::vector<sycl::event> & deps,
+                           const char *                     file,
+                           int                              line,
+                           const char *                     function) {
+    return mem_copy_submit(dst, src, size, queue, deps, true, file, line, function);
 }
 
 sycl::event mem_copy_async(const mem_handle &               dst,
@@ -869,8 +1306,11 @@ sycl::event mem_copy_async(const mem_handle &               dst,
                            size_t                           src_offset,
                            size_t                           size,
                            sycl::queue &                    queue,
-                           const std::vector<sycl::event> & deps) {
-    return mem_copy_submit(dst, dst_offset, src, src_offset, size, queue, deps, true);
+                           const std::vector<sycl::event> & deps,
+                           const char *                     file,
+                           int                              line,
+                           const char *                     function) {
+    return mem_copy_submit(dst, dst_offset, src, src_offset, size, queue, deps, true, file, line, function);
 }
 
 sycl::event mem_fill_async(const mem_handle &               h,
@@ -908,8 +1348,11 @@ void mem_copy(const mem_handle &               dst,
               const mem_handle &               src,
               size_t                           size,
               sycl::queue &                    queue,
-              const std::vector<sycl::event> & deps) {
-    mem_copy_submit(dst, src, size, queue, deps, false).wait_and_throw();
+              const std::vector<sycl::event> & deps,
+              const char *                     file,
+              int                              line,
+              const char *                     function) {
+    mem_copy_submit(dst, src, size, queue, deps, false, file, line, function).wait_and_throw();
 }
 
 void mem_copy(const mem_handle &               dst,
@@ -918,8 +1361,11 @@ void mem_copy(const mem_handle &               dst,
               size_t                           src_offset,
               size_t                           size,
               sycl::queue &                    queue,
-              const std::vector<sycl::event> & deps) {
-    mem_copy_submit(dst, dst_offset, src, src_offset, size, queue, deps, false).wait_and_throw();
+              const std::vector<sycl::event> & deps,
+              const char *                     file,
+              int                              line,
+              const char *                     function) {
+    mem_copy_submit(dst, dst_offset, src, src_offset, size, queue, deps, false, file, line, function).wait_and_throw();
 }
 
 void mem_fill(const mem_handle &               h,

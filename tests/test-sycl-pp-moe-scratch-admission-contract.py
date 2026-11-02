@@ -79,9 +79,12 @@ def reserve_call_arguments(source):
 # directory, with token pasting banned, so a new reservation site (or one that raises the ceiling and reads it back)
 # cannot appear without editing this gate. A count failure says which pin to bump after review.
 RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
-SET_PLANNED_CALLS_IN_FILE = 3   # plan, replan x2
-# Whole ggml-sycl directory, comments and strings removed: definition + the wrapper's call + hpp declaration + 5 calls.
-DIRECTORY_TOKENS = {"reserve": 8, "wrapper": 2, "setter": 5}
+# plan, the explicit micro-batch's load placement (ggml_sycl_publish_load_ubatch_scratch: the same planner-sized ring,
+# published at the micro-batch the caller named), replan x2
+SET_PLANNED_CALLS_IN_FILE = 4
+# Whole ggml-sycl directory, comments and strings removed: reserve is definition + the wrapper's call + hpp declaration
+# + 5 calls; setter is definition + hpp declaration + the 4 calls above.
+DIRECTORY_TOKENS = {"reserve": 8, "wrapper": 2, "setter": 6}
 _DIRECTORY_TOKEN_PATTERNS = {
     "reserve": r"(?<!\w)reserve_pp_moe_onednn_scratch\b",
     "wrapper": r"\bunified_cache_reserve_pp_moe_onednn_scratch\b",
@@ -366,8 +369,8 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
 
     # The batched MXFP4 SoA oneDNN executor: the site that must run on planner
     # scratch or not at all.
-    batched = between(sycl, "auto try_pp_mxfp4_soa_onednn_f16_batched = ",
-                      "if (try_pp_mxfp4_soa_onednn_f16_batched())")
+    batched = between(sycl, "auto try_pp_onednn_f16_batched = ",
+                      "if (try_pp_onednn_f16_batched())")
     # The non-batched PP MXFP4 SoA f16 staging: the terminal MoE PP route, which
     # keeps its transient staging but must not enlarge the planned ring.
     staging_start = sycl.find("scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;")
@@ -407,8 +410,10 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
                     "dequantize_row_mxfp4_soa_to_fp16_rowmajor(",
                     "DnnlGemmWrapper::gemm_batch_strided("),
         "the batched executor refuses with the typed reason name":
-            "return reject_batched(ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason));"
-            in batched,
+            ordered(batched,
+                    "const char * reason_name = "
+                    "ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason);",
+                    "return reject_batched(moe_pp_batched_refusal::SCRATCH_UNPLANNED, reason_name);"),
         "the non-batched staging admits before it reserves":
             ordered(staging, "pp_moe_onednn_admit_scratch(planned_shape, required_shape)",
                     "reserve_pp_moe_onednn_scratch(planned_weight_slot, planned_activation_slot,"),
@@ -566,7 +571,7 @@ ABSENCE_MUTANTS = {
     "the batched executor warns unconditionally, once, on refusal": (
         "sycl",
         "if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {",
-        "if (pp_mxfp4_soa_f16_batched_trace &&\n"
+        "if (pp_f16_batched_trace &&\n"
         " ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {"),
     # A latch that is not `static` is reconstructed on every dispatch, so
     # "once per process" silently becomes "every time" -- the spam this exists

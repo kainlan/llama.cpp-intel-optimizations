@@ -11,6 +11,7 @@
 #include "pinned-buffer-pool.hpp"
 
 #include "common.hpp"
+#include "moe-decode-hostpath.hpp"
 #include "unified-cache.hpp"
 
 #include <cassert>
@@ -45,7 +46,7 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     // for the process lifetime (see shutdown() -- released only at module
     // shutdown), not a per-graph ephemeral staging buffer. alloc_role::
     // EXPERT_STAGING is force-routed to the host SCRATCH zone by
-    // select_zone() specifically so that genuinely short-lived EXPERT_STAGING
+    // unified_alloc_host_zone() specifically so that genuinely short-lived EXPERT_STAGING
     // leaks stay visible to host_zone_boundary_check()'s per-graph live scan
     // (that routing exists on purpose -- see 9a0670712 / llama.cpp-0igs /
     // llama.cpp-7f2e, which fixed the opposite bug of persistent allocations
@@ -57,11 +58,11 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     // via the WEIGHT zone's own per-allocation host_zone_free() TLSF reclaim).
     // role=COMPUTE + category=EXPERT_CACHE mirrors the existing
     // g_retained_scratch precedent in cpu-dispatch.cpp (role=COMPUTE,
-    // category=HOST_COMPUTE): both hit select_zone()'s category-based WEIGHT
+    // category=HOST_COMPUTE): both hit unified_alloc_host_zone()'s category-based WEIGHT
     // branch, which is never swept by host_zone_settle(), while leaving the
     // EXPERT_STAGING-role-first SCRATCH routing that 0igs/7f2e protect
     // untouched for every other (genuinely ephemeral) EXPERT_STAGING caller.
-    alloc_request req_act;
+    alloc_request req_act{};
     req_act.queue                               = &q;
     req_act.device                              = device_id;
     req_act.size                                = act_bytes;
@@ -107,15 +108,34 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     }
     out_pool_ = static_cast<float *>(out_resolved.ptr);
 
-    GGML_LOG_INFO("[MOE-POOL] Pinned buffer pool: act=%zu KB, out=%zu KB, max_experts=%zu\n", act_bytes / 1024,
-                  out_bytes / 1024, max_experts);
+    // The ids entries (llama.cpp-7pvo). A failure here leaves act and out serving the CPU dispatch; only the
+    // event-chained decode route needs these, and it refuses without them.
+    alloc_request req_ids    = req_act;
+    req_ids.size             = max_experts * sizeof(int32_t);
+    req_ids.intent.cohort_id = "moe_ids_pool";
+    ids_handle_              = unified_allocate(req_ids);
+    auto ids_resolved        = ids_handle_.valid() ? ids_handle_.resolve(device_id) : resolved_ptr{};
+    if (ids_resolved.ptr) {
+        ids_pool_ = static_cast<int32_t *>(ids_resolved.ptr);
+    } else {
+        GGML_LOG_WARN(
+            "[MOE-POOL] Failed to allocate the expert-id entries (%zu bytes); host-expert decode reads its "
+            "ids back on the submitting thread\n",
+            req_ids.size);
+        ids_handle_ = {};
+    }
+
+    GGML_LOG_INFO("[MOE-POOL] Pinned buffer pool: act=%zu KB, out=%zu KB, ids=%zu B, max_experts=%zu\n",
+                  act_bytes / 1024, out_bytes / 1024, ids_pool_ ? req_ids.size : 0, max_experts);
 }
 
 void PinnedBufferPool::shutdown() {
     act_handle_ = {};
     out_handle_ = {};
+    ids_handle_ = {};
     act_pool_   = nullptr;
     out_pool_   = nullptr;
+    ids_pool_   = nullptr;
     next_entry_ = 0;
 }
 
@@ -127,12 +147,13 @@ PinnedBufferPool::BufferPair PinnedBufferPool::acquire(size_t n_experts) {
 
 size_t PinnedBufferPool::reserve(size_t n_experts) {
     GGML_ASSERT(n_experts <= max_experts_ && "Expert count exceeds pool capacity");
-    if (next_entry_ + n_experts > max_experts_) {
-        next_entry_ = 0;
-    }
-    const size_t first = next_entry_;
+    const size_t first = ggml_sycl::moe_pool_reserve_first(next_entry_, n_experts, max_experts_);
     next_entry_        = (first + n_experts) % max_experts_;
     return first;
+}
+
+size_t PinnedBufferPool::reserve_peek(size_t n_experts) const {
+    return ggml_sycl::moe_pool_reserve_first(next_entry_, n_experts, max_experts_);
 }
 
 void PinnedBufferPool::release(BufferPair) {
@@ -147,6 +168,10 @@ mem_handle PinnedBufferPool::act_handle() const {
 
 mem_handle PinnedBufferPool::out_handle() const {
     return out_handle_;
+}
+
+mem_handle PinnedBufferPool::ids_handle() const {
+    return ids_handle_;
 }
 
 }  // namespace ggml_sycl

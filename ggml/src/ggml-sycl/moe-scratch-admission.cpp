@@ -10,6 +10,8 @@
 
 #include "moe-scratch-admission.hpp"
 
+#include "zone-sizing.hpp"
+
 #include <limits>
 
 namespace ggml_sycl {
@@ -22,6 +24,27 @@ bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out) {
     if (out != nullptr) {
         *out = (value + alignment - 1) / alignment * alignment;
     }
+    return true;
+}
+
+bool pp_moe_onednn_slots_at(uint32_t n_ubatch,
+                            size_t   activation_bytes_per_row,
+                            size_t   output_bytes_per_row,
+                            size_t * activation_slot_bytes,
+                            size_t * output_slot_bytes) {
+    constexpr size_t kMax = std::numeric_limits<size_t>::max();
+    const size_t     rows = n_ubatch;
+    if (rows != 0 && (activation_bytes_per_row > kMax / rows || output_bytes_per_row > kMax / rows)) {
+        return false;
+    }
+    size_t act_slot = 0;
+    size_t out_slot = 0;
+    if (!pp_moe_onednn_checked_align_slot_bytes(rows * activation_bytes_per_row, &act_slot) ||
+        !pp_moe_onednn_checked_align_slot_bytes(rows * output_bytes_per_row, &out_slot)) {
+        return false;
+    }
+    *activation_slot_bytes = act_slot;
+    *output_slot_bytes     = out_slot;
     return true;
 }
 
@@ -123,13 +146,9 @@ static bool pp_moe_onednn_admit_ring_at(const pp_moe_onednn_ring_admission_input
     const size_t     rows  = n_ubatch;
     out->compute_reserve_bytes =
         in.compute_reserve_bytes_per_row > kMax / rows ? kMax : rows * in.compute_reserve_bytes_per_row;
-    if (in.activation_bytes_per_row > kMax / rows || in.output_bytes_per_row > kMax / rows) {
-        return false;
-    }
     size_t act_slot = 0;
     size_t out_slot = 0;
-    if (!pp_moe_onednn_checked_align_slot_bytes(rows * in.activation_bytes_per_row, &act_slot) ||
-        !pp_moe_onednn_checked_align_slot_bytes(rows * in.output_bytes_per_row, &out_slot)) {
+    if (!pp_moe_onednn_slots_at(n_ubatch, in.activation_bytes_per_row, in.output_bytes_per_row, &act_slot, &out_slot)) {
         return false;
     }
     out->activation_slot_bytes = act_slot;
@@ -207,6 +226,127 @@ pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_a
     }
     result.largest_fitting_n_ubatch = lo * 32;
     return result;
+}
+
+// The ring at `n_ubatch`, sized as pp_moe_onednn_admit_ring_at() sizes it. False on overflow.
+static bool pp_moe_onednn_ring_bytes_at(const pp_moe_onednn_explicit_ubatch_inputs & in,
+                                        uint32_t                                     n_ubatch,
+                                        size_t *                                     out) {
+    constexpr size_t kMax     = std::numeric_limits<size_t>::max();
+    const size_t     depth    = in.ring_depth;
+    size_t           act_slot = 0;
+    size_t           out_slot = 0;
+    if (!pp_moe_onednn_slots_at(n_ubatch, in.activation_bytes_per_row, in.output_bytes_per_row, &act_slot, &out_slot)) {
+        return false;
+    }
+    if (in.weight_slot_bytes > kMax - act_slot || in.weight_slot_bytes + act_slot > kMax - out_slot) {
+        return false;
+    }
+    const size_t per_ring = in.weight_slot_bytes + act_slot + out_slot;
+    if (per_ring > kMax / depth) {
+        return false;
+    }
+    *out = per_ring * depth;
+    return true;
+}
+
+// The RUNTIME zone for a requirement of fixed + dense + ring, as the arena reserves it (zone_runtime_reserved_bytes).
+// False on overflow.
+static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,
+                                             size_t                                       dense_bytes,
+                                             size_t                                       ring_bytes,
+                                             size_t *                                     out) {
+    constexpr size_t kMax = std::numeric_limits<size_t>::max();
+    if (in.runtime_fixed_bytes > kMax - dense_bytes || in.runtime_fixed_bytes + dense_bytes > kMax - ring_bytes) {
+        return false;
+    }
+    return zone_runtime_reserved_bytes(in.runtime_floor_bytes, in.runtime_fixed_bytes + dense_bytes + ring_bytes, out);
+}
+
+pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
+    const pp_moe_onednn_explicit_ubatch_inputs & in) {
+    constexpr size_t                   kMax = std::numeric_limits<size_t>::max();
+    pp_moe_onednn_explicit_ubatch_room room;
+    room.in = in;
+    if (in.n_ubatch_default == 0 || in.n_ubatch <= in.n_ubatch_default || in.weight_slot_bytes == 0 ||
+        in.ring_depth == 0 || (in.activation_bytes_per_row == 0 && in.output_bytes_per_row == 0)) {
+        return room;
+    }
+    room.valid = true;
+
+    // The default micro-batch's ring and zone were already reserved once, so they cannot overflow; if they do anyway,
+    // nothing can be planned against them.
+    size_t ring_default = 0;
+    if (!pp_moe_onednn_ring_bytes_at(in, in.n_ubatch_default, &ring_default) ||
+        !pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_default_bytes, ring_default, &room.zone_default_bytes)) {
+        room.valid = false;
+        return room;
+    }
+    // An overflowing ring for the explicit micro-batch is a room no budget holds, not a wrapped small one.
+    if (!pp_moe_onednn_ring_bytes_at(in, in.n_ubatch, &room.ring_bytes) ||
+        !pp_moe_onednn_runtime_zone_bytes(in, in.dense_scratch_bytes, room.ring_bytes, &room.zone_bytes)) {
+        room.ring_bytes = room.ring_bytes == 0 ? kMax : room.ring_bytes;
+        room.zone_bytes = kMax;
+        room.room_bytes = kMax;
+    } else {
+        room.room_bytes = room.zone_bytes > room.zone_default_bytes ? room.zone_bytes - room.zone_default_bytes : 0;
+    }
+    const size_t grown =
+        in.runtime_zone_bytes > room.zone_default_bytes ? in.runtime_zone_bytes - room.zone_default_bytes : 0;
+    room.room_reserved_bytes = grown < room.room_bytes ? grown : room.room_bytes;
+    return room;
+}
+
+pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide(
+    const pp_moe_onednn_explicit_ubatch_room & room,
+    size_t                                     expert_budget_bytes) {
+    constexpr size_t                       kMax = std::numeric_limits<size_t>::max();
+    pp_moe_onednn_explicit_ubatch_decision decision;
+    if (!room.valid || room.room_bytes == 0) {
+        return decision;
+    }
+    if (room.room_reserved_bytes >= room.room_bytes) {
+        decision.action = pp_moe_onednn_explicit_ubatch_action::PLACE;
+        return decision;
+    }
+    if (room.room_bytes - room.room_reserved_bytes <= expert_budget_bytes) {
+        decision.action = pp_moe_onednn_explicit_ubatch_action::GROW_ZONE;
+        return decision;
+    }
+    decision.action                                 = pp_moe_onednn_explicit_ubatch_action::REFUSE;
+    // With every device-resident routed expert on the host tier the zone could be as large as it is now plus their
+    // bytes; the fixed rest and the dense scratch at the explicit micro-batch still take their share of it.
+    const pp_moe_onednn_explicit_ubatch_inputs & in = room.in;
+    const size_t                                 zone =
+        in.runtime_zone_bytes > kMax - expert_budget_bytes ? kMax : in.runtime_zone_bytes + expert_budget_bytes;
+    const size_t taken =
+        in.runtime_fixed_bytes > kMax - in.dense_scratch_bytes ? kMax : in.runtime_fixed_bytes + in.dense_scratch_bytes;
+    decision.max_ring_runtime_bytes = zone > taken ? zone - taken : 0;
+    // The largest micro-batch whose whole ring fits those bytes, by the ring admission's own slot arithmetic: no KV
+    // zone part is offered, so a ring that does not fit them entirely is not admitted.
+    pp_moe_onednn_ring_admission_inputs fit;
+    fit.runtime_available_bytes       = decision.max_ring_runtime_bytes;
+    fit.weight_slot_bytes             = in.weight_slot_bytes;
+    fit.activation_bytes_per_row      = in.activation_bytes_per_row;
+    fit.output_bytes_per_row          = in.output_bytes_per_row;
+    fit.ring_depth                    = in.ring_depth;
+    fit.n_ubatch                      = in.n_ubatch;
+    decision.largest_fitting_n_ubatch = pp_moe_onednn_admit_ring(fit).largest_fitting_n_ubatch;
+    return decision;
+}
+
+const char * pp_moe_onednn_explicit_ubatch_action_name(pp_moe_onednn_explicit_ubatch_action action) {
+    switch (action) {
+        case pp_moe_onednn_explicit_ubatch_action::NONE:
+            return "none";
+        case pp_moe_onednn_explicit_ubatch_action::PLACE:
+            return "place";
+        case pp_moe_onednn_explicit_ubatch_action::GROW_ZONE:
+            return "grow-zone";
+        case pp_moe_onednn_explicit_ubatch_action::REFUSE:
+            return "refuse";
+    }
+    return "unknown";
 }
 
 }  // namespace ggml_sycl

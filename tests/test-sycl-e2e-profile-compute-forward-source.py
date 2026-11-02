@@ -69,8 +69,17 @@ def test_graph_diag_records_e2e_graph_stage() -> None:
     end = src.index("static void ggml_sycl_moe_aggregation_diag", begin)
     body = src[begin:end]
     record = body.index("ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::GRAPH")
-    gate = body.rindex("if (ggml_sycl::e2e_tg_profile_enabled())", 0, record)
-    gate_close = matching_brace(body, body.index("{", gate))
+    # The record stays behind e2e_tg_profile_enabled(). Since 54b35bfbf (GW7) the gate also excludes the
+    # `phase=final` summary that ggml_backend_sycl_free prints (it is not a frame); that clause is a pure string
+    # compare, so the gate is either the bare predicate or the predicate and that exclusion, and nothing else.
+    gate = body.rindex("if (ggml_sycl::e2e_tg_profile_enabled()", 0, record)
+    gate_open = body.index("{", gate)
+    condition = " ".join(body[gate:gate_open].split())
+    assert condition in (
+        "if (ggml_sycl::e2e_tg_profile_enabled())",
+        'if (ggml_sycl::e2e_tg_profile_enabled() && !(phase && std::strcmp(phase, "final") == 0))',
+    ), condition
+    gate_close = matching_brace(body, gate_open)
     assert gate < record < gate_close
     assert "use_graph ? \"use_graph_1\" : \"use_graph_0\"" in body[record:gate_close]
     assert_no_waits(body[gate:gate_close])

@@ -8,12 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from sycl_dense_type_list import with_dense_type_list_inlined
+
 ROOT = Path(__file__).resolve().parents[1]
 CONVERT = ROOT / "ggml/src/ggml-sycl/convert.cpp"
 COMMON = ROOT / "ggml/src/ggml-common.h"
 SUPPORT = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 SOURCE = CONVERT.read_text(encoding="utf-8")
-SUPPORT_SOURCE = SUPPORT.read_text(encoding="utf-8")
+SUPPORT_SOURCE_RAW = SUPPORT.read_text(encoding="utf-8")
+SUPPORT_SOURCE = with_dense_type_list_inlined(SUPPORT_SOURCE_RAW)
 KVALUES = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
 
@@ -29,6 +32,17 @@ def _function(source: str, signature: str) -> str:
             if depth == 0:
                 return source[start : pos + 1]
     raise AssertionError(f"unterminated function: {signature}")
+
+
+# The decisions live in the impl; anchor on its definition (a forward declaration ends in `;`, so it does not match).
+SUPPORTS_IMPL_DEFINITION = re.compile(r"static\s+bool\s+ggml_sycl_device_supports_op_impl\s*\([^)]*\)\s*\{")
+
+
+def _function_matching(source: str, pattern: "re.Pattern[str]") -> str:
+    found = list(pattern.finditer(source))
+    if len(found) != 1:
+        raise AssertionError(f"expected exactly one definition matching {pattern.pattern}, found {len(found)}")
+    return _function(source, found[0].group(0))
 
 
 def _half(value: float) -> bytes:
@@ -92,7 +106,7 @@ def _contract(convert_source: str, support_source: str = SUPPORT_SOURCE) -> bool
         kernel = _function(convert_source, "static void dequantize_block_nvfp4_fp16(")
         launch = _function(convert_source, "static void dequantize_row_nvfp4_fp16_sycl(")
         dense = _function(support_source, "static bool ggml_sycl_mul_mat_type_supported(")
-        supports = _function(support_source, "static bool ggml_backend_sycl_device_supports_op(")
+        supports = _function_matching(support_source, SUPPORTS_IMPL_DEFINITION)
     except (ValueError, AssertionError):
         return False
 
@@ -181,7 +195,7 @@ def test_source_contract_mutations_fail_closed() -> None:
             "q1_0 registration renamed away",
             SOURCE.replace(
                 "case GGML_TYPE_Q1_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
-                "case GGML_TYPE_Q2_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
+                "case GGML_TYPE_TQ2_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
                 1,
             ),
         ),

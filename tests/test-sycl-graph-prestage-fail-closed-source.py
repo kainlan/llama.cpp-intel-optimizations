@@ -266,8 +266,13 @@ def evaluate(backend, common, memo_hdr):
 
     # --- (a) a view of an INPUT is that input -------------------------------------------------
     results["the INPUT test walks view_src"] = "view_src" in is_input and "GGML_TENSOR_FLAG_INPUT" in is_input
-    results["pre-stage asks the view-aware INPUT test"] = "graph_tensor_is_input(" in prestage
-    results["pre-stage has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in prestage
+    # Pre-stage decides INPUT through the shared classifier (llama.cpp-zhcn's prestage predicate), which asks the
+    # view-aware test; the flag-only test must be gone from both.
+    classify = function_body(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{") or ""
+    results["pre-stage asks the view-aware INPUT test"] = \
+        "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in classify
+    results["pre-stage has no flag-only INPUT test left"] = \
+        "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify
     results["refresh discovery asks the view-aware INPUT test"] = "graph_tensor_is_input(" in refresh
     results["refresh discovery has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in refresh
     # A zero-byte tensor has nothing to stage; reporting it as a failure is what made fail-closed unusable.
@@ -347,7 +352,7 @@ def evaluate(backend, common, memo_hdr):
                 if re.search(r"if\s*\([^;{]*!\s*$", backend[max(0, at - 160):at]) is not None]
     results["every pre-stage consumer tests the result (void-style calls ignore a failure)"] = \
         len(consumers) > 0 and len(consumers) == len(consumed)
-    results["no unnamed pre-stage consumer: the six recording sites below are all there are"] = len(consumers) == 6
+    results["no unnamed pre-stage consumer: the seven recording sites below are all there are"] = len(consumers) == 7
 
     # Each recording site, named, with the exact shape of its decline: the condition is the bare negated call (a
     # `&& false` or `|| true` tail would make the decline dead or the pre-stage unconditional), and the body leaves
@@ -381,6 +386,23 @@ def evaluate(backend, common, memo_hdr):
                           compute[compute.rfind("if", 0, rr_call):]) if rr_call >= 0 else None
     results["site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path"] = \
         rr_decline is not None
+    # llama.cpp-7pm2: a keyed decode split's slot. Warmup and direct keys record nothing and run before the
+    # decline; a replay or a record runs only past it, and each re-reads the slot, since a staging swap at the
+    # gateway retires every slot after begin() chose the action. A replay whose inputs now stage to other buffers
+    # than the slot's graphs read forgets the slot and runs direct.
+    keyed = re.search(
+        r"\}\s*else if\s*\(slot_action == gsc::action::DIRECT\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*" + site +
+        r"compute_impl_unlocked\(\);\s*\}\s*else if\s*\(slot_action == gsc::action::REPLAY\)\s*\{\s*"
+        r"const auto \* slot = sycl_ctx->moe_segment_slots\.payload\(slot_key\);\s*if\s*\(!slot\)\s*\{\s*"
+        r"compute_impl_unlocked\(\);\s*\}\s*"
+        r"else if\s*\(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{[^{}]*?"
+        r"sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*compute_impl_unlocked\(\);\s*\}\s*"
+        r"else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*"
+        r"moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);\s*graph_executed = true;\s*\}\s*\}\s*"
+        r"else if\s*\(!sycl_ctx->moe_segment_slots\.state\(slot_key\)\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*\{",
+        compute)
+    results["site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists"] = \
+        keyed is not None and compute.find("moe_graph_record_segment_slot(", keyed.end()) > keyed.end()
     first_at = compute.find("Pre-staging leaf tensors before recording")
     results["site 6, full first record: declines and leaves for the direct path"] = \
         first_at >= 0 and re.match(r"[^;]*;\s*" + site + exit_direct, compute[first_at:]) is not None
@@ -405,8 +427,13 @@ def evaluate(backend, common, memo_hdr):
     begin = [m.start() for m in re.finditer(r"model_sycl_graph\.begin_recording\(", compute)]
     s3 = re.search(r"moe_graph_replay_segments\(", compute)
     s4 = re.search(r"moe_graph_record_segments\(", compute)
+    s7 = re.search(r"slot_action == gsc::action::DIRECT", compute)
+    s7_call = compute.find("graph_prestage_or_decline(", s7.end()) if s7 else -1
+    s7_replay = compute.find("moe_graph_replay_segment_slot(")
+    s7_record = compute.find("moe_graph_record_segment_slot(")
     first_call = compute.find("graph_prestage_or_decline(", first_at) if first_at >= 0 else -1
-    chain = [("segment replay", s3.start() if s3 else -1), ("segment record", s4.start() if s4 else -1),
+    chain = [("keyed decline", s7_call), ("keyed replay", s7_replay), ("keyed record", s7_record),
+             ("segment replay", s3.start() if s3 else -1), ("segment record", s4.start() if s4 else -1),
              ("re-record anchor", rerecord_at), ("re-record decline", rr_call),
              ("re-record begin_recording", begin[0] if len(begin) == 2 else -1),
              ("first-record anchor", first_at), ("first-record decline", first_call),
@@ -453,12 +480,20 @@ def evaluate(backend, common, memo_hdr):
         stage_fn.find("ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)") < stage_fn.find("retain_handles_until_event")
     # One fact, one source, and the only mutation sites: the swap itself publishes and retains; nothing else resets,
     # erases or releases an entry, and the swap waits on nothing (retention is by event, not by host wait).
+    # llama.cpp-zhcn adds the one other erase: an eager graph_compute exit drops the entries that are tenant slices
+    # (tenant_cohort() != nullptr), whose release is the tenant claim's event-chained one; a recording or replaying
+    # call keeps them, so no erase can free a buffer a replay still reads. Exactly that one site, nothing broader.
+    release_fn = function_body(common, r"size_t graph_input_staging_release_tenants\(\)\s*\{") or ""
+    tenant_release_only_erase = \
+        len(re.findall(r"graph_input_staging\.erase\(", common)) == 1 and \
+        len(re.findall(r"graph_input_staging\.erase\(", release_fn)) == 1 and \
+        re.search(r"if\s*\(\s*it->second\.handle\.tenant_cohort\(\)\s*!=\s*nullptr\s*\)\s*\{\s*it\s*=\s*graph_input_staging\.erase\(it\);", release_fn) is not None
     results["the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing"] = \
         len(re.findall(r"\.handle\s*=[^=]", stage_fn)) == 1 and \
         len(re.findall(r"graph_input_staging_swapped\s*=\s*true", stage_fn)) == 1 and \
         re.search(r"\.wait\(|wait_and_throw|trace_queue_wait|sycl::event\s*\{\s*\}", stage_fn) is None and \
         len(re.findall(r"graph_input_staging\.clear\(\)", common)) == 1 and \
-        re.search(r"graph_input_staging\.erase\(", common) is None and \
+        tenant_release_only_erase and \
         re.search(r"graph_input_staging\.(clear|erase)|graph_input_staging_retired", backend) is None and \
         "graph_input_staging_retired" not in common
     results["the context owns the swapped flag, and clear resets it with the map"] = \
@@ -467,7 +502,7 @@ def evaluate(backend, common, memo_hdr):
     results["a staging failure for an INPUT tensor is terminal for the pass (no fallthrough to the cache paths)"] = \
         re.search(r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\ball_staged\s*=\s*false;\s*return;\s*\}", prestage) is not None
     results["the INPUT arm tests exactly 'is input, named' and its success path returns"] = \
-        re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{[^{}]*"
+        re.search(r"if\s*\(source_class\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{[^{}]*"
                   r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\}\s*staged_count\+\+;\s*mark_staged\(tensor\);\s*"
                   r"GGML_SYCL_DEBUG\([^;]*;\s*return;\s*\}", prestage) is not None
     results["the gateway consumes the swapped flag and retires the recorders, with no second pass"] = \
@@ -539,7 +574,7 @@ def evaluate(backend, common, memo_hdr):
         print("NOTE: compute-entry check: " + entry_reason)
     results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = entry_reason == ""
     results["the INPUT arm stages on the backend's own queue"] = \
-        re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
+        re.search(r"if\s*\(source_class\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
                   r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void\s*\*\s*dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
                   prestage) is not None
     dense_drop = function_body(backend, r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
@@ -550,11 +585,15 @@ def evaluate(backend, common, memo_hdr):
         gw_at >= 0 and re.search(r"if\s*\(st\.graphs\.size\(\)\s*!=\s*ranges_\.size\(\)\)\s*\{\s*st\.graphs\.resize\(ranges_\.size\(\)\);\s*st\.graphs_key\s*=\s*key;\s*ctx_\.input_tensors_cached\s*=\s*false;", dense[gw_at:]) is not None
 
     # Every release of recorded state waits first, under the guard that says there is something in flight (review r6).
-    clear_active = function_body(backend, r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
+    # The release is the context-scoped body since llama.cpp-zhcn: clear_active is that body (called exactly once, before
+    # the process-global effects) plus the unpins, so the wait-before-release order is pinned on the scoped body.
+    clear_active_outer = function_body(backend, r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
+    clear_active = function_body(backend, r"static void sycl_exec_graph_clear_scoped\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
     wait_at = re.search(r"if\s*\(\s*ctx->exec_graph\s*\)\s*\{\s*ggml_sycl_trace_queue_wait\(ctx->stream\(\)", clear_active)
     results["clear_active waits on the queue before it resets the exec graph or releases the staging"] = \
         bool(wait_at) and 0 <= wait_at.start() < clear_active.find("ctx->exec_graph.reset()") < \
-        clear_active.find("graph_input_staging_clear(") and clear_active.count("graph_input_staging_clear(") == 1
+        clear_active.find("graph_input_staging_clear(") and clear_active.count("graph_input_staging_clear(") == 1 and \
+        clear_active_outer.count("sycl_exec_graph_clear_scoped(ctx, reason);") == 1
     drop_fn = function_body(backend, r"void ggml_sycl_block_exec_dense_state::drop_graphs\(ggml_backend_sycl_context & ctx\)\s*\{") or ""
     results["drop_graphs drains each used device before it clears the range graphs"] = \
         re.search(r"if\s*\(!used\[d\]\)\s*\{\s*continue;\s*\}\s*try\s*\{\s*ggml_sycl_block_exec_dense_queue\(ctx, d\)->wait_and_throw\(\);", drop_fn) is not None \
@@ -613,12 +652,14 @@ if args.self_test:
     ref_sig = r"static void graph_refresh_input_tensors\([^)]*\)\s*\{"
     dec_sig = r"static bool graph_prestage_or_decline\([^)]*\)\s*\{"
     cmp_sig = r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{"
+    # Sites 3 and 4 sit in the legacy (prompt-phase) segmented branch, after the keyed slot's own decline (site 7).
+    legacy_seg_sig = r"\}\s*else if \(segments_match\)\s*\{"
     # the first full-graph recording site (the debug line just above it is the anchor)
     full_sig = r"Pre-staging leaf tensors before recording[^;]*;"
     stage_sig = r"void \* graph_input_stage\(const ggml_tensor \* owner,[^)]*\)\s*\{"
     swap_sig = r"static bool graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{"
     dense_drop_sig = r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{"
-    clear_sig = r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{"
+    clear_sig = r"static void sycl_exec_graph_clear_scoped\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{"
     drop_sig = r"void ggml_sycl_block_exec_dense_state::drop_graphs\(ggml_backend_sycl_context & ctx\)\s*\{"
     retire_sig = r"static bool moe_graph_retention_retire_exact\(ggml_backend_sycl_context \* ctx\)\s*\{"
     def move_first_record_decline(src):
@@ -761,7 +802,7 @@ if args.self_test:
          (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
                          "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
-         (mutate_in_func(backend, pre_sig, "graph_tensor_is_input(tensor)",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{", "graph_tensor_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
         ("flag-only INPUT test in refresh", "refresh discovery has no flag-only INPUT test left",
          (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor)",
@@ -828,10 +869,10 @@ if args.self_test:
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { (void) 0;"
                          " } if (false) {"), common, mem_)),
         ("segment replay decline is dead", "site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays",
-         (mutate_in_func(backend, cmp_sig, "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
+         (mutate_in_func(backend, legacy_seg_sig, "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash) && false) {"), common, mem_)),
         ("segment record decline loses its direct run", "site 4, MoE segment record: declines and runs direct, else records",
-         (mutate_re(backend, cmp_sig, r"\}\s*else if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*compute_impl_unlocked\(\);",
+         (mutate_re(backend, legacy_seg_sig, r"\}\s*else if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*compute_impl_unlocked\(\);",
                     "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { (void) 0;"), common, mem_)),
         ("re-record decline is unconditional-tail", "site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path",
          (mutate_re(backend, r"re-record \+ update \(%s\)", r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{",
@@ -913,6 +954,12 @@ if args.self_test:
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;", "slot.capacity = nbytes;\n        graph_input_staging_swapped = true;"), mem_)),
         ("the generation is not bumped at the swap", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;\n        graph_input_staging_generation++;", "slot.capacity = nbytes;"), mem_)),
+        ("the tenant release drops its tenant filter", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
+         (backend, mutate_in_func(common, r"size_t graph_input_staging_release_tenants\(\)\s*\{", "if (it->second.handle.tenant_cohort() != nullptr) {",
+                                  "if (true) {"), mem_)),
+        ("a second erase site", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
+         (backend, mutate_in_func(common, r"void graph_input_staging_clear\(sycl::queue & q\)\s*\{", "graph_input_staging.clear();",
+                                  "graph_input_staging.erase(graph_input_staging.begin());"), mem_)),
         ("the swap waits on the host", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;", "slot.capacity = nbytes;\n        q.wait();"), mem_)),
         ("the entry is published before the resolve check", "graph_input_stage publishes into the map only after its last failure return",
@@ -923,8 +970,8 @@ if args.self_test:
         ("the staging map is released before the wait", "clear_active waits on the queue before it resets the exec graph or releases the staging",
          (mutate_in_func(backend, clear_sig, "if (ctx->exec_graph) {", "ctx->graph_input_staging_clear(*ctx->stream());\n    if (ctx->exec_graph) {"), common, mem_)),
         ("the INPUT condition is dead", "the INPUT arm tests exactly 'is input, named' and its success path returns",
-         (mutate_re(backend, pre_sig, r"if \(graph_tensor_is_input\(tensor\) && tensor->name && tensor->name\[0\] != '\\0'\) \{",
-                    "if (graph_tensor_is_input(tensor) && tensor->name && tensor->name[0] != '\\0' && false) {"), common, mem_)),
+         (mutate_re(backend, pre_sig, r"if \(source_class == ggml_sycl_prestage_class::INPUT && tensor->name && tensor->name\[0\] != '\\0'\) \{",
+                    "if (source_class == ggml_sycl_prestage_class::INPUT && tensor->name && tensor->name[0] != '\\0' && false) {"), common, mem_)),
         ("the INPUT success falls through", "the INPUT arm tests exactly 'is input, named' and its success path returns",
          (mutate_re(backend, pre_sig, r"(\(long long\) tensor->name, tensor->data, nbytes, dev_ptr\);|tensor->name, tensor->data, nbytes, dev_ptr\);)\s*return;",
                     "tensor->name, tensor->data, nbytes, dev_ptr);"), common, mem_)),
@@ -974,7 +1021,14 @@ if args.self_test:
          (mutate_in_func(backend, cmp_sig, "else if (!sycl_ctx->moe_segments_valid) {", "else if (false) {"), common, mem_)),
         ("the retired-segments branch is gone", "site 3: segments a staging swap retired run the token direct instead of replaying nothing",
          (mutate_re(backend, cmp_sig, r"\s*else if \(!sycl_ctx->moe_segments_valid\) \{\s*compute_impl_unlocked\(\);\s*\}", ""), common, mem_)),
-        ("a seventh recorder appears", "no unnamed pre-stage consumer: the six recording sites below are all there are",
+        ("the keyed slot replays a slot a staging swap retired", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, cmp_sig, "if (!slot) {", "if (false) {"), common, mem_)),
+        ("the keyed slot records a slot a staging swap retired", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, cmp_sig, "} else if (!sycl_ctx->moe_segment_slots.state(slot_key)) {", "} else if (false) {"), common, mem_)),
+        ("the keyed slot records past a decline", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, r"slot_action == gsc::action::DIRECT\)", "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
+                         "} else if (false) {"), common, mem_)),
+        ("an eighth recorder appears", "no unnamed pre-stage consumer: the seven recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),
     ]

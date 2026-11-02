@@ -45,6 +45,10 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = common_model_params_to_llama(params);
 
+    // the context below is sized from the prompt, tokenized after the load, whatever -c says; n_predict counts the
+    // prompt, so n_predict x n_parallel bounds it, and the load plans the KV room for that (llama.cpp-7fmt)
+    model_params.n_ctx_hint = n_predict > 0 && n_parallel > 0 ? (uint32_t) n_predict * (uint32_t) n_parallel : 0;
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
 
     if (model == NULL) {

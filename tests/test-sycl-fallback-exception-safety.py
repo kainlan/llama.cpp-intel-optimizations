@@ -46,13 +46,16 @@ with gate("graph_recorder_scope::leave is noexcept and restores the capture stat
         assert re.search(restored, leave), restored
 with gate("graph_recorder_scope destructor leaves the scope"):
     assert re.search(r"~graph_recorder_scope\(\) \{\s*leave\(\);", recorder_scope)
-# Exactly the two direct recording sites in the graph-compute path construct the scope by value (the
-# re-record site holds it in an optional via recorder_.emplace). A count of >= 1 let a mutant drop one site's
-# scope unnoticed, so pin the pair.
-with gate("both direct recording sites construct the recorder scope"):
+# Exactly three direct recording sites construct the scope by value: the two in the graph-compute path and the
+# keyed segment record (the re-record site holds it in an optional via recorder_.emplace). A count of >= 1 let a
+# mutant drop one site's scope unnoticed, so pin the set, and pin the keyed one to its function.
+with gate("every direct recording site constructs the recorder scope"):
     # Count CODE: a comment that mentions the construction is not a construction.
     sycl_code = re.sub(r"//[^\n]*|/\*.*?\*/", "", sycl, flags=re.S)
-    assert sycl_code.count("ggml_sycl_graph_recorder recorder(") == 2
+    assert sycl_code.count("ggml_sycl_graph_recorder recorder(") == 3
+    keyed = sycl_code[sycl_code.index("static void moe_graph_record_segment_slot("):
+                      sycl_code.index("static void moe_graph_replay_segment_slot(")]
+    assert keyed.count("ggml_sycl_graph_recorder recorder(") == 1
 with gate("the re-record site holds the recorder scope in an optional"):
     assert "recorder_.emplace(" in sycl
 with gate("both fallback catch sites classify the recoverable error by dynamic_cast"):
@@ -120,8 +123,12 @@ with gate("a segment is marked submitted only before its executable graph is sub
     # whitespace-tolerant: the formatter aligns the name with its neighbouring declarations
     assert re.search(r"bool\s+segment_submitted\s*=\s*false", sycl)
     assert "segment_submitted = true" in sycl
-    assert (sycl.index("segment_submitted = true")
-            < sycl.index("stream->ext_oneapi_graph(*recorded_segments.back().exec_graph)"))
+    # The submit goes through graph_exec_submit since zhcn C7a (cec4a5f10): it counts, then calls
+    # stream.ext_oneapi_graph(exec). The flag must still be set before that submit, and no bare call may remain.
+    submit = "ggml_sycl::graph_exec_submit(*stream, *recorded_segments.back().exec_graph)"
+    assert sycl.count(submit) == 1
+    assert "stream->ext_oneapi_graph(*recorded_segments.back().exec_graph)" not in sycl
+    assert sycl.index("segment_submitted = true") < sycl.index(submit)
 with gate("an unsubmitted segment rolls back to the baseline at both failure sites"):
     assert sycl.count("if (!segment_submitted)") >= 2
     assert sycl.count("graph_retained_handles.resize(retained_baseline)") >= 2

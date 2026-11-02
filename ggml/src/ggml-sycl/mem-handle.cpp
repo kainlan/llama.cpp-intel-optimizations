@@ -53,6 +53,14 @@ struct retained_handle_record {
     // handles[i].owner_control_id(), read when the record is published, so a
     // reap matches under the store mutex without asking any handle.
     std::vector<uint64_t>   ids;
+    // The futures of every CPU expert job a device command may still wait on, from
+    // every live ring when the record is published (cpu_job_signal_gates_outstanding,
+    // llama.cpp-42zj). The drain worker sleeps on them before its driver wait on the
+    // event, because a host wait on an event behind a job that has not started can
+    // keep the job from starting. A record behind none of those jobs sleeps on them
+    // too, by design: its handles are released later, never earlier, so lifetime
+    // stays safe and only memory is held a little longer.
+    std::vector<std::shared_future<void>> gates;
 };
 
 struct retained_handle_state {
@@ -141,6 +149,47 @@ struct graph_recording_sink_state {
 
 std::atomic<uint64_t>                   g_graph_retention_token_counter{ 0 };
 thread_local graph_recording_sink_state g_graph_recording_sink;
+
+// The drain worker's waits for the trace (retained_handle_drain_census): counted once the trace turned the census on,
+// taken and zeroed by the thread that prints the trace's waits line (llama.cpp-qwn5).
+std::atomic<bool>     g_retained_drain_census_on{ false };
+std::atomic<uint64_t> g_retained_drain_census_records{ 0 };
+std::atomic<uint64_t> g_retained_drain_census_gates{ 0 };
+std::atomic<uint64_t> g_retained_drain_census_gate_sleep_ns{ 0 };
+std::atomic<uint64_t> g_retained_drain_census_driver_ns{ 0 };
+
+// Times one record's wait for the census: from the timer to the end of the gate sleep, and from there to the end of
+// the event wait. Reads no clock while the census is off; a wait that throws is not counted.
+struct retained_drain_wait_timer {
+    using clock = std::chrono::steady_clock;
+
+    bool              on      = g_retained_drain_census_on.load(std::memory_order_relaxed);
+    clock::time_point t_begin = on ? clock::now() : clock::time_point{};
+    clock::time_point t_slept;
+    uint64_t          gates = 0;
+
+    void slept(size_t n) {
+        if (on) {
+            t_slept = clock::now();
+            gates   = n;
+        }
+    }
+
+    void waited() const {
+        if (!on) {
+            return;
+        }
+        const clock::time_point t_end = clock::now();
+        g_retained_drain_census_records.fetch_add(1, std::memory_order_relaxed);
+        g_retained_drain_census_gates.fetch_add(gates, std::memory_order_relaxed);
+        g_retained_drain_census_gate_sleep_ns.fetch_add(
+            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_slept - t_begin).count(),
+            std::memory_order_relaxed);
+        g_retained_drain_census_driver_ns.fetch_add(
+            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_slept).count(),
+            std::memory_order_relaxed);
+    }
+};
 // Compatibility alias used only inside this translation unit; epoch identity is
 // always checked by terminal_retention_ticket before publication.
 #define g_graph_retained_handle_sink g_graph_recording_sink.sink
@@ -238,7 +287,16 @@ void retained_handle_drain_loop() {
                 ~event_wait_watchdog_guard() { ggml_sycl_watchdog_non_graph_end(); }
             } watchdog_guard;
 
+            // Asleep on the jobs first, then in the driver only for the device work after them (llama.cpp-qwn5).
+            retained_drain_wait_timer wait_timer;
+            for (const std::shared_future<void> & gate : record.gates) {
+                if (gate.valid()) {
+                    gate.wait();
+                }
+            }
+            wait_timer.slept(record.gates.size());
             record.event.wait_and_throw();
+            wait_timer.waited();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
             switch (g_retained_drain_test_fail_wait.exchange(RETAINED_DRAIN_TEST_WAIT_OK)) {
                 case RETAINED_DRAIN_TEST_WAIT_COMMAND_GRAPH:
@@ -605,6 +663,7 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
     }
     h.leased_entry_         = entry;  // ownership of the refcount bump transferred
     h.leased_storage_owner_ = std::move(storage_owner);
+    h.leased_alloc_owner_   = leased_entry_alloc_owner(entry);
     if (entry) {
         h.canonical_allocation_id_ = entry->allocation_identity();
         h.canonical_generation_    = entry->replacement_identity();
@@ -864,6 +923,31 @@ mem_handle detail::from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_m
     return promotion ? mem_handle::from_owned_alloc(std::move(promotion.owner), layout) : mem_handle{};
 }
 
+uint32_t mem_handle::owner_use_count() const noexcept {
+    // Taken for the reason owns_allocation() takes it: copy- and move-assignment replace
+    // owned_alloc_ under lock_, so an unlocked read would race an assignment into this object.
+    mem_handle_lock_guard g(lock_);
+    return owned_alloc_.use_count();
+}
+
+bool mem_handle::owner_metadata(alloc_metadata * out) const {
+    // Under lock_ for the reason owner_use_count() takes it: assignment replaces
+    // owned_alloc_ under lock_.
+    mem_handle_lock_guard g(lock_);
+    if (!out) {
+        return false;
+    }
+    if (owned_alloc_) {
+        *out = owned_alloc_.metadata();
+        return true;
+    }
+    if (leased_alloc_owner_) {
+        *out = leased_alloc_owner_.metadata();
+        return true;
+    }
+    return false;
+}
+
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     // An ownerless DIRECT may derive a view only when its creator explicitly
     // minted a finite extent. This is bounded address authority, not lifetime
@@ -910,10 +994,34 @@ mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     return h;
 }
 
+mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size, ggml_layout_mode layout) const {
+    // Only an owner names what its bytes hold (lead ruling c-o9uw-1). Refused
+    // before anything else, so a weight lease is never resolved on the way.
+    if (!owned_alloc_) {
+        return {};
+    }
+    // A refused range is the default handle, which owns nothing. (Not valid():
+    // an arena handle not yet resolved has no cached pointer.)
+    mem_handle h = slice(byte_offset, byte_size);
+    if (!h.owned_alloc_) {
+        return {};
+    }
+    {
+        mem_handle_lock_guard g(h.lock_);
+        h.view_layout_ = layout;
+    }
+    return h;
+}
+
 resolved_ptr mem_handle::resolved_view_locked() const {
     resolved_ptr view = cached_;
     if (!view.ptr) {
         return view;
+    }
+    // A tagged slice's layout replaces the backing resolver's, on every
+    // resolve: an arena resolve rewrites cached_ as AOS.
+    if (view_layout_) {
+        view.layout = *view_layout_;
     }
     if (!is_slice_) {
         view.extent = size_;
@@ -941,40 +1049,49 @@ void mem_handle::set_canonical_identity_for_test(uint64_t allocation_id, uint64_
 }
 #endif
 
+// Every read below is a field load, an atomic spin lock or a noexcept owner
+// query, so the test cannot throw and needs no catch of its own.
+std::optional<moe::canonical_allocation_identity> moe::canonical_allocation_integration::exact_identity(
+    const mem_handle & handle) noexcept {
+    canonical_allocation_identity exact;
+    {
+        mem_handle_lock_guard guard(handle.lock_);
+        if (!handle.cached_.ptr) {
+            return std::nullopt;
+        }
+        exact.device        = handle.owned_alloc_ ? handle.owned_alloc_.metadata().device : handle.device_;
+        exact.allocation_id = handle.canonical_allocation_id_;
+        exact.generation    = handle.canonical_generation_;
+        exact.extent        = handle.canonical_extent_;
+        if (handle.kind_ == mem_handle_kind::WEIGHT && exact.allocation_id == 0) {
+            // Cache-entry minted IDs/replacement generations are not yet
+            // propagated by unified-cache. Never substitute a key hash.
+            return std::nullopt;
+        }
+        if (!handle.owned_alloc_ && !handle.is_arena() && handle.kind_ != mem_handle_kind::WEIGHT) {
+            // Non-owning DIRECT and compatibility CHUNK_LEASE handles do
+            // not carry an exact allocation identity/range.
+            return std::nullopt;
+        }
+    }
+    if (exact.allocation_id == 0 || exact.generation == 0 || exact.device < 0 ||
+        exact.device >= static_cast<int>(execution::max_devices) || exact.extent == 0) {
+        return std::nullopt;
+    }
+    return exact;
+}
+
 std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integration::retain(
     const mem_handle & handle) noexcept {
     try {
-        uint64_t allocation_id = 0;
-        uint64_t generation    = 0;
-        int      device        = mem_handle::HOST_DEVICE;
-        size_t   extent        = 0;
-        {
-            mem_handle_lock_guard guard(handle.lock_);
-            if (!handle.cached_.ptr) {
-                return std::nullopt;
-            }
-            device        = handle.owned_alloc_ ? handle.owned_alloc_.metadata().device : handle.device_;
-            allocation_id = handle.canonical_allocation_id_;
-            generation    = handle.canonical_generation_;
-            extent        = handle.canonical_extent_;
-            if (handle.kind_ == mem_handle_kind::WEIGHT && allocation_id == 0) {
-                // Cache-entry minted IDs/replacement generations are not yet
-                // propagated by unified-cache. Never substitute a key hash.
-                return std::nullopt;
-            }
-            if (!handle.owned_alloc_ && !handle.is_arena() && handle.kind_ != mem_handle_kind::WEIGHT) {
-                // Non-owning DIRECT and compatibility CHUNK_LEASE handles do
-                // not carry an exact allocation identity/range.
-                return std::nullopt;
-            }
-        }
-        if (allocation_id == 0 || generation == 0 || device < 0 ||
-            device >= static_cast<int>(execution::max_devices) || extent == 0) {
+        const auto identity = exact_identity(handle);
+        if (!identity) {
             return std::nullopt;
         }
         auto retained_handle = std::make_shared<mem_handle>(handle);
         std::shared_ptr<const void> owner = retained_handle;
-        return retained_allocation_owner(allocation_id, generation, device, extent, std::move(owner));
+        return retained_allocation_owner(identity->allocation_id, identity->generation, identity->device,
+                                         identity->extent, std::move(owner));
     } catch (...) {
         return std::nullopt;
     }
@@ -1008,12 +1125,27 @@ void mem_handle::set_ready_event(const sycl::event & event) {
     mem_handle_lock_guard g(lock_);
     cached_.has_ready_event = true;
     cached_.ready_event     = event;
+    // A producer recorded with an earlier event does not describe this one (llama.cpp-wfsl).
+    cached_.has_ready_queue = false;
+    cached_.ready_queue     = 0;
+}
+
+void mem_handle::set_ready_event(const sycl::event & event, const sycl::queue & producer) {
+    size_t                identity = 0;
+    const bool            known    = ready_queue_identity(producer, &identity);
+    mem_handle_lock_guard g(lock_);
+    cached_.has_ready_event = true;
+    cached_.ready_event     = event;
+    cached_.has_ready_queue = known;
+    cached_.ready_queue     = identity;
 }
 
 void mem_handle::clear_ready_event() {
     mem_handle_lock_guard g(lock_);
     cached_.has_ready_event = false;
     cached_.ready_event     = {};
+    cached_.has_ready_queue = false;
+    cached_.ready_queue     = 0;
 }
 
 // === resolve ===
@@ -1155,6 +1287,7 @@ resolved_ptr mem_handle::resolve_slow() const {
     lease_state fresh;
     fresh.entry         = result.entry;  // may be nullptr for S1-PRELOAD direct entries
     fresh.storage_owner = std::move(result.storage_owner);
+    fresh.leased_owner  = leased_entry_alloc_owner(result.entry);
 
     // llama.cpp-dyhdl: also pin the underlying arena chunk.  Belt + suspenders
     // alongside the cache_entry lease: entry refcount prevents cache-layer
@@ -1212,6 +1345,25 @@ resolved_ptr mem_handle::resolve_slow() const {
 
 // === lease_state helpers ===
 
+shared_alloc_owner mem_handle::leased_entry_alloc_owner(const unified_cache_entry * entry) {
+    // The entry's typed owner is the provenance of the storage a lease on it
+    // reads; the copy path trusts a host source only on that evidence
+    // (llama.cpp-36j0). Only a host-pinned owner is retained: the host-endpoint
+    // check is the one consumer, and retaining a device entry's owner would
+    // cost every copy of its lease an atomic for nothing. The caller's lease
+    // keeps entry from being erased, and the read takes the owner handle's own
+    // lock_ because assignment replaces owned_alloc_ under it.
+    if (!entry) {
+        return {};
+    }
+    mem_handle_lock_guard      g(entry->direct_alloc_owner.lock_);
+    const shared_alloc_owner & owner = entry->direct_alloc_owner.owned_alloc_;
+    if (!owner || owner.metadata().tier != alloc_tier::HOST_PINNED) {
+        return {};
+    }
+    return owner;
+}
+
 mem_handle::lease_state mem_handle::take_lease_state_locked() const {
     lease_state state;
     state.entry             = leased_entry_;
@@ -1220,6 +1372,7 @@ mem_handle::lease_state mem_handle::take_lease_state_locked() const {
     state.vram_chunk_idx    = vram_chunk_idx_;
     state.chunk_device      = chunk_device_;
     state.storage_owner     = std::move(leased_storage_owner_);
+    state.leased_owner      = std::move(leased_alloc_owner_);
 
     leased_entry_      = nullptr;
     chunk_source_      = 0;
@@ -1238,6 +1391,7 @@ void mem_handle::store_lease_state_locked(const lease_state & state) const {
     vram_chunk_idx_    = state.vram_chunk_idx;
     chunk_device_      = state.chunk_device;
     leased_storage_owner_ = state.storage_owner;
+    leased_alloc_owner_   = state.leased_owner;
 }
 
 void mem_handle::release_lease_state(const lease_state & state) noexcept {
@@ -1499,6 +1653,30 @@ bool mem_handle::has_stable_owner_identity() const {
     return is_weight() || is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE || static_cast<bool>(owned_alloc_);
 }
 
+mem_handle_identity mem_handle::identity() const {
+    mem_handle_lock_guard g(lock_);
+    mem_handle_identity   id;
+    // A weight's canonical id stays 0 (cache WEIGHT constructors do not
+    // populate it), so a weight is "no identity" rather than a key-derived one.
+    id.allocation_id = canonical_allocation_id_;
+    id.generation    = canonical_generation_;
+    id.slice_offset  = offset_;
+    id.size          = size_;
+    if (id.allocation_id == 0) {
+        return mem_handle_identity{};
+    }
+    return id;
+}
+
+bool mem_handle::identity_equal(const mem_handle_identity & id) const {
+    return id == identity();
+}
+
+const char * mem_handle::tenant_cohort() const {
+    mem_handle_lock_guard g(lock_);
+    return owned_alloc_ ? owned_alloc_.tenant_cohort() : nullptr;
+}
+
 void mem_handle::set_debug_owner(const char * owner_tag) {
     debug_owner_tag_ = owner_tag ? owner_tag : "";
 }
@@ -1607,6 +1785,7 @@ mem_handle::mem_handle(const mem_handle & other) {
         backing_offset_          = other.backing_offset_;
         slice_offset_            = other.slice_offset_;
         is_slice_                = other.is_slice_;
+        view_layout_             = other.view_layout_;
         arena_gen_               = other.arena_gen_;
         arena_authority_         = other.arena_authority_;
         arena_lease_             = other.arena_lease_;
@@ -1619,6 +1798,7 @@ mem_handle::mem_handle(const mem_handle & other) {
         cached_                  = other.cached_;
         leased_entry_            = other.leased_entry_;
         leased_storage_owner_    = other.leased_storage_owner_;
+        leased_alloc_owner_      = other.leased_alloc_owner_;
         chunk_source_            = other.chunk_source_;
         chunk_device_            = other.chunk_device_;
         if (leased_entry_) {
@@ -1660,6 +1840,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     backing_offset_          = other.backing_offset_;
     slice_offset_            = other.slice_offset_;
     is_slice_                = other.is_slice_;
+    view_layout_             = other.view_layout_;
     arena_gen_               = other.arena_gen_;
     arena_authority_         = std::move(other.arena_authority_);
     arena_lease_             = std::move(other.arena_lease_);
@@ -1673,6 +1854,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     const lease_state st     = other.take_lease_state_locked();
     leased_entry_            = st.entry;
     leased_storage_owner_    = std::move(st.storage_owner);
+    leased_alloc_owner_      = std::move(st.leased_owner);
     chunk_source_            = st.chunk_source;
     host_chunk_handle_       = st.host_chunk_handle;
     vram_chunk_idx_          = st.vram_chunk_idx;
@@ -1688,6 +1870,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     other.backing_offset_          = 0;
     other.slice_offset_            = 0;
     other.is_slice_                = false;
+    other.view_layout_.reset();
     other.arena_gen_               = 0;
     other.arena_authority_.reset();
     other.arena_lease_.reset();
@@ -1717,6 +1900,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     size_t                new_backing_offset         = 0;
     size_t                new_slice_offset           = 0;
     bool                  new_is_slice               = false;
+    std::optional<ggml_layout_mode>  new_view_layout;
     uint64_t              new_arena_gen              = 0;
     std::shared_ptr<arena_authority> new_arena_authority;
     std::shared_ptr<void>            new_arena_lease;
@@ -1729,6 +1913,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     uint8_t               new_chunk_source           = 0;
     int                   new_chunk_device           = -1;
     std::shared_ptr<void> new_storage_owner;
+    shared_alloc_owner               new_alloc_owner;
     {
         mem_handle_lock_guard g(other.lock_);
         new_kind                    = other.kind_;
@@ -1741,6 +1926,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_backing_offset          = other.backing_offset_;
         new_slice_offset            = other.slice_offset_;
         new_is_slice                = other.is_slice_;
+        new_view_layout             = other.view_layout_;
         new_arena_gen               = other.arena_gen_;
         new_canonical_allocation_id = other.canonical_allocation_id_;
         new_canonical_generation    = other.canonical_generation_;
@@ -1755,6 +1941,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_chunk_source            = other.chunk_source_;
         new_chunk_device            = other.chunk_device_;
         new_storage_owner           = other.leased_storage_owner_;
+        new_alloc_owner             = other.leased_alloc_owner_;
         if (new_entry) {
             new_entry->in_use_count.fetch_add(1);
             // llama.cpp-2wv5: see the copy ctor -- the copy holds the lease it
@@ -1799,6 +1986,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         backing_offset_          = new_backing_offset;
         slice_offset_            = new_slice_offset;
         is_slice_                = new_is_slice;
+        view_layout_             = new_view_layout;
         arena_gen_               = new_arena_gen;
         canonical_allocation_id_ = new_canonical_allocation_id;
         canonical_generation_    = new_canonical_generation;
@@ -1816,6 +2004,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         fresh.vram_chunk_idx    = new_vram_chunk_idx;
         fresh.chunk_device      = new_chunk_device;
         fresh.storage_owner     = std::move(new_storage_owner);
+        fresh.leased_owner      = std::move(new_alloc_owner);
         store_lease_state_locked(fresh);
     }
 
@@ -1843,6 +2032,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     size_t                new_backing_offset          = 0;
     size_t                new_slice_offset            = 0;
     bool                  new_is_slice                = false;
+    std::optional<ggml_layout_mode>  new_view_layout;
     uint64_t              new_arena_gen               = 0;
     std::shared_ptr<arena_authority> new_arena_authority;
     std::shared_ptr<void>            new_arena_lease;
@@ -1864,6 +2054,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         new_backing_offset          = other.backing_offset_;
         new_slice_offset            = other.slice_offset_;
         new_is_slice                = other.is_slice_;
+        new_view_layout             = other.view_layout_;
         new_arena_gen               = other.arena_gen_;
         new_canonical_allocation_id = other.canonical_allocation_id_;
         new_canonical_generation    = other.canonical_generation_;
@@ -1886,6 +2077,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         other.backing_offset_          = 0;
         other.slice_offset_            = 0;
         other.is_slice_                = false;
+        other.view_layout_.reset();
         other.arena_gen_               = 0;
         other.arena_authority_.reset();
         other.arena_lease_.reset();
@@ -1915,6 +2107,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         backing_offset_          = new_backing_offset;
         slice_offset_            = new_slice_offset;
         is_slice_                = new_is_slice;
+        view_layout_             = new_view_layout;
         arena_gen_               = new_arena_gen;
         canonical_allocation_id_ = new_canonical_allocation_id;
         canonical_generation_    = new_canonical_generation;
@@ -2560,12 +2753,30 @@ static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::e
     std::call_once(g_retained_drain_worker_once, start_retained_handle_drain_worker);
 
     std::vector<uint64_t> ids = owner_control_ids(handles);
+
+    // Every record takes the gates of every CPU expert job a device command may still wait on, whether or not its
+    // own event stands behind one: the drain worker must not reach a driver wait in front of a job that has not
+    // started (llama.cpp-42zj). Taken before the store lock, under which it never runs.
+    std::vector<std::shared_future<void>> gates = cpu_job_signal_gates_outstanding();
     {
         auto &              state = *g_retained_handles_state;
         retained_store_lock lock(state);
-        state.queue.push_back({ std::move(handles), std::move(event), std::move(ids) });
+        state.queue.push_back({ std::move(handles), std::move(event), std::move(ids), std::move(gates) });
     }
     g_retained_handles_state->cv.notify_one();
+}
+
+void retained_handle_drain_census_enable() noexcept {
+    g_retained_drain_census_on.store(true, std::memory_order_relaxed);
+}
+
+retained_handle_drain_census retained_handle_drain_census_take() noexcept {
+    retained_handle_drain_census c;
+    c.records       = g_retained_drain_census_records.exchange(0, std::memory_order_relaxed);
+    c.gate_waits    = g_retained_drain_census_gates.exchange(0, std::memory_order_relaxed);
+    c.gate_sleep_us = (double) g_retained_drain_census_gate_sleep_ns.exchange(0, std::memory_order_relaxed) / 1000.0;
+    c.driver_us     = (double) g_retained_drain_census_driver_ns.exchange(0, std::memory_order_relaxed) / 1000.0;
+    return c;
 }
 
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {

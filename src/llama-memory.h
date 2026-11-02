@@ -6,10 +6,12 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
 class llama_batch_allocr;
+class llama_kv_cache;
 
 class llama_io_write_i;
 class llama_io_read_i;
@@ -32,6 +34,15 @@ enum llama_memory_status {
     LLAMA_MEMORY_STATUS_NO_UPDATE,
     LLAMA_MEMORY_STATUS_FAILED_PREPARE,
     LLAMA_MEMORY_STATUS_FAILED_COMPUTE,
+};
+
+// the outcome of applying pending memory updates (shifts, copies, ...)
+// kept apart from llama_memory_status: "an update was performed" is a retry signal for the decode loop, and a
+// failed update must not share that meaning
+enum llama_memory_update_result {
+    LLAMA_MEMORY_UPDATE_NONE,   // nothing was updated (no pending update, or none that could be prepared)
+    LLAMA_MEMORY_UPDATE_DONE,   // an update was performed
+    LLAMA_MEMORY_UPDATE_FAILED, // an update was attempted and failed; it stays pending
 };
 
 // helper function for combining the status of two memory contexts
@@ -93,12 +104,21 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // like init_full(), for a ubatch that spans exactly n_streams streams (1 <= n_streams <= the memory's stream count)
+    // used for allocating the worst-case compute buffers of a decode over fewer sequences than the cache has streams:
+    // init_full() always spans every stream, so the K/V views and the mask would disagree on the stream count
+    virtual llama_memory_context_ptr init_reserve(uint32_t n_streams) = 0;
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // the KV caches whose update() allocates a K-shift graph, one per sub-cache that can shift; none for a memory
+    // that cannot shift or that holds no rope'd KV cache. A planned reserve measures each of those graphs.
+    virtual void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const = 0;
 
     //
     // ops

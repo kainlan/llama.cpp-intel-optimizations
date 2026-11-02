@@ -64,7 +64,9 @@
 #include <unordered_map>
 #include <vector>
 
-static constexpr int EXIT_SKIP = 77;
+#include "test-skip.h"
+
+static constexpr int EXIT_SKIP = LLAMA_TEST_EXIT_SKIP;
 
 #if GGML_SYCL_DNNL
 

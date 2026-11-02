@@ -9,10 +9,15 @@
 
 #include "ggml.h"
 
+#include <cstddef>
+#include <cstdint>
+
 // Single source of truth for batched-MoE MUL_MAT_ID (type, layout) coverage.
 //
-// Three tables and one invariant. Two describe what the executors can actually
-// run; the third describes what the capability query is allowed to advertise:
+// Three tables, one invariant and one publication predicate. Two tables describe
+// what the executors can actually run; the third describes what the capability
+// query is allowed to advertise (the predicate, moe_aos_expert_publication_wanted at
+// the end, says when a tensor's per-expert handles are published):
 //
 //   moe_mmvq_batched_dispatch_supports_layout   -- mmvq_moe_batched_dispatch()
 //   moe_mmvq_pair_glu_dispatch_supports_layout  -- the MXFP4 gate/up pair path
@@ -37,6 +42,7 @@
 inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
@@ -46,9 +52,19 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
         // the corresponding instantiation.
         //
         // This is the complete set reachable by transcribing an existing generic
-        // mul_mat_vec_q<> tuple. The iq* family has no such tuple -- it uses
-        // per-type kernels -- so those types stay refused until someone writes
-        // their _id variants.
+        // mul_mat_vec_q<> tuple, plus the iq* types s36q has covered so far: IQ4_NL,
+        // whose dense kernel is that same generic body with vec_dot_iq4_nl_q8_1
+        // (Q4_0-shaped, qi=4, vdr=2), and the IQ3 and IQ2 types, whose dense tuples
+        // (qi = QI3_x / 2 or QI2_x / 2, vdr=1) take their grid-table vec_dots behind
+        // generic-signature adaptors (IQ2_S's is already generic). Q2_0 (phase 4) is the
+        // Q1_0 tuple shape: qi = QK2_0 / 32 q8_1 chunks, vdr = 1, generic vec_dot. IQ4_XS,
+        // IQ1_S and IQ1_M stay refused until their _id variants exist.
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -73,10 +89,17 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
 inline bool moe_mmvq_batched_dispatch_supports_type(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -156,9 +179,16 @@ inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml
 inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -212,6 +242,337 @@ inline bool moe_mmvq_admission_supports_type(enum ggml_type type) {
         }
     }
     return false;
+}
+
+// Whether a device AoS weight tensor gets per-expert retained handles published for
+// it (ggml_sycl_publish_backend_aos_expert_handles). The buffer cannot see its
+// consumer when the weights are uploaded, so two proxies stand in for "this is an
+// expert tensor": the name-based usage classification (classified_expert) and the
+// structural test ne[2] > 1. A MUL_MAT_ID dispatch publishes again just before its
+// non-materializing retained resolver runs, and there the consumer IS known.
+inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne2, bool consumer_is_mul_mat_id) {
+    return classified_expert || ne2 > 1 || consumer_is_mul_mat_id;
+}
+
+// The batched mul_mat_id prompt executor (try_pp_onednn_f16_batched in ggml-sycl.cpp): which
+// (type, layout) pairs it runs, as two arms (llama.cpp-348c).
+//
+//   moe_pp_batched_f16_supports_layout  -- the f16 arm: dequantize the active experts into the planned weight
+//                                          slot, in groups that fit it (moe_pp_batched_f16_plan_groups), and run
+//                                          batched oneDNN GEMMs over each group.
+//   moe_pp_batched_woq_supports_layout  -- the MXFP4 weight-only-quantized arm: repack each expert into the
+//                                          WOQ nibble/scale slots and let oneDNN dequantize inside the GEMM.
+//
+// The rule for the f16 arm: a (type, layout) pair is admitted when a kernel exists that decodes one expert, in the
+// layout the cache materialized it in, to f16. That kernel is ggml_get_to_fp16_sycl_for_layout's answer for the
+// pair, except Q8_0 SOA, which uses dequantize_row_q8_0_soa_to_fp16_rowmajor because that table answers Q8_0 with
+// the AOS kernel for every layout. The executor picks the kernel from the layout the expert is loaded in, never
+// from a policy. Every quantized type that table decodes is listed, except the two below, and each is admitted on
+// AOS. Q4_0, Q8_0, Q4_K and Q6_K are admitted on SOA too, because each SOA plane is flat over one expert's blocks.
+// The planner materializes Q8_0 experts SOA on an XMX card and Q6_K experts SOA (the B50 loads both that way). It
+// plans Q4_0 and Q4_K experts AOS (layout_policy::get_optimal, common.hpp) and no knob changes that, so the Q4_0
+// and Q4_K SOA rows have no device evidence: nothing reaches them until a plan chooses SOA for those types. MXFP4's
+// f16 arm has its own SOA row-major dequant and no AOS one in this executor.
+// The rule covers AOS and SOA only. COALESCED is left out although ggml_get_to_fp16_sycl_for_layout answers Q4_0
+// COALESCED: that converter takes only an element count and indexes the tiled blocks as one flat run, so it does not
+// promise row-major output. The oneDNN prompt path decodes a COALESCED weight with
+// dequantize_row_q4_0_sycl_coalesced_rowmajor, which takes blocks_per_row and nrows, and that function's Q8_0 case
+// records the same limit (llama.cpp-dkw0). This executor's per-expert call passes only the element count. No plan
+// reaches the case either: the planner materializes an expert COALESCED only for MXFP4 without XMX
+// (layout_policy::get_optimal), and MXFP4's f16 arm admits SOA alone.
+// Q1_0 and NVFP4 have converters but are left out, because they run on a device only through their direct kernel
+// (moe_type_needs_direct_kernel, moe-resolved-batch.hpp): validate_moe_execution_recipe and
+// choose_moe_batch_executor refuse any other device recipe for them, so this executor would never be allowed to run
+// them. The float types need no dequant and keep their own routes.
+// IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
+// so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
+// test-moe-pp-batched-dequant runs every listed type on a device except IQ1_S, IQ2_XXS and IQ2_XS, which need an
+// importance matrix to quantize (ggml_quantize_requires_imatrix), so the fixture cannot make their weights.
+//
+// The executor's candidate gate and its claim predicate (ggml_sycl_moe_pp_onednn_batched_claims_tensor)
+// both ask moe_pp_batched_supports_layout about the type. The claim then also asks
+// moe_pp_batched_has_expert_entries (below), which declines a non-AOS layout of a weight in a device buffer:
+// under GGML_SYCL_WEIGHTS_EVICTABLE=0 the SOA rows here are therefore never claimed, since that upload holds
+// no per-expert entry at SOA, and such a weight keeps the routes it had before. The f16 arm needs no slot of its
+// own: it runs in the weight slot libllama plans for the ring (sized for MXFP4's WOQ planes, about a quarter of
+// every expert in f16) and groups the active experts to fit it.
+inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
+    switch (type) {
+        case GGML_TYPE_MXFP4:
+            return layout == GGML_LAYOUT_SOA;
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return layout == GGML_LAYOUT_AOS;
+        default:
+            return false;
+    }
+}
+
+inline bool moe_pp_batched_woq_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
+    return type == GGML_TYPE_MXFP4 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED);
+}
+
+// The one question both gates ask. woq_enabled is GGML_SYCL_MOE_PP_WOQ; aos_enabled is
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS, which set to 0 drops every non-MXFP4 entry (the SOA ones too, despite
+// the name) and so restricts the executor to MXFP4 as it was before llama.cpp-348c.
+inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
+                                           enum ggml_layout_mode layout,
+                                           bool                  woq_enabled,
+                                           bool                  aos_enabled) {
+    if (woq_enabled && moe_pp_batched_woq_supports_layout(type, layout)) {
+        return true;
+    }
+    if (type != GGML_TYPE_MXFP4 && !aos_enabled) {
+        return false;
+    }
+    return moe_pp_batched_f16_supports_layout(type, layout);
+}
+
+// The types the batched executor takes from a host-staged ring slot (llama.cpp-3460): the one type question that the
+// staged claim (ggml_sycl_moe_pp_onednn_batched_claims_tensor, host_staged) and the cost model's device-rate seed
+// (moe_exec_dev_gflops_seed) both ask. So the two agree on type, and on type only: the claim can still refuse a type
+// this helper takes while the seed stays at the executor's rate (9000 or 5000). It refuses one with
+// GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0, GGML_SYCL_MOE_PP_ONEDNN_F16=0 or the route not selected, in a build without
+// oneDNN, and for a weight with no per-expert entries (moe_pp_batched_has_expert_entries). Two terms:
+//   - an f16 row at AOS: the ring stages a claimed weight's host experts as AOS slots, which the f16 arm dequantizes;
+//   - an MMVQ-ID kernel (moe_mmvq_admission_supports_type): a layer the executor does not take at dispatch (a CPU
+//     decision, no ring, the decline knob) runs the hybrid path, and supports_op, which decides before that, admits no
+//     other type on a hybrid layer (ggml_sycl_moe_pp_batched_admits_op).
+// IQ1_S, IQ1_M and IQ4_XS have the f16 row but no MMVQ-ID kernel, so they are left out until one exists
+// (llama.cpp-w4qk). MXFP4 has no f16 row at AOS: the ring stages nothing of it, so its layer stays hybrid.
+inline bool moe_pp_batched_takes_staged_type(enum ggml_type type) {
+    return moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS);
+}
+
+// Whether the cache holds one entry per expert of a `type` weight at `layout`, which the batched executor needs:
+// the retained prompt admission resolves each active expert's own entry before the executor runs. The claim
+// predicate asks this after the table, so the claim never takes a layout the cache does not hold per expert.
+//   - host buffer (device_buffer false; every default load, since GGML_SYCL_WEIGHTS_EVICTABLE defaults on): the
+//     load-end preload stages each device-planned expert in its planned layout, one entry per expert;
+//   - device buffer, AOS: ggml_backend_sycl_buffer_set_tensor publishes one slice per expert
+//     (ggml_sycl_publish_backend_aos_expert_handles) only when three conditions hold: the upload is complete, it is
+//     not reordered, and the buffer is not in the host-pinned tier. This predicate encodes only the second, through
+//     the layout: an AOS upload is never reordered. The first holds for every model load, because the device reports
+//     async uploads off while a load is open (ggml_backend_sycl_device_get_props), so the loader writes each tensor
+//     with one full set_tensor. The third holds only because ggml_backend_sycl_buffer_publish refuses a host-pinned
+//     fallback of a device buffer (llama.cpp-mmi1), and that refusal is an accident of the pinned pool's alignment,
+//     not a policy. If it is lifted, this predicate must also decline a host-pinned device buffer, or the claim
+//     takes an AOS weight that has no per-expert entries;
+//   - device buffer, any other layout: the upload reorders the whole tensor into one block over every expert, so
+//     no expert has an entry of its own and the admission refuses the op.
+// MXFP4 keeps the route it had before llama.cpp-348c, so it is not declined here.
+inline bool moe_pp_batched_has_expert_entries(enum ggml_type type, enum ggml_layout_mode layout, bool device_buffer) {
+    return type == GGML_TYPE_MXFP4 || !device_buffer || layout == GGML_LAYOUT_AOS;
+}
+
+// How the batched executor's f16 arm fits a dispatch's active experts into the weight slot it claimed
+// (llama.cpp-348c). The slot is the one the plan sized for the ring, which holds about a quarter of every expert in
+// f16, so the arm does not widen it: that took the room from routed experts with no cost decision (llama.cpp-348c
+// c-kj22; the room rulings llama.cpp-8ecj and llama.cpp-w013). It dequantizes the experts in groups instead.
+//   - The slot holds every active expert, and no cap is smaller: one group in one buffer, exactly the single
+//     batched pass the arm ran before.
+//   - Otherwise the slot is split into two halves when it holds two experts, and groups alternate between them,
+//     so group k + 1 dequantizes while group k's GEMMs run. A slot that holds one expert is one buffer that every
+//     group reuses. The dispatch chains each group on the GEMMs that last read its half, on the device.
+// `cap` is GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX: 0 means none, otherwise at most that many experts per group.
+// groups is 0 only when the slot cannot hold one expert, which the admission refuses first.
+struct moe_pp_batched_f16_groups {
+    size_t experts_per_group = 0;  // the experts one group dequantizes into its buffer
+    size_t buffers           = 0;  // 1: one buffer (every expert fits, or the slot holds one); 2: two halves
+    size_t groups            = 0;  // ceil(active / experts_per_group)
+};
+
+inline moe_pp_batched_f16_groups moe_pp_batched_f16_plan_groups(size_t slot_bytes,
+                                                                size_t expert_bytes,
+                                                                size_t active,
+                                                                size_t cap) {
+    moe_pp_batched_f16_groups plan;
+    const size_t              fit = expert_bytes > 0 ? slot_bytes / expert_bytes : 0;
+    if (fit == 0 || active == 0) {
+        return plan;
+    }
+    if (fit >= active && (cap == 0 || cap >= active)) {
+        plan.experts_per_group = active;
+        plan.buffers           = 1;
+        plan.groups            = 1;
+        return plan;
+    }
+    plan.buffers           = fit >= 2 ? 2 : 1;
+    plan.experts_per_group = fit / plan.buffers;
+    if (cap != 0 && cap < plan.experts_per_group) {
+        plan.experts_per_group = cap;
+    }
+    plan.groups = (active + plan.experts_per_group - 1) / plan.experts_per_group;
+    return plan;
+}
+
+// The experts one group holds when the expert count is unbounded: the window the prompt stream's ring is sized to
+// (moe_stream_window_experts), by the same two-buffer rule and cap. 0 when the slot holds no expert.
+inline size_t moe_pp_batched_f16_window_experts(size_t slot_bytes, size_t expert_bytes, size_t cap) {
+    return moe_pp_batched_f16_plan_groups(slot_bytes, expert_bytes, SIZE_MAX, cap).experts_per_group;
+}
+
+// Whether the f16 arm's phases write one region in turn (two halves alternating, or the one buffer a slot that holds a
+// single expert has) and so must each wait for the GEMMs that last read their buffer. When the slot holds every active
+// expert (one group) each phase has its own region and is given no wait on an earlier phase's GEMMs: a windowed op
+// splits such a layer into phases by the ring window, and those phases are not made to run one after another (each
+// still waits for its own window's copies).
+inline bool moe_pp_batched_phases_reuse_buffers(const moe_pp_batched_f16_groups & groups) {
+    return groups.groups != 1;
+}
+
+// Where the phase whose first active expert is `phase_begin` dequantizes, in half-elements from the claimed slot's
+// start: its buffer's start when phases reuse buffers, otherwise its own region at phase_begin experts, which the slot
+// holds because it holds every active expert.
+inline size_t moe_pp_batched_phase_weight_offset(const moe_pp_batched_f16_groups & groups,
+                                                 size_t                            phase_begin,
+                                                 size_t                            phase_buffer,
+                                                 size_t                            half_elems,
+                                                 size_t                            weight_elems) {
+    return moe_pp_batched_phases_reuse_buffers(groups) ? phase_buffer * half_elems : phase_begin * weight_elems;
+}
+
+// The experts one phase of an op that reads ring windows holds: the f16 group's size, capped by the experts the ring's
+// phase holds (moe_stream_phase::phase_experts, G_plan). Both come from one rule, moe_pp_batched_f16_plan_groups, at
+// two expert counts: G_plan at an unbounded count (moe_pp_batched_f16_window_experts), the group size at this
+// dispatch's active count. So either can be the smaller: active experts that all fit one buffer can make a group larger
+// than G_plan, and fewer active experts than G_plan do make it smaller. 0 when either is 0, which the executor asserts
+// against.
+inline size_t moe_pp_batched_phase_experts(size_t experts_per_group, size_t ring_phase_experts) {
+    return ring_phase_experts < experts_per_group ? ring_phase_experts : experts_per_group;
+}
+
+// The phases `active` experts take at `phase_experts` each: ceil(active / phase_experts), 0 for no phase experts.
+inline size_t moe_pp_batched_phase_count(size_t active, size_t phase_experts) {
+    return phase_experts == 0 ? 0 : (active + phase_experts - 1) / phase_experts;
+}
+
+// Why the batched prompt executor declined a dispatch: one value per refusal site, so a refusal is reported
+// once per (device, cause) by its name. The latch is a 32-bit mask per device: COUNT, last, is the number of
+// causes, and the latch static_asserts that it fits.
+enum class moe_pp_batched_refusal : uint8_t {
+    NONE = 0,
+    CPU_REFERENCE,      // GGML_SYCL_MOE_CPU_REFERENCE asked for the CPU reference instead
+    ROUTE_OFF,          // GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=0 (route not selected) or GGML_SYCL_MOE_PP_ONEDNN_F16=0
+    CANDIDATE,          // the (type, layout) pair is not in the tables above, or src1/dst are not f32
+    NO_EXPERT_CACHE,    // the dispatch has no expert cache to resolve experts through
+    NO_PLAN,            // the layer has no execution plan
+    DECODE,             // one token per expert row: decode stays on MMVQ
+    NO_ROWS,            // zero tokens
+    DIMS,               // the weight row is not a whole number of quant blocks, or a stride is not packed
+    DIMS_OVERFLOW,      // a dimension does not fit the GEMM's integer types
+    EXPERT_NOT_LOCAL,   // an active expert is not device-resident on this device
+    EXPERT_LAYOUT,      // an active expert is materialized in another layout than the route's
+    NO_ACTIVE_EXPERTS,  // no expert received a token
+    XMX_TILE_CAPS,      // the XMX-tiled WOQ repack is not supported on this device
+    F16_TILED,          // XMX-tiled experts reached the f16 arm, which has no tiled dequant
+    NO_DEQUANT,         // no f16 dequant kernel for the expert's materialized layout
+    SCRATCH_SIZE,       // the scratch arithmetic overflowed
+    SCRATCH_CACHE,      // no unified cache for this device
+    SCRATCH_UNPLANNED,  // the plan's ring is smaller than this dispatch needs (for the f16 arm: one expert)
+    SCRATCH_RESERVE,    // the planned ring could not be reserved
+    SCRATCH_SLOT,       // a ring slot could not be acquired
+    SCRATCH_SLOT_SIZE,  // an acquired slot is smaller than planned
+    GEMM,               // the batched GEMM failed after the experts were staged
+    COUNT,              // not a cause: the number of causes
+};
+
+inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) {
+    switch (refusal) {
+        case moe_pp_batched_refusal::NONE:
+            return "none";
+        case moe_pp_batched_refusal::CPU_REFERENCE:
+            return "cpu-reference";
+        case moe_pp_batched_refusal::ROUTE_OFF:
+            return "route-off";
+        case moe_pp_batched_refusal::CANDIDATE:
+            return "candidate";
+        case moe_pp_batched_refusal::NO_EXPERT_CACHE:
+            return "no-expert-cache";
+        case moe_pp_batched_refusal::NO_PLAN:
+            return "no-plan";
+        case moe_pp_batched_refusal::DECODE:
+            return "decode";
+        case moe_pp_batched_refusal::NO_ROWS:
+            return "no-rows";
+        case moe_pp_batched_refusal::DIMS:
+            return "dims";
+        case moe_pp_batched_refusal::DIMS_OVERFLOW:
+            return "dims-overflow";
+        case moe_pp_batched_refusal::EXPERT_NOT_LOCAL:
+            return "expert-not-local";
+        case moe_pp_batched_refusal::EXPERT_LAYOUT:
+            return "expert-layout";
+        case moe_pp_batched_refusal::NO_ACTIVE_EXPERTS:
+            return "no-active-experts";
+        case moe_pp_batched_refusal::XMX_TILE_CAPS:
+            return "xmx-tile-caps";
+        case moe_pp_batched_refusal::F16_TILED:
+            return "f16-tiled";
+        case moe_pp_batched_refusal::NO_DEQUANT:
+            return "no-dequant";
+        case moe_pp_batched_refusal::SCRATCH_SIZE:
+            return "scratch-size";
+        case moe_pp_batched_refusal::SCRATCH_CACHE:
+            return "scratch-cache";
+        case moe_pp_batched_refusal::SCRATCH_UNPLANNED:
+            return "scratch-unplanned";
+        case moe_pp_batched_refusal::SCRATCH_RESERVE:
+            return "scratch-reserve";
+        case moe_pp_batched_refusal::SCRATCH_SLOT:
+            return "scratch-slot";
+        case moe_pp_batched_refusal::SCRATCH_SLOT_SIZE:
+            return "scratch-slot-size";
+        case moe_pp_batched_refusal::GEMM:
+            return "gemm";
+        case moe_pp_batched_refusal::COUNT:
+            break;
+    }
+    return "unknown";
+}
+
+// Whether `refusal` is a decline the executor reaches only after the claim steered the op to it, past the MMVQ
+// probes and the fused routes. Such a decline loses the fast path silently, so the executor reports it once per
+// (device, cause) at default verbosity. The other causes are prechecks: the op was never this executor's, or it had
+// nothing to run, so they stay behind GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE. SCRATCH_UNPLANNED is left out
+// because its admission refusal already warns at default verbosity, once per process, with the sizes. DIMS_OVERFLOW
+// stays trace-only at both of its sites, since one cause has one latch bit and its first site is a precheck.
+inline bool moe_pp_batched_refusal_after_claim(moe_pp_batched_refusal refusal) {
+    switch (refusal) {
+        case moe_pp_batched_refusal::EXPERT_NOT_LOCAL:
+        case moe_pp_batched_refusal::EXPERT_LAYOUT:
+        case moe_pp_batched_refusal::XMX_TILE_CAPS:
+        case moe_pp_batched_refusal::F16_TILED:
+        case moe_pp_batched_refusal::NO_DEQUANT:
+        case moe_pp_batched_refusal::SCRATCH_SIZE:
+        case moe_pp_batched_refusal::SCRATCH_CACHE:
+        case moe_pp_batched_refusal::SCRATCH_RESERVE:
+        case moe_pp_batched_refusal::SCRATCH_SLOT:
+        case moe_pp_batched_refusal::SCRATCH_SLOT_SIZE:
+        case moe_pp_batched_refusal::GEMM:
+            return true;
+        default:
+            return false;
+    }
 }
 
 #endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP

@@ -19,6 +19,7 @@
 // too, since "no flags" also reads as "no hg".
 
 #include "../src/llama-mmap.h"
+#include "test-skip.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -83,7 +84,7 @@ int main() {
             munmap(ctl, 8 * MiB);
             close(fd);
             unlink(path);
-            return 77;
+            return LLAMA_TEST_EXIT_SKIP;
         }
         const std::string ctl_flags = vm_flags_at(ctl);
         munmap(ctl, 8 * MiB);
@@ -97,7 +98,7 @@ int main() {
             printf("SKIP: the advised control mapping carries no hg flag (THP unavailable): '%s'\n", ctl_flags.c_str());
             close(fd);
             unlink(path);
-            return 77;
+            return LLAMA_TEST_EXIT_SKIP;
         }
     }
     close(fd);

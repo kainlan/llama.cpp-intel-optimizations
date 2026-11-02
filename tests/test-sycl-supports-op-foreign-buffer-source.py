@@ -6,24 +6,36 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 
 
+# Anchors are the DEFINITIONS (signature plus opening brace), never a bare
+# name: llama.cpp-9qjy added a forward declaration of
+# ggml_sycl_weight_residency_is_observable ~105k lines above its definition,
+# and a name-only anchor then opened the section there, so the "section" held
+# most of the file and every check below passed on unrelated code.
+OBSERVABLE_DEF = "static bool ggml_sycl_weight_residency_is_observable(const ggml_tensor * tensor) {"
+EXECUTES_DEF = "static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device) {"
+LAYER_PLAN_DEF = "static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {"
+OBSERVABLE_BOUNDS = (OBSERVABLE_DEF, EXECUTES_DEF)
+EXECUTES_BOUNDS = (EXECUTES_DEF, LAYER_PLAN_DEF)
+# Both predicates are a few dozen lines; a section past this is a mis-anchor.
+MAX_SECTION_LINES = 120
+
+
 def section(text: str, start: str, end: str) -> str:
+    for anchor in (start, end):
+        if text.count(anchor) != 1:
+            raise ValueError(f"anchor must occur exactly once, found {text.count(anchor)}: {anchor}")
     begin = text.index(start)
     finish = text.index(end, begin)
-    return text[begin:finish]
+    body = text[begin:finish]
+    if body.count("\n") > MAX_SECTION_LINES:
+        raise ValueError(f"section from {start!r} spans {body.count(chr(10))} lines (> {MAX_SECTION_LINES})")
+    return body
 
 
 def contract(text: str) -> bool:
     try:
-        observable = section(
-            text,
-            "static bool ggml_sycl_weight_residency_is_observable",
-            "static bool ggml_sycl_weight_executes_on_host",
-        )
-        executes = section(
-            text,
-            "static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device) {",
-            "static bool ggml_sycl_layer_plan_applies_to_op",
-        )
+        observable = section(text, *OBSERVABLE_BOUNDS)
+        executes = section(text, *EXECUTES_BOUNDS)
     except ValueError:
         return False
 
@@ -49,14 +61,6 @@ def test_foreign_buffers_are_not_claimed_as_host_resident() -> None:
     assert contract(SOURCE)
 
 
-OBSERVABLE_BOUNDS = (
-    "static bool ggml_sycl_weight_residency_is_observable",
-    "static bool ggml_sycl_weight_executes_on_host",
-)
-EXECUTES_BOUNDS = (
-    "static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device) {",
-    "static bool ggml_sycl_layer_plan_applies_to_op",
-)
 
 
 def mutate_in_section(bounds: tuple, old: str, new: str) -> str:
@@ -89,6 +93,34 @@ def test_mutations_are_rejected() -> None:
         "ggml_backend_buffer_has_sycl_context(tensor->buffer)",
         "false",
     ))
+
+
+def test_anchors_bind_to_the_definitions() -> None:
+    # Controls for the anchors themselves, so a mis-anchor is a FAIL rather
+    # than a gate that quietly reads the wrong code.
+    observable = section(SOURCE, *OBSERVABLE_BOUNDS)
+    executes = section(SOURCE, *EXECUTES_BOUNDS)
+    assert observable.startswith(OBSERVABLE_DEF) and "return ggml_backend_buffer_is_host" in observable
+    assert executes.startswith(EXECUTES_DEF)
+
+    # A forward declaration (the 9qjy shape) plus an unrelated use of a
+    # checked predicate above the definition must not move the section: the
+    # contract still holds and the scoped mutant is still rejected.
+    decl = "static bool ggml_sycl_weight_residency_is_observable(const ggml_tensor * tensor);\n"
+    decoy = "static bool decoy(ggml_tensor * tensor) { return ggml_backend_buffer_has_sycl_context(tensor->buffer); }\n"
+    with_decl = decl + decoy + SOURCE
+    assert contract(with_decl)
+    body = section(with_decl, *OBSERVABLE_BOUNDS)
+    disarmed = body.replace("ggml_backend_buffer_has_sycl_context(tensor->buffer)", "false", 1)
+    assert disarmed != body
+    assert not contract(with_decl.replace(body, disarmed, 1))
+
+    # A second definition-shaped anchor, a renamed anchor, or a section that
+    # has grown past the predicate are each refused.
+    assert not contract(OBSERVABLE_DEF + "\n}\n" + SOURCE)
+    assert not contract(SOURCE.replace(EXECUTES_DEF, EXECUTES_DEF.replace("executes_on_host", "runs_on_host"), 1))
+    bloated = SOURCE.replace(observable, observable + "// filler\n" * (MAX_SECTION_LINES + 1), 1)
+    assert not contract(bloated)
 
 
 if __name__ == "__main__":
