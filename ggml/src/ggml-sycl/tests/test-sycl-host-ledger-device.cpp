@@ -23,6 +23,7 @@
 // GGML_SYCL_STRICT_LEASES=1: it makes the backstop's request in mode A or B and must die by SIGABRT.
 
 #include "../common.hpp"
+#include "../kv-region-registry.hpp"
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
@@ -345,13 +346,15 @@ std::string ledger_state() {
     return "committed " + num(host_ledger_committed()) + ", budget " + num(host_ledger_budget());
 }
 
-// (l) A class-C charge, made under a held lock with yieldable bytes the yielder could free, refuses and calls no
-// yielder. Class C is every caller that may hold a lock, so its request carries may_yield = false, the default.
-// Engagement: the same charge with may_yield = true and no lock held does call the yielder and fits, so the refusal is
-// the class's, not an empty yielder's. Mutant: class C passing may_yield = true calls the yielder from under the lock.
-// Only the host sample asserts the lock witness (th32 §4.2); the charge path does not, and the lock a class-C charge
-// runs under, g_tensor_inventory_mutex, is a plain mutex the witness never sees. So the lock here is a plain mutex and
-// the arm scores the call count alone.
+// (l) A class-C charge, made under a held witnessed lock with yieldable bytes the yielder could free, refuses and calls
+// no yielder. Class C is every caller that may hold a lock, so its request carries may_yield = false, the default.
+// The lock is a kv_witnessed_mutex at the inventory rank, the kind the host test's sample leg holds, so the witness
+// sees it. The production lock a class-C charge runs under, g_tensor_inventory_mutex, is a plain mutex the witness
+// does not see; holding a witnessed one means a witness check on the charge path, like the host sample's (design
+// §4.2), would fire here instead of passing unseen.
+// Engagement: while the charge runs the witness records the lock held with its checks on, and the same charge with
+// may_yield = true and no lock held does call the yielder and fits, so the refusal is the class's, not an empty
+// yielder's. Mutant: class C passing may_yield = true calls the yielder from under the lock.
 arm_result arm_l_class_c_never_yields() {
     arm_result      r;
     ledger_baseline base;
@@ -365,15 +368,22 @@ arm_result arm_l_class_c_never_yields() {
             void_arm(r, "the yielder's chunk could not be charged");
         }
         expect(r, alloc_request{}.may_yield == false, "an alloc_request's may_yield does not default to false");
-        std::mutex witnessed;
+        kv_witnessed_mutex witnessed(KV_LOCK_L1_INVENTORY, "arm (l)'s class-C lock");
+        const size_t       violations = kv_lock_witness::violations();
         {
-            std::lock_guard<std::mutex> lock(witnessed);
-            host_ledger_charge_request  req{};
+            std::lock_guard<kv_witnessed_mutex> lock(witnessed);
+            if (!g_sycl_witness_enabled || !kv_lock_witness::holds(KV_LOCK_L1_INVENTORY)) {
+                void_arm(r, std::string("the witness does not see the held lock (checks ") +
+                                (g_sycl_witness_enabled ? "on" : "off") + ")");
+            }
+            host_ledger_charge_request req{};
             req.bytes                             = 80;  // 40 over what is left, below the 60 the yielder holds
             const host_ledger_charge_result under = host_ledger_try_charge(req);
             expect(r, !under.charged, "a class-C charge over the budget was admitted");
             expect(r, y.calls.load() == 0, "a class-C charge called the yielder " + num(y.calls.load()) + " times");
         }
+        expect(r, kv_lock_witness::violations() == violations,
+               "the class-C charge recorded a witness violation: " + kv_lock_witness::last());
         host_ledger_charge_request req{};
         req.bytes                               = 80;
         req.may_yield                           = true;
