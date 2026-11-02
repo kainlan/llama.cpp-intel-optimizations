@@ -12,7 +12,10 @@
 // They are two formulas for one size until one byte helper serves both the planner and S1-PRELOAD (llama.cpp-y5x9).
 // The terms:
 //
-//   host_weights          the sum of those bytes over the host-resident entries, one pinned block per entry
+//   host_weights          the sum of those bytes over the host-planned entries the plan charges to
+//                         weight_host_bytes (backed PINNED or HOST_CPU), one pinned block per entry; a FILE_MAPPED
+//                         entry is served from the file's mapping and a CPU_OWNED one by ggml-cpu, so neither
+//                         holds a block in this zone
 //   host_compute_reserve  64 MiB for the runtime HOST_COMPUTE requests that also land in WEIGHT (the context's
 //                         logits and embeddings host buffer, the server's prompt-checkpoint reads); the plan has no
 //                         figure for those sizes, so the reserve is the term
@@ -39,6 +42,10 @@
 // the bytes. Every byte the zone gains belongs to a named term or to unplanned loader residency, which
 // is reported on its own line; any other byte fails. The terms stay within their bytes and the zone does not grow for
 // them. It needs a device, so a host without one exits 77 after arm 1 has passed.
+//
+// Arm 1b (no device) re-backs one host expert FILE_MAPPED and another CPU_OWNED on the single-device plan and asserts
+// that neither one's bytes reach host_weights, blocks or tlsf_bound, while host_weights still equals the plan's
+// weight_host_bytes.
 
 #include "../common.hpp"
 #include "../ggml-sycl-test.hpp"
@@ -278,10 +285,16 @@ struct derived_terms {
     size_t total() const { return host_weights + k_host_compute_reserve_bytes + blocks * k_tlsf_grain; }
 };
 
+// The backings whose bytes placement_plan::charge_host_weight adds to weight_host_bytes, written out here rather than
+// asked of the predicate under test, so the oracle stays independent of it.
+bool backing_held_in_weight_zone(placement_host_backing backing) {
+    return backing == placement_host_backing::PINNED || backing == placement_host_backing::HOST_CPU;
+}
+
 derived_terms derive_terms(const placement_plan & plan) {
     derived_terms t;
     for (const placement_entry & e : plan.entries) {
-        if (e.on_device) {
+        if (e.on_device || !backing_held_in_weight_zone(e.host_backing)) {
             continue;
         }
         t.host_weights += e.src_size;
@@ -425,6 +438,65 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(const std::vector<placemen
     // weight_host_bytes both carry that same src_size. It agrees once the inventory always carries ne[2]
     // (llama.cpp-y5x9).
     out_plan = single_line_plan;
+}
+
+// Arm 1b: the walk counts only the backings that hold a block in the WEIGHT zone.
+//
+// Every built plan backs its entries PINNED today, since nothing plans a FILE_MAPPED or CPU_OWNED weight yet, so the
+// arm re-backs two of the plan's host experts itself. It moves each one's charge through the plan's own
+// uncharge_host_weight and charge_host_weight, as a planner assigning the backing would. populate_host_zone_sizing()
+// is file-static and cannot run again on the re-backed plan, so the arm asserts the comparison its [HOST-PLAN-BUG]
+// WARN makes rather than the WARN itself.
+void arm1b_walk_counts_only_weight_zone_backings(const placement_plan & built) {
+    std::printf("(1b) a FILE_MAPPED and a CPU_OWNED host expert stay out of the WEIGHT terms\n");
+
+    placement_plan    plan   = built;
+    placement_entry * mapped = nullptr;
+    placement_entry * owned  = nullptr;
+    for (placement_entry & e : plan.entries) {
+        if (e.on_device || e.expert_id < 0 || e.host_backing != placement_host_backing::PINNED) {
+            continue;
+        }
+        if (mapped == nullptr) {
+            mapped = &e;
+        } else if (owned == nullptr) {
+            owned = &e;
+        }
+    }
+    check(mapped != nullptr && owned != nullptr, "the plan has two PINNED host experts to re-back");
+    if (mapped == nullptr || owned == nullptr) {
+        return;
+    }
+    const size_t mapped_bytes = mapped->src_size;
+    const size_t owned_bytes  = owned->src_size;
+    check(mapped_bytes > 0 && owned_bytes > 0, "both re-backed experts carry bytes");
+
+    const derived_terms before = derive_terms(plan);
+    check_eq("the built plan's host_weights == its weight_host_bytes", before.host_weights, plan.weight_host_bytes);
+
+    const auto reback = [&plan](placement_entry & e, placement_host_backing backing) {
+        plan.uncharge_host_weight(e.host_backing, e.src_size);
+        e.host_backing = backing;
+        plan.charge_host_weight(e.host_backing, e.src_size);
+    };
+    reback(*mapped, placement_host_backing::FILE_MAPPED);
+    reback(*owned, placement_host_backing::CPU_OWNED);
+    check_eq("the FILE_MAPPED bytes moved to host_mapped_bytes", plan.host_mapped_bytes,
+             built.host_mapped_bytes + mapped_bytes);
+    check_eq("the CPU_OWNED bytes moved to host_cpu_owned_bytes", plan.host_cpu_owned_bytes,
+             built.host_cpu_owned_bytes + owned_bytes);
+
+    const host_weight_zone_terms terms = placement_plan_host_weight_zone_terms(plan);
+    check_eq("host_weights leaves out the FILE_MAPPED and CPU_OWNED bytes", terms.host_weights,
+             before.host_weights - mapped_bytes - owned_bytes);
+    check_eq("blocks leaves out the two re-backed experts", terms.blocks, before.blocks - 2);
+    check_eq("tlsf_bound covers the remaining blocks only", terms.tlsf_bound, (before.blocks - 2) * k_tlsf_grain);
+    check_eq("the terms match the test's own derivation", terms.total(), derive_terms(plan).total());
+
+    const char * figures = terms.host_weights != plan.weight_host_bytes ? "differ" : "agree";
+    std::printf("  [HOST-PLAN-BUG] comparison on the re-backed plan: figures %s\n", figures);
+    check_eq("host_weights == weight_host_bytes on the re-backed plan, so the WARN stays silent", terms.host_weights,
+             plan.weight_host_bytes);
 }
 
 // --- arm 2: the census ---
@@ -691,6 +763,7 @@ int main() {
 
     placement_plan plan{};
     arm1_weight_zone_is_exact_bytes_plus_named_terms(inventory, tensors, plan);
+    arm1b_walk_counts_only_weight_zone_backings(plan);
 
     const bool ran_census = arm2_every_weight_zone_allocation_has_a_term(plan, tensors);
 

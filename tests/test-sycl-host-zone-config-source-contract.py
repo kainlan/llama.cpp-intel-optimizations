@@ -37,6 +37,7 @@ args = parser.parse_args()
 root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[1]
 sycl_cpp = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 pool_cpp = (root / "ggml/src/ggml-sycl/pinned-pool.cpp").read_text()
 env_doc = (root / "docs/backend/sycl-env-vars.md").read_text()
 
@@ -125,6 +126,10 @@ texts = {
     "weight_zone_terms_fn": function_window(
         cache_cpp,
         "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"),
+    "charge_host_weight_fn": function_window(
+        cache_hpp, "void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
+    "uncharge_host_weight_fn": function_window(
+        cache_hpp, "void uncharge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
     # llama.cpp-16el: 3200 chars, not the 1400 default -- the strict-parse
     # switch (four cases, two log lines) sits after the glkg comment block and
     # the default window ended inside it.
@@ -328,6 +333,27 @@ def witness_c2_weight_zone_is_terms(t):
     return t
 
 
+# --- C3: the walk that sums the host weights and the plan's charge of
+# weight_host_bytes ask one predicate which host backings the WEIGHT zone
+# holds, so the two figures the [HOST-PLAN-BUG] WARN compares cannot disagree
+# on which entries they count.
+WALK_ASKS_PREDICATE = "placement_plan::host_backing_sizes_weight_zone(entry.host_backing)"
+CHARGE_ASKS_PREDICATE = "host_backing_sizes_weight_zone(backing)"
+
+
+def check_c3_one_backing_predicate(t):
+    return (
+        WALK_ASKS_PREDICATE in t["weight_zone_terms_fn"]
+        and CHARGE_ASKS_PREDICATE in t["charge_host_weight_fn"]
+        and CHARGE_ASKS_PREDICATE in t["uncharge_host_weight_fn"]
+    )
+
+
+def witness_c3_one_backing_predicate(t):
+    t["weight_zone_terms_fn"] = t["weight_zone_terms_fn"].replace(WALK_ASKS_PREDICATE, "true")
+    return t
+
+
 # --- D: the pre-zone runtime-pinned fallback (the actual path that consumed
 # the pool's budget before configure_zones ever ran, on master) now WARNs
 # per chunk grown, naming the running total against the budget.
@@ -465,6 +491,8 @@ checks = [
      check_c_headroom, witness_c_headroom),
     ("C2: WEIGHT zone is the sum of its named terms, not a ratio",
      check_c2_weight_zone_is_terms, witness_c2_weight_zone_is_terms),
+    ("C3: the WEIGHT-term walk and charge_host_weight ask one backing predicate",
+     check_c3_one_backing_predicate, witness_c3_one_backing_predicate),
     ("D: pre-zone runtime chunk growth WARNs with running total vs budget",
      check_d_fallback_warn, witness_d_fallback_warn),
     ("A2: configure_zones capacity-shortfall WARN names budget/zone/runtime bytes",
