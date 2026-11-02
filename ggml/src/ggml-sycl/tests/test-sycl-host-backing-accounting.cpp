@@ -240,8 +240,11 @@ static void test_an_expert_moving_between_tiers_follows_its_backing() {
     const placement_host_backing all[] = { placement_host_backing::PINNED, placement_host_backing::HOST_CPU,
                                            placement_host_backing::CPU_OWNED, placement_host_backing::FILE_MAPPED };
     for (placement_host_backing b : all) {
+        // src != dst pins the basis: the device side charges the materialized layout (dst, through
+        // vram_charge_size), and the host side charges the file bytes the host executes (src), as the MoE host
+        // group does.
         placement_plan plan{};
-        plan.entries.push_back(make_entry("blk.0.ffn_gate_exps.weight", 80 * MiB, 80 * MiB, b, true, 0, 5));
+        plan.entries.push_back(make_entry("blk.0.ffn_gate_exps.weight", 64 * MiB, 80 * MiB, b, true, 0, 5));
         plan.entries[0].vram_charge_size = 80 * MiB;
         plan.entries[0].target_device    = 0;
         plan.weight_vram_bytes           = 80 * MiB;
@@ -250,11 +253,11 @@ static void test_an_expert_moving_between_tiers_follows_its_backing() {
         plan.recount_host_mapped_source_bytes();
         const bool mapped = b == placement_host_backing::FILE_MAPPED;
         check_eq("on device: no host weight", plan.placed_host_weight_bytes(), 0);
-        check_eq("on device: the mapped source", plan.host_mapped_source_bytes, mapped ? 80 * MiB : 0);
+        check_eq("on device: the mapped source", plan.host_mapped_source_bytes, mapped ? 64 * MiB : 0);
 
         check_true("demote", plan.update_expert_placement(0, 5, expert_tensor_role::GATE, false, -1));
         check_eq("demoted: weight_vram", plan.weight_vram_bytes, 0);
-        const size_t host_expected = 80 * MiB;
+        const size_t host_expected = 64 * MiB;
         check_eq("demoted: placed", plan.placed_host_weight_bytes(), host_expected);
         check_eq("demoted: charged", plan.charged_host_weight_bytes(), mapped ? 0 : host_expected);
         check_eq("demoted: host_bytes", plan.host_bytes, mapped ? 0 : host_expected);
@@ -264,7 +267,7 @@ static void test_an_expert_moving_between_tiers_follows_its_backing() {
         check_eq("promoted: placed", plan.placed_host_weight_bytes(), 0);
         check_eq("promoted: host_bytes", plan.host_bytes, 0);
         check_eq("promoted: weight_vram", plan.weight_vram_bytes, 80 * MiB);
-        check_eq("promoted: the mapped source again", plan.host_mapped_source_bytes, mapped ? 80 * MiB : 0);
+        check_eq("promoted: the mapped source again", plan.host_mapped_source_bytes, mapped ? 64 * MiB : 0);
     }
 }
 

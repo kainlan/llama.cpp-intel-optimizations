@@ -1529,16 +1529,18 @@ struct placement_plan {
         // authority.
         const bool   mapped = e.host_backing == placement_host_backing::FILE_MAPPED;
 
+        // The host terms take src_size, the file bytes the host executes, the same basis the MoE host group charges
+        // the same entries on; the VRAM terms take the materialized layout through charge.
         if (e.on_device && !on_device) {
             saturating_sub(weight_vram_bytes, charge);
             saturating_sub(vram_bytes, charge + e.kv_size);
-            charge_host_weight(e.host_backing, e.dst_size);
+            charge_host_weight(e.host_backing, e.src_size);
             host_bytes += e.kv_size;
             if (mapped) {
                 saturating_sub(host_mapped_source_bytes, e.src_size);
             }
         } else if (!e.on_device && on_device) {
-            uncharge_host_weight(e.host_backing, e.dst_size);
+            uncharge_host_weight(e.host_backing, e.src_size);
             saturating_sub(host_bytes, e.kv_size);
             weight_vram_bytes += charge;
             vram_bytes += charge + e.kv_size;
