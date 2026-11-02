@@ -30,9 +30,12 @@
 // Arm 1 (no model, no device: the real planner over a synthetic Q2_K-shaped inventory, under a mocked device table)
 // asserts, for both planner builders, that the WEIGHT size is exactly the sum of those terms and is not the 1.2x
 // ratio, and that the plan prints each term by name, and the unplanned class, on a [HOST-PLAN] line. It also asserts
-// that the planned host weights equal the plan's weight_host_bytes, but only for the single-device builder: the
-// multi-device builder is known to count a host expert group at the device layout's dst_size rather than the src_size
-// the cache materializes (llama.cpp-4qdx), so for it the two figures are printed, not compared.
+// that the planned host weights equal the plan's weight_host_bytes for both builders, a fact about this fixture rather
+// than about every plan. The single-device builder charges a host expert at its src_size. The multi-device builder
+// does so in its cohesive host-layer branch, which it takes when the cards have no direct peer path, as under the
+// mocked table; the arm asserts that branch's [PLACEMENT-BLOCK] line before relying on it. Its MoE group branch still
+// charges a host-spilled group at the device layout's dst_size (llama.cpp-4qdx), so a plan that takes that branch can
+// still trip the [HOST-PLAN-BUG] WARN.
 //
 // Arm 2 (the census) constructs device 0's cache, configures the host zones from that plan, and makes every planned
 // WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through
@@ -252,19 +255,30 @@ void check_entry_bytes(const char * builder, const placement_plan & plan, const 
     check_eq("entries whose planned host bytes are not the cache's", mismatched, 0);
 }
 
-// --- the [HOST-PLAN] line, captured from the log callback ---
+// --- the log lines the test reads, captured from the log callback ---
 
-std::string g_host_plan_line;
-bool        g_host_plan_bug = false;  // a [HOST-PLAN-BUG] line was logged since the last reset
+// What one plan build logged, of the lines the test reads. capture_log is the one filter list: a line the test starts
+// reading is a field here and a branch there, matched on the text the code prints.
+struct captured_log {
+    std::string host_plan_line;         // "[HOST-PLAN] device=%d WEIGHT zone: ..."
+    bool        host_plan_bug = false;  // a "[HOST-PLAN-BUG] ..." line was logged
+    std::string cohesive_host_line;     // "[PLACEMENT-BLOCK] cohesive host layers=%zu reason=..."
+};
+
+captured_log g_log;  // reset to {} before each plan build
 
 void capture_log(ggml_log_level level, const char * text, void * user) {
     (void) level;
     (void) user;
-    if (text && std::strstr(text, "[HOST-PLAN]") && std::strstr(text, "WEIGHT zone")) {
-        g_host_plan_line = text;
+    if (text == nullptr) {
+        return;
     }
-    if (text && std::strstr(text, "[HOST-PLAN-BUG]")) {
-        g_host_plan_bug = true;
+    if (std::strstr(text, "[HOST-PLAN]") && std::strstr(text, "WEIGHT zone")) {
+        g_log.host_plan_line = text;
+    } else if (std::strstr(text, "[HOST-PLAN-BUG]")) {
+        g_log.host_plan_bug = true;
+    } else if (std::strstr(text, "[PLACEMENT-BLOCK] cohesive host layers=")) {
+        g_log.cohesive_host_line = text;
     }
 }
 
@@ -323,36 +337,39 @@ placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & i
     return compute_multi_device_plan(budgets, inventory, k_layers, multi_gpu_mode::HYBRID, kv, nullptr, k_experts);
 }
 
-// The checks one plan's WEIGHT zone must pass, whichever builder made it. `line` is that plan's [HOST-PLAN] line.
+// The checks one plan's WEIGHT zone must pass, whichever builder made it. `log` is what that plan's build logged.
 //
-// `counts_host_at_src_size` says whether the builder's weight_host_bytes counts a host expert at its AOS src_size,
-// the bytes the cache materializes. The single-device builder does, and resets a host expert to AOS. The
-// multi-device builder counts a host expert at the device layout's dst_size and leaves that layout on the entry, so
-// its weight_host_bytes is not the materialized fact; the WEIGHT zone is sized from the entries in both, and the
-// comparison is printed rather than asserted there.
+// host_weights == weight_host_bytes is asserted for both builders, as a fact about this fixture. The single-device
+// builder charges a host expert at its AOS src_size, the bytes the cache materializes. The multi-device builder does
+// so only in its cohesive host-layer branch; its MoE group branch charges a host-spilled group at the device layout's
+// dst_size (llama.cpp-4qdx). For that builder, `needs_cohesive_branch`, the equality rests on the branch, so the
+// branch's [PLACEMENT-BLOCK] line is asserted and printed first.
 void check_weight_zone(const char *           builder,
                        const placement_plan & plan,
-                       const std::string &    line,
-                       bool                   warned,
-                       bool                   counts_host_at_src_size) {
+                       const captured_log &   log,
+                       bool                   needs_cohesive_branch) {
     std::printf("  [%s]\n", builder);
+    const std::string & line   = log.host_plan_line;
+    const bool          warned = log.host_plan_bug;
+    if (needs_cohesive_branch) {
+        check(!log.cohesive_host_line.empty(),
+              "the plan took the cohesive host-layer branch, which charges host experts at src_size");
+        if (!log.cohesive_host_line.empty()) {
+            std::printf("  logged: %s", log.cohesive_host_line.c_str());
+        }
+    }
     const derived_terms t                = derive_terms(plan);
     const size_t        n_expert_entries = static_cast<size_t>(k_layers) * 3 * k_experts;
     check(t.blocks >= n_expert_entries, "every routed expert is host-resident under the 1 MiB budget");
     check(t.host_weights > 0, "the plan placed weights on the host");
-    // The [HOST-PLAN-BUG] WARN fires exactly when the entries and the plan's running total disagree. A builder whose
-    // figures differ is the WARN's positive control; one whose figures agree is its negative control.
+    // The [HOST-PLAN-BUG] WARN fires exactly when the entries and the plan's running total disagree. Both builders'
+    // figures agree on this fixture, so each is a negative control of the WARN.
     const bool figures_differ = t.host_weights != plan.weight_host_bytes;
     std::printf("  [HOST-PLAN-BUG] control: figures %s, WARN %s\n", figures_differ ? "differ" : "agree",
                 warned ? "logged" : "silent");
     check(warned == figures_differ, "[HOST-PLAN-BUG] is logged exactly when host_weights != weight_host_bytes");
-    if (counts_host_at_src_size) {
-        // The plan's own host-weight accounting is the same fact: the term sums what the cache materializes.
-        check_eq("host_weights == the plan's weight_host_bytes", t.host_weights, plan.weight_host_bytes);
-    } else {
-        std::printf("  note: host_weights=%zu, the builder's weight_host_bytes=%zu\n", t.host_weights,
-                    plan.weight_host_bytes);
-    }
+    // The plan's own host-weight accounting is the same fact: the term sums what the cache materializes.
+    check_eq("host_weights == the plan's weight_host_bytes", t.host_weights, plan.weight_host_bytes);
 
     const size_t ratio_size =
         static_cast<size_t>(static_cast<double>(t.host_weights) * 1.2) + k_host_compute_reserve_bytes;
@@ -395,16 +412,12 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(const std::vector<placemen
     void *            prev_data = nullptr;
     ggml_log_get(&prev_cb, &prev_data);
     ggml_log_set(capture_log, nullptr);
-    g_host_plan_line.clear();
-    g_host_plan_bug                       = false;
+    g_log                                 = {};
     const placement_plan single_line_plan = plan_q2k(inventory);
-    const std::string    single_line      = g_host_plan_line;
-    const bool           single_warned    = g_host_plan_bug;
-    g_host_plan_line.clear();
-    g_host_plan_bug                   = false;
-    const placement_plan multi_plan   = plan_q2k_two_devices(inventory);
-    const std::string    multi_line   = g_host_plan_line;
-    const bool           multi_warned = g_host_plan_bug;
+    const captured_log   single_log       = g_log;
+    g_log                                 = {};
+    const placement_plan multi_plan       = plan_q2k_two_devices(inventory);
+    const captured_log   multi_log        = g_log;
 
     // The fallback the planner takes for an expert row whose inventory shape was not populated: it splits the row by
     // the model-wide expert count. Here that count is the tensor's own ne[2], as it is for every architecture but
@@ -425,8 +438,8 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(const std::vector<placemen
     const placement_plan fallback_plan = plan_q2k(unshaped);
     ggml_log_set(prev_cb, prev_data);
 
-    check_weight_zone("compute_placement_plan", single_line_plan, single_line, single_warned, true);
-    check_weight_zone("compute_multi_device_plan", multi_plan, multi_line, multi_warned, false);
+    check_weight_zone("compute_placement_plan", single_line_plan, single_log, false);
+    check_weight_zone("compute_multi_device_plan", multi_plan, multi_log, true);
 
     std::printf("  planned host bytes against the cache's expressions\n");
     check_entry_bytes("compute_placement_plan", single_line_plan, tensors);

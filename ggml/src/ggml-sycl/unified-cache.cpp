@@ -33249,8 +33249,9 @@ static void populate_host_zone_sizing(placement_plan &                          
     // WEIGHT: exact bytes plus named terms. The host weights are summed from the entries, the bytes the cache
     // materializes; weight_host_bytes is the plan's running total of the same bytes, so a difference means a writer
     // charged something the entries do not hold, and the zone is sized from the entries. It warns rather than aborts:
-    // the multi-device builder charges a host expert group at the device layout's dst_size, so every padded
-    // multi-device load would abort until that charge is the materialized src_size (llama.cpp-4qdx).
+    // the multi-device builder's MoE group branch still charges a host-spilled group at the device layout's dst_size,
+    // so a padded multi-device load that takes that branch would abort until that charge is the materialized src_size
+    // (llama.cpp-4qdx). Its cohesive host-layer branch already charges a host expert at src_size.
     const host_weight_zone_terms weight_terms = placement_plan_host_weight_zone_terms(plan);
     if (weight_terms.host_weights != plan.weight_host_bytes) {
         GGML_LOG_WARN(
