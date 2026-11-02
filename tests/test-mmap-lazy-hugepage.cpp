@@ -24,6 +24,8 @@
 #include "test-skip.h"
 
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -39,6 +41,30 @@
 
 static const size_t MiB       = 1024 * 1024;
 static const size_t FILE_SIZE = 20 * MiB;
+
+// The backing device's read_ahead_kb, or -1 when /sys has no entry for the
+// file's device. The probes below assume the lazy window is 2 MiB, which holds
+// while twice the read-ahead is at most 2 MiB. A whole disk or a filesystem
+// with its own bdi is /sys/class/bdi/MAJ:MIN; a partition shares its disk's,
+// one directory up.
+static long read_ahead_kb(int fd) {
+    struct stat st = {};
+    if (fstat(fd, &st) != 0) {
+        return -1;
+    }
+    char paths[2][160];
+    snprintf(paths[0], sizeof(paths[0]), "/sys/class/bdi/%u:%u/read_ahead_kb", major(st.st_dev), minor(st.st_dev));
+    snprintf(paths[1], sizeof(paths[1]), "/sys/dev/block/%u:%u/../bdi/read_ahead_kb", major(st.st_dev),
+             minor(st.st_dev));
+    for (const char * p : paths) {
+        std::ifstream in(p);
+        long          kb = -1;
+        if (in >> kb) {
+            return kb;
+        }
+    }
+    return -1;
+}
 
 // VmFlags of the VMA that contains `p`, or "" when no VMA or no VmFlags line
 // for it was found
@@ -70,6 +96,14 @@ int main() {
     if (fd < 0 || ftruncate(fd, FILE_SIZE) != 0) {
         fprintf(stderr, "FAIL: could not create a 20 MiB temp file\n");
         return 1;
+    }
+
+    const long ra = read_ahead_kb(fd);
+    if (ra > 1024) {
+        printf("SKIP: read_ahead_kb %ld puts the lazy window past 2 MiB, which the probes assume\n", ra);
+        close(fd);
+        unlink(path);
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     // positive control: can this kernel mark a file mapping VM_HUGEPAGE at all?
