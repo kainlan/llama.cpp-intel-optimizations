@@ -177,27 +177,38 @@ static std::string thp_mode() {
     return l != std::string::npos && r != std::string::npos && r > l ? line.substr(l + 1, r - l - 1) : "unknown";
 }
 
-// creates and fills a fixture of `size` bytes under g_fixture_dir; returns the path, "" on failure
-static std::string make_fixture(const char * stem, uint64_t size) {
-    std::string       path = std::string(g_fixture_dir) + "/" + stem + "-XXXXXX";
-    std::vector<char> tmpl(path.begin(), path.end());
-    tmpl.push_back('\0');
-    const int w = mkstemp(tmpl.data());
-    if (w < 0) {
-        return "";
-    }
-    path = tmpl.data();
-    std::vector<unsigned char> bytes(1 * MiB, 0x5a);
-    for (uint64_t off = 0; off < size; off += bytes.size()) {
-        if (write(w, bytes.data(), bytes.size()) != (ssize_t) bytes.size()) {
-            close(w);
-            unlink(path.c_str());
-            return "";
+// Creates and fills an anonymous fixture of `size` bytes in g_fixture_dir and returns its fd, -1 on failure. The file
+// has no name: O_TMPFILE where the filesystem has it, else mkstemp unlinked at once. Anything that walks the build
+// directory (an indexer, a scanner) could otherwise open a named fixture mid-run and read it into the page cache,
+// which fails the arm that wants it cold and satisfies the mutant that wants it warm. The mapping under test opens
+// the same inode through fixture_path(), so nothing opens the file by a name it could find.
+static int make_fixture(const char * stem, uint64_t size) {
+    int fd = open(g_fixture_dir, O_TMPFILE | O_RDWR, 0600);
+    if (fd < 0) {
+        std::string       path = std::string(g_fixture_dir) + "/" + stem + "-XXXXXX";
+        std::vector<char> tmpl(path.begin(), path.end());
+        tmpl.push_back('\0');
+        fd = mkstemp(tmpl.data());
+        if (fd >= 0) {
+            unlink(tmpl.data());
         }
     }
-    fsync(w);
-    close(w);
-    return path;
+    if (fd < 0) {
+        return -1;
+    }
+    std::vector<unsigned char> bytes(1 * MiB, 0x5a);
+    for (uint64_t off = 0; off < size; off += bytes.size()) {
+        if (write(fd, bytes.data(), bytes.size()) != (ssize_t) bytes.size()) {
+            close(fd);
+            return -1;
+        }
+    }
+    fsync(fd);
+    return fd;
+}
+
+static std::string fixture_path(int fd) {
+    return "/proc/self/fd/" + std::to_string(fd);
 }
 
 // the ranges llama_mmap is given, as the loader gets them: from a filled record
@@ -243,15 +254,9 @@ struct prefetch_result {
 // Maps with prefetch = -1 over `ranges` and polls the file's residency for up to 10 s. `stop_on_interior` ends the
 // poll when the interior first reads resident (the mutant); otherwise the poll runs until the neighbours are
 // prefetched and one more second has passed, so that read that arrives late is seen.
-static prefetch_result run_prefetch(const std::string &        path,
-                                    const llama_mmap::ranges & ranges,
-                                    bool                       stop_on_interior) {
+static prefetch_result run_prefetch(int fd, const llama_mmap::ranges & ranges, bool stop_on_interior) {
     prefetch_result res;
-    const int       fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0 || !evict(fd, P_FILE_SIZE)) {
-        if (fd >= 0) {
-            close(fd);
-        }
+    if (!evict(fd, P_FILE_SIZE)) {
         return res;
     }
     const uint64_t shared_begin = page_floor(P_LAZY_BEGIN);
@@ -259,12 +264,11 @@ static prefetch_result run_prefetch(const std::string &        path,
     const uint64_t interior_off = shared_begin + g_page;
     const uint64_t interior_len = shared_end - interior_off;
     if (resident_pages(fd, P_FILE_SIZE, interior_off, interior_len) != 0) {
-        close(fd);
         return res;
     }
     res.ran = true;
     {
-        llama_file f(path.c_str(), "rb");
+        llama_file f(fixture_path(fd).c_str(), "rb");
         llama_mmap m(&f, (size_t) -1, /*numa =*/false, ranges);
 
         const auto t0       = std::chrono::steady_clock::now();
@@ -294,15 +298,14 @@ static prefetch_result run_prefetch(const std::string &        path,
         }
         res.neighbours_ready = ready_ms >= 0;
     }
-    close(fd);
     return res;
 }
 
 static int prefetch_arm(int * skip) {
     int fail = 0;
 
-    const std::string path = make_fixture("llama-mmap-lazy-prefetch", P_FILE_SIZE);
-    if (path.empty()) {
+    const int fd = make_fixture("llama-mmap-lazy-prefetch", P_FILE_SIZE);
+    if (fd < 0) {
         std::fprintf(stderr, "SKIP: prefetch arm: cannot create the fixture under %s\n", g_fixture_dir);
         ++*skip;
         return 0;
@@ -311,7 +314,7 @@ static int prefetch_arm(int * skip) {
     const llama_mmap::ranges ranges = record_ranges({
         { P_LAZY_BEGIN, P_LAZY_END }
     });
-    const prefetch_result    prod   = run_prefetch(path, ranges, false);
+    const prefetch_result    prod   = run_prefetch(fd, ranges, false);
     if (!prod.ran) {
         std::fprintf(stderr, "SKIP: prefetch arm: the fixture directory cannot be evicted\n");
         ++*skip;
@@ -338,7 +341,7 @@ static int prefetch_arm(int * skip) {
     }
 
     // the mutant: an empty record. The same call must now bring the interior in, or the arm cannot fail.
-    const prefetch_result mut = run_prefetch(path, record_ranges({}), true);
+    const prefetch_result mut = run_prefetch(fd, record_ranges({}), true);
     if (mut.ran) {
         std::printf("prefetch arm, empty-record mutant: interior max %lld pages resident (want > 0)%s\n",
                     (long long) mut.interior_max, mut.seconds_to_interior >= 0 ? "" : ", not within 10 s");
@@ -353,7 +356,7 @@ static int prefetch_arm(int * skip) {
         ++*skip;
     }
 
-    unlink(path.c_str());
+    close(fd);
     return fail;
 }
 
@@ -380,13 +383,9 @@ struct hugepage_result {
 
 // Maps with prefetch 0 (a SYCL load), faults the page next to each edge, and reads the folio bands. `mutant` re-advises
 // the window MADV_HUGEPAGE on the mapping first.
-static hugepage_result run_hugepage(const std::string & path, bool mutant) {
+static hugepage_result run_hugepage(int fd, bool mutant) {
     hugepage_result res;
-    const int       fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0 || !evict(fd, H_FILE_SIZE)) {
-        if (fd >= 0) {
-            close(fd);
-        }
+    if (!evict(fd, H_FILE_SIZE)) {
         return res;
     }
     res.ran = true;
@@ -399,7 +398,7 @@ static hugepage_result run_hugepage(const std::string & path, bool mutant) {
         { H_LAZY_BEGIN, H_LAZY_END }
     });
     {
-        llama_file f(path.c_str(), "rb");
+        llama_file f(fixture_path(fd).c_str(), "rb");
         llama_mmap m(&f, /*prefetch =*/0, /*numa =*/false, ranges);
         char *     base = (char *) m.addr();
 
@@ -422,7 +421,6 @@ static hugepage_result run_hugepage(const std::string & path, bool mutant) {
         res.band_begin    = resident_pages(fd, H_FILE_SIZE, shared_begin + g_page, 10 * MiB - (shared_begin + g_page));
         res.band_end      = resident_pages(fd, H_FILE_SIZE, 24 * MiB, shared_end - 24 * MiB);
     }
-    close(fd);
     return res;
 }
 
@@ -436,14 +434,14 @@ static int hugepage_arm(int * skip) {
         return 0;
     }
 
-    const std::string path = make_fixture("llama-mmap-lazy-hugepage", H_FILE_SIZE);
-    if (path.empty()) {
+    const int fd = make_fixture("llama-mmap-lazy-hugepage", H_FILE_SIZE);
+    if (fd < 0) {
         std::fprintf(stderr, "SKIP: HUGEPAGE arm: cannot create the fixture under %s\n", g_fixture_dir);
         ++*skip;
         return 0;
     }
 
-    const hugepage_result prod = run_hugepage(path, false);
+    const hugepage_result prod = run_hugepage(fd, false);
     if (!prod.ran) {
         std::fprintf(stderr, "SKIP: HUGEPAGE arm: the fixture directory cannot be evicted\n");
         ++*skip;
@@ -474,7 +472,7 @@ static int hugepage_arm(int * skip) {
         }
     }
 
-    const hugepage_result mut = run_hugepage(path, true);
+    const hugepage_result mut = run_hugepage(fd, true);
     if (mut.ran) {
         std::printf("HUGEPAGE arm, window left MADV_HUGEPAGE: folio band %lld %lld pages resident (want > 0 each)\n",
                     (long long) mut.band_begin, (long long) mut.band_end);
@@ -490,7 +488,7 @@ static int hugepage_arm(int * skip) {
         ++*skip;
     }
 
-    unlink(path.c_str());
+    close(fd);
     return fail;
 }
 
@@ -503,17 +501,13 @@ int main(int argc, char ** argv) {
     int skip = 0;
 
     // the layout assumes W = 2 MiB, which holds while twice the backing device's read-ahead is at most 2 MiB
-    const std::string probe_path = make_fixture("llama-mmap-lazy-bdi", 1 * MiB);
-    if (probe_path.empty()) {
+    const int pfd = make_fixture("llama-mmap-lazy-bdi", 1 * MiB);
+    if (pfd < 0) {
         std::fprintf(stderr, "SKIP: cannot create a fixture under %s\n", g_fixture_dir);
         return 77;
     }
-    const int  pfd = open(probe_path.c_str(), O_RDONLY);
-    const long ra  = pfd >= 0 ? read_ahead_kb(pfd) : -1;
-    if (pfd >= 0) {
-        close(pfd);
-    }
-    unlink(probe_path.c_str());
+    const long ra = read_ahead_kb(pfd);
+    close(pfd);
     std::printf("fixture directory %s, backing read_ahead_kb %ld, page %llu\n", g_fixture_dir, ra,
                 (unsigned long long) g_page);
     if (ra > 1024) {
