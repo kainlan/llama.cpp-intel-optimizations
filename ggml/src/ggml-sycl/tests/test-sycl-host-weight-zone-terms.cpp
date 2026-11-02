@@ -67,39 +67,46 @@ void check_eq(const char * what, size_t got, size_t want) {
     }
 }
 
-// --- the mocked device table: one discrete card, enough to plan, nothing touched ---
+// --- the mocked device table: discrete cards, enough to plan, nothing touched ---
 
-ggml_sycl_device_info make_mock_sycl_info() {
+ggml_sycl_device_info make_mock_sycl_info(int device_count) {
     ggml_sycl_device_info info{};
-    info.device_count        = 1;
-    info.total_gpu_count     = 1;
+    info.device_count        = device_count;
+    info.total_gpu_count     = device_count;
     info.host_max_alloc_size = 128ull * 1024ull * MiB;
 
-    const size_t       total_vram   = 16ull * 1024ull * MiB;
-    sycl_device_info & dev          = info.devices[0];
-    dev.cc                          = 1200;
-    dev.nsm                         = 128;
-    dev.smpbo                       = 64ull * 1024ull;
-    dev.vmm                         = true;
-    dev.total_vram                  = total_vram;
-    dev.free_vram_at_init           = total_vram;
-    dev.max_alloc_size              = total_vram - 512ull * MiB;
-    dev.safe_max_alloc_size         = dev.max_alloc_size;
-    dev.supports_soa_reorder        = true;
-    dev.xmx_caps.compute_units      = dev.nsm;
-    dev.xmx_caps.global_mem_size    = total_vram;
-    dev.xmx_caps.max_mem_alloc_size = dev.max_alloc_size;
-    std::snprintf(dev.device_name, sizeof(dev.device_name), "mock-weight-zone-terms");
-    info.max_work_group_sizes[0] = 256;
-    info.default_tensor_split[0] = 1.0f;
-    info.gpu_dpct_ids[0]         = 0;
-
-    sycl_peer_link_info & link = info.peer_links[0][0];
-    link.valid                 = true;
-    link.same_device           = true;
-    link.same_backend          = true;
-    link.same_platform         = true;
-    link.same_sycl_context     = true;
+    for (int d = 0; d < device_count; ++d) {
+        const size_t       total_vram   = 16ull * 1024ull * MiB;
+        sycl_device_info & dev          = info.devices[d];
+        dev.cc                          = 1200;
+        dev.nsm                         = 128;
+        dev.smpbo                       = 64ull * 1024ull;
+        dev.vmm                         = true;
+        dev.total_vram                  = total_vram;
+        dev.free_vram_at_init           = total_vram;
+        dev.max_alloc_size              = total_vram - 512ull * MiB;
+        dev.safe_max_alloc_size         = dev.max_alloc_size;
+        dev.supports_soa_reorder        = true;
+        dev.xmx_caps.compute_units      = dev.nsm;
+        dev.xmx_caps.global_mem_size    = total_vram;
+        dev.xmx_caps.max_mem_alloc_size = dev.max_alloc_size;
+        std::snprintf(dev.device_name, sizeof(dev.device_name), "mock-weight-zone-terms-%d", d);
+        info.max_work_group_sizes[d] = 256;
+        info.default_tensor_split[d] = static_cast<float>(d + 1) / static_cast<float>(device_count);
+        info.gpu_dpct_ids[d]         = d;
+    }
+    for (int src = 0; src < device_count; ++src) {
+        for (int dst = 0; dst < device_count; ++dst) {
+            sycl_peer_link_info & link = info.peer_links[src][dst];
+            link.valid                 = true;
+            link.src_device            = src;
+            link.dst_device            = dst;
+            link.same_device           = src == dst;
+            link.same_backend          = true;
+            link.same_platform         = true;
+            link.same_sycl_context     = src == dst;
+        }
+    }
     return info;
 }
 
@@ -184,14 +191,76 @@ derived_terms derive_terms(const placement_plan & plan) {
 }
 
 placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory) {
-    const ggml_sycl_device_info   info = make_mock_sycl_info();
+    const ggml_sycl_device_info   info = make_mock_sycl_info(1);
     test_sycl_info_override_guard info_guard(info);
     placement_kv_info             kv{};
     // A budget far below the experts: every expert, and with them the dense weights, is host-resident.
     return compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, /*device_id=*/0, kv, nullptr, k_experts);
 }
 
-// Arm 1: the WEIGHT zone is the exact bytes plus the named terms, and not 1.2x.
+// The other planner builder, over two cards with the same starved budget.
+placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & inventory) {
+    const ggml_sycl_device_info      info = make_mock_sycl_info(2);
+    test_sycl_info_override_guard    info_guard(info);
+    placement_kv_info                kv{};
+    const std::vector<device_budget> budgets = {
+        { 0, 1 * MiB, 16ull * 1024ull * MiB, 1.0, true },
+        { 1, 1 * MiB, 16ull * 1024ull * MiB, 1.0, true },
+    };
+    return compute_multi_device_plan(budgets, inventory, k_layers, multi_gpu_mode::HYBRID, kv, nullptr, k_experts);
+}
+
+// The checks one plan's WEIGHT zone must pass, whichever builder made it. `line` is that plan's [HOST-PLAN] line.
+//
+// `counts_host_at_src_size` says whether the builder's weight_host_bytes counts a host expert at its AOS src_size,
+// the bytes the cache materializes. The single-device builder does, and resets a host expert to AOS. The
+// multi-device builder counts a host expert at the device layout's dst_size and leaves that layout on the entry, so
+// its weight_host_bytes is not the materialized fact; the WEIGHT zone is sized from the entries in both, and the
+// comparison is printed rather than asserted there.
+void check_weight_zone(const char *           builder,
+                       const placement_plan & plan,
+                       const std::string &    line,
+                       bool                   counts_host_at_src_size) {
+    std::printf("  [%s]\n", builder);
+    const derived_terms t                = derive_terms(plan);
+    const size_t        n_expert_entries = static_cast<size_t>(k_layers) * 3 * k_experts;
+    check(t.blocks >= n_expert_entries, "every routed expert is host-resident under the 1 MiB budget");
+    check(t.host_weights > 0, "the plan placed weights on the host");
+    if (counts_host_at_src_size) {
+        // The plan's own host-weight accounting is the same fact: the term sums what the cache materializes.
+        check_eq("host_weights == the plan's weight_host_bytes", t.host_weights, plan.weight_host_bytes);
+    } else {
+        std::printf("  note: host_weights=%zu, the builder's weight_host_bytes=%zu\n", t.host_weights,
+                    plan.weight_host_bytes);
+    }
+
+    const size_t ratio_size = static_cast<size_t>(static_cast<double>(t.host_weights) * 1.2) + k_runtime_reserve_bytes;
+    // Vacuity guard: the two answers must differ on this inventory, or "not 1.2x" would prove nothing.
+    check(ratio_size != t.total(), "the fixture separates exact-plus-terms from the 1.2x ratio");
+    check_eq("host_zone_weight_bytes == host_weights + runtime_reserve + layout_copies + tlsf_bound",
+             plan.host_zone_weight_bytes, t.total());
+    check(plan.host_zone_weight_bytes != ratio_size, "host_zone_weight_bytes is not the 1.2x ratio");
+
+    // The builder sized the zone through the one terms function.
+    const host_weight_zone_terms terms = placement_host_weight_zone_terms(plan);
+    check_eq("placement_host_weight_zone_terms().total() is the planned size", terms.total(),
+             plan.host_zone_weight_bytes);
+    check_eq("terms.host_weights", terms.host_weights, t.host_weights);
+    check_eq("terms.blocks", terms.blocks, t.blocks);
+
+    check(!line.empty(), "a [HOST-PLAN] WEIGHT zone line was logged");
+    if (!line.empty()) {
+        std::printf("  logged: %s", line.c_str());
+        check_eq("[HOST-PLAN] host_weights", printed_term(line, "host_weights"), t.host_weights);
+        check_eq("[HOST-PLAN] blocks", printed_term(line, "blocks"), t.blocks);
+        check_eq("[HOST-PLAN] runtime_reserve", printed_term(line, "runtime_reserve"), k_runtime_reserve_bytes);
+        check_eq("[HOST-PLAN] layout_copies", printed_term(line, "layout_copies"), 0);
+        check_eq("[HOST-PLAN] tlsf_bound", printed_term(line, "tlsf_bound"), t.blocks * k_tlsf_grain);
+        check_eq("[HOST-PLAN] total", printed_term(line, "total"), t.total());
+    }
+}
+
+// Arm 1: the WEIGHT zone is the exact bytes plus the named terms, and not 1.2x, from both planner builders.
 void arm1_weight_zone_is_exact_bytes_plus_named_terms(placement_plan & out_plan) {
     std::printf("(1) a Q2_K-shaped inventory's WEIGHT zone is exact bytes plus named terms, not 1.2x\n");
     const std::vector<placement_tensor_info> inventory = q2k_inventory();
@@ -200,36 +269,17 @@ void arm1_weight_zone_is_exact_bytes_plus_named_terms(placement_plan & out_plan)
     void *            prev_data = nullptr;
     ggml_log_get(&prev_cb, &prev_data);
     ggml_log_set(capture_log, nullptr);
-    const placement_plan plan = plan_q2k(inventory);
+    g_host_plan_line.clear();
+    const placement_plan single_line_plan = plan_q2k(inventory);
+    const std::string    single_line      = g_host_plan_line;
+    g_host_plan_line.clear();
+    const placement_plan multi_plan = plan_q2k_two_devices(inventory);
+    const std::string    multi_line = g_host_plan_line;
     ggml_log_set(prev_cb, prev_data);
 
-    const derived_terms t                = derive_terms(plan);
-    const size_t        n_expert_entries = static_cast<size_t>(k_layers) * 3 * k_experts;
-    check(t.blocks >= n_expert_entries, "every routed expert is host-resident under the 1 MiB budget");
-    check(t.host_weights > 0, "the plan placed weights on the host");
-    // The plan's own host-weight accounting is the same fact: the term sums what the cache materializes.
-    check_eq("host_weights == the plan's weight_host_bytes", t.host_weights, plan.weight_host_bytes);
-
-    const size_t ratio_size =
-        static_cast<size_t>(static_cast<double>(plan.weight_host_bytes) * 1.2) + k_runtime_reserve_bytes;
-    // Vacuity guard: the two answers must differ on this inventory, or "not 1.2x" would prove nothing.
-    check(ratio_size != t.total(), "the fixture separates exact-plus-terms from the 1.2x ratio");
-    check_eq("host_zone_weight_bytes == host_weights + runtime_reserve + layout_copies + tlsf_bound",
-             plan.host_zone_weight_bytes, t.total());
-    check(plan.host_zone_weight_bytes != ratio_size, "host_zone_weight_bytes is not the 1.2x ratio");
-
-    check(!g_host_plan_line.empty(), "a [HOST-PLAN] WEIGHT zone line was logged");
-    if (!g_host_plan_line.empty()) {
-        std::printf("  logged: %s", g_host_plan_line.c_str());
-        check_eq("[HOST-PLAN] host_weights", printed_term(g_host_plan_line, "host_weights"), t.host_weights);
-        check_eq("[HOST-PLAN] blocks", printed_term(g_host_plan_line, "blocks"), t.blocks);
-        check_eq("[HOST-PLAN] runtime_reserve", printed_term(g_host_plan_line, "runtime_reserve"),
-                 k_runtime_reserve_bytes);
-        check_eq("[HOST-PLAN] layout_copies", printed_term(g_host_plan_line, "layout_copies"), 0);
-        check_eq("[HOST-PLAN] tlsf_bound", printed_term(g_host_plan_line, "tlsf_bound"), t.blocks * k_tlsf_grain);
-        check_eq("[HOST-PLAN] total", printed_term(g_host_plan_line, "total"), t.total());
-    }
-    out_plan = plan;
+    check_weight_zone("compute_placement_plan", single_line_plan, single_line, true);
+    check_weight_zone("compute_multi_device_plan", multi_plan, multi_line, false);
+    out_plan = single_line_plan;
 }
 
 // --- arm 2: the census ---

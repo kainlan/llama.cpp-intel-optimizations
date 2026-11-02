@@ -32631,21 +32631,18 @@ static void publish_moe_host_scatter_term(const placement_plan &                
     }
 }
 
-static void populate_host_zone_sizing(placement_plan &                           plan,
-                                      const std::vector<placement_tensor_info> & tensor_inventory,
-                                      int                                        n_experts,
-                                      int                                        n_expert_used) {
-    constexpr size_t k_min_zone_bytes        = 64ull * 1024ull * 1024ull;
-    constexpr size_t k_tp_staging_headroom   = 16ull * 1024ull * 1024ull;
-    constexpr size_t k_scratch_headroom      = 32ull * 1024ull * 1024ull;
-    constexpr double k_weight_headroom_ratio = 1.2;
+size_t placement_host_weight_bytes(const placement_entry & entry) {
+    return entry.src_size;
+}
+
+host_weight_zone_terms placement_host_weight_zone_terms(const placement_plan & plan) {
     // llama.cpp-glkg: the WEIGHT zone is where every runtime HOST_COMPUTE
     // request lands (unified_alloc_host_zone() routes role==WEIGHT OR
     // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
     // that includes llama_context::output_reserve()'s logits/embd host
     // buffer plus the server's prompt-checkpoint reads after model load.
-    // Add 64 MiB of consumable sizing slack beyond the weight estimate and
-    // its 20% headroom. This is not an earmarked context reservation: other
+    // Add 64 MiB of consumable sizing slack beyond the host weights' exact
+    // bytes. This is not an earmarked context reservation: other
     // WEIGHT-zone owners can consume it before a context requests memory.
     // It neither guarantees sufficient context capacity nor protects free
     // pool budget for growth. Dynamic growth still depends on available
@@ -32653,6 +32650,32 @@ static void populate_host_zone_sizing(placement_plan &                          
     // Retained-weight/post-load tests must establish sufficiency for each
     // qualified workload; the observed request sizes alone do not prove it.
     constexpr size_t k_host_runtime_reserve_bytes = 64ull * 1024ull * 1024ull;
+
+    host_weight_zone_terms terms;
+    for (const placement_entry & entry : plan.entries) {
+        if (entry.on_device) {
+            continue;
+        }
+        terms.host_weights += placement_host_weight_bytes(entry);
+        terms.blocks++;
+    }
+    terms.runtime_reserve = k_host_runtime_reserve_bytes;
+    // S1-PRELOAD materializes a host-planned weight once, in AOS (the planner rewrites every host entry to AOS), so
+    // the plan keeps no second, converted copy of any host weight in this zone.
+    terms.layout_copies   = 0;
+    // The pinned pool's TLSF hands out whole grains and keeps its metadata outside the managed region, so a block
+    // occupies at most its bytes plus one grain.
+    terms.tlsf_bound      = terms.blocks * tlsf_allocator::block_grain;
+    return terms;
+}
+
+static void populate_host_zone_sizing(placement_plan &                           plan,
+                                      const std::vector<placement_tensor_info> & tensor_inventory,
+                                      int                                        n_experts,
+                                      int                                        n_expert_used) {
+    constexpr size_t k_min_zone_bytes      = 64ull * 1024ull * 1024ull;
+    constexpr size_t k_tp_staging_headroom = 16ull * 1024ull * 1024ull;
+    constexpr size_t k_scratch_headroom    = 32ull * 1024ull * 1024ull;
 
     plan.max_tensor_bytes       = 0;
     plan.max_staging_pair_bytes = 0;
@@ -33219,9 +33242,23 @@ static void populate_host_zone_sizing(placement_plan &                          
 
     // --- Host zone sizing (uses inference category fields computed above) ---
 
-    plan.host_zone_weight_bytes =
-        static_cast<size_t>(static_cast<double>(plan.weight_host_bytes) * k_weight_headroom_ratio) +
-        k_host_runtime_reserve_bytes;
+    // WEIGHT: exact bytes plus named terms. The host weights are summed from the entries, the bytes the cache
+    // materializes; weight_host_bytes is the plan's running total of the same bytes, so a difference means a writer
+    // charged something the entries do not hold, and the zone is sized from the entries.
+    const host_weight_zone_terms weight_terms = placement_host_weight_zone_terms(plan);
+    if (weight_terms.host_weights != plan.weight_host_bytes) {
+        GGML_LOG_WARN(
+            "[HOST-PLAN-BUG] device=%d host-resident entries hold %zu B but the plan's weight_host_bytes is %zu B; "
+            "the WEIGHT zone is sized from the entries\n",
+            plan.device_id, weight_terms.host_weights, plan.weight_host_bytes);
+    }
+    plan.host_zone_weight_bytes = weight_terms.total();
+    GGML_LOG_INFO(
+        "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu runtime_reserve=%zu layout_copies=%zu "
+        "tlsf_bound=%zu total=%zu (%.1f MB)\n",
+        plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.runtime_reserve,
+        weight_terms.layout_copies, weight_terms.tlsf_bound, weight_terms.total(),
+        weight_terms.total() / (1024.0 * 1024.0));
     plan.host_zone_kv_bytes             = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
     // Staging zone: S1 preload may keep multiple async H2D/reorder submissions
     // alive. CPU-side layout conversion can hold both the source staging copy

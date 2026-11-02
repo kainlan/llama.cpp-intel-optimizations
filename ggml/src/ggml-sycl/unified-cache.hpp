@@ -1864,6 +1864,29 @@ struct placement_plan {
     std::unordered_set<size_t>                                 expert_fallback_entries_;  // entries counted there
 };
 
+// The host WEIGHT zone's size, term by term: the bytes the cache materializes for every host-resident weight, plus one
+// named term for each real extra, never a ratio over the weights. A ratio is slack nobody can name, a second source
+// for a fact the plan already knows, and over a large host-expert set it is more than the host budget holds.
+// populate_host_zone_sizing() sizes host_zone_weight_bytes as total() and prints every term on a [HOST-PLAN] line.
+struct host_weight_zone_terms {
+    size_t host_weights    = 0;  // placement_host_weight_bytes() summed over the host-resident entries
+    size_t blocks          = 0;  // the pinned allocations those weights take: one per host-resident entry
+    size_t runtime_reserve = 0;  // the runtime HOST_COMPUTE requests that also land in WEIGHT
+    size_t layout_copies   = 0;  // converted copies of a host weight the plan keeps beside the first: none today
+    size_t tlsf_bound      = 0;  // each block rounded up to the TLSF grain: blocks x grain
+
+    size_t total() const { return host_weights + runtime_reserve + layout_copies + tlsf_bound; }
+};
+
+// The bytes S1-PRELOAD materializes for a host-resident entry. A host weight is copied once, in AOS, with no layout
+// padding: a dense weight's copy is ggml_nbytes(tensor) and an expert's is tensor->nb[2], which are the entry's
+// src_size (the inventory's size is ggml_nbytes, and an expert's is that over ne[2]).
+size_t placement_host_weight_bytes(const placement_entry & entry);
+
+// The terms over `plan`'s host-resident entries. The one function both planner builders size the WEIGHT zone
+// through, by way of populate_host_zone_sizing().
+host_weight_zone_terms placement_host_weight_zone_terms(const placement_plan & plan);
+
 struct moe_mmid_queue_binding {
     int                       owner_device = -1;
     sycl::queue *             queue        = nullptr;
