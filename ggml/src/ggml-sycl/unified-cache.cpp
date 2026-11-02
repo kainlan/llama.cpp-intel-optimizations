@@ -20488,6 +20488,11 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                             }
                             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = tier;
                             registered = true;
+                            // The row's copy holds the HOST_CPU charge now, so the local record gives its copy up
+                            // (th32 §4.2). Not before this point: the cohort-map write above can throw after the
+                            // emplace, which erases the row and frees through the local record, and only the local
+                            // record's charge can then credit the ledger.
+                            rec.charged_bytes = 0;
                         } catch (...) {
                             runtime_registry_erase_locked(inserted.first);
                         }
