@@ -1234,8 +1234,10 @@ std::string list(const std::vector<size_t> & v) {
 // A stage run builds one plan per device the scheduler exposes. On a multi-GPU host that is device 0 alone unless a
 // split is asked for, and its plan is the multi-device plan over every card, so the arm runs on any number of cards.
 // Engagement: every leg's plans were built (their [HOST-LEDGER] plan lines are counted, one per exposed device in a
-// stage run), the stage runs returned OK, and the pinned commit injected between the early and the late run moves a
-// fresh computation by at least its bytes, so a second store would have recorded a different number.
+// stage run), the stage runs returned OK, and the pinned commit injected between the early and the late run moves the
+// budget by exactly the bytes the pool committed, read back: the budget computed from one sample with the pinned bytes
+// before and after the commit differs by those bytes, and the one before is the stored value, so a second store would
+// have recorded the stored value less the commit.
 // Mutants: the store after the plan call (the first leg's plan records B0); a store per stage call (stores reads 2
 // and the late plans read the early value less the injected bytes); a store per planner call, inside the stage run's
 // device loop (the transaction stores at least once per stage run, so twice, and the late plans read the early value
@@ -1300,16 +1302,37 @@ arm_result arm_j_store_order() {
     expect(r, stores() == s0 + 1, "the early stage run stored " + num(stores() - s0) + " times, want 1");
     expect(r, all_equal(early, S1), "the early plans recorded " + list(early) + ", stored " + num(S1));
 
-    // a pinned commit between the runs: a fresh computation now sees it
-    constexpr size_t injected = 512 * MiB;
-    unified_cache *  cache    = get_unified_cache_for_device(0);
-    if (cache == nullptr || cache->pre_allocate_runtime_chunks(injected) == 0) {
+    // A pinned commit between the runs. The injection grows device 0's RUNTIME chunks by the shortfall past the free
+    // bytes they already hold, each chunk pinned host memory committed to the pool and never charged to the ledger, so
+    // the budget sees it through the pinned share. In this fixture the share is the binding term: 5 % of RAM less the
+    // pinned bytes sits far below committed plus MemAvailable less the OS reserve. So the commit moves the budget by
+    // the bytes the pool committed, which are read back here, not by the bytes requested. The two budgets come from
+    // one sample that differs only in its pinned bytes, so a MemAvailable reading cannot move between them.
+    constexpr size_t requested     = 512 * MiB;
+    unified_cache *  cache         = get_unified_cache_for_device(0);
+    const size_t     pinned_before = host_ledger_sample().pinned_bytes;
+    const uint64_t   pool_before   = cache != nullptr ? cache->pinned_pool_committed() : 0;
+    if (cache == nullptr || cache->pre_allocate_runtime_chunks(requested) == 0) {
         void_arm(r, "the pinned commit between the stage runs was not made");
     }
-    const size_t fresh = host_ledger_compute_budget(host_ledger_sample(), host_ledger_committed());
-    if (!(fresh + injected <= S1)) {
-        void_arm(r, "the injected commit does not move a fresh budget (" + num(fresh) + " vs stored " + num(S1) +
-                        "), so a second store would not show");
+    const uint64_t           injected     = cache != nullptr ? cache->pinned_pool_committed() - pool_before : 0;
+    const host_budget_sample sample_after = host_ledger_sample();
+    host_budget_sample       sample_prior = sample_after;
+    sample_prior.pinned_bytes             = pinned_before;
+    const size_t committed_now            = host_ledger_committed();
+    const size_t prior                    = host_ledger_compute_budget(sample_prior, committed_now);
+    const size_t fresh                    = host_ledger_compute_budget(sample_after, committed_now);
+    if (injected == 0 || sample_after.pinned_bytes != pinned_before + injected) {
+        void_arm(r, "the pinned share moved from " + num(pinned_before) + " to " + num(sample_after.pinned_bytes) +
+                        " bytes, the pool committed " + num(injected));
+    }
+    if (prior != fresh + injected) {
+        void_arm(r, "the pinned share is not the binding term: a commit of " + num(injected) +
+                        " bytes moved the budget from " + num(prior) + " to " + num(fresh));
+    }
+    if (prior != S1) {
+        void_arm(r, "the budget before the commit is " + num(prior) + ", not the stored " + num(S1) +
+                        ", so a second store would not show as the stored value less the commit");
     }
 
     log_clear();
