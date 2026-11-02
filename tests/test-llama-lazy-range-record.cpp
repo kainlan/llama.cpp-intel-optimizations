@@ -1,8 +1,8 @@
 // The per-model lazy-range record (llama.cpp-5efe C1, design sycl-mmap-host-tier.md §3.1).
 //
-// Drives the pre-fill, the load-mode fallback and the record's queries over a model
-// of five tensors in two files, three of them declared lazy, one of those a sparse
-// table of 6 GiB (see lazy-range-fixture.h). Host-only: no backend, device or model.
+// Drives the pre-fill and the record's queries over a model of five tensors in two
+// files, three of them declared lazy, one of those a sparse table of 6 GiB (see
+// lazy-range-fixture.h). Host-only: no backend, device or model.
 //
 // What it pins:
 //   - rows equal the declared tensors' (file, offset, size) exactly, whatever the
@@ -11,10 +11,11 @@
 //     lazy_eligible = llama_lazy_eligible(taker ? mode_pre : mode_post, size,
 //     taker ? true : SUPPORTED), STORAGE iff eligible and taker, LAZY_READ iff
 //     eligible and not taker, and `deferral != EAGER` iff `lazy_eligible`;
-//   - the witness cell: AUTO requested, a device that cannot mmap, taker -> the
-//     fallback turns mode_post OFF, yet the sparse row is eligible and STORAGE and
-//     the early plan's filter excludes it. A fill that reads mode_post for the taker
-//     (the post-fallback fill) clears the bit and fails here;
+//   - the witness cell: AUTO requested, a device that cannot mmap and owns no
+//     placement, taker -> the loader's AUTO resolver (llama_lazy_auto_enabled) turns
+//     mode_post OFF, yet the sparse row is eligible and STORAGE and the early plan's
+//     filter excludes it. A fill that reads mode_post for the taker (the post-fallback
+//     fill) clears the bit and fails here;
 //   - off the taker without mmap the bit is clear under every mode and the WARN
 //     prints once per row that would have been lazy;
 //   - the attributes are per model, from hparams: two qwen4exp hparams sets give each
@@ -25,6 +26,7 @@
 //     printed even when the model has no declared name;
 //   - a second write to a filled record aborts.
 
+#include "../src/llama-lazy-mode.h"
 #include "../src/llama-model.h"
 #include "lazy-range-fixture.h"
 
@@ -175,18 +177,14 @@ int main() {
         }
     }
 
-    // ---- the witness cell: AUTO, a device without mmap, the taker ----
+    // ---- the witness cell: AUTO, a device without mmap that owns no placement, the taker ----
     {
-        std::vector<ggml_backend_dev_caps> caps(1);
-        caps[0].mmap_support            = false;
-        const llama_lazy_mode mode_pre  = LLAMA_LAZY_MODE_AUTO;
-        const llama_lazy_mode mode_post = llama_lazy_mode_resolve(mode_pre, caps);
-        CHECK(mode_post == LLAMA_LAZY_MODE_OFF, "the fallback did not turn AUTO into OFF: %s", mode_name(mode_post));
-
-        caps[0].mmap_support = true;
-        CHECK(llama_lazy_mode_resolve(LLAMA_LAZY_MODE_AUTO, caps) == LLAMA_LAZY_MODE_AUTO, "AUTO fell back with mmap");
-        caps[0].mmap_support = false;
-        CHECK(llama_lazy_mode_resolve(LLAMA_LAZY_MODE_ON, caps) == LLAMA_LAZY_MODE_ON, "ON fell back without mmap");
+        // mode_post as the loader's AUTO block computes it, through the one resolver it calls
+        // (tests/test-lazy-mode-resolve.cpp drives that resolver over its full truth table)
+        const llama_lazy_device_caps no_mmap   = { /*mmap_support=*/false, /*planner_owns_placement=*/false };
+        const llama_lazy_mode        mode_pre  = LLAMA_LAZY_MODE_AUTO;
+        const llama_lazy_mode        mode_post = llama_lazy_auto_enabled(&no_mmap, 1) ? mode_pre : LLAMA_LAZY_MODE_OFF;
+        CHECK(mode_post == LLAMA_LAZY_MODE_OFF, "the resolver did not turn AUTO into OFF: %s", mode_name(mode_post));
 
         llama_lazy_range_record rec;
         llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), mode_pre, mode_post, true,

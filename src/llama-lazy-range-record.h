@@ -9,7 +9,6 @@
 // before the early placement plan, and a later write aborts; consumers read the
 // record and keep no copy of the ranges or the decision.
 
-#include "ggml-backend.h"
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
@@ -89,13 +88,6 @@ class llama_lazy_range_record {
     std::vector<llama_lazy_range_row> rows_;
     bool                              filled_ = false;
 };
-
-// The lazy mode a load resolves to: AUTO becomes OFF when any device cannot mmap
-// (an integrated GPU, see upstream #28160). The other modes pass through. This is
-// the load-mode fallback block of llama_model_base::load_tensors, factored out so
-// that a host test can drive it over a list of device caps.
-enum llama_lazy_mode llama_lazy_mode_resolve(enum llama_lazy_mode                       mode,
-                                             const std::vector<ggml_backend_dev_caps> & caps);
 
 // looks a declared tensor up in the model file(s); false when the file does not carry it
 using llama_lazy_range_find_fn = std::function<bool(const std::string & name, llama_lazy_range_source & out)>;

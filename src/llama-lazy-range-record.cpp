@@ -122,21 +122,8 @@ llama_mmap::ranges llama_lazy_range_record::excluded_for_file(uint32_t file_idx)
 }
 
 //
-// the load-mode fallback, the pre-fill, the early-plan filter and the create_tensor check
+// the pre-fill, the early-plan filter and the create_tensor check
 //
-
-enum llama_lazy_mode llama_lazy_mode_resolve(enum llama_lazy_mode                       mode,
-                                             const std::vector<ggml_backend_dev_caps> & caps) {
-    if (mode != LLAMA_LAZY_MODE_AUTO) {
-        return mode;
-    }
-    for (const ggml_backend_dev_caps & c : caps) {
-        if (!c.mmap_support) {
-            return LLAMA_LAZY_MODE_OFF;
-        }
-    }
-    return mode;
-}
 
 // "per_layer_token_embd.weight" -> itself; "blk.%d.x.weight" -> one name per block
 static std::vector<std::string> llama_lazy_expand_declared(const std::string & declared, uint32_t n_layer) {

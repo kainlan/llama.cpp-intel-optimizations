@@ -21,8 +21,11 @@ Windows) or that a rebase of upstream code would silently restore:
    `mmap_supported` argument and load_tensors() passes llama_mmap::SUPPORTED, so the
    clause is pinned in two places. The mode argument is `taker ? mode_pre : mode_post`.
    Always-SUPPORTED and always-true each fail it;
-5. mode_pre is captured before llama_lazy_mode_resolve(), and the pre-fill runs after
-   the guard and before llama_model_sycl_compute_early_plan();
+5. mode_pre is captured before the AUTO resolver llama_lazy_auto_enabled()
+   (src/llama-lazy-mode.h, the one resolver load_tensors() calls), the pre-fill runs
+   after the guard and before llama_model_sycl_compute_early_plan(), and the early
+   plan is called once (a second call ahead of the pre-fill would plan the table as
+   an ordinary weight);
 6. create_tensor()'s TENSOR_READ_LAZY handling checks the record and does not fill
    it, compares the flag with membership (not with `deferral`), and refuses a STORAGE
    row, through llama_lazy_range_check_storage() as the first statement of the branch
@@ -183,8 +186,9 @@ def test_mode_pre_is_captured_before_the_fallback_and_the_prefill_precedes_the_e
     guard = body.index("sycl_model_loading_guard(")
     capture = re.search(r"\blazy_mode_pre\s*=\s*ml\.lazy\.mode\s*;", body)
     assert capture, "load_tensors() does not capture mode_pre from ml.lazy.mode"
-    resolve = body.index("llama_lazy_mode_resolve(")
+    resolve = body.index("llama_lazy_auto_enabled(")
     prefill = body.index("llama_lazy_range_record_prefill(")
+    assert body.count("llama_model_sycl_compute_early_plan(") == 1, "load_tensors() calls the early plan more than once"
     early = body.index("llama_model_sycl_compute_early_plan(")
     assert guard < capture.start() < resolve < prefill < early, (
         f"order guard {guard}, capture {capture.start()}, resolve {resolve}, prefill {prefill}, early plan {early}"
