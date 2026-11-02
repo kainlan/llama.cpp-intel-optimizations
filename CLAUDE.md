@@ -786,13 +786,13 @@ Models live under `/models/`, a mergerfs union (since 2026-11-01) of three XFS d
 - `/mnt/models-ugreen` (894 G)
 - `/mnt/models-t7` (932 G, on the Thunderbolt port; keep it on that port)
 
-The union uses `category.create=ff`, so new files fill the NVMe first, and `minfreespace=20G`.
+The union uses `category.create=ff`, so new files fill the NVMe first until its free space drops below `minfreespace=20G`, then the next branch.
 The NAS backup of the pre-move layout is `/Storage/GenAI/models-backup-2026-11-01/`.
 
 Placement on the host at the time of writing:
 
 - **NVMe:** both Qwen3.8-Flash-Next GGUFs (Q8_0 and GSQ-RCO IQ3_XXS), the Mistral files, GPT-OSS 20B
-  (`gpt-oss-20b-mxfp4.gguf`), gemma4 (`gemma-4-12b-it-GGUF`, `stock-gemma-4-E4B-it.Q8_0.gguf`), Qwen3.5-9B,
+  (`gpt-oss-20b-mxfp4.gguf`), gemma4 (`gemma-4-12b-it-GGUF`, `stock-gemma-4-E4B-it.Q8_0.gguf`), Qwen3.5-9B (the GGUF directory and the UD-Q6_K_XL file),
   Qwen3-14B, Qwen3.6-27B and `qwen36-35b-a3b-nvfp4`.
 - **UGREEN:** gpt-oss-120b, the three Qwen1.5-MoE files, DeepSeek-V4-Flash-0731-GGUF,
   DeepSeek-V4.1-Flash-HF-dspark, Llama-3.1-8B-Instruct-GGUF and Qwen3.8-Flash-Next-MTP.

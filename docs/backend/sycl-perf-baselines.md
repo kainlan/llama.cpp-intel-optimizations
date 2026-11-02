@@ -701,12 +701,11 @@ granularity are dead by measurement; (a) launch overhead is real but small.
 
 **The largest contributor is not the ring.** The per-layer-embedding table `per_layer_token_embd.weight` (IQ4_NL [160,
 320001536], 27466 MiB, 16 random 90-byte rows per token) stays mmap-backed under upstream's lazy-read AUTO mode ("lazy
-read enabled", `CPU_Mapped model buffer size = 27465.95 MiB`) and the CPU scheduler split page-faults it from the
-degraded bcachefs array on every ubatch (history: this bcachefs pool was retired 2026-11-01): a state+wchan sampler put
-the bench main thread in D state on `bch2_read_single_folio` for 90 of 138 samples in ~4.7 s bursts per ~6.8 s ubatch,
-the DWARF stack runs `ggml_compute_forward_get_rows` -> `dequantize_row_iq4_nl` -> page fault -> bcachefs read (history,
-same pool), and the GT idle sampler shows the B70 busy ~2 s then idle for the rest of each ubatch. Same-binary ABBA on
-`llama-bench -lzm`:
+read enabled", `CPU_Mapped model buffer size = 27465.95 MiB`) and the CPU scheduler split page-faulted it from the
+degraded bcachefs array on every ubatch: a state+wchan sampler put the bench main thread in D state on
+`bch2_read_single_folio` for 90 of 138 samples in ~4.7 s bursts per ~6.8 s ubatch, the DWARF stack ran
+`ggml_compute_forward_get_rows` -> `dequantize_row_iq4_nl` -> page fault -> bcachefs read, and the GT idle sampler
+showed the B70 busy ~2 s then idle for the rest of each ubatch. Same-binary ABBA on `llama-bench -lzm`:
 
 | arm | lazy mode | pp2048 t/s | sd |
 |---|---|---:|---:|
@@ -721,10 +720,10 @@ is `llama.cpp-th32` (planner-decided placement of lazy n-gram tables). The remai
 time the kernel profiler does not attribute (434 ms of ~1930 ms per ubatch are labelled; the `moe.pp.dequant` label
 records ~100 ns per launch): `llama.cpp-qmen`, then the dequant/GEMM work under `llama.cpp-36j0`. **These are
 records, not baselines**; at the default load mode every Qwen3.8 prefill figure on this host measured the disk, not
-the executor, on the bcachefs layout (history), and the 200/500 floors were set for the executor.
+the executor, on the bcachefs layout, and the 200/500 floors were set for the executor.
 
-/models moved to XFS per drive under mergerfs on 2026-11-01; the stall has not been re-measured on that layout (Task 27
-of the th32 plan re-measures).
+History: /models moved to XFS per drive under mergerfs on 2026-11-01; the stall has not been re-measured on that layout
+(Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` re-measures).
 
 Against the 4229a205d record (c-4m7d): Q_pp pp512 30.9 ± 29.39 -> 76.5 ± 0.17, because the straddle is gone and the
 ring engages on the first context with no loan (`llama.cpp-86bl`, `llama.cpp-384v`); pp2048 66.5 -> 75.7; Q_pp_ub2048
