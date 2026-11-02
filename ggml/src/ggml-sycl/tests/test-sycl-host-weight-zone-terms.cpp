@@ -34,7 +34,9 @@
 // Arm 2 (the census) constructs device 0's cache, configures the host zones from that plan, and makes every planned
 // WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through
 // the loader's own buffer type. Each allocation is classed by the call that made it, and its owner metadata must
-// agree with that class. Every byte the zone gains belongs to a named term or to unplanned loader residency, which
+// agree with that class. Metadata separates host_weights from the HOST_COMPUTE tenants; the reserve and unplanned
+// loader residency come from one buffer type with one request shape, so between those two the call alone attributes
+// the bytes. Every byte the zone gains belongs to a named term or to unplanned loader residency, which
 // is reported on its own line; any other byte fails. The terms stay within their bytes and the zone does not grow for
 // them. It needs a device, so a host without one exits 77 after arm 1 has passed.
 
@@ -432,6 +434,9 @@ const char * weight_class_name(weight_class cls) {
 
 // Whether an allocation's owner metadata is what its origin's request makes. The class comes from the call the census
 // made; metadata that disagrees with it means the allocation is not what that origin allocates, and it has no class.
+// The metadata separates host_weights from the HOST_COMPUTE tenants only: with weights evictable the reserve and the
+// loader's buffer both carry role WEIGHT, category HOST_COMPUTE and cohort "backend_host_buffer", because both come
+// from the SYCL_Host buffer type, so between those two classes the call alone attributes the bytes.
 bool metadata_fits(weight_class cls, const alloc_metadata & md) {
     switch (cls) {
         case weight_class::HOST_WEIGHTS:
