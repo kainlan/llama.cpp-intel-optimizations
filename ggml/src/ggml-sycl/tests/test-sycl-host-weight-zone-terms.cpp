@@ -48,7 +48,8 @@
 //
 // Arm 1b (no device) re-backs one host expert FILE_MAPPED and another CPU_OWNED on the single-device plan and asserts
 // that neither one's bytes reach host_weights, blocks or tlsf_bound, while host_weights still equals the plan's
-// weight_host_bytes.
+// weight_host_bytes. It then re-backs a third without moving its charge, and the two figures must differ: the positive
+// control of the comparison the [HOST-PLAN-BUG] WARN makes.
 
 #include "../common.hpp"
 #include "../ggml-sycl-test.hpp"
@@ -363,7 +364,8 @@ void check_weight_zone(const char *           builder,
     check(t.blocks >= n_expert_entries, "every routed expert is host-resident under the 1 MiB budget");
     check(t.host_weights > 0, "the plan placed weights on the host");
     // The [HOST-PLAN-BUG] WARN fires exactly when the entries and the plan's running total disagree. Both builders'
-    // figures agree on this fixture, so each is a negative control of the WARN.
+    // figures agree on this fixture, so each is a negative control of the WARN; arm 1b's mis-charged plan is the
+    // comparison's positive control.
     const bool figures_differ = t.host_weights != plan.weight_host_bytes;
     std::printf("  [HOST-PLAN-BUG] control: figures %s, WARN %s\n", figures_differ ? "differ" : "agree",
                 warned ? "logged" : "silent");
@@ -510,6 +512,26 @@ void arm1b_walk_counts_only_weight_zone_backings(const placement_plan & built) {
     std::printf("  [HOST-PLAN-BUG] comparison on the re-backed plan: figures %s\n", figures);
     check_eq("host_weights == weight_host_bytes on the re-backed plan, so the WARN stays silent", terms.host_weights,
              plan.weight_host_bytes);
+
+    // The comparison's positive control, which needs no planner defect: re-back one more host expert without moving
+    // its charge, the mistake the WARN exists to catch, and the two figures must differ. The expert is restored after.
+    placement_entry * mis_charged = nullptr;
+    for (placement_entry & e : plan.entries) {
+        if (!e.on_device && e.expert_id >= 0 && e.host_backing == placement_host_backing::PINNED) {
+            mis_charged = &e;
+            break;
+        }
+    }
+    bool mis_charged_differs = false;
+    if (mis_charged != nullptr) {
+        mis_charged->host_backing = placement_host_backing::FILE_MAPPED;
+        const size_t walked       = placement_plan_host_weight_zone_terms(plan).host_weights;
+        mis_charged->host_backing = placement_host_backing::PINNED;
+        mis_charged_differs       = walked != plan.weight_host_bytes;
+    }
+    std::printf("  [HOST-PLAN-BUG] comparison on a mis-charged plan: figures %s\n",
+                mis_charged_differs ? "differ" : "agree");
+    check(mis_charged_differs, "a host expert re-backed without moving its charge makes the figures differ");
 }
 
 // --- arm 2: the census ---
