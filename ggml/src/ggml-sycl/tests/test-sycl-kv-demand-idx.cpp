@@ -84,12 +84,13 @@ static void test_demand_adds_the_indexer_to_every_kv_layer() {
 }
 
 static void test_zero_width_is_the_old_size() {
-    printf("(b) a model with no indexer (width 0) demands exactly kv_size_for_layer\n");
+    printf("(b) no indexer (width 0): no layer has indexer keys, and the demand is the K/V buffer alone\n");
     const placement_plan plan = make_qwen_plan(0);
     for (uint32_t il = 0; il < 48; ++il) {
         char label[64];
         snprintf(label, sizeof(label), "layer %u", il);
-        check_eq(label, plan.kv_demand_for_layer(il), plan.kv_size_for_layer(il));
+        check_eq(label, plan.kv_idx_size_for_layer(il), 0);
+        check_eq(label, plan.kv_demand_for_layer(il), plan.kv_main_size_for_layer(il));
     }
     check_eq("layer 3", plan.kv_demand_for_layer(3), 512 * MiB);
 }
