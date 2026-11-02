@@ -25,8 +25,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
 
+# One lexer for every pass: a raw string (whose body may hold quotes and newlines), a string, a char literal, a line
+# comment, a block comment. Scanning left to right, a quote inside a char literal or a raw string opens nothing.
 _LEXEME_RE = re.compile(
-    r'"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|//[^\n]*" r"|/\*.*?\*/",
+    r'\b(?:u8|u|U|L)?R"(?P<delim>[^ ()\\\t\n]{0,16})\((?P<raw>.*?)\)(?P=delim)"'
+    r'|"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|//[^\n]*" r"|/\*.*?\*/",
     flags=re.DOTALL,
 )
 
@@ -34,7 +37,7 @@ _LEXEME_RE = re.compile(
 def strip_comments(src: str) -> str:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
-        if tok[0] in "\"'":
+        if m.group("delim") is not None or tok[0] in "\"'":
             return tok
         return "\n" * tok.count("\n")
 
@@ -113,12 +116,22 @@ def without(text: str, bodies: list) -> str:
     return text
 
 
-_STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"')
-
-
 def blank_string_literals(text: str) -> str:
-    """Keeps each string literal's quotes and blanks its inside, so lengths and line numbers are unchanged."""
-    return _STRING_RE.sub(lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', text)
+    """Keeps each string literal's delimiters and blanks its inside, so lengths and line numbers are unchanged.
+
+    Built on the same lexer as strip_comments, so a char literal (even `'"'`) is left alone and a raw string's body is
+    blanked whole."""
+
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if m.group("delim") is not None:
+            start, end = m.start("raw") - m.start(), m.end("raw") - m.start()
+            return tok[:start] + re.sub(r"[^\n]", " ", tok[start:end]) + tok[end:]
+        if tok[0] == '"':
+            return '"' + " " * (len(tok) - 2) + '"'
+        return tok
+
+    return _LEXEME_RE.sub(repl, text)
 
 
 def host_term_writes(text: str) -> list:
@@ -314,6 +327,20 @@ def test_the_write_scanner_ignores_a_label_inside_a_string():
     assert ("weight_host_bytes", "=", "%zu") in found, found
     assert ("host_cpu_owned_bytes", "=", "7") in found, found
     assert blank_string_literals('a("x\\n")\nb').count("\n") == 1
+
+
+def test_the_write_scanner_sees_a_write_after_a_quote_char_or_a_raw_string():
+    # A quote character inside a char literal opens no string, so the write after it stays visible.
+    after_char = "if (c == '\"') weight_host_bytes = 5; log(\"x\");"
+    assert ("weight_host_bytes", "=", "5") in host_term_writes(blank_string_literals(after_char))
+    # A quote inside a raw string closes nothing, so the write after the raw string stays visible. The trailing string
+    # is what a quote-pairing blanker would pair the stray quote with, hiding the write between them.
+    after_raw = 'auto s = R"(a"b)"; weight_host_bytes = 5; log("x");'
+    assert ("weight_host_bytes", "=", "5") in host_term_writes(blank_string_literals(after_raw))
+    # A label inside a raw string is not a write, and blanking a raw string keeps its line count.
+    raw_label = 'log(R"x(host_cpu_owned_bytes = 7;\n)x");'
+    assert host_term_writes(blank_string_literals(raw_label)) == []
+    assert blank_string_literals('R"(a\nb)"\nc').count("\n") == 2
 
 
 if __name__ == "__main__":
