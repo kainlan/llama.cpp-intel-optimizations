@@ -791,10 +791,12 @@ The NAS backup of the pre-move layout is `/Storage/GenAI/models-backup-2026-11-0
 
 Placement on the host at the time of writing:
 
-- **NVMe:** both Qwen3.8-Flash-Next GGUFs (Q8_0 and GSQ-RCO IQ3_XXS), Mistral, GPT-OSS 20B, gemma4 and the
-  small Qwen models.
-- **UGREEN:** gpt-oss-120b, the Qwen1.5-MoE files and DeepSeek-V4-Flash.
-- **T7:** DeepSeek-V4.1-Flash.
+- **NVMe:** both Qwen3.8-Flash-Next GGUFs (Q8_0 and GSQ-RCO IQ3_XXS), the Mistral files, GPT-OSS 20B
+  (`gpt-oss-20b-mxfp4.gguf`), gemma4 (`gemma-4-12b-it-GGUF`, `stock-gemma-4-E4B-it.Q8_0.gguf`), Qwen3.5-9B,
+  Qwen3-14B, Qwen3.6-27B and `qwen36-35b-a3b-nvfp4`.
+- **UGREEN:** gpt-oss-120b, the three Qwen1.5-MoE files, DeepSeek-V4-Flash-0731-GGUF,
+  DeepSeek-V4.1-Flash-HF-dspark, Llama-3.1-8B-Instruct-GGUF and Qwen3.8-Flash-Next-MTP.
+- **T7:** DeepSeek-V4.1-Flash-GGUF.
 
 A `/models` path says nothing about its branch. Check with `getfattr --only-values -n user.mergerfs.fullpath <file>`
 before making any storage claim. `df` on a `/models` path reports the pool, never the branch.
