@@ -1523,17 +1523,28 @@ struct placement_plan {
         }
 
         const size_t charge = e.vram_charge_size != 0 ? e.vram_charge_size : placement_vram_charge_bytes(e.dst_size);
+        // A FILE_MAPPED entry's file bytes are a staging source exactly while it is device-planned. Only e changes
+        // here, so moving its src_size in or out keeps host_mapped_source_bytes equal to a recount in O(1); the
+        // expert loan/refill transaction calls this per move. The builders' recount before the Totals stays the
+        // authority.
+        const bool   mapped = e.host_backing == placement_host_backing::FILE_MAPPED;
 
         if (e.on_device && !on_device) {
             saturating_sub(weight_vram_bytes, charge);
             saturating_sub(vram_bytes, charge + e.kv_size);
             charge_host_weight(e.host_backing, e.dst_size);
             host_bytes += e.kv_size;
+            if (mapped) {
+                saturating_sub(host_mapped_source_bytes, e.src_size);
+            }
         } else if (!e.on_device && on_device) {
             uncharge_host_weight(e.host_backing, e.dst_size);
             saturating_sub(host_bytes, e.kv_size);
             weight_vram_bytes += charge;
             vram_bytes += charge + e.kv_size;
+            if (mapped) {
+                host_mapped_source_bytes += e.src_size;
+            }
         }
 
         auto group_it = expert_groups_.find(expert_residency_group_key(layer_id, role));
@@ -1551,10 +1562,6 @@ struct placement_plan {
 
         e.on_device     = on_device;
         e.target_device = target;
-        // Only a FILE_MAPPED entry's move can change the staging sources, and the recount walks every entry.
-        if (e.host_backing == placement_host_backing::FILE_MAPPED) {
-            recount_host_mapped_source_bytes();
-        }
 
         if (!on_device) {
             expert_device[layer_id][expert_id] = -1;

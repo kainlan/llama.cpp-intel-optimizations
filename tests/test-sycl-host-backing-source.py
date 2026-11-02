@@ -183,7 +183,16 @@ def test_update_expert_placement_moves_bytes_through_the_helpers():
     body = function_body(hpp, r"bool\s+update_expert_placement\s*\(")
     assert re.search(r"\bcharge_host_weight\s*\(\s*e\s*\.\s*host_backing", body), "demotion does not charge by backing"
     assert re.search(r"\buncharge_host_weight\s*\(\s*e\s*\.\s*host_backing", body), "promotion does not uncharge by backing"
-    assert re.search(r"recount_host_mapped_source_bytes\s*\(", body), "the mapped-source term is not re-derived"
+    # The expert loan/refill transaction calls this per move, so it stays O(1): only e changes, and a FILE_MAPPED
+    # entry's file bytes leave the staging sources on demotion and return on promotion. The builders' recount before
+    # the Totals stays the authority.
+    assert not re.search(r"recount_host_mapped_source_bytes\s*\(", body), "a per-move recount walks every entry"
+    assert re.search(
+        r"saturating_sub\s*\(\s*host_mapped_source_bytes\s*,\s*e\s*\.\s*src_size\s*\)", body
+    ), "demotion does not take the mapped expert's file bytes out of the staging sources"
+    assert re.search(
+        r"host_mapped_source_bytes\s*\+=\s*e\s*\.\s*src_size\s*;", body
+    ), "promotion does not return the mapped expert's file bytes to the staging sources"
 
 
 def test_both_builders_recount_the_mapped_sources_before_the_totals():
