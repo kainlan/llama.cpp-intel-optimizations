@@ -252,6 +252,7 @@ struct prefetch_result {
     int64_t shared_begin_max    = 0;   // the page holding A's tail and the lazy range's first byte
     int64_t shared_end_max      = 0;   // the page holding the lazy range's last byte and B's head
     bool    neighbours_ready    = false;
+    int     probe_errors        = 0;   // samples where cachestat or its fallback failed: they hide a resident page
     double  seconds_to_interior = -1;  // when the interior first read resident
 };
 
@@ -279,11 +280,15 @@ static prefetch_result run_prefetch(int fd, const llama_mmap::ranges & ranges, b
         int        ready_ms = -1;
         for (int ms = 0; ms < 10000; ms += 50) {
             sleep_ms(50);
+            // one sample of the lazy pages and the two shared pages; a failed probe reads -1, which the maxima
+            // would swallow as 0, so it is counted and reported
             const int64_t interior = resident_pages(fd, P_FILE_SIZE, interior_off, interior_len);
-            res.interior_max       = std::max(res.interior_max, interior);
-            res.shared_begin_max =
-                std::max(res.shared_begin_max, resident_pages(fd, P_FILE_SIZE, shared_begin, g_page));
-            res.shared_end_max = std::max(res.shared_end_max, resident_pages(fd, P_FILE_SIZE, shared_end, g_page));
+            const int64_t sb       = resident_pages(fd, P_FILE_SIZE, shared_begin, g_page);
+            const int64_t se       = resident_pages(fd, P_FILE_SIZE, shared_end, g_page);
+            res.probe_errors += (interior < 0) + (sb < 0) + (se < 0);
+            res.interior_max     = std::max(res.interior_max, interior);
+            res.shared_begin_max = std::max(res.shared_begin_max, sb);
+            res.shared_end_max   = std::max(res.shared_end_max, se);
             if (interior > 0 && res.seconds_to_interior < 0) {
                 res.seconds_to_interior = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 if (stop_on_interior) {
@@ -291,8 +296,10 @@ static prefetch_result run_prefetch(int fd, const llama_mmap::ranges & ranges, b
                 }
             }
             // the neighbours are prefetched right up to the shared pages: the page before and the page after them
-            const bool ready = resident_pages(fd, P_FILE_SIZE, shared_begin - g_page, g_page) == 1 &&
-                               resident_pages(fd, P_FILE_SIZE, shared_end + g_page, g_page) == 1;
+            const int64_t before = resident_pages(fd, P_FILE_SIZE, shared_begin - g_page, g_page);
+            const int64_t after  = resident_pages(fd, P_FILE_SIZE, shared_end + g_page, g_page);
+            res.probe_errors += (before < 0) + (after < 0);
+            const bool ready = before == 1 && after == 1;
             if (ready && ready_ms < 0) {
                 ready_ms = ms;
             }
@@ -328,6 +335,14 @@ static int prefetch_arm(int * skip) {
             "(want 0 0), neighbours prefetched %d (want 1)\n",
             (long long) prod.interior_max, (long long) prod.shared_begin_max, (long long) prod.shared_end_max,
             (int) prod.neighbours_ready);
+        if (prod.probe_errors != 0) {
+            // an intermittent probe error hides the samples that matter, so it can never read as a pass
+            std::fprintf(stderr,
+                         "SKIP: prefetch arm: the residency probe (cachestat) failed in %d samples, so a zero proves "
+                         "nothing\n",
+                         prod.probe_errors);
+            ++*skip;
+        }
         if (prod.interior_max != 0) {
             std::fprintf(stderr, "FAIL: prefetch arm: the mapping brought the lazy interior into the page cache\n");
             ++fail;
