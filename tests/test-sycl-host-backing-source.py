@@ -25,8 +25,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
 
+# One lexer for every pass: a raw string (whose body may hold quotes and newlines), a string, a char literal, a line
+# comment, a block comment. Scanning left to right, a quote inside a char literal or a raw string opens nothing.
 _LEXEME_RE = re.compile(
-    r'"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|//[^\n]*" r"|/\*.*?\*/",
+    r'\b(?:u8|u|U|L)?R"(?P<delim>[^ ()\\\t\n]{0,16})\((?P<raw>.*?)\)(?P=delim)"'
+    r'|"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|//[^\n]*" r"|/\*.*?\*/",
     flags=re.DOTALL,
 )
 
@@ -34,7 +37,7 @@ _LEXEME_RE = re.compile(
 def strip_comments(src: str) -> str:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
-        if tok[0] in "\"'":
+        if m.group("delim") is not None or tok[0] in "\"'":
             return tok
         return "\n" * tok.count("\n")
 
@@ -113,6 +116,24 @@ def without(text: str, bodies: list) -> str:
     return text
 
 
+def blank_string_literals(text: str) -> str:
+    """Keeps each string literal's delimiters and blanks its inside, so lengths and line numbers are unchanged.
+
+    Built on the same lexer as strip_comments, so a char literal (even `'"'`) is left alone and a raw string's body is
+    blanked whole."""
+
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if m.group("delim") is not None:
+            start, end = m.start("raw") - m.start(), m.end("raw") - m.start()
+            return tok[:start] + re.sub(r"[^\n]", " ", tok[start:end]) + tok[end:]
+        if tok[0] == '"':
+            return '"' + " " * (len(tok) - 2) + '"'
+        return tok
+
+    return _LEXEME_RE.sub(repl, text)
+
+
 def host_term_writes(text: str) -> list:
     """Every write to one of the host terms: `+=`, `-=`, a plain `=` and saturating_sub on it."""
     pat = rf"\b({'|'.join(HOST_TERMS)})\b\s*(\+=|-=|=(?!=))\s*([^;]*);"
@@ -126,7 +147,8 @@ def test_only_the_helpers_write_the_host_terms():
     hpp = read(HPP)
     cpp = read(CPP)
     for rel, text in ((HPP, without(hpp, helper_bodies(hpp))), (CPP, cpp)):
-        stray = [w for w in host_term_writes(text) if not (w[1] == "=" and w[2] == "0")]
+        # A printf label is not a write: the write scan blanks string-literal contents first.
+        stray = [w for w in host_term_writes(blank_string_literals(text)) if not (w[1] == "=" and w[2] == "0")]
         assert not stray, f"{rel}: a host term is written outside charge_host_weight/uncharge_host_weight: {stray}"
 
 
@@ -161,7 +183,16 @@ def test_update_expert_placement_moves_bytes_through_the_helpers():
     body = function_body(hpp, r"bool\s+update_expert_placement\s*\(")
     assert re.search(r"\bcharge_host_weight\s*\(\s*e\s*\.\s*host_backing", body), "demotion does not charge by backing"
     assert re.search(r"\buncharge_host_weight\s*\(\s*e\s*\.\s*host_backing", body), "promotion does not uncharge by backing"
-    assert re.search(r"recount_host_mapped_source_bytes\s*\(", body), "the mapped-source term is not re-derived"
+    # The expert loan/refill transaction calls this per move, so it stays O(1): only e changes, and a FILE_MAPPED
+    # entry's file bytes leave the staging sources on demotion and return on promotion. The builders' recount before
+    # the Totals stays the authority.
+    assert not re.search(r"recount_host_mapped_source_bytes\s*\(", body), "a per-move recount walks every entry"
+    assert re.search(
+        r"saturating_sub\s*\(\s*host_mapped_source_bytes\s*,\s*e\s*\.\s*src_size\s*\)", body
+    ), "demotion does not take the mapped expert's file bytes out of the staging sources"
+    assert re.search(
+        r"host_mapped_source_bytes\s*\+=\s*e\s*\.\s*src_size\s*;", body
+    ), "promotion does not return the mapped expert's file bytes to the staging sources"
 
 
 def test_both_builders_recount_the_mapped_sources_before_the_totals():
@@ -177,17 +208,41 @@ def test_both_builders_recount_the_mapped_sources_before_the_totals():
 # ---- 3. the readers ----
 
 
+MAKE_CANDIDATE_SIGNATURE = r"std::shared_ptr<const\s+lifecycle_plan_snapshot>\s+lifecycle_make_candidate_snapshot\s*\("
+
+
+def staged_candidate_problems(make_body: str) -> list:
+    """What is wrong with the candidate builder's host figures. The stage and the probe both build their candidate
+    through lifecycle_make_candidate_snapshot, so that helper is the one writer of a candidate's host bytes."""
+    problems = []
+    if not re.search(
+        r"snapshot\s*->\s*planned_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
+        make_body,
+    ):
+        problems.append("the staged candidate's planned_host_bytes is not the placed figure")
+    if not re.search(
+        r"snapshot\s*->\s*charged_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*charged_host_weight_bytes\s*\(\s*\)\s*;",
+        make_body,
+    ):
+        problems.append("the staged candidate does not carry the charged figure")
+    if "weight_host_bytes" in make_body:
+        problems.append("the candidate builder still reads weight_host_bytes")
+    return problems
+
+
 def test_the_snapshot_planned_host_bytes_is_the_placed_figure():
     cpp = read(CPP)
     stage = function_body(cpp, r"void\s+lifecycle_stage_placement_plan\s*\(")
-    assert re.search(
-        r"snapshot\s*->\s*planned_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
-        stage,
-    ), "the staged candidate's planned_host_bytes is not the placed figure"
-    assert re.search(
-        r"snapshot\s*->\s*charged_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*charged_host_weight_bytes\s*\(\s*\)\s*;",
-        stage,
-    ), "the staged candidate does not carry the charged figure"
+    probe = function_body(cpp, r"void\s+lifecycle_stage_probe_placement_plan\s*\(")
+    make = function_body(cpp, MAKE_CANDIDATE_SIGNATURE)
+    problems = staged_candidate_problems(make)
+    assert not problems, problems
+    # one source: the stage and the load-time measure's probe both build their candidate through the helper
+    # (tests/test-sycl-tiered-verdict-contract.py reads the same helper for the same fact)
+    for name, body in (("lifecycle_stage_placement_plan", stage), ("lifecycle_stage_probe_placement_plan", probe)):
+        assert re.search(r"\blifecycle_make_candidate_snapshot\s*\(", body), (
+            f"{name} does not build its candidate through lifecycle_make_candidate_snapshot"
+        )
     publish = function_body(cpp, r"bool\s+lifecycle_publish_placement_plan\s*\(")
     assert re.search(
         r"published\s*->\s*planned_host_bytes\s*=\s*published\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
@@ -248,6 +303,19 @@ def test_the_refresh_counts_cpu_owned_and_not_mapped():
 # ---- positive controls ----
 
 
+def test_the_candidate_clause_rejects_the_old_figure():
+    make = function_body(read(CPP), MAKE_CANDIDATE_SIGNATURE)
+    placed = re.search(
+        r"snapshot\s*->\s*planned_host_bytes\s*=\s*snapshot\s*->\s*plan\s*->\s*placed_host_weight_bytes\s*\(\s*\)\s*;",
+        make,
+    )
+    assert placed, "the control has no placed-figure assignment to replace"
+    old = make.replace(placed.group(0), "snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;")
+    problems = staged_candidate_problems(old)
+    assert "the staged candidate's planned_host_bytes is not the placed figure" in problems, problems
+    assert "the candidate builder still reads weight_host_bytes" in problems, problems
+
+
 def test_the_write_scanner_sees_a_planted_write():
     planted = "plan.weight_host_bytes += entry.dst_size; saturating_sub(host_mapped_bytes, 4); host_cpu_owned_bytes = 7;"
     found = host_term_writes(planted)
@@ -256,6 +324,32 @@ def test_the_write_scanner_sees_a_planted_write():
     assert ("host_cpu_owned_bytes", "=", "7") in found, found
     assert host_term_writes("plan.weight_host_bytes = 0;") == [("weight_host_bytes", "=", "0")]
     assert host_term_writes("if (a.weight_host_bytes == 0) {}") == []
+    # the blanking the real scan applies does not hide a write in code
+    assert host_term_writes(blank_string_literals(planted)) == found
+
+
+def test_the_write_scanner_ignores_a_label_inside_a_string():
+    quoted = 'snprintf(text, n, "weight_host_bytes=%zu", x); log("host_cpu_owned_bytes = 7");'
+    assert host_term_writes(blank_string_literals(quoted)) == []
+    bare = "weight_host_bytes=%zu; host_cpu_owned_bytes = 7;"
+    found = host_term_writes(blank_string_literals(bare))
+    assert ("weight_host_bytes", "=", "%zu") in found, found
+    assert ("host_cpu_owned_bytes", "=", "7") in found, found
+    assert blank_string_literals('a("x\\n")\nb').count("\n") == 1
+
+
+def test_the_write_scanner_sees_a_write_after_a_quote_char_or_a_raw_string():
+    # A quote character inside a char literal opens no string, so the write after it stays visible.
+    after_char = "if (c == '\"') weight_host_bytes = 5; log(\"x\");"
+    assert ("weight_host_bytes", "=", "5") in host_term_writes(blank_string_literals(after_char))
+    # A quote inside a raw string closes nothing, so the write after the raw string stays visible. The trailing string
+    # is what a quote-pairing blanker would pair the stray quote with, hiding the write between them.
+    after_raw = 'auto s = R"(a"b)"; weight_host_bytes = 5; log("x");'
+    assert ("weight_host_bytes", "=", "5") in host_term_writes(blank_string_literals(after_raw))
+    # A label inside a raw string is not a write, and blanking a raw string keeps its line count.
+    raw_label = 'log(R"x(host_cpu_owned_bytes = 7;\n)x");'
+    assert host_term_writes(blank_string_literals(raw_label)) == []
+    assert blank_string_literals('R"(a\nb)"\nc').count("\n") == 2
 
 
 if __name__ == "__main__":

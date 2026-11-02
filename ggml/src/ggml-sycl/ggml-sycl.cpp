@@ -1262,12 +1262,22 @@ static void ggml_sycl_log_load_summary(int          device,
         actual_weights                    = state.have_actual_weights;
     }
 
-    auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!actual_weights && cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        const auto   plan_owner = ggml_sycl_cache_plan_owner(cache);
-        const auto & plan       = *plan_owner;
-        weight_device_bytes     = plan.weight_vram_bytes;
-        weight_host_bytes       = plan.weight_host_bytes;
+    // The plan's host weights, both ways (design 5efe §4.4): placed on host, which the tiering verdict reads, and
+    // charged, which the host ledger reads. They differ by the file-mapped weights, so one number would read as the
+    // other.
+    size_t host_placed_bytes  = 0;
+    size_t host_charged_bytes = 0;
+    auto * cache              = ggml_sycl::get_unified_cache_for_device(device);
+    if (cache) {
+        const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+        if (plan_owner && !plan_owner->entries.empty()) {
+            host_placed_bytes  = plan_owner->placed_host_weight_bytes();
+            host_charged_bytes = plan_owner->charged_host_weight_bytes();
+            if (!actual_weights) {
+                weight_device_bytes = plan_owner->weight_vram_bytes;
+                weight_host_bytes   = host_placed_bytes;
+            }
+        }
     }
 
     const char * weight_basis   = actual_weights ? "actual" : "planned";
@@ -1277,17 +1287,18 @@ static void ggml_sycl_log_load_summary(int          device,
     const size_t onednn_weights = cache ? cache->onednn_weights_scratch_size() : 0;
     const size_t onednn_acts    = cache ? cache->onednn_activations_scratch_size() : 0;
 
-    char summary[512];
+    char summary[640];
     snprintf(
         summary, sizeof(summary),
         "[LOAD-SUMMARY] Device %d: weights=%s %.1f MB device / %.1f MB host (%zu device / %zu host, %.1f MB total), "
+        "planned weights=%.1f MB host placed / %.1f MB host charged, "
         "kv=%s %.1f MB device / %.1f MB host (%u device layers / %u host layers, %.1f MB total), "
         "oneDNN scratch=%s (weights=%.1f MB, activations=%.1f MB)\n",
         device, weight_basis, weight_device_bytes / (1024.0 * 1024.0), weight_host_bytes / (1024.0 * 1024.0),
-        weight_device_count, weight_host_count, weight_total / (1024.0 * 1024.0), kv_basis,
-        kv_device_bytes / (1024.0 * 1024.0), kv_host_bytes / (1024.0 * 1024.0), kv_device_layers, kv_host_layers,
-        kv_total / (1024.0 * 1024.0), onednn_source, onednn_weights / (1024.0 * 1024.0),
-        onednn_acts / (1024.0 * 1024.0));
+        weight_device_count, weight_host_count, weight_total / (1024.0 * 1024.0), host_placed_bytes / (1024.0 * 1024.0),
+        host_charged_bytes / (1024.0 * 1024.0), kv_basis, kv_device_bytes / (1024.0 * 1024.0),
+        kv_host_bytes / (1024.0 * 1024.0), kv_device_layers, kv_host_layers, kv_total / (1024.0 * 1024.0),
+        onednn_source, onednn_weights / (1024.0 * 1024.0), onednn_acts / (1024.0 * 1024.0));
 
     GGML_LOG_INFO("%s", summary);
     if (ggml_sycl_layout_summary_enabled()) {
@@ -12980,6 +12991,7 @@ static ggml_sycl::lifecycle::publication_data ggml_sycl_lifecycle_publication_fr
     const ggml_sycl::lifecycle_plan_snapshot & snapshot) {
     ggml_sycl::lifecycle::publication_data data;
     data.planned_host_bytes = snapshot.planned_host_bytes;
+    data.charged_host_bytes = snapshot.charged_host_bytes;
     data.actual_host_bytes  = snapshot.actual_host_bytes;
     switch (snapshot.verdict) {
         case ggml_sycl::lifecycle_plan_verdict::DEVICE:
@@ -14117,7 +14129,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         const auto publication = ggml_sycl_lifecycle_publication_from_plan(*plan_snapshot);
         auto       state  = std::make_shared<const ggml_sycl::lifecycle::ModelState>(ggml_sycl::lifecycle::ModelState{
             ticket.token, ggml_sycl::lifecycle::model_phase::LIVE, publication.planned_host_bytes,
-            publication.actual_host_bytes, publication.verdict });
+            publication.charged_host_bytes, publication.actual_host_bytes, publication.verdict });
         // Three-phase commit: prepare_end reserved the COMMITTING token and all
         // fallible publication state above; publish cache-first/global-last
         // while waiters still observe COMMITTING; only finalize_end makes LIVE
@@ -15914,12 +15926,13 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
     // llama.cpp-p6i0, for the compute trace: the placement each stage's measure runs over, so a difference between
     // the stages' compute terms can be read against what the plan put on the host.
     GGML_LOG_INFO(
-        "[LOAD-PLAN] measure plan override: load %llu stage %s: weights %.1f MiB device, %.1f MiB host; "
-        "kv %.1f MiB device, %.1f MiB host; kv n_ctx %u n_ubatch %u\n",
+        "[LOAD-PLAN] measure plan override: load %llu stage %s: weights %.1f MiB device, %.1f MiB host placed "
+        "(%.1f MiB host charged); kv %.1f MiB device, %.1f MiB host; kv n_ctx %u n_ubatch %u\n",
         (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage),
-        snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0, snapshot->plan->weight_host_bytes / 1024.0 / 1024.0,
-        snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0, snapshot->plan->kv_host_bytes / 1024.0 / 1024.0,
-        snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
+        snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0,
+        snapshot->plan->placed_host_weight_bytes() / 1024.0 / 1024.0,
+        snapshot->plan->charged_host_weight_bytes() / 1024.0 / 1024.0, snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0,
+        snapshot->plan->kv_host_bytes / 1024.0 / 1024.0, snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
     g_measure_plan_override = std::move(snapshot);
     return true;
 }

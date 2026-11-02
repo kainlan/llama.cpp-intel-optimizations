@@ -181,6 +181,11 @@ static void test_a_group_is_charged_per_entry() {
     check_eq("none charged: host_bytes stays 0", none_charged.host_bytes, 0);
     check_eq("none charged: mapped", none_charged.host_mapped_bytes, 109 * MiB);
 
+    // an empty group charges no bytes, so it takes none of the figure either
+    placement_plan empty = plan;
+    empty.charge_host_weight_entries({}, placement_size_basis::DST, 999);
+    check_eq("empty group: host_bytes stays 0", empty.host_bytes, 0);
+
     // a mixed group: the charged share of the caller's figure (20 of 40 bytes is charged -> 500 of 1000)
     placement_plan half{};
     half.entries.push_back(make_entry("p", 20, 20, placement_host_backing::PINNED, false));
@@ -202,6 +207,10 @@ static void test_the_refresh_counts_cpu_owned_and_not_mapped() {
     plan.layer_k_width.assign(2, 64);
     plan.layer_v_width.assign(2, 64);
     plan.planner_n_ctx = 1024;
+    // The planner records every layer's KV owner and writes -1 for a host layer; kv_layer_count() counts the
+    // layers from those records, so a layer without one has no KV to total.
+    plan.kv_device[0]  = -1;
+    plan.kv_device[1]  = -1;
     plan.charge_host_weight(placement_host_backing::PINNED, 10 * MiB);
     plan.charge_host_weight(placement_host_backing::CPU_OWNED, 4 * MiB);
     plan.charge_host_weight(placement_host_backing::FILE_MAPPED, 500 * MiB);
@@ -231,8 +240,11 @@ static void test_an_expert_moving_between_tiers_follows_its_backing() {
     const placement_host_backing all[] = { placement_host_backing::PINNED, placement_host_backing::HOST_CPU,
                                            placement_host_backing::CPU_OWNED, placement_host_backing::FILE_MAPPED };
     for (placement_host_backing b : all) {
+        // src != dst pins the basis: the device side charges the materialized layout (dst, through
+        // vram_charge_size), and the host side charges the file bytes the host executes (src), as the MoE host
+        // group does.
         placement_plan plan{};
-        plan.entries.push_back(make_entry("blk.0.ffn_gate_exps.weight", 80 * MiB, 80 * MiB, b, true, 0, 5));
+        plan.entries.push_back(make_entry("blk.0.ffn_gate_exps.weight", 64 * MiB, 80 * MiB, b, true, 0, 5));
         plan.entries[0].vram_charge_size = 80 * MiB;
         plan.entries[0].target_device    = 0;
         plan.weight_vram_bytes           = 80 * MiB;
@@ -241,11 +253,11 @@ static void test_an_expert_moving_between_tiers_follows_its_backing() {
         plan.recount_host_mapped_source_bytes();
         const bool mapped = b == placement_host_backing::FILE_MAPPED;
         check_eq("on device: no host weight", plan.placed_host_weight_bytes(), 0);
-        check_eq("on device: the mapped source", plan.host_mapped_source_bytes, mapped ? 80 * MiB : 0);
+        check_eq("on device: the mapped source", plan.host_mapped_source_bytes, mapped ? 64 * MiB : 0);
 
         check_true("demote", plan.update_expert_placement(0, 5, expert_tensor_role::GATE, false, -1));
         check_eq("demoted: weight_vram", plan.weight_vram_bytes, 0);
-        const size_t host_expected = 80 * MiB;
+        const size_t host_expected = 64 * MiB;
         check_eq("demoted: placed", plan.placed_host_weight_bytes(), host_expected);
         check_eq("demoted: charged", plan.charged_host_weight_bytes(), mapped ? 0 : host_expected);
         check_eq("demoted: host_bytes", plan.host_bytes, mapped ? 0 : host_expected);
@@ -255,7 +267,7 @@ static void test_an_expert_moving_between_tiers_follows_its_backing() {
         check_eq("promoted: placed", plan.placed_host_weight_bytes(), 0);
         check_eq("promoted: host_bytes", plan.host_bytes, 0);
         check_eq("promoted: weight_vram", plan.weight_vram_bytes, 80 * MiB);
-        check_eq("promoted: the mapped source again", plan.host_mapped_source_bytes, mapped ? 80 * MiB : 0);
+        check_eq("promoted: the mapped source again", plan.host_mapped_source_bytes, mapped ? 64 * MiB : 0);
     }
 }
 
