@@ -6004,8 +6004,9 @@ static void ggml_sycl_configure_host_zones_for_plan(
             plan.pp_moe_onednn_weight_slot_bytes, plan.pp_moe_onednn_activation_slot_bytes,
             plan.pp_moe_onednn_output_slot_bytes, plan.pp_moe_onednn_ring_depth);
     }
-    // The pool grows by at most what the plan counted when it was made: its recorded terms, never this step's own
-    // recomputation, so a chunk committed here that the plan does not count is named (th32 §4.2, §10's ledger check).
+    // The pool grows by at most what the plan counts: its recorded terms, which a re-plan that moves a term re-records,
+    // never this step's own recomputation, so a chunk committed here that the plan does not count is named (th32 §4.2,
+    // §10's ledger check).
     (void) ggml_sycl::host_zone_commit_check(plan.device_id, plan.host_zone_terms.total(), committed_before,
                                              cache->pinned_pool_committed());
 

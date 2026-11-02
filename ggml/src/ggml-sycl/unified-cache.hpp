@@ -974,10 +974,20 @@ struct host_zone_commit_terms {
     size_t runtime  = 0;  // the RUNTIME pool: oneDNN scratchpad, DMA staging, PP pipeline and PP MoE oneDNN scratch
     size_t rounding = 0;  // the zones and the runtime bytes each grown to whole chunks, chunk headers included
 
+    // The inputs the terms were computed from, the live oneDNN scratch and the pool's chunk, so a re-plan re-records
+    // from the record's inputs and never from the cache's state at the re-plan.
+    size_t onednn_live = 0;
+    size_t chunk       = 0;
+
     size_t zones() const { return weight + kv + staging + scratch; }
 
     size_t total() const { return zones() + runtime + rounding; }
 };
+
+struct placement_plan;
+
+// Defined below the plan, with the commit terms it recomputes: the KV refresh inside placement_plan calls it.
+inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan);
 
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
@@ -1078,8 +1088,9 @@ struct placement_plan {
     size_t                       max_tensor_bytes         = 0;
     size_t                       max_staging_pair_bytes   = 0;
     // th32 §4.2: the ledger's stored budget when the plan was made, the host bytes the plan commits term by term (both
-    // planner builders record them after populate_host_zone_sizing), and the plan's host figure. The zone terms are all
-    // of host_planned_bytes until the lazy tables' terms join it, so the zone configuration checks its pool growth
+    // planner builders record them after populate_host_zone_sizing, and a re-plan that moves a zone term re-records
+    // them through placement_plan_rerecord_host_zone_terms), and the plan's host figure. The zone terms are all of
+    // host_planned_bytes until the lazy tables' terms join it, so the zone configuration checks its pool growth
     // against host_zone_terms, never against the sum.
     size_t                                     host_budget                = 0;
     size_t                                     host_planned_bytes         = 0;
@@ -1470,6 +1481,8 @@ struct placement_plan {
         vram_bytes += moe_stream_ring_reserve_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
+            // the KV zone grew past the plan's record, so the plan's host figures follow it (th32 §4.2)
+            placement_plan_rerecord_host_zone_terms(*this);
         }
     }
 
@@ -2052,11 +2065,61 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
 
 // The host bytes configuring `plan`'s zones commits on a fresh pinned pool of `chunk_bytes` chunks, with
-// `onednn_live_bytes` of oneDNN scratch already reserved (the SCRATCH zone's floor). All zero when the plan has no
-// entries, as the configure step then configures nothing.
-host_zone_commit_terms placement_plan_host_zone_commit_terms(const placement_plan & plan,
-                                                             size_t                 onednn_live_bytes,
-                                                             size_t                 chunk_bytes);
+// `onednn_live_bytes` of oneDNN scratch already reserved (the SCRATCH zone's floor), and those two inputs. All zero but
+// the inputs when the plan has no entries, as the configure step then configures nothing. Inline, as is the re-record
+// below it, because the KV refresh inside placement_plan re-records, and tests that use the plan without libggml-sycl
+// call that refresh.
+inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placement_plan & plan,
+                                                                    size_t                 onednn_live_bytes,
+                                                                    size_t                 chunk_bytes) {
+    constexpr size_t       k_min_kv_zone_bytes      = 64ull * 1024ull * 1024ull;
+    constexpr size_t       k_scratch_headroom_bytes = 32ull * 1024ull * 1024ull;
+    host_zone_commit_terms terms;
+    terms.onednn_live = onednn_live_bytes;
+    terms.chunk       = chunk_bytes;
+    // configuring a plan with no entries commits nothing: the configure step returns before it sizes a zone
+    if (plan.entries.empty() || chunk_bytes == 0) {
+        return terms;
+    }
+    const auto sat_add = [](size_t a, size_t b) {
+        return a > SIZE_MAX - b ? SIZE_MAX : a + b;
+    };
+    terms.weight  = plan.host_zone_weight_bytes;
+    terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
+    terms.staging = plan.host_zone_staging_bytes;
+    terms.scratch = std::max(plan.host_zone_scratch_bytes,
+                             sat_add(sat_add(onednn_live_bytes, plan.max_tensor_bytes), k_scratch_headroom_bytes));
+    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + plan.pp_pipeline_scratch_bytes +
+                    plan.pp_moe_onednn_scratch_bytes;
+    // The pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME chunks apart, in
+    // whole chunks, each backed by the chunk plus a header of that same alignment.
+    const size_t align    = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    const auto   align_up = [align](size_t bytes) {
+        return (bytes + align - 1) & ~(align - 1);
+    };
+    const auto chunks_for = [chunk_bytes](size_t bytes) {
+        return (bytes + chunk_bytes - 1) / chunk_bytes;
+    };
+    const size_t zone_bytes =
+        align_up(terms.weight) + align_up(terms.kv) + align_up(terms.staging) + align_up(terms.scratch);
+    const size_t n_chunks  = chunks_for(zone_bytes) + (terms.runtime > 0 ? chunks_for(terms.runtime) : 0);
+    const size_t committed = n_chunks * (chunk_bytes + align);
+    terms.rounding         = committed - terms.zones() - terms.runtime;
+    return terms;
+}
+
+// Re-records `plan`'s host figures after a re-plan moved one of its zone terms past the record (th32 §4.2): the commit
+// terms, from the inputs the record took, and their total, host_planned_bytes. Each writer that moves a term after the
+// record re-records what it moved: the KV refresh when it raises host_zone_kv_bytes, and the runtime MMID re-plan when
+// its host pool grows host_zone_scratch_bytes. Any other write after the record records nothing, so configuring that
+// plan names the bytes it does not count (§10's zone check). A plan never recorded holds no chunk, so its terms stay
+// empty. Nothing is logged: the would-refuse line is the planner pass's own, and the runtime transaction re-plans on
+// every probe.
+inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan) {
+    plan.host_zone_terms =
+        placement_plan_host_zone_commit_terms(plan, plan.host_zone_terms.onednn_live, plan.host_zone_terms.chunk);
+    plan.host_planned_bytes = plan.host_zone_terms.total();
+}
 
 // The zone configuration's ledger check (th32 §4.2, §10): the pool grew from committed_before to committed_after while
 // a plan counting planned_bytes was configured. Growth past the plan logs one [HOST-PLAN-BUG] naming the device, the

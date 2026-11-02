@@ -33064,6 +33064,8 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
                 return refuse(moe_mmid_runtime_reason::HOST_GROWTH_OVERFLOW);
             plan.host_zone_scratch_bytes += growth;
             plan.host_bytes += growth;
+            // the SCRATCH zone grew past the plan's record, so the plan's host figures follow it (th32 §4.2)
+            placement_plan_rerecord_host_zone_terms(plan);
         }
         plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
         plan.moe_mmid_device_pool_bytes = demand.moe_mmid_device_pool_bytes;
@@ -33221,41 +33223,6 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     return terms;
 }
 
-host_zone_commit_terms placement_plan_host_zone_commit_terms(const placement_plan & plan,
-                                                             size_t                 onednn_live_bytes,
-                                                             size_t                 chunk_bytes) {
-    constexpr size_t       k_min_kv_zone_bytes      = 64ull * 1024ull * 1024ull;
-    constexpr size_t       k_scratch_headroom_bytes = 32ull * 1024ull * 1024ull;
-    host_zone_commit_terms terms;
-    // configuring a plan with no entries commits nothing: the configure step returns before it sizes a zone
-    if (plan.entries.empty() || chunk_bytes == 0) {
-        return terms;
-    }
-    terms.weight  = plan.host_zone_weight_bytes;
-    terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
-    terms.staging = plan.host_zone_staging_bytes;
-    terms.scratch = std::max(
-        plan.host_zone_scratch_bytes,
-        host_ledger_sat_add(host_ledger_sat_add(onednn_live_bytes, plan.max_tensor_bytes), k_scratch_headroom_bytes));
-    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + plan.pp_pipeline_scratch_bytes +
-                    plan.pp_moe_onednn_scratch_bytes;
-    // The pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME chunks apart, in
-    // whole chunks, each backed by the chunk plus a header of that same alignment.
-    const size_t align    = pinned_chunk_pool::DEFAULT_ALIGNMENT;
-    const auto   align_up = [align](size_t bytes) {
-        return (bytes + align - 1) & ~(align - 1);
-    };
-    const auto chunks_for = [chunk_bytes](size_t bytes) {
-        return (bytes + chunk_bytes - 1) / chunk_bytes;
-    };
-    const size_t zone_bytes =
-        align_up(terms.weight) + align_up(terms.kv) + align_up(terms.staging) + align_up(terms.scratch);
-    const size_t n_chunks  = chunks_for(zone_bytes) + (terms.runtime > 0 ? chunks_for(terms.runtime) : 0);
-    const size_t committed = n_chunks * (chunk_bytes + align);
-    terms.rounding         = committed - terms.zones() - terms.runtime;
-    return terms;
-}
-
 bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_before, size_t committed_after) {
     const size_t committed = host_ledger_sat_sub(committed_after, committed_before);
     if (committed <= planned_bytes) {
@@ -33273,8 +33240,9 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
 // Records the plan's host figures (th32 §4.2): the stored budget it was made under, its commit terms and their total,
 // read once populate_host_zone_sizing() has set every term. One INFO line names them. A plan whose host bytes exceed
 // the budget logs one would-refuse WARN carrying each term and is kept whole: phase (a) of th32 T2 refuses nothing.
-// The cache supplies the live oneDNN scratch and the chunk size; a plan made before any cache exists counts the default
-// chunk. A lookup before the device count is known would enumerate the devices, so it is skipped.
+// The cache supplies the live oneDNN scratch and the chunk size, which the terms keep so a re-plan re-records from the
+// same inputs; a plan made before any cache exists counts the default chunk. A lookup before the device count is known
+// would enumerate the devices, so it is skipped.
 static void record_host_ledger_plan(placement_plan & plan) {
     unified_cache * cache =
         g_total_gpu_count > 0 ? get_existing_unified_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
