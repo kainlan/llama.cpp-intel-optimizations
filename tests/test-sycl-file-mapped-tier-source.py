@@ -25,12 +25,12 @@ from outside, or that a rebase restoring upstream's shape would silently undo:
 10. the WILLNEED advice is chunked at 128 KiB with a floor of one page, and the loop steps by the chunk (the kernel
    clamps one call to the backing device's io_pages, so a larger chunk or one call prefetches only part of a
    segment; the residency test's arm 7 measures it where a host can show it);
-11. unified-cache.cpp writes g_runtime_alloc_registry (a mutating member call or operator[]) only inside
-   runtime_registry_emplace_locked, runtime_registry_erase_locked and runtime_registry_assign_locked, the helpers that
-   keep the containment index and the settle counters in step with the map, and the front door adds its row through
-   runtime_registry_emplace_locked after the pointer claim. A row the map holds without its index entry aborts its own
-   release, because runtime_registry_erase_locked asserts the entry was there, and the span settle cannot see it
-   until then. The direct emplace this front door once used fails both clauses; the controls below assert it.
+11. the front door adds its row through runtime_registry_emplace_locked, after the pointer claim, so the row gets its
+   containment-index entry and its settle-counter share. A row the map holds without its index entry aborts its own
+   release, because runtime_registry_erase_locked asserts the entry was there. Registry-wide coverage (every write of
+   g_runtime_alloc_registry kept inside its helpers) is rule (A) of test-sycl-runtime-registry-index-source.py; this
+   clause pins only the front door. The direct emplace this front door once used fails it; the control below asserts
+   that.
 
 Plain file I/O, comment-stripped text.
 """
@@ -350,56 +350,16 @@ def test_the_willneed_chunk_is_128_kib_with_a_page_floor_and_the_loop_steps_by_i
     )
 
 
+# ---- 11. the front door adds its row through the helper ----
 
-# ---- 11. the registry row goes in through the helper ----
-
-# The functions allowed to write g_runtime_alloc_registry directly: they keep its containment index and its settle
-# counters in step with it. runtime_registry_assign_locked writes through the other two today, but it is one of the
-# three by contract, so a write placed in it is not a bypass.
-REGISTRY_HELPERS = ("runtime_registry_emplace_locked", "runtime_registry_erase_locked", "runtime_registry_assign_locked")
-# A direct write of the map: a mutating member call, or operator[]. Reads (find, end, size, a const range-for) do not
-# match.
-REGISTRY_WRITE_RE = re.compile(
-    r"\bg_runtime_alloc_registry\s*(?:\.\s*(?:emplace|emplace_hint|try_emplace|insert|insert_or_assign|erase|clear|"
-    r"extract|merge|swap)\s*\(|\[)"
-)
-
-
-def registry_helper_spans(text: str) -> list:
-    spans = []
-    for name in REGISTRY_HELPERS:
-        # A definition: the name, a parameter list with no parentheses in it, then the body. A call is followed by
-        # `;`, `.`, `)` or an operator, never by `{` right after its own argument list.
-        for m in re.finditer(r"\b" + name + r"\s*\([^;{}()]*\)\s*(?:noexcept\s*)?\{", text):
-            open_idx = m.end() - 1
-            spans.append((open_idx, open_idx + len(balanced(text, open_idx)) + 2))
-    return spans
-
-
-def registry_writes_outside_the_helpers(text: str) -> list:
-    spans = registry_helper_spans(text)
-    out = []
-    for m in REGISTRY_WRITE_RE.finditer(text):
-        if not any(lo <= m.start() < hi for lo, hi in spans):
-            end = text.find("\n", m.start())
-            out.append((text.count("\n", 0, m.start()) + 1, text[m.start() : end if end >= 0 else len(text)].strip()))
-    return out
+# Registry-wide, rule (A) of test-sycl-runtime-registry-index-source.py keeps every write of g_runtime_alloc_registry
+# inside the helpers that keep its containment index and settle counters in step. This clause pins only the front door.
 
 
 def front_door_adds_its_row_through_the_helper(body: str) -> bool:
     claim = re.search(r"\bruntime_registry_claim_ptr_locked\s*\(", body)
     emplace = re.search(r"\bruntime_registry_emplace_locked\s*\(\s*mapping\.base\s*,", body)
     return bool(claim and emplace and claim.start() < emplace.start())
-
-
-def test_the_registry_is_written_only_inside_its_helpers():
-    text = code("unified-cache.cpp")
-    spans = registry_helper_spans(text)
-    # emplace, the two erase overloads (by iterator and by pointer), assign
-    assert len(spans) == 4, f"the registry helpers were not all found: {len(spans)} definitions"
-    inside = [m.group(0) for m in REGISTRY_WRITE_RE.finditer(text) if any(lo <= m.start() < hi for lo, hi in spans)]
-    assert any("emplace" in w for w in inside), "the emplace helper no longer writes the map (the gate lost its anchor)"
-    assert registry_writes_outside_the_helpers(text) == []
 
 
 def test_the_front_door_adds_its_row_through_the_emplace_helper():
@@ -412,33 +372,12 @@ FIXED_ROW = "registered = runtime_registry_emplace_locked(mapping.base, rec).sec
 DIRECT_ROW = "registered = g_runtime_alloc_registry.emplace(mapping.base, rec).second;"
 
 
-def test_the_direct_emplace_fails_both_clauses():
+def test_the_direct_emplace_fails_the_front_door_clause():
     # Positive control: the map holds the row and the index never sees it.
     text = code("unified-cache.cpp")
     assert text.count(FIXED_ROW) == 1, "the front door's row line moved (the control lost its anchor)"
     mutant = text.replace(FIXED_ROW, DIRECT_ROW)
-    found = registry_writes_outside_the_helpers(mutant)
-    assert len(found) == 1 and "g_runtime_alloc_registry.emplace(mapping.base" in found[0][1], found
     assert not front_door_adds_its_row_through_the_helper(function_body(mutant, FRONT_DOOR_SIG))
-
-
-def test_the_registry_write_gate_catches_each_write_form_and_allows_reads():
-    text = code("unified-cache.cpp")
-    for write in (
-        "g_runtime_alloc_registry[p] = rec;",
-        "g_runtime_alloc_registry.insert({ p, rec });",
-        "g_runtime_alloc_registry . try_emplace(p, rec);",
-        "g_runtime_alloc_registry.erase(p);",
-        "g_runtime_alloc_registry.clear();",
-    ):
-        assert len(registry_writes_outside_the_helpers(text + "\nvoid f() {\n    " + write + "\n}\n")) == 1, write
-    for read in (
-        "auto it = g_runtime_alloc_registry.find(p);",
-        "if (it == g_runtime_alloc_registry.end()) {}",
-        "for (const auto & kv : g_runtime_alloc_registry) {}",
-        "size_t n = g_runtime_alloc_registry.size();",
-    ):
-        assert registry_writes_outside_the_helpers(text + "\nvoid f() {\n    " + read + "\n}\n") == [], read
 
 
 if __name__ == "__main__":
