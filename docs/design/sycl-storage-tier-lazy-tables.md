@@ -2616,8 +2616,11 @@ IO pool registry of §3.3 is a different object):
   `unified_cache::pinned_pool_committed()` (`unified-cache.hpp:4184`, which is
   `host_arena_->allocated()`), and `allocated()` runs 5efe's
   `footprint_locked()` reconcile under that pool's own `mutex_`. The caches are
-  enumerated by device index through `get_unified_cache_for_device`, one per
-  device in PER_DEVICE mode. There is no `ledger_pinned` and no equality
+  enumerated by device index through `get_existing_cache_for_device`, the
+  lookup that creates no cache: it holds the cache map's lock shared for the
+  find alone, so no lock spans `allocated()`, and each cache is counted once,
+  one per device in PER_DEVICE mode and one for every index in GLOBAL mode.
+  There is no `ledger_pinned` and no equality
   assertion, so pinned bytes have one source, the pools'. **It is read before
   any lock is taken**: `host_ledger_sample()` runs in `host_budget_pass_scope`,
   before any planner entry takes `g_tensor_inventory_mutex`, and the sum is
