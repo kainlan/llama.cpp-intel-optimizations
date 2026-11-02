@@ -181,6 +181,11 @@ static void test_a_group_is_charged_per_entry() {
     check_eq("none charged: host_bytes stays 0", none_charged.host_bytes, 0);
     check_eq("none charged: mapped", none_charged.host_mapped_bytes, 109 * MiB);
 
+    // an empty group charges no bytes, so it takes none of the figure either
+    placement_plan empty = plan;
+    empty.charge_host_weight_entries({}, placement_size_basis::DST, 999);
+    check_eq("empty group: host_bytes stays 0", empty.host_bytes, 0);
+
     // a mixed group: the charged share of the caller's figure (20 of 40 bytes is charged -> 500 of 1000)
     placement_plan half{};
     half.entries.push_back(make_entry("p", 20, 20, placement_host_backing::PINNED, false));

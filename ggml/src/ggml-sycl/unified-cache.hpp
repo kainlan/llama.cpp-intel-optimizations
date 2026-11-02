@@ -1385,13 +1385,11 @@ struct placement_plan {
         }
         const size_t charged_bytes = host_bytes - host_bytes_before;
         size_t       figure_share  = 0;
-        if (charged_bytes == 0) {
-            figure_share = 0;
-        } else if (charged_bytes == group_bytes) {
-            figure_share = host_bytes_figure;
-        } else {
+        if (charged_bytes != 0) {
             figure_share =
-                static_cast<size_t>(static_cast<long double>(host_bytes_figure) * charged_bytes / group_bytes);
+                charged_bytes == group_bytes ?
+                    host_bytes_figure :
+                    static_cast<size_t>(static_cast<long double>(host_bytes_figure) * charged_bytes / group_bytes);
         }
         host_bytes = host_bytes_before + figure_share;
     }
