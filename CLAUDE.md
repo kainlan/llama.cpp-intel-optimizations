@@ -780,7 +780,26 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 ## Development Workflow (Machine-Specific)
 
 ### Model Locations
-Models are stored on the local SSD in `/models/`:
+Models live under `/models/`, a mergerfs union (since 2026-11-01) of three XFS drives:
+
+- `/mnt/models-nvme` (Kingston OM3PDP3512B, 477 G)
+- `/mnt/models-ugreen` (894 G)
+- `/mnt/models-t7` (932 G, on the Thunderbolt port; keep it on that port)
+
+The union uses `category.create=ff`, so new files fill the NVMe first, and `minfreespace=20G`.
+The NAS backup of the pre-move layout is `/Storage/GenAI/models-backup-2026-11-01/`.
+
+Placement on the host at the time of writing:
+
+- **NVMe:** both Qwen3.8-Flash-Next GGUFs (Q8_0 and GSQ-RCO IQ3_XXS), Mistral, GPT-OSS 20B, gemma4 and the
+  small Qwen models.
+- **UGREEN:** gpt-oss-120b, the Qwen1.5-MoE files and DeepSeek-V4-Flash.
+- **T7:** DeepSeek-V4.1-Flash.
+
+A `/models` path says nothing about its branch. Check with `getfattr --only-values -n user.mergerfs.fullpath <file>`
+before making any storage claim. `df` on a `/models` path reports the pool, never the branch.
+
+Files used by the benchmarks:
 
 **Mistral 7B variants** (standard benchmark model):
 - `mistral-7b-v0.1.Q4_0.gguf` (3.9G) - **Default for benchmarks**

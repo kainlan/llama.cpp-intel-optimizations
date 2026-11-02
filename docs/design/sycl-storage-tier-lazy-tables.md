@@ -1065,6 +1065,10 @@ shard 2 (tensors); Appendix A.1:
   `GGML_SYCL_GRAPH_DIAG` counts both kinds (`:632-660`, printed at `:794-830`).
 ### 2.4 The storage under the table (measured)
 
+> **Dated note, 2026-11-01.** The figures in this section were measured on bcachefs over USB. `/models` has since
+> moved to XFS per drive under mergerfs, with the Qwen3.8 Q8_0 files on the NVMe. The figures are history for the old
+> layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` re-pins them.
+
 `/models` is bcachefs with three members (sysfs
 `/sys/fs/bcachefs/118129b2-.../dev-*`, and `bcachefs fs usage`):
 
@@ -5730,6 +5734,10 @@ is the one per-model hook. Model code is untouched apart from
 ---
 
 ## 8. Pre-registered speed targets (item 6)
+
+> **Dated note, 2026-11-01.** The targets below were derived from figures measured on bcachefs over USB. `/models` has
+> since moved to XFS per drive under mergerfs, with the Qwen3.8 Q8_0 files on the NVMe. The targets are history for the
+> old layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` re-pins them.
 
 Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on
 this host, bcachefs as-is, under ambient load. The implementer measures against
