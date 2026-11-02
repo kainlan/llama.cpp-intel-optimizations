@@ -7665,8 +7665,9 @@ bool                      allocation_registry_test_publish_raw(void * ptr,
 // later reader loads the stored value, so the early plan, the late plan and every device's plan read one number. It
 // starts at 0: before the first store every charge is refused by name, which fails closed.
 
-// The budget's inputs, read into a local before any lock is taken (th32 §4.2). The pinned share reads each pool under
-// that pool's own mutex and nothing else.
+// The budget's inputs, read into a local before any lock is taken (th32 §4.2). The pinned share looks each cache up by
+// device index, holding the cache lock shared for each lookup alone, and reads each pool under that pool's own mutex
+// with no other lock held.
 struct host_budget_sample {
     detail::host_reserve_parse_result reserve{};              // GGML_SYCL_HOST_RESERVE_MB through its strict parser
     size_t                            total_bytes     = 0;    // the host's RAM; 0 when detection failed

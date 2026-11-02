@@ -18072,19 +18072,23 @@ unified_cache * get_existing_unified_cache_for_device(int device_id) {
 }
 
 // The pinned share of the host budget (th32 §4.2): the bytes the pinned pools hold, summed over the caches that exist,
-// each cache once. Derived on each read, never stored, and it creates no cache. The cache lock (L4) is taken once,
-// before each pool's own lock (L5), the rank order.
+// each cache once. Derived on each read, never stored, and it creates no cache. The caches are looked up by device
+// index, and each lookup holds the cache lock (L4) shared for the map find alone, so no lock is held while a pool's
+// allocated() takes that pool's own mutex (L5): a writer of the cache map never waits on a pool's growth through this
+// reader. In GLOBAL mode every index resolves to one cache, which is counted once.
 static size_t host_ledger_pinned_share() {
-    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-    size_t                              share = 0;
-    for (auto it = g_device_caches.begin(); it != g_device_caches.end(); ++it) {
-        const unified_cache * cache = it->second.get();
+    const unified_cache * counted[GGML_SYCL_MAX_DEVICES] = {};
+    size_t                n_counted                      = 0;
+    size_t                share                          = 0;
+    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
+        const unified_cache * cache = get_existing_cache_for_device(device);
         bool                  known = cache == nullptr;
-        for (auto prev = g_device_caches.begin(); prev != it && !known; ++prev) {
-            known = prev->second.get() == cache;
+        for (size_t i = 0; i < n_counted && !known; ++i) {
+            known = counted[i] == cache;
         }
         if (!known) {
-            share = host_ledger_sat_add(share, cache->pinned_pool_committed());
+            counted[n_counted++] = cache;
+            share                = host_ledger_sat_add(share, cache->pinned_pool_committed());
         }
     }
     return share;
