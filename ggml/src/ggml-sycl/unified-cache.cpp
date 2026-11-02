@@ -1005,6 +1005,95 @@ thread_local alloc_owner_control * g_allocating_owner_control = nullptr;
 // persistence sites below can never copy a caller-supplied request field.
 thread_local bool g_allocating_cache_backing = false;
 
+// The host ledger's declared surface (th32 §4.2, §11 T2). Not implemented yet: every charge is refused and nothing is
+// counted.
+host_budget_sample host_ledger_sample() {
+    return {};
+}
+
+size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed) {
+    (void) sample;
+    (void) committed;
+    return 0;
+}
+
+size_t host_ledger_store_budget(const host_budget_sample & sample) {
+    (void) sample;
+    return 0;
+}
+
+size_t host_ledger_budget() {
+    return 0;
+}
+
+size_t host_ledger_committed() {
+    return 0;
+}
+
+size_t host_ledger_yieldable_bytes() {
+    return 0;
+}
+
+void host_ledger_yieldable_add(size_t bytes) {
+    (void) bytes;
+}
+
+void host_ledger_yieldable_sub(size_t bytes) {
+    (void) bytes;
+}
+
+host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_request & req) {
+    host_ledger_charge_result result{};
+    result.ask = req.bytes;
+    return result;
+}
+
+void host_ledger_credit(size_t bytes) {
+    (void) bytes;
+}
+
+int host_ledger_register_yielder(host_ledger_yield_fn fn, void * ctx) {
+    (void) fn;
+    (void) ctx;
+    return -1;
+}
+
+void host_ledger_unregister_yielder(int slot) {
+    (void) slot;
+}
+
+}  // namespace ggml_sycl
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The host ledger's test seams (th32 §11 T2). Not implemented yet.
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_hook(int32_t point, ggml_sycl_test_host_ledger_hook_fn fn) {
+    (void) point;
+    (void) fn;
+    return false;
+}
+
+GGML_BACKEND_API void ggml_sycl_test_host_ledger_store_budget(uint64_t budget) {
+    (void) budget;
+}
+
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_committed(uint64_t * committed) {
+    (void) committed;
+    return false;
+}
+
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_stores(uint64_t * stores) {
+    (void) stores;
+    return false;
+}
+
+GGML_BACKEND_API bool ggml_sycl_test_host_cpu_live_bytes(uint64_t * live_bytes) {
+    (void) live_bytes;
+    return false;
+}
+#endif
+
+namespace ggml_sycl {
+
 static registered_release_status release_registered_allocation_owned(
     const alloc_metadata & exact_key, registered_release_mode mode, bool require_exact_key,
     bool promotion_cleanup_on_refusal = false);
@@ -21597,6 +21686,17 @@ void unified_alloc_registry_sums_for_test(size_t * host, size_t * file_mapped) n
 void unified_alloc_registry_host_cpu_sum_for_test(size_t * host_cpu) noexcept {
     *host_cpu = unified_alloc_registry_tier_sums().host_cpu;
 }
+
+std::vector<void *> unified_alloc_registry_host_cpu_ptrs_for_test() {
+    std::vector<void *>         ptrs;
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    for (const auto & kv : g_runtime_alloc_registry) {
+        if (kv.second.handle.tier == alloc_tier::HOST_CPU) {
+            ptrs.push_back(kv.first);
+        }
+    }
+    return ptrs;
+}
 #endif
 
 bool unified_alloc_validate_registry(int device, const char * where) {
@@ -32671,6 +32771,23 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     // occupies at most its bytes plus one grain.
     terms.tlsf_bound           = terms.blocks * tlsf_allocator::block_grain;
     return terms;
+}
+
+host_zone_commit_terms placement_plan_host_zone_commit_terms(const placement_plan & plan,
+                                                             size_t                 onednn_live_bytes,
+                                                             size_t                 chunk_bytes) {
+    (void) plan;
+    (void) onednn_live_bytes;
+    (void) chunk_bytes;
+    return {};
+}
+
+bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_before, size_t committed_after) {
+    (void) device;
+    (void) planned_bytes;
+    (void) committed_before;
+    (void) committed_after;
+    return true;
 }
 
 static void populate_host_zone_sizing(placement_plan &                           plan,

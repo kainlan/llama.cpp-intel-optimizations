@@ -13,6 +13,7 @@
 #include "file-mapping.hpp"
 #include "ggml-sycl.h"
 #include "host-cpu-mapping.hpp"
+#include "host-reserve-env.hpp"
 #include "kv-room-cost.hpp"
 #include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
@@ -959,6 +960,25 @@ bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, 
 // so it keeps its own and the re-plan reports it.
 uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch);
 
+// The host bytes a plan commits, term by term, as configuring its host zones commits them (th32 §4.2: the plan's host
+// figure is what the sizing code will commit, not a second estimate of it). The four zones are the sizes
+// ggml_sycl_configure_host_zones_for_plan() hands configure_host_zones(), KV and SCRATCH at their floors; runtime is
+// the RUNTIME pool it pre-allocates; rounding is what growing the pinned pool in whole chunks adds to both, each chunk
+// with its header. total() is the pool's growth from an empty pool. placement_plan_host_zone_commit_terms() computes
+// it, for the planner and for the configure step alike.
+struct host_zone_commit_terms {
+    size_t weight   = 0;  // host_zone_weight_bytes
+    size_t kv       = 0;  // host_zone_kv_bytes, at least 64 MiB
+    size_t staging  = 0;  // host_zone_staging_bytes
+    size_t scratch  = 0;  // host_zone_scratch_bytes, at least the live oneDNN scratch + max_tensor_bytes + 32 MiB
+    size_t runtime  = 0;  // the RUNTIME pool: oneDNN scratchpad, DMA staging, PP pipeline and PP MoE oneDNN scratch
+    size_t rounding = 0;  // the zones and the runtime bytes each grown to whole chunks, chunk headers included
+
+    size_t zones() const { return weight + kv + staging + scratch; }
+
+    size_t total() const { return zones() + runtime + rounding; }
+};
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
@@ -1057,6 +1077,13 @@ struct placement_plan {
     size_t                       host_zone_scratch_bytes  = 0;
     size_t                       max_tensor_bytes         = 0;
     size_t                       max_staging_pair_bytes   = 0;
+    // th32 §4.2: the ledger's stored budget when the plan was made, the host bytes the plan commits term by term (both
+    // planner builders record them after populate_host_zone_sizing), and the plan's host figure. The zone terms are all
+    // of host_planned_bytes until the lazy tables' terms join it, so the zone configuration checks its pool growth
+    // against host_zone_terms, never against the sum.
+    size_t                                     host_budget                = 0;
+    size_t                                     host_planned_bytes         = 0;
+    host_zone_commit_terms                     host_zone_terms;
 
     // --- Inference memory categories (computed by populate_host_zone_sizing) ---
     // oneDNN reorder: one temp buffer reused per layer, sized to the largest
@@ -2023,6 +2050,19 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 // builders size the WEIGHT zone through, by way of populate_host_zone_sizing(), and the one place the host weights are
 // summed.
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
+
+// The host bytes configuring `plan`'s zones commits on a fresh pinned pool of `chunk_bytes` chunks, with
+// `onednn_live_bytes` of oneDNN scratch already reserved (the SCRATCH zone's floor). All zero when the plan has no
+// entries, as the configure step then configures nothing.
+host_zone_commit_terms placement_plan_host_zone_commit_terms(const placement_plan & plan,
+                                                             size_t                 onednn_live_bytes,
+                                                             size_t                 chunk_bytes);
+
+// The zone configuration's ledger check (th32 §4.2, §10): the pool grew from committed_before to committed_after while
+// a plan counting planned_bytes was configured. Growth past the plan logs one [HOST-PLAN-BUG] naming the device, the
+// planned bytes and the committed bytes, and returns false; growth within it returns true. Growth below the plan is no
+// defect here, since a pool that already held chunks grows less; a pre-allocation that runs short is phase (b)'s check.
+bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_before, size_t committed_after);
 
 struct moe_mmid_queue_binding {
     int                       owner_device = -1;
@@ -5247,6 +5287,11 @@ class unified_cache {
 
     size_t pinned_pool_committed() const { return host_arena_ ? host_arena_->allocated() : 0; }
 
+    // The grain the plan's host bytes round to: GGML_SYCL_PINNED_CHUNK_MB, else the pool's 2 GiB default.
+    size_t pinned_pool_chunk_size() const {
+        return host_arena_ ? host_arena_->chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+    }
+
     size_t pinned_pool_chunk_count() const { return host_arena_ ? host_arena_->chunk_count() : 0; }
 
     bool   contains_pinned(const void * ptr) const;
@@ -7103,6 +7148,10 @@ struct alloc_request {
     alloc_intent  intent;
     const char *  site_file            = __builtin_FILE();
     int           site_line            = __builtin_LINE();
+    // The host ledger's charge entry (th32 §4.2): only a HOST_CPU request charges. may_yield stays false everywhere
+    // but the loader-thread sites that hold no lock; load_txn_id is that load's transaction, which a yield skips.
+    bool          may_yield            = false;
+    uint64_t      load_txn_id          = 0;
 };
 
 // Copyable, non-owning exact allocation identity and geometry. Registry rows,
@@ -7540,6 +7589,93 @@ bool                      allocation_registry_test_publish_raw(void * ptr,
                                                                bool   releasing) noexcept;
 #endif
 
+// ---- the process-global host ledger (th32 §4.2, §11 T2) ----
+//
+// One budget for the host bytes th32's own consumers hold: every HOST_CPU allocation charges it at the top of
+// unified_allocate_owner, before any allocator lock, and the free credits it. Three lock-free atomics hold it (the
+// committed bytes, the stored budget and the yieldable bytes), so a charge or a credit is legal at any lock depth and
+// the ledger has no mutex. Only a yield needs a caller that holds no lock (may_yield below).
+//
+// The budget is stored once per load transaction, by the first host_budget_pass_scope of that transaction, and every
+// later reader loads the stored value, so the early plan, the late plan and every device's plan read one number. It
+// starts at 0: before the first store every charge is refused by name, which fails closed.
+
+// The budget's inputs, read into a local before any lock is taken (th32 §4.2). The pinned share reads each pool under
+// that pool's own mutex and nothing else.
+struct host_budget_sample {
+    detail::host_reserve_parse_result reserve{};              // GGML_SYCL_HOST_RESERVE_MB through its strict parser
+    size_t                            total_bytes     = 0;    // the host's RAM; 0 when detection failed
+    size_t                            available_bytes = 0;    // MemAvailable; 0 when the read failed
+    int                               budget_pct      = 100;  // the host-budget percentage, clamped to 1..100 when used
+    size_t                            pinned_bytes    = 0;    // the sum of pinned_pool_committed() over the caches
+};
+
+// Reads the inputs. Takes no allocator lock and creates no cache: the pinned share is summed over the caches that
+// exist.
+host_budget_sample host_ledger_sample();
+
+// The budget for `sample` with `committed` bytes already charged. Pure and saturating: no subtraction wraps, so a
+// pinned share above the percentage cap, or an available reading at or below the OS reserve, gives a budget at or
+// below `committed`, which refuses the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB is the whole budget.
+size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed);
+
+// Computes against the live committed bytes and stores the result. The one writer of the stored budget besides the
+// test setter; it counts its stores, the setter does not.
+size_t host_ledger_store_budget(const host_budget_sample & sample);
+
+size_t host_ledger_budget();           // one atomic load of the stored budget
+size_t host_ledger_committed();        // one atomic load of the committed bytes
+size_t host_ledger_yieldable_bytes();  // one atomic load of the yieldable bytes
+
+// A cache's yieldable chunk appears (add) or goes (sub). One call is one chunk: a yield makes at most one round per
+// chunk counted at its first shortfall.
+void host_ledger_yieldable_add(size_t bytes);
+void host_ledger_yieldable_sub(size_t bytes);
+
+struct host_ledger_charge_request {
+    size_t   bytes       = 0;
+    // True only at a loader-thread site that holds no lock (th32 §4.2: the ring ensure and the HOST body load). A
+    // shortfall with false refuses at once, whatever the yielders hold.
+    bool     may_yield   = false;
+    // The caller's load transaction: a yielder never gives back a chunk of the same nonzero id. 0 is no transaction.
+    uint64_t load_txn_id = 0;
+    // Phase (a) of th32 T2: a refusal is logged as a would-refuse WARN carrying each term, and the bytes are charged
+    // anyway, saturating.
+    bool     warn_only   = false;
+};
+
+struct host_ledger_charge_result {
+    bool     charged         = false;  // the ask is in the committed bytes
+    bool     over_budget     = false;  // charged by warn_only past a refusal
+    size_t   ask             = 0;
+    size_t   committed       = 0;      // the committed bytes the last attempt saw
+    size_t   budget          = 0;      // the stored budget the call loaded
+    size_t   deficit         = 0;      // the bytes the last attempt was short; 0 when it fit
+    size_t   yieldable_bytes = 0;
+    uint32_t retries         = 0;      // yield rounds made
+};
+
+// A CAS loop on the committed bytes against one load of the budget: it adds the ask only when committed <= budget
+// and ask <= budget - committed, the form that cannot overflow. On a shortfall it yields when the request allows it
+// and no yield is running on this thread, and otherwise refuses, logging host-budget-exceeded with each term.
+host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_request & req);
+
+// An atomic subtract, saturating at 0. A credit above the committed bytes is a [HOST-PLAN-BUG].
+void host_ledger_credit(size_t bytes);
+
+// The yielder interface (th32 §4.2): a cache registers one callback, which frees up to `deficit` bytes of its
+// yieldable chunks, skips the chunks of `load_txn_id` when it is nonzero, credits the ledger for each free, and
+// returns the bytes it freed. A charge the callback makes never yields. It does not throw: a yield runs inside a
+// charge, which has no failure path for an exception to take.
+using host_ledger_yield_fn = size_t (*)(void * ctx, size_t deficit, uint64_t load_txn_id) noexcept;
+
+// Returns the slot, or -1 after logging host-yielder-slots-exhausted when every slot is taken; that cache then runs
+// unregistered, with no yieldable bytes.
+int  host_ledger_register_yielder(host_ledger_yield_fn fn, void * ctx);
+// The only unregister, from the cache's destructor: stores null, then waits until no yield that loaded the callback is
+// still running. The caller holds no cache, shard or registry lock, since a running callback may wait on one.
+void host_ledger_unregister_yielder(int slot);
+
 // Foundation owner path. The intrusive control is allocated before any physical
 // allocation. The legacy alloc_handle adapter remains inside the allocator;
 // broad caller migration is intentionally deferred.
@@ -7570,6 +7706,13 @@ void unified_alloc_registry_sums_for_test(size_t * host, size_t * file_mapped) n
 // in neither of the two sums above, so the host-pinned figure the validator compares with the host ledger never
 // carries a locked CPU-only mapping.
 void unified_alloc_registry_host_cpu_sum_for_test(size_t * host_cpu) noexcept;
+
+// The pointers of the live HOST_CPU registry rows, so a test can find the row an allocation left behind.
+std::vector<void *> unified_alloc_registry_host_cpu_ptrs_for_test();
+
+// Configures `cache`'s host zones for `plan` as a model load does (ggml-sycl.cpp), so a test can measure the pool's
+// growth against the plan's host bytes.
+void configure_host_zones_for_plan_for_testing(unified_cache * cache, const placement_plan & plan);
 
 // How often unified_free_record reached ::free and sycl::free, so a test can tell a file mapping that was
 // unmapped from one that fell through to another branch.

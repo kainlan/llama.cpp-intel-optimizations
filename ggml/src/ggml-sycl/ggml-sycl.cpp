@@ -6033,6 +6033,12 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void configure_host_zones_for_plan_for_testing(unified_cache * cache, const placement_plan & plan) {
+    ggml_sycl_configure_host_zones_for_plan(cache, std::make_shared<const placement_plan>(plan));
+}
+#endif
+
 static bool ggml_sycl_is_device_expert_ptr(const void * ptr) {
     return ptr && ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device;
 }
