@@ -3,42 +3,62 @@
 SYCL_Mapped from it (design 5efe §4.3, §4.4, §5.3; docs/design/sycl-mmap-host-tier.md).
 
 The runtime half is the lead-run planner test `test-sycl-host-backing-plan` (the Qwen-shaped inventory under the fact
-true, false and locked). This gate pins what that test cannot see: the publication, the ABI that makes the two
-libraries rebuild together, every loader site of the §4.3 table, and the planner's readers. Each clause is a function
-over the comment-stripped tree that returns its problems; `--self-test` runs each witness mutant below in memory and
-requires its clause to report it, and the unmodified tree to pass.
+true, false and locked). This gate pins what that test cannot see: where the fact comes from and where it lives, the ABI
+that makes the two libraries rebuild together, every loader site of the §4.3 table, and the planner's readers. Each
+clause is a function over the comment-stripped tree that returns its problems; `--self-test` runs each witness mutant
+below in memory and requires its clause to report it, and the unmodified tree to pass.
+
+One fact, one source. The inventory carries only what libllama alone knows: its resolved use_mmap and use_mlock, and its
+resolved GGML_SYCL_HOST_WEIGHT_LAYOUT (libllama is that variable's only reader). The staging proc derives
+load_maps_files = use_mmap && file_mapping_supported() from them once per stage, and the plan holds the answer: the
+planner derives every host_backing from it, and planned_host_backing serves the loader from the bound load's plan. This
+deviates from two rows of the §4.3 table, the hook structs and the caps loops, which add a set_load_maps_files hook that
+publishes the fact on the load transaction. That hook would be a second source for one fact, so it does not exist, and
+neither does a transaction store of the fact; F4 pins their absence, and F1, F6 and P1 pin the inventory fields that
+replace it (set at both populate sites, read by the planner).
 
 The fact and the ABI
-  F1. ggml_sycl_tensor_inventory carries load_maps_files, load_locks_files and host_dense_repacked in the padding after
-      n_ctx_context_is_default (offsets 185-187, so the struct stays 192 bytes and n_ubatch_context stays at 188), and
-      both static_assert blocks pin the three offsets;
-  F2. the four new exports (set_load_maps_files, planned_host_backing, mapped_buffer_type_for_device,
-      mapped_buffer_from_file) are declared in ggml-sycl.h and resolvable through the strcmp proc table, the only way a
-      GGML_BACKEND_DL build reaches them;
-  F3. the proc table answers the stage's name with the checking entry, which refuses a load that published no fact by
-      name ("rebuild libllama and libggml-sycl together") before it reads the inventory: a libllama built before the
-      fact passes the old layout and never calls set_load_maps_files;
-  F4. the stage refuses an inventory whose copy of the fact disagrees with the transaction's publication;
-  F5. libllama resolves the three new lifecycle procs by name and its loading guard refuses, naming the proc, a
-      backend that has the old ones and not these (the reverse stale pair);
-  F6. set_load_maps_files resolves the fact as use_mmap && file_mapping_supported() and publishes it on the bound load
-      transaction.
+  F1. ggml_sycl_tensor_inventory carries use_mmap_resolved, use_mlock_resolved and host_dense_repacked in the padding
+      after n_ctx_context_is_default (offsets 185-187, so the struct stays 192 bytes and n_ubatch_context stays at
+      188), and both static_assert blocks pin the three offsets;
+  F2. the four new exports (the renamed staging proc ggml_backend_sycl_stage_load_inventory_plan, planned_host_backing,
+      mapped_buffer_type_for_device, mapped_buffer_from_file) are declared in ggml-sycl.h and resolvable through the
+      strcmp proc table, the only way a GGML_BACKEND_DL build reaches them;
+  F3. the stale pair refuses by name: the old proc name ggml_backend_sycl_stage_inventory_plan resolves to a stub that
+      logs "libllama predates this backend's inventory; rebuild libllama and libggml-sycl together" and returns
+      GGML_SYCL_LIFECYCLE_UNSUPPORTED without reading the inventory, so libllama's "SYCL inventory planning failed"
+      path fires after the backend has said why; no function of the old name remains to be called;
+  F4. no second source: no set_load_maps_files hook, no transaction store of the fact, and nothing reads a published
+      fact out of the inventory;
+  F5. libllama resolves the renamed staging proc and the two mapped-buffer procs by name, and never the old name; its
+      loading guard refuses, naming the proc, a backend that lacks them (the reverse stale pair); and the hooks' enable
+      test does not require the staging proc, so that backend is refused instead of loaded as a non-SYCL model;
+  F6. the staging path derives the fact once: populate_inventory_globals sets load_maps_files =
+      inventory->use_mmap_resolved && file_mapping_supported(), load_locks_files = load_maps_files &&
+      inventory->use_mlock_resolved, and copies host_dense_repacked; nothing else reads use_mmap_resolved;
+  F7. planned_host_backing answers from the bound load's staged plan only: the plan's fact first
+      (host_backing_maps_files), then the dense entry's backing, then the transaction default FILE_MAPPED. A plan
+      another model published never answers for this load;
+  F8. libllama keeps no copy of the fact: llama_model_loader::sycl_load_maps_files() asks planned_host_backing(nullptr)
+      for the transaction default, and the loader declares no data member of that name.
 
 The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.cpp, gs = ggml-sycl.cpp)
   L1. hook structs: the loader hooks resolve planned_host_backing and mapped_buffer_type_for_device by LOAD_SYCL_PROC;
-  L2. the caps loops run above the early plan, and the fact is published between them and the early plan, both
-      inventories carry it (llama_model_sycl_set_inventory_host_backing at both populate sites);
+  L2. the caps loops run above the early plan, and both inventories carry libllama's resolved inputs
+      (llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock) at both populate sites);
   L3. select_weight_buft's prefer_host_weights path asks planned_host_backing and returns SYCL_Mapped for FILE_MAPPED;
   L4. weight_buft_supported's SYCL_Host short-circuit also accepts SYCL_Mapped;
-  L5. make_cpu_buft_list puts the device's SYCL_Mapped ahead of its host buft on a load that maps files;
+  L5. make_cpu_buft_list puts the device's SYCL_Mapped ahead of its host buft on a load that maps files
+      (ml.sycl_load_maps_files());
   L6. create_tensor's buffer-type choice reads no use_mmap: the -ot CPU-override WARN (whose buft_list_cpu leads with
       SYCL_Mapped on a mapping load) and the host-buft demotion ask llama_model_loader::weight_maps_files(buft), the
-      published fact for a SYCL buft and use_mmap otherwise; the demotion compares against the device's host buft
-      only, so SYCL_Mapped is never demoted;
+      plan's fact for a SYCL buft once this load staged a plan and use_mmap otherwise; the demotion compares against
+      the device's host buft only, so SYCL_Mapped is never demoted;
   L7. buffer creation: a SYCL_Mapped context's buffers come from mapped_buffer_from_file per file, with the record's
       excluded_for_file(idx) as its lazy ranges, never from ggml_backend_alloc_ctx_tensors_from_buft; the mlock_bufs
       block skips SYCL_Mapped buffers, which lock through the tier;
-  L8. lm's use_mmap clear is narrowed to a SYCL load whose fact is false (a build without the tier);
+  L8. lm's use_mmap clear is narrowed to a SYCL load whose fact is false (!ml.sycl_load_maps_files(): a build without
+      the tier);
   L9. init_mappings: prefetch 0 on a SYCL load (landed before this change; kept here as the §4.3 row);
   L10. load_all_data addresses a SYCL_Mapped tensor from its buffer's base, before the loader's lock and mmaps_used;
   L11. the preload serves a SYCL_Mapped source in place: register_host_aos_expert and the host-planned dense copy (the
@@ -47,7 +67,8 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       memset_tensor and clear abort naming the tensor; alloc_buffer returns a dummy for 0 and aborts otherwise;
       init_tensor registers the host weight; get_max_size takes the device from the buft;
   L13. mapped_buffer_from_file builds on the C2 primitives: file_mapping_segments, unified_allocate_file_mapping,
-      WILLNEED and RANDOM advice, and the lock under load_locks_files, refusing where the tier is absent.
+      WILLNEED and RANDOM advice, and the lock under the plan's host_mapped_locked, refusing where the tier is absent or
+      where the plan maps no files.
 
 The planner (§4.4)
   P1. every entry-creation site in both builders derives host_backing from the fact
@@ -56,9 +77,12 @@ The planner (§4.4)
   P2. every host-weight accumulation site in the planner passes the entry's host_backing (the per-entry group helper
       reads it itself);
   P3. the readers: charged_host_weight_bytes and refresh_kv_byte_totals count the mapped bytes only when locked, both
-      builders copy the fact into the plan, and populate_inventory_globals copies the three inventory fields;
-  P4. the DMA staging pool is 0, with "(no pinned host weights)", when the load maps files and no host weight is
-      PINNED-backed (§4.4 "The DMA staging pool in mmap mode").
+      builders copy the fact into the plan, and placement_kv_info carries the derived fact to the builders;
+  P4. the DMA staging pool is 0, with "(no pinned host weights)", when no entry's host backing is PINNED (§4.4 "The DMA
+      staging pool in mmap mode": C4 sets dma_streamed to 0 when no host weight is PINNED-backed). The census reads
+      every entry's backing, a device-planned weight's being its staging source, and is not gated on the fact itself.
+      With the fact false (-lm none) every entry is PINNED, so the pool is kept even when no weight is host-resident,
+      which is what the design says -lm none does.
 
 The census rows (§5.3), adapted to this tree
   C1. the eight ggml_sycl_resolve_or_host_tensor_ptr callers are the pinned list: 2 in common.cpp, 1 in binbcast.cpp,
@@ -95,12 +119,17 @@ STREAM_DMA_CALLERS = (
 )
 FILES = (H, GS, UCH, UCC, LM, LML, LMLH, COMMON, BINBCAST) + STREAM_DMA_CALLERS
 
+STAGE_NEW = "ggml_backend_sycl_stage_load_inventory_plan"
+STAGE_OLD = "ggml_backend_sycl_stage_inventory_plan"
+STALE_MESSAGE = "libllama predates this backend's inventory; rebuild libllama and libggml-sycl together"
 NEW_EXPORTS = (
-    "ggml_backend_sycl_set_load_maps_files",
+    STAGE_NEW,
     "ggml_backend_sycl_planned_host_backing",
     "ggml_backend_sycl_mapped_buffer_type_for_device",
     "ggml_backend_sycl_mapped_buffer_from_file",
 )
+LIFECYCLE_NEW = (STAGE_NEW, "ggml_backend_sycl_mapped_buffer_type_for_device",
+                 "ggml_backend_sycl_mapped_buffer_from_file")
 
 # One lexer: a raw string, a string, a char literal, a line comment, a block comment. A quote inside a char literal or
 # a raw string opens nothing.
@@ -162,8 +191,13 @@ def struct_body(text: str, name: str) -> str:
 # ---- the fact and the ABI ----
 
 
-INVENTORY_FIELDS = ("load_maps_files", "load_locks_files", "host_dense_repacked")
-INVENTORY_OFFSETS = {"load_maps_files": 185, "load_locks_files": 186, "host_dense_repacked": 187}
+INVENTORY_FIELDS = ("use_mmap_resolved", "use_mlock_resolved", "host_dense_repacked")
+INVENTORY_OFFSETS = {"use_mmap_resolved": 185, "use_mlock_resolved": 186, "host_dense_repacked": 187}
+# The fact as the builders read it: derived by the staging path, never published.
+KV_FACT_FIELDS = ("load_maps_files", "load_locks_files", "host_dense_repacked")
+# A second source for the fact: the hook and the transaction store the ruled ABI does without.
+SECOND_SOURCE_NAMES = ("set_load_maps_files", "lifecycle_publish_load_host_backing", "lifecycle_find_load_host_backing",
+                       "lifecycle_load_host_backing", "g_lifecycle_load_host_backings")
 
 
 def clause_f1_inventory_fields(t: dict) -> list:
@@ -178,8 +212,11 @@ def clause_f1_inventory_fields(t: dict) -> list:
     if all(f in order for f in INVENTORY_FIELDS + ("n_ctx_context_is_default", "n_ubatch_context")):
         idx = [order.index(f) for f in ("n_ctx_context_is_default",) + INVENTORY_FIELDS + ("n_ubatch_context",)]
         if idx != sorted(idx):
-            problems.append("the fact's fields are not in the padding between n_ctx_context_is_default and "
+            problems.append("libllama's resolved inputs are not in the padding between n_ctx_context_is_default and "
                             "n_ubatch_context")
+    for field in KV_FACT_FIELDS[:2]:
+        if re.search(rf"\bbool\s+{field}\s*;", body):
+            problems.append(f"the inventory carries the derived fact `{field}`, not libllama's input")
     for rel in (H, GS):
         text = t[rel]
         if not re.search(r"static_assert\s*\(\s*sizeof\s*\(\s*ggml_sycl_tensor_inventory\s*\)\s*==\s*192\s*,", text):
@@ -201,80 +238,137 @@ def clause_f2_new_exports(t: dict) -> list:
     return problems
 
 
-STAGE_PROC_RE = (r'strcmp\s*\(\s*name\s*,\s*"ggml_backend_sycl_stage_inventory_plan"\s*\)\s*==\s*0\s*\)\s*\{\s*'
-                 r"return\s*\(\s*void\s*\*\s*\)\s*(\w+)\s*;")
+STAGE_OLD_PROC_RE = (rf'strcmp\s*\(\s*name\s*,\s*"{STAGE_OLD}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
+                     r"return\s*\(\s*void\s*\*\s*\)\s*(\w+)\s*;")
 
 
-def clause_f3_stage_proc_checks_publication(t: dict) -> list:
-    hit = re.search(STAGE_PROC_RE, t[GS])
+def clause_f3_old_stage_name_refuses(t: dict) -> list:
+    hit = re.search(STAGE_OLD_PROC_RE, t[GS])
     if not hit:
-        return ["the proc table does not answer ggml_backend_sycl_stage_inventory_plan"]
+        return [f"the proc table does not answer {STAGE_OLD}: a stale libllama would read a null stage and load the "
+                "model as a non-SYCL one, without a word"]
     target = hit.group(1)
-    if target == "ggml_backend_sycl_stage_inventory_plan":
-        return ["the stage's proc name returns the unchecked stage: a libllama built before the fact is not refused"]
+    if target == STAGE_NEW:
+        return ["the old stage name returns the staging proc: a stale libllama's inventory would be read as the new "
+                "layout"]
     body = body_of(t[GS], rf"\b{target}\s*\([^;{{]*\)\s*\{{")
-    problems = []
     if not body:
-        return [f"the stage's proc entry {target} has no body"]
-    if "lifecycle_find_load_host_backing" not in body:
-        problems.append(f"{target} does not look for the transaction's published fact")
-    if "rebuild libllama and libggml-sycl together" not in body:
-        problems.append(f"{target}'s refusal does not name the stale pair")
-    calls = body.find("ggml_backend_sycl_stage_inventory_plan(")
-    looks = body.find("lifecycle_find_load_host_backing")
-    if calls < 0:
-        problems.append(f"{target} does not call the stage")
-    elif looks < 0 or looks > calls:
-        problems.append(f"{target} reaches the stage before it checks the publication")
-    if re.search(r"inventory\s*->\s*(?:" + "|".join(INVENTORY_FIELDS) + r")\b", body[: calls if calls >= 0 else None]):
-        problems.append(f"{target} reads a field of the new layout before the publication proves a current libllama")
+        return [f"the old stage name's entry {target} has no body"]
+    problems = []
+    if STALE_MESSAGE not in body:
+        problems.append(f"{target} does not say \"{STALE_MESSAGE}\"")
+    if "GGML_LOG_ERROR(" not in body:
+        problems.append(f"{target} does not log its refusal as an error")
+    if not re.search(r"return\s+GGML_SYCL_LIFECYCLE_UNSUPPORTED\s*;", body):
+        problems.append(f"{target} does not return GGML_SYCL_LIFECYCLE_UNSUPPORTED")
+    if re.search(r"\binventory\s*->", body) or f"{STAGE_NEW}(" in body:
+        problems.append(f"{target} reads the stale inventory or reaches the staging proc")
+    if re.search(rf"\b{STAGE_OLD}\s*\(", t[H]):
+        problems.append(f"ggml-sycl.h still declares {STAGE_OLD}")
+    if re.search(rf"ggml_sycl_lifecycle_result\s+{STAGE_OLD}\s*\(", t[GS]):
+        problems.append(f"a function named {STAGE_OLD} is still defined")
     return problems
 
 
-def clause_f4_stage_compares_the_fact(t: dict) -> list:
-    body = body_of(t[GS], r"ggml_sycl_lifecycle_result\s+ggml_backend_sycl_stage_inventory_plan\s*\(\s*const\s+"
-                          r"ggml_sycl_tensor_inventory\s*\*\s*inventory\s*,[^{;]*\)\s*\{")
-    if not body:
-        return ["the stage's definition was not found"]
+def clause_f4_one_source(t: dict) -> list:
     problems = []
-    if "lifecycle_find_load_host_backing" not in body:
-        problems.append("the stage does not read the transaction's published fact")
-    for field in INVENTORY_FIELDS:
-        if not re.search(rf"inventory\s*->\s*{field}\s*!=", body):
-            problems.append(f"the stage does not compare inventory->{field} with the publication")
+    for rel in FILES:
+        for name in SECOND_SOURCE_NAMES:
+            if re.search(rf"\b{name}\b", t[rel]):
+                problems.append(f"{rel} names {name}: a second source for the fact")
+    if re.search(r"\binventory\s*->\s*(?:load_maps_files|load_locks_files)\b", t[GS]):
+        problems.append("the backend reads a published fact out of the inventory")
     return problems
-
-
-LIFECYCLE_NEW = ("ggml_backend_sycl_set_load_maps_files", "ggml_backend_sycl_mapped_buffer_type_for_device",
-                 "ggml_backend_sycl_mapped_buffer_from_file")
 
 
 def clause_f5_libllama_refuses_an_old_backend(t: dict) -> list:
     problems = []
     hooks = struct_body(t[LM], "llama_model_sycl_lifecycle_hooks")
-    for field in ("set_load_maps_files", "mapped_buffer_type_for_device", "mapped_buffer_from_file"):
+    for field in ("stage_inventory", "mapped_buffer_type_for_device", "mapped_buffer_from_file"):
         if not re.search(rf"decltype\s*\(\s*&\s*ggml_backend_sycl_\w+\s*\)\s+{field}\s*=", hooks):
             problems.append(f"llama_model_sycl_lifecycle_hooks has no `{field}` hook")
     for name in LIFECYCLE_NEW:
         if f'ggml_backend_reg_get_proc_address(reg, "{name}")' not in t[LM]:
             problems.append(f"libllama does not resolve {name} by name")
+    for rel in (LM, LML):
+        if f'"{STAGE_OLD}"' in t[rel]:
+            problems.append(f"{rel} still resolves the old stage name")
+    enabled = body_of(t[LM], r"static\s+bool\s+llama_model_sycl_hooks_enabled\s*\(\s*const\s+"
+                             r"llama_model_sycl_lifecycle_hooks\s*&\s*\w+\s*\)\s*\{")
+    if not enabled:
+        problems.append("llama_model_sycl_hooks_enabled(hooks) was not found")
+    elif re.search(r"\bstage_inventory\b", enabled):
+        problems.append("the hooks' enable test requires the staging proc: a backend without the renamed proc is "
+                        "loaded as a non-SYCL model instead of refused by name")
     guard = struct_body(t[LM], "llama_model_sycl_loading_guard")
     if "rebuild libllama and libggml-sycl together" not in guard:
         problems.append("the loading guard does not refuse a backend without the new procs by name")
+    for name in LIFECYCLE_NEW:
+        if f'"{name}"' not in guard:
+            problems.append(f"the loading guard does not name {name} when the backend lacks it")
     return problems
 
 
-def clause_f6_publication_resolves_the_tier(t: dict) -> list:
-    body = body_of(t[GS], r"ggml_sycl_lifecycle_result\s+ggml_backend_sycl_set_load_maps_files\s*\([^;{]*\)\s*\{")
-    if not body:
-        return ["ggml_backend_sycl_set_load_maps_files has no definition"]
+POPULATE_SIG = r"static\s+void\s+populate_inventory_globals\s*\("
+
+
+def clause_f6_fact_derived_once(t: dict) -> list:
+    pop = body_of(t[GS], POPULATE_SIG)
+    if not pop:
+        return ["populate_inventory_globals was not found"]
     problems = []
-    if not re.search(r"use_mmap\s*&&\s*(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)", body):
-        problems.append("the fact is not use_mmap && file_mapping_supported()")
-    if "bound_candidate()" not in body:
-        problems.append("the fact is not published on the bound load transaction")
-    if "lifecycle_publish_load_host_backing" not in body:
-        problems.append("set_load_maps_files does not publish to the lifecycle store")
+    if not re.search(r"g_placement_kv_info\s*\.\s*load_maps_files\s*=\s*inventory\s*->\s*use_mmap_resolved\s*&&\s*"
+                     r"(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)\s*;", pop):
+        problems.append("the staging path does not derive load_maps_files = use_mmap_resolved && "
+                        "file_mapping_supported()")
+    if not re.search(r"g_placement_kv_info\s*\.\s*load_locks_files\s*=\s*g_placement_kv_info\s*\.\s*load_maps_files\s*"
+                     r"&&\s*inventory\s*->\s*use_mlock_resolved\s*;", pop):
+        problems.append("the staging path does not derive load_locks_files = load_maps_files && use_mlock_resolved")
+    if not re.search(r"g_placement_kv_info\s*\.\s*host_dense_repacked\s*=\s*inventory\s*->\s*host_dense_repacked\s*;",
+                     pop):
+        problems.append("the staging path does not copy libllama's resolved host_dense_repacked")
+    readers = len(re.findall(r"\buse_mmap_resolved\b", t[GS]))
+    asserts = len(re.findall(r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)", t[GS]))
+    if readers - asserts != 1:
+        problems.append(f"{readers - asserts} backend sites read use_mmap_resolved: the fact must be derived once")
+    return problems
+
+
+PLANNED_HOST_BACKING_SIG = (r"ggml_sycl_host_backing\s+ggml_backend_sycl_planned_host_backing\s*\(\s*const\s+char\s*\*"
+                            r"\s*\w+\s*\)\s*\{")
+
+
+def clause_f7_planned_host_backing_reads_the_plan(t: dict) -> list:
+    body = body_of(t[GS], PLANNED_HOST_BACKING_SIG)
+    if not body:
+        return ["ggml_backend_sycl_planned_host_backing has no definition"]
+    problems = []
+    if "ggml_sycl_bound_load_candidate()" not in body:
+        problems.append("planned_host_backing does not read the bound load's staged plan")
+    if "ggml_sycl_global_plan_owner" in body or "g_placement_publication" in body:
+        problems.append("planned_host_backing can answer from a plan another model published")
+    fact = body.find("host_backing_maps_files")
+    dense = body.find("find_dense_entry(")
+    default = body.rfind("GGML_SYCL_HOST_BACKING_FILE_MAPPED")
+    if fact < 0:
+        problems.append("planned_host_backing does not test the plan's fact")
+    elif dense < 0 or not (fact < dense < default):
+        problems.append("planned_host_backing does not answer the fact, then the dense entry, then the FILE_MAPPED "
+                        "default")
+    return problems
+
+
+def clause_f8_libllama_keeps_no_copy(t: dict) -> list:
+    problems = []
+    reader = body_of(t[LML], r"bool\s+llama_model_loader::sycl_load_maps_files\s*\(\s*\)\s*const\s*\{")
+    if not reader:
+        problems.append("llama_model_loader::sycl_load_maps_files() has no definition")
+    elif not re.search(r"planned_host_backing\s*\(\s*nullptr\s*\)\s*==\s*GGML_SYCL_HOST_BACKING_FILE_MAPPED", reader):
+        problems.append("sycl_load_maps_files() does not read the transaction default through planned_host_backing")
+    if re.search(r"\bbool\s+sycl_load_(?:maps|locks)_files\s*(?:=|;)", t[LMLH]):
+        problems.append("the loader keeps its own copy of the fact")
+    if not re.search(r"\bbool\s+sycl_load_maps_files\s*\(\s*\)\s*const\s*;", t[LMLH]):
+        problems.append("llama-model-loader.h does not declare sycl_load_maps_files() const")
     return problems
 
 
@@ -294,21 +388,30 @@ def load_tensors_body(t: dict) -> str:
     return body_of(t[LM], r"bool\s+llama_model\w*::load_tensors\s*\(\s*llama_model_loader\s*&\s*ml\s*\)\s*\{")
 
 
-def clause_l2_publication_before_the_early_plan(t: dict) -> list:
+def clause_l2_inputs_reach_both_inventories(t: dict) -> list:
     body = load_tensors_body(t)
     if not body:
         return ["llama_model_base::load_tensors was not found"]
     caps = body.find("props.caps.mmap_support")
-    publish = body.find("llama_model_sycl_publish_load_maps_files(")
-    early = body.find("llama_model_sycl_compute_early_plan(ml, *this, __func__)")
+    early = re.search(r"llama_model_sycl_compute_early_plan\s*\(\s*ml\s*,", body)
     problems = []
-    if publish < 0:
-        problems.append("load_tensors does not publish load_maps_files")
-    elif not (0 <= caps < publish < early):
-        problems.append("the fact is not published after the caps loop and before the early plan")
-    sites = len(re.findall(r"llama_model_sycl_set_inventory_host_backing\s*\(\s*inventory\s*,\s*ml\s*\)", t[LM]))
+    if not early:
+        problems.append("load_tensors does not compute the early plan")
+    elif not (0 <= caps < early.start()):
+        problems.append("the caps loop does not resolve use_mmap before the early plan")
+    sites = len(re.findall(r"llama_model_sycl_set_inventory_host_backing\s*\(\s*inventory\s*,\s*ml\s*,\s*use_mlock\s*\)",
+                           t[LM]))
     if sites != 2:
-        problems.append(f"{sites} inventories carry the fact, expected the early and the late one")
+        problems.append(f"{sites} inventories carry libllama's resolved inputs, expected the early and the late one")
+    setter = body_of(t[LM], r"static\s+void\s+llama_model_sycl_set_inventory_host_backing\s*\(")
+    for needle, why in (
+        (r"inventory\s*\.\s*use_mmap_resolved\s*=\s*ml\s*\.\s*use_mmap\s*;", "the resolved use_mmap"),
+        (r"inventory\s*\.\s*use_mlock_resolved\s*=\s*use_mlock\s*;", "the resolved use_mlock"),
+        (r"inventory\s*\.\s*host_dense_repacked\s*=\s*llama_model_loader::host_dense_repacked\s*\(\s*\)\s*;",
+         "the resolved host weight layout"),
+    ):
+        if not re.search(needle, setter):
+            problems.append(f"the inventory setter does not carry {why}")
     return problems
 
 
@@ -350,8 +453,8 @@ def clause_l5_make_cpu_buft_list(t: dict) -> list:
         problems.append("make_cpu_buft_list never adds SYCL_Mapped")
     elif host >= 0 and mapped > host:
         problems.append("SYCL_Mapped is not ahead of the device's host buft")
-    if not re.search(r"make_cpu_buft_list\s*\(\s*devices\s*,[^;]*ml\s*\.\s*sycl_load_maps_files", t[LM]):
-        problems.append("load_tensors does not pass the published fact to make_cpu_buft_list")
+    if not re.search(r"make_cpu_buft_list\s*\(\s*devices\s*,[^;]*ml\s*\.\s*sycl_load_maps_files\s*\(\s*\)", t[LM]):
+        problems.append("load_tensors does not pass the plan's fact to make_cpu_buft_list")
     return problems
 
 
@@ -375,8 +478,8 @@ def clause_l6_create_tensor_reads_no_use_mmap(t: dict) -> list:
                              r"\s*const\s*\{")
     if not helper:
         problems.append("llama_model_loader::weight_maps_files has no definition")
-    elif "sycl_load_maps_files" not in helper or "use_mmap" not in helper:
-        problems.append("weight_maps_files is not the published fact for a SYCL buft and use_mmap otherwise")
+    elif "sycl_load_maps_files()" not in helper or "use_mmap" not in helper:
+        problems.append("weight_maps_files is not the plan's fact for a SYCL buft and use_mmap otherwise")
     if not re.search(r"bool\s+weight_maps_files\s*\(\s*ggml_backend_buffer_type_t\s+\w+\s*\)\s*const\s*;", t[LMLH]):
         problems.append("llama-model-loader.h does not declare weight_maps_files")
     return problems
@@ -418,7 +521,7 @@ def clause_l8_narrowed_use_mmap_clear(t: dict) -> list:
         return ["the SYCL use_mmap clear was not found"]
     block = balanced(body, body.index("{", hit.start()))
     clear = block.find("ml.use_mmap = false")
-    guard = re.search(r"!\s*ml\s*\.\s*sycl_load_maps_files", block)
+    guard = re.search(r"!\s*ml\s*\.\s*sycl_load_maps_files\s*\(\s*\)", block)
     if clear < 0:
         return ["the SYCL use_mmap clear no longer clears"]
     if not guard or guard.start() > clear:
@@ -518,7 +621,8 @@ def clause_l13_from_file_on_c2(t: dict) -> list:
         ("file_advice::RANDOM", "it does not advise the lazy edges RANDOM"),
         ("unified_cache_raw_lock_file_segments(", "it does not lock under load_locks_files"),
         ("RLIMIT_MEMLOCK", "a lock failure does not name RLIMIT_MEMLOCK"),
-        ("load_locks_files", "the lock does not follow the published fact"),
+        ("host_mapped_locked", "the lock does not follow the plan's lock"),
+        ("host_backing_maps_files", "it does not refuse a load whose plan maps no files"),
     ):
         if needle not in body:
             problems.append(f"mapped_buffer_from_file: {why}")
@@ -588,11 +692,9 @@ def clause_p3_readers(t: dict) -> list:
     if "host_mapped_locked" not in charge:
         problems.append("charge_host_weight does not charge host_bytes for a locked mapping")
     kv = struct_body(hpp, "placement_kv_info")
-    for field in INVENTORY_FIELDS:
+    for field in KV_FACT_FIELDS:
         if not re.search(rf"\bbool\s+{field}\s*=", kv):
             problems.append(f"placement_kv_info has no `{field}`")
-        if not re.search(rf"g_placement_kv_info\s*\.\s*{field}\s*=\s*inventory\s*->\s*{field}\s*;", t[GS]):
-            problems.append(f"populate_inventory_globals does not copy inventory->{field}")
     return problems
 
 
@@ -603,13 +705,23 @@ def clause_p4_dma_pool(t: dict) -> list:
     if not step:
         return ["the DMA staging pool step was not found"]
     problems = []
-    if not re.search(r"plan\s*\.\s*host_backing_maps_files\s*&&\s*!\s*plan\s*\.\s*has_pinned_host_weight\s*\(\s*\)",
-                     step):
-        problems.append("the DMA pool does not test the fact and the pinned host weights")
+    cond = re.search(r"if\s*\(\s*!\s*plan\s*\.\s*has_pinned_backing\s*\(\s*\)\s*\)", step)
+    if not cond:
+        problems.append("the DMA pool is not gated on the host-backing census alone (!plan.has_pinned_backing())")
     if "(no pinned host weights)" not in step:
         problems.append("the DMA pool's 0 line does not say why")
-    if re.search(r"plan\s*\.\s*dma_staging_pool_bytes\s*=\s*zone_maxima\s*\.\s*dma_streamed\s*\*", step):
-        problems.append("the DMA pool is still sized unconditionally")
+    sized = re.search(r"plan\s*\.\s*dma_staging_pool_bytes\s*=\s*zone_maxima\s*\.\s*dma_streamed\s*\*", step)
+    if sized and (not cond or sized.start() < cond.start()):
+        problems.append("the DMA pool is sized before the test, so unconditionally")
+    census = body_of(t[UCH], r"bool\s+has_pinned_backing\s*\(\s*\)\s*const\s+noexcept\s*")
+    if not census:
+        problems.append("placement_plan::has_pinned_backing() was not found")
+    else:
+        if not re.search(r"\.\s*host_backing\s*==\s*placement_host_backing::PINNED", census):
+            problems.append("has_pinned_backing() does not test each entry's backing for PINNED")
+        if "on_device" in census:
+            problems.append("has_pinned_backing() skips the device-planned entries, so an all-device -lm none load "
+                            "loses its pool")
     return problems
 
 
@@ -634,14 +746,16 @@ def clause_c2_stream_dma_callers(t: dict) -> list:
 
 
 CLAUSES = [
-    ("F1 inventory carries the fact in its padding", clause_f1_inventory_fields),
+    ("F1 inventory carries libllama's resolved inputs in its padding", clause_f1_inventory_fields),
     ("F2 four new exports in the proc table", clause_f2_new_exports),
-    ("F3 stage proc refuses an unpublished load", clause_f3_stage_proc_checks_publication),
-    ("F4 stage compares the inventory with the publication", clause_f4_stage_compares_the_fact),
+    ("F3 the old stage name refuses a stale libllama by name", clause_f3_old_stage_name_refuses),
+    ("F4 no second source for the fact", clause_f4_one_source),
     ("F5 libllama refuses a backend without the new procs", clause_f5_libllama_refuses_an_old_backend),
-    ("F6 publication resolves the tier", clause_f6_publication_resolves_the_tier),
+    ("F6 the staging path derives the fact once", clause_f6_fact_derived_once),
+    ("F7 planned_host_backing reads the bound load's plan", clause_f7_planned_host_backing_reads_the_plan),
+    ("F8 libllama keeps no copy of the fact", clause_f8_libllama_keeps_no_copy),
     ("L1 loader hook structs", clause_l1_loader_hooks),
-    ("L2 publication between the caps loops and the early plan", clause_l2_publication_before_the_early_plan),
+    ("L2 libllama's inputs reach both inventories", clause_l2_inputs_reach_both_inventories),
     ("L3 select_weight_buft prefer path", clause_l3_select_weight_buft),
     ("L4 weight_buft_supported short-circuit", clause_l4_weight_buft_supported),
     ("L5 make_cpu_buft_list", clause_l5_make_cpu_buft_list),
@@ -656,7 +770,7 @@ CLAUSES = [
     ("P1 the derivation at every entry-creation site", clause_p1_derivation_sites),
     ("P2 accumulation sites pass the backing", clause_p2_accumulation_sites_test_backing),
     ("P3 the readers", clause_p3_readers),
-    ("P4 the DMA pool without pinned host weights", clause_p4_dma_pool),
+    ("P4 the DMA pool follows the host-backing census", clause_p4_dma_pool),
     ("C1 resolve_or_host callers", clause_c1_resolve_or_host_callers),
     ("C2 stream_dma callers", clause_c2_stream_dma_callers),
 ]
@@ -682,27 +796,54 @@ def _mut(t: dict, rel: str, pattern: str, repl: str) -> dict:
     return m
 
 
+def _mut_all(t: dict, rel: str, pattern: str, repl: str) -> dict:
+    m = dict(t)
+    m[rel], n = re.subn(pattern, repl, t[rel])
+    if n == 0:
+        raise LookupError(f"mutant anchor not found: {pattern!r}")
+    return m
+
+
 MUTANTS = [
     # (label, clause label prefix, builder)
-    ("the stage's proc name returns the unchecked stage", "F3",
-     lambda t: _mut(t, GS, r'(strcmp\s*\(\s*name\s*,\s*"ggml_backend_sycl_stage_inventory_plan"\s*\)\s*==\s*0\s*\)'
-                           r"\s*\{\s*return\s*\(\s*void\s*\*\s*\)\s*)\w+", r"\1ggml_backend_sycl_stage_inventory_plan")),
-    ("the inventory's fact moved past the padding", "F1",
-     lambda t: _mut(t, H, r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*load_maps_files\s*\)\s*==\s*185",
-                    "offsetof(ggml_sycl_tensor_inventory, load_maps_files) == 192")),
+    ("the old stage name returns the staging proc", "F3",
+     lambda t: _mut(t, GS, rf'(strcmp\s*\(\s*name\s*,\s*"{STAGE_OLD}"\s*\)\s*==\s*0\s*\)\s*\{{\s*return\s*\(\s*void\s*\*\s*\)'
+                           r"\s*)\w+", rf"\g<1>{STAGE_NEW}")),
+    ("libllama's inputs moved past the padding", "F1",
+     lambda t: _mut(t, H, r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)\s*==\s*185",
+                    "offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 192")),
+    ("a transaction store of the fact comes back", "F4",
+     lambda t: _mut(t, UCC, r"(placement_plan\s+compute_placement_plan\s*\()",
+                    r"bool lifecycle_publish_load_host_backing(); \1")),
+    ("the enable test requires the renamed staging proc", "F5",
+     lambda t: _mut(t, LM, r"(static\s+bool\s+llama_model_sycl_hooks_enabled\s*\(\s*const[^{]*\{\s*return\s*)",
+                    r"\1hooks.stage_inventory && ")),
+    ("the fact ignores the tier", "F6",
+     lambda t: _mut(t, GS, r"inventory\s*->\s*use_mmap_resolved\s*&&\s*(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)",
+                    "inventory->use_mmap_resolved")),
+    ("planned_host_backing answers from the published plan", "F7",
+     lambda t: _mut(t, GS, r"(ggml_backend_sycl_planned_host_backing\s*\(\s*const\s+char\s*\*\s*\w+\s*\)\s*\{.*?)"
+                           r"ggml_sycl_bound_load_candidate\s*\(\s*\)", r"\1ggml_sycl_global_plan_owner()")),
+    ("the loader keeps its own copy of the fact", "F8",
+     lambda t: _mut(t, LMLH, r"(\bbool\s+use_direct_io\s*=\s*false\s*;)", r"\1 bool sycl_load_maps_files = false;")),
     ("the use_mmap clear is unconditional again", "L8",
-     lambda t: _mut(t, LM, r"!\s*ml\s*\.\s*sycl_load_maps_files", "true")),
+     lambda t: _mut(t, LM, r"!\s*ml\s*\.\s*sycl_load_maps_files\s*\(\s*\)", "true")),
+    ("one inventory goes without libllama's inputs", "L2",
+     lambda t: _mut(t, LM, r"llama_model_sycl_set_inventory_host_backing\s*\(\s*inventory\s*,\s*ml\s*,\s*use_mlock\s*\)"
+                           r"\s*;", ";")),
     ("select_weight_buft ignores the plan's backing", "L3",
-     lambda t: _mut(t, LML, r"planned_host_backing\s*\(", "planned_target_device(")),
+     lambda t: _mut(t, LML, r"planned_host_backing\s*\(\s*ggml_get_name", "planned_target_device(ggml_get_name")),
     ("the mlock block locks SYCL_Mapped buffers", "L7",
      lambda t: _mut(t, LM, r"(if\s*\(\s*use_mlock\s*&&\s*ggml_backend_buffer_is_host\s*\(\s*buf\s*\))[^)]*\)",
                     r"\1)")),
     ("create_tensor's demotion reads use_mmap", "L6",
      lambda t: _mut(t, LML, r"if\s*\(\s*weight_maps_files\s*\(\s*buft\s*\)\s*&&\s*buft_dev",
                     "if (use_mmap && buft_dev")),
-    ("the DMA pool is sized unconditionally", "P4",
-     lambda t: _mut(t, UCC, r"plan\s*\.\s*host_backing_maps_files\s*&&\s*!\s*plan\s*\.\s*has_pinned_host_weight\s*"
-                            r"\(\s*\)", "false")),
+    ("the DMA pool is gated on the fact instead of the census", "P4",
+     lambda t: _mut(t, UCC, r"!\s*plan\s*\.\s*has_pinned_backing\s*\(\s*\)", "plan.host_backing_maps_files")),
+    ("the census skips the device-planned entries", "P4",
+     lambda t: _mut(t, UCH, r"(bool\s+has_pinned_backing\s*\(\s*\)\s*const\s+noexcept\s*\{\s*for\s*\([^)]*\)\s*\{\s*if\s*"
+                            r"\(\s*)", r"\1!e.on_device && ")),
     ("a ninth resolve_or_host caller", "C1",
      lambda t: _mut(t, BINBCAST, r"(\bggml_sycl_resolve_or_host_tensor_ptr\s*\()",
                     r"ggml_sycl_resolve_or_host_tensor_ptr(nullptr, 0); \1")),
@@ -716,10 +857,6 @@ MUTANTS = [
     ("m-7 copies a SYCL_Mapped weight", "L11",
      lambda t: _mut(t, GS, r"(if\s*\(\s*!\s*dense_planned_on_this_device\s*&&\s*!\s*dense_alternate_on_this_device"
                            r"\s*\)\s*\{.*?)ggml_sycl_mapped_buffer_owner\s*\(", r"\1no_owner(")),
-    ("the publication comes after the early plan", "L2",
-     lambda t: _mut(t, LM, r"llama_model_sycl_publish_load_maps_files\s*\(", "llama_model_sycl_publish_later(")),
-    ("the stage skips the inventory comparison", "F4",
-     lambda t: _mut(t, GS, r"inventory\s*->\s*load_maps_files\s*!=", "false !=")),
     ("SYCL_Mapped's set_tensor writes", "L12",
      lambda t: _mut(t, GS, r"(static\s+void\s+ggml_backend_sycl_mapped_buffer_set_tensor\s*\([^{]*\{)[^}]*\}",
                     r"\1 }")),
@@ -728,7 +865,7 @@ MUTANTS = [
     ("the from-file hook never locks", "L13",
      lambda t: _mut(t, GS, r"unified_cache_raw_lock_file_segments\s*\(", "unified_cache_raw_skip_lock(")),
     ("a stream_dma caller drops the refusal", "C2",
-     lambda t: _mut(t, STREAM_DMA_CALLERS[3], r"refused_file_mapped", "refused_other")),
+     lambda t: _mut_all(t, STREAM_DMA_CALLERS[3], r"refused_file_mapped", "refused_other")),
 ]
 
 

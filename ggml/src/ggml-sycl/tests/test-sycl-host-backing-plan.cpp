@@ -1,7 +1,8 @@
 // Every planned weight's host backing comes from one published fact, load_maps_files (design 5efe §4.3-4.4).
 //
-// The loader resolves whether the file-mapping tier maps the model for this load and publishes the answer once on the
-// load transaction; the planner reads it and gives every inventory entry its host_backing from the §4.4 table:
+// The inventory carries libllama's resolved use_mmap and use_mlock; the staging proc derives the fact once from them
+// (use_mmap and a build with the file-mapping tier) into the planner's placement_kv_info, and the plan holds it. The
+// planner gives every inventory entry its host_backing from the §4.4 table:
 //
 //   weight                                   load_maps_files true        load_maps_files false
 //   device-planned dense or expert           FILE_MAPPED (staging src)   PINNED
@@ -13,8 +14,8 @@
 // The plan's terms follow from the backings: weight_host_bytes holds only PINNED / HOST_CPU host entries, so with the
 // fact true it is 0 and the host WEIGHT zone is only its 64 MiB HOST_COMPUTE reserve; host_mapped_bytes holds the host
 // FILE_MAPPED entries and is not charged unless -lm mlock locks them (§4.5); the DMA staging pool exists for streaming,
-// which every FILE_MAPPED source refuses (§5.3), so it is 0 when no host weight is PINNED (§4.4, "The DMA staging pool
-// in mmap mode"). With the fact false every figure is today's.
+// which every FILE_MAPPED source refuses (§5.3), so it is 0 when no entry's host backing is PINNED (§4.4, "The DMA
+// staging pool in mmap mode"). With the fact false every figure is today's.
 //
 // The inventory is Qwen3.8's (the 1223 SYCL weights of qwen38-q8, generated here from the GGUF's shape rules, the
 // lazy per_layer_token_embd table left out as the loader leaves it out), run through the real planner under a mocked
@@ -229,7 +230,7 @@ void capture_log(ggml_log_level level, const char * text, void * user) {
     }
 }
 
-// The published fact as the planner reads it: placement_kv_info's three inputs.
+// The fact as the planner reads it: placement_kv_info's three fields, which the staging proc derives.
 struct fact {
     bool maps_files     = false;
     bool locks_files    = false;
