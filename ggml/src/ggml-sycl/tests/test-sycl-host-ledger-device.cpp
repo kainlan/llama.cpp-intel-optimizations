@@ -1116,11 +1116,17 @@ arm_result fixture_over_budget_warns_and_loads() {
 // The pool-commit leg of the plan-against-committed fixture (th32 §4.2, §10's ledger check). On device 0 the plan's
 // zone terms are the configure rules' bytes, its host_planned_bytes is their total, and configuring its zones commits
 // exactly that, with no [HOST-PLAN-BUG]; on device 1 the plan's runtime grows by one chunk after planning, so
-// configuring it commits one pool chunk the plan does not count, and the check names both numbers.
-// Engagement: both caches are fresh (no chunk, no zones), the derived figure is nonzero, and the delta is measured on
-// the real pool. Mutants: a term dropped from the plan's number (the equality fails on device 0, and the bug line's
-// planned figure moves on device 1); the check removed (no line on device 1); the check comparing configure's own
-// recomputation instead of the plan's recorded terms (no line on device 1).
+// configuring it commits one pool chunk the plan does not count, and the check names both numbers. On both devices the
+// real plan's CPU quant buffer bytes are in no term (design §4.2, "Two terms are deliberately absent"): the terms equal
+// those of the same plan with the field zeroed. The PP MoE oneDNN scratch ring is 0 on a plan built by a direct planner
+// call, because its planned bytes are published by the load path, so this leg does not engage it; the host leg's
+// hand-built plan does.
+// Engagement: both caches are fresh (no chunk, no zones), the derived figure is nonzero, the real plan's CPU quant, DMA
+// staging and oneDNN scratchpad fields and its RUNTIME pool term are nonzero, and the delta is measured on the real
+// pool. Mutants: a term dropped from the plan's number (the equality fails on device 0, and the bug line's planned
+// figure moves on device 1); cpu_quant_buffer_bytes added to a term (the runtime or a zone term differs from the
+// configure rules' and from the zeroed copy's); the check removed (no line on device 1); the check comparing
+// configure's own recomputation instead of the plan's recorded terms (no line on device 1).
 arm_result fixture_plan_against_committed() {
     arm_result r;
     // Two cards, counted before the scheduler hides any: the scheduler exposes device 0 alone unless a split is asked
@@ -1159,10 +1165,26 @@ arm_result fixture_plan_against_committed() {
             void_arm(r, name + ": the configure rules derive no bytes for the plan");
             continue;
         }
+        if (plan.cpu_quant_buffer_bytes == 0 || plan.dma_staging_pool_bytes == 0 || plan.onednn_scratchpad_bytes == 0 ||
+            t.runtime == 0) {
+            void_arm(r, name + ": the real plan's CPU quant " + num(plan.cpu_quant_buffer_bytes) + ", DMA staging " +
+                            num(plan.dma_staging_pool_bytes) + ", oneDNN scratchpad " +
+                            num(plan.onednn_scratchpad_bytes) + " or runtime term " + num(t.runtime) +
+                            " is 0, so the CPU quant exclusion is not engaged");
+            continue;
+        }
         expect(r,
                t.weight == d.weight && t.kv == d.kv && t.staging == d.staging && t.scratch == d.scratch &&
                    t.runtime == d.runtime,
                name + ": the plan's zone terms are not the configure rules' bytes");
+        placement_plan no_quant         = plan;
+        no_quant.cpu_quant_buffer_bytes = 0;
+        const host_zone_commit_terms t0 = placement_plan_host_zone_commit_terms(no_quant, onednn_live, chunk);
+        expect(r,
+               t.weight == t0.weight && t.kv == t0.kv && t.staging == t0.staging && t.scratch == t0.scratch &&
+                   t.runtime == t0.runtime && t.total() == t0.total(),
+               name + ": the CPU quant buffer bytes " + num(plan.cpu_quant_buffer_bytes) + " moved a term: runtime " +
+                   num(t.runtime) + " against " + num(t0.runtime));
         expect(r, planned == d.committed,
                name + ": the plan's zone terms total " + num(planned) + ", the configure rules commit " +
                    num(d.committed));
