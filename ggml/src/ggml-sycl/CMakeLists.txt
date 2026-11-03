@@ -8135,6 +8135,65 @@ else()
         LABELS "sycl;expert-predict;41bs;hostonly;not-built")
 endif()
 
+# Host zone routing, host-allocation lifetimes, the host SCRATCH demand ledger and the host holder plan
+# (docs/design/sycl-mmap-host-tier.md §4.4). host-zone-plan.cpp includes no SYCL header and is also globbed into
+# libggml-sycl, where it is the production copy; these targets compile it host-only, with no -fsycl, and link
+# ggml-base (plus ggml-cpu for the real-scheduler test). None constructs a unified_cache or initializes SYCL, so all
+# four are `sycl;host`.
+#
+# Each MUTANTS pair is a positive control: a macro that plants one defect the design names (in host-zone-plan.cpp or in
+# the test) and the failure text the test prints when it does. Each builds its own executable and ctest, which passes
+# only when that text appears.
+function(ggml_sycl_host_zone_plan_test stem)
+    cmake_parse_arguments(HZP "" "" "LIBS;MUTANTS" ${ARGN})
+    set(_variants "${stem}" "")
+    list(LENGTH HZP_MUTANTS _n)
+    if (_n GREATER 0)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            list(GET HZP_MUTANTS ${_i} _macro)
+            string(REGEX REPLACE "^.*_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            list(APPEND _variants "${stem}-mutant-${_suffix}" "${_macro}")
+        endforeach()
+    endif()
+    list(LENGTH _variants _nv)
+    math(EXPR _lastv "${_nv} - 1")
+    foreach (_i RANGE 0 ${_lastv} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _variants ${_i} _name)
+        list(GET _variants ${_j} _macro)
+        add_executable(test-sycl-${_name} tests/test-sycl-${stem}.cpp host-zone-plan.cpp)
+        target_include_directories(test-sycl-${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_link_libraries(test-sycl-${_name} PRIVATE ggml-base ${HZP_LIBS})
+        set_target_properties(test-sycl-${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME sycl-${_name} COMMAND test-sycl-${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(sycl-${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+        else()
+            target_compile_definitions(test-sycl-${_name} PRIVATE ${_macro}=1)
+            math(EXPR _k "${_i} - 1")
+            list(GET HZP_MUTANTS ${_k} _regex)
+            set_tests_properties(sycl-${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+endfunction()
+
+ggml_sycl_host_zone_plan_test(host-zone-select MUTANTS
+    HOST_ZONE_PLAN_MUTANT_OWNER_BY_LIFETIME
+        "the owner check fired on another context's or model's live record"
+    HOST_ZONE_PLAN_MUTANT_DEVICE_CHECK_EVERY_FREE
+        "the DEVICE check fired at a non-last backend's free while a second backend is live"
+    HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND
+        "llama_context's destruction order printed 2 leaked-record WARN")
+
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
 
