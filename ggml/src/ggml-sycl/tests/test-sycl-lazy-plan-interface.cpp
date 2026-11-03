@@ -18,6 +18,7 @@
 // arm fails the binary like a FAIL. Every arm runs, so one failure does not hide the rest.
 
 #include "../host-cpu-mapping.hpp"
+#include "../lazy-io-pool.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "host-ledger-test-harness.hpp"
@@ -184,8 +185,9 @@ arm_result arm_a_through_the_stage() {
 // (b) The planner caller reads the thread's plan slot: a direct early entry with a fixture's pin on the slot plans a
 // ~1 TiB table STORAGE, which only a pinned plan can do, and the candidate carries it at its floor and yieldable
 // share, the figure the plan's [PLACEMENT] line prints.
-// Engagement: the pin holds a lease (coverage_pin_make returned one), and the staged-load seam made the direct entry
-// stage a candidate for the transaction.
+// Engagement: the pin holds a lease, read from the registry (its live leases rise across coverage_pin_make, since the
+// helper returns a guard even when its take came back empty), and the staged-load seam made the direct entry stage a
+// candidate for the transaction. Without the lease check a pool that built nothing would read as a dropped forward.
 // Mutants: the slot not read at either planner call of compute_and_store_plan_for_inventory (one per path: the
 // single-device call on the -1dev registration, the multi-device one on -2dev), or not forwarded by the one-device
 // delegation or a pair overload: the planner gets no pin, the table cannot be HOST (it exceeds the budget) and is not
@@ -204,10 +206,17 @@ arm_result arm_b_the_slot_reaches_the_planner() {
         void_arm(arr, "the load transaction did not begin");
         return arr;
     }
+    ggml_sycl::lazy_registry_state before{};
+    ggml_sycl::lazy_registry_state after{};
+    (void) ggml_sycl::ggml_sycl_lazy_registry_for_testing(&before);
     void * pin = ggml_sycl_test_coverage_pin_make(0);
-    if (pin == nullptr) {
+    (void) ggml_sycl::ggml_sycl_lazy_registry_for_testing(&after);
+    if (pin == nullptr || after.live_leases <= before.live_leases) {
+        ggml_sycl_test_coverage_pin_release(pin);
         (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
-        void_arm(arr, "the coverage pin could not be made");
+        void_arm(arr, "the pin holds no lease: the registry's live leases went from " + num(before.live_leases) +
+                          " to " + num(after.live_leases) + " across coverage_pin_make, so the arm cannot tell a " +
+                          "dropped slot forward from a pool that was never built");
         return arr;
     }
     log_clear();
