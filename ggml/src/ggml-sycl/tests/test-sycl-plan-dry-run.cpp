@@ -257,15 +257,120 @@ size_t dry_run_figure(arm_result & r, uint32_t plan, const char * term) {
     return printed(found[0], term);
 }
 
+placement_entry hand_entry(const char * name, size_t src, size_t dst, placement_host_backing backing, bool on_device) {
+    placement_entry e;
+    e.name         = name;
+    e.src_size     = src;
+    e.dst_size     = dst;
+    e.host_backing = backing;
+    e.on_device    = on_device;
+    return e;
+}
+
+// The printed residency line of `backing` for hand-built plan `index`: exactly one must exist.
+std::string residency_line(arm_result & r, uint32_t index, const char * backing) {
+    const std::string              which = " plan=" + num(index) + " ";
+    const std::string              tag   = std::string(" backing=") + backing + " ";
+    const std::vector<std::string> lines = lines_with(k_prefix, tag.c_str());
+    std::vector<std::string>       found;
+    for (const std::string & line : lines) {
+        if (line.find(which) != std::string::npos) {
+            found.push_back(line);
+        }
+    }
+    if (found.size() != 1) {
+        fail(r,
+             "hand-built plan " + num(index) + ": " + num(found.size()) + " " + backing + " residency lines, want 1");
+        return std::string();
+    }
+    return found[0];
+}
+
+// Arm (b)'s second leg: the residency of a hand-built plan with one host entry of each backing and one device entry.
+// The PINNED and HOST_CPU entries are charged on the SRC basis, so weight_host_bytes is their per-entry sum; the
+// FILE_MAPPED and CPU_OWNED entries on the DST basis, and each field then grows by a further charge, as a planner's
+// layout growth charges one, so neither field is the SRC or the DST sum of its entries.
+void residency_from_the_plan_fields(arm_result & r) {
+    constexpr uint32_t agree    = 90;
+    constexpr uint32_t disagree = 91;
+    placement_plan     plan{};
+    plan.device_id = 0;
+    plan.entries.push_back(hand_entry("pinned", 10 * MiB, 12 * MiB, placement_host_backing::PINNED, false));
+    plan.entries.push_back(hand_entry("host_cpu", 4 * MiB, 4 * MiB, placement_host_backing::HOST_CPU, false));
+    plan.entries.push_back(hand_entry("mapped", 20 * MiB, 24 * MiB, placement_host_backing::FILE_MAPPED, false));
+    plan.entries.push_back(hand_entry("cpu_owned", 30 * MiB, 33 * MiB, placement_host_backing::CPU_OWNED, false));
+    plan.entries.push_back(hand_entry("device", 8 * MiB, 8 * MiB, placement_host_backing::PINNED, true));
+    plan.charge_host_weight_entries({ 2, 3 }, placement_size_basis::DST, 0);
+    plan.charge_host_weight(placement_host_backing::FILE_MAPPED, 1 * MiB);
+    plan.charge_host_weight(placement_host_backing::CPU_OWNED, 2 * MiB);
+    placement_plan dst_charged = plan;
+    plan.charge_host_weight_entries({ 0, 1 }, placement_size_basis::SRC, 0);
+    dst_charged.charge_host_weight_entries({ 0, 1 }, placement_size_basis::DST, 0);
+    if (plan.host_mapped_bytes == 20 * MiB || plan.host_mapped_bytes == 24 * MiB ||
+        plan.host_cpu_owned_bytes == 30 * MiB || plan.host_cpu_owned_bytes == 33 * MiB) {
+        void_arm(r,
+                 "the hand-built plan's FILE_MAPPED or CPU_OWNED field is a per-entry sum, so a recomputed figure "
+                 "would not show");
+        return;
+    }
+
+    log_clear();
+    const ggml_sycl_plan_dry_run_plan out   = test_plan_dry_run_record(agree, plan);
+    const std::vector<std::string>    bug_a = lines_with("[PLAN-DRY-RUN-BUG]", " the PINNED and HOST_CPU entries ");
+
+    struct want {
+        int          backing;
+        const char * name;
+        uint64_t     bytes;
+    };
+
+    const want wants[] = {
+        { GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED,      "PINNED",      10 * MiB                  },
+        { GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED, "FILE_MAPPED", plan.host_mapped_bytes    },
+        { GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU,    "HOST_CPU",    4 * MiB                   },
+        { GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED,   "CPU_OWNED",   plan.host_cpu_owned_bytes },
+    };
+    for (const want & w : wants) {
+        if (out.residency_count[w.backing] != 1) {
+            void_arm(r, std::string("the hand-built plan's record counted ") + num(out.residency_count[w.backing]) +
+                            " " + w.name + " entries, not its one");
+            continue;
+        }
+        expect(r, out.residency_bytes[w.backing] == w.bytes,
+               std::string("hand-built plan: the result's ") + w.name + " bytes are " +
+                   num(out.residency_bytes[w.backing]) + ", the plan's " + num(w.bytes));
+        const std::string line = residency_line(r, agree, w.name);
+        expect(r, line.empty() || printed(line, "bytes") == w.bytes,
+               std::string("hand-built plan: printed ") + w.name + " bytes=" + num(printed(line, "bytes")) +
+                   ", the plan's " + num(w.bytes));
+    }
+    expect(r, bug_a.empty(),
+           "the plan whose weight_host_bytes is its PINNED and HOST_CPU sum logged " + num(bug_a.size()) +
+               " residency disagreement lines");
+
+    log_clear();
+    (void) test_plan_dry_run_record(disagree, dst_charged);
+    const std::vector<std::string> bug_d = lines_with("[PLAN-DRY-RUN-BUG]", " the PINNED and HOST_CPU entries ");
+    expect(r, bug_d.size() == 1 && bug_d[0].find(" plan=" + num(disagree) + " ") != std::string::npos,
+           "the plan charged on the DST basis logged " + num(bug_d.size()) + " residency disagreement lines, want 1");
+}
+
 // (b) The printout names every term on its own line, and each figure is the plan's. The planner prints the plan's own
 // record of each term: the WEIGHT zone's terms on its [HOST-PLAN] line, the commit terms, host_planned_bytes and the
 // budget the plan recorded on its [HOST-LEDGER] plan line. The dry run prints each on a line of its own, under the
 // term's name, and each must equal the planner's. The residency lines are scored against the WEIGHT walk: the PINNED
-// and HOST_CPU entries are the ones it counts, so their count is its blocks and their bytes its host_weights.
-// Engagement: the dry run returned OK, and each plan has exactly one planner line of each kind to score against.
+// and HOST_CPU entries are the ones it counts, so their count is its blocks and their bytes its host_weights. No planner
+// in this tree gives an entry another backing, so a second leg scores the residency on a plan built by hand, through the
+// record's private seam: its FILE_MAPPED and CPU_OWNED figures are the plan's host_mapped_bytes and
+// host_cpu_owned_bytes, which the fixture charges apart from either per-entry sum, and a plan whose weight_host_bytes
+// is charged on the DST basis gets the one [PLAN-DRY-RUN-BUG] line the plan charged on the SRC basis does not.
+// Engagement: the dry run returned OK, and each plan has exactly one planner line of each kind to score against; the
+// hand-built plan's record counted one entry of each backing, and its two field figures differ from both the SRC and
+// the DST sums of their entries.
 // Mutants: a figure printed from a recomputed value (it differs from the planner's record: a rounding from another
-// chunk, a WEIGHT total re-summed, a budget re-sampled); a term not printed, or two terms on one line (the line count
-// for that term is not 1); a residency line walking another set of entries.
+// chunk, a WEIGHT total re-summed, a budget re-sampled, a residency byte figure re-summed per entry on either basis); a
+// term not printed, or two terms on one line (the line count for that term is not 1); a residency line walking another
+// set of entries; the disagreement WARN dropped, or raised on an agreeing plan.
 arm_result arm_b_every_term_printed_from_the_plan() {
     arm_result       r;
     loader_inventory inv(qwen38_shape);
@@ -348,6 +453,7 @@ arm_result arm_b_every_term_printed_from_the_plan() {
             expect(r, n == 1, "plan " + num(i) + ": " + num(n) + " residency lines for " + backings[b] + ", want 1");
         }
     }
+    residency_from_the_plan_fields(r);
     return r;
 }
 

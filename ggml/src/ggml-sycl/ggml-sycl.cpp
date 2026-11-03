@@ -18575,33 +18575,50 @@ static const char * ggml_sycl_plan_dry_run_backing_name(int backing) {
     }
 }
 
-// The residency of `plan`'s host-resident weights: for each host backing, the entries that carry it and the bytes
-// S1-PRELOAD materializes for them (placement_entry_host_weight_bytes, the WEIGHT walk's figure). th32 §4.3 decides
-// residency per lazy table, as the joint placement's computation; this tree has no lazy table, so the residency is
-// reported per backing, and the per-table decision replaces this function.
-static void ggml_sycl_plan_dry_run_residency(const ggml_sycl::placement_plan & plan,
+// The residency of `plan`'s host-resident weights: for each host backing, the entries that carry it (the walk below
+// counts them and only counts them) and their bytes. A backing's bytes are the plan's own field where it keeps one:
+// host_mapped_bytes for FILE_MAPPED, host_cpu_owned_bytes for CPU_OWNED. PINNED and HOST_CPU share one field,
+// weight_host_bytes, so the plan has no figure for either alone: their bytes are summed once here, through
+// placement_entry_host_weight_bytes(), the per-entry figure placement_plan_host_weight_zone_terms() sizes the WEIGHT
+// zone with. Their sum and weight_host_bytes are then two figures for one set of entries, and a [PLAN-DRY-RUN-BUG]
+// WARN names a disagreement: a dense group charged on the DST basis whose host entries carry a converted dst_size is
+// how they part. th32 §4.3 decides residency per lazy table, as the joint placement's computation; this tree has no
+// lazy table, so the residency is reported per backing, and the per-table decision replaces this function.
+static void ggml_sycl_plan_dry_run_residency(uint32_t                          index,
+                                             const ggml_sycl::placement_plan & plan,
                                              ggml_sycl_plan_dry_run_plan &     out) {
     for (const ggml_sycl::placement_entry & entry : plan.entries) {
         if (entry.on_device) {
             continue;
         }
-        int backing = GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED;
         switch (entry.host_backing) {
             case ggml_sycl::placement_host_backing::PINNED:
-                backing = GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED;
-                break;
-            case ggml_sycl::placement_host_backing::FILE_MAPPED:
-                backing = GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED;
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED]++;
+                out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +=
+                    ggml_sycl::placement_entry_host_weight_bytes(entry);
                 break;
             case ggml_sycl::placement_host_backing::HOST_CPU:
-                backing = GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU;
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU]++;
+                out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU] +=
+                    ggml_sycl::placement_entry_host_weight_bytes(entry);
+                break;
+            case ggml_sycl::placement_host_backing::FILE_MAPPED:
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED]++;
                 break;
             case ggml_sycl::placement_host_backing::CPU_OWNED:
-                backing = GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED;
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED]++;
                 break;
         }
-        out.residency_count[backing]++;
-        out.residency_bytes[backing] += ggml_sycl::placement_entry_host_weight_bytes(entry);
+    }
+    out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED] = plan.host_mapped_bytes;
+    out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED]   = plan.host_cpu_owned_bytes;
+    const uint64_t zone_walk = out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +
+                               out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU];
+    if (zone_walk != plan.weight_host_bytes) {
+        GGML_LOG_WARN("[PLAN-DRY-RUN-BUG] plan=%u device=%d the PINNED and HOST_CPU entries hold %" PRIu64
+                      " bytes by placement_entry_host_weight_bytes but the plan charged weight_host_bytes=%zu: the "
+                      "WEIGHT zone and the plan's charge disagree on these entries\n",
+                      index, plan.device_id, zone_walk, plan.weight_host_bytes);
     }
 }
 
@@ -18632,7 +18649,7 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
     out.runtime                     = terms.runtime;
     out.rounding                    = terms.rounding;
     out.expected_host               = plan.host_planned_bytes;
-    ggml_sycl_plan_dry_run_residency(plan, out);
+    ggml_sycl_plan_dry_run_residency(index, plan, out);
     if (terms.total() != plan.host_planned_bytes) {
         GGML_LOG_WARN(
             "[PLAN-DRY-RUN-BUG] plan=%u device=%d the commit terms sum to %zu bytes but the plan recorded "
@@ -18668,6 +18685,17 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
                       out.residency_bytes[b], out.residency_bytes[b] / (1024.0 * 1024.0));
     }
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+namespace ggml_sycl {
+// The record on a plan a test builds by hand, with backings and charges no planner in this tree produces.
+ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const placement_plan & plan) {
+    ggml_sycl_plan_dry_run_plan out{};
+    ggml_sycl_plan_dry_run_record(index, plan, false, out);
+    return out;
+}
+}  // namespace ggml_sycl
+#endif
 
 // Plans `inventory` as the load's stage plans it: once per device the scheduler exposes, publishing that device's
 // planner inputs first, through the stage's helpers, against `host_budget`. A multi-device plan packs each physical
