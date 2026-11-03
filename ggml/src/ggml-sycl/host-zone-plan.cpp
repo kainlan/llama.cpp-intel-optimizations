@@ -167,7 +167,7 @@ bool host_zone_device_check_due(int live_backends_on_device_after_free) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The SCRATCH demand: today's additive grow_scratch_zone(additional_bytes), which grows by every call's bytes.
+// The host SCRATCH demand ledger.
 // ---------------------------------------------------------------------------------------------------------------
 
 size_t host_scratch_buffers_at_cap(size_t bytes, size_t chunk_cap) {
@@ -182,51 +182,76 @@ size_t host_scratch_buffers_at_cap(size_t bytes, size_t chunk_cap) {
 
 host_scratch_ensure_result host_scratch_ledger::ensure_locked_then_grow(std::unique_lock<std::mutex> & lock,
                                                                         const host_scratch_zone_ops &  ops) {
-    (void) lock;
-    (void) ops;
-    return host_scratch_ensure_result{};
-}
-
-namespace {
-
-host_scratch_ensure_result additive_grow(size_t bytes, size_t total, const host_scratch_zone_ops & ops) {
     host_scratch_ensure_result r;
-    r.total           = total;
-    r.target          = ops.plan_scratch_bytes + total;
-    r.capacity_before = ops.capacity ? ops.capacity(ops.user) : 0;
-    r.request         = bytes;
-    if (bytes > 0 && ops.grow) {
-        r.ok = ops.grow(ops.user, bytes);
+    size_t                     n_buffers = 0;
+    for (const auto & kv : contexts_) {
+        r.total += kv.second.bytes;
+        n_buffers += kv.second.n_buffers;
     }
-    const size_t after = ops.capacity ? ops.capacity(ops.user) : 0;
-    r.grown            = after > r.capacity_before ? after - r.capacity_before : 0;
+    for (const auto & kv : holders_) {
+        r.total += kv.second.bytes;
+        n_buffers += kv.second.n_buffers;
+    }
+    r.target = ops.plan_scratch_bytes + r.total;
+    // The grow runs with the ledger's mutex released: it takes the pool's own locks and may commit a chunk, and no
+    // lock of this ledger is held across a grow (canonical contract §12.5).
+    lock.unlock();
+    r.capacity_before = ops.capacity ? ops.capacity(ops.user) : 0;
+#if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW)
+    // Positive control: today's additive grow_scratch_zone(additional_bytes) grows by the whole demand on every call,
+    // whatever the zone already holds (the ratchet).
+    r.request = r.total;
+    if (r.request > 0 && ops.grow) {
+        r.ok = ops.grow(ops.user, r.request);
+    }
+#else
+    if (r.capacity_before < r.target) {
+        // One grow_zone call for the deficit plus one alignment of slack per buffer the demands split into, the same
+        // slack rule as the miss path. The pool commits one chunk of max(2048 MB, align_up(request)).
+        r.request = (r.target - r.capacity_before) + n_buffers * ops.alignment;
+        r.ok      = ops.grow ? ops.grow(ops.user, r.request) : false;
+    }
+#endif
+    const size_t capacity_after = ops.capacity ? ops.capacity(ops.user) : 0;
+    r.grown                     = capacity_after > r.capacity_before ? capacity_after - r.capacity_before : 0;
     return r;
 }
-
-}  // namespace
 
 host_scratch_ensure_result host_scratch_ledger::notify_context(uint64_t                      context_key,
                                                                size_t                        compute_bytes,
                                                                size_t                        output_bytes,
                                                                const host_scratch_zone_ops & ops) {
-    size_t total = 0;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        contexts_[context_key].bytes += compute_bytes + output_bytes;
-        for (const auto & kv : contexts_) {
-            total += kv.second.bytes;
-        }
-    }
-    return additive_grow(compute_bytes + output_bytes, total, ops);
+    std::unique_lock<std::mutex> lock(mutex_);
+    demand &                     d = contexts_[context_key];
+#if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE)
+    // Positive control: accumulate instead of replace, so a context's second notify grows again for the same bytes.
+    d.bytes += compute_bytes + output_bytes;
+    d.n_buffers += host_scratch_buffers_at_cap(compute_bytes, ops.chunk_cap) +
+                   host_scratch_buffers_at_cap(output_bytes, ops.chunk_cap);
+#else
+    d.bytes     = compute_bytes + output_bytes;
+    d.n_buffers = host_scratch_buffers_at_cap(compute_bytes, ops.chunk_cap) +
+                  host_scratch_buffers_at_cap(output_bytes, ops.chunk_cap);
+#endif
+    const host_scratch_ensure_result r = ensure_locked_then_grow(lock, ops);
+    GGML_LOG_INFO("[HOST-ARENA] SCRATCH demand ctx=%llu compute=%.1f MB output=%.1f MB total=%.1f MB grown=%.1f MB\n",
+                  (unsigned long long) context_key, to_mib(compute_bytes), to_mib(output_bytes), to_mib(r.total),
+                  to_mib(r.grown));
+    return r;
 }
 
 host_scratch_ensure_result host_scratch_ledger::holder_demand(const char *                  holder,
                                                               int                           device,
                                                               size_t                        bytes,
                                                               const host_scratch_zone_ops & ops) {
-    (void) holder;
-    (void) device;
-    return additive_grow(bytes, bytes, ops);
+    std::unique_lock<std::mutex> lock(mutex_);
+    demand &                     d     = holders_[std::string(holder ? holder : "?") + "@" + std::to_string(device)];
+    d.bytes                            = bytes;
+    d.n_buffers                        = host_scratch_buffers_at_cap(bytes, ops.chunk_cap);
+    const host_scratch_ensure_result r = ensure_locked_then_grow(lock, ops);
+    GGML_LOG_INFO("[HOST-ARENA] SCRATCH demand holder=%s dev=%d bytes=%.1f MB total=%.1f MB grown=%.1f MB\n",
+                  holder ? holder : "?", device, to_mib(bytes), to_mib(r.total), to_mib(r.grown));
+    return r;
 }
 
 void host_scratch_ledger::drop_context(uint64_t context_key) {
@@ -238,6 +263,9 @@ size_t host_scratch_ledger::total() const {
     std::lock_guard<std::mutex> lock(mutex_);
     size_t                      total = 0;
     for (const auto & kv : contexts_) {
+        total += kv.second.bytes;
+    }
+    for (const auto & kv : holders_) {
         total += kv.second.bytes;
     }
     return total;
@@ -253,12 +281,31 @@ bool host_scratch_notify(const host_scratch_notify_env & env,
                          ggml_backend_t                  backend,
                          size_t                          host_compute_bytes,
                          size_t                          host_output_bytes) {
-    // Today nothing notifies the SYCL side.
-    (void) env;
-    (void) backend;
-    (void) host_compute_bytes;
-    (void) host_output_bytes;
-    return false;
+    // The backend is checked before anything reads its context: a non-SYCL backend's context is not a
+    // ggml_backend_sycl_context.
+    if (!backend || !env.is_sycl || !env.is_sycl(backend)) {
+        GGML_LOG_WARN("[HOST-ARENA] SCRATCH notify refused: the backend is not a SYCL backend; nothing recorded\n");
+        return false;
+    }
+    const host_scratch_context_info info = env.context_of(backend);
+#if defined(HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0)
+    // Positive control: the device-0 resolve.
+    const int device = 0;
+#elif defined(HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE)
+    // Positive control: the notifying backend's own device in place of the host buft's.
+    const int device = info.device;
+#else
+    // The zone that grows is the one the host buffers land in: the device the host buft allocates from.
+    const int device = env.host_buft_device(backend);
+#endif
+    host_scratch_ledger * ledger = nullptr;
+    host_scratch_zone_ops ops{};
+    if (device < 0 || !env.ledger_of || !env.ledger_of(device, &ledger, &ops) || !ledger) {
+        GGML_LOG_WARN("[HOST-ARENA] SCRATCH notify for ctx=%llu found no unified cache on device %d; nothing grown\n",
+                      (unsigned long long) info.key, device);
+        return false;
+    }
+    return ledger->notify_context(info.key, host_compute_bytes, host_output_bytes, ops).ok;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

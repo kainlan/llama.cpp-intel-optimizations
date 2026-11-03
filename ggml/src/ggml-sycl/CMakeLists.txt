@@ -8196,7 +8196,7 @@ ggml_sycl_host_zone_plan_test(host-zone-select MUTANTS
 
 ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
     HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE
-        "demand 410.0 MiB after \\(100, 10\\) then \\(300, 10\\), expected 310.0 MiB"
+        "demand 420.0 MiB after \\(100, 10\\) then \\(300, 10\\), expected 310.0 MiB"
     HOST_SCRATCH_DEMAND_MUTANT_PER_BACKEND
         "a two-backend context's demand is 2400.0 MiB with grow_zone called 2 times"
     HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW
