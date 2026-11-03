@@ -23,13 +23,12 @@
 #include "../kv-region-registry.hpp"
 #include "../unified-cache.hpp"
 #include "host-ledger-commit-oracle.hpp"
+#include "host-ledger-test-harness.hpp"
 
-#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -43,6 +42,7 @@
 #include <vector>
 
 using namespace ggml_sycl;
+using namespace host_ledger_test_harness;
 
 namespace {
 
@@ -52,58 +52,7 @@ constexpr size_t GiB = 1024ull * 1024ull * 1024ull;
 // or a lost release, and the arm is VOID.
 constexpr auto k_bound = std::chrono::seconds(5);
 
-enum class outcome { PASS, FAIL, VOID };
-
-struct arm_result {
-    outcome     result = outcome::PASS;
-    std::string why;
-};
-
-// The first FAIL or VOID wins; a later check does not overwrite the reason.
-void fail(arm_result & r, const std::string & why) {
-    if (r.result == outcome::PASS) {
-        r.result = outcome::FAIL;
-        r.why    = why;
-    }
-}
-
-void void_arm(arm_result & r, const std::string & why) {
-    if (r.result == outcome::PASS) {
-        r.result = outcome::VOID;
-        r.why    = why;
-    }
-}
-
-void expect(arm_result & r, bool condition, const std::string & why) {
-    if (!condition) {
-        fail(r, why);
-    }
-}
-
-std::string num(size_t v) {
-    return std::to_string(static_cast<unsigned long long>(v));
-}
-
 // --- the log lines the arms read ---
-
-std::mutex               g_log_mutex;
-std::vector<std::string> g_log_lines;
-
-void capture_log(ggml_log_level level, const char * text, void * user) {
-    (void) level;
-    (void) user;
-    if (text == nullptr) {
-        return;
-    }
-    fputs(text, stderr);
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    g_log_lines.emplace_back(text);
-}
-
-void log_clear() {
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    g_log_lines.clear();
-}
 
 // The last captured line that contains every needle, or "" when none does.
 std::string log_line_with(const char * a, const char * b = nullptr, const char * c = nullptr) {
@@ -122,25 +71,6 @@ std::string log_line_with(const char * a, const char * b = nullptr, const char *
         return line;
     }
     return "";
-}
-
-size_t log_count_with(const char * a) {
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    size_t                      n = 0;
-    for (const std::string & line : g_log_lines) {
-        n += line.find(a) != std::string::npos ? 1 : 0;
-    }
-    return n;
-}
-
-// The value printed after " <name>=" on the line, or SIZE_MAX when the name is absent.
-size_t printed(const std::string & line, const char * name) {
-    const std::string key = std::string(" ") + name + "=";
-    const size_t      at  = line.find(key);
-    if (at == std::string::npos) {
-        return SIZE_MAX;
-    }
-    return static_cast<size_t>(std::strtoull(line.c_str() + at + key.size(), nullptr, 10));
 }
 
 // --- ledger state the arms share ---
@@ -1090,17 +1020,10 @@ arm_result leg_m() {
 // The text the witness abort carries, the probe the aborting case scores by.
 constexpr const char * k_witness_message = "host_ledger_sample ran with a witnessed lock held";
 
-struct child_run {
-    bool        ran    = false;  // started, and exited or was signalled within the bound
-    int         status = 0;
-    std::string err;             // everything the child wrote to stderr
-};
-
-// Runs this binary as `--witness-child <mode>` and collects its stderr. The environment and argv are built before the
-// fork, so the child calls only dup2, close and execve. The child runs with the witness checks at the build's default
-// and with no abort backtrace.
+// Runs this binary as `--witness-child <mode>` and collects its stderr within k_bound. The environment and argv are
+// built before the fork (run_child's rule). The child runs with the witness checks at the build's default and with no
+// abort backtrace.
 child_run run_witness_child(const char * mode) {
-    child_run                r;
     std::vector<std::string> env_strings;
     for (char ** e = environ; *e != nullptr; ++e) {
         if (std::strncmp(*e, "GGML_SYCL_WITNESS_CHECKS=", 25) != 0 && std::strncmp(*e, "GGML_NO_BACKTRACE=", 18) != 0) {
@@ -1117,55 +1040,7 @@ child_run run_witness_child(const char * mode) {
     char        arg1[] = "--witness-child";
     std::string arg2   = mode;
     char *      argv[] = { arg0, arg1, arg2.data(), nullptr };
-
-    int fds[2];
-    if (pipe(fds) != 0) {
-        return r;
-    }
-    const pid_t pid = fork();
-    if (pid == 0) {
-        dup2(fds[1], STDERR_FILENO);
-        close(fds[0]);
-        close(fds[1]);
-        execve("/proc/self/exe", argv, envp.data());
-        _exit(127);
-    }
-    close(fds[1]);
-    if (pid < 0) {
-        close(fds[0]);
-        return r;
-    }
-    const auto deadline  = std::chrono::steady_clock::now() + k_bound;
-    bool       timed_out = false;
-    char       buf[512];
-    for (;;) {
-        const auto left =
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-        if (left <= 0) {
-            timed_out = true;
-            kill(pid, SIGKILL);
-            break;
-        }
-        pollfd    p     = { fds[0], POLLIN, 0 };
-        const int ready = poll(&p, 1, static_cast<int>(left));
-        if (ready <= 0) {
-            continue;  // EINTR, or the bound passed: the loop's top decides
-        }
-        const ssize_t got = read(fds[0], buf, sizeof(buf));
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        if (got <= 0) {
-            break;  // end of file: the child has exited
-        }
-        r.err.append(buf, static_cast<size_t>(got));
-    }
-    close(fds[0]);
-    if (waitpid(pid, &r.status, 0) != pid) {
-        return r;
-    }
-    r.ran = !timed_out;
-    return r;
+    return run_child(argv, envp.data(), k_bound);
 }
 
 // The sample reads the host before any lock is taken (th32 §4.2): host_ledger_sample asserts that no witnessed lock is
