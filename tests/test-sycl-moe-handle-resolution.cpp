@@ -456,8 +456,8 @@ static bool test_q1_nvfp4_recipe_workspace_is_inventory_planned() {
     const std::vector<ggml_sycl::device_budget> devices = { { 0, 1, 1 } };
     ggml_sycl::placement_kv_info kv{};
     kv.n_ctx = 32;
-    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::HYBRID,
-                                                     kv, nullptr, 1);
+    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::HYBRID, kv,
+                                                     nullptr, 1, ggml_sycl::host_ledger_budget());
     TEST_ASSERT(plan.moe_host_recipe_workspace_bytes > 0, "Q1/NVFP4 workspace must be inventory-planned");
     TEST_ASSERT(plan.host_zone_scratch_bytes >= plan.moe_host_recipe_workspace_bytes,
                 "host SCRATCH must include immutable recipe workspace");
@@ -484,7 +484,7 @@ static bool test_planner_role_specific_expert_placement() {
 
     ggml_sycl::placement_kv_info kv_info{};
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 9, ggml_sycl::multi_gpu_mode::HYBRID, kv_info,
-                                                     nullptr, n_experts);
+                                                     nullptr, n_experts, ggml_sycl::host_ledger_budget());
 
     auto summary = plan.summarize_expert_placements(2, n_experts);
     TEST_ASSERT(summary.expected == 2u * n_experts * 3u, "expected count should cover all layer/expert/role tensors");

@@ -365,16 +365,25 @@ over the backend's tokenized sources (llama.cpp-5efe C2, llama.cpp-th32 T1a).
 
 **Rule (`HOST_CPU`, llama.cpp-th32 T1):** the `HOST_CPU` tier is host memory only the
 CPU reads: one anonymous mapping, `MADV_HUGEPAGE`, locked in full. It is requested
-only through `unified_allocate_owner(req)` (or `unified_alloc`) with
-`constraints.must_host_cpu`, and that field selects the tier and nothing else.
+only through `unified_allocate_owner(req)` with `constraints.must_host_cpu`, and that
+field selects the tier and nothing else. The owner entry charges the process-global host
+ledger for it, by `host_cpu_mapped_size(size)`, before it mints the control (th32 §4.2,
+T2), and hands the charge to `unified_alloc` through the thread-local
+`g_allocating_charge`. `unified_alloc` refuses a `must_host_cpu` request that holds no
+charge, so the legacy entry cannot reach the tier, and refuses a final tier that
+disagrees with the charge (`[HOST-PLAN-BUG]`, an abort under strict). The registry row
+takes the charge into `charged_bytes`, and the row's one free credits it.
 Nothing falls into the tier (`unified_select_tier`'s size fallback stays `HOST_PINNED`,
 and its cohort branch skips a cohort entry that names `HOST_CPU`) and nothing falls out
 of it: a request that cannot be mapped or locked is refused by name
 (`host-cpu-lock-failed`), never served from another tier. The owner is classified
 `EXTERNAL_EXACT` whatever role or placement field rides with it, so the two-site
-`CACHE_BACKING` allowlist of §3.1 is untouched; `must_host_cpu` beside `must_device` or
-`must_host_pinned`, or an `alignment` above `HOST_CPU_MAX_ALIGNMENT` (one 4 KiB page,
-all an anonymous mapping guarantees), is `INVALID_REQUEST` before any control is minted.
+`CACHE_BACKING` allowlist of §3.1 is untouched; `must_host_cpu` beside a routing
+constraint (`must_device`, `must_host_pinned`, `prefer_same_tier_as_cohort`,
+`use_pinned_pool`, `forbid_host_zone_growth`, `require_host_usm_base`, or a
+`prefer_vram_zone` other than `COUNT`), or an `alignment` above `HOST_CPU_MAX_ALIGNMENT`
+(one 4 KiB page, all an anonymous mapping guarantees), is `INVALID_REQUEST` before the
+charge and before any control is minted.
 `unified_alloc` calls `unified_cache_raw_alloc_host_cpu` once and takes no queue; `unified_free_record`
 calls `unified_cache_raw_free_host_cpu` once, ahead of every other branch, sized by
 `host_cpu_mapped_size(handle.size)`. No lock is held across either call: the lock
@@ -998,7 +1007,7 @@ are grouped by subsystem:
 | `unified-cache.cpp` internals | all | — | Allowed permanently as raw-malloc gateway |
 | `dpct/helper.hpp` (vendored upstream) | 3, pinned by function, raw name and count 1 each: `dpct_malloc` / `malloc_device`; `device_memory::allocate_device` / `malloc_shared` and / `malloc_device`; and, as libc sites pinned by clause (q) (code `E-LIBC`, function, name and count): `mem_mgr`'s constructor `mmap` (Linux) and `VirtualAlloc` (`_WIN64`), the two `host_buffer` constructors' `std::malloc`, and the two `device_memory` initializer-list constructors' host-staging `std::malloc` | — (sanctioned-vendored; disposition carried by `llama.cpp-23mk`) | Allowed permanently, not edited (rebase churn). `test-sycl-alloc-zone-contract` clause (e) pins the three sites and forbids `dpct_malloc`, `dpct_memcpy`, `async_dpct_memcpy` (the 3-D host-staged paths are `host_buffer`'s only users) and the `dpct::device_memory`, `global_memory`, `constant_memory` and `shared_memory` names everywhere outside `dpct/helper.hpp`; clause (q) pins the libc sites. The vendored allocations are ruled unreachable from the backend; clause (e) forbids the entry points that allocate or stage through them (`dpct_malloc`, the memory classes and the memcpy paths). Any transient intent for these sites belongs to `llama.cpp-6lfq` |
 | `unified-cache.hpp` `cache_guard_allocator` | 1 `mmap`, pinned by function, name and count (clause (q), `E-LIBC-CACHE-GUARD`) | — | Allowed permanently: it backs the cache's own hash maps in the guard-page debug mode and falls back to `std::allocator`; it holds no tensor, KV, scratch, pinned or USM bytes, and the cache cannot allocate its own map nodes through itself |
-| `file-mapping.cpp`, `host-cpu-mapping.cpp` (device-free tier TUs) | 3 `mmap`, pinned by function, name and count (clause (q)): `unified_cache_raw_map_file`'s reservation and segment maps (2, `E-LIBC-FILE-MAPPED-RAW`) and `unified_cache_raw_alloc_host_cpu`'s locked mapping (1, `E-LIBC-HOST-CPU-RAW`) | — | Allowed permanently: they are the raw layer of the `FILE_MAPPED` and `HOST_CPU` tiers (section 3, Allocator Entry Points), unified-cache internals kept in device-free translation units. `unified_cache_raw_map_file` is called only from the owner-first front door `unified_allocate_file_mapping`; `unified_cache_raw_alloc_host_cpu` only from `unified_alloc`'s `HOST_CPU` branch, which `unified_allocate_owner` reaches with its owner already minted and the legacy `unified_alloc` entry reaches with none, so owner-first is section 3's usage rule there |
+| `file-mapping.cpp`, `host-cpu-mapping.cpp` (device-free tier TUs) | 3 `mmap`, pinned by function, name and count (clause (q)): `unified_cache_raw_map_file`'s reservation and segment maps (2, `E-LIBC-FILE-MAPPED-RAW`) and `unified_cache_raw_alloc_host_cpu`'s locked mapping (1, `E-LIBC-HOST-CPU-RAW`) | — | Allowed permanently: they are the raw layer of the `FILE_MAPPED` and `HOST_CPU` tiers (section 3, Allocator Entry Points), unified-cache internals kept in device-free translation units. `unified_cache_raw_map_file` is called only from the owner-first front door `unified_allocate_file_mapping`; `unified_cache_raw_alloc_host_cpu` only from `unified_alloc`'s `HOST_CPU` branch, which only `unified_allocate_owner` reaches, with its owner already minted and the host ledger charged: `unified_alloc` refuses a `must_host_cpu` request that holds no charge, so owner-first is enforced there |
 | `ggml-sycl.cpp` `weight_cache_allocator` | 1 `mmap` and 1 `posix_memalign`, shrink-only debt (clause (q), fate `deleted-by-step-7`) | `llama.cpp-23mk` | Never instantiated; deleted whole at step 7 of the 23mk design (the dead `weight_cache_allocator` bullet) |
 | Test files under `tests/` | all | — | Allowed permanently (see §8) |
 

@@ -7863,6 +7863,44 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         RUN_SERIAL TRUE
         TIMEOUT 60)
 
+    # The process-global host ledger (th32 §11 T2), arms (a)-(i): the lock-free charge protocol, the yield and its
+    # unregister handshake, the credit and the saturating budget function, plus the plan's commit terms, the zone
+    # commit check and the re-record of the terms by the KV refresh and the runtime MMID re-plan, on hand-built plans.
+    # Host-only: the arms call the ledger functions, a fake yielder, the budget function, those two pure functions and
+    # the two re-plans (the MMID re-plan under a mocked device table), and none constructs a cache or a pool or touches
+    # a device, so it carries none of the OOM-family labels. RUN_SERIAL: the ledger is process-global.
+    add_executable(test-sycl-host-ledger
+        tests/test-sycl-host-ledger.cpp)
+    target_link_libraries(test-sycl-host-ledger PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-host-ledger PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-ledger COMMAND test-sycl-host-ledger)
+    set_tests_properties(test-sycl-host-ledger PROPERTIES
+        LABELS "sycl;host"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 60)
+
+    # The host ledger's lead-run arms (th32 §11 T2), (j)-(o), with the over-budget and plan-against-committed fixtures:
+    # the budget's store order across planner passes and load transactions, the charge and credit at every exit of
+    # unified_allocate_owner, the must_host_cpu request rules, the yield's load exclusion and the tier backstop. It
+    # initialises the SYCL backends, constructs caches, configures their host zones, and runs the planner and a staged
+    # load, so it carries the OOM-family labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
+    add_executable(test-sycl-host-ledger-device
+        tests/test-sycl-host-ledger-device.cpp)
+    target_link_libraries(test-sycl-host-ledger-device PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-host-ledger-device PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-ledger-device COMMAND test-sycl-host-ledger-device)
+    set_tests_properties(test-sycl-host-ledger-device PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120)
+
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
     # requires them to be rejected.  It is not redundant with the source gate in

@@ -323,7 +323,8 @@ placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory) {
     test_sycl_info_override_guard info_guard(info);
     placement_kv_info             kv{};
     // A budget far below the experts: every expert, and with them the dense weights, is host-resident.
-    return compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, /*device_id=*/0, kv, nullptr, k_experts);
+    return compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, /*device_id=*/0, kv, nullptr, k_experts,
+                                  host_ledger_budget());
 }
 
 // The other planner builder, over two cards with the same starved budget.
@@ -335,7 +336,8 @@ placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & i
         { 0, 1 * MiB, 16ull * 1024ull * MiB, 1.0, true },
         { 1, 1 * MiB, 16ull * 1024ull * MiB, 1.0, true },
     };
-    return compute_multi_device_plan(budgets, inventory, k_layers, multi_gpu_mode::HYBRID, kv, nullptr, k_experts);
+    return compute_multi_device_plan(budgets, inventory, k_layers, multi_gpu_mode::HYBRID, kv, nullptr, k_experts,
+                                     host_ledger_budget());
 }
 
 // The checks one plan's WEIGHT zone must pass, whichever builder made it. `log` is what that plan's build logged.

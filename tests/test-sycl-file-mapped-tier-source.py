@@ -83,7 +83,8 @@ def function_body(text: str, signature_re: str) -> str:
 
 
 def free_record_body() -> str:
-    return function_body(code("unified-cache.cpp"), r"static\s+bool\s+unified_free_record\s*\(const runtime_alloc_record\s*&\s*rec\)")
+    # non-const since the free consumes the record's host-ledger charge (th32 §11 T2)
+    return function_body(code("unified-cache.cpp"), r"static\s+bool\s+unified_free_record\s*\(runtime_alloc_record\s*&\s*rec\)")
 
 
 FRONT_DOOR_SIG = r"allocation_result\s+unified_allocate_file_mapping\s*\(const file_mapping_request\s*&\s*req\)\s*noexcept"

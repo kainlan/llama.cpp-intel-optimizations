@@ -5954,34 +5954,27 @@ static void ggml_sycl_configure_host_zones_for_plan(
         return;
     }
 
-    const auto &     plan               = *plan_owner;
-    constexpr size_t min_kv_zone        = 64ull * 1024ull * 1024ull;
-    constexpr size_t scratch_headroom   = 32ull * 1024ull * 1024ull;
-    // KV is co-located with attention weights via the plan. If a layer's attention
-    // weights are on host, its KV goes on host too. plan.kv_host_bytes reflects this.
-    // Use the plan's value, but also compute from actual context size as a floor:
-    // layers with host-resident attention weights need kv_per_layer * n_host_kv_layers
-    // of host KV. The plan already accounts for this, so use it directly.
-    const size_t     kv_zone_bytes      = std::max(plan.host_zone_kv_bytes, min_kv_zone);
-    const size_t     scratch_zone_bytes = std::max(
-        plan.host_zone_scratch_bytes, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() +
-                                          plan.max_tensor_bytes + scratch_headroom);
-    const size_t total_host_needed =
-        plan.host_zone_weight_bytes + kv_zone_bytes + plan.host_zone_staging_bytes + scratch_zone_bytes;
+    const auto & plan = *plan_owner;
+
+    // The zone sizes come from the function the plan's host figure comes from (th32 §4.2), so what this step commits
+    // is what the planner counted: the KV zone at its 64 MiB floor (KV is co-located with attention weights, so
+    // plan.host_zone_kv_bytes already counts the host layers' KV), the SCRATCH zone at least the live oneDNN scratch
+    // plus the largest tensor plus headroom, and the RUNTIME pool's bytes.
+    const ggml_sycl::host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(
+        plan, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size(),
+        cache->pinned_pool_chunk_size());
+    const size_t committed_before = cache->pinned_pool_committed();
 
     // Zone-config preflight: grow the pinned-pool to total capacity before configure_host_zones()
     // carves it into sub-zones. Without this, the first zone alloc triggers incremental chunk growth
     // mid-inference (HOST_ALLOC_PHASE_GATE warnings) instead of upfront at model load.
-    cache->pre_allocate_host_pool(total_host_needed);
-    cache->configure_host_zones(plan.host_zone_weight_bytes, kv_zone_bytes, plan.host_zone_staging_bytes,
-                                scratch_zone_bytes);
+    cache->pre_allocate_host_pool(terms.zones());
+    cache->configure_host_zones(terms.weight, terms.kv, terms.staging, terms.scratch);
 
     // Pre-allocate runtime pool to prevent lazy growth during inference.
     // Covers oneDNN reorder scratch + DMA staging; prevents HOST_ALLOC_PHASE_GATE warnings.
-    const size_t runtime_bytes = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes +
-                                 plan.pp_pipeline_scratch_bytes + plan.pp_moe_onednn_scratch_bytes;
-    if (runtime_bytes > 0) {
-        cache->pre_allocate_runtime_chunks(runtime_bytes);
+    if (terms.runtime > 0) {
+        cache->pre_allocate_runtime_chunks(terms.runtime);
     }
     if (plan.pp_moe_onednn_scratch_bytes > 0) {
         // llama.cpp-ibj0 spec round 5 F16: the plan-time reserve of the
@@ -6011,11 +6004,16 @@ static void ggml_sycl_configure_host_zones_for_plan(
             plan.pp_moe_onednn_weight_slot_bytes, plan.pp_moe_onednn_activation_slot_bytes,
             plan.pp_moe_onednn_output_slot_bytes, plan.pp_moe_onednn_ring_depth);
     }
+    // The pool grows by at most what the plan counts: its recorded terms, which a re-plan that moves a term re-records,
+    // never this step's own recomputation, so a chunk committed here that the plan does not count is named (th32 §4.2,
+    // §10's ledger check).
+    (void) ggml_sycl::host_zone_commit_check(plan.device_id, plan.host_zone_terms.total(), committed_before,
+                                             cache->pinned_pool_committed());
 
     if (cache->host_zones_configured()) {
         GGML_LOG_INFO("[HOST-ARENA] Zones configured: WEIGHT=%.1f MB KV=%.1f MB STAGING=%.1f MB SCRATCH=%.1f MB\n",
-                      plan.host_zone_weight_bytes / (1024.0 * 1024.0), kv_zone_bytes / (1024.0 * 1024.0),
-                      plan.host_zone_staging_bytes / (1024.0 * 1024.0), scratch_zone_bytes / (1024.0 * 1024.0));
+                      terms.weight / (1024.0 * 1024.0), terms.kv / (1024.0 * 1024.0), terms.staging / (1024.0 * 1024.0),
+                      terms.scratch / (1024.0 * 1024.0));
         GGML_LOG_INFO("[HOST-ARENA] Committed %.1f MB in %zu chunk(s) after plan pre-size (budget=%.1f MB)\n",
                       cache->pinned_pool_committed() / (1024.0 * 1024.0), cache->pinned_pool_chunk_count(),
                       cache->pinned_pool_budget() / (1024.0 * 1024.0));
@@ -6032,6 +6030,12 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
         ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));
     }
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void configure_host_zones_for_plan_for_testing(unified_cache * cache, const placement_plan & plan) {
+    ggml_sycl_configure_host_zones_for_plan(cache, std::make_shared<const placement_plan>(plan));
+}
+#endif
 
 static bool ggml_sycl_is_device_expert_ptr(const void * ptr) {
     return ptr && ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device;
@@ -17587,6 +17591,40 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
 
 thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
 
+// The host budget's pass scope (th32 §4.2): sample, compute, store, then plan. The outermost scope of a load
+// transaction samples the host and stores the budget before any plan of that transaction is built; a later scope of the
+// same transaction finds its id in g_host_budget_stored_txn and only reads, so the early and the late plans and every
+// device's plan record one stored number. A direct planner entry (id 0) stores for itself when no load transaction is
+// open and never writes the id, so a second direct entry stores again; while a transaction is open it only reads, so
+// it cannot move the number that load plans against. A nested scope on the thread is a no-op. The protocol assumes one
+// planning thread per transaction, which the model lifecycle gives. Each caller opens the scope before it takes a lock,
+// so no lock is held while the sample takes the cache lock and each pinned pool's own.
+static std::atomic<uint64_t> g_host_budget_stored_txn{ 0 };
+thread_local int             g_host_budget_pass_depth = 0;
+
+struct host_budget_pass_scope {
+    host_budget_pass_scope() {
+        // the store runs before the depth moves, so a throw from it leaves the depth as it was
+        if (g_host_budget_pass_depth == 0) {
+            const uint64_t txn = g_sycl_plan_load_effect_txn;
+            if (txn != 0) {
+                if (g_host_budget_stored_txn.load(std::memory_order_acquire) != txn) {
+                    ggml_sycl::host_ledger_store_budget(ggml_sycl::host_ledger_sample());
+                    g_host_budget_stored_txn.store(txn, std::memory_order_release);
+                }
+            } else if (ggml_sycl::lifecycle::global_registry().current_active_token().load.value == 0) {
+                ggml_sycl::host_ledger_store_budget(ggml_sycl::host_ledger_sample());
+            }
+        }
+        ++g_host_budget_pass_depth;
+    }
+
+    ~host_budget_pass_scope() { --g_host_budget_pass_depth; }
+
+    host_budget_pass_scope(const host_budget_pass_scope &)             = delete;
+    host_budget_pass_scope & operator=(const host_budget_pass_scope &) = delete;
+};
+
 // Publishes the PP MoE oneDNN scratch ring and the dense scratch of `n_ubatch` on `device` as this load's plan, with
 // every ring slot in the RUNTIME zone as at load, so ensure_planned_arena_zones() sizes the zone for both and the
 // runtime context transaction finds the ring already planned for a context of that micro-batch. The explicit
@@ -17715,9 +17753,9 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 info.device_count, info.total_gpu_count);
         }
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
-        plan_candidate =
-            ggml_sycl::compute_multi_device_plan(budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer),
-                                                 gpu_mode, g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
+        plan_candidate                                    = ggml_sycl::compute_multi_device_plan(
+            budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
+            envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget());
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
             size_t moe_entries = 0;
             size_t xmx_entries = 0;
@@ -17789,7 +17827,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 g_placement_kv_info.explicit_ubatch = {};
             }
             return ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
-                                                     g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
+                                                     g_placement_kv_info, envelope_arg, g_moe_n_experts_total,
+                                                     ggml_sycl::host_ledger_budget());
         };
         // An explicit micro-batch's PP MoE oneDNN scratch ring: the planner holds the RUNTIME room the ring needs
         // against the routed experts. Every stage of the load re-publishes the ring and the dense scratch at the load's
@@ -17956,6 +17995,7 @@ void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t              
         return;
     }
 
+    host_budget_pass_scope      host_budget;
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     populate_inventory_globals(ctx, inventory);
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
@@ -17999,6 +18039,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
         return {};
     }
 
+    host_budget_pass_scope      host_budget;
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
 
     // Phase A: inventory + KV + MoE globals.  Idempotent against a prior
@@ -18316,6 +18357,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
                 }
             }
         } rollback{ effect.owner, false, false };
+
+        // the transaction's one budget store, before any device plans (th32 §4.2); the planner entries below only read
+        host_budget_pass_scope host_budget;
         for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
             if (!backend) {
