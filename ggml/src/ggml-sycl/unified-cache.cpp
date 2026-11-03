@@ -27560,28 +27560,6 @@ bool unified_cache_host_scratch_ledger(int                     device,
     return cache != nullptr && cache->host_scratch_ledger_ops(chunk_cap, ledger, ops);
 }
 
-bool unified_cache_ensure_host_scratch_capacity(int      device,
-                                                uint64_t context_key,
-                                                size_t   compute_bytes,
-                                                size_t   output_bytes,
-                                                size_t   chunk_cap) {
-    host_scratch_ledger * ledger = nullptr;
-    host_scratch_zone_ops ops{};
-    if (!unified_cache_host_scratch_ledger(device, chunk_cap, &ledger, &ops)) {
-        return false;
-    }
-    return ledger->notify_context(context_key, compute_bytes, output_bytes, ops).ok;
-}
-
-bool unified_cache_host_scratch_demand(const char * holder, int device, size_t bytes, size_t chunk_cap) {
-    host_scratch_ledger * ledger = nullptr;
-    host_scratch_zone_ops ops{};
-    if (!unified_cache_host_scratch_ledger(device, chunk_cap, &ledger, &ops)) {
-        return false;
-    }
-    return ledger->holder_demand(holder, device, bytes, ops).ok;
-}
-
 void unified_cache_host_scratch_drop_context(uint64_t context_key) {
     if (context_key == 0) {
         return;
@@ -34108,7 +34086,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     // the actual allocations live in the VRAM RUNTIME zone, but the host SCRATCH zone
     // grows proportionally to ensure the planner accounts for peak VRAM usage.
     // A context's host compute and output buffers are not folded here: they are notified demands on the cache's
-    // host SCRATCH ledger, which unified_cache_ensure_host_scratch_capacity() covers before each allocation.
+    // host SCRATCH ledger (unified_cache_host_scratch_ledger()), which covers them before each allocation.
     // Note: onednn_scratchpad_bytes goes to the ONEDNN zone (separate 256 MB allocation),
     // not counted here.
     size_t host_scratch_total = 0;

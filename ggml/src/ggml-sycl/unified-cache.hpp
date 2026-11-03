@@ -8808,21 +8808,14 @@ bool                    unified_cache_allocate_moe_q8_1_graph_scratch(int       
                                                                       const moe_q8_1_scratch_demand & demand,
                                                                       alloc_handle *                  out);
 
-// The host SCRATCH demand ledger of `device`'s cache (§4.4 "What the SYCL side does with it"). Every call ensures
+// The host SCRATCH demand ledger of `device`'s cache (§4.4 "What the SYCL side does with it"). Every demand ensures
 // capacity, a high-water mark, never an additive grow: the target is the plan's SCRATCH plus the sum of the live
-// demands, and only a deficit grows the zone. `chunk_cap` is the host buffer chunk cap. False when the device has no
-// cache or no host zones, or when a needed grow failed.
-//   ensure:  one llama_context's demand (keyed by the notifying backend context's owner serial), replacing its last.
-//   demand:  one DEVICE holder's demand, keyed by (device, holder).
+// demands, and only a deficit grows the zone. A context's demand and the DEVICE holders' demands are driven through
+// the ledger unified_cache_host_scratch_ledger hands out (host-zone-plan.hpp).
 //   drop:    the context's demand, at its owner boundary, on every device; capacity is never returned.
-bool unified_cache_ensure_host_scratch_capacity(int      device,
-                                                uint64_t context_key,
-                                                size_t   compute_bytes,
-                                                size_t   output_bytes,
-                                                size_t   chunk_cap);
-bool unified_cache_host_scratch_demand(const char * holder, int device, size_t bytes, size_t chunk_cap);
 void unified_cache_host_scratch_drop_context(uint64_t context_key);
 // The ledger and zone operations of `device`'s cache, for callers that drive the ledger through host-zone-plan.hpp.
+// `chunk_cap` is the host buffer chunk cap. False when the device has no cache or no host zones.
 bool unified_cache_host_scratch_ledger(int                     device,
                                        size_t                  chunk_cap,
                                        host_scratch_ledger **  ledger,
