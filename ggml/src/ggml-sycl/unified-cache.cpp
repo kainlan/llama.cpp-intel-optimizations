@@ -4494,7 +4494,7 @@ offload_phase offload_stats_phase() {
 // takes no lock):
 //   TRANSACTION  set_runtime_context, set_runtime_context_for_model (the second
 //                calls the first: a same-kind nested hold)
-//   LOAD         model_load_begin, stage_inventory_plan, model_load_end
+//   LOAD         model_load_begin, stage_load_inventory_plan, model_load_end
 //   LIFECYCLE    model_unloaded_token, activate_model_plan,
 //                probe_runtime_context_for_model,
 //                recheck_runtime_context_flash_attn, can_unload (try-lock: it
@@ -33308,6 +33308,46 @@ static void record_host_ledger_plan(placement_plan & plan, size_t host_budget) {
     }
 }
 
+// The load's fact onto the plan (design 5efe §4.4), the one place either builder copies it, before it makes any entry.
+// The lock follows the mapping: a load that maps nothing locks nothing.
+static void placement_plan_copy_host_backing_fact(placement_plan & plan, const placement_kv_info & info) {
+    plan.host_backing_maps_files = info.load_maps_files;
+    plan.host_mapped_locked      = info.load_maps_files && info.load_locks_files;
+}
+
+// A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
+// the fact onto the plan before any entry is made, and every reader, this rule included, asks the plan. Without the
+// fact every backing is PINNED, today's. With it a routed expert is served in place from the mapping (host experts are
+// AOS here, so no reorder copy exists to charge), and so is token_embd, which the CPU reads as a row gather in the file
+// layout; a dense weight is CPU_OWNED when ggml-cpu repacks it into a buffer of its own (libllama resolved
+// GGML_SYCL_HOST_WEIGHT_LAYOUT to cpu) and FILE_MAPPED when the CPU reads the file layout in place (=plain, =off).
+static placement_host_backing placement_host_backing_when_host(const placement_plan &    plan,
+                                                               const placement_kv_info & kv_info,
+                                                               bool                      routed_expert,
+                                                               bool                      get_rows_only) {
+    if (!plan.host_backing_maps_files) {
+        return placement_host_backing::PINNED;
+    }
+    if (routed_expert || get_rows_only || !kv_info.host_weight_layout_cpu) {
+        return placement_host_backing::FILE_MAPPED;
+    }
+    return placement_host_backing::CPU_OWNED;
+}
+
+// A device-planned weight's host copy is its staging source: on a load that maps files, that is the mapping
+// (design 5efe §4.4, recounted as host_mapped_source_bytes). Runs once every placement decision is made and before the
+// host zones are sized, so the zones and the DMA pool see the final backings.
+static void placement_mark_device_entries_file_mapped(placement_plan & plan) {
+    if (!plan.host_backing_maps_files) {
+        return;
+    }
+    for (placement_entry & e : plan.entries) {
+        if (e.on_device) {
+            e.host_backing = placement_host_backing::FILE_MAPPED;
+        }
+    }
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -33748,10 +33788,18 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    GGML_SYCL_FORCE_STREAMING enables streaming; planner uses a conservative per-model estimate.
     {
         constexpr size_t k_dma_pipeline_depth = 2;  // Double-buffer (matches resolve_dma_defaults)
-        plan.dma_staging_pool_bytes           = zone_maxima.dma_streamed * k_dma_pipeline_depth;
-        GGML_LOG_INFO("[SYCL-PLAN] DMA staging pool: %.1f MB (%zu x dma_streamed %.1f MB; global max %.1f MB)\n",
-                      plan.dma_staging_pool_bytes / (1024.0 * 1024.0), k_dma_pipeline_depth,
-                      zone_maxima.dma_streamed / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
+        // The pool streams only PINNED-backed weights: every FILE_MAPPED source refuses the stream (design 5efe §5.3),
+        // so a plan with no PINNED backing has nothing for it to carry (§4.4, "The DMA staging pool in mmap mode").
+        // The census reads the entries' derived backings; a load that maps nothing keeps them PINNED and the pool.
+        if (!plan.has_pinned_backing()) {
+            plan.dma_staging_pool_bytes = 0;
+            GGML_LOG_INFO("[SYCL-PLAN] DMA staging pool: 0.0 MB (no pinned host weights)\n");
+        } else {
+            plan.dma_staging_pool_bytes = zone_maxima.dma_streamed * k_dma_pipeline_depth;
+            GGML_LOG_INFO("[SYCL-PLAN] DMA staging pool: %.1f MB (%zu x dma_streamed %.1f MB; global max %.1f MB)\n",
+                          plan.dma_staging_pool_bytes / (1024.0 * 1024.0), k_dma_pipeline_depth,
+                          zone_maxima.dma_streamed / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
+        }
     }
 
     // 8. oneDNN scratchpad: ONEDNN zone workspace for weight reorder + activation buffer.
@@ -34685,6 +34733,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_envelope_fa_name(envelope->flash_attn_type));
     }
     placement_plan plan;
+    placement_plan_copy_host_backing_fact(plan, kv_info);
     plan.vram_budget                         = vram_budget;
     plan.device_id                           = device_id;
     plan.multi_device                        = false;
@@ -34792,6 +34841,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 entry.priority         = prio;
                 entry.on_device        = false;
                 entry.target_device    = -1;
+                entry.host_backing     = placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/true,
+                                                                          /*get_rows_only=*/false);
                 plan.entries.push_back(std::move(entry));
             }
             continue;
@@ -34821,6 +34872,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 
         entry.on_device     = false;  // Will be set during packing below
         entry.target_device = -1;     // -1 = host (updated during packing)
+        entry.host_backing =
+            placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/false, tensor.get_rows_only);
         plan.entries.push_back(std::move(entry));
     }
 
@@ -35210,6 +35263,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         !account_moe_mmid_workspaces(plan, { device_budget{ device_id, vram_budget, vram_budget } })) {
         reject_moe_mmid_workspaces(plan);
     }
+    placement_mark_device_entries_file_mapped(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     record_host_ledger_plan(plan, host_budget);
 
@@ -36149,6 +36203,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     const size_t n_devs = device_budgets.size();
 
     placement_plan plan;
+    placement_plan_copy_host_backing_fact(plan, kv_info);
     plan.device_id                = -1;  // Multi-device
     plan.multi_device             = true;
     plan.vram_bytes               = 0;
@@ -36310,6 +36365,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 entry.priority         = prio;
                 entry.on_device        = false;
                 entry.target_device    = -1;
+                entry.host_backing     = placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/true,
+                                                                          /*get_rows_only=*/false);
                 plan.entries.push_back(std::move(entry));
             }
             continue;
@@ -36327,6 +36384,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         entry.expert_id        = -1;
         entry.on_device        = false;
         entry.target_device    = -1;
+
+        entry.host_backing =
+            placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/false, tensor.get_rows_only);
 
         entry.priority = tensor_to_placement_priority(usage, name.c_str());
         if (entry.layer_id >= 0) {
@@ -37257,6 +37317,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     if (!plan.moe_mmid_workspace_valid || !account_moe_mmid_workspaces(plan, device_budgets)) {
         reject_moe_mmid_workspaces(plan);
     }
+    placement_mark_device_entries_file_mapped(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     record_host_ledger_plan(plan, host_budget);
 

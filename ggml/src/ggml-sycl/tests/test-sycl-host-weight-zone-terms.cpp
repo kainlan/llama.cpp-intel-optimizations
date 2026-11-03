@@ -25,7 +25,10 @@
 // One tenant of the zone is not a term: unplanned loader residency, the model loader's SYCL_Host buffer, which holds
 // every weight the loader reads (role WEIGHT, category HOST_COMPUTE, from the buffer type the loader adds to a SYCL
 // device's list when weights are evictable). Planning it would plan a duplicate copy of the weights, the defect the
-// mapped host tier (SYCL_Mapped) removes, so the class is expected to read zero once that tier lands.
+// mapped host tier (SYCL_Mapped) removes. Which buffer the loader binds is the plan's fact, not the build's: on a load
+// whose plan maps files the loader binds SYCL_Mapped for every FILE_MAPPED weight, whose bytes are the file's pages
+// outside every host zone, so the class reads zero; on a load whose plan does not (-lm none, or a build without the
+// tier) every weight keeps SYCL_Host and the class is the whole model. Arm 2 measures the second, arm 3 the first.
 //
 // Arm 1 (no model, no device: the real planner over a synthetic Q2_K-shaped inventory, under a mocked device table)
 // asserts, for both planner builders, that the WEIGHT size is exactly the sum of those terms and is not the 1.2x
@@ -38,24 +41,42 @@
 // still trip the [HOST-PLAN-BUG] WARN.
 //
 // Arm 2 (the census) constructs device 0's cache, configures the host zones from that plan, and makes every planned
-// WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through
-// the loader's own buffer type. Each allocation is classed by the call that made it, and its owner metadata must
-// agree with that class. Metadata separates host_weights from the HOST_COMPUTE tenants; the reserve and unplanned
-// loader residency come from one buffer type with one request shape, so between those two the call alone attributes
-// the bytes. Every byte the zone gains belongs to a named term or to unplanned loader residency, which
-// is reported on its own line; any other byte fails. The terms stay within their bytes and the zone does not grow for
-// them. It needs a device, so a host without one exits 77 after arm 1 has passed.
+// WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through the
+// loader's own buffer type. That plan is arm 1's, built with the fact false, so the loader's buffer is the one a load
+// that does not map files takes, and the arm measures it on every build; the buffer must be allocated and its bytes
+// must land in WEIGHT. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 removes it: the loader then adds no SYCL_Host buffer type, so
+// there is no loader buffer to measure, and the binary exits 77 naming that leg rather than passing. Each allocation is
+// classed by the call that made it, and its owner metadata must agree with that class. Metadata separates host_weights
+// from the HOST_COMPUTE tenants; the reserve and unplanned loader residency come from one buffer type with one request
+// shape, so between those two the call alone attributes the bytes. Every byte the zone gains belongs to a named term or
+// to unplanned loader residency, which is reported on its own line; any other byte fails. The terms stay within their
+// bytes and the zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b and 3a
+// have passed.
 //
 // Arm 1b (no device) re-backs one host expert FILE_MAPPED and another CPU_OWNED on the single-device plan and asserts
 // that neither one's bytes reach host_weights, blocks or tlsf_bound, while host_weights still equals the plan's
 // weight_host_bytes. It then re-backs a third without moving its charge, and the two figures must differ: the positive
 // control of the comparison the [HOST-PLAN-BUG] WARN makes.
+//
+// Arm 3 measures unplanned loader residency on a plan built with the fact true. 3a (no device) binds a load transaction
+// with that plan staged, as the loader's begin and stage do, and asks ggml_backend_sycl_planned_host_backing for every
+// weight, as select_weight_buft asks it: no weight may answer a backing that keeps SYCL_Host. Under a
+// GGML_SYCL_HOST_WEIGHT_LAYOUT other than cpu every weight answers FILE_MAPPED; under cpu, the default, a host dense
+// weight answers CPU_OWNED, which binds ggml-cpu's own buffer type and is reported on its own line. Its positive
+// controls are the fact-false plan, whose answers keep the whole model on SYCL_Host, and a copy of the mapping plan
+// whose dense entries the planner left PINNED, whose answers keep exactly those weights there. 3b (device) maps a
+// stand-in model file through ggml_backend_sycl_mapped_buffer_from_file with that plan bound, addresses every weight in
+// the buffer from its file offset as load_all_data does, reads one in place as the file's own bytes, and measures the
+// WEIGHT zone around it: it must not grow. Its positive control is a pinned copy of the same bytes through S1-PRELOAD's
+// request, which must grow the zone by at least those bytes, the effect a hook that copied into the pinned pool has.
 
 #include "../common.hpp"
 #include "../ggml-sycl-test.hpp"
+#include "../model-lifecycle.hpp"
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
+#include "host-planner-test-fixture.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <cstdio>
@@ -67,6 +88,10 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#if !defined(_WIN32)
+#    include <unistd.h>
+#endif
+
 using namespace ggml_sycl;
 
 namespace {
@@ -77,67 +102,16 @@ constexpr size_t MiB = 1024ull * 1024ull;
 constexpr size_t k_host_compute_reserve_bytes = 64ull * MiB;
 constexpr size_t k_tlsf_grain                 = 256;
 
-int g_checks = 0;
-int g_fail   = 0;
+using host_planner_test::check;
+using host_planner_test::check_eq;
+using host_planner_test::g_checks;
+using host_planner_test::g_fail;
+using host_planner_test::make_mock_sycl_info;
 
-void check(bool cond, const char * what) {
-    g_checks++;
-    if (!cond) {
-        g_fail++;
-        std::printf("  FAIL: %s\n", what);
-    }
-}
-
-void check_eq(const char * what, size_t got, size_t want) {
-    g_checks++;
-    if (got != want) {
-        g_fail++;
-        std::printf("  FAIL: %s: got %zu, want %zu\n", what, got, want);
-    }
-}
-
-// --- the mocked device table: discrete cards, enough to plan, nothing touched ---
-
-ggml_sycl_device_info make_mock_sycl_info(int device_count) {
-    ggml_sycl_device_info info{};
-    info.device_count        = device_count;
-    info.total_gpu_count     = device_count;
-    info.host_max_alloc_size = 128ull * 1024ull * MiB;
-
-    for (int d = 0; d < device_count; ++d) {
-        const size_t       total_vram   = 16ull * 1024ull * MiB;
-        sycl_device_info & dev          = info.devices[d];
-        dev.cc                          = 1200;
-        dev.nsm                         = 128;
-        dev.smpbo                       = 64ull * 1024ull;
-        dev.vmm                         = true;
-        dev.total_vram                  = total_vram;
-        dev.free_vram_at_init           = total_vram;
-        dev.max_alloc_size              = total_vram - 512ull * MiB;
-        dev.safe_max_alloc_size         = dev.max_alloc_size;
-        dev.supports_soa_reorder        = true;
-        dev.xmx_caps.compute_units      = dev.nsm;
-        dev.xmx_caps.global_mem_size    = total_vram;
-        dev.xmx_caps.max_mem_alloc_size = dev.max_alloc_size;
-        std::snprintf(dev.device_name, sizeof(dev.device_name), "mock-weight-zone-terms-%d", d);
-        info.max_work_group_sizes[d] = 256;
-        info.default_tensor_split[d] = static_cast<float>(d + 1) / static_cast<float>(device_count);
-        info.gpu_dpct_ids[d]         = d;
-    }
-    for (int src = 0; src < device_count; ++src) {
-        for (int dst = 0; dst < device_count; ++dst) {
-            sycl_peer_link_info & link = info.peer_links[src][dst];
-            link.valid                 = true;
-            link.src_device            = src;
-            link.dst_device            = dst;
-            link.same_device           = src == dst;
-            link.same_backend          = true;
-            link.same_platform         = true;
-            link.same_sycl_context     = src == dst;
-        }
-    }
-    return info;
-}
+// The mocked cards: B50-shaped discrete GPUs, enough to plan, nothing touched.
+constexpr size_t k_card_vram   = 16ull * 1024ull * MiB;
+constexpr int    k_card_nsm    = 128;
+constexpr char   k_card_name[] = "mock-weight-zone-terms";
 
 // --- a Q2_K-shaped inventory: DeepSeek's quant type, at a size a test can hold ---
 
@@ -318,10 +292,10 @@ derived_terms derive_terms(const placement_plan & plan) {
     return t;
 }
 
-placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory) {
-    const ggml_sycl_device_info   info = make_mock_sycl_info(1);
+// `kv` carries the load's host-backing fact; the default is a load that does not map files.
+placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory, const placement_kv_info & kv = {}) {
+    const ggml_sycl_device_info   info = make_mock_sycl_info(1, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard info_guard(info);
-    placement_kv_info             kv{};
     // A budget far below the experts: every expert, and with them the dense weights, is host-resident.
     return compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, /*device_id=*/0, kv, nullptr, k_experts,
                                   host_ledger_budget());
@@ -329,7 +303,7 @@ placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory) {
 
 // The other planner builder, over two cards with the same starved budget.
 placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & inventory) {
-    const ggml_sycl_device_info      info = make_mock_sycl_info(2);
+    const ggml_sycl_device_info      info = make_mock_sycl_info(2, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard    info_guard(info);
     placement_kv_info                kv{};
     const std::vector<device_budget> budgets = {
@@ -639,10 +613,14 @@ struct weight_census {
     size_t used() const { return cache->host_zone_used(host_zone_id::WEIGHT); }
 };
 
-bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, const cache_tensors & tensors) {
+// `measured_loader` is set once the loader's buffer has been taken and measured.
+bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan,
+                                                  const cache_tensors &  tensors,
+                                                  bool &                 measured_loader) {
     std::printf("(2) census: every WEIGHT-zone byte belongs to a named term or to unplanned loader residency\n");
+    measured_loader = false;
     std::optional<sycl::device> dev_opt =
-        sycl_test_require_gpu("the WEIGHT-zone census (arm 1, the sizing, DID run and its result stands)");
+        sycl_test_require_gpu("the WEIGHT-zone census (arms 1, 1b and 3a DID run and their results stand)");
     if (!dev_opt) {
         return false;
     }
@@ -674,13 +652,19 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
     const size_t used_before     = census.used();
     check(capacity_before >= plan.host_zone_weight_bytes, "the WEIGHT zone holds at least the plan's size");
 
+    // The loader's buffer below is the one a load whose plan does not map files takes.
+    check(!plan.host_backing_maps_files,
+          "the census sizes from a plan whose fact is false, the load that keeps SYCL_Host");
+
     const derived_terms     t = derive_terms(plan);
     std::vector<mem_handle> held;
 
     // The SYCL_Host buffer type the loader adds to a SYCL device's list while weights are evictable: the context's
-    // output buffer and the loader's own buffer both come from it.
-    ggml_backend_buffer_type_t host_buft =
-        ggml_backend_sycl_weights_evictable() ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
+    // output buffer and the loader's own buffer both come from it. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 leaves it out;
+    // a current device with evictable weights always has one.
+    const bool                 evictable = ggml_backend_sycl_weights_evictable();
+    ggml_backend_buffer_type_t host_buft = evictable ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
+    check(!evictable || host_buft != nullptr, "device 0 has a SYCL_Host buffer type while weights are evictable");
 
     auto take = [&](weight_class cls, const alloc_request & req) {
         const size_t before = census.used();
@@ -748,9 +732,9 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
              capacity_before);
     check(census.used() - used_before <= plan.host_zone_weight_bytes, "the terms fit the planned WEIGHT zone");
 
-    // The unplanned class: the loader's own buffer, through that same buffer type, sized as the loader sizes it,
-    // every weight it reads. Once the mapped host tier replaces that buffer type, the buffer no longer lands in WEIGHT
-    // and this class reads zero.
+    // The unplanned class on a load whose plan does not map files: the loader keeps SYCL_Host for every weight
+    // (design 5efe §4.3), so its buffer comes through that same buffer type, sized as the loader sizes it, every
+    // weight it reads. Arm 3 measures the class on a plan whose fact is true.
     const size_t          loader_requested = tensors.total();
     ggml_backend_buffer_t loader_buf       = nullptr;
     size_t                loader_grew_by   = 0;
@@ -758,8 +742,13 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         const size_t capacity_pre = cache.host_zone_capacity(host_zone_id::WEIGHT);
         loader_buf                = take_buffer(weight_class::LOADER_RESIDENCY, host_buft, loader_requested);
         loader_grew_by            = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
+        check(loader_buf != nullptr, "the loader's SYCL_Host buffer was allocated");
     }
     const size_t loader_bytes = census.bytes(weight_class::LOADER_RESIDENCY);
+    if (host_buft != nullptr) {
+        check(loader_bytes > 0, "the loader's SYCL_Host buffer lands in WEIGHT as unplanned loader residency");
+        measured_loader = true;
+    }
 
     check_eq("WEIGHT bytes in neither a named term nor unplanned loader residency", census.unclassed_bytes, 0);
     check_eq("every WEIGHT byte gained is accounted to a class", census.used() - used_before,
@@ -769,7 +758,9 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         host_weights_bytes, t.host_weights, t.blocks * k_tlsf_grain, reserve_bytes, k_host_compute_reserve_bytes,
         t.blocks);
     if (host_buft == nullptr) {
-        std::printf("  unplanned loader_residency=0 B (the loader adds no SYCL_Host buffer type here)\n");
+        std::printf("  loader leg not run: %s\n",
+                    evictable ? "device 0 has no SYCL_Host buffer type" :
+                                "GGML_SYCL_WEIGHTS_EVICTABLE=0, so the loader adds no SYCL_Host buffer type");
     } else if (loader_buf == nullptr) {
         std::printf("  unplanned loader_residency=0 B (the loader's %zu B buffer was refused)\n", loader_requested);
     } else {
@@ -788,6 +779,323 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
     return true;
 }
 
+// --- arm 3: unplanned loader residency on a load whose plan maps files ---
+
+// A load transaction bound to this thread with `plan` staged as its candidate, as the loader's begin and stage make
+// it, so ggml_backend_sycl_planned_host_backing and the from-file hook answer from that plan. It ends as a failed
+// load, which publishes nothing.
+struct bound_load {
+    lifecycle::Registry & registry = lifecycle::global_registry();
+    lifecycle::LoadTxnId  txn{};
+    bool                  active = false;
+
+    bound_load(placement_plan plan, const placement_kv_info & kv) {
+        const lifecycle::begin_result begin = registry.begin_outer();
+        if (begin.code != lifecycle::error::OK) {
+            return;
+        }
+        txn = begin.txn;
+        registry.bind_candidate(txn);
+        lifecycle_stage_placement_plan(txn.value, std::move(plan), kv);
+        active = true;
+    }
+
+    ~bound_load() {
+        if (!active) {
+            return;
+        }
+        registry.unbind_candidate(txn);
+        lifecycle_abort_placement_plan(txn.value);
+        (void) registry.end(txn, false);
+    }
+
+    bound_load(const bound_load &)             = delete;
+    bound_load & operator=(const bound_load &) = delete;
+};
+
+const char * host_backing_name(ggml_sycl_host_backing backing) {
+    switch (backing) {
+        case GGML_SYCL_HOST_BACKING_PINNED:
+            return "PINNED";
+        case GGML_SYCL_HOST_BACKING_FILE_MAPPED:
+            return "FILE_MAPPED";
+        case GGML_SYCL_HOST_BACKING_HOST_CPU:
+            return "HOST_CPU";
+        case GGML_SYCL_HOST_BACKING_CPU_OWNED:
+            return "CPU_OWNED";
+    }
+    return "?";
+}
+
+// The loader's answers over every weight it reads, summed by what each answer binds (design 5efe §4.3, the
+// select_weight_buft row): FILE_MAPPED binds SYCL_Mapped, the file's pages; PINNED and HOST_CPU keep SYCL_Host, the
+// loader's buffer in WEIGHT; CPU_OWNED binds ggml-cpu's own buffer type, and keeps SYCL_Host only where no such type
+// holds the weight. unknown sums an answer outside the enum, and default_answer is the transaction default, the answer
+// to a query with no name. bound is false when no load transaction could begin.
+struct loader_answers {
+    bool                   bound          = false;
+    size_t                 sycl_host      = 0;
+    size_t                 file_mapped    = 0;
+    size_t                 cpu_owned      = 0;
+    size_t                 unknown        = 0;
+    ggml_sycl_host_backing default_answer = GGML_SYCL_HOST_BACKING_PINNED;
+};
+
+// Stages `plan` for a bound load and asks ggml_backend_sycl_planned_host_backing about every tensor, as
+// select_weight_buft asks it.
+loader_answers ask_loader(const placement_plan & plan, const placement_kv_info & kv, const cache_tensors & tensors) {
+    loader_answers a;
+    bound_load     load(plan, kv);
+    a.bound = load.active;
+    if (!load.active) {
+        return a;
+    }
+    for (const auto & named : tensors.by_name) {
+        const size_t bytes = ggml_nbytes(named.second);
+        switch (ggml_backend_sycl_planned_host_backing(named.first.c_str())) {
+            case GGML_SYCL_HOST_BACKING_PINNED:
+            case GGML_SYCL_HOST_BACKING_HOST_CPU:
+                a.sycl_host += bytes;
+                break;
+            case GGML_SYCL_HOST_BACKING_FILE_MAPPED:
+                a.file_mapped += bytes;
+                break;
+            case GGML_SYCL_HOST_BACKING_CPU_OWNED:
+                a.cpu_owned += bytes;
+                break;
+            default:
+                a.unknown += bytes;
+                break;
+        }
+    }
+    a.default_answer = ggml_backend_sycl_planned_host_backing(nullptr);
+    return a;
+}
+
+void print_answers(const char * what, const loader_answers & a) {
+    std::printf("  [%s] SYCL_Host=%zu B SYCL_Mapped=%zu B cpu_owned=%zu B default=%s\n", what, a.sycl_host,
+                a.file_mapped, a.cpu_owned, host_backing_name(a.default_answer));
+}
+
+// The load arm 3b maps: the fact true under a host weight layout other than cpu, so every weight is FILE_MAPPED.
+struct mapping_load {
+    placement_kv_info kv{};
+    placement_plan    plan{};
+};
+
+// Arm 3a: on a load whose plan maps files, no weight answers a backing that keeps SYCL_Host.
+mapping_load arm3a_mapping_load_keeps_no_weight_on_sycl_host(const std::vector<placement_tensor_info> & inventory,
+                                                             const cache_tensors &                      tensors,
+                                                             const placement_plan & fact_false_plan) {
+    std::printf("(3a) the loader's answers on a load whose plan maps files keep no weight on SYCL_Host\n");
+    const size_t total = tensors.total();
+
+    // Positive control of the probe: arm 2's plan, the fact false, keeps every weight on SYCL_Host.
+    const loader_answers off = ask_loader(fact_false_plan, placement_kv_info{}, tensors);
+    check(off.bound, "a load transaction binds with the fact-false plan staged");
+    print_answers("fact false", off);
+    check_eq("fact false: the answers keep every weight on SYCL_Host", off.sycl_host, total);
+    check(off.default_answer == GGML_SYCL_HOST_BACKING_PINNED, "fact false: the transaction default is PINNED");
+
+    // The fact true under a layout other than cpu: every weight, a device-planned one included, is FILE_MAPPED.
+    mapping_load plain;
+    plain.kv.load_maps_files        = true;
+    plain.kv.host_weight_layout_cpu = false;
+    plain.plan                      = plan_q2k(inventory, plain.kv);
+    check(plain.plan.host_backing_maps_files, "the builder copied the fact onto the plan");
+    const loader_answers on = ask_loader(plain.plan, plain.kv, tensors);
+    check(on.bound, "a load transaction binds with the mapping plan staged");
+    print_answers("fact true, layout not cpu", on);
+    check_eq("fact true: no weight answers a backing that keeps SYCL_Host", on.sycl_host, 0);
+    check_eq("fact true, layout not cpu: every weight answers FILE_MAPPED", on.file_mapped, total);
+    check_eq("fact true: no answer outside the enum", on.unknown, 0);
+    check(on.default_answer == GGML_SYCL_HOST_BACKING_FILE_MAPPED, "fact true: the transaction default is FILE_MAPPED");
+
+    // The fact true under the default layout, cpu: a host dense weight is CPU_OWNED. It binds ggml-cpu's own buffer
+    // type, and the loader keeps SYCL_Host for one only where no such type holds it, which the host zone select
+    // decides, so its bytes are reported apart from the class rather than counted as zero.
+    placement_kv_info cpu_kv{};
+    cpu_kv.load_maps_files        = true;
+    cpu_kv.host_weight_layout_cpu = true;
+    const loader_answers cpu      = ask_loader(plan_q2k(inventory, cpu_kv), cpu_kv, tensors);
+    check(cpu.bound, "a load transaction binds with the default-layout mapping plan staged");
+    print_answers("fact true, layout cpu", cpu);
+    check_eq("fact true, layout cpu: no weight answers a backing that keeps SYCL_Host", cpu.sycl_host, 0);
+    check(cpu.cpu_owned > 0, "fact true, layout cpu: a host dense weight answers CPU_OWNED");
+    check_eq("fact true, layout cpu: every weight answers FILE_MAPPED or CPU_OWNED", cpu.file_mapped + cpu.cpu_owned,
+             total);
+
+    // Positive control of the zero, the planner defect it exists to catch: the mapping plan with its dense entries
+    // left PINNED. A routed expert is not name-indexed and keeps the transaction default, so exactly the dense
+    // weights must come back on SYCL_Host.
+    placement_plan left_pinned = plain.plan;
+    size_t         dense_bytes = 0;
+    for (placement_entry & e : left_pinned.entries) {
+        if (e.expert_id >= 0) {
+            continue;
+        }
+        e.host_backing     = placement_host_backing::PINNED;
+        const size_t bytes = tensors.bytes(e);
+        dense_bytes += bytes == SIZE_MAX ? 0 : bytes;
+    }
+    const loader_answers pinned = ask_loader(left_pinned, plain.kv, tensors);
+    check(pinned.bound, "a load transaction binds with the left-PINNED plan staged");
+    print_answers("fact true, dense entries left PINNED", pinned);
+    check(dense_bytes > 0, "the plan has dense weights to leave PINNED");
+    check_eq("dense entries left PINNED come back on SYCL_Host", pinned.sycl_host, dense_bytes);
+    return plain;
+}
+
+#if !defined(_WIN32)
+// A stand-in model file: unlinked, `size` bytes, zero except where the arm writes. -1 when it cannot be made.
+int make_model_file(size_t size) {
+    const char * dir  = std::getenv("TMPDIR");
+    std::string  path = std::string(dir != nullptr && dir[0] != '\0' ? dir : "/tmp") + "/zone-terms-model-XXXXXX";
+    const int    fd   = mkstemp(path.data());
+    if (fd < 0) {
+        return -1;
+    }
+    unlink(path.c_str());
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+#endif
+
+// Arm 3b: the SYCL_Mapped buffer the loader builds on that load takes no WEIGHT-zone byte.
+//
+// The weights are addressed in the buffer from their file offsets, as load_all_data addresses them, but not bound
+// into it: binding runs the buffer's init_tensor, which registers each weight with the bound load, and only a model's
+// load end releases those rows. The bytes a weight reads are the buffer's bytes at that address either way.
+void arm3b_mapped_buffer_takes_no_weight_zone_bytes(const mapping_load &                       load,
+                                                    const std::vector<placement_tensor_info> & inventory) {
+    std::printf("(3b) the loader's SYCL_Mapped buffer on that load takes no WEIGHT-zone byte\n");
+#if defined(_WIN32)
+    GGML_UNUSED(load);
+    GGML_UNUSED(inventory);
+    std::printf("  not run: this build has no file-mapping tier, so no load maps files\n");
+#else
+    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
+    if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
+        return;  // arm 2 already failed for it
+    }
+    ggml_backend_dev_t dev0  = ggml_backend_reg_dev_get(reg, 0);
+    unified_cache *    cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !cache->host_zones_configured()) {
+        return;  // arm 2 already failed for it
+    }
+    unified_cache &            zones       = *cache;
+    ggml_backend_buffer_type_t mapped_buft = ggml_backend_sycl_mapped_buffer_type_for_device(dev0);
+    check(mapped_buft != nullptr, "device 0 has a SYCL_Mapped buffer type");
+    if (mapped_buft == nullptr) {
+        return;
+    }
+
+    // The weights' ranges in the stand-in file, in name order at GGUF's default 32-byte alignment: every weight,
+    // since on this load every one answers FILE_MAPPED and binds SYCL_Mapped.
+    std::vector<ggml_sycl_mapped_tensor_range> ranges;
+    uint64_t                                   file_size = 0;
+    for (const auto & row : inventory) {
+        file_size = (file_size + 31) / 32 * 32;
+        ranges.push_back({ row.name.c_str(), file_size, static_cast<uint64_t>(row.size) });
+        file_size += row.size;
+    }
+    size_t mapped_bytes = 0;
+    for (const ggml_sycl_mapped_tensor_range & r : ranges) {
+        mapped_bytes += r.size;
+    }
+
+    // The probe the first weight must read in place: bytes written to the file, never to the buffer.
+    const char   probe[]   = "zone-terms-probe";
+    const size_t probe_len = sizeof(probe) - 1;
+    const int    fd        = make_model_file(file_size);
+    check(fd >= 0, "a stand-in model file was made");
+    if (fd < 0) {
+        return;
+    }
+    const bool probe_written =
+        pwrite(fd, probe, probe_len, static_cast<off_t>(ranges[0].file_offset)) == static_cast<ssize_t>(probe_len);
+    check(probe_written, "the probe bytes were written to the file");
+
+    // Positive control of the measurement: a pinned copy of the same bytes through S1-PRELOAD's request, what a hook
+    // that copied the weights into the pinned pool would allocate, grows the zone by at least those bytes.
+    {
+        const size_t before = zones.host_zone_used(host_zone_id::WEIGHT);
+        mem_handle   copy   = unified_allocate(host_weight_request(zones.get_queue(), mapped_bytes));
+        const size_t after  = zones.host_zone_used(host_zone_id::WEIGHT);
+        const size_t grew   = after > before ? after - before : 0;
+        check(copy.valid(), "the pinned copy of the mapped bytes was allocated");
+        check(grew >= mapped_bytes, "a pinned copy of the mapped bytes grows the WEIGHT zone by at least those bytes");
+        std::printf("  positive control: a pinned copy of %zu B grew WEIGHT by %zu B\n", mapped_bytes, grew);
+    }
+
+    {
+        bound_load bound(load.plan, load.kv);
+        check(bound.active, "a load transaction binds with the mapping plan staged");
+        if (!bound.active) {
+            close(fd);
+            return;
+        }
+
+        constexpr int n_zones = static_cast<int>(host_zone_id::COUNT);
+        size_t        used_before[n_zones];
+        for (int z = 0; z < n_zones; ++z) {
+            used_before[z] = zones.host_zone_used(static_cast<host_zone_id>(z));
+        }
+        const size_t weight_capacity_before = zones.host_zone_capacity(host_zone_id::WEIGHT);
+
+        uint64_t              base_file_offset = 0;
+        ggml_backend_buffer_t buf              = ggml_backend_sycl_mapped_buffer_from_file(
+            dev0, /*file_idx=*/0, fd, file_size, ranges.data(), ranges.size(), nullptr, 0, &base_file_offset);
+        check(buf != nullptr, "the from-file hook maps the file for the bound load");
+        if (buf != nullptr) {
+            check(ggml_backend_buffer_get_type(buf) == mapped_buft, "the buffer is device 0's SYCL_Mapped");
+            check(ggml_backend_buffer_is_host(buf), "the CPU reads the buffer");
+            alloc_metadata md{};
+            const bool     registered = unified_lookup_runtime_allocation(ggml_backend_buffer_get_base(buf), &md);
+            check(registered && md.host_zone != host_zone_id::WEIGHT,
+                  "the buffer's registered allocation is in no WEIGHT zone");
+
+            // Every weight's range lies in the buffer at base + (offset - base offset), load_all_data's address.
+            const uint8_t * base     = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(buf));
+            const size_t    size     = ggml_backend_buffer_get_size(buf);
+            size_t          n_inside = 0;
+            for (const ggml_sycl_mapped_tensor_range & r : ranges) {
+                if (r.file_offset >= base_file_offset && r.file_offset - base_file_offset + r.size <= size) {
+                    n_inside++;
+                }
+            }
+            check_eq("weights whose range lies in the SYCL_Mapped buffer", n_inside, ranges.size());
+            const bool probe_inside = ranges[0].file_offset >= base_file_offset &&
+                                      ranges[0].file_offset - base_file_offset + probe_len <= size;
+            check(probe_inside && std::memcmp(base + (ranges[0].file_offset - base_file_offset), probe, probe_len) == 0,
+                  "the first weight reads the file's bytes in place");
+
+            constexpr int weight_zone = static_cast<int>(host_zone_id::WEIGHT);
+            size_t        weight_grew = 0;
+            size_t        other_grew  = 0;
+            for (int z = 0; z < n_zones; ++z) {
+                const size_t used = zones.host_zone_used(static_cast<host_zone_id>(z));
+                const size_t grew = used > used_before[z] ? used - used_before[z] : 0;
+                (z == weight_zone ? weight_grew : other_grew) += grew;
+            }
+            check_eq("unplanned loader residency on a load whose plan maps files", weight_grew, 0);
+            check_eq("the WEIGHT zone did not grow for the mapped buffer",
+                     zones.host_zone_capacity(host_zone_id::WEIGHT), weight_capacity_before);
+            check_eq("no other host zone gained a byte for the mapped buffer", other_grew, 0);
+            std::printf(
+                "  unplanned loader_residency=%zu B on a load whose plan maps files (SYCL_Mapped buffer %zu B "
+                "of file pages for %zu B of weights)\n",
+                weight_grew, size, mapped_bytes);
+            ggml_backend_buffer_free(buf);
+        }
+    }
+    close(fd);
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -801,8 +1109,13 @@ int main() {
     placement_plan plan{};
     arm1_weight_zone_is_exact_bytes_plus_named_terms(inventory, tensors, plan);
     arm1b_walk_counts_only_weight_zone_backings(plan);
+    const mapping_load mapping = arm3a_mapping_load_keeps_no_weight_on_sycl_host(inventory, tensors, plan);
 
-    const bool ran_census = arm2_every_weight_zone_allocation_has_a_term(plan, tensors);
+    bool       measured_loader = false;
+    const bool ran_census      = arm2_every_weight_zone_allocation_has_a_term(plan, tensors, measured_loader);
+    if (ran_census) {
+        arm3b_mapped_buffer_takes_no_weight_zone_bytes(mapping, inventory);
+    }
 
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {
@@ -810,7 +1123,14 @@ int main() {
         return 1;
     }
     if (!ran_census) {
-        std::printf("SKIP: arm 1 passed; the census needs a device and proved nothing\n");
+        std::printf("SKIP: arms 1, 1b and 3a passed; arms 2 and 3b need a device and proved nothing\n");
+        return SYCL_TEST_SKIP;
+    }
+    if (!measured_loader) {
+        std::printf(
+            "SKIP: every arm that ran passed, but arm 2's loader leg did not run "
+            "(GGML_SYCL_WEIGHTS_EVICTABLE=0: the loader adds no SYCL_Host buffer type), so unplanned loader "
+            "residency on a load that does not map files was not measured\n");
         return SYCL_TEST_SKIP;
     }
     std::printf("PASSED\n");

@@ -342,9 +342,11 @@ def claim_sentinel_has_one_reader(tree: dict[str, str], value_tree: dict[str, st
 
 
 INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
-# The named micro-batch follows the provenance, in its padding (test-sycl-explicit-ubatch-placement-source).
+# libllama's resolved storage inputs follow the provenance, in its padding (test-sycl-mapped-loader-source pins their
+# offsets), and the named micro-batch follows them (test-sycl-explicit-ubatch-placement-source).
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
-            "bool n_ctx_context_is_default; uint32_t n_ubatch_context; }")
+            "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
+            "bool host_weight_layout_cpu; uint32_t n_ubatch_context; }")
 SIZE_PINS = (
     "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184,",
@@ -708,7 +710,7 @@ def test_mutant_backend_drops_the_provenance_fails():
 
 def test_mutant_inventory_without_the_field_fails():
     assert not claim_backend_carries_the_source(
-        _once(SYCL_H, "bool n_ctx_context_is_default; uint32_t n_ubatch_context; };", "uint32_t n_ubatch_context; };"),
+        _once(SYCL_H, "bool n_ctx_context_is_default; bool use_mmap_resolved;", "bool use_mmap_resolved;"),
         SYCL, CACHE_HPP)
 
 
@@ -719,7 +721,7 @@ def test_mutant_size_pin_not_moved_fails():
 
 def test_mutant_provenance_inserted_mid_struct_fails():
     """Inserted before the indexer widths instead of appended: every pinned offset after it moves."""
-    h = _once(SYCL_H, "bool n_ctx_context_is_default; uint32_t n_ubatch_context; };", "uint32_t n_ubatch_context; };")
+    h = _once(SYCL_H, "bool n_ctx_context_is_default; bool use_mmap_resolved;", "bool use_mmap_resolved;")
     tail = "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer;"
     assert h.count(tail) == 1
     h = h.replace(tail, tail.replace("n_ctx_context;", "n_ctx_context; bool n_ctx_context_is_default;"), 1)

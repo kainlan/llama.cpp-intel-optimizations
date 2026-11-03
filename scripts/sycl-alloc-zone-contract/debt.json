@@ -384,7 +384,7 @@
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_register_host_weight_tensor::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_register_weight_identity::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_shutdown::catch_clause:all#0"},
-    {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_stage_inventory_plan::catch_clause:all#0"},
+    {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_stage_load_inventory_plan::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:all#1"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:exception#0"},

@@ -92,6 +92,14 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+
+    // Set once load_tensors() has staged this load's early SYCL plan, which holds the host-backing fact (design 5efe
+    // §4.3). false on a load with no SYCL transaction, or before the plan, which keeps today's use_mmap answers.
+    bool sycl_load_plan_staged = false;
+
+    // Each SYCL_Mapped buffer's base file offset: a tensor at file offset offs lives at base + (offs - this).
+    std::unordered_map<ggml_backend_buffer_t, uint64_t> sycl_mapped_base_offsets;
+
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
@@ -196,11 +204,12 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
     // llama.cpp-lufn: `-ot <pattern>=CPU` is resolved through make_cpu_buft_list(), whose
-    // FIRST entry is the first device's host buffer type -- SYCL_Host on this fork -- ahead
-    // of the CPU_REPACK extras and the plain CPU buft. select_weight_buft() returns the
-    // first entry whose device accepts the op, so a CPU override silently lands in pinned
-    // host memory that the GPU still executes from, and reaches the CPU backend only for the
-    // ops the SYCL device declines. Nothing said so: two runs asking for 96 and 144 layers
+    // FIRST entries are the first device's host buffer types -- SYCL_Host on this fork, after
+    // SYCL_Mapped on a load that maps files -- ahead of the CPU_REPACK extras and the plain CPU
+    // buft. select_weight_buft() returns the first entry whose device accepts the op (SYCL_Mapped
+    // only for a weight the plan backs FILE_MAPPED), so a CPU override silently lands in host
+    // memory that the GPU still executes from, pinned or file-mapped, and reaches the CPU backend
+    // only for the ops the SYCL device declines. Nothing said so: two runs asking for 96 and 144 layers
     // both put the same 45 MB on CPU. Count the downgrades here so done_getting_tensors()
     // can refuse loudly. Note `ggml_backend_buft_is_host()` cannot be the discriminator --
     // SYCL_Host IS host memory; the question is which DEVICE owns the buffer type.
@@ -217,6 +226,13 @@ struct llama_model_loader {
     size_t                     host_planned_cpu_owned_bytes = 0;
     std::string                first_host_planned_cpu_owned_name;
     ggml_backend_buffer_type_t first_host_planned_cpu_owned_buft = nullptr;
+
+    // Weights the SYCL plan backs FILE_MAPPED that create_tensor still bound to another SYCL host buffer type: a
+    // pinned copy the plan never charged (design 5efe §4.3). Counted per load, reported once by done_getting_tensors().
+    size_t                     n_planned_mapped_unserved     = 0;
+    size_t                     planned_mapped_unserved_bytes = 0;
+    std::string                first_planned_mapped_unserved_name;
+    ggml_backend_buffer_type_t first_planned_mapped_unserved_buft = nullptr;
 
     llama_model_loader(
         struct gguf_context * metadata,
@@ -286,6 +302,20 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // Whether this SYCL load maps its model files: the fact on the bound load's staged plan, which the staging proc
+    // derived from the inventory's resolved use_mmap (design 5efe §4.3). false before the plan is staged.
+    bool sycl_load_maps_files() const;
+
+    // Whether a weight bound to `buft` is served from the model file's mapping: for a SYCL buffer type, once this load
+    // staged a plan, the plan's backing for that weight (planned_file_mapped, which create_tensor asks once); use_mmap
+    // otherwise. create_tensor never consults use_mmap for a SYCL weight (design 5efe §4.3).
+    bool weight_maps_files(ggml_backend_buffer_type_t buft, bool planned_file_mapped) const;
+
+    // Whether GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu, the default, where a planner-host dense weight is repacked
+    // into a CPU-owned buffer rather than read in the file layout (=plain, =off). Carried in the inventory, so the
+    // planner charges the backing this loader binds instead of reading the variable itself.
+    static bool host_weight_layout_cpu();
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

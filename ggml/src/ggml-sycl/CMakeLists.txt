@@ -7750,6 +7750,25 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         SKIP_RETURN_CODE 77
         TIMEOUT 60)
 
+    # Host-resident weights are one published fact (design 5efe section 4.4): the real planner over the Qwen-shaped
+    # inventory under the fact true, false and locked, single- and two-device, under a mocked device table. It touches
+    # no device, but it links the backend's private fixtures and runs the planner on a model-sized inventory, so the
+    # rule for that registers it with the cache tests: gpu-serial, serial, selector pinned, 77 as the skip code.
+    # Lead-run.
+    add_executable(test-sycl-host-backing-plan
+        tests/test-sycl-host-backing-plan.cpp)
+    target_link_libraries(test-sycl-host-backing-plan PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-host-backing-plan PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-backing-plan COMMAND test-sycl-host-backing-plan)
+    set_tests_properties(test-sycl-host-backing-plan PROPERTIES
+        LABELS "sycl;host;gpu-serial;cache;mem-handle"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 600)
+
     # The runtime allocation registry's containment lookup follows its range index (llama.cpp-ii25): bounds, nested
     # chunk/suballocation precedence, every registry mutation, and a brute-force oracle. Rows are published through the
     # host-only test seams; nothing is allocated and no device is touched.

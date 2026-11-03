@@ -33,16 +33,32 @@ struct llama_model_loader_sycl_hooks {
     decltype(&ggml_backend_sycl_register_weight_identity)    register_identity           = nullptr;
     decltype(&ggml_backend_sycl_register_gguf_file_identity) register_file_identity      = nullptr;
     decltype(&ggml_backend_sycl_try_register_weight_usage)   try_register_usage          = nullptr;
+
+    // design 5efe §4.3: the backing a weight is planned with, and the mapped host buffer type that serves the
+    // file-backed ones in place
+    decltype(&ggml_backend_sycl_planned_host_backing)          planned_host_backing          = nullptr;
+    decltype(&ggml_backend_sycl_mapped_buffer_type_for_device) mapped_buffer_type_for_device = nullptr;
 };
 
-static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for(ggml_backend_dev_t dev) {
-    llama_model_loader_sycl_hooks hooks;
-    if (ggml_backend_device_backends_disabled() || !dev) {
-        return hooks;
+// The SYCL registry when `reg` is it and device backends are enabled, else nullptr: the one gate in front of every proc
+// the loader resolves. A caller that needs a single proc, or only the gate's answer, asks this rather than building
+// the whole hook table.
+static ggml_backend_reg_t llama_model_loader_sycl_reg(ggml_backend_reg_t reg) {
+    if (ggml_backend_device_backends_disabled() || !reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return nullptr;
     }
-    hooks.reg = ggml_backend_dev_backend_reg(dev);
-    if (!hooks.reg || std::strcmp(ggml_backend_reg_name(hooks.reg), "SYCL") != 0) {
-        return {};
+    return reg;
+}
+
+static ggml_backend_reg_t llama_model_loader_sycl_reg_for(ggml_backend_dev_t dev) {
+    return llama_model_loader_sycl_reg(dev ? ggml_backend_dev_backend_reg(dev) : nullptr);
+}
+
+static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for_reg(ggml_backend_reg_t reg) {
+    llama_model_loader_sycl_hooks hooks;
+    hooks.reg = llama_model_loader_sycl_reg(reg);
+    if (!hooks.reg) {
+        return hooks;
     }
 #    define LOAD_SYCL_PROC(field, name) \
         hooks.field = reinterpret_cast<decltype(hooks.field)>(ggml_backend_reg_get_proc_address(hooks.reg, name))
@@ -53,8 +69,14 @@ static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for(ggml_back
     LOAD_SYCL_PROC(register_identity, "ggml_backend_sycl_register_weight_identity");
     LOAD_SYCL_PROC(register_file_identity, "ggml_backend_sycl_register_gguf_file_identity");
     LOAD_SYCL_PROC(try_register_usage, "ggml_backend_sycl_try_register_weight_usage");
+    LOAD_SYCL_PROC(planned_host_backing, "ggml_backend_sycl_planned_host_backing");
+    LOAD_SYCL_PROC(mapped_buffer_type_for_device, "ggml_backend_sycl_mapped_buffer_type_for_device");
 #    undef LOAD_SYCL_PROC
     return hooks;
+}
+
+static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for(ggml_backend_dev_t dev) {
+    return llama_model_loader_sycl_hooks_for_reg(dev ? ggml_backend_dev_backend_reg(dev) : nullptr);
 }
 #endif
 
@@ -984,6 +1006,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         if (host_buft && buft == host_buft) {
             return true;
         }
+        // the mapped host buffer type holds the same weights, in place in the file's mapping (design 5efe §4.3)
+        ggml_backend_buffer_type_t mapped_buft =
+            sycl_hooks.mapped_buffer_type_for_device ? sycl_hooks.mapped_buffer_type_for_device(dev) : nullptr;
+        if (mapped_buft && buft == mapped_buft) {
+            return true;
+        }
     }
 #endif
 
@@ -1119,17 +1147,46 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     return op_supported;
 }
 
-// find the first buffer type in the list that can use the tensor
+// Whether `buft` is a SYCL device's mapped host buffer type (design 5efe §4.3). A list walk binds it only for a weight
+// the plan backs FILE_MAPPED, never because it heads buft_list_cpu on a load that maps files. The walks ask this per
+// list entry per tensor, so it resolves the one proc it needs rather than the whole hook table.
+static bool buft_is_sycl_mapped(ggml_backend_buffer_type_t buft) {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    ggml_backend_reg_t reg = llama_model_loader_sycl_reg_for(dev);
+    if (!reg) {
+        return false;
+    }
+    const auto mapped_for_device = reinterpret_cast<decltype(&ggml_backend_sycl_mapped_buffer_type_for_device)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_mapped_buffer_type_for_device"));
+    return mapped_for_device && buft == mapped_for_device(dev);
+#else
+    GGML_UNUSED(buft);
+    return false;
+#endif
+}
+
+// find the first buffer type in the list that can use the tensor. planned_file_mapped is the plan's answer for this
+// weight, which create_tensor asks once (design 5efe §4.3).
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams,
                                                      ggml_tensor *         tensor,
                                                      ggml_op               op,
                                                      const buft_list_t *   buft_list,
-                                                     bool                  prefer_host_weights = false) {
+                                                     bool                  prefer_host_weights,
+                                                     bool                  planned_file_mapped) {
     GGML_ASSERT(!buft_list->empty());
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     if (prefer_host_weights) {
         ggml_backend_dev_t dev = buft_list->front().first;
         const auto         sycl_hooks = llama_model_loader_sycl_hooks_for(dev);
+        // A load that maps files binds the mapped host buffer type for every weight the plan backs FILE_MAPPED
+        // (design 5efe §4.3, the select_weight_buft row); any other backing keeps SYCL_Host as before.
+        if (planned_file_mapped && sycl_hooks.reg && sycl_hooks.mapped_buffer_type_for_device) {
+            ggml_backend_buffer_type_t mapped_buft = sycl_hooks.mapped_buffer_type_for_device(dev);
+            if (mapped_buft && weight_buft_supported(hparams, tensor, op, mapped_buft, dev)) {
+                return mapped_buft;
+            }
+        }
         if (sycl_hooks.reg && sycl_hooks.host_buffer_type_for_device) {
             ggml_backend_buffer_type_t host_buft = sycl_hooks.host_buffer_type_for_device(dev);
             if (host_buft && ggml_backend_buft_is_host(host_buft) &&
@@ -1144,6 +1201,9 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
             if (!ggml_backend_buft_is_host(cur_buft)) {
                 continue;
             }
+            if (!planned_file_mapped && buft_is_sycl_mapped(cur_buft)) {
+                continue;
+            }
             if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
                 return cur_buft;
             }
@@ -1151,11 +1211,15 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     }
 #else
     GGML_UNUSED(prefer_host_weights);
+    GGML_UNUSED(planned_file_mapped);
 #endif
 
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
+        if (!planned_file_mapped && buft_is_sycl_mapped(cur_buft)) {
+            continue;
+        }
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
             return cur_buft;
         }
@@ -1232,6 +1296,15 @@ static ggml_backend_buffer_type_t select_weight_buft_cpu_owned(const llama_hpara
     return last;
 }
 #endif
+
+bool llama_model_loader::host_weight_layout_cpu() {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    return host_weight_layout() == LLAMA_HOST_WEIGHT_LAYOUT_CPU;
+#else
+    // No SYCL planner reads the layout in this build; false is the value a zeroed inventory carries.
+    return false;
+#endif
+}
 
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1421,11 +1494,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         selected_bias                = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
 
         bool prefer_host_weights = false;
+        // The plan's backing for this weight, asked once: select_weight_buft, the layout block below and
+        // weight_maps_files read this answer (design 5efe §4.3). No staged plan answers PINNED.
+        bool planned_file_mapped = false;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         const auto layer_sycl_hooks = llama_model_loader_sycl_hooks_for(layer_dev);
         if (layer_sycl_hooks.reg && layer_sycl_hooks.weights_evictable) {
             prefer_host_weights = layer_sycl_hooks.weights_evictable();
         }
+        ggml_sycl_host_backing planned_backing = GGML_SYCL_HOST_BACKING_PINNED;
+        if (layer_sycl_hooks.reg && layer_sycl_hooks.planned_host_backing) {
+            planned_backing = layer_sycl_hooks.planned_host_backing(tn.str().c_str());
+        }
+        planned_file_mapped = planned_backing == GGML_SYCL_HOST_BACKING_FILE_MAPPED;
 #endif
 
         ggml_backend_buffer_type_t buft = nullptr;
@@ -1438,7 +1519,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+                        // An overridden weight's host buffer type comes from the plan's backing like every other
+                        // weight's (design 5efe §4.3): CPU_OWNED binds a CPU-owned buffer type as the layout block
+                        // below does, and select_weight_buft binds SYCL_Mapped for FILE_MAPPED only, never by its place
+                        // at the head of buft_list_cpu. The plan answers every weight of a load that maps files: a
+                        // device-planned weight's backing is FILE_MAPPED, its staging source (§4.4), so it keeps the
+                        // mapping it is staged from rather than a pinned copy the plan never charged.
+                        if (planned_backing == GGML_SYCL_HOST_BACKING_CPU_OWNED) {
+                            buft = select_weight_buft_cpu_owned(hparams, t_meta, op, buft_list_cpu,
+                                                                host_weight_layout() == LLAMA_HOST_WEIGHT_LAYOUT_CPU);
+                        }
+#endif
+                        if (!buft) {
+                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu, false, planned_file_mapped);
+                        }
                         // llama.cpp-lufn: honour it or say so. buft_list_cpu leads with the
                         // GPU's host buffer type, so this resolves to SYCL_Host for every op
                         // the SYCL device accepts and the request is silently not honoured.
@@ -1458,7 +1553,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                                 cpu_override_downgraded_bytes += ggml_nbytes(t_meta);
                             }
                         }
-                        if (use_mmap) {
+                        if (weight_maps_files(buft, planned_file_mapped)) {
                             static std::once_flag once;
                             std::call_once(once, [] {
                                 LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n");
@@ -1502,7 +1597,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             host_weight_layout() != LLAMA_HOST_WEIGHT_LAYOUT_OFF) {
             const int  planned_dev   = layer_sycl_hooks.planned_target_device(tn.str().c_str());
             const bool want_repacked = host_weight_layout() == LLAMA_HOST_WEIGHT_LAYOUT_CPU;
-            if (planned_dev == -1) {
+            // A load that maps files serves a host dense weight read in the file layout (=plain) from SYCL_Mapped in
+            // place, so only a CPU_OWNED weight takes a CPU-owned buffer here (design 5efe §4.4).
+            if (planned_dev == -1 && !planned_file_mapped) {
                 ggml_backend_buffer_type_t cpu_buft =
                     select_weight_buft_cpu_owned(hparams, t_meta, op, buft_list_cpu, want_repacked);
                 if (cpu_buft) {
@@ -1523,7 +1620,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 #endif
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list, prefer_host_weights);
+            buft = select_weight_buft(hparams, t_meta, op, buft_list, prefer_host_weights, planned_file_mapped);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
@@ -1538,13 +1635,29 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             allow_host_buft_with_mmap = true;
         }
 #endif
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) && !allow_host_buft_with_mmap) {
+        if (weight_maps_files(buft, planned_file_mapped) && buft_dev &&
+            buft == ggml_backend_dev_host_buffer_type(buft_dev) && !allow_host_buft_with_mmap) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        // A weight the plan backs with the file's mapping that still lands in another SYCL host buffer type (the
+        // device's SYCL_Mapped absent or declining it) is a pinned copy the plan never charged (design 5efe §4.3).
+        // Counted on the loader, so done_getting_tensors() reports it once for this load.
+        if (planned_file_mapped && ggml_backend_buft_is_host(buft) && !buft_is_sycl_mapped(buft) &&
+            llama_model_loader_sycl_reg_for(ggml_backend_buft_get_device(buft))) {
+            if (n_planned_mapped_unserved == 0) {
+                first_planned_mapped_unserved_name = tn.str();
+                first_planned_mapped_unserved_buft = buft;
+            }
+            n_planned_mapped_unserved++;
+            planned_mapped_unserved_bytes += ggml_nbytes(t_meta);
+        }
+#endif
 
         selected_final_buft = buft;
         selected_final_dev  = ggml_backend_buft_get_device(buft);
@@ -1899,13 +2012,26 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
             first_host_planned_cpu_owned_name.c_str());
     }
 
+    // WARN: memory the plan never charged, which the plan's own host totals cannot show.
+    if (n_planned_mapped_unserved > 0) {
+        LLAMA_LOG_WARN(
+            "%s: %zu tensor(s) (%.1f MiB) the SYCL plan backs with the model file's mapping were bound to "
+            "'%s' instead of the device's mapped buffer type, a pinned copy the plan did not charge "
+            "(first: '%s')\n",
+            __func__, n_planned_mapped_unserved, planned_mapped_unserved_bytes / (1024.0 * 1024.0),
+            ggml_backend_buft_name(first_planned_mapped_unserved_buft), first_planned_mapped_unserved_name.c_str());
+    }
+
     if (n_cpu_override_downgraded > 0) {
-        LLAMA_LOG_WARN("%s: -ot ...=CPU NOT HONOURED for %zu tensor(s) (%.1f MiB) -- they were placed in "
-            "'%s', which belongs to a non-CPU device, so the GPU still executes them from pinned host "
-            "memory. The CPU override list leads with that device's host buffer type; pass --no-host to "
-            "drop it and reach the CPU backend. First affected tensor: '%s'\n",
+        // The memory is the backing the plan's fact bound: SYCL_Mapped holds a FILE_MAPPED weight in the file's pages.
+        const char * held_in = buft_is_sycl_mapped(first_cpu_override_downgraded_buft) ? "file-mapped" : "pinned";
+        LLAMA_LOG_WARN(
+            "%s: -ot ...=CPU NOT HONOURED for %zu tensor(s) (%.1f MiB) -- they were placed in "
+            "'%s', which belongs to a non-CPU device, so the GPU still executes them from %s host "
+            "memory. The CPU override list leads with that device's host buffer types; pass --no-host to "
+            "drop them and reach the CPU backend. First affected tensor: '%s'\n",
             __func__, n_cpu_override_downgraded, cpu_override_downgraded_bytes / (1024.0 * 1024.0),
-            ggml_backend_buft_name(first_cpu_override_downgraded_buft),
+            ggml_backend_buft_name(first_cpu_override_downgraded_buft), held_in,
             first_cpu_override_downgraded_name.c_str());
     }
 }
@@ -1991,6 +2117,32 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     }
 
     return data;
+}
+
+bool llama_model_loader::sycl_load_maps_files() const {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    if (!sycl_load_plan_staged) {
+        return false;
+    }
+    // The transaction default, which the backend answers from the bound load's staged plan.
+    const auto hooks = llama_model_loader_sycl_hooks_for_reg(ggml_backend_reg_by_name("SYCL"));
+    return hooks.planned_host_backing && hooks.planned_host_backing(nullptr) == GGML_SYCL_HOST_BACKING_FILE_MAPPED;
+#else
+    return false;
+#endif
+}
+
+bool llama_model_loader::weight_maps_files(ggml_backend_buffer_type_t buft, bool planned_file_mapped) const {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    if (sycl_load_plan_staged && llama_model_loader_sycl_reg_for(dev)) {
+        return planned_file_mapped;
+    }
+#else
+    GGML_UNUSED(buft);
+    GGML_UNUSED(planned_file_mapped);
+#endif
+    return use_mmap;
 }
 
 bool llama_model_loader::load_all_data(
@@ -2142,6 +2294,27 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // A SYCL_Mapped tensor lives in its buffer's own mapping of the file (design 5efe §4.3): address it from that
+        // buffer's base, never the loader's mapping. The tier locks what -lm mlock locks, so neither the loader's lock
+        // nor mmaps_used grows for it.
+        if (!sycl_mapped_base_offsets.empty() && cur->data == nullptr && bufs.count(weight->idx)) {
+            ggml_backend_buffer_t buf_mapped = bufs.at(weight->idx);
+            const auto            mapped     = sycl_mapped_base_offsets.find(buf_mapped);
+            if (mapped != sycl_mapped_base_offsets.end()) {
+                GGML_ASSERT(weight->offs >= mapped->second);
+                uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_mapped);
+                ggml_backend_tensor_alloc(buf_mapped, cur, base + (weight->offs - mapped->second));
+                if (check_tensors) {
+                    const uint8_t * data = (const uint8_t *) cur->data;
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
+                    }));
+                }
+                size_done += n_size;
+                continue;
+            }
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

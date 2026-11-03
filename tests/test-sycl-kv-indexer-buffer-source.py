@@ -127,10 +127,11 @@ HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == devic
 
 
 # The indexer widths follow n_ctx_context; the context's provenance is appended after them (llama.cpp-7fmt, pinned by
-# test-sycl-ctx-hint-default-source), and the named micro-batch after that, in the provenance's padding (pinned by
+# test-sycl-ctx-hint-default-source), then libllama's resolved storage inputs in the provenance's padding (pinned by
+# test-sycl-mapped-loader-source), and the named micro-batch after that (pinned by
 # test-sycl-explicit-ubatch-placement-source), so the struct no longer ends here.
 FIELD = ("uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; bool n_ctx_context_is_default; "
-         "uint32_t n_ubatch_context; };")
+         "bool use_mmap_resolved; bool use_mlock_resolved; bool host_weight_layout_cpu; uint32_t n_ubatch_context; };")
 READ = ("g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
@@ -156,8 +157,8 @@ HOT_ENV = "const char * hot_layers_env = std::getenv(\"GGML_SYCL_KV_HOT_LAYERS\"
 
 
 def claim_inventory_carries_the_indexer_width(header: str, sycl_cpp: str) -> bool:
-    """The field follows n_ctx_context (with only the context's provenance after it), the backend copies it, and the
-    consumer pins the layout."""
+    """The field follows n_ctx_context (with the context's provenance, libllama's resolved storage inputs and the
+    named micro-batch after it), the backend copies it, and the consumer pins the layout."""
     n = norm(sycl_cpp)
     return FIELD in norm(header) and READ in n and all(a in n for a in LAYOUT)
 

@@ -189,14 +189,14 @@ def evaluate(backend, cache, test):
 
         # --- 3. the executable test is non-vacuous ---
         "the executable test registers inventory through the load bracket":
-            "ggml_backend_sycl_stage_inventory_plan(&fixture.inventory" in case,
+            "ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory" in case,
         # ABSENCE: a direct call stages no plan onto the load-effect
         # transaction, so every planned-target assertion downstream reads
         # NO_PLAN and asserts against nothing.
         "the executable test does not stage inventory outside the bracket":
             "ggml_backend_sycl_set_tensor_inventory(" not in test,
         "the executable test asserts the verdict mid-load, before commit":
-            ordered(case, "ggml_backend_sycl_stage_inventory_plan(",
+            ordered(case, "ggml_backend_sycl_stage_load_inventory_plan(",
                     "ggml_backend_sycl_is_tiered_enabled(backend)",
                     "ggml_backend_sycl_model_load_end("),
         "the executable test cross-checks the verdict against a target oracle":

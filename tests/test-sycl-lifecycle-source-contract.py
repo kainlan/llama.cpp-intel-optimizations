@@ -46,7 +46,9 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_register_gguf_file_identity": "ggml_backend_sycl_register_gguf_file_identity",
     "ggml_backend_sycl_register_weight_usage": "ggml_backend_sycl_register_weight_usage",
     "ggml_backend_sycl_try_register_weight_usage": "ggml_backend_sycl_try_register_weight_usage",
-    "ggml_backend_sycl_stage_inventory_plan": "ggml_backend_sycl_stage_inventory_plan",
+    # The staging proc's renamed export (design 5efe §4.3); the old name answers with a stub that refuses
+    # a libllama predating the inventory's storage inputs, and mutates nothing.
+    "ggml_backend_sycl_stage_load_inventory_plan": "ggml_backend_sycl_stage_load_inventory_plan",
     "ggml_backend_sycl_model_load_begin": "ggml_backend_sycl_model_load_begin",
     "ggml_backend_sycl_model_load_enter_nested": "ggml_backend_sycl_model_load_enter_nested",
     "ggml_backend_sycl_model_load_end": "ggml_backend_sycl_model_load_end",
@@ -761,6 +763,11 @@ def _wrapper_sites():
     return sites
 
 
+# The preload's definition, not its forward declaration: without the brace the lazy match starts at the declaration
+# and ends at the next column-0 brace a few lines on, so a check of the preload would read none of its body.
+_preload_match = re.search(r"static void ggml_sycl_preload_model_weights\(\)\s*\{.*?\n\}", backend, re.S)
+preload_body = _preload_match.group(0) if _preload_match else ""
+
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -992,18 +999,18 @@ checks = {
     < backend.index("registry.defer_quarantine(owner)"),
     "three phase commit publication before LIVE": backend.index("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
     < backend.index("registry->finalize_end(ticket, true, publication"),
-    "DL early and late inventory planning parity": "ggml_backend_sycl_stage_inventory_plan" in public
+    "DL early and late inventory planning parity": "ggml_backend_sycl_stage_load_inventory_plan" in public
     and "hooks.stage_inventory(&inventory, &envelope, early)" in llama
     and "defined(GGML_BACKEND_DL)" in llama
-    and "llama_model_sycl_compute_early_plan(ml, *this, __func__)" in llama
-    and "ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_stage_inventory_plan\")" in llama
-    and "strcmp(name, \"ggml_backend_sycl_stage_inventory_plan\")" in backend
-    and "llama_model_sycl_set_late_inventory(ml, *this, __func__)" in llama
+    and "llama_model_sycl_compute_early_plan(ml, *this, use_mlock, __func__)" in llama
+    and "ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_stage_load_inventory_plan\")" in llama
+    and "strcmp(name, \"ggml_backend_sycl_stage_load_inventory_plan\")" in backend
+    and "llama_model_sycl_set_late_inventory(ml, *this, use_mlock, __func__)" in llama
     and "sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft" in llama
     and "if (sycl_model_backend && ml.use_mmap)" in llama
     and "disabling mmap for SYCL weight layout upload" in llama
     and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count(
-        "ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope"
+        "ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope"
     ) >= 2,
     "DL allocation and metadata parity": all(
         f'LOAD_SYCL_PROC({field}, "{name}")' in (root / "src/llama-model-loader.cpp").read_text()
@@ -1097,12 +1104,16 @@ checks = {
     and cache_cpp.count("stamp_pending_owner(cache_entry, load_effect_guard)") >= 2,
     "preload retains candidate identity": "const auto   preload_plan_snapshot = ggml_sycl_identity_plan_snapshot()" in backend
     and "ggml_sycl_scoped_alloc_rollback" in backend
-    and "ggml_sycl_global_plan_snapshot()" not in re.search(
-        r"static void ggml_sycl_preload_model_weights\(\).*?\n\}", backend, re.S).group(0)
+    and preload_body != ""
+    and "ggml_sycl_global_plan_snapshot()" not in preload_body
     and "SYCL host expert registration failed during preload" in backend
     and "SYCL host weight registration failed during preload" in backend
     and "dense_alloc_guard" in backend
-    and "ggml_sycl::mem_handle host_owner = ggml_sycl_host_expert_alloc(device, expert_size);" in backend,
+    # A SYCL_Mapped expert is served in place and allocates nothing, so the preload declares the owning mem_handle
+    # first and the branch that copies assigns the allocation to that same local (design 5efe §4.3).
+    and re.search(r"\bggml_sycl::mem_handle\s+host_owner\s*;.*?(?<![\w.>])host_owner\s*=\s*"
+                  r"ggml_sycl_host_expert_alloc\s*\(\s*device\s*,\s*expert_size\s*\)\s*;", preload_body,
+                  re.S) is not None,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
