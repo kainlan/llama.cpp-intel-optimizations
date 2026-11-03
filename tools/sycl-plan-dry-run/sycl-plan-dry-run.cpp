@@ -4,9 +4,15 @@
 // the load's stage calls and stores nothing. The SYCL backend is initialised (the planner reads device info), but no
 // model, context, cache or buffer is created.
 //
-// It plans the EARLY inventory: the one the load plans before create_tensor. The load's late inventory differs only
-// by tensors created off SYCL (on another backend's buffer), which a header read cannot know; for a load that keeps
-// every weight on SYCL the two are the same inventory.
+// It plans the EARLY inventory: the one the load plans before create_tensor, every tensor of the file but the lazy
+// rows the record defers to the storage tier. The dry run plans that inventory because it is the one the load's own
+// early plan plans (th32 §4.2's "the host plan a load would make" is the early plan's), so it differs from the load's
+// late inventory in exactly the ways the load's early plan does, three of them:
+//   - tensors created off SYCL, on another backend's buffer: in the early inventory, not the late one;
+//   - file tensors the load never creates, a TENSOR_SKIP tensor and one the architecture does not use: in the early
+//     inventory, not the late one;
+//   - the copies a TENSOR_DUPLICATED create makes, such as a tied output head created from token_embd: in the late
+//     inventory, not the early one, which holds the file's one tensor.
 
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
