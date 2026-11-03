@@ -7966,6 +7966,33 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
 
+    # The lazy tables' backend interface (th32 §11 T3): a table enters through the inventory, rides the early and the
+    # late stage into the published plan and leaves with the model, all read through the model token; and a direct
+    # entry with a pin on the thread's plan slot plans a table STORAGE that only a pinned plan can hold. --devices 1
+    # runs on the B70 alone, where the planner caller takes its single-device path; --devices 2 runs on both cards,
+    # where it takes the multi-device path, and exits 77 below two GPUs. The stage builds every device's cache, so both
+    # carry the OOM-family labels and run alone. Lead-run.
+    add_executable(test-sycl-lazy-plan-interface
+        tests/test-sycl-lazy-plan-interface.cpp)
+    target_link_libraries(test-sycl-lazy-plan-interface PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-plan-interface PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-plan-interface-1dev COMMAND test-sycl-lazy-plan-interface --devices 1)
+    set_tests_properties(test-sycl-lazy-plan-interface-1dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    add_test(NAME test-sycl-lazy-plan-interface-2dev COMMAND test-sycl-lazy-plan-interface --devices 2)
+    set_tests_properties(test-sycl-lazy-plan-interface-2dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
     # requires them to be rejected.  It is not redundant with the source gate in
