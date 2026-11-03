@@ -525,8 +525,9 @@ arm_result arm_k_every_exit_accounts() {
             return x;
         }
         expect(r, x.committed < (UINT64_MAX >> 1), where + ": committed wrapped to " + num(x.committed));
-        expect(r, x.committed == x.live + stranded,
-                   where + ": committed " + num(x.committed) + " != live " + num(x.live) + " + stranded " + num(stranded));
+        const std::string terms =
+            "committed " + num(x.committed) + " != live " + num(x.live) + " + stranded " + num(stranded);
+        expect(r, x.committed == x.live + stranded, where + ": " + terms);
         return x;
     };
     const reading prior = invariant("the base allocation");
