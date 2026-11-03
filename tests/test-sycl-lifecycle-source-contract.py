@@ -763,6 +763,11 @@ def _wrapper_sites():
     return sites
 
 
+# The preload's definition, not its forward declaration: without the brace the lazy match starts at the declaration
+# and ends at the next column-0 brace a few lines on, so a check of the preload would read none of its body.
+_preload_match = re.search(r"static void ggml_sycl_preload_model_weights\(\)\s*\{.*?\n\}", backend, re.S)
+preload_body = _preload_match.group(0) if _preload_match else ""
+
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -1099,16 +1104,15 @@ checks = {
     and cache_cpp.count("stamp_pending_owner(cache_entry, load_effect_guard)") >= 2,
     "preload retains candidate identity": "const auto   preload_plan_snapshot = ggml_sycl_identity_plan_snapshot()" in backend
     and "ggml_sycl_scoped_alloc_rollback" in backend
-    and "ggml_sycl_global_plan_snapshot()" not in re.search(
-        r"static void ggml_sycl_preload_model_weights\(\).*?\n\}", backend, re.S).group(0)
+    and preload_body != ""
+    and "ggml_sycl_global_plan_snapshot()" not in preload_body
     and "SYCL host expert registration failed during preload" in backend
     and "SYCL host weight registration failed during preload" in backend
     and "dense_alloc_guard" in backend
     # A SYCL_Mapped expert is served in place and allocates nothing, so the preload declares the owning mem_handle
     # first and the branch that copies assigns the allocation to that same local (design 5efe §4.3).
     and re.search(r"\bggml_sycl::mem_handle\s+host_owner\s*;.*?(?<![\w.>])host_owner\s*=\s*"
-                  r"ggml_sycl_host_expert_alloc\s*\(\s*device\s*,\s*expert_size\s*\)\s*;",
-                  re.search(r"static void ggml_sycl_preload_model_weights\(\)\s*\{.*?\n\}", backend, re.S).group(0),
+                  r"ggml_sycl_host_expert_alloc\s*\(\s*device\s*,\s*expert_size\s*\)\s*;", preload_body,
                   re.S) is not None,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
