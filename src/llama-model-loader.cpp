@@ -1251,10 +1251,6 @@ static llama_host_weight_layout host_weight_layout() {
     return cached;
 }
 
-bool llama_model_loader::host_weight_layout_cpu() {
-    return host_weight_layout() == LLAMA_HOST_WEIGHT_LAYOUT_CPU;
-}
-
 static ggml_backend_buffer_type_t select_weight_buft_cpu_owned(const llama_hparams & hparams,
                                                                ggml_tensor *         tensor,
                                                                ggml_op               op,
@@ -1280,6 +1276,15 @@ static ggml_backend_buffer_type_t select_weight_buft_cpu_owned(const llama_hpara
     return last;
 }
 #endif
+
+bool llama_model_loader::host_weight_layout_cpu() {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    return host_weight_layout() == LLAMA_HOST_WEIGHT_LAYOUT_CPU;
+#else
+    // No SYCL planner reads the layout in this build; false is the value a zeroed inventory carries.
+    return false;
+#endif
+}
 
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
