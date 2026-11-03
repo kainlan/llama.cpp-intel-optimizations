@@ -578,7 +578,8 @@ arm_result arm_c_a_dry_run_stores_nothing() {
 //   opts:    an options header 8 bytes short is refused the same way, with its own WARN. The options' layout has not
 //            changed, so there is no older size to send;
 //   control: the current sizes return OK with a plan and no refused WARN.
-// Engagement: the control returned OK with at least one plan; neither refused leg sampled the host (no sample line).
+// Engagement: the control returned OK with at least one plan. Neither refused leg sampled the host (no sample line),
+// and the control logged exactly one sample line, so that absence is evidence.
 // Mutants: the size gate dropped (the old size returns OK); the refusal silent (no WARN naming both sizes); a refused
 // call that writes the result.
 constexpr uint32_t k_plan_size_before_weight_host_bytes   = 176;
@@ -637,6 +638,11 @@ arm_result arm_0_another_layout_is_refused() {
         return r;
     }
     expect(r, lines_with(refused.c_str()).empty(), "the current sizes logged a refused WARN");
+    // The refused legs' "no sample line" is evidence only if the OK path logs that line: a reworded, demoted or
+    // uncaptured sample line would make their absence vacuous, so its absence here fails the arm.
+    expect(r, lines_with(sample.c_str()).size() == 1,
+           "the current sizes logged " + num(lines_with(sample.c_str()).size()) + " '" + sample +
+               "' lines, want 1: the refused legs' missing sample line proves nothing");
     return r;
 }
 
