@@ -13,7 +13,7 @@
 # body, under g_tensor_inventory_mutex. 8c8a0afae moved it: the exported setter
 # delegates to a private ggml_sycl_set_tensor_inventory_impl that finalizes the
 # plan and captures the candidate snapshot UNDER the inventory lock, and the
-# guarded ggml_backend_sycl_stage_inventory_plan wrapper provisions that
+# guarded ggml_backend_sycl_stage_load_inventory_plan wrapper provisions that
 # retained snapshot OUTSIDE the lock (canonical contract 12.5). A 528397d03
 # extract is the positive control for A3 (its setter body carries the call).
 #
@@ -104,7 +104,8 @@ CONFIGURE_TOKEN = "configure_host_zones"
 texts = {
     "stage_fn": function_window(
         sycl_cpp,
-        "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,",
+        "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan("
+        "const ggml_sycl_tensor_inventory *   inventory,",
         window=30000),
     "impl_fn": function_window(
         sycl_cpp,
@@ -144,7 +145,7 @@ texts = {
 # --- A: host zones provisioned eagerly, before create_tensor allocates any
 # weight buffer -- not lazily at S1-PRELOAD, which runs after weight loading
 # has already gone through the pre-zone runtime-pinned fallback. The eager
-# call lives in the guarded stage_inventory_plan wrapper (8c8a0afae shape):
+# call lives in the guarded stage_load_inventory_plan wrapper (8c8a0afae shape):
 # the wrapper captures the candidate snapshot from the private setter impl,
 # then provisions that exact retained snapshot, in that order, in the same
 # function. On master the call existed only in S1-PRELOAD.
@@ -475,9 +476,10 @@ def witness_e_docs(t):
 # (name, check, witness): the witness reproduces the defect textually in a
 # copy of `texts`; the check must then fail against that copy.
 checks = [
-    ("A: host zones provisioned eagerly in stage_inventory_plan after the snapshot capture, from the retained snapshot",
+    ("A: host zones provisioned eagerly in stage_load_inventory_plan after the snapshot capture, "
+     "from the retained snapshot",
      check_a_eager_in_stage_wrapper, witness_a),
-    ("A1: inventory lock scoped to the setter impl; provisioning in stage_inventory_plan runs outside it",
+    ("A1: inventory lock scoped to the setter impl; provisioning in stage_load_inventory_plan runs outside it",
      check_a1_lock_scoped_to_impl, witness_a1),
     ("A3: neither the exported setter nor its impl contains a configure_host_zones call",
      check_a3_no_configure_in_setter, witness_a3),

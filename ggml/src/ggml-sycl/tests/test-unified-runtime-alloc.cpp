@@ -966,7 +966,7 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     const auto begin_candidate = lifecycle_find_candidate_placement_plan(load.txn.id);
     TEST_ASSERT(begin_candidate && begin_candidate->load_txn_id == load.txn.id && begin_candidate->explicit_no_plan,
                 "public begin did not expose its exact initial candidate");
-    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, true) == GGML_SYCL_LIFECYCLE_OK,
+    TEST_ASSERT(ggml_backend_sycl_stage_load_inventory_plan(&inventory, nullptr, true) == GGML_SYCL_LIFECYCLE_OK,
                 "public early inventory staging failed");
     const auto snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
     TEST_ASSERT(snapshot && snapshot->load_txn_id == load.txn.id && !snapshot->explicit_no_plan && snapshot->plan,
@@ -1005,7 +1005,7 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     // Now cross the real late-inventory boundary. Its tiered_headroom
     // diagnostic (base_mem/4 when weights exceed shared capacity) is not a
     // second budget subtraction: g_tiered_headroom_reserve has no readers.
-    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
+    TEST_ASSERT(ggml_backend_sycl_stage_load_inventory_plan(&inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
                 "public late inventory staging failed");
     const auto late_snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
     TEST_ASSERT(late_snapshot && late_snapshot->load_txn_id == load.txn.id && !late_snapshot->explicit_no_plan &&

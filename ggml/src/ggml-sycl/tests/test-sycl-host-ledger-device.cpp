@@ -1331,7 +1331,7 @@ arm_result arm_j_store_order() {
     expect(r, all_equal(plans, host_ledger_budget()), "the direct entry inside the transaction did not read the store");
 
     log_clear();
-    const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, true);
+    const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
     const std::vector<size_t>        early    = plan_budgets();
     const size_t                     S1       = host_ledger_budget();
     if (early_rc != GGML_SYCL_LIFECYCLE_OK || early.size() < n_dev) {
@@ -1375,7 +1375,7 @@ arm_result arm_j_store_order() {
     }
 
     log_clear();
-    const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, false);
+    const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, false);
     const std::vector<size_t>        late    = plan_budgets();
     if (late_rc != GGML_SYCL_LIFECYCLE_OK || late.size() < n_dev) {
         void_arm(r, "the late stage run returned " + num(late_rc) + " with " + num(late.size()) +
@@ -1392,7 +1392,7 @@ arm_result arm_j_store_order() {
         return r;
     }
     s0 = stores();
-    (void) ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, true);
+    (void) ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
     expect(r, stores() == s0 + 1, "the second transaction stored " + num(stores() - s0) + " times, want 1");
     (void) ggml_backend_sycl_model_load_end(txn2, false, nullptr);
 

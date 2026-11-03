@@ -604,7 +604,7 @@ struct test_moe_mmid_route_reachable_override_guard {
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The plan dry run's record of one plan (th32 §4.2): every term and residency line it prints for `plan` under
-// `index`, and the result it fills. A hand-built plan reaches backings and charges no planner in this tree produces.
+// `index`, and the result it fills. A hand-built plan reaches backing mixes and charges a shaped inventory does not.
 ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const placement_plan & plan);
 #endif
 

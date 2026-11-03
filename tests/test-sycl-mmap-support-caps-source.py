@@ -16,8 +16,10 @@ The contract:
    and the init loop assigns it from a query that reports whether it returned,
    so a throwing query leaves the device off rather than "discrete".
 4. The load path still clears `use_mmap` for a SYCL model backend
-   (`if (sycl_model_backend && ml.use_mmap)`): C1 deliberately does not remove
-   it. C4 amends this clause.
+   (`if (sycl_model_backend && ml.use_mmap)`), narrowed by C4 to a load whose
+   staged plan maps no files (`!ml.sycl_load_maps_files()`): a load that maps
+   its files keeps the mapping, because its host-resident weights bind
+   SYCL_Mapped in place and its device weights stage from it.
 
 Plain file I/O, not the codescout index: ggml-sycl.cpp is blind to it.
 """
@@ -140,11 +142,30 @@ def test_known_is_set_only_when_the_query_returned():
     )
 
 
-def test_load_path_still_clears_use_mmap_for_a_sycl_model_backend():
+def _balanced_block(text: str, open_idx: int) -> str:
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:i + 1]
+    return text[open_idx:]
+
+
+def test_load_path_clears_use_mmap_only_for_a_sycl_load_that_maps_no_files():
     code = read_code(LLAMA_MODEL_CPP)
-    m = re.search(r"if\s*\(\s*sycl_model_backend\s*&&\s*ml\.use_mmap\s*\)\s*\{(.*?)\}", code, flags=re.DOTALL)
-    assert m, "`if (sycl_model_backend && ml.use_mmap)` is gone: C1 must not remove it (C4 narrows it)"
-    assert re.search(r"ml\.use_mmap\s*=\s*false\s*;", m.group(1)), "that branch no longer clears ml.use_mmap"
+    m = re.search(r"if\s*\(\s*sycl_model_backend\s*&&\s*ml\.use_mmap\s*\)\s*\{", code)
+    assert m, "`if (sycl_model_backend && ml.use_mmap)` is gone: a SYCL load without the tier must still clear use_mmap"
+    block = _balanced_block(code, m.end() - 1)
+    clear = re.search(r"ml\.use_mmap\s*=\s*false\s*;", block)
+    assert clear, "that branch no longer clears ml.use_mmap"
+    guard = re.search(r"if\s*\(\s*!\s*ml\.sycl_load_maps_files\s*\(\s*\)\s*\)\s*\{", block)
+    assert guard and guard.start() < clear.start(), (
+        "the clear is not narrowed to a load whose staged plan maps no files (`if (!ml.sycl_load_maps_files())`): "
+        "a load that maps its files would lose the mapping its SYCL_Mapped buffers and staging read from"
+    )
 
 
 if __name__ == "__main__":

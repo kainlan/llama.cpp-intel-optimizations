@@ -166,8 +166,8 @@ struct lifecycle_fixture {
             }
             load_open = true;
             synthetic_inventory fixture;
-            const auto stage_result =
-                ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false);
+            const auto          stage_result =
+                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
             if (stage_result != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error("inventory staging result=" +
                                          std::to_string(static_cast<int>(stage_result)));

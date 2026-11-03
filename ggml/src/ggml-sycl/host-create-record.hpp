@@ -7,7 +7,7 @@
 // drives every arm.
 //
 // The flow it carries.  llama calls ggml_backend_sycl_publish_host_create_record
-// immediately before each stage_inventory_plan call; the export's body is
+// immediately before each stage_load_inventory_plan call; the export's body is
 // host_create_pending_set, which converts the wire struct with the ONE converter
 // below and parks the copy in a thread_local slot tagged with the bound
 // candidate.  The stage takes the slot once, at entry, into a

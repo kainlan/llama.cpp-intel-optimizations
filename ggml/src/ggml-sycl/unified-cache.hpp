@@ -667,6 +667,19 @@ struct placement_kv_info {
     // expert type with no measured CPU rate refuses the room for every layer instead of being priced at
     // cpu_expert_gbps (kv_room_expert_rate_for, kv-room-cost.hpp). It never makes a room held.
     bool                  n_ctx_context_is_default = false;
+    // The load's host-backing fact (design 5efe §4.3-4.4), which the staging proc derives once from libllama's resolved
+    // inputs in ggml_sycl_tensor_inventory (use_mmap_resolved, use_mlock_resolved, host_weight_layout_cpu); the plan
+    // copies it and is the store every reader asks. load_maps_files: libllama resolved use_mmap and this build has the
+    // file-mapping tier, so a host-resident weight is FILE_MAPPED (a routed expert, token_embd, a dense weight read in
+    // the file layout) or CPU_OWNED (a dense weight ggml-cpu repacks), and a device-planned weight's staging source is
+    // the mapping. false keeps every backing PINNED, today's figures. load_locks_files: -lm mmap+mlock, so the mapped
+    // bytes are locked and charged (§4.5). host_weight_layout_cpu: libllama's answer, copied unchanged, to whether
+    // GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu (its default), the one layout whose dense weights are CPU_OWNED.
+    // Unstaged it is false, a zeroed inventory's value: the rule reads it only under load_maps_files, and the staging
+    // proc writes both together.
+    bool                  load_maps_files          = false;
+    bool                  load_locks_files         = false;
+    bool                  host_weight_layout_cpu   = false;
     // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
     // is held for a layer only when the attention it keeps on the device is worth more per decode token than the
     // routed experts it displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at
@@ -1006,6 +1019,12 @@ struct placement_plan {
     size_t                       host_cpu_owned_bytes     = 0;
     size_t                       host_mapped_bytes        = 0;
     size_t                       host_mapped_source_bytes = 0;
+
+    // The load's fact as the builder read it from placement_kv_info: host_backing_maps_files gives the entries their
+    // §4.4 backings, and host_mapped_locked charges host_mapped_bytes as locked memory (§4.5).
+    bool host_backing_maps_files = false;
+    bool host_mapped_locked      = false;
+
     size_t                       kv_vram_bytes;      // KV bytes on device(s)
     size_t                       kv_host_bytes;      // KV bytes on host
     size_t                       vram_budget;        // VRAM budget used for planning (primary device)
@@ -1381,13 +1400,16 @@ struct placement_plan {
         return false;
     }
 
-    // Adds a host-planned weight's bytes to its backing's term. Only FILE_MAPPED bytes stay out of host_bytes.
+    // Adds a host-planned weight's bytes to its backing's term. FILE_MAPPED bytes stay out of host_bytes unless the
+    // load locks the mapping (design 5efe §4.5): until then the page cache is not ours.
     void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
         if (host_backing_sizes_weight_zone(backing)) {
             weight_host_bytes += bytes;
         } else if (backing == placement_host_backing::FILE_MAPPED) {
             host_mapped_bytes += bytes;
-            return;
+            if (!host_mapped_locked) {
+                return;
+            }
         } else {  // CPU_OWNED
             host_cpu_owned_bytes += bytes;
         }
@@ -1400,7 +1422,9 @@ struct placement_plan {
             saturating_sub(weight_host_bytes, bytes);
         } else if (backing == placement_host_backing::FILE_MAPPED) {
             saturating_sub(host_mapped_bytes, bytes);
-            return;
+            if (!host_mapped_locked) {
+                return;
+            }
         } else {  // CPU_OWNED
             saturating_sub(host_cpu_owned_bytes, bytes);
         }
@@ -1441,7 +1465,26 @@ struct placement_plan {
         return weight_host_bytes + host_cpu_owned_bytes + host_mapped_bytes;
     }
 
-    size_t charged_host_weight_bytes() const noexcept { return weight_host_bytes + host_cpu_owned_bytes; }
+    size_t charged_host_weight_bytes() const noexcept {
+        return weight_host_bytes + host_cpu_owned_bytes + locked_mapped_weight_bytes();
+    }
+
+    // The mapped host weights' bytes the load locks, and so charges (design 5efe §4.5); 0 while the mapping is only
+    // page cache.
+    size_t locked_mapped_weight_bytes() const noexcept { return host_mapped_locked ? host_mapped_bytes : 0; }
+
+    // Whether any entry is PINNED-backed: a host weight held in pinned memory, or a device weight whose staging source
+    // is (design 5efe §4.4). The DMA staging pool exists to stream such a weight; a FILE_MAPPED source refuses
+    // streaming (§5.3), so a plan with no PINNED backing sizes no pool. The census reads the backings the planner
+    // derived from the load's fact, so a load that maps nothing (-lm none) keeps every entry PINNED and its pool.
+    bool has_pinned_backing() const noexcept {
+        for (const placement_entry & e : entries) {
+            if (e.host_backing == placement_host_backing::PINNED) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // Re-derives the staging sources from the entries instead of accumulating them, so no placement move can leave
     // the term stale: the file bytes of every device-planned FILE_MAPPED entry.
@@ -1476,7 +1519,7 @@ struct placement_plan {
         kv_context_reserve_bytes = 0;
         vram_bytes               = weight_vram_bytes + kv_vram_bytes;
         // Mapped weights are placed on host but not charged: the page cache is not ours until it is locked.
-        host_bytes               = weight_host_bytes + host_cpu_owned_bytes + kv_host_bytes;
+        host_bytes = weight_host_bytes + host_cpu_owned_bytes + kv_host_bytes + locked_mapped_weight_bytes();
         // The window ring's room is not KV: it stays held, since the ring is reserved again at every prompt.
         vram_bytes += moe_stream_ring_reserve_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
@@ -2253,6 +2296,7 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
                                        const placement_kv_info & kv_info       = {},
                                        uint32_t                  model_n_layer = 0);
 void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
+
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept;
 bool lifecycle_publish_placement_plan(
     uint64_t                                         model_id,
@@ -8038,7 +8082,7 @@ void                   zero_alloc_check(const char * tag, int device);
 enum ggml_sycl_replan_kind : int {
     GGML_SYCL_REPLAN_KIND_ANY         = 0,
     GGML_SYCL_REPLAN_KIND_TRANSACTION = 1,  // a context's own planned transaction
-    GGML_SYCL_REPLAN_KIND_LOAD        = 2,  // load_begin, stage_inventory_plan, load_end
+    GGML_SYCL_REPLAN_KIND_LOAD        = 2,  // load_begin, stage_load_inventory_plan, load_end
     GGML_SYCL_REPLAN_KIND_LIFECYCLE   = 3,  // every other holder
 };
 

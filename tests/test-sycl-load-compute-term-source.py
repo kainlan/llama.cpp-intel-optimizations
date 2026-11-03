@@ -183,7 +183,8 @@ MERGE_WRITE_RE = re.compile(
     r"|\bg_planned_(?:compute|state)_term_bytes\s*\[[^\]]*\]\s*"
     r"(?:\.\s*(?:store|exchange|fetch_\w+|compare_exchange_\w+)\s*\(|(?:<<|>>|[-+*/%&|^])?=(?!=)|\+\+|--)")
 HEADER = read("ggml/src/ggml-sycl/unified-cache.hpp")
-STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory * inventory,"
+STAGE_SIG = ("ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory "
+             "* inventory,")
 STAGE_PROBE = ("if (early) { const uint64_t txn = effect.owner.load.value; "
                "const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn); "
                "if (candidate && candidate->plan) { ggml_sycl::lifecycle_stage_probe_placement_plan(txn, "

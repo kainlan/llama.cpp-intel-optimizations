@@ -116,7 +116,7 @@ struct lifecycle_fixture {
             require(begin_result == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
             load_open = true;
             synthetic_inventory fixture;
-            require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
+            require(ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
                         GGML_SYCL_LIFECYCLE_OK,
                     "inventory staging failed");
             const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);

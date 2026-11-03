@@ -113,7 +113,7 @@ struct lifecycle_fixture {
         require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle load begin failed");
         synthetic_inventory fixture;
-        require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
+        require(ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
                     GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle inventory staging failed");
         // This binary links the ordinary backend, where the MMID direct route is closed, so the planner must plan

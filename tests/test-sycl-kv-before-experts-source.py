@@ -278,10 +278,12 @@ HINT_PICK_RE = re.compile(r"return \{ n_ctx_hint != 0 \? GGML_PAD\(n_ctx_hint, (
 HINT_PICK = "inventory.n_ctx_context = ctx_room.n_ctx_context;"
 HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);"
 # Both builders pass the model's context hint, with its micro-batch hint after it (test-sycl-explicit-ubatch-placement-
-# source pins that one), and the inventory ends with the micro-batch, after the context's provenance.
+# source pins that one), and the inventory ends with the micro-batch, after the context's provenance and libllama's
+# resolved storage inputs (test-sycl-mapped-loader-source pins those).
 HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
-            "bool n_ctx_context_is_default; uint32_t n_ubatch_context; }")
+            "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
+            "bool host_weight_layout_cpu; uint32_t n_ubatch_context; }")
 COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
 TAIL_ASSERTS = (
     "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",

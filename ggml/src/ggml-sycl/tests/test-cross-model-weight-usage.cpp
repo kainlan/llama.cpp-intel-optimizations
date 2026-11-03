@@ -72,7 +72,7 @@ int main(int, char ** argv) {
     ggml_sycl_load_txn load_a{};
     ggml_sycl_model_token model_a{};
     check(ggml_backend_sycl_model_load_begin(&load_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle begin");
-    check(ggml_backend_sycl_stage_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
+    check(ggml_backend_sycl_stage_load_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
           "model A plan stage");
 
     // Check 1 (positive control): first-sight registration of a name unique
@@ -104,7 +104,7 @@ int main(int, char ** argv) {
     ggml_sycl_load_txn load_b{};
     ggml_sycl_model_token model_b{};
     check(ggml_backend_sycl_model_load_begin(&load_b) == GGML_SYCL_LIFECYCLE_OK, "model B lifecycle begin");
-    check(ggml_backend_sycl_stage_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
+    check(ggml_backend_sycl_stage_load_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
           "model B plan stage");
 
     // Check 3 (negative control): the reused name, registered fresh with

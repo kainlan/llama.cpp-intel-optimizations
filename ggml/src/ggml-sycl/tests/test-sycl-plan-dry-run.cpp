@@ -194,7 +194,7 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
         return r;
     }
     log_clear();
-    const ggml_sycl_lifecycle_result stage_rc = ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, true);
+    const ggml_sycl_lifecycle_result stage_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
     const std::vector<std::string>   stage    = lines_with("[HOST-LEDGER] device=", " plan host_budget=");
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     if (stage_rc != GGML_SYCL_LIFECYCLE_OK || stage.empty()) {
@@ -359,11 +359,12 @@ void residency_from_the_plan_fields(arm_result & r) {
 // record of each term: the WEIGHT zone's terms on its [HOST-PLAN] line, the commit terms, host_planned_bytes and the
 // budget the plan recorded on its [HOST-LEDGER] plan line. The dry run prints each on a line of its own, under the
 // term's name, and each must equal the planner's. The residency lines are scored against the WEIGHT walk: the PINNED
-// and HOST_CPU entries are the ones it counts, so their count is its blocks and their bytes its host_weights. No
-// planner in this tree gives an entry another backing, so a second leg scores the residency on a plan built by hand,
-// through the record's private seam: its FILE_MAPPED and CPU_OWNED figures are the plan's host_mapped_bytes and
-// host_cpu_owned_bytes, which the fixture charges apart from either per-entry sum, and a plan whose weight_host_bytes
-// is charged on the DST basis gets the one [PLAN-DRY-RUN-BUG] line the plan charged on the SRC basis does not.
+// and HOST_CPU entries are the ones it counts, so their count is its blocks and their bytes its host_weights. The
+// shaped inventory maps no file (use_mmap_resolved is false), so its plan keeps every host entry PINNED, and a second
+// leg scores the residency on a plan built by hand, through the record's private seam: its FILE_MAPPED and CPU_OWNED
+// figures are the plan's host_mapped_bytes and host_cpu_owned_bytes, which the fixture charges apart from either
+// per-entry sum, and a plan whose weight_host_bytes is charged on the DST basis gets the one [PLAN-DRY-RUN-BUG] line
+// the plan charged on the SRC basis does not.
 // Engagement: the dry run returned OK, and each plan has exactly one planner line of each kind to score against; the
 // hand-built plan's record counted one entry of each backing, and its two field figures differ from both the SRC and
 // the DST sums of their entries.
@@ -485,7 +486,7 @@ arm_result arm_c_a_dry_run_stores_nothing() {
         return r;
     }
     log_clear();
-    const ggml_sycl_lifecycle_result stage_rc     = ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, true);
+    const ggml_sycl_lifecycle_result stage_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
     const size_t                     staged_plans = lines_with("[HOST-LEDGER] device=", " plan host_budget=").size();
     // An uncommitted end returns the transaction's finish reason, not OK; the dry run below returning OK, not
     // LOAD_BUSY, is what shows the load ended.

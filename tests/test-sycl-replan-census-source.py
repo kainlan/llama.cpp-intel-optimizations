@@ -457,7 +457,7 @@ TOKEN_ENTRIES = {
     "ggml_sycl_set_runtime_context_for_model_impl":    "TRANSACTION",
     "ggml_backend_sycl_set_runtime_context":           "TRANSACTION",
     "ggml_backend_sycl_model_load_begin":              "LOAD",
-    "ggml_backend_sycl_stage_inventory_plan":          "LOAD",
+    "ggml_backend_sycl_stage_load_inventory_plan":     "LOAD",
     "ggml_backend_sycl_model_load_end":                "LOAD",
     "ggml_backend_sycl_probe_runtime_context_for_model":        "LIFECYCLE",
     "ggml_backend_sycl_recheck_runtime_context_flash_attn":     "LIFECYCLE",
@@ -922,14 +922,18 @@ def gate36(files, bad):
         if re.match(r"\s*\)?\s*,\s*snapshot", c[m.end():m.end() + 40]) and "atomic_store" in c[max(0, m.start() - 40):m.start()]:
             continue
         bad("gate 36: g_placement_publication is read in %s, which is not one of the four accessors" % fn)
-    # bound_load_candidate has the named list.
+    # bound_load_candidate has the named list. The two host-backing readers (design 5efe §4.3) are on it
+    # because they answer for the bound load's staged plan only: a plan another load published must never bind
+    # SYCL_Mapped buffers for this one, so they cannot fall back to the publication as the accessors do.
     for m in re.finditer(r"ggml_sycl_bound_load_candidate\s*\(", c):
         fn = enclosing_top(c, m.start())
         if fn is None:
             continue
         if fn.split("::")[-1] not in ACCESSORS + ("ggml_sycl_host_row_authorized",
                                                    "ggml_sycl_register_buffer_tensor_provenance",
-                                                   "ggml_sycl_bound_load_candidate"):
+                                                   "ggml_sycl_bound_load_candidate",
+                                                   "ggml_backend_sycl_planned_host_backing",
+                                                   "ggml_backend_sycl_mapped_buffer_from_file"):
             bad("gate 36: ggml_sycl_bound_load_candidate is called from %s, which is not on the named list" % fn)
     # The latch.
     for fn in LATCH_READERS:
