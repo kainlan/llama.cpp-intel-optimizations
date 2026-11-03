@@ -8211,6 +8211,34 @@ if (NOT GGML_BACKEND_DL)
     ggml_sycl_host_zone_plan_test(plan-walk-sched LIBS ggml-cpu)
 endif()
 
+ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
+    HOST_ZONE_PLAN_MUTANT_WALK_TG_REPLACES_PP
+        "committed q=1048512 expected 9437120[^~]*committed D=10 expected D=5120"
+    HOST_STAGING_PLAN_MUTANT_NO_BEGIN
+        "backend B committed a plan its reserve never walked"
+    HOST_ZONE_PLAN_MUTANT_CAPACITY_HIGH_WATER
+        "an auto-n_ubatch trial settled on 512 ends at Q capacity 34602944, expected 9437120"
+    HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING
+        "a refused host FLASH_ATTN_EXT reads fa=0 refusals=1, expected fa=1 refusals=1"
+    HOST_ZONE_PLAN_MUTANT_FAIL_CLOSED_ASSERTS
+        "the fail-closed helper killed the process: rc 134"
+    HOST_ZONE_PLAN_MUTANT_POOLS_OWN_SCAN
+        "the pools initialized at D=32, expected the plan's D=16"
+    HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED
+        "no `exceeds its planned` line for graph needs D=32"
+    HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST
+        "pool demand 0.3 MiB for an all-device src0"
+    HOST_ZONE_PLAN_MUTANT_POOLS_INIT_ONCE
+        "pools hold D=16 below committed high-water D=32"
+    HOST_ZONE_PLAN_MUTANT_DISPATCH_GROW
+        "the over-plan request recorded an allocation"
+    HOST_ZONE_PLAN_MUTANT_PLAN_IGNORES_SWITCH
+        "with the host dispatch off the plan allocated [1-9][0-9]* slot"
+    HOST_ZONE_PLAN_MUTANT_PREDICATE_IS_HOST
+        "the walk counted 2 host-KV node\\(s\\), expected 1 \\(the view\\)"
+    HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE
+        "device 1's slots are unplanned")
+
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
 
