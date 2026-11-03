@@ -4069,8 +4069,9 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
-# The plan dry run's command line (tools/sycl-plan-dry-run): every option reaches the field the export reads. The
-# parser is a header over llama.h, so the test touches no backend, device or model.
+# The plan dry run's command line (tools/sycl-plan-dry-run): every option reaches the field the export reads, and the
+# tool's header read refuses a GGUF the test writes with an unknown architecture. No backend is initialised and no
+# device or model is touched; the binary links libllama, and with it the SYCL backend's library.
 if (GGML_SYCL)
     llama_build_and_test(test-sycl-plan-dry-run-args.cpp)
     target_include_directories(test-sycl-plan-dry-run-args PRIVATE ${PROJECT_SOURCE_DIR}/tools/sycl-plan-dry-run)
