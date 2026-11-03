@@ -7901,6 +7901,25 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 120)
 
+    # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): expected_host is the stage's
+    # host_planned_bytes, every term is printed by name from the plan, a dry run stores no budget, and the
+    # --mem-available option is the sample's MemAvailable. The planner initialises SYCL and arm (a) stages a load
+    # through real backends that construct caches, so it carries the OOM-family labels, runs alone on the discrete
+    # cards, and exits 77 without a SYCL GPU.
+    add_executable(test-sycl-plan-dry-run
+        tests/test-sycl-plan-dry-run.cpp)
+    target_link_libraries(test-sycl-plan-dry-run PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-plan-dry-run PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-plan-dry-run COMMAND test-sycl-plan-dry-run)
+    set_tests_properties(test-sycl-plan-dry-run PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
     # requires them to be rejected.  It is not redundant with the source gate in

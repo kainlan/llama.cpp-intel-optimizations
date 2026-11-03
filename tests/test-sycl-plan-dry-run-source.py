@@ -19,7 +19,13 @@ cannot see:
    it takes the inventory lock, and is declared, versioned and reachable through the proc table;
 5. libllama shares the early plan's inventory builder and the lazy-record pre-fill between the load and the header
    read, and the header read loads no tensor and opens no load; the tool resolves the export through the registry and
-   includes no backend internals.
+   includes no backend internals;
+6. the extraction changes no behaviour: the load's early plan is the builder and the apply, the builder takes the
+   steps the early plan took in the order it took them, and the load's pre-fill helper calls the record pre-fill;
+7. the dry run leaves no trace: every per-device planner global the stage planners write (in their recording
+   definitions and the static functions those reach within two calls) or the shared planner-input publish writes is
+   written again by the destructor of the dry run's saved state, so a later load reads what it would have read
+   without the dry run.
 
 Plain file I/O, comment-stripped text.
 """
@@ -323,6 +329,112 @@ def test_the_tool_resolves_the_export_through_the_registry():
         assert "ggml-sycl/" not in inc and not inc.endswith(".hpp"), f"the tool includes backend internals: {inc}"
     for name in ("llama_model_load_from_file", "llama_init_from_model", "ggml_backend_sycl_init"):
         assert not calls(tool, name), f"the tool calls {name}"
+
+
+# ---- 6. the extraction changes no behaviour ----
+
+# The early plan's steps, in the order the load took them before the builder was extracted.
+EARLY_STEPS = (
+    "llama_lazy_early_plan_excludes",
+    "llama_model_sycl_add_tensor_info",
+    "llama_model_sycl_mark_get_rows_only",
+    "llama_model_sycl_build_kv_layer_arrays",
+    "llama_model_sycl_populate_inventory",
+)
+
+
+def first_call(text: str, name: str) -> int:
+    m = re.search(rf"(?<![\w.])(?<!->){re.escape(name)}\s*\(", text)
+    return m.start() if m else -1
+
+
+def test_the_early_plan_is_the_builder_and_the_apply():
+    src = read(ROOT / "src/llama-model.cpp")
+    early = body(src, "llama_model_sycl_compute_early_plan")
+    assert calls(early, "llama_model_sycl_build_early_inventory"), "the early plan does not call the builder"
+    assert calls(early, "llama_model_sycl_apply_inventory"), "the early plan does not apply the inventory"
+    for step in EARLY_STEPS:
+        assert not calls(early, step), f"the early plan restates {step} beside the builder"
+
+
+def test_the_builder_takes_the_early_plans_steps_in_order():
+    builder = body(read(ROOT / "src/llama-model.cpp"), "llama_model_sycl_build_early_inventory")
+    at = [first_call(builder, step) for step in EARLY_STEPS]
+    missing = [step for step, pos in zip(EARLY_STEPS, at) if pos < 0]
+    assert not missing, f"the builder does not call {missing}"
+    assert at == sorted(at), f"the builder calls the steps out of order: {dict(zip(EARLY_STEPS, at))}"
+    hit = re.search(r"llama_model_sycl_populate_inventory\s*\(([^;]*)\)\s*;", builder)
+    assert hit and "get_n_ctx_hint()" in hit.group(1) and "get_n_ubatch_hint()" in hit.group(1), (
+        "the builder does not plan at the model's context and micro-batch hints"
+    )
+
+
+def test_the_prefill_helper_is_the_record_prefill():
+    helper = body(read(ROOT / "src/llama-model.cpp"), "llama_model_prefill_lazy_record")
+    assert calls(helper, "llama_lazy_range_record_prefill"), "the pre-fill helper does not call the record pre-fill"
+    assert calls(helper, "get_weight"), "the pre-fill helper does not resolve the record's sources from the file"
+
+
+# ---- 7. no trace ----
+
+
+def setters_in(text: str) -> set:
+    return set(re.findall(r"\b(unified_cache_set_planned_\w+)\s*\(", text))
+
+
+def static_callees(cpp: str, text: str) -> list:
+    names = set(re.findall(r"\b([a-z_][a-z0-9_]*)\s*\(", text))
+    return [n for n in sorted(names) if re.search(rf"(?m)^static\s+[^;{{]*\b{n}\s*\(", cpp)]
+
+
+def planner_written_setters() -> set:
+    """The setters the stage planners call while they plan: in their recording definitions and in the file's static
+    functions those reach within two calls (the host sizing, the host scatter term and what they call)."""
+    cpp = read(SYCL / "unified-cache.cpp")
+    texts, seen = [], set()
+    frontier = []
+    for planner in stage_planners():
+        frontier.extend(b for b in definitions(cpp, planner) if calls(b, "populate_host_zone_sizing"))
+    texts.extend(frontier)
+    for _ in range(2):
+        nxt = []
+        for text in frontier:
+            for name in static_callees(cpp, text):
+                if name not in seen:
+                    seen.add(name)
+                    nxt.extend(definitions(cpp, name))
+        texts.extend(nxt)
+        frontier = nxt
+    found = setters_in("\n".join(texts))
+    assert found, "the stage planners write no per-device planner global"
+    return found
+
+
+def test_the_planner_writes_the_known_globals():
+    # Engagement for the derivation: the shapes the sizing is known to publish.
+    found = planner_written_setters()
+    for name in ("unified_cache_set_planned_nonfa_attn_scratch_shape",
+                 "unified_cache_set_planned_onednn_graph_scratch_shape",
+                 "unified_cache_set_planned_moe_control_requirement",
+                 "unified_cache_set_planned_moe_host_scatter_scratch_bytes"):
+        assert name in found, f"the derivation misses {name}: {sorted(found)}"
+
+
+def test_the_saved_state_restores_every_written_global():
+    cpp = sycl_cpp()
+    hit = re.search(r"struct\s+(ggml_sycl_plan_dry_run_\w*state\w*)\s*\{", cpp)
+    assert hit, "the dry run has no saved-state struct"
+    name = hit.group(1)
+    struct_body = balanced(cpp, hit.end() - 1)
+    dtor = re.search(rf"~\s*{name}\s*\(\s*\)\s*(?:noexcept\s*)?\{{", struct_body)
+    assert dtor, f"{name} has no destructor"
+    restored = setters_in(balanced(struct_body, dtor.end() - 1))
+    written = planner_written_setters() | setters_in(body(cpp, "ggml_sycl_inventory_publish_planner_inputs"))
+    missing = sorted(written - restored)
+    assert not missing, f"the dry run's saved state does not restore {missing}"
+    assert re.search(rf"\b{name}\s+\w+\s*[;({{]", body(cpp, EXPORT) + dry_run_closure(cpp)), (
+        f"the dry run never holds a {name}"
+    )
 
 
 if __name__ == "__main__":

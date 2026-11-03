@@ -4069,6 +4069,14 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# The plan dry run's command line (tools/sycl-plan-dry-run): every option reaches the field the export reads. The
+# parser is a header over llama.h, so the test touches no backend, device or model.
+if (GGML_SYCL)
+    llama_build_and_test(test-sycl-plan-dry-run-args.cpp)
+    target_include_directories(test-sycl-plan-dry-run-args PRIVATE ${PROJECT_SOURCE_DIR}/tools/sycl-plan-dry-run)
+    set_tests_properties(test-sycl-plan-dry-run-args PROPERTIES LABELS "sycl;host")
+endif()
+
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over
 # a two-file GGUF fixture whose tables are sparse holes. Host-only: no backend,
 # device or model.
