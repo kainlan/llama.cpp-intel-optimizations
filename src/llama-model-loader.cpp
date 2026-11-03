@@ -40,12 +40,26 @@ struct llama_model_loader_sycl_hooks {
     decltype(&ggml_backend_sycl_mapped_buffer_type_for_device) mapped_buffer_type_for_device = nullptr;
 };
 
+// The SYCL registry when `reg` is it and device backends are enabled, else nullptr: the one gate in front of every proc
+// the loader resolves. A caller that needs a single proc, or only the gate's answer, asks this rather than building
+// the whole hook table.
+static ggml_backend_reg_t llama_model_loader_sycl_reg(ggml_backend_reg_t reg) {
+    if (ggml_backend_device_backends_disabled() || !reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return nullptr;
+    }
+    return reg;
+}
+
+static ggml_backend_reg_t llama_model_loader_sycl_reg_for(ggml_backend_dev_t dev) {
+    return llama_model_loader_sycl_reg(dev ? ggml_backend_dev_backend_reg(dev) : nullptr);
+}
+
 static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for_reg(ggml_backend_reg_t reg) {
     llama_model_loader_sycl_hooks hooks;
-    if (ggml_backend_device_backends_disabled() || !reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+    hooks.reg = llama_model_loader_sycl_reg(reg);
+    if (!hooks.reg) {
         return hooks;
     }
-    hooks.reg = reg;
 #    define LOAD_SYCL_PROC(field, name) \
         hooks.field = reinterpret_cast<decltype(hooks.field)>(ggml_backend_reg_get_proc_address(hooks.reg, name))
     LOAD_SYCL_PROC(weights_evictable, "ggml_backend_sycl_weights_evictable");
@@ -1134,12 +1148,18 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // Whether `buft` is a SYCL device's mapped host buffer type (design 5efe §4.3). A list walk binds it only for a weight
-// the plan backs FILE_MAPPED, never because it heads buft_list_cpu on a load that maps files.
+// the plan backs FILE_MAPPED, never because it heads buft_list_cpu on a load that maps files. The walks ask this per
+// list entry per tensor, so it resolves the one proc it needs rather than the whole hook table.
 static bool buft_is_sycl_mapped(ggml_backend_buffer_type_t buft) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    ggml_backend_dev_t dev   = buft ? ggml_backend_buft_get_device(buft) : nullptr;
-    const auto         hooks = llama_model_loader_sycl_hooks_for(dev);
-    return hooks.reg && hooks.mapped_buffer_type_for_device && buft == hooks.mapped_buffer_type_for_device(dev);
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    ggml_backend_reg_t reg = llama_model_loader_sycl_reg_for(dev);
+    if (!reg) {
+        return false;
+    }
+    const auto mapped_for_device = reinterpret_cast<decltype(&ggml_backend_sycl_mapped_buffer_type_for_device)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_mapped_buffer_type_for_device"));
+    return mapped_for_device && buft == mapped_for_device(dev);
 #else
     GGML_UNUSED(buft);
     return false;
@@ -1629,7 +1649,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // device's SYCL_Mapped absent or declining it) is a pinned copy the plan never charged (design 5efe §4.3).
         // Counted on the loader, so done_getting_tensors() reports it once for this load.
         if (planned_file_mapped && ggml_backend_buft_is_host(buft) && !buft_is_sycl_mapped(buft) &&
-            llama_model_loader_sycl_hooks_for(ggml_backend_buft_get_device(buft)).reg) {
+            llama_model_loader_sycl_reg_for(ggml_backend_buft_get_device(buft))) {
             if (n_planned_mapped_unserved == 0) {
                 first_planned_mapped_unserved_name = tn.str();
                 first_planned_mapped_unserved_buft = buft;
@@ -2115,7 +2135,7 @@ bool llama_model_loader::sycl_load_maps_files() const {
 bool llama_model_loader::weight_maps_files(ggml_backend_buffer_type_t buft, bool planned_file_mapped) const {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
-    if (sycl_load_plan_staged && llama_model_loader_sycl_hooks_for(dev).reg) {
+    if (sycl_load_plan_staged && llama_model_loader_sycl_reg_for(dev)) {
         return planned_file_mapped;
     }
 #else

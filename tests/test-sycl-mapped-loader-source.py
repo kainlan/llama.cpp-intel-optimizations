@@ -77,8 +77,10 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       where the plan maps no files;
   L14. the -ot CPU override binds from the plan's backing like every other weight: CPU_OWNED takes
       select_weight_buft_cpu_owned, and both of select_weight_buft's list walks skip SYCL_Mapped (buft_is_sycl_mapped)
-      unless the plan backs the weight FILE_MAPPED, so its place at the head of buft_list_cpu never binds it; the
-      NOT HONOURED WARN says file-mapped or pinned from the buffer type the fact bound, never pinned alone;
+      unless the plan backs the weight FILE_MAPPED, so its place at the head of buft_list_cpu never binds it;
+      buft_is_sycl_mapped, which those walks ask per entry per tensor, resolves only mapped_buffer_type_for_device
+      behind the loader's SYCL gate and never builds the whole hook table; the NOT HONOURED WARN says file-mapped or
+      pinned from the buffer type the fact bound, never pinned alone;
   L15. a weight the plan backs FILE_MAPPED that create_tensor still binds to another SYCL host buffer type (a pinned
       copy the plan never charged) is counted on the loader after the demotion, and done_getting_tensors WARNs once
       for the load, naming the first such tensor and its buffer type; no function-local static keys it per process.
@@ -709,8 +711,18 @@ def clause_l14_override_binds_from_the_plan(t: dict) -> list:
     if skips != 2:
         problems.append(f"{skips} of select_weight_buft's two list walks skip SYCL_Mapped for a weight not FILE_MAPPED")
     helper = body_of(t[LML], r"static\s+bool\s+buft_is_sycl_mapped\s*\(")
-    if not re.search(r"buft\s*==\s*hooks\s*\.\s*mapped_buffer_type_for_device\s*\(\s*dev\s*\)", helper):
+    gate = re.search(r"(\w+)\s*=\s*llama_model_loader_sycl_reg_for\s*\(\s*dev\s*\)\s*;", helper)
+    proc = gate and re.search(rf"(\w+)\s*=\s*reinterpret_cast\s*<[^;]*?>\s*\(\s*ggml_backend_reg_get_proc_address\s*"
+                              rf'\(\s*{gate.group(1)}\s*,\s*"ggml_backend_sycl_mapped_buffer_type_for_device"\s*\)'
+                              r"\s*\)\s*;", helper)
+    if not gate:
+        problems.append("buft_is_sycl_mapped does not take the registry from the loader's SYCL gate")
+    elif not proc:
+        problems.append("buft_is_sycl_mapped does not resolve mapped_buffer_type_for_device from the gated registry")
+    elif not re.search(rf"buft\s*==\s*{proc.group(1)}\s*\(\s*dev\s*\)", helper):
         problems.append("buft_is_sycl_mapped does not compare against the device's SYCL_Mapped")
+    if "llama_model_loader_sycl_hooks_for" in helper:
+        problems.append("buft_is_sycl_mapped builds the whole hook table for the one proc it needs")
     report = body_of(t[LML], r"void\s+llama_model_loader::done_getting_tensors\s*\(")
     held = re.search(r"(\w+)\s*=\s*buft_is_sycl_mapped\s*\(\s*first_cpu_override_downgraded_buft\s*\)\s*\?\s*"
                      r'"file-mapped"\s*:\s*"pinned"\s*;', report)
@@ -951,6 +963,8 @@ MAPPED_ALLOC_BODY_RE = (r"(static\s+ggml_backend_buffer_t\s+ggml_backend_sycl_ma
                         r"\([^)]*\)\s*\{.*?)")
 # The SYCL_Mapped prototype definition up to a point in its body, the same way.
 MAPPED_PROTO_RE = r"(static\s+ggml_backend_buffer_type\s+ggml_sycl_mapped_buft_prototype\s*\(\s*\)\s*\{.*?)"
+# The loader's buft_is_sycl_mapped definition up to a point in its body, the same way.
+BUFT_IS_MAPPED_RE = r"(static\s+bool\s+buft_is_sycl_mapped\s*\([^)]*\)\s*\{.*?)"
 
 MUTANTS = [
     # (label, clause label prefix, builder)
@@ -1084,8 +1098,14 @@ MUTANTS = [
      lambda t: _mut(t, LML, r"(GGML_UNUSED\s*\(\s*planned_file_mapped\s*\)\s*;.*?)if\s*\(\s*!\s*planned_file_mapped\s*"
                             r"&&\s*buft_is_sycl_mapped\s*\(\s*cur_buft\s*\)\s*\)\s*\{\s*continue\s*;\s*\}", r"\1")),
     ("buft_is_sycl_mapped never answers true", "L14",
-     lambda t: _mut(t, LML, r"return\s+hooks\s*\.\s*reg\s*&&\s*hooks\s*\.\s*mapped_buffer_type_for_device\s*&&[^;]*;",
-                    "return false;")),
+     lambda t: _mut(t, LML, BUFT_IS_MAPPED_RE + r"return\s+\w+\s*&&\s*buft\s*==\s*\w+\s*\(\s*dev\s*\)\s*;",
+                    r"\1return false;")),
+    ("buft_is_sycl_mapped builds the whole hook table again", "L14",
+     lambda t: _mut(t, LML, BUFT_IS_MAPPED_RE + r"(\w+\s*=\s*llama_model_loader_sycl_reg_for\s*\(\s*dev\s*\)\s*;)",
+                    r"\1\2 const auto hooks = llama_model_loader_sycl_hooks_for(dev); GGML_UNUSED(hooks);")),
+    ("buft_is_sycl_mapped asks any backend's registry", "L14",
+     lambda t: _mut(t, LML, BUFT_IS_MAPPED_RE + r"llama_model_loader_sycl_reg_for\s*\(\s*dev\s*\)",
+                    r"\1(dev ? ggml_backend_dev_backend_reg(dev) : nullptr)")),
     ("the NOT HONOURED WARN says pinned on a mapping load", "L14",
      lambda t: _mut(t, LML, r'buft_is_sycl_mapped\s*\(\s*first_cpu_override_downgraded_buft\s*\)\s*\?\s*'
                             r'"file-mapped"\s*:\s*"pinned"', '"pinned"')),
