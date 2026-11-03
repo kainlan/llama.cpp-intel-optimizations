@@ -95,6 +95,11 @@ def calls(text: str, name: str) -> bool:
     return re.search(rf"(?<![\w.])(?<!->){re.escape(name)}\s*\(", text) is not None
 
 
+def member_calls(text: str, name: str) -> bool:
+    """A call of `name` through an object or a pointer, which `calls` deliberately does not match."""
+    return re.search(rf"(?:\.|->)\s*{re.escape(name)}\s*\(", text) is not None
+
+
 def read(path: Path) -> str:
     return strip_comments(path.read_text())
 
@@ -260,6 +265,13 @@ def test_the_shared_helpers_store_nothing():
             assert not calls(b, forbidden) and not re.search(rf"\b{forbidden}\b", b), f"{name} reaches {forbidden}"
 
 
+def test_member_calls_sees_a_member_call_only():
+    assert member_calls("auto t = registry.current_active_token();", "current_active_token")
+    assert member_calls("auto * w = ml->get_weight(n);", "get_weight")
+    assert not member_calls("current_active_token();", "current_active_token")
+    assert not calls("auto t = registry.current_active_token();", "current_active_token")
+
+
 def test_the_forbidden_scan_sees_a_store():
     src = strip_comments("int ggml_backend_sycl_plan_dry_run(int a) { host_budget_pass_scope s(1); return a; }")
     assert re.search(r"\bhost_budget_pass_scope\b", body(src, EXPORT))
@@ -273,7 +285,7 @@ def test_the_forbidden_scan_sees_a_store():
 def test_the_export_refuses_then_samples_then_locks():
     b = body(sycl_cpp(), EXPORT)
     for name in ("current_active_token", "live_mask"):
-        assert calls(b, name), f"the export does not consult {name}"
+        assert member_calls(b, name), f"the export does not consult {name}"
     busy = b.find("GGML_SYCL_LIFECYCLE_LOAD_BUSY")
     sample = b.find("host_ledger_sample(")
     budget = b.find("host_ledger_compute_budget(")
@@ -372,7 +384,9 @@ def test_the_builder_takes_the_early_plans_steps_in_order():
 def test_the_prefill_helper_is_the_record_prefill():
     helper = body(read(ROOT / "src/llama-model.cpp"), "llama_model_prefill_lazy_record")
     assert calls(helper, "llama_lazy_range_record_prefill"), "the pre-fill helper does not call the record pre-fill"
-    assert calls(helper, "get_weight"), "the pre-fill helper does not resolve the record's sources from the file"
+    assert member_calls(helper, "get_weight"), (
+        "the pre-fill helper does not resolve the record's sources from the file"
+    )
 
 
 # ---- 7. no trace ----
