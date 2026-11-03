@@ -55,6 +55,8 @@ host_zone_id select_zone(alloc_role       role,
     if (role == alloc_role::EXPERT_STAGING) {
         return host_zone_id::SCRATCH;
     }
+    // persistent_owner stays here: the cache's CPU-job input marker is a CONTROL request that lives as long as the
+    // cache, and only WEIGHT keeps it out of the STAGING graph-boundary check that catches a leaked scoped CONTROL.
     if (lifetime == alloc_lifetime::UNOWNED || persistent_owner) {
         return host_zone_id::WEIGHT;
     }
