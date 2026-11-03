@@ -17123,8 +17123,8 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184, "n_ctx_context_is_default moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
-static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "resolved use_mmap left the padding");
-static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "resolved use_mlock left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
               "host_weight_layout_cpu left the padding");
 
