@@ -1278,10 +1278,11 @@ std::string list(const std::vector<size_t> & v) {
 // and the late plans read the early value less the injected bytes); a store per planner call, inside the stage run's
 // device loop (the transaction stores at least once per stage run, so twice, and the late plans read the early value
 // less the injected bytes); no current_active_token() check (the direct entry inside the transaction stores); id 0
-// writing the stored transaction (the second direct entry skips its store). A dry run is not in this tree, so the
-// last leg is the planner called outside any scope with a budget other than the stored B0: the planner takes the
-// budget as an input (design §4.2), so the plan records the one it was passed and nothing is stored. Mutant: the
-// planner's record reading the stored budget instead of its input (the plan records B0).
+// writing the stored transaction (the second direct entry skips its store). That a plan dry run leaves the stored
+// budget at B0 is test-sycl-plan-dry-run's arm (c); the last leg here is the planner the dry run calls, called outside
+// any scope with a budget other than the stored B0: the planner takes the budget as an input (design §4.2), so the
+// plan records the one it was passed and nothing is stored. Mutant: the planner's record reading the stored budget
+// instead of its input (the plan records B0).
 arm_result arm_j_store_order() {
     arm_result   r;
     const size_t n_dev = static_cast<size_t>(ggml_backend_sycl_get_device_count());  // the stage runs' device loop

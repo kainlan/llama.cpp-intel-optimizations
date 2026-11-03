@@ -1890,6 +1890,98 @@ GGML_BACKEND_API enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_r
     bool                                   flash_attn_enabled,
     const ggml_sycl_runtime_context_desc * desc,
     struct ggml_sycl_residency_probe *     out);
+
+// ---- the host-only plan dry run (th32 §4.2 "One source for the number") ----
+//
+// ggml_backend_sycl_plan_dry_run plans `inventory` through the planner the load's stage calls, sizes each plan's host
+// zones through the function the stage's configure step calls, and reports every host term from that plan, so its
+// expected_host is the stage's host_planned_bytes by construction. It stores nothing: no host budget, no plan, no
+// zone, no cache. It samples the host itself and plans against the budget computed from that sample.
+//
+// It is for a process with no model loaded and no load open: an open load or a live model is refused with LOAD_BUSY,
+// before anything is sampled. A cache that already exists is read (its arena zones, its live oneDNN scratch), never
+// created; with none, a device plans against its budget authority's fresh answer. An explicit micro-batch above the
+// load's planning shape (inventory->n_ubatch_context) is not modelled: every plan is the planning-shape plan.
+
+#define GGML_SYCL_PLAN_DRY_RUN_VERSION     1
+#define GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES 16
+
+// The host backings a plan entry can carry, in placement_host_backing's order.
+enum ggml_sycl_plan_dry_run_backing {
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED      = 0,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED = 1,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU    = 2,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED   = 3,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT       = 4,
+};
+
+// The caller's inputs. struct_size and version gate the read; opts may be NULL, which is all zero.
+typedef struct ggml_sycl_plan_dry_run_opts {
+    uint32_t struct_size;
+    uint32_t version;            // GGML_SYCL_PLAN_DRY_RUN_VERSION
+    uint32_t mem_available_set;  // 1: mem_available_bytes is the sample's MemAvailable instead of the live reading
+    uint32_t n_device_budgets;   // device_budget_bytes[0..n) are read, at most GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES
+    uint64_t mem_available_bytes;
+    // The envelope the load would set (llama_model_sycl_make_placement_envelope); NULL plans without one.
+    const struct ggml_sycl_placement_envelope * envelope;
+    // A device's VRAM budget for the plan in bytes, in place of its budget authority's; 0 keeps the authority's.
+    uint64_t                                    device_budget_bytes[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];
+} ggml_sycl_plan_dry_run_opts;
+
+// One plan's host terms, each the plan's own field: the WEIGHT zone's terms (placement_plan_host_weight_zone_terms),
+// the commit terms (placement_plan_host_zone_commit_terms), expected_host (host_planned_bytes) and the residency of
+// the plan's host entries by backing.
+typedef struct ggml_sycl_plan_dry_run_plan {
+    int32_t  device;        // the plan's device_id, the device the planner's own lines name
+    uint32_t multi_device;  // 1: one plan over every physical device
+    uint64_t host_budget;   // the budget the plan recorded
+    uint64_t weight_host_weights;
+    uint64_t weight_blocks;
+    uint64_t weight_host_compute_reserve;
+    uint64_t weight_layout_copies;
+    uint64_t weight_tlsf_bound;
+    uint64_t zone_weight;
+    uint64_t zone_kv;
+    uint64_t zone_staging;
+    uint64_t zone_scratch;
+    uint64_t runtime;
+    uint64_t rounding;
+    uint64_t expected_host;
+    uint64_t residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT];
+    uint64_t residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT];
+} ggml_sycl_plan_dry_run_plan;
+
+// The answer. The caller fills struct_size (sizeof(*this)) and version; the backend writes the rest on OK. The sample
+// fields are the inputs the budget was computed from, with mem_available_bytes the option's when it was given.
+typedef struct ggml_sycl_plan_dry_run_result {
+    uint32_t                    struct_size;
+    uint32_t                    version;  // GGML_SYCL_PLAN_DRY_RUN_VERSION
+    uint64_t                    mem_total_bytes;
+    uint64_t                    mem_available_bytes;
+    uint64_t                    pinned_bytes;
+    uint64_t                    committed_bytes;
+    uint32_t                    budget_pct;
+    uint32_t                    mem_available_from_opts;  // 1: mem_available_bytes is the option's
+    uint32_t                    host_reserve_override;    // 1: an accepted GGML_SYCL_HOST_RESERVE_MB is the budget
+    uint32_t                    n_plans;
+    uint64_t                    host_budget;  // host_ledger_compute_budget of the sample and committed_bytes
+    uint64_t                    device_budget_bytes[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];  // each device's VRAM budget
+    ggml_sycl_plan_dry_run_plan plans[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];
+} ggml_sycl_plan_dry_run_result;
+
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_opts) == 160 || sizeof(void *) != 8, "dry run opts layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_plan) == 176, "dry run plan layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_result) == 3008, "dry run result layout changed");
+
+// OK with the result written; NULL_OUTPUT for a null inventory or result, or a struct header this backend does not
+// read; LOAD_BUSY while a load is open or a model is live; BUSY while the module is being mutated; NOT_FOUND with no
+// SYCL device; EFFECT_FAILED when planning threw. On every status but OK the result is left as the caller wrote it.
+// Proc name: "ggml_backend_sycl_plan_dry_run".
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(
+    const struct ggml_sycl_tensor_inventory *  inventory,
+    const struct ggml_sycl_plan_dry_run_opts * opts,
+    struct ggml_sycl_plan_dry_run_result *     result);
+
 // Capability-only form of ggml_backend_dev_supports_op for a SYCL device: supports_op with its two PLACEMENT
 // declines -- host-demoted KV (the KV-host buffer type) and planner-on-host (ggml_sycl_op_is_planned_on_host) --
 // switched off, so it is false only when there is no kernel for `op` (its type and shape). supports_op's "false"

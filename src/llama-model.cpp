@@ -702,20 +702,24 @@ static void llama_model_sycl_mark_get_rows_only(std::vector<ggml_sycl_tensor_inf
     }
 }
 
-static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
-                                                const llama_model &  model,
-                                                const char *         log_func) {
-    const llama_hparams & hparams = model.hparams;
-    if (!llama_model_sycl_hooks_enabled()) {
-        return;
-    }
-    if (ml.no_alloc || ml.weights_map.empty()) {
-        return;
-    }
-
+// The early plan's inventory, built from weights_map before create_tensor() runs, with the storage its raw pointers
+// point into. The tensor names point into the loader's metadata, so the loader must outlive it. The load's early plan
+// and the plan dry run's header read build it here, so the dry run plans what the load plans.
+struct llama_model_sycl_early_inventory {
     std::vector<ggml_sycl_tensor_info> tensors;
-    tensors.reserve(ml.weights_map.size());
-    size_t total_size                   = 0;
+    std::unique_ptr<bool[]>            swa_layer_mask;
+    llama_model_sycl_kv_layer_arrays   kv_layer_arrays;
+    ggml_sycl_tensor_inventory         inventory  = {};
+    size_t                             total_size = 0;
+};
+
+// False when no weight remains for the plan.
+static bool llama_model_sycl_build_early_inventory(llama_model_loader &               ml,
+                                                   const llama_model &                model,
+                                                   llama_model_sycl_early_inventory & out) {
+    const llama_hparams & hparams = model.hparams;
+
+    out.tensors.reserve(ml.weights_map.size());
     size_t max_pp_pipeline_weight_bytes = 0;
     for (auto & weight : ml.weights_map) {
         // a lazy table the record defers to the SYCL storage tier is not an ordinary weight:
@@ -724,31 +728,48 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
         if (llama_lazy_early_plan_excludes(ml.lazy_record, weight.first)) {
             continue;
         }
-        llama_model_sycl_add_tensor_info(tensors, total_size, max_pp_pipeline_weight_bytes, weight.second.tensor);
+        llama_model_sycl_add_tensor_info(out.tensors, out.total_size, max_pp_pipeline_weight_bytes,
+                                         weight.second.tensor);
     }
-    if (tensors.empty()) {
+    if (out.tensors.empty()) {
+        return false;
+    }
+
+    llama_model_sycl_mark_get_rows_only(out.tensors, ml);
+
+    const uint32_t n_layer = hparams.n_layer();
+    out.swa_layer_mask.reset(new bool[n_layer]);
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        out.swa_layer_mask[il] = hparams.is_swa(il);
+    }
+    out.kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
+
+    llama_model_sycl_populate_inventory(
+        out.inventory, out.tensors, out.swa_layer_mask.get(), out.kv_layer_arrays.k_width.get(),
+        out.kv_layer_arrays.v_width.get(), out.kv_layer_arrays.kind.get(), out.kv_layer_arrays.idx_k_width.get(),
+        out.total_size, max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
+    return true;
+}
+
+static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
+                                                const llama_model &  model,
+                                                const char *         log_func) {
+    if (!llama_model_sycl_hooks_enabled()) {
+        return;
+    }
+    if (ml.no_alloc || ml.weights_map.empty()) {
         return;
     }
 
-    llama_model_sycl_mark_get_rows_only(tensors, ml);
-
-    const uint32_t n_layer = hparams.n_layer();
-    std::unique_ptr<bool[]> swa_layer_mask(new bool[n_layer]);
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        swa_layer_mask[il] = hparams.is_swa(il);
+    llama_model_sycl_early_inventory early;
+    if (!llama_model_sycl_build_early_inventory(ml, model, early)) {
+        return;
     }
-    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
-
-    ggml_sycl_tensor_inventory inventory = {};
-    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
-                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
-                                        kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
-                                        hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
-    llama_model_sycl_apply_inventory(inventory, envelope, true);
+    llama_model_sycl_apply_inventory(early.inventory, envelope, true);
 
     LLAMA_LOG_INFO("%s: SYCL early placement plan: %zu weights, %.2f GiB (computed pre-create_tensor)\n", log_func,
-                   tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
+                   early.tensors.size(), early.total_size / (1024.0 * 1024.0 * 1024.0));
 }
 
 static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
@@ -831,6 +852,73 @@ const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch arch) {
         default:                return none;
     }
 }
+
+// The lazy-range record: one row per TENSOR_READ_LAZY tensor this arch declares and the
+// file carries, filled before the early plan, which builds its inventory from weights_map
+// and so cannot see a row that create_tensor() would fill later. It runs the same way
+// under no_alloc, so the memory-fit pass and the plan dry run plan what the real load plans.
+static void llama_model_prefill_lazy_record(llama_model_loader &  ml,
+                                            llm_arch              arch,
+                                            const llama_hparams & hparams,
+                                            enum llama_lazy_mode  lazy_mode_pre,
+                                            bool                  lazy_taker) {
+    llama_lazy_range_record_prefill(
+        ml.lazy_record, arch, hparams, llama_model_lazy_tensor_names(arch),
+        [&ml](const std::string & name, llama_lazy_range_source & out) {
+            const llama_model_loader::llama_tensor_weight * w = ml.get_weight(name.c_str());
+            if (w == nullptr) {
+                return false;
+            }
+            out = { w->idx, w->offs, ggml_nbytes(w->tensor) };
+            return true;
+        },
+        lazy_mode_pre, ml.lazy.mode, lazy_taker, llama_mmap::SUPPORTED);
+}
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+bool llama_model_sycl_header_inventory(const char *                         fname,
+                                       const llama_model_params &           params,
+                                       llama_model_sycl_header_inventory_cb callback,
+                                       void *                               user_data) {
+    if (fname == nullptr || callback == nullptr) {
+        return false;
+    }
+    try {
+        // The header only: no_alloc, so no tensor data is read and no buffer is allocated, and no load transaction
+        // is opened, so nothing is staged.
+        std::vector<std::string> splits;
+        llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr, fname,
+                              splits, /*file*/ nullptr, params.load_mode, /*check_tensors*/ false,
+                              /*no_alloc*/ true, params.load_mtp, params.kv_overrides,
+                              /*param_tensor_buft_overrides_p*/ nullptr);
+        ml.lazy.mode = params.lazy_mode;
+
+        std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+        auto *                       model = dynamic_cast<llama_model_base *>(model_ptr.get());
+        if (model == nullptr) {
+            return false;
+        }
+        model->hparams.vocab_only = false;
+        model->hparams.no_alloc   = true;
+        model->load_hparams(ml);
+
+        // The load resolves AUTO against its devices, keeping it wherever SYCL owns placement; the dry run plans for
+        // SYCL-owned weights, so AUTO stays AUTO, and the model is the lazy taker as a SYCL-owned load is.
+        llama_model_prefill_lazy_record(ml, model->arch, model->hparams, ml.lazy.mode, /*lazy_taker*/ true);
+
+        llama_model_sycl_early_inventory early;
+        if (!llama_model_sycl_build_early_inventory(ml, *model, early)) {
+            return false;
+        }
+        const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
+        callback(&early.inventory, &envelope, user_data);
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+#endif  // GGML_USE_SYCL || GGML_BACKEND_DL
 
 llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams, const std::string & name) {
     const llama_lazy_tensor_attrs unknown = { 0, -1 };
@@ -2428,21 +2516,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // The lazy-range record: one row per TENSOR_READ_LAZY tensor this arch declares and the
-    // file carries, filled before the early plan, which builds its inventory from weights_map
-    // and so cannot see a row that create_tensor() would fill later. It runs the same way
-    // under no_alloc, so the memory-fit pass plans what the real load plans.
-    llama_lazy_range_record_prefill(
-        ml.lazy_record, arch, hparams, llama_model_lazy_tensor_names(arch),
-        [&ml](const std::string & name, llama_lazy_range_source & out) {
-            const llama_model_loader::llama_tensor_weight * w = ml.get_weight(name.c_str());
-            if (w == nullptr) {
-                return false;
-            }
-            out = { w->idx, w->offs, ggml_nbytes(w->tensor) };
-            return true;
-        },
-        lazy_mode_pre, ml.lazy.mode, lazy_taker, llama_mmap::SUPPORTED);
+    llama_model_prefill_lazy_record(ml, arch, hparams, lazy_mode_pre, lazy_taker);
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     if (sycl_model_loading_guard.active) {
