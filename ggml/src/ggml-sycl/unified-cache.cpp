@@ -18,6 +18,7 @@
 #include "host-reserve-env.hpp"
 #include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
+#include "lazy-io-pool.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
@@ -33294,6 +33295,23 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
     return false;
 }
 
+// The lazy tables' residency (th32 §4.3 step 4), decided once the zone terms are set. The interface only: every
+// carried table is recorded STORAGE with no resident bytes and no ring, whatever the pin reads; the decision follows
+// its fixtures.
+static void placement_plan_decide_lazy_residency(placement_plan &          plan,
+                                                 const placement_kv_info & kv_info,
+                                                 const ring_lease *        coverage_pin) {
+    GGML_UNUSED(coverage_pin);
+    plan.lazy_tables.clear();
+    for (const placement_lazy_table_info & info : kv_info.lazy_tables) {
+        placement_lazy_table table;
+        table.name        = info.name;
+        table.residency   = lazy_residency::STORAGE;
+        table.table_bytes = info.table_bytes;
+        plan.lazy_tables.push_back(table);
+    }
+}
+
 // Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms and their
 // total, read once populate_host_zone_sizing() has set every term. The budget is an input, never read here: a load
 // passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
@@ -33302,7 +33320,10 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
 // the terms keep so a re-plan re-records from the same inputs; a plan made before any cache exists counts the default
 // chunk. A lookup before the device count is known would enumerate the devices, so it is skipped. The lookup creates
 // no cache and holds the cache lock shared once, for the find alone.
-static void record_host_ledger_plan(placement_plan & plan, size_t host_budget) {
+static void record_host_ledger_plan(placement_plan &          plan,
+                                    const placement_kv_info & kv_info,
+                                    size_t                    host_budget,
+                                    const ring_lease *        coverage_pin) {
     unified_cache * cache =
         g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
     const size_t onednn_live =
@@ -33311,6 +33332,7 @@ static void record_host_ledger_plan(placement_plan & plan, size_t host_budget) {
     plan.host_budget                 = host_budget;
     plan.host_zone_terms             = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
     plan.host_planned_bytes          = plan.host_zone_terms.total();
+    placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);
     const host_zone_commit_terms & t = plan.host_zone_terms;
     GGML_LOG_INFO(
         "[HOST-LEDGER] device=%d plan host_budget=%zu host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu "
@@ -34194,7 +34216,9 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                       const placement_kv_info &                           kv_info,
                                       const ggml_sycl_placement_envelope *                envelope,
                                       int                                                 n_experts,
-                                      size_t                                              host_budget) {
+                                      size_t                                              host_budget,
+                                      const ring_lease *                                  coverage_pin) {
+    GGML_UNUSED(coverage_pin);
     return compute_placement_plan(placement_tensor_inventory_from_pairs(tensor_inventory), vram_budget, device_id,
                                   kv_info, envelope, n_experts, host_budget);
 }
@@ -34744,7 +34768,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                                       const placement_kv_info &                  kv_info,
                                       const ggml_sycl_placement_envelope *       envelope,
                                       int                                        n_experts,
-                                      size_t                                     host_budget) {
+                                      size_t                                     host_budget,
+                                      const ring_lease *                         coverage_pin) {
     if (envelope != nullptr) {
         GGML_LOG_INFO(
             "[PLACEMENT] envelope (from sycl-snapshot): n_ctx=%u n_ubatch=%u n_seq_max=%u flash_attn_type=%s\n",
@@ -35284,7 +35309,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     }
     placement_mark_device_entries_file_mapped(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan, host_budget);
+    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
@@ -36199,7 +36224,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                           kv_info,
                                          const ggml_sycl_placement_envelope *                envelope,
                                          int                                                 n_experts,
-                                         size_t                                              host_budget) {
+                                         size_t                                              host_budget,
+                                         const ring_lease *                                  coverage_pin) {
+    GGML_UNUSED(coverage_pin);
     return compute_multi_device_plan(device_budgets, placement_tensor_inventory_from_pairs(tensor_inventory), n_layers,
                                      mode, kv_info, envelope, n_experts, host_budget);
 }
@@ -36211,7 +36238,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                  kv_info,
                                          const ggml_sycl_placement_envelope *       envelope,
                                          int                                        n_experts,
-                                         size_t                                     host_budget) {
+                                         size_t                                     host_budget,
+                                         const ring_lease *                         coverage_pin) {
     // Single device: delegate to existing P4 path
     if (device_budgets.size() <= 1) {
         const int    dev    = device_budgets.empty() ? 0 : device_budgets[0].device_id;
@@ -37330,7 +37358,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     }
     placement_mark_device_entries_file_mapped(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan, host_budget);
+    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 
     plan.build_index();
     publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);

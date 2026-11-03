@@ -128,14 +128,15 @@ HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == devic
 
 # The indexer widths follow n_ctx_context; the context's provenance is appended after them (llama.cpp-7fmt, pinned by
 # test-sycl-ctx-hint-default-source), then libllama's resolved storage inputs in the provenance's padding (pinned by
-# test-sycl-mapped-loader-source), and the named micro-batch after that (pinned by
-# test-sycl-explicit-ubatch-placement-source), so the struct no longer ends here.
+# test-sycl-mapped-loader-source), the named micro-batch after that (pinned by
+# test-sycl-explicit-ubatch-placement-source), and the lazy tables last (th32 §4.1), so the struct no longer ends here.
 FIELD = ("uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; bool n_ctx_context_is_default; "
-         "bool use_mmap_resolved; bool use_mlock_resolved; bool host_weight_layout_cpu; uint32_t n_ubatch_context; };")
+         "bool use_mmap_resolved; bool use_mlock_resolved; bool host_weight_layout_cpu; uint32_t n_ubatch_context; "
+         "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; };")
 READ = ("g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",

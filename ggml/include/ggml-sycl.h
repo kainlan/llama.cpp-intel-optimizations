@@ -288,6 +288,23 @@ struct ggml_sycl_tensor_info {
     int64_t        ne[GGML_MAX_DIMS];
 };
 
+// A lazy table (th32 §4.1): a row table read per ubatch, either from a locked host body or from the file, which the
+// planner places by its own rule and never as a tensor. It is carried apart from ggml_sycl_tensor_info, so no zone
+// maximum the tensors size ever counts it. row_size is one row's bytes in the file's type; rows_per_token the rows one
+// token reads; consumer_layer the layer that reads it (-1 = unknown); file_index, file_offset and size the table's byte
+// range in the model's files.
+struct ggml_sycl_lazy_table_info {
+    const char *   name;
+    enum ggml_type type;
+    uint32_t       rows_per_token;
+    int64_t        ne[GGML_MAX_DIMS];
+    size_t         row_size;
+    int32_t        consumer_layer;
+    uint32_t       file_index;
+    size_t         file_offset;
+    size_t         size;
+};
+
 // llama.cpp-3aos: per-layer attention/KV kind, carried by
 // ggml_sycl_tensor_inventory::kv_layer_kind[] below. SHARED covers layers
 // with no K/V tensors of their own (Gemma 4/3n's reuse pattern,
@@ -445,14 +462,26 @@ struct ggml_sycl_tensor_inventory {
     // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
     // still be rebuilt together for the planner to see it.
     uint32_t                       n_ubatch_context;
+    // th32 §4.1: the lazy tables [lazy_table_count], an inventory class of their own: the planner decides each one's
+    // residency (§4.3 step 4) and none enters `tensors`, so max_tensor and every zone maximum leave them out. NULL with
+    // a count of 0 is a model with none, which every `= {}` inventory libllama builds reads as. Appended: the struct
+    // grew from 192 to 208 bytes, which the static_asserts below and ggml-sycl.cpp pin. The struct carries no size
+    // field, so a libllama built before these fields passes a 192-byte object: libggml-sycl then reads these 16 bytes
+    // past the end of the caller's object, and with a nonzero count dereferences whatever lies there as an array of
+    // tables. libllama and libggml-sycl must be rebuilt together.
+    const struct ggml_sycl_lazy_table_info * lazy_tables;
+    uint32_t                                 lazy_table_count;
 };
 
 #if defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
 // Both sides of the dlopen boundary compile the inventory's layout from here: libllama, which fills it, and
 // libggml-sycl, which reads it (ggml-sycl.cpp pins the same figures). A field that moves fails both builds instead of
 // being read from the wrong place.
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
+static_assert(sizeof(ggml_sycl_lazy_table_info) == 80, "ggml_sycl_lazy_table_info layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
@@ -2183,6 +2212,15 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 // the arguments are invalid: a VOID reading, never a zero that could be mistaken for "nothing allocated".
 GGML_BACKEND_API bool ggml_backend_sycl_role_bytes_for_testing(int device, int role, uint64_t * out);
 
+// The lazy tables a placement plan carries (th32 §4.3 step 4, §11 T3): out[0] is the table count and out[1] the sum of
+// their host_resident_bytes. A nonzero model.model_id reads the plan published for (model_id, load_txn_id); model_id 0
+// reads the candidate staged for load_txn_id, so a fixture reads a load's plan before and after the load's end through
+// one entry. Returns false, with both outputs zero, when no such plan exists or `out` is null: a VOID reading, never a
+// count of 0 that could be mistaken for "no table". Exported unconditionally and reachable through the proc table, like
+// ggml_backend_sycl_role_bytes_for_testing above.
+// Proc name: "ggml_sycl_plan_lazy_tables_for_testing".
+GGML_BACKEND_API bool ggml_sycl_plan_lazy_tables_for_testing(struct ggml_sycl_model_token model, uint64_t out[2]);
+
 // The load-time measure's plan override.  While installed, every plan accessor on the
 // calling thread answers from the plan named by `stage` for the load `load_txn`,
 // and nothing is published.  Written only by these two functions; llama reaches them
@@ -2439,6 +2477,20 @@ GGML_BACKEND_API void ggml_sycl_test_host_ledger_store_budget(uint64_t budget);
 GGML_BACKEND_API bool ggml_sycl_test_host_ledger_committed(uint64_t * committed);
 GGML_BACKEND_API bool ggml_sycl_test_host_ledger_stores(uint64_t * stores);
 GGML_BACKEND_API bool ggml_sycl_test_host_cpu_live_bytes(uint64_t * live_bytes);
+
+// The lazy tables' planning seams (th32 §3.3, §11 T3), for a fixture that calls a planner entry directly.
+// plan_effect_begin makes `load_txn_id` this thread's staged-load transaction, as the stage does around its planner
+// calls, so the entry stages its plan as that load's candidate; it returns the id it replaced, which plan_effect_end
+// restores. coverage_pin_make takes a coverage pin through the IO pool's registry (ring_bytes 0 only: lazy-io-pool.hpp)
+// and coverage_pin_release drops it and runs the closing reap. lazy_slot_begin publishes a pin on this thread's plan
+// slot, the one the planner caller reads, and returns the scope lazy_slot_end closes. Each pair nests: close them in
+// reverse order, on the thread that opened them.
+GGML_BACKEND_API uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id);
+GGML_BACKEND_API void     ggml_sycl_test_plan_effect_end(uint64_t previous_txn_id);
+GGML_BACKEND_API void *   ggml_sycl_test_coverage_pin_make(uint64_t ring_bytes);
+GGML_BACKEND_API void     ggml_sycl_test_coverage_pin_release(void * pin);
+GGML_BACKEND_API void *   ggml_sycl_test_lazy_slot_begin(void * pin);
+GGML_BACKEND_API void     ggml_sycl_test_lazy_slot_end(void * scope);
 #endif
 
 #ifdef __cplusplus

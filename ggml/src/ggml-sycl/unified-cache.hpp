@@ -60,6 +60,10 @@ namespace ggml_sycl {
 
 struct onednn_scratch_token;
 
+// The lazy tables' coverage pin (lazy-io-pool.hpp, th32 §3.3): the planners take a const pointer to one and read the
+// IO pool's ring bytes through it, so only unified-cache.cpp includes the definition.
+class ring_lease;
+
 // Forward declaration — needed by unified_cache::process_deferred_frees_public()
 bool unified_cache_is_graph_compute_active();
 
@@ -490,6 +494,25 @@ struct placement_tensor_info {
     bool has_shape() const { return type >= 0 && type < GGML_TYPE_COUNT && ne[0] > 0 && ne[1] > 0; }
 };
 
+// A lazy table, a distinct inventory class (th32 §4.1): its rows are read per ubatch, either from a locked HOST_CPU
+// body or from the file (lazy_residency). It is never a placement entry and never a placement_tensor_info: a device
+// tier is forbidden for it, so the planner cannot offer one, and it sits outside the tensor inventory, so
+// max_tensor_bytes, max_staging_pair_bytes and every zone maximum that populate_host_zone_sizing() and
+// unified_cache_adapt_zone_inventory() compute never see it (a 30 GiB table counted as max_tensor would make the host
+// STAGING zone alone ~60 GiB). The planner decides its residency from these fields (§4.3 step 4).
+struct placement_lazy_table_info {
+    std::string name;
+    ggml_type   type              = GGML_TYPE_COUNT;
+    int64_t     ne[GGML_MAX_DIMS] = {};
+    size_t      row_size          = 0;   // bytes of one row in the file's type, the unit a STORAGE cache holds
+    uint32_t    rows_per_token    = 0;   // rows one token reads; sizes the cache floor
+    int32_t     consumer_layer    = -1;  // the layer that reads it; orders the decision (ascending)
+    // The table's byte range in the model's files, by value from the loader's per-file lazy-range record.
+    uint32_t    file_index        = 0;
+    size_t      file_offset       = 0;
+    size_t      table_bytes       = 0;
+};
+
 // Adapt a placement inventory into the dependency-free descriptors that the
 // structural zone classifier consumes (see zone-sizing.hpp). Two independent
 // sites size zones from a maximum over an inventory — populate_host_zone_sizing
@@ -733,6 +756,17 @@ struct placement_kv_info {
     // when no micro-batch above n_ubatch was named, the model has no ring, or there is no arena. The planner weighs it
     // against the routed experts (placement_plan::explicit_ubatch).
     pp_moe_onednn_explicit_ubatch_room explicit_ubatch;
+
+    // The lazy tables (th32 §4.1), copied from the inventory's lazy-table class; empty for a model with none, which
+    // leaves every plan figure as it was. They never enter tensor_inventory, so no zone maximum sees them.
+    std::vector<placement_lazy_table_info> lazy_tables;
+    // MemAvailable from the load's one host-budget sample (host_ledger_mem_available()): P3's reading (§4.3 step 4,
+    // MemAvailable_pre - expected_host - 5 >= 24 GiB), from the same sample as the budget. 0 = no sample: P3 cannot
+    // hold, so a plan that carries lazy tables refuses.
+    size_t                                 host_mem_available_pre = 0;
+    // A cold expert class is selected (§4.3 step 4): the cold set is not implemented, so a plan that carries lazy
+    // tables refuses it rather than plan a set it cannot hold.
+    bool                                   cold_expert_class      = false;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
 
@@ -1002,6 +1036,26 @@ struct placement_plan;
 // Defined below the plan, with the commit terms it recomputes: the KV refresh inside placement_plan calls it.
 inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan);
 
+// Defined with the lazy table's body below; the plan records each table's residency.
+enum class lazy_residency : uint8_t;
+
+// One lazy table's residency as the plan decided it (th32 §4.3 step 4), in the order the decision ran.
+//   host_resident_bytes  the host bytes the table holds, each allocation counted at host_cpu_mapped_size: the mapped
+//                        body for HOST, the cache slab chunks plus the index row for STORAGE (floor plus the yieldable
+//                        share)
+//   cache_slots          the STORAGE cache's slots (rows), floor plus yieldable; 0 for HOST
+//   cache_floor_slots    the slots one double-buffered ubatch working set needs, 2 x n_ubatch x rows_per_token
+//   consumer_device      the device that runs the consumer layer, -1 when the layer runs on the CPU
+struct placement_lazy_table {
+    std::string    name;
+    lazy_residency residency{};
+    int            consumer_device     = -1;
+    size_t         table_bytes         = 0;
+    size_t         host_resident_bytes = 0;
+    size_t         cache_slots         = 0;
+    size_t         cache_floor_slots   = 0;
+};
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
@@ -1108,12 +1162,26 @@ struct placement_plan {
     size_t                       max_staging_pair_bytes   = 0;
     // th32 §4.2: the ledger's stored budget when the plan was made, the host bytes the plan commits term by term (both
     // planner builders record them after populate_host_zone_sizing, and a re-plan that moves a zone term re-records
-    // them through placement_plan_rerecord_host_zone_terms), and the plan's host figure. The zone terms are all of
-    // host_planned_bytes until the lazy tables' terms join it, so the zone configuration checks its pool growth
-    // against host_zone_terms, never against the sum.
+    // them through placement_plan_rerecord_host_zone_terms), and the plan's host figure. The zone terms are
+    // host_planned_bytes less the lazy tables' terms below, so the zone configuration checks its pool growth against
+    // host_zone_terms, never against the sum.
     size_t                                     host_budget                = 0;
     size_t                                     host_planned_bytes         = 0;
     host_zone_commit_terms                     host_zone_terms;
+    // th32 §3.3, §4.3 step 4: the lazy tables' residency and the block ring their STORAGE reads need. The ring is
+    // sized after the residency pass over the tables that stayed STORAGE: block_ring_need = block_ring_qd x
+    // block_ring_span_max, and block_ring_charge is its mapped size when the live ring the coverage pin reads is
+    // smaller, 0 when it already holds the need. host_planned_bytes = host_zone_terms.total() + the tables'
+    // host_resident_bytes + block_ring_charge. A refused decision leaves no table and no ring and names the reason
+    // (lazy-table-ring-unpinned, lazy-table-ring-too-narrow, lazy-table-cache-below-floor, cold-set-not-implemented)
+    // in lazy_refusal, with the figures in lazy_refusal_detail; the load's stage turns it into a typed rejection.
+    size_t                                     block_ring_qd       = 0;
+    size_t                                     block_ring_span_max = 0;
+    size_t                                     block_ring_need     = 0;
+    size_t                                     block_ring_charge   = 0;
+    std::vector<placement_lazy_table>          lazy_tables;
+    std::string                                lazy_refusal;
+    std::string                                lazy_refusal_detail;
 
     // --- Inference memory categories (computed by populate_host_zone_sizing) ---
     // oneDNN reorder: one temp buffer reused per layer, sized to the largest
@@ -2345,20 +2413,26 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
 // against (th32 §4.2): a load passes host_ledger_budget(), the value its
 // transaction stored, and a caller planning against another budget passes
 // that one. The planner never reads the stored budget itself.
+// `coverage_pin` is the lazy tables' coverage pin (th32 §3.3), the lease the
+// caller holds across the planning: the planner reads the live block ring's
+// bytes through it to decide which tables may be STORAGE. Null makes none
+// STORAGE-eligible, so every table takes the HOST test (§4.3 step 4).
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
                                       const placement_kv_info &                           kv_info,
                                       const ggml_sycl_placement_envelope *                envelope,
                                       int                                                 n_experts,
-                                      size_t                                              host_budget);
+                                      size_t                                              host_budget,
+                                      const ring_lease *                                  coverage_pin = nullptr);
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,
                                       size_t                                     vram_budget,
                                       int                                        device_id,
                                       const placement_kv_info &                  kv_info,
                                       const ggml_sycl_placement_envelope *       envelope,
                                       int                                        n_experts,
-                                      size_t                                     host_budget);
+                                      size_t                                     host_budget,
+                                      const ring_lease *                         coverage_pin = nullptr);
 
 // P4.5: Compute multi-device placement plan for hybrid parallelism.
 // Dense layers use layer parallelism (contiguous ranges per device, proportional to VRAM).
@@ -2374,6 +2448,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 //            per-expert device assignment.
 // host_budget: the host ledger's budget the plan records, as for
 //            compute_placement_plan() above (th32 §4.2).
+// coverage_pin: the lazy tables' coverage pin, as for compute_placement_plan()
+//            above (th32 §3.3); the one-device delegation forwards it.
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &                  device_budgets,
                                          const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                          int                                                 n_layers,
@@ -2381,7 +2457,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                           kv_info,
                                          const ggml_sycl_placement_envelope *                envelope,
                                          int                                                 n_experts,
-                                         size_t                                              host_budget);
+                                         size_t                                              host_budget,
+                                         const ring_lease *                                  coverage_pin = nullptr);
 // Recomputes MMID demand against updated planner capacity. If every owner fits
 // the immutable published pools, retains their exact geometry/accounting.
 // Otherwise publishes exact new geometry and checked accounting in `plan`.
@@ -2398,7 +2475,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                  kv_info,
                                          const ggml_sycl_placement_envelope *       envelope,
                                          int                                        n_experts,
-                                         size_t                                     host_budget);
+                                         size_t                                     host_budget,
+                                         const ring_lease *                         coverage_pin = nullptr);
 
 void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);

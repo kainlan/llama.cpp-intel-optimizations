@@ -117,6 +117,7 @@
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/kv-region-registry.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
+#include "ggml-sycl/lazy-io-pool.hpp"
 #include "ggml-sycl/lightning-indexer.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
@@ -17119,9 +17120,9 @@ static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owne
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), the context's provenance appended
-// after it (llama.cpp-7fmt), and libllama's resolved storage inputs and the micro-batch the caller named, both in the
-// provenance's padding.
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
+// after it (llama.cpp-7fmt), libllama's resolved storage inputs and the micro-batch the caller named, both in the
+// provenance's padding, and the lazy tables appended after them (th32 §4.1).
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
@@ -17131,6 +17132,9 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "u
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
               "host_weight_layout_cpu left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
+static_assert(sizeof(ggml_sycl_lazy_table_info) == 80, "ggml_sycl_lazy_table_info layout changed");
 
 // llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
 // host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,
@@ -17734,6 +17738,37 @@ static size_t ggml_sycl_plan_single_device_budget(int device, size_t vram_budget
 }
 
 thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
+
+// The lazy tables' coverage pin for the plan this thread is building (th32 §3.3): the planner caller publishes the pin
+// of its lazy_coverage_scope here through lazy_plan_slot_scope, and compute_and_store_plan_for_inventory reads it at
+// its planner calls, so a planning entry reached through any caller plans against the lease that caller holds. Null
+// outside such a scope: a plan made then makes no lazy table STORAGE-eligible.
+thread_local const ggml_sycl::ring_lease * g_sycl_lazy_plan_slot = nullptr;
+
+// Publishes a coverage pin on this thread's plan slot for the scope's lifetime and restores the previous slot after it,
+// so scopes nest. The production constructor takes the caller's lazy_coverage_scope, so the slot only ever names a
+// lease a live scope holds; the testing one takes a fixture's pin guard, which holds its lease the same way.
+class lazy_plan_slot_scope {
+  public:
+    explicit lazy_plan_slot_scope(const ggml_sycl::lazy_coverage_scope & coverage) noexcept :
+        lazy_plan_slot_scope(coverage.pin()) {}
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    explicit lazy_plan_slot_scope(const ggml_sycl::lazy_test_coverage_pin & pin) noexcept :
+        lazy_plan_slot_scope(pin.pin()) {}
+#endif
+
+    ~lazy_plan_slot_scope() { g_sycl_lazy_plan_slot = previous_; }
+
+    lazy_plan_slot_scope(const lazy_plan_slot_scope &)             = delete;
+    lazy_plan_slot_scope & operator=(const lazy_plan_slot_scope &) = delete;
+
+  private:
+    explicit lazy_plan_slot_scope(const ggml_sycl::ring_lease * pin) noexcept : previous_(g_sycl_lazy_plan_slot) {
+        g_sycl_lazy_plan_slot = pin;
+    }
+
+    const ggml_sycl::ring_lease * previous_;
+};
 
 // The host budget's pass scope (th32 §4.2): sample, compute, store, then plan. The outermost scope of a load
 // transaction samples the host and stores the budget before any plan of that transaction is built; a later scope of the
@@ -126095,6 +126130,59 @@ extern "C" bool ggml_backend_sycl_role_bytes_for_testing(int device, int role, u
     return ggml_sycl::unified_cache_role_bytes_for_testing(device, static_cast<ggml_sycl::alloc_role>(role), out);
 }
 
+// C linkage from the header's declaration; the L4 proc gate finds the definition by its plain signature.
+bool ggml_sycl_plan_lazy_tables_for_testing(ggml_sycl_model_token model, uint64_t out[2]) {
+    if (out == nullptr) {
+        return false;
+    }
+    out[0] = 0;
+    out[1] = 0;
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot =
+        model.model_id != 0 ? ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id) :
+                              ggml_sycl::lifecycle_find_candidate_placement_plan(model.load_txn_id);
+    if (!snapshot || !snapshot->plan) {
+        return false;
+    }
+    uint64_t resident = 0;
+    for (const ggml_sycl::placement_lazy_table & table : snapshot->plan->lazy_tables) {
+        resident += table.host_resident_bytes;
+    }
+    out[0] = snapshot->plan->lazy_tables.size();
+    out[1] = resident;
+    return true;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+extern "C" uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id) {
+    const uint64_t previous     = g_sycl_plan_load_effect_txn;
+    g_sycl_plan_load_effect_txn = load_txn_id;
+    return previous;
+}
+
+extern "C" void ggml_sycl_test_plan_effect_end(uint64_t previous_txn_id) {
+    g_sycl_plan_load_effect_txn = previous_txn_id;
+}
+
+extern "C" void * ggml_sycl_test_coverage_pin_make(uint64_t ring_bytes) {
+    return new ggml_sycl::lazy_test_coverage_pin(ggml_sycl::ggml_sycl_test_make_coverage_pin(ring_bytes));
+}
+
+extern "C" void ggml_sycl_test_coverage_pin_release(void * pin) {
+    delete static_cast<ggml_sycl::lazy_test_coverage_pin *>(pin);
+}
+
+extern "C" void * ggml_sycl_test_lazy_slot_begin(void * pin) {
+    if (pin == nullptr) {
+        return nullptr;
+    }
+    return new lazy_plan_slot_scope(*static_cast<const ggml_sycl::lazy_test_coverage_pin *>(pin));
+}
+
+extern "C" void ggml_sycl_test_lazy_slot_end(void * scope) {
+    delete static_cast<lazy_plan_slot_scope *>(scope);
+}
+#endif
+
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
     // Taken before the meta lock and released immediately: g_moe_bias_state_mutex
     // is strictly leaf (canonical §12.5), so it is never held across another.
@@ -126556,7 +126644,28 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_role_bytes_for_testing") == 0) {
         return (void *) ggml_backend_sycl_role_bytes_for_testing;
     }
+    if (strcmp(name, "ggml_sycl_plan_lazy_tables_for_testing") == 0) {
+        return (void *) ggml_sycl_plan_lazy_tables_for_testing;
+    }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (strcmp(name, "ggml_sycl_test_plan_effect_begin") == 0) {
+        return (void *) ggml_sycl_test_plan_effect_begin;
+    }
+    if (strcmp(name, "ggml_sycl_test_plan_effect_end") == 0) {
+        return (void *) ggml_sycl_test_plan_effect_end;
+    }
+    if (strcmp(name, "ggml_sycl_test_coverage_pin_make") == 0) {
+        return (void *) ggml_sycl_test_coverage_pin_make;
+    }
+    if (strcmp(name, "ggml_sycl_test_coverage_pin_release") == 0) {
+        return (void *) ggml_sycl_test_coverage_pin_release;
+    }
+    if (strcmp(name, "ggml_sycl_test_lazy_slot_begin") == 0) {
+        return (void *) ggml_sycl_test_lazy_slot_begin;
+    }
+    if (strcmp(name, "ggml_sycl_test_lazy_slot_end") == 0) {
+        return (void *) ggml_sycl_test_lazy_slot_end;
+    }
     if (strcmp(name, "ggml_backend_sycl_test_hold_live_update") == 0) {
         return (void *) ggml_backend_sycl_test_hold_live_update;
     }
