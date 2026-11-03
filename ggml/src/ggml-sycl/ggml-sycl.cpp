@@ -18810,6 +18810,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
             const size_t plan_budget =
                 forced != 0 ? forced : ggml_sycl_plan_single_device_budget(i, authority.budget_bytes);
             device_budget[i] = plan_budget;
+
             const ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(i);
             unmodelled[i] |= cache == nullptr || !cache->arena_active();
             plans.push_back(
