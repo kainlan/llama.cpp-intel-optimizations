@@ -8206,6 +8206,11 @@ ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
     HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE
         "with the host buft on device 0, a device-1 backend's notify grew device 0 0 time\\(s\\) and device 1 1")
 
+if (NOT GGML_BACKEND_DL)
+    # The real ggml-base scheduler over two CPU backend instances; ggml-cpu is a MODULE under GGML_BACKEND_DL.
+    ggml_sycl_host_zone_plan_test(plan-walk-sched LIBS ggml-cpu)
+endif()
+
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
 
