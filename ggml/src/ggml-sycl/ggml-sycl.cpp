@@ -8365,6 +8365,12 @@ static void moe_compute_gate_norm_placement(ggml_cgraph * cgraph, int device) {
         "Skipping inference-based warmup entirely.\n");
 }
 
+// The MUL_MAT_ID nodes moe_hybrid_init_once registers experts of: those whose src0 has storage.
+static bool moe_hybrid_init_scans_node(void * user, const ggml_tensor * src0) {
+    (void) user;
+    return ggml_sycl_host_data(src0) != nullptr;
+}
+
 // Scan a compute graph for MUL_MAT_ID nodes, register experts with the unified cache,
 // and set up prefetcher + predictor.
 // Called once per device via std::call_once.
@@ -8377,9 +8383,11 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     int     n_experts_per_layer = 0;
     int     n_experts_used      = 0;  // top-K from ids tensor
     size_t  expert_weight_bytes = 0;
-    int64_t max_K               = 0;  // max input dimension (ne00)
-    int64_t max_N               = 0;  // max output dimension (ne01)
-    int     max_dispatch_count  = 0;  // max total expert dispatches per MUL_MAT_ID
+    // The pools' (D, K, N) over the same nodes: D = max top-K x tokens, K = max ne00, N = max ne01. One scan, the one
+    // the plan walk folds with (host_pool_scan over host_pool_dims_add), so the plan and this graph's check of it read
+    // one rule.
+    const ggml_sycl::host_pool_dims graph_needs =
+        ggml_sycl::host_pool_scan(cgraph, moe_hybrid_init_scans_node, nullptr);
 
     struct moe_expert_info {
         int                     layer_id;
@@ -8433,19 +8441,6 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
         if (nb02 > expert_weight_bytes) {
             expert_weight_bytes = nb02;
-        }
-        if (src0->ne[0] > max_K) {
-            max_K = src0->ne[0];
-        }
-        if (src0->ne[1] > max_N) {
-            max_N = src0->ne[1];
-        }
-        // Track max dispatch count (top-K * tokens) for pinned buffer sizing
-        if (ids) {
-            int dispatch = static_cast<int>(ids->ne[0] * std::max(ids->ne[1], (int64_t) 1));
-            if (dispatch > max_dispatch_count) {
-                max_dispatch_count = dispatch;
-            }
         }
         n_moe_layers++;
 
@@ -9444,8 +9439,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // them (§4.4 "And the pools are sized from the plan"). Their SCRATCH demand is registered by the plan's commit, not
     // here. With no committed plan, the pre-notify fallback sizes them from this graph's scan, with a once-only WARN.
     {
-        const ggml_sycl::host_pool_dims          graph_needs = { max_dispatch_count, max_K, max_N, n_moe_layers };
-        const ggml_sycl::host_pool_init_decision pools       = ggml_sycl::host_pools_init_from_plan(
+        const ggml_sycl::host_pool_init_decision pools = ggml_sycl::host_pools_init_from_plan(
             device, g_host_holder_plans->device_state(device), graph_needs, g_host_pool_init_warnings[device]);
         if (pools.init) {
             auto & pool = g_pinned_buffer_pools[device];
@@ -9474,16 +9468,15 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             GGML_LOG_INFO("[MOE-MULTI-GPU] Initializing device %d for MoE expert dispatch\n", gpu_d);
 
             try {
-                if (max_K > 0 && max_N > 0 && max_dispatch_count > 0) {
+                if (graph_needs.K > 0 && graph_needs.N > 0 && graph_needs.D > 0) {
                     auto & pool_d = g_pinned_buffer_pools[gpu_d];
-                    pool_d.init(*ggml_sycl::get_shared_context_queue(gpu_d), gpu_d,
-                                static_cast<size_t>(max_dispatch_count), static_cast<size_t>(max_K),
-                                static_cast<size_t>(max_N));
+                    pool_d.init(*ggml_sycl::get_shared_context_queue(gpu_d), gpu_d, static_cast<size_t>(graph_needs.D),
+                                static_cast<size_t>(graph_needs.K), static_cast<size_t>(graph_needs.N));
                 }
 
                 // Allocate malloc_host staging buffer for secondary GPU expert outputs.
                 // malloc_host is PCIe zero-copy readable from primary GPU's compute queue.
-                const size_t staging_floats = static_cast<size_t>(max_dispatch_count) * static_cast<size_t>(max_N);
+                const size_t staging_floats = static_cast<size_t>(graph_needs.D) * static_cast<size_t>(graph_needs.N);
                 const size_t staging_bytes  = staging_floats * sizeof(float);
                 try {
                     // Use device 0's queue for unified host-pinned allocation so the
@@ -9493,13 +9486,13 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                             ggml_sycl::runtime_category::STAGING, "moe_secondary_staging", true)) {
                         g_secondary_staging_buffer[gpu_d] = g_secondary_staging_alloc[gpu_d].as<float>();
                         g_secondary_staging_size[gpu_d]   = staging_floats;
-                        g_secondary_staging_max_N[gpu_d]  = static_cast<size_t>(max_N);
+                        g_secondary_staging_max_N[gpu_d]  = static_cast<size_t>(graph_needs.N);
                     }
                     if (g_secondary_staging_buffer[gpu_d]) {
                         GGML_LOG_INFO(
                             "[MOE-MULTI-GPU] Device %d staging buffer: %.1f KB "
-                            "(max_dispatch=%d, N=%ld)\n",
-                            gpu_d, staging_bytes / 1024.0, max_dispatch_count, (long) max_N);
+                            "(max_dispatch=%lld, N=%lld)\n",
+                            gpu_d, staging_bytes / 1024.0, (long long) graph_needs.D, (long long) graph_needs.N);
                     }
                 } catch (const sycl::exception & e) {
                     GGML_LOG_WARN("[MOE-MULTI-GPU] Failed to allocate staging buffer for device %d: %s\n", gpu_d,
@@ -9590,7 +9583,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         moe_params.max_batch     = 512;
         moe_params.n_moe_layers  = n_moe_layers;  // total MUL_MAT_ID nodes
         moe_params.n_moe_tensors = 1;             // seq index is per-tensor already
-        moe_params.n_embd        = max_K > 0 ? max_K : 4096;
+        moe_params.n_embd        = graph_needs.K > 0 ? graph_needs.K : 4096;
         if (ggml_sycl::moe_preallocate_inference_buffers(device, moe_params)) {
             GGML_LOG_INFO(
                 "[MOE-HYBRID] Phase 4: pre-allocated MoE inference buffers "
