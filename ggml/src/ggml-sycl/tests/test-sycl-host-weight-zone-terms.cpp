@@ -76,6 +76,7 @@
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
+#include "host-planner-test-fixture.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <cstdio>
@@ -101,67 +102,16 @@ constexpr size_t MiB = 1024ull * 1024ull;
 constexpr size_t k_host_compute_reserve_bytes = 64ull * MiB;
 constexpr size_t k_tlsf_grain                 = 256;
 
-int g_checks = 0;
-int g_fail   = 0;
+using host_planner_test::check;
+using host_planner_test::check_eq;
+using host_planner_test::g_checks;
+using host_planner_test::g_fail;
+using host_planner_test::make_mock_sycl_info;
 
-void check(bool cond, const char * what) {
-    g_checks++;
-    if (!cond) {
-        g_fail++;
-        std::printf("  FAIL: %s\n", what);
-    }
-}
-
-void check_eq(const char * what, size_t got, size_t want) {
-    g_checks++;
-    if (got != want) {
-        g_fail++;
-        std::printf("  FAIL: %s: got %zu, want %zu\n", what, got, want);
-    }
-}
-
-// --- the mocked device table: discrete cards, enough to plan, nothing touched ---
-
-ggml_sycl_device_info make_mock_sycl_info(int device_count) {
-    ggml_sycl_device_info info{};
-    info.device_count        = device_count;
-    info.total_gpu_count     = device_count;
-    info.host_max_alloc_size = 128ull * 1024ull * MiB;
-
-    for (int d = 0; d < device_count; ++d) {
-        const size_t       total_vram   = 16ull * 1024ull * MiB;
-        sycl_device_info & dev          = info.devices[d];
-        dev.cc                          = 1200;
-        dev.nsm                         = 128;
-        dev.smpbo                       = 64ull * 1024ull;
-        dev.vmm                         = true;
-        dev.total_vram                  = total_vram;
-        dev.free_vram_at_init           = total_vram;
-        dev.max_alloc_size              = total_vram - 512ull * MiB;
-        dev.safe_max_alloc_size         = dev.max_alloc_size;
-        dev.supports_soa_reorder        = true;
-        dev.xmx_caps.compute_units      = dev.nsm;
-        dev.xmx_caps.global_mem_size    = total_vram;
-        dev.xmx_caps.max_mem_alloc_size = dev.max_alloc_size;
-        std::snprintf(dev.device_name, sizeof(dev.device_name), "mock-weight-zone-terms-%d", d);
-        info.max_work_group_sizes[d] = 256;
-        info.default_tensor_split[d] = static_cast<float>(d + 1) / static_cast<float>(device_count);
-        info.gpu_dpct_ids[d]         = d;
-    }
-    for (int src = 0; src < device_count; ++src) {
-        for (int dst = 0; dst < device_count; ++dst) {
-            sycl_peer_link_info & link = info.peer_links[src][dst];
-            link.valid                 = true;
-            link.src_device            = src;
-            link.dst_device            = dst;
-            link.same_device           = src == dst;
-            link.same_backend          = true;
-            link.same_platform         = true;
-            link.same_sycl_context     = src == dst;
-        }
-    }
-    return info;
-}
+// The mocked cards: B50-shaped discrete GPUs, enough to plan, nothing touched.
+constexpr size_t k_card_vram   = 16ull * 1024ull * MiB;
+constexpr int    k_card_nsm    = 128;
+constexpr char   k_card_name[] = "mock-weight-zone-terms";
 
 // --- a Q2_K-shaped inventory: DeepSeek's quant type, at a size a test can hold ---
 
@@ -344,7 +294,7 @@ derived_terms derive_terms(const placement_plan & plan) {
 
 // `kv` carries the load's host-backing fact; the default is a load that does not map files.
 placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory, const placement_kv_info & kv = {}) {
-    const ggml_sycl_device_info   info = make_mock_sycl_info(1);
+    const ggml_sycl_device_info   info = make_mock_sycl_info(1, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard info_guard(info);
     // A budget far below the experts: every expert, and with them the dense weights, is host-resident.
     return compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, /*device_id=*/0, kv, nullptr, k_experts);
@@ -352,7 +302,7 @@ placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory, co
 
 // The other planner builder, over two cards with the same starved budget.
 placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & inventory) {
-    const ggml_sycl_device_info      info = make_mock_sycl_info(2);
+    const ggml_sycl_device_info      info = make_mock_sycl_info(2, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard    info_guard(info);
     placement_kv_info                kv{};
     const std::vector<device_budget> budgets = {

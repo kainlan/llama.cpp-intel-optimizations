@@ -38,6 +38,7 @@
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
+#include "host-planner-test-fixture.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -77,67 +78,16 @@ constexpr size_t k_host_mapped_bytes    = k_host_groups * 3 * k_expert_matrix_by
 constexpr size_t k_stacked_expert_bytes = k_expert_matrix_bytes * k_experts;
 constexpr size_t k_dma_pipeline_depth   = 2;
 
-int g_checks = 0;
-int g_fail   = 0;
+using host_planner_test::check;
+using host_planner_test::check_eq;
+using host_planner_test::g_checks;
+using host_planner_test::g_fail;
+using host_planner_test::make_mock_sycl_info;
 
-void check(bool cond, const char * what) {
-    g_checks++;
-    if (!cond) {
-        g_fail++;
-        std::printf("  FAIL: %s\n", what);
-    }
-}
-
-void check_eq(const char * what, size_t got, size_t want) {
-    g_checks++;
-    if (got != want) {
-        g_fail++;
-        std::printf("  FAIL: %s: got %zu, want %zu\n", what, got, want);
-    }
-}
-
-// --- the mocked device table: discrete cards, enough to plan, nothing touched ---
-
-ggml_sycl_device_info make_mock_sycl_info(int device_count) {
-    ggml_sycl_device_info info{};
-    info.device_count        = device_count;
-    info.total_gpu_count     = device_count;
-    info.host_max_alloc_size = 128ull * 1024ull * MiB;
-
-    for (int d = 0; d < device_count; ++d) {
-        const size_t       total_vram   = 32ull * 1024ull * MiB;
-        sycl_device_info & dev          = info.devices[d];
-        dev.cc                          = 1200;
-        dev.nsm                         = 256;
-        dev.smpbo                       = 64ull * 1024ull;
-        dev.vmm                         = true;
-        dev.total_vram                  = total_vram;
-        dev.free_vram_at_init           = total_vram;
-        dev.max_alloc_size              = total_vram - 512ull * MiB;
-        dev.safe_max_alloc_size         = dev.max_alloc_size;
-        dev.supports_soa_reorder        = true;
-        dev.xmx_caps.compute_units      = dev.nsm;
-        dev.xmx_caps.global_mem_size    = total_vram;
-        dev.xmx_caps.max_mem_alloc_size = dev.max_alloc_size;
-        std::snprintf(dev.device_name, sizeof(dev.device_name), "mock-host-backing-plan-%d", d);
-        info.max_work_group_sizes[d] = 256;
-        info.default_tensor_split[d] = static_cast<float>(d + 1) / static_cast<float>(device_count);
-        info.gpu_dpct_ids[d]         = d;
-    }
-    for (int src = 0; src < device_count; ++src) {
-        for (int dst = 0; dst < device_count; ++dst) {
-            sycl_peer_link_info & link = info.peer_links[src][dst];
-            link.valid                 = true;
-            link.src_device            = src;
-            link.dst_device            = dst;
-            link.same_device           = src == dst;
-            link.same_backend          = true;
-            link.same_platform         = true;
-            link.same_sycl_context     = src == dst;
-        }
-    }
-    return info;
-}
+// The mocked cards: B70-shaped discrete GPUs, the card run2 measured on, enough to plan, nothing touched.
+constexpr size_t k_card_vram   = 32ull * 1024ull * MiB;
+constexpr int    k_card_nsm    = 256;
+constexpr char   k_card_name[] = "mock-host-backing-plan";
 
 // --- the Qwen3.8 inventory ---
 
@@ -249,7 +199,7 @@ placement_plan plan_single(const std::vector<placement_tensor_info> & inv,
                            size_t                                     budget,
                            const fact &                               f,
                            captured_log *                             log = nullptr) {
-    const ggml_sycl_device_info   info = make_mock_sycl_info(1);
+    const ggml_sycl_device_info   info = make_mock_sycl_info(1, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard info_guard(info);
     g_log               = {};
     placement_plan plan = compute_placement_plan(inv, budget, /*device_id=*/0, kv_for(f), nullptr, k_experts);
@@ -260,7 +210,7 @@ placement_plan plan_single(const std::vector<placement_tensor_info> & inv,
 }
 
 placement_plan plan_two_devices(const std::vector<placement_tensor_info> & inv, size_t budget, const fact & f) {
-    const ggml_sycl_device_info      info = make_mock_sycl_info(2);
+    const ggml_sycl_device_info      info = make_mock_sycl_info(2, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard    info_guard(info);
     const std::vector<device_budget> budgets = {
         { 0, budget, 32ull * 1024ull * MiB, 1.0, true },
