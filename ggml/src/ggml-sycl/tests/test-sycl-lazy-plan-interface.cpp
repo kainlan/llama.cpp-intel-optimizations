@@ -10,7 +10,9 @@
 // LEAD-RUN. The stage initialises the SYCL backends, constructs their caches and plans through them, so the binary is
 // registered gpu-serial, serial, with the selector pinned: test-sycl-lazy-plan-interface-1dev runs on the B70 alone,
 // where the planner caller takes its single-device path, and test-sycl-lazy-plan-interface-2dev on both cards, where it
-// takes the multi-device path (the default with two GPUs) and a host with fewer exits 77.
+// takes the multi-device path. Each runs iff the host takes its path, by the planner caller's own predicate,
+// ggml_backend_sycl_moe_multi_gpu_requested(), and exits 77 otherwise. The scheduler-exposed device count is never the
+// test: this backend exposes one device whenever more than one GPU is visible.
 //
 // Every arm names its engagement check and the mutant it kills. An arm whose engagement check fails is VOID, and a VOID
 // arm fails the binary like a FAIL. Every arm runs, so one failure does not hide the rest.
@@ -262,22 +264,29 @@ int main(int argc, char ** argv) {
     if (!sycl_test_require_gpu("the lazy plan interface arms")) {
         return SYCL_TEST_SKIP;
     }
-    if (ggml_backend_sycl_get_device_count() != g_devices) {
-        std::printf("SKIP: --devices %d needs exactly %d SYCL GPUs visible, %d are\n", g_devices, g_devices,
-                    ggml_backend_sycl_get_device_count());
+    // The planner caller takes the multi-device path iff this predicate holds, so each registration scores the path
+    // it names or skips; a run on the other path would score the wrong planner call.
+    const bool multi_path = ggml_backend_sycl_moe_multi_gpu_requested();
+    if (multi_path != (g_devices == 2)) {
+        std::printf(
+            "SKIP: --devices %d scores the %s planner call, and this host takes the other path: "
+            "ggml_backend_sycl_moe_multi_gpu_requested() is %s\n",
+            g_devices, g_devices == 2 ? "multi-device" : "single-device", multi_path ? "true" : "false");
         return SYCL_TEST_SKIP;
     }
     ggml_log_set(capture_log, nullptr);
 
-    // Every device's backend lives for the whole run, as at a load: the stage plans through each device's cache.
-    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> b0(ggml_backend_sycl_init(0), ggml_backend_free);
-    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> b1(g_devices > 1 ? ggml_backend_sycl_init(1) : nullptr,
-                                                                   ggml_backend_free);
-    if (!b0 || (g_devices > 1 && !b1)) {
-        std::printf("FAIL: a backend did not initialise\n");
-        return 1;
+    // The backends the scheduler is shown live for the whole run, as at a load; the stage reaches the second card's
+    // cache itself on the multi-device path, as the internal multi-GPU path does.
+    std::vector<std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>> backends;
+    for (int d = 0; d < ggml_backend_sycl_get_device_count(); ++d) {
+        backends.emplace_back(ggml_backend_sycl_init(d), ggml_backend_free);
+        if (!backends.back()) {
+            std::printf("FAIL: backend %d did not initialise\n", d);
+            return 1;
+        }
     }
-    g_backend0 = b0.get();
+    g_backend0 = backends.front().get();
 
     struct named_arm {
         const char * name;

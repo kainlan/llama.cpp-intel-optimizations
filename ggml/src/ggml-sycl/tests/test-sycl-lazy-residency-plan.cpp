@@ -7,9 +7,11 @@
 // Copyright (C) 2024-2026 Intel Corporation
 // SPDX-License-Identifier: MIT
 //
-// LEAD-RUN. The planner's shaped path initialises SYCL and reads each device's existing cache, so the binary is
-// registered gpu-serial, serial, with the selector pinned to the discrete cards, and a host with too few SYCL GPUs for
-// its --devices count exits 77 before any arm runs.
+// LEAD-RUN. The planner's shaped path initialises SYCL and reads each device's cache, so the binary is registered
+// gpu-serial, serial, with the selector pinned to the discrete cards. --devices 2 runs iff the host takes the
+// multi-device path, which is the planner caller's own predicate, ggml_backend_sycl_moe_multi_gpu_requested();
+// otherwise it exits 77 before any arm runs. The scheduler-exposed device count is never the test: this backend exposes
+// one device whenever more than one GPU is visible.
 //
 //   test-sycl-lazy-residency-plan --devices 1   compute_placement_plan, and compute_multi_device_plan with one budget
 //                                               (its one-device delegation)
@@ -487,16 +489,18 @@ int main(int argc, char ** argv) {
     if (!sycl_test_require_gpu("the lazy residency plan arms")) {
         return SYCL_TEST_SKIP;
     }
-    if (ggml_backend_sycl_get_device_count() < g_devices) {
-        std::printf("SKIP: --devices %d needs %d SYCL GPUs, %d visible\n", g_devices, g_devices,
-                    ggml_backend_sycl_get_device_count());
+    if (g_devices == 2 && !ggml_backend_sycl_moe_multi_gpu_requested()) {
+        std::printf(
+            "SKIP: --devices 2 plans on the multi-device path, and this host does not take it: "
+            "ggml_backend_sycl_moe_multi_gpu_requested() is false\n");
         return SYCL_TEST_SKIP;
     }
     ggml_log_set(capture_log, nullptr);
 
-    // The backends stay alive across the arms, so every plan reads the same caches.
+    // The backends the scheduler is shown stay alive across the arms, as at a load, so every plan reads the same
+    // caches; the multi-device planner reaches the second card's cache itself, as the internal multi-GPU path does.
     std::vector<std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>> backends;
-    for (int d = 0; d < g_devices; ++d) {
+    for (int d = 0; d < ggml_backend_sycl_get_device_count(); ++d) {
         backends.emplace_back(ggml_backend_sycl_init(d), ggml_backend_free);
         if (!backends.back()) {
             std::printf("FAIL: backend %d did not initialise\n", d);
