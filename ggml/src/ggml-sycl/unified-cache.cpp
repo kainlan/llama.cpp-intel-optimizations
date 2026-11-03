@@ -19793,9 +19793,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // legacy callers continue to receive alloc_handle without gaining a way to
     // mint or mutate an intrusive control.
     alloc_owner_control * const owner_control = g_allocating_owner_control;
+
     // The owner entry's charge for a HOST_CPU request: only the owner entry charges the host ledger (th32 §4.2). This
     // call consumes it, so a unified_alloc nested on this thread finds none and a HOST_CPU request there is refused.
-    host_ledger_charge_token * const charge        = std::exchange(g_allocating_charge, nullptr);
+    host_ledger_charge_token * const charge = std::exchange(g_allocating_charge, nullptr);
 
     struct charge_consume_scope {
         host_ledger_charge_token * charge;
@@ -20502,6 +20503,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                             }
                             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = tier;
                             registered = true;
+
                             // The row's copy holds the HOST_CPU charge now, so the local record gives its copy up
                             // (th32 §4.2). Not before this point: the cohort-map write above can throw after the
                             // emplace, which erases the row and frees through the local record, and only the local
