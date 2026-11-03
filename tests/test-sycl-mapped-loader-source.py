@@ -27,7 +27,9 @@ The fact and the ABI
   F3. the stale pair refuses by name: the old proc name ggml_backend_sycl_stage_inventory_plan resolves to a stub that
       logs "libllama predates this backend's inventory; rebuild libllama and libggml-sycl together" and returns
       GGML_SYCL_LIFECYCLE_UNSUPPORTED without reading the inventory, so libllama's "SYCL inventory planning failed"
-      path fires after the backend has said why; no function of the old name remains to be called;
+      path fires after the backend has said why; no function of the old name remains to be called. The runtime half
+      is test-sycl-lifecycle-runtime-wrapper's arm, which resolves the old name, calls it with no inventory, and
+      requires UNSUPPORTED and the ERROR line;
   F4. no second source: no set_load_maps_files hook, no transaction store of the fact, and nothing reads a published
       fact out of the inventory;
   F5. libllama resolves the renamed staging proc and the two mapped-buffer procs by name, and never the old name; its

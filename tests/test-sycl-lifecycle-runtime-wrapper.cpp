@@ -252,6 +252,23 @@ static void phase(const char * name) {
     std::fflush(stderr);
 }
 
+// Whether the backend logged the stale-libllama refusal at ERROR since the last reset. The callback forwards every line
+// to the callback it replaced, so the log stays as it would be without the probe.
+static bool              g_stale_stage_logged      = false;
+static ggml_log_callback g_stale_stage_prev_log    = nullptr;
+static void *            g_stale_stage_prev_log_ud = nullptr;
+
+static void stale_stage_log(enum ggml_log_level level, const char * text, void * user_data) {
+    if (level == GGML_LOG_LEVEL_ERROR && text &&
+        std::strstr(text, "libllama predates this backend's inventory; rebuild libllama and libggml-sycl together")) {
+        g_stale_stage_logged = true;
+    }
+    if (g_stale_stage_prev_log) {
+        g_stale_stage_prev_log(level, text, g_stale_stage_prev_log_ud);
+    }
+    GGML_UNUSED(user_data);
+}
+
 static bool fixture_expect(bool condition, const char * detail) {
     if (!condition) {
         std::fprintf(stderr, "[sycl-runtime-wrapper] assert failed: %s\n", detail);
@@ -1468,6 +1485,41 @@ int main() {
     if (CALL_SYCL(ggml_backend_sycl_model_load_end)(stage_fail, false, nullptr) == GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
         std::fprintf(stderr, "late stage failure left txn unrecoverable\n");
         return 1;
+    }
+
+    // A libllama built before the inventory carried its storage inputs resolves the staging proc by its old name. The
+    // registry answers that name with a stub that refuses by name before it reads anything (design 5efe §4.3), so the
+    // call passes no inventory and no envelope: a stub that read either would fault here instead of refusing. The stub
+    // is file-static, so the registry is the only way to reach it in either build.
+    phase("the staging proc's old name refuses a stale libllama");
+    {
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+        ggml_backend_reg_t stale_reg = reg;
+#else
+        ggml_backend_reg_t stale_reg = ggml_backend_sycl_reg();
+#endif
+        void * stale_proc = ggml_backend_reg_get_proc_address(stale_reg, "ggml_backend_sycl_stage_inventory_plan");
+        void * renamed_proc =
+            ggml_backend_reg_get_proc_address(stale_reg, "ggml_backend_sycl_stage_load_inventory_plan");
+        if (!stale_proc || stale_proc == renamed_proc) {
+            std::fprintf(stderr, "the old staging proc name does not resolve to its own refusal stub\n");
+            return 1;
+        }
+        auto stale_stage = reinterpret_cast<decltype(&ggml_backend_sycl_stage_load_inventory_plan)>(stale_proc);
+        ggml_log_get(&g_stale_stage_prev_log, &g_stale_stage_prev_log_ud);
+        g_stale_stage_logged = false;
+        ggml_log_set(stale_stage_log, nullptr);
+        const ggml_sycl_lifecycle_result stale_rc = stale_stage(nullptr, nullptr, true);
+        ggml_log_set(g_stale_stage_prev_log, g_stale_stage_prev_log_ud);
+        if (stale_rc != GGML_SYCL_LIFECYCLE_UNSUPPORTED || CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
+            std::fprintf(stderr, "the old staging proc name returned %d, not UNSUPPORTED, or staged a plan\n",
+                         (int) stale_rc);
+            return 1;
+        }
+        if (!g_stale_stage_logged) {
+            std::fprintf(stderr, "the old staging proc name refused without logging why at ERROR\n");
+            return 1;
+        }
     }
 
     // llama.cpp-moua L4 step 3: the load's compute-term ledger.  An early c(P) is recorded for the open load,
