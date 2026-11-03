@@ -1104,10 +1104,12 @@ checks = {
     and "SYCL host expert registration failed during preload" in backend
     and "SYCL host weight registration failed during preload" in backend
     and "dense_alloc_guard" in backend
-    # A SYCL_Mapped expert is served in place and allocates nothing, so the owning allocation is an assignment in
-    # the branch that copies (design 5efe §4.3).
-    and "ggml_sycl::mem_handle host_owner;" in backend
-    and "host_owner = ggml_sycl_host_expert_alloc(device, expert_size);" in backend,
+    # A SYCL_Mapped expert is served in place and allocates nothing, so the preload declares the owning mem_handle
+    # first and the branch that copies assigns the allocation to that same local (design 5efe §4.3).
+    and re.search(r"\bggml_sycl::mem_handle\s+host_owner\s*;.*?(?<![\w.>])host_owner\s*=\s*"
+                  r"ggml_sycl_host_expert_alloc\s*\(\s*device\s*,\s*expert_size\s*\)\s*;",
+                  re.search(r"static void ggml_sycl_preload_model_weights\(\)\s*\{.*?\n\}", backend, re.S).group(0),
+                  re.S) is not None,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
