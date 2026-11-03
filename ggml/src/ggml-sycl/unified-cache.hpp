@@ -14,6 +14,7 @@
 #include "ggml-sycl.h"
 #include "host-cpu-mapping.hpp"
 #include "host-reserve-env.hpp"
+#include "host-zone-kinds.hpp"
 #include "kv-room-cost.hpp"
 #include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
@@ -7061,18 +7062,8 @@ enum class alloc_hint : uint8_t {
     DEBUG      = 4,  // Debug/profiling allocations (env-gated, not production)
 };
 
-// Classification of runtime (non-weight) VRAM reservations for diagnostics.
-enum class runtime_category : uint8_t {
-    KV_CACHE     = 0,  // KV buffer allocations
-    COMPUTE      = 1,  // Compute buffer pool + scratch
-    STAGING      = 2,  // Expert staging, DMA staging, BLAS fallback
-    GRAPH        = 3,  // Persistent TG temp allocs, get_rows_pool
-    HOST_COMPUTE = 4,  // Host-pinned scratch for CPU offload layers
-    EXPERT_CACHE = 5,  // MoE expert VRAM cache pool
-    CONTROL      = 6,  // Small CPU-produced control tensors read by any GPU
-    OTHER        = 7,  // Everything else (default for backward compat)
-    COUNT        = 8
-};
+// runtime_category, alloc_role and host_zone_id live in host-zone-kinds.hpp, SYCL-free, so the host zone routing
+// and its host-only tests share them (host-zone-plan.hpp).
 
 // Unified runtime allocation API.
 // Managed runtime allocations must flow through this API so budget accounting,
@@ -7091,23 +7082,6 @@ enum class alloc_tier : uint8_t {
     // device (llama.cpp-th32 T1). Requested only through alloc_constraints::must_host_cpu; nothing falls into it and
     // nothing falls out of it. host_accessible() is true for it and device_mappable() is false.
     HOST_CPU     = 4,
-};
-
-enum class alloc_role : uint8_t {
-    WEIGHT         = 0,
-    COMPUTE        = 1,
-    KV             = 2,
-    STAGING        = 3,
-    GRAPH_TMP      = 4,
-    TP_TMP         = 5,
-    EXPERT_STAGING = 6,
-    CONTROL        = 7,
-    OTHER          = 8,
-    // The lazy-table roles (llama.cpp-th32 T1), appended so no existing value moves.
-    // unified_cache_role_bytes_for_testing reads the live bytes of each.
-    LAZY_ROW_CACHE = 9,   // a lazy table's row-cache slab and index
-    LAZY_STAGING   = 10,  // landing slabs, epoch-ring captures and the block ring
-    LAZY_OUTPUT    = 11,  // the gathered rows a lazy GET_ROWS writes
 };
 
 // Where the planner puts a lazy table's rows (llama.cpp-th32 T1). Not an allocation tier: no byte is allocated "in"

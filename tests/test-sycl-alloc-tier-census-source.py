@@ -173,7 +173,9 @@ def test_the_new_names_exist():
     assert enumerators(enum_body(hpp, "lazy_residency")) == ["HOST", "STORAGE"]
     assert "STORAGE" in enumerators(enum_body(hpp, "cache_location"))
     assert "STORAGE" in enumerators(enum_body(hpp, "expert_resolve_tier"))
-    roles = enum_body(hpp, "alloc_role")
+    # alloc_role moved to the SYCL-free kinds header the host zone routing shares; unified-cache.hpp includes it.
+    assert '#include "host-zone-kinds.hpp"' in hpp, "unified-cache.hpp no longer includes host-zone-kinds.hpp"
+    roles = enum_body(strip_comments((SYCL_DIR / "host-zone-kinds.hpp").read_text()), "alloc_role")
     for name, value in (("LAZY_ROW_CACHE", 9), ("LAZY_STAGING", 10), ("LAZY_OUTPUT", 11)):
         assert re.search(rf"\b{name}\s*=\s*{value}\b", roles), f"alloc_role has no {name} = {value}"
     assert re.search(r"\bOTHER\s*=\s*8\b", roles), "OTHER moved: the new roles are appended after it"
