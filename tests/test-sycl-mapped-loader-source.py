@@ -76,7 +76,10 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
   L14. the -ot CPU override binds from the plan's backing like every other weight: CPU_OWNED takes
       select_weight_buft_cpu_owned, and both of select_weight_buft's list walks skip SYCL_Mapped (buft_is_sycl_mapped)
       unless the plan backs the weight FILE_MAPPED, so its place at the head of buft_list_cpu never binds it; the
-      NOT HONOURED WARN says file-mapped or pinned from the buffer type the fact bound, never pinned alone.
+      NOT HONOURED WARN says file-mapped or pinned from the buffer type the fact bound, never pinned alone;
+  L15. a weight the plan backs FILE_MAPPED that create_tensor still binds to another SYCL host buffer type (a pinned
+      copy the plan never charged) is counted on the loader after the demotion, and done_getting_tensors WARNs once
+      for the load, naming the first such tensor and its buffer type; no function-local static keys it per process.
 
 The planner (§4.4)
   P1. every entry-creation site in both builders derives host_backing from the fact as the plan holds it
@@ -704,6 +707,40 @@ def clause_l14_override_binds_from_the_plan(t: dict) -> list:
     return problems
 
 
+def clause_l15_unserved_mapping_warned_once_per_load(t: dict) -> list:
+    problems = []
+    region = create_tensor_buft_region(t)
+    hit = re.search(r"if\s*\(\s*planned_file_mapped\s*&&\s*ggml_backend_buft_is_host\s*\(\s*buft\s*\)\s*&&\s*"
+                    r"!\s*buft_is_sycl_mapped\s*\(\s*buft\s*\)", region)
+    if not hit:
+        return ["create_tensor does not detect a FILE_MAPPED weight bound to another SYCL host buffer type"]
+    block = balanced(region, region.index("{", hit.end()))
+    for needle in ("first_planned_mapped_unserved_name = tn.str()", "first_planned_mapped_unserved_buft = buft",
+                   "n_planned_mapped_unserved++", "planned_mapped_unserved_bytes +="):
+        if needle not in block:
+            problems.append(f"the unserved-mapping count does not record {needle.split(' ')[0]}")
+    if "static" in block:
+        problems.append("the unserved-mapping count is keyed per process, not on the load")
+    demotion = region.find("buft = ggml_backend_dev_buffer_type(cpu_dev);")
+    if demotion < 0 or hit.start() < demotion:
+        problems.append("the unserved-mapping count runs before the demotion settles the buffer type")
+    report = body_of(t[LML], r"void\s+llama_model_loader::done_getting_tensors\s*\(")
+    warn = re.search(r"if\s*\(\s*n_planned_mapped_unserved\s*>\s*0\s*\)\s*\{", report)
+    if not warn:
+        problems.append("done_getting_tensors does not report the unserved-mapping count")
+    else:
+        body = balanced(report, report.index("{", warn.start()))
+        if "LLAMA_LOG_WARN(" not in body:
+            problems.append("the unserved-mapping report is not a WARN")
+        if "first_planned_mapped_unserved_name" not in body or "first_planned_mapped_unserved_buft" not in body:
+            problems.append("the unserved-mapping WARN does not name the tensor and its buffer type")
+    for member in ("n_planned_mapped_unserved", "first_planned_mapped_unserved_name",
+                   "first_planned_mapped_unserved_buft"):
+        if not re.search(rf"^\s*[\w:]+(?:\s+\w+)*\s+{member}\b", t[LMLH], re.M):
+            problems.append(f"llama-model-loader.h does not declare {member}")
+    return problems
+
+
 def clause_p1_derivation_sites(t: dict) -> list:
     ucc = t[UCC]
     problems = []
@@ -845,6 +882,7 @@ CLAUSES = [
     ("L12 the SYCL_Mapped buffer type", clause_l12_mapped_buft),
     ("L13 the from-file hook on the C2 primitives", clause_l13_from_file_on_c2),
     ("L14 the -ot CPU override binds from the plan", clause_l14_override_binds_from_the_plan),
+    ("L15 an unserved mapping is warned once per load", clause_l15_unserved_mapping_warned_once_per_load),
     ("P1 the derivation at every entry-creation site", clause_p1_derivation_sites),
     ("P2 accumulation sites pass the backing", clause_p2_accumulation_sites_test_backing),
     ("P3 the readers", clause_p3_readers),
@@ -1012,6 +1050,17 @@ MUTANTS = [
     ("the NOT HONOURED WARN says pinned on a mapping load", "L14",
      lambda t: _mut(t, LML, r'buft_is_sycl_mapped\s*\(\s*first_cpu_override_downgraded_buft\s*\)\s*\?\s*'
                             r'"file-mapped"\s*:\s*"pinned"', '"pinned"')),
+    ("an unserved mapping is never counted", "L15",
+     lambda t: _mut(t, LML, r"if\s*\(\s*planned_file_mapped\s*&&\s*ggml_backend_buft_is_host\s*\(\s*buft\s*\)",
+                    "if (false && ggml_backend_buft_is_host(buft)")),
+    ("the unserved-mapping report is DEBUG", "L15",
+     lambda t: _mut(t, LML, r"(if\s*\(\s*n_planned_mapped_unserved\s*>\s*0\s*\)\s*\{\s*)LLAMA_LOG_WARN\s*\(",
+                    r"\1LLAMA_LOG_DEBUG(")),
+    ("the unserved-mapping WARN stops naming the tensor", "L15",
+     lambda t: _mut(t, LML, r",\s*first_planned_mapped_unserved_name\s*\.\s*c_str\s*\(\s*\)\s*\)", ", \"\")")),
+    ("the unserved-mapping count is keyed per process", "L15",
+     lambda t: _mut(t, LML, r"(if\s*\(\s*n_planned_mapped_unserved\s*==\s*0\s*\)\s*\{)",
+                    r"static bool warned = false; \1")),
     ("the from-file hook never locks", "L13",
      lambda t: _mut(t, GS, r"unified_cache_raw_lock_file_segments\s*\(", "unified_cache_raw_skip_lock(")),
     ("a stream_dma caller drops the refusal", "C2",

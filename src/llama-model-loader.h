@@ -227,6 +227,13 @@ struct llama_model_loader {
     std::string                first_host_planned_cpu_owned_name;
     ggml_backend_buffer_type_t first_host_planned_cpu_owned_buft = nullptr;
 
+    // Weights the SYCL plan backs FILE_MAPPED that create_tensor still bound to another SYCL host buffer type: a
+    // pinned copy the plan never charged (design 5efe §4.3). Counted per load, reported once by done_getting_tensors().
+    size_t                     n_planned_mapped_unserved     = 0;
+    size_t                     planned_mapped_unserved_bytes = 0;
+    std::string                first_planned_mapped_unserved_name;
+    ggml_backend_buffer_type_t first_planned_mapped_unserved_buft = nullptr;
+
     llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,

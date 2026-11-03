@@ -1619,6 +1619,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        // A weight the plan backs with the file's mapping that still lands in another SYCL host buffer type (the
+        // device's SYCL_Mapped absent or declining it) is a pinned copy the plan never charged (design 5efe §4.3).
+        // Counted on the loader, so done_getting_tensors() reports it once for this load.
+        if (planned_file_mapped && ggml_backend_buft_is_host(buft) && !buft_is_sycl_mapped(buft) &&
+            llama_model_loader_sycl_hooks_for(ggml_backend_buft_get_device(buft)).reg) {
+            if (n_planned_mapped_unserved == 0) {
+                first_planned_mapped_unserved_name = tn.str();
+                first_planned_mapped_unserved_buft = buft;
+            }
+            n_planned_mapped_unserved++;
+            planned_mapped_unserved_bytes += ggml_nbytes(t_meta);
+        }
+#endif
+
         selected_final_buft = buft;
         selected_final_dev  = ggml_backend_buft_get_device(buft);
 
@@ -1970,6 +1985,16 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
             __func__, n_host_planned_cpu_owned, host_planned_cpu_owned_bytes / (1024.0 * 1024.0),
             ggml_backend_buft_name(first_host_planned_cpu_owned_buft),
             first_host_planned_cpu_owned_name.c_str());
+    }
+
+    // WARN: memory the plan never charged, which the plan's own host totals cannot show.
+    if (n_planned_mapped_unserved > 0) {
+        LLAMA_LOG_WARN(
+            "%s: %zu tensor(s) (%.1f MiB) the SYCL plan backs with the model file's mapping were bound to "
+            "'%s' instead of the device's mapped buffer type, a pinned copy the plan did not charge "
+            "(first: '%s')\n",
+            __func__, n_planned_mapped_unserved, planned_mapped_unserved_bytes / (1024.0 * 1024.0),
+            ggml_backend_buft_name(first_planned_mapped_unserved_buft), first_planned_mapped_unserved_name.c_str());
     }
 
     if (n_cpu_override_downgraded > 0) {
