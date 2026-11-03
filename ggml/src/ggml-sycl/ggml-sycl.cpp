@@ -17704,13 +17704,20 @@ static ggml_sycl::multi_gpu_mode ggml_sycl_plan_multi_gpu_mode(bool is_moe) {
     return gpu_mode;
 }
 
-// The VRAM budget a single-device plan on `device` packs to: the arena's whole reservation when the device's cache has
-// an active arena (the planner subtracts the arena's zones from it once), else `vram_budget`. Reads the existing cache
-// and creates none. The stage and the plan dry run call it.
+// The cache whose arena a single-device plan on `device` packs against, or nullptr when the plan packs against its
+// VRAM budget alone: the device's existing cache, when its arena is active. ggml_sycl_plan_single_device_budget and
+// the plan dry run's arena caveat ask it. Reads the existing cache and creates none.
+static ggml_sycl::unified_cache * ggml_sycl_plan_single_device_arena_cache(int device) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    return cache != nullptr && cache->arena_active() ? cache : nullptr;
+}
+
+// The VRAM budget a single-device plan on `device` packs to: the arena's whole reservation when
+// ggml_sycl_plan_single_device_arena_cache names a cache (the planner subtracts the arena's zones from it once), else
+// `vram_budget`. The stage and the plan dry run call it.
 static size_t ggml_sycl_plan_single_device_budget(int device, size_t vram_budget) {
     size_t plan_budget = vram_budget;
-    auto * cache       = ggml_sycl::get_existing_unified_cache_for_device(device);
-    if (cache && cache->arena_active()) {
+    if (ggml_sycl::unified_cache * cache = ggml_sycl_plan_single_device_arena_cache(device)) {
         const size_t arena_total   = cache->arena_total_size();
         const size_t zone_overhead = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) +
                                      cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN) +
@@ -18810,9 +18817,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
             const size_t plan_budget =
                 forced != 0 ? forced : ggml_sycl_plan_single_device_budget(i, authority.budget_bytes);
             device_budget[i] = plan_budget;
-
-            const ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(i);
-            unmodelled[i] |= cache == nullptr || !cache->arena_active();
+            unmodelled[i] |= ggml_sycl_plan_single_device_arena_cache(i) == nullptr;
             plans.push_back(
                 ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts, host_budget));
         }
