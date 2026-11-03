@@ -2021,8 +2021,9 @@ typedef struct ggml_sycl_plan_dry_run_opts {
 } ggml_sycl_plan_dry_run_opts;
 
 // One plan's host terms, each the plan's own field: the WEIGHT zone's terms (placement_plan_host_weight_zone_terms),
-// the commit terms (placement_plan_host_zone_commit_terms), expected_host (host_planned_bytes) and the residency of
-// the plan's host entries by backing.
+// the commit terms (placement_plan_host_zone_commit_terms), expected_host (host_planned_bytes), the residency of the
+// plan's host entries by backing, and weight_host_bytes, the plan's charge for its PINNED and HOST_CPU entries, which
+// the residency of those two backings must equal (the dry run warns where it does not).
 typedef struct ggml_sycl_plan_dry_run_plan {
     int32_t  device;        // the plan's device_id, the device the planner's own lines name
     uint32_t multi_device;  // 1: one plan over every physical device
@@ -2041,6 +2042,7 @@ typedef struct ggml_sycl_plan_dry_run_plan {
     uint64_t expected_host;
     uint64_t residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT];
     uint64_t residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT];
+    uint64_t weight_host_bytes;
 } ggml_sycl_plan_dry_run_plan;
 
 // The answer. The caller fills struct_size (sizeof(*this)) and version; the backend writes the rest on OK. The sample
@@ -2062,8 +2064,8 @@ typedef struct ggml_sycl_plan_dry_run_result {
 } ggml_sycl_plan_dry_run_result;
 
 GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_opts) == 160 || sizeof(void *) != 8, "dry run opts layout changed");
-GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_plan) == 176, "dry run plan layout changed");
-GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_result) == 3008, "dry run result layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_plan) == 184, "dry run plan layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_result) == 3136, "dry run result layout changed");
 
 // OK with the result written; NULL_OUTPUT for a null inventory or result, or a struct header this backend does not
 // read; LOAD_BUSY while a load is open or a model is live; BUSY while the module is being mutated; NOT_FOUND with no

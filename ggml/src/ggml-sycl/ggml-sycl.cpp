@@ -18644,6 +18644,7 @@ static void ggml_sycl_plan_dry_run_residency(uint32_t                          i
     }
     out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED] = plan.host_mapped_bytes;
     out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED]   = plan.host_cpu_owned_bytes;
+    out.weight_host_bytes                                           = plan.weight_host_bytes;
     const uint64_t zone_walk = out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +
                                out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU];
     if (zone_walk != plan.weight_host_bytes) {

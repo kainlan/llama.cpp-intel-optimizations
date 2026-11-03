@@ -347,10 +347,16 @@ void residency_from_the_plan_fields(arm_result & r) {
     expect(r, bug_a.empty(),
            "the plan whose weight_host_bytes is its PINNED and HOST_CPU sum logged " + num(bug_a.size()) +
                " residency disagreement lines");
+    expect(r, out.weight_host_bytes == plan.weight_host_bytes,
+           "hand-built plan: the result's weight_host_bytes is " + num(out.weight_host_bytes) + ", the plan's " +
+               num(plan.weight_host_bytes));
 
     log_clear();
-    (void) test_plan_dry_run_record(disagree, dst_charged);
-    const std::vector<std::string> bug_d = lines_with("[PLAN-DRY-RUN-BUG]", " the PINNED and HOST_CPU entries ");
+    const ggml_sycl_plan_dry_run_plan out_d = test_plan_dry_run_record(disagree, dst_charged);
+    const std::vector<std::string>    bug_d = lines_with("[PLAN-DRY-RUN-BUG]", " the PINNED and HOST_CPU entries ");
+    expect(r, out_d.weight_host_bytes == dst_charged.weight_host_bytes,
+           "the plan charged on the DST basis: the result's weight_host_bytes is " + num(out_d.weight_host_bytes) +
+               ", the plan's " + num(dst_charged.weight_host_bytes));
     expect(r, bug_d.size() == 1 && bug_d[0].find(" plan=" + num(disagree) + " ") != std::string::npos,
            "the plan charged on the DST basis logged " + num(bug_d.size()) + " residency disagreement lines, want 1");
 }
@@ -358,20 +364,22 @@ void residency_from_the_plan_fields(arm_result & r) {
 // (b) The printout names every term on its own line, and each figure is the plan's. The planner prints the plan's own
 // record of each term: the WEIGHT zone's terms on its [HOST-PLAN] line, the commit terms, host_planned_bytes and the
 // budget the plan recorded on its [HOST-LEDGER] plan line. The dry run prints each on a line of its own, under the
-// term's name, and each must equal the planner's. The residency lines are scored against the WEIGHT walk: the PINNED
-// and HOST_CPU entries are the ones it counts, so their count is its blocks and their bytes its host_weights. The
-// shaped inventory maps no file (use_mmap_resolved is false), so its plan keeps every host entry PINNED, and a second
-// leg scores the residency on a plan built by hand, through the record's private seam: its FILE_MAPPED and CPU_OWNED
-// figures are the plan's host_mapped_bytes and host_cpu_owned_bytes, which the fixture charges apart from either
-// per-entry sum, and a plan whose weight_host_bytes is charged on the DST basis gets the one [PLAN-DRY-RUN-BUG] line
-// the plan charged on the SRC basis does not.
+// term's name, and each must equal the planner's. The dry run logs no [PLAN-DRY-RUN-BUG] line for these plans. The
+// PINNED and HOST_CPU residency is scored against the plan: those are the entries the WEIGHT walk counts, so their
+// count is its blocks, and their bytes are the plan's own charge for them, weight_host_bytes, which the result
+// carries. The shaped inventory maps no file (use_mmap_resolved is false), so its plan keeps every host entry PINNED,
+// and a second leg scores the residency on a plan built by hand, through the record's private seam: its FILE_MAPPED
+// and CPU_OWNED figures are the plan's host_mapped_bytes and host_cpu_owned_bytes, which the fixture charges apart from
+// either per-entry sum, its weight_host_bytes is the plan's, and a plan whose weight_host_bytes is charged on the DST
+// basis gets the one [PLAN-DRY-RUN-BUG] line the plan charged on the SRC basis does not.
 // Engagement: the dry run returned OK, and each plan has exactly one planner line of each kind to score against; the
 // hand-built plan's record counted one entry of each backing, and its two field figures differ from both the SRC and
 // the DST sums of their entries.
 // Mutants: a figure printed from a recomputed value (it differs from the planner's record: a rounding from another
 // chunk, a WEIGHT total re-summed, a budget re-sampled, a residency byte figure re-summed per entry on either basis); a
 // term not printed, or two terms on one line (the line count for that term is not 1); a residency line walking another
-// set of entries; the disagreement WARN dropped, or raised on an agreeing plan.
+// set of entries; PINNED and HOST_CPU bytes that part from the plan's weight_host_bytes, or a result that does not
+// carry that field; the disagreement WARN dropped, or raised on an agreeing plan.
 arm_result arm_b_every_term_printed_from_the_plan() {
     arm_result       r;
     loader_inventory inv(qwen38_shape);
@@ -388,6 +396,12 @@ arm_result arm_b_every_term_printed_from_the_plan() {
                         " [HOST-LEDGER] plan lines and " + num(weight.size()) + " [HOST-PLAN] WEIGHT lines");
         return r;
     }
+    // The planner's own plans are one computation: a [PLAN-DRY-RUN-BUG] line names a term or a charge that parted from
+    // the figure it must equal, so the shaped inventory's dry run logs none.
+    const std::vector<std::string> bugs = lines_with("[PLAN-DRY-RUN-BUG]");
+    expect(r, bugs.empty(),
+           "the shaped inventory's dry run logged " + num(bugs.size()) + " [PLAN-DRY-RUN-BUG] lines" +
+               (bugs.empty() ? std::string() : ", the first: " + bugs[0]));
 
     using dry_plan = ggml_sycl_plan_dry_run_plan;
 
@@ -433,9 +447,9 @@ arm_result arm_b_every_term_printed_from_the_plan() {
         expect(r, zone_count == p.weight_blocks,
                "plan " + num(i) + ": PINNED + HOST_CPU residency counts " + num(zone_count) + " entries, the WEIGHT " +
                    "walk " + num(p.weight_blocks) + " blocks");
-        expect(r, zone_bytes == p.weight_host_weights,
-               "plan " + num(i) + ": PINNED + HOST_CPU residency holds " + num(zone_bytes) + " bytes, the WEIGHT " +
-                   "walk " + num(p.weight_host_weights));
+        expect(r, zone_bytes == p.weight_host_bytes,
+               "plan " + num(i) + ": PINNED + HOST_CPU residency holds " + num(zone_bytes) + " bytes, the plan's " +
+                   "weight_host_bytes " + num(p.weight_host_bytes));
         const char * const backings[] = { "PINNED", "FILE_MAPPED", "HOST_CPU", "CPU_OWNED" };
         for (int b = 0; b < GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT; ++b) {
             const std::string              tag   = " plan=" + num(i) + " ";
