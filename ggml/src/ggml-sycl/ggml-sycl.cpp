@@ -53110,6 +53110,12 @@ static void ggml_backend_sycl_mapped_buffer_free_buffer(ggml_backend_buffer_t bu
     delete static_cast<sycl_mapped_buf_ctx *>(buffer->context);
 }
 
+// Whether `buffer` is a SYCL_Mapped buffer, a slice of the model file's mapping (design 5efe §4.3): its free_buffer is
+// the one no other buffer type shares, so every consumer asks this instead of comparing the pointer itself.
+static bool ggml_sycl_buffer_is_mapped(ggml_backend_buffer_t buffer) {
+    return buffer && buffer->iface.free_buffer == ggml_backend_sycl_mapped_buffer_free_buffer;
+}
+
 static void * ggml_backend_sycl_mapped_buffer_get_base(ggml_backend_buffer_t buffer) {
     return static_cast<sycl_mapped_buf_ctx *>(buffer->context)->base;
 }
@@ -53221,7 +53227,7 @@ ggml_backend_buffer_type_t ggml_backend_sycl_mapped_buffer_type_for_device(ggml_
 // The FILE_MAPPED owner behind a SYCL_Mapped buffer, so a consumer that registers one of its weights takes a copy of
 // the owner instead of copying the bytes (design 5efe §4.3, the preload rows). false for any other buffer.
 static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_sycl::mem_handle * out) {
-    if (!buffer || buffer->iface.free_buffer != ggml_backend_sycl_mapped_buffer_free_buffer || !buffer->context) {
+    if (!ggml_sycl_buffer_is_mapped(buffer) || !buffer->context) {
         return false;
     }
     const auto * ctx = static_cast<const sycl_mapped_buf_ctx *>(buffer->context);
@@ -63361,8 +63367,8 @@ static bool ggml_sycl_tensor_slice_identity(const ggml_tensor *              ten
     }
 
     // SYCL_Mapped tensor: the slice of its buffer's FILE_MAPPED owner (design 5efe §4.3).
-    if (owner_buffer_tensor && owner_buffer_tensor->buffer && owner_buffer_tensor->buffer->context &&
-        owner_buffer_tensor->buffer->iface.free_buffer == ggml_backend_sycl_mapped_buffer_free_buffer && tensor->data) {
+    if (owner_buffer_tensor && ggml_sycl_buffer_is_mapped(owner_buffer_tensor->buffer) &&
+        owner_buffer_tensor->buffer->context && tensor->data) {
         const auto * ctx  = static_cast<const sycl_mapped_buf_ctx *>(owner_buffer_tensor->buffer->context);
         const char * data = static_cast<const char *>(tensor->data);
         const char * base = static_cast<const char *>(ctx->base);
@@ -110663,7 +110669,7 @@ static uint64_t moe_segment_buffer_identity(ggml_backend_buffer_t buffer) {
         if (hctx && hctx->buffer_handle.valid() && hctx->buffer_handle.has_stable_owner_identity()) {
             return moe_segment_handle_identity(hctx->buffer_handle);
         }
-    } else if (buffer && buffer->iface.free_buffer == ggml_backend_sycl_mapped_buffer_free_buffer) {
+    } else if (ggml_sycl_buffer_is_mapped(buffer)) {
         // SYCL_Mapped: its FILE_MAPPED owner's identity (design 5efe §4.3)
         const auto * mctx = static_cast<const sycl_mapped_buf_ctx *>(buffer->context);
         if (mctx && mctx->owner.valid() && mctx->owner.has_stable_owner_identity()) {
