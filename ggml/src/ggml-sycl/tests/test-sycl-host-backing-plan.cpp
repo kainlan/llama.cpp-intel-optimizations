@@ -181,10 +181,12 @@ void capture_log(ggml_log_level level, const char * text, void * user) {
 }
 
 // The fact as the planner reads it: placement_kv_info's three fields, which the staging proc derives.
+// Each defaults as placement_kv_info does; an arm that models libllama's answer for GGML_SYCL_HOST_WEIGHT_LAYOUT's
+// default, cpu, sets layout_cpu itself.
 struct fact {
     bool maps_files  = false;
     bool locks_files = false;
-    bool layout_cpu  = true;  // GGML_SYCL_HOST_WEIGHT_LAYOUT's default, cpu
+    bool layout_cpu  = false;
 };
 
 placement_kv_info kv_for(const fact & f) {
@@ -331,6 +333,7 @@ void arm1_mapping_load(const std::vector<placement_tensor_info> & inv, size_t bu
     std::printf("(1) load_maps_files true: host experts FILE_MAPPED, weight_host_bytes 0, WEIGHT 64 MiB, DMA pool 0\n");
     fact f;
     f.maps_files = true;
+    f.layout_cpu = true;
     captured_log         log;
     const placement_plan plan = plan_single(inv, budget, f, &log);
     const census         c    = take_census(plan);
@@ -394,6 +397,7 @@ void arm3_locked_mapping(const std::vector<placement_tensor_info> & inv, size_t 
     fact f;
     f.maps_files              = true;
     f.locks_files             = true;
+    f.layout_cpu              = true;
     const placement_plan plan = plan_single(inv, budget, f);
 
     check_eq("host_mapped_bytes", plan.host_mapped_bytes, k_host_mapped_bytes);
@@ -408,6 +412,7 @@ void arm3_locked_mapping(const std::vector<placement_tensor_info> & inv, size_t 
     // The same plan without the lock, for the contrast: host_bytes differs by exactly the mapped bytes.
     fact unlocked;
     unlocked.maps_files            = true;
+    unlocked.layout_cpu            = true;
     const placement_plan free_plan = plan_single(inv, budget, unlocked);
     check_eq("host_bytes(locked) - host_bytes(unlocked) == host_mapped_bytes", plan.host_bytes - free_plan.host_bytes,
              k_host_mapped_bytes);
@@ -418,6 +423,7 @@ void arm4_host_dense(const std::vector<placement_tensor_info> & inv) {
     std::printf("(4) planner-host dense: CPU_OWNED when ggml-cpu repacks it, FILE_MAPPED in the file layout\n");
     fact repacked;
     repacked.maps_files     = true;
+    repacked.layout_cpu     = true;
     const placement_plan rp = plan_single(inv, 1 * MiB, repacked);
     const census         rc = take_census(rp);
     check(rc.host_dense_entries > 1, "the starved budget puts dense weights on the host");
@@ -451,6 +457,7 @@ void arm5_multi_device(const std::vector<placement_tensor_info> & inv) {
     std::printf("(5) compute_multi_device_plan: the same derivation from the same fact\n");
     fact f;
     f.maps_files              = true;
+    f.layout_cpu              = true;
     const placement_plan plan = plan_two_devices(inv, 1 * MiB, f);
     const census         c    = take_census(plan);
     check(c.host_expert_entries > 0, "the starved budget puts routed experts on the host");
@@ -472,6 +479,13 @@ int main() {
     void *            prev_data = nullptr;
     ggml_log_get(&prev_cb, &prev_data);
     ggml_log_set(capture_log, nullptr);
+
+    // host_weight_layout_cpu has one default, the value a zeroed inventory carries (false), held by placement_kv_info
+    // and this file's fact alike.
+    const ggml_sycl_tensor_inventory zeroed_inventory{};
+    check(placement_kv_info{}.host_weight_layout_cpu == zeroed_inventory.host_weight_layout_cpu &&
+              fact{}.layout_cpu == zeroed_inventory.host_weight_layout_cpu && !zeroed_inventory.host_weight_layout_cpu,
+          "host_weight_layout_cpu defaults to a zeroed inventory's false in placement_kv_info and the fact");
 
     const std::vector<placement_tensor_info> inv    = qwen_inventory();
     const size_t                             budget = arm0_inventory_and_budget(inv);

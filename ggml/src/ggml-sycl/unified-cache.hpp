@@ -674,9 +674,11 @@ struct placement_kv_info {
     // the mapping. false keeps every backing PINNED, today's figures. load_locks_files: -lm mmap+mlock, so the mapped
     // bytes are locked and charged (§4.5). host_weight_layout_cpu: libllama's answer, copied unchanged, to whether
     // GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu (its default), the one layout whose dense weights are CPU_OWNED.
+    // Unstaged it is false, a zeroed inventory's value: the rule reads it only under load_maps_files, and the staging
+    // proc writes both together.
     bool                  load_maps_files          = false;
     bool                  load_locks_files         = false;
-    bool                  host_weight_layout_cpu   = true;
+    bool                  host_weight_layout_cpu   = false;
     // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
     // is held for a layer only when the attention it keeps on the device is worth more per decode token than the
     // routed experts it displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at
