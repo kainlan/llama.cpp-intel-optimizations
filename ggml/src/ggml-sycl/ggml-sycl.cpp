@@ -17344,6 +17344,28 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     kv.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();
     kv.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
     kv.n_expert_used           = inventory->n_expert_used;
+    // The lazy tables (th32 §4.1), an inventory class of their own: copied here, the one intake, and never into the
+    // tensor rows, so no table enters g_tensor_inventory_detail and no zone maximum the rows size ever counts it.
+    kv.lazy_tables.clear();
+    if (inventory->lazy_table_count > 0 && inventory->lazy_tables != nullptr) {
+        kv.lazy_tables.reserve(inventory->lazy_table_count);
+        for (uint32_t i = 0; i < inventory->lazy_table_count; ++i) {
+            const ggml_sycl_lazy_table_info &    src = inventory->lazy_tables[i];
+            ggml_sycl::placement_lazy_table_info t;
+            t.name = src.name != nullptr ? src.name : "";
+            t.type = src.type;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                t.ne[d] = src.ne[d];
+            }
+            t.row_size       = src.row_size;
+            t.rows_per_token = src.rows_per_token;
+            t.consumer_layer = src.consumer_layer;
+            t.file_index     = src.file_index;
+            t.file_offset    = src.file_offset;
+            t.table_bytes    = src.size;
+            kv.lazy_tables.push_back(std::move(t));
+        }
+    }
 }
 
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
