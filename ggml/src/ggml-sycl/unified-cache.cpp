@@ -33261,10 +33261,11 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
 // line names them. A plan whose host bytes exceed the budget logs one would-refuse WARN carrying each term and is kept
 // whole: phase (a) of th32 T2 refuses nothing. The cache supplies the live oneDNN scratch and the chunk size, which
 // the terms keep so a re-plan re-records from the same inputs; a plan made before any cache exists counts the default
-// chunk. A lookup before the device count is known would enumerate the devices, so it is skipped.
+// chunk. A lookup before the device count is known would enumerate the devices, so it is skipped. The lookup creates
+// no cache and holds the cache lock shared once, for the find alone.
 static void record_host_ledger_plan(placement_plan & plan, size_t host_budget) {
     unified_cache * cache =
-        g_total_gpu_count > 0 ? get_existing_unified_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
+        g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
     const size_t onednn_live =
         cache ? cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() : 0;
     const size_t chunk               = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
