@@ -458,15 +458,18 @@ arm_result arm_b_every_term_printed_from_the_plan() {
 }
 
 // (c) A dry run stores nothing and leaves no trace (T2 row arm (j)'s last leg; th32 §4.2 "The dry-run and the
-// candidates do not store"). Three legs:
+// candidates do not store"). The arm first stages a load of the shaped inventory through the stage and ends it
+// uncommitted, so the dry run runs over the caches and planner state a staged load leaves, whatever arms ran before.
+// Three legs:
 //   budget:  with B0 seeded as the stored budget, a dry run leaves the stored budget at B0 and the store count where it
 //            was, and its plans record the budget it computed from its own sample, not B0;
 //   trace:   with a sentinel in every per-device global the dry run writes while it plans, each reads its sentinel
 //            again afterwards, so a later load reads what it would have read without the dry run;
 //   refusal: while a load is open the dry run is refused with LOAD_BUSY before it samples or plans, and stores nothing.
-// Engagement: the dry run returned OK and planned at least one device; its budget is not B0 (so a store would have
-// moved the value); it published the inventory's PP MoE ring while it planned (its RUNTIME term carries the ring, which
-// the sentinel does not hold), so it wrote at least one of the globals; the refusal was observed.
+// Engagement: a load was staged before the dry run (its stage returned OK with at least one plan line); the dry run
+// returned OK, not LOAD_BUSY, so that load had ended, and planned at least one device; its budget is not B0 (so a store
+// would have moved the value); it published the inventory's PP MoE ring while it planned (its RUNTIME term carries the
+// ring, which the sentinel does not hold), so it wrote at least one of the globals; the refusal was observed.
 // Mutants: a storing host_budget_pass_scope or a host_ledger_store_budget call in the dry run (the stored value leaves
 // B0 and the store count moves); the planner recording the stored budget instead of the one passed in (the plans record
 // B0); the restore dropped (a global reads what the dry run wrote, not its sentinel); the refusal dropped (the dry run
@@ -475,6 +478,23 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     arm_result       r;
     loader_inventory inv(qwen38_shape);
     const uint64_t   B0 = 4096;
+
+    ggml_sycl_load_txn staged{};
+    if (ggml_backend_sycl_model_load_begin(&staged) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the staged load's transaction did not begin, so no load was staged before the dry run");
+        return r;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result stage_rc     = ggml_backend_sycl_stage_inventory_plan(&inv.inv, nullptr, true);
+    const size_t                     staged_plans = lines_with("[HOST-LEDGER] device=", " plan host_budget=").size();
+    // An uncommitted end returns the transaction's finish reason, not OK; the dry run below returning OK, not
+    // LOAD_BUSY, is what shows the load ended.
+    (void) ggml_backend_sycl_model_load_end(staged, false, nullptr);
+    if (stage_rc != GGML_SYCL_LIFECYCLE_OK || staged_plans == 0) {
+        void_arm(r, "no load was staged before the dry run: the stage returned " + num(stage_rc) + " with " +
+                        num(staged_plans) + " plan lines");
+        return r;
+    }
 
     const std::vector<device_planner_state> original = read_planner_state();
     const std::vector<device_planner_state> sentinel = sentinel_planner_state(original.size());
