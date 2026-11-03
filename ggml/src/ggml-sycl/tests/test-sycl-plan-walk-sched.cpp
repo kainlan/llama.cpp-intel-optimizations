@@ -73,13 +73,30 @@ int main() {
     ggml_backend_sched_t sched       = ggml_backend_sched_new(backends, nullptr, 2, 256, false, false);
     size_t               sizes[2]    = { 0, 0 };
 
-    // The walk at the point rev 3g placed it: after ggml_backend_sched_reserve. All four nodes should attribute to
-    // the stand-in.
+    // After ggml_backend_sched_reserve_size the split is live: all four nodes attribute to the stand-in.
     ggml_backend_sched_reserve_size(sched, graph, sizes);
-    ggml_backend_sched_reserve(sched, graph);
-    const host_plan_attribution a =
+    capture_begin();
+    const host_plan_attribution live =
         host_plan_attribute(sched, graph, is_stand_in, is_set_rows, nullptr, nullptr, /*warn_zero=*/true);
-    HZP_CHECK(a.attributed == 4, "after reserve: attributed %d of %d", a.attributed, a.matched);
+    HZP_CHECK(live.attributed == 4, "after reserve_size: attributed %d of %d", live.attributed, live.matched);
+    HZP_CHECK(!log_has("plan attributed 0"), "the zero-attribution WARN printed while the split was live");
+
+    // After ggml_backend_sched_reserve the scheduler has reset: zero, and the zero-attribution WARN prints.
+    ggml_backend_sched_reserve(sched, graph);
+    capture_begin();
+    const host_plan_attribution reset =
+        host_plan_attribute(sched, graph, is_stand_in, is_set_rows, nullptr, nullptr, /*warn_zero=*/true);
+    HZP_CHECK(reset.attributed == 0 && reset.matched == 4, "after reserve: attributed %d of %d, expected 0 of 4",
+              reset.attributed, reset.matched);
+    HZP_CHECK(log_has("[ATTN-HOST] plan attributed 0 host-KV nodes to a SYCL backend (4 matched the predicate)"),
+              "after reserve: no zero-attribution WARN");
+
+    // A second reserve_size on the same scheduler: four again.
+    ggml_backend_sched_reserve_size(sched, graph, sizes);
+    const host_plan_attribution again =
+        host_plan_attribute(sched, graph, is_stand_in, is_set_rows, nullptr, nullptr, /*warn_zero=*/true);
+    HZP_CHECK(again.attributed == 4, "after a second reserve_size: attributed %d of %d", again.attributed,
+              again.matched);
 
     ggml_backend_sched_free(sched);
     ggml_free(graph_ctx);
