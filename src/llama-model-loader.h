@@ -299,9 +299,10 @@ struct llama_model_loader {
     // derived from the inventory's resolved use_mmap (design 5efe §4.3). false before the plan is staged.
     bool sycl_load_maps_files() const;
 
-    // Whether a weight in `buft` is served from the model file's mapping: the staged plan's fact for a SYCL buffer
-    // type, use_mmap otherwise. create_tensor never consults use_mmap for a SYCL weight (design 5efe §4.3).
-    bool weight_maps_files(ggml_backend_buffer_type_t buft) const;
+    // Whether a weight bound to `buft` is served from the model file's mapping: for a SYCL buffer type, once this load
+    // staged a plan, the plan's backing for that weight (planned_file_mapped, which create_tensor asks once); use_mmap
+    // otherwise. create_tensor never consults use_mmap for a SYCL weight (design 5efe §4.3).
+    bool weight_maps_files(ggml_backend_buffer_type_t buft, bool planned_file_mapped) const;
 
     // Whether GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu, the default, where a planner-host dense weight is repacked
     // into a CPU-owned buffer rather than read in the file layout (=plain, =off). Carried in the inventory, so the

@@ -46,15 +46,17 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
   L1. hook structs: the loader hooks resolve planned_host_backing and mapped_buffer_type_for_device by LOAD_SYCL_PROC;
   L2. the caps loops run above the early plan, and both inventories carry libllama's resolved inputs
       (llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock) at both populate sites);
-  L3. select_weight_buft's prefer_host_weights path asks planned_host_backing and returns SYCL_Mapped for FILE_MAPPED
-      only; every other backing keeps SYCL_Host, as the §4.3 select_weight_buft row says;
+  L3. create_tensor asks planned_host_backing once per weight and passes planned_file_mapped (FILE_MAPPED alone) to
+      both select_weight_buft calls; select_weight_buft asks nothing itself, and its prefer_host_weights path returns
+      SYCL_Mapped on that answer only; every other backing keeps SYCL_Host, as the §4.3 select_weight_buft row says;
   L4. weight_buft_supported's SYCL_Host short-circuit also accepts SYCL_Mapped;
   L5. make_cpu_buft_list puts the device's SYCL_Mapped ahead of its host buft on a load that maps files
       (ml.sycl_load_maps_files());
   L6. create_tensor's buffer-type choice reads no use_mmap: the -ot CPU-override WARN (whose buft_list_cpu leads with
-      SYCL_Mapped on a mapping load) and the host-buft demotion ask llama_model_loader::weight_maps_files(buft), the
-      plan's fact for a SYCL buft once this load staged a plan and use_mmap otherwise; the demotion compares against
-      the device's host buft only, so SYCL_Mapped is never demoted;
+      SYCL_Mapped on a mapping load) and the host-buft demotion ask
+      llama_model_loader::weight_maps_files(buft, planned_file_mapped), the plan's answer for that weight on a SYCL
+      buft once this load staged a plan and use_mmap otherwise; the demotion compares against the device's host buft
+      only, so SYCL_Mapped is never demoted;
   L7. buffer creation: a SYCL_Mapped context's buffers come from mapped_buffer_from_file per file, with the record's
       excluded_for_file(idx) as its lazy ranges, never from ggml_backend_alloc_ctx_tensors_from_buft; the mlock_bufs
       block skips SYCL_Mapped buffers, which lock through the tier;
@@ -427,15 +429,25 @@ def clause_l3_select_weight_buft(t: dict) -> list:
     if not prefer:
         return ["select_weight_buft's prefer_host_weights path was not found"]
     problems = []
-    if "planned_host_backing(" not in prefer:
-        problems.append("the prefer_host_weights path does not ask planned_host_backing")
-    if not re.search(r"GGML_SYCL_HOST_BACKING_FILE_MAPPED", prefer):
-        problems.append("the prefer_host_weights path does not test FILE_MAPPED")
-    # SYCL_Mapped only for FILE_MAPPED: a CPU_OWNED weight that no CPU-owned buffer type holds keeps SYCL_Host.
-    if re.search(r"GGML_SYCL_HOST_BACKING_CPU_OWNED", prefer):
-        problems.append("the prefer_host_weights path binds SYCL_Mapped for a backing other than FILE_MAPPED")
+    # One question per weight: create_tensor asks the plan and passes the answer down, so select_weight_buft, the
+    # layout block and weight_maps_files cannot disagree about one weight.
+    if "planned_host_backing(" in body:
+        problems.append("select_weight_buft asks planned_host_backing itself instead of taking create_tensor's answer")
+    if not re.search(r"if\s*\(\s*planned_file_mapped\s*&&", prefer):
+        problems.append("the prefer_host_weights path does not bind SYCL_Mapped on the plan's answer")
     if "mapped_buffer_type_for_device(" not in prefer:
         problems.append("the prefer_host_weights path never returns SYCL_Mapped")
+    region = create_tensor_buft_region(t)
+    asks = len(re.findall(r"planned_host_backing\s*\(", region))
+    if asks != 1:
+        problems.append(f"create_tensor asks planned_host_backing {asks} times per weight, not once")
+    # SYCL_Mapped only for FILE_MAPPED: a CPU_OWNED weight that no CPU-owned buffer type holds keeps SYCL_Host.
+    if not re.search(r"\bplanned_file_mapped\s*=\s*planned_backing\s*==\s*GGML_SYCL_HOST_BACKING_FILE_MAPPED\s*;",
+                     region):
+        problems.append("create_tensor's planned_file_mapped is not the plan's FILE_MAPPED answer alone")
+    passed = len(re.findall(r"select_weight_buft\s*\([^;]*\bplanned_file_mapped\s*\)", region))
+    if passed != 2:
+        problems.append(f"{passed} of create_tensor's two select_weight_buft calls pass its answer")
     return problems
 
 
@@ -478,18 +490,22 @@ def clause_l6_create_tensor_reads_no_use_mmap(t: dict) -> list:
     problems = []
     if re.search(r"\buse_mmap\b", region):
         problems.append("create_tensor's buffer-type choice reads use_mmap instead of weight_maps_files(buft)")
-    if not re.search(r"if\s*\(\s*weight_maps_files\s*\(\s*buft\s*\)\s*&&\s*buft_dev\s*&&\s*buft\s*==\s*"
+    asked = r"weight_maps_files\s*\(\s*buft\s*,\s*planned_file_mapped\s*\)"
+    if not re.search(rf"if\s*\(\s*{asked}\s*&&\s*buft_dev\s*&&\s*buft\s*==\s*"
                      r"ggml_backend_dev_host_buffer_type\s*\(\s*buft_dev\s*\)", region):
-        problems.append("the host-buft demotion does not read weight_maps_files(buft) against the device's host buft")
-    if not re.search(r"if\s*\(\s*weight_maps_files\s*\(\s*buft\s*\)\s*\)\s*\{\s*static\s+std::once_flag", region):
-        problems.append("the -ot CPU-override WARN does not read weight_maps_files(buft)")
-    helper = body_of(t[LML], r"bool\s+llama_model_loader::weight_maps_files\s*\(\s*ggml_backend_buffer_type_t\s+\w+\s*\)"
-                             r"\s*const\s*\{")
+        problems.append("the host-buft demotion does not read weight_maps_files(buft, planned_file_mapped) against the "
+                        "device's host buft")
+    if not re.search(rf"if\s*\(\s*{asked}\s*\)\s*\{{\s*static\s+std::once_flag", region):
+        problems.append("the -ot CPU-override WARN does not read weight_maps_files(buft, planned_file_mapped)")
+    helper = body_of(t[LML], r"bool\s+llama_model_loader::weight_maps_files\s*\(\s*ggml_backend_buffer_type_t\s+\w+\s*,"
+                             r"\s*bool\s+\w+\s*\)\s*const\s*\{")
     if not helper:
         problems.append("llama_model_loader::weight_maps_files has no definition")
-    elif "sycl_load_maps_files()" not in helper or "use_mmap" not in helper:
-        problems.append("weight_maps_files is not the plan's fact for a SYCL buft and use_mmap otherwise")
-    if not re.search(r"bool\s+weight_maps_files\s*\(\s*ggml_backend_buffer_type_t\s+\w+\s*\)\s*const\s*;", t[LMLH]):
+    elif not re.search(r"return\s+planned_file_mapped\s*;", helper) or "use_mmap" not in helper:
+        problems.append("weight_maps_files is not the plan's answer for the weight on a SYCL buft and use_mmap "
+                        "otherwise")
+    if not re.search(r"bool\s+weight_maps_files\s*\(\s*ggml_backend_buffer_type_t\s+\w+\s*,\s*bool\s+\w+\s*\)"
+                     r"\s*const\s*;", t[LMLH]):
         problems.append("llama-model-loader.h does not declare weight_maps_files")
     return problems
 
@@ -861,16 +877,26 @@ MUTANTS = [
      lambda t: _mut(t, LM, r"llama_model_sycl_set_inventory_host_backing\s*\(\s*inventory\s*,\s*ml\s*,\s*use_mlock\s*\)"
                            r"\s*;", ";")),
     ("select_weight_buft ignores the plan's backing", "L3",
-     lambda t: _mut(t, LML, r"planned_host_backing\s*\(\s*ggml_get_name", "planned_target_device(ggml_get_name")),
+     lambda t: _mut(t, LML, r"if\s*\(\s*planned_file_mapped\s*&&\s*sycl_hooks\.reg", "if (sycl_hooks.reg")),
     ("select_weight_buft binds SYCL_Mapped for CPU_OWNED too", "L3",
-     lambda t: _mut(t, LML, r"backing\s*==\s*GGML_SYCL_HOST_BACKING_FILE_MAPPED\s*\)",
-                    "backing == GGML_SYCL_HOST_BACKING_FILE_MAPPED || backing == GGML_SYCL_HOST_BACKING_CPU_OWNED)")),
+     lambda t: _mut(t, LML, r"(\bplanned_file_mapped\s*=\s*planned_backing\s*==\s*"
+                            r"GGML_SYCL_HOST_BACKING_FILE_MAPPED)\s*;",
+                    r"\1 || planned_backing == GGML_SYCL_HOST_BACKING_CPU_OWNED;")),
+    ("the layout block asks planned_host_backing a second time", "L3",
+     lambda t: _mut(t, LML, r"if\s*\(\s*planned_dev\s*==\s*-1\s*&&\s*!\s*planned_file_mapped\s*\)",
+                    "if (planned_dev == -1 && layer_sycl_hooks.planned_host_backing(tn.str().c_str()) != "
+                    "GGML_SYCL_HOST_BACKING_FILE_MAPPED)")),
+    ("the override's select_weight_buft drops create_tensor's answer", "L3",
+     lambda t: _mut(t, LML, r"(buft_list_cpu\s*,\s*false\s*,\s*)planned_file_mapped\s*\)", r"\1false)")),
     ("the mlock block locks SYCL_Mapped buffers", "L7",
      lambda t: _mut(t, LM, r"(if\s*\(\s*use_mlock\s*&&\s*ggml_backend_buffer_is_host\s*\(\s*buf\s*\))[^)]*\)",
                     r"\1)")),
     ("create_tensor's demotion reads use_mmap", "L6",
-     lambda t: _mut(t, LML, r"if\s*\(\s*weight_maps_files\s*\(\s*buft\s*\)\s*&&\s*buft_dev",
+     lambda t: _mut(t, LML, r"if\s*\(\s*weight_maps_files\s*\(\s*buft\s*,\s*planned_file_mapped\s*\)\s*&&\s*buft_dev",
                     "if (use_mmap && buft_dev")),
+    ("weight_maps_files answers the load's fact again", "L6",
+     lambda t: _mut(t, LML, r"(llama_model_loader::weight_maps_files\s*\([^)]*\)\s*const\s*\{.*?)"
+                            r"return\s+planned_file_mapped\s*;", r"\1return sycl_load_maps_files();")),
     ("the DMA pool is gated on the fact instead of the census", "P4",
      lambda t: _mut(t, UCC, r"!\s*plan\s*\.\s*has_pinned_backing\s*\(\s*\)", "plan.host_backing_maps_files")),
     ("the census skips the device-planned entries", "P4",
