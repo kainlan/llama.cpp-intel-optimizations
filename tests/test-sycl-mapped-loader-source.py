@@ -677,6 +677,13 @@ def clause_l13_from_file_on_c2(t: dict) -> list:
     ):
         if needle not in body:
             problems.append(f"mapped_buffer_from_file: {why}")
+    # errno names a cause only when mlock itself failed; a refused segment set never reached mlock.
+    lock_failed = re.search(r"const\s+bool\s+(\w+)\s*=\s*\w+\s*==\s*ggml_sycl::file_map_status::LOCK_FAILED\s*;",
+                            body)
+    at = re.search(rf"if\s*\(\s*{lock_failed.group(1)}\s*\)\s*\{{", body) if lock_failed else None
+    branch = balanced(body, at.end() - 1) if at else ""
+    if "std::strerror(" not in branch or body.count("std::strerror(") != branch.count("std::strerror("):
+        problems.append("mapped_buffer_from_file: errno is printed outside the mlock-failure branch")
     return problems
 
 
@@ -1093,6 +1100,8 @@ MUTANTS = [
     ("the unserved-mapping count is keyed per process", "L15",
      lambda t: _mut(t, LML, r"(if\s*\(\s*n_planned_mapped_unserved\s*==\s*0\s*\)\s*\{)",
                     r"static bool warned = false; \1")),
+    ("the lock error prints errno for a refused segment set", "L13",
+     lambda t: _mut(t, GS, r"if\s*\(\s*mlock_failed\s*\)\s*\{", "if (true) {")),
     ("the from-file hook never locks", "L13",
      lambda t: _mut(t, GS, r"unified_cache_raw_lock_file_segments\s*\(", "unified_cache_raw_skip_lock(")),
     ("a stream_dma caller drops the refusal", "C2",

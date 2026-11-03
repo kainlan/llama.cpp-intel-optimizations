@@ -53416,21 +53416,31 @@ ggml_backend_buffer_t ggml_backend_sycl_mapped_buffer_from_file(ggml_backend_dev
         const ggml_sycl::file_map_status locked =
             ggml_sycl::unified_cache_raw_lock_file_segments(view, segments.willneed);
         if (locked != ggml_sycl::file_map_status::OK) {
-            const int err   = errno;
-            uint64_t  bytes = 0;
+            // errno and the memlock limit name a cause only when mlock itself failed; a refused segment set
+            // (INVALID_ARGUMENT) returns before mlock runs, so errno is whatever an earlier call left.
+            const bool mlock_failed = locked == ggml_sycl::file_map_status::LOCK_FAILED;
+            const int  err          = errno;
+            uint64_t   bytes        = 0;
             for (const ggml_sycl::file_map_range & r : segments.willneed) {
                 bytes += r.length;
             }
-            struct rlimit limit = {};
-            std::string   soft  = "unknown";
-            if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
-                soft = limit.rlim_cur == RLIM_INFINITY ? "unlimited" : std::to_string(limit.rlim_cur) + " bytes";
+            if (mlock_failed) {
+                struct rlimit limit = {};
+                std::string   soft  = "unknown";
+                if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
+                    soft = limit.rlim_cur == RLIM_INFINITY ? "unlimited" : std::to_string(limit.rlim_cur) + " bytes";
+                }
+                GGML_LOG_ERROR(
+                    "%s: file %u: -lm mmap+mlock cannot lock the %.1f MB of host-executed weights: %s (%s); "
+                    "RLIMIT_MEMLOCK soft limit %s, refusing the load (design 5efe §4.5)\n",
+                    __func__, file_idx, bytes / (1024.0 * 1024.0), std::strerror(err),
+                    ggml_sycl::file_map_status_name(locked), soft.c_str());
+            } else {
+                GGML_LOG_ERROR(
+                    "%s: file %u: -lm mmap+mlock cannot lock the %.1f MB of host-executed weights: the segment set "
+                    "was refused (%s), refusing the load (design 5efe §4.5)\n",
+                    __func__, file_idx, bytes / (1024.0 * 1024.0), ggml_sycl::file_map_status_name(locked));
             }
-            GGML_LOG_ERROR(
-                "%s: file %u: -lm mmap+mlock cannot lock the %.1f MB of host-executed weights: %s (%s); "
-                "RLIMIT_MEMLOCK soft limit %s, refusing the load (design 5efe §4.5)\n",
-                __func__, file_idx, bytes / (1024.0 * 1024.0), std::strerror(err),
-                ggml_sycl::file_map_status_name(locked), soft.c_str());
             return nullptr;
         }
     }
