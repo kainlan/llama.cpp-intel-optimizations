@@ -7939,6 +7939,33 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
 
+    # The lazy tables' residency (th32 §4.3 step 4, §11 T3): the DeepSeek-shaped tables both STORAGE and one HOST at
+    # thresholds derived from the plan's own zone terms, the Qwen PLE flip, the tables kept out of every zone maximum,
+    # and the null-pin and cold-class refusals. One binary, two registrations: --devices 1 plans through
+    # compute_placement_plan and the one-budget delegation on the B70 alone, --devices 2 through
+    # compute_multi_device_plan on both cards and exits 77 below two GPUs. The planner initialises SYCL and reads each
+    # device's cache, so both carry the OOM-family labels and run alone. Lead-run.
+    add_executable(test-sycl-lazy-residency-plan
+        tests/test-sycl-lazy-residency-plan.cpp)
+    target_link_libraries(test-sycl-lazy-residency-plan PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-residency-plan PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-residency-plan-1dev COMMAND test-sycl-lazy-residency-plan --devices 1)
+    set_tests_properties(test-sycl-lazy-residency-plan-1dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    add_test(NAME test-sycl-lazy-residency-plan-2dev COMMAND test-sycl-lazy-residency-plan --devices 2)
+    set_tests_properties(test-sycl-lazy-residency-plan-2dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
     # requires them to be rejected.  It is not redundant with the source gate in
