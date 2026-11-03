@@ -17208,6 +17208,140 @@ static uint64_t ggml_sycl_moe_stream_staged_types() {
     return mask;
 }
 
+// The planner's per-tensor view of an inventory: the stage publishes it, and the plan dry run builds its own.
+static std::vector<ggml_sycl::placement_tensor_info> ggml_sycl_inventory_planner_detail(
+    const ggml_sycl_tensor_inventory * inventory) {
+    std::vector<ggml_sycl::placement_tensor_info> detail;
+    detail.reserve(inventory->count);
+    for (size_t i = 0; i < inventory->count; i++) {
+        const ggml_sycl_tensor_info & t = inventory->tensors[i];
+        if (t.name == nullptr) {
+            continue;
+        }
+        ggml_sycl::placement_tensor_info info(t.name, t.size);
+        if (t.ne[0] > 0 && t.ne[1] > 0 && t.type >= 0 && t.type < GGML_TYPE_COUNT) {
+            info.type = t.type;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                info.ne[d] = t.ne[d];
+            }
+        }
+        info.get_rows_only = t.get_rows_only;
+        detail.push_back(std::move(info));
+    }
+    return detail;
+}
+
+// The per-device planner inputs an inventory carries, as ggml_sycl_inventory_publish_planner_inputs() published them.
+struct ggml_sycl_inventory_planner_inputs {
+    size_t   pp_pipeline_scratch_bytes           = 0;
+    size_t   pp_moe_onednn_weight_slot_bytes     = 0;
+    size_t   pp_moe_onednn_activation_slot_bytes = 0;
+    size_t   pp_moe_onednn_output_slot_bytes     = 0;
+    uint32_t pp_moe_onednn_ring_depth            = 0;
+};
+
+// Publishes on `device` the inventory's inputs the planner reads back per device (the PP pipeline scratch, zero unless
+// its variable enables it, and the PP MoE oneDNN ring) and returns them. The stage and the plan dry run publish
+// through it, so both plan from the same inputs; the dry run puts the previous values back when it is done.
+static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_inputs(
+    int                                device,
+    const ggml_sycl_tensor_inventory * inventory) {
+    ggml_sycl_inventory_planner_inputs in;
+    in.pp_pipeline_scratch_bytes           = pp_pipeline_env_enabled() ? inventory->pp_pipeline_scratch_bytes : 0;
+    in.pp_moe_onednn_weight_slot_bytes     = inventory->pp_moe_onednn_weight_slot_bytes;
+    in.pp_moe_onednn_activation_slot_bytes = inventory->pp_moe_onednn_activation_slot_bytes;
+    in.pp_moe_onednn_output_slot_bytes     = inventory->pp_moe_onednn_output_slot_bytes;
+    in.pp_moe_onednn_ring_depth            = inventory->pp_moe_onednn_ring_depth;
+    ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(device, in.pp_pipeline_scratch_bytes);
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(
+        device, in.pp_moe_onednn_weight_slot_bytes, in.pp_moe_onednn_activation_slot_bytes,
+        in.pp_moe_onednn_output_slot_bytes, in.pp_moe_onednn_ring_depth);
+    return in;
+}
+
+// The planner's KV and cost inputs from an inventory, written over `kv`, which keeps every field the inventory does not
+// carry (n_seq_max is a runtime-context input). The stage fills g_placement_kv_info; the plan dry run fills a copy.
+static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     kv,
+                                             const ggml_sycl_tensor_inventory * inventory) {
+    kv.n_layer        = inventory->n_layer;
+    kv.n_embd_k_gqa   = inventory->n_embd_k_gqa;
+    kv.n_embd_v_gqa   = inventory->n_embd_v_gqa;
+    kv.n_ctx          = inventory->n_ctx;
+    kv.n_ubatch       = inventory->n_ubatch;
+    kv.n_swa          = inventory->n_swa;
+    kv.n_swa_layers   = inventory->n_swa_layers;
+    kv.n_head_ctx_max = inventory->n_head_ctx_max;
+    kv.n_head_swa_max = inventory->n_head_swa_max;
+    kv.n_head_all_max = inventory->n_head_all_max;
+    if (inventory->swa_layer_mask != nullptr && inventory->swa_layer_mask_count > 0) {
+        kv.swa_layer_mask.assign(inventory->swa_layer_mask,
+                                 inventory->swa_layer_mask + inventory->swa_layer_mask_count);
+    } else {
+        kv.swa_layer_mask.clear();
+    }
+    // llama.cpp-3aos: per-layer KV truth (see the field comments in
+    // ggml-sycl.h and unified-cache.hpp). n_seq_max is NOT set here --
+    // it is a runtime-context input, not a load-time model property, and
+    // stays at the struct's default (1) until ggml_backend_sycl_set_runtime_context_for_model()'s
+    // transaction body sets it on next_kv_info from the caller's real
+    // n_seq_max.
+    if (inventory->kv_layer_count > 0 && inventory->kv_k_width_per_layer != nullptr &&
+        inventory->kv_v_width_per_layer != nullptr && inventory->kv_layer_kind != nullptr) {
+        kv.layer_kind.assign(inventory->kv_layer_kind, inventory->kv_layer_kind + inventory->kv_layer_count);
+        kv.layer_k_width.assign(inventory->kv_k_width_per_layer,
+                                inventory->kv_k_width_per_layer + inventory->kv_layer_count);
+        kv.layer_v_width.assign(inventory->kv_v_width_per_layer,
+                                inventory->kv_v_width_per_layer + inventory->kv_layer_count);
+    } else {
+        kv.layer_kind.clear();
+        kv.layer_k_width.clear();
+        kv.layer_v_width.clear();
+    }
+    // llama.cpp-8ecj: the indexer key cache's width per layer, a second KV buffer every budget adds to the K/V.
+    if (inventory->kv_layer_count > 0 && inventory->kv_idx_k_width_per_layer != nullptr) {
+        kv.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer,
+                                    inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);
+    } else {
+        kv.layer_idx_k_width.clear();
+    }
+    kv.n_ctx_is_runtime         = false;
+    // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
+    kv.n_ctx_context            = inventory->n_ctx_context;
+    // llama.cpp-7fmt: whether that is the model's default context. The room's lines say so, and for the default
+    // context an expert type with no measured CPU rate refuses the room instead of being priced at the fallback.
+    kv.n_ctx_context_is_default = inventory->n_ctx_context_is_default;
+    // The micro-batch the caller named, whose PP MoE oneDNN scratch ring the planner plans in the RUNTIME zone (0:
+    // none named, so the ring keeps the load's planning shape).
+    kv.n_ubatch_context         = inventory->n_ubatch_context;
+    // The load's host-backing fact (design 5efe §4.3-4.4), derived here and nowhere else from what only libllama knows:
+    // the file-mapping tier maps the model when libllama resolved use_mmap and this build has the tier. The plan copies
+    // it, and every entry's host backing, planned_host_backing and the from-file hook read it from the plan.
+    kv.load_maps_files          = inventory->use_mmap_resolved && ggml_sycl::file_mapping_supported();
+    kv.load_locks_files         = kv.load_maps_files && inventory->use_mlock_resolved;
+    kv.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
+    // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
+    // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
+    kv.explicit_ubatch          = {};
+    // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs that room by, layer by layer: the share of the requested
+    // context a conversation is expected to fill (a percent, so at most 100), the two host read rates (the CPU expert
+    // rate, when its variable is given, prices every expert type), and the cost of each CPU split a host layer adds.
+    kv.ctx_fill_pct =
+        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CTX_FILL_PCT", ggml_sycl::PLACEMENT_CTX_FILL_PCT_DEFAULT, 100.0);
+    kv.host_attn_gbps =
+        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_HOST_ATTN_GBPS", ggml_sycl::PLACEMENT_HOST_ATTN_GBPS_DEFAULT,
+                                  std::numeric_limits<double>::max());
+    kv.cpu_expert_gbps =
+        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CPU_EXPERT_GBPS", ggml_sycl::PLACEMENT_CPU_EXPERT_GBPS_DEFAULT,
+                                  std::numeric_limits<double>::max(), &kv.cpu_expert_gbps_set);
+    kv.host_split_us = ggml_sycl_plan_cost_param(
+        "GGML_SYCL_PLAN_HOST_SPLIT_US", ggml_sycl::PLACEMENT_HOST_SPLIT_US_DEFAULT, std::numeric_limits<double>::max());
+    // What the planner sizes the prompt phase's window ring with, so it holds the ring's room before the routed experts:
+    // the executor's staged types and its group cap, the inputs the phase's own sizing reads when it runs.
+    kv.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();
+    kv.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
+    kv.n_expert_used           = inventory->n_expert_used;
+}
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17225,29 +17359,15 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
     g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
     g_tensor_inventory_device                              = ctx->device;
-    g_tensor_inventory.reserve(inventory->count);
-    g_tensor_inventory_detail.reserve(inventory->count);
-    g_tensor_inventory_index.reserve(inventory->count);
+    g_tensor_inventory_detail                              = ggml_sycl_inventory_planner_detail(inventory);
+    g_tensor_inventory.reserve(g_tensor_inventory_detail.size());
+    g_tensor_inventory_index.reserve(g_tensor_inventory_detail.size());
     size_t max_tensor_bytes = 0;
-    for (size_t i = 0; i < inventory->count; i++) {
-        if (inventory->tensors[i].name != nullptr) {
-            std::string name(inventory->tensors[i].name);
-            size_t      idx = g_tensor_inventory.size();
-            g_tensor_inventory.emplace_back(name, inventory->tensors[i].size);
-            ggml_sycl::placement_tensor_info info(name, inventory->tensors[i].size);
-            if (inventory->tensors[i].ne[0] > 0 && inventory->tensors[i].ne[1] > 0 && inventory->tensors[i].type >= 0 &&
-                inventory->tensors[i].type < GGML_TYPE_COUNT) {
-                info.type = inventory->tensors[i].type;
-                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-                    info.ne[d] = inventory->tensors[i].ne[d];
-                }
-            }
-            info.get_rows_only = inventory->tensors[i].get_rows_only;
-            g_tensor_inventory_detail.push_back(std::move(info));
-            g_tensor_inventory_index[name] = idx;
-            g_tensor_inventory_total_size += inventory->tensors[i].size;
-            max_tensor_bytes = std::max(max_tensor_bytes, inventory->tensors[i].size);
-        }
+    for (const ggml_sycl::placement_tensor_info & info : g_tensor_inventory_detail) {
+        g_tensor_inventory_index[info.name] = g_tensor_inventory.size();
+        g_tensor_inventory.emplace_back(info.name, info.size);
+        g_tensor_inventory_total_size += info.size;
+        max_tensor_bytes = std::max(max_tensor_bytes, info.size);
     }
     // This — not plan.onednn_scratchpad_bytes — is what actually sizes the VRAM
     // ONEDNN zone: it lands in g_planned_onednn_scratchpad_bytes[device] and is
@@ -17309,20 +17429,13 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
             inventory_maxima.dequant_f16_src1_bytes_per_token, dense_n_ubatch,
             dense_planned.dequant_f16 ? "" : unplanned);
     }
-    {
-        const bool pp_pipeline_enabled               = pp_pipeline_env_enabled();
-        g_tensor_inventory_pp_pipeline_scratch_bytes = pp_pipeline_enabled ? inventory->pp_pipeline_scratch_bytes : 0;
-    }
-    ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(ctx->device,
-                                                                   g_tensor_inventory_pp_pipeline_scratch_bytes);
-    g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = inventory->pp_moe_onednn_weight_slot_bytes;
-    g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = inventory->pp_moe_onednn_activation_slot_bytes;
-    g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = inventory->pp_moe_onednn_output_slot_bytes;
-    g_tensor_inventory_pp_moe_onednn_ring_depth            = inventory->pp_moe_onednn_ring_depth;
-    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(
-        ctx->device, g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,
-        g_tensor_inventory_pp_moe_onednn_activation_slot_bytes, g_tensor_inventory_pp_moe_onednn_output_slot_bytes,
-        g_tensor_inventory_pp_moe_onednn_ring_depth);
+    const ggml_sycl_inventory_planner_inputs published =
+        ggml_sycl_inventory_publish_planner_inputs(ctx->device, inventory);
+    g_tensor_inventory_pp_pipeline_scratch_bytes           = published.pp_pipeline_scratch_bytes;
+    g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = published.pp_moe_onednn_weight_slot_bytes;
+    g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = published.pp_moe_onednn_activation_slot_bytes;
+    g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = published.pp_moe_onednn_output_slot_bytes;
+    g_tensor_inventory_pp_moe_onednn_ring_depth            = published.pp_moe_onednn_ring_depth;
     // The load-time ring is sized for the RUNTIME zone, which the arena sizes
     // from it, so every slot starts there. Only a runtime-context transaction
     // places slots in the shared KV zone (ggml_sycl_replan_pp_moe_onednn_ring()).
@@ -17369,84 +17482,8 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         ctx->device, inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row);
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(ctx->device, inventory->n_ubatch);
 
-    g_model_n_layer                    = inventory->n_layer;
-    g_placement_kv_info.n_layer        = inventory->n_layer;
-    g_placement_kv_info.n_embd_k_gqa   = inventory->n_embd_k_gqa;
-    g_placement_kv_info.n_embd_v_gqa   = inventory->n_embd_v_gqa;
-    g_placement_kv_info.n_ctx          = inventory->n_ctx;
-    g_placement_kv_info.n_ubatch       = inventory->n_ubatch;
-    g_placement_kv_info.n_swa          = inventory->n_swa;
-    g_placement_kv_info.n_swa_layers   = inventory->n_swa_layers;
-    g_placement_kv_info.n_head_ctx_max = inventory->n_head_ctx_max;
-    g_placement_kv_info.n_head_swa_max = inventory->n_head_swa_max;
-    g_placement_kv_info.n_head_all_max = inventory->n_head_all_max;
-    if (inventory->swa_layer_mask != nullptr && inventory->swa_layer_mask_count > 0) {
-        g_placement_kv_info.swa_layer_mask.assign(inventory->swa_layer_mask,
-                                                  inventory->swa_layer_mask + inventory->swa_layer_mask_count);
-    } else {
-        g_placement_kv_info.swa_layer_mask.clear();
-    }
-    // llama.cpp-3aos: per-layer KV truth (see the field comments in
-    // ggml-sycl.h and unified-cache.hpp). n_seq_max is NOT set here --
-    // it is a runtime-context input, not a load-time model property, and
-    // stays at the struct's default (1) until ggml_backend_sycl_set_runtime_context_for_model()'s
-    // transaction body sets it on next_kv_info from the caller's real
-    // n_seq_max.
-    if (inventory->kv_layer_count > 0 && inventory->kv_k_width_per_layer != nullptr &&
-        inventory->kv_v_width_per_layer != nullptr && inventory->kv_layer_kind != nullptr) {
-        g_placement_kv_info.layer_kind.assign(inventory->kv_layer_kind,
-                                              inventory->kv_layer_kind + inventory->kv_layer_count);
-        g_placement_kv_info.layer_k_width.assign(inventory->kv_k_width_per_layer,
-                                                 inventory->kv_k_width_per_layer + inventory->kv_layer_count);
-        g_placement_kv_info.layer_v_width.assign(inventory->kv_v_width_per_layer,
-                                                 inventory->kv_v_width_per_layer + inventory->kv_layer_count);
-    } else {
-        g_placement_kv_info.layer_kind.clear();
-        g_placement_kv_info.layer_k_width.clear();
-        g_placement_kv_info.layer_v_width.clear();
-    }
-    // llama.cpp-8ecj: the indexer key cache's width per layer, a second KV buffer every budget adds to the K/V.
-    if (inventory->kv_layer_count > 0 && inventory->kv_idx_k_width_per_layer != nullptr) {
-        g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer,
-                                                     inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);
-    } else {
-        g_placement_kv_info.layer_idx_k_width.clear();
-    }
-    g_placement_kv_info.n_ctx_is_runtime = false;
-    // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
-    g_placement_kv_info.n_ctx_context    = inventory->n_ctx_context;
-    // llama.cpp-7fmt: whether that is the model's default context. The room's lines say so, and for the default
-    // context an expert type with no measured CPU rate refuses the room instead of being priced at the fallback.
-    g_placement_kv_info.n_ctx_context_is_default = inventory->n_ctx_context_is_default;
-    // The micro-batch the caller named, whose PP MoE oneDNN scratch ring the planner plans in the RUNTIME zone (0:
-    // none named, so the ring keeps the load's planning shape).
-    g_placement_kv_info.n_ubatch_context         = inventory->n_ubatch_context;
-    // The load's host-backing fact (design 5efe §4.3-4.4), derived here and nowhere else from what only libllama knows:
-    // the file-mapping tier maps the model when libllama resolved use_mmap and this build has the tier. The plan copies
-    // it, and every entry's host backing, planned_host_backing and the from-file hook read it from the plan.
-    g_placement_kv_info.load_maps_files          = inventory->use_mmap_resolved && ggml_sycl::file_mapping_supported();
-    g_placement_kv_info.load_locks_files         = g_placement_kv_info.load_maps_files && inventory->use_mlock_resolved;
-    g_placement_kv_info.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
-    // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
-    // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
-    g_placement_kv_info.explicit_ubatch          = {};
-    // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs that room by, layer by layer: the share of the requested
-    // context a conversation is expected to fill (a percent, so at most 100), the two host read rates (the CPU expert
-    // rate, when its variable is given, prices every expert type), and the cost of each CPU split a host layer adds.
-    g_placement_kv_info.ctx_fill_pct =
-        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CTX_FILL_PCT", ggml_sycl::PLACEMENT_CTX_FILL_PCT_DEFAULT, 100.0);
-    g_placement_kv_info.host_attn_gbps =
-        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_HOST_ATTN_GBPS", ggml_sycl::PLACEMENT_HOST_ATTN_GBPS_DEFAULT,
-                                  std::numeric_limits<double>::max());
-    g_placement_kv_info.cpu_expert_gbps =
-        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CPU_EXPERT_GBPS", ggml_sycl::PLACEMENT_CPU_EXPERT_GBPS_DEFAULT,
-                                  std::numeric_limits<double>::max(), &g_placement_kv_info.cpu_expert_gbps_set);
-    g_placement_kv_info.host_split_us = ggml_sycl_plan_cost_param(
-        "GGML_SYCL_PLAN_HOST_SPLIT_US", ggml_sycl::PLACEMENT_HOST_SPLIT_US_DEFAULT, std::numeric_limits<double>::max());
-    // What the planner sizes the prompt phase's window ring with, so it holds the ring's room before the routed experts:
-    // the executor's staged types and its group cap, the inputs the phase's own sizing reads when it runs.
-    g_placement_kv_info.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();
-    g_placement_kv_info.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
+    g_model_n_layer = inventory->n_layer;
+    ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
             "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB "
@@ -17458,7 +17495,6 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
 
     g_moe_n_experts_total             = inventory->n_expert;
     g_moe_n_experts_used              = inventory->n_expert_used;
-    g_placement_kv_info.n_expert_used = inventory->n_expert_used;
     g_moe_expert_total_bytes          = 0;
     if (g_moe_n_experts_total > 0) {
         for (const auto & [name, size] : g_tensor_inventory) {
@@ -17520,8 +17556,10 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
             "of reading a published value\n",
             ctx->device);
     }
+    // The lookup above constructs the device's cache when it has none; the authority is read off it without
+    // constructing one, the call the plan dry run makes for the same device (th32 §4.2).
     const ggml_sycl::vram_budget_authority authority =
-        ggml_sycl::ggml_sycl_device_budget_authority(ctx->device, total_mem, free_mem, /*default_pct=*/100);
+        ggml_sycl::ggml_sycl_device_budget_authority_existing(ctx->device, total_mem, free_mem, /*default_pct=*/100);
     vram_budget_out = authority.budget_bytes;
     budget_pct_out  = authority.budget_pct;
     base_mem_out    = authority.base_mem;
@@ -17602,6 +17640,97 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
     const double subgroup_factor =
         xmx_capabilities_support_sub_group(caps, WARP_SIZE) || caps.preferred_sub_group_size == WARP_SIZE ? 1.05 : 1.0;
     return cu_score * xmx_factor * fp16_factor * usm_factor * subgroup_factor;
+}
+
+// Whether the stage plans one plan over every physical device: two or more GPUs and the multi-GPU MoE placement
+// requested. The stage and the plan dry run ask it.
+static bool ggml_sycl_plan_multi_device() {
+    return ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested();
+}
+
+// The VRAM budget each physical device packs its share of a multi-device plan to: the device's budget authority at
+// `budget_pct`, read off its existing cache, with its dense capability. A device `ready` does not name has no cache or
+// queue the planner can place on and is skipped. The stage and the plan dry run call it.
+static std::vector<ggml_sycl::device_budget> ggml_sycl_plan_device_budgets(
+    int                                             budget_pct,
+    const std::array<bool, GGML_SYCL_MAX_DEVICES> & ready) {
+    const auto &                          info = ggml_sycl_info();
+    std::vector<ggml_sycl::device_budget> budgets;
+    budgets.reserve(info.total_gpu_count);
+    for (int d = 0; d < info.total_gpu_count; d++) {
+        if (d >= GGML_SYCL_MAX_DEVICES || !ready[d]) {
+            GGML_LOG_WARN("[PLACEMENT-MULTI] Skipping device %d: no registered cache/queue for planner\n", d);
+            continue;
+        }
+        size_t dev_free = 0, dev_total = 0;
+        ggml_backend_sycl_get_device_memory(d, &dev_free, &dev_total);
+        // llama.cpp-o3h1: this used to be a bare dev_total*pct/100 with NO
+        // headroom subtraction at all -- a fourth, more permissive budget
+        // formula for the multi-GPU path specifically, on top of the six
+        // single-GPU sites this ticket already consolidated. Read the
+        // per-device cache's published authority instead of recomputing; a
+        // device whose cache is not available or whose authority was never
+        // resolved gets the fresh computation. `budget_pct` is the plan's own
+        // already-resolved percentage, not the hardcoded 100 the other call
+        // sites of this shared helper use. The authority is read without
+        // constructing a cache: a ready device already has one.
+        const ggml_sycl::vram_budget_authority dev_authority =
+            ggml_sycl::ggml_sycl_device_budget_authority_existing(d, dev_total, dev_free, budget_pct);
+        const double dense_score = ggml_sycl_dense_capability_score_for_device(d);
+        budgets.push_back({ d, dev_authority.budget_bytes, dev_total, dense_score, dense_score > 0.0 });
+    }
+    return budgets;
+}
+
+// The multi-device plan's execution mode for a MoE model or a dense one. The stage and the plan dry run ask it.
+static ggml_sycl::multi_gpu_mode ggml_sycl_plan_multi_gpu_mode(bool is_moe) {
+    const auto & info     = ggml_sycl_info();
+    auto         gpu_mode = ggml_sycl::get_multi_gpu_mode(is_moe);
+    const char * mode_env = std::getenv("GGML_SYCL_MULTI_GPU_MODE");
+    if (is_moe && mode_env == nullptr && info.device_count < info.total_gpu_count) {
+        // The scheduler-visible backend set is intentionally collapsed to a
+        // single device on current Level Zero multi-GPU runtimes.  Keep
+        // expert-locality as the automatic execution policy, but the
+        // placement planner still treats all registered GPU cache arenas as
+        // capacity before host fallback.  Dense overflow therefore remains
+        // a complete-layer smart-handle placement decision, not a
+        // primary-device capacity limit.
+        gpu_mode = ggml_sycl::multi_gpu_mode::EXPERT;
+        GGML_LOG_INFO(
+            "[SYCL] Multi-GPU auto mode: using expert locality while scheduler exposes %d/%d devices; "
+            "dense/expert overflow may use any registered GPU cache before host\n",
+            info.device_count, info.total_gpu_count);
+    }
+    return gpu_mode;
+}
+
+// The cache whose arena a single-device plan on `device` packs against, or nullptr when the plan packs against its
+// VRAM budget alone: the device's existing cache, when its arena is active. ggml_sycl_plan_single_device_budget and
+// the plan dry run's arena caveat ask it. Reads the existing cache and creates none.
+static ggml_sycl::unified_cache * ggml_sycl_plan_single_device_arena_cache(int device) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    return cache != nullptr && cache->arena_active() ? cache : nullptr;
+}
+
+// The VRAM budget a single-device plan on `device` packs to: the arena's whole reservation when
+// ggml_sycl_plan_single_device_arena_cache names a cache (the planner subtracts the arena's zones from it once), else
+// `vram_budget`. The stage and the plan dry run call it.
+static size_t ggml_sycl_plan_single_device_budget(int device, size_t vram_budget) {
+    size_t plan_budget = vram_budget;
+    if (ggml_sycl::unified_cache * cache = ggml_sycl_plan_single_device_arena_cache(device)) {
+        const size_t arena_total   = cache->arena_total_size();
+        const size_t zone_overhead = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) +
+                                     cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN) +
+                                     cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+        plan_budget = arena_total;
+        GGML_LOG_INFO(
+            "[SYCL] Plan budget tied to arena: %.1f MB arena "
+            "(shared zone %.1f MB after %.1f MB zones)\n",
+            plan_budget / (1024.0 * 1024.0),
+            arena_total > zone_overhead ? (arena_total - zone_overhead) / (1024.0 * 1024.0) : 0.0,
+            zone_overhead / (1024.0 * 1024.0));
+    }
+    return plan_budget;
 }
 
 thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
@@ -17695,7 +17824,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     }
     const bool   is_moe = g_moe_n_experts_total > 0;
     const auto & info   = ggml_sycl_info();
-    if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {
+    if (ggml_sycl_plan_multi_device()) {
         // P4.5: Multi-device placement
         ggml_sycl::init_shared_context_queues(info.total_gpu_count);
         std::array<bool, GGML_SYCL_MAX_DEVICES> cache_device_ready{};
@@ -17722,51 +17851,9 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 "host fallback may be used for overflow\n");
         }
 
-        std::vector<ggml_sycl::device_budget> budgets;
-        budgets.reserve(info.total_gpu_count);
-        for (int d = 0; d < info.total_gpu_count; d++) {
-            if (d >= GGML_SYCL_MAX_DEVICES || !cache_device_ready[d]) {
-                GGML_LOG_WARN("[PLACEMENT-MULTI] Skipping device %d: no registered cache/queue for planner\n", d);
-                continue;
-            }
-            size_t dev_free = 0, dev_total = 0;
-            ggml_backend_sycl_get_device_memory(d, &dev_free, &dev_total);
-            // llama.cpp-o3h1: this used to be a bare dev_total*pct/100 with NO
-            // headroom subtraction at all -- a fourth, more permissive budget
-            // formula for the multi-GPU path specifically, on top of the six
-            // single-GPU sites this ticket already consolidated. Read the
-            // per-device cache's published authority (already registered by
-            // the loop above via unified_cache_register_for_queue) instead of
-            // recomputing; fall back to a fresh authority call only if that
-            // device's cache is somehow not yet available or its authority was
-            // never resolved (quality review final batch, F2/F4 --
-            // ggml_sycl_device_budget_authority() checks both). `budget_pct`
-            // here is this plan's own already-resolved percentage, not the
-            // hardcoded 100 the other three call sites of this shared helper
-            // use -- kept as this call's explicit default_pct argument rather
-            // than silently unified with theirs.
-            const ggml_sycl::vram_budget_authority dev_authority =
-                ggml_sycl::ggml_sycl_device_budget_authority(d, dev_total, dev_free, budget_pct);
-            const size_t dev_budget = dev_authority.budget_bytes;
-            const double dense_score = ggml_sycl_dense_capability_score_for_device(d);
-            budgets.push_back({ d, dev_budget, dev_total, dense_score, dense_score > 0.0 });
-        }
-        auto         gpu_mode = ggml_sycl::get_multi_gpu_mode(is_moe);
-        const char * mode_env = std::getenv("GGML_SYCL_MULTI_GPU_MODE");
-        if (is_moe && mode_env == nullptr && info.device_count < info.total_gpu_count) {
-            // The scheduler-visible backend set is intentionally collapsed to a
-            // single device on current Level Zero multi-GPU runtimes.  Keep
-            // expert-locality as the automatic execution policy, but the
-            // placement planner still treats all registered GPU cache arenas as
-            // capacity before host fallback.  Dense overflow therefore remains
-            // a complete-layer smart-handle placement decision, not a
-            // primary-device capacity limit.
-            gpu_mode = ggml_sycl::multi_gpu_mode::EXPERT;
-            GGML_LOG_INFO(
-                "[SYCL] Multi-GPU auto mode: using expert locality while scheduler exposes %d/%d devices; "
-                "dense/expert overflow may use any registered GPU cache before host\n",
-                info.device_count, info.total_gpu_count);
-        }
+        const std::vector<ggml_sycl::device_budget> budgets =
+            ggml_sycl_plan_device_budgets(budget_pct, cache_device_ready);
+        const ggml_sycl::multi_gpu_mode      gpu_mode     = ggml_sycl_plan_multi_gpu_mode(is_moe);
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
         plan_candidate                                    = ggml_sycl::compute_multi_device_plan(
             budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
@@ -17821,21 +17908,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // with_room: the planner holds the explicit micro-batch's RUNTIME room (below) against the routed experts.
         // Without it the plan is the load's planning-shape plan.
         auto plan_single_device = [&](bool with_room) {
-            size_t plan_budget = vram_budget;
-            auto * cache       = ggml_sycl::get_unified_cache_for_device(ctx->device);
-            if (cache && cache->arena_active()) {
-                const size_t arena_total   = cache->arena_total_size();
-                const size_t zone_overhead = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) +
-                                             cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN) +
-                                             cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
-                plan_budget = arena_total;
-                GGML_LOG_INFO(
-                    "[SYCL] Plan budget tied to arena: %.1f MB arena "
-                    "(shared zone %.1f MB after %.1f MB zones)\n",
-                    plan_budget / (1024.0 * 1024.0),
-                    arena_total > zone_overhead ? (arena_total - zone_overhead) / (1024.0 * 1024.0) : 0.0,
-                    zone_overhead / (1024.0 * 1024.0));
-            }
+            const size_t plan_budget = ggml_sycl_plan_single_device_budget(ctx->device, vram_budget);
             if (with_room) {
                 ggml_sycl_fill_explicit_ubatch_room(ctx->device);
             } else {
@@ -18461,6 +18534,411 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         }
         rollback.released = true;
         return ggml_backend_sycl_get_device_count() == 0 ? GGML_SYCL_LIFECYCLE_NOT_FOUND : GGML_SYCL_LIFECYCLE_OK;
+    } catch (...) {
+        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    }
+}
+
+// ---- the host-only plan dry run (th32 §4.2 "One source for the number") ----
+
+// The per-device globals a plan dry run writes while it plans, read when it starts and written back when it ends, on
+// every exit, so a later load reads what it would have read without the dry run: the planner inputs it publishes from
+// the inventory (ggml_sycl_inventory_publish_planner_inputs) and the shapes the planners publish from each plan (the
+// oneDNN Graph scratch and non-FA attention shapes, the MoE CONTROL requirement, the MoE host scatter scratch). Each
+// setter stores what its getter reads, so the write-back is exact.
+struct ggml_sycl_plan_dry_run_saved_state {
+    struct device_state {
+        size_t                                        pp_pipeline = 0;
+        size_t                                        ring_weight = 0;
+        size_t                                        ring_act    = 0;
+        size_t                                        ring_out    = 0;
+        uint32_t                                      ring_depth  = 0;
+        ggml_sycl::onednn_graph_scratch_planned_shape graph{};
+        ggml_sycl::nonfa_attn_scratch_planned_shape   nonfa{};
+        ggml_sycl::moe_control_requirement            control{};
+        size_t                                        scatter = 0;
+    };
+
+    std::vector<device_state> devices;
+
+    explicit ggml_sycl_plan_dry_run_saved_state(int n_devices) {
+        devices.resize(static_cast<size_t>(std::max(0, std::min(n_devices, GGML_SYCL_MAX_DEVICES))));
+        for (size_t i = 0; i < devices.size(); ++i) {
+            const int      d = static_cast<int>(i);
+            device_state & s = devices[i];
+            s.pp_pipeline    = ggml_sycl::unified_cache_get_planned_pp_pipeline_scratch_bytes(d);
+            s.ring_weight    = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(d);
+            s.ring_act       = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(d);
+            s.ring_out       = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(d);
+            s.ring_depth     = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(d);
+            s.graph          = ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(d);
+            s.nonfa          = ggml_sycl::unified_cache_get_planned_nonfa_attn_scratch_shape(d);
+            s.control        = ggml_sycl::unified_cache_get_planned_moe_control_requirement(d);
+            s.scatter        = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(d);
+        }
+    }
+
+    ~ggml_sycl_plan_dry_run_saved_state() {
+        for (size_t i = 0; i < devices.size(); ++i) {
+            const int            d = static_cast<int>(i);
+            const device_state & s = devices[i];
+            ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(d, s.pp_pipeline);
+            ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(d, s.ring_weight, s.ring_act, s.ring_out,
+                                                                       s.ring_depth);
+            ggml_sycl::unified_cache_set_planned_onednn_graph_scratch_shape(
+                d, s.graph.n_head_ctx_max, s.graph.n_head_swa_max, s.graph.n_swa, s.graph.n_ubatch, s.graph.n_ctx);
+            ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(d, s.nonfa.n_head, s.nonfa.n_ubatch,
+                                                                          s.nonfa.n_ctx);
+            ggml_sycl::unified_cache_set_planned_moe_control_requirement(d, s.control);
+            ggml_sycl::unified_cache_set_planned_moe_host_scatter_scratch_bytes(d, s.scatter);
+        }
+    }
+
+    ggml_sycl_plan_dry_run_saved_state(const ggml_sycl_plan_dry_run_saved_state &)             = delete;
+    ggml_sycl_plan_dry_run_saved_state & operator=(const ggml_sycl_plan_dry_run_saved_state &) = delete;
+};
+
+static const char * ggml_sycl_plan_dry_run_backing_name(int backing) {
+    switch (backing) {
+        case GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED:
+            return "PINNED";
+        case GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED:
+            return "FILE_MAPPED";
+        case GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU:
+            return "HOST_CPU";
+        case GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED:
+            return "CPU_OWNED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+// The residency of `plan`'s host-resident weights: for each host backing, the entries that carry it (the walk below
+// counts them and only counts them) and their bytes. A backing's bytes are the plan's own field where it keeps one:
+// host_mapped_bytes for FILE_MAPPED, host_cpu_owned_bytes for CPU_OWNED. PINNED and HOST_CPU share one field,
+// weight_host_bytes, so the plan has no figure for either alone: their bytes are summed once here, through
+// placement_entry_host_weight_bytes(), the per-entry figure placement_plan_host_weight_zone_terms() sizes the WEIGHT
+// zone with. Their sum and weight_host_bytes are then two figures for one set of entries, and a [PLAN-DRY-RUN-BUG]
+// WARN names a disagreement: a dense group charged on the DST basis whose host entries carry a converted dst_size is
+// how they part. th32 §4.3 decides residency per lazy table, as the joint placement's computation. This tree has lazy
+// tables, and they defer to the storage tier; what it lacks is §4.3's per-table residency decision, the plan's
+// Task 12, so the residency is reported per backing, and that decision replaces this function.
+static void ggml_sycl_plan_dry_run_residency(uint32_t                          index,
+                                             const ggml_sycl::placement_plan & plan,
+                                             ggml_sycl_plan_dry_run_plan &     out) {
+    for (const ggml_sycl::placement_entry & entry : plan.entries) {
+        if (entry.on_device) {
+            continue;
+        }
+        switch (entry.host_backing) {
+            case ggml_sycl::placement_host_backing::PINNED:
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED]++;
+                out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +=
+                    ggml_sycl::placement_entry_host_weight_bytes(entry);
+                break;
+            case ggml_sycl::placement_host_backing::HOST_CPU:
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU]++;
+                out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU] +=
+                    ggml_sycl::placement_entry_host_weight_bytes(entry);
+                break;
+            case ggml_sycl::placement_host_backing::FILE_MAPPED:
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED]++;
+                break;
+            case ggml_sycl::placement_host_backing::CPU_OWNED:
+                out.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED]++;
+                break;
+        }
+    }
+    out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED] = plan.host_mapped_bytes;
+    out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED]   = plan.host_cpu_owned_bytes;
+    out.weight_host_bytes                                           = plan.weight_host_bytes;
+    const uint64_t zone_walk = out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +
+                               out.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU];
+    if (zone_walk != plan.weight_host_bytes) {
+        GGML_LOG_WARN("[PLAN-DRY-RUN-BUG] plan=%u device=%d the PINNED and HOST_CPU entries hold %" PRIu64
+                      " bytes by placement_entry_host_weight_bytes but the plan charged weight_host_bytes=%zu: the "
+                      "WEIGHT zone and the plan's charge disagree on these entries\n",
+                      index, plan.device_id, zone_walk, plan.weight_host_bytes);
+    }
+}
+
+// Reports plan `index`: every host term from the plan's own record, each printed on its own line under its name. The
+// WEIGHT terms are the walk populate_host_zone_sizing() sized the zone with; the commit terms are the configure step's
+// sizing (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan()
+// summed into host_planned_bytes; expected_host is that figure.
+static void ggml_sycl_plan_dry_run_record(uint32_t                          index,
+                                          const ggml_sycl::placement_plan & plan,
+                                          bool                              multi_device,
+                                          ggml_sycl_plan_dry_run_plan &     out) {
+    const ggml_sycl::host_weight_zone_terms weight = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
+    const ggml_sycl::host_zone_commit_terms terms  = ggml_sycl::placement_plan_host_zone_commit_terms(
+        plan, plan.host_zone_terms.onednn_live, plan.host_zone_terms.chunk);
+    out                             = ggml_sycl_plan_dry_run_plan{};
+    out.device                      = plan.device_id;
+    out.multi_device                = multi_device ? 1 : 0;
+    out.host_budget                 = plan.host_budget;
+    out.weight_host_weights         = weight.host_weights;
+    out.weight_blocks               = weight.blocks;
+    out.weight_host_compute_reserve = weight.host_compute_reserve;
+    out.weight_layout_copies        = weight.layout_copies;
+    out.weight_tlsf_bound           = weight.tlsf_bound;
+    out.zone_weight                 = terms.weight;
+    out.zone_kv                     = terms.kv;
+    out.zone_staging                = terms.staging;
+    out.zone_scratch                = terms.scratch;
+    out.runtime                     = terms.runtime;
+    out.rounding                    = terms.rounding;
+    out.expected_host               = plan.host_planned_bytes;
+    ggml_sycl_plan_dry_run_residency(index, plan, out);
+    if (terms.total() != plan.host_planned_bytes) {
+        GGML_LOG_WARN(
+            "[PLAN-DRY-RUN-BUG] plan=%u device=%d the commit terms sum to %zu bytes but the plan recorded "
+            "host_planned_bytes=%zu: a writer moved a zone term after the record without re-recording it\n",
+            index, plan.device_id, terms.total(), plan.host_planned_bytes);
+    }
+
+    const auto line = [&](const char * group, const char * term, uint64_t bytes) {
+        GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d %s %s=%" PRIu64 " (%.1f MB)\n", index, plan.device_id, group,
+                      term, bytes, bytes / (1024.0 * 1024.0));
+    };
+    // host_bytes is the planner's charged host figure: the host weights it charged and the KV of the layers it put on
+    // the host, with file-mapped weights only when the load locks the mapping (design 5efe §4.5). It is not the sum of
+    // the residency lines below, which report every backing's bytes, an unlocked mapping's included.
+    GGML_LOG_INFO(
+        "[PLAN-DRY-RUN] plan=%u device=%d %s plan: %zu entries, %.1f MB device + %.1f MB host charged (host "
+        "KV included, file-mapped weights only when locked)\n",
+        index, plan.device_id, multi_device ? "multi-device" : "single-device", plan.entries.size(),
+        plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0));
+    line("WEIGHT", "host_weights", out.weight_host_weights);
+    GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d WEIGHT blocks=%" PRIu64 "\n", index, plan.device_id,
+                  out.weight_blocks);
+    line("WEIGHT", "host_compute_reserve", out.weight_host_compute_reserve);
+    line("WEIGHT", "layout_copies", out.weight_layout_copies);
+    line("WEIGHT", "tlsf_bound", out.weight_tlsf_bound);
+    line("ZONE", "weight", out.zone_weight);
+    line("ZONE", "kv", out.zone_kv);
+    line("ZONE", "staging", out.zone_staging);
+    line("ZONE", "scratch", out.zone_scratch);
+    line("COMMIT", "runtime", out.runtime);
+    line("COMMIT", "rounding", out.rounding);
+    line("HOST", "expected_host", out.expected_host);
+    line("HOST", "host_budget", out.host_budget);
+    // The plan's own host-KV field, printed as recorded: the KV of the layers the plan put on the host, which the
+    // charged figure above includes. A multi-device plan that put none there records the whole model's KV in it, to
+    // size the KV zone for a run restricted to fewer devices, and the charged figure does not include that.
+    line("HOST", "kv_host_bytes", plan.kv_host_bytes);
+    for (int b = 0; b < GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT; ++b) {
+        GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d RESIDENCY backing=%s count=%" PRIu64 " bytes=%" PRIu64
+                      " (%.1f MB)\n",
+                      index, plan.device_id, ggml_sycl_plan_dry_run_backing_name(b), out.residency_count[b],
+                      out.residency_bytes[b], out.residency_bytes[b] / (1024.0 * 1024.0));
+    }
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+namespace ggml_sycl {
+// The record on a plan a test builds by hand, with backing mixes and charges a shaped inventory does not produce.
+ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const placement_plan & plan) {
+    ggml_sycl_plan_dry_run_plan out{};
+    ggml_sycl_plan_dry_run_record(index, plan, false, out);
+    return out;
+}
+}  // namespace ggml_sycl
+#endif
+
+// Plans `inventory` as the load's stage plans it: once per device the scheduler exposes, publishing that device's
+// planner inputs first, through the stage's helpers, against `host_budget`. A multi-device plan packs each physical
+// device to its budget authority's answer; a single-device plan to the arena's reservation when the device's cache
+// has an active arena, else to the authority's answer. A device budget in `opts` replaces either. Each device's budget
+// lands in `device_budget`. Plans nothing when the VRAM arena is disabled, as the stage then plans nothing. Reads a
+// cache that exists and creates none. Caller holds g_tensor_inventory_mutex and a saved state.
+static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
+    const ggml_sycl_tensor_inventory *  inventory,
+    const ggml_sycl_plan_dry_run_opts & opts,
+    size_t                              host_budget,
+    uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES]) {
+    std::vector<ggml_sycl::placement_plan> plans;
+    if (!ggml_sycl::vram_arena_enabled()) {
+        GGML_LOG_INFO("[PLAN-DRY-RUN] the VRAM arena is disabled, so the load plans nothing and neither does this\n");
+        return plans;
+    }
+    const std::vector<ggml_sycl::placement_tensor_info> detail = ggml_sycl_inventory_planner_detail(inventory);
+    // The inventory writes every KV field it carries over the stage's own copy; n_seq_max, a runtime-context input,
+    // keeps the value a load would plan with.
+    ggml_sycl::placement_kv_info                        kv     = g_placement_kv_info;
+    ggml_sycl_inventory_fill_kv_info(kv, inventory);
+    if (kv.n_ubatch_context != 0) {
+        GGML_LOG_INFO(
+            "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: every plan is the load's planning shape "
+            "(n_ubatch=%u), without the explicit micro-batch's RUNTIME room\n",
+            kv.n_ubatch_context, kv.n_ubatch);
+    }
+    const auto override_for = [&](int device) -> size_t {
+        return device >= 0 && static_cast<uint32_t>(device) < opts.n_device_budgets ?
+                   static_cast<size_t>(opts.device_budget_bytes[device]) :
+                   0;
+    };
+    const int  n_experts    = static_cast<int>(inventory->n_expert);
+    const int  n_exposed    = std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES);
+    const bool multi_device = ggml_sycl_plan_multi_device();
+
+    // The planners subtract the arena's SCRATCH, ONEDNN and RUNTIME reservations only from the budget of a device whose
+    // cache has an active arena, and the dry run creates no cache. Where they subtract none the plan packs more weight
+    // onto the device than a load would, and leaves less on the host. Each plan is asked about the devices it packs:
+    // a multi-device plan every physical device in its budgets, by the multi-device planner's rule; a single-device
+    // plan its scheduler-visible device, by ggml_sycl_plan_single_device_budget's.
+    bool unmodelled[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES] = {};
+    for (int i = 0; i < n_exposed; ++i) {
+        (void) ggml_sycl_inventory_publish_planner_inputs(i, inventory);
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_sycl_get_device_memory(i, &free_mem, &total_mem);
+        const ggml_sycl::vram_budget_authority authority =
+            ggml_sycl::ggml_sycl_device_budget_authority_existing(i, total_mem, free_mem, /*default_pct=*/100);
+        if (multi_device) {
+            // No queue is registered here, so every physical device counts as ready.
+            std::array<bool, GGML_SYCL_MAX_DEVICES> ready{};
+            ready.fill(true);
+            std::vector<ggml_sycl::device_budget> budgets = ggml_sycl_plan_device_budgets(authority.budget_pct, ready);
+            for (ggml_sycl::device_budget & b : budgets) {
+                if (const size_t forced = override_for(b.device_id); forced != 0) {
+                    b.vram_budget = forced;
+                }
+                if (b.device_id >= 0 && b.device_id < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES) {
+                    device_budget[b.device_id] = b.vram_budget;
+                    unmodelled[b.device_id] |= !ggml_sycl::multi_device_plan_subtracts_arena(b.device_id);
+                }
+            }
+            const bool is_moe = n_experts > 0;
+            plans.push_back(ggml_sycl::compute_multi_device_plan(budgets, detail, static_cast<int>(inventory->n_layer),
+                                                                 ggml_sycl_plan_multi_gpu_mode(is_moe), kv,
+                                                                 opts.envelope, n_experts, host_budget));
+        } else {
+            const size_t forced = override_for(i);
+            const size_t plan_budget =
+                forced != 0 ? forced : ggml_sycl_plan_single_device_budget(i, authority.budget_bytes);
+            device_budget[i] = plan_budget;
+            unmodelled[i] |= ggml_sycl_plan_single_device_arena_cache(i) == nullptr;
+            plans.push_back(
+                ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts, host_budget));
+        }
+    }
+    std::string no_arena;
+    for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
+        if (unmodelled[d]) {
+            no_arena += " " + std::to_string(d);
+        }
+    }
+    if (!no_arena.empty()) {
+        GGML_LOG_INFO(
+            "[PLAN-DRY-RUN] arena zone reservations not modelled: device share is an upper bound, host terms a lower "
+            "bound (no active arena on device%s)\n",
+            no_arena.c_str());
+    }
+    return plans;
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor_inventory *  inventory,
+                                                          const ggml_sycl_plan_dry_run_opts * opts,
+                                                          ggml_sycl_plan_dry_run_result *     result) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LIFECYCLE_BUSY;
+    }
+    if (!inventory || (inventory->count > 0 && !inventory->tensors) || !result) {
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    // A caller built against another layout sends another struct_size. The size gate refuses it before anything is
+    // read past the header, which is why the result's layout can grow while its version stays the same.
+    if (result->struct_size != sizeof(ggml_sycl_plan_dry_run_result) ||
+        result->version != GGML_SYCL_PLAN_DRY_RUN_VERSION) {
+        GGML_LOG_WARN(
+            "[PLAN-DRY-RUN] refused: the result struct is %u bytes of version %u; this backend reads %zu "
+            "bytes of version %d\n",
+            result->struct_size, result->version, sizeof(ggml_sycl_plan_dry_run_result),
+            GGML_SYCL_PLAN_DRY_RUN_VERSION);
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    ggml_sycl_plan_dry_run_opts in{};
+    if (opts) {
+        if (opts->struct_size != sizeof(ggml_sycl_plan_dry_run_opts) ||
+            opts->version != GGML_SYCL_PLAN_DRY_RUN_VERSION ||
+            opts->n_device_budgets > GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES) {
+            GGML_LOG_WARN(
+                "[PLAN-DRY-RUN] refused: the options struct is %u bytes of version %u naming %u device "
+                "budgets; this backend reads %zu bytes of version %d naming at most %d\n",
+                opts->struct_size, opts->version, opts->n_device_budgets, sizeof(ggml_sycl_plan_dry_run_opts),
+                GGML_SYCL_PLAN_DRY_RUN_VERSION, GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES);
+            return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+        }
+        in = *opts;
+    }
+    try {
+        // A load plans against the budget its transaction stored, and a live model's plan is the device's: a dry run
+        // beside either would plan against state it does not own, so it is refused before anything is sampled.
+        auto & registry = ggml_sycl::lifecycle::global_registry();
+        if (registry.current_active_token().load.value != 0 || registry.live_mask() != 0) {
+            GGML_LOG_WARN("[PLAN-DRY-RUN] refused: a load is open or a model is live; run it with no model loaded\n");
+            return GGML_SYCL_LIFECYCLE_LOAD_BUSY;
+        }
+        if (ggml_backend_sycl_get_device_count() <= 0) {
+            return GGML_SYCL_LIFECYCLE_NOT_FOUND;
+        }
+
+        // th32 §4.2: the dry run samples before its own planner call with no lock held, computes the budget a load
+        // would store from that sample, and passes it to the planner. It never stores, so a later load's budget is
+        // its own sample's.
+        ggml_sycl::host_budget_sample sample = ggml_sycl::host_ledger_sample();
+        if (in.mem_available_set != 0) {
+            sample.available_bytes = static_cast<size_t>(in.mem_available_bytes);
+        }
+        const size_t committed        = ggml_sycl::host_ledger_committed();
+        const size_t host_budget      = ggml_sycl::host_ledger_compute_budget(sample, committed);
+        const bool   reserve_override = sample.reserve.status == ggml_sycl::detail::host_reserve_parse_status::OVERRIDE;
+        GGML_LOG_INFO("[PLAN-DRY-RUN] sample: total=%zu available=%zu (%s) pinned=%zu committed=%zu budget_pct=%d%s\n",
+                      sample.total_bytes, sample.available_bytes,
+                      in.mem_available_set != 0 ? "--mem-available" : "MemAvailable", sample.pinned_bytes, committed,
+                      sample.budget_pct, reserve_override ? " GGML_SYCL_HOST_RESERVE_MB (the whole budget)" : "");
+        GGML_LOG_INFO("[PLAN-DRY-RUN] host_budget=%zu (%.1f MB): the budget a load would store; nothing is stored\n",
+                      host_budget, host_budget / (1024.0 * 1024.0));
+
+        ggml_sycl_plan_dry_run_result out{};
+        out.struct_size             = result->struct_size;
+        out.version                 = result->version;
+        out.mem_total_bytes         = sample.total_bytes;
+        out.mem_available_bytes     = sample.available_bytes;
+        out.pinned_bytes            = sample.pinned_bytes;
+        out.committed_bytes         = committed;
+        out.budget_pct              = static_cast<uint32_t>(sample.budget_pct);
+        out.mem_available_from_opts = in.mem_available_set != 0 ? 1 : 0;
+        out.host_reserve_override   = reserve_override ? 1 : 0;
+        out.host_budget             = host_budget;
+
+        std::vector<ggml_sycl::placement_plan> plans;
+        bool                                   multi_device = false;
+        {
+            std::lock_guard<std::mutex>        lock(g_tensor_inventory_mutex);
+            ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
+            multi_device = ggml_sycl_plan_multi_device();
+            plans        = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, out.device_budget_bytes);
+        }
+        for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
+            if (out.device_budget_bytes[d] != 0) {
+                GGML_LOG_INFO("[PLAN-DRY-RUN] device=%d vram_budget=%" PRIu64 " (%.1f MB)%s\n", d,
+                              out.device_budget_bytes[d], out.device_budget_bytes[d] / (1024.0 * 1024.0),
+                              static_cast<uint32_t>(d) < in.n_device_budgets && in.device_budget_bytes[d] != 0 ?
+                                  " from --device-budget" :
+                                  "");
+            }
+        }
+        out.n_plans = static_cast<uint32_t>(plans.size());
+        for (uint32_t i = 0; i < out.n_plans; ++i) {
+            ggml_sycl_plan_dry_run_record(i, plans[i], multi_device, out.plans[i]);
+        }
+        *result = out;
+        return GGML_SYCL_LIFECYCLE_OK;
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
@@ -126048,6 +126526,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     // The staging proc's old name: only a libllama that predates the inventory's storage inputs resolves it.
     if (strcmp(name, "ggml_backend_sycl_stage_inventory_plan") == 0) {
         return (void *) ggml_backend_sycl_stage_inventory_plan_stale_libllama;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_dry_run") == 0) {
+        return (void *) ggml_backend_sycl_plan_dry_run;
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_begin") == 0) {
         return (void *) ggml_backend_sycl_model_load_begin;

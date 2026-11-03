@@ -4061,6 +4061,12 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-backing-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    # th32 §4.2: the plan dry run calls the planner and the sizing the stage calls, and stores nothing.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-plan-dry-run-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-plan-dry-run-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
     # Host-resident weights are one published fact, and the loader binds SYCL_Mapped from it (design 5efe §4.3). A
     # plain script: --self-test requires each witness mutant to be caught, so an anchor that stops matching fails
     # instead of passing vacuously.
@@ -4068,6 +4074,16 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mapped-loader-source.py --self-test)
     set_tests_properties(test-sycl-mapped-loader-source PROPERTIES
         LABELS "sycl;host;source-contract;python" TIMEOUT 120)
+endif()
+
+# The plan dry run's command line (tools/sycl-plan-dry-run): every option reaches the field the export reads, and the
+# tool's header read refuses a GGUF the test writes with an unknown architecture and hands the callback a one-tensor
+# inventory for a llama GGUF it writes. No backend is initialised and no device or model is touched; the binary links
+# libllama, and with it the SYCL backend's library.
+if (GGML_SYCL)
+    llama_build_and_test(test-sycl-plan-dry-run-args.cpp)
+    target_include_directories(test-sycl-plan-dry-run-args PRIVATE ${PROJECT_SOURCE_DIR}/tools/sycl-plan-dry-run)
+    set_tests_properties(test-sycl-plan-dry-run-args PROPERTIES LABELS "sycl;host")
 endif()
 
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over

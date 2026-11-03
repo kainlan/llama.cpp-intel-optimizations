@@ -603,6 +603,12 @@ struct test_moe_mmid_route_reachable_override_guard {
 #endif
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// The plan dry run's record of one plan (th32 §4.2): every term and residency line it prints for `plan` under
+// `index`, and the result it fills. A hand-built plan reaches backing mixes and charges a shaped inventory does not.
+ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const placement_plan & plan);
+#endif
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 // The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an
 // empty string on a pass and otherwise names the first failed assertion. The shared-storage case reserves a WEIGHT
 // arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
