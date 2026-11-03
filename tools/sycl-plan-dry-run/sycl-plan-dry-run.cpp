@@ -19,8 +19,8 @@
 #include "llama.h"
 #include "sycl-plan-dry-run-args.h"
 
-// The load's inventory builder over a header read (llama_model_sycl_header_inventory); src/ headers are included
-// from a tool the way tools/fit-params includes ../src/llama-ext.h.
+// The load's inventory builder over a header read (llama_model_sycl_header_inventory), an undecorated libllama
+// internal kept out of the public API and reached the way tests/test-llama-lazy-range-prefill.cpp reaches the loader's.
 #include "../src/llama-model.h"
 
 #include <cstdio>
