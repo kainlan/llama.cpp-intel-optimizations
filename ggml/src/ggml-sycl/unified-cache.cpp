@@ -19791,18 +19791,24 @@ static host_zone_id unified_alloc_host_zone(const alloc_request & req,
 bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // Non-null only for the narrow allocator-internal owner adapter. Broad
     // legacy callers continue to receive alloc_handle without gaining a way to
-    // mint or mutate an intrusive control.
-    alloc_owner_control * const owner_control = g_allocating_owner_control;
+    // mint or mutate an intrusive control. This call consumes it, so a unified_alloc nested on this thread cannot
+    // publish into the outer request's control, which owns that request's allocation alone (canonical contract §3).
+    alloc_owner_control * const owner_control = std::exchange(g_allocating_owner_control, nullptr);
 
     // The owner entry's charge for a HOST_CPU request: only the owner entry charges the host ledger (th32 §4.2). This
     // call consumes it, so a unified_alloc nested on this thread finds none and a HOST_CPU request there is refused.
     host_ledger_charge_token * const charge = std::exchange(g_allocating_charge, nullptr);
 
-    struct charge_consume_scope {
+    // Both go back on every exit, for the owner entry that set them.
+    struct adapter_consume_scope {
+        alloc_owner_control *      owner_control;
         host_ledger_charge_token * charge;
 
-        ~charge_consume_scope() { g_allocating_charge = charge; }
-    } consume_scope{ charge };
+        ~adapter_consume_scope() {
+            g_allocating_owner_control = owner_control;
+            g_allocating_charge        = charge;
+        }
+    } consume_scope{ owner_control, charge };
 
     if (out == nullptr) {
         return false;

@@ -592,7 +592,8 @@ arm_result arm_k_every_exit_accounts() {
 
 thread_local int  t_nested_depth = 0;
 std::atomic<bool> g_nested_armed{ false };
-std::atomic<bool> g_nested_direct{ false };  // the depth-1 direct topology instead of the owner topology
+std::atomic<bool> g_nested_direct{ false };         // the depth-1 direct topology instead of the owner topology
+std::atomic<bool> g_nested_direct_device{ false };  // the direct topology's request is a device request
 std::atomic<int>  g_nested_at_depth1{ 0 };
 std::atomic<int>  g_nested_at_depth2{ 0 };
 std::atomic<int>  g_nested_owner_ok{ -1 };
@@ -601,8 +602,9 @@ std::atomic<int>  g_inner_result{ -1 };
 // The owner topology. Depth 1 (inside the outer HOST_CPU owner entry's unified_alloc): a nested owner request that is
 // not HOST_CPU, whose scope must null the charge. Depth 2 (inside that nested request's own unified_alloc): a direct
 // must_host_cpu unified_alloc, which must refuse. The direct topology: at depth 1, a direct must_host_cpu
-// unified_alloc, which must refuse because the outer unified_alloc consumed the charge. The hook counts its own
-// recursion; the point carries no depth.
+// unified_alloc, which must refuse because the outer unified_alloc consumed the charge, or a direct device
+// unified_alloc, which must be served as a legacy allocation because the outer unified_alloc consumed its owner
+// control. The hook counts its own recursion; the point carries no depth.
 int32_t nested_step() {
     if (!g_nested_armed.load()) {
         return 0;
@@ -612,7 +614,8 @@ int32_t nested_step() {
             ++t_nested_depth;
             g_nested_at_depth1.fetch_add(1);
             alloc_handle direct;
-            const bool   ok = unified_alloc(host_cpu_request(4096), &direct);
+            const bool   device = g_nested_direct_device.load();
+            const bool   ok     = unified_alloc(device ? device_request(4096) : host_cpu_request(4096), &direct);
             g_inner_result.store(ok ? 1 : 0);
             if (ok) {
                 (void) unified_free(direct);
@@ -651,13 +654,14 @@ int32_t nested_step() {
 // nested in the outer one spends its caller's charge; the seven routing fields beside must_host_cpu are rejected before
 // the charge; forbid_vram_zone_spill is not one of them.
 // Engagement: the direct refusal prints its named line; the owner topology fired at depth 1 and depth 2 and the
-// nested device allocation succeeded; the direct topology fired at depth 1; the positive control charges (the charge
-// hook is seen) and credits once.
+// nested device allocation succeeded; the direct topology fired at depth 1, and its device request was served; the
+// positive control charges (the charge hook is seen) and credits once.
 // Mutants: a refusal keyed on g_allocating_owner_control admits the depth-2 request (it then dies at the backstop
 // with [HOST-PLAN-BUG] instead of the named line); a unified_alloc that reads the charge without consuming it lets the
-// depth-1 direct request take the outer charge and succeed (two rows, one charge); at depth 2 the consume and the
-// nested owner scope both null the charge, so only both dropped let that request take it; one dropped field check per
-// row charges that row.
+// depth-1 direct request take the outer charge and succeed (two rows, one charge); one that reads the owner control
+// without consuming it lets the depth-1 device request publish into the outer control, whose own publication then
+// fails, so the outer allocation fails; at depth 2 the consume and the nested owner scope both null the charge, so
+// only both dropped let that request take it; one dropped field check per row charges that row.
 arm_result arm_m_request_rules() {
     arm_result r;
     board_install();
@@ -731,6 +735,33 @@ arm_result arm_m_request_rules() {
                "the outer charge is not host_cpu_mapped_size of its ask: committed " + num(during.committed));
         expect(r, during.live == prior.live + m,
                "the outer row's charged_bytes is not host_cpu_mapped_size of its ask");
+    }
+    expect(r, read_ledger().committed == prior.committed, "the outer release did not credit exactly once");
+
+    // the direct device topology: the depth-1 device request publishes into no outer owner's control
+    log_clear();
+    g_nested_at_depth1.store(0);
+    g_inner_result.store(-1);
+    g_nested_direct_device.store(true);
+    g_nested_direct.store(true);
+    g_nested_armed.store(true);
+    {
+        allocation_result outer = unified_allocate_owner(host_cpu_request(ask));
+        g_nested_armed.store(false);
+        g_nested_direct.store(false);
+        g_nested_direct_device.store(false);
+        if (g_nested_at_depth1.load() != 1) {
+            void_arm(r, "the direct device topology did not fire at depth 1: " + num(g_nested_at_depth1.load()));
+        }
+        if (g_inner_result.load() != 1) {
+            void_arm(r, "the depth-1 device request was refused, so it never reached publication");
+        }
+        expect(r, static_cast<bool>(outer),
+               "the outer HOST_CPU allocation failed: the depth-1 device request took its owner control");
+        expect(r, log_count_with("[HOST-PLAN-BUG]") == 0, "the depth-1 device request reached the tier backstop");
+        const reading during = read_ledger();
+        expect(r, during.committed == prior.committed + m,
+               "the outer charge is not host_cpu_mapped_size of its ask: committed " + num(during.committed));
     }
     expect(r, read_ledger().committed == prior.committed, "the outer release did not credit exactly once");
 
