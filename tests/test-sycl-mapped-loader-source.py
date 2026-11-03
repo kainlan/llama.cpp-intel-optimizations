@@ -66,8 +66,8 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       the tier);
   L9. init_mappings: prefetch 0 on a SYCL load (landed before this change; kept here as the §4.3 row);
   L10. load_all_data addresses a SYCL_Mapped tensor from its buffer's base, before the loader's lock and mmaps_used;
-  L11. the preload serves a SYCL_Mapped source in place: register_host_aos_expert and the host-planned dense copy (the
-      m-7 row) take the mapping's owner (ggml_sycl_mapped_buffer_owner) instead of copying;
+  L11. the preload serves a SYCL_Mapped source in place: register_host_aos_expert and the host-planned dense copy
+      (§4.3's preload rows) take the mapping's owner (ggml_sycl_mapped_buffer_owner) instead of copying;
   L12. the SYCL_Mapped buft: its own get_name ("SYCL_Mapped"), is_host, listed by supports_buft; set_tensor and
       memset_tensor abort naming the tensor, clear naming the buffer's size; alloc_buffer aborts unconditionally (core
       answers a zero-size request first), naming the core entry point and the from-file hook;
@@ -611,12 +611,12 @@ def clause_l11_preload_serves_mapped_in_place(t: dict) -> list:
     dense = between(gs, "if (!dense_planned_on_this_device && !dense_alternate_on_this_device) {",
                     "dense_host_placed++;")
     if "ggml_sycl_mapped_buffer_owner(" not in dense:
-        problems.append("the host-planned dense copy (m-7) copies a SYCL_Mapped weight")
+        problems.append("the host-planned dense copy copies a SYCL_Mapped weight instead of taking its owner")
     else:
         mapped_at = dense.find("ggml_sycl_mapped_buffer_owner(")
         memcpy_at = dense.find("std::memcpy(arena_ptr, tensor->data")
         if memcpy_at >= 0 and memcpy_at < mapped_at:
-            problems.append("the m-7 copy runs before the SYCL_Mapped test")
+            problems.append("the host-planned dense copy runs before the SYCL_Mapped test")
     return problems
 
 
@@ -1019,7 +1019,7 @@ MUTANTS = [
                     "plan.charge_host_weight(placement_host_backing::PINNED,")),
     ("the refresh counts no locked mapped bytes", "P3",
      lambda t: _mut(t, UCH, r"(\bhost_bytes\s*=\s*[^;]*?)\s*\+\s*locked_mapped_weight_bytes\s*\(\s*\)", r"\1")),
-    ("m-7 copies a SYCL_Mapped weight", "L11",
+    ("the host-planned dense copy copies a SYCL_Mapped weight", "L11",
      lambda t: _mut(t, GS, r"(if\s*\(\s*!\s*dense_planned_on_this_device\s*&&\s*!\s*dense_alternate_on_this_device"
                            r"\s*\)\s*\{.*?)ggml_sycl_mapped_buffer_owner\s*\(", r"\1no_owner(")),
     ("SYCL_Mapped's set_tensor writes", "L12",
