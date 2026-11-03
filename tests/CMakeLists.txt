@@ -4061,6 +4061,12 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-backing-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    # th32 §4.2: the plan dry run calls the planner and the sizing the stage calls, and stores nothing.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-plan-dry-run-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-plan-dry-run-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
 endif()
 
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over

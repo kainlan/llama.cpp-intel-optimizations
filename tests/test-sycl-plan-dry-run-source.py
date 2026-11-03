@@ -1,0 +1,333 @@
+"""Source contract for the host-only plan dry run (th32 §4.2 "One source for the number").
+
+The dry run, the stage's host_planned_bytes and the loader's expected_host are one computation, and "the dry-run and
+the candidates do not store". The device test `test-sycl-plan-dry-run` scores the figures; this gate pins what a run
+cannot see:
+
+1. the stage's planner calls are DERIVED from the stage's own source: the calls in
+   `compute_and_store_plan_for_inventory` to a function unified-cache.hpp declares returning `placement_plan`, and the
+   calls in `ggml_sycl_configure_host_zones_for_plan` to one declared returning `host_zone_commit_terms`; every planner
+   so found records its host terms through `populate_host_zone_sizing` and `record_host_ledger_plan`;
+2. the dry run (the export and every `ggml_sycl_plan_dry_run*` helper) calls each of those functions, takes the WEIGHT
+   terms from `placement_plan_host_weight_zone_terms`, reports expected_host as the plan's `host_planned_bytes`, sizes
+   the commit terms from the plan's own `host_zone_terms` inputs, and shares the stage's inventory and budget helpers
+   rather than restating them;
+3. the dry run stores nothing: no `host_ledger_store_budget`, no `host_budget_pass_scope`, no zone configuration, no
+   cache construction, no backend or queue initialisation, no write of the inventory globals; the shared helpers store
+   nothing either;
+4. the export refuses an open load or a live model before it samples, samples the host and computes the budget before
+   it takes the inventory lock, and is declared, versioned and reachable through the proc table;
+5. libllama shares the early plan's inventory builder and the lazy-record pre-fill between the load and the header
+   read, and the header read loads no tensor and opens no load; the tool resolves the export through the registry and
+   includes no backend internals.
+
+Plain file I/O, comment-stripped text.
+"""
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SYCL = ROOT / "ggml/src/ggml-sycl"
+
+# One lexer for every pass: a raw string, a string, a char literal, a line comment, a block comment.
+_LEXEME_RE = re.compile(
+    r'\b(?:u8|u|U|L)?R"(?P<delim>[^ ()\\\t\n]{0,16})\((?P<raw>.*?)\)(?P=delim)"'
+    r'|"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|//[^\n]*" r"|/\*.*?\*/",
+    flags=re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if m.group("delim") is not None or tok[0] in "\"'":
+            return tok
+        return "\n" * tok.count("\n")
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+def balanced(text: str, open_idx: int) -> str:
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : i]
+    raise AssertionError("unbalanced braces")
+
+
+def definitions(text: str, name: str) -> list:
+    """The bodies of every definition of `name` (overloads included): a name, its parameter list, then a brace."""
+    bodies = []
+    for m in re.finditer(rf"(?<![\w.])(?<!->){re.escape(name)}\s*\(", text):
+        depth, i = 0, m.end() - 1
+        while i < len(text):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        tail = re.match(r"\s*(?:const\s*)?(?:noexcept\s*)?\{", text[i + 1 :])
+        if tail:
+            bodies.append(balanced(text, i + 1 + tail.end() - 1))
+    return bodies
+
+
+def body(text: str, name: str) -> str:
+    found = definitions(text, name)
+    assert found, f"no definition of {name}"
+    return "\n".join(found)
+
+
+def calls(text: str, name: str) -> bool:
+    return re.search(rf"(?<![\w.])(?<!->){re.escape(name)}\s*\(", text) is not None
+
+
+def read(path: Path) -> str:
+    return strip_comments(path.read_text())
+
+
+def sycl_cpp() -> str:
+    return read(SYCL / "ggml-sycl.cpp")
+
+
+def declared_returning(hpp: str, rtype: str) -> set:
+    return set(re.findall(rf"(?m)^\s*(?:(?:inline|static|constexpr)\s+)*{rtype}\s+(\w+)\s*\(", hpp))
+
+
+def called_from(text: str, names: set) -> set:
+    return {n for n in names if calls(text, n)}
+
+
+EXPORT = "ggml_backend_sycl_plan_dry_run"
+
+# The stage helpers the dry run shares instead of restating: the inventory's planner detail and KV shape, the
+# per-device planner inputs it publishes, the single- versus multi-device choice, and the budgets each plan packs to.
+SHARED = (
+    "ggml_sycl_inventory_planner_detail",
+    "ggml_sycl_inventory_fill_kv_info",
+    "ggml_sycl_inventory_publish_planner_inputs",
+    "ggml_sycl_plan_multi_device",
+    "ggml_sycl_plan_single_device_budget",
+    "ggml_sycl_plan_device_budgets",
+)
+
+# What a dry run must never reach: a store, a storing scope, zone configuration on a live cache, cache construction
+# (the get-or-create accessors), backend or queue initialisation, the stage's own storing entries.
+FORBIDDEN = (
+    "host_ledger_store_budget",
+    "host_budget_pass_scope",
+    "ggml_sycl_configure_host_zones_for_plan",
+    "configure_host_zones",
+    "ensure_planned_arena_zones",
+    "get_unified_cache_for_device",
+    "ggml_sycl_device_budget_authority",
+    "register_for_queue",
+    "init_shared_context_queues",
+    "ggml_backend_sycl_init",
+    "populate_inventory_globals",
+    "compute_and_store_plan_for_inventory",
+    "ggml_sycl_set_tensor_inventory_impl",
+    "unified_cache_set_plan",
+)
+
+
+def dry_run_closure(cpp: str) -> str:
+    """The export and every `ggml_sycl_plan_dry_run*` helper it is built from."""
+    parts = [body(cpp, EXPORT)]
+    for name in sorted(set(re.findall(r"\b(ggml_sycl_plan_dry_run\w*)\s*\(", cpp))):
+        parts.extend(definitions(cpp, name))
+    return "\n".join(parts)
+
+
+# ---- 1. the stage's calls, derived ----
+
+
+def stage_planners() -> set:
+    hpp = read(SYCL / "unified-cache.hpp")
+    stage = body(sycl_cpp(), "compute_and_store_plan_for_inventory")
+    found = called_from(stage, declared_returning(hpp, "placement_plan"))
+    assert found, "compute_and_store_plan_for_inventory calls no planner unified-cache.hpp declares"
+    return found
+
+
+def stage_sizing() -> set:
+    hpp = read(SYCL / "unified-cache.hpp")
+    found = called_from(
+        body(sycl_cpp(), "ggml_sycl_configure_host_zones_for_plan"), declared_returning(hpp, "host_zone_commit_terms")
+    )
+    assert found, "ggml_sycl_configure_host_zones_for_plan calls no sizing unified-cache.hpp declares"
+    return found
+
+
+def test_the_derivation_finds_the_stage_planners():
+    # Engagement for the derivation: the two planners and the commit-terms sizing this tree is known to call.
+    assert stage_planners() == {"compute_placement_plan", "compute_multi_device_plan"}, stage_planners()
+    assert stage_sizing() == {"placement_plan_host_zone_commit_terms"}, stage_sizing()
+
+
+def test_the_derivation_sees_a_planner_call_and_ignores_a_comment():
+    hpp = "placement_plan compute_a(int x);\ninline placement_plan compute_b(int x);\nsize_t other(int);\n"
+    src = strip_comments("void f() { auto p = compute_a(1); // compute_b(2)\n other(3); }")
+    assert called_from(body(src, "f"), declared_returning(hpp, "placement_plan")) == {"compute_a"}
+
+
+def test_every_stage_planner_records_its_host_terms():
+    cpp = read(SYCL / "unified-cache.cpp")
+    for planner in stage_planners():
+        bodies = definitions(cpp, planner)
+        assert bodies, f"no definition of {planner}"
+        recording = [b for b in bodies if calls(b, "populate_host_zone_sizing") and calls(b, "record_host_ledger_plan")]
+        assert recording, f"no definition of {planner} calls populate_host_zone_sizing and record_host_ledger_plan"
+
+
+# ---- 2. the dry run calls the same functions ----
+
+
+def test_the_dry_run_calls_every_stage_planner_and_the_sizing():
+    closure = dry_run_closure(sycl_cpp())
+    for name in sorted(stage_planners() | stage_sizing() | {"placement_plan_host_weight_zone_terms"}):
+        assert calls(closure, name), f"the dry run does not call {name}"
+
+
+def test_expected_host_is_the_plans_figure():
+    closure = dry_run_closure(sycl_cpp())
+    assert re.search(r"\bexpected_host\s*=\s*[\w.\->\[\]]*\bhost_planned_bytes\s*;", closure), (
+        "the dry run's expected_host is not assigned the plan's host_planned_bytes"
+    )
+
+
+def test_the_commit_terms_take_the_plans_own_inputs():
+    closure = dry_run_closure(sycl_cpp())
+    hit = re.search(r"placement_plan_host_zone_commit_terms\s*\(([^;]*)\)\s*;", closure)
+    assert hit, "the dry run does not size the commit terms"
+    args = hit.group(1)
+    own = re.search(r"host_zone_terms\s*\.\s*onednn_live", args) and re.search(r"host_zone_terms\s*\.\s*chunk", args)
+    assert own, (
+        f"the commit terms are sized from ({args}), not the plan's own host_zone_terms.onednn_live and .chunk"
+    )
+    assert "CHUNK_SIZE" not in closure, "the dry run restates the chunk"
+
+
+def test_the_dry_run_shares_the_stage_helpers():
+    cpp = sycl_cpp()
+    stage = body(cpp, "populate_inventory_globals") + body(cpp, "compute_and_store_plan_for_inventory")
+    closure = dry_run_closure(cpp)
+    for name in SHARED:
+        assert definitions(cpp, name), f"{name} is not defined"
+        assert calls(stage, name), f"the stage does not call {name}"
+        assert calls(closure, name), f"the dry run does not call {name}"
+
+
+def test_the_residency_seam_is_named():
+    # The per-table lazy decision is not in this tree (th32 §4.3), so the residency is reported per host backing from
+    # one named function the decision will replace.
+    cpp = sycl_cpp()
+    seam = body(cpp, "ggml_sycl_plan_dry_run_residency")
+    assert calls(dry_run_closure(cpp).replace(seam, ""), "ggml_sycl_plan_dry_run_residency"), (
+        "nothing in the dry run calls the residency seam"
+    )
+
+
+# ---- 3. nothing stored ----
+
+
+def test_the_dry_run_stores_nothing():
+    closure = dry_run_closure(sycl_cpp())
+    for name in FORBIDDEN:
+        assert not calls(closure, name), f"the dry run calls {name}"
+    assert not re.search(r"\bhost_budget_pass_scope\b", closure), "the dry run names a host_budget_pass_scope"
+
+
+def test_the_shared_helpers_store_nothing():
+    cpp = sycl_cpp()
+    for name in SHARED:
+        b = body(cpp, name)
+        for forbidden in ("host_ledger_store_budget", "host_budget_pass_scope", "get_unified_cache_for_device",
+                          "ggml_sycl_device_budget_authority"):
+            assert not calls(b, forbidden) and not re.search(rf"\b{forbidden}\b", b), f"{name} reaches {forbidden}"
+
+
+def test_the_forbidden_scan_sees_a_store():
+    src = strip_comments("int ggml_backend_sycl_plan_dry_run(int a) { host_budget_pass_scope s(1); return a; }")
+    assert re.search(r"\bhost_budget_pass_scope\b", body(src, EXPORT))
+    assert not calls(body(src, EXPORT), "get_unified_cache_for_device")
+    assert not calls("x = get_existing_unified_cache_for_device(d);", "get_unified_cache_for_device")
+
+
+# ---- 4. the export ----
+
+
+def test_the_export_refuses_then_samples_then_locks():
+    b = body(sycl_cpp(), EXPORT)
+    for name in ("current_active_token", "live_mask"):
+        assert calls(b, name), f"the export does not consult {name}"
+    busy = b.find("GGML_SYCL_LIFECYCLE_LOAD_BUSY")
+    sample = b.find("host_ledger_sample(")
+    budget = b.find("host_ledger_compute_budget(")
+    lock = b.find("g_tensor_inventory_mutex")
+    assert busy >= 0, "the export never refuses with LOAD_BUSY"
+    assert 0 <= busy < sample, "the export samples before it refuses an open load"
+    assert 0 <= sample < budget, "the export does not compute the budget from its sample"
+    assert lock < 0 or budget < lock, "the export samples the host while it holds the inventory lock"
+
+
+def test_the_export_is_declared_versioned_and_in_the_proc_table():
+    hdr = (ROOT / "ggml/include/ggml-sycl.h").read_text()
+    assert re.search(rf"//\s*Proc name:\s*\"{EXPORT}\"", hdr), "the header carries no proc name line"
+    assert re.search(rf"GGML_BACKEND_API\s+enum\s+ggml_sycl_lifecycle_result\s+{EXPORT}\s*\(", hdr), (
+        "the export is not a GGML_BACKEND_API returning ggml_sycl_lifecycle_result"
+    )
+    assert re.search(r"#define\s+GGML_SYCL_PLAN_DRY_RUN_VERSION\s+\d+", hdr), "no result version"
+    for s in ("ggml_sycl_plan_dry_run_opts", "ggml_sycl_plan_dry_run_plan", "ggml_sycl_plan_dry_run_result"):
+        assert re.search(rf"GGML_SYCL_ABI_ASSERT\s*\(\s*sizeof\s*\(\s*(struct\s+)?{s}\s*\)", hdr), (
+            f"{s} has no size assert"
+        )
+    cpp = sycl_cpp()
+    assert re.search(rf'strcmp\s*\(\s*name\s*,\s*"{EXPORT}"\s*\)\s*==\s*0', cpp), "the proc table has no arm"
+    assert re.search(rf"return\s*\(\s*void\s*\*\s*\)\s*{EXPORT}\s*;", cpp), "the proc table arm returns another symbol"
+
+
+# ---- 5. libllama and the tool ----
+
+
+def test_libllama_shares_the_builder_and_the_prefill():
+    src = read(ROOT / "src/llama-model.cpp")
+    header = body(src, "llama_model_sycl_header_inventory")
+    early = body(src, "llama_model_sycl_compute_early_plan")
+    load = body(src, "load_tensors")
+    assert calls(early, "llama_model_sycl_build_early_inventory"), "the early plan does not use the shared builder"
+    assert calls(header, "llama_model_sycl_build_early_inventory"), "the header read does not use the shared builder"
+    assert calls(load, "llama_model_prefill_lazy_record"), "the load does not use the shared pre-fill"
+    assert calls(header, "llama_model_prefill_lazy_record"), "the header read does not use the shared pre-fill"
+    assert not calls(load, "llama_lazy_range_record_prefill"), "the load restates the pre-fill"
+    builder = body(src, "llama_model_sycl_build_early_inventory")
+    assert calls(builder, "llama_model_sycl_populate_inventory"), "the shared builder does not populate the inventory"
+    for name in ("load_all_data", "llama_model_sycl_apply_inventory", "ggml_backend_sycl_model_load_begin",
+                 "create_tensor", "load_tensors"):
+        assert not calls(header, name), f"the header read calls {name}"
+
+
+def test_the_tool_resolves_the_export_through_the_registry():
+    tool = read(ROOT / "tools/sycl-plan-dry-run/sycl-plan-dry-run.cpp")
+    assert calls(tool, "ggml_backend_reg_get_proc_address"), "the tool does not resolve the export"
+    assert f'"{EXPORT}"' in tool, "the tool resolves another name"
+    assert not calls(tool, EXPORT), "the tool links the export directly"
+    for inc in re.findall(r'#\s*include\s*[<"]([^>"]+)[>"]', tool):
+        assert "ggml-sycl/" not in inc and not inc.endswith(".hpp"), f"the tool includes backend internals: {inc}"
+    for name in ("llama_model_load_from_file", "llama_init_from_model", "ggml_backend_sycl_init"):
+        assert not calls(tool, name), f"the tool calls {name}"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
