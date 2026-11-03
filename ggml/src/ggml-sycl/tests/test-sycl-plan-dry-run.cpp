@@ -569,6 +569,77 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     return r;
 }
 
+// (0) A caller built against another layout is refused before anything past the header is read. The struct_size gate
+// is what lets the result's layout grow while GGML_SYCL_PLAN_DRY_RUN_VERSION stays 1. The arm runs first, before any
+// other arm's dry run, so a refusal is the gate's and not a device's. Two refused legs, then the control:
+//   result:  a result header of the size it had before weight_host_bytes joined each of its plans (each plan was then
+//            176 bytes, the result 3008) is refused with NULL_OUTPUT and the named WARN, and the result is left
+//            exactly as the caller wrote it;
+//   opts:    an options header 8 bytes short is refused the same way, with its own WARN. The options' layout has not
+//            changed, so there is no older size to send;
+//   control: the current sizes return OK with a plan and no refused WARN.
+// Engagement: the control returned OK with at least one plan; neither refused leg sampled the host (no sample line).
+// Mutants: the size gate dropped (the old size returns OK); the refusal silent (no WARN naming both sizes); a refused
+// call that writes the result.
+constexpr uint32_t k_plan_size_before_weight_host_bytes   = 176;
+constexpr uint32_t k_result_size_before_weight_host_bytes = 3008;
+static_assert(sizeof(ggml_sycl_plan_dry_run_result) - k_result_size_before_weight_host_bytes ==
+                  GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES *
+                      (sizeof(ggml_sycl_plan_dry_run_plan) - k_plan_size_before_weight_host_bytes),
+              "the old result size is the old plan size times the result's plans");
+
+arm_result arm_0_another_layout_is_refused() {
+    arm_result        r;
+    loader_inventory  inv(qwen38_shape);
+    const std::string refused = "[PLAN-DRY-RUN] refused: ";
+    const std::string sample  = "[PLAN-DRY-RUN] sample:";
+
+    // result leg: the old size, with sentinels the refusal must not overwrite
+    auto old_res         = fresh_result();
+    old_res->struct_size = k_result_size_before_weight_host_bytes;
+    old_res->n_plans     = 77;
+    old_res->host_budget = 0xa5a5a5a5ull;
+
+    const ggml_sycl_plan_dry_run_result before = *old_res;
+    ggml_sycl_plan_dry_run_opts         opts   = default_opts();
+    log_clear();
+    const ggml_sycl_lifecycle_result rc_res = ggml_backend_sycl_plan_dry_run(&inv.inv, &opts, old_res.get());
+    const std::string want_res = refused + "the result struct is " + num(k_result_size_before_weight_host_bytes) +
+                                 " bytes of version " + num(GGML_SYCL_PLAN_DRY_RUN_VERSION) + "; this backend reads " +
+                                 num(sizeof(ggml_sycl_plan_dry_run_result)) + " bytes";
+    expect(r, rc_res == GGML_SYCL_LIFECYCLE_NULL_OUTPUT,
+           "a result of the old size returned " + num(rc_res) + ", not NULL_OUTPUT");
+    expect(r, lines_with(want_res.c_str()).size() == 1, "a result of the old size logged no '" + want_res + "' WARN");
+    expect(r, std::memcmp(&before, old_res.get(), sizeof(before)) == 0,
+           "the refused call wrote the result the caller sized for the old layout");
+    expect(r, lines_with(sample.c_str()).empty(), "a result of the old size was refused only after the host sample");
+
+    // opts leg: a short options header with a current result
+    auto                        res        = fresh_result();
+    ggml_sycl_plan_dry_run_opts short_opts = default_opts();
+    short_opts.struct_size                 = static_cast<uint32_t>(sizeof(short_opts) - 8);
+    log_clear();
+    const ggml_sycl_lifecycle_result rc_opts = ggml_backend_sycl_plan_dry_run(&inv.inv, &short_opts, res.get());
+    const std::string want_opts = refused + "the options struct is " + num(short_opts.struct_size) + " bytes";
+    expect(r, rc_opts == GGML_SYCL_LIFECYCLE_NULL_OUTPUT,
+           "an options header 8 bytes short returned " + num(rc_opts) + ", not NULL_OUTPUT");
+    expect(r, lines_with(want_opts.c_str()).size() == 1,
+           "an options header 8 bytes short logged no '" + want_opts + "' WARN");
+    expect(r, res->n_plans == 0, "the refused call wrote " + num(res->n_plans) + " plans into the result");
+    expect(r, lines_with(sample.c_str()).empty(), "a short options header was refused only after the host sample");
+
+    // control: the current sizes are read
+    log_clear();
+    const ggml_sycl_lifecycle_result rc_ok = ggml_backend_sycl_plan_dry_run(&inv.inv, &opts, res.get());
+    if (rc_ok != GGML_SYCL_LIFECYCLE_OK || res->n_plans == 0) {
+        void_arm(r, "the current sizes returned " + num(rc_ok) + " with " + num(res->n_plans) +
+                        " plans, so the refusals above may be another failure's");
+        return r;
+    }
+    expect(r, lines_with(refused.c_str()).empty(), "the current sizes logged a refused WARN");
+    return r;
+}
+
 // (d) --mem-available is the sample's MemAvailable. With opts.mem_available_set the dry run takes the caller's bytes
 // as the sample's MemAvailable, reports them as such, and its budget is host_ledger_compute_budget of that sample (the
 // other inputs read live, as the result reports them) and the committed bytes it reports. Without the option it
@@ -658,6 +729,7 @@ int main() {
     };
 
     const named_arm arms[] = {
+        { "(0) a caller of another layout is refused",           arm_0_another_layout_is_refused          },
         { "(a) expected_host is the stage's host_planned_bytes", arm_a_expected_host_is_the_stage_figure  },
         { "(b) every term printed by name, from the plan",       arm_b_every_term_printed_from_the_plan   },
         { "(c) a dry run stores nothing and leaves no trace",    arm_c_a_dry_run_stores_nothing           },

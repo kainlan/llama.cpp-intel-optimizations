@@ -18840,9 +18840,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
     if (!module_guard) {
         return GGML_SYCL_LIFECYCLE_BUSY;
     }
-    if (!inventory || (inventory->count > 0 && !inventory->tensors) || !result ||
-        result->struct_size != sizeof(ggml_sycl_plan_dry_run_result) ||
+    if (!inventory || (inventory->count > 0 && !inventory->tensors) || !result) {
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    // A caller built against another layout sends another struct_size. The size gate refuses it before anything is
+    // read past the header, which is why the result's layout can grow while its version stays the same.
+    if (result->struct_size != sizeof(ggml_sycl_plan_dry_run_result) ||
         result->version != GGML_SYCL_PLAN_DRY_RUN_VERSION) {
+        GGML_LOG_WARN(
+            "[PLAN-DRY-RUN] refused: the result struct is %u bytes of version %u; this backend reads %zu "
+            "bytes of version %d\n",
+            result->struct_size, result->version, sizeof(ggml_sycl_plan_dry_run_result),
+            GGML_SYCL_PLAN_DRY_RUN_VERSION);
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
     ggml_sycl_plan_dry_run_opts in{};
@@ -18850,6 +18859,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         if (opts->struct_size != sizeof(ggml_sycl_plan_dry_run_opts) ||
             opts->version != GGML_SYCL_PLAN_DRY_RUN_VERSION ||
             opts->n_device_budgets > GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES) {
+            GGML_LOG_WARN(
+                "[PLAN-DRY-RUN] refused: the options struct is %u bytes of version %u naming %u device "
+                "budgets; this backend reads %zu bytes of version %d naming at most %d\n",
+                opts->struct_size, opts->version, opts->n_device_budgets, sizeof(ggml_sycl_plan_dry_run_opts),
+                GGML_SYCL_PLAN_DRY_RUN_VERSION, GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES);
             return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
         }
         in = *opts;

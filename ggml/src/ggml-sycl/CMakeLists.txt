@@ -7920,11 +7920,11 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 120)
 
-    # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): expected_host is the stage's
-    # host_planned_bytes, every term is printed by name from the plan, a dry run stores no budget, and the
-    # --mem-available option is the sample's MemAvailable. The planner initialises SYCL and arm (a) stages a load
-    # through real backends that construct caches, so it carries the OOM-family labels, runs alone on the discrete
-    # cards, and exits 77 without a SYCL GPU.
+    # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct
+    # layout is refused, expected_host is the stage's host_planned_bytes, every term is printed by name from the
+    # plan, a dry run stores no budget, and the --mem-available option is the sample's MemAvailable. The planner
+    # initialises SYCL and arm (a) stages a load through real backends that construct caches, so it carries the
+    # OOM-family labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
     add_executable(test-sycl-plan-dry-run
         tests/test-sycl-plan-dry-run.cpp)
     target_link_libraries(test-sycl-plan-dry-run PRIVATE

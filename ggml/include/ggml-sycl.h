@@ -2068,8 +2068,10 @@ GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_plan) == 184, "dry run plan l
 GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_result) == 3136, "dry run result layout changed");
 
 // OK with the result written; NULL_OUTPUT for a null inventory or result, or a struct header this backend does not
-// read; LOAD_BUSY while a load is open or a model is live; BUSY while the module is being mutated; NOT_FOUND with no
-// SYCL device; EFFECT_FAILED when planning threw. On every status but OK the result is left as the caller wrote it.
+// read (a caller built against another layout, whose struct_size differs; a [PLAN-DRY-RUN] refused WARN names both
+// sizes and versions); LOAD_BUSY while a load is open or a model is live; BUSY while the module is being mutated;
+// NOT_FOUND with no SYCL device; EFFECT_FAILED when planning threw. On every status but OK the result is left as the
+// caller wrote it.
 // Proc name: "ggml_backend_sycl_plan_dry_run".
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(
     const struct ggml_sycl_tensor_inventory *  inventory,
