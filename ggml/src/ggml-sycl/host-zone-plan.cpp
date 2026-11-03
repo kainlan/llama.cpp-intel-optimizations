@@ -2,8 +2,9 @@
 // Host zone routing, host-allocation lifetimes, the host SCRATCH demand ledger, and the host holder plan. See
 // host-zone-plan.hpp and docs/design/sycl-mmap-host-tier.md §4.4.
 //
-// This is the tests' RED form: the routing, the grow and the slot admission are today's, and the parts of the plan
-// that do not exist yet are inert.
+// The HOST_ZONE_PLAN_MUTANT_* macros below are the positive controls of the four host-only tests: each plants one
+// defect the design names, a test target compiles this TU with exactly one of them, and ctest scores the design's
+// failure text (ggml/src/ggml-sycl/CMakeLists.txt). No production build defines any of them.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -33,7 +34,7 @@ double to_mib(size_t bytes) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
-// Routing: today's rule, in which the HOST_COMPUTE and EXPERT_CACHE categories select WEIGHT.
+// Routing.
 // ---------------------------------------------------------------------------------------------------------------
 
 host_zone_id select_zone(alloc_role       role,
@@ -41,24 +42,30 @@ host_zone_id select_zone(alloc_role       role,
                          alloc_lifetime   lifetime,
                          bool             persistent_owner,
                          bool             kv_spill_to_host) {
-    (void) lifetime;
+    // persistent_owner is a lifetime claim, not a routing preference: WEIGHT is the one host zone no graph boundary
+    // checks, so a persistent request that would land in KV or SCRATCH is a defect.
     GGML_ASSERT(!persistent_owner ||
                 (!kv_spill_to_host && role != alloc_role::KV && role != alloc_role::EXPERT_STAGING));
     if (kv_spill_to_host || role == alloc_role::KV) {
         return host_zone_id::KV;
     }
+    if (role == alloc_role::WEIGHT) {
+        return host_zone_id::WEIGHT;
+    }
     if (role == alloc_role::EXPERT_STAGING) {
         return host_zone_id::SCRATCH;
     }
-    if (role == alloc_role::WEIGHT || category == runtime_category::HOST_COMPUTE ||
-        category == runtime_category::EXPERT_CACHE || persistent_owner) {
+    if (lifetime == alloc_lifetime::UNOWNED || persistent_owner) {
         return host_zone_id::WEIGHT;
+    }
+    if (category == runtime_category::HOST_COMPUTE || category == runtime_category::EXPERT_CACHE) {
+        return host_zone_id::SCRATCH;
     }
     return host_zone_id::STAGING;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Lifetimes: today no record carries one, the graph boundary counts every row, and no owner boundary is checked.
+// Lifetimes.
 // ---------------------------------------------------------------------------------------------------------------
 
 const char * alloc_lifetime_name(alloc_lifetime lifetime) {
@@ -103,8 +110,7 @@ uint64_t host_zone_owner_next_id() {
 }
 
 bool host_zone_lifetime_counts_at_graph_boundary(alloc_lifetime lifetime) {
-    (void) lifetime;
-    return true;
+    return lifetime == alloc_lifetime::GRAPH;
 }
 
 size_t host_zone_graph_boundary_live(const host_zone_record_view * records, size_t n, host_zone_id zone) {
@@ -118,10 +124,13 @@ size_t host_zone_graph_boundary_live(const host_zone_record_view * records, size
 }
 
 bool host_zone_record_owned_by(const host_zone_record_view & record, alloc_lifetime lifetime, alloc_owner_ref owner) {
-    (void) record;
-    (void) lifetime;
+#if defined(HOST_ZONE_PLAN_MUTANT_OWNER_BY_LIFETIME)
+    // Positive control: the owner check keyed by lifetime alone fires on another context's live record.
     (void) owner;
-    return false;
+    return record.lifetime == lifetime;
+#else
+    return record.lifetime == lifetime && record.owner.kind == owner.kind && record.owner.id == owner.id;
+#endif
 }
 
 size_t host_zone_owner_boundary_check(const host_zone_record_view * records,
@@ -129,17 +138,32 @@ size_t host_zone_owner_boundary_check(const host_zone_record_view * records,
                                       alloc_lifetime                lifetime,
                                       alloc_owner_ref               owner,
                                       bool                          strict) {
-    (void) records;
-    (void) n;
-    (void) lifetime;
-    (void) owner;
-    (void) strict;
-    return 0;
+    size_t leaked = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const host_zone_record_view & r = records[i];
+        if (!host_zone_record_owned_by(r, lifetime, owner)) {
+            continue;
+        }
+        ++leaked;
+        GGML_LOG_WARN("[HOST-ZONE] leaked %s record: %s %zu owner=%s/%llu\n", alloc_lifetime_name(r.lifetime),
+                      r.cohort && r.cohort[0] ? r.cohort : "(no cohort)", r.bytes, alloc_owner_kind_name(r.owner.kind),
+                      (unsigned long long) r.owner.id);
+    }
+    if (leaked > 0 && strict) {
+        GGML_ABORT("[HOST-ZONE] %zu %s record(s) live at their owner's boundary under GGML_SYCL_STRICT_LEASES=1",
+                   leaked, alloc_lifetime_name(lifetime));
+    }
+    return leaked;
 }
 
 bool host_zone_device_check_due(int live_backends_on_device_after_free) {
+#if defined(HOST_ZONE_PLAN_MUTANT_DEVICE_CHECK_EVERY_FREE)
+    // Positive control: the DEVICE check taken at every backend free fires while a second backend is live.
     (void) live_backends_on_device_after_free;
-    return false;
+    return true;
+#else
+    return live_backends_on_device_after_free == 0;
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------------------
