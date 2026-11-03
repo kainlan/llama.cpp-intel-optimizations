@@ -71,6 +71,10 @@ void ggml_sycl_test_lazy_reap_hold(lazy_reap_hold_fn hold, void * ctx) {
     GGML_UNUSED(ctx);
 }
 
+void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease) {
+    GGML_UNUSED(lease);
+}
+
 lazy_test_coverage_pin::lazy_test_coverage_pin(ring_lease lease) noexcept : lease_(std::move(lease)) {}
 
 lazy_test_coverage_pin::~lazy_test_coverage_pin() {}

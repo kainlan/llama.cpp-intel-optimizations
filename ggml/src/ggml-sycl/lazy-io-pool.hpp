@@ -161,6 +161,11 @@ class lazy_test_coverage_pin {
     ring_lease lease_;
 };
 
+// Marks the pool `lease` holds DYING under the leaf mutex, without dropping a reference or parking it, so the next
+// clone of that lease finds the state a held lease never shows and takes its abort path. Only a child process that is
+// about to abort calls it: the pool can no longer be parked or reaped. An empty lease is ignored.
+void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease);
+
 // Only ring_bytes == 0, a ring-less pool, is accepted here: every table is then STORAGE-eligible and block_ring_charge
 // is the mapped need. Any other value aborts naming it, since a ring arrives only with the IO engine. A call while a
 // guard is live joins the live pool with a counted reference.

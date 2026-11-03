@@ -279,6 +279,24 @@ if (BUILD_TESTING)
         set_tests_properties(test-sycl-host-cpu-mapping PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
     endif()
 
+    # The lazy tables' IO pool registry (th32 §3.3, §11 T3): the counted lease, clone, park, DYING, the FULL reap, the
+    # coverage wrapper, the helper guard and shut-down. lazy-io-pool.cpp includes no SYCL header, so this target links
+    # it alone with ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
+    # re-execute the binary through fork and /proc/self/exe, so it is Linux-only.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-lazy-io-pool-host
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-pool-host.cpp
+            lazy-io-pool.cpp)
+        target_include_directories(test-sycl-lazy-io-pool-host PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(test-sycl-lazy-io-pool-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(test-sycl-lazy-io-pool-host PRIVATE ggml-base Threads::Threads)
+        set_target_properties(test-sycl-lazy-io-pool-host PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-lazy-io-pool-host COMMAND test-sycl-lazy-io-pool-host)
+        set_tests_properties(test-sycl-lazy-io-pool-host PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+    endif()
+
     # The tier on a build without it (llama.cpp-th32 T1a): host-cpu-mapping.cpp and the test are compiled with _WIN32
     # defined, so the refusing stub Windows gets is built and run on the host. Both are portable C++.
     add_executable(test-sycl-host-cpu-unsupported
