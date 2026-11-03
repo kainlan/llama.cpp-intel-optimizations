@@ -666,13 +666,8 @@ static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory & 
     if (!llama_model_sycl_hooks_enabled(hooks)) {
         return;
     }
-    // The loading guard refuses a load whose backend lacks the staging proc, so only a caller outside a guarded
-    // load can get here without it.
-    if (!hooks.stage_inventory) {
-        throw std::runtime_error(
-            "the SYCL backend does not export ggml_backend_sycl_stage_load_inventory_plan, so it "
-            "predates this libllama: rebuild libllama and libggml-sycl together");
-    }
+    // Both callers run inside an active loading guard, whose require_host_backing_hooks() refused a backend without
+    // the staging proc before begin().
     const auto rc = hooks.stage_inventory(&inventory, &envelope, early);
     if (rc != GGML_SYCL_LIFECYCLE_OK) {
         throw std::runtime_error(format("SYCL inventory planning failed: early=%d result=%d", early, (int) rc));
