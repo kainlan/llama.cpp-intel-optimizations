@@ -17199,12 +17199,7 @@ static uint64_t ggml_sycl_moe_stream_staged_types() {
     return mask;
 }
 
-// Phase A helper: populate inventory + KV + MoE globals from the inventory
-// snapshot.  Idempotent — safe to call from both the early pre-create_tensor
-// entry point and the late set_tensor_inventory entry.  Caller must hold
-// g_tensor_inventory_mutex.
-// The planner's view of an inventory's tensors: one row per named tensor, its type and shape when the inventory gives a
-// valid one. The stage publishes it as g_tensor_inventory_detail; the plan dry run plans from its own copy.
+// The planner's per-tensor view of an inventory: the stage publishes it, and the plan dry run builds its own.
 static std::vector<ggml_sycl::placement_tensor_info> ggml_sycl_inventory_planner_detail(
     const ggml_sycl_tensor_inventory * inventory) {
     std::vector<ggml_sycl::placement_tensor_info> detail;
@@ -17332,6 +17327,10 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     kv.n_expert_used           = inventory->n_expert_used;
 }
 
+// Phase A helper: populate inventory + KV + MoE globals from the inventory
+// snapshot.  Idempotent — safe to call from both the early pre-create_tensor
+// entry point and the late set_tensor_inventory entry.  Caller must hold
+// g_tensor_inventory_mutex.
 static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const ggml_sycl_tensor_inventory * inventory) {
     g_tensor_inventory.clear();
     g_tensor_inventory_detail.clear();
