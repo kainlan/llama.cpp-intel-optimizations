@@ -451,7 +451,7 @@ arm_result arm_d_mem_available_option_is_the_sample() {
         void_arm(r, "the dry run returned " + num(rc) + " with " + num(res->n_plans) + " plans");
         return r;
     }
-    if (now.reserve.accepted || res->host_reserve_override != 0) {
+    if (now.reserve.status == detail::host_reserve_parse_status::OVERRIDE || res->host_reserve_override != 0) {
         void_arm(r, "GGML_SYCL_HOST_RESERVE_MB is accepted, so MemAvailable does not enter the budget");
         return r;
     }
