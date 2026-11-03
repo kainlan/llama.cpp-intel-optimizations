@@ -95278,10 +95278,11 @@ static std::mutex        g_attn_host_cpu_backend_mutex;
 // (same-device concurrent inference is unsupported, canonical contract §5), so the slots take no lock. The ASYNC FA
 // body also uses the slots and hands dst_ptr to a pool worker thread, so slot-CONTENT reuse safety is NOT "both
 // bodies are synchronous": the real invariant is written at the staging-get call site in the async body (search
-// "S1 invariant"). Released explicitly in ggml_sycl_attn_host_cpu_backend_free(), never by a static destructor,
-// which would release into a torn-down cache: so the slots, the dispatch counter and their blocks' owners are
-// heap-allocated by this file's leak idiom.
-static auto * const g_host_staging_slots          = new ggml_sycl::host_staging_slots();
+// "S1 invariant"). Released explicitly, never by a static destructor, which would release into a torn-down cache: an
+// unplanned device's slots at every backend free (ggml_sycl_attn_host_cpu_backend_free()), a planned device's when
+// its last plan is dropped, and every slot at module shutdown. So the slots, the dispatch counter and their blocks'
+// owners are heap-allocated by this file's leak idiom. The slots ask g_host_holder_plans whether a device is planned.
+static auto * const g_host_staging_slots          = new ggml_sycl::host_staging_slots(*g_host_holder_plans);
 static auto * const g_attn_host_dispatch_counters = new ggml_sycl::attn_host_dispatch_counters();
 
 enum ggml_sycl_attn_host_staging_kind {
@@ -95468,6 +95469,13 @@ static void ggml_sycl_attn_host_staging_check_canaries(const char * where) {
     }
 }
 
+// At every backend free, a load's temporary backend included: only the slots of devices with no committed plan go. A
+// committed plan stays in force on its device until its own context's free drops it.
+static void ggml_sycl_attn_host_staging_free_unplanned() {
+    g_host_staging_slots->release_unplanned(ggml_sycl_attn_host_staging_allocator());
+}
+
+// Module shutdown: every slot, before the cache is torn down.
 static void ggml_sycl_attn_host_staging_free_all() {
     g_host_staging_slots->release_all(ggml_sycl_attn_host_staging_allocator());
 }
@@ -95739,7 +95747,7 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
     // symbol never appears in the DL module's undefined-symbol table
     // (it's one of the checker's forbidden imports, tests/test-sycl-module-
     // dependencies.py).
-    ggml_sycl_attn_host_staging_free_all();
+    ggml_sycl_attn_host_staging_free_unplanned();
 #else
     std::lock_guard<std::mutex> lock(g_attn_host_cpu_backend_mutex);
     if (g_attn_host_cpu_backend) {
@@ -95750,7 +95758,7 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
         ggml_threadpool_free(g_attn_host_cpu_threadpool);
         g_attn_host_cpu_threadpool = nullptr;
     }
-    ggml_sycl_attn_host_staging_free_all();
+    ggml_sycl_attn_host_staging_free_unplanned();
 #endif
 }
 
@@ -126045,6 +126053,7 @@ void ggml_backend_sycl_shutdown(void) {
     if (!ggml_sycl_shutdown_global_runtime_pinned_owners()) {
         throw std::runtime_error("SYCL global runtime/pinned owner shutdown failed");
     }
+    ggml_sycl_attn_host_staging_free_all();
     // Event-retained mem_handles and retained CPU outputs both own cache/pinned
     // allocations. Drain events synchronously, return the scratch lease, then
     // erase/free every offload-pool owner before queue or cache destruction.

@@ -775,8 +775,7 @@ bool host_staging_slots::apply(int                              device,
     if (!slot_device_ok(device)) {
         return false;
     }
-    planned_[device] = state.planned;
-    bool ok          = true;
+    bool ok = true;
     for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
         host_staging_block & slot = slots_[device][k];
         const size_t         want = state.slot_bytes[k];
@@ -804,7 +803,7 @@ void * host_staging_slots::admit(int                            device,
         return nullptr;
     }
     host_staging_block & slot = slots_[device][kind];
-    if (!planned_[device]) {
+    if (!planned(device)) {
 #if defined(HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES)
         // Positive control: an unplanned device refuses as a planned one does, so the pre-notify fallback is gone.
         if (bytes > slot.cap) {
@@ -847,15 +846,36 @@ void * host_staging_slots::admit(int                            device,
     return nullptr;
 }
 
+namespace {
+
+void slots_release_device(host_staging_block (&slots)[HOST_STAGING_KIND_COUNT], const host_staging_allocator & alloc) {
+    for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
+        if (slots[k].ptr && alloc.release) {
+            alloc.release(alloc.user, &slots[k]);
+        }
+        slots[k] = host_staging_block{};
+    }
+}
+
+}  // namespace
+
+void host_staging_slots::release_unplanned(const host_staging_allocator & alloc) {
+    for (int d = 0; d < max_devices; ++d) {
+#if defined(HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED)
+        // Positive control: every device's slots released, so an unrelated backend's free takes a committed plan's
+        // slots with it.
+#else
+        if (planned(d)) {
+            continue;  // released only when the device's last plan is dropped and the device re-applied
+        }
+#endif
+        slots_release_device(slots_[d], alloc);
+    }
+}
+
 void host_staging_slots::release_all(const host_staging_allocator & alloc) {
     for (int d = 0; d < max_devices; ++d) {
-        for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
-            if (slots_[d][k].ptr && alloc.release) {
-                alloc.release(alloc.user, &slots_[d][k]);
-            }
-            slots_[d][k] = host_staging_block{};
-        }
-        planned_[d] = false;
+        slots_release_device(slots_[d], alloc);
     }
 }
 
@@ -867,7 +887,7 @@ size_t host_staging_slots::capacity(int device, int kind) const {
 }
 
 bool host_staging_slots::planned(int device) const {
-    return slot_device_ok(device) && planned_[device];
+    return slot_device_ok(device) && plans_.device_state(device).planned;
 }
 
 const host_staging_block & host_staging_slots::block(int device, int kind) const {

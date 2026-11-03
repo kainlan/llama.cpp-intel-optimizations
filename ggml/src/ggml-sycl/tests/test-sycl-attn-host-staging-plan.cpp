@@ -24,6 +24,7 @@
 //   HOST_ZONE_PLAN_MUTANT_PREDICATE_IS_HOST       ggml_backend_buffer_is_host as the walk's predicate
 //   HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE           the notify helper's device for every slot
 //   HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES       an unplanned device refusing instead of growing at dispatch
+//   HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED   a backend's free releasing a planned device's slots too
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -336,7 +337,7 @@ host_pool_sink pool_sink() {
 // One process's worth of the backend's holder state.
 struct holders {
     host_holder_plans   plans;
-    host_staging_slots  slots;
+    host_staging_slots  slots{ plans };
     host_scratch_ledger ledger;
 
     ~holders() { slots.release_all(fake_allocator()); }
@@ -577,6 +578,30 @@ void test_unplanned_device_grows_until_a_commit() {
               "after a commit on device 1 an over-plan request was not refused over the plan: admitted=%d, %d "
               "allocation(s), %zu refusal(s)",
               p ? 1 : 0, g_alloc_state.allocs - allocs, counters.refusals(1));
+
+    // An unrelated backend's free, a load's temporary backend or a context with no plan, leaves device 1's committed
+    // plan in force. It drops no plan, and of the slots it releases only the unplanned device 0's fallback slot goes.
+    void *       fallback    = h.slots.admit(0, HOST_STAGING_Q, q_bytes(16), fake_allocator(), &counters);
+    const size_t planned_cap = h.slots.capacity(1, HOST_STAGING_Q);
+    capture_begin();
+    const int releases = g_alloc_state.releases;
+    h.drop_apply(99, true);                       // the freed backend's own plan: it has none
+    h.slots.release_unplanned(fake_allocator());  // what every backend free does to the slots
+    const int    allocs_after = g_alloc_state.allocs;
+    const size_t refusals     = counters.refusals(1);
+    void *       kept         = h.slots.admit(1, HOST_STAGING_Q, planned_cap, fake_allocator(), &counters);
+    HZP_CHECK(fallback && kept && h.slots.planned(1) && g_alloc_state.allocs == allocs_after &&
+                  counters.refusals(1) == refusals && !log_has("unplanned") && !log_has("exceeds the planned"),
+              "after an unrelated backend's free, device 1 did not admit by its plan: admitted=%d planned=%d, %d "
+              "allocation(s), %zu refusal(s)",
+              kept ? 1 : 0, h.slots.planned(1) ? 1 : 0, g_alloc_state.allocs - allocs_after,
+              counters.refusals(1) - refusals);
+    HZP_CHECK(g_alloc_state.releases == releases + 1 && h.slots.capacity(0, HOST_STAGING_Q) == 0 &&
+                  h.slots.capacity(1, HOST_STAGING_Q) == planned_cap,
+              "the unrelated free released %d slot(s), leaving device 0 at %zu B and device 1 at %zu B, expected 1 "
+              "(device 0's fallback slot), 0 and %zu",
+              g_alloc_state.releases - releases, h.slots.capacity(0, HOST_STAGING_Q),
+              h.slots.capacity(1, HOST_STAGING_Q), planned_cap);
 }
 
 void test_recommit_replaces() {

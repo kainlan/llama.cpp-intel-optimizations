@@ -339,14 +339,17 @@ class attn_host_dispatch_counters;
 
 // One process's slots, [device][kind]. Touched by commit and drop in sched_reserve and by the graph-walker thread at
 // dispatch; same-device concurrent inference is unsupported (canonical contract §5), so no dispatch on a device runs
-// while that device's slots are re-sized.
+// while that device's slots are re-sized. Whether a device is planned is not kept here: it is asked of `plans`, the
+// one record of the committed plans, so no free that releases slots can leave a committed plan out of force.
 class host_staging_slots {
   public:
     static constexpr int max_devices = 48;  // GGML_SYCL_MAX_DEVICES
 
+    explicit host_staging_slots(const host_holder_plans & plans) : plans_(plans) {}
+
     // Re-sizes `device`'s slots to the committed state: a slot below its planned capacity grows once, one above it is
-    // re-allocated down, a slot planned at 0 is released. Marks the device planned. False if an allocation failed (the
-    // slot is then left at capacity 0, so its dispatch refuses by name).
+    // re-allocated down, a slot planned at 0 is released. False if an allocation failed (the slot is then left at
+    // capacity 0, so its dispatch refuses by name).
     bool   apply(int device, const host_holder_device_state & state, const host_staging_allocator & alloc);
     // Dispatch admission. At or below the slot's capacity: the slot. Above it, or a slot never planned on a planned
     // device: nullptr, with `[ATTN-HOST] staging request %zu B for kind %s exceeds the planned %zu B on device %d;
@@ -357,16 +360,21 @@ class host_staging_slots {
                  size_t                         bytes,
                  const host_staging_allocator & alloc,
                  attn_host_dispatch_counters *  counters);
+    // Releases the slots of every device with no committed plan: the pre-notify fallback's slots, which grow again at
+    // their next dispatch. A planned device's slots stay at its plan; they go when its last plan is dropped and the
+    // device is re-applied (a backend's free of a load's temporary backend, or of a context with no plan, frees here).
+    void                       release_unplanned(const host_staging_allocator & alloc);
     // Releases every slot (module teardown).
     void   release_all(const host_staging_allocator & alloc);
     size_t capacity(int device, int kind) const;
+    // Whether `device` has a committed plan, asked of the plans.
     bool   planned(int device) const;
     const host_staging_block & block(int device, int kind) const;
 
   private:
-    host_staging_block slots_[max_devices][HOST_STAGING_KIND_COUNT]{};
-    bool               planned_[max_devices]{};
-    std::atomic<bool>  fallback_warned_[max_devices]{};
+    const host_holder_plans & plans_;
+    host_staging_block        slots_[max_devices][HOST_STAGING_KIND_COUNT]{};
+    std::atomic<bool>         fallback_warned_[max_devices]{};
 };
 
 // ---------------------------------------------------------------------------------------------------------------

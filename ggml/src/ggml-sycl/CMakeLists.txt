@@ -8239,7 +8239,9 @@ ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
     HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE
         "device 1's slots are unplanned"
     HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES
-        "an unplanned device refused a dispatch")
+        "an unplanned device refused a dispatch"
+    HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED
+        "after an unrelated backend's free, device 1 did not admit by its plan")
 
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
