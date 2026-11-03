@@ -7993,6 +7993,25 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
 
+    # The coverage wrapper (th32 §3.3, §11 T3): lazy_coverage_scope runs its entry FULL reap before its take and its
+    # closing FULL reap after its drop, scored by the registry's take-time snapshots with the guard's reap held in the
+    # hook. The registry lives in the backend's objects, so the binary links the private fixtures; it initialises no
+    # device, but it is registered gpu-serial and serial with the selector pinned like the other lazy-table tests.
+    # Lead-run.
+    add_executable(test-sycl-lazy-coverage-wrapper
+        tests/test-sycl-lazy-coverage-wrapper.cpp)
+    target_link_libraries(test-sycl-lazy-coverage-wrapper PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-coverage-wrapper PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-coverage-wrapper COMMAND test-sycl-lazy-coverage-wrapper)
+    set_tests_properties(test-sycl-lazy-coverage-wrapper PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120)
+
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
     # requires them to be rejected.  It is not redundant with the source gate in
