@@ -987,7 +987,8 @@ bool host_holders_apply_device(int                            device,
                 staging_bytes += state.slot_bytes[k];
             }
         }
-        // The capacity is ensured before any slot or pool allocates against it.
+        // The capacity is ensured before any slot or pool allocates against it. No cpu_expert_pool demand: in this
+        // tree CpuExpertPool holds no memory, only workers to join (as the backend free's pinned-owner shutdown notes).
         ok = ledger->holder_demand("attn_host_staging", device, staging_bytes, ops).ok && ok;
         ok = ledger->holder_demand("pinned_buffer_pool", device, host_pool_pinned_bytes(state.pools), ops).ok && ok;
     }
