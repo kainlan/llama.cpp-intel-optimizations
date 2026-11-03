@@ -805,6 +805,16 @@ void * host_staging_slots::admit(int                            device,
     }
     host_staging_block & slot = slots_[device][kind];
     if (!planned_[device]) {
+#if defined(HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES)
+        // Positive control: an unplanned device refuses as a planned one does, so the pre-notify fallback is gone.
+        if (bytes > slot.cap) {
+            if (counters) {
+                counters->refusal(device);
+            }
+            return nullptr;
+        }
+        return slot.ptr;
+#endif
         // The pre-notify fallback: until llama_context commits a host holder plan, the slot grows at dispatch as it
         // did before the plan existed.
         if (!fallback_warned_[device].exchange(true)) {

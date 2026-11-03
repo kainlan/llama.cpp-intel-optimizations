@@ -8237,7 +8237,9 @@ ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
     HOST_ZONE_PLAN_MUTANT_PREDICATE_IS_HOST
         "the walk counted 2 host-KV node\\(s\\), expected 1 \\(the view\\)"
     HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE
-        "device 1's slots are unplanned")
+        "device 1's slots are unplanned"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES
+        "an unplanned device refused a dispatch")
 
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
