@@ -18694,9 +18694,14 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
         GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d %s %s=%" PRIu64 " (%.1f MB)\n", index, plan.device_id, group,
                       term, bytes, bytes / (1024.0 * 1024.0));
     };
-    GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d %s plan: %zu entries, %.1f MB device + %.1f MB host\n", index,
-                  plan.device_id, multi_device ? "multi-device" : "single-device", plan.entries.size(),
-                  plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0));
+    // host_bytes is the planner's charged host figure: the host weights it charged and the KV of the layers it put on
+    // the host, with file-mapped weights only when the load locks the mapping (design 5efe §4.5). It is not the sum of
+    // the residency lines below, which report every backing's bytes, an unlocked mapping's included.
+    GGML_LOG_INFO(
+        "[PLAN-DRY-RUN] plan=%u device=%d %s plan: %zu entries, %.1f MB device + %.1f MB host charged (host "
+        "KV included, file-mapped weights only when locked)\n",
+        index, plan.device_id, multi_device ? "multi-device" : "single-device", plan.entries.size(),
+        plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0));
     line("WEIGHT", "host_weights", out.weight_host_weights);
     GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d WEIGHT blocks=%" PRIu64 "\n", index, plan.device_id,
                   out.weight_blocks);
@@ -18711,6 +18716,10 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
     line("COMMIT", "rounding", out.rounding);
     line("HOST", "expected_host", out.expected_host);
     line("HOST", "host_budget", out.host_budget);
+    // The plan's own host-KV field, printed as recorded: the KV of the layers the plan put on the host, which the
+    // charged figure above includes. A multi-device plan that put none there records the whole model's KV in it, to
+    // size the KV zone for a run restricted to fewer devices, and the charged figure does not include that.
+    line("HOST", "kv_host_bytes", plan.kv_host_bytes);
     for (int b = 0; b < GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT; ++b) {
         GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d RESIDENCY backing=%s count=%" PRIu64 " bytes=%" PRIu64
                       " (%.1f MB)\n",
