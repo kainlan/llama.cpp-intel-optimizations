@@ -1,14 +1,16 @@
 // The plan dry run's command line (tools/sycl-plan-dry-run): every option reaches the field the export reads, and
 // every malformed value is refused with a message rather than read as a default. Then the tool's header read
-// (llama_model_sycl_header_inventory) on a GGUF the test writes with an architecture no loader knows: it returns false
-// and names the architecture, before any model exists. Host-only: no backend is initialised, and no device or model
-// is touched.
+// (llama_model_sycl_header_inventory) on two GGUFs the test writes. On an architecture no loader knows it returns false
+// and names the architecture, before any model exists. On a known one (llama, with the hparams its loader requires and
+// one tensor) it hands the callback the inventory the load's own builder makes of the header: one call, one tensor.
+// Host-only: no backend is initialised, and no device or model is touched.
 
 #include "sycl-plan-dry-run-args.h"
 
 // The tool's header read, an undecorated libllama internal reached the way tests/test-llama-lazy-range-prefill.cpp
 // reaches the loader's.
 #include "../src/llama-model.h"
+#include "ggml-sycl.h"
 #include "ggml.h"
 #include "gguf.h"
 
@@ -68,27 +70,52 @@ void capture_log(ggml_log_level level, const char * text, void * user) {
     }
 }
 
-void count_inventory(const ggml_sycl_tensor_inventory *   inventory,
-                     const ggml_sycl_placement_envelope * envelope,
-                     void *                               user_data) {
-    (void) inventory;
+// What the header read handed its callback: how often it was called, and the last inventory's size and first tensor.
+struct header_seen {
+    int         calls = 0;
+    size_t      count = 0;
+    std::string first_name;
+    size_t      first_size = 0;
+};
+
+void record_inventory(const ggml_sycl_tensor_inventory *   inventory,
+                      const ggml_sycl_placement_envelope * envelope,
+                      void *                               user_data) {
     (void) envelope;
-    ++*static_cast<int *>(user_data);
+    header_seen & seen = *static_cast<header_seen *>(user_data);
+    ++seen.calls;
+    seen.count = inventory != nullptr ? inventory->count : 0;
+    if (seen.count > 0 && inventory->tensors != nullptr) {
+        seen.first_name = inventory->tensors[0].name != nullptr ? inventory->tensors[0].name : "";
+        seen.first_size = inventory->tensors[0].size;
+    }
 }
 
-// Writes `path`: a GGUF whose general.architecture is `arch`, with one zeroed F32 tensor, so the loader reads a
-// complete header and stops at the architecture alone.
-bool write_gguf(const std::string & path, const char * arch) {
+constexpr int64_t TENSOR_ELEMENTS = 16;
+
+// Writes `path`: a GGUF whose general.architecture is `arch`, with one zeroed F32 tensor of TENSOR_ELEMENTS. An unknown
+// `arch` makes the loader read a complete header and stop at the architecture alone. With `llama_hparams`, it also
+// carries the keys the llama loader requires (context length, embedding length, block count, RMS epsilon) and a head
+// count, so the header read reaches the inventory builder.
+bool write_gguf(const std::string & path, const char * arch, bool llama_hparams) {
     ggml_init_params params = { /*.mem_size =*/1024 * 1024, /*.mem_buffer =*/nullptr, /*.no_alloc =*/false };
     ggml_context *   ctx    = ggml_init(params);
     if (ctx == nullptr) {
         return false;
     }
-    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TENSOR_ELEMENTS);
     ggml_set_name(tensor, "token_embd.weight");
     std::memset(tensor->data, 0, ggml_nbytes(tensor));
     gguf_context * gguf = gguf_init_empty();
     gguf_set_val_str(gguf, "general.architecture", arch);
+    if (llama_hparams) {
+        gguf_set_val_u32(gguf, "llama.context_length", 64);
+        gguf_set_val_u32(gguf, "llama.embedding_length", static_cast<uint32_t>(TENSOR_ELEMENTS));
+        gguf_set_val_u32(gguf, "llama.block_count", 1);
+        gguf_set_val_u32(gguf, "llama.feed_forward_length", 32);
+        gguf_set_val_u32(gguf, "llama.attention.head_count", 1);
+        gguf_set_val_f32(gguf, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    }
     gguf_add_tensor(gguf, tensor);
     const bool ok = gguf_write_to_file(gguf, path.c_str(), /*only_meta =*/false);
     gguf_free(gguf);
@@ -96,40 +123,70 @@ bool write_gguf(const std::string & path, const char * arch) {
     return ok;
 }
 
-// The header read on an unknown architecture returns false, calls back with nothing, and logs the loader's refusal
-// naming the architecture: the false is the architecture's, not a missing or unreadable file's. The file and its
-// directory live under the test's own scratch directory and are removed after.
-void header_read_refuses_an_unknown_architecture() {
-    const char * const arch = "plan-dry-run-no-such-arch";
-    std::string        tmpl = (std::filesystem::temp_directory_path() / "test-sycl-plan-dry-run-args-XXXXXX").string();
+// Runs the header read on a GGUF `write_gguf` makes for `arch`, in a scratch directory of the test's own that is
+// removed after, capturing libllama's log. Returns false when the file could not be made; `read` is the call's result.
+bool header_read(const char * arch, bool llama_hparams, bool & read, header_seen & seen, std::string & log) {
+    std::string tmpl = (std::filesystem::temp_directory_path() / "test-sycl-plan-dry-run-args-XXXXXX").string();
     if (mkdtemp(&tmpl[0]) == nullptr) {
         check(false, "the scratch directory could not be made under " + tmpl);
-        return;
+        return false;
     }
-    const std::filesystem::path dir  = tmpl;
-    const std::string           path = (dir / "unknown-arch.gguf").string();
-    if (!write_gguf(path, arch)) {
-        check(false, "the unknown-architecture GGUF could not be written to " + path);
+    const std::filesystem::path dir     = tmpl;
+    const std::string           path    = (dir / "header.gguf").string();
+    const bool                  written = write_gguf(path, arch, llama_hparams);
+    if (!written) {
+        check(false, "the '" + std::string(arch) + "' GGUF could not be written to " + path);
     } else {
-        llama_log_set(capture_log, nullptr);
-        int        calls = 0;
-        const bool read =
-            llama_model_sycl_header_inventory(path.c_str(), llama_model_default_params(), count_inventory, &calls);
-        llama_log_set(nullptr, nullptr);
-        std::string log;
         {
             std::lock_guard<std::mutex> lock(g_log_mutex);
-            log = g_log;
+            g_log.clear();
         }
-        check(!read, "the header read accepted a GGUF whose architecture is '" + std::string(arch) + "'");
-        check(calls == 0,
-              "the header read called back " + std::to_string(calls) + " times for an unknown architecture");
-        check(log.find("unknown model architecture") != std::string::npos && log.find(arch) != std::string::npos,
-              "the header read's refusal does not name the architecture '" + std::string(arch) + "'");
+        llama_log_set(capture_log, nullptr);
+        read = llama_model_sycl_header_inventory(path.c_str(), llama_model_default_params(), record_inventory, &seen);
+        llama_log_set(nullptr, nullptr);
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        log = g_log;
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     check(!ec && !std::filesystem::exists(dir), "the scratch directory " + dir.string() + " was not removed");
+    return written;
+}
+
+// The header read on an unknown architecture returns false, calls back with nothing, and logs the loader's refusal
+// naming the architecture: the false is the architecture's, not a missing or unreadable file's.
+void header_read_refuses_an_unknown_architecture() {
+    const char * const arch = "plan-dry-run-no-such-arch";
+    bool               read = false;
+    header_seen        seen;
+    std::string        log;
+    if (!header_read(arch, /*llama_hparams =*/false, read, seen, log)) {
+        return;
+    }
+    check(!read, "the header read accepted a GGUF whose architecture is '" + std::string(arch) + "'");
+    check(seen.calls == 0,
+          "the header read called back " + std::to_string(seen.calls) + " times for an unknown architecture");
+    check(log.find("unknown model architecture") != std::string::npos && log.find(arch) != std::string::npos,
+          "the header read's refusal does not name the architecture '" + std::string(arch) + "'");
+}
+
+// The header read on a known architecture returns true and calls back exactly once, with the inventory the load's
+// builder makes of the header: the file's one tensor, by name and byte size.
+void header_read_builds_the_inventory_of_a_known_architecture() {
+    bool        read = false;
+    header_seen seen;
+    std::string log;
+    if (!header_read("llama", /*llama_hparams =*/true, read, seen, log)) {
+        return;
+    }
+    check(read, "the header read refused a llama GGUF carrying the hparams its loader requires");
+    check(seen.calls == 1, "the header read called back " + std::to_string(seen.calls) + " times, want 1");
+    check(seen.count == 1, "the inventory holds " + std::to_string(seen.count) + " tensors, want the file's 1");
+    check(seen.first_name == "token_embd.weight",
+          "the inventory's tensor is '" + seen.first_name + "', want the file's token_embd.weight");
+    const size_t want_size = static_cast<size_t>(TENSOR_ELEMENTS) * sizeof(float);
+    check(seen.first_size == want_size,
+          "the inventory's tensor is " + std::to_string(seen.first_size) + " bytes, want " + std::to_string(want_size));
 }
 
 }  // namespace
@@ -209,6 +266,7 @@ int main() {
     refused({ "-m", "x", "-ngl", "99" }, "-ngl");
 
     header_read_refuses_an_unknown_architecture();
+    header_read_builds_the_inventory_of_a_known_architecture();
 
     std::printf("%s: %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
