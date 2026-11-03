@@ -1343,7 +1343,8 @@ struct host_ledger_charge_token {
 };
 
 // The token of the owner entry running on this thread: null outside one, and null for a request that is not HOST_CPU,
-// so a HOST_CPU request made any other way finds none and is refused, and no nested request spends an outer token.
+// so a HOST_CPU request made any other way finds none and is refused. unified_alloc consumes it on entry and restores
+// it on exit, so no allocation nested on this thread, an owner request or a direct unified_alloc, spends an outer token.
 thread_local host_ledger_charge_token * g_allocating_charge = nullptr;
 
 }  // namespace ggml_sycl
@@ -19787,8 +19788,16 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // legacy callers continue to receive alloc_handle without gaining a way to
     // mint or mutate an intrusive control.
     alloc_owner_control * const owner_control = g_allocating_owner_control;
-    // The owner entry's charge for a HOST_CPU request: only the owner entry charges the host ledger (th32 §4.2).
-    host_ledger_charge_token * const charge        = g_allocating_charge;
+    // The owner entry's charge for a HOST_CPU request: only the owner entry charges the host ledger (th32 §4.2). This
+    // call consumes it, so a unified_alloc nested on this thread finds none and a HOST_CPU request there is refused.
+    host_ledger_charge_token * const charge        = std::exchange(g_allocating_charge, nullptr);
+
+    struct charge_consume_scope {
+        host_ledger_charge_token * charge;
+
+        ~charge_consume_scope() { g_allocating_charge = charge; }
+    } consume_scope{ charge };
+
     if (out == nullptr) {
         return false;
     }
