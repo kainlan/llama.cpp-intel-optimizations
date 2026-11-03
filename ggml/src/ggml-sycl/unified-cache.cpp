@@ -34434,9 +34434,8 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                       int                                                 n_experts,
                                       size_t                                              host_budget,
                                       const ring_lease *                                  coverage_pin) {
-    GGML_UNUSED(coverage_pin);
     return compute_placement_plan(placement_tensor_inventory_from_pairs(tensor_inventory), vram_budget, device_id,
-                                  kv_info, envelope, n_experts, host_budget);
+                                  kv_info, envelope, n_experts, host_budget, coverage_pin);
 }
 
 // The KV phase's per-layer charge (llama.cpp-8ecj): each layer whose dense weights the dense pass put on `device_id`
@@ -36442,9 +36441,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          int                                                 n_experts,
                                          size_t                                              host_budget,
                                          const ring_lease *                                  coverage_pin) {
-    GGML_UNUSED(coverage_pin);
     return compute_multi_device_plan(device_budgets, placement_tensor_inventory_from_pairs(tensor_inventory), n_layers,
-                                     mode, kv_info, envelope, n_experts, host_budget);
+                                     mode, kv_info, envelope, n_experts, host_budget, coverage_pin);
 }
 
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &         device_budgets,
@@ -36460,7 +36458,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     if (device_budgets.size() <= 1) {
         const int    dev    = device_budgets.empty() ? 0 : device_budgets[0].device_id;
         const size_t budget = device_budgets.empty() ? 0 : device_budgets[0].vram_budget;
-        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, envelope, n_experts, host_budget);
+        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, envelope, n_experts, host_budget,
+                                      coverage_pin);
     }
 
     const size_t n_devs = device_budgets.size();
