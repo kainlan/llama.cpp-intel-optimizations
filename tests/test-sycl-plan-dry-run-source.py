@@ -30,6 +30,7 @@ cannot see:
 Plain file I/O, comment-stripped text.
 """
 
+import os
 import re
 from pathlib import Path
 
@@ -341,6 +342,51 @@ def test_the_tool_resolves_the_export_through_the_registry():
         assert "ggml-sycl/" not in inc and not inc.endswith(".hpp"), f"the tool includes backend internals: {inc}"
     for name in ("llama_model_load_from_file", "llama_init_from_model", "ggml_backend_sycl_init"):
         assert not calls(tool, name), f"the tool calls {name}"
+
+
+def prefill_log_marker() -> str:
+    """The text every line the lazy-range record's pre-fill logs starts with, after its function-name prefix: the
+    common prefix of the format strings in llama_lazy_range_record_prefill, so a rewording there moves it here."""
+    b = body(read(ROOT / "src/llama-lazy-range-record.cpp"), "llama_lazy_range_record_prefill")
+    fmts = re.findall(r'LLAMA_LOG_INFO\s*\(\s*"((?:\\.|[^"\\])*)"', b)
+    assert len(fmts) >= 2, f"the pre-fill logs {len(fmts)} INFO lines, want the mode line and the row line"
+    texts = [f[len("%s: "):] if f.startswith("%s: ") else f for f in fmts]
+    return os.path.commonprefix(texts).rstrip()
+
+
+def callback_routes_to_stdout(callback: str, marker: str) -> bool:
+    """A branch of `callback` whose condition finds `marker` in the text with strstr and whose body writes the text,
+    unchanged, to stdout."""
+    for m in re.finditer(r"if\s*\((.*?)\)\s*\{", callback, flags=re.DOTALL):
+        lits = re.findall(r'strstr\s*\(\s*\w+\s*,\s*"((?:\\.|[^"\\])*)"\s*\)', m.group(1))
+        if marker in lits and re.search(r"fputs\s*\(\s*text\s*,\s*stdout\s*\)", balanced(callback, m.end() - 1)):
+            return True
+    return False
+
+
+def test_the_tool_prints_the_lazy_range_record():
+    # A table the record defers to the storage tier is left out of the plan; the tool shows which, in the pre-fill's
+    # own words, beside the plan.
+    marker = prefill_log_marker()
+    assert marker == "lazy-range record:", f"the pre-fill's lines start {marker!r}"
+    callback = body(read(ROOT / "tools/sycl-plan-dry-run/sycl-plan-dry-run.cpp"), "log_callback")
+    assert callback_routes_to_stdout(callback, marker), (
+        f"the tool's log_callback does not write the pre-fill's '{marker}' lines to stdout unchanged"
+    )
+
+
+def test_the_route_check_sees_a_dropped_route():
+    routed = strip_comments(
+        'void log_callback(int level, const char * text) {\n'
+        '    if (std::strstr(text, "[PLAN-DRY-RUN") != nullptr'
+        ' || std::strstr(text, "lazy-range record:") != nullptr) {\n'
+        '        std::fputs(text, stdout);\n    } else if (level > 2) {\n        std::fputs(text, stderr);\n    }\n}\n'
+    )
+    assert callback_routes_to_stdout(body(routed, "log_callback"), "lazy-range record:")
+    dropped = routed.replace(' || std::strstr(text, "lazy-range record:") != nullptr', "")
+    assert not callback_routes_to_stdout(body(dropped, "log_callback"), "lazy-range record:")
+    reworded = routed.replace("std::fputs(text, stdout);", 'std::printf("table deferred\\n");')
+    assert not callback_routes_to_stdout(body(reworded, "log_callback"), "lazy-range record:")
 
 
 # ---- 6. the extraction changes no behaviour ----

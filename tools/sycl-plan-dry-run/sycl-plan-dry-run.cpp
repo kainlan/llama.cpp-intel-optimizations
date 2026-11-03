@@ -45,9 +45,11 @@ static void print_usage(FILE * out, const char * argv0) {
                  argv0);
 }
 
-// The dry run's own lines go to stdout; warnings and errors to stderr; the rest of the backend's log is dropped.
+// The dry run's own lines go to stdout, and so do the lazy-range record's, in the pre-fill's own words: a table the
+// record defers to the storage tier is left out of the plan, and its row says so beside the plan. Warnings and errors
+// go to stderr; the rest of the log is dropped.
 static void log_callback(enum ggml_log_level level, const char * text, void * /*user*/) {
-    if (std::strstr(text, "[PLAN-DRY-RUN") != nullptr) {
+    if (std::strstr(text, "[PLAN-DRY-RUN") != nullptr || std::strstr(text, "lazy-range record:") != nullptr) {
         std::fputs(text, stdout);
     } else if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
         std::fputs(text, stderr);
