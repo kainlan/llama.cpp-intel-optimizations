@@ -4475,7 +4475,7 @@ offload_phase offload_stats_phase() {
 // the offload stats.  The depth and the outermost kind are one thread-local
 // state, written only by ggml_sycl_replan_token's constructor and destructor.
 //
-// The audit of the fourteen public C entries that hold L0 (ggml-sycl.cpp), and
+// The audit of the fifteen public C entries that hold L0 (ggml-sycl.cpp), and
 // the acquisition order every one of them follows.  A lock may be taken only
 // while holding locks that are EARLIER in this list:
 //
@@ -4494,15 +4494,17 @@ offload_phase offload_stats_phase() {
 // takes no lock):
 //   TRANSACTION  set_runtime_context, set_runtime_context_for_model (the second
 //                calls the first: a same-kind nested hold)
-//   LOAD         model_load_begin, stage_load_inventory_plan, model_load_end
+//   LOAD         model_load_begin, stage_load_inventory_plan, model_load_end,
+//                plan_dry_run
 //   LIFECYCLE    model_unloaded_token, activate_model_plan,
 //                probe_runtime_context_for_model,
 //                recheck_runtime_context_flash_attn, can_unload (try-lock: it
 //                reports busy instead of waiting), complete_unload,
 //                commit_reactivate, rollback_reactivate, shutdown
-// Locks the entries take under L0: model_load_end, activate_model_plan,
-// set_runtime_context_for_model and recheck_runtime_context_flash_attn take the
-// inventory lock (2); set_runtime_context_for_model nests the binding lock and
+// Locks the entries take under L0: model_load_end, plan_dry_run,
+// activate_model_plan, set_runtime_context_for_model and
+// recheck_runtime_context_flash_attn take the inventory lock (2);
+// set_runtime_context_for_model nests the binding lock and
 // then the execution-state lock inside it (2, then 3).  No entry calls an entry
 // of another kind, so the only nesting is that same-kind one.  graph_compute and
 // the backend's execution-bound paths take no L0 (witnessed at graph_compute's
