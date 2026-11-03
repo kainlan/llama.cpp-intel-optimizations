@@ -1010,7 +1010,8 @@ thread_local bool g_allocating_cache_backing = false;
 //
 // Lock-free by design: a charge runs at the top of unified_allocate_owner with no allocator lock held, and a credit
 // runs in unified_free_record under whatever lock its caller holds, so neither may take a mutex. The stored budget
-// starts at 0, which refuses every charge until the first store.
+// starts at 0, at which host_ledger_try_charge refuses every charge until the first store. Phase (a)'s owner entry
+// passes warn_only, so its charge there logs a would-refuse WARN and is made.
 static std::atomic<size_t> g_host_ledger_committed{ 0 };
 static std::atomic<size_t> g_host_ledger_budget{ 0 };
 static std::atomic<size_t> g_host_ledger_yieldable_bytes{ 0 };

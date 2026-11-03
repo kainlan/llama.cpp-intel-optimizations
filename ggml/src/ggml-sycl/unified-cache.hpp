@@ -7673,7 +7673,9 @@ bool                      allocation_registry_test_publish_raw(void * ptr,
 //
 // The budget is stored once per load transaction, by the first host_budget_pass_scope of that transaction, and every
 // later reader loads the stored value, so the early plan, the late plan and every device's plan read one number. It
-// starts at 0: before the first store every charge is refused by name, which fails closed.
+// starts at 0: before the first store the ledger API refuses every charge by name, which fails closed. Phase (a) of
+// th32 T2 charges with warn_only at its one charge site, the owner entry, so there a charge before the first store
+// logs its would-refuse WARN and is made.
 
 // The budget's inputs, read into a local before any lock is taken (th32 §4.2). The pinned share looks each cache up by
 // device index, holding the cache lock shared for each lookup alone, and reads each pool under that pool's own mutex
