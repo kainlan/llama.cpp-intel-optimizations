@@ -375,7 +375,7 @@ host_plan_attribution host_plan_attribute(ggml_backend_sched_t   sched,
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The host holder plan: today there is none. Slots grow at dispatch and the pools size from their own graph.
+// The host holder plan.
 // ---------------------------------------------------------------------------------------------------------------
 
 const char * host_staging_kind_name(int kind) {
@@ -453,60 +453,346 @@ host_pool_dims host_pool_scan(const ggml_cgraph * graph,
     return dims;
 }
 
+namespace {
+
+void plan_merge_max(host_holder_plan & into, const host_holder_plan & from) {
+    if (into.device < 0) {
+        into.device = from.device;
+    }
+    for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
+        into.staging[k] = std::max(into.staging[k], from.staging[k]);
+    }
+    into.pools.D                 = std::max(into.pools.D, from.pools.D);
+    into.pools.K                 = std::max(into.pools.K, from.pools.K);
+    into.pools.N                 = std::max(into.pools.N, from.pools.N);
+    into.pools.host_expert_nodes = std::max(into.pools.host_expert_nodes, from.pools.host_expert_nodes);
+}
+
+// One walk's figures, gathered with no lock held, per backend context.
+struct walk_scratch {
+    const host_holder_walk_env *         env = nullptr;
+    std::map<uint64_t, host_holder_plan> plans;
+};
+
+host_holder_plan & walk_plan_for(walk_scratch & w, ggml_backend_t backend, int device) {
+    host_holder_plan & p = w.plans[w.env->backend_key(backend)];
+    if (p.device < 0) {
+        p.device = device;
+    }
+    return p;
+}
+
+bool walk_in_kv_host(const host_holder_walk_env & env, const ggml_tensor * t) {
+#if defined(HOST_ZONE_PLAN_MUTANT_PREDICATE_IS_HOST)
+    // Positive control: ggml_backend_buffer_is_host as the predicate counts CPU and SYCL_Host K and misses the view,
+    // whose own buffer is NULL.
+    (void) env;
+    return t && t->buffer && ggml_backend_buffer_is_host(t->buffer);
+#else
+    return t && env.in_kv_host_buft(t);
+#endif
+}
+
+// The dispatch's own predicate (the FLASH_ATTN_EXT and SET_ROWS interceptions): attention whose K or V is in a
+// SYCL_KV_Host buffer, and a SET_ROWS into one.
+bool walk_is_host_kv_node(void * user, const ggml_tensor * node) {
+    const walk_scratch & w = *static_cast<const walk_scratch *>(user);
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        return walk_in_kv_host(*w.env, node->src[1]) || walk_in_kv_host(*w.env, node->src[2]);
+    }
+    if (node->op == GGML_OP_SET_ROWS) {
+        return walk_in_kv_host(*w.env, node);
+    }
+    return false;
+}
+
+bool walk_is_mul_mat_id(void * user, const ggml_tensor * node) {
+    (void) user;
+    return node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr;
+}
+
+int walk_staging_device(const walk_scratch & w, ggml_backend_t backend) {
+#if defined(HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE)
+    // Positive control: the notify helper's device (the SYCL_Host buft's device 0) for every slot, which leaves the
+    // dispatching device 1's slots unplanned.
+    (void) w;
+    (void) backend;
+    return 0;
+#else
+    // The device that dispatches owns the slot: the dispatch indexes its slots by ctx.device.
+    return w.env->backend_device(backend);
+#endif
+}
+
+void walk_visit_host_kv(void * user, ggml_tensor * node, ggml_backend_t backend) {
+    walk_scratch &     w = *static_cast<walk_scratch *>(user);
+    host_holder_plan & p = walk_plan_for(w, backend, walk_staging_device(w, backend));
+#if !defined(HOST_ZONE_PLAN_MUTANT_PLAN_IGNORES_SWITCH)
+    // With the host dispatch off nothing stages: the scheduler's CPU split runs demoted-layer attention, in the CPU
+    // backend's compute buffer the notify covers.
+    if (!w.env->host_dispatch_on) {
+        return;
+    }
+#endif
+    // The operands the dispatch stages, sized by the calls it makes.
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        p.staging[HOST_STAGING_Q]   = std::max(p.staging[HOST_STAGING_Q], ggml_nbytes(node->src[0]));
+        p.staging[HOST_STAGING_DST] = std::max(p.staging[HOST_STAGING_DST], ggml_nbytes(node));
+        if (node->src[3]) {
+            p.staging[HOST_STAGING_MASK] = std::max(p.staging[HOST_STAGING_MASK], ggml_nbytes(node->src[3]));
+        }
+    } else if (node->op == GGML_OP_SET_ROWS) {
+        p.staging[HOST_STAGING_VAL] = std::max(p.staging[HOST_STAGING_VAL], ggml_nbytes(node->src[0]));
+        if (node->src[1]) {
+            p.staging[HOST_STAGING_IDS] = std::max(p.staging[HOST_STAGING_IDS], ggml_nbytes(node->src[1]));
+        }
+    }
+}
+
+void walk_visit_mul_mat_id(void * user, ggml_tensor * node, ggml_backend_t backend) {
+    walk_scratch &      w      = *static_cast<walk_scratch *>(user);
+    const int           device = w.env->backend_device(backend);
+    host_holder_plan &  p      = walk_plan_for(w, backend, device);
+    const ggml_tensor * src0   = node->src[0];
+#if defined(HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST)
+    // Positive control: the buffer gate. SYCL_Mapped is is_host, so every expert of a mapped load would plan the
+    // pools, device-placed ones included.
+    if (!(src0->buffer && ggml_backend_buffer_is_host(src0->buffer))) {
+        return;
+    }
+#else
+    // Placement's executor fact, the one the dispatch's CPU-island gate routes on, never the buffer.
+    bool         known = false;
+    const char * cause = nullptr;
+    const bool   host  = w.env->host_experts && w.env->host_experts(src0, device, &known, &cause);
+    if (!known) {
+        GGML_LOG_WARN("[HOST-ARENA] DEVICE pools dev=%d %s: placement unknown (%s)\n", device, src0->name,
+                      cause ? cause : "no placement plan");
+        return;
+    }
+    if (!host) {
+        return;
+    }
+#endif
+    host_pool_dims_add(p.pools, node);
+}
+
+}  // namespace
+
 void host_holder_plans::begin(const uint64_t * keys, size_t n) {
-    (void) keys;
-    (void) n;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < n; ++i) {
+        entry & e       = entries_[keys[i]];
+        e.pending       = host_holder_plan{};
+        e.pending_valid = true;
+    }
 }
 
 host_plan_attribution host_holder_plans::walk(ggml_backend_sched_t         sched,
                                               ggml_cgraph *                graph,
                                               const host_holder_walk_env & env) {
-    (void) sched;
-    (void) graph;
-    (void) env;
-    return host_plan_attribution{};
+    walk_scratch w;
+    w.env = &env;
+#if defined(HOST_ZONE_PLAN_MUTANT_PLAN_IGNORES_SWITCH)
+    const bool staging_planned = true;
+#else
+    const bool staging_planned = env.host_dispatch_on;
+#endif
+    // The host-KV attention nodes and the MUL_MAT_ID nodes, attributed by the scheduler's live split. The callbacks run
+    // here with no lock of this object held: the placement fact takes the inventory's own lock.
+    const host_plan_tensor_backend lookup =
+        env.tensor_backend ? env.tensor_backend : ggml_backend_sched_get_tensor_backend;
+    const host_plan_attribution a = attribute_with(lookup, sched, graph, env.is_target, walk_is_host_kv_node,
+                                                   walk_visit_host_kv, &w, /*warn_zero=*/staging_planned);
+    (void) attribute_with(lookup, sched, graph, env.is_target, walk_is_mul_mat_id, walk_visit_mul_mat_id, &w,
+                          /*warn_zero=*/false);
+    if (!staging_planned && !staging_off_warned_.exchange(true)) {
+        GGML_LOG_WARN("[ATTN-HOST] staging not planned (host dispatch off)\n");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto & kv : w.plans) {
+        entry & e = entries_[kv.first];
+#if defined(HOST_ZONE_PLAN_MUTANT_WALK_TG_REPLACES_PP)
+        // Positive control: a later walk of the same reserve replaces what an earlier one recorded, so the tg walk's
+        // 1-token figures overwrite the pp walk's.
+        e.pending = kv.second;
+#else
+        if (!e.pending_valid) {
+            e.pending = host_holder_plan{};
+        }
+        plan_merge_max(e.pending, kv.second);
+#endif
+        e.pending_valid = true;
+    }
+    return a;
 }
 
 bool host_holder_plans::commit(uint64_t key, int * device_out, int * previous_out) {
-    (void) key;
+    host_holder_device_state state;
+    int                      device   = -1;
+    int                      previous = -1;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = entries_.find(key);
+        if (it == entries_.end() || !it->second.pending_valid) {
+            if (device_out) {
+                *device_out = -1;
+            }
+            if (previous_out) {
+                *previous_out = -1;
+            }
+            return false;
+        }
+        entry & e = it->second;
+        if (e.committed_valid) {
+            previous = e.committed.device;
+        }
+#if defined(HOST_ZONE_PLAN_MUTANT_CAPACITY_HIGH_WATER)
+        // Positive control: a high-water over every plan ever committed, so a smaller re-commit keeps the larger.
+        if (e.committed_valid && e.pending.device >= 0) {
+            plan_merge_max(e.committed, e.pending);
+        } else {
+            e.committed = e.pending;
+        }
+#else
+        e.committed = e.pending;
+#endif
+        e.committed_valid = e.committed.device >= 0;
+        e.pending         = host_holder_plan{};
+        e.pending_valid   = false;
+        device            = e.committed_valid ? e.committed.device : -1;
+    }
     if (device_out) {
-        *device_out = -1;
+        *device_out = device;
     }
     if (previous_out) {
-        *previous_out = -1;
+        *previous_out = previous;
     }
-    return false;
+    if (device >= 0) {
+        state = device_state(device);
+        GGML_LOG_INFO("[HOST-ARENA] DEVICE pools dev=%d committed D=%lld K=%lld N=%lld host_expert_nodes=%d\n", device,
+                      (long long) state.pools.D, (long long) state.pools.K, (long long) state.pools.N,
+                      state.pools.host_expert_nodes);
+        size_t total = 0;
+        for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
+            total += state.slot_bytes[k];
+        }
+        if (total > 0) {
+            GGML_LOG_INFO("[ATTN-HOST] planned staging dev=%d q=%zu dst=%zu mask=%zu val=%zu ids=%zu total=%.1f MB\n",
+                          device, state.slot_capacity[HOST_STAGING_Q], state.slot_capacity[HOST_STAGING_DST],
+                          state.slot_capacity[HOST_STAGING_MASK], state.slot_capacity[HOST_STAGING_VAL],
+                          state.slot_capacity[HOST_STAGING_IDS], to_mib(total));
+        }
+    }
+    return true;
 }
 
 void host_holder_plans::drop(uint64_t key, int * device_out) {
-    (void) key;
+    std::lock_guard<std::mutex> lock(mutex_);
+    int                         device = -1;
+    auto                        it     = entries_.find(key);
+    if (it != entries_.end()) {
+        if (it->second.committed_valid) {
+            device = it->second.committed.device;
+        }
+#if defined(HOST_ZONE_PLAN_MUTANT_CAPACITY_HIGH_WATER)
+        // Positive control: a high-water over every plan ever committed, so a dropped context's figures still size
+        // its device.
+        it->second.pending_valid = false;
+#else
+        entries_.erase(it);
+#endif
+    }
     if (device_out) {
-        *device_out = -1;
+        *device_out = device;
     }
 }
 
 host_holder_device_state host_holder_plans::device_state(int device) const {
-    (void) device;
-    return host_holder_device_state{};
+    host_holder_device_state    s;
+    std::lock_guard<std::mutex> lock(mutex_);
+    host_holder_plan            high{};
+    for (const auto & kv : entries_) {
+        const entry & e = kv.second;
+        if (!e.committed_valid || e.committed.device != device) {
+            continue;
+        }
+        s.planned = true;
+        plan_merge_max(high, e.committed);
+    }
+    for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
+        s.slot_capacity[k] = host_staging_slot_capacity(high.staging[k]);
+        s.slot_bytes[k]    = host_staging_slot_bytes(high.staging[k]);
+    }
+    s.pools = high.pools;
+    return s;
 }
 
 bool host_holder_plans::has_pending(uint64_t key) const {
-    (void) key;
-    return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto                  it = entries_.find(key);
+    return it != entries_.end() && it->second.pending_valid;
 }
 
 bool host_holder_plans::has_committed(uint64_t key) const {
-    (void) key;
-    return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto                  it = entries_.find(key);
+    return it != entries_.end() && it->second.committed_valid;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Attention host staging slots.
+// ---------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+bool slot_replace(host_staging_block & slot, int device, int kind, size_t bytes, const host_staging_allocator & alloc) {
+    host_staging_block fresh;
+    if (bytes > 0) {
+        if (!alloc.alloc || !alloc.alloc(alloc.user, device, kind, bytes, &fresh) || !fresh.ptr) {
+            return false;
+        }
+        fresh.bytes = bytes;
+        fresh.cap   = bytes - 64;
+    }
+    if (slot.ptr && alloc.release) {
+        alloc.release(alloc.user, &slot);
+    }
+    slot = fresh;
+    return true;
+}
+
+bool slot_device_ok(int device) {
+    return device >= 0 && device < host_staging_slots::max_devices;
+}
+
+}  // namespace
 
 bool host_staging_slots::apply(int                              device,
                                const host_holder_device_state & state,
                                const host_staging_allocator &   alloc) {
-    (void) device;
-    (void) state;
-    (void) alloc;
-    return true;
+    if (!slot_device_ok(device)) {
+        return false;
+    }
+    planned_[device] = state.planned;
+    bool ok          = true;
+    for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
+        host_staging_block & slot = slots_[device][k];
+        const size_t         want = state.slot_bytes[k];
+        if (slot.bytes == want) {
+            continue;
+        }
+        if (!slot_replace(slot, device, k, want, alloc)) {
+            // Left at capacity 0: its dispatch refuses by name rather than reading a slot of the wrong size.
+            if (slot.ptr && alloc.release) {
+                alloc.release(alloc.user, &slot);
+            }
+            slot = host_staging_block{};
+            ok   = false;
+        }
+    }
+    return ok;
 }
 
 void * host_staging_slots::admit(int                            device,
@@ -514,25 +800,41 @@ void * host_staging_slots::admit(int                            device,
                                  size_t                         bytes,
                                  const host_staging_allocator & alloc,
                                  attn_host_dispatch_counters *  counters) {
-    (void) counters;
-    if (device < 0 || device >= max_devices || kind < 0 || kind >= HOST_STAGING_KIND_COUNT || bytes == 0) {
+    if (!slot_device_ok(device) || kind < 0 || kind >= HOST_STAGING_KIND_COUNT || bytes == 0) {
         return nullptr;
     }
     host_staging_block & slot = slots_[device][kind];
-    if (bytes > slot.cap) {
-        host_staging_block fresh;
-        const size_t       want = host_staging_slot_bytes(bytes);
-        if (!alloc.alloc || !alloc.alloc(alloc.user, device, kind, want, &fresh) || !fresh.ptr) {
-            return nullptr;
+    if (!planned_[device]) {
+        // The pre-notify fallback: until llama_context commits a host holder plan, the slot grows at dispatch as it
+        // did before the plan existed.
+        if (!fallback_warned_[device].exchange(true)) {
+            GGML_LOG_WARN(
+                "[ATTN-HOST] staging dev=%d unplanned; slots grow at dispatch (the pre-notify fallback: no host holder "
+                "plan is committed for this device)\n",
+                device);
         }
-        fresh.bytes = want;
-        fresh.cap   = want - 64;
-        if (slot.ptr && alloc.release) {
-            alloc.release(alloc.user, &slot);
+        if (bytes > slot.cap && !slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {
+            return nullptr;  // the caller declines; the old slot, if any, stays usable
         }
-        slot = fresh;
+        return slot.ptr;
     }
-    return slot.ptr;
+    if (bytes <= slot.cap) {
+        return slot.ptr;
+    }
+#if defined(HOST_ZONE_PLAN_MUTANT_DISPATCH_GROW)
+    // Positive control: the dispatch-time grow restored, which allocates for an over-plan request instead of refusing.
+    if (slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {
+        return slot.ptr;
+    }
+#endif
+    GGML_LOG_WARN(
+        "[ATTN-HOST] staging request %zu B for kind %s exceeds the planned %zu B on device %d; declining host "
+        "dispatch\n",
+        bytes, host_staging_kind_name(kind), slot.cap, device);
+    if (counters) {
+        counters->refusal(device);
+    }
+    return nullptr;
 }
 
 void host_staging_slots::release_all(const host_staging_allocator & alloc) {
@@ -543,46 +845,97 @@ void host_staging_slots::release_all(const host_staging_allocator & alloc) {
             }
             slots_[d][k] = host_staging_block{};
         }
+        planned_[d] = false;
     }
 }
 
 size_t host_staging_slots::capacity(int device, int kind) const {
-    if (device < 0 || device >= max_devices || kind < 0 || kind >= HOST_STAGING_KIND_COUNT) {
+    if (!slot_device_ok(device) || kind < 0 || kind >= HOST_STAGING_KIND_COUNT) {
         return 0;
     }
     return slots_[device][kind].cap;
 }
 
 bool host_staging_slots::planned(int device) const {
-    (void) device;
-    return false;
+    return slot_device_ok(device) && planned_[device];
 }
 
 const host_staging_block & host_staging_slots::block(int device, int kind) const {
     static const host_staging_block none{};
-    if (device < 0 || device >= max_devices || kind < 0 || kind >= HOST_STAGING_KIND_COUNT) {
+    if (!slot_device_ok(device) || kind < 0 || kind >= HOST_STAGING_KIND_COUNT) {
         return none;
     }
     return slots_[device][kind];
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The pools.
+// ---------------------------------------------------------------------------------------------------------------
+
 void host_pools_apply_commit(int device, const host_holder_device_state & state, const host_pool_sink & sink) {
+#if defined(HOST_ZONE_PLAN_MUTANT_POOLS_INIT_ONCE)
+    // Positive control: init-once kept, so the pools stay at their first figures after a larger commit.
     (void) device;
     (void) state;
     (void) sink;
+#else
+    host_pool_dims held{};
+    if (!sink.initialized || !sink.initialized(sink.user, device, &held)) {
+        return;  // before the first initialization the commit only records
+    }
+    const host_pool_dims & want = state.pools;
+    if (held.D == want.D && held.K == want.K && held.N == want.N) {
+        return;
+    }
+    if (sink.shutdown) {
+        sink.shutdown(sink.user, device);
+    }
+    if (want.D > 0 && want.K > 0 && want.N > 0 && sink.init) {
+        sink.init(sink.user, device, want);
+    }
+    GGML_LOG_INFO("[HOST-ARENA] DEVICE pools dev=%d resized D=%lld->%lld\n", device, (long long) held.D,
+                  (long long) want.D);
+#endif
 }
 
 host_pool_init_decision host_pools_init_from_plan(int                              device,
                                                   const host_holder_device_state & state,
                                                   const host_pool_dims &           graph_needs,
                                                   host_pool_init_warnings &        warnings) {
-    (void) device;
-    (void) state;
-    (void) warnings;
     host_pool_init_decision d;
+    if (!state.planned) {
+        if (!warnings.unplanned.exchange(true)) {
+            GGML_LOG_WARN(
+                "[HOST-ARENA] DEVICE pools dev=%d unplanned; initialized from this graph's own scan (the pre-notify "
+                "fallback: no host holder plan is committed for this device)\n",
+                device);
+        }
+        d.dims = graph_needs;
+        d.init = graph_needs.D > 0 && graph_needs.K > 0 && graph_needs.N > 0;
+        return d;
+    }
+#if defined(HOST_ZONE_PLAN_MUTANT_POOLS_OWN_SCAN)
+    // Positive control: the init sized from its own graph (rev 3g), which prints nothing.
     d.dims = graph_needs;
     d.init = graph_needs.D > 0 && graph_needs.K > 0 && graph_needs.N > 0;
     return d;
+#else
+    d.dims = state.pools;
+    d.init = state.pools.D > 0 && state.pools.K > 0 && state.pools.N > 0;
+#    if !defined(HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED)
+    const bool exceeds =
+        graph_needs.D > state.pools.D || graph_needs.K > state.pools.K || graph_needs.N > state.pools.N;
+    if (exceeds && !warnings.over_plan.exchange(true)) {
+        GGML_LOG_WARN(
+            "[HOST-ARENA] DEVICE holder pinned_buffer_pool dev=%d graph needs D=%lld K=%lld N=%lld, exceeds its "
+            "planned "
+            "D=%lld K=%lld N=%lld\n",
+            device, (long long) graph_needs.D, (long long) graph_needs.K, (long long) graph_needs.N,
+            (long long) state.pools.D, (long long) state.pools.K, (long long) state.pools.N);
+    }
+#    endif
+    return d;
+#endif
 }
 
 bool host_holders_apply_device(int                            device,
@@ -593,47 +946,74 @@ bool host_holders_apply_device(int                            device,
                                const host_scratch_zone_ops &  ops,
                                const host_pool_sink &         pools,
                                bool                           host_dispatch_on) {
-    (void) device;
-    (void) plans;
-    (void) slots;
-    (void) alloc;
-    (void) ledger;
-    (void) ops;
-    (void) pools;
-    (void) host_dispatch_on;
-    return true;
+    const host_holder_device_state state = plans.device_state(device);
+    bool                           ok    = true;
+    if (ledger) {
+        size_t staging_bytes = 0;
+        if (host_dispatch_on) {
+            for (int k = 0; k < HOST_STAGING_KIND_COUNT; ++k) {
+                staging_bytes += state.slot_bytes[k];
+            }
+        }
+        // The capacity is ensured before any slot or pool allocates against it.
+        ok = ledger->holder_demand("attn_host_staging", device, staging_bytes, ops).ok && ok;
+        ok = ledger->holder_demand("pinned_buffer_pool", device, host_pool_pinned_bytes(state.pools), ops).ok && ok;
+    }
+    ok = slots.apply(device, state, alloc) && ok;
+    host_pools_apply_commit(device, state, pools);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The dispatch counter does not exist yet; the segmented sites throw without it.
+// The dispatch counter and the fail-closed helper.
 // ---------------------------------------------------------------------------------------------------------------
 
+namespace {
+
+bool counter_device_ok(int device) {
+    return device >= 0 && device < attn_host_dispatch_counters::max_devices;
+}
+
+}  // namespace
+
 void attn_host_dispatch_counters::intercept(int device, ggml_op op) {
-    (void) device;
-    (void) op;
+    if (!counter_device_ok(device)) {
+        return;
+    }
+    if (op == GGML_OP_FLASH_ATTN_EXT) {
+        fa_[device].fetch_add(1, std::memory_order_relaxed);
+    } else if (op == GGML_OP_SET_ROWS) {
+        set_rows_[device].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!first_[device].exchange(true)) {
+        GGML_LOG_WARN("[ATTN-HOST] first host dispatch dev=%d op=%s\n", device, ggml_op_name(op));
+    }
 }
 
 void attn_host_dispatch_counters::refusal(int device) {
-    (void) device;
+    if (counter_device_ok(device)) {
+        refusals_[device].fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void attn_host_dispatch_counters::print(int device) const {
-    (void) device;
+    if (!counter_device_ok(device)) {
+        return;
+    }
+    GGML_LOG_WARN("[ATTN-HOST] host dispatches dev=%d fa=%zu set_rows=%zu refusals=%zu\n", device, fa(device),
+                  set_rows(device), refusals(device));
 }
 
 size_t attn_host_dispatch_counters::fa(int device) const {
-    (void) device;
-    return 0;
+    return counter_device_ok(device) ? fa_[device].load(std::memory_order_relaxed) : 0;
 }
 
 size_t attn_host_dispatch_counters::set_rows(int device) const {
-    (void) device;
-    return 0;
+    return counter_device_ok(device) ? set_rows_[device].load(std::memory_order_relaxed) : 0;
 }
 
 size_t attn_host_dispatch_counters::refusals(int device) const {
-    (void) device;
-    return 0;
+    return counter_device_ok(device) ? refusals_[device].load(std::memory_order_relaxed) : 0;
 }
 
 void host_dispatch_fail_closed(bool                                ok,
@@ -641,14 +1021,21 @@ void host_dispatch_fail_closed(bool                                ok,
                                int                                 device,
                                const ggml_tensor *                 node,
                                const char *                        role) {
-    (void) counters;
-    (void) device;
     if (ok) {
         return;
+    }
+    // The counter line first, so it survives the failed graph.
+    if (counters) {
+        counters->print(device);
     }
     fprintf(stderr, "[SYCL] graph compute unsupported node name=%s op=%s type=%s (segmented %s)\n",
             node && node->name[0] ? node->name : "", node ? ggml_op_name(node->op) : "(null)",
             node ? ggml_type_name(node->type) : "(null)", role ? role : "?");
+#if defined(HOST_ZONE_PLAN_MUTANT_FAIL_CLOSED_ASSERTS)
+    // Positive control: the helper asserting, which kills the process instead of failing the graph.
+    GGML_ASSERT(ok && "segmented graph node refused");
+#endif
+    // A string literal: the exception stores the pointer and the catch prints what() after the unwind.
     throw ggml_sycl_fallback_error("segmented graph node refused");
 }
 
