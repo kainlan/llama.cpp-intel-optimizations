@@ -153,7 +153,9 @@ void write_planner_state(const std::vector<device_planner_state> & state) {
     }
 }
 
-// A value per device no plan of the shaped inventories publishes, so a write the dry run left behind shows.
+// A value per device no plan of the shaped inventories publishes, so a write the dry run left behind shows. Each must
+// be one its setter stores as given: the ring's setter stores the effective depth, one slot for any request, so the
+// sentinel's depth is 1 and its slot sizes carry the difference.
 std::vector<device_planner_state> sentinel_planner_state(size_t n) {
     std::vector<device_planner_state> out(n);
     for (size_t d = 0; d < n; ++d) {
@@ -163,7 +165,7 @@ std::vector<device_planner_state> sentinel_planner_state(size_t n) {
         s.ring_weight            = 5 * MiB + d;
         s.ring_act               = 256 * v;
         s.ring_out               = 512 * v;
-        s.ring_depth             = 3;
+        s.ring_depth             = 1;
         s.graph                  = { v, v, v, v, v };
         s.nonfa                  = { v, v, v };
         s.control                = { 4096 + d, true };
