@@ -8194,6 +8194,18 @@ ggml_sycl_host_zone_plan_test(host-zone-select MUTANTS
     HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND
         "llama_context's destruction order printed 2 leaked-record WARN")
 
+ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
+    HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE
+        "demand 410.0 MiB after \\(100, 10\\) then \\(300, 10\\), expected 310.0 MiB"
+    HOST_SCRATCH_DEMAND_MUTANT_PER_BACKEND
+        "a two-backend context's demand is 2400.0 MiB with grow_zone called 2 times"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW
+        "a replacing notify within capacity grew again: grow_zone called 2 times, expected 1"
+    HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0
+        "with the host buft on device 1, the notify grew device 1 0 time\\(s\\) and device 0 1"
+    HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE
+        "with the host buft on device 0, a device-1 backend's notify grew device 0 0 time\\(s\\) and device 1 1")
+
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
 
