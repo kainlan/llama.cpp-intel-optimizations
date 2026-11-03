@@ -43,12 +43,15 @@
 // Arm 2 (the census) constructs device 0's cache, configures the host zones from that plan, and makes every planned
 // WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through the
 // loader's own buffer type. That plan is arm 1's, built with the fact false, so the loader's buffer is the one a load
-// that does not map files takes, and the arm measures it on every build. Each allocation is classed by the call that
-// made it, and its owner metadata must agree with that class. Metadata separates host_weights from the HOST_COMPUTE
-// tenants; the reserve and unplanned loader residency come from one buffer type with one request shape, so between
-// those two the call alone attributes the bytes. Every byte the zone gains belongs to a named term or to unplanned
-// loader residency, which is reported on its own line; any other byte fails. The terms stay within their bytes and the
-// zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b and 3a have passed.
+// that does not map files takes, and the arm measures it on every build; the buffer must be allocated and its bytes
+// must land in WEIGHT. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 removes it: the loader then adds no SYCL_Host buffer type, so
+// there is no loader buffer to measure, and the binary exits 77 naming that leg rather than passing. Each allocation is
+// classed by the call that made it, and its owner metadata must agree with that class. Metadata separates host_weights
+// from the HOST_COMPUTE tenants; the reserve and unplanned loader residency come from one buffer type with one request
+// shape, so between those two the call alone attributes the bytes. Every byte the zone gains belongs to a named term or
+// to unplanned loader residency, which is reported on its own line; any other byte fails. The terms stay within their
+// bytes and the zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b and 3a
+// have passed.
 //
 // Arm 1b (no device) re-backs one host expert FILE_MAPPED and another CPU_OWNED on the single-device plan and asserts
 // that neither one's bytes reach host_weights, blocks or tlsf_bound, while host_weights still equals the plan's
@@ -658,8 +661,12 @@ struct weight_census {
     size_t used() const { return cache->host_zone_used(host_zone_id::WEIGHT); }
 };
 
-bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, const cache_tensors & tensors) {
+// `measured_loader` is set once the loader's buffer has been taken and measured.
+bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan,
+                                                  const cache_tensors &  tensors,
+                                                  bool &                 measured_loader) {
     std::printf("(2) census: every WEIGHT-zone byte belongs to a named term or to unplanned loader residency\n");
+    measured_loader = false;
     std::optional<sycl::device> dev_opt =
         sycl_test_require_gpu("the WEIGHT-zone census (arms 1, 1b and 3a DID run and their results stand)");
     if (!dev_opt) {
@@ -701,9 +708,11 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
     std::vector<mem_handle> held;
 
     // The SYCL_Host buffer type the loader adds to a SYCL device's list while weights are evictable: the context's
-    // output buffer and the loader's own buffer both come from it.
-    ggml_backend_buffer_type_t host_buft =
-        ggml_backend_sycl_weights_evictable() ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
+    // output buffer and the loader's own buffer both come from it. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 leaves it out;
+    // a current device with evictable weights always has one.
+    const bool                 evictable = ggml_backend_sycl_weights_evictable();
+    ggml_backend_buffer_type_t host_buft = evictable ? ggml_backend_sycl_host_buffer_type_for_device(dev0) : nullptr;
+    check(!evictable || host_buft != nullptr, "device 0 has a SYCL_Host buffer type while weights are evictable");
 
     auto take = [&](weight_class cls, const alloc_request & req) {
         const size_t before = census.used();
@@ -781,8 +790,13 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         const size_t capacity_pre = cache.host_zone_capacity(host_zone_id::WEIGHT);
         loader_buf                = take_buffer(weight_class::LOADER_RESIDENCY, host_buft, loader_requested);
         loader_grew_by            = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
+        check(loader_buf != nullptr, "the loader's SYCL_Host buffer was allocated");
     }
     const size_t loader_bytes = census.bytes(weight_class::LOADER_RESIDENCY);
+    if (host_buft != nullptr) {
+        check(loader_bytes > 0, "the loader's SYCL_Host buffer lands in WEIGHT as unplanned loader residency");
+        measured_loader = true;
+    }
 
     check_eq("WEIGHT bytes in neither a named term nor unplanned loader residency", census.unclassed_bytes, 0);
     check_eq("every WEIGHT byte gained is accounted to a class", census.used() - used_before,
@@ -792,7 +806,9 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan, c
         host_weights_bytes, t.host_weights, t.blocks * k_tlsf_grain, reserve_bytes, k_host_compute_reserve_bytes,
         t.blocks);
     if (host_buft == nullptr) {
-        std::printf("  unplanned loader_residency=0 B (the loader adds no SYCL_Host buffer type here)\n");
+        std::printf("  loader leg not run: %s\n",
+                    evictable ? "device 0 has no SYCL_Host buffer type" :
+                                "GGML_SYCL_WEIGHTS_EVICTABLE=0, so the loader adds no SYCL_Host buffer type");
     } else if (loader_buf == nullptr) {
         std::printf("  unplanned loader_residency=0 B (the loader's %zu B buffer was refused)\n", loader_requested);
     } else {
@@ -1143,7 +1159,8 @@ int main() {
     arm1b_walk_counts_only_weight_zone_backings(plan);
     const mapping_load mapping = arm3a_mapping_load_keeps_no_weight_on_sycl_host(inventory, tensors, plan);
 
-    const bool ran_census = arm2_every_weight_zone_allocation_has_a_term(plan, tensors);
+    bool       measured_loader = false;
+    const bool ran_census      = arm2_every_weight_zone_allocation_has_a_term(plan, tensors, measured_loader);
     if (ran_census) {
         arm3b_mapped_buffer_takes_no_weight_zone_bytes(mapping, inventory);
     }
@@ -1155,6 +1172,13 @@ int main() {
     }
     if (!ran_census) {
         std::printf("SKIP: arms 1, 1b and 3a passed; arms 2 and 3b need a device and proved nothing\n");
+        return SYCL_TEST_SKIP;
+    }
+    if (!measured_loader) {
+        std::printf(
+            "SKIP: every arm that ran passed, but arm 2's loader leg did not run "
+            "(GGML_SYCL_WEIGHTS_EVICTABLE=0: the loader adds no SYCL_Host buffer type), so unplanned loader "
+            "residency on a load that does not map files was not measured\n");
         return SYCL_TEST_SKIP;
     }
     std::printf("PASSED\n");
