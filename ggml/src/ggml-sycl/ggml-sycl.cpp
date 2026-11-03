@@ -18582,8 +18582,9 @@ static const char * ggml_sycl_plan_dry_run_backing_name(int backing) {
 // placement_entry_host_weight_bytes(), the per-entry figure placement_plan_host_weight_zone_terms() sizes the WEIGHT
 // zone with. Their sum and weight_host_bytes are then two figures for one set of entries, and a [PLAN-DRY-RUN-BUG]
 // WARN names a disagreement: a dense group charged on the DST basis whose host entries carry a converted dst_size is
-// how they part. th32 §4.3 decides residency per lazy table, as the joint placement's computation; this tree has no
-// lazy table, so the residency is reported per backing, and the per-table decision replaces this function.
+// how they part. th32 §4.3 decides residency per lazy table, as the joint placement's computation. This tree has lazy
+// tables, and they defer to the storage tier; what it lacks is §4.3's per-table residency decision, the plan's
+// Task 12, so the residency is reported per backing, and that decision replaces this function.
 static void ggml_sycl_plan_dry_run_residency(uint32_t                          index,
                                              const ggml_sycl::placement_plan & plan,
                                              ggml_sycl_plan_dry_run_plan &     out) {
