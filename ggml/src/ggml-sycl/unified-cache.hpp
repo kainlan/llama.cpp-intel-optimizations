@@ -2226,10 +2226,20 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
 // plan names the bytes it does not count (§10's zone check). A plan never recorded holds no chunk, so its terms stay
 // empty. Nothing is logged: the would-refuse line is the planner pass's own, and the runtime transaction re-plans on
 // every probe.
+// host_planned_bytes (th32 §4.2): the zone terms, the lazy tables' host_resident_bytes and the block ring's charge. The
+// one sum: the planner's record and a re-record both set the figure through it.
+inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
+    size_t bytes = plan.host_zone_terms.total();
+    for (const placement_lazy_table & table : plan.lazy_tables) {
+        bytes += table.host_resident_bytes;
+    }
+    return bytes + plan.block_ring_charge;
+}
+
 inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan) {
     plan.host_zone_terms =
         placement_plan_host_zone_commit_terms(plan, plan.host_zone_terms.onednn_live, plan.host_zone_terms.chunk);
-    plan.host_planned_bytes = plan.host_zone_terms.total();
+    plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
 }
 
 // The zone configuration's ledger check (th32 §4.2, §10): the pool grew from committed_before to committed_after while

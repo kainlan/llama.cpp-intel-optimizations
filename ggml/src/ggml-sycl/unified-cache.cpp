@@ -33304,25 +33304,233 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
     return false;
 }
 
-// The lazy tables' residency (th32 §4.3 step 4), decided once the zone terms are set. The interface only: every
-// carried table is recorded STORAGE with no resident bytes and no ring, whatever the pin reads; the decision follows
-// its fixtures.
+// A STORAGE row cache's resident bytes at `slots` slots (th32 §3.3, §6.3): the slab of slots x row_size in 256 MiB
+// chunks and the index row (4 B slot ids at load factor 0.75 plus one 8 B key word per slot), each allocation counted
+// at host_cpu_mapped_size, as the ledger charges it.
+static size_t lazy_row_cache_resident_bytes(size_t slots, size_t row_size) {
+    constexpr size_t chunk = 256ull << 20;
+    const size_t     slab  = slots * row_size;
+    const size_t     index = 4 * ((4 * slots + 2) / 3) + 8 * slots;
+    size_t           bytes = (slab / chunk) * host_cpu_mapped_size(chunk);
+    if (slab % chunk != 0) {
+        bytes += host_cpu_mapped_size(slab % chunk);
+    }
+    if (index != 0) {
+        bytes += host_cpu_mapped_size(index);
+    }
+    return bytes;
+}
+
+// The most slots, from `floor_slots` up to `max_slots`, whose cache stays within `bytes`. The resident bytes never
+// fall as the slots grow, so a bisection finds it; the floor is returned when even it exceeds `bytes`.
+static size_t lazy_row_cache_slots_within(size_t floor_slots, size_t max_slots, size_t row_size, size_t bytes) {
+    size_t lo = floor_slots;
+    size_t hi = std::max(floor_slots, max_slots);
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo + 1) / 2;
+        if (lazy_row_cache_resident_bytes(mid, row_size) <= bytes) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+// The device that runs a lazy table's consumer layer: the device of a dense entry of that layer placed on a device,
+// -1 when the layer's dense weights are on the host, so the CPU runs it.
+static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_layer) {
+    for (const placement_entry & e : plan.entries) {
+        if (e.layer_id == consumer_layer && e.expert_id < 0 && e.on_device) {
+            return e.target_device >= 0 ? e.target_device : plan.device_id;
+        }
+    }
+    return -1;
+}
+
+// The lazy tables' residency (th32 §4.3 step 4), decided once the zone terms are set, so their total is step 2. Step 3
+// sets aside the context envelope, a named 0 until the SYCL_Host compute buffer is a planned tenant, and host_reserve =
+// max(2 GiB, 1% of the budget). The tables are taken in ascending consumer_layer (ties to the larger table, then the
+// name). A table is HOST when its mapped body fits what the budget leaves (the planner's fit) and P3 holds with it
+// resident (MemAvailable_pre - expected_host - 5 >= 24 GiB, against everything decided before it); otherwise it is
+// STORAGE when the coverage pin makes it eligible, at its cache floor of 2 x n_ubatch x rows_per_token slots; otherwise
+// the plan refuses, naming the ring: lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live
+// ring's slot is narrower than the table's read span. After the pass the block ring is sized over the STORAGE tables
+// and charged unless the live ring holds it; the floors and the ring must fit both the budget and P3, or the plan
+// refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches' yieldable share (§6.4),
+// split in proportion to table_bytes x rows_per_token. A cold expert class refuses as cold-set-not-implemented. A
+// refused plan carries no table and no ring, and host_planned_bytes is then the zone total.
 static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                                                  const placement_kv_info & kv_info,
                                                  const ring_lease *        coverage_pin) {
-    GGML_UNUSED(coverage_pin);
+    constexpr size_t p3_floor   = 24ull << 30;            // P3: the MemAvailable a load must leave
+    constexpr size_t p3_runtime = 5ull << 30;             // 9g22's runtime allowance above expected_host
+    constexpr size_t p3_margin  = p3_floor + p3_runtime;  // expected_host + 29 GiB <= MemAvailable_pre
+    constexpr size_t envelope   = 0;                      // step 3's context envelope: no planned term exists yet
     plan.lazy_tables.clear();
-    for (const placement_lazy_table_info & info : kv_info.lazy_tables) {
-        placement_lazy_table table;
-        table.name        = info.name;
-        table.residency   = lazy_residency::STORAGE;
-        table.table_bytes = info.table_bytes;
-        plan.lazy_tables.push_back(table);
+    plan.lazy_refusal.clear();
+    plan.lazy_refusal_detail.clear();
+    plan.block_ring_qd       = 0;
+    plan.block_ring_span_max = 0;
+    plan.block_ring_need     = 0;
+    plan.block_ring_charge   = 0;
+    if (kv_info.lazy_tables.empty()) {
+        plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
+        return;
     }
+
+    const size_t   step2      = plan.host_zone_terms.total();
+    const size_t   budget     = plan.host_budget;
+    const size_t   reserve    = std::max<size_t>(2ull << 30, budget / 100);
+    const size_t   mem_pre    = kv_info.host_mem_available_pre;
+    const size_t   fit_room   = host_ledger_sat_sub(budget, host_ledger_sat_add(step2, reserve + envelope));
+    const size_t   p3_room    = host_ledger_sat_sub(mem_pre, host_ledger_sat_add(step2, p3_margin));
+    const uint64_t ring_bytes = coverage_pin != nullptr ? coverage_pin->ring_bytes() : 0;
+
+    std::vector<size_t> order(kv_info.lazy_tables.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const placement_lazy_table_info & x = kv_info.lazy_tables[a];
+        const placement_lazy_table_info & y = kv_info.lazy_tables[b];
+        if (x.consumer_layer != y.consumer_layer) {
+            return x.consumer_layer < y.consumer_layer;
+        }
+        if (x.table_bytes != y.table_bytes) {
+            return x.table_bytes > y.table_bytes;
+        }
+        return x.name < y.name;
+    });
+
+    // Each planned table's inputs, beside plan.lazy_tables, for the yieldable share and the plan lines.
+    std::vector<const placement_lazy_table_info *> table_info;
+    bool                                           any_storage = false;
+    size_t                                         used        = 0;  // the bytes decided so far: HOST bodies, floors
+
+    const auto refuse = [&](const char * reason, const std::string & detail) {
+        plan.lazy_tables.clear();
+        table_info.clear();
+        plan.block_ring_qd       = 0;
+        plan.block_ring_span_max = 0;
+        plan.block_ring_need     = 0;
+        plan.block_ring_charge   = 0;
+        plan.lazy_refusal        = reason;
+        plan.lazy_refusal_detail = detail;
+    };
+
+    if (kv_info.cold_expert_class) {
+        refuse("cold-set-not-implemented",
+               "tables=" + std::to_string(kv_info.lazy_tables.size()) +
+                   " (a cold expert class needs the joint cold-set placement, which is not implemented)");
+    }
+    for (size_t i = 0; i < order.size() && plan.lazy_refusal.empty(); ++i) {
+        const placement_lazy_table_info & info = kv_info.lazy_tables[order[i]];
+        placement_lazy_table              t;
+        t.name              = info.name;
+        t.table_bytes       = info.table_bytes;
+        t.consumer_device   = lazy_consumer_device(plan, info.consumer_layer);
+        t.cache_floor_slots = 2ull * kv_info.n_ubatch * info.rows_per_token;
+        const size_t body   = host_cpu_mapped_size(info.table_bytes);
+        const size_t with   = host_ledger_sat_add(used, body);
+        const size_t span   = lazy_block_ring_span(info.row_size);
+        if (body != 0 && with <= fit_room && with <= p3_room) {
+            t.residency           = lazy_residency::HOST;
+            t.host_resident_bytes = body;
+            used                  = with;
+        } else if (coverage_pin != nullptr && (ring_bytes == 0 || span <= ring_bytes / LAZY_BLOCK_RING_QD)) {
+            t.residency              = lazy_residency::STORAGE;
+            t.cache_slots            = t.cache_floor_slots;
+            t.host_resident_bytes    = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
+            used                     = host_ledger_sat_add(used, t.host_resident_bytes);
+            plan.block_ring_span_max = std::max(plan.block_ring_span_max, span);
+            any_storage              = true;
+        } else {
+            refuse(coverage_pin == nullptr ? "lazy-table-ring-unpinned" : "lazy-table-ring-too-narrow",
+                   "table=" + info.name + " mapped=" + std::to_string(body) + " fit_room=" + std::to_string(fit_room) +
+                       " p3_room=" + std::to_string(p3_room) + " decided=" + std::to_string(used) +
+                       " span=" + std::to_string(span) + " ring_bytes=" + std::to_string(ring_bytes));
+            break;
+        }
+        plan.lazy_tables.push_back(t);
+        table_info.push_back(&info);
+    }
+
+    if (plan.lazy_refusal.empty() && plan.block_ring_span_max != 0) {
+        plan.block_ring_qd     = LAZY_BLOCK_RING_QD;
+        plan.block_ring_need   = LAZY_BLOCK_RING_QD * plan.block_ring_span_max;
+        plan.block_ring_charge = ring_bytes >= plan.block_ring_need ? 0 : host_cpu_mapped_size(plan.block_ring_need);
+    }
+    const size_t needed = host_ledger_sat_add(used, plan.block_ring_charge);
+    if (plan.lazy_refusal.empty() && (needed > fit_room || needed > p3_room)) {
+        refuse("lazy-table-cache-below-floor",
+               "floors_and_bodies=" + std::to_string(used) + " ring_charge=" + std::to_string(plan.block_ring_charge) +
+                   " fit_room=" + std::to_string(fit_room) + " p3_room=" + std::to_string(p3_room));
+    }
+
+    if (plan.lazy_refusal.empty() && any_storage) {
+        const size_t avail  = std::min(fit_room, p3_room) - needed;
+        long double  weight = 0;
+        for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
+            if (plan.lazy_tables[i].residency == lazy_residency::STORAGE) {
+                weight += static_cast<long double>(table_info[i]->table_bytes) * table_info[i]->rows_per_token;
+            }
+        }
+        size_t given = 0;
+        for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
+            placement_lazy_table & t = plan.lazy_tables[i];
+            if (t.residency != lazy_residency::STORAGE) {
+                continue;
+            }
+            const placement_lazy_table_info & info  = *table_info[i];
+            const long double                 w     = static_cast<long double>(info.table_bytes) * info.rows_per_token;
+            size_t                            share = weight > 0 ? static_cast<size_t>(avail * (w / weight)) : 0;
+            share                                   = std::min(share, avail - given);
+            const size_t rows                       = info.row_size != 0 ? info.table_bytes / info.row_size : 0;
+            const size_t floor_res                  = t.host_resident_bytes;
+            t.cache_slots = lazy_row_cache_slots_within(t.cache_floor_slots, rows, info.row_size, floor_res + share);
+            t.host_resident_bytes = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
+            given += t.host_resident_bytes - floor_res;
+        }
+    }
+    plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
+
+    // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan.
+    size_t lazy_resident = 0;
+    size_t yieldable     = 0;
+    size_t n_host        = 0;
+    for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
+        const placement_lazy_table &      t       = plan.lazy_tables[i];
+        const placement_lazy_table_info & info    = *table_info[i];
+        const bool                        storage = t.residency == lazy_residency::STORAGE;
+        const size_t                      floor_res =
+            storage ? lazy_row_cache_resident_bytes(t.cache_floor_slots, info.row_size) : t.host_resident_bytes;
+        lazy_resident += t.host_resident_bytes;
+        yieldable += t.host_resident_bytes - floor_res;
+        n_host += storage ? 0 : 1;
+        const std::string device = t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU";
+        GGML_LOG_WARN(
+            "[PLACEMENT] lazy %s residency=%s table=%zu resident=%zu cache_slots=%zu floor_slots=%zu yieldable=%zu "
+            "consumer_layer=%d device=%s rows_per_token=%u file=%u off=%zu\n",
+            t.name.c_str(), storage ? "STORAGE" : "HOST", t.table_bytes, t.host_resident_bytes, t.cache_slots,
+            t.cache_floor_slots, t.host_resident_bytes - floor_res, info.consumer_layer, device.c_str(),
+            info.rows_per_token, info.file_index, info.file_offset);
+    }
+    const size_t planned = plan.host_planned_bytes;
+    GGML_LOG_WARN(
+        "[HOST-PLAN] lazy device=%d budget=%zu planned=%zu zones=%zu envelope=%zu lazy_resident=%zu ring=%zu "
+        "reserve=%zu leftover=%zu mem_available_pre=%zu p3_post_load=%zu yieldable=%zu tables=%zu host=%zu "
+        "storage=%zu refusal=%s%s%s\n",
+        plan.device_id, budget, planned, step2, envelope, lazy_resident, plan.block_ring_charge, reserve,
+        host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope)), mem_pre,
+        host_ledger_sat_sub(mem_pre, host_ledger_sat_add(planned, p3_runtime)), yieldable, kv_info.lazy_tables.size(),
+        n_host, plan.lazy_tables.size() - n_host, plan.lazy_refusal.empty() ? "none" : plan.lazy_refusal.c_str(),
+        plan.lazy_refusal_detail.empty() ? "" : " ", plan.lazy_refusal_detail.c_str());
 }
 
-// Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms and their
-// total, read once populate_host_zone_sizing() has set every term. The budget is an input, never read here: a load
+// Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms, and
+// host_planned_bytes, their total plus the lazy tables' terms the residency decision sets, read once
+// populate_host_zone_sizing() has set every term. The budget is an input, never read here: a load
 // passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
 // line names them. A plan whose host bytes exceed the budget logs one would-refuse WARN carrying each term and is kept
 // whole: phase (a) of th32 T2 refuses nothing. The cache supplies the live oneDNN scratch and the chunk size, which
@@ -33340,7 +33548,6 @@ static void record_host_ledger_plan(placement_plan &          plan,
     const size_t chunk               = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
     plan.host_budget                 = host_budget;
     plan.host_zone_terms             = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
-    plan.host_planned_bytes          = plan.host_zone_terms.total();
     placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);
     const host_zone_commit_terms & t = plan.host_zone_terms;
     GGML_LOG_INFO(
