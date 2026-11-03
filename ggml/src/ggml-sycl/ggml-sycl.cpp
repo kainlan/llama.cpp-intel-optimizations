@@ -53172,15 +53172,11 @@ static void ggml_backend_sycl_mapped_buffer_clear(ggml_backend_buffer_t buffer, 
 
 static ggml_backend_buffer_t ggml_backend_sycl_mapped_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                                size_t                     size) {
-    // A memory-fit pass sizes nothing and asks for a zero-size dummy; any real buffer is a file's mapping, which only
-    // ggml_backend_sycl_mapped_buffer_from_file makes.
-    if (size == 0) {
-        return ggml_backend_buffer_init(buft, {}, nullptr, 0);
-    }
+    // Core ggml_backend_buft_alloc_buffer answers a zero-size request itself, so this runs only for a real size, and a
+    // real buffer of this type is a file's mapping that only ggml_backend_sycl_mapped_buffer_from_file makes.
     GGML_ABORT(
-        "ggml_backend_buft_alloc_buffer(%s, %zu bytes): this buffer type's alloc_buffer serves only the zero-size "
-        "dummy of a memory-fit pass; a weight binds to %s only through the from-file hook, "
-        "ggml_backend_sycl_mapped_buffer_from_file",
+        "ggml_backend_buft_alloc_buffer(%s, %zu bytes): this buffer type allocates nothing; a weight binds to %s only "
+        "through the from-file hook, ggml_backend_sycl_mapped_buffer_from_file",
         ggml_backend_buft_name(buft), size, ggml_backend_buft_name(buft));
 }
 

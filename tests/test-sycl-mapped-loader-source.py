@@ -65,8 +65,8 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
   L11. the preload serves a SYCL_Mapped source in place: register_host_aos_expert and the host-planned dense copy (the
       m-7 row) take the mapping's owner (ggml_sycl_mapped_buffer_owner) instead of copying;
   L12. the SYCL_Mapped buft: its own get_name ("SYCL_Mapped"), is_host, listed by supports_buft; set_tensor and
-      memset_tensor abort naming the tensor, clear naming the buffer's size; alloc_buffer returns a dummy for 0 and
-      aborts otherwise, naming itself and the from-file hook;
+      memset_tensor abort naming the tensor, clear naming the buffer's size; alloc_buffer aborts unconditionally (core
+      answers a zero-size request first), naming the core entry point and the from-file hook;
       init_tensor registers the host weight; get_max_size takes the device from the buft;
   L13. mapped_buffer_from_file builds on the C2 primitives: file_mapping_segments, unified_allocate_file_mapping,
       WILLNEED and RANDOM advice, and the lock under the plan's host_mapped_locked, refusing where the tier is absent or
@@ -608,8 +608,10 @@ def clause_l12_mapped_buft(t: dict) -> list:
         elif fn != "clear" and "tensor->name" not in body:
             problems.append(f"SYCL_Mapped's {fn} abort does not name the tensor")
     alloc = body_of(gs, r"static\s+ggml_backend_buffer_t\s+ggml_backend_sycl_mapped_buffer_type_alloc_buffer\s*\(")
-    if not re.search(r"if\s*\(\s*size\s*==\s*0\s*\)", alloc) or "GGML_ABORT(" not in alloc:
-        problems.append("SYCL_Mapped's alloc_buffer does not return a dummy for 0 and abort otherwise")
+    # Core answers a zero-size request before it calls the buft, so the body has no branch and no return: any path
+    # that does not abort would hand out a buffer that is not a file's mapping.
+    if "GGML_ABORT(" not in alloc or re.search(r"\breturn\b|\bif\s*\(", alloc):
+        problems.append("SYCL_Mapped's alloc_buffer does not abort unconditionally")
     elif "ggml_backend_buft_alloc_buffer" not in alloc or "ggml_backend_sycl_mapped_buffer_from_file" not in alloc:
         problems.append("SYCL_Mapped's alloc_buffer abort does not name the entry point and the from-file hook")
     init = body_of(gs, r"static\s+enum\s+ggml_status\s+ggml_backend_sycl_mapped_buffer_init_tensor\s*\(")
@@ -918,13 +920,14 @@ MUTANTS = [
     ("register_host_aos_expert's in-place test is false", "L11",
      lambda t: _mut(t, GS, r"!\s*tensor_source_is_device\s*&&\s*"
                            r"(ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer)", r"false && \1")),
-    ("SYCL_Mapped's alloc_buffer drops the zero-size branch", "L12",
-     lambda t: _mut(t, GS, MAPPED_ALLOC_BODY_RE + r"if\s*\(\s*size\s*==\s*0\s*\)", r"\1if (false)")),
+    ("SYCL_Mapped's alloc_buffer returns a zero-size dummy before aborting", "L12",
+     lambda t: _mut(t, GS, MAPPED_ALLOC_BODY_RE + r"(GGML_ABORT\s*\()",
+                    r"\1if (size == 0) { return ggml_backend_buffer_init(buft, {}, nullptr, 0); } \2")),
     ("SYCL_Mapped's alloc_buffer warns instead of aborting", "L12",
      lambda t: _mut(t, GS, MAPPED_ALLOC_BODY_RE + r"GGML_ABORT\s*\(", r"\1GGML_LOG_WARN(")),
     ("SYCL_Mapped's alloc_buffer abort stops naming the from-file hook", "L12",
-     lambda t: _mut(t, GS, r'("dummy of a memory-fit pass; a weight binds to %s only through the from-file hook, "\s*)'
-                           r'"ggml_backend_sycl_mapped_buffer_from_file"', r'\1"the loader"')),
+     lambda t: _mut(t, GS, r'("through the from-file hook, )ggml_backend_sycl_mapped_buffer_from_file"',
+                    r'\1the loader"')),
     ("SYCL_Mapped drops is_host", "L12",
      lambda t: _mut(t, GS, r"per_device\s*\[\s*i\s*\]\s*\.\s*iface\s*\.\s*is_host\s*=[^;]*;", "")),
     ("SYCL_Mapped's is_host is null", "L12",
