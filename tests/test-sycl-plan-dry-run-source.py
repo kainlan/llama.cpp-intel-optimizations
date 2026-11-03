@@ -16,7 +16,9 @@ cannot see:
    cache construction, no backend or queue initialisation, no write of the inventory globals; the shared helpers store
    nothing either;
 4. the export refuses an open load or a live model before it samples, samples the host and computes the budget before
-   it takes the inventory lock, and is declared, versioned and reachable through the proc table;
+   it takes the inventory lock, and is declared, versioned and reachable through the proc table; the plans say, on
+   one [PLAN-DRY-RUN] line gated on a device whose existing cache has no active arena, that the arena's zone
+   reservations are not modelled;
 5. libllama shares the early plan's inventory builder and the lazy-record pre-fill between the load and the header
    read, and the header read loads no tensor and opens no load; the tool resolves the export through the registry and
    includes no backend internals;
@@ -295,6 +297,53 @@ def test_the_export_refuses_then_samples_then_locks():
     assert 0 <= busy < sample, "the export samples before it refuses an open load"
     assert 0 <= sample < budget, "the export does not compute the budget from its sample"
     assert lock < 0 or budget < lock, "the export samples the host while it holds the inventory lock"
+
+
+# The planners subtract the arena's zone reservations only on a device whose cache has an active arena, and the dry
+# run creates no cache, so where none is active its device share is an upper bound and its host terms a lower bound.
+ARENA_CAVEAT = "arena zone reservations not modelled: device share is an upper bound, host terms a lower bound"
+
+
+def arena_caveat_printed(text: str) -> bool:
+    """A log call whose format, its adjacent literals joined, starts with the caveat, after a member call of
+    arena_active on a cache from get_existing_unified_cache_for_device."""
+    joined = re.sub(r'"\s+"', "", text)
+    m = re.search(r'GGML_LOG_(?:INFO|WARN)\s*\(\s*"\[PLAN-DRY-RUN\] ' + re.escape(ARENA_CAVEAT), joined)
+    if m is None:
+        return False
+    head = joined[: m.start()]
+    return member_calls(head, "arena_active") and calls(head, "get_existing_unified_cache_for_device")
+
+
+def test_the_dry_run_says_when_arena_reservations_are_not_modelled():
+    plans = body(sycl_cpp(), "ggml_sycl_plan_dry_run_plans")
+    assert arena_caveat_printed(plans), (
+        f"ggml_sycl_plan_dry_run_plans does not print '[PLAN-DRY-RUN] {ARENA_CAVEAT}' for a device with no active arena"
+    )
+
+
+def test_the_arena_caveat_check_sees_a_dropped_reworded_or_ungated_line():
+    printed = strip_comments(
+        "static int ggml_sycl_plan_dry_run_plans(int n) {\n"
+        "    std::string no_arena;\n"
+        "    for (int i = 0; i < n; ++i) {\n"
+        "        const auto * cache = ggml_sycl::get_existing_unified_cache_for_device(i);\n"
+        "        if (cache == nullptr || !cache->arena_active()) { no_arena += \" x\"; }\n"
+        "    }\n"
+        "    if (!no_arena.empty()) {\n"
+        '        GGML_LOG_INFO("[PLAN-DRY-RUN] arena zone reservations not modelled: device share is an upper bound, "\n'
+        '                      "host terms a lower bound (no active arena on device%s)\\n", no_arena.c_str());\n'
+        "    }\n"
+        "    return n;\n"
+        "}\n"
+    )
+    assert arena_caveat_printed(body(printed, "ggml_sycl_plan_dry_run_plans"))
+    dropped = re.sub(r"GGML_LOG_INFO\(.*?\);", "", printed, flags=re.DOTALL)
+    assert not arena_caveat_printed(body(dropped, "ggml_sycl_plan_dry_run_plans"))
+    reworded = printed.replace("an upper bound", "a bound")
+    assert not arena_caveat_printed(body(reworded, "ggml_sycl_plan_dry_run_plans"))
+    ungated = printed.replace("!cache->arena_active()", "false")
+    assert not arena_caveat_printed(body(ungated, "ggml_sycl_plan_dry_run_plans"))
 
 
 def test_the_export_is_declared_versioned_and_in_the_proc_table():

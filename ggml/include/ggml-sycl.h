@@ -1900,8 +1900,11 @@ GGML_BACKEND_API enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_r
 //
 // It is for a process with no model loaded and no load open: an open load or a live model is refused with LOAD_BUSY,
 // before anything is sampled. A cache that already exists is read (its arena zones, its live oneDNN scratch), never
-// created; with none, a device plans against its budget authority's fresh answer. An explicit micro-batch above the
-// load's planning shape (inventory->n_ubatch_context) is not modelled: every plan is the planning-shape plan.
+// created; with none, a device plans against its budget authority's fresh answer. The planners subtract the arena's
+// zone reservations only on a device whose cache has an active arena, so on a device without one the plan's device
+// share is an upper bound and its host terms a lower bound, and one [PLAN-DRY-RUN] line says so. An explicit
+// micro-batch above the load's planning shape (inventory->n_ubatch_context) is not modelled: every plan is the
+// planning-shape plan.
 
 #define GGML_SYCL_PLAN_DRY_RUN_VERSION     1
 #define GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES 16

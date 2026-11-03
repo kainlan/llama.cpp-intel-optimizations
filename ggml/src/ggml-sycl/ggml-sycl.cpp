@@ -18732,6 +18732,23 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     const int  n_experts    = static_cast<int>(inventory->n_expert);
     const int  n_exposed    = std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES);
     const bool multi_device = ggml_sycl_plan_multi_device();
+
+    // The planners subtract the arena's SCRATCH, ONEDNN and RUNTIME reservations only on a device whose cache has an
+    // active arena, and the dry run creates no cache. Where none is active the plan packs more weight onto the device
+    // than a load would, and leaves less on the host.
+    std::string no_arena;
+    for (int i = 0; i < n_exposed; ++i) {
+        const ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(i);
+        if (cache == nullptr || !cache->arena_active()) {
+            no_arena += " " + std::to_string(i);
+        }
+    }
+    if (!no_arena.empty()) {
+        GGML_LOG_INFO(
+            "[PLAN-DRY-RUN] arena zone reservations not modelled: device share is an upper bound, host terms a lower "
+            "bound (no active arena on device%s)\n",
+            no_arena.c_str());
+    }
     for (int i = 0; i < n_exposed; ++i) {
         (void) ggml_sycl_inventory_publish_planner_inputs(i, inventory);
         size_t free_mem = 0, total_mem = 0;

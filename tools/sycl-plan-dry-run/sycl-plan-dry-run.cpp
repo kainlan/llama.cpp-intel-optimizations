@@ -2,7 +2,9 @@
 // the model (th32 §4.2 "One source for the number"). It reads the GGUF header only, builds the load's early inventory
 // through the load's own builder, and hands it to the SYCL backend's plan dry run, which plans it through the planner
 // the load's stage calls and stores nothing. The SYCL backend is initialised (the planner reads device info), but no
-// model, context, cache or buffer is created.
+// model, context, cache or buffer is created. With no cache there is no active arena, and the planners subtract the
+// arena's zone reservations only with one, so each plan's device share is an upper bound and its host terms a lower
+// bound; the printout carries a line that says so.
 //
 // It plans the EARLY inventory: the one the load plans before create_tensor, every tensor of the file but the lazy
 // rows the record defers to the storage tier. The dry run plans that inventory because it is the one the load's own
