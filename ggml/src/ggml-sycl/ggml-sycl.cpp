@@ -12708,6 +12708,14 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // teardown -- like MID_LOAD_REPLAN -- runs on the same thread that owns
     // this cache's contents, not from an arbitrary other thread.
     ggml_sycl_moe_ids_cache_new_graph();
+    // The MODEL boundary (§4.4 "Lifetimes"): the model's device weight buffers went in pimpl.reset() before this hook,
+    // and its host-registered weight extras and graph leases just above, so no MODEL row it owns may remain. Not at a
+    // weight buffer's free_buffer: one model's weights span several weight buffers that share its model id, and a
+    // host-registered expert's extra is in no device buffer at all.
+    if (owner.model.value != 0) {
+        ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL,
+                                                       { ggml_sycl::alloc_owner_kind::MODEL, owner.model.value });
+    }
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
     ggml_sycl_erase_weight_identities_for_owner(owner);
@@ -52660,6 +52668,8 @@ static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_ki
     switch (kind) {
         case ggml_sycl_host_buft_kind::HOST:
             if (g_sycl_in_model_load.load(std::memory_order_acquire)) {
+                // Accepted deviation from §4.4's MODEL owner: this MODEL row carries its buffer's BUFFER owner and is
+                // checked at that buffer's free_buffer, the model's weight buffer whose free releases it.
                 intent.role     = ggml_sycl::alloc_role::WEIGHT;
                 intent.lifetime = ggml_sycl::alloc_lifetime::MODEL;
             } else {
@@ -83726,6 +83736,7 @@ static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_d
 static bool ggml_sycl_moe_hybrid_decode_table_allocate(sycl::queue &           queue,
                                                        int                     device,
                                                        size_t                  bytes,
+                                                       uint64_t                model_id,
                                                        ggml_sycl::mem_handle * out) {
     ggml_sycl::alloc_request req{};
     req.queue                               = &queue;
@@ -83735,8 +83746,10 @@ static bool ggml_sycl_moe_hybrid_decode_table_allocate(sycl::queue &           q
     req.intent.category                     = ggml_sycl::runtime_category::EXPERT_CACHE;
     req.intent.cohort_id                    = "moe_hybrid_decode_table";
     // Held by the weight's tensor extra, so it lives as long as the model's weight: MODEL, never counted at the
-    // SCRATCH graph boundary (§4.4 "Lifetimes").
+    // SCRATCH graph boundary (§4.4 "Lifetimes"). The owner is the model whose weight the extra is, checked at that
+    // model's slot release (ggml_sycl_release_model_slot_resources).
     req.intent.lifetime                     = ggml_sycl::alloc_lifetime::MODEL;
+    req.intent.owner                        = { ggml_sycl::alloc_owner_kind::MODEL, model_id };
     req.intent.constraints.must_host_pinned = true;
     ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
     if (!allocation) {
@@ -83892,7 +83905,7 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     sycl::queue & queue = *ctx.stream();
     if (!all_host) {
         if (!ggml_sycl_moe_hybrid_decode_table_allocate(queue, device, record->n_as * sizeof(const void *),
-                                                        &record->table)) {
+                                                        extra->model_id, &record->table)) {
             return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;
         }
         const void ** table = static_cast<const void **>(record->table.resolve().ptr);

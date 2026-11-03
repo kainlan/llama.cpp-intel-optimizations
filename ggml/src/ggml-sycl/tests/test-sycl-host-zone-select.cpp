@@ -8,6 +8,7 @@
 //   HOST_ZONE_PLAN_MUTANT_OWNER_BY_LIFETIME        (host-zone-plan.cpp) the owner check keyed by lifetime alone
 //   HOST_ZONE_PLAN_MUTANT_DEVICE_CHECK_EVERY_FREE  (host-zone-plan.cpp) the DEVICE check at every backend free
 //   HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND (this file) the buffer-owned check moved to backend destruction
+//   HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE (this file) the MODEL check at the first weight buffer's free
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -144,6 +145,16 @@ struct fake_registry {
         }
     }
 
+    // Releases the one row of `owner` that is `bytes` long: one extra's allocation, where several share an owner.
+    void release_row(alloc_owner_ref owner, size_t bytes) {
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i].owner.kind == owner.kind && rows[i].owner.id == owner.id && rows[i].bytes == bytes) {
+                rows.erase(rows.begin() + (long) i);
+                return;
+            }
+        }
+    }
+
     size_t check(alloc_lifetime lt, alloc_owner_ref owner, bool strict = false) const {
         return host_zone_owner_boundary_check(rows.data(), rows.size(), lt, owner, strict);
     }
@@ -257,6 +268,60 @@ void test_other_owner_does_not_fire() {
               model_n);
 }
 
+// The MODEL boundary (§4.4 "Lifetimes"): a decode table is owned by its weight's model id, and its extra is released
+// in one of two places: a device weight buffer's free_buffer releases its own tensors' extras, and the model's slot
+// release releases the host-registered weight extras. A model's weights span several weight buffers, so the check
+// runs once, at the slot release, after both.
+void test_model_boundary_at_slot_release() {
+    const alloc_owner_ref model_5{ alloc_owner_kind::MODEL, 5 };
+    const alloc_owner_ref model_6{ alloc_owner_kind::MODEL, 6 };
+    {
+        fake_registry reg;
+        reg.add(host_zone_id::SCRATCH, alloc_lifetime::MODEL, model_5, "moe_hybrid_decode_table", 1024);  // buffer 1
+        reg.add(host_zone_id::SCRATCH, alloc_lifetime::MODEL, model_5, "moe_hybrid_decode_table", 2048);  // buffer 2
+        reg.add(host_zone_id::SCRATCH, alloc_lifetime::MODEL, model_5, "moe_hybrid_decode_table", 3072);  // host extra
+        reg.add(host_zone_id::SCRATCH, alloc_lifetime::MODEL, model_6, "moe_hybrid_decode_table", 4096);  // live model
+        capture_begin();
+        size_t leaked = 0;
+        reg.release_row(model_5, 1024);  // weight buffer 1's free_buffer releases its extras
+#if defined(HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE)
+        // Positive control: the check at the first weight buffer's free, keyed by the model id its siblings share.
+        leaked += reg.check(alloc_lifetime::MODEL, model_5);
+#endif
+        reg.release_row(model_5, 2048);                       // weight buffer 2's
+        reg.release_row(model_5, 3072);                       // the slot release's host-registered weight extras
+        leaked += reg.check(alloc_lifetime::MODEL, model_5);  // the boundary
+        HZP_CHECK(leaked == 0 && !log_has("[HOST-ZONE] leaked"),
+                  "the MODEL boundary printed %zu leaked-record WARN(s) for a model whose rows all went with its "
+                  "extras",
+                  leaked);
+    }
+    {
+        // A decode table whose extra no release reached: the boundary names it, and not the other model's.
+        fake_registry reg;
+        reg.add(host_zone_id::SCRATCH, alloc_lifetime::MODEL, model_5, "moe_hybrid_decode_table", 1024);
+        reg.add(host_zone_id::SCRATCH, alloc_lifetime::MODEL, model_6, "moe_hybrid_decode_table", 4096);
+        capture_begin();
+        const size_t n = reg.check(alloc_lifetime::MODEL, model_5);
+        HZP_CHECK(n == 1 && log_has("[HOST-ZONE] leaked MODEL record: moe_hybrid_decode_table 1024 owner=model/5") &&
+                      !log_has("owner=model/6"),
+                  "a leaked decode table at its model's slot release printed %zu leaked-record WARN(s), expected 1 "
+                  "naming model/5 only",
+                  n);
+    }
+    // Strict leases: the same leak aborts.
+    const child_result r = run_in_child([&]() {
+        fake_registry reg;
+        reg.add(host_zone_id::SCRATCH, alloc_lifetime::MODEL, model_5, "moe_hybrid_decode_table", 1024);
+        reg.check(alloc_lifetime::MODEL, model_5, /*strict=*/true);
+    });
+    HZP_CHECK(
+        r.rc == 134 && r.err.find("[HOST-ZONE] leaked MODEL record: moe_hybrid_decode_table 1024 owner=model/5") !=
+                           std::string::npos,
+        "a strict leaked decode table at its model's slot release: rc %d, expected 134; child stderr:\n%s", r.rc,
+        r.err.c_str());
+}
+
 // The strict cases: each aborts in its own process, scored on rc 134 plus the leaked-record text.
 void test_strict_aborts() {
     struct strict_case {
@@ -303,6 +368,7 @@ int main() {
     test_device_last_backend();
     test_destruction_order();
     test_other_owner_does_not_fire();
+    test_model_boundary_at_slot_release();
     test_strict_aborts();
     return finish("test-sycl-host-zone-select");
 }

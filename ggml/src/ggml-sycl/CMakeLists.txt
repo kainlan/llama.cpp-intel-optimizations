@@ -8192,7 +8192,9 @@ ggml_sycl_host_zone_plan_test(host-zone-select MUTANTS
     HOST_ZONE_PLAN_MUTANT_DEVICE_CHECK_EVERY_FREE
         "the DEVICE check fired at a non-last backend's free while a second backend is live"
     HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND
-        "llama_context's destruction order printed 2 leaked-record WARN")
+        "llama_context's destruction order printed 2 leaked-record WARN"
+    HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE
+        "the MODEL boundary printed 2 leaked-record WARN")
 
 ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
     HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE
