@@ -341,8 +341,10 @@ def clause_f6_fact_derived_once(t: dict) -> list:
     if not re.search(r"g_placement_kv_info\s*\.\s*host_weight_layout_cpu\s*=\s*"
                      r"inventory\s*->\s*host_weight_layout_cpu\s*;", pop):
         problems.append("the staging path does not copy libllama's resolved host_weight_layout_cpu")
-    readers = len(re.findall(r"\buse_mmap_resolved\b", t[GS]))
-    asserts = len(re.findall(r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)", t[GS]))
+    # A string literal is not a read: the layout static_assert's message names the field it pins.
+    code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', t[GS])
+    readers = len(re.findall(r"\buse_mmap_resolved\b", code))
+    asserts = len(re.findall(r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)", code))
     if readers - asserts != 1:
         problems.append(f"{readers - asserts} backend sites read use_mmap_resolved: the fact must be derived once")
     return problems
@@ -954,6 +956,9 @@ MUTANTS = [
     ("the fact ignores the tier", "F6",
      lambda t: _mut(t, GS, r"inventory\s*->\s*use_mmap_resolved\s*&&\s*(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)",
                     "inventory->use_mmap_resolved")),
+    ("a second backend site reads the fact", "F6",
+     lambda t: _mut(t, GS, r"(g_placement_kv_info\s*\.\s*load_maps_files\s*=[^;]*;)",
+                    r"\1 (void) inventory->use_mmap_resolved;")),
     ("planned_host_backing answers from the published plan", "F7",
      lambda t: _mut(t, GS, r"(ggml_backend_sycl_planned_host_backing\s*\(\s*const\s+char\s*\*\s*\w+\s*\)\s*\{.*?)"
                            r"ggml_sycl_bound_load_candidate\s*\(\s*\)", r"\1ggml_sycl_global_plan_owner()")),
