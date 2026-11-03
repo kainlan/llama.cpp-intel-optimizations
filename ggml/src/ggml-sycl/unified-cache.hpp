@@ -7825,11 +7825,13 @@ host_budget_sample host_ledger_sample();
 // below `committed`, which refuses the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB is the whole budget.
 size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed);
 
-// Computes against the live committed bytes and stores the result. The one writer of the stored budget besides the
-// test setter; it counts its stores, the setter does not.
+// Computes against the live committed bytes and stores the result, and stores the sample's MemAvailable beside it. The
+// one writer of the stored budget besides the test setter, which leaves the MemAvailable as it was; it counts its
+// stores, the setter does not.
 size_t host_ledger_store_budget(const host_budget_sample & sample);
 
 size_t host_ledger_budget();           // one atomic load of the stored budget
+size_t host_ledger_mem_available();    // one atomic load of the stored budget's sample MemAvailable (0: none stored)
 size_t host_ledger_committed();        // one atomic load of the committed bytes
 size_t host_ledger_yieldable_bytes();  // one atomic load of the yieldable bytes
 

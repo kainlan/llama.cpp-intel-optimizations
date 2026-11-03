@@ -17857,8 +17857,11 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // is llama.cpp-ouur.
         GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
     }
-    const bool   is_moe = g_moe_n_experts_total > 0;
-    const auto & info   = ggml_sycl_info();
+    // P3's reading (th32 §4.3 step 4): the MemAvailable of the sample this load's stored budget came from, so every
+    // plan of the load reads the one value its budget does.
+    g_placement_kv_info.host_mem_available_pre = ggml_sycl::host_ledger_mem_available();
+    const bool   is_moe                        = g_moe_n_experts_total > 0;
+    const auto & info                          = ggml_sycl_info();
     if (ggml_sycl_plan_multi_device()) {
         // P4.5: Multi-device placement
         ggml_sycl::init_shared_context_queues(info.total_gpu_count);
@@ -18791,6 +18794,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     const ggml_sycl_tensor_inventory *  inventory,
     const ggml_sycl_plan_dry_run_opts & opts,
     size_t                              host_budget,
+    size_t                              mem_available,
     uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES]) {
     std::vector<ggml_sycl::placement_plan> plans;
     if (!ggml_sycl::vram_arena_enabled()) {
@@ -18802,6 +18806,8 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // keeps the value a load would plan with.
     ggml_sycl::placement_kv_info                        kv     = g_placement_kv_info;
     ggml_sycl_inventory_fill_kv_info(kv, inventory);
+    // P3's reading is the dry run's own sample, the one its budget came from, never the ledger's stored value.
+    kv.host_mem_available_pre = mem_available;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
             "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: every plan is the load's planning shape "
@@ -18955,7 +18961,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
             std::lock_guard<std::mutex>        lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
-            plans        = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, out.device_budget_bytes);
+            plans        = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes,
+                                                        out.device_budget_bytes);
         }
         for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
             if (out.device_budget_bytes[d] != 0) {

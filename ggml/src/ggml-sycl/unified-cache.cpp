@@ -1016,11 +1016,15 @@ thread_local bool g_allocating_cache_backing = false;
 // starts at 0, at which host_ledger_try_charge refuses every charge until the first store. Phase (a)'s owner entry
 // passes warn_only, so its charge there logs a would-refuse WARN and is made.
 //
-// The committed bytes, the stored budget and the two yieldable counters publish no other data: each is read for its
-// own value alone, so the acquire, release and acq_rel orders on them order nothing else. The orders are kept as
-// documentation of intent, not relaxed. The yielder slots below are different: their handshake orders the callback.
+// The committed bytes, the stored budget, its sample's MemAvailable and the two yieldable counters publish no other
+// data: each is read for its own value alone, so the acquire, release and acq_rel orders on them order nothing else.
+// The orders are kept as documentation of intent, not relaxed. The yielder slots below are different: their handshake
+// orders the callback.
 static std::atomic<size_t> g_host_ledger_committed{ 0 };
 static std::atomic<size_t> g_host_ledger_budget{ 0 };
+// The MemAvailable of the sample the stored budget was computed from, stored by the same writer beside it, so a load's
+// P3 reading (th32 §4.3 step 4) is the same sample as its budget, once per load transaction.
+static std::atomic<size_t> g_host_ledger_mem_available{ 0 };
 static std::atomic<size_t> g_host_ledger_yieldable_bytes{ 0 };
 // The yieldable chunks behind those bytes: a yield makes at most one round per chunk counted at its first shortfall.
 static std::atomic<size_t> g_host_ledger_yieldable_chunks{ 0 };
@@ -1084,6 +1088,10 @@ size_t host_ledger_budget() {
 
 size_t host_ledger_committed() {
     return g_host_ledger_committed.load(std::memory_order_acquire);
+}
+
+size_t host_ledger_mem_available() {
+    return g_host_ledger_mem_available.load(std::memory_order_acquire);
 }
 
 size_t host_ledger_yieldable_bytes() {
@@ -1179,6 +1187,7 @@ size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t comm
 size_t host_ledger_store_budget(const host_budget_sample & sample) {
     const size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
     const size_t budget    = host_ledger_compute_budget(sample, committed);
+    g_host_ledger_mem_available.store(sample.available_bytes, std::memory_order_release);
     g_host_ledger_budget.store(budget, std::memory_order_release);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     g_test_host_ledger_stores.fetch_add(1, std::memory_order_acq_rel);

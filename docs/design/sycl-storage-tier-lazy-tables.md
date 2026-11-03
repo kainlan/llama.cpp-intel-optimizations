@@ -2483,10 +2483,14 @@ IO pool registry of §3.3 is a different object):
   rulings §M128, §M130, §M134*). `host_ledger_sample()` reads `MemAvailable` and
   the pinned share (below) into a local; `host_ledger_compute_budget(sample,
   committed)` is a pure function of them; `host_ledger_store_budget(sample)`
-  calls it and stores the result. **The order is fixed: sample, compute, store,
-  plan, publish; and the store runs once per load transaction, not once per
-  planner call or per stage call.** A load plans through
-  `ggml_backend_sycl_stage_inventory_plan`, which holds
+  calls it and stores the result, and stores the sample's `MemAvailable` in a
+  sibling atomic beside it, read by `host_ledger_mem_available()`, which
+  `compute_and_store_plan_for_inventory` copies into P3's reading
+  (`placement_kv_info::host_mem_available_pre`, §4.3 step 4), so a load's P3
+  test and its budget read one sample (the dry run reads its own). **The
+  order is fixed: sample, compute, store, plan, publish; and the store runs
+  once per load transaction, not once per planner call or per stage call.** A
+  load plans through `ggml_backend_sycl_stage_inventory_plan`, which holds
   `sycl_module_mutation_guard` and a load effect and no witnessed lock, and
   which runs twice per load (once with `early` true and once with it false),
   each run looping over every device (`ggml-sycl.cpp:16808-16826`). Each run
@@ -6503,7 +6507,7 @@ statics are not exempt: the classifier has no carve-out, and the existing
 | row | statics it adds | host file (`FILES`, `scripts/audit-sycl-static-storage.py:38-44`) |
 |---|---|---|
 | T2 | `ledger_committed`, `ledger_budget`, `yieldable_bytes` (all atomics), the per-cache yielder slot array with its in-flight counters, the PRIVATE_TESTING hook table and its store counter, the thread-local `g_allocating_charge` beside `g_allocating_owner_control`, and the thread-local depth of `host_budget_pass_scope` and the atomic `g_host_budget_stored_txn` in `ggml-sycl.cpp` | `unified-cache.cpp` (listed), `ggml-sycl.cpp` (listed) |
-| T3 | the registry (pool slot and generation), the reap list head, the registry's leaf mutex, `shut_down`, the reap-run and parked counters with their take-time snapshots, the one-shot hold hook, the `ggml-sycl.cpp` slot | `lazy-io-pool.hpp` and `lazy-io-pool.cpp` (added by T3), `ggml-sycl.cpp` (listed) |
+| T3 | the registry (pool slot and generation), the reap list head, the registry's leaf mutex, `shut_down`, the reap-run and parked counters with their take-time snapshots, the one-shot hold hook, the `ggml-sycl.cpp` slot, and the budget ledger's `MemAvailable` sibling atomic `g_host_ledger_mem_available` in `unified-cache.cpp` (§4.2) | `lazy-io-pool.hpp` and `lazy-io-pool.cpp` (added by T3), `ggml-sycl.cpp` and `unified-cache.cpp` (listed) |
 | T4 | none: each cache's chunk table is a cache member, and its yielder registers through T2's per-cache hook | none |
 | T5 | `lazy_ring_coverage_reads`, the ring-write-offset recorder, the depth table, the IO pool's queue state, the held-lease-destructor counter, the ensure hook, the `GGML_SYCL_LAZY_READ_FAULT` accessor's cache if it caches the value | `witnessed-mutex.hpp` (added by T5), `lazy-io-pool.cpp` and `ggml-sycl.cpp` (listed) |
 
