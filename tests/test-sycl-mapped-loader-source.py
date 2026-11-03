@@ -84,7 +84,8 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       for the load, naming the first such tensor and its buffer type; no function-local static keys it per process.
 
 The planner (§4.4)
-  P1. every entry-creation site in both builders derives host_backing from the fact as the plan holds it
+  P1. both builders copy the fact into the plan through placement_plan_copy_host_backing_fact, and nowhere else,
+      before any entry; every entry-creation site derives host_backing from the fact as the plan holds it
       (placement_host_backing_when_host reads plan.host_backing_maps_files, never kv_info's), and both builders mark the
       device-planned entries FILE_MAPPED before the host zones are sized;
   P2. every host-weight accumulation site in the planner passes the entry's host_backing (the per-entry group helper
@@ -766,10 +767,20 @@ def clause_p1_derivation_sites(t: dict) -> list:
             problems.append(f"{builder} does not mark its device-planned entries FILE_MAPPED")
         elif zones >= 0 and mark > zones:
             problems.append(f"{builder} marks the device-planned entries after the host zones are sized")
-        if not re.search(r"plan\s*\.\s*host_backing_maps_files\s*=\s*kv_info\s*\.\s*load_maps_files\s*;", body):
+        copy = re.search(r"placement_plan_copy_host_backing_fact\s*\(\s*plan\s*,\s*kv_info\s*\)\s*;", body)
+        first_entry = body.find("placement_host_backing_when_host(")
+        if not copy:
             problems.append(f"{builder} does not copy the fact into the plan")
-        if not re.search(r"plan\s*\.\s*host_mapped_locked\s*=", body):
-            problems.append(f"{builder} does not copy the lock into the plan")
+        elif first_entry >= 0 and copy.start() > first_entry:
+            problems.append(f"{builder} copies the fact after it derives an entry's backing")
+        if re.search(r"plan\s*\.\s*(host_backing_maps_files|host_mapped_locked)\s*=", body):
+            problems.append(f"{builder} writes the fact itself instead of through the one copy helper")
+    helper = body_of(ucc, r"static\s+void\s+placement_plan_copy_host_backing_fact\s*\(")
+    if not re.search(r"plan\s*\.\s*host_backing_maps_files\s*=\s*info\s*\.\s*load_maps_files\s*;", helper):
+        problems.append("placement_plan_copy_host_backing_fact does not copy the fact into the plan")
+    if not re.search(r"plan\s*\.\s*host_mapped_locked\s*=\s*info\s*\.\s*load_maps_files\s*&&\s*info\s*\.\s*"
+                     r"load_locks_files\s*;", helper):
+        problems.append("placement_plan_copy_host_backing_fact does not lock only a mapping load")
     rule = body_of(ucc, r"static\s+placement_host_backing\s+placement_host_backing_when_host\s*\(")
     for needle in ("host_weight_layout_cpu", "placement_host_backing::CPU_OWNED",
                    "placement_host_backing::FILE_MAPPED", "placement_host_backing::PINNED"):
@@ -982,6 +993,11 @@ MUTANTS = [
     ("a ninth resolve_or_host caller", "C1",
      lambda t: _mut(t, BINBCAST, r"(\bggml_sycl_resolve_or_host_tensor_ptr\s*\()",
                     r"ggml_sycl_resolve_or_host_tensor_ptr(nullptr, 0); \1")),
+    ("one builder skips the fact copy", "P1",
+     lambda t: _mut(t, UCC, r"(placement_plan\s+plan\s*;\s*)placement_plan_copy_host_backing_fact\s*\(\s*plan\s*,\s*"
+                            r"kv_info\s*\)\s*;", r"\1")),
+    ("the fact copy locks a load that maps nothing", "P1",
+     lambda t: _mut(t, UCC, r"(plan\s*\.\s*host_mapped_locked\s*=\s*)info\s*\.\s*load_maps_files\s*&&\s*", r"\1")),
     ("one builder's dense site keeps the PINNED default", "P1",
      lambda t: _mut(t, UCC, r"entry\s*\.\s*host_backing\s*=\s*placement_host_backing_when_host\s*\([^;]*;", ";")),
     ("the backing rule reads kv_info's fact instead of the plan's copy", "P1",

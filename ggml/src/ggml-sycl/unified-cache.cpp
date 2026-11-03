@@ -32673,6 +32673,13 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     return terms;
 }
 
+// The load's fact onto the plan (design 5efe §4.4), the one place either builder copies it, before it makes any entry.
+// The lock follows the mapping: a load that maps nothing locks nothing.
+static void placement_plan_copy_host_backing_fact(placement_plan & plan, const placement_kv_info & info) {
+    plan.host_backing_maps_files = info.load_maps_files;
+    plan.host_mapped_locked      = info.load_maps_files && info.load_locks_files;
+}
+
 // A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
 // the fact onto the plan before any entry is made, and every reader, this rule included, asks the plan. Without the
 // fact every backing is PINNED, today's. With it a routed expert is served in place from the mapping (host experts are
@@ -34089,11 +34096,10 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_envelope_fa_name(envelope->flash_attn_type));
     }
     placement_plan plan;
+    placement_plan_copy_host_backing_fact(plan, kv_info);
     plan.vram_budget                         = vram_budget;
     plan.device_id                           = device_id;
     plan.multi_device                        = false;
-    plan.host_backing_maps_files             = kv_info.load_maps_files;
-    plan.host_mapped_locked                  = kv_info.load_maps_files && kv_info.load_locks_files;
     plan.vram_bytes                          = 0;
     plan.host_bytes                          = 0;
     plan.weight_vram_bytes                   = 0;
@@ -35557,10 +35563,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     const size_t n_devs = device_budgets.size();
 
     placement_plan plan;
+    placement_plan_copy_host_backing_fact(plan, kv_info);
     plan.device_id                = -1;  // Multi-device
     plan.multi_device             = true;
-    plan.host_backing_maps_files  = kv_info.load_maps_files;
-    plan.host_mapped_locked       = kv_info.load_maps_files && kv_info.load_locks_files;
     plan.vram_bytes               = 0;
     plan.host_bytes               = 0;
     plan.weight_vram_bytes        = 0;
