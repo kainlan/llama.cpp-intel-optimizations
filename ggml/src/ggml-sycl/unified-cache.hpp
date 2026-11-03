@@ -7744,7 +7744,8 @@ void host_ledger_credit(size_t bytes);
 // The yielder interface (th32 §4.2): a cache registers one callback, which frees up to `deficit` bytes of its
 // yieldable chunks, skips the chunks of `load_txn_id` when it is nonzero, credits the ledger for each free, and
 // returns the bytes it freed. A charge the callback makes never yields. It does not throw: a yield runs inside a
-// charge, which has no failure path for an exception to take.
+// charge, which has no failure path for an exception to take. A using alias, not a typedef: the static-storage audit's
+// declaration parser rejects a function-pointer typedef that carries noexcept.
 using host_ledger_yield_fn = size_t (*)(void * ctx, size_t deficit, uint64_t load_txn_id) noexcept;
 
 // Returns the slot, or -1 after logging host-yielder-slots-exhausted when every slot is taken; that cache then runs
