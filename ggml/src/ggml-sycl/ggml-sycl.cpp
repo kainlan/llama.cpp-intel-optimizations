@@ -18765,22 +18765,12 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     const int  n_exposed    = std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES);
     const bool multi_device = ggml_sycl_plan_multi_device();
 
-    // The planners subtract the arena's SCRATCH, ONEDNN and RUNTIME reservations only on a device whose cache has an
-    // active arena, and the dry run creates no cache. Where none is active the plan packs more weight onto the device
-    // than a load would, and leaves less on the host.
-    std::string no_arena;
-    for (int i = 0; i < n_exposed; ++i) {
-        const ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(i);
-        if (cache == nullptr || !cache->arena_active()) {
-            no_arena += " " + std::to_string(i);
-        }
-    }
-    if (!no_arena.empty()) {
-        GGML_LOG_INFO(
-            "[PLAN-DRY-RUN] arena zone reservations not modelled: device share is an upper bound, host terms a lower "
-            "bound (no active arena on device%s)\n",
-            no_arena.c_str());
-    }
+    // The planners subtract the arena's SCRATCH, ONEDNN and RUNTIME reservations only from the budget of a device whose
+    // cache has an active arena, and the dry run creates no cache. Where they subtract none the plan packs more weight
+    // onto the device than a load would, and leaves less on the host. Each plan is asked about the devices it packs:
+    // a multi-device plan every physical device in its budgets, by the multi-device planner's rule; a single-device
+    // plan its scheduler-visible device, by ggml_sycl_plan_single_device_budget's.
+    bool unmodelled[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES] = {};
     for (int i = 0; i < n_exposed; ++i) {
         (void) ggml_sycl_inventory_publish_planner_inputs(i, inventory);
         size_t free_mem = 0, total_mem = 0;
@@ -18798,6 +18788,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
                 }
                 if (b.device_id >= 0 && b.device_id < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES) {
                     device_budget[b.device_id] = b.vram_budget;
+                    unmodelled[b.device_id] |= !ggml_sycl::multi_device_plan_subtracts_arena(b.device_id);
                 }
             }
             const bool is_moe = n_experts > 0;
@@ -18809,9 +18800,23 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
             const size_t plan_budget =
                 forced != 0 ? forced : ggml_sycl_plan_single_device_budget(i, authority.budget_bytes);
             device_budget[i] = plan_budget;
+            const ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(i);
+            unmodelled[i] |= cache == nullptr || !cache->arena_active();
             plans.push_back(
                 ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts, host_budget));
         }
+    }
+    std::string no_arena;
+    for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
+        if (unmodelled[d]) {
+            no_arena += " " + std::to_string(d);
+        }
+    }
+    if (!no_arena.empty()) {
+        GGML_LOG_INFO(
+            "[PLAN-DRY-RUN] arena zone reservations not modelled: device share is an upper bound, host terms a lower "
+            "bound (no active arena on device%s)\n",
+            no_arena.c_str());
     }
     return plans;
 }

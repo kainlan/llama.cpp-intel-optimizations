@@ -305,14 +305,33 @@ ARENA_CAVEAT = "arena zone reservations not modelled: device share is an upper b
 
 
 def arena_caveat_printed(text: str) -> bool:
-    """A log call whose format, its adjacent literals joined, starts with the caveat, after a member call of
-    arena_active on a cache from get_existing_unified_cache_for_device."""
+    """A log call whose format, its adjacent literals joined, starts with the caveat, after the two questions it is
+    gated on: a single-device plan's, a member call of arena_active on a cache from
+    get_existing_unified_cache_for_device; and a multi-device plan's, multi_device_plan_subtracts_arena asked of the
+    device_id of each budget the plan packs (every physical device), not of a scheduler-visible index."""
     joined = re.sub(r'"\s+"', "", text)
     m = re.search(r'GGML_LOG_(?:INFO|WARN)\s*\(\s*"\[PLAN-DRY-RUN\] ' + re.escape(ARENA_CAVEAT), joined)
     if m is None:
         return False
     head = joined[: m.start()]
-    return member_calls(head, "arena_active") and calls(head, "get_existing_unified_cache_for_device")
+    single = member_calls(head, "arena_active") and calls(head, "get_existing_unified_cache_for_device")
+    loop = re.search(r"for\s*\(\s*(?:const\s+)?(?:ggml_sycl::)?device_budget\s*&\s*(\w+)\s*:\s*budgets\s*\)", head)
+    multi = loop is not None and re.search(
+        rf"(?<![\w.])(?:ggml_sycl::)?multi_device_plan_subtracts_arena\s*\(\s*{loop.group(1)}\s*\.\s*device_id\s*\)",
+        head[loop.end():]) is not None
+    return single and multi
+
+
+def test_the_multi_device_planner_and_the_caveat_ask_one_rule():
+    ucc = read(SYCL / "unified-cache.cpp")
+    planner = body(ucc, "compute_multi_device_plan")
+    assert calls(planner, "multi_device_plan_arena_cache"), (
+        "compute_multi_device_plan decides its arena subtraction without multi_device_plan_arena_cache, the rule the "
+        "dry run's caveat asks through multi_device_plan_subtracts_arena"
+    )
+    assert calls(body(ucc, "multi_device_plan_subtracts_arena"), "multi_device_plan_arena_cache"), (
+        "multi_device_plan_subtracts_arena answers from another rule than the planner's"
+    )
 
 
 def test_the_dry_run_says_when_arena_reservations_are_not_modelled():
@@ -327,11 +346,18 @@ def test_the_arena_caveat_check_sees_a_dropped_reworded_or_ungated_line():
         "static int ggml_sycl_plan_dry_run_plans(int n) {\n"
         "    std::string no_arena;\n"
         "    for (int i = 0; i < n; ++i) {\n"
-        "        const auto * cache = ggml_sycl::get_existing_unified_cache_for_device(i);\n"
-        "        if (cache == nullptr || !cache->arena_active()) { no_arena += \" x\"; }\n"
+        "        if (multi) {\n"
+        "            for (ggml_sycl::device_budget & b : budgets) {\n"
+        "                if (!ggml_sycl::multi_device_plan_subtracts_arena(b.device_id)) { no_arena += \" x\"; }\n"
+        "            }\n"
+        "        } else {\n"
+        "            const auto * cache = ggml_sycl::get_existing_unified_cache_for_device(i);\n"
+        "            if (cache == nullptr || !cache->arena_active()) { no_arena += \" x\"; }\n"
+        "        }\n"
         "    }\n"
         "    if (!no_arena.empty()) {\n"
-        '        GGML_LOG_INFO("[PLAN-DRY-RUN] arena zone reservations not modelled: device share is an upper bound, "\n'
+        '        GGML_LOG_INFO("[PLAN-DRY-RUN] arena zone reservations not modelled: "\n'
+        '                      "device share is an upper bound, "\n'
         '                      "host terms a lower bound (no active arena on device%s)\\n", no_arena.c_str());\n'
         "    }\n"
         "    return n;\n"
@@ -344,6 +370,13 @@ def test_the_arena_caveat_check_sees_a_dropped_reworded_or_ungated_line():
     assert not arena_caveat_printed(body(reworded, "ggml_sycl_plan_dry_run_plans"))
     ungated = printed.replace("!cache->arena_active()", "false")
     assert not arena_caveat_printed(body(ungated, "ggml_sycl_plan_dry_run_plans"))
+    # A multi-device plan asked about the scheduler-visible index: on a collapsed layout it names device 0 alone.
+    exposed = printed.replace("multi_device_plan_subtracts_arena(b.device_id)", "multi_device_plan_subtracts_arena(i)")
+    assert exposed != printed
+    assert not arena_caveat_printed(body(exposed, "ggml_sycl_plan_dry_run_plans"))
+    unasked = printed.replace("!ggml_sycl::multi_device_plan_subtracts_arena(b.device_id)", "false")
+    assert unasked != printed
+    assert not arena_caveat_printed(body(unasked, "ggml_sycl_plan_dry_run_plans"))
 
 
 def test_the_export_is_declared_versioned_and_in_the_proc_table():
