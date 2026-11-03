@@ -363,7 +363,7 @@ class host_staging_slots {
     // Releases the slots of every device with no committed plan: the pre-notify fallback's slots, which grow again at
     // their next dispatch. A planned device's slots stay at its plan; they go when its last plan is dropped and the
     // device is re-applied (a backend's free of a load's temporary backend, or of a context with no plan, frees here).
-    void                       release_unplanned(const host_staging_allocator & alloc);
+    void   release_unplanned(const host_staging_allocator & alloc);
     // Releases every slot (module teardown).
     void   release_all(const host_staging_allocator & alloc);
     size_t capacity(int device, int kind) const;
