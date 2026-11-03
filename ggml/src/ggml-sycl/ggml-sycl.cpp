@@ -9468,10 +9468,17 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             GGML_LOG_INFO("[MOE-MULTI-GPU] Initializing device %d for MoE expert dispatch\n", gpu_d);
 
             try {
-                if (graph_needs.K > 0 && graph_needs.N > 0 && graph_needs.D > 0) {
+                // The primary's rule: the device's committed plan when it has one, this graph's scan only under the
+                // pre-notify fallback.
+                const ggml_sycl::host_pool_init_decision pools_d = ggml_sycl::host_pools_init_from_plan(
+                    gpu_d, g_host_holder_plans->device_state(gpu_d), graph_needs, g_host_pool_init_warnings[gpu_d]);
+                if (pools_d.init) {
                     auto & pool_d = g_pinned_buffer_pools[gpu_d];
-                    pool_d.init(*ggml_sycl::get_shared_context_queue(gpu_d), gpu_d, static_cast<size_t>(graph_needs.D),
-                                static_cast<size_t>(graph_needs.K), static_cast<size_t>(graph_needs.N));
+                    pool_d.init(*ggml_sycl::get_shared_context_queue(gpu_d), gpu_d, static_cast<size_t>(pools_d.dims.D),
+                                static_cast<size_t>(pools_d.dims.K), static_cast<size_t>(pools_d.dims.N));
+                    if (pool_d.is_initialized()) {
+                        g_host_pool_held[gpu_d] = pools_d.dims;
+                    }
                 }
 
                 // Allocate malloc_host staging buffer for secondary GPU expert outputs.
