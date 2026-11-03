@@ -649,9 +649,12 @@ def clause_l12_mapped_buft(t: dict) -> list:
     if "buft->device" not in maxs:
         problems.append("SYCL_Mapped's get_max_size does not take the device from the buft")
     getter = body_of(gs, r"ggml_backend_buffer_type_t\s+ggml_backend_sycl_mapped_buffer_type_for_device\s*\(")
-    if "ggml_backend_sycl_mapped_buffer_type_name" not in getter or "is_host" not in getter:
+    if not re.search(r"ggml_sycl_per_device_buft\s*\([^;]*\bggml_sycl_mapped_buft_prototype\b", getter):
+        problems.append("the per-device SYCL_Mapped buft is not built from its own prototype")
+    proto = body_of(gs, r"static\s+ggml_backend_buffer_type\s+ggml_sycl_mapped_buft_prototype\s*\(\s*\)")
+    if "ggml_backend_sycl_mapped_buffer_type_name" not in proto or "is_host" not in proto:
         problems.append("the per-device SYCL_Mapped buft does not carry its own name and is_host")
-    elif not re.search(r"\.iface\.is_host\s*=(?!\s*nullptr\b)[^;]+;", getter):
+    elif not re.search(r"\.iface\.is_host\s*=(?!\s*nullptr\b)[^;]+;", proto):
         problems.append("the per-device SYCL_Mapped buft's is_host is not a predicate")
     return problems
 
@@ -938,6 +941,8 @@ def _mut_all(t: dict, rel: str, pattern: str, repl: str) -> dict:
 # The SYCL_Mapped alloc_buffer definition up to a point in its body: group 1 for a witness that rewrites what follows.
 MAPPED_ALLOC_BODY_RE = (r"(static\s+ggml_backend_buffer_t\s+ggml_backend_sycl_mapped_buffer_type_alloc_buffer\s*"
                         r"\([^)]*\)\s*\{.*?)")
+# The SYCL_Mapped prototype definition up to a point in its body, the same way.
+MAPPED_PROTO_RE = r"(static\s+ggml_backend_buffer_type\s+ggml_sycl_mapped_buft_prototype\s*\(\s*\)\s*\{.*?)"
 
 MUTANTS = [
     # (label, clause label prefix, builder)
@@ -1053,9 +1058,12 @@ MUTANTS = [
      lambda t: _mut(t, GS, r'("through the from-file hook, )ggml_backend_sycl_mapped_buffer_from_file"',
                     r'\1the loader"')),
     ("SYCL_Mapped drops is_host", "L12",
-     lambda t: _mut(t, GS, r"per_device\s*\[\s*i\s*\]\s*\.\s*iface\s*\.\s*is_host\s*=[^;]*;", "")),
+     lambda t: _mut(t, GS, MAPPED_PROTO_RE + r"t\s*\.\s*iface\s*\.\s*is_host\s*=[^;]*;", r"\1")),
     ("SYCL_Mapped's is_host is null", "L12",
-     lambda t: _mut(t, GS, r"(per_device\s*\[\s*i\s*\]\s*\.\s*iface\s*\.\s*is_host\s*=)[^;]*;", r"\1 nullptr;")),
+     lambda t: _mut(t, GS, MAPPED_PROTO_RE + r"(t\s*\.\s*iface\s*\.\s*is_host\s*=)[^;]*;", r"\1\2 nullptr;")),
+    ("the SYCL_Mapped getter builds from the SYCL_Host prototype", "L12",
+     lambda t: _mut(t, GS, r"(ggml_sycl_per_device_buft\s*\([^;]*)\bggml_sycl_mapped_buft_prototype\b",
+                    r"\1ggml_sycl_host_buft_prototype")),
     ("supports_buft stops listing SYCL_Mapped", "L12",
      lambda t: _mut(t, GS, r"(buft->iface\.get_name\s*==\s*ggml_backend_sycl_mapped_buffer_type_name\s*\)\s*\{\s*"
                            r"return\s+)true", r"\1false")),

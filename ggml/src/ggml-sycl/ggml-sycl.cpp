@@ -53062,6 +53062,31 @@ ggml_backend_buffer_type_t ggml_backend_sycl_cpu_activation_buffer_type() {
     return &buffer_type_cpu_activation;
 }
 
+// The per-device table behind a SYCL host-side buffer type: on first use, one copy of make_prototype()'s buffer type
+// per registered device, with that device set. The caller owns the table and its once flag, so each buffer type keeps
+// its own; the result is the slot at `index` only when that slot holds `dev` itself.
+static ggml_backend_buffer_type_t ggml_sycl_per_device_buft(
+    std::array<ggml_backend_buffer_type, GGML_SYCL_MAX_DEVICES> & per_device,
+    std::once_flag &                                              initialized,
+    ggml_backend_buffer_type (*make_prototype)(),
+    ggml_backend_reg_t reg,
+    size_t             index,
+    ggml_backend_dev_t dev) {
+    std::call_once(initialized, [&] {
+        const ggml_backend_buffer_type prototype = make_prototype();
+        const size_t count = std::min(ggml_backend_reg_dev_count(reg), (size_t) GGML_SYCL_MAX_DEVICES);
+        for (size_t i = 0; i < count; ++i) {
+            per_device[i]        = prototype;
+            per_device[i].device = ggml_backend_reg_dev_get(reg, i);
+        }
+    });
+    return per_device[index].device == dev ? &per_device[index] : nullptr;
+}
+
+static ggml_backend_buffer_type ggml_sycl_host_buft_prototype() {
+    return *ggml_backend_sycl_host_buffer_type();
+}
+
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
@@ -53078,15 +53103,7 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_ba
     }
     static std::once_flag                                              initialized;
     static std::array<ggml_backend_buffer_type, GGML_SYCL_MAX_DEVICES> per_device{};
-    std::call_once(initialized, [&] {
-        const auto   prototype = *ggml_backend_sycl_host_buffer_type();
-        const size_t count     = std::min(ggml_backend_reg_dev_count(reg), (size_t) GGML_SYCL_MAX_DEVICES);
-        for (size_t i = 0; i < count; ++i) {
-            per_device[i]        = prototype;
-            per_device[i].device = ggml_backend_reg_dev_get(reg, i);
-        }
-    });
-    return per_device[index].device == dev ? &per_device[index] : nullptr;
+    return ggml_sycl_per_device_buft(per_device, initialized, ggml_sycl_host_buft_prototype, reg, index, dev);
 }
 
 // SYCL_Mapped: host weights served in place from the model file's mapping (design 5efe §4.3). A buffer of it is one
@@ -53194,6 +53211,19 @@ static size_t ggml_backend_sycl_mapped_buffer_type_get_max_size(ggml_backend_buf
     return SIZE_MAX;
 }
 
+static ggml_backend_buffer_type ggml_sycl_mapped_buft_prototype() {
+    ggml_backend_buffer_type t{};
+    t.iface.get_name       = ggml_backend_sycl_mapped_buffer_type_name;
+    t.iface.alloc_buffer   = ggml_backend_sycl_mapped_buffer_type_alloc_buffer;
+    t.iface.get_alignment  = ggml_backend_cpu_buffer_type()->iface.get_alignment;
+    t.iface.get_max_size   = ggml_backend_sycl_mapped_buffer_type_get_max_size;
+    t.iface.get_alloc_size = ggml_backend_cpu_buffer_type()->iface.get_alloc_size;
+    // is_host: the CPU backend executes an op on a weight it holds (placement decides the executor)
+    t.iface.is_host        = ggml_backend_cpu_buffer_type()->iface.is_host;
+    t.context              = nullptr;
+    return t;
+}
+
 ggml_backend_buffer_type_t ggml_backend_sycl_mapped_buffer_type_for_device(ggml_backend_dev_t dev) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) {
@@ -53207,21 +53237,8 @@ ggml_backend_buffer_type_t ggml_backend_sycl_mapped_buffer_type_for_device(ggml_
 
     static std::once_flag                                              initialized;
     static std::array<ggml_backend_buffer_type, GGML_SYCL_MAX_DEVICES> per_device{};
-    std::call_once(initialized, [&] {
-        const size_t count = std::min(ggml_backend_reg_dev_count(reg), (size_t) GGML_SYCL_MAX_DEVICES);
-        for (size_t i = 0; i < count; ++i) {
-            per_device[i].iface.get_name       = ggml_backend_sycl_mapped_buffer_type_name;
-            per_device[i].iface.alloc_buffer   = ggml_backend_sycl_mapped_buffer_type_alloc_buffer;
-            per_device[i].iface.get_alignment  = ggml_backend_cpu_buffer_type()->iface.get_alignment;
-            per_device[i].iface.get_max_size   = ggml_backend_sycl_mapped_buffer_type_get_max_size;
-            per_device[i].iface.get_alloc_size = ggml_backend_cpu_buffer_type()->iface.get_alloc_size;
-            // is_host: the CPU backend executes an op on a weight it holds (placement decides the executor)
-            per_device[i].iface.is_host        = ggml_backend_cpu_buffer_type()->iface.is_host;
-            per_device[i].device               = ggml_backend_reg_dev_get(reg, i);
-            per_device[i].context              = nullptr;
-        }
-    });
-    return per_device[index].device == dev ? &per_device[index] : nullptr;
+    return ggml_sycl_per_device_buft(per_device, initialized, ggml_sycl_mapped_buft_prototype, reg,
+                                     static_cast<size_t>(index), dev);
 }
 
 // The FILE_MAPPED owner behind a SYCL_Mapped buffer, so a consumer that registers one of its weights takes a copy of
