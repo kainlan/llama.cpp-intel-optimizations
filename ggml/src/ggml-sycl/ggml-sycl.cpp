@@ -111476,20 +111476,14 @@ struct moe_segmented_dispatch_scope {
 // GGML_ASSERT does. It throws rather than asserting or returning: a refusal is a capability refusal, not a terminal
 // plan bug, and a return from a recording site would destroy the local command graph while the queue still records into
 // it. The throw reaches graph_compute's fallback catch, which drains, releases the cached graph state and returns
-// GGML_STATUS_FAILED. The argument is a string literal because the exception stores the pointer and the catch prints
-// what() after the unwind; the node is named in the line above it.
+// GGML_STATUS_FAILED. The print and the throw live in host_dispatch_fail_closed (host-zone-plan.cpp), the one function
+// the host-only tests and their fail-closed mutant score, so this path cannot drift from what they check. The device's
+// dispatch counter line prints first when the host dispatch is on (§4.4 "The dispatch counter").
 static void ggml_sycl_segment_forward_or_throw(ggml_backend_sycl_context & ctx, ggml_tensor * node, const char * role) {
-    if (ggml_sycl_compute_forward(ctx, node)) {
-        return;
-    }
-    // The device's dispatch counter line first, so it survives the failed graph (§4.4 "The dispatch counter").
-    if (ggml_sycl_attn_host_dispatch_enabled()) {
-        g_attn_host_dispatch_counters->print(ctx.device);
-    }
-    fprintf(stderr, "[SYCL] graph compute unsupported node name=%s op=%s type=%s (segmented %s)\n",
-            node && node->name ? node->name : "", node ? ggml_op_name(node->op) : "(null)",
-            node ? ggml_type_name(node->type) : "(null)", role);
-    throw ggml_sycl_fallback_error("segmented graph node refused");
+    const bool                                     ok = ggml_sycl_compute_forward(ctx, node);
+    const ggml_sycl::attn_host_dispatch_counters * counters =
+        ggml_sycl_attn_host_dispatch_enabled() ? g_attn_host_dispatch_counters : nullptr;
+    ggml_sycl::host_dispatch_fail_closed(ok, counters, ctx.device, node, role);
 }
 
 // Records one decode split into `slot` and runs it, so the split has executed when this returns. A run that fails
