@@ -7895,6 +7895,11 @@ struct ggml_backend_sycl_context {
     size_t                readback_staging_size = 0;
     ggml_sycl::mem_handle readback_staging_handle;
 
+    // This backend context's owner serial (docs/design/sycl-mmap-host-tier.md §4.4 "Lifetimes"): the owner its member
+    // allocations carry (CONTEXT lifetime, checked after `delete` in ggml_backend_sycl_free), and the key of its host
+    // SCRATCH demand and its host holder plan. Never 0.
+    uint64_t host_zone_owner_id = ggml_sycl::host_zone_owner_next_id();
+
     // Persistent host-pinned staging buffer for MMVQ/DMMV/MMQ weight streaming.
     // Eliminates per-token sycl::malloc_host in the mmap-source scatter-gather path.
     // Shared across all three kernel paths (only one runs at a time per context).

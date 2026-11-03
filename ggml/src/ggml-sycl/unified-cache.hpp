@@ -15,6 +15,7 @@
 #include "host-cpu-mapping.hpp"
 #include "host-reserve-env.hpp"
 #include "host-zone-kinds.hpp"
+#include "host-zone-plan.hpp"
 #include "kv-room-cost.hpp"
 #include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
@@ -5399,7 +5400,13 @@ class unified_cache {
     bool   host_zone_grow(host_zone_id zone, size_t additional_bytes);
     void   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
     bool   host_zones_configured() const;
-    void   grow_scratch_zone(size_t additional_bytes);
+    // One grow_zone(SCRATCH, request) call, the host SCRATCH demand ledger's only growth (§4.4 "Ensure capacity").
+    // Prints `[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute buffers` when it grows.
+    bool   grow_scratch_zone(size_t request_bytes);
+    // This cache's host SCRATCH demand ledger and the zone operations it ensures capacity with. `chunk_cap` is the
+    // host buffer chunk cap the demands split at (GGML_SYCL_HOST_BUFFER_CHUNK_MB). False when host zones are not
+    // configured, so there is no SCRATCH zone to ensure.
+    bool   host_scratch_ledger_ops(size_t chunk_cap, host_scratch_ledger ** ledger, host_scratch_zone_ops * ops);
 
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 
@@ -5829,6 +5836,9 @@ class unified_cache {
     // The pool is destroyed (freeing all chunks) in the unified_cache destructor.
     std::unique_ptr<ggml_sycl::sycl_device_pool>                 layout_pool_;
     std::array<size_t, static_cast<size_t>(host_zone_id::COUNT)> host_zone_reserved_bytes_{};
+    // One demand per llama_context and per DEVICE holder on this device; its mutex is a leaf (canonical contract
+    // §12.5).
+    host_scratch_ledger                                          host_scratch_ledger_;
 
     // VRAM arena data members (merged from vram_arena class).
     // Single pre-allocated VRAM block with zone-based sub-allocation.
@@ -7169,8 +7179,8 @@ struct alloc_constraints {
     // The allocation's owner outlives every graph: it is released at model or cache teardown, never by the graph that
     // first asked for it. A host-zone request carrying it goes to the WEIGHT host zone, which no graph boundary checks
     // and host_zone_settle() never settles. It must carry neither role KV nor role EXPERT_STAGING (nor be a KV spill):
-    // those choose the KV and SCRATCH zones before WEIGHT is considered, so unified_alloc_host_zone() asserts against
-    // the combination. The host STAGING and SCRATCH zones must be empty at every graph boundary, so one row that lives
+    // those choose the KV and SCRATCH zones before WEIGHT is considered, so select_zone() asserts against the
+    // combination. The host STAGING and SCRATCH zones must be empty at every graph boundary, so one row that lives
     // for the process there makes every boundary check refuse (llama.cpp-nqbe). Role alone cannot say this: CONTROL
     // also names scoped host transients, which belong in STAGING so a leaked one is still caught at the boundary. Set
     // on such a transient, the flag would hide exactly that leak, so its setters are pinned
@@ -7230,6 +7240,12 @@ struct alloc_intent {
     alloc_constraints constraints;
     const char *      site_file = __builtin_FILE();
     int               site_line = __builtin_LINE();
+    // How long the owner keeps the allocation, and who that owner is (docs/design/sycl-mmap-host-tier.md §4.4
+    // "Lifetimes"). select_zone() reads the lifetime (UNOWNED goes to WEIGHT), the graph-boundary check counts only
+    // GRAPH rows, and each other lifetime is checked at its owner's boundary. Stamped on the registry row at
+    // registration. Declared last so every positional initialiser of the fields above keeps its meaning.
+    alloc_lifetime    lifetime  = alloc_lifetime::GRAPH;
+    alloc_owner_ref   owner{};
 };
 
 struct alloc_request {
@@ -7285,6 +7301,10 @@ struct alloc_metadata {
     bool         zone_managed = false;
     bool         cache_backing = false;  // Lifecycle annotation; not part of the exact release key.
     host_zone_id host_zone    = host_zone_id::COUNT;
+    // The request's alloc_intent::lifetime and owner, stamped at registration: lifecycle annotations, not part of
+    // the exact release key.
+    alloc_lifetime  lifetime      = alloc_lifetime::GRAPH;
+    alloc_owner_ref owner{};
 
     struct exact_key {
         void *           ptr;
@@ -8784,9 +8804,31 @@ bool                    unified_cache_allocate_moe_q8_1_graph_scratch(int       
                                                                       const moe_q8_1_scratch_demand & demand,
                                                                       alloc_handle *                  out);
 
-// Grow the host SCRATCH zone to accommodate compute buffer needs.
-// Called after the ggml scheduler is created and compute buffer sizes are known.
-void unified_cache_grow_host_scratch_zone(size_t additional_bytes);
+// The host SCRATCH demand ledger of `device`'s cache (§4.4 "What the SYCL side does with it"). Every call ensures
+// capacity, a high-water mark, never an additive grow: the target is the plan's SCRATCH plus the sum of the live
+// demands, and only a deficit grows the zone. `chunk_cap` is the host buffer chunk cap. False when the device has no
+// cache or no host zones, or when a needed grow failed.
+//   ensure:  one llama_context's demand (keyed by the notifying backend context's owner serial), replacing its last.
+//   demand:  one DEVICE holder's demand, keyed by (device, holder).
+//   drop:    the context's demand, at its owner boundary, on every device; capacity is never returned.
+bool unified_cache_ensure_host_scratch_capacity(int      device,
+                                                uint64_t context_key,
+                                                size_t   compute_bytes,
+                                                size_t   output_bytes,
+                                                size_t   chunk_cap);
+bool unified_cache_host_scratch_demand(const char * holder, int device, size_t bytes, size_t chunk_cap);
+void unified_cache_host_scratch_drop_context(uint64_t context_key);
+// The ledger and zone operations of `device`'s cache, for callers that drive the ledger through host-zone-plan.hpp.
+bool unified_cache_host_scratch_ledger(int                     device,
+                                       size_t                  chunk_cap,
+                                       host_scratch_ledger **  ledger,
+                                       host_scratch_zone_ops * ops);
+
+// The owner-boundary check (§4.4 "Each lifetime keeps a leak check at its owner's boundary", §M57 (b)): every live
+// registry row with this lifetime and owner prints `[HOST-ZONE] leaked <lifetime> record: ...` at WARN, and under
+// GGML_SYCL_STRICT_LEASES=1 the check aborts once every line has printed. The rows are copied under the registry
+// mutex and reported after it is released. Returns the number of leaked rows.
+size_t unified_cache_host_zone_owner_check(alloc_lifetime lifetime, alloc_owner_ref owner);
 
 [[deprecated("use unified_allocate() with must_host_pinned + use_pinned_pool instead")]] void *
      unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);

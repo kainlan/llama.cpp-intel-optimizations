@@ -39,6 +39,7 @@ sycl_cpp = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 pool_cpp = (root / "ggml/src/ggml-sycl/pinned-pool.cpp").read_text()
+plan_cpp = (root / "ggml/src/ggml-sycl/host-zone-plan.cpp").read_text()
 env_doc = (root / "docs/backend/sycl-env-vars.md").read_text()
 
 
@@ -120,6 +121,31 @@ texts = {
     "alloc_buffer_fn": function_window(
         sycl_cpp,
         "static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,"),
+    "intent_fn": function_window(
+        sycl_cpp, "static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind kind) {"),
+    "host_max_size_fn": function_window(
+        sycl_cpp,
+        "static size_t ggml_sycl_host_buft_max_size(ggml_backend_buffer_type_t buft, int device, "
+        "ggml_sycl::host_zone_id zone) {"),
+    "host_alloc_fn": function_window(
+        sycl_cpp, "static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_t buft,"),
+    "kv_get_max_size_fn": function_window(
+        sycl_cpp, "static size_t ggml_backend_sycl_kv_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
+    "kv_alloc_buffer_fn": function_window(
+        sycl_cpp,
+        "static ggml_backend_buffer_t ggml_backend_sycl_kv_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,"),
+    "kv_buft_fn": function_window(sycl_cpp, "ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {"),
+    "hc_get_max_size_fn": function_window(
+        sycl_cpp,
+        "static size_t ggml_backend_sycl_host_compute_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
+    "hc_alloc_fn": function_window(
+        sycl_cpp,
+        "static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_backend_buffer_type_t buft,",
+        window=20000),
+    "hc_iface": statement_window(
+        sycl_cpp, "static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_type_interface = {",
+        window=700),
+    "select_zone_fn": function_window(plan_cpp, "host_zone_id select_zone(alloc_role       role,"),
     "populate_zone_sizing_fn": function_window(
         cache_cpp,
         "static void populate_host_zone_sizing(placement_plan &                           plan,",
@@ -219,73 +245,151 @@ def witness_a3(t):
     return t
 
 
-# --- B: ggml_backend_sycl_host_buffer_type_get_max_size must mirror the zone
-# unified_alloc_host_zone() (unified-cache.cpp) ACTUALLY uses for this
-# buft's requests -- WEIGHT, unconditionally, because alloc_buffer always sets
-# category=HOST_COMPUTE and unified_alloc_host_zone's WEIGHT branch is checked before any
-# role-only STAGING fallback. The old code re-derived alloc_buffer's ROLE
-# computation (in_model_load || weights_evictable) instead, which disagreed
-# with the real zone once in_model_load went false post-load.
-TARGET_ZONE_WEIGHT = "constexpr ggml_sycl::host_zone_id target_zone = ggml_sycl::host_zone_id::WEIGHT;"
-OLD_ROLE_TERNARY = "in_model_load || weights_evictable"
+# --- B: the host bufts' size and alloc share one builder (design 5efe section 7, the C4 part f clauses "The host
+# bufts' size and alloc share one builder", amending this gate). Before C4, SYCL_Host's get_max_size hard-coded
+# WEIGHT because every HOST_COMPUTE request routed there; after C4 a post-load SYCL_Host buffer is a context's and
+# routes to SCRATCH, so a get_max_size that names its own zone chunks against the wrong one (the glkg shape). Each
+# buft's get_max_size therefore builds the same intent its alloc_buffer builds and asks select_zone, on the buft's
+# own device.
+HOST_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST)"
+KV_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::KV_HOST)"
+TP_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST_COMPUTE_TP)"
+SELECT_FROM_INTENT = ("ggml_sycl::select_zone(intent.role, intent.category, intent.lifetime,\n"
+                      "                                                                  "
+                      "intent.constraints.persistent_owner, false);")
+HOST_DEVICE = "const int                     device = ggml_sycl_host_buft_device(buft);"
 
 
-def check_b_mirror(t):
-    fn = t["get_max_size_fn"]
-    return TARGET_ZONE_WEIGHT in fn and OLD_ROLE_TERNARY not in fn
+def flat_ws(text):
+    return re.sub(r"\s+", " ", text)
 
 
-def witness_b_mirror(t):
-    t["get_max_size_fn"] = t["get_max_size_fn"].replace(
-        TARGET_ZONE_WEIGHT,
-        "const ggml_sycl::host_zone_id target_zone = (in_model_load || weights_evictable) ? "
-        "ggml_sycl::host_zone_id::WEIGHT : ggml_sycl::host_zone_id::STAGING;")
+def check_b_host_builder(t):
+    size_fn, alloc_fn = t["get_max_size_fn"], t["alloc_buffer_fn"]
+    return (
+        bool(size_fn) and bool(alloc_fn)
+        and HOST_INTENT in size_fn and SELECT_FROM_INTENT in size_fn and HOST_DEVICE in size_fn
+        and "return ggml_sycl_host_buft_alloc(buft, size, " + HOST_INTENT + ");" in alloc_fn
+    )
+
+
+def witness_b_host_builder(t):
+    # SYCL_Host's get_max_size with WEIGHT hard-coded again.
+    t["get_max_size_fn"] = t["get_max_size_fn"].replace(SELECT_FROM_INTENT, "ggml_sycl::host_zone_id::WEIGHT;")
     return t
 
 
-# unified_alloc_host_zone's real precedence (unified-cache.cpp): WEIGHT branch fires on
-# role==WEIGHT OR cat==HOST_COMPUTE OR cat==EXPERT_CACHE, checked before the
-# STAGING fallback. This is the reason B's unconditional WEIGHT is correct
-# for this call site (alloc_buffer always sets category=HOST_COMPUTE) --
-# pinned so a future rewrite of unified_alloc_host_zone's precedence is forced to revisit
-# the mirror in get_max_size too.
-SELECT_ZONE_WEIGHT_BRANCH = "role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||"
-SELECT_ZONE_EXPERT_BRANCH = "cat == runtime_category::EXPERT_CACHE"
+# No host get_max_size names a zone or calls get_current_device_id(), and SYCL_Host's and SYCL_KV_Host's paths take
+# the device from ggml_sycl_host_buft_device and nowhere else (no ctx->device on those paths). The shared helper the
+# three answer through takes the zone as a parameter and names none.
+HOST_SIZE_WINDOWS = ("get_max_size_fn", "kv_get_max_size_fn", "hc_get_max_size_fn", "host_max_size_fn")
 
 
+def check_b_no_zone_no_current_device(t):
+    for key in HOST_SIZE_WINDOWS:
+        fn = t[key]
+        if not fn or "host_zone_id::" in fn or "get_current_device_id(" in fn:
+            return False
+    for key in ("get_max_size_fn", "alloc_buffer_fn", "kv_get_max_size_fn", "kv_alloc_buffer_fn", "host_alloc_fn"):
+        fn = t[key]
+        if not fn or "get_current_device_id(" in fn or "ctx->device" in fn:
+            return False
+    return "const int exact_device = ggml_sycl_host_buft_device(buft);" in t["host_alloc_fn"]
+
+
+def witness_b_no_zone_no_current_device(t):
+    # SYCL_Host's get_max_size back on get_current_device_id().
+    t["get_max_size_fn"] = t["get_max_size_fn"].replace("ggml_sycl_host_buft_device(buft)", "get_current_device_id()")
+    return t
+
+
+# SYCL_KV_Host has its own iface: its own get_name, and its alloc_buffer and get_max_size slots call the builder with
+# role KV. A copy of SYCL_Host's iface would allocate host KV with SYCL_Host's role (design 5efe section M57 (a)).
+def check_b_kv_own_iface(t):
+    buft = flat_ws(t["kv_buft_fn"])
+    return (
+        "/* .get_name = */ ggml_backend_sycl_kv_host_buffer_type_name," in buft
+        and "/* .alloc_buffer = */ ggml_backend_sycl_kv_host_buffer_type_alloc_buffer," in buft
+        and "/* .get_max_size = */ ggml_backend_sycl_kv_host_buffer_type_get_max_size," in buft
+        and "ggml_backend_sycl_host_buffer_type()->iface" not in buft
+        and KV_INTENT in t["kv_get_max_size_fn"] and SELECT_FROM_INTENT in t["kv_get_max_size_fn"]
+        and "return ggml_sycl_host_buft_alloc(buft, size, " + KV_INTENT + ");" in t["kv_alloc_buffer_fn"]
+        and "intent.role      = ggml_sycl::alloc_role::KV;" in t["intent_fn"]
+    )
+
+
+def witness_b_kv_own_iface(t):
+    # SYCL_KV_Host back on the copied SYCL_Host iface.
+    t["kv_buft_fn"] = t["kv_buft_fn"].replace(
+        "ggml_backend_sycl_kv_host_buffer_type_alloc_buffer,",
+        "ggml_backend_sycl_host_buffer_type()->iface.alloc_buffer,")
+    return t
+
+
+# SYCL_HostCompute's iface names its own get_max_size, which asks ggml_sycl_host_compute_is_tp(), the predicate its
+# alloc_buffer asks, and outside TP mode delegates to the device buft's get_max_size.
+def check_b_host_compute(t):
+    fn = t["hc_get_max_size_fn"]
+    return (
+        "/* .get_max_size     = */ ggml_backend_sycl_host_compute_buffer_type_get_max_size," in t["hc_iface"]
+        and "if (!ggml_sycl_host_compute_is_tp()) {\n        return ggml_backend_sycl_buffer_type_get_max_size(buft);"
+        in fn
+        and TP_INTENT in fn and SELECT_FROM_INTENT.replace("\n" + " " * 66, "\n" + " " * 68) in fn
+        and "if (ggml_sycl_host_compute_is_tp()) {" in t["hc_alloc_fn"]
+    )
+
+
+def witness_b_host_compute(t):
+    # The glkg defect reversed: the host builder's answer outside TP mode.
+    t["hc_get_max_size_fn"] = t["hc_get_max_size_fn"].replace(
+        "return ggml_backend_sycl_buffer_type_get_max_size(buft);",
+        "return ggml_sycl_host_buft_max_size(buft, -1, ggml_sycl::host_zone_id::STAGING);")
+    return t
+
+
+# select_zone has no category clause for WEIGHT and sends UNOWNED there: the WEIGHT returns are role WEIGHT and
+# UNOWNED-or-persistent, and the HOST_COMPUTE/EXPERT_CACHE category clause returns SCRATCH.
 def check_b_select_zone(t):
-    src = t["cache_cpp"]
-    return SELECT_ZONE_WEIGHT_BRANCH in src and SELECT_ZONE_EXPERT_BRANCH in src
+    fn = flat_ws(t["select_zone_fn"])
+    weight_conds = re.findall(r"if \(([^{]*)\) \{ return host_zone_id::WEIGHT; \}", fn)
+    return (
+        weight_conds == ["role == alloc_role::WEIGHT", "lifetime == alloc_lifetime::UNOWNED || persistent_owner"]
+        and "if (category == runtime_category::HOST_COMPUTE || category == runtime_category::EXPERT_CACHE) "
+            "{ return host_zone_id::SCRATCH; }" in fn
+    )
 
 
 def witness_b_select_zone(t):
-    # Drop HOST_COMPUTE from the WEIGHT branch: the runtime-category route
-    # that alloc_buffer relies on.
-    t["cache_cpp"] = t["cache_cpp"].replace(SELECT_ZONE_WEIGHT_BRANCH, "role == alloc_role::WEIGHT ||")
+    # The pre-C4 category clause for WEIGHT restored.
+    t["select_zone_fn"] = t["select_zone_fn"].replace(
+        "lifetime == alloc_lifetime::UNOWNED || persistent_owner",
+        "lifetime == alloc_lifetime::UNOWNED || persistent_owner || category == runtime_category::HOST_COMPUTE")
     return t
 
 
-# alloc_buffer's category must still be unconditionally HOST_COMPUTE for this
-# buft -- if it ever became conditional, B's unconditional WEIGHT would need
-# to change with it.
-ALLOC_BUFFER_CATEGORY = "req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;"
+# SYCL_Host takes role WEIGHT only under in_model_load; weights_evictable no longer chooses its role.
+def check_b_weight_only_in_load(t):
+    fn = t["intent_fn"]
+    load = fn.find("if (g_sycl_in_model_load.load(std::memory_order_acquire)) {")
+    weight = fn.find("intent.role     = ggml_sycl::alloc_role::WEIGHT;")
+    other = fn.find("} else {", load)
+    compute = fn.find("intent.role     = ggml_sycl::alloc_role::COMPUTE;", other)
+    return (
+        0 <= load < weight < other < compute
+        and fn.count("alloc_role::WEIGHT") == 1
+        and "weights_evictable" not in fn
+    )
 
 
-def check_b_alloc_buffer_category(t):
-    return ALLOC_BUFFER_CATEGORY in t["alloc_buffer_fn"]
-
-
-def witness_b_alloc_buffer_category(t):
-    t["alloc_buffer_fn"] = t["alloc_buffer_fn"].replace(
-        ALLOC_BUFFER_CATEGORY,
-        "req.intent.category = in_model_load ? ggml_sycl::runtime_category::HOST_COMPUTE : "
-        "ggml_sycl::runtime_category::STAGING;")
+def witness_b_weight_only_in_load(t):
+    t["intent_fn"] = t["intent_fn"].replace(
+        "if (g_sycl_in_model_load.load(std::memory_order_acquire)) {",
+        "if (g_sycl_in_model_load.load(std::memory_order_acquire) || ggml_backend_sycl_weights_evictable()) {")
     return t
 
 
-# --- C: the WEIGHT zone (where every runtime HOST_COMPUTE request lands,
-# per B/unified_alloc_host_zone above) reserves headroom for the context's own host
-# buffers (llama_context::output_reserve() et al.), not just weight bytes. The
+# --- C: the WEIGHT zone (where the UNOWNED runtime HOST_COMPUTE requests land,
+# per select_zone above) reserves headroom for them, not just weight bytes. The
 # zone is sized as the named terms of placement_plan_host_weight_zone_terms(),
 # the HOST_COMPUTE reserve is one of them, and no ratio over the weights stands in for a term.
 WEIGHT_ZONE_FROM_TERMS = "plan.host_zone_weight_bytes = weight_terms.total();"
@@ -483,12 +587,18 @@ checks = [
      check_a1_lock_scoped_to_impl, witness_a1),
     ("A3: neither the exported setter nor its impl contains a configure_host_zones call",
      check_a3_no_configure_in_setter, witness_a3),
-    ("B: get_max_size mirrors unified_alloc_host_zone's actual WEIGHT routing unconditionally",
-     check_b_mirror, witness_b_mirror),
-    ("B: unified_alloc_host_zone's WEIGHT-before-STAGING precedence unchanged (the reason B is correct)",
+    ("B: SYCL_Host's get_max_size and alloc_buffer share the host builder, and get_max_size asks select_zone",
+     check_b_host_builder, witness_b_host_builder),
+    ("B: no host get_max_size names a zone or calls get_current_device_id; the device is the buft's",
+     check_b_no_zone_no_current_device, witness_b_no_zone_no_current_device),
+    ("B: SYCL_KV_Host has its own iface whose slots call the builder with role KV",
+     check_b_kv_own_iface, witness_b_kv_own_iface),
+    ("B: SYCL_HostCompute's own get_max_size asks the TP predicate and delegates to the device buft outside TP",
+     check_b_host_compute, witness_b_host_compute),
+    ("B: select_zone has no category clause for WEIGHT and sends UNOWNED to WEIGHT",
      check_b_select_zone, witness_b_select_zone),
-    ("B: alloc_buffer still sets category=HOST_COMPUTE unconditionally for this buft",
-     check_b_alloc_buffer_category, witness_b_alloc_buffer_category),
+    ("B: SYCL_Host takes role WEIGHT only under in_model_load",
+     check_b_weight_only_in_load, witness_b_weight_only_in_load),
     ("C: WEIGHT zone reserves headroom for runtime host-compute requests",
      check_c_headroom, witness_c_headroom),
     ("C2: WEIGHT zone is the sum of its named terms, not a ratio",

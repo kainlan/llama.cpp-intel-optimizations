@@ -29,13 +29,16 @@ THE CONTRACT.  With comments and string literals blanked:
   Z1. alloc_constraints has `bool persistent_owner = false;`.  unified_cache::arm_cpu_job_input_marker builds the
       word's request with role CONTROL (its only role write), must_host_pinned = true and persistent_owner = true,
       each an unconditional statement between the request's declaration and its unified_allocate_owner call.
-  Z2. unified_alloc_host_zone, the allocator's host-zone choice, first asserts that a persistent_owner request is
+  Z2. unified_alloc_host_zone, the allocator's host-zone choice, is exactly `return select_zone(req.intent.role,
+      cat, req.intent.lifetime, req.intent.constraints.persistent_owner, kv_spill_to_host);`, and select_zone
+      (host-zone-plan.cpp, the rules of design 5efe section 4.4) first asserts that a persistent_owner request is
       neither a KV spill nor role KV nor role EXPERT_STAGING (those choose KV and SCRATCH before WEIGHT is
-      considered, so the flag would not reach WEIGHT).  It then returns KV exactly for `kv_spill_to_host ||
-      req.intent.role == alloc_role::KV`, SCRATCH exactly for `req.intent.role == alloc_role::EXPERT_STAGING`, WEIGHT
-      for a condition with `req.intent.constraints.persistent_owner` among its top-level `||` operands, and STAGING
-      only as its last statement; it has no other return, and reads persistent_owner only in the assert and the
-      WEIGHT condition.  So a persistent CONTROL request lands in WEIGHT.
+      considered, so the flag would not reach WEIGHT).  Its branches are, in order: KV exactly for `kv_spill_to_host
+      || role == alloc_role::KV`, WEIGHT exactly for `role == alloc_role::WEIGHT`, SCRATCH exactly for `role ==
+      alloc_role::EXPERT_STAGING`, WEIGHT for a condition with `persistent_owner` among its top-level `||` operands,
+      SCRATCH for the category clause, and STAGING only as its last statement; it has no other return, and reads
+      persistent_owner only in the assert and that WEIGHT condition.  So a persistent CONTROL request lands in
+      WEIGHT.
   Z3. unified_alloc chooses every host zone through unified_alloc_host_zone(req, cat, kv_spill_to_host), twice (the
       pinned-pool branch and the direct-zone branch, each the initialiser of its zone variable), and no lambda of its
       returns a host_zone_id of its own.
@@ -78,6 +81,7 @@ TAG = "(llama.cpp-nqbe)"
 FILES = {
     "cache": "ggml/src/ggml-sycl/unified-cache.cpp",
     "header": "ggml/src/ggml-sycl/unified-cache.hpp",
+    "plan": "ggml/src/ggml-sycl/host-zone-plan.cpp",
 }
 SYCL_DIR = "ggml/src/ggml-sycl"
 FLAG = "persistent_owner"
@@ -181,6 +185,12 @@ SETTLE_SIG = r"void\s+unified_cache::host_zone_settle\s*\(\s*host_zone_id\s+zone
 TAKE_SIG = (r"static\s+host_zone_refusal_report\s+host_zone_refusal_take\s*\(\s*std::atomic<int>\s*&\s*refusals\s*,\s*"
             r"bool\s+audit_active\s*\)\s*noexcept\s*\{")
 ZONE_CALL = "unified_alloc_host_zone(req, cat, kv_spill_to_host)"
+ZONE_FORWARD = ("return select_zone(req.intent.role, cat, req.intent.lifetime, req.intent.constraints.persistent_owner, "
+                "kv_spill_to_host);")
+SELECT_SIG = (r"\nhost_zone_id\s+select_zone\s*\(\s*alloc_role\s+role\s*,\s*runtime_category\s+category\s*,\s*"
+              r"alloc_lifetime\s+lifetime\s*,\s*bool\s+persistent_owner\s*,\s*bool\s+kv_spill_to_host\s*\)\s*\{")
+SELECT_ASSERT = ("GGML_ASSERT(!persistent_owner || (!kv_spill_to_host && role != alloc_role::KV && "
+                 "role != alloc_role::EXPERT_STAGING));")
 SCAN = "runtime_registry_scan_host_zone_locked"
 LIVE_GATE = "runtime_registry_host_zone_live_locked(zone)"
 TAKE_STMT = "const host_zone_refusal_report report = host_zone_refusal_take(zone_refusals, audit.active());"
@@ -221,44 +231,49 @@ def check_marker_request(code: str, fails: list) -> None:
                             "it lands in the boundary-swept STAGING zone and every graph boundary refuses on it"))
 
 
-def check_zone_choice(code: str, fails: list) -> None:
+def check_zone_choice(code: str, plan: str, fails: list) -> None:
     body = definition(code, ZONE_SIG)
     if body is None:
         fails.append(("Z2", "unified_alloc_host_zone(const alloc_request & req, runtime_category cat, bool "
                             "kv_spill_to_host) noexcept is not defined"))
         return
-    rets = re.findall(r"\breturn\s+host_zone_id::(\w+)\s*;", body)
-    if rets != ["KV", "SCRATCH", "WEIGHT", "STAGING"] or len(re.findall(r"\breturn\b", body)) != 4:
-        fails.append(("Z2", f"unified_alloc_host_zone returns {rets}; want KV, SCRATCH, WEIGHT, then STAGING and no "
-                            "other return"))
+    if nospace(body) != nospace(ZONE_FORWARD):
+        fails.append(("Z2", "unified_alloc_host_zone is not exactly a forward of the request's role, lifetime and "
+                            "persistent_owner to select_zone: the allocator would choose a zone the rules did not"))
+    sel = definition(plan, SELECT_SIG)
+    if sel is None:
+        fails.append(("Z2", "select_zone(alloc_role role, runtime_category category, alloc_lifetime lifetime, bool "
+                            "persistent_owner, bool kv_spill_to_host) is not defined in host-zone-plan.cpp"))
         return
-    if not nospace(body).endswith("returnhost_zone_id::STAGING;"):
-        fails.append(("Z2", "STAGING is not unified_alloc_host_zone's last statement"))
-    want = {
-        "KV": "kv_spill_to_host||req.intent.role==alloc_role::KV",
-        "SCRATCH": "req.intent.role==alloc_role::EXPERT_STAGING",
-    }
-    seen = {}
-    for cond, b, _ in if_blocks(body):
+    rets = re.findall(r"\breturn\s+host_zone_id::(\w+)\s*;", sel)
+    want_rets = ["KV", "WEIGHT", "SCRATCH", "WEIGHT", "SCRATCH", "STAGING"]
+    if rets != want_rets or len(re.findall(r"\breturn\b", sel)) != len(want_rets):
+        fails.append(("Z2", f"select_zone returns {rets}; want {want_rets} and no other return"))
+        return
+    if not nospace(sel).endswith("returnhost_zone_id::STAGING;"):
+        fails.append(("Z2", "STAGING is not select_zone's last statement"))
+    branches = []
+    for cond, b, _ in if_blocks(sel):
         r = re.search(r"\breturn\s+host_zone_id::(\w+)\s*;", b)
         if r and nospace(b) == f"returnhost_zone_id::{r.group(1)};":
-            seen[r.group(1)] = cond
-    for zone, cond in want.items():
-        if nospace(seen.get(zone, "")) != cond:
-            fails.append(("Z2", f"unified_alloc_host_zone does not return {zone} exactly for `{cond}`: a CONTROL "
-                                "request could land in a zone the graph boundary sweeps"))
-    weight = seen.get("WEIGHT")
-    if weight is None or "req.intent.constraints.persistent_owner" not in \
-            [nospace(o) for o in top_level_or_operands(weight)]:
-        fails.append(("Z2", "unified_alloc_host_zone's WEIGHT condition does not take a request with "
-                            "persistent_owner: such an owner would fall through to STAGING"))
-    if not nospace(body).startswith(nospace(ZONE_ASSERT)):
-        fails.append(("Z2", "unified_alloc_host_zone does not first assert that a persistent_owner request is neither a "
-                            "KV spill, role KV nor role EXPERT_STAGING: such a request would land in KV or SCRATCH, "
-                            "and SCRATCH must be empty at every graph boundary"))
-    if body.count("persistent_owner") != 2:
-        fails.append(("Z2", "unified_alloc_host_zone reads persistent_owner outside its assert and its WEIGHT "
-                            "condition"))
+            branches.append((r.group(1), cond))
+    exact = [("KV", "kv_spill_to_host||role==alloc_role::KV"), ("WEIGHT", "role==alloc_role::WEIGHT"),
+             ("SCRATCH", "role==alloc_role::EXPERT_STAGING")]
+    got = [(z, nospace(c)) for z, c in branches[:3]]
+    if len(branches) != 5 or got != exact:
+        fails.append(("Z2", f"select_zone's first branches are {got}; want {exact}: a CONTROL request could land in "
+                            "a zone the graph boundary sweeps"))
+        return
+    if branches[3][0] != "WEIGHT" or "persistent_owner" not in [nospace(o) for o in
+                                                                top_level_or_operands(branches[3][1])]:
+        fails.append(("Z2", "select_zone's second WEIGHT condition does not take a request with persistent_owner: "
+                            "such an owner would fall through to STAGING"))
+    if not nospace(sel).startswith(nospace(SELECT_ASSERT)):
+        fails.append(("Z2", "select_zone does not first assert that a persistent_owner request is neither a KV "
+                            "spill, role KV nor role EXPERT_STAGING: such a request would land in KV or SCRATCH, and "
+                            "SCRATCH must be empty at every graph boundary"))
+    if sel.count("persistent_owner") != 2:
+        fails.append(("Z2", "select_zone reads persistent_owner outside its assert and its WEIGHT condition"))
 
 
 def check_alloc_uses_choice(code: str, fails: list) -> None:
@@ -397,7 +412,7 @@ def check(sources: dict) -> list:
     code = blank(sources["cache"])
     check_header(blank(sources["header"]), fails)
     check_marker_request(code, fails)
-    check_zone_choice(code, fails)
+    check_zone_choice(code, blank(sources["plan"]), fails)
     check_alloc_uses_choice(code, fails)
     check_weight_never_settled(code, fails)
     check_settle(code, fails)
@@ -438,18 +453,21 @@ def mutants():
          sub(r"(\n\s*)(req\.intent\.constraints\.persistent_owner\s*= true;)", r"\1if (device >= 0) { \2 }")),
         ("Z1", "cache", "the marker's request is not CONTROL",
          sub(r"(cohort_id\s*= \"cpu_job_input_marker\";)", r"\1\n        req.intent.role = alloc_role::STAGING;")),
-        ("Z2", "cache", "the WEIGHT branch ignores persistent_owner",
-         sub(r"\s*\|\|\s*req\.intent\.constraints\.persistent_owner", "")),
-        ("Z2", "cache", "CONTROL is sent to SCRATCH",
-         sub(r"if \(req\.intent\.role == alloc_role::EXPERT_STAGING\) \{",
-             r"if (req.intent.role == alloc_role::EXPERT_STAGING || req.intent.role == alloc_role::CONTROL) {")),
-        ("Z2", "cache", "the persistent-owner assert is gone",
-         sub(r"\n\s*GGML_ASSERT\(!req\.intent\.constraints\.persistent_owner[^;]*;", "")),
-        ("Z2", "cache", "the persistent-owner assert lets EXPERT_STAGING through",
-         sub(r" &&\s*req\.intent\.role != alloc_role::EXPERT_STAGING\)\);", r"));")),
-        ("Z2", "cache", "CONTROL is sent to STAGING ahead of WEIGHT",
-         sub(r"(\n(\s*)if \(req\.intent\.role == alloc_role::WEIGHT)",
-             r"\n\2if (req.intent.role == alloc_role::CONTROL) {\n\2    return host_zone_id::STAGING;\n\2}\1")),
+        ("Z2", "plan", "the WEIGHT branch ignores persistent_owner",
+         sub(r"\s*\|\|\s*persistent_owner\) \{", ") {")),
+        ("Z2", "plan", "CONTROL is sent to SCRATCH",
+         sub(r"if \(role == alloc_role::EXPERT_STAGING\) \{",
+             r"if (role == alloc_role::EXPERT_STAGING || role == alloc_role::CONTROL) {")),
+        ("Z2", "plan", "the persistent-owner assert is gone",
+         sub(r"\n\s*GGML_ASSERT\(!persistent_owner[^;]*;", "")),
+        ("Z2", "plan", "the persistent-owner assert lets EXPERT_STAGING through",
+         sub(r" &&\s*role != alloc_role::EXPERT_STAGING\)\);", r"));")),
+        ("Z2", "plan", "CONTROL is sent to STAGING ahead of WEIGHT",
+         sub(r"(\n(\s*)if \(lifetime == alloc_lifetime::UNOWNED)",
+             r"\n\2if (role == alloc_role::CONTROL) {\n\2    return host_zone_id::STAGING;\n\2}\1")),
+        ("Z2", "cache", "the allocator's choice drops the request's lifetime",
+         sub(r"req\.intent\.lifetime, req\.intent\.constraints\.persistent_owner",
+             r"alloc_lifetime::GRAPH, req.intent.constraints.persistent_owner")),
         ("Z3", "cache", "the direct-zone branch picks STAGING itself",
          sub(r"host_zone_id zone\s*= unified_alloc_host_zone\(req, cat, kv_spill_to_host\);",
              r"host_zone_id zone = host_zone_id::STAGING;")),

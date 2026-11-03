@@ -2726,6 +2726,14 @@ static ggml_sycl::CpuExpertPool     g_cpu_expert_pools[GGML_SYCL_MAX_DEVICES];
 static ggml_sycl::AttnHostPool      g_attn_host_pools[GGML_SYCL_MAX_DEVICES];
 static std::atomic<bool>            g_moe_hybrid_init_success[GGML_SYCL_MAX_DEVICES];
 static std::atomic<bool>            g_moe_hybrid_init_done{ false };
+// The host holder plan (docs/design/sycl-mmap-host-tier.md §4.4 "Pending, then committed"): one pending and one
+// committed plan per SYCL backend context, which size the attention host staging slots and the CPU-expert pools of
+// the device each context dispatches on. The pools' figures as last initialized, per device, so a commit can tell
+// whether they changed, and the pools' once-per-device sizing warnings. All three are heap-allocated by this file's
+// leak idiom, so no static destructor runs after the caches are gone.
+static auto * const                 g_host_holder_plans = new ggml_sycl::host_holder_plans();
+static auto * const                 g_host_pool_held    = new ggml_sycl::host_pool_dims[GGML_SYCL_MAX_DEVICES]();
+static auto * const g_host_pool_init_warnings           = new ggml_sycl::host_pool_init_warnings[GGML_SYCL_MAX_DEVICES];
 
 // TKV-13 (B2) step 3: forward declarations for functions defined near
 // ggml_sycl_dispatch_host_flash_attn (below ggml_sycl_compute_forward), used
@@ -7906,7 +7914,8 @@ struct managed_host_pinned_buffer {
                 ggml_sycl::alloc_role       role,
                 ggml_sycl::runtime_category category,
                 const char *                cohort_id,
-                bool                        zero_init = false) {
+                bool                        zero_init = false,
+                ggml_sycl::alloc_lifetime   lifetime  = ggml_sycl::alloc_lifetime::GRAPH) {
         if (handle.valid() && bytes >= needed_bytes) {
             return true;
         }
@@ -7918,6 +7927,7 @@ struct managed_host_pinned_buffer {
         req.intent.role                         = role;
         req.intent.category                     = category;
         req.intent.cohort_id                    = cohort_id;
+        req.intent.lifetime                     = lifetime;
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.use_pinned_pool  = true;
 
@@ -9427,21 +9437,26 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
     }
 
-    // Initialize PinnedBufferPool for O(1) acquire/release of pinned staging
-    // buffers used by CPU expert dispatch (replaces per-call malloc_host/free).
-    // max_experts = n_experts_used (top-K per MUL_MAT_ID) for single-token TG.
-    if (max_K > 0 && max_N > 0 && max_dispatch_count > 0) {
-        auto & pool = g_pinned_buffer_pools[device];
-        pool.init(q, device, static_cast<size_t>(max_dispatch_count), static_cast<size_t>(max_K),
-                  static_cast<size_t>(max_N));
-    }
-
-    // Initialize CPU expert thread pool for persistent async dispatch.
-    // One worker by default (get_cpu_expert_thread_count()), or N workers
-    // via GGML_SYCL_CPU_EXPERT_THREADS=N.
-    if (max_K > 0 && max_N > 0 && max_dispatch_count > 0) {
-        auto & cpu_pool = g_cpu_expert_pools[device];
-        cpu_pool.init(0 /* auto thread count */);
+    // Initialize PinnedBufferPool for O(1) acquire/release of pinned staging buffers used by CPU expert dispatch
+    // (replaces per-call malloc_host/free), and the CPU expert thread pool for persistent async dispatch (one worker
+    // by default, get_cpu_expert_thread_count(), or N via GGML_SYCL_CPU_EXPERT_THREADS=N). The pools' figures come
+    // from the device's committed host holder plan, never from this graph, whose own scan only checks the graph against
+    // them (§4.4 "And the pools are sized from the plan"). Their SCRATCH demand is registered by the plan's commit, not
+    // here. With no committed plan, the pre-notify fallback sizes them from this graph's scan, with a once-only WARN.
+    {
+        const ggml_sycl::host_pool_dims          graph_needs = { max_dispatch_count, max_K, max_N, n_moe_layers };
+        const ggml_sycl::host_pool_init_decision pools       = ggml_sycl::host_pools_init_from_plan(
+            device, g_host_holder_plans->device_state(device), graph_needs, g_host_pool_init_warnings[device]);
+        if (pools.init) {
+            auto & pool = g_pinned_buffer_pools[device];
+            pool.init(q, device, static_cast<size_t>(pools.dims.D), static_cast<size_t>(pools.dims.K),
+                      static_cast<size_t>(pools.dims.N));
+            if (pool.is_initialized()) {
+                g_host_pool_held[device] = pools.dims;
+            }
+            auto & cpu_pool = g_cpu_expert_pools[device];
+            cpu_pool.init(0 /* auto thread count */);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -11105,6 +11120,16 @@ static int64_t get_fused_moe_max_batch() {
 // Model load phase flag - when true, skip weight caching to avoid OOM during load
 static std::atomic<bool> g_sycl_in_model_load{ false };
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+namespace ggml_sycl {
+// A direct-source fixture allocates a SYCL_Host buffer as the loader does: under the load flag the host buffer
+// type asks role WEIGHT and lifetime MODEL, outside it COMPUTE and CONTEXT (design 5efe §4.4).
+void test_set_in_model_load(bool loading) {
+    g_sycl_in_model_load.store(loading, std::memory_order_release);
+}
+}  // namespace ggml_sycl
+#endif
+
 // llama.cpp-kpjw (kpjw-g7): the scheduler compute scopes open on THIS thread (compute-alloc-scope.hpp, host-tested).
 // The llama context opens one (ggml_backend_sycl_compute_alloc_scope) around every allocation its scheduler makes, so
 // a buffer-type allocation made inside it is positively a scheduler compute buffer. Thread-local on purpose: the
@@ -11307,6 +11332,10 @@ static void store_routing_indices(const char *    tensor_name,
             req.size                                = count * sizeof(int32_t);
             req.intent.role                         = ggml_sycl::alloc_role::STAGING;
             req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+            // A file-scope holder no backend context owns yet: the interim UNOWNED, which select_zone sends to
+            // WEIGHT, where it landed before routing by role (§4.4 site table).
+            req.intent.cohort_id                    = "routing_indices_cache";
+            req.intent.lifetime                     = ggml_sycl::alloc_lifetime::UNOWNED;
             req.intent.constraints.must_host_pinned = true;
             req.intent.constraints.use_pinned_pool  = true;
             if (!ggml_sycl::unified_alloc(req, &host_indices_owner) || !host_indices_owner.ptr) {
@@ -13387,6 +13416,10 @@ static bool ggml_sycl_reserve_host_tenants(const ggml_backend_sycl_context *    
         req.intent.role                         = ggml_sycl::alloc_role::STAGING;
         req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
         req.intent.cohort_id                    = info->name;
+        // Held by the execution context's tenant reservation, erased when that context's registry entries drop
+        // (§4.4 "Lifetimes", CONTEXT).
+        req.intent.lifetime                     = ggml_sycl::alloc_lifetime::CONTEXT;
+        req.intent.owner = { ggml_sycl::alloc_owner_kind::EXECUTION_CONTEXT, ggml_sycl_context_execution_id(ctx) };
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.use_pinned_pool  = true;
         ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
@@ -25859,7 +25892,7 @@ void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend, const
     GGML_LOG_INFO("[SYCL-PLAN] Compute buffer sizes notified: %.1f MB total (%d backends)\n",
                   total_bytes / (1024.0 * 1024.0), n_sizes);
 
-    // Pre-size the VRAM compute arena and host SCRATCH zone using the actual
+    // Pre-size the VRAM compute arena using the actual
     // scheduler-derived sizes, replacing the heuristic defaults set at model
     // load time.  VRAM arena zones are a single pre-allocated device block
     // with fixed zone boundaries — they cannot grow after creation.  This
@@ -25868,13 +25901,12 @@ void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend, const
     //
     // unified_cache_reserve_compute_arena: no-op if arena already has enough
     // capacity; otherwise records the updated reservation for zone layout.
-    // unified_cache_grow_host_scratch_zone: extends the host pinned SCRATCH
-    // zone to accommodate host-side compute buffers (oneDNN reorder workspace,
-    // CPU-offload staging) beyond what the planner estimated at load time.
+    // The host SCRATCH zone is not grown here: this sum counts device buffers too, and a context's host compute and
+    // output buffers are notified through ggml_backend_sycl_notify_host_buffer_sizes, whose ensure-capacity ledger
+    // covers them (docs/design/sycl-mmap-host-tier.md §4.4 "The notify path").
     if (!ggml_sycl::unified_cache_reserve_compute_arena(device, total_bytes)) {
         GGML_ABORT("[SYCL-PLAN] compute arena reserve smaller than scheduler requirement");
     }
-    ggml_sycl::unified_cache_grow_host_scratch_zone(total_bytes);
 }
 
 // Get the total model size from tensor inventory (for budget calculations)
@@ -29232,6 +29264,9 @@ static ggml_sycl::mem_handle arena_pinned_alloc(size_t bytes, sycl::queue & queu
     req.size                                = bytes;
     req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
     req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    // Held in a thread_local no backend context owns: the interim UNOWNED (§4.4 site table).
+    req.intent.cohort_id                    = "moe_fusion_fused_buf";
+    req.intent.lifetime                     = ggml_sycl::alloc_lifetime::UNOWNED;
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = false;
     ggml_sycl::alloc_handle handle{};
@@ -34470,6 +34505,9 @@ struct ggml_backend_sycl_buffer_context {
     // Per-device owning TP handles plus range/tier metadata.
     allocation_metadata                                            tp_meta[GGML_SYCL_MAX_DEVICES]     = {};
     ggml_sycl::mem_handle                                          tp_handles[GGML_SYCL_MAX_DEVICES]  = {};
+    // The TP host compute buffer's owner serial (§4.4 "Lifetimes"): its host allocation is registered CONTEXT with this
+    // buffer as owner, and the destructor checks that no record of it outlives the buffer. 0 for every other buffer.
+    uint64_t                                                       host_owner_id                      = 0;
 
     ggml_backend_sycl_buffer_context(int                         device,
                                      void *                      dev_ptr,
@@ -34537,6 +34575,16 @@ struct ggml_backend_sycl_buffer_context {
         for (auto & [tensor, extra] : tensor_extras) {
             (void) tensor;  // intentionally unused — tensor may be dangling
             release_extra_gpu(extra);
+        }
+        if (host_owner_id != 0) {
+            // The buffer-owned check: release the shared host allocation's handles (every TP device holds a copy of
+            // the managed one), then no record of this owner may remain.
+            managed_handle = {};
+            for (auto & handle : tp_handles) {
+                handle = {};
+            }
+            ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::CONTEXT,
+                                                           { ggml_sycl::alloc_owner_kind::BUFFER, host_owner_id });
         }
     }
 };
@@ -52583,51 +52631,74 @@ static size_t ggml_backend_sycl_host_buffer_type_chunk_cap() {
     return cap;
 }
 
-static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+// The device a SYCL_Host or SYCL_KV_Host buffer allocates from: the device index of buft->device
+// (docs/design/sycl-mmap-host-tier.md §4.4, the notify path's one helper). SYCL_Host is one global buft on reg
+// device 0, so this is never the current device and never the notifying backend's own. -1 when no SYCL device is
+// behind the buft (the testing buft).
+static int ggml_sycl_host_buft_device(ggml_backend_buffer_type_t buft) {
+    return ggml_sycl_device_id_from_backend_dev(buft ? buft->device : nullptr);
+}
+
+// Which host buft an intent is built for.
+enum class ggml_sycl_host_buft_kind {
+    HOST,             // SYCL_Host, and the CpuActivation clone that shares its iface
+    KV_HOST,          // SYCL_KV_Host
+    HOST_COMPUTE_TP,  // SYCL_HostCompute in tensor-parallel mode
+};
+
+// The one intent builder of the host bufts (§4.4 "One intent builder per host buft, shared by its get_max_size and
+// its alloc_buffer"), so ggml-alloc chunks a buffer against the zone its allocation reaches. SYCL_Host takes role
+// WEIGHT, lifetime MODEL, only inside a model load. A post-load SYCL_Host buffer (compute, output, inputs, a CPU
+// layer's LoRA or control vector) is a context's: role COMPUTE, lifetime CONTEXT, which select_zone sends to
+// SCRATCH. SYCL_KV_Host is host KV: role KV, cohort kv_host_buffer, lifetime CONTEXT, so the KV zone. The TP
+// HostCompute buffer is a context's compute buffer. The owner is the buffer's own serial, which its alloc_buffer
+// mints.
+static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind kind) {
+    ggml_sycl::alloc_intent intent{};
+    intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    intent.constraints.must_host_pinned = true;
+    switch (kind) {
+        case ggml_sycl_host_buft_kind::HOST:
+            if (g_sycl_in_model_load.load(std::memory_order_acquire)) {
+                intent.role     = ggml_sycl::alloc_role::WEIGHT;
+                intent.lifetime = ggml_sycl::alloc_lifetime::MODEL;
+            } else {
+                intent.role     = ggml_sycl::alloc_role::COMPUTE;
+                intent.lifetime = ggml_sycl::alloc_lifetime::CONTEXT;
+            }
+            intent.cohort_id = "backend_host_buffer";
+            break;
+        case ggml_sycl_host_buft_kind::KV_HOST:
+            intent.role      = ggml_sycl::alloc_role::KV;
+            intent.lifetime  = ggml_sycl::alloc_lifetime::CONTEXT;
+            intent.cohort_id = "kv_host_buffer";
+            break;
+        case ggml_sycl_host_buft_kind::HOST_COMPUTE_TP:
+            intent.role     = ggml_sycl::alloc_role::COMPUTE;
+            intent.lifetime = ggml_sycl::alloc_lifetime::CONTEXT;
+            break;
+    }
+    return intent;
+}
+
+// The chunk ceiling of a host buft whose allocations land in `zone` on `device`'s cache. The caller derives `zone`
+// from its builder's intent through select_zone, the function the allocation itself reaches.
+//
+// When host zones are configured this reports the largest single-chunk contiguous free block of that zone. ggml-alloc
+// uses the value to split a large buffer into chunk-sized buffers. The zone's aggregate capacity would be wrong: it can
+// span several non-contiguous `sycl::malloc_host` chunks, the allocator cannot hand out a pointer across them, and a
+// buffer sized past the first chunk's end put `tensor->data = base + offset` in the unmapped gap between chunks (a
+// SIGSEGV in the CPU backend's `mul_mat_id` output memcpy). Answering from a zone other than the allocation's chunks
+// against the wrong zone's largest block, which is why the zone comes from the builder.
+static size_t ggml_sycl_host_buft_max_size(ggml_backend_buffer_type_t buft, int device, ggml_sycl::host_zone_id zone) {
     if (g_plan_scope) {
         return ggml_sycl_plan_scope_chunk_cap(g_plan_scope, buft, ggml_sycl_chunk_cap_buft_kind::HOST, -1);
     }
     const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
 
-    // When host zones are configured, report the largest single-chunk
-    // contiguous free block in whichever zone `alloc_buffer` will route this
-    // buffer to.  ggml-alloc uses this value to split a large requested
-    // buffer into a sequence of chunk-sized buffers.  Reporting
-    // zone_capacity (total aggregate size) instead of
-    // largest-contiguous-free-block is incorrect: aggregate size can span
-    // multiple non-contiguous `sycl::malloc_host` chunks, and the underlying
-    // allocator cannot hand out a cross-chunk pointer that is virtually
-    // contiguous.  Returning aggregate size previously caused ggml-alloc to
-    // request a buffer the allocator silently fragmented, after which
-    // `tensor->data = base + offset` for tensors past the first chunk's end
-    // landed in the unmapped gap between chunks — manifesting as SIGSEGV in
-    // CPU-backend `mul_mat_id`'s output memcpy (bug llama.cpp-lj6p0).
-    auto * cache = ggml_sycl::get_unified_cache_for_device(get_current_device_id());
+    auto * cache = device >= 0 ? ggml_sycl::get_unified_cache_for_device(device) : nullptr;
     if (cache && cache->host_zones_configured()) {
-        // Mirror the zone-selection logic `alloc_buffer` actually reaches
-        // (unified-cache.cpp's `unified_alloc_host_zone`, used by `unified_alloc`):
-        //   role == WEIGHT || cat == HOST_COMPUTE || cat == EXPERT_CACHE
-        //     || constraints.persistent_owner                            -> WEIGHT
-        //   otherwise                                                    -> STAGING
-        // (This buft never sets persistent_owner; its HOST_COMPUTE category
-        // already takes the WEIGHT branch.)
-        // `alloc_buffer` unconditionally sets
-        // `req.intent.category = ggml_sycl::runtime_category::HOST_COMPUTE` for
-        // every buffer this buft allocates, and unified_alloc_host_zone's WEIGHT branch is
-        // checked BEFORE any role-only STAGING fallback, so a HOST_COMPUTE
-        // category request routes to WEIGHT unconditionally here -- regardless
-        // of role, in_model_load, or weights_evictable. This function used to
-        // re-derive alloc_buffer's ROLE computation instead of unified_alloc_host_zone's
-        // actual ZONE decision -- a role-only ternary (WEIGHT when
-        // in_model_load was set or weights_evictable, STAGING otherwise) --
-        // so once in_model_load went false after model load, it picked
-        // STAGING while the real allocator kept using WEIGHT -- ggml-alloc
-        // then chunked a request against the wrong zone's
-        // largest-free-block (llama.cpp-glkg). See
-        // tests/test-sycl-host-zone-config-source-contract.py for the source
-        // gate pinning this agreement.
-        constexpr ggml_sycl::host_zone_id target_zone = ggml_sycl::host_zone_id::WEIGHT;
-        size_t largest = cache->host_zone_largest_free_block(target_zone);
+        size_t largest = cache->host_zone_largest_free_block(zone);
         // Optimistic chunk capability, not a reservation or a guarantee of
         // currently available contiguous bytes. unified_alloc may try zone
         // growth, but budget, phase, or alignment constraints can still make
@@ -52647,13 +52718,19 @@ static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffe
     if (host_max > 0) {
         return std::min(host_max, chunk_cap);
     }
-    const int    device_id = get_current_device_id();
-    const size_t safe_max  = ggml_sycl_get_safe_max_alloc_size(device_id);
+    const size_t safe_max = device >= 0 ? ggml_sycl_get_safe_max_alloc_size(device) : 0;
     if (safe_max > 0) {
         return std::min(safe_max, chunk_cap);
     }
     return chunk_cap;
-    GGML_UNUSED(buft);
+}
+
+static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    const int                     device = ggml_sycl_host_buft_device(buft);
+    const ggml_sycl::alloc_intent intent = ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST);
+    const ggml_sycl::host_zone_id zone   = ggml_sycl::select_zone(intent.role, intent.category, intent.lifetime,
+                                                                  intent.constraints.persistent_owner, false);
+    return ggml_sycl_host_buft_max_size(buft, device, zone);
 }
 
 struct sycl_host_buf_ctx {
@@ -52669,6 +52746,10 @@ struct sycl_host_buf_ctx {
     // releases it.  `buffer_handle` is then a copy of the slot's own handle, so the memory outlives
     // the table that carried it.
     std::unique_ptr<ggml_sycl::tenant_claim> claim;
+    // The buffer's owner serial and the lifetime its allocation was registered with (§4.4 "Lifetimes"): free_buffer
+    // checks that no record of this owner outlives it. 0 for a claimed slot, whose memory the tenant table owns.
+    uint64_t                                 owner_id = 0;
+    ggml_sycl::alloc_lifetime                lifetime = ggml_sycl::alloc_lifetime::GRAPH;
 };
 
 // llama.cpp-30h4: order host-side access to this pinned USM against the GPU
@@ -52778,6 +52859,12 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     }
     ggml_sycl::host_mem_ledger_get().sycl_host_buffer_bytes.fetch_sub(ctx->size, std::memory_order_relaxed);
     ctx->buffer_handle = {};
+    // The buffer-owned check (§4.4 "Lifetimes", §M57 (b)): the buffer owns its allocation, so once its handle is
+    // released no record of this owner may remain.
+    if (ctx->owner_id != 0) {
+        ggml_sycl::unified_cache_host_zone_owner_check(ctx->lifetime,
+                                                       { ggml_sycl::alloc_owner_kind::BUFFER, ctx->owner_id });
+    }
     delete ctx;
     buffer->context = nullptr;
 }
@@ -52888,7 +52975,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
                                                                 size_t                                   size,
                                                                 ggml_sycl::mem_handle                    handle,
                                                                 int                                      device,
-                                                                std::unique_ptr<ggml_sycl::tenant_claim> claim) {
+                                                                std::unique_ptr<ggml_sycl::tenant_claim> claim,
+                                                                uint64_t                                 owner_id,
+                                                                ggml_sycl::alloc_lifetime                lifetime) {
     // Use the wrapper struct as buffer context so free_buffer knows which
     // deallocation path to take.  Override get_base to extract the raw pointer.
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
@@ -52904,7 +52993,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
         ggml_backend_buffer_free(buffer);
         return nullptr;
     }
-    ctx->claim = std::move(claim);
+    ctx->claim    = std::move(claim);
+    ctx->owner_id = owner_id;
+    ctx->lifetime = lifetime;
 
     if (!ggml_backend_buffer_set_type(buffer, buft)) {
         ggml_backend_buffer_free(buffer);
@@ -52936,14 +53027,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
     return buffer;
 }
 
-static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
-                                                                             size_t                     size) {
-    const bool weights_evictable = ggml_backend_sycl_weights_evictable();
-    const bool in_model_load     = g_sycl_in_model_load.load(std::memory_order_acquire);
-    GGML_LOG_INFO("[SYCL] Host buffer alloc request: %.1f MB (evictable=%d, in_model_load=%d)\n",
-                  size / (1024.0 * 1024.0), weights_evictable ? 1 : 0, in_model_load ? 1 : 0);
+// The host bufts' one allocation path, over the intent their builder made. The device is the buft's, never the
+// current device's. An allocation is owned by the buffer it backs, so its owner is the buffer's serial, minted here
+// before the allocation and checked at the buffer's free_buffer.
+static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_t buft,
+                                                       size_t                     size,
+                                                       ggml_sycl::alloc_intent    intent) {
+    GGML_LOG_INFO("[SYCL] Host buffer alloc request: %.1f MB (role=%d lifetime=%s cohort=%s)\n",
+                  size / (1024.0 * 1024.0), (int) intent.role, ggml_sycl::alloc_lifetime_name(intent.lifetime),
+                  intent.cohort_id ? intent.cohort_id : "(none)");
 
-    const int exact_device = ggml_sycl_device_id_from_backend_dev(buft ? buft->device : nullptr);
+    const int exact_device = ggml_sycl_host_buft_device(buft);
     if (exact_device < 0) {
         return nullptr;
     }
@@ -52956,25 +53050,23 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
             return nullptr;
         }
         return ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr, size, std::move(claimed_handle), exact_device,
-                                                  std::move(claim));
+                                                  std::move(claim), 0, intent.lifetime);
     }
     auto *        exact_cache = ggml_sycl::get_unified_cache_for_device(exact_device);
     sycl::queue * exact_queue =
         exact_cache ? &exact_cache->get_queue() : &ggml_sycl_get_device(exact_device).default_queue();
+    const uint64_t owner_id            = ggml_sycl::host_zone_owner_next_id();
+    intent.owner                       = { ggml_sycl::alloc_owner_kind::BUFFER, owner_id };
+    // When host zones are configured, route through the zone system so allocations are tracked and budgeted; the
+    // zone is select_zone()'s answer for this intent. When zones are not configured, use the pinned pool runtime.
+    intent.constraints.use_pinned_pool = (exact_cache && exact_cache->host_zones_configured());
     ggml_sycl::alloc_request req{};
-    req.queue  = exact_queue;
-    req.device = exact_device;
-    req.size   = size;
-    req.intent.role =
-        (in_model_load || weights_evictable) ? ggml_sycl::alloc_role::WEIGHT : ggml_sycl::alloc_role::STAGING;
-    req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-    req.intent.cohort_id                    = "backend_host_buffer";
-    req.intent.constraints.must_host_pinned = true;
-    // When host zones are configured, route through the zone system so allocations
-    // are tracked and budgeted. This buft's WEIGHT/STAGING roles both route
-    // to WEIGHT because its category is HOST_COMPUTE. When zones are not
-    // configured, use the pinned pool runtime.
-    req.intent.constraints.use_pinned_pool  = (exact_cache && exact_cache->host_zones_configured());
+    req.queue     = exact_queue;
+    req.device    = exact_device;
+    req.size      = size;
+    req.intent    = intent;
+    req.site_file = intent.site_file;
+    req.site_line = intent.site_line;
     ggml_sycl::alloc_handle host_buffer_owner{};
     if (!ggml_sycl::unified_alloc(req, &host_buffer_owner)) {
         host_buffer_owner = {};
@@ -52992,7 +53084,13 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     ggml_sycl::mem_handle buffer_handle =
         ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_buffer_owner), GGML_LAYOUT_AOS);
 
-    return ggml_backend_sycl_host_buffer_wrap(buft, ptr, size, std::move(buffer_handle), exact_device, nullptr);
+    return ggml_backend_sycl_host_buffer_wrap(buft, ptr, size, std::move(buffer_handle), exact_device, nullptr,
+                                              owner_id, intent.lifetime);
+}
+
+static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+                                                                             size_t                     size) {
+    return ggml_sycl_host_buft_alloc(buft, size, ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST));
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
@@ -53042,28 +53140,48 @@ static const char * ggml_backend_sycl_kv_host_buffer_type_name(ggml_backend_buff
     return GGML_SYCL_NAME "_KV_Host";
 }
 
-// Dedicated pinned-host buft for runtime-demoted KV layers (llama.cpp-uize
-// c-qjb5). Shares the generic host buft's alloc/free/clear iface and context
-// (same unified-cache-owned allocation path) but carries a distinct identity
-// via .get_name, so the structural residency decline
-// (ggml_sycl_tensor_is_in_kv_host_buft) and any diagnostics key on exactly this
-// buft and never perturb other pinned-host consumers (e.g. the pinned-host
-// overflow branch of ggml_sycl_select_buffer_for_tensor, which must keep
-// resolving to the generic host buft). The keying mechanism is the .get_name
-// FUNCTION POINTER, not buft-struct identity: ggml_backend_sycl_device_supports_buft
-// (and the analogous checks near it) compare
-// `buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name`, so a
-// clone that reused the generic name function instead of overriding it here
-// would silently defeat the decline -- the new buft must have its OWN
-// .get_name, and callers must never rely on struct-address comparison alone.
+// SYCL_KV_Host's two sizing and allocation slots: the host builder with role KV (§4.4 "SYCL_KV_Host gets its own
+// alloc_buffer, with role KV"), so demoted host KV and the indexer cache land in the KV zone and ggml-alloc chunks
+// them against that zone.
+static size_t ggml_backend_sycl_kv_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    const int                     device = ggml_sycl_host_buft_device(buft);
+    const ggml_sycl::alloc_intent intent = ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::KV_HOST);
+    const ggml_sycl::host_zone_id zone   = ggml_sycl::select_zone(intent.role, intent.category, intent.lifetime,
+                                                                  intent.constraints.persistent_owner, false);
+    return ggml_sycl_host_buft_max_size(buft, device, zone);
+}
+
+static ggml_backend_buffer_t ggml_backend_sycl_kv_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+                                                                                size_t                     size) {
+    return ggml_sycl_host_buft_alloc(buft, size, ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::KV_HOST));
+}
+
+// Dedicated pinned-host buft for runtime-demoted KV layers. It has its own iface: its own alloc_buffer and
+// get_max_size over the host builder with role KV (above), and its own .get_name. Every other slot is the generic host
+// buft's, and its buffers are the same wrapped CPU buffers (same free/clear/accessors). The distinct identity matters
+// twice. The structural residency decline (ggml_sycl_tensor_is_in_kv_host_buft) and any diagnostics key on exactly
+// this buft and never perturb other pinned-host consumers (e.g. the pinned-host overflow branch of
+// ggml_sycl_select_buffer_for_tensor, which must keep resolving to the generic host buft). The keying mechanism is the
+// .get_name FUNCTION POINTER, not buft-struct identity: ggml_backend_sycl_device_supports_buft (and the analogous
+// checks near it) compare `buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name`, so a buft that reused
+// the generic name function would silently defeat the decline. A copy of SYCL_Host's iface would also allocate host KV
+// with SYCL_Host's role and route it to SCRATCH (§M57 (a)).
 ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
-    static ggml_backend_buffer_type buffer_type_kv_host = [] {
-        ggml_backend_buffer_type t = *ggml_backend_sycl_host_buffer_type();
-        t.iface.get_name           = ggml_backend_sycl_kv_host_buffer_type_name;
-        return t;
-    }();
+    static ggml_backend_buffer_type buffer_type_kv_host = {
+        /* .iface    = */ {
+                           /* .get_name         = */ ggml_backend_sycl_kv_host_buffer_type_name,
+                           /* .alloc_buffer     = */ ggml_backend_sycl_kv_host_buffer_type_alloc_buffer,
+                           /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                           /* .get_max_size     = */ ggml_backend_sycl_kv_host_buffer_type_get_max_size,
+                           /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                           },
+        /* .device   = */
+        ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), 0),
+        /* .context  = */ nullptr,
+    };
     return &buffer_type_kv_host;
 }
 
@@ -53560,12 +53678,20 @@ static const char * ggml_backend_sycl_host_compute_buffer_type_name(ggml_backend
 // This is the Megatron-LM approach: activations in shared/host memory, weights sharded per device
 // For non-TP mode: Uses regular device buffer allocation
 
+// Whether SYCL_HostCompute allocates host memory: only in tensor-parallel mode, where every TP device reads and writes
+// one shared host-pinned compute buffer. Outside it the buft allocates a device buffer. Its alloc_buffer and its
+// get_max_size both ask this one predicate (§4.4 "SYCL_HostCompute gets its own get_max_size"), so the chunk ceiling
+// is the host builder's only when the allocation is host memory.
+static bool ggml_sycl_host_compute_is_tp() {
+    return g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1;
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_backend_buffer_type_t buft,
                                                                          size_t                     size) try {
     ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     // For TP mode, allocate SINGLE host buffer accessible by ALL devices
     // All devices read/write to the same memory - no need for data copies
-    if (g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1) {
+    if (ggml_sycl_host_compute_is_tp()) {
         int primary_device = buft_ctx->device;
         size               = std::max(size, (size_t) 1);
         GGML_SYCL_DEBUG("SYCL TP: Allocating shared host-pinned compute buffer for %d TP devices (size=%zu)\n",
@@ -53579,14 +53705,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
             primary_stream          = &(primary_dpct_dev.default_queue());
         }
 
+        // The host builder's intent (role COMPUTE, lifetime CONTEXT), owned by this buffer.
+        const uint64_t           owner_id = ggml_sycl::host_zone_owner_next_id();
         ggml_sycl::alloc_request req{};
-        req.queue                               = primary_stream;
-        req.device                              = primary_device;
-        req.size                                = size;
-        req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
-        req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-        req.intent.constraints.must_host_pinned = true;
-        req.intent.constraints.must_device      = false;
+        req.queue                          = primary_stream;
+        req.device                         = primary_device;
+        req.size                           = size;
+        req.intent                         = ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST_COMPUTE_TP);
+        req.intent.owner                   = { ggml_sycl::alloc_owner_kind::BUFFER, owner_id };
+        req.intent.constraints.must_device = false;
 
         ggml_sycl::alloc_handle host_alloc{};
         if (!ggml_sycl::unified_alloc(req, &host_alloc) || host_alloc.ptr == nullptr) {
@@ -53601,6 +53728,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
             new ggml_backend_sycl_buffer_context(primary_device, shared_ptr, primary_stream, size, nullptr);
         ctx->set_managed_owner(std::move(host_alloc));
         ctx->is_tp_compute_buffer = true;
+        ctx->host_owner_id        = owner_id;
         // In multi-process mode, we only have ONE device visible per process
         // world_size is the MPI world size, not the number of local devices
         if (g_sycl_tp_config.is_multiprocess) {
@@ -53642,11 +53770,26 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
+
+// SYCL_HostCompute's own chunk ceiling (§4.4, the table of which buft's get_max_size each design owns). In TP mode its
+// allocation is host memory, so the host builder's answer, on the buft's own device. Outside TP mode it allocates a
+// device buffer, so the device buft's answer: a host ceiling there would chunk a VRAM allocation against a host zone.
+static size_t ggml_backend_sycl_host_compute_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    if (!ggml_sycl_host_compute_is_tp()) {
+        return ggml_backend_sycl_buffer_type_get_max_size(buft);
+    }
+    const auto *                  buft_ctx = static_cast<const ggml_backend_sycl_buffer_type_context *>(buft->context);
+    const ggml_sycl::alloc_intent intent   = ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST_COMPUTE_TP);
+    const ggml_sycl::host_zone_id zone     = ggml_sycl::select_zone(intent.role, intent.category, intent.lifetime,
+                                                                    intent.constraints.persistent_owner, false);
+    return ggml_sycl_host_buft_max_size(buft, buft_ctx ? buft_ctx->device : -1, zone);
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_host_compute_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_host_compute_buffer_alloc,  // Per-device buffer for TP
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
-    /* .get_max_size     = */ ggml_backend_sycl_buffer_type_get_max_size,
+    /* .get_max_size     = */ ggml_backend_sycl_host_compute_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,  // Not a CPU host buffer - it's SYCL host memory
 };
@@ -54935,6 +55078,9 @@ void * ggml_backend_sycl_context::ensure_readback_staging(size_t needed, sycl::q
     req.intent.role                         = ggml_sycl::alloc_role::STAGING;
     req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
     req.intent.cohort_id                    = "context_readback_staging";
+    // A backend-context member, checked after `delete sycl_ctx` (§4.4 "Lifetimes", §M57 (b)).
+    req.intent.lifetime                     = ggml_sycl::alloc_lifetime::CONTEXT;
+    req.intent.owner                        = { ggml_sycl::alloc_owner_kind::BACKEND, host_zone_owner_id };
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
     ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
@@ -74480,7 +74626,8 @@ static void split_staging_ensure(int dev_idx, size_t src1_bytes, size_t out_byte
         s.src1_host = nullptr;
         s.src1_alloc.reset();
         if (s.src1_alloc.ensure(*q, queue_device, src1_bytes, ggml_sycl::alloc_role::STAGING,
-                                ggml_sycl::runtime_category::HOST_COMPUTE, "tensor_split_src1_host")) {
+                                ggml_sycl::runtime_category::HOST_COMPUTE, "tensor_split_src1_host", false,
+                                ggml_sycl::alloc_lifetime::UNOWNED)) {
             s.src1_host = s.src1_alloc.as<float>();
         }
         if (!s.src1_host) {
@@ -74495,7 +74642,8 @@ static void split_staging_ensure(int dev_idx, size_t src1_bytes, size_t out_byte
         s.output = nullptr;
         s.output_alloc.reset();
         if (s.output_alloc.ensure(*q, queue_device, out_bytes, ggml_sycl::alloc_role::STAGING,
-                                  ggml_sycl::runtime_category::HOST_COMPUTE, "tensor_split_output_host")) {
+                                  ggml_sycl::runtime_category::HOST_COMPUTE, "tensor_split_output_host", false,
+                                  ggml_sycl::alloc_lifetime::UNOWNED)) {
             s.output = s.output_alloc.as<float>();
         }
         if (!s.output) {
@@ -74699,7 +74847,7 @@ static void split_weight_staging_ensure(size_t needed, sycl::queue * q) {
     g_split_weight_staging.alloc.reset();
     if (g_split_weight_staging.alloc.ensure(*q, ggml_sycl_get_device_id_from_queue(*q), needed,
                                             ggml_sycl::alloc_role::STAGING, ggml_sycl::runtime_category::HOST_COMPUTE,
-                                            "tensor_split_weight_stage")) {
+                                            "tensor_split_weight_stage", false, ggml_sycl::alloc_lifetime::UNOWNED)) {
         g_split_weight_staging.data = g_split_weight_staging.alloc.as();
     }
     if (!g_split_weight_staging.data) {
@@ -75102,7 +75250,8 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
                     s_cpu_out_ring_alloc[i].reset();
                     if (s_cpu_out_ring_alloc[i].ensure(*stream, device, cpu_out_bytes, ggml_sycl::alloc_role::STAGING,
                                                        ggml_sycl::runtime_category::HOST_COMPUTE,
-                                                       "tensor_split_cpu_out_ring")) {
+                                                       "tensor_split_cpu_out_ring", false,
+                                                       ggml_sycl::alloc_lifetime::UNOWNED)) {
                         s_cpu_out_ring[i] = s_cpu_out_ring_alloc[i].as<float>();
                     }
                 }
@@ -83585,6 +83734,9 @@ static bool ggml_sycl_moe_hybrid_decode_table_allocate(sycl::queue &           q
     req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
     req.intent.category                     = ggml_sycl::runtime_category::EXPERT_CACHE;
     req.intent.cohort_id                    = "moe_hybrid_decode_table";
+    // Held by the weight's tensor extra, so it lives as long as the model's weight: MODEL, never counted at the
+    // SCRATCH graph boundary (§4.4 "Lifetimes").
+    req.intent.lifetime                     = ggml_sycl::alloc_lifetime::MODEL;
     req.intent.constraints.must_host_pinned = true;
     ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
     if (!allocation) {
@@ -95114,37 +95266,23 @@ static ggml_backend_t    g_attn_host_cpu_backend    = nullptr;
 static ggml_threadpool * g_attn_host_cpu_threadpool = nullptr;
 static std::mutex        g_attn_host_cpu_backend_mutex;
 
-// Persistent grow-only pinned staging for the SYNCHRONOUS host-dispatch
-// bodies (FA sync Q/dst/mask, SET_ROWS val/ids). Rationale
-// (llama.cpp-sbky residual hunt): per-call unified_allocate/release churned
-// 3+ cache entries per decode token, and entry erase paths call
-// cache_generation_bump() -- one bump per token invalidates EVERY weight
-// handle's generation memo, so every subsequent resolve takes the slow
-// revalidation path; DISPATCH_TIMING measured resolve at 73 us/op vs the
-// control's 21 us/op, ~+24 ms/token across a 1374-node decode graph.
-// Grow-only with 1 MiB rounding so the mask's slow growth with n_kv
-// re-allocates rarely; only the graph-walker thread for a device touches
-// the slot STRUCTS (get/grow), so no locking on the array itself -- but the
-// ASYNC FA body also uses the slots and hands dst_ptr to a pool worker
-// thread, so slot-CONTENT reuse safety is NOT "both bodies are synchronous"
-// (rev-2gag S1). The real invariant is written at the staging-get call site
-// in the async body (search "S1 invariant"). Released explicitly in
-// ggml_sycl_attn_host_cpu_backend_free() -- a static-dtor release would
-// outlive the cache -- and per rev-2gag S3, "released explicitly" alone was
-// not enough: a plain static array of mem_handle still HAS static
-// destructors, which are safe no-ops only when the explicit free ran first;
-// on any exit path that skips it they release into a torn-down cache.
-// Heap-allocate via this file's own leak idiom (cf. the `static auto * x =
-// new ...` pattern near ggml_sycl_shutdown_global_runtime_pinned_owners) so
-// no static dtor ever runs; the explicit free below remains the sole
-// release point.
-struct ggml_sycl_attn_host_staging_slot {
-    ggml_sycl::mem_handle handle;
-    void *                ptr = nullptr;
-    size_t                cap = 0;
-};
-
-static auto * const g_attn_host_staging = new ggml_sycl_attn_host_staging_slot[GGML_SYCL_MAX_DEVICES][5];
+// Persistent pinned staging for the SYNCHRONOUS host-dispatch bodies (FA sync Q/dst/mask, SET_ROWS val/ids), one
+// slot per device and kind. Per-call unified_allocate/release churned 3+ cache entries per decode token, and entry
+// erase paths call cache_generation_bump(): one bump per token invalidates EVERY weight handle's generation memo, so
+// every subsequent resolve takes the slow revalidation path (measured: resolve at 73 us/op vs 21 us/op, ~+24 ms/token
+// across a 1374-node decode graph). The slots are sized by the host holder plan (docs/design/sycl-mmap-host-tier.md
+// §4.4 "At dispatch no slot grows"): the plan's commit re-sizes them in sched_reserve, and a dispatch is admitted at or
+// below a slot's capacity and refused by name above it. Until a plan is committed for the device, the slots grow at
+// dispatch as before the plan existed (the pre-notify fallback, with a once-per-device WARN). Only the graph-walker
+// thread for a device touches the slot structs at dispatch, and the commit runs after sched_reserve's synchronize
+// (same-device concurrent inference is unsupported, canonical contract §5), so the slots take no lock. The ASYNC FA
+// body also uses the slots and hands dst_ptr to a pool worker thread, so slot-CONTENT reuse safety is NOT "both
+// bodies are synchronous": the real invariant is written at the staging-get call site in the async body (search
+// "S1 invariant"). Released explicitly in ggml_sycl_attn_host_cpu_backend_free(), never by a static destructor,
+// which would release into a torn-down cache: so the slots, the dispatch counter and their blocks' owners are
+// heap-allocated by this file's leak idiom.
+static auto * const g_host_staging_slots          = new ggml_sycl::host_staging_slots();
+static auto * const g_attn_host_dispatch_counters = new ggml_sycl::attn_host_dispatch_counters();
 
 enum ggml_sycl_attn_host_staging_kind {
     ATTN_STAGE_Q = 0,
@@ -95153,6 +95291,98 @@ enum ggml_sycl_attn_host_staging_kind {
     ATTN_STAGE_VAL,
     ATTN_STAGE_IDS
 };
+
+static_assert((int) ATTN_STAGE_Q == ggml_sycl::HOST_STAGING_Q && (int) ATTN_STAGE_DST == ggml_sycl::HOST_STAGING_DST &&
+                  (int) ATTN_STAGE_MASK == ggml_sycl::HOST_STAGING_MASK &&
+                  (int) ATTN_STAGE_VAL == ggml_sycl::HOST_STAGING_VAL &&
+                  (int) ATTN_STAGE_IDS == ggml_sycl::HOST_STAGING_IDS,
+              "the dispatch's staging kinds index the planned slots");
+
+// The cohort each slot kind's allocation is traced under.
+static const char * ggml_sycl_attn_host_staging_cohort(int kind) {
+    switch (kind) {
+        case ATTN_STAGE_Q:
+            return "attn_host_q";
+        case ATTN_STAGE_DST:
+            return "attn_host_dst";
+        case ATTN_STAGE_MASK:
+            return "attn_host_mask";
+        case ATTN_STAGE_VAL:
+            return "attn_host_setrows_val";
+        case ATTN_STAGE_IDS:
+            return "attn_host_setrows_ids";
+        default:
+            return "attn_host_staging";
+    }
+}
+
+// The owner of one slot block: its handle, released when the block is.
+struct ggml_sycl_attn_host_staging_token {
+    ggml_sycl::mem_handle handle;
+};
+
+// One slot block: `bytes` (already slot-rounded) of host-pinned memory on `device`'s cache. A DEVICE holder (§4.4
+// "Lifetimes"): every context's host attention on the device reuses it, so the SCRATCH graph-boundary check does not
+// count it, and the last live backend on the device owns it. Its last 64 bytes are the stomper canary, never handed
+// out (the block's usable capacity stops before them), poisoned here and checked by
+// ggml_sycl_attn_host_staging_check_canaries: a dead canary means a FOREIGN write landed inside the block.
+static bool ggml_sycl_attn_host_staging_block_alloc(void *                          user,
+                                                    int                             device,
+                                                    int                             kind,
+                                                    size_t                          bytes,
+                                                    ggml_sycl::host_staging_block * out) {
+    (void) user;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes <= 64 || out == nullptr) {
+        return false;
+    }
+    auto *                   cache = ggml_sycl::get_unified_cache_for_device(device);
+    sycl::queue &            queue = cache ? cache->get_queue() : ggml_sycl_get_device(device).default_queue();
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    req.intent.cohort_id                    = ggml_sycl_attn_host_staging_cohort(kind);
+    req.intent.lifetime                     = ggml_sycl::alloc_lifetime::DEVICE;
+    req.intent.owner                        = { ggml_sycl::alloc_owner_kind::DEVICE, static_cast<uint64_t>(device) };
+    req.intent.constraints.must_host_pinned = true;
+    ggml_sycl::mem_handle handle            = ggml_sycl::unified_allocate(req);
+    void *                ptr               = handle.resolve().ptr;
+    if (!ptr) {
+        return false;
+    }
+    auto * token = new (std::nothrow) ggml_sycl_attn_host_staging_token{ std::move(handle) };
+    if (!token) {
+        return false;
+    }
+    memset((char *) ptr + bytes - 64, 0xC5, 64);
+    // Aliasing probe, gated: the mask slot can be re-sized with n_kv, so a long run would otherwise write several
+    // lines into every user's stderr on the default path.
+    if (g_ggml_sycl_debug) {
+        fprintf(stderr, "[ATTN-STAGING-ALLOC] dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device, kind, ptr, bytes,
+                req.intent.cohort_id);
+    }
+    out->ptr   = ptr;
+    out->token = token;
+    return true;
+}
+
+static void ggml_sycl_attn_host_staging_block_release(void * user, ggml_sycl::host_staging_block * block) {
+    (void) user;
+    if (block) {
+        delete static_cast<ggml_sycl_attn_host_staging_token *>(block->token);
+        block->token = nullptr;
+        block->ptr   = nullptr;
+    }
+}
+
+static ggml_sycl::host_staging_allocator ggml_sycl_attn_host_staging_allocator() {
+    ggml_sycl::host_staging_allocator alloc;
+    alloc.alloc   = ggml_sycl_attn_host_staging_block_alloc;
+    alloc.release = ggml_sycl_attn_host_staging_block_release;
+    return alloc;
+}
 
 // Kill-switch / bisection mask (llama.cpp-sbky): GGML_SYCL_ATTN_HOST_STAGING
 // unset = all slots persistent; otherwise an integer bitmask of which slot
@@ -95166,105 +95396,50 @@ static bool ggml_sycl_attn_host_staging_enabled(ggml_sycl_attn_host_staging_kind
     return (mask & (1 << (int) kind)) != 0;
 }
 
+// The caller's per-call buffer, held in `fallback_holder` for one dispatch: GRAPH, released before the boundary.
+static void * ggml_sycl_attn_host_staging_per_call(size_t                  bytes,
+                                                   sycl::queue &           q_dev,
+                                                   const char *            tag,
+                                                   ggml_sycl::mem_handle & fallback_holder) {
+    ggml_sycl::alloc_constraints c{};
+    c.must_host_pinned = true;
+    ggml_sycl::alloc_request req{};
+    req.queue       = &q_dev;
+    req.device      = -1;
+    req.size        = bytes;
+    req.intent      = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
+    fallback_holder = ggml_sycl::unified_allocate(req);
+    return fallback_holder.resolve().ptr;
+}
+
+// A slot for one host dispatch's staging. No slot grows here once a plan is committed for the device: the admission
+// returns the slot at or below its planned capacity, and refuses above it with a WARN naming the request, the kind,
+// the planned capacity and the device, counted as a refusal, so the caller declines the host dispatch.
 static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_staging_kind kind, size_t bytes,
                                               sycl::queue & q_dev, const char * tag,
                                               ggml_sycl::mem_handle & fallback_holder) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes == 0) {
         return nullptr;
     }
-    // GGML_SYCL_ATTN_HOST_STAGING_IDLE=1 (bisection): allocate and HOLD the
-    // persistent slot exactly as normal, but hand the caller a per-call
-    // buffer -- separates "holding a never-freed mid-graph allocation" from
-    // "writing through the slot pointer" as the corruption trigger.
+    // GGML_SYCL_ATTN_HOST_STAGING_IDLE=1 (bisection): hold the persistent slot through the same admission as the
+    // persistent path, but hand the caller a per-call buffer -- separates "holding a never-freed mid-graph
+    // allocation" from "writing through the slot pointer" as the corruption trigger.
     static const bool idle_slots = [] {
         const char * env = std::getenv("GGML_SYCL_ATTN_HOST_STAGING_IDLE");
         return env && std::atoi(env) != 0;
     }();
     if (idle_slots && ggml_sycl_attn_host_staging_enabled(kind)) {
-        ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[device][kind];
-        if (bytes > slot.cap) {
-            // rev-2gag S4: same canary-tail reservation as the persistent
-            // branch below.
-            const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
-            ggml_sycl::alloc_constraints c;
-            c.must_host_pinned = true;
-            ggml_sycl::alloc_request req{};
-            req.queue  = &q_dev;
-            req.device = -1;
-            req.size   = rounded;
-            req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
-            ggml_sycl::mem_handle grown = ggml_sycl::unified_allocate(req);
-            if (grown.resolve().ptr) {
-                slot.handle = std::move(grown);
-                slot.ptr    = slot.handle.resolve().ptr;
-                slot.cap    = rounded - 64;
-                memset((char *) slot.ptr + slot.cap, 0xC5, 64);
-                if (g_ggml_sycl_debug) {
-                    fprintf(stderr, "[ATTN-STAGING-ALLOC] IDLE dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device,
-                            (int) kind, slot.ptr, rounded, tag);
-                }
-            }
+        if (!g_host_staging_slots->admit(device, (int) kind, bytes, ggml_sycl_attn_host_staging_allocator(),
+                                         g_attn_host_dispatch_counters)) {
+            return nullptr;
         }
-        // slot held but NEVER handed out; the caller gets a per-call buffer
-        ggml_sycl::alloc_constraints c;
-        c.must_host_pinned = true;
-        ggml_sycl::alloc_request req{};
-        req.queue       = &q_dev;
-        req.device      = -1;
-        req.size        = bytes;
-        req.intent      = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
-        fallback_holder = ggml_sycl::unified_allocate(req);
-        return fallback_holder.resolve().ptr;
+        return ggml_sycl_attn_host_staging_per_call(bytes, q_dev, tag, fallback_holder);
     }
     if (!ggml_sycl_attn_host_staging_enabled(kind)) {
-        ggml_sycl::alloc_constraints c;
-        c.must_host_pinned = true;
-        ggml_sycl::alloc_request req{};
-        req.queue       = &q_dev;
-        req.device      = -1;
-        req.size        = bytes;
-        req.intent      = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
-        fallback_holder = ggml_sycl::unified_allocate(req);
-        return fallback_holder.resolve().ptr;
+        return ggml_sycl_attn_host_staging_per_call(bytes, q_dev, tag, fallback_holder);
     }
-    ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[device][kind];
-    if (bytes > slot.cap) {
-        // rev-2gag S4: size for bytes PLUS the 64-byte canary tail, and
-        // publish cap as the USABLE size (rounded - 64) -- previously cap
-        // was the full allocation, so a request landing within 64 bytes of
-        // capacity was legitimately handed the canary region and the
-        // checker then reported a false FOREIGN write.
-        const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
-        ggml_sycl::alloc_constraints c;
-        c.must_host_pinned = true;
-        ggml_sycl::alloc_request req{};
-        req.queue  = &q_dev;
-        req.device = -1;
-        req.size   = rounded;
-        req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
-        ggml_sycl::mem_handle grown = ggml_sycl::unified_allocate(req);
-        void *                ptr   = grown.resolve().ptr;
-        if (!ptr) {
-            return nullptr;  // caller declines; old slot (if any) stays usable
-        }
-        slot.handle = std::move(grown);  // old handle released -- rare, amortized
-        slot.ptr    = ptr;
-        slot.cap    = rounded - 64;
-        // Aliasing probe (llama.cpp-sbky bisection). Gated (rev-2gag S5):
-        // rare (grow-only), but the mask slot regrows with n_kv, so a
-        // long-context run would otherwise write several lines into every
-        // user's stderr on the default path.
-        if (g_ggml_sycl_debug) {
-            fprintf(stderr, "[ATTN-STAGING-ALLOC] dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device, (int) kind, ptr,
-                    rounded, tag);
-        }
-        // Stomper canary: poison the RESERVED tail (never handed out, see
-        // the cap comment above); checked in
-        // ggml_sycl_attn_host_staging_check_canaries. A dead canary means a
-        // FOREIGN write landed inside this slot's allocation.
-        memset((char *) ptr + slot.cap, 0xC5, 64);
-    }
-    return slot.ptr;
+    return g_host_staging_slots->admit(device, (int) kind, bytes, ggml_sycl_attn_host_staging_allocator(),
+                                       g_attn_host_dispatch_counters);
 }
 
 // rev-2gag S6: armed on every slot grow but CHECKED at exactly one boundary
@@ -95275,8 +95450,8 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
 // cost more than the diagnostic is worth when not actively hunting.
 static void ggml_sycl_attn_host_staging_check_canaries(const char * where) {
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-        for (int k = 0; k < 5; ++k) {
-            const ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[d][k];
+        for (int k = 0; k < ggml_sycl::HOST_STAGING_KIND_COUNT; ++k) {
+            const ggml_sycl::host_staging_block & slot = g_host_staging_slots->block(d, k);
             if (!slot.ptr || slot.cap == 0) {
                 continue;
             }
@@ -95294,11 +95469,191 @@ static void ggml_sycl_attn_host_staging_check_canaries(const char * where) {
 }
 
 static void ggml_sycl_attn_host_staging_free_all() {
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-        for (int k = 0; k < 5; ++k) {
-            g_attn_host_staging[d][k] = ggml_sycl_attn_host_staging_slot{};
+    g_host_staging_slots->release_all(ggml_sycl_attn_host_staging_allocator());
+}
+
+// The pools as the host holder plan drives them: PinnedBufferPool, at the committed figures, on the device's own
+// execution queue.
+static bool ggml_sycl_host_pool_sink_initialized(void * user, int device, ggml_sycl::host_pool_dims * held) {
+    (void) user;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || !g_pinned_buffer_pools[device].is_initialized()) {
+        return false;
+    }
+    if (held) {
+        *held = g_host_pool_held[device];
+    }
+    return true;
+}
+
+static void ggml_sycl_host_pool_sink_init(void * user, int device, const ggml_sycl::host_pool_dims & dims) {
+    (void) user;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    auto *        cache = ggml_sycl::get_unified_cache_for_device(device);
+    sycl::queue & queue = cache ? cache->get_queue() : ggml_sycl_get_device(device).default_queue();
+    auto &        pool  = g_pinned_buffer_pools[device];
+    pool.init(queue, device, static_cast<size_t>(dims.D), static_cast<size_t>(dims.K), static_cast<size_t>(dims.N));
+    g_host_pool_held[device] = pool.is_initialized() ? dims : ggml_sycl::host_pool_dims{};
+}
+
+static void ggml_sycl_host_pool_sink_shutdown(void * user, int device) {
+    (void) user;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_pinned_buffer_pools[device].shutdown();
+    g_host_pool_held[device] = ggml_sycl::host_pool_dims{};
+}
+
+static ggml_sycl::host_pool_sink ggml_sycl_host_pool_sink() {
+    ggml_sycl::host_pool_sink sink;
+    sink.initialized = ggml_sycl_host_pool_sink_initialized;
+    sink.init        = ggml_sycl_host_pool_sink_init;
+    sink.shutdown    = ggml_sycl_host_pool_sink_shutdown;
+    return sink;
+}
+
+// One device's committed host holder figures, applied: the DEVICE holders' SCRATCH demand on the device's ledger,
+// then the staging slots and the pools re-sized to them (§4.4 "Pending, then committed").
+static bool ggml_sycl_host_holders_apply(int device) {
+    ggml_sycl::host_scratch_ledger * ledger = nullptr;
+    ggml_sycl::host_scratch_zone_ops ops{};
+    if (!ggml_sycl::unified_cache_host_scratch_ledger(device, ggml_backend_sycl_host_buffer_type_chunk_cap(), &ledger,
+                                                      &ops)) {
+        ledger = nullptr;
+    }
+    const bool ok = ggml_sycl::host_holders_apply_device(
+        device, *g_host_holder_plans, *g_host_staging_slots, ggml_sycl_attn_host_staging_allocator(), ledger, ops,
+        ggml_sycl_host_pool_sink(), ggml_sycl_attn_host_dispatch_enabled());
+    if (!ok) {
+        GGML_LOG_WARN(
+            "[ATTN-HOST] host holder plan failed on device %d: a SCRATCH ensure or a slot allocation was "
+            "refused, so an affected dispatch declines by name\n",
+            device);
+    }
+    return ok;
+}
+
+// The notify's view of the backend (docs/design/sycl-mmap-host-tier.md §4.4 "The notify path"). Each callback is
+// reached only after host_scratch_notify has tested ggml_backend_is_sycl(backend).
+static int ggml_sycl_notify_host_buft_device(ggml_backend_t backend) {
+    // The host buft llama_context's CPU backend allocates from: the host buffer type of the backend's device.
+    return ggml_sycl_host_buft_device(ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend)));
+}
+
+static ggml_sycl::host_scratch_context_info ggml_sycl_notify_context_of(ggml_backend_t backend) {
+    const auto *                         ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
+    ggml_sycl::host_scratch_context_info info;
+    if (ctx) {
+        info.key    = ctx->host_zone_owner_id;
+        info.device = ctx->device;
+    }
+    return info;
+}
+
+static bool ggml_sycl_notify_ledger_of(int                                device,
+                                       ggml_sycl::host_scratch_ledger **  ledger,
+                                       ggml_sycl::host_scratch_zone_ops * ops) {
+    return ggml_sycl::unified_cache_host_scratch_ledger(device, ggml_backend_sycl_host_buffer_type_chunk_cap(), ledger,
+                                                        ops);
+}
+
+bool ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t backend,
+                                                size_t         host_compute_bytes,
+                                                size_t         host_output_bytes) {
+    // host_scratch_notify tests ggml_backend_is_sycl(backend) before any callback reads backend->context, and refuses
+    // a non-SYCL backend with a WARN. The zone's device is the host buft's, never the notifying backend's own, and the
+    // growth is the ledger's ensure-capacity call on that device.
+    ggml_sycl::host_scratch_notify_env env;
+    env.is_sycl          = ggml_backend_is_sycl;
+    env.host_buft_device = ggml_sycl_notify_host_buft_device;
+    env.context_of       = ggml_sycl_notify_context_of;
+    env.ledger_of        = ggml_sycl_notify_ledger_of;
+    return ggml_sycl::host_scratch_notify(env, backend, host_compute_bytes, host_output_bytes);
+}
+
+// The plan walk's view of the backend. The staging slots are planned on the dispatching backend's own device, the one
+// whose slots the dispatch indexes (§M69 (d)).
+static int ggml_sycl_host_holder_backend_device(ggml_backend_t backend) {
+    return static_cast<const ggml_backend_sycl_context *>(backend->context)->device;
+}
+
+static uint64_t ggml_sycl_host_holder_backend_key(ggml_backend_t backend) {
+    return static_cast<const ggml_backend_sycl_context *>(backend->context)->host_zone_owner_id;
+}
+
+// Placement's executor fact for the pools: whether the plan put an expert of src0 on the host for `device`.
+static bool ggml_sycl_host_holder_host_experts(const ggml_tensor * src0,
+                                               int                 device,
+                                               bool *              known,
+                                               const char **       cause) {
+    bool       fact_known = false;
+    const bool host       = ggml_sycl_moe_plan_has_host_experts(src0, device, &fact_known);
+    if (known) {
+        *known = fact_known;
+    }
+    if (!fact_known && cause) {
+        *cause = (src0 && ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) ?
+                     "usage not MOE_EXPERT_WEIGHT" :
+                     "no placement plan";
+    }
+    return host;
+}
+
+static ggml_sycl::host_holder_walk_env ggml_sycl_host_holder_walk_env() {
+    ggml_sycl::host_holder_walk_env env;
+    env.is_target        = ggml_backend_is_sycl;
+    env.backend_device   = ggml_sycl_host_holder_backend_device;
+    env.backend_key      = ggml_sycl_host_holder_backend_key;
+    env.in_kv_host_buft  = ggml_sycl_tensor_is_in_kv_host_buft;
+    env.host_experts     = ggml_sycl_host_holder_host_experts;
+    env.host_dispatch_on = ggml_sycl_attn_host_dispatch_enabled();
+    return env;
+}
+
+void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t sched) {
+    if (!sched) {
+        return;
+    }
+    std::vector<uint64_t> keys;
+    const int             n_backends = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n_backends; ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (backend && ggml_backend_is_sycl(backend)) {
+            keys.push_back(ggml_sycl_host_holder_backend_key(backend));
         }
     }
+    g_host_holder_plans->begin(keys.data(), keys.size());
+}
+
+bool ggml_backend_sycl_plan_host_holders(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (!sched || !graph) {
+        return false;
+    }
+    (void) g_host_holder_plans->walk(sched, graph, ggml_sycl_host_holder_walk_env());
+    return true;
+}
+
+bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_sycl(backend)) {
+        GGML_LOG_WARN("[ATTN-HOST] host holder commit refused: not a SYCL backend\n");
+        return false;
+    }
+    int device   = -1;
+    int previous = -1;
+    if (!g_host_holder_plans->commit(ggml_sycl_host_holder_backend_key(backend), &device, &previous)) {
+        return false;
+    }
+    // Both devices' figures change when the plan moved: the new one's grow, the old one's fall to the plans left.
+    bool ok = true;
+    if (device >= 0) {
+        ok = ggml_sycl_host_holders_apply(device) && ok;
+    }
+    if (previous >= 0 && previous != device) {
+        ok = ggml_sycl_host_holders_apply(previous) && ok;
+    }
+    return ok;
 }
 
 // Process-lifetime CPU backend instance shared by every device's demoted
@@ -96227,6 +96582,8 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     // intercepting here — rather than at each of its ~7 call sites — covers
     // all of them uniformly.
     if (dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_node_is_host_dispatched(dst)) {
+        // The dispatch counter counts the interception, before any staging is asked for (§4.4 "The dispatch counter").
+        g_attn_host_dispatch_counters->intercept(ctx.device, dst->op);
         return ggml_sycl_dispatch_host_flash_attn(ctx, dst);
     }
 
@@ -96234,6 +96591,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     // SYCL graph by the matching supports_op acceptance and executed
     // host-side (see ggml_sycl_dispatch_host_set_rows_sync).
     if (dst && dst->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(dst)) {
+        g_attn_host_dispatch_counters->intercept(ctx.device, dst->op);
         return ggml_sycl_dispatch_host_set_rows_sync(ctx, dst);
     }
 
@@ -97470,7 +97828,40 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     if (ggml_sycl::sycl_timeline_enabled() && !ggml_sycl::sycl_timeline_has_flushed_file()) {
         ggml_sycl::sycl_timeline_flush("backend-free");
     }
+    const int      freed_device   = sycl_ctx ? sycl_ctx->device : -1;
+    const uint64_t freed_owner_id = sycl_ctx ? sycl_ctx->host_zone_owner_id : 0;
     delete sycl_ctx;
+    // The backend-member check (§4.4 "Lifetimes", §M57 (b)): after the context's destructor has released its members,
+    // no CONTEXT record of this backend may remain. Then the context's notified SCRATCH demand and its host holder plan
+    // go, and the device its plan was on is re-sized to the plans that remain.
+    if (freed_owner_id != 0) {
+        ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::CONTEXT,
+                                                       { ggml_sycl::alloc_owner_kind::BACKEND, freed_owner_id });
+        ggml_sycl::unified_cache_host_scratch_drop_context(freed_owner_id);
+        int plan_device = -1;
+        g_host_holder_plans->drop(freed_owner_id, &plan_device);
+        if (plan_device >= 0) {
+            (void) ggml_sycl_host_holders_apply(plan_device);
+        }
+    }
+    if (freed_device >= 0 && freed_device < GGML_SYCL_MAX_DEVICES) {
+        if (ggml_sycl_attn_host_dispatch_enabled()) {
+            g_attn_host_dispatch_counters->print(freed_device);
+        }
+        // The DEVICE check, only when the backend just freed was the last live one on its device: a second live
+        // backend there still shares every DEVICE holder (§M62 (D)). The context's destructor has already left the
+        // device's context list.
+        size_t live_on_device = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
+            live_on_device = g_backend_context_by_device[freed_device].size();
+        }
+        if (ggml_sycl::host_zone_device_check_due(static_cast<int>(live_on_device))) {
+            ggml_sycl::unified_cache_host_zone_owner_check(
+                ggml_sycl::alloc_lifetime::DEVICE,
+                { ggml_sycl::alloc_owner_kind::DEVICE, static_cast<uint64_t>(freed_device) });
+        }
+    }
     delete backend;
     g_sycl_backend_refcount.fetch_sub(1, std::memory_order_acq_rel);
     ggml_sycl::lifecycle::global_registry().release_backend_context();
@@ -111091,6 +111482,10 @@ static void ggml_sycl_segment_forward_or_throw(ggml_backend_sycl_context & ctx, 
     if (ggml_sycl_compute_forward(ctx, node)) {
         return;
     }
+    // The device's dispatch counter line first, so it survives the failed graph (§4.4 "The dispatch counter").
+    if (ggml_sycl_attn_host_dispatch_enabled()) {
+        g_attn_host_dispatch_counters->print(ctx.device);
+    }
     fprintf(stderr, "[SYCL] graph compute unsupported node name=%s op=%s type=%s (segmented %s)\n",
             node && node->name ? node->name : "", node ? ggml_op_name(node->op) : "(null)",
             node ? ggml_type_name(node->type) : "(null)", role);
@@ -123932,11 +124327,9 @@ static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {
 // never strcmp) and its rationale: see the comment on
 // ggml_backend_sycl_kv_host_buffer_type() above.
 static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
-    if (!t) {
-        return false;
-    }
-    const ggml_backend_buffer_t buf = (t->view_src && t->view_src->buffer) ? t->view_src->buffer : t->buffer;
-    return buf && buf->buft && buf->buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
+    // One function for the dispatch and the host holder plan's walk, so the plan stages exactly the nodes the
+    // dispatch intercepts (§4.4 "The plan walk is SYCL-side").
+    return ggml_sycl::host_tensor_in_buft_named(t, ggml_backend_sycl_kv_host_buffer_type_name);
 }
 
 // supports_op is "is there a kernel for this op, type and shape" AND "is the data placed where this device runs it".
@@ -125940,6 +126333,20 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
 #endif
     if (strcmp(name, "ggml_backend_sycl_host_compute_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_host_compute_buffer_type;
+    }
+    // The notify path and the host holder plan (docs/design/sycl-mmap-host-tier.md §4.4): llama_context looks each up
+    // by name, so a backend that predates them answers NULL rather than running with misread arguments.
+    if (strcmp(name, "ggml_backend_sycl_notify_host_buffer_sizes") == 0) {
+        return (void *) ggml_backend_sycl_notify_host_buffer_sizes;
+    }
+    if (strcmp(name, "ggml_backend_sycl_begin_host_holders") == 0) {
+        return (void *) ggml_backend_sycl_begin_host_holders;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_host_holders") == 0) {
+        return (void *) ggml_backend_sycl_plan_host_holders;
+    }
+    if (strcmp(name, "ggml_backend_sycl_commit_host_holders") == 0) {
+        return (void *) ggml_backend_sycl_commit_host_holders;
     }
     if (strcmp(name, "ggml_backend_sycl_cpu_offload_compute_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_cpu_offload_compute_buffer_type;

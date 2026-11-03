@@ -124,8 +124,12 @@ ALLOCATE_SIG = r"\nmem_handle unified_allocate\(const alloc_request & req\)\s*\{
 POOL_INIT_SIG = r"void PinnedBufferPool::init\(sycl::queue & q, int device_id, size_t max_experts, size_t act_dim, size_t out_dim\)\s*\{"
 SCATTER_SIG = r"static void moe_host_scatter_submit_flagged\([^)]*\)\s*\{"
 ENTRY_SIG = r"struct moe_ids_cache_entry\s*\{"
-HOST_ALLOC_SIG = r"static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer\([^)]*\)\s*\{"
+# The host bufts share one allocation path over their intent builder (design 5efe section 4.4); SYCL_Host's and
+# SYCL_KV_Host's alloc_buffer only delegate to it, so the allocator this pin reads is that path.
+HOST_ALLOC_SIG = r"static ggml_backend_buffer_t ggml_sycl_host_buft_alloc\([^)]*\)\s*\{"
 HOST_WRAP_SIG = r"static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap\([^)]*\)\s*\{"
+# The host bufts' intent builder sets their role and category, so the role pin reads it like an allocator body.
+HOST_INTENT_SIG = r"static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent\(ggml_sycl_host_buft_kind kind\)\s*\{"
 BUFFER_ALLOC_SIG = r"\n(?:static )?ggml_backend_buffer_t\s+(\w*alloc\w*)\s*\([^)]*\)\s*(?:try\s*)?\{"
 ROUTE_SIG = r"static bool ggml_sycl_moe_hybrid_decode_event_chained\(ggml_backend_sycl_context & ctx,[^)]*\)\s*\{"
 FLUSH_SLOT_SIG = r"static void flush_pending_cpu_scatter_slot\(pending_cpu_scatter & slot\)\s*\{"
@@ -488,10 +492,22 @@ def check_storage(s: dict) -> None:
     wrap = flat_body(s["backend"], HOST_WRAP_SIG, "T")
     if len(re.findall(r"\bhandle\b", wrap)) != 1 or "std::move(handle)" not in wrap:
         fail("T", "the SYCL_Host buffer wrap uses the owned handle other than by storing it")
+    intent = flat_body(s["backend"], HOST_INTENT_SIG, "T")
+    intent_roles = re.findall(r"intent\.role = ([^;]+);", intent)
+    if len(intent_roles) < 3:
+        fail("T", "the host bufts' intent builder sets fewer roles than its three kinds, so the role pin would pass "
+                  "vacuously")
+    for role in intent_roles:
+        if role not in BACKEND_BUFFER_ROLES:
+            fail("T", f"the host bufts' intent builder requests role {role!r}; a backend buffer's owner must stay out "
+                      f"of scope (roles COMPUTE, KV, WEIGHT)")
+    if "runtime_category::EXPERT_CACHE" in intent:
+        fail("T", "the host bufts' intent builder requests category EXPERT_CACHE, which would put a tensor's handle in "
+                  "scope")
     seen = 0
     for m in re.finditer(BUFFER_ALLOC_SIG, code):
         name = m.group(1)
-        if name == "ggml_backend_sycl_host_buffer_type_alloc_buffer":
+        if name == "ggml_sycl_host_buft_alloc":
             continue
         body = flat(body_at(code, m, "T"))
         seen += 1
@@ -736,9 +752,12 @@ def self_test(s: dict) -> int:
          sub(r"(is_kv_buft \? ggml_sycl::alloc_role::KV : )ggml_sycl::alloc_role::WEIGHT\)", r"\1ggml_sycl::alloc_role::STAGING)")),
         ("T", "backend", "arena runtime buffer becomes a stage",
          sub(r"(runtime_req\.intent\.role\s*= )ggml_sycl::alloc_role::COMPUTE;", r"\1ggml_sycl::alloc_role::STAGING;")),
-        ("T", "backend", "host compute buffer becomes expert-path memory",
-         sub(r"(ggml_backend_sycl_host_compute_buffer_alloc\([\s\S]*?req\.intent\.category\s*= )"
+        ("T", "backend", "host buft intent becomes expert-path memory",
+         sub(r"(ggml_sycl_host_buft_intent\(ggml_sycl_host_buft_kind kind\) \{[\s\S]*?intent\.category\s*= )"
              r"ggml_sycl::runtime_category::HOST_COMPUTE;", r"\1ggml_sycl::runtime_category::EXPERT_CACHE;")),
+        ("T", "backend", "post-load SYCL_Host buffer becomes a stage",
+         sub(r"(\} else \{\n\s*intent\.role\s*= )ggml_sycl::alloc_role::COMPUTE;(\n\s*intent\.lifetime\s*= "
+             r"ggml_sycl::alloc_lifetime::CONTEXT;)", r"\1ggml_sycl::alloc_role::STAGING;\2")),
         ("G", "backend", "route accepts an out-of-order queue",
          sub(r" \|\|\n\s*!ctx\.stream\(\)->has_property<sycl::property::queue::in_order>\(\)\)", ")")),
         ("G", "backend", "route skips its pre-reserve flush",

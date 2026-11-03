@@ -16,15 +16,17 @@
 //                         weight_host_bytes (backed PINNED or HOST_CPU), one pinned block per entry; a FILE_MAPPED
 //                         entry is served from the file's mapping and a CPU_OWNED one by ggml-cpu, so neither
 //                         holds a block in this zone
-//   host_compute_reserve  64 MiB for the runtime HOST_COMPUTE requests that also land in WEIGHT (the context's
-//                         logits and embeddings host buffer, the server's prompt-checkpoint reads); the plan has no
-//                         figure for those sizes, so the reserve is the term
+//   host_compute_reserve  64 MiB for the runtime HOST_COMPUTE requests that still land in WEIGHT: the UNOWNED
+//                         file-scope and thread-local holders no backend context owns yet (the routing indices, the
+//                         fused-MoE output buffers, the tensor-split staging), which select_zone sends to WEIGHT
+//                         (design 5efe §4.4); the plan has no figure for those sizes, so the reserve is the term
 //   layout_copies         a second, converted copy of a host weight the plan keeps beside the first: none today
 //   tlsf_bound            the TLSF rounding of each block to its grain, so the block count times the grain
 //
 // One tenant of the zone is not a term: unplanned loader residency, the model loader's SYCL_Host buffer, which holds
-// every weight the loader reads (role WEIGHT, category HOST_COMPUTE, from the buffer type the loader adds to a SYCL
-// device's list when weights are evictable). Planning it would plan a duplicate copy of the weights, the defect the
+// every weight the loader reads (role WEIGHT, lifetime MODEL, category HOST_COMPUTE, from the buffer type the loader
+// adds to a SYCL device's list when weights are evictable; the buffer type asks role WEIGHT only under the model-load
+// flag, and a SYCL_Host buffer made after the load, the context's compute and output buffers, routes to SCRATCH). Planning it would plan a duplicate copy of the weights, the defect the
 // mapped host tier (SYCL_Mapped) removes. Which buffer the loader binds is the plan's fact, not the build's: on a load
 // whose plan maps files the loader binds SYCL_Mapped for every FILE_MAPPED weight, whose bytes are the file's pages
 // outside every host zone, so the class reads zero; on a load whose plan does not (-lm none, or a build without the
@@ -42,13 +44,15 @@
 //
 // Arm 2 (the census) constructs device 0's cache, configures the host zones from that plan, and makes every planned
 // WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through the
-// loader's own buffer type. That plan is arm 1's, built with the fact false, so the loader's buffer is the one a load
-// that does not map files takes, and the arm measures it on every build; the buffer must be allocated and its bytes
-// must land in WEIGHT. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 removes it: the loader then adds no SYCL_Host buffer type, so
+// loader's own buffer type under the model-load flag. That plan is arm 1's, built with the fact false, so the loader's
+// buffer is the one a load that does not map files takes, and the arm measures it on every build; the buffer must be
+// allocated and its bytes must land in WEIGHT. A buffer of the same type made outside the load must land in SCRATCH
+// and take no WEIGHT byte. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 removes it: the loader then adds no SYCL_Host buffer type, so
 // there is no loader buffer to measure, and the binary exits 77 naming that leg rather than passing. Each allocation is
 // classed by the call that made it, and its owner metadata must agree with that class. Metadata separates host_weights
 // from the HOST_COMPUTE tenants; the reserve and unplanned loader residency come from one buffer type with one request
-// shape, so between those two the call alone attributes the bytes. Every byte the zone gains belongs to a named term or
+// shape, so between those two the call alone attributes the bytes; the reserve is now an UNOWNED request and the
+// loader's buffer a MODEL one, so their lifetimes separate them as well. Every byte the zone gains belongs to a named term or
 // to unplanned loader residency, which is reported on its own line; any other byte fails. The terms stay within their
 // bytes and the zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b and 3a
 // have passed.
@@ -532,17 +536,17 @@ const char * weight_class_name(weight_class cls) {
 
 // Whether an allocation's owner metadata is what its origin's request makes. The class comes from the call the census
 // made; metadata that disagrees with it means the allocation is not what that origin allocates, and it has no class.
-// The metadata separates host_weights from the HOST_COMPUTE tenants only: with weights evictable the reserve and the
-// loader's buffer both carry role WEIGHT, category HOST_COMPUTE and cohort "backend_host_buffer", because both come
-// from the SYCL_Host buffer type, so between those two classes the call alone attributes the bytes.
+// The metadata separates every class: host_weights is a WEIGHT request outside HOST_COMPUTE, the reserve an UNOWNED
+// HOST_COMPUTE request, and the loader's buffer a WEIGHT, MODEL-lifetime HOST_COMPUTE request (design 5efe §4.4).
 bool metadata_fits(weight_class cls, const alloc_metadata & md) {
     switch (cls) {
         case weight_class::HOST_WEIGHTS:
             return md.role == alloc_role::WEIGHT && md.category != runtime_category::HOST_COMPUTE;
         case weight_class::HOST_COMPUTE_RESERVE:
-            return md.category == runtime_category::HOST_COMPUTE;
+            return md.category == runtime_category::HOST_COMPUTE && md.lifetime == alloc_lifetime::UNOWNED;
         case weight_class::LOADER_RESIDENCY:
-            return md.role == alloc_role::WEIGHT && md.category == runtime_category::HOST_COMPUTE;
+            return md.role == alloc_role::WEIGHT && md.category == runtime_category::HOST_COMPUTE &&
+                   md.lifetime == alloc_lifetime::MODEL;
         case weight_class::COUNT:
             break;
     }
@@ -562,20 +566,17 @@ alloc_request host_weight_request(sycl::queue & q, size_t bytes) {
     return req;
 }
 
-// The request a SYCL_Host buffer makes after the model load (the context's output buffer): category HOST_COMPUTE,
-// which routes to WEIGHT whatever the role. Its role is the buffer type's: WEIGHT while weights are evictable (the
-// default), STAGING otherwise, the same choice ggml_backend_sycl_host_buffer_type_alloc_buffer makes outside a load.
-// The census uses it only when the loader adds no SYCL_Host buffer type; otherwise it allocates through that buffer
-// type itself, so the request cannot drift from the real one.
+// The request the routing-indices holder makes, one of the UNOWNED HOST_COMPUTE tenants the reserve covers: a
+// file-scope holder no backend context owns, which select_zone sends to WEIGHT (design 5efe §4.4 site table).
 alloc_request host_compute_request(sycl::queue & q, size_t bytes) {
-    const alloc_role role = ggml_backend_sycl_weights_evictable() ? alloc_role::WEIGHT : alloc_role::STAGING;
-    alloc_request    req{};
+    alloc_request req{};
     req.queue                               = &q;
     req.device                              = 0;
     req.size                                = bytes;
-    req.intent.role                         = role;
+    req.intent.role                         = alloc_role::STAGING;
     req.intent.category                     = runtime_category::HOST_COMPUTE;
-    req.intent.cohort_id                    = "backend_host_buffer";
+    req.intent.cohort_id                    = "routing_indices_cache";
+    req.intent.lifetime                     = alloc_lifetime::UNOWNED;
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
     return req;
@@ -697,7 +698,7 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan,
     };
 
     // The terms: every planned host weight at the bytes the cache allocates for it, so the census compares cache bytes
-    // with the planner's terms, then a logits-sized HOST_COMPUTE request the reserve covers.
+    // with the planner's terms, then an UNOWNED HOST_COMPUTE request the reserve covers.
     for (const placement_entry & e : plan.entries) {
         if (e.on_device) {
             continue;
@@ -709,15 +710,7 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan,
         }
         take(weight_class::HOST_WEIGHTS, host_weight_request(q, cache_bytes));
     }
-    ggml_backend_buffer_t reserve_buf = nullptr;
-    if (host_buft != nullptr) {
-        reserve_buf = take_buffer(weight_class::HOST_COMPUTE_RESERVE, host_buft, 8 * MiB);
-        if (reserve_buf == nullptr) {
-            census.failed++;
-        }
-    } else {
-        take(weight_class::HOST_COMPUTE_RESERVE, host_compute_request(q, 8 * MiB));
-    }
+    take(weight_class::HOST_COMPUTE_RESERVE, host_compute_request(q, 8 * MiB));
 
     check_eq("planned WEIGHT allocations that failed", census.failed, 0);
     check_eq("planned WEIGHT allocations that landed outside WEIGHT", census.not_in_weight, 0);
@@ -732,6 +725,24 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan,
              capacity_before);
     check(census.used() - used_before <= plan.host_zone_weight_bytes, "the terms fit the planned WEIGHT zone");
 
+    // A SYCL_Host buffer made after the load (the context's compute or output buffer) is CONTEXT-lifetime COMPUTE and
+    // routes to SCRATCH, so the WEIGHT zone gains nothing for it (design 5efe §4.4).
+    if (host_buft != nullptr) {
+        const size_t          weight_pre = census.used();
+        ggml_backend_buffer_t post_load  = ggml_backend_buft_alloc_buffer(host_buft, 8 * MiB);
+        check(post_load != nullptr, "a SYCL_Host buffer made after the load was allocated");
+        if (post_load != nullptr) {
+            alloc_metadata md{};
+            const bool     found = unified_lookup_runtime_allocation(ggml_backend_buffer_get_base(post_load), &md);
+            check(found, "the post-load SYCL_Host buffer has a registered allocation");
+            check(found && md.host_zone == host_zone_id::SCRATCH, "the post-load SYCL_Host buffer lands in SCRATCH");
+            check(found && md.lifetime == alloc_lifetime::CONTEXT,
+                  "the post-load SYCL_Host buffer is CONTEXT lifetime");
+            check_eq("WEIGHT bytes gained for the post-load SYCL_Host buffer", census.used() - weight_pre, 0);
+            ggml_backend_buffer_free(post_load);
+        }
+    }
+
     // The unplanned class on a load whose plan does not map files: the loader keeps SYCL_Host for every weight
     // (design 5efe §4.3), so its buffer comes through that same buffer type, sized as the loader sizes it, every
     // weight it reads. Arm 3 measures the class on a plan whose fact is true.
@@ -739,9 +750,12 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan,
     ggml_backend_buffer_t loader_buf       = nullptr;
     size_t                loader_grew_by   = 0;
     if (host_buft != nullptr) {
+        // Under the load flag, as the loader allocates it: the buffer type asks role WEIGHT and lifetime MODEL.
         const size_t capacity_pre = cache.host_zone_capacity(host_zone_id::WEIGHT);
-        loader_buf                = take_buffer(weight_class::LOADER_RESIDENCY, host_buft, loader_requested);
-        loader_grew_by            = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
+        test_set_in_model_load(true);
+        loader_buf = take_buffer(weight_class::LOADER_RESIDENCY, host_buft, loader_requested);
+        test_set_in_model_load(false);
+        loader_grew_by = cache.host_zone_capacity(host_zone_id::WEIGHT) - capacity_pre;
         check(loader_buf != nullptr, "the loader's SYCL_Host buffer was allocated");
     }
     const size_t loader_bytes = census.bytes(weight_class::LOADER_RESIDENCY);
@@ -770,9 +784,6 @@ bool arm2_every_weight_zone_allocation_has_a_term(const placement_plan & plan,
 
     if (loader_buf != nullptr) {
         ggml_backend_buffer_free(loader_buf);
-    }
-    if (reserve_buf != nullptr) {
-        ggml_backend_buffer_free(reserve_buf);
     }
     held.clear();
     check_eq("the census released every WEIGHT allocation", census.used(), used_before);
