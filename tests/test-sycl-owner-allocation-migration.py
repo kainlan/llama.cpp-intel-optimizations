@@ -1861,6 +1861,52 @@ def check_internal_backing_mint_stays_private(cache_cpp: str) -> list:
 
 
 
+# unified_alloc reads the owner entry's adapter thread-locals: its control, its CACHE_BACKING provenance and its
+# HOST_CPU charge (canonical contract §3 and §3.1; th32 §4.2). A unified_alloc nested on the same thread inside the
+# outer one would otherwise publish into the outer control, copy its provenance or spend its charge, so unified_alloc
+# takes each with std::exchange on entry, a destructor puts it back on every exit, and nothing else in unified_alloc
+# names it: a read of the global after the consume reads the consumed value. The set is derived from what the owner
+# entry's adapter_scope constructor assigns, so a thread-local added there is pinned too. This is a source pin
+# because the NESTED_HOST_CPU test seam cannot drive a pinned backing allocation on the test thread reliably; the
+# control and the charge are also scored through that seam by arm (m) of test-sycl-host-ledger-device.
+def check_unified_alloc_consumes_adapter_locals(code: str) -> list:
+    problems = []
+    scope_start = code.index("struct adapter_scope {")
+    scope = code[scope_start:code.index("} scope(", scope_start)]
+    constructor = scope[:scope.index("~adapter_scope()")]
+    adapter_locals = sorted(set(re.findall(r"\b(g_allocating_\w+)\s*=(?!=)", constructor)))
+    if len(adapter_locals) < 3:
+        problems.append("the owner entry's adapter_scope assigns %d thread-locals, expected at least 3: %s" %
+                        (len(adapter_locals), adapter_locals))
+    start, end = function_body_span(code, "unified_alloc")
+    body = code[start:end]
+    entry = body[:body.index("if (out == nullptr)")]
+    for name in adapter_locals:
+        if not re.search(r"=\s*std::exchange\(\s*%s\s*," % name, entry):
+            problems.append("unified_alloc does not consume %s with std::exchange before its first exit" % name)
+        restores = re.findall(r"~\w+\(\)\s*\{[^}]*\b%s\s*=(?!=)" % name, entry)
+        if len(restores) != 1:
+            problems.append("unified_alloc's entry has %d destructors restoring %s, want 1" % (len(restores), name))
+        uses = len(re.findall(r"\b%s\b" % name, body))
+        if uses != 2:
+            problems.append("%s is named %d times in unified_alloc, want 2: the consume and the restore" % (name, uses))
+    return problems
+
+
+# Each mutant must be caught, so the check above is not decorative: the consume dropped, a read left on the global,
+# the restore dropped, and a fourth thread-local assigned by adapter_scope but never consumed.
+CONSUME_MUTANTS = (
+    ("cache-backing consume dropped", "std::exchange(g_allocating_cache_backing, false)", "g_allocating_cache_backing"),
+    ("owner-control consume dropped", "std::exchange(g_allocating_owner_control, nullptr)",
+     "g_allocating_owner_control"),
+    ("a provenance read left on the global", "rec.handle.cache_backing    = cache_backing;",
+     "rec.handle.cache_backing    = g_allocating_cache_backing;"),
+    ("cache-backing restore dropped", "g_allocating_cache_backing = cache_backing;\n            g_allocating_charge",
+     "g_allocating_charge"),
+    ("an unconsumed fourth thread-local", "g_allocating_charge        = charge;\n            }",
+     "g_allocating_charge        = charge;\n                g_allocating_extra = true;\n            }"),
+)
+
 # Four independent checks: a failure of one must not hide the others.
 with gate('cache-backing-not-public'):
     problems = check_cache_backing_not_public(CACHE_HPP)
@@ -1874,5 +1920,13 @@ with gate('dot-directory-skip-is-live'):
 with gate('internal-backing-mint-stays-private'):
     problems = check_internal_backing_mint_stays_private(CACHE)
     assert not problems, "\n".join(problems)
+with gate('unified-alloc-consumes-adapter-thread-locals'):
+    problems = check_unified_alloc_consumes_adapter_locals(CACHE_CODE)
+    assert not problems, "\n".join(problems)
+with gate('unified-alloc-consume-check-catches-its-mutants'):
+    for _label, _old, _new in CONSUME_MUTANTS:
+        assert CACHE_CODE.count(_old) == 1, "mutant %r: its anchor is not in unified-cache.cpp once" % _label
+        assert check_unified_alloc_consumes_adapter_locals(CACHE_CODE.replace(_old, _new)), \
+            "mutant %r was not caught" % _label
 
-finish(min_checks=63)
+finish(min_checks=65)

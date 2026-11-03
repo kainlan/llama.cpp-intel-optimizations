@@ -1004,6 +1004,8 @@ thread_local alloc_owner_control * g_allocating_owner_control = nullptr;
 // Internally-minted backing provenance for the legacy allocation adapter
 // beneath unified_allocate_owner_backing(). Only that overload sets it, so the
 // persistence sites below can never copy a caller-supplied request field.
+// unified_alloc consumes it on entry with the owner control and the charge, so a
+// unified_alloc nested on the same thread never copies an outer request's provenance.
 thread_local bool g_allocating_cache_backing = false;
 
 // ---- the process-global host ledger (th32 §4.2, §11 T2) ----
@@ -19794,21 +19796,26 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // mint or mutate an intrusive control. This call consumes it, so a unified_alloc nested on this thread cannot
     // publish into the outer request's control, which owns that request's allocation alone (canonical contract §3).
     alloc_owner_control * const owner_control = std::exchange(g_allocating_owner_control, nullptr);
+    // The owner entry's CACHE_BACKING provenance, consumed with its control: a nested unified_alloc that kept it
+    // while losing the control would build a legacy record flagged cache_backing (canonical contract §3.1).
+    const bool                  cache_backing = std::exchange(g_allocating_cache_backing, false);
 
     // The owner entry's charge for a HOST_CPU request: only the owner entry charges the host ledger (th32 §4.2). This
     // call consumes it, so a unified_alloc nested on this thread finds none and a HOST_CPU request there is refused.
     host_ledger_charge_token * const charge = std::exchange(g_allocating_charge, nullptr);
 
-    // Both go back on every exit, for the owner entry that set them.
+    // All three go back on every exit, for the owner entry that set them.
     struct adapter_consume_scope {
         alloc_owner_control *      owner_control;
+        bool                       cache_backing;
         host_ledger_charge_token * charge;
 
         ~adapter_consume_scope() {
             g_allocating_owner_control = owner_control;
+            g_allocating_cache_backing = cache_backing;
             g_allocating_charge        = charge;
         }
-    } consume_scope{ owner_control, charge };
+    } consume_scope{ owner_control, cache_backing, charge };
 
     if (out == nullptr) {
         return false;
@@ -19980,7 +19987,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             rec.handle.alloc_id     = reserved_alloc_id;
             rec.handle.vram_zone    = zid;
             rec.handle.zone_managed  = true;
-            rec.handle.cache_backing = g_allocating_cache_backing;
+            rec.handle.cache_backing = cache_backing;
             rec.queue                = req.queue;
             if (req.queue) rec.queue_keepalive = *req.queue;
             rec.zone_managed = true;
@@ -20448,7 +20455,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         rec.handle.arena_extent     = exact_arena.extent;
         rec.handle.vram_zone        = output_metadata.vram_zone;
         rec.handle.zone_managed     = output_metadata.zone_managed;
-        rec.handle.cache_backing    = g_allocating_cache_backing;
+        rec.handle.cache_backing    = cache_backing;
         rec.handle.host_zone        = output_metadata.host_zone;
         rec.queue                   = req.queue;
         if (tier == alloc_tier::HOST_CPU) {
