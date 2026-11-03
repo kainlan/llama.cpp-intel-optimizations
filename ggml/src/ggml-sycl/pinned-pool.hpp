@@ -203,6 +203,8 @@ class pinned_chunk_pool {
     // Statistics
     size_t budget() const { return budget_; }
 
+    size_t chunk_size() const { return chunk_size_; }
+
     size_t allocated() const;  // Total bytes allocated (in chunks)
     size_t chunk_count() const;
 

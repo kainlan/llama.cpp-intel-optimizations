@@ -2302,6 +2302,43 @@ GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset(void);
 // submit its primitive. Returns false for an unknown site.
 GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts(const char * site, uint64_t * calls, uint64_t * declined,
                                                             uint64_t * engaged);
+
+// The host ledger's charge-protocol seams (th32 §11 T2): one hook table, one hook per point. A point fires its hook
+// with an argument and reads the return value as its decision: an injection point fails when the hook returns nonzero;
+// FORCE_TIER_HOST_CPU returns 1 to force the final tier to HOST_CPU (mode A, no charge held) or 2 to force a
+// non-HOST_CPU tier (mode B, a charge held), both just before the tier-iff-charge check, its argument 1 when a charge
+// is held; NESTED_HOST_CPU fires inside every unified_alloc after that check and before registry publication, with no
+// allocator lock held, so a hook may allocate from it and counts its own recursion depth; OWNER_THROW's argument is 0
+// before unified_alloc and 1 after it. CHARGE_BEFORE_CAS and YIELD_AFTER_INFLIGHT are hold points: a hook there blocks
+// to hold the thread, and its return value is ignored.
+enum ggml_sycl_test_host_ledger_point {
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_CHARGE_BEFORE_CAS = 0,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_YIELD_AFTER_INFLIGHT,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_HOST_CPU_MMAP_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_HOST_CPU_MLOCK_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_COORDINATOR_NULL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_CONTROL_NULL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_COHORT_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_PUBLISH_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_REGISTRY_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_IDENTITY_MISMATCH,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_OWNER_THROW,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_FREE_REFUSED,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_FORCE_TIER_HOST_CPU,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_NESTED_HOST_CPU,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_COUNT,
+};
+
+typedef int32_t (*ggml_sycl_test_host_ledger_hook_fn)(int32_t point, int32_t arg);
+// Sets (fn) or clears (NULL) the point's hook. Returns false, and changes nothing, for an unknown point.
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_hook(int32_t point, ggml_sycl_test_host_ledger_hook_fn fn);
+// Seeds the stored budget without counting a store, so a store count read after seeding is still 0.
+GGML_BACKEND_API void ggml_sycl_test_host_ledger_store_budget(uint64_t budget);
+// The committed bytes; the budget stores made by the pass scope's store (the setter's are not counted); and the sum of
+// charged_bytes over the live HOST_CPU registry rows. Each returns false, writing nothing, for a null pointer.
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_committed(uint64_t * committed);
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_stores(uint64_t * stores);
+GGML_BACKEND_API bool ggml_sycl_test_host_cpu_live_bytes(uint64_t * live_bytes);
 #endif
 
 #ifdef __cplusplus

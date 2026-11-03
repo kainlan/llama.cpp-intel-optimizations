@@ -204,7 +204,8 @@ placement_plan plan_single(const std::vector<placement_tensor_info> & inv,
     const ggml_sycl_device_info   info = make_mock_sycl_info(1, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard info_guard(info);
     g_log               = {};
-    placement_plan plan = compute_placement_plan(inv, budget, /*device_id=*/0, kv_for(f), nullptr, k_experts);
+    placement_plan plan =
+        compute_placement_plan(inv, budget, /*device_id=*/0, kv_for(f), nullptr, k_experts, host_ledger_budget());
     if (log) {
         *log = g_log;
     }
@@ -218,7 +219,8 @@ placement_plan plan_two_devices(const std::vector<placement_tensor_info> & inv, 
         { 0, budget, 32ull * 1024ull * MiB, 1.0, true },
         { 1, budget, 32ull * 1024ull * MiB, 1.0, true },
     };
-    return compute_multi_device_plan(budgets, inv, k_layers, multi_gpu_mode::HYBRID, kv_for(f), nullptr, k_experts);
+    return compute_multi_device_plan(budgets, inv, k_layers, multi_gpu_mode::HYBRID, kv_for(f), nullptr, k_experts,
+                                     host_ledger_budget());
 }
 
 size_t device_groups(const placement_plan & plan) {
