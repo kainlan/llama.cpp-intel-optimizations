@@ -246,8 +246,8 @@ def clause_f2_new_exports(t: dict) -> list:
     for name in NEW_EXPORTS:
         if not re.search(rf"GGML_BACKEND_API\s[^;]*?\b{name}\s*\(", t[H]):
             problems.append(f"ggml-sycl.h does not declare {name}")
-        if not re.search(rf'strcmp\s*\(\s*name\s*,\s*"{name}"\s*\)\s*==\s*0\s*\)\s*\{{\s*return\s*\(\s*void\s*\*\s*\)\s*'
-                         rf"{name}\s*;", t[GS]):
+        if not re.search(rf'strcmp\s*\(\s*name\s*,\s*"{name}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
+                         rf"return\s*\(\s*void\s*\*\s*\)\s*{name}\s*;", t[GS]):
             problems.append(f"the proc table does not return {name} for its name")
     return problems
 
@@ -415,8 +415,8 @@ def clause_l2_inputs_reach_both_inventories(t: dict) -> list:
         problems.append("load_tensors does not compute the early plan")
     elif not (0 <= caps < early.start()):
         problems.append("the caps loop does not resolve use_mmap before the early plan")
-    sites = len(re.findall(r"llama_model_sycl_set_inventory_host_backing\s*\(\s*inventory\s*,\s*ml\s*,\s*use_mlock\s*\)",
-                           t[LM]))
+    sites = len(re.findall(r"llama_model_sycl_set_inventory_host_backing\s*\(\s*inventory\s*,\s*ml\s*,\s*"
+                           r"use_mlock\s*\)", t[LM]))
     if sites != 2:
         problems.append(f"{sites} inventories carry libllama's resolved inputs, expected the early and the late one")
     setter = body_of(t[LM], r"static\s+void\s+llama_model_sycl_set_inventory_host_backing\s*\(")
@@ -626,8 +626,8 @@ def clause_l12_mapped_buft(t: dict) -> list:
     name = body_of(gs, r"static\s+const\s+char\s*\*\s*ggml_backend_sycl_mapped_buffer_type_name\s*\(")
     if 'GGML_SYCL_NAME "_Mapped"' not in name:
         problems.append("SYCL_Mapped has no get_name of its own")
-    if not re.search(r"buft->iface\.get_name\s*==\s*ggml_backend_sycl_mapped_buffer_type_name\s*\)\s*\{\s*return\s+true",
-                     gs):
+    if not re.search(r"buft->iface\.get_name\s*==\s*ggml_backend_sycl_mapped_buffer_type_name\s*\)\s*\{\s*"
+                     r"return\s+true", gs):
         problems.append("supports_buft does not list SYCL_Mapped")
     for fn in ("set_tensor", "memset_tensor", "clear"):
         body = body_of(gs, rf"static\s+void\s+ggml_backend_sycl_mapped_buffer_{fn}\s*\(")
@@ -765,7 +765,8 @@ def clause_p1_derivation_sites(t: dict) -> list:
             continue
         n = len(re.findall(r"entry\s*\.\s*host_backing\s*=\s*placement_host_backing_when_host\s*\(", body))
         if n != 2:
-            problems.append(f"{builder}: {n} entry-creation sites derive host_backing, expected the expert and dense one")
+            problems.append(f"{builder}: {n} entry-creation sites derive host_backing, "
+                            "expected the expert and dense one")
         mark = body.find("placement_mark_device_entries_file_mapped(plan)")
         zones = body.find("populate_host_zone_sizing(plan,")
         if mark < 0:
@@ -947,8 +948,8 @@ MAPPED_PROTO_RE = r"(static\s+ggml_backend_buffer_type\s+ggml_sycl_mapped_buft_p
 MUTANTS = [
     # (label, clause label prefix, builder)
     ("the old stage name returns the staging proc", "F3",
-     lambda t: _mut(t, GS, rf'(strcmp\s*\(\s*name\s*,\s*"{STAGE_OLD}"\s*\)\s*==\s*0\s*\)\s*\{{\s*return\s*\(\s*void\s*\*\s*\)'
-                           r"\s*)\w+", rf"\g<1>{STAGE_NEW}")),
+     lambda t: _mut(t, GS, rf'(strcmp\s*\(\s*name\s*,\s*"{STAGE_OLD}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
+                           r"return\s*\(\s*void\s*\*\s*\)\s*)\w+", rf"\g<1>{STAGE_NEW}")),
     ("libllama's inputs moved past the padding", "F1",
      lambda t: _mut(t, H, r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)\s*==\s*185",
                     "offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 192")),
@@ -959,8 +960,8 @@ MUTANTS = [
      lambda t: _mut(t, LM, r"(static\s+bool\s+llama_model_sycl_hooks_enabled\s*\(\s*const[^{]*\{\s*return\s*)",
                     r"\1hooks.stage_inventory && ")),
     ("the fact ignores the tier", "F6",
-     lambda t: _mut(t, GS, r"inventory\s*->\s*use_mmap_resolved\s*&&\s*(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)",
-                    "inventory->use_mmap_resolved")),
+     lambda t: _mut(t, GS, r"inventory\s*->\s*use_mmap_resolved\s*&&\s*"
+                           r"(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)", "inventory->use_mmap_resolved")),
     ("a second backend site reads the fact", "F6",
      lambda t: _mut(t, GS, r"(g_placement_kv_info\s*\.\s*load_maps_files\s*=[^;]*;)",
                     r"\1 (void) inventory->use_mmap_resolved;")),
@@ -998,8 +999,8 @@ MUTANTS = [
     ("the DMA pool is gated on the fact instead of the census", "P4",
      lambda t: _mut(t, UCC, r"!\s*plan\s*\.\s*has_pinned_backing\s*\(\s*\)", "plan.host_backing_maps_files")),
     ("the census skips the device-planned entries", "P4",
-     lambda t: _mut(t, UCH, r"(bool\s+has_pinned_backing\s*\(\s*\)\s*const\s+noexcept\s*\{\s*for\s*\([^)]*\)\s*\{\s*if\s*"
-                            r"\(\s*)", r"\1!e.on_device && ")),
+     lambda t: _mut(t, UCH, r"(bool\s+has_pinned_backing\s*\(\s*\)\s*const\s+noexcept\s*\{\s*"
+                            r"for\s*\([^)]*\)\s*\{\s*if\s*\(\s*)", r"\1!e.on_device && ")),
     ("a ninth resolve_or_host caller", "C1",
      lambda t: _mut(t, BINBCAST, r"(\bggml_sycl_resolve_or_host_tensor_ptr\s*\()",
                     r"ggml_sycl_resolve_or_host_tensor_ptr(nullptr, 0); \1")),
@@ -1117,7 +1118,8 @@ def self_test(t: dict) -> int:
     base = run(t)
     dirty = [label for label, problems in base.items() if problems]
     if dirty:
-        print(f"  self-test: the unmodified tree FAILS {len(dirty)} clause(s): {', '.join(d.split()[0] for d in dirty)}")
+        failing = ", ".join(d.split()[0] for d in dirty)
+        print(f"  self-test: the unmodified tree FAILS {len(dirty)} clause(s): {failing}")
         ok = False
     else:
         print("  self-test: the unmodified tree passes")

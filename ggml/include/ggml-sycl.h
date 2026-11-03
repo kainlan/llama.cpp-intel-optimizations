@@ -532,8 +532,8 @@ enum ggml_sycl_host_backing {
 
 // The backing the loader binds a weight's buffer type from (design 5efe §4.3), read from the bound load's staged plan,
 // which holds the load's fact: the plan's dense entry for a name-indexed weight, otherwise the transaction default
-// (FILE_MAPPED when the load maps files, PINNED when it does not). tensor_name NULL asks for that default alone, which is
-// how the loader reads the fact. PINNED when no plan is staged for the bound load.
+// (FILE_MAPPED when the load maps files, PINNED when it does not). tensor_name NULL asks for that default alone, which
+// is how the loader reads the fact. PINNED when no plan is staged for the bound load.
 GGML_BACKEND_API enum ggml_sycl_host_backing ggml_backend_sycl_planned_host_backing(const char * tensor_name);
 
 // Set the placement envelope (snapshot of llama_model_params capacity inputs)
