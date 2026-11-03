@@ -1,6 +1,7 @@
 #include "ggml-sycl.h"
 #include "../ggml/src/ggml-backend-impl.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -253,15 +254,16 @@ static void phase(const char * name) {
 }
 
 // Whether the backend logged the stale-libllama refusal at ERROR since the last reset. The callback forwards every line
-// to the callback it replaced, so the log stays as it would be without the probe.
-static bool              g_stale_stage_logged      = false;
+// to the callback it replaced, so the log stays as it would be without the probe. The flag is atomic because the
+// callback runs on whichever thread logs, and a thread the backend owns may log while the probe is installed.
+static std::atomic<bool> g_stale_stage_logged{ false };
 static ggml_log_callback g_stale_stage_prev_log    = nullptr;
 static void *            g_stale_stage_prev_log_ud = nullptr;
 
 static void stale_stage_log(enum ggml_log_level level, const char * text, void * user_data) {
     if (level == GGML_LOG_LEVEL_ERROR && text &&
         std::strstr(text, "libllama predates this backend's inventory; rebuild libllama and libggml-sycl together")) {
-        g_stale_stage_logged = true;
+        g_stale_stage_logged.store(true);
     }
     if (g_stale_stage_prev_log) {
         g_stale_stage_prev_log(level, text, g_stale_stage_prev_log_ud);
@@ -1506,8 +1508,11 @@ int main() {
             return 1;
         }
         auto stale_stage = reinterpret_cast<decltype(&ggml_backend_sycl_stage_load_inventory_plan)>(stale_proc);
+        // ggml_log_set writes ggml's logger globals without synchronization, so the probe is swapped in and out only
+        // where this test runs no thread of its own: every std::async above has been joined by this phase, and the
+        // stub logs its refusal on this thread before it returns.
         ggml_log_get(&g_stale_stage_prev_log, &g_stale_stage_prev_log_ud);
-        g_stale_stage_logged = false;
+        g_stale_stage_logged.store(false);
         ggml_log_set(stale_stage_log, nullptr);
         const ggml_sycl_lifecycle_result stale_rc = stale_stage(nullptr, nullptr, true);
         ggml_log_set(g_stale_stage_prev_log, g_stale_stage_prev_log_ud);
@@ -1516,7 +1521,7 @@ int main() {
                          (int) stale_rc);
             return 1;
         }
-        if (!g_stale_stage_logged) {
+        if (!g_stale_stage_logged.load()) {
             std::fprintf(stderr, "the old staging proc name refused without logging why at ERROR\n");
             return 1;
         }
