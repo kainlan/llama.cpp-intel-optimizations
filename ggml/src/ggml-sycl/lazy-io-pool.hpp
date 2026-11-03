@@ -65,16 +65,19 @@ class ring_lease {
 
   private:
     friend ring_lease lazy_io_pool_take();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    friend void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease);
+#endif
 
     explicit ring_lease(lazy_io_pool * pool) noexcept : pool_(pool) {}
 
     lazy_io_pool * pool_ = nullptr;
 };
 
-// Takes a lease on the live pool, creating the pool when there is none: reserve the registry's generation under the
-// lock, build the pool and its reap node outside it, and install it under the lock if the generation still matches;
-// a take that finds a pool installed meanwhile joins it and destroys its own outside the lock. Returns an empty lease
-// once the registry is shut down. Throws std::bad_alloc when the pool cannot be built.
+// Takes a lease on the live pool, creating the pool when there is none: find the slot empty under the lock, build the
+// pool and its reap node outside it, and install it under the lock if the slot is still empty; a take that finds a
+// pool installed meanwhile joins it and destroys its own outside the lock. Returns an empty lease once the registry is
+// shut down. Throws std::bad_alloc when the pool cannot be built.
 ring_lease lazy_io_pool_take();
 
 enum class lazy_reap_scope : uint8_t {

@@ -143,8 +143,8 @@ arm_result arm_park_and_reap() {
 
 // Concurrent takes on an empty registry give one pool: a take that loses the install race joins the winner's pool and
 // destroys its own. Several rounds, each released together from a spin barrier.
-// Mutant: an install that does not check the generation (a second pool replaces the first, whose leases are lost from
-// the slot's count, and two pools park at the drops).
+// Mutant: an install that does not check the slot (a second pool replaces the first, whose leases are lost from the
+// slot's count, and two pools park at the drops).
 arm_result arm_concurrent_takes() {
     arm_result    r;
     constexpr int threads = 16;
