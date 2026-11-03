@@ -72,7 +72,11 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       init_tensor registers the host weight; get_max_size takes the device from the buft;
   L13. mapped_buffer_from_file builds on the C2 primitives: file_mapping_segments, unified_allocate_file_mapping,
       WILLNEED and RANDOM advice, and the lock under the plan's host_mapped_locked, refusing where the tier is absent or
-      where the plan maps no files.
+      where the plan maps no files;
+  L14. the -ot CPU override binds from the plan's backing like every other weight: CPU_OWNED takes
+      select_weight_buft_cpu_owned, and both of select_weight_buft's list walks skip SYCL_Mapped (buft_is_sycl_mapped)
+      unless the plan backs the weight FILE_MAPPED, so its place at the head of buft_list_cpu never binds it; the
+      NOT HONOURED WARN says file-mapped or pinned from the buffer type the fact bound, never pinned alone.
 
 The planner (§4.4)
   P1. every entry-creation site in both builders derives host_backing from the fact as the plan holds it
@@ -668,6 +672,38 @@ def clause_l13_from_file_on_c2(t: dict) -> list:
 # ---- the planner ----
 
 
+def clause_l14_override_binds_from_the_plan(t: dict) -> list:
+    problems = []
+    region = create_tensor_buft_region(t)
+    override = between(region, "if (overrides->buft == ggml_backend_cpu_buffer_type()) {", "} else {")
+    if not override:
+        return ["the -ot CPU override branch was not found"]
+    if not re.search(r"if\s*\(\s*planned_backing\s*==\s*GGML_SYCL_HOST_BACKING_CPU_OWNED\s*\)\s*\{\s*buft\s*=\s*"
+                     r"select_weight_buft_cpu_owned\s*\(", override):
+        problems.append("the override does not bind a CPU_OWNED weight to a CPU-owned buffer type")
+    owned = override.find("select_weight_buft_cpu_owned(")
+    walk = override.find("select_weight_buft(")
+    if owned >= 0 and walk >= 0 and walk < owned:
+        problems.append("the override walks buft_list_cpu before it asks the plan's backing")
+    body = select_weight_buft_body(t)
+    skips = len(re.findall(r"if\s*\(\s*!\s*planned_file_mapped\s*&&\s*buft_is_sycl_mapped\s*\(\s*cur_buft\s*\)\s*\)"
+                           r"\s*\{\s*continue\s*;", body))
+    if skips != 2:
+        problems.append(f"{skips} of select_weight_buft's two list walks skip SYCL_Mapped for a weight not FILE_MAPPED")
+    helper = body_of(t[LML], r"static\s+bool\s+buft_is_sycl_mapped\s*\(")
+    if not re.search(r"buft\s*==\s*hooks\s*\.\s*mapped_buffer_type_for_device\s*\(\s*dev\s*\)", helper):
+        problems.append("buft_is_sycl_mapped does not compare against the device's SYCL_Mapped")
+    report = body_of(t[LML], r"void\s+llama_model_loader::done_getting_tensors\s*\(")
+    held = re.search(r"(\w+)\s*=\s*buft_is_sycl_mapped\s*\(\s*first_cpu_override_downgraded_buft\s*\)\s*\?\s*"
+                     r'"file-mapped"\s*:\s*"pinned"\s*;', report)
+    if not held:
+        problems.append("the NOT HONOURED WARN does not derive file-mapped or pinned from the bound buffer type")
+    elif "from pinned host" in report or not re.search(
+            rf"first_cpu_override_downgraded_buft\s*\)\s*,\s*{held.group(1)}\b", report):
+        problems.append("the NOT HONOURED WARN still says pinned whatever the backing")
+    return problems
+
+
 def clause_p1_derivation_sites(t: dict) -> list:
     ucc = t[UCC]
     problems = []
@@ -808,6 +844,7 @@ CLAUSES = [
     ("L11 preload serves SYCL_Mapped in place", clause_l11_preload_serves_mapped_in_place),
     ("L12 the SYCL_Mapped buffer type", clause_l12_mapped_buft),
     ("L13 the from-file hook on the C2 primitives", clause_l13_from_file_on_c2),
+    ("L14 the -ot CPU override binds from the plan", clause_l14_override_binds_from_the_plan),
     ("P1 the derivation at every entry-creation site", clause_p1_derivation_sites),
     ("P2 accumulation sites pass the backing", clause_p2_accumulation_sites_test_backing),
     ("P3 the readers", clause_p3_readers),
@@ -961,6 +998,20 @@ MUTANTS = [
     ("supports_buft stops listing SYCL_Mapped", "L12",
      lambda t: _mut(t, GS, r"(buft->iface\.get_name\s*==\s*ggml_backend_sycl_mapped_buffer_type_name\s*\)\s*\{\s*"
                            r"return\s+)true", r"\1false")),
+    ("a CPU_OWNED override walks buft_list_cpu", "L14",
+     lambda t: _mut(t, LML, r"if\s*\(\s*planned_backing\s*==\s*GGML_SYCL_HOST_BACKING_CPU_OWNED\s*\)", "if (false)")),
+    ("select_weight_buft binds SYCL_Mapped by its place in either walk", "L14",
+     lambda t: _mut_all(t, LML, r"if\s*\(\s*!\s*planned_file_mapped\s*&&\s*buft_is_sycl_mapped\s*\(\s*cur_buft\s*\)"
+                                r"\s*\)\s*\{\s*continue\s*;\s*\}", "")),
+    ("select_weight_buft's final walk binds SYCL_Mapped by its place", "L14",
+     lambda t: _mut(t, LML, r"(GGML_UNUSED\s*\(\s*planned_file_mapped\s*\)\s*;.*?)if\s*\(\s*!\s*planned_file_mapped\s*"
+                            r"&&\s*buft_is_sycl_mapped\s*\(\s*cur_buft\s*\)\s*\)\s*\{\s*continue\s*;\s*\}", r"\1")),
+    ("buft_is_sycl_mapped never answers true", "L14",
+     lambda t: _mut(t, LML, r"return\s+hooks\s*\.\s*reg\s*&&\s*hooks\s*\.\s*mapped_buffer_type_for_device\s*&&[^;]*;",
+                    "return false;")),
+    ("the NOT HONOURED WARN says pinned on a mapping load", "L14",
+     lambda t: _mut(t, LML, r'buft_is_sycl_mapped\s*\(\s*first_cpu_override_downgraded_buft\s*\)\s*\?\s*'
+                            r'"file-mapped"\s*:\s*"pinned"', '"pinned"')),
     ("the from-file hook never locks", "L13",
      lambda t: _mut(t, GS, r"unified_cache_raw_lock_file_segments\s*\(", "unified_cache_raw_skip_lock(")),
     ("a stream_dma caller drops the refusal", "C2",

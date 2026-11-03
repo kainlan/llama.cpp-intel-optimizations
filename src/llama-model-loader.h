@@ -204,11 +204,12 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
     // llama.cpp-lufn: `-ot <pattern>=CPU` is resolved through make_cpu_buft_list(), whose
-    // FIRST entry is the first device's host buffer type -- SYCL_Host on this fork -- ahead
-    // of the CPU_REPACK extras and the plain CPU buft. select_weight_buft() returns the
-    // first entry whose device accepts the op, so a CPU override silently lands in pinned
-    // host memory that the GPU still executes from, and reaches the CPU backend only for the
-    // ops the SYCL device declines. Nothing said so: two runs asking for 96 and 144 layers
+    // FIRST entries are the first device's host buffer types -- SYCL_Host on this fork, after
+    // SYCL_Mapped on a load that maps files -- ahead of the CPU_REPACK extras and the plain CPU
+    // buft. select_weight_buft() returns the first entry whose device accepts the op (SYCL_Mapped
+    // only for a weight the plan backs FILE_MAPPED), so a CPU override silently lands in host
+    // memory that the GPU still executes from, pinned or file-mapped, and reaches the CPU backend
+    // only for the ops the SYCL device declines. Nothing said so: two runs asking for 96 and 144 layers
     // both put the same 45 MB on CPU. Count the downgrades here so done_getting_tensors()
     // can refuse loudly. Note `ggml_backend_buft_is_host()` cannot be the discriminator --
     // SYCL_Host IS host memory; the question is which DEVICE owns the buffer type.
