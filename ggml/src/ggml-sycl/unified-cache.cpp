@@ -26299,6 +26299,15 @@ size_t unified_cache::host_scratch_begin_release(uint64_t owner) {
             marked_candidate_note(candidates, entry, owner);
         }
         for (const marked_chunk_entry & candidate : candidates) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::BEGIN_NAMES_ANY_OWNER)) {
+                const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
+                if (status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) {
+                    refusals.push_back({ candidate.chunk_idx, status });
+                }
+                continue;
+            }
+#endif
             const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
             // Another owner's chunk still in use is left silently: it holds that context's scheduler buffers (§4.4
             // "A begin and a live owner"). Only the owning context's own begin names it.

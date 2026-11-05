@@ -55,12 +55,13 @@ enum class scratch_test_mutant : int {
     OWNER_END_NO_EMPTY        = 23,  // the owner's end leaves its empty chunks withdrawn
     OWNER_END_FIRST_ONLY      = 24,  // the owner's end frees only the first backing it collected
     LEASE_DROP_NO_INDEX       = 25,  // the last lease's drop on an orphaned chunk does not release it
+    BEGIN_NAMES_ANY_OWNER     = 26,  // a begin names another owner's live chunk as refused
     // The SCRATCH transaction and its backend entry points.
-    RETURN_NOOP               = 26,  // RETURN does nothing: the ensure keeps the high-water
-    RTM_LEFT_IN_TXN           = 27,  // RETURN_TO_MARK files the tail but leaves it in the transaction
-    KEEP_WALKS_SET            = 28,  // KEEP clears the withdrawn flag of every chunk in the device's marked set
-    OWNER_END_REMOVED         = 29,  // ggml_backend_sycl_free makes no owner-end call
-    COUNT                     = 30,
+    RETURN_NOOP               = 27,  // RETURN does nothing: the ensure keeps the high-water
+    RTM_LEFT_IN_TXN           = 28,  // RETURN_TO_MARK files the tail but leaves it in the transaction
+    KEEP_WALKS_SET            = 29,  // KEEP clears the withdrawn flag of every chunk in the device's marked set
+    OWNER_END_REMOVED         = 30,  // ggml_backend_sycl_free makes no owner-end call
+    COUNT                     = 31,
 };
 
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
