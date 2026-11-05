@@ -8158,7 +8158,6 @@ static uint64_t ggml_sycl_assign_cache_uuid(ggml_tensor_extra_gpu * extra);
 
 // Forward declaration: check if tensor's buffer is in device VRAM (defined after buffer context struct).
 static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t);
-
 // Forward declaration: check if tensor's weights are host-resident (defined after buffer context struct).
 static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::queue * stream);
 // Forward declaration: check if weight executes on host rather than GPU (defined in dispatch section).
@@ -96508,6 +96507,11 @@ void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t sched) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         if (backend && ggml_backend_is_sycl(backend)) {
             keys.push_back(ggml_sycl_host_holder_backend_key(backend));
+            // The scheduler creation before this begin freed the previous scheduler's compute buffers, so the
+            // device's empty marked SCRATCH chunks are released here (§4.4 "A begin and a live owner"). The marked set
+            // is the host buft device's, the device whose SCRATCH zone the notify grows.
+            (void) ggml_sycl::unified_cache_host_scratch_begin_release(ggml_sycl_notify_host_buft_device(backend),
+                                                                       ggml_sycl_host_holder_backend_key(backend));
         }
     }
     g_host_holder_plans->begin(keys.data(), keys.size());

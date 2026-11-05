@@ -4584,7 +4584,11 @@ I-5, §F2). It is the commit that changes every SYCL load.
       wiring positively (r10 m-5): `ggml_backend_sycl_free` calls the
       owner-end step before `delete sycl_ctx` (`gs:84119`), and
       `sched_reserve` calls `RETURN` on its own transaction's throw path
-      and `KEEP` on its success path. `RETURN` withdraws the marked chunks and files them in the
+      and `KEEP` on its success path. That `KEEP` is excepted under the
+      auto-`n_ubatch` trial, as the end commit is, because inside
+      `try_candidate` it would run before the host-fallback check and keep
+      a losing candidate's growth.
+      `RETURN` withdraws the marked chunks and files them in the
       device cache's marked set, and nothing in `OPEN` touches that set
       (r8 m-1). Withdrawal is the only writer that lowers
       `zones_[zi].size`, and `release_zone_chunk` does not write it (r9
