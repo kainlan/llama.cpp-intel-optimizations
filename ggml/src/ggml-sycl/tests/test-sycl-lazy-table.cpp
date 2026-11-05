@@ -975,8 +975,14 @@ const char * k_eager_arm_name = "(2) a HOST table reads its rows eagerly into on
 // table's own load that does not fit frees nothing. The last reference releases every allocation and takes the
 // yieldable bytes back. Engagement: the cache holds three chunks, one the floor's, and the budget is stored at the
 // committed figure before each charge, so neither fits without a yield.
+// The role reading needs device 0's cache: the reader is VOID in a process that has none (§3.1), and the HOST_CPU owner
+// path builds none, so the arm creates it before any baseline and scores an unreadable reading VOID, never as a figure.
 arm_result arm_storage_cache_owner_path() {
-    arm_result     r;
+    arm_result r;
+    if (ggml_sycl::get_unified_cache_for_device(0) == nullptr) {
+        void_arm(r, "device 0 has no cache, so the LAZY_ROW_CACHE role reading would be VOID");
+        return r;
+    }
     const uint64_t live0      = host_cpu_live();
     const uint64_t committed0 = ggml_sycl::host_ledger_committed();
     const uint64_t yieldable0 = ggml_sycl::host_ledger_yieldable_bytes();
@@ -1014,9 +1020,13 @@ arm_result arm_storage_cache_owner_path() {
         uint64_t   role1 = 0;
         const bool role_read1 =
             ggml_sycl::unified_cache_role_bytes_for_testing(0, ggml_sycl::alloc_role::LAZY_ROW_CACHE, &role1);
-        expect(r, role_read0 && role_read1 && role1 - role0 == k_cache_role_bytes,
+        if (!role_read0 || !role_read1) {
+            void_arm(r, "the LAZY_ROW_CACHE role reading was VOID with device 0's cache created (readings " +
+                            num(role_read0) + "/" + num(role_read1) + ")");
+        }
+        expect(r, role1 - role0 == k_cache_role_bytes,
                "the bytes requested under role LAZY_ROW_CACHE grew by " + num(role1 - role0) + ", want " +
-                   num(k_cache_role_bytes) + " (readings " + num(role_read0) + "/" + num(role_read1) + ")");
+                   num(k_cache_role_bytes));
 
         // Another load's charge that does not fit: the cache's yielder frees its last chunk on this thread.
         ggml_sycl_test_host_ledger_store_budget(ggml_sycl::host_ledger_committed());
