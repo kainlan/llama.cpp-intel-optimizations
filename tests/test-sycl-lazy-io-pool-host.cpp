@@ -1,6 +1,6 @@
 // The lazy tables' IO pool registry (docs/design/sycl-storage-tier-lazy-tables.md §3.2, §3.3): the counted lease, its
-// clone, the park and the DYING transition at the last drop, the FULL reap and its list, the coverage wrapper and the
-// helper guard, and the shut-down flag.
+// clone, the install on a generation match, the park and the DYING transition at the last drop, the FULL reap and its
+// list, the coverage wrapper and the helper guard, and the shut-down flag.
 //
 // Links ggml-sycl/lazy-io-pool.cpp alone, with ggml-base for the abort and the log: no SYCL header, no device, no
 // unified cache, no SYCL module. The process holds one registry, so the arms run in order and each leaves it with no
@@ -143,8 +143,8 @@ arm_result arm_park_and_reap() {
 
 // Concurrent takes on an empty registry give one pool: a take that loses the install race joins the winner's pool and
 // destroys its own. Several rounds, each released together from a spin barrier.
-// Mutant: an install that does not check the slot (a second pool replaces the first, whose leases are lost from the
-// slot's count, and two pools park at the drops).
+// Mutant: an install that checks neither the generation nor the slot (a second pool replaces the first, whose leases
+// are lost from the slot's count, and two pools park at the drops).
 arm_result arm_concurrent_takes() {
     arm_result    r;
     constexpr int threads = 16;
@@ -182,6 +182,61 @@ arm_result arm_concurrent_takes() {
                "round " + num(round) + " after every drop: " + describe(registry()) + ", want one pool parked");
         settle();
     }
+    return r;
+}
+
+// What take B saw inside take A's build.
+struct take_race {
+    bool                fired        = false;
+    bool                b_held       = false;
+    uint64_t            b_generation = 0;
+    lazy_registry_state after_b;
+};
+
+// The take hook: take B runs inside take A's build window, installs a pool, and drops it, so it parks.
+void take_and_drop_b(void * ctx) {
+    take_race * race   = static_cast<take_race *>(ctx);
+    race->fired        = true;
+    ring_lease b       = lazy_io_pool_take();
+    race->b_held       = b.held();
+    race->b_generation = registry().live_generation;
+    b.reset();
+    race->after_b = registry();
+}
+
+// A take installs only on a generation match (§3.3): take A reserves the generation after g0 and, held in the take hook
+// after its build, take B reserves the same one, installs and drops, so B's pool parks. A's generation no longer
+// matches, so A destroys its pool and takes again: B's pool had g0 + 1, A's has g0 + 2, and A's pool is live with one
+// lease beside B's parked one.
+// Mutant: LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT, the empty-slot install rule (A installs the pool it built for the
+// generation B already installed, so A's pool carries g0 + 1 too).
+arm_result arm_generation_install() {
+    arm_result r;
+    settle();
+    const uint64_t g0 = registry().generation;
+    take_race      race;
+    ggml_sycl_test_lazy_take_hold(take_and_drop_b, &race);
+    ring_lease a = lazy_io_pool_take();
+    // Disarmed in case the hook never fired, so it cannot hold a later arm's take.
+    ggml_sycl_test_lazy_take_hold(nullptr, nullptr);
+    const lazy_registry_state s = registry();
+    if (!race.fired) {
+        fail(r, "take A's build never reached the take hook: the hook is not between the reserve and the install");
+    }
+    expect(r, race.b_held && race.b_generation == g0 + 1,
+           "take B, inside A's build, holds a pool of generation " + num(race.b_generation) + ", want " + num(g0 + 1));
+    expect(r, is(race.after_b, 0, 0, 1), "after B's drop: " + describe(race.after_b) + ", want B's pool parked");
+    expect(r, a.held(), "take A returned an empty lease");
+    expect(r, s.live_generation != race.b_generation,
+           "take A's pool shares generation " + num(s.live_generation) +
+               " with the pool installed and parked during its build");
+    expect(r, s.live_generation == g0 + 2 && s.generation == g0 + 2,
+           "take A's pool has generation " + num(s.live_generation) + " and the registry " + num(s.generation) +
+               ", want " + num(g0 + 2) + " for both");
+    expect(r, is(s, 1, 1, 1), "after A's take: " + describe(s) + ", want A's pool live with 1 lease and B's parked");
+    a.reset();
+    settle();
+    expect(r, is(registry(), 0, 0, 0), "after A's drop and a FULL reap: " + describe(registry()) + ", want 0, 0, 0");
     return r;
 }
 
@@ -383,6 +438,7 @@ int main(int argc, char ** argv) {
         { "a clone counts, moves transfer",                        arm_clone_and_move        },
         { "takes never revive a parked pool; one reap frees all",  arm_park_and_reap         },
         { "concurrent takes give one pool",                        arm_concurrent_takes      },
+        { "a take installs only on a generation match",            arm_generation_install    },
         { "a clone of a DYING pool aborts",                        arm_clone_on_dying_aborts },
         { "the helper guard takes through the registry and reaps", arm_helper_guard          },
         { "the wrapper reaps before its take and after its drop",  arm_wrapper_reaps         },

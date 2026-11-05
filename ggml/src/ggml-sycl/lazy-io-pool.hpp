@@ -13,8 +13,8 @@
 // host test links the translation unit alone.
 //
 // The registry's leaf mutex (canonical contract §12.5, L5) is a true leaf: nothing is taken, allocated, freed, waited
-// on or logged under it. A pool is built outside it and installed under it; a final drop only parks the pool, and the
-// reap frees parked pools after its unlock.
+// on or logged under it. A take reserves a generation under it, builds its pool outside it and installs the pool under
+// it on a generation match; a final drop only parks the pool, and the reap frees parked pools after its unlock.
 
 #include <cstddef>
 #include <cstdint>
@@ -74,10 +74,11 @@ class ring_lease {
     lazy_io_pool * pool_ = nullptr;
 };
 
-// Takes a lease on the live pool, creating the pool when there is none: find the slot empty under the lock, build the
-// pool and its reap node outside it, and install it under the lock if the slot is still empty; a take that finds a
-// pool installed meanwhile joins it and destroys its own outside the lock. Returns an empty lease once the registry is
-// shut down. Throws std::bad_alloc when the pool cannot be built.
+// Takes a lease on the live pool, creating the pool when there is none: find the slot empty and reserve the generation
+// after the last one installed under the lock, build the pool and its reap node outside it, and install it under the
+// lock if the generation still matches, that is, if no take installed a pool meanwhile. A take that lost joins the pool
+// installed meanwhile, or, when that pool has already parked, takes again; either way it destroys its own pool outside
+// the lock. Returns an empty lease once the registry is shut down. Throws std::bad_alloc when the pool cannot be built.
 ring_lease lazy_io_pool_take();
 
 enum class lazy_reap_scope : uint8_t {
@@ -131,6 +132,8 @@ class lazy_coverage_scope {
 struct lazy_registry_state {
     uint64_t live_pools             = 0;  // pools in the registry's slot: 0 or 1
     uint64_t live_leases            = 0;  // the slot pool's lease count
+    uint64_t generation             = 0;  // the last installed pool's generation
+    uint64_t live_generation        = 0;  // the slot pool's generation; 0 when the slot is empty
     uint64_t parked_nodes           = 0;  // DYING pools parked on the reap list
     uint64_t full_reaps_run         = 0;  // FULL reaps run, an empty list included
     uint64_t reaps_run_at_last_take = 0;
@@ -140,11 +143,18 @@ struct lazy_registry_state {
 // Copies the registry's state into *out. Returns false, writing nothing, for a null pointer.
 bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out);
 
-// A one-shot hold point in the FULL reap: armed with a callback, the first FULL reap that starts after the arming
-// calls it once, with no lock held, after its count has landed and before it swaps the list out; the callback blocks
-// for as long as the fixture wants that reap held. Arming with a null callback disarms.
-using lazy_reap_hold_fn = void (*)(void * ctx);
-void ggml_sycl_test_lazy_reap_hold(lazy_reap_hold_fn hold, void * ctx);
+// The registry's one-shot hold hook, armed at one of two points; arming either point replaces whatever was armed, and
+// arming with a null callback disarms. The callback runs once, with no lock held, and blocks for as long as the fixture
+// wants its caller held.
+using lazy_hold_fn = void (*)(void * ctx);
+
+// Arms the hook in the FULL reap: the first FULL reap that starts after the arming calls it after its count has landed
+// and before it swaps the list out.
+void ggml_sycl_test_lazy_reap_hold(lazy_hold_fn hold, void * ctx);
+
+// Arms the hook in the take: the first take that reserves a generation after the arming calls it after building its
+// pool and before the install, so a fixture can install and park another pool inside that window.
+void ggml_sycl_test_lazy_take_hold(lazy_hold_fn hold, void * ctx);
 
 // The coverage pin a direct-planner fixture passes (§3.3): an RAII guard that owns the lease, so the const ring_lease *
 // the planner takes cannot dangle. It takes the pool through the registry's take path, never off-registry, and its

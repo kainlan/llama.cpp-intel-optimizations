@@ -292,7 +292,9 @@ if (BUILD_TESTING)
             LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP
                 "FAIL the wrapper reaps before its take and after its drop: the take snapshot [0-9]+ reaps run, want [0-9]+: the entry reap did not run before the take"
             LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP
-                "FAIL the wrapper reaps before its take and after its drop: after the scope: 0 live pools, 0 leases, 1 parked, want its pool reaped by its closing reap")
+                "FAIL the wrapper reaps before its take and after its drop: after the scope: 0 live pools, 0 leases, 1 parked, want its pool reaped by its closing reap"
+            LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT
+                "FAIL a take installs only on a generation match: take A's pool shares generation [0-9]+ with the pool installed and parked during its build")
         set(_lazy_io_pool_host_variants test-sycl-lazy-io-pool-host "" "")
         list(LENGTH _lazy_io_pool_host_mutants _n)
         math(EXPR _last "${_n} - 1")

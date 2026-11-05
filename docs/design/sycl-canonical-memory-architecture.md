@@ -1634,16 +1634,19 @@ state machine.
 
 The lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`, th32
 T3; design `sycl-storage-tier-lazy-tables.md` §3.3) guards the registry's pool
-slot, the reap list, every pool's lease count and DYING flag, the reap-run and
-parked counters with their take-time snapshots, and the PRIVATE_TESTING hold
-hook. It sits at L5 and is a **true leaf: nothing is taken under it.** No lock
-is acquired, nothing is allocated, freed or waited on, and nothing is logged
-while it is held. A take builds its pool and reap node before it locks and
-installs them under it, and a take that lost the install race destroys its own
+slot and generation, the reap list, every pool's lease count and DYING flag, the
+reap-run and parked counters with their take-time snapshots, and the
+PRIVATE_TESTING hold hook. It sits at L5 and is a **true leaf: nothing is taken
+under it.** No lock is acquired, nothing is allocated, freed or waited on, and
+nothing is logged while it is held. A take that finds no pool reserves the next
+generation under it, builds its pool and reap node after the unlock, and
+installs them under it only if the generation still matches, that is, if no take
+installed a pool meanwhile. A take that lost joins the pool installed meanwhile,
+or takes again when that pool has already parked; either way it destroys its own
 pool after the unlock. The drop that reaches zero marks the pool DYING and links
 the pool's preallocated node into the reap list, which allocates nothing. A
 `FULL` reap swaps the list out under it and frees the parked pools after the
-unlock, and its hold hook runs with no lock held. A clone that finds its pool
+unlock. The hold hook, armed at the reap or at the take, runs with no lock held. A clone that finds its pool
 DYING unlocks before it logs and aborts. It may be taken while a non-leaf lock
 is held, as a clone under `g_tensor_inventory_mutex` will be. It is never taken
 while another global L5 lock is held: `g_lifecycle_plan_mutex` and the
