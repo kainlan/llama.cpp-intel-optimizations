@@ -13,7 +13,7 @@ intent builder and the KV clauses have their own gates (test-sycl-seg-forward-re
 test-sycl-host-zone-config-source-contract, test-sycl-host-zone-boundary-owner-source and the test-sycl-kv-* gates).
 
 Each clause is REQUIRED (green on this tree) or EXPECTED-RED with the task that turns it green. An expected-red
-clause is scored: it must fail on this tree with its reason (reported as an ExpectedRed warning, never a skip), it
+clause is scored: it must fail on this tree with its recorded reason (an ExpectedRed warning, never a skip), it
 must pass on a planted fixture of the landed shape, and its test fails the moment the tree satisfies it, so the
 landing commit moves it to REQUIRED. Every clause has at least one planted mutant that must fail with its quoted
 reason, and a negative control (comments appended to the edited files) must leave every REQUIRED clause green.
@@ -1583,31 +1583,40 @@ def clause_runtime_term(texts: dict) -> list:
 
 REQUIRED, EXPECTED_RED = "REQUIRED", "EXPECTED-RED"
 
-# (id, status, function, landing task for an expected-red clause)
+# (id, status, function, landing task, the reason an expected-red clause fails with on this tree). The reason
+# names the transitional code its landing task removes, so a clause red for any other cause does not score as
+# expected-red.
 CLAUSES = [
-    ("site-table", REQUIRED, clause_site_table, None),
-    ("doc-table", REQUIRED, clause_doc_table, None),
-    ("select-zone", REQUIRED, clause_select_zone, None),
-    ("owners", REQUIRED, clause_owners, None),
-    ("unowned-ratchet", REQUIRED, clause_unowned_ratchet, None),
-    ("unsized-ratchet", REQUIRED, clause_unsized_ratchet, None),
-    ("device-holders", REQUIRED, clause_device_holders, None),
-    ("slot-refusal", REQUIRED, clause_slot_refusal, None),
-    ("staging-plan", REQUIRED, clause_staging_plan, None),
-    ("pool-dims", REQUIRED, clause_pool_dims, None),
-    ("marked-set-reach", REQUIRED, clause_marked_set_reach, None),
-    ("return-files", REQUIRED, clause_return_files, None),
-    ("withdrawal", REQUIRED, clause_withdrawal, None),
-    ("notify-device", REQUIRED, clause_notify_device, None),
-    ("grow-host-scratch-gone", REQUIRED, clause_grow_host_scratch_gone, None),
-    ("slot-growth-plan-only", EXPECTED_RED, clause_slot_growth_plan_only, "Task 7"),
-    ("pools-from-plan", EXPECTED_RED, clause_pools_from_plan, "Task 7"),
-    ("context-wiring", EXPECTED_RED, clause_context_wiring, "Task 7"),
-    ("trial-ops", EXPECTED_RED, clause_trial_ops, "Task 7"),
-    ("owner-end-wired", EXPECTED_RED, clause_owner_end_wired, "Task 7"),
-    ("open-touches-no-set", EXPECTED_RED, clause_open_touches_no_set, "Task 7"),
-    ("scratch-fold", EXPECTED_RED, clause_scratch_fold, "Task 7"),
-    ("runtime-term", EXPECTED_RED, clause_runtime_term, "Task 7"),
+    ("site-table", REQUIRED, clause_site_table, None, None),
+    ("doc-table", REQUIRED, clause_doc_table, None, None),
+    ("select-zone", REQUIRED, clause_select_zone, None, None),
+    ("owners", REQUIRED, clause_owners, None, None),
+    ("unowned-ratchet", REQUIRED, clause_unowned_ratchet, None, None),
+    ("unsized-ratchet", REQUIRED, clause_unsized_ratchet, None, None),
+    ("device-holders", REQUIRED, clause_device_holders, None, None),
+    ("slot-refusal", REQUIRED, clause_slot_refusal, None, None),
+    ("staging-plan", REQUIRED, clause_staging_plan, None, None),
+    ("pool-dims", REQUIRED, clause_pool_dims, None, None),
+    ("marked-set-reach", REQUIRED, clause_marked_set_reach, None, None),
+    ("return-files", REQUIRED, clause_return_files, None, None),
+    ("withdrawal", REQUIRED, clause_withdrawal, None, None),
+    ("notify-device", REQUIRED, clause_notify_device, None, None),
+    ("grow-host-scratch-gone", REQUIRED, clause_grow_host_scratch_gone, None, None),
+    ("slot-growth-plan-only", EXPECTED_RED, clause_slot_growth_plan_only, "Task 7",
+     "slot_replace is called by ['host_staging_slots::admit'"),
+    ("pools-from-plan", EXPECTED_RED, clause_pools_from_plan, "Task 7",
+     "the pools' init is sized from 'd.dims = host_pool_scan("),
+    ("context-wiring", EXPECTED_RED, clause_context_wiring, "Task 7",
+     "llama_context does not resolve ggml_backend_sycl_begin_host_holders"),
+    ("trial-ops", EXPECTED_RED, clause_trial_ops, "Task 7",
+     "llama_context does not resolve ggml_backend_sycl_host_scratch_trial"),
+    ("owner-end-wired", EXPECTED_RED, clause_owner_end_wired, "Task 7",
+     "ggml_backend_sycl_free does not call the owner's end"),
+    ("open-touches-no-set", EXPECTED_RED, clause_open_touches_no_set, "Task 7",
+     "no host_scratch_trial OPEN step in the tree"),
+    ("scratch-fold", EXPECTED_RED, clause_scratch_fold, "Task 7", "beyond the four host terms (§M62 (A))"),
+    ("runtime-term", EXPECTED_RED, clause_runtime_term, "Task 7",
+     "names ['pp_pipeline_scratch_bytes', 'pp_moe_onednn_scratch_bytes']"),
 ]
 
 
@@ -1962,10 +1971,12 @@ def test_required_clause_holds_on_the_tree(cid):
 
 @pytest.mark.parametrize("cid", [c[0] for c in CLAUSES if c[1] == EXPECTED_RED])
 def test_expected_red_clause_scores_red_until_its_task(cid):
-    _, _, fn, landing = _BY_ID[cid]
+    _, _, fn, landing, reason = _BY_ID[cid]
     fails = fn(_tree())
     assert fails, (f"{cid} is EXPECTED-RED until {landing} and now passes on this tree: the commit that satisfies it "
                    f"moves it to REQUIRED")
+    assert any(reason in f for f in fails), (f"{cid} is red on this tree, but not for its recorded reason {reason!r}; "
+                                             f"it reported:\n" + "\n".join(fails))
     warnings.warn(ExpectedRed(f"{cid}: EXPECTED-RED until {landing}: " + " | ".join(fails)))
 
 
@@ -1984,7 +1995,7 @@ def test_planted_mutant_fails_with_its_reason(mid, cid, edits, reason):
 
 def test_negative_control_passes():
     texts = apply_edits(_tree(), NEGATIVE_CONTROL)
-    for cid, status, fn, _ in CLAUSES:
+    for cid, status, fn, _, _ in CLAUSES:
         if status == REQUIRED:
             fails = fn(texts)
             assert not fails, f"{cid} fails on the negative control:\n" + "\n".join(fails)
@@ -1997,11 +2008,13 @@ def test_every_clause_has_a_planted_mutant_and_every_expected_red_clause_a_fixtu
     assert planted <= set(ids), f"a mutant names no clause: {sorted(planted - set(ids))}"
     assert not set(ids) - planted, f"clauses with no planted mutant: {sorted(set(ids) - planted)}"
     assert len({m[0] for m in MUTANTS}) == len(MUTANTS), "a mutant id is listed twice"
-    for cid, status, _, landing in CLAUSES:
+    for cid, status, _, landing, reason in CLAUSES:
         if status == EXPECTED_RED:
             assert landing and FIXTURES.get(cid), f"EXPECTED-RED clause {cid} names no landing task or fixture"
+            assert reason, f"EXPECTED-RED clause {cid} records no reason"
         else:
-            assert landing is None and cid not in FIXTURES, f"REQUIRED clause {cid} carries a landing or fixture"
+            assert landing is None and reason is None and cid not in FIXTURES, \
+                f"REQUIRED clause {cid} carries a landing, a reason or a fixture"
 
 
 if __name__ == "__main__":
