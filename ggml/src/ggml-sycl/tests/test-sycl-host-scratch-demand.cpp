@@ -168,6 +168,52 @@ void test_request_alignment_and_holder() {
               (double) ledger.total() / MiB);
 }
 
+// A zone whose grow lets one more notify in before its chunk commits: the notify a second thread makes while the first
+// notify's grow runs. The ledger holds no lock across the grow, so this nested call is that interleaving.
+struct interleaved_zone {
+    fake_zone             zone;
+    host_scratch_ledger * ledger = nullptr;
+    host_scratch_zone_ops ops;
+    bool                  pending        = false;  // a notify waits to arrive during the next grow
+    uint64_t              pending_key    = 0;
+    size_t                pending_demand = 0;
+};
+
+size_t interleaved_capacity(void * user) {
+    return static_cast<interleaved_zone *>(user)->zone.capacity;
+}
+
+bool interleaved_grow(void * user, size_t request) {
+    interleaved_zone & z = *static_cast<interleaved_zone *>(user);
+    if (z.pending) {
+        z.pending = false;
+        z.ledger->notify_context(z.pending_key, z.pending_demand, 0, z.ops);
+    }
+    return fake_grow(&z.zone, request);
+}
+
+void test_interleaved_notify_grows_once() {
+    // Two llama_contexts on one device. B's 500 MiB is already covered. A's 1000 MiB needs a grow, and while it runs,
+    // B's reserve repeats its notify. Both see the one deficit (the target is the plan's SCRATCH plus 1500 MiB either
+    // way), so one grow covers it.
+    interleaved_zone    z;
+    host_scratch_ledger ledger;
+    z.zone.capacity = plan_scratch + 500 * MiB;
+    z.ledger        = &ledger;
+    z.ops           = ops_for(z.zone);
+    z.ops.user      = &z;
+    z.ops.capacity  = interleaved_capacity;
+    z.ops.grow      = interleaved_grow;
+    ledger.notify_context(2, 500 * MiB, 0, z.ops);
+    HZP_CHECK(z.zone.grows == 0, "B's covered notify grew %d time(s), expected 0", z.zone.grows);
+    z.pending        = true;
+    z.pending_key    = 2;
+    z.pending_demand = 500 * MiB;
+    ledger.notify_context(1, 1000 * MiB, 0, z.ops);
+    HZP_CHECK(!z.pending, "B's notify did not arrive during A's grow");
+    HZP_CHECK(z.zone.grows == 1, "two notifies for one deficit grew %d time(s), expected 1", z.zone.grows);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // The notify's core over two fake caches.
 // ---------------------------------------------------------------------------------------------------------------
@@ -263,6 +309,7 @@ int main() {
     test_two_contexts_and_repeats();
     test_one_demand_per_context();
     test_request_alignment_and_holder();
+    test_interleaved_notify_grows_once();
     test_non_sycl_refused();
     test_device_is_the_host_bufts();
     test_failed_grow_returns_false();

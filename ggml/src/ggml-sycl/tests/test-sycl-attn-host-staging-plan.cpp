@@ -172,6 +172,10 @@ host_holder_walk_env walk_env(bool dispatch_on) {
 
 enum k_where { K_VIEW_KV_HOST, K_CPU, K_SYCL_HOST, K_DEVICE };
 
+// The storage behind every expert tensor: a loaded weight has a data pointer whichever buffer holds it, and
+// moe_hybrid_init_once's storage scan keys on that pointer. Never dereferenced.
+char g_expert_storage[1];
+
 struct graph_builder {
     ggml_context * ctx   = nullptr;
     ggml_cgraph *  graph = nullptr;
@@ -229,6 +233,7 @@ struct graph_builder {
                       ggml_backend_t        backend) {
         ggml_tensor * src0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 2880, 32);
         src0->buffer       = buf;
+        src0->data         = g_expert_storage;
         ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, top_k, n_tokens);
         ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
         ggml_tensor * node = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2880, top_k, n_tokens);
@@ -814,6 +819,38 @@ void test_pools_sized_from_the_plan() {
               (long long) u.dims.D, count_of(captured_log(), "[HOST-ARENA] DEVICE pools dev=0 unplanned;"));
 }
 
+// moe_hybrid_init_once's storage filter (moe_hybrid_init_scans_node, ggml_sycl_host_data(src0) != nullptr): every
+// MUL_MAT_ID whose src0 has storage, device-placed experts included.
+bool has_storage(void *, const ggml_tensor * src0) {
+    return src0->data != nullptr;
+}
+
+void test_pools_all_device_plan_is_quiet() {
+    // Every expert in VRAM: the walk visits the MUL_MAT_ID node but folds none, so the committed plan holds D=K=N=0.
+    // The graph moe_hybrid_init_once sees still has storage behind every src0, so its storage scan finds the node. The
+    // over-plan check must read the nodes the plan folded, not that scan.
+    reset_fakes();
+    holders       h;
+    graph_builder g;
+    g.moe(8, 2, &g_device_buf, 0, A);
+    h.begin({ 1 });
+    h.plans.walk(g_sched, g.graph, walk_env(true));
+    h.commit_apply(1, true);
+    const host_holder_device_state state   = h.plans.device_state(0);
+    const host_pool_dims           storage = host_pool_scan(g.graph, has_storage, nullptr);
+    HZP_CHECK(state.planned && state.pools.D == 0, "the all-device plan reads planned=%d D=%lld, expected planned D=0",
+              (int) state.planned, (long long) state.pools.D);
+    HZP_CHECK(storage.D == 16, "the storage scan of the all-device graph found D=%lld, expected 16",
+              (long long) storage.D);
+
+    host_pool_init_warnings warnings;
+    capture_begin();
+    const host_pool_init_decision d = host_pools_init_from_plan(0, state, storage, warnings);
+    HZP_CHECK(!d.init, "an all-device plan initialized the pools at D=%lld", (long long) d.dims.D);
+    HZP_CHECK(!log_has("exceeds its planned"), "an all-device plan printed the over-plan WARN: %s",
+              captured_log().c_str());
+}
+
 void test_pools_gate_is_placement() {
     reset_fakes();
     holders       h;
@@ -891,6 +928,7 @@ int main() {
     test_walk_uses_the_dispatch_predicate();
     test_per_dispatching_device();
     test_pools_sized_from_the_plan();
+    test_pools_all_device_plan_is_quiet();
     test_pools_gate_is_placement();
     test_two_contexts_resize_pools();
     return finish("test-sycl-attn-host-staging-plan");
