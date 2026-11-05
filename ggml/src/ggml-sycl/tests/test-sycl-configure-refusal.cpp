@@ -37,6 +37,7 @@
 // ggml/src/ggml-sycl/CMakeLists.txt list them with the children each one runs.
 
 #include "../common.hpp"
+#include "ggml-backend-impl.h"
 #include "scratch-return-test-common.hpp"
 
 #include <signal.h>
