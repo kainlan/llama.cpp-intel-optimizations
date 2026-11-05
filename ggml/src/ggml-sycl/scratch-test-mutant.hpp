@@ -49,8 +49,8 @@ enum class scratch_test_mutant : int {
     RETURN_NO_IMMEDIATE       = 17,  // a return leaves an empty chunk for a begin to release
     RELEASE_NO_ERASE          = 18,  // a release leaves the chunk's marked-set entry behind
     CONFIGURE_DIRECT_RELEASE  = 19,  // configure_host_zones calls release_zone_chunk directly
-    STRICT_ABORT_DROPPED      = 20,  // configure_host_zones returns false under GGML_SYCL_STRICT instead of aborting
-    ABORT_NON_STRICT          = 21,  // configure_host_zones aborts on a refusal without GGML_SYCL_STRICT
+    STRICT_ABORT_DROPPED      = 20,  // configure_host_zones returns false under GGML_SYCL_STRICT_LEASES=1, no abort
+    ABORT_NON_STRICT          = 21,  // configure_host_zones aborts on a refusal without GGML_SYCL_STRICT_LEASES=1
     ORPHAN_FREE_IGNORED       = 22,  // the free that empties an orphaned chunk does not release it
     OWNER_END_NO_EMPTY        = 23,  // the owner's end leaves its empty chunks withdrawn
     OWNER_END_FIRST_ONLY      = 24,  // the owner's end frees only the first backing it collected

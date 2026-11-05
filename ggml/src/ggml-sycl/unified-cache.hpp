@@ -5535,8 +5535,8 @@ class unified_cache {
     // return as a hard failure and fall back to non-pinned allocation.
     bool   host_zone_grow(host_zone_id zone, size_t additional_bytes);
     // Releases the device's empty marked SCRATCH chunks first. False only when a withdrawn chunk survives, so the pool
-    // refused the rebuild by name (under GGML_SYCL_STRICT it aborts instead); a capacity shortfall returns true with
-    // the zones unconfigured and the reserved figures zeroed, as before.
+    // refused the rebuild by name (with GGML_SYCL_STRICT_LEASES=1 it aborts instead); a capacity shortfall returns
+    // true with the zones unconfigured and the reserved figures zeroed, as before.
     bool   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
     bool   host_zones_configured() const;
     // One grow_zone(SCRATCH, request) call, the host SCRATCH demand ledger's only growth (§4.4 "Ensure capacity").

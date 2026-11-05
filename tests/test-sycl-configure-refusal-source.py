@@ -423,8 +423,8 @@ def test_driver_rejects_a_late_rlimit_and_a_wrong_score():
 
 
 def test_production_rejects_a_lost_abort_and_a_late_scan():
-    rejects("production", planted(UC, 'GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk '
-                                      'survives (GGML_SYCL_STRICT)");', ";"),
+    rejects("production", planted(UC, 'GGML_ABORT(\n                "[HOST-ARENA] configure_zones refused: a withdrawn '
+                                      'SCRATCH chunk survives "\n                "(GGML_SYCL_STRICT_LEASES=1)");', ";"),
             "does not abort under ggml_sycl_strict_enabled()")
     texts = tree_texts()
     pool = texts.get(POOL, "")
@@ -436,7 +436,8 @@ def test_production_rejects_a_lost_abort_and_a_late_scan():
 
 
 def test_production_rejects_a_reserved_write_in_the_refusal():
-    strict = '        if (ggml_sycl_strict_enabled()) {\n            GGML_ABORT("[HOST-ARENA] configure_zones refused'
+    strict = ('        if (ggml_sycl_strict_enabled()) {\n            GGML_ABORT(\n'
+              '                "[HOST-ARENA] configure_zones refused')
     rejects("production", planted(UC, strict, "        host_zone_reserved_bytes_.fill(0);\n" + strict),
             "refusal touches the reserved figures")
 

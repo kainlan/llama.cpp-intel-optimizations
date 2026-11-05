@@ -26168,7 +26168,9 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
         }
 #endif
         if (ggml_sycl_strict_enabled()) {
-            GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT)");
+            GGML_ABORT(
+                "[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives "
+                "(GGML_SYCL_STRICT_LEASES=1)");
         }
         return false;
     }
