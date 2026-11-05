@@ -128,7 +128,9 @@ def cmake_strip(text: str) -> str:
 
 def cmake_args(text: str, open_at: int) -> list:
     """The arguments of the command whose `(` is at `open_at`: quoted ones as written between the quotes (escapes
-    kept), unquoted ones as tokens. None when the command is not closed."""
+    kept), unquoted ones as tokens. None when the command is not closed. The function re-expands its arguments as
+    ${ARGN}, which splits a quoted argument at each unescaped `;`, so a quoted one is split there too: a semicolon in
+    an expected text adds a list element and shifts every later triple, as CMake reads it."""
     args, i, n = [], open_at + 1, len(text)
     while i < n:
         c = text[i]
@@ -140,7 +142,7 @@ def cmake_args(text: str, open_at: int) -> list:
             j = i + 1
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
-            args.append(text[i + 1:j])
+            args += re.split(r"(?<!\\);", text[i + 1:j])
             i = j + 1
         else:
             j = i
@@ -458,6 +460,12 @@ def test_source_rejects_a_direct_stand_in_and_a_lost_case():
             "allocates a SCRATCH block directly")
     rejects("source", planted(TEST, '} else if (a.case_name == "two-empty") {', '} else if (a.case_name == "two") {'),
             "run_case does not run case two-empty")
+
+
+def test_registration_rejects_a_semicolon_in_an_expected_text():
+    rejects("registration", planted(CMAKE, '"owner-end freed one of two chunks"',
+                                    '"owner-end freed one; of two chunks"'),
+            "MUTANTS list is not whole")
 
 
 def test_registration_rejects_a_moved_and_an_unlisted_arm():

@@ -7985,7 +7985,8 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # and pinned pools on a real queue, so they carry the OOM-family labels, run alone on the B50 with 64 MiB chunks
     # (§M88 (2)), load no model, and exit 77 without a SYCL GPU. Lead-run.
     #   MUTANTS is a flat list of triples: the mutant names (comma-separated), the cases (comma-separated) and the
-    #   expected text. ENV adds variables to the registration's environment.
+    #   expected text. ENV adds variables to the registration's environment. An expected text carries no `;`:
+    #   ${ARGN} splits it there and shifts every later triple, so a printed `;` is matched by `.`.
     function(ggml_sycl_scratch_return_test stem)
         cmake_parse_arguments(SRT "" "TIMEOUT" "ENV;MUTANTS" ${ARGN})
         add_executable(${stem} tests/${stem}.cpp)
@@ -8030,7 +8031,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         return-no-withdraw window,ladder
             "capacity [0-9.]+ MiB after RETURN, expected 64\\.0 MiB[\r\n]+  the capacity quotes the loser"
         return-no-file window
-            "chunk_count [0-9]+ after the ladder, expected [0-9]+; no SCRATCH released line for chunk [0-9]+"
+            "chunk_count [0-9]+ after the ladder, expected [0-9]+. no SCRATCH released line for chunk [0-9]+"
         double-decrement ladder
             "SCRATCH capacity [0-9.]+ MiB exceeds the pool's allocated\\(\\) [0-9.]+ MiB"
         return-no-immediate empty-return

@@ -58,7 +58,7 @@ ARMS = {
     "return-noop": ("ladder,second-context", ("(winner's need)", "the capacity quotes the loser")),
     "return-releases-live": ("ladder", ("RETURN printed a SCRATCH return refused line for live chunk",)),
     "return-no-withdraw": ("window,ladder", ("after RETURN", "the capacity quotes the loser")),
-    "return-no-file": ("window", ("after the ladder, expected", "; no SCRATCH released line for chunk")),
+    "return-no-file": ("window", ("after the ladder, expected", "no SCRATCH released line for chunk")),
     "double-decrement": ("ladder", ("exceeds the pool's allocated()",)),
     "return-no-immediate": ("empty-return", ("right after RETURN", " not released")),
     "footprint-before-free": ("empty-return", ("footprint decremented before the free",)),
@@ -132,7 +132,9 @@ def cmake_strip(text: str) -> str:
 
 def cmake_args(text: str, open_at: int) -> list:
     """The arguments of the command whose `(` is at `open_at`: quoted ones as written between the quotes (escapes
-    kept), unquoted ones as tokens. None when the command is not closed."""
+    kept), unquoted ones as tokens. None when the command is not closed. The function re-expands its arguments as
+    ${ARGN}, which splits a quoted argument at each unescaped `;`, so a quoted one is split there too: a semicolon in
+    an expected text adds a list element and shifts every later triple, as CMake reads it."""
     args, i, n = [], open_at + 1, len(text)
     while i < n:
         c = text[i]
@@ -144,7 +146,7 @@ def cmake_args(text: str, open_at: int) -> list:
             j = i + 1
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
-            args.append(text[i + 1:j])
+            args += re.split(r"(?<!\\);", text[i + 1:j])
             i = j + 1
         else:
             j = i
@@ -450,6 +452,12 @@ def test_registration_rejects_moved_cases_and_a_lost_phrase():
             "arm return-noop runs cases 'ladder'")
     rejects("registration", planted(CMAKE, "footprint decremented before the free", "footprint moved"),
             "arm footprint-before-free's expected text lacks the design's")
+
+
+def test_registration_rejects_a_semicolon_in_an_expected_text():
+    rejects("registration", planted(CMAKE, "expected [0-9]+. no SCRATCH released line",
+                                    "expected [0-9]+; no SCRATCH released line"),
+            "MUTANTS list is not whole")
 
 
 def test_registration_rejects_an_unlisted_arm():
