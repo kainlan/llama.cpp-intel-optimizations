@@ -64,9 +64,10 @@ namespace {
 
 // --- the fixture file ---
 
-// Table A sits at the unaligned offset of a real table (Qwen's PLE table, off=4032 in its dry run), with Q8_0 rows of
-// 160 elements: 170-byte rows, 24680 of them. Table B starts at the same offset with 12335 rows, 2096950 bytes: below
-// one 2 MiB huge page on its own, past it once the O_DIRECT window's head is counted, so its body maps 4 MiB.
+// Table A sits at the unaligned offset of a real table (DeepSeek's blk.14.engram_embd, off=4032 in its dry run), with
+// the row of another (Qwen's PLE table): Q8_0 rows of 160 elements, 170 bytes each, 24680 of them. Table B starts at
+// the same offset with 12335 rows, 2096950 bytes: below one 2 MiB huge page on its own, past it once the O_DIRECT
+// window's head is counted, so its body maps 4 MiB.
 constexpr uint64_t k_table_offset = 4032;
 constexpr int64_t  k_ne0          = 160;
 constexpr int64_t  k_rows_a       = 24680;
@@ -465,7 +466,7 @@ arm_result arm_storage_holds_its_descriptor() {
     expect(r, real != nullptr && fd_target(fd) == real, "the descriptor is not the source: " + fd_target(fd));
     std::free(real);
     expect(r, (fd_flags(fd) & O_DIRECT) != 0, "the descriptor is not O_DIRECT");
-    expect(r, !t.table->rows(), "a STORAGE table holds rows");
+    expect(r, !t.table->rows().valid(), "a STORAGE table holds rows");
     expect(r, t.table->charged_bytes() == 0 && host_cpu_live() == before, "a STORAGE table charged HOST_CPU bytes");
     t.table.reset();
     errno = 0;
