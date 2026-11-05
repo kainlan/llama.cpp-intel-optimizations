@@ -8082,6 +8082,11 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # ggml_backend_sycl_buffer_is_lazy also claiming the SYCL device type, the table must FAIL naming that type's
     # changed answer. It is a runtime seam in ggml-sycl.cpp (PRIVATE_TESTING) rather than a compile variant, which
     # would build ggml-sycl.cpp and the backend's device link a second time.
+    #
+    # The -mutant-read-whole-window registration is arm (2)'s end-of-file positive control: the table that ends its
+    # file at an unaligned end (Qwen's geometry), built by a read that asks for the whole O_DIRECT window instead of
+    # stopping at the table's last byte, must refuse naming that geometry. Also a runtime seam: a PRIVATE_TESTING
+    # constructor in lazy-table.cpp.
     string(CONCAT _lazy_table_env
         "ONEAPI_DEVICE_SELECTOR=level_zero:1;"
         "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
@@ -8110,6 +8115,19 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 120
         PASS_REGULAR_EXPRESSION "${_lazy_table_mutant_regex}")
+    string(CONCAT _lazy_table_eof_mutant_regex
+        "FAIL \\(2\\) a HOST table reads its rows eagerly into one locked HOST_CPU record: "
+        "the table that ends its file at an unaligned end \\(offset 192, 4195600 B, the window 2608 B past the end "
+        "of the file\\) refused: lazy-table-read-failed: read 4195792 of 4198400 B")
+    add_test(NAME test-sycl-lazy-table-mutant-read-whole-window
+        COMMAND test-sycl-lazy-table --mutant read-whole-window)
+    set_tests_properties(test-sycl-lazy-table-mutant-read-whole-window PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "${_lazy_table_eof_mutant_regex}")
 
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and

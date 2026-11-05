@@ -97,23 +97,31 @@ size_t lazy_table::charged_bytes() const {
 
 lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
                                           lazy_residency          residency,
-                                          size_t                  extra_record_bytes) {
+                                          const test_variation &  variation) {
     (void) residency;
-    (void) extra_record_bytes;
+    (void) variation;
     return refuse(desc, lazy_table_status::READ_FAILED, "no materialization is built");
 }
 
 lazy_table_result lazy_table_create_host(const lazy_table_desc & desc) {
-    return lazy_table::materialize(desc, lazy_residency::HOST, 0);
+    return lazy_table::materialize(desc, lazy_residency::HOST, lazy_table::test_variation{});
 }
 
 lazy_table_result lazy_table_create_storage(const lazy_table_desc & desc) {
-    return lazy_table::materialize(desc, lazy_residency::STORAGE, 0);
+    return lazy_table::materialize(desc, lazy_residency::STORAGE, lazy_table::test_variation{});
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 lazy_table_result lazy_table_test_create_host_with_extra_record(const lazy_table_desc & desc, size_t extra_bytes) {
-    return lazy_table::materialize(desc, lazy_residency::HOST, extra_bytes);
+    lazy_table::test_variation variation;
+    variation.extra_record_bytes = extra_bytes;
+    return lazy_table::materialize(desc, lazy_residency::HOST, variation);
+}
+
+lazy_table_result lazy_table_test_create_host_reading_window(const lazy_table_desc & desc) {
+    lazy_table::test_variation variation;
+    variation.read_whole_window = true;
+    return lazy_table::materialize(desc, lazy_residency::HOST, variation);
 }
 #endif
 

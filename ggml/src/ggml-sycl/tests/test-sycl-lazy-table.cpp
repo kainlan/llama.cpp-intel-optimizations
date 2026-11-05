@@ -22,6 +22,11 @@
 // --mutant predicate-too-broad runs the buffer-type table alone with ggml_backend_sycl_buffer_is_lazy also claiming
 // the SYCL device type, and the table must FAIL on that row: the registered positive control of an arm whose RED
 // cannot fail (with no descriptor test, no other type's answer can change).
+//
+// --mutant read-whole-window runs arm (2) alone with its end-of-file table built by a read that asks for the whole
+// O_DIRECT window, and the arm must FAIL naming that geometry: the registered positive control of a sub-check the
+// stub cannot fail for the right reason (a read that stops at the table's last byte and one that does not differ only
+// when the window runs past the end of the file).
 
 #include "../common.hpp"
 #include "../host-cpu-mapping.hpp"
@@ -38,6 +43,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -88,29 +94,42 @@ constexpr size_t k_mapped_b_bytes = 4 * MiB;
 
 const char * k_guard_phrase = "[LAZY-PLAN-BUG] data pointer requested for lazy table";
 
+// Arm (2)'s end-of-file table, in Qwen's geometry (its PLE table sits at offset 192 and ends its file): table A's rows
+// at offset 192 in a second file that ends at the table's last byte, 4195792 bytes, 1488 bytes into a block. Its
+// window is ceil((192 + 4195600) / 4096) * 4096 = 4198400 bytes, 2608 past the end of the file, mapped to 6 MiB.
+constexpr uint64_t k_eof_offset       = 192;
+constexpr uint64_t k_eof_file_bytes   = 4195792;
+constexpr size_t   k_eof_window_bytes = 4198400;
+constexpr size_t   k_eof_past_end     = 2608;
+
 // A ledger budget far above the fixture's bytes, seeded in every process, so no charge logs a would-refuse WARN and
 // strict mode meets only the check under test.
 constexpr uint64_t k_ledger_budget = 64 * GiB;
 
 std::string g_fixture_path;
-bool        g_direct_unsupported = false;  // the fixture's filesystem refuses O_DIRECT: the reading arms are VOID
+std::string g_eof_fixture_path;
+bool        g_direct_unsupported       = false;  // the fixture's filesystem refuses O_DIRECT: the reading arms are VOID
+bool        g_mutant_read_whole_window = false;  // --mutant read-whole-window
 
 uint8_t pattern_byte(uint64_t offset) {
     return static_cast<uint8_t>((offset * 2654435761ull) >> 13);
 }
 
-bool write_fixture(const std::string & path) {
+// Writes `bytes` of the pattern, each byte the pattern of its own offset, so any table in any fixture file reads the
+// same bytes at the same offset.
+bool write_fixture(const std::string & path, uint64_t bytes) {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
         return false;
     }
     std::vector<uint8_t> chunk(1 * MiB);
     bool                 ok = true;
-    for (uint64_t base = 0; base < k_file_bytes && ok; base += chunk.size()) {
-        for (size_t i = 0; i < chunk.size(); ++i) {
+    for (uint64_t base = 0; base < bytes && ok; base += chunk.size()) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk.size(), bytes - base));
+        for (size_t i = 0; i < n; ++i) {
             chunk[i] = pattern_byte(base + i);
         }
-        ok = ::write(fd, chunk.data(), chunk.size()) == static_cast<ssize_t>(chunk.size());
+        ok = ::write(fd, chunk.data(), n) == static_cast<ssize_t>(n);
     }
     ok = ok && ::fsync(fd) == 0;
     ::close(fd);
@@ -308,9 +327,43 @@ arm_result arm_body_request_window() {
     return r;
 }
 
+// Arm (2)'s end-of-file sub-check: a table that ends its file at an unaligned end, as Qwen's PLE table does, has a
+// window past the end of the file, and the read must end once it holds the table's last byte, so the short read at the
+// end of the file is not a failure. Engagement: as (2). Mutant: --mutant read-whole-window.
+void expect_eof_table_reads(arm_result & r) {
+    const std::string geometry = "the table that ends its file at an unaligned end (offset " + num(k_eof_offset) +
+                                 ", " + num(k_table_a_bytes) + " B, the window " + num(k_eof_past_end) +
+                                 " B past the end of the file)";
+    expect(r,
+           k_eof_offset + k_table_a_bytes == k_eof_file_bytes && k_eof_file_bytes % 4096 != 0 &&
+               lazy_table_host_body_request_bytes(k_eof_offset, k_table_a_bytes) == k_eof_window_bytes &&
+               k_eof_window_bytes - k_eof_file_bytes == k_eof_past_end,
+           "the end-of-file fixture is not the geometry the hand figures assume");
+    lazy_table_desc d   = fixture_desc("host.eof.lazy", k_eof_offset, k_rows_a, lazy_residency::HOST, 0);
+    d.file_path         = g_eof_fixture_path;
+    lazy_table_result t = g_mutant_read_whole_window ? ggml_sycl::lazy_table_test_create_host_reading_window(d) :
+                                                       lazy_table_create_host(d);
+    std::string       why;
+    if (environment_refusal(t, k_mapped_a_bytes, why)) {
+        void_arm(r, geometry + ": " + why);
+        return;
+    }
+    if (!t) {
+        fail(r, geometry + " refused: " + ggml_sycl::lazy_table_status_name(t.status) + ": " + t.reason);
+        return;
+    }
+    const ggml_sycl::resolved_ptr view = t.table->rows().resolve(0);
+    if (!view) {
+        fail(r, geometry + ": the rows view does not resolve");
+        return;
+    }
+    const size_t bad = first_mismatch(static_cast<const uint8_t *>(view.ptr), k_eof_offset, k_table_a_bytes);
+    expect(r, bad == SIZE_MAX, geometry + ": row byte " + num(bad) + " differs from the file's");
+}
+
 // (2) A HOST table reads its rows eagerly with O_DIRECT into one locked HOST_CPU record, owned by its model, and keeps
-// no descriptor. Engagement: the environment takes O_DIRECT and locks the body; a refusal it caused is VOID, any
-// other refusal FAILs.
+// no descriptor; a table that ends its file reads whole too (the sub-check above). Engagement: the environment takes
+// O_DIRECT and locks the body; a refusal it caused is VOID, any other refusal FAILs.
 arm_result arm_host_eager_read() {
     arm_result      r;
     const uint64_t  live_before = host_cpu_live();
@@ -360,6 +413,7 @@ arm_result arm_host_eager_read() {
         expect(r, printed(lines[0], "charged") == k_mapped_a_bytes && printed(lines[0], "planned") == k_mapped_a_bytes,
                "the [LAZY-TABLE] line does not carry charged= and planned=: " + lines[0]);
     }
+    expect_eof_table_reads(r);
     return r;
 }
 
@@ -829,6 +883,7 @@ arm_result arm_vram_answer_unchanged_for_other_types() {
 }
 
 const char * k_table_arm_name = "(13) no other buffer type's is_device_vram_buffer answer changes";
+const char * k_eager_arm_name = "(2) a HOST table reads its rows eagerly into one locked HOST_CPU record";
 
 }  // namespace
 
@@ -841,13 +896,16 @@ int main(int argc, char ** argv) {
         g_fixture_path = argv[2];
         return strict_child();
     }
-    const bool mutant =
-        argc >= 3 && std::strcmp(argv[1], "--mutant") == 0 && std::strcmp(argv[2], "predicate-too-broad") == 0;
-    if (argc >= 2 && !mutant) {
-        std::printf("FAIL: unknown arguments; the only option is --mutant predicate-too-broad\n");
+    const bool mutant_args     = argc == 3 && std::strcmp(argv[1], "--mutant") == 0;
+    const bool mutant_table    = mutant_args && std::strcmp(argv[2], "predicate-too-broad") == 0;
+    g_mutant_read_whole_window = mutant_args && std::strcmp(argv[2], "read-whole-window") == 0;
+    if (argc >= 2 && !mutant_table && !g_mutant_read_whole_window) {
+        std::printf(
+            "FAIL: unknown arguments; the options are --mutant predicate-too-broad and --mutant "
+            "read-whole-window\n");
         return 1;
     }
-    if (mutant) {
+    if (mutant_table) {
         if (!sycl_test_require_gpu("the lazy table buffer-type table")) {
             return SYCL_TEST_SKIP;
         }
@@ -865,12 +923,30 @@ int main(int argc, char ** argv) {
         std::printf("FAIL: getcwd: %s\n", std::strerror(errno));
         return 1;
     }
-    g_fixture_path = std::string(cwd) + "/test-sycl-lazy-table-" + std::to_string(getpid()) + ".bin";
-    if (!write_fixture(g_fixture_path)) {
-        std::printf("FAIL: the fixture file %s was not written: %s\n", g_fixture_path.c_str(), std::strerror(errno));
+    g_fixture_path     = std::string(cwd) + "/test-sycl-lazy-table-" + std::to_string(getpid()) + ".bin";
+    g_eof_fixture_path = std::string(cwd) + "/test-sycl-lazy-table-eof-" + std::to_string(getpid()) + ".bin";
+    if (!write_fixture(g_fixture_path, k_file_bytes) || !write_fixture(g_eof_fixture_path, k_eof_file_bytes)) {
+        std::printf("FAIL: the fixture files %s and %s were not written: %s\n", g_fixture_path.c_str(),
+                    g_eof_fixture_path.c_str(), std::strerror(errno));
+        ::unlink(g_fixture_path.c_str());
+        ::unlink(g_eof_fixture_path.c_str());
         return 1;
     }
     g_direct_unsupported = !probe_direct(g_fixture_path);
+
+    if (g_mutant_read_whole_window) {
+        int rc = SYCL_TEST_SKIP;
+        if (sycl_test_require_gpu("the lazy table end-of-file sub-check")) {
+            ggml_log_set(capture_log, nullptr);
+            ggml_sycl_test_host_ledger_store_budget(k_ledger_budget);
+            std::vector<named_arm> eof_only;
+            eof_only.push_back({ k_eager_arm_name, arm_host_eager_read });
+            rc = run_arms(eof_only, "lazy table arms (--mutant read-whole-window)");
+        }
+        ::unlink(g_fixture_path.c_str());
+        ::unlink(g_eof_fixture_path.c_str());
+        return rc;
+    }
 
     // Both children start before this process initialises SYCL.
     g_guard_run  = spawn("--guard-child", nullptr);
@@ -880,6 +956,7 @@ int main(int argc, char ** argv) {
 
     if (!sycl_test_require_gpu("the lazy table arms")) {
         ::unlink(g_fixture_path.c_str());
+        ::unlink(g_eof_fixture_path.c_str());
         return SYCL_TEST_SKIP;
     }
     ggml_log_set(capture_log, nullptr);
@@ -887,7 +964,7 @@ int main(int argc, char ** argv) {
 
     std::vector<named_arm> arms;
     arms.push_back({ "(1) the HOST body requests the O_DIRECT window over the table", arm_body_request_window });
-    arms.push_back({ "(2) a HOST table reads its rows eagerly into one locked HOST_CPU record", arm_host_eager_read });
+    arms.push_back({ k_eager_arm_name, arm_host_eager_read });
     arms.push_back({ "(3) a window past a huge page maps the larger figure", arm_host_window_crosses_huge_page });
     arms.push_back({ "(4) the last reference releases the body, once", arm_last_reference_releases });
     arms.push_back({ "(5) a STORAGE table holds its O_DIRECT descriptor until its last reference",
@@ -906,5 +983,6 @@ int main(int argc, char ** argv) {
     arms.push_back({ k_table_arm_name, arm_vram_answer_unchanged_for_other_types });
     const int rc = run_arms(arms, "lazy table arms");
     ::unlink(g_fixture_path.c_str());
+    ::unlink(g_eof_fixture_path.c_str());
     return rc;
 }

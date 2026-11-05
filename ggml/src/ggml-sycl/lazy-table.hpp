@@ -97,6 +97,11 @@ lazy_table_result lazy_table_create_storage(const lazy_table_desc & desc);
 // lazy_table_create_host, with one extra HOST_CPU record of `extra_bytes` allocated beside the body and owned by the
 // table like its own (th32 §10, T4's activation-check fixture: one extra chunk must fail the check).
 lazy_table_result lazy_table_test_create_host_with_extra_record(const lazy_table_desc & desc, size_t extra_bytes);
+
+// lazy_table_create_host, with the eager read asked for the whole O_DIRECT window instead of stopping once it holds
+// the table's last byte (th32 §3.3). The positive control of T4's end-of-file fixture: a table that ends its file at an
+// unaligned end has a window past the end of the file, and this read must refuse it.
+lazy_table_result lazy_table_test_create_host_reading_window(const lazy_table_desc & desc);
 #endif
 
 class lazy_table {
@@ -134,17 +139,24 @@ class lazy_table {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     friend lazy_table_result lazy_table_test_create_host_with_extra_record(const lazy_table_desc & desc,
                                                                            size_t                  extra_bytes);
+    friend lazy_table_result lazy_table_test_create_host_reading_window(const lazy_table_desc & desc);
 #endif
 
     explicit lazy_table(const lazy_table_desc & desc) : desc_(desc) {}
 
     ~lazy_table();
 
+    // The fixtures' variations of a materialization, both off for the two constructors: one extra HOST_CPU record (the
+    // activation fixture) and an eager read asked for the whole window (the end-of-file fixture's positive control).
+    struct test_variation {
+        size_t extra_record_bytes = 0;
+        bool   read_whole_window  = false;
+    };
+
     // Both constructors: validates `desc` for `residency`, builds the residency's memory, runs the activation check.
-    // `extra_record_bytes` is the activation fixture's extra record, 0 everywhere else.
     static lazy_table_result materialize(const lazy_table_desc & desc,
                                          lazy_residency          residency,
-                                         size_t                  extra_record_bytes);
+                                         const test_variation &  variation);
 
     lazy_table_desc         desc_;
     // Every handle the table's resident bytes are (§3.3), each minted by unified_allocate_owner: a HOST table's body
