@@ -17121,7 +17121,8 @@ static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owne
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), the context's provenance appended
 // after it (llama.cpp-7fmt), libllama's resolved storage inputs and the micro-batch the caller named, both in the
-// provenance's padding, and the lazy tables appended after them (th32 §4.1).
+// provenance's padding, and the lazy tables appended after them (th32 §4.1). The tables cross by pointer too, so each
+// field of a lazy table is pinned as well.
 static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
@@ -17135,6 +17136,15 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 18
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
 static_assert(sizeof(ggml_sycl_lazy_table_info) == 80, "ggml_sycl_lazy_table_info layout changed");
+static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, rows_per_token) == 12, "lazy table rows_per_token moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, ne) == 16, "lazy table ne moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, row_size) == 48, "lazy table row_size moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, consumer_layer) == 56, "lazy table consumer_layer moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, file_index) == 60, "lazy table file_index moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, file_offset) == 64, "lazy table file_offset moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, size) == 72, "lazy table size moved");
 
 // llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
 // host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,
