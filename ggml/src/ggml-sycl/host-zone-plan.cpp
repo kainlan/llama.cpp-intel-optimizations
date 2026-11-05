@@ -208,8 +208,8 @@ host_scratch_ensure_result host_scratch_ledger::ensure_locked_then_grow(std::uni
     }
     r.target = ops.plan_scratch_bytes + r.total;
 #if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW)
-    // Positive control: today's additive grow_scratch_zone(additional_bytes) grows by the whole demand on every call,
-    // whatever the zone already holds (the ratchet).
+    // Positive control: the additive grow_scratch_zone(additional_bytes) this ledger replaced, which grew by the whole
+    // demand on every call, whatever the zone already held (the ratchet).
     r.request = r.total;
 #else
     // Reserve, then grow. What the zone holds, or what a grow already in flight will bring it to, may cover the target;

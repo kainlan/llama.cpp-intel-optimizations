@@ -8114,7 +8114,8 @@ static sycl::event ggml_sycl_copy_payload_to_handle_async(sycl::queue &         
 }
 
 // Per-secondary-GPU staging buffers (malloc_host, readable from primary GPU).
-// Allocated once during init, sized for max_dispatch_count * max_N floats.
+// Allocated once during init, sized for D x N floats from moe_hybrid_init_once's storage scan (graph_needs: D = max
+// top-K x tokens, N = max src0 ne[1]).
 static float *                    g_secondary_staging_buffer[GGML_SYCL_MAX_DEVICES] = {};
 static size_t                     g_secondary_staging_size[GGML_SYCL_MAX_DEVICES]   = {};
 static size_t                     g_secondary_staging_max_N[GGML_SYCL_MAX_DEVICES]  = {};

@@ -6,7 +6,7 @@
 // Positive controls, one compile-time macro and one ctest target each (ggml/src/ggml-sycl/CMakeLists.txt):
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE    (host-zone-plan.cpp) accumulate instead of replace
 //   HOST_SCRATCH_DEMAND_MUTANT_PER_BACKEND     (this file) one notify, so one grow, per SYCL backend of a context
-//   HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW (host-zone-plan.cpp) today's additive grow_scratch_zone
+//   HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW (host-zone-plan.cpp) the additive grow_scratch_zone it replaced
 //   HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0       (host-zone-plan.cpp) the device-0 resolve
 //   HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE    (host-zone-plan.cpp) the notifying backend's ctx->device
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK   (host-zone-plan.cpp) a failed grow keeps its reservation

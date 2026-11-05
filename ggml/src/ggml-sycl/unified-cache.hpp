@@ -1416,7 +1416,8 @@ struct placement_plan {
             // Overcharged on a mapping load, and deferred: libllama keeps use_mmap there, so a CPU_OWNED weight that
             // ggml-cpu cannot repack lands in a from-host-ptr CPU buffer over the loader's mapping, while this charges
             // it as anonymous memory. Planning such a weight FILE_MAPPED, or clearing use_mmap for it, needs a
-            // libllama change (design 5efe §4.3-4.4, the CPU_OWNED rows at sycl-mmap-host-tier.md:1132, :1150-1156).
+            // libllama change (design 5efe §4.3-4.4: in sycl-mmap-host-tier.md §4.4 "Which weights stay mapped, and
+            // the planner's split", the CPU_OWNED row of the weights table and the host_cpu_owned_bytes plan term).
             host_cpu_owned_bytes += bytes;
         }
         host_bytes += bytes;
