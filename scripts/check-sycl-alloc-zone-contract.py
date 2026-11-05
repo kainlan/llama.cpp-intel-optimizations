@@ -14,8 +14,11 @@ What this unit (S2a-S2d, S3-0 and its review fold) enforces
   (a) a request-type token inside an ERROR/MISSING region fails; a file whose root is ERROR
       (today cpu-dispatch.cpp) is also scanned lexically, and each lexical request must be
       host-only by a literal on its statement run
-  (b) a literal tier flag: must_device = true or must_host_pinned = true, not both, and the last
-      write of the flag must be that literal
+  (b) a literal tier flag: exactly one of must_device, must_host_pinned and must_host_cpu is true,
+      the last write of that flag is the literal, and each of the other two is unwritten or ends on
+      an unconditional literal false. must_host_cpu selects HOST_CPU explicitly (unified_select_tier
+      never falls into it), so it is a tier of its own, and like must_host_pinned a host tier that
+      clause (d) excuses. The lexical pass of (a) still reads only must_host_pinned as host-only.
   (d) a device request carries a prefer_vram_zone that is a literal non-COUNT enumerator, or a
       ternary whose arms all are, and forbid_vram_zone_spill = true, and the last write of each
       is that literal. A write nested under a conditional below the construction's own block
@@ -219,8 +222,10 @@ REQUIRED_FILES = ("ggml-sycl.cpp", "unified-cache.cpp", "unified-cache.hpp", "co
 BASE_TYPES = ("alloc_request", "alloc_intent", "alloc_constraints")
 ZONES = ("KV", "WEIGHT", "ONEDNN", "RUNTIME", "SCRATCH")
 # Fields whose literal value the rules read. Later clauses add to this set.
-TRACKED = ("must_device", "must_host_pinned", "prefer_vram_zone", "forbid_vram_zone_spill",
+TRACKED = ("must_device", "must_host_pinned", "must_host_cpu", "prefer_vram_zone", "forbid_vram_zone_spill",
            "cascade_step", "unconverted_ticket", "cohort_id")
+# The tier flags of clause (b), in the order a finding names them. Exactly one is established.
+TIER_FLAGS = ("must_device", "must_host_pinned", "must_host_cpu")
 # Fields of a request that are themselves structs: a write to one is a copy, not a literal.
 STRUCT_FIELDS = ("intent", "constraints")
 # Members of alloc_constraints the rules read (the tracked fields that are not the cohort).
@@ -854,7 +859,7 @@ def classify(src, field, n):
         return str_class(src, n)
     if field == "prefer_vram_zone":
         return zone_class(src, n)
-    if field in ("must_device", "must_host_pinned", "forbid_vram_zone_spill", "cascade_step"):
+    if field in TIER_FLAGS + ("forbid_vram_zone_spill", "cascade_step"):
         return bool_class(src, n)
     return "expr"
 
@@ -2315,8 +2320,9 @@ def judge(c):
         out.append(("B-BRACE", "braceless `%s %s;` reports the class definition as its construction site; write `%s %s{}`"
                     % (c["type"], c["var"], c["type"], c["var"])))
     w = c["fields"]
-    dev = established(w.get("must_device", []), "true")
-    host = established(w.get("must_host_pinned", []), "true")
+    tiers = [f for f in TIER_FLAGS if established(w.get(f, []), "true")]
+    dev = "must_device" in tiers
+    host = "must_host_pinned" in tiers or "must_host_cpu" in tiers  # a host tier, pinned or HOST_CPU
     zone_ws, forbid_ws = w.get("prefer_vram_zone", []), w.get("forbid_vram_zone_spill", [])
     # A COUNT zone or a false forbid is a violation whatever a copy resolves to, so it is read before
     # the DEFER-C return; an established host tier is the only thing that excuses it.
@@ -2342,21 +2348,24 @@ def judge(c):
         return out
     if c["form"] == "stray" or c["pass"]:
         return out  # a pass-through's tier and zone are the caller's, judged at the caller's construction
-    if dev and host:
-        out.append(("B-TIER", "both must_device and must_host_pinned are established true; the tier is not decidable"))
+    if len(tiers) > 1:
+        out.append(("B-TIER", "%s are all established true; the tier is not decidable" % " and ".join(tiers)))
         return out
-    if not dev and not host:
-        out.append(("B-TIER", "neither must_device nor must_host_pinned is established by an unconditional literal true as its "
-                              "last write; unified_select_tier may turn it into HOST"))
+    if not tiers:
+        out.append(("B-TIER", "none of must_device, must_host_pinned and must_host_cpu is established by an "
+                              "unconditional literal true as its last write; unified_select_tier may turn it into "
+                              "HOST"))
         return out
-    other_name = "must_device" if host else "must_host_pinned"
-    ows = w.get(other_name, [])
-    if ows and not (ows[-1][1] == "false" and not ows[-1][2]):
-        # a write that is a conditional, a non-literal or a true can make the request the other tier unless an
-        # unconditional literal false comes after it (a copy may inherit such a write and overwrite it)
-        out.append(("B-TIER", "%s has a write that is not a literal false (a conditional true or a non-literal), so the "
-                              "tier is not decidable" % other_name))
-        return out
+    for other_name in TIER_FLAGS:
+        if other_name == tiers[0]:
+            continue
+        ows = w.get(other_name, [])
+        if ows and not (ows[-1][1] == "false" and not ows[-1][2]):
+            # a write that is a conditional, a non-literal or a true can make the request another tier unless an
+            # unconditional literal false comes after it (a copy may inherit such a write and overwrite it)
+            out.append(("B-TIER", "%s has a write that is not a literal false (a conditional true or a non-literal), "
+                                  "so the tier is not decidable" % other_name))
+            return out
     if host:
         return out
     codes = {o[0] for o in out}
