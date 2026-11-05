@@ -45,8 +45,11 @@ constexpr uintptr_t LAZY_TABLE_SENTINEL_BASE = uintptr_t{ 1 } << 62;
 // so the table sits at body + file_offset % LAZY_IO_BLOCK_BYTES. The HOST term the planner charges and the request the
 // materialization makes both read this one rule. SIZE_MAX when the window does not fit a size_t.
 inline size_t lazy_table_host_body_request_bytes(uint64_t file_offset, size_t table_bytes) {
-    (void) file_offset;
-    return table_bytes;
+    const size_t head = static_cast<size_t>(file_offset % LAZY_IO_BLOCK_BYTES);
+    if (table_bytes > SIZE_MAX - head - (LAZY_IO_BLOCK_BYTES - 1)) {
+        return SIZE_MAX;
+    }
+    return (head + table_bytes + LAZY_IO_BLOCK_BYTES - 1) / LAZY_IO_BLOCK_BYTES * LAZY_IO_BLOCK_BYTES;
 }
 
 // What a table is made from (th32 §3.2). The source is the lazy-range record's, handed over by value at plan publish,
