@@ -27651,7 +27651,10 @@ size_t unified_cache_host_zone_owner_check(alloc_lifetime lifetime, alloc_owner_
     for (size_t i = 0; i < owned.size(); i++) {
         owned[i].cohort = cohorts[i].c_str();
     }
-    return host_zone_owner_boundary_check(owned.data(), owned.size(), lifetime, owner, strict_lease_checks_enabled());
+    if (ggml_sycl_strict_enabled()) {
+        return host_zone_owner_boundary_check(owned.data(), owned.size(), lifetime, owner, /*strict=*/true);
+    }
+    return host_zone_owner_boundary_check(owned.data(), owned.size(), lifetime, owner, /*strict=*/false);
 }
 
 void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment) {

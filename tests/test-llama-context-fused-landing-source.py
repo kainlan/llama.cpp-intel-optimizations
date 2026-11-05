@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """resolve_fused_ops() tells a capability gap from a placement landing (llama.cpp-pmzl).
 
-Host-only: reads src/llama-context.cpp, src/llama-fused-landing.h, src/llama-fused-resolution.h, ggml-sycl.cpp and
-ggml-sycl.h, runs no build and loads no model. The classifier's behaviour is test-llama-fused-landing (fake devices and tensors); this gate pins the
+Host-only: reads src/llama-context.cpp, src/llama-fused-landing.h, src/llama-fused-resolution.h, ggml-sycl.cpp,
+host-zone-plan.cpp and ggml-sycl.h, runs no build and loads no model. The classifier's behaviour is test-llama-fused-landing (fake devices and tensors); this gate pins the
 wiring around it.
 
 The defect: a fused op (flash attention, gated delta net) that the scheduler put on the CPU was always reported as
@@ -20,7 +20,9 @@ Pinned here:
     ggml-sycl.h. supports_op and the query are the same function, ggml_sycl_device_supports_op_impl, differing
     only in its `placement_declines` parameter: supports_op passes true, the query passes false, and each of the
     four placement-predicate call sites (host-demoted KV x3, planner-on-host x1) is gated on the parameter, so
-    the query is supports_op minus placement and the two cannot drift apart. The predicates themselves stay pure;
+    the query is supports_op minus placement and the two cannot drift apart. The predicates themselves stay pure,
+    and so do the host-zone-plan.cpp helpers the KV-host predicate delegates to (host_tensor_in_buft_named,
+    host_tensor_buffer), which the dispatch and the host holder plan's walk share;
   * the classifier asks that query when the backend has one, and otherwise falls back to the device supporting the
     node or a persistent host-resident operand (a host buffer whose usage is not COMPUTE);
   * a landing the device could not have executed is counted apart from a placement landing, and each gets its own
@@ -46,6 +48,7 @@ parser.add_argument("--landing-header", default=str(root / "src/llama-fused-land
 parser.add_argument("--resolution-header", default=str(root / "src/llama-fused-resolution.h"))
 parser.add_argument("--backend", default=str(root / "ggml/src/ggml-sycl/ggml-sycl.cpp"))
 parser.add_argument("--sycl-header", default=str(root / "ggml/include/ggml-sycl.h"))
+parser.add_argument("--host-zone-plan", default=str(root / "ggml/src/ggml-sycl/host-zone-plan.cpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -235,7 +238,7 @@ def ungated_sites(body, site):
             if not any(lo <= m.start() <= hi for lo, hi in spans)]
 
 
-def evaluate(ctx, hdr, be, sh, res):
+def evaluate(ctx, hdr, be, sh, res, hzp):
     classifier = function_body(
         hdr, r"static\s+inline\s+bool\s+llama_fused_cpu_landing_is_placement\s*\([^)]*\)\s*\{") or ""
     resolve = function_body(ctx, r"void\s+llama_context::resolve_fused_ops\s*\([^)]*\)\s*\{") or ""
@@ -270,9 +273,17 @@ def evaluate(ctx, hdr, be, sh, res):
     pl_sites = re.findall(r"ggml_sycl_op_is_planned_on_host\s*\(", impl)
     checks["backend: every planner-on-host site in the impl is gated on the parameter"] = \
         bool(pl_sites) and not ungated_sites(impl, r"ggml_sycl_op_is_planned_on_host\s*\(")
-    checks["backend: the placement predicates take no flag (they stay pure)"] = bool(kv_host) and bool(planned) and not re.search(
-        r"placement_declines|thread_local|capability_only", kv_host + planned)
-    checks["backend: no thread-local capability state"] = not re.search(r"thread_local[^;]*capability", be)
+    # The KV-host predicate is one call into host-zone-plan.cpp, so its logic lives in these two helpers: a flag
+    # planted there is a flag in the predicate. Each must be found, or the purity scan reads nothing.
+    in_buft_named = function_body(
+        hzp, r"\bbool\s+host_tensor_in_buft_named\s*\(\s*const\s+ggml_tensor\s*\*\s*\w+\s*,"
+             r"\s*const\s+char\s*\*\s*\(\s*\*\s*\w+\s*\)\s*\([^)]*\)\s*\)\s*\{") or ""
+    tensor_buffer = function_body(
+        hzp, r"\bggml_backend_buffer_t\s+host_tensor_buffer\s*\([^)]*\)\s*\{") or ""
+    checks["backend: the placement predicates take no flag (they stay pure)"] = (
+        bool(kv_host) and bool(planned) and bool(in_buft_named) and bool(tensor_buffer) and not re.search(
+            r"placement_declines|thread_local|capability_only", kv_host + planned + in_buft_named + tensor_buffer))
+    checks["backend: no thread-local capability state"] = not re.search(r"thread_local[^;]*capability", be + "\n" + hzp)
     checks["backend: the query is registered as a reg proc"] = bool(
         re.search(r"strcmp\s*\(\s*name\s*,\s*\"ggml_backend_sycl_supports_op_capability\"\s*\)\s*==\s*0\s*\)\s*\{\s*return\s*\(void\s*\*\)\s*ggml_backend_sycl_supports_op_capability",
                   squash(be)))
@@ -345,7 +356,7 @@ def evaluate(ctx, hdr, be, sh, res):
     return checks
 
 
-NAMES = ("ctx", "hdr", "be", "sh", "res")
+NAMES = ("ctx", "hdr", "be", "sh", "res", "hzp")
 
 
 def run(label, srcs, expect_fail=None):
@@ -373,6 +384,7 @@ sources = {
     "be": load(args.backend),
     "sh": load(args.sycl_header),
     "res": load(args.resolution_header),
+    "hzp": load(args.host_zone_plan),
 }
 failed = run("tree", tuple(sources[k] for k in NAMES))
 
@@ -402,9 +414,23 @@ if args.self_test:
         ("planner site ungated", "backend: every planner-on-host site in the impl is gated on the parameter",
          with_(be=mutate(sources["be"], "if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {", "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"))),
         ("KV-host predicate takes a flag", "backend: the placement predicates take no flag (they stay pure)",
-         with_(be=mutate(sources["be"], "static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {\n    if (!t) {", "static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {\n    if (!t || placement_declines) {"))),
+         with_(be=mutate(sources["be"], "return ggml_sycl::host_tensor_in_buft_named(t, ggml_backend_sycl_kv_host_buffer_type_name);", "return !placement_declines && ggml_sycl::host_tensor_in_buft_named(t, ggml_backend_sycl_kv_host_buffer_type_name);"))),
+        ("KV-host helper keeps a thread-local flag", "backend: the placement predicates take no flag (they stay pure)",
+         with_(hzp=mutate(sources["hzp"], "    const ggml_backend_buffer_t buf = host_tensor_buffer(tensor);\n",
+                          "    static thread_local bool placement_flag = false;\n"
+                          "    const ggml_backend_buffer_t buf = host_tensor_buffer(tensor);\n"))),
+        ("KV-host buffer helper keeps a thread-local flag", "backend: the placement predicates take no flag (they stay pure)",
+         with_(hzp=mutate(sources["hzp"], "    if (!tensor) {\n        return nullptr;\n    }\n",
+                          "    static thread_local bool placement_flag = false;\n"
+                          "    if (!tensor) {\n        return nullptr;\n    }\n"))),
+        ("KV-host helper not found", "backend: the placement predicates take no flag (they stay pure)",
+         with_(hzp=mutate(sources["hzp"], "bool host_tensor_in_buft_named(", "bool host_tensor_in_buft_named_x("))),
+        ("KV-host buffer helper not found", "backend: the placement predicates take no flag (they stay pure)",
+         with_(hzp=mutate(sources["hzp"], "ggml_backend_buffer_t host_tensor_buffer(const ggml_tensor", "ggml_backend_buffer_t host_tensor_buffer_x(const ggml_tensor"))),
         ("thread-local capability state returns", "backend: no thread-local capability state",
          with_(be=sources["be"] + "\nstatic thread_local bool g_sycl_capability_flag = false;\n")),
+        ("thread-local capability state returns in host-zone-plan.cpp", "backend: no thread-local capability state",
+         with_(hzp=sources["hzp"] + "\nstatic thread_local bool g_sycl_capability_flag = false;\n")),
         ("proc not registered", "backend: the query is registered as a reg proc",
          with_(be=mutate(sources["be"], 'strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0', 'strcmp(name, "ggml_backend_sycl_supports_op_capability_x") == 0'))),
         ("query undeclared", "backend: the query is declared in ggml-sycl.h",
