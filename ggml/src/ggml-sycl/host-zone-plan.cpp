@@ -292,6 +292,15 @@ void host_scratch_ledger::drop_context(uint64_t context_key) {
     contexts_.erase(context_key);
 }
 
+void host_scratch_ledger::release_reserved(size_t bytes) {
+#if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_WITHDRAW_KEPT)
+    // Positive control: the reservation keeps the withdrawn chunk, so the same target finds it covered and never grows.
+    bytes = 0;
+#endif
+    std::lock_guard<std::mutex> lock(mutex_);
+    reserved_target_ = reserved_target_ > bytes ? reserved_target_ - bytes : 0;
+}
+
 size_t host_scratch_ledger::total() const {
     std::lock_guard<std::mutex> lock(mutex_);
     size_t                      total = 0;

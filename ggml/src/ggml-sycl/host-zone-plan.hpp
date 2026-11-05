@@ -151,8 +151,11 @@ class host_scratch_ledger {
                                              int                           device,
                                              size_t                        bytes,
                                              const host_scratch_zone_ops & ops);
-    // Drops the context's demand at its owner boundary. Capacity is never returned.
+    // Drops the context's demand at its owner boundary. Dropping a demand returns no capacity.
     void                       drop_context(uint64_t context_key);
+    // A returned SCRATCH chunk was withdrawn, so the zone's capacity fell by `bytes` (§4.4 "a marked chunk is withdrawn
+    // at once"). The reservation falls by the same bytes, so a later target above what is left grows again.
+    void                       release_reserved(size_t bytes);
 
     // Test seams: production never calls these (diagnostics and tests).
     size_t total() const;

@@ -11,6 +11,7 @@
 //   HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE    (host-zone-plan.cpp) the notifying backend's ctx->device
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK   (host-zone-plan.cpp) a failed grow keeps its reservation
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE    (host-zone-plan.cpp) the deficit is not reserved before the unlock
+//   HOST_ZONE_PLAN_MUTANT_LEDGER_WITHDRAW_KEPT (host-zone-plan.cpp) a withdrawal leaves the reservation as it was
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -266,6 +267,26 @@ void test_failed_grow_returns_its_reservation() {
               "after a failed grow, the next notify for the same deficit grew %d time(s), expected 1", z.grows);
 }
 
+void test_withdrawal_releases_its_reservation() {
+    // A losing candidate's RETURN withdraws its chunk, and the zone's capacity falls by the chunk's bytes (§4.4 "a
+    // marked chunk is withdrawn at once"). The reservation that grew it falls by the same bytes, so the next
+    // candidate's notify for the same target grows again instead of finding the withdrawn chunk still counted.
+    fake_zone z;
+    z.capacity = plan_scratch;
+    host_scratch_ledger ledger;
+    const auto          ops = ops_for(z);
+    ledger.notify_context(1, 1000 * MiB, 0, ops);
+    const size_t chunk = z.capacity - plan_scratch;
+    z.capacity -= chunk;
+    ledger.drop_context(1);
+    ledger.release_reserved(chunk);
+    const auto r = ledger.notify_context(1, 1000 * MiB, 0, ops);
+    HZP_CHECK(r.ok && z.grows == 2,
+              "after a %.1f MiB withdrawal, the same target grew %d time(s) in all, expected 2: the reservation still "
+              "counts the withdrawn chunk",
+              chunk / (double) MiB, z.grows);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // The notify's core over two fake caches.
 // ---------------------------------------------------------------------------------------------------------------
@@ -366,6 +387,7 @@ int main() {
     test_interleaved_notify_grows_once();
     test_covered_notify_reports_its_own_grow();
     test_failed_grow_returns_its_reservation();
+    test_withdrawal_releases_its_reservation();
     test_non_sycl_refused();
     test_device_is_the_host_bufts();
     test_failed_grow_returns_false();
