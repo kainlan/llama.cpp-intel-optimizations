@@ -455,6 +455,11 @@ host_pool_dims host_pool_scan(const ggml_cgraph * graph,
     return dims;
 }
 
+bool host_pool_has_storage(void * user, const ggml_tensor * src0) {
+    (void) user;
+    return src0 && src0->data != nullptr;  // raw-ok: storage presence only (ggml_sycl_host_data), never read
+}
+
 namespace {
 
 void plan_merge_max(host_holder_plan & into, const host_holder_plan & from) {
@@ -508,6 +513,28 @@ bool walk_is_host_kv_node(void * user, const ggml_tensor * node) {
     return false;
 }
 
+// The pools' one eligibility rule, the walk's and the over-plan check's: placement's executor fact says `device` runs
+// at least one expert of src0 on the host. *known false means the fact is absent (*cause says why), and such a node is
+// not eligible.
+bool pool_host_placed(host_plan_host_experts host_experts,
+                      const ggml_tensor *    src0,
+                      int                    device,
+                      bool *                 known,
+                      const char **          cause) {
+#if defined(HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST)
+    // Positive control: the buffer gate. SYCL_Mapped is is_host, so every expert of a mapped load would plan the
+    // pools, device-placed ones included.
+    (void) host_experts;
+    (void) device;
+    (void) cause;
+    *known = true;
+    return src0->buffer && ggml_backend_buffer_is_host(src0->buffer);
+#else
+    *known = false;
+    return host_experts && host_experts(src0, device, known, cause);
+#endif
+}
+
 bool walk_is_mul_mat_id(void * user, const ggml_tensor * node) {
     (void) user;
     return node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr;
@@ -556,17 +583,10 @@ void walk_visit_mul_mat_id(void * user, ggml_tensor * node, ggml_backend_t backe
     const int           device = w.env->backend_device(backend);
     host_holder_plan &  p      = walk_plan_for(w, backend, device);
     const ggml_tensor * src0   = node->src[0];
-#if defined(HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST)
-    // Positive control: the buffer gate. SYCL_Mapped is is_host, so every expert of a mapped load would plan the
-    // pools, device-placed ones included.
-    if (!(src0->buffer && ggml_backend_buffer_is_host(src0->buffer))) {
-        return;
-    }
-#else
     // Placement's executor fact, the one the dispatch's CPU-island gate routes on, never the buffer.
-    bool         known = false;
-    const char * cause = nullptr;
-    const bool   host  = w.env->host_experts && w.env->host_experts(src0, device, &known, &cause);
+    bool                known  = false;
+    const char *        cause  = nullptr;
+    const bool          host   = pool_host_placed(w.env->host_experts, src0, device, &known, &cause);
     if (!known) {
         GGML_LOG_WARN("[HOST-ARENA] DEVICE pools dev=%d %s: placement unknown (%s)\n", device, src0->name,
                       cause ? cause : "no placement plan");
@@ -575,7 +595,6 @@ void walk_visit_mul_mat_id(void * user, ggml_tensor * node, ggml_backend_t backe
     if (!host) {
         return;
     }
-#endif
     host_pool_dims_add(p.pools, node);
 }
 
@@ -930,9 +949,28 @@ void host_pools_apply_commit(int device, const host_holder_device_state & state,
 #endif
 }
 
+namespace {
+
+struct host_placed_scan {
+    host_plan_host_experts host_experts = nullptr;
+    int                    device       = -1;
+};
+
+// The over-plan check's node set: the walk's eligibility, so the check reads exactly the nodes the plan folded.
+bool scan_host_placed(void * user, const ggml_tensor * src0) {
+    const host_placed_scan & s     = *static_cast<const host_placed_scan *>(user);
+    bool                     known = false;
+    const char *             cause = nullptr;
+    const bool               host  = pool_host_placed(s.host_experts, src0, s.device, &known, &cause);
+    return known && host;
+}
+
+}  // namespace
+
 host_pool_init_decision host_pools_init_from_plan(int                              device,
                                                   const host_holder_device_state & state,
-                                                  const host_pool_dims &           graph_needs,
+                                                  const ggml_cgraph *              graph,
+                                                  host_plan_host_experts           host_experts,
                                                   host_pool_init_warnings &        warnings) {
     host_pool_init_decision d;
     if (!state.planned) {
@@ -942,20 +980,28 @@ host_pool_init_decision host_pools_init_from_plan(int                           
                 "fallback: no host holder plan is committed for this device)\n",
                 device);
         }
-        d.dims = graph_needs;
-        d.init = graph_needs.D > 0 && graph_needs.K > 0 && graph_needs.N > 0;
+        d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);
+        d.init = d.dims.D > 0 && d.dims.K > 0 && d.dims.N > 0;
         return d;
     }
 #if defined(HOST_ZONE_PLAN_MUTANT_POOLS_OWN_SCAN)
     // Positive control: the init sized from its own graph (rev 3g), which prints nothing.
-    d.dims = graph_needs;
-    d.init = graph_needs.D > 0 && graph_needs.K > 0 && graph_needs.N > 0;
+    (void) host_experts;
+    d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);
+    d.init = d.dims.D > 0 && d.dims.K > 0 && d.dims.N > 0;
     return d;
 #else
     d.dims = state.pools;
     d.init = state.pools.D > 0 && state.pools.K > 0 && state.pools.N > 0;
-#    if !defined(HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED)
-    const bool exceeds =
+#    if defined(HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED)
+    (void) graph;
+    (void) host_experts;
+#    else
+    host_placed_scan s;
+    s.host_experts                   = host_experts;
+    s.device                         = device;
+    const host_pool_dims graph_needs = host_pool_scan(graph, scan_host_placed, &s);
+    const bool           exceeds =
         graph_needs.D > state.pools.D || graph_needs.K > state.pools.K || graph_needs.N > state.pools.N;
     if (exceeds && !warnings.over_plan.exchange(true)) {
         GGML_LOG_WARN(

@@ -772,11 +772,6 @@ void test_per_dispatching_device() {
               "a device-1 dispatch within its plan was refused or allocated");
 }
 
-bool host_placed(void *, const ggml_tensor * src0) {
-    const auto it = g_placement.find(src0);
-    return it != g_placement.end() && it->second == 1;
-}
-
 void test_pools_sized_from_the_plan() {
     reset_fakes();
     holders       h;
@@ -792,8 +787,7 @@ void test_pools_sized_from_the_plan() {
     g16.moe(16, 2, &g_mapped_buf, 1, A);
     host_pool_init_warnings warnings;
     capture_begin();
-    const host_pool_init_decision d =
-        host_pools_init_from_plan(0, state, host_pool_scan(g16.graph, host_placed, nullptr), warnings);
+    const host_pool_init_decision d = host_pools_init_from_plan(0, state, g16.graph, fake_host_experts, warnings);
     HZP_CHECK(d.init && d.dims.D == 16, "the pools initialized at D=%lld, expected the plan's D=16",
               (long long) d.dims.D);
     HZP_CHECK(log_has("exceeds its planned") && log_has("graph needs D=32") && log_has("planned D=16"),
@@ -804,7 +798,7 @@ void test_pools_sized_from_the_plan() {
     g4.moe(4, 2, &g_mapped_buf, 1, A);
     host_pool_init_warnings quiet;
     capture_begin();
-    host_pools_init_from_plan(0, state, host_pool_scan(g4.graph, host_placed, nullptr), quiet);
+    host_pools_init_from_plan(0, state, g4.graph, fake_host_experts, quiet);
     HZP_CHECK(!log_has("exceeds its planned"), "a graph within the plan printed the over-plan line");
 
     // With no commit, the pre-notify fallback: the graph's own scan, and the once-only `unplanned` WARN.
@@ -812,17 +806,11 @@ void test_pools_sized_from_the_plan() {
     host_pool_init_warnings fresh;
     capture_begin();
     const host_pool_init_decision u =
-        host_pools_init_from_plan(0, none.device_state(0), host_pool_scan(g16.graph, host_placed, nullptr), fresh);
-    host_pools_init_from_plan(0, none.device_state(0), host_pool_scan(g16.graph, host_placed, nullptr), fresh);
+        host_pools_init_from_plan(0, none.device_state(0), g16.graph, fake_host_experts, fresh);
+    host_pools_init_from_plan(0, none.device_state(0), g16.graph, fake_host_experts, fresh);
     HZP_CHECK(u.dims.D == 32 && count_of(captured_log(), "[HOST-ARENA] DEVICE pools dev=0 unplanned;") == 1,
               "with no commit the pools took D=%lld and the `unplanned` line printed %zu time(s), expected D=32 and 1",
               (long long) u.dims.D, count_of(captured_log(), "[HOST-ARENA] DEVICE pools dev=0 unplanned;"));
-}
-
-// moe_hybrid_init_once's storage filter (moe_hybrid_init_scans_node, ggml_sycl_host_data(src0) != nullptr): every
-// MUL_MAT_ID whose src0 has storage, device-placed experts included.
-bool has_storage(void *, const ggml_tensor * src0) {
-    return src0->data != nullptr;
 }
 
 void test_pools_all_device_plan_is_quiet() {
@@ -837,7 +825,7 @@ void test_pools_all_device_plan_is_quiet() {
     h.plans.walk(g_sched, g.graph, walk_env(true));
     h.commit_apply(1, true);
     const host_holder_device_state state   = h.plans.device_state(0);
-    const host_pool_dims           storage = host_pool_scan(g.graph, has_storage, nullptr);
+    const host_pool_dims           storage = host_pool_scan(g.graph, host_pool_has_storage, nullptr);
     HZP_CHECK(state.planned && state.pools.D == 0, "the all-device plan reads planned=%d D=%lld, expected planned D=0",
               (int) state.planned, (long long) state.pools.D);
     HZP_CHECK(storage.D == 16, "the storage scan of the all-device graph found D=%lld, expected 16",
@@ -845,7 +833,7 @@ void test_pools_all_device_plan_is_quiet() {
 
     host_pool_init_warnings warnings;
     capture_begin();
-    const host_pool_init_decision d = host_pools_init_from_plan(0, state, storage, warnings);
+    const host_pool_init_decision d = host_pools_init_from_plan(0, state, g.graph, fake_host_experts, warnings);
     HZP_CHECK(!d.init, "an all-device plan initialized the pools at D=%lld", (long long) d.dims.D);
     HZP_CHECK(!log_has("exceeds its planned"), "an all-device plan printed the over-plan WARN: %s",
               captured_log().c_str());
@@ -891,7 +879,8 @@ void test_two_contexts_resize_pools() {
     h.commit_apply(1, true);
     // moe_hybrid_init_once initializes at the committed figures.
     host_pool_init_warnings       w;
-    const host_pool_init_decision d = host_pools_init_from_plan(0, h.plans.device_state(0), host_pool_dims{}, w);
+    const host_pool_init_decision d =
+        host_pools_init_from_plan(0, h.plans.device_state(0), a8.graph, fake_host_experts, w);
     pools_init(nullptr, 0, d.dims);
 
     capture_begin();

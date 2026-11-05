@@ -201,6 +201,9 @@ typedef bool (*host_plan_backend_pred)(ggml_backend_t backend);
 typedef ggml_backend_t (*host_plan_tensor_backend)(ggml_backend_sched_t sched, ggml_tensor * node);
 typedef bool (*host_plan_node_pred)(void * user, const ggml_tensor * node);
 typedef void (*host_plan_visit)(void * user, ggml_tensor * node, ggml_backend_t backend);
+// Placement's executor fact: whether the plan put at least one expert of src0 on the host for `device`. *known false
+// means the fact is absent, and *cause names why ("usage not MOE_EXPERT_WEIGHT" or "no placement plan").
+typedef bool (*host_plan_host_experts)(const ggml_tensor * src0, int device, bool * known, const char ** cause);
 
 struct host_plan_attribution {
     int attributed = 0;  // nodes passing node_pred whose scheduler backend passes is_target
@@ -261,17 +264,16 @@ struct host_holder_plan {
 
 // What the walk reads from the backend.
 struct host_holder_walk_env {
-    host_plan_backend_pred   is_target                                                            = nullptr;
+    host_plan_backend_pred   is_target                  = nullptr;
     // Null: ggml_backend_sched_get_tensor_backend. The staging test injects a fixed assignment.
-    host_plan_tensor_backend tensor_backend                                                       = nullptr;
-    int (*backend_device)(ggml_backend_t backend)                                                 = nullptr;
-    uint64_t (*backend_key)(ggml_backend_t backend)                                               = nullptr;
+    host_plan_tensor_backend tensor_backend             = nullptr;
+    int (*backend_device)(ggml_backend_t backend)       = nullptr;
+    uint64_t (*backend_key)(ggml_backend_t backend)     = nullptr;
     // The dispatch's own predicate: the tensor (or the tensor its view_src names) lives in a SYCL_KV_Host buffer.
-    bool (*in_kv_host_buft)(const ggml_tensor * tensor)                                           = nullptr;
-    // Placement's executor fact: whether the plan put at least one expert of src0 on the host for `device`. *known
-    // false means the fact is absent, and *cause names why ("usage not MOE_EXPERT_WEIGHT" or "no placement plan").
-    bool (*host_experts)(const ggml_tensor * src0, int device, bool * known, const char ** cause) = nullptr;
-    bool host_dispatch_on                                                                         = false;
+    bool (*in_kv_host_buft)(const ggml_tensor * tensor) = nullptr;
+    // Placement's executor fact, the pools' one eligibility rule (host_pools_init_from_plan's check reads it too).
+    host_plan_host_experts host_experts                 = nullptr;
+    bool                   host_dispatch_on             = false;
 };
 
 // One device's committed figures: the per-field high-water over the live contexts' committed plans.
@@ -406,23 +408,31 @@ struct host_pool_init_decision {
     host_pool_dims dims{};
 };
 
-// moe_hybrid_init_once's sizing. With a committed plan for the device the pools take its figures, never the graph's
-// own scan, which only checks the graph against them: a graph needing more prints `[HOST-ARENA] DEVICE holder
-// pinned_buffer_pool dev=%d graph needs D=%d K=%lld N=%lld, exceeds its planned D=%d K=%lld N=%lld` once at WARN. With
-// no committed plan, the pre-notify fallback: the pools take the graph's own scan, with a once-per-device WARN
-// `[HOST-ARENA] DEVICE pools dev=%d unplanned; ...` naming that fallback.
+// moe_hybrid_init_once's sizing over its graph. With a committed plan for the device the pools take its figures. The
+// graph only checks them, over the nodes the plan folds: a MUL_MAT_ID whose src0 `host_experts` says has an expert on
+// the host for `device` (an unknown placement is not counted, as the walk does not fold it). A graph needing more
+// prints `[HOST-ARENA] DEVICE holder pinned_buffer_pool dev=%d graph needs D=%d K=%lld N=%lld, exceeds its planned
+// D=%d K=%lld N=%lld` once at WARN. With no committed plan, the pre-notify fallback: the pools take the graph's storage
+// scan (host_pool_has_storage), with a once-per-device WARN `[HOST-ARENA] DEVICE pools dev=%d unplanned; ...` naming
+// that fallback.
 host_pool_init_decision host_pools_init_from_plan(int                              device,
                                                   const host_holder_device_state & state,
-                                                  const host_pool_dims &           graph_needs,
+                                                  const ggml_cgraph *              graph,
+                                                  host_plan_host_experts           host_experts,
                                                   host_pool_init_warnings &        warnings);
 
-// The dimension scan moe_hybrid_init_once and the plan walk share. host_pool_dims_add folds one MUL_MAT_ID node in:
+// The dimension fold moe_hybrid_init_once and the plan walk share. host_pool_dims_add folds one MUL_MAT_ID node in:
 // D = max top-K x tokens (its ids' ne[0] x ne[1]), K = max src0 ne[0], N = max src0 ne[1], and one host-expert node.
 // host_pool_scan folds every MUL_MAT_ID node whose src0 passes `eligible` (null: every node with a src0).
 void           host_pool_dims_add(host_pool_dims & dims, const ggml_tensor * node);
 host_pool_dims host_pool_scan(const ggml_cgraph * graph,
                               bool (*eligible)(void * user, const ggml_tensor * src0),
                               void * user);
+
+// The storage filter of moe_hybrid_init_once's own scan: a MUL_MAT_ID whose src0 has storage, device-placed experts
+// included. That scan registers the experts and sizes n_embd and the secondary staging buffer. It is not the node set
+// the plan folds, so the over-plan check never reads it.
+bool host_pool_has_storage(void * user, const ggml_tensor * src0);
 
 // One device's commit, applied: registers the DEVICE holders' demand on the device's ledger (the staging slots' sum
 // as attn_host_staging, only with the host dispatch on, and PinnedBufferPool's bytes as pinned_buffer_pool), ensures

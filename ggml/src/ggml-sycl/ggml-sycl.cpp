@@ -8365,11 +8365,9 @@ static void moe_compute_gate_norm_placement(ggml_cgraph * cgraph, int device) {
         "Skipping inference-based warmup entirely.\n");
 }
 
-// The MUL_MAT_ID nodes moe_hybrid_init_once registers experts of: those whose src0 has storage.
-static bool moe_hybrid_init_scans_node(void * user, const ggml_tensor * src0) {
-    (void) user;
-    return ggml_sycl_host_data(src0) != nullptr;
-}
+// Placement's executor fact for the pools, the plan walk's (defined with the walk's environment, below): the pools'
+// over-plan check reads the nodes the plan folded through it.
+static bool ggml_sycl_host_holder_host_experts(const ggml_tensor * src0, int device, bool * known, const char ** cause);
 
 // Scan a compute graph for MUL_MAT_ID nodes, register experts with the unified cache,
 // and set up prefetcher + predictor.
@@ -8383,11 +8381,12 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     int     n_experts_per_layer = 0;
     int     n_experts_used      = 0;  // top-K from ids tensor
     size_t  expert_weight_bytes = 0;
-    // The pools' (D, K, N) over the same nodes: D = max top-K x tokens, K = max ne00, N = max ne01. One scan, the one
-    // the plan walk folds with (host_pool_scan over host_pool_dims_add), so the plan and this graph's check of it read
-    // one rule.
+    // (D, K, N) over the nodes registered below, those whose src0 has storage: D = max top-K x tokens, K = max ne00,
+    // N = max ne01, for n_embd and the secondary staging buffer. What the plan walk shares with it is the fold
+    // (host_pool_dims_add), not the node set: the plan folds only the nodes placement puts on the host for the device,
+    // so host_pools_init_from_plan checks the plan over those, never over this scan.
     const ggml_sycl::host_pool_dims graph_needs =
-        ggml_sycl::host_pool_scan(cgraph, moe_hybrid_init_scans_node, nullptr);
+        ggml_sycl::host_pool_scan(cgraph, ggml_sycl::host_pool_has_storage, nullptr);
 
     struct moe_expert_info {
         int                     layer_id;
@@ -9435,12 +9434,14 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // Initialize PinnedBufferPool for O(1) acquire/release of pinned staging buffers used by CPU expert dispatch
     // (replaces per-call malloc_host/free), and the CPU expert thread pool for persistent async dispatch (one worker
     // by default, get_cpu_expert_thread_count(), or N via GGML_SYCL_CPU_EXPERT_THREADS=N). The pools' figures come
-    // from the device's committed host holder plan, never from this graph, whose own scan only checks the graph against
-    // them (§4.4 "And the pools are sized from the plan"). Their SCRATCH demand is registered by the plan's commit, not
-    // here. With no committed plan, the pre-notify fallback sizes them from this graph's scan, with a once-only WARN.
+    // from the device's committed host holder plan, never from this graph, which is only checked against them over the
+    // nodes the plan folds (§4.4 "And the pools are sized from the plan"). Their SCRATCH demand is registered by the
+    // plan's commit, not here. With no committed plan, the pre-notify fallback sizes them from this graph's storage
+    // scan, with a once-only WARN.
     {
-        const ggml_sycl::host_pool_init_decision pools = ggml_sycl::host_pools_init_from_plan(
-            device, g_host_holder_plans->device_state(device), graph_needs, g_host_pool_init_warnings[device]);
+        const ggml_sycl::host_pool_init_decision pools =
+            ggml_sycl::host_pools_init_from_plan(device, g_host_holder_plans->device_state(device), cgraph,
+                                                 ggml_sycl_host_holder_host_experts, g_host_pool_init_warnings[device]);
         if (pools.init) {
             auto & pool = g_pinned_buffer_pools[device];
             pool.init(q, device, static_cast<size_t>(pools.dims.D), static_cast<size_t>(pools.dims.K),
@@ -9471,7 +9472,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                 // The primary's rule: the device's committed plan when it has one, this graph's scan only under the
                 // pre-notify fallback.
                 const ggml_sycl::host_pool_init_decision pools_d = ggml_sycl::host_pools_init_from_plan(
-                    gpu_d, g_host_holder_plans->device_state(gpu_d), graph_needs, g_host_pool_init_warnings[gpu_d]);
+                    gpu_d, g_host_holder_plans->device_state(gpu_d), cgraph, ggml_sycl_host_holder_host_experts,
+                    g_host_pool_init_warnings[gpu_d]);
                 if (pools_d.init) {
                     auto & pool_d = g_pinned_buffer_pools[gpu_d];
                     pool_d.init(*ggml_sycl::get_shared_context_queue(gpu_d), gpu_d, static_cast<size_t>(pools_d.dims.D),
