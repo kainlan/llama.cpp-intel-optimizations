@@ -10,14 +10,37 @@
 #include "lazy-table.hpp"
 
 #include "ggml-impl.h"
+#include "host-cpu-mapping.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <string>
+#include <utility>
 
 namespace ggml_sycl {
 
 namespace {
+
+// The largest single pread of the eager read. Linux returns at most 0x7ffff000 bytes from one call, so a block-aligned
+// request of at most 1 GiB is returned whole, and every later call starts on a block boundary, as O_DIRECT requires.
+constexpr size_t LAZY_TABLE_READ_CHUNK_BYTES = size_t{ 1 } << 30;
+
+std::string errno_text(int err) {
+    return std::string(std::strerror(err)) + " (errno " + std::to_string(err) + ")";
+}
+
+const char * residency_name(lazy_residency residency) {
+    return residency == lazy_residency::HOST ? "HOST" : "STORAGE";
+}
+
+std::string device_text(int device) {
+    return device < 0 ? std::string("CPU") : std::to_string(device);
+}
 
 lazy_table_result refuse(const lazy_table_desc & desc, lazy_table_status status, const std::string & reason) {
     GGML_LOG_WARN("[LAZY-TABLE] %s refused: %s: %s\n", desc.name.c_str(), lazy_table_status_name(status),
@@ -26,6 +49,54 @@ lazy_table_result refuse(const lazy_table_desc & desc, lazy_table_status status,
     result.status = status;
     result.reason = reason;
     return result;
+}
+
+// Why `desc` is not a table of `residency`, before anything is opened or allocated; empty when it is one.
+std::string desc_invalid(const lazy_table_desc & desc, lazy_residency residency) {
+    if (desc.name.empty()) {
+        return "the table has no name";
+    }
+    if (desc.residency != residency) {
+        return std::string("the plan's residency is ") + residency_name(desc.residency) + ", this constructor builds " +
+               residency_name(residency);
+    }
+    if ((int) desc.type < 0 || desc.type >= GGML_TYPE_COUNT || ggml_blck_size(desc.type) <= 0 || desc.ne0 <= 0 ||
+        desc.n_rows <= 0 || desc.ne0 % ggml_blck_size(desc.type) != 0) {
+        return "type=" + std::to_string((int) desc.type) + " ne0=" + std::to_string(desc.ne0) +
+               " n_rows=" + std::to_string(desc.n_rows) + " is not a row geometry";
+    }
+    const size_t row_size = ggml_row_size(desc.type, desc.ne0);
+    if (desc.row_size != row_size) {
+        return "row_size=" + std::to_string(desc.row_size) +
+               " B, ggml_row_size(type, ne0)=" + std::to_string(row_size) + " B";
+    }
+    if (static_cast<uint64_t>(desc.n_rows) > SIZE_MAX / row_size ||
+        row_size * static_cast<size_t>(desc.n_rows) != desc.table_bytes) {
+        return "table_bytes=" + std::to_string(desc.table_bytes) + " B, row_size * n_rows=" + std::to_string(row_size) +
+               " * " + std::to_string(desc.n_rows);
+    }
+    if (desc.file_path.empty()) {
+        return "the table has no source file";
+    }
+    if (desc.file_offset > UINT64_MAX - desc.table_bytes) {
+        return "offset=" + std::to_string(desc.file_offset) + " + size=" + std::to_string(desc.table_bytes) +
+               " overflows";
+    }
+    if (desc.consumer_device >= GGML_SYCL_MAX_DEVICES) {
+        return "consumer_device=" + std::to_string(desc.consumer_device) + " is no SYCL device";
+    }
+    return {};
+}
+
+// Opens the source for direct IO (D1): the body is the copy, and a page-cache copy beside it would be a second,
+// unplanned one.
+int open_direct(const std::string & path, int * err) {
+    int fd = -1;
+    do {
+        fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
+    *err = fd < 0 ? errno : 0;
+    return fd;
 }
 
 void close_fd(int fd) {
@@ -43,6 +114,52 @@ size_t record_charged_bytes(const mem_handle & record) {
         return 0;
     }
     return unified_alloc_host_cpu_charged_bytes(meta);
+}
+
+// The device a HOST_CPU record names: the consumer's, or device 0 for a CPU consumer. A HOST_CPU request names a device
+// only for its owner's release coordinator, never for a queue (§3.3).
+int record_device(const lazy_table_desc & desc) {
+    return desc.consumer_device >= 0 ? desc.consumer_device : 0;
+}
+
+// One HOST_CPU record of `bytes` for the table: owner first, WEIGHT, MODEL lifetime under the table's model (§3.3).
+// The body's charge is one of the two sites that may yield (§4.2): the load's thread holds no lock here, and the yield
+// skips this load's own chunks.
+allocation_result allocate_host_record(const lazy_table_desc & desc, size_t bytes) {
+    alloc_request req{};
+    req.device                           = record_device(desc);
+    req.size                             = bytes;
+    req.alignment                        = LAZY_IO_BLOCK_BYTES;
+    req.intent.role                      = alloc_role::WEIGHT;
+    req.intent.constraints.must_host_cpu = true;
+    req.intent.lifetime                  = alloc_lifetime::MODEL;
+    req.intent.owner                     = { alloc_owner_kind::MODEL, desc.model.model_id };
+    req.may_yield                        = true;
+    req.load_txn_id                      = desc.model.load_txn_id;
+    return unified_allocate_owner(req);
+}
+
+// Reads [file_offset - head, file_offset - head + window) into `dst` with O_DIRECT, stopping once the table's last
+// byte is in. Returns the bytes read; *err is the errno of a failed call, 0 otherwise.
+size_t read_window(int fd, uint64_t aligned_offset, uint8_t * dst, size_t window, size_t need, int * err) {
+    size_t done = 0;
+    *err        = 0;
+    while (done < need) {
+        const size_t  ask = std::min(window - done, LAZY_TABLE_READ_CHUNK_BYTES);
+        const ssize_t got = ::pread(fd, dst + done, ask, static_cast<off_t>(aligned_offset + done));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            *err = errno;
+            break;
+        }
+        if (got == 0) {
+            break;  // end of file before the table's end: the caller names the short read
+        }
+        done += static_cast<size_t>(got);
+    }
+    return done;
 }
 
 }  // namespace
@@ -98,9 +215,97 @@ size_t lazy_table::charged_bytes() const {
 lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
                                           lazy_residency          residency,
                                           const test_variation &  variation) {
-    (void) residency;
-    (void) variation;
-    return refuse(desc, lazy_table_status::READ_FAILED, "no materialization is built");
+    const std::string invalid = desc_invalid(desc, residency);
+    if (!invalid.empty()) {
+        return refuse(desc, lazy_table_status::INVALID_DESC, invalid);
+    }
+
+    int       open_err = 0;
+    const int fd       = open_direct(desc.file_path, &open_err);
+    if (fd < 0) {
+        return refuse(desc, lazy_table_status::OPEN_FAILED,
+                      "open(" + desc.file_path + ", O_DIRECT): " + errno_text(open_err));
+    }
+    // The table owns the descriptor from here: a STORAGE table keeps it, a HOST table closes it after its read, and
+    // every refusal below closes it with the table.
+    lazy_table_ref table(new lazy_table(desc));
+    table->fd_ = fd;
+
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) {
+        return refuse(desc, lazy_table_status::OPEN_FAILED, "fstat(" + desc.file_path + "): " + errno_text(errno));
+    }
+    const uint64_t end = desc.file_offset + desc.table_bytes;
+    if (static_cast<uint64_t>(st.st_size) < end) {
+        return refuse(desc, lazy_table_status::SOURCE_SHORT,
+                      "file_size=" + std::to_string(static_cast<uint64_t>(st.st_size)) +
+                          " B < offset+size=" + std::to_string(end) + " B (offset=" + std::to_string(desc.file_offset) +
+                          " size=" + std::to_string(desc.table_bytes) + ")");
+    }
+
+    if (residency == lazy_residency::HOST) {
+        const size_t      head       = static_cast<size_t>(desc.file_offset % LAZY_IO_BLOCK_BYTES);
+        const size_t      request    = lazy_table_host_body_request_bytes(desc.file_offset, desc.table_bytes);
+        allocation_result body_alloc = request == SIZE_MAX ? allocation_result{} : allocate_host_record(desc, request);
+        if (!body_alloc) {
+            const size_t mapped = request == SIZE_MAX ? 0 : host_cpu_mapped_size(request);
+            return refuse(desc, lazy_table_status::BODY_REFUSED,
+                          "request=" + std::to_string(request) + " B (mapped " + std::to_string(mapped) +
+                              " B) HOST_CPU on device " + std::to_string(record_device(desc)) +
+                              ": allocation_error=" + std::to_string((int) body_alloc.error));
+        }
+        table->records_.push_back(mem_handle::from_owned_alloc(std::move(body_alloc.owner), GGML_LAYOUT_AOS));
+        table->body_offset_ = head;
+
+        // The body's bytes are a transient CPU view, resolved for this read alone (P2). The read writes the whole
+        // window, so the view must authorize it: an extent of 0 is unknown, never unbounded.
+        const resolved_ptr view = table->records_.front().resolve(record_device(desc));
+        if (!view || view.extent < request) {
+            return refuse(desc, lazy_table_status::BODY_REFUSED,
+                          "the body did not resolve to " + std::to_string(request) + " CPU bytes (extent " +
+                              std::to_string(view.extent) + ")");
+        }
+        // The read ends once it holds the table's last byte: a table that ends its file has a window past the end
+        // (Qwen's PLE table by 832 B), and the short read there is the end of the file, not a failure.
+        int          read_err = 0;
+        const size_t need     = variation.read_whole_window ? request : head + desc.table_bytes;
+        const size_t got =
+            read_window(fd, desc.file_offset - head, static_cast<uint8_t *>(view.ptr), request, need, &read_err);
+        if (got < need) {
+            return refuse(desc, lazy_table_status::READ_FAILED,
+                          "read " + std::to_string(got) + " of " + std::to_string(need) + " B from offset " +
+                              std::to_string(desc.file_offset - head) +
+                              (read_err != 0 ? ": " + errno_text(read_err) : std::string(": end of file")));
+        }
+        // A HOST table reads its rows from the body and never from the file again.
+        close_fd(table->fd_);
+        table->fd_ = -1;
+    }
+
+    if (variation.extra_record_bytes != 0) {
+        allocation_result extra = allocate_host_record(desc, variation.extra_record_bytes);
+        if (!extra) {
+            return refuse(
+                desc, lazy_table_status::BODY_REFUSED,
+                "the fixture's extra record of " + std::to_string(variation.extra_record_bytes) + " B was refused");
+        }
+        table->records_.push_back(mem_handle::from_owned_alloc(std::move(extra.owner), GGML_LAYOUT_AOS));
+    }
+
+    const size_t charged = table->charged_bytes();
+
+    GGML_LOG_INFO(
+        "[LAZY-TABLE] %s residency=%s table=%zu B body=%zu B charged=%zu B planned=%zu B locked=%s consumer_layer=%d "
+        "device=%s file=%u off=%llu\n",
+        desc.name.c_str(), residency_name(residency), desc.table_bytes,
+        residency == lazy_residency::HOST ? lazy_table_host_body_request_bytes(desc.file_offset, desc.table_bytes) : 0,
+        charged, desc.host_resident_bytes, residency == lazy_residency::HOST ? "yes" : "none", desc.consumer_layer,
+        device_text(desc.consumer_device).c_str(), desc.file_index, (unsigned long long) desc.file_offset);
+
+    lazy_table_result result;
+    result.table  = std::move(table);
+    result.status = lazy_table_status::OK;
+    return result;
 }
 
 lazy_table_result lazy_table_create_host(const lazy_table_desc & desc) {
