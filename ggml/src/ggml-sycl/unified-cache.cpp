@@ -19,7 +19,6 @@
 #include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
 #include "lazy-io-pool.hpp"
-#include "lazy-table.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"

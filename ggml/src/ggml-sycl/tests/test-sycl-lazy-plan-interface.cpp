@@ -19,7 +19,6 @@
 
 #include "../host-cpu-mapping.hpp"
 #include "../lazy-io-pool.hpp"
-#include "../lazy-table.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "host-plan-shaped-inventory.hpp"

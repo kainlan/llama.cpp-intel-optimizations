@@ -40,18 +40,6 @@ static_assert(sizeof(uintptr_t) == 8, "the descriptor sentinel is a 64-bit addre
 // address of the buffer in that range.
 constexpr uintptr_t LAZY_TABLE_SENTINEL_BASE = uintptr_t{ 1 } << 62;
 
-// The bytes a HOST body requests for a table at `file_offset` of `table_bytes` (th32 §3.3, D1): the O_DIRECT window
-// over the table, from the start of the block that holds its first byte to the end of the block that holds its last,
-// so the table sits at body + file_offset % LAZY_IO_BLOCK_BYTES. The HOST term the planner charges and the request the
-// materialization makes both read this one rule. SIZE_MAX when the window does not fit a size_t.
-inline size_t lazy_table_host_body_request_bytes(uint64_t file_offset, size_t table_bytes) {
-    const size_t head = static_cast<size_t>(file_offset % LAZY_IO_BLOCK_BYTES);
-    if (table_bytes > SIZE_MAX - head - (LAZY_IO_BLOCK_BYTES - 1)) {
-        return SIZE_MAX;
-    }
-    return (head + table_bytes + LAZY_IO_BLOCK_BYTES - 1) / LAZY_IO_BLOCK_BYTES * LAZY_IO_BLOCK_BYTES;
-}
-
 // What a table is made from (th32 §3.2). The source is the lazy-range record's, handed over by value at plan publish,
 // never derived again; the residency, the consumer's executor and the resident bytes are the plan's.
 struct lazy_table_desc {

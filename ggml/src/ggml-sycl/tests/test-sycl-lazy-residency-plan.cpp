@@ -27,7 +27,6 @@
 
 #include "../host-cpu-mapping.hpp"
 #include "../lazy-io-pool.hpp"
-#include "../lazy-table.hpp"
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"

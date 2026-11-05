@@ -1711,8 +1711,8 @@ window from the start of the block that holds the table's first byte to the end 
 the block that holds its last, and the table starts at
 `body + file_offset % LAZY_IO_BLOCK_BYTES`. A table that ends its file has a window
 that runs past the end (Qwen's by 832 B); the read ends once it holds the table's last
-byte, so the short read at the end of the file is not a failure. One function in
-`lazy-table.hpp`, `lazy_table_host_body_request_bytes(file_offset, table_bytes)`
+byte, so the short read at the end of the file is not a failure. One function in the
+device-free `lazy-io-pool.hpp`, `lazy_table_host_body_request_bytes(file_offset, table_bytes)`
 (`round_up(file_offset % LAZY_IO_BLOCK_BYTES + table_bytes,
 LAZY_IO_BLOCK_BYTES)`), is the request the materialization makes and, through
 `host_cpu_mapped_size`, the HOST term the planner charges: one rule for plan and
