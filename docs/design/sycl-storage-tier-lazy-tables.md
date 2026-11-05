@@ -5208,7 +5208,10 @@ Code and docs stay in the tables as the upper bound.
   tenant forced. That is proposed for v1 (D7); regrowing between publishes would
   need a trigger the ledger does not have.
 - **Logging.** The planner logs `cache_slots` per table and the yieldable bytes
-  (§10), and every yield logs the chunk count and the tenant that asked.
+  (§10), and every yield logs the chunk count and the tenant that asked. The
+  planner and the built cache count those bytes with one device-free helper,
+  `lazy_row_cache_yieldable_bytes` (`lazy-row-cache.hpp`): the chunks above the
+  chunks that hold the floor, each at `host_cpu_mapped_size`, never the index.
 
 ---
 

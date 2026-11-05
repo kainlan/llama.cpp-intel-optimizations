@@ -141,21 +141,60 @@ const char * lazy_row_cache_status_name(lazy_row_cache_status status) {
     return "unknown";
 }
 
-// RED stubs: no chunk rule yet.
-size_t lazy_row_cache_floor_chunks(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
-    (void) cache_slots;
-    (void) floor_slots;
-    (void) row_size;
-    (void) chunk_bytes;
-    return 0;
+// The geometries the cache builds: a row that fits a chunk, a floor that fits the slots, and a slab that fits a size_t.
+static bool lazy_row_cache_geometry_ok(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
+    return row_size != 0 && chunk_bytes >= row_size && floor_slots != 0 && cache_slots >= floor_slots &&
+           cache_slots <= SIZE_MAX / row_size;
 }
 
+size_t lazy_row_cache_floor_chunks(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
+    if (!lazy_row_cache_geometry_ok(cache_slots, floor_slots, row_size, chunk_bytes)) {
+        return 0;
+    }
+    const size_t slab      = cache_slots * row_size;
+    const size_t n_whole   = slab / chunk_bytes;
+    const size_t per_whole = chunk_bytes / row_size;
+    const size_t need      = floor_slots / per_whole + (floor_slots % per_whole != 0 ? 1 : 0);
+    if (need <= n_whole) {
+        return need;
+    }
+    // The whole chunks hold fewer rows than the floor, so the remainder joins it: the floor is every chunk.
+    return n_whole + (slab % chunk_bytes != 0 ? 1 : 0);
+}
+
+#if defined(LAZY_ROW_CACHE_MUTANT_YIELDABLE_BY_SUBTRACTION)
+// Mutant: the planner's former figure, the resident bytes at cache_slots less those at floor_slots.
+static size_t lazy_row_cache_mutant_resident(size_t slots, size_t row_size, size_t chunk_bytes) {
+    const size_t slab  = slots * row_size;
+    size_t       bytes = (slab / chunk_bytes) * host_cpu_mapped_size(chunk_bytes);
+    if (slab % chunk_bytes != 0) {
+        bytes += host_cpu_mapped_size(slab % chunk_bytes);
+    }
+    return bytes + host_cpu_mapped_size(lazy_row_cache_index_raw_bytes(slots));
+}
+#endif
+
 size_t lazy_row_cache_yieldable_bytes(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
-    (void) cache_slots;
-    (void) floor_slots;
-    (void) row_size;
-    (void) chunk_bytes;
-    return 0;
+    const size_t floor_chunks = lazy_row_cache_floor_chunks(cache_slots, floor_slots, row_size, chunk_bytes);
+    if (floor_chunks == 0) {
+        return 0;
+    }
+#if defined(LAZY_ROW_CACHE_MUTANT_YIELDABLE_BY_SUBTRACTION)
+    return lazy_row_cache_mutant_resident(cache_slots, row_size, chunk_bytes) -
+           lazy_row_cache_mutant_resident(floor_slots, row_size, chunk_bytes);
+#else
+    const size_t slab      = cache_slots * row_size;
+    const size_t n_whole   = slab / chunk_bytes;
+    const size_t remainder = slab % chunk_bytes;
+    size_t       bytes     = 0;
+    if (floor_chunks < n_whole) {
+        bytes += (n_whole - floor_chunks) * host_cpu_mapped_size(chunk_bytes);
+    }
+    if (remainder != 0 && floor_chunks <= n_whole) {
+        bytes += host_cpu_mapped_size(remainder);
+    }
+    return bytes;
+#endif
 }
 
 lazy_row_cache::lazy_row_cache() = default;
@@ -327,16 +366,10 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
         result.allocations_made++;
         result.charged_bytes += ch.charged;
     }
-    // The floor is the fewest leading chunks that hold floor_slots rows, every chunk when even all of them hold fewer;
-    // it is never yielded (§6.4).
-    size_t held = 0;
-    for (size_t i = 0; i < c->n_chunks_; ++i) {
-        if (held >= config.floor_slots) {
-            break;
-        }
+    // The floor is the chunk rule's, the one the planner counts the yieldable bytes by, and is never yielded (§6.4).
+    c->n_floor_chunks_ = lazy_row_cache_floor_chunks(slots, config.floor_slots, row, config.chunk_bytes);
+    for (size_t i = 0; i < c->n_floor_chunks_; ++i) {
         c->chunks_[i].floor = true;
-        held += c->chunks_[i].n_slots;
-        c->n_floor_chunks_++;
     }
 
     // The index: one key word per slot, then the buckets, (4 x slots + 2) / 3 of them (load factor 0.75), split over

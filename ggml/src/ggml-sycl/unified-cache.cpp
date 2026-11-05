@@ -19,6 +19,7 @@
 #include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
 #include "lazy-io-pool.hpp"
+#include "lazy-row-cache.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
@@ -33779,12 +33780,14 @@ static size_t lazy_row_cache_slots_within(size_t floor_slots, size_t max_slots, 
     return lo;
 }
 
-// A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor. A HOST table yields nothing.
+// A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor, by the row cache's own chunk
+// rule, so the plan counts the bytes the built cache publishes. A HOST table yields nothing.
 static size_t lazy_table_yieldable_bytes(const placement_lazy_table & table, size_t row_size) {
     if (table.residency != lazy_residency::STORAGE) {
         return 0;
     }
-    return table.host_resident_bytes - lazy_row_cache_resident_bytes(table.cache_floor_slots, row_size);
+    return lazy_row_cache_yieldable_bytes(table.cache_slots, table.cache_floor_slots, row_size,
+                                          LAZY_ROW_CACHE_CHUNK_BYTES);
 }
 
 std::string placement_lazy_table_fields(const placement_lazy_table & table, const placement_lazy_table_info * info) {
