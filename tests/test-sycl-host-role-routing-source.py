@@ -23,9 +23,10 @@ Three clauses of the bullet are pinned by behaviour, not by this source read:
 
 Each clause is REQUIRED (green on this tree) or EXPECTED-RED with the task that turns it green. An expected-red
 clause is scored: it must fail on this tree with its recorded reason (an ExpectedRed warning, never a skip), it
-must pass on a planted fixture of the landed shape, and its test fails the moment the tree satisfies it, so the
-landing commit moves it to REQUIRED. Every clause has at least one planted mutant that must fail with its quoted
-reason, and a negative control (comments appended to the edited files) must leave every REQUIRED clause green.
+must pass on a planted fixture of the landed shape, it must fail with a distinct reason, never its recorded one,
+once what it inspects is removed, and its test fails the moment the tree satisfies it, so the landing commit moves
+it to REQUIRED. Every clause has at least one planted mutant that must fail with its quoted reason, and a negative
+control (comments appended to the edited files) must leave every REQUIRED clause green.
 
 The tree is read with its compile-time positive controls resolved (each `#if defined(..._MUTANT_...)` block as the
 production build compiles it) and comment-stripped. Plain file I/O, not the codescout index, which is blind in
@@ -1744,8 +1745,10 @@ def clause_trial_ops(texts: dict) -> list:
     paths; sched_reserve RETURNs on its transaction's throw path and KEEPs on its success path, MARKs before the
     measure and RETURN_TO_MARKs before the pipeline-parallel retry."""
     lc = texts.get(LC, "")
-    s = source_for(LC, lc) if lc else None
-    trial = _proc_pointer(s.code, "ggml_backend_sycl_host_scratch_trial") if s else None
+    if not lc:
+        return ["trial ops: src/llama-context.cpp is missing"]
+    s = source_for(LC, lc)
+    trial = _proc_pointer(s.code, "ggml_backend_sycl_host_scratch_trial")
     if not trial:
         return ["trial ops: llama_context does not resolve ggml_backend_sycl_host_scratch_trial"]
     code = s.bare
@@ -1838,8 +1841,10 @@ def clause_notify_position(texts: dict) -> list:
     buffer's free and ggml_backend_buft_alloc_buffer; on sched_reserve's path it follows the measure's last size-only
     graph_reserve and precedes the first allocating one."""
     lc = texts.get(LC, "")
-    s = source_for(LC, lc) if lc else None
-    ptr = _proc_pointer(s.code, NOTIFY) if s else None
+    if not lc:
+        return ["notify position: src/llama-context.cpp is missing"]
+    s = source_for(LC, lc)
+    ptr = _proc_pointer(s.code, NOTIFY)
     if not ptr:
         return [f"notify position: llama_context does not resolve {NOTIFY}"]
     _, out = _fn(texts, LC, "llama_context::output_reserve")
@@ -1909,9 +1914,12 @@ def clause_dlopen_context(texts: dict) -> list:
     """§7 C4 dlopen shape (r3 m5), the llama_context half: the function pointer types llama_context resolves the
     notify and the plan entry into have the header's shape; a decltype of the header's function inherits it."""
     lc = texts.get(LC, "")
+    if not lc:
+        return ["dlopen shape: src/llama-context.cpp is missing"]
+    code = source_for(LC, lc).code
     fails = []
     for name, label, shape in _DLOPEN_ENTRIES:
-        ptr = _proc_pointer(source_for(LC, lc).code, name) if lc else None
+        ptr = _proc_pointer(code, name)
         if not ptr:
             fails.append(f"dlopen shape: llama_context does not resolve {name}")
             continue
@@ -1929,6 +1937,8 @@ def clause_dlopen_context(texts: dict) -> list:
 def clause_owner_end_wired(texts: dict) -> list:
     """§M75, r9 m-5, r10 m-5: ggml_backend_sycl_free calls the owner's end before delete sycl_ctx."""
     free = _body(texts, GS, "ggml_backend_sycl_free")
+    if not free:
+        return ["owner end: ggml_backend_sycl_free is gone"]
     d = free.find("delete sycl_ctx")
     m = re.search(r"\b\w*host_scratch_owner_end\s*\(", free)
     if not m:
@@ -2037,10 +2047,11 @@ CLAUSES = [
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Controls. An edit is (file, old text, new text): the old text must occur exactly once in that file, and an old text
-# of None appends. A fixture is the landed shape an EXPECTED-RED clause passes on. A mutant must make its clause fail
-# with its quoted reason; an EXPECTED-RED clause's mutants are planted on its fixture, so each fails for its own
-# reason and not for the transitional code the fixture removes.
+# Controls. An edit is (file, old text, new text): the old text must occur exactly once in that file, an old text
+# of None appends, and (file, None, None) removes the file, which then reads as a missing file reads. A fixture is
+# the landed shape an EXPECTED-RED clause passes on. A mutant must make its clause fail with its quoted reason; an
+# EXPECTED-RED clause's mutants are planted on its fixture, so each fails for its own reason and not for the
+# transitional code the fixture removes.
 # ---------------------------------------------------------------------------------------------------------------
 
 PBP = SYCL_DIR + "/pinned-buffer-pool.cpp"
@@ -2514,6 +2525,28 @@ MUTANTS = [
      "names ['pp_moe_onednn_scratch_bytes']"),
 ]
 
+# A target-gone control removes what an EXPECTED-RED clause inspects. The clause must then fail with a distinct
+# reason and never with its recorded one, so a tree that deletes the target does not score as still waiting for its
+# landing task. open-touches-no-set has none: its red state is the OPEN step's absence itself.
+_GONE_LC = ([(LC, None, None)], "src/llama-context.cpp is missing")
+GONE = {
+    "slot-growth-plan-only": ([(PLAN, None, None)], "slot_replace is called by []"),
+    "pools-from-plan": ([(PLAN, "host_pool_init_decision host_pools_init_from_plan(",
+                          "host_pool_init_decision host_pools_init_moved(")], "host_pools_init_from_plan is gone"),
+    "context-wiring": _GONE_LC,
+    "trial-ops": _GONE_LC,
+    "notify-position": _GONE_LC,
+    "dlopen-context": _GONE_LC,
+    "owner-end-wired": ([(GS, "static void ggml_backend_sycl_free(ggml_backend_t backend) {",
+                          "static void ggml_backend_sycl_free_moved(ggml_backend_t backend) {")],
+                        "ggml_backend_sycl_free is gone"),
+    "scratch-fold": ([(UC, "    plan.host_zone_scratch_bytes = std::max<size_t>(k_min_zone_bytes, host_scratch_total);",
+                       "    plan.host_zone_scratch_bytes = host_scratch_total;")],
+                     "the host SCRATCH zone sum is not found"),
+    "runtime-term": ([(UCH, "    terms.runtime = ", "    terms.runtime_moved = ")], "sets no runtime term"),
+}
+NO_GONE = ("open-touches-no-set",)
+
 # An edit that changes no clause's subject: every REQUIRED clause must still hold, so a mutant's failure is its edit's.
 NEGATIVE_CONTROL = [(rel, None, "\n// routing gate negative control: a comment changes nothing\n")
                     for rel in (GS, PLAN, UC, POOL)]
@@ -2537,7 +2570,7 @@ def apply_edits(texts: dict, edits) -> dict:
     out = dict(texts)
     for rel, old, new in edits:
         if old is None:
-            out[rel] = out[rel] + new
+            out[rel] = "" if new is None else out[rel] + new
             continue
         n = out[rel].count(old)
         assert n == 1, f"control edit for {rel} matches {n} times (must be once): {old[:100]!r}"
@@ -2579,6 +2612,17 @@ def test_planted_mutant_fails_with_its_reason(mid, cid, edits, reason):
                                              + ("\n".join(fails) or "(nothing: the clause passed)"))
 
 
+@pytest.mark.parametrize("cid", sorted(GONE))
+def test_expected_red_clause_with_its_target_gone_fails_as_gone(cid):
+    edits, gone = GONE[cid]
+    reason = _BY_ID[cid][4]
+    fails = _BY_ID[cid][2](apply_edits(_tree(), edits))
+    assert any(gone in f for f in fails), (f"{cid} with its target gone does not fail with {gone!r}; it reported:\n"
+                                           + ("\n".join(fails) or "(nothing: the clause passed)"))
+    assert not any(reason in f for f in fails), (f"{cid} with its target gone still reports its recorded reason "
+                                                 f"{reason!r}, so it would score as expected-red")
+
+
 def test_negative_control_passes():
     texts = apply_edits(_tree(), NEGATIVE_CONTROL)
     for cid, status, fn, _, _ in CLAUSES:
@@ -2601,6 +2645,9 @@ def test_every_clause_has_a_planted_mutant_and_every_expected_red_clause_a_fixtu
         else:
             assert landing is None and reason is None and cid not in FIXTURES, \
                 f"REQUIRED clause {cid} carries a landing, a reason or a fixture"
+    expected_red = {c[0] for c in CLAUSES if c[1] == EXPECTED_RED}
+    assert set(GONE) | set(NO_GONE) == expected_red and not set(GONE) & set(NO_GONE), \
+        "every EXPECTED-RED clause needs a target-gone control or a place in NO_GONE, and not both"
 
 
 if __name__ == "__main__":
