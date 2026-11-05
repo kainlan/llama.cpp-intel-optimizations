@@ -30,30 +30,25 @@
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
-#include "host-ledger-test-harness.hpp"
 #include "host-plan-shaped-inventory.hpp"
+#include "lazy-table-test-util.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
 using namespace ggml_sycl;
 using namespace host_ledger_test_harness;
+using namespace lazy_table_test;
 using host_plan_shaped_inventory::moe_shape;
 using host_plan_shaped_inventory::planner_inventory;
 using host_plan_shaped_inventory::qwen38_shape;
 
 namespace {
 
-constexpr uint64_t MiB = 1024ull * 1024ull;
-constexpr uint64_t GiB = 1024ull * MiB;
-
-// P3's margin over expected_host: 24 GiB left after load, plus P3's 5 GiB runtime allowance (§4.3 step 4).
-constexpr uint64_t k_p3_margin = 29 * GiB;
 // The budget the planner is handed: far above every plan here, so the fit never decides.
 constexpr uint64_t k_budget    = 4096 * GiB;
 // One yieldable chunk with its index share and huge-page rounding stays under this, for every row size here.
@@ -470,20 +465,10 @@ arm_result arm_f_cold_class_refuses() {
     return r;
 }
 
-const char * outcome_name(outcome o) {
-    return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
-}
-
 }  // namespace
 
 int main(int argc, char ** argv) {
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--devices") == 0 && i + 1 < argc) {
-            g_devices = std::atoi(argv[++i]);
-        }
-    }
-    if (g_devices != 1 && g_devices != 2) {
-        std::printf("FAIL: --devices must be 1 or 2, got %d\n", g_devices);
+    if (!parse_devices(argc, argv, g_devices)) {
         return 1;
     }
     if (!sycl_test_require_gpu("the lazy residency plan arms")) {
@@ -508,11 +493,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    struct named_arm {
-        const char * name;
-        arm_result (*run)();
-    };
-
     std::vector<named_arm> arms = {
         { "(a) the tables stay out of every zone maximum",   arm_a_tables_stay_out_of_the_zone_maxima },
         { "(b) DeepSeek: both tables STORAGE below P3",      arm_b_deepseek_both_storage              },
@@ -525,17 +505,5 @@ int main(int argc, char ** argv) {
         arms.push_back(
             { "(b') DeepSeek both STORAGE through the one-budget delegation", arm_b_deepseek_both_storage_delegated });
     }
-    int passed = 0, failed = 0, voided = 0;
-    for (const named_arm & arm : arms) {
-        const arm_result result = arm.run();
-        std::printf("%s %s%s%s\n", outcome_name(result.result), arm.name, result.why.empty() ? "" : ": ",
-                    result.why.c_str());
-        std::fflush(stdout);
-        passed += result.result == outcome::PASS;
-        failed += result.result == outcome::FAIL;
-        voided += result.result == outcome::VOID;
-    }
-    std::printf("lazy residency plan arms (--devices %d): %d passed, %d failed, %d void\n", g_devices, passed, failed,
-                voided);
-    return failed == 0 && voided == 0 ? 0 : 1;
+    return run_arms(arms, "lazy residency plan arms (--devices " + std::to_string(g_devices) + ")");
 }

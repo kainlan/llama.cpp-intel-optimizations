@@ -10,15 +10,12 @@
 // Every arm names the mutant it kills. Every arm runs, so one failure does not hide the rest.
 
 #include "../ggml/src/ggml-sycl/lazy-io-pool.hpp"
-#include "../ggml/src/ggml-sycl/tests/host-ledger-test-harness.hpp"
+#include "../ggml/src/ggml-sycl/tests/lazy-table-test-util.hpp"
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
-#include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -28,27 +25,11 @@ extern char ** environ;
 
 using namespace ggml_sycl;
 using namespace host_ledger_test_harness;
+using namespace lazy_table_test;
 
 namespace {
 
-constexpr std::chrono::seconds      k_hook_bound{ 10 };
 constexpr std::chrono::milliseconds k_child_bound{ 30000 };
-
-lazy_registry_state registry() {
-    lazy_registry_state state;
-    if (!ggml_sycl_lazy_registry_for_testing(&state)) {
-        std::printf("FAIL: the registry accessor refused a valid pointer\n");
-    }
-    return state;
-}
-
-std::string describe(const lazy_registry_state & s) {
-    return num(s.live_pools) + " live pools, " + num(s.live_leases) + " leases, " + num(s.parked_nodes) + " parked";
-}
-
-bool is(const lazy_registry_state & s, uint64_t pools, uint64_t leases, uint64_t parked) {
-    return s.live_pools == pools && s.live_leases == leases && s.parked_nodes == parked;
-}
 
 // Frees whatever an arm left parked, so the next arm starts from an empty registry.
 void settle() {
@@ -64,18 +45,19 @@ arm_result arm_take_and_drop() {
     ring_lease a = lazy_io_pool_take();
     expect(r, a.held(), "the first take returned an empty lease");
     expect(r, a.ring_bytes() == 0, "a held lease on a ring-less pool reads " + num(a.ring_bytes()) + " ring bytes");
-    expect(r, is(registry(), 1, 1, 0), "after one take: " + describe(registry()) + ", want 1, 1, 0");
+    expect(r, registry_is(registry(), 1, 1, 0), "after one take: " + describe(registry()) + ", want 1, 1, 0");
     ring_lease b = lazy_io_pool_take();
     expect(r, b.held(), "the second take returned an empty lease");
-    expect(r, is(registry(), 1, 2, 0), "after a second take: " + describe(registry()) + ", want it joined: 1, 2, 0");
+    expect(r, registry_is(registry(), 1, 2, 0),
+           "after a second take: " + describe(registry()) + ", want it joined: 1, 2, 0");
     a.reset();
     expect(r, !a.held(), "a reset lease still reads held");
-    expect(r, is(registry(), 1, 1, 0), "after one drop of two: " + describe(registry()) + ", want 1, 1, 0");
+    expect(r, registry_is(registry(), 1, 1, 0), "after one drop of two: " + describe(registry()) + ", want 1, 1, 0");
     b.reset();
-    expect(r, is(registry(), 0, 0, 1),
+    expect(r, registry_is(registry(), 0, 0, 1),
            "after the last drop: " + describe(registry()) + ", want the pool parked: 0, 0, 1");
     settle();
-    expect(r, is(registry(), 0, 0, 0), "after a FULL reap: " + describe(registry()) + ", want 0, 0, 0");
+    expect(r, registry_is(registry(), 0, 0, 0), "after a FULL reap: " + describe(registry()) + ", want 0, 0, 0");
     return r;
 }
 
@@ -88,28 +70,30 @@ arm_result arm_clone_and_move() {
     ring_lease empty;
     ring_lease empty_clone = empty.clone();
     expect(r, !empty_clone.held(), "a clone of an empty lease is held");
-    expect(r, is(registry(), 0, 0, 0), "a clone of an empty lease changed the registry: " + describe(registry()));
+    expect(r, registry_is(registry(), 0, 0, 0),
+           "a clone of an empty lease changed the registry: " + describe(registry()));
 
     ring_lease a     = lazy_io_pool_take();
     ring_lease clone = a.clone();
     expect(r, clone.held(), "a clone of a held lease is empty");
-    expect(r, is(registry(), 1, 2, 0), "after a clone: " + describe(registry()) + ", want 1, 2, 0");
+    expect(r, registry_is(registry(), 1, 2, 0), "after a clone: " + describe(registry()) + ", want 1, 2, 0");
     a.reset();
-    expect(r, is(registry(), 1, 1, 0),
+    expect(r, registry_is(registry(), 1, 1, 0),
            "the original dropped while its clone lives: " + describe(registry()) + ", want the pool kept: 1, 1, 0");
 
     ring_lease moved(std::move(clone));
     expect(r, moved.held() && !clone.held(), "a move did not transfer the reference");
-    expect(r, is(registry(), 1, 1, 0), "a move changed the count: " + describe(registry()) + ", want 1, 1, 0");
+    expect(r, registry_is(registry(), 1, 1, 0), "a move changed the count: " + describe(registry()) + ", want 1, 1, 0");
 
     ring_lease target = lazy_io_pool_take();
-    expect(r, is(registry(), 1, 2, 0), "a take beside a live lease: " + describe(registry()) + ", want 1, 2, 0");
+    expect(r, registry_is(registry(), 1, 2, 0),
+           "a take beside a live lease: " + describe(registry()) + ", want 1, 2, 0");
     target = std::move(moved);
     expect(r, target.held() && !moved.held(), "a move-assignment did not transfer the reference");
-    expect(r, is(registry(), 1, 1, 0),
+    expect(r, registry_is(registry(), 1, 1, 0),
            "a move-assignment over a held lease: " + describe(registry()) + ", want its reference dropped: 1, 1, 0");
     target.reset();
-    expect(r, is(registry(), 0, 0, 1), "after the last drop: " + describe(registry()) + ", want 0, 0, 1");
+    expect(r, registry_is(registry(), 0, 0, 1), "after the last drop: " + describe(registry()) + ", want 0, 0, 1");
     settle();
     return r;
 }
@@ -127,16 +111,19 @@ arm_result arm_park_and_reap() {
 
     ring_lease a = lazy_io_pool_take();
     a.reset();
-    expect(r, is(registry(), 0, 0, 1), "after the first pool's last drop: " + describe(registry()) + ", want 0, 0, 1");
+    expect(r, registry_is(registry(), 0, 0, 1),
+           "after the first pool's last drop: " + describe(registry()) + ", want 0, 0, 1");
     ring_lease b = lazy_io_pool_take();
     expect(r, b.held(), "a take after the last drop returned an empty lease");
-    expect(r, is(registry(), 1, 1, 1),
+    expect(r, registry_is(registry(), 1, 1, 1),
            "a take after the last drop: " + describe(registry()) + ", want a new pool beside the parked one: 1, 1, 1");
     b.reset();
-    expect(r, is(registry(), 0, 0, 2), "after the second pool's last drop: " + describe(registry()) + ", want 0, 0, 2");
+    expect(r, registry_is(registry(), 0, 0, 2),
+           "after the second pool's last drop: " + describe(registry()) + ", want 0, 0, 2");
     const uint64_t c1 = registry().full_reaps_run;
     settle();
-    expect(r, is(registry(), 0, 0, 0), "one FULL reap left " + describe(registry()) + ", want every node freed");
+    expect(r, registry_is(registry(), 0, 0, 0),
+           "one FULL reap left " + describe(registry()) + ", want every node freed");
     expect(r, registry().full_reaps_run == c1 + 1, "the FULL reap did not count once");
     return r;
 }
@@ -175,10 +162,10 @@ arm_result arm_concurrent_takes() {
             held += l.held() ? 1 : 0;
         }
         expect(r, held == threads, "round " + num(round) + ": " + num(held) + " of " + num(threads) + " takes held");
-        expect(r, is(registry(), 1, threads, 0),
+        expect(r, registry_is(registry(), 1, threads, 0),
                "round " + num(round) + ": " + describe(registry()) + ", want one pool with every lease");
         leases.clear();
-        expect(r, is(registry(), 0, 0, 1),
+        expect(r, registry_is(registry(), 0, 0, 1),
                "round " + num(round) + " after every drop: " + describe(registry()) + ", want one pool parked");
         settle();
     }
@@ -225,7 +212,8 @@ arm_result arm_generation_install() {
     }
     expect(r, race.b_held && race.b_generation == g0 + 1,
            "take B, inside A's build, holds a pool of generation " + num(race.b_generation) + ", want " + num(g0 + 1));
-    expect(r, is(race.after_b, 0, 0, 1), "after B's drop: " + describe(race.after_b) + ", want B's pool parked");
+    expect(r, registry_is(race.after_b, 0, 0, 1),
+           "after B's drop: " + describe(race.after_b) + ", want B's pool parked");
     expect(r, a.held(), "take A returned an empty lease");
     expect(r, s.live_generation != race.b_generation,
            "take A's pool shares generation " + num(s.live_generation) +
@@ -233,10 +221,12 @@ arm_result arm_generation_install() {
     expect(r, s.live_generation == g0 + 2 && s.generation == g0 + 2,
            "take A's pool has generation " + num(s.live_generation) + " and the registry " + num(s.generation) +
                ", want " + num(g0 + 2) + " for both");
-    expect(r, is(s, 1, 1, 1), "after A's take: " + describe(s) + ", want A's pool live with 1 lease and B's parked");
+    expect(r, registry_is(s, 1, 1, 1),
+           "after A's take: " + describe(s) + ", want A's pool live with 1 lease and B's parked");
     a.reset();
     settle();
-    expect(r, is(registry(), 0, 0, 0), "after A's drop and a FULL reap: " + describe(registry()) + ", want 0, 0, 0");
+    expect(r, registry_is(registry(), 0, 0, 0),
+           "after A's drop and a FULL reap: " + describe(registry()) + ", want 0, 0, 0");
     return r;
 }
 
@@ -292,102 +282,22 @@ arm_result arm_helper_guard() {
     {
         lazy_test_coverage_pin pin = ggml_sycl_test_make_coverage_pin(0);
         expect(r, pin.pin() != nullptr && pin.pin() == &pin.lease(), "the guard holds no lease");
-        expect(r, is(registry(), 1, 1, 0), "with one guard: " + describe(registry()) + ", want 1, 1, 0");
+        expect(r, registry_is(registry(), 1, 1, 0), "with one guard: " + describe(registry()) + ", want 1, 1, 0");
         {
             lazy_test_coverage_pin second = ggml_sycl_test_make_coverage_pin(0);
-            expect(r, is(registry(), 1, 2, 0), "with two guards: " + describe(registry()) + ", want them joined");
+            expect(r, registry_is(registry(), 1, 2, 0),
+                   "with two guards: " + describe(registry()) + ", want them joined");
         }
-        expect(r, is(registry(), 1, 1, 0), "after the inner guard: " + describe(registry()) + ", want 1, 1, 0");
+        expect(r, registry_is(registry(), 1, 1, 0),
+               "after the inner guard: " + describe(registry()) + ", want 1, 1, 0");
     }
-    expect(r, is(registry(), 0, 0, 0), "after the guards: " + describe(registry()) + ", want their pool reaped");
+    expect(r, registry_is(registry(), 0, 0, 0),
+           "after the guards: " + describe(registry()) + ", want their pool reaped");
     expect(r, registry().full_reaps_run == c0 + 2,
            "the two guards ran " + num(registry().full_reaps_run - c0) + " FULL reaps, want one each");
     const child_run c = run_leg("--ring-bytes-child");
     expect(r, aborted(c) && c.err.find("4096") != std::string::npos,
            "a guard with 4096 ring bytes did not abort naming them; the child wrote: " + c.err);
-    return r;
-}
-
-// The hold hook's rendezvous: the held reap reports itself and blocks until the fixture releases it.
-struct reap_hold {
-    std::mutex              mutex;
-    std::condition_variable cv;
-    bool                    entered  = false;
-    bool                    released = false;
-};
-
-void release(reap_hold & hold) {
-    {
-        std::lock_guard<std::mutex> lock(hold.mutex);
-        hold.released = true;
-    }
-    hold.cv.notify_all();
-}
-
-void hold_reap(void * ctx) {
-    reap_hold *                  hold = static_cast<reap_hold *>(ctx);
-    std::unique_lock<std::mutex> lock(hold->mutex);
-    hold->entered = true;
-    hold->cv.notify_all();
-    hold->cv.wait(lock, [hold] { return hold->released; });
-}
-
-// The wrapper's reaps, scored at the take (§11 T3's wrapper arm, the same scoring as the lead-run
-// test-sycl-lazy-coverage-wrapper): a guard's pool is parked and the guard's FULL reap is held in the hook before its
-// list swap; with c0 read after the hook reports, the scope's take must snapshot c0 + 1 reaps run and no parked node,
-// and the scope must leave no parked node and c0 + 2 reaps run. take_if(false) takes nothing and still reaps twice.
-// Mutants: the entry reap dropped or run after the take (the take snapshots c0, or the parked node); the closing reap
-// dropped (the scope's pool survives parked); take_if gated wrong (a lease without a candidate, none with one). The two
-// dropped reaps are registered controls: LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP and LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP.
-arm_result arm_wrapper_reaps() {
-    arm_result r;
-    reap_hold  hold;
-
-    std::unique_ptr<lazy_test_coverage_pin> guard(new lazy_test_coverage_pin(ggml_sycl_test_make_coverage_pin(0)));
-    ggml_sycl_test_lazy_reap_hold(hold_reap, &hold);
-    std::thread dropper([&guard] { guard.reset(); });
-    bool        entered = false;
-    {
-        std::unique_lock<std::mutex> lock(hold.mutex);
-        entered = hold.cv.wait_for(lock, k_hook_bound, [&hold] { return hold.entered; });
-    }
-    const lazy_registry_state held = registry();
-    const uint64_t            c0   = held.full_reaps_run;
-    if (!entered) {
-        // Released and disarmed before the scope exists, so a late reap cannot hold the scope's own entry reap.
-        release(hold);
-        ggml_sycl_test_lazy_reap_hold(nullptr, nullptr);
-        fail(r, "the guard's drop never reached the hold hook within " + num(k_hook_bound.count()) + " s");
-    } else {
-        expect(r, is(held, 0, 0, 1), "while the guard's reap is held: " + describe(held) + ", want 0, 0, 1");
-    }
-    {
-        lazy_coverage_scope       scope;
-        const bool                took  = scope.take_if(true);
-        const lazy_registry_state taken = registry();
-        expect(r, took && scope.pin() != nullptr, "take_if(true) took no lease for a lazy candidate");
-        expect(r, taken.reaps_run_at_last_take == c0 + 1,
-               "the take snapshot " + num(taken.reaps_run_at_last_take) + " reaps run, want " + num(c0 + 1) +
-                   ": the entry reap did not run before the take");
-        expect(r, taken.parked_at_last_take == 0,
-               "the take found " + num(taken.parked_at_last_take) + " parked nodes: the entry reap did not free them");
-        release(hold);
-        dropper.join();
-        ggml_sycl_test_lazy_reap_hold(nullptr, nullptr);
-    }
-    const lazy_registry_state after = registry();
-    expect(r, is(after, 0, 0, 0), "after the scope: " + describe(after) + ", want its pool reaped by its closing reap");
-    expect(r, after.full_reaps_run == c0 + 2,
-           "after the scope " + num(after.full_reaps_run) + " reaps have run, want " + num(c0 + 2));
-
-    const uint64_t c1 = registry().full_reaps_run;
-    {
-        lazy_coverage_scope scope;
-        expect(r, !scope.take_if(false) && scope.pin() == nullptr, "take_if(false) took a lease");
-        expect(r, registry().live_pools == 0, "take_if(false) built a pool");
-    }
-    expect(r, registry().full_reaps_run == c1 + 2,
-           "a scope with no candidate ran " + num(registry().full_reaps_run - c1) + " FULL reaps, want 2");
     return r;
 }
 
@@ -414,10 +324,6 @@ arm_result arm_shut_down() {
     return r;
 }
 
-const char * outcome_name(outcome o) {
-    return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
-}
-
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -428,12 +334,7 @@ int main(int argc, char ** argv) {
         return ring_bytes_child();
     }
 
-    struct named_arm {
-        const char * name;
-        arm_result (*run)();
-    };
-
-    const named_arm arms[] = {
+    std::vector<named_arm> arms = {
         { "takes join one pool, drops count, the last drop parks", arm_take_and_drop         },
         { "a clone counts, moves transfer",                        arm_clone_and_move        },
         { "takes never revive a parked pool; one reap frees all",  arm_park_and_reap         },
@@ -441,19 +342,11 @@ int main(int argc, char ** argv) {
         { "a take installs only on a generation match",            arm_generation_install    },
         { "a clone of a DYING pool aborts",                        arm_clone_on_dying_aborts },
         { "the helper guard takes through the registry and reaps", arm_helper_guard          },
-        { "the wrapper reaps before its take and after its drop",  arm_wrapper_reaps         },
-        { "shut-down: no take, and a drop only decrements",        arm_shut_down             },
     };
-    int passed = 0, failed = 0, voided = 0;
-    for (const named_arm & arm : arms) {
-        const arm_result result = arm.run();
-        std::printf("%s %s%s%s\n", outcome_name(result.result), arm.name, result.why.empty() ? "" : ": ",
-                    result.why.c_str());
-        std::fflush(stdout);
-        passed += result.result == outcome::PASS;
-        failed += result.result == outcome::FAIL;
-        voided += result.result == outcome::VOID;
+    for (const named_arm & arm : wrapper_arms()) {
+        arms.push_back(arm);
     }
-    std::printf("lazy io pool host arms: %d passed, %d failed, %d void\n", passed, failed, voided);
-    return failed == 0 && voided == 0 ? 0 : 1;
+    // Last: the shut-down flag is never cleared.
+    arms.push_back({ "shut-down: no take, and a drop only decrements", arm_shut_down });
+    return run_arms(arms, "lazy io pool host arms");
 }

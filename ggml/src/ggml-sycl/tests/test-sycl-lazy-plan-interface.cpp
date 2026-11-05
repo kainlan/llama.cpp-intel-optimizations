@@ -21,30 +21,22 @@
 #include "../lazy-io-pool.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
-#include "host-ledger-test-harness.hpp"
 #include "host-plan-shaped-inventory.hpp"
+#include "lazy-table-test-util.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
 using namespace host_ledger_test_harness;
+using namespace lazy_table_test;
 using ggml_sycl::host_cpu_mapped_size;
 using host_plan_shaped_inventory::loader_inventory;
 
 namespace {
-
-constexpr uint64_t MiB = 1024ull * 1024ull;
-constexpr uint64_t GiB = 1024ull * MiB;
-
-// P3's margin over expected_host (§4.3 step 4).
-constexpr uint64_t k_p3_margin = 29 * GiB;
 
 int            g_devices  = 1;
 ggml_backend_t g_backend0 = nullptr;  // main's backend 0, alive for every arm
@@ -63,17 +55,6 @@ ggml_sycl_lazy_table_info lazy_table(const char * name, int64_t rows) {
     t.consumer_layer = 1;
     t.size           = t.row_size * static_cast<size_t>(rows);
     return t;
-}
-
-std::vector<std::string> lines_with(const char * a, const char * b = nullptr) {
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    std::vector<std::string>    out;
-    for (const std::string & line : g_log_lines) {
-        if (line.find(a) != std::string::npos && (b == nullptr || line.find(b) != std::string::npos)) {
-            out.push_back(line);
-        }
-    }
-    return out;
 }
 
 struct lazy_reading {
@@ -112,7 +93,7 @@ void expect_reading(arm_result & r, const lazy_reading & got, uint64_t resident,
 // The last [HOST-PLAN] lazy line's reading cannot clear P3 with `bytes` resident: the arm is VOID, since the host,
 // not the plan, decided.
 bool reading_too_low(arm_result & r, size_t bytes) {
-    const std::vector<std::string> lines = lines_with("[HOST-PLAN] lazy ");
+    const std::vector<std::string> lines = log_lines_containing("[HOST-PLAN] lazy ");
     if (lines.empty()) {
         return false;
     }
@@ -206,11 +187,9 @@ arm_result arm_b_the_slot_reaches_the_planner() {
         void_arm(arr, "the load transaction did not begin");
         return arr;
     }
-    ggml_sycl::lazy_registry_state before{};
-    ggml_sycl::lazy_registry_state after{};
-    (void) ggml_sycl::ggml_sycl_lazy_registry_for_testing(&before);
-    void * pin = ggml_sycl_test_coverage_pin_make(0);
-    (void) ggml_sycl::ggml_sycl_lazy_registry_for_testing(&after);
+    const ggml_sycl::lazy_registry_state before = registry();
+    void *                               pin    = ggml_sycl_test_coverage_pin_make(0);
+    const ggml_sycl::lazy_registry_state after  = registry();
     if (pin == nullptr || after.live_leases <= before.live_leases) {
         ggml_sycl_test_coverage_pin_release(pin);
         (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
@@ -234,12 +213,12 @@ arm_result arm_b_the_slot_reaches_the_planner() {
         return arr;
     }
     if (got.count != 1) {
-        const size_t refused = lines_with("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").size();
+        const size_t refused = log_lines_containing("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").size();
         fail(arr, "the candidate carries " + num(got.count) + " lazy tables, want 1 STORAGE table; the plan logged " +
                       "refusal=lazy-table-ring-unpinned " + num(refused) + " times");
         return arr;
     }
-    const std::vector<std::string> placed = lines_with("[PLACEMENT] lazy blk.14.engram_embd.weight ");
+    const std::vector<std::string> placed = log_lines_containing("[PLACEMENT] lazy blk.14.engram_embd.weight ");
     expect(arr, !placed.empty() && placed.back().find(" residency=STORAGE ") != std::string::npos,
            "no [PLACEMENT] line places the table STORAGE");
     expect(arr, got.resident >= floor_raw,
@@ -282,34 +261,24 @@ arm_result arm_c_the_stage_refuses_a_refused_plan() {
     const lazy_reading               left = read_candidate(txn);
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
 
-    if (lines_with("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").empty()) {
+    if (log_lines_containing("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").empty()) {
         void_arm(arr, "no plan line carries refusal=lazy-table-ring-unpinned, so the stage saw no refused plan");
         return arr;
     }
     expect(arr, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
            "the early stage returned " + num(rc) + ", want PLAN_REJECTED (" + num(GGML_SYCL_LIFECYCLE_PLAN_REJECTED) +
                ")");
-    const size_t warned = lines_with("[HOST-PLAN] load refused: lazy-table-ring-unpinned ").size();
+    const size_t warned = log_lines_containing("[HOST-PLAN] load refused: lazy-table-ring-unpinned ").size();
     expect(arr, warned == 1,
            "the stage logged " + num(warned) + " load-refused lines naming lazy-table-ring-unpinned, want 1");
     expect(arr, !left.ok, "a candidate is still staged for the refused load");
     return arr;
 }
 
-const char * outcome_name(outcome o) {
-    return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
-}
-
 }  // namespace
 
 int main(int argc, char ** argv) {
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--devices") == 0 && i + 1 < argc) {
-            g_devices = std::atoi(argv[++i]);
-        }
-    }
-    if (g_devices != 1 && g_devices != 2) {
-        std::printf("FAIL: --devices must be 1 or 2, got %d\n", g_devices);
+    if (!parse_devices(argc, argv, g_devices)) {
         return 1;
     }
     if (!sycl_test_require_gpu("the lazy plan interface arms")) {
@@ -339,27 +308,10 @@ int main(int argc, char ** argv) {
     }
     g_backend0 = backends.front().get();
 
-    struct named_arm {
-        const char * name;
-        arm_result (*run)();
-    };
-
-    const named_arm arms[] = {
+    const std::vector<named_arm> arms = {
         { "(a) a table through the stage, the publish and the unload", arm_a_through_the_stage                },
         { "(b) the thread's plan slot reaches the planner",            arm_b_the_slot_reaches_the_planner     },
         { "(c) a refused plan refuses the load at the stage",          arm_c_the_stage_refuses_a_refused_plan },
     };
-    int passed = 0, failed = 0, voided = 0;
-    for (const named_arm & arm : arms) {
-        const arm_result result = arm.run();
-        std::printf("%s %s%s%s\n", outcome_name(result.result), arm.name, result.why.empty() ? "" : ": ",
-                    result.why.c_str());
-        std::fflush(stdout);
-        passed += result.result == outcome::PASS;
-        failed += result.result == outcome::FAIL;
-        voided += result.result == outcome::VOID;
-    }
-    std::printf("lazy plan interface arms (--devices %d): %d passed, %d failed, %d void\n", g_devices, passed, failed,
-                voided);
-    return failed == 0 && voided == 0 ? 0 : 1;
+    return run_arms(arms, "lazy plan interface arms (--devices " + std::to_string(g_devices) + ")");
 }
