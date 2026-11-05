@@ -9,6 +9,7 @@
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW (host-zone-plan.cpp) today's additive grow_scratch_zone
 //   HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0       (host-zone-plan.cpp) the device-0 resolve
 //   HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE    (host-zone-plan.cpp) the notifying backend's ctx->device
+//   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK   (host-zone-plan.cpp) a failed grow keeps its reservation
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -19,6 +20,7 @@
 #include "host-zone-plan.hpp"
 
 #include <algorithm>
+#include <memory>
 
 using namespace ggml_sycl;
 using namespace host_zone_plan_test;
@@ -214,12 +216,30 @@ void test_interleaved_notify_grows_once() {
     HZP_CHECK(z.zone.grows == 1, "two notifies for one deficit grew %d time(s), expected 1", z.zone.grows);
 }
 
+void test_failed_grow_returns_its_reservation() {
+    // The deficit is reserved before the grow runs. A grow that fails gives the reservation back, so the next notify
+    // for the same deficit grows again instead of finding it covered.
+    fake_zone z;
+    z.capacity = plan_scratch;
+    z.fail     = true;
+    host_scratch_ledger ledger;
+    const auto          ops = ops_for(z);
+    const auto          r1  = ledger.notify_context(1, 1000 * MiB, 0, ops);
+    HZP_CHECK(!r1.ok && z.grows == 0, "the failing grow returned ok=%d after %d grow(s)", (int) r1.ok, z.grows);
+    z.fail        = false;
+    const auto r2 = ledger.notify_context(1, 1000 * MiB, 0, ops);
+    HZP_CHECK(r2.ok && z.grows == 1,
+              "after a failed grow, the next notify for the same deficit grew %d time(s), expected 1", z.grows);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // The notify's core over two fake caches.
 // ---------------------------------------------------------------------------------------------------------------
 
-fake_zone            g_zone[2];
-host_scratch_ledger  g_ledger[2];
+// One ledger per zone, made fresh with it: a ledger's reservations describe its zone, whose capacity never falls.
+fake_zone                            g_zone[2];
+std::unique_ptr<host_scratch_ledger> g_ledger[2];
+
 int                  g_buft_device   = 0;
 int                  g_context_calls = 0;
 char                 g_backend_storage[2];
@@ -243,7 +263,7 @@ bool fake_ledger_of(int device, host_scratch_ledger ** ledger, host_scratch_zone
     if (device < 0 || device > 1) {
         return false;
     }
-    *ledger = &g_ledger[device];
+    *ledger = g_ledger[device].get();
     *ops    = ops_for(g_zone[device]);
     return true;
 }
@@ -261,7 +281,7 @@ void reset_caches() {
     for (int d = 0; d < 2; ++d) {
         g_zone[d]          = fake_zone{};
         g_zone[d].capacity = plan_scratch;
-        g_ledger[d].drop_context(42);
+        g_ledger[d]        = std::make_unique<host_scratch_ledger>();
     }
     g_context_calls = 0;
 }
@@ -272,7 +292,7 @@ void test_non_sycl_refused() {
     const bool ok = host_scratch_notify(fake_env(), g_not_sycl, 100 * MiB, 0);
     HZP_CHECK(!ok && log_has("[HOST-ARENA] SCRATCH notify refused: the backend is not a SYCL backend"),
               "a non-SYCL backend's notify was not refused with the WARN");
-    HZP_CHECK(g_context_calls == 0 && g_ledger[0].total() == 0 && g_ledger[1].total() == 0,
+    HZP_CHECK(g_context_calls == 0 && g_ledger[0]->total() == 0 && g_ledger[1]->total() == 0,
               "a refused notify read the backend's context or recorded a demand");
 }
 
@@ -310,6 +330,7 @@ int main() {
     test_one_demand_per_context();
     test_request_alignment_and_holder();
     test_interleaved_notify_grows_once();
+    test_failed_grow_returns_its_reservation();
     test_non_sycl_refused();
     test_device_is_the_host_bufts();
     test_failed_grow_returns_false();

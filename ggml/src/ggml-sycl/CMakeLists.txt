@@ -8206,7 +8206,9 @@ ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
     HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0
         "with the host buft on device 1, the notify grew device 1 0 time\\(s\\) and device 0 1"
     HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE
-        "with the host buft on device 0, a device-1 backend's notify grew device 0 0 time\\(s\\) and device 1 1")
+        "with the host buft on device 0, a device-1 backend's notify grew device 0 0 time\\(s\\) and device 1 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK
+        "after a failed grow, the next notify for the same deficit grew 0 time\\(s\\), expected 1")
 
 if (NOT GGML_BACKEND_DL)
     # The real ggml-base scheduler over two CPU backend instances; ggml-cpu is a MODULE under GGML_BACKEND_DL.

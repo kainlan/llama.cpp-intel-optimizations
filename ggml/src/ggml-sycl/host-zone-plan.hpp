@@ -127,7 +127,8 @@ size_t host_scratch_buffers_at_cap(size_t bytes, size_t chunk_cap);
 
 // One device's demands: one per llama_context, keyed by the notifying backend context, and one per DEVICE holder.
 // Thread-safe. The ledger's mutex is a leaf held only across its own map updates and arithmetic, never across the
-// grow (canonical contract §12.5).
+// grow or a zone callback (canonical contract §12.5). A deficit is reserved before the grow runs, so two notifies that
+// see one deficit grow once.
 class host_scratch_ledger {
   public:
     // Replaces the context's demand with (compute, output), not adds to it, then ensures capacity. Prints
@@ -153,12 +154,18 @@ class host_scratch_ledger {
         size_t n_buffers = 0;
     };
 
+    // Reserves the deficit of the demands now recorded under `lock`, releases it, makes the one grow, and returns a
+    // failed grow's reservation. `capacity_before` is the zone's capacity, read before `lock` was taken.
     host_scratch_ensure_result ensure_locked_then_grow(std::unique_lock<std::mutex> & lock,
-                                                       const host_scratch_zone_ops &  ops);
+                                                       const host_scratch_zone_ops &  ops,
+                                                       size_t                         capacity_before);
 
     mutable std::mutex            mutex_;
     std::map<uint64_t, demand>    contexts_;
     std::map<std::string, demand> holders_;
+    // The highest target this ledger has reserved: a grow's deficit is added before the grow runs and taken back if
+    // the grow fails. A notify grows only for the part of its target above both this and the zone's capacity.
+    size_t                        reserved_target_ = 0;
 };
 
 // The notify's core (ggml_backend_sycl_notify_host_buffer_sizes): refuses a non-SYCL backend with a WARN before it

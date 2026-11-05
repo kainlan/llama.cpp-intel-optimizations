@@ -182,10 +182,22 @@ size_t host_scratch_buffers_at_cap(size_t bytes, size_t chunk_cap) {
     return (bytes + chunk_cap - 1) / chunk_cap;
 }
 
+namespace {
+
+// Read with no ledger lock held: the capacity is the zone's, behind a callback.
+size_t scratch_zone_capacity(const host_scratch_zone_ops & ops) {
+    return ops.capacity ? ops.capacity(ops.user) : 0;
+}
+
+}  // namespace
+
 host_scratch_ensure_result host_scratch_ledger::ensure_locked_then_grow(std::unique_lock<std::mutex> & lock,
-                                                                        const host_scratch_zone_ops &  ops) {
+                                                                        const host_scratch_zone_ops &  ops,
+                                                                        size_t capacity_before) {
     host_scratch_ensure_result r;
-    size_t                     n_buffers = 0;
+    r.capacity_before         = capacity_before;
+    size_t n_buffers          = 0;
+    size_t reserved_increment = 0;
     for (const auto & kv : contexts_) {
         r.total += kv.second.bytes;
         n_buffers += kv.second.n_buffers;
@@ -195,26 +207,38 @@ host_scratch_ensure_result host_scratch_ledger::ensure_locked_then_grow(std::uni
         n_buffers += kv.second.n_buffers;
     }
     r.target = ops.plan_scratch_bytes + r.total;
-    // The grow runs with the ledger's mutex released: it takes the pool's own locks and may commit a chunk, and no
-    // lock of this ledger is held across a grow (canonical contract §12.5).
-    lock.unlock();
-    r.capacity_before = ops.capacity ? ops.capacity(ops.user) : 0;
 #if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW)
     // Positive control: today's additive grow_scratch_zone(additional_bytes) grows by the whole demand on every call,
     // whatever the zone already holds (the ratchet).
     r.request = r.total;
-    if (r.request > 0 && ops.grow) {
-        r.ok = ops.grow(ops.user, r.request);
-    }
 #else
-    if (r.capacity_before < r.target) {
+    // Reserve, then grow. What the zone holds, or what a grow already in flight will bring it to, may cover the target;
+    // otherwise the deficit is reserved here, before the mutex is released, so a notify that arrives while this grow
+    // runs finds it covered and does not grow for it again.
+    const size_t covered = std::max(r.capacity_before, reserved_target_);
+    if (covered < r.target) {
+        reserved_increment = r.target - covered;
+        reserved_target_   = r.target;
         // One grow_zone call for the deficit plus one alignment of slack per buffer the demands split into, the same
         // slack rule as the miss path. The pool commits one chunk of max(2048 MB, align_up(request)).
-        r.request = (r.target - r.capacity_before) + n_buffers * ops.alignment;
-        r.ok      = ops.grow ? ops.grow(ops.user, r.request) : false;
+        r.request          = reserved_increment + n_buffers * ops.alignment;
     }
 #endif
-    const size_t capacity_after = ops.capacity ? ops.capacity(ops.user) : 0;
+    // The grow runs with the ledger's mutex released: it takes the pool's own locks and may commit a chunk, and no
+    // lock of this ledger is held across a grow (canonical contract §12.5).
+    lock.unlock();
+    if (r.request > 0) {
+        r.ok = ops.grow ? ops.grow(ops.user, r.request) : false;
+#if !defined(HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK)
+        if (!r.ok && reserved_increment > 0) {
+            // The zone did not grow, so the reservation goes back and the next notify for this deficit grows again.
+            lock.lock();
+            reserved_target_ = reserved_target_ > reserved_increment ? reserved_target_ - reserved_increment : 0;
+            lock.unlock();
+        }
+#endif
+    }
+    const size_t capacity_after = scratch_zone_capacity(ops);
     r.grown                     = capacity_after > r.capacity_before ? capacity_after - r.capacity_before : 0;
     return r;
 }
@@ -223,6 +247,7 @@ host_scratch_ensure_result host_scratch_ledger::notify_context(uint64_t         
                                                                size_t                        compute_bytes,
                                                                size_t                        output_bytes,
                                                                const host_scratch_zone_ops & ops) {
+    const size_t                 capacity_before = scratch_zone_capacity(ops);
     std::unique_lock<std::mutex> lock(mutex_);
     demand &                     d = contexts_[context_key];
 #if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE)
@@ -235,7 +260,7 @@ host_scratch_ensure_result host_scratch_ledger::notify_context(uint64_t         
     d.n_buffers = host_scratch_buffers_at_cap(compute_bytes, ops.chunk_cap) +
                   host_scratch_buffers_at_cap(output_bytes, ops.chunk_cap);
 #endif
-    const host_scratch_ensure_result r = ensure_locked_then_grow(lock, ops);
+    const host_scratch_ensure_result r = ensure_locked_then_grow(lock, ops, capacity_before);
     GGML_LOG_INFO("[HOST-ARENA] SCRATCH demand ctx=%llu compute=%.1f MB output=%.1f MB total=%.1f MB grown=%.1f MB\n",
                   (unsigned long long) context_key, to_mib(compute_bytes), to_mib(output_bytes), to_mib(r.total),
                   to_mib(r.grown));
@@ -246,11 +271,12 @@ host_scratch_ensure_result host_scratch_ledger::holder_demand(const char *      
                                                               int                           device,
                                                               size_t                        bytes,
                                                               const host_scratch_zone_ops & ops) {
+    const size_t                 capacity_before = scratch_zone_capacity(ops);
     std::unique_lock<std::mutex> lock(mutex_);
     demand &                     d     = holders_[std::string(holder ? holder : "?") + "@" + std::to_string(device)];
     d.bytes                            = bytes;
     d.n_buffers                        = host_scratch_buffers_at_cap(bytes, ops.chunk_cap);
-    const host_scratch_ensure_result r = ensure_locked_then_grow(lock, ops);
+    const host_scratch_ensure_result r = ensure_locked_then_grow(lock, ops, capacity_before);
     GGML_LOG_INFO("[HOST-ARENA] SCRATCH demand holder=%s dev=%d bytes=%.1f MB total=%.1f MB grown=%.1f MB\n",
                   holder ? holder : "?", device, to_mib(bytes), to_mib(r.total), to_mib(r.grown));
     return r;

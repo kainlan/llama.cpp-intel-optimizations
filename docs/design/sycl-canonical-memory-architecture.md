@@ -1617,13 +1617,16 @@ and per-holder SCRATCH demands of one device, and the pending and committed host
 holder plans of every backend context. Both sit at L5 with the allocation
 bookkeeping they size, and both are **strictly leaf: never held while any other
 lock is acquired, and no allocation, device work, callback or logging happens
-under either.** The ledger computes its target under its lock and releases it
-before the one `grow_zone` call, which takes the pinned pool's own locks; its
-demand line prints after the release. The plan walk gathers each reserve graph's
-figures with no lock held, because the placement fact it asks for takes the
-inventory's L1 lock, and only then merges them under `host_holder_plans::mutex_`;
-`commit` prints after releasing it. The slot re-size and the pools' re-size that
-follow a commit run with neither lock held.
+under either.** The ledger reads the zone's capacity before taking its lock.
+Under the lock it computes its target and reserves the deficit, so a notify that
+arrives while the grow runs finds the deficit covered and does not grow for it
+again. It releases the lock before the one `grow_zone` call, which takes the
+pinned pool's own locks, and retakes it only to give back a failed grow's
+reservation. Its demand line prints after the release. The plan walk gathers
+each reserve graph's figures with no lock held, because the placement fact it
+asks for takes the inventory's L1 lock, and only then merges them under
+`host_holder_plans::mutex_`; `commit` prints after releasing it. The slot
+re-size and the pools' re-size that follow a commit run with neither lock held.
 
 The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
 guards the per-(device, plan) reservation table, the conversion generations, and
