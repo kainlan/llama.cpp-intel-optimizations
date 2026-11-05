@@ -42,13 +42,18 @@ std::string device_text(int device) {
     return device < 0 ? std::string("CPU") : std::to_string(device);
 }
 
-lazy_table_result refuse(const lazy_table_desc & desc, lazy_table_status status, const std::string & reason) {
-    GGML_LOG_WARN("[LAZY-TABLE] %s refused: %s: %s\n", desc.name.c_str(), lazy_table_status_name(status),
-                  reason.c_str());
+// The typed result of a refusal, after its WARN: refuse() and the activation check build theirs here.
+lazy_table_result refusal(lazy_table_status status, const std::string & reason) {
     lazy_table_result result;
     result.status = status;
     result.reason = reason;
     return result;
+}
+
+lazy_table_result refuse(const lazy_table_desc & desc, lazy_table_status status, const std::string & reason) {
+    GGML_LOG_WARN("[LAZY-TABLE] %s refused: %s: %s\n", desc.name.c_str(), lazy_table_status_name(status),
+                  reason.c_str());
+    return refusal(status, reason);
 }
 
 // Why `desc` is not a table of `residency`, before anything is opened or allocated; empty when it is one.
@@ -243,7 +248,8 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
 
     struct stat st{};
     if (::fstat(fd, &st) != 0) {
-        return refuse(desc, lazy_table_status::OPEN_FAILED, "fstat(" + desc.file_path + "): " + errno_text(errno));
+        const int fstat_err = errno;  // read before the reason's allocations can change it
+        return refuse(desc, lazy_table_status::OPEN_FAILED, "fstat(" + desc.file_path + "): " + errno_text(fstat_err));
     }
     const uint64_t end = desc.file_offset + desc.table_bytes;
     if (static_cast<uint64_t>(st.st_size) < end) {
@@ -329,14 +335,12 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
                                    std::to_string(table->records_.size()) +
                                    " record(s), the block ring excluded, planned host_resident_bytes=" +
                                    std::to_string(desc.host_resident_bytes) + " B";
-        GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s activation check: %s\n", desc.name.c_str(), reason.c_str());
+        GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s activation check: %s: %s\n", desc.name.c_str(),
+                      lazy_table_status_name(lazy_table_status::ACTIVATION_MISMATCH), reason.c_str());
         if (ggml_sycl_strict_enabled()) {
             GGML_ABORT("lazy table %s failed its activation check under GGML_SYCL_STRICT_LEASES=1", desc.name.c_str());
         }
-        lazy_table_result result;
-        result.status = lazy_table_status::ACTIVATION_MISMATCH;
-        result.reason = reason;
-        return result;
+        return refusal(lazy_table_status::ACTIVATION_MISMATCH, reason);
     }
 
     GGML_LOG_INFO(

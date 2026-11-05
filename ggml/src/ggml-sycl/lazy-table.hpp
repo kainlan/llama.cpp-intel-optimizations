@@ -61,7 +61,8 @@ struct lazy_table_desc {
 };
 
 // Why a materialization refused (th32 §3.2, §10). Every refusal logs one WARN naming the table, its status name and
-// the figures that decided it.
+// the figures that decided it: "[LAZY-TABLE] <table> refused: ...", or "[HOST-PLAN-BUG] lazy table <table> activation
+// check: ..." for an activation mismatch, which is a plan bug.
 enum class lazy_table_status : uint8_t {
     OK = 0,
     INVALID_DESC,         // the descriptor's geometry, source or residency is not a table's

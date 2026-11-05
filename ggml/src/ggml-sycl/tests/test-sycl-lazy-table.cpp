@@ -648,6 +648,8 @@ arm_result arm_activation_extra_chunk_refuses() {
     const auto lines = log_lines_containing("[HOST-PLAN-BUG] lazy table activation.lazy activation check");
     expect(r, lines.size() == 1, "the mismatch printed " + num(lines.size()) + " [HOST-PLAN-BUG] lines, want 1");
     if (lines.size() == 1) {
+        expect(r, lines[0].find("lazy-table-activation-mismatch") != std::string::npos,
+               "the [HOST-PLAN-BUG] line does not name its status: " + lines[0]);
         expect(r, printed(lines[0], "charged_bytes") == charged,
                "the line's charged_bytes is not the body plus one chunk (" + num(charged) + "): " + lines[0]);
         expect(r, printed(lines[0], "host_resident_bytes") == k_mapped_a_bytes,
