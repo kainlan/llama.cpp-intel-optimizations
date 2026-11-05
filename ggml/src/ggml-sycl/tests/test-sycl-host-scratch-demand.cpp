@@ -177,9 +177,11 @@ struct interleaved_zone {
     fake_zone             zone;
     host_scratch_ledger * ledger = nullptr;
     host_scratch_zone_ops ops;
-    bool                  pending        = false;  // a notify waits to arrive during the next grow
-    uint64_t              pending_key    = 0;
-    size_t                pending_demand = 0;
+    bool                       pending        = false;  // a notify waits to arrive during the next grow
+    uint64_t                   pending_key    = 0;
+    size_t                     pending_demand = 0;
+    host_scratch_ensure_result pending_result;  // what that notify returned
+    int                        grow_calls = 0;  // grow_zone calls, failed ones included
 };
 
 size_t interleaved_capacity(void * user) {
@@ -189,9 +191,10 @@ size_t interleaved_capacity(void * user) {
 bool interleaved_grow(void * user, size_t request) {
     interleaved_zone & z = *static_cast<interleaved_zone *>(user);
     if (z.pending) {
-        z.pending = false;
-        z.ledger->notify_context(z.pending_key, z.pending_demand, 0, z.ops);
+        z.pending        = false;
+        z.pending_result = z.ledger->notify_context(z.pending_key, z.pending_demand, 0, z.ops);
     }
+    ++z.grow_calls;
     return fake_grow(&z.zone, request);
 }
 
@@ -215,6 +218,36 @@ void test_interleaved_notify_grows_once() {
     ledger.notify_context(1, 1000 * MiB, 0, z.ops);
     HZP_CHECK(!z.pending, "B's notify did not arrive during A's grow");
     HZP_CHECK(z.zone.grows == 1, "two notifies for one deficit grew %d time(s), expected 1", z.zone.grows);
+}
+
+void test_covered_notify_reports_its_own_grow() {
+    // `ok` reports the notify's own grow. A's grow fails while B's notify, covered by A's reservation, arrives: B makes
+    // no grow and returns ok, A returns false, and the next notify finds the reservation given back and grows the
+    // deficit once.
+    interleaved_zone    z;
+    host_scratch_ledger ledger;
+    z.zone.capacity = plan_scratch + 500 * MiB;
+    z.ledger        = &ledger;
+    z.ops           = ops_for(z.zone);
+    z.ops.user      = &z;
+    z.ops.capacity  = interleaved_capacity;
+    z.ops.grow      = interleaved_grow;
+    ledger.notify_context(2, 500 * MiB, 0, z.ops);
+    z.zone.fail      = true;
+    z.pending        = true;
+    z.pending_key    = 2;
+    z.pending_demand = 500 * MiB;
+    const auto a     = ledger.notify_context(1, 1000 * MiB, 0, z.ops);
+    HZP_CHECK(!z.pending, "B's notify did not arrive during A's grow");
+    HZP_CHECK(z.pending_result.ok && z.pending_result.request == 0,
+              "B's covered notify returned ok=%d with a %zu-byte grow request, expected ok and no grow",
+              (int) z.pending_result.ok, z.pending_result.request);
+    HZP_CHECK(!a.ok && z.grow_calls == 1, "A's failing grow returned ok=%d after %d grow call(s), expected false and 1",
+              (int) a.ok, z.grow_calls);
+    z.zone.fail     = false;
+    const auto next = ledger.notify_context(2, 500 * MiB, 0, z.ops);
+    HZP_CHECK(next.ok && z.zone.grows == 1, "after A's failed grow, the next notify grew %d time(s), expected 1",
+              z.zone.grows);
 }
 
 void test_failed_grow_returns_its_reservation() {
@@ -331,6 +364,7 @@ int main() {
     test_one_demand_per_context();
     test_request_alignment_and_holder();
     test_interleaved_notify_grows_once();
+    test_covered_notify_reports_its_own_grow();
     test_failed_grow_returns_its_reservation();
     test_non_sycl_refused();
     test_device_is_the_host_bufts();

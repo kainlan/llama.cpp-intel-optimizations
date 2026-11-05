@@ -1622,15 +1622,21 @@ Under the lock it computes its target and reserves the deficit, so a notify that
 arrives while the grow runs finds the deficit covered and does not grow for it
 again. It releases the lock before the one `grow_zone` call, which takes the
 pinned pool's own locks, and retakes it only to give back a failed grow's
-reservation. Its demand line prints after the release. The plan walk gathers
-each reserve graph's figures with no lock held, because the placement fact it
-asks for takes the inventory's L1 lock, and only then merges them under
-`host_holder_plans::mutex_`. `commit` and `drop`, the only writers of a
-committed plan, fold each changed device's committed plans into its merged state
-under that lock. `device_state`, which dispatch admission reads, copies one
-device's merged state under it and merges nothing. `commit` prints after
-releasing it. The slot re-size and the pools' re-size that follow a commit run
-with neither lock held.
+reservation. A notify's `ok` reports its own grow only. A notify that finds the
+deficit covered by another notify's grow in flight makes no grow and returns
+`ok`, even if that grow then fails. The notify whose grow failed is the one that
+reports it: it returns false, and the pool WARNs for that one failed `grow_zone`
+call. The reservation it gives back is grown by the next notify, or by the miss
+path. Making the covered notify wait for the other grow's outcome would be a
+host wait, which the design forbids. The ledger's demand line prints after the
+release. The plan walk gathers each reserve graph's figures with no lock held,
+because the placement fact it asks for takes the inventory's L1 lock, and only
+then merges them under `host_holder_plans::mutex_`. `commit` and `drop`, the
+only writers of a committed plan, fold each changed device's committed plans
+into its merged state under that lock. `device_state`, which dispatch admission
+reads, copies one device's merged state under it and merges nothing. `commit`
+prints after releasing it. The slot re-size and the pools' re-size that follow a
+commit run with neither lock held.
 
 The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
 guards the per-(device, plan) reservation table, the conversion generations, and

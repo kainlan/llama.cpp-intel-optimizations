@@ -117,7 +117,12 @@ struct host_scratch_zone_ops {
 };
 
 struct host_scratch_ensure_result {
-    bool   ok              = true;  // false only when a needed grow failed
+    // This notify's own grow: false only when the grow this notify made failed. A notify whose deficit another notify's
+    // grow in flight already covers makes no grow and returns true, even if that grow then fails. The notify whose grow
+    // failed is the one that reports it: it returns false, and the pool WARNs for that one failed grow_zone call. It
+    // also gives its reservation back, so the next notify, or the miss path, grows the deficit. Waiting for the other
+    // grow's outcome instead would be a host wait.
+    bool   ok              = true;
     size_t total           = 0;     // the sum of the live demands
     size_t target          = 0;     // plan_scratch_bytes + total
     size_t capacity_before = 0;
