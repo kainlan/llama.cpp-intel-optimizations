@@ -53,8 +53,6 @@
 #include <string>
 #include <vector>
 
-extern char ** environ;
-
 using namespace host_ledger_test_harness;
 using namespace lazy_table_test;
 using ggml_sycl::host_cpu_mapped_size;
@@ -207,6 +205,34 @@ bool environment_refusal(const lazy_table_result & r, size_t locked_bytes, std::
     return false;
 }
 
+// What an arm records when its table refuses for a reason the environment did not cause: an arm whose subject is the
+// materialization FAILs, and an arm that only needs a built table to reach its subject is VOID.
+enum class other_refusal { FAIL, VOID };
+
+// Whether `t` built. When it did not, records the arm's verdict naming `what` and the refusal: VOID for a refusal the
+// environment caused (no O_DIRECT, or a lock limit below `locked_bytes`), `other` for any other.
+bool table_built(arm_result &              r,
+                 const lazy_table_result & t,
+                 size_t                    locked_bytes,
+                 other_refusal             other,
+                 const std::string &       what = "the table") {
+    if (t) {
+        return true;
+    }
+    std::string why;
+    if (environment_refusal(t, locked_bytes, why)) {
+        void_arm(r, what + " refused, by the environment: " + why);
+        return false;
+    }
+    const std::string text = what + " refused: " + status_name(t) + ": " + t.reason;
+    if (other == other_refusal::FAIL) {
+        fail(r, text);
+    } else {
+        void_arm(r, text);
+    }
+    return false;
+}
+
 // The table's bytes, compared with the file's at the record's offset. Returns the first mismatching index, or
 // SIZE_MAX when every byte matches.
 size_t first_mismatch(const uint8_t * rows, uint64_t file_offset, size_t bytes) {
@@ -258,51 +284,15 @@ int strict_child() {
                                                                                                        0;
 }
 
-// The children's environment: this one's, with GGML_NO_BACKTRACE so an abort prints its message and no gdb attach,
-// and `extra` when given.
-std::vector<std::string> child_environment(const char * extra) {
-    std::vector<std::string> env;
-    for (char ** e = environ; e != nullptr && *e != nullptr; ++e) {
-        env.emplace_back(*e);
-    }
-    env.emplace_back("GGML_NO_BACKTRACE=1");
-    if (extra != nullptr) {
-        env.emplace_back(extra);
-    }
-    return env;
-}
-
+// Runs this binary as `mode` on the fixture. The child's environment is this one's with GGML_NO_BACKTRACE=1, so an
+// abort prints its message and attaches no gdb, and with `extra_env` when given.
 child_run spawn(const char * mode, const char * extra_env) {
-    std::vector<std::string> args = { "test-sycl-lazy-table", mode, g_fixture_path };
-    std::vector<std::string> env  = child_environment(extra_env);
-    std::vector<char *>      argv;
-    std::vector<char *>      envp;
-    for (std::string & a : args) {
-        argv.push_back(a.data());
+    std::vector<std::string> sets = { "GGML_NO_BACKTRACE=1" };
+    if (extra_env != nullptr) {
+        sets.emplace_back(extra_env);
     }
-    argv.push_back(nullptr);
-    for (std::string & e : env) {
-        envp.push_back(e.data());
-    }
-    envp.push_back(nullptr);
-    return run_child(argv.data(), envp.data(), std::chrono::milliseconds(120000));
-}
-
-size_t count_lines_with(const std::string & text, const char * a, const char * b = nullptr) {
-    size_t count = 0;
-    size_t start = 0;
-    while (start < text.size()) {
-        size_t end = text.find('\n', start);
-        if (end == std::string::npos) {
-            end = text.size();
-        }
-        const std::string line = text.substr(start, end - start);
-        if (line.find(a) != std::string::npos && (b == nullptr || line.find(b) != std::string::npos)) {
-            count++;
-        }
-        start = end + 1;
-    }
-    return count;
+    return run_child_strings({ "test-sycl-lazy-table", mode, g_fixture_path }, child_environment(sets),
+                             std::chrono::milliseconds(120000));
 }
 
 child_run g_guard_run;
@@ -353,13 +343,7 @@ void expect_eof_table_reads(arm_result & r) {
     d.file_path         = g_eof_fixture_path;
     lazy_table_result t = g_mutant_read_whole_window ? ggml_sycl::lazy_table_test_create_host_reading_window(d) :
                                                        lazy_table_create_host(d);
-    std::string       why;
-    if (environment_refusal(t, k_mapped_a_bytes, why)) {
-        void_arm(r, geometry + ": " + why);
-        return;
-    }
-    if (!t) {
-        fail(r, geometry + " refused: " + ggml_sycl::lazy_table_status_name(t.status) + ": " + t.reason);
+    if (!table_built(r, t, k_mapped_a_bytes, other_refusal::FAIL, geometry)) {
         return;
     }
     const ggml_sycl::resolved_ptr view = t.table->rows().resolve();
@@ -381,13 +365,7 @@ arm_result arm_host_eager_read() {
     lazy_table_desc d           = fixture_desc("host.a.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0);
     log_clear();
     lazy_table_result t = lazy_table_create_host(d);
-    std::string       why;
-    if (environment_refusal(t, k_mapped_a_bytes, why)) {
-        void_arm(r, why);
-        return r;
-    }
-    if (!t) {
-        fail(r, std::string("the table refused: ") + ggml_sycl::lazy_table_status_name(t.status) + ": " + t.reason);
+    if (!table_built(r, t, k_mapped_a_bytes, other_refusal::FAIL)) {
         return r;
     }
     expect(r, t.table->ref_count() == 1, "the result holds " + num(t.table->ref_count()) + " references, want 1");
@@ -435,13 +413,7 @@ arm_result arm_host_window_crosses_huge_page() {
     arm_result        r;
     lazy_table_result t =
         lazy_table_create_host(fixture_desc("host.b.lazy", k_table_offset, k_rows_b, lazy_residency::HOST, 0));
-    std::string why;
-    if (environment_refusal(t, k_mapped_b_bytes, why)) {
-        void_arm(r, why);
-        return r;
-    }
-    if (!t) {
-        fail(r, std::string("the table refused: ") + ggml_sycl::lazy_table_status_name(t.status) + ": " + t.reason);
+    if (!table_built(r, t, k_mapped_b_bytes, other_refusal::FAIL)) {
         return r;
     }
     expect(r, t.table->charged_bytes() == k_mapped_b_bytes,
@@ -466,13 +438,7 @@ arm_result arm_last_reference_releases() {
     {
         lazy_table_result t =
             lazy_table_create_host(fixture_desc("release.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0));
-        std::string why;
-        if (environment_refusal(t, k_mapped_a_bytes, why)) {
-            void_arm(r, why);
-            return r;
-        }
-        if (!t) {
-            fail(r, std::string("the table refused: ") + ggml_sycl::lazy_table_status_name(t.status) + ": " + t.reason);
+        if (!table_built(r, t, k_mapped_a_bytes, other_refusal::FAIL)) {
             return r;
         }
         if (host_cpu_live() - before != k_mapped_a_bytes) {
@@ -520,13 +486,7 @@ arm_result arm_storage_holds_its_descriptor() {
     const uint64_t    before = host_cpu_live();
     lazy_table_result t =
         lazy_table_create_storage(fixture_desc("storage.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0));
-    std::string why;
-    if (environment_refusal(t, 0, why)) {
-        void_arm(r, why);
-        return r;
-    }
-    if (!t) {
-        fail(r, std::string("the table refused: ") + ggml_sycl::lazy_table_status_name(t.status) + ": " + t.reason);
+    if (!table_built(r, t, 0, other_refusal::FAIL)) {
         return r;
     }
     const int fd = t.table->storage_fd();
@@ -635,13 +595,8 @@ arm_result arm_activation_extra_chunk_refuses() {
     {
         lazy_table_result control =
             lazy_table_create_host(fixture_desc("activation.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0));
-        std::string why;
-        if (environment_refusal(control, k_mapped_a_bytes, why)) {
-            void_arm(r, why);
-            return r;
-        }
-        if (!control) {
-            void_arm(r, "the control table without the extra chunk refused: " + control.reason);
+        if (!table_built(r, control, k_mapped_a_bytes, other_refusal::VOID,
+                         "the control table without the extra chunk")) {
             return r;
         }
     }
@@ -687,10 +642,10 @@ arm_result arm_activation_strict_aborts() {
     expect(r, WIFSIGNALED(g_strict_run.status) && WTERMSIG(g_strict_run.status) == SIGABRT,
            "the strict child did not abort (status " + std::to_string(g_strict_run.status) + ")");
     expect(r,
-           count_lines_with(g_strict_run.err, "[HOST-PLAN-BUG] lazy table strict.lazy activation check",
-                            ("charged_bytes=" + num(charged)).c_str()) == 1,
+           text_count_with(g_strict_run.err, "[HOST-PLAN-BUG] lazy table strict.lazy activation check",
+                           ("charged_bytes=" + num(charged)).c_str()) == 1,
            "the strict child printed no [HOST-PLAN-BUG] line naming charged_bytes=" + num(charged));
-    expect(r, count_lines_with(g_strict_run.err, "STRICT-CHILD returned") == 0, "the strict child returned");
+    expect(r, text_count_with(g_strict_run.err, "STRICT-CHILD returned") == 0, "the strict child returned");
     return r;
 }
 
@@ -707,13 +662,7 @@ arm_result arm_bound_tensor_keeps_extra_null() {
     arm_result        r;
     lazy_table_result t =
         lazy_table_create_host(fixture_desc("bind.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0));
-    std::string why;
-    if (environment_refusal(t, k_mapped_a_bytes, why)) {
-        void_arm(r, why);
-        return r;
-    }
-    if (!t) {
-        void_arm(r, "the table did not build: " + t.reason);
+    if (!table_built(r, t, k_mapped_a_bytes, other_refusal::VOID)) {
         return r;
     }
     ggml_init_params params = { ggml_tensor_overhead() * 4, nullptr, /*no_alloc=*/true };
@@ -788,17 +737,17 @@ arm_result arm_descriptor_guard() {
         void_arm(r, "the guard child could not build and bind its table");
         return r;
     }
-    if (count_lines_with(g_guard_run.err, "GUARD-CHILD bound extra=null") != 1) {
+    if (text_count_with(g_guard_run.err, "GUARD-CHILD bound extra=null") != 1) {
         void_arm(r, "the guard child did not bind its tensor with extra null before the call");
         return r;
     }
-    const size_t lines = count_lines_with(g_guard_run.err, k_guard_phrase);
+    const size_t lines = text_count_with(g_guard_run.err, k_guard_phrase);
     expect(r, lines == 1, "the child printed " + num(lines) + " guard lines, want exactly 1");
-    expect(r, count_lines_with(g_guard_run.err, k_guard_phrase, "guard.lazy") == lines,
+    expect(r, text_count_with(g_guard_run.err, k_guard_phrase, "guard.lazy") == lines,
            "the guard line does not name the table");
     expect(r, WIFSIGNALED(g_guard_run.status) && WTERMSIG(g_guard_run.status) == SIGABRT,
            "the child did not exit 134 (status " + std::to_string(g_guard_run.status) + ")");
-    expect(r, count_lines_with(g_guard_run.err, "GUARD-CHILD returned") == 0,
+    expect(r, text_count_with(g_guard_run.err, "GUARD-CHILD returned") == 0,
            "ggml_sycl_get_data_ptr_slow returned a pointer for a lazy table");
     return r;
 }
@@ -808,6 +757,23 @@ arm_result arm_descriptor_guard() {
 // SYCL buffer context, which holds GGML_SYCL_MAX_DEVICES mem_handles and their metadata. The read stays inside it
 // because it touches only managed_meta.tier, which lies within the first 128 bytes of ggml_backend_sycl_buffer_context.
 alignas(64) unsigned char g_zero_context[4096] = {};
+
+// A buffer of `buft` over g_zero_context and a tensor on it, so the fixture controls every byte a cast of the context
+// reads. Not copyable: the tensor points at the buffer beside it.
+struct zeroed_tensor {
+    explicit zeroed_tensor(ggml_backend_buffer_type_t buft) {
+        buffer.buft    = buft;
+        buffer.context = g_zero_context;
+        buffer.size    = sizeof(g_zero_context);
+        tensor.buffer  = &buffer;
+    }
+
+    zeroed_tensor(const zeroed_tensor &)             = delete;
+    zeroed_tensor & operator=(const zeroed_tensor &) = delete;
+
+    ggml_backend_buffer buffer{};
+    ggml_tensor         tensor{};
+};
 
 struct buft_row {
     std::string                name;
@@ -822,13 +788,7 @@ arm_result arm_vram_answer_for_descriptors() {
     arm_result        r;
     lazy_table_result t =
         lazy_table_create_host(fixture_desc("vram.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0));
-    std::string why;
-    if (environment_refusal(t, k_mapped_a_bytes, why)) {
-        void_arm(r, why);
-        return r;
-    }
-    if (!t) {
-        void_arm(r, "the table did not build: " + t.reason);
+    if (!table_built(r, t, k_mapped_a_bytes, other_refusal::VOID)) {
         return r;
     }
     const buft_row rows[] = {
@@ -850,17 +810,12 @@ arm_result arm_vram_answer_for_descriptors() {
         expect(r, !ggml_sycl_test_is_device_vram_buffer(&real), row.name + " bound to a table answered true");
         ggml_backend_buffer_free(bound);
 
-        ggml_backend_buffer zeroed{};
-        zeroed.buft    = row.buft;
-        zeroed.context = g_zero_context;
-        zeroed.size    = sizeof(g_zero_context);
-        ggml_tensor fake{};
-        fake.buffer = &zeroed;
-        if (!ggml_sycl_test_device_vram_context_read(&fake)) {
+        zeroed_tensor zeroed(row.buft);
+        if (!ggml_sycl_test_device_vram_context_read(&zeroed.tensor)) {
             void_arm(r, "today's read of a zeroed context is not DEVICE_VRAM, so the zeroed row cannot fail");
             continue;
         }
-        expect(r, !ggml_sycl_test_is_device_vram_buffer(&fake),
+        expect(r, !ggml_sycl_test_is_device_vram_buffer(&zeroed.tensor),
                row.name + " over a zeroed context answered true: the cast ran before the descriptor test");
     }
     return r;
@@ -915,15 +870,10 @@ arm_result arm_vram_answer_unchanged_for_other_types() {
             void_arm(r, row.name + " returned no buffer type");
             continue;
         }
-        ggml_backend_buffer zeroed{};
-        zeroed.buft    = row.buft;
-        zeroed.context = g_zero_context;
-        zeroed.size    = sizeof(g_zero_context);
-        ggml_tensor fake{};
-        fake.buffer          = &zeroed;
-        const bool today     = ggml_sycl_test_device_vram_context_read(&fake);
-        const bool answer    = ggml_sycl_test_is_device_vram_buffer(&fake);
-        const bool predicate = ggml_backend_sycl_buffer_is_lazy(&zeroed);
+        zeroed_tensor zeroed(row.buft);
+        const bool    today     = ggml_sycl_test_device_vram_context_read(&zeroed.tensor);
+        const bool    answer    = ggml_sycl_test_is_device_vram_buffer(&zeroed.tensor);
+        const bool    predicate = ggml_backend_sycl_buffer_is_lazy(&zeroed.buffer);
         if (!today) {
             void_arm(r, row.name + ": today's read of a zeroed context is not DEVICE_VRAM");
             continue;

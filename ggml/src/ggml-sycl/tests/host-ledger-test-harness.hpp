@@ -22,9 +22,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
+
+extern char ** environ;
 
 namespace host_ledger_test_harness {
 
@@ -170,6 +173,64 @@ inline child_run run_child(char * const * argv, char * const * envp, std::chrono
     }
     r.ran = !timed_out;
     return r;
+}
+
+// This process's environment for a child, each "NAME=value" of `sets` replacing any inherited NAME, so the child's
+// getenv reads the value given here and never the first of two entries.
+inline std::vector<std::string> child_environment(const std::vector<std::string> & sets) {
+    std::vector<std::string> env;
+    for (char ** e = environ; e != nullptr && *e != nullptr; ++e) {
+        bool replaced = false;
+        for (const std::string & set : sets) {
+            const size_t eq = set.find('=');
+            if (eq != std::string::npos && std::strncmp(*e, set.c_str(), eq + 1) == 0) {
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            env.emplace_back(*e);
+        }
+    }
+    env.insert(env.end(), sets.begin(), sets.end());
+    return env;
+}
+
+// run_child over strings: builds the argv and envp arrays before the fork, as run_child requires, and keeps the
+// strings alive until the child is reaped.
+inline child_run run_child_strings(std::vector<std::string>  args,
+                                   std::vector<std::string>  env,
+                                   std::chrono::milliseconds bound) {
+    std::vector<char *> argv;
+    std::vector<char *> envp;
+    for (std::string & a : args) {
+        argv.push_back(a.data());
+    }
+    argv.push_back(nullptr);
+    for (std::string & e : env) {
+        envp.push_back(e.data());
+    }
+    envp.push_back(nullptr);
+    return run_child(argv.data(), envp.data(), bound);
+}
+
+// How many lines of `text` contain `a`, and `b` too when it is given: log_count_with's match over a child's stderr
+// rather than the captured log.
+inline size_t text_count_with(const std::string & text, const char * a, const char * b = nullptr) {
+    size_t count = 0;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string line = text.substr(start, end - start);
+        if (line.find(a) != std::string::npos && (b == nullptr || line.find(b) != std::string::npos)) {
+            count++;
+        }
+        start = end + 1;
+    }
+    return count;
 }
 
 }  // namespace host_ledger_test_harness
