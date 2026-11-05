@@ -111,6 +111,57 @@ static bool llama_context_backend_is_sycl(ggml_backend_t backend) {
     return backend != nullptr && llama_context_dev_is_sycl(ggml_backend_get_device(backend));
 }
 
+// The host SCRATCH entries of the SYCL backend on `dev` (llama_context_sycl_host_hooks), by proc name in every link
+// mode. A SYCL library without the notify leaves host SCRATCH ungrown, which is said once, here (§4.4 "On NULL").
+static llama_context_sycl_host_hooks llama_context_sycl_host_procs(ggml_backend_dev_t dev) {
+    llama_context_sycl_host_hooks hooks;
+    auto *                        reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return hooks;
+    }
+    hooks.notify_host_buffer_sizes = reinterpret_cast<decltype(hooks.notify_host_buffer_sizes)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_notify_host_buffer_sizes"));
+    hooks.begin_host_holders = reinterpret_cast<decltype(hooks.begin_host_holders)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_begin_host_holders"));
+    hooks.plan_host_holders = reinterpret_cast<decltype(hooks.plan_host_holders)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_plan_host_holders"));
+    hooks.commit_host_holders = reinterpret_cast<decltype(hooks.commit_host_holders)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_commit_host_holders"));
+    hooks.host_scratch_trial = reinterpret_cast<decltype(hooks.host_scratch_trial)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_scratch_trial"));
+    if (!hooks.host_scratch_trial) {
+        hooks.host_scratch_trial = llama_context_sycl_trial_none;
+    }
+    if (!hooks.notify_host_buffer_sizes) {
+        LLAMA_LOG_WARN("SYCL backend has no ggml_backend_sycl_notify_host_buffer_sizes; host SCRATCH is not grown\n");
+    }
+    return hooks;
+}
+
+// The backend of `dev` among `backends` when `dev` is SYCL, else nullptr. model.devices[0]'s is the one the notify
+// and the SCRATCH transaction go through: its device's host buft is the one the CPU backend computes in (§4.4).
+static ggml_backend_t llama_context_sycl_backend_of(const std::vector<ggml_backend_ptr> & backends,
+                                                    ggml_backend_dev_t                    dev) {
+    if (!llama_context_dev_is_sycl(dev)) {
+        return nullptr;
+    }
+    for (const auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == dev) {
+            return backend.get();
+        }
+    }
+    return nullptr;
+}
+
+// The notify's answer (§4.4 "It returns bool"): false when host SCRATCH could not grow to cover this context's
+// demand. The allocation goes ahead and takes the miss path, which the SCRATCH criterion names.
+static void llama_context_sycl_notify_checked(bool grown, size_t host_compute_bytes, size_t host_output_bytes) {
+    if (!grown) {
+        LLAMA_LOG_WARN("host SCRATCH could not grow to %.1f MB for this context\n",
+                       (host_compute_bytes + host_output_bytes) / 1024.0 / 1024.0);
+    }
+}
+
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 static int llama_context_sycl_device_index(ggml_backend_dev_t dev, int fallback) {
     const char * name = ggml_backend_dev_name(dev);
@@ -701,6 +752,50 @@ static void llama_context_cpu_compute_buft_reselect(const llama_model &         
         }
     }
 }
+
+// The index in backend_ptrs of the CPU backend when it computes in model.devices[0]'s SYCL host buft or that buft's
+// activation twin, the buffer the notify's host_compute_bytes covers (the predicate measure_tenant_caps reads); -1
+// when model.devices[0] is not SYCL or the CPU backend computes elsewhere.
+static int llama_context_sycl_host_compute_index(const llama_model &                             model,
+                                                 const std::vector<ggml_backend_t> &             backend_ptrs,
+                                                 const std::vector<ggml_backend_buffer_type_t> & backend_buft) {
+    if (model.devices.empty() || !llama_context_dev_is_sycl(model.devices[0].dev)) {
+        return -1;
+    }
+    ggml_backend_buffer_type_t host_buft       = ggml_backend_dev_host_buffer_type(model.devices[0].dev);
+    ggml_backend_buffer_type_t activation_buft = llama_context_sycl_cpu_activation_buft(model.devices[0].dev);
+    for (size_t i = 0; i < backend_ptrs.size() && i < backend_buft.size(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        if (backend_buft[i] && (backend_buft[i] == host_buft || backend_buft[i] == activation_buft)) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+// The host compute buffer `sched` allocated in that buft: the witness compares it with the notified figure, and the
+// commit's re-notify records it (§4.4 "The same fact for the notify's measure").
+static size_t llama_context_sycl_host_compute_allocated(const llama_model &                             model,
+                                                        ggml_backend_sched_t                            sched,
+                                                        const std::vector<ggml_backend_t> &             backend_ptrs,
+                                                        const std::vector<ggml_backend_buffer_type_t> & backend_buft) {
+    const int host_index = llama_context_sycl_host_compute_index(model, backend_ptrs, backend_buft);
+    return sched && host_index >= 0 ? ggml_backend_sched_get_buffer_size(sched, backend_ptrs[host_index]) : 0;
+}
+
+// Resets a flag to false when the scope that set it ends, on every return and every exception.
+struct llama_context_flag_reset {
+    bool & flag;
+
+    explicit llama_context_flag_reset(bool & f) : flag(f) {}
+
+    ~llama_context_flag_reset() { flag = false; }
+
+    llama_context_flag_reset(const llama_context_flag_reset &)             = delete;
+    llama_context_flag_reset & operator=(const llama_context_flag_reset &) = delete;
+};
 
 // llama.cpp-7n6n (wires nphx Task 5): a cheap, deterministic FNV-1a hash
 // over every loaded tensor's (name, byte size) -- a proxy for "this exact
@@ -1416,6 +1511,9 @@ llama_context::llama_context(
         }
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
+
+        // The host SCRATCH entries, before the first notify: the output buffer's, right below.
+        sycl_host_hooks = llama_context_sycl_host_procs(model.devices.empty() ? nullptr : model.devices[0].dev);
 
         // graph outputs buffer
         {
@@ -2574,6 +2672,14 @@ void llama_context::sycl_select_auto_ubatch() {
         // it must correct that state back.
         published_any      = true;
         sched_need_reserve = true;
+        // The candidate's SCRATCH growth is charged to it from here (§M75): OPEN before its reserve, RETURN on each
+        // loss below, KEEP beside its commit on a win. While the candidate runs, sched_reserve leaves the commit and
+        // the KEEP to it, since only after the host-fallback and hold-spill checks is the candidate known to win.
+        ggml_backend_t sycl_dev0 =
+            model.devices.empty() ? nullptr : llama_context_sycl_backend_of(backends, model.devices[0].dev);
+        sycl_ubatch_trial_active = true;
+        const llama_context_flag_reset trial_active_reset(sycl_ubatch_trial_active);
+        sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN, c);
         // Guarded like the candidate publish right above it: sched_reserve()
         // throws "failed to allocate compute pp/tg buffers" when
         // graph_reserve() fails even after its own host-pinned-retry fallback
@@ -2605,6 +2711,7 @@ void llama_context::sycl_select_auto_ubatch() {
             // is safe only because published_any is already true, which
             // forces the settle's full publish.
             LLAMA_LOG_INFO("[SYCL-PLAN] auto n_ubatch candidate %u: compute buffer reserve failed: %s\n", c, e.what());
+            sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);
             cparams.pipeline_parallel = pipeline_parallel_before_reserve;
             sched_matches_last_good   = false;
             // Only a fit verdict (the compute buffers, or the plan the recheck refused) starts or continues the
@@ -2616,6 +2723,7 @@ void llama_context::sycl_select_auto_ubatch() {
 
         for (auto & sb : sycl_backends) {
             if (fallback_fn(sb.dev_index) > 0) {
+                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);
                 cparams.pipeline_parallel = pipeline_parallel_before_reserve;
                 sched_matches_last_good   = false;
                 return "compute buffer fell back to host";
@@ -2634,12 +2742,28 @@ void llama_context::sycl_select_auto_ubatch() {
                     "[SYCL-PLAN] auto n_ubatch candidate %u: hold spill left no headroom (the largest -ub that fits is "
                     "about %u)\n",
                     c, rung_largest_ub);
+                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);
                 cparams.pipeline_parallel = pipeline_parallel_before_reserve;
                 sched_matches_last_good   = false;
                 rung_fit_refused          = true;
                 return "hold spill left no headroom";
             }
         }
+        // The candidate won: its plans are committed, the host compute size it allocated is re-notified, and its
+        // SCRATCH growth is kept, in that order (§4.4 "The same fact for the notify's measure", §M75).
+        for (auto & sb : sycl_backends) {
+            if (sycl_host_hooks.commit_host_holders) {
+                sycl_host_hooks.commit_host_holders(sb.backend);
+            }
+        }
+        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.hparams.no_alloc) {
+            sycl_host_compute_bytes =
+                llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, backend_buft);
+            llama_context_sycl_notify_checked(
+                sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, sycl_host_compute_bytes, sycl_host_output_bytes),
+                sycl_host_compute_bytes, sycl_host_output_bytes);
+        }
+        sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP, c);
         // The check ran for every backend only when the hook exists (a backend-DL SYCL library that predates it
         // leaves nothing validated, and the constructor's check, which has no hook either, skips it the same way).
         hold_spill_validated_ub = hold_spill_fn ? c : 0;
@@ -3071,12 +3195,40 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
-    const sched_reserve_result result = sched_reserve_transaction();
-    if (result.status != sched_reserve_status::OK) {
-        if (result.fit_refusal) {
-            throw llama_auto_ubatch_fit_refusal(result.reason);
+    // A reserve that throws, the transaction itself or for its refused result, returns the SCRATCH its measure grew
+    // since the MARK, under the auto-n_ubatch trial too (§4.4 "The transaction", §M75).
+    ggml_backend_t sycl_dev0 =
+        model.devices.empty() ? nullptr : llama_context_sycl_backend_of(backends, model.devices[0].dev);
+    try {
+        const sched_reserve_result result = sched_reserve_transaction();
+        if (result.status != sched_reserve_status::OK) {
+            if (result.fit_refusal) {
+                throw llama_auto_ubatch_fit_refusal(result.reason);
+            }
+            throw std::runtime_error(result.reason);
         }
-        throw std::runtime_error(result.reason);
+    } catch (...) {
+        sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, cparams.n_ubatch);
+        throw;
+    }
+
+    // The reserve's plans are committed, the host compute size it allocated is re-notified, and its SCRATCH growth is
+    // kept, in that order (§4.4 "The same fact for the notify's measure"). The auto-n_ubatch trial does all three in
+    // try_candidate instead, after its host-fallback and hold-spill checks, so a losing rung keeps nothing (§M75).
+    if (!sycl_ubatch_trial_active) {
+        for (auto & backend : backends) {
+            if (sycl_host_hooks.commit_host_holders && llama_context_backend_is_sycl(backend.get())) {
+                sycl_host_hooks.commit_host_holders(backend.get());
+            }
+        }
+        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.hparams.no_alloc) {
+            sycl_host_compute_bytes =
+                llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, backend_buft);
+            llama_context_sycl_notify_checked(
+                sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, sycl_host_compute_bytes, sycl_host_output_bytes),
+                sycl_host_compute_bytes, sycl_host_output_bytes);
+        }
+        sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP, cparams.n_ubatch);
     }
 }
 
@@ -3087,9 +3239,27 @@ bool llama_context::sched_reserve_nothrow() {
 
     sched_need_reserve = false;
 
+    ggml_backend_t sycl_dev0 =
+        model.devices.empty() ? nullptr : llama_context_sycl_backend_of(backends, model.devices[0].dev);
     try {
         const sched_reserve_result result = sched_reserve_transaction();
         if (result.status == sched_reserve_status::OK) {
+            // As sched_reserve's success: commit, re-notify, KEEP (§4.4 "The same fact for the notify's measure").
+            if (!sycl_ubatch_trial_active) {
+                for (auto & backend : backends) {
+                    if (sycl_host_hooks.commit_host_holders && llama_context_backend_is_sycl(backend.get())) {
+                        sycl_host_hooks.commit_host_holders(backend.get());
+                    }
+                }
+                if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.hparams.no_alloc) {
+                    sycl_host_compute_bytes =
+                        llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, backend_buft);
+                    llama_context_sycl_notify_checked(sycl_host_hooks.notify_host_buffer_sizes(
+                                                          sycl_dev0, sycl_host_compute_bytes, sycl_host_output_bytes),
+                                                      sycl_host_compute_bytes, sycl_host_output_bytes);
+                }
+                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP, cparams.n_ubatch);
+            }
             return true;
         }
         LLAMA_LOG_ERROR("%s: %s\n", __func__, result.reason.c_str());
@@ -3099,8 +3269,10 @@ bool llama_context::sched_reserve_nothrow() {
         LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
     }
 
-    // The scheduler is no longer reserved for the graphs decode builds, so the
-    // next decode or encode reserves again from the start.
+    // Every way out but OK returns the SCRATCH the reserve's measure grew since the MARK (§4.4 "The transaction",
+    // §M75). The scheduler is no longer reserved for the graphs decode builds, so the next decode or encode reserves
+    // again from the start.
+    sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, cparams.n_ubatch);
     sched_need_reserve = true;
     return false;
 }
@@ -3446,6 +3618,11 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
 #ifdef GGML_USE_SYCL
     llama_context_sycl_attach_sched_plan(state.sched.get(), backends);
 #endif
+    // A begin after each scheduler creation (§4.4 "The lifecycle of a pending plan"): the creation freed the previous
+    // scheduler's compute buffers, and the walks of this reserve fill the pending plans afresh.
+    if (sycl_host_hooks.begin_host_holders) {
+        sycl_host_hooks.begin_host_holders(state.sched.get());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -3481,6 +3658,47 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
     // naming a -ub for that shape would be wrong, so it is 0 (no -ub is named).
     const uint32_t refused_ub_pp = n_tokens == state.cparams.n_ubatch ? state.cparams.n_ubatch : 0;
 
+    // The notify's measure (§4.4 "Compute buffers", §4.3): the pp and the tg graph through the size-only split, each
+    // walked for the host holder plan while its split is live (§4.4 "The lifecycle of a pending plan"), then the
+    // notify with the larger host compute size, before the first allocating reserve. Every ALLOC reserve measures
+    // here, since a context without the chunk-cap copy runs no MEASURE pass. MARK opens it, so the pipeline-parallel
+    // retry, which repeats it, returns what the failed reserve grew (§M75). The no_alloc fit pass reserves size-only
+    // already and grows nothing.
+    ggml_backend_t sycl_dev0 =
+        model.devices.empty() ? nullptr : llama_context_sycl_backend_of(backends, model.devices[0].dev);
+    bool   sycl_host_measured = false;
+    size_t sycl_host_notified = 0;
+    auto   sycl_host_measure  = [&]() {
+        if (model.hparams.no_alloc || !sycl_dev0 || !sycl_host_hooks.notify_host_buffer_sizes) {
+            return;
+        }
+        sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_MARK, state.cparams.n_ubatch);
+        const int           host_index   = llama_context_sycl_host_compute_index(model, backend_ptrs, backend_buft);
+        size_t              host_compute = 0;
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        if (ggml_cgraph * gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes.data())) {
+            if (sycl_host_hooks.plan_host_holders) {
+                sycl_host_hooks.plan_host_holders(state.sched.get(), gf);
+            }
+            host_compute = host_index >= 0 ? sizes[host_index] : 0;
+        }
+        if (ggml_cgraph * gf = graph_reserve(state, n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes.data())) {
+            if (sycl_host_hooks.plan_host_holders) {
+                sycl_host_hooks.plan_host_holders(state.sched.get(), gf);
+            }
+            host_compute = std::max(host_compute, host_index >= 0 ? sizes[host_index] : 0);
+        }
+        sycl_host_compute_bytes = host_compute;
+        sycl_host_measured      = true;
+        sycl_host_notified      = host_compute;
+        if (!measure_only) {  // a measure-only context resolves no hooks and prints nothing a vehicle arm scores
+            llama_context_sycl_notify_checked(
+                sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, sycl_host_compute_bytes, sycl_host_output_bytes),
+                sycl_host_compute_bytes, sycl_host_output_bytes);
+        }
+    };
+    sycl_host_measure();
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc,
@@ -3493,12 +3711,20 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
                 GGML_ASSERT(!plan_caps);
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n",
                                "sched_reserve");
+                // The failed reserve's SCRATCH growth since the measure's MARK goes back before the retry measures
+                // again (§M75).
+                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK,
+                                                   state.cparams.n_ubatch);
                 state.cparams.pipeline_parallel = false;
                 state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                          max_nodes, false, state.cparams.op_offload));
 #ifdef GGML_USE_SYCL
                 llama_context_sycl_attach_sched_plan(state.sched.get(), backends);
 #endif
+                if (sycl_host_hooks.begin_host_holders) {
+                    sycl_host_hooks.begin_host_holders(state.sched.get());
+                }
+                sycl_host_measure();
                 gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3594,6 +3820,17 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
         }
     }
 
+    // The witness (§4.4): the allocated host compute buffer against the notified figure. Plan != reality is then
+    // printed, not inferred; the commit's re-notify then records the allocated size.
+    if (sycl_host_measured) {
+        const size_t allocated =
+            llama_context_sycl_host_compute_allocated(model, state.sched.get(), backend_ptrs, backend_buft);
+        if (allocated > sycl_host_notified) {
+            LLAMA_LOG_WARN("[HOST-ARENA] host compute buffer %.1f MB exceeds notified %.1f MB\n",
+                           allocated / 1024.0 / 1024.0, sycl_host_notified / 1024.0 / 1024.0);
+        }
+    }
+
     {
         const bool diff = n_nodes_pp != n_nodes_tg || n_splits_pp != n_splits_tg ||
                           n_inputs_pp != n_inputs_tg || n_input_tensors_pp != n_input_tensors_tg;
@@ -3659,6 +3896,11 @@ sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & sta
 #ifdef GGML_USE_SYCL
     llama_context_sycl_attach_sched_plan(state.sched.get(), backends);
 #endif
+    // The creation freed the previous scheduler's compute buffers, so a begin follows it here too (§4.4 "The
+    // lifecycle of a pending plan"). The ALLOC reserve that follows walks the plans its commit takes.
+    if (sycl_host_hooks.begin_host_holders) {
+        sycl_host_hooks.begin_host_holders(state.sched.get());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -5667,6 +5909,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
+        }
+        // The output buffer's notify, between the old buffer's free and the allocation (§4.4 "Output buffer"), when
+        // the buffer lands in the SYCL host buft whose SCRATCH zone the notify grows.
+        if (sycl_host_hooks.notify_host_buffer_sizes && llama_context_dev_is_sycl(output_dev) &&
+            buft == output_dev_host_buft) {
+            ggml_backend_t sycl_dev0 = llama_context_sycl_backend_of(backends, model.devices[0].dev);
+            if (sycl_dev0) {
+                sycl_host_output_bytes = new_size;
+                const bool grown       = sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, sycl_host_compute_bytes,
+                                                                                  sycl_host_output_bytes);
+                llama_context_sycl_notify_checked(grown, sycl_host_compute_bytes, sycl_host_output_bytes);
+            }
         }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {

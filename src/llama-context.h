@@ -144,6 +144,28 @@ struct llama_measure_context_args {
     enum ggml_sycl_measure_stage  stage = GGML_SYCL_MEASURE_STAGE_PROBE;
 };
 
+// The SCRATCH transaction entry of a context with no SYCL one: there is no transaction to step, so each step is a
+// no-op and every call site steps unguarded.
+inline bool llama_context_sycl_trial_none(ggml_backend_t backend, int op, uint32_t n_ubatch) {
+    (void) backend;
+    (void) op;
+    (void) n_ubatch;
+    return false;
+}
+
+// The SYCL backend's host SCRATCH notify, host holder and SCRATCH transaction entries
+// (docs/design/sycl-mmap-host-tier.md §4.4, §M75), resolved by their proc names from the registry of
+// model.devices[0] in every link mode: a direct call does not link under GGML_BACKEND_DL. Each of the first four
+// is null when that device is not SYCL or its library lacks the entry, and the caller then skips the step; the
+// transaction entry is the no-op above instead.
+struct llama_context_sycl_host_hooks {
+    decltype(&ggml_backend_sycl_notify_host_buffer_sizes) notify_host_buffer_sizes = nullptr;
+    decltype(&ggml_backend_sycl_begin_host_holders)       begin_host_holders       = nullptr;
+    decltype(&ggml_backend_sycl_plan_host_holders)        plan_host_holders        = nullptr;
+    decltype(&ggml_backend_sycl_commit_host_holders)      commit_host_holders      = nullptr;
+    decltype(&ggml_backend_sycl_host_scratch_trial)       host_scratch_trial       = llama_context_sycl_trial_none;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -570,6 +592,16 @@ private:
     // re-reserved, a backend without the check). The constructor's own check runs unless it equals n_ubatch, so
     // it never re-reads the live free memory at the margin to overturn a rung the ladder just accepted.
     uint32_t sycl_hold_spill_validated_ub = 0;
+
+    // The host SCRATCH entries, resolved once by the constructor (llama_context_sycl_host_hooks).
+    llama_context_sycl_host_hooks sycl_host_hooks;
+    // The two host terms every notify passes (§4.4 "When it is called"): the CPU backend's compute buffer in the
+    // SYCL host buft, as last measured or allocated, and the output buffer's size, as last allocated there.
+    size_t                        sycl_host_compute_bytes  = 0;
+    size_t                        sycl_host_output_bytes   = 0;
+    // True only while try_candidate's own reserve runs. sched_reserve then leaves the plan commit and the SCRATCH
+    // KEEP to the candidate, which makes them after its host-fallback and hold-spill checks (§M75).
+    bool                          sycl_ubatch_trial_active = false;
 
     // llama.cpp-kpjw: the SYCL backend's scheduler-compute scope (ggml_backend_sycl_compute_alloc_scope), resolved once
     // from the first SYCL backend of this context; null for a context without one or a SYCL library that predates it.

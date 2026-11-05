@@ -8522,8 +8522,10 @@ ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
         "the walk counted 2 host-KV node\\(s\\), expected 1 \\(the view\\)"
     HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE
         "device 1's slots are unplanned"
-    HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES
-        "an unplanned device refused a dispatch"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_GROWS
+        "an unplanned device admitted a dispatch: [1-3] of 3 admits returned a slot"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_POOLS_SCAN
+        "with no commit the pools initialized=1 at D=32"
     HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED
         "after an unrelated backend's free, device 1 did not admit by its plan")
 

@@ -9454,8 +9454,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // by default, get_cpu_expert_thread_count(), or N via GGML_SYCL_CPU_EXPERT_THREADS=N). The pools' figures come
     // from the device's committed host holder plan, never from this graph, which is only checked against them over the
     // nodes the plan folds (§4.4 "And the pools are sized from the plan"). Their SCRATCH demand is registered by the
-    // plan's commit, not here. With no committed plan, the pre-notify fallback sizes them from this graph's storage
-    // scan, with a once-only WARN.
+    // plan's commit, not here. With no committed plan they are not initialized, with a once-only WARN.
     {
         const ggml_sycl::host_pool_init_decision pools =
             ggml_sycl::host_pools_init_from_plan(device, g_host_holder_plans->device_state(device), cgraph,
@@ -9482,8 +9481,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             GGML_LOG_INFO("[MOE-MULTI-GPU] Initializing device %d for MoE expert dispatch\n", gpu_d);
 
             try {
-                // The primary's rule: the device's committed plan when it has one, this graph's scan only under the
-                // pre-notify fallback.
+                // The primary's rule: the device's committed plan, and no pools without one.
                 const ggml_sycl::host_pool_init_decision pools_d = ggml_sycl::host_pools_init_from_plan(
                     gpu_d, g_host_holder_plans->device_state(gpu_d), cgraph, ggml_sycl_host_holder_host_experts,
                     g_host_pool_init_warnings[gpu_d]);
@@ -95901,8 +95899,8 @@ static std::mutex        g_attn_host_cpu_backend_mutex;
 // every subsequent resolve takes the slow revalidation path (measured: resolve at 73 us/op vs 21 us/op, ~+24 ms/token
 // across a 1374-node decode graph). The slots are sized by the host holder plan (docs/design/sycl-mmap-host-tier.md
 // §4.4 "At dispatch no slot grows"): the plan's commit re-sizes them in sched_reserve, and a dispatch is admitted at or
-// below a slot's capacity and refused by name above it. Until a plan is committed for the device, the slots grow at
-// dispatch as before the plan existed (the pre-notify fallback, with a once-per-device WARN). Only the graph-walker
+// below a slot's capacity and refused by name above it. Until a plan is committed for the device, every request is
+// refused by name over a planned 0 B: no slot grows at dispatch. Only the graph-walker
 // thread for a device touches the slot structs at dispatch, and the commit runs after sched_reserve's synchronize
 // (same-device concurrent inference is unsupported, canonical contract §5), so the slots take no lock. The ASYNC FA
 // body also uses the slots and hands dst_ptr to a pool worker thread, so slot-CONTENT reuse safety is NOT "both

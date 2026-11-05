@@ -24,7 +24,8 @@
 //   HOST_ZONE_PLAN_MUTANT_PLAN_IGNORES_SWITCH     the plan ignoring GGML_SYCL_ATTN_HOST_DISPATCH
 //   HOST_ZONE_PLAN_MUTANT_PREDICATE_IS_HOST       ggml_backend_buffer_is_host as the walk's predicate
 //   HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE           the notify helper's device for every slot
-//   HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES       an unplanned device refusing instead of growing at dispatch
+//   HOST_ZONE_PLAN_MUTANT_UNPLANNED_GROWS         an unplanned device's slot growing at dispatch
+//   HOST_ZONE_PLAN_MUTANT_UNPLANNED_POOLS_SCAN    an unplanned device's pools sized from the graph's own scan
 //   HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED   a backend's free releasing a planned device's slots too
 // HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING moves the count in simulate_host_fa, this file's re-enactment of the
 // dispatch's entry, so it scores the fixture's model of the order, not production. Production's order is pinned by
@@ -548,31 +549,30 @@ void test_unplanned_slot_refused() {
               "a request to a slot never planned was not refused with the WARN");
 }
 
-// The slots' pre-notify fallback (§4.4, ruling 2's transitional fallback): on a device no plan is committed for, a slot
-// grows at dispatch, and one WARN names the fallback across every admit. A commit on that device ends it: from then
-// on a request over the plan is refused.
-void test_unplanned_device_grows_until_a_commit() {
+// A device no plan is committed for has no slots to hand out (§M62 (E)): its capacity is 0, so every request is
+// refused and counted by the planned rule, naming the planned 0 B, and no slot grows at dispatch. After a commit on
+// that device a request over the plan is refused naming the plan's capacity instead.
+void test_unplanned_device_refuses_until_a_commit() {
     reset_fakes();
     holders                     h;
     attn_host_dispatch_counters counters;
-    const char *                warn = "[ATTN-HOST] staging dev=1 unplanned; slots grow at dispatch";
+    const char * warn = "for kind attn_host_q exceeds the planned 0 B on device 1; declining host dispatch";
     capture_begin();
-    void *    small    = h.slots.admit(1, HOST_STAGING_Q, q_bytes(16), fake_allocator(), &counters);  // a first slot
-    void *    large    = h.slots.admit(1, HOST_STAGING_Q, q_bytes(64), fake_allocator(), &counters);  // grows past it
-    void *    fits     = h.slots.admit(1, HOST_STAGING_Q, q_bytes(32), fake_allocator(), &counters);  // the grown slot
+    void *    small    = h.slots.admit(1, HOST_STAGING_Q, q_bytes(16), fake_allocator(), &counters);
+    void *    large    = h.slots.admit(1, HOST_STAGING_Q, q_bytes(64), fake_allocator(), &counters);
+    void *    fits     = h.slots.admit(1, HOST_STAGING_Q, q_bytes(32), fake_allocator(), &counters);
     const int returned = (small ? 1 : 0) + (large ? 1 : 0) + (fits ? 1 : 0);
-    HZP_CHECK(returned == 3 && g_alloc_state.allocs == 2 && counters.refusals(1) == 0,
-              "an unplanned device refused a dispatch: %d of 3 admits returned a slot, %d allocation(s), %zu "
-              "refusal(s), expected 3, 2 and 0",
+    HZP_CHECK(returned == 0 && g_alloc_state.allocs == 0 && counters.refusals(1) == 3,
+              "an unplanned device admitted a dispatch: %d of 3 admits returned a slot, %d allocation(s), %zu "
+              "refusal(s), expected 0, 0 and 3",
               returned, g_alloc_state.allocs, counters.refusals(1));
-    HZP_CHECK(h.slots.capacity(1, HOST_STAGING_Q) >= q_bytes(64) && fits == large,
-              "the fallback slot holds %zu B after a %zu B request, or a smaller request did not reuse it",
-              h.slots.capacity(1, HOST_STAGING_Q), q_bytes(64));
-    HZP_CHECK(count_of(captured_log(), warn) == 1,
-              "the unplanned-device WARN printed %zu time(s) across three admits, expected 1",
+    HZP_CHECK(h.slots.capacity(1, HOST_STAGING_Q) == 0, "an unplanned device's slot holds %zu B, expected 0",
+              h.slots.capacity(1, HOST_STAGING_Q));
+    HZP_CHECK(count_of(captured_log(), warn) == 3,
+              "the planned-0 refusal printed %zu time(s) across three admits to an unplanned device, expected 3",
               count_of(captured_log(), warn));
 
-    // The device's first commit: the design behaviour, refusal over the plan, and no fallback line.
+    // The device's first commit: refusal over the plan, naming the plan's capacity rather than 0 B.
     graph_builder g;
     g.fa(16, 1024, K_VIEW_KV_HOST, C);
     h.begin({ 3 });
@@ -582,15 +582,16 @@ void test_unplanned_device_grows_until_a_commit() {
     const int    allocs = g_alloc_state.allocs;
     const size_t over   = h.slots.capacity(1, HOST_STAGING_Q) + 1;
     void *       p      = h.slots.admit(1, HOST_STAGING_Q, over, fake_allocator(), &counters);
-    HZP_CHECK(p == nullptr && g_alloc_state.allocs == allocs && counters.refusals(1) == 1 &&
-                  log_has("exceeds the planned") && !log_has("unplanned"),
+    char         want[160];
+    snprintf(want, sizeof(want), "exceeds the planned %zu B on device 1; declining host dispatch", over - 1);
+    HZP_CHECK(p == nullptr && g_alloc_state.allocs == allocs && counters.refusals(1) == 4 && over > 1 && log_has(want),
               "after a commit on device 1 an over-plan request was not refused over the plan: admitted=%d, %d "
               "allocation(s), %zu refusal(s)",
-              p ? 1 : 0, g_alloc_state.allocs - allocs, counters.refusals(1));
+              p ? 1 : 0, g_alloc_state.allocs - allocs, counters.refusals(1) - 3);
 
     // An unrelated backend's free, a load's temporary backend or a context with no plan, leaves device 1's committed
-    // plan in force. It drops no plan, and of the slots it releases only the unplanned device 0's fallback slot goes.
-    void *       fallback    = h.slots.admit(0, HOST_STAGING_Q, q_bytes(16), fake_allocator(), &counters);
+    // plan in force. It drops no plan, and releases no planned slot; the unplanned device 0 has none to release.
+    void *       unplanned   = h.slots.admit(0, HOST_STAGING_Q, q_bytes(16), fake_allocator(), &counters);
     const size_t planned_cap = h.slots.capacity(1, HOST_STAGING_Q);
     capture_begin();
     const int releases = g_alloc_state.releases;
@@ -599,16 +600,16 @@ void test_unplanned_device_grows_until_a_commit() {
     const int    allocs_after = g_alloc_state.allocs;
     const size_t refusals     = counters.refusals(1);
     void *       kept         = h.slots.admit(1, HOST_STAGING_Q, planned_cap, fake_allocator(), &counters);
-    HZP_CHECK(fallback && kept && h.slots.planned(1) && g_alloc_state.allocs == allocs_after &&
-                  counters.refusals(1) == refusals && !log_has("unplanned") && !log_has("exceeds the planned"),
+    HZP_CHECK(!unplanned && kept && h.slots.planned(1) && g_alloc_state.allocs == allocs_after &&
+                  counters.refusals(1) == refusals && !log_has("declining host dispatch"),
               "after an unrelated backend's free, device 1 did not admit by its plan: admitted=%d planned=%d, %d "
               "allocation(s), %zu refusal(s)",
               kept ? 1 : 0, h.slots.planned(1) ? 1 : 0, g_alloc_state.allocs - allocs_after,
               counters.refusals(1) - refusals);
-    HZP_CHECK(g_alloc_state.releases == releases + 1 && h.slots.capacity(0, HOST_STAGING_Q) == 0 &&
+    HZP_CHECK(g_alloc_state.releases == releases && h.slots.capacity(0, HOST_STAGING_Q) == 0 &&
                   h.slots.capacity(1, HOST_STAGING_Q) == planned_cap,
-              "the unrelated free released %d slot(s), leaving device 0 at %zu B and device 1 at %zu B, expected 1 "
-              "(device 0's fallback slot), 0 and %zu",
+              "the unrelated free released %d slot(s), leaving device 0 at %zu B and device 1 at %zu B, expected 0, 0 "
+              "and %zu",
               g_alloc_state.releases - releases, h.slots.capacity(0, HOST_STAGING_Q),
               h.slots.capacity(1, HOST_STAGING_Q), planned_cap);
 }
@@ -806,16 +807,18 @@ void test_pools_sized_from_the_plan() {
     host_pools_init_from_plan(0, state, g4.graph, fake_host_experts, quiet);
     HZP_CHECK(!log_has("exceeds its planned"), "a graph within the plan printed the over-plan line");
 
-    // With no commit, the pre-notify fallback: the graph's own scan, and the once-only `unplanned` WARN.
+    // With no commit nothing sized the pools: they are not initialized, and the `unplanned` WARN prints once.
     host_holder_plans       none;
     host_pool_init_warnings fresh;
     capture_begin();
     const host_pool_init_decision u =
         host_pools_init_from_plan(0, none.device_state(0), g16.graph, fake_host_experts, fresh);
     host_pools_init_from_plan(0, none.device_state(0), g16.graph, fake_host_experts, fresh);
-    HZP_CHECK(u.dims.D == 32 && count_of(captured_log(), "[HOST-ARENA] DEVICE pools dev=0 unplanned;") == 1,
-              "with no commit the pools took D=%lld and the `unplanned` line printed %zu time(s), expected D=32 and 1",
-              (long long) u.dims.D, count_of(captured_log(), "[HOST-ARENA] DEVICE pools dev=0 unplanned;"));
+    const char * unplanned = "[HOST-ARENA] DEVICE pools dev=0 unplanned; not initialized";
+    HZP_CHECK(!u.init && u.dims.D == 0 && count_of(captured_log(), unplanned) == 1,
+              "with no commit the pools initialized=%d at D=%lld and the `unplanned; not initialized` line printed "
+              "%zu time(s), expected 0, D=0 and 1",
+              u.init ? 1 : 0, (long long) u.dims.D, count_of(captured_log(), unplanned));
 }
 
 void test_pools_all_device_plan_is_quiet() {
@@ -915,7 +918,7 @@ int main() {
     test_begin_clears_every_pending();
     test_slot_rule_and_admission();
     test_unplanned_slot_refused();
-    test_unplanned_device_grows_until_a_commit();
+    test_unplanned_device_refuses_until_a_commit();
     test_recommit_replaces();
     test_auto_ubatch_trial();
     test_dispatch_counter_and_fail_closed();

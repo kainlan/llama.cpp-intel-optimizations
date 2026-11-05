@@ -1886,7 +1886,11 @@ created") describes a path that does not run.
       with the allocated size (`ggml_backend_sched_get_buffer_size` on the
       CPU backend), which replaces the measured one, and the demand line
       then prints both, `measured=%.1f allocated=%.1f`. The ledger then
-      holds the fact. Capacity an over-estimate already grew stays grown
+      holds the fact. At each commit, `sched_reserve`'s,
+      `sched_reserve_nothrow`'s and `try_candidate`'s, the order is the
+      commit, then this re-notify in the same block, then `KEEP`, so a grow
+      the allocated figure makes is charged to the open transaction and
+      kept with it. Capacity an over-estimate already grew stays grown
       (capacity is never returned, above); the SCRATCH criterion's chunk
       rule (§7 C4 step 2) FAILs a chunk that no committed demand line
       explains.
@@ -1968,8 +1972,10 @@ created") describes a path that does not run.
       ordinary capacity. On a
       win, `try_candidate` calls `KEEP` together with the commit, after the
       host-fallback check; the chunks become ordinary SCRATCH capacity. On
-      each loss path, the allocating reserve's throw (`lc:1609-1619`) and
-      the host fallback (`lc:1624-1628`), it calls `RETURN`.
+      each loss path, the allocating reserve's throw (`lc:1609-1619`), the
+      host fallback (`lc:1624-1628`) and the hold-spill rung that leaves no
+      headroom, it calls `RETURN`: each is a losing candidate, and a losing
+      candidate returns its growth.
     - **The marked set is the device cache's, and a marked chunk is
       withdrawn at once** (r8 m-1). `RETURN` drops the context's demand,
       moves the transaction's chunks into a **per-device marked set** held
@@ -4579,7 +4585,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
       (r7 m-1).
     - **§M75.** `try_candidate` calls `ggml_backend_sycl_host_scratch_trial`
       with `OPEN` before its `sched_reserve`, `KEEP` beside the commit,
-      and `RETURN` on both loss paths. The begin entry follows each
+      and `RETURN` on every loss path, the hold-spill rung's included. The
+      begin entry follows each
       scheduler creation. The pinned pool frees a chunk only in its
       destructor and in `release_zone_chunk`, and `release_zone_chunk` is
       reached only from `release_marked_chunk`, whose callers are the
@@ -4592,7 +4599,14 @@ I-5, §F2). It is the commit that changes every SYCL load.
       and `KEEP` on its success path. That `KEEP` is excepted under the
       auto-`n_ubatch` trial, as the end commit is, because inside
       `try_candidate` it would run before the host-fallback check and keep
-      a losing candidate's growth.
+      a losing candidate's growth. That `RETURN` sits in a `catch (...)`
+      arm around the reserve that ends in a bare rethrow, because
+      `test-sycl-reserve-state-source` pins the text of the not-OK block;
+      the gate counts the arm's `RETURN` for every throw its `try` encloses.
+      `sched_reserve_nothrow` follows the same rule: on `OK` it commits,
+      re-notifies and calls `KEEP` before its `return true`, under the
+      same exception, and every other way out, the not-OK result and each
+      catch arm, reaches one `RETURN` before its `return false`.
       `RETURN` withdraws the marked chunks and files them in the
       device cache's marked set, and nothing in `OPEN` touches that set
       (r8 m-1). Withdrawal is the only writer that lowers
@@ -4944,6 +4958,17 @@ I-5, §F2). It is the commit that changes every SYCL load.
       - `RETURN` removed from the host-fallback loss path (§M75), and
         separately the begin moved before the scheduler creation, where
         the losing scheduler's buffers are still live;
+      - `RETURN` removed from the hold-spill loss path, and separately from
+        `sched_reserve`'s rethrowing catch arm, and that arm's rethrow
+        removed (§M75);
+      - `sched_reserve_nothrow`'s commit removed, and separately left
+        unguarded under the trial; its `KEEP` unguarded; its `RETURN`
+        removed (§M75);
+      - a commit's re-notify removed, and separately moved after its `KEEP`
+        (§4.4 "The same fact for the notify's measure");
+      - the unplanned device's slot grow restored in
+        `host_staging_slots::admit` (§M62 (E)), and separately its pools
+        sized from the graph's own scan (r6 I-3);
       - the pools gated on `ggml_backend_buffer_is_host(src0->buffer)`
         (r7 I-2);
       - the helper asserting on a refusal, and separately the helper

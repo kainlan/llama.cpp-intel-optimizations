@@ -1608,13 +1608,79 @@ def _trial_excepted(s, fn: dict, flags: set, p: int) -> bool:
     return False
 
 
+def _ok_arm(code: str, fn):
+    """(open, end) of `fn`'s success arm, the block of its `if (result.status == sched_reserve_status::OK)`, up to
+    the arm's `return true;`, or None."""
+    m = re.search(r"\bif\s*\(\s*result\s*\.\s*status\s*==\s*sched_reserve_status\s*::\s*OK\s*\)\s*\{",
+                  code[fn["open"]:fn["close"]]) if fn else None
+    if not m:
+        return None
+    a_open = fn["open"] + m.end() - 1
+    ret = re.search(r"\breturn\s+true\s*;", code[a_open:match_close(code, a_open)])
+    return (a_open, a_open + ret.start()) if ret else None
+
+
+def _catch_arms(code: str, t_close: int) -> list:
+    """(declaration, open, close) of each catch arm that follows the try block closing at `t_close`."""
+    arms, k = [], t_close + 1
+    while True:
+        c = re.match(r"\s*catch\s*\(([^)]*)\)\s*\{", code[k:])
+        if not c:
+            return arms
+        a_open = k + c.end() - 1
+        arms.append((c.group(1).strip(), a_open, match_close(code, a_open)))
+        k = arms[-1][2] + 1
+
+
+def _rethrowing_tries(code: str, fn, returns: list) -> list:
+    """(open, close) of each try block in `fn` whose catch (...) arm RETURNs in the arm's own block and then ends in
+    a rethrow: every throw inside that try block leaves through the arm, so the RETURN runs on its path."""
+    out = []
+    for m in re.finditer(r"\btry\s*\{", code[fn["open"]:fn["close"]]):
+        t_open = fn["open"] + m.end() - 1
+        t_close = match_close(code, t_open)
+        for decl, a_open, a_close in _catch_arms(code, t_close):
+            rethrow = re.search(r"\bthrow\s*;\s*$", code[a_open + 1:a_close]) if decl == "..." else None
+            if rethrow and any(a_open < r < a_open + 1 + rethrow.start() and _block_open(code, r) == a_open
+                               for r in returns):
+                out.append((t_open, t_close))
+    return out
+
+
+def _statement_block(bare: str, lo: int, pos: int) -> int:
+    """The `{` of the block that holds the statement at `pos`: its innermost block, or, when `pos` is in loops whose
+    heads start after lo, the block holding the outermost of them."""
+    heads = []
+    for m in re.finditer(r"\b(?:for|while)\s*\(", bare[lo:pos]):
+        rp = match_close(bare, lo + m.end() - 1)
+        k = rp + 1
+        while k < len(bare) and bare[k].isspace():
+            k += 1
+        end = match_close(bare, k) if k < len(bare) and bare[k] == "{" else bare.find(";", k)
+        if rp < pos <= end:
+            heads.append(lo + m.start())
+    return _block_open(bare, min(heads) if heads else pos)
+
+
+def _trial_steps(s) -> dict:
+    """{op: [positions]} of the calls through llama_context's SCRATCH transaction pointer, by op."""
+    trial = _proc_pointer(s.code, "ggml_backend_sycl_host_scratch_trial")
+    at = {}
+    if trial:
+        for m in re.finditer(r"\b" + re.escape(trial) + r"\s*\([^;]*?\b\w*?(RETURN_TO_MARK|OPEN|KEEP|RETURN|MARK)\b",
+                             s.bare):
+            at.setdefault(m.group(1), []).append(m.start())
+    return at
+
+
 def clause_context_wiring(texts: dict) -> list:
     """r6 I-1, r7 I-1, r7 m-1: llama_context resolves the notify, begin, plan and commit entries; each begin follows
     a scheduler creation before any graph_reserve, and each plan call follows a split_only graph_reserve. The commit
     calls run at the end of sched_reserve on its success for every caller except the auto-n_ubatch trial, so that
     commit sits under an if whose condition, with no ||, reads negated a flag the trial sets true and sched_reserve
     never assigns; the trial's try_candidate commits instead, after its host-fallback check (design :4571-4574,
-    :1932-1943)."""
+    :1932-1943). sched_reserve_nothrow, decode's and encode's reserve, commits in its success arm before its return
+    true, under the same exception (§M75)."""
     lc = texts.get(LC, "")
     if not lc:
         return ["context wiring: src/llama-context.cpp is missing"]
@@ -1645,9 +1711,18 @@ def clause_context_wiring(texts: dict) -> list:
     fallback = re.search(r"\breturn\s+\"compute buffer fell back to host\"\s*;", s.code[cand[0]:cand[1]]) \
         if cand else None
     trial_fn, trial_flags = _trial_flags(s, sr)
-    at_end = at_trial = 0
+    _, nt = _fn(texts, LC, "llama_context::sched_reserve_nothrow")
+    ok_arm = _ok_arm(s.bare, nt)
+    at_end = at_trial = at_nothrow = 0
     for p in _pointer_calls(s, ptr["commit_host_holders"]):
-        if sr and sr["open"] < p < sr["close"] and all(t < p for t in throws):
+        if ok_arm and ok_arm[0] < p < ok_arm[1]:
+            at_nothrow += 1
+            if not _trial_excepted(s, nt, _trial_flags(s, nt)[1], p):
+                fails.append(f"context wiring: sched_reserve_nothrow's success commit at line {s.line(p)} is not "
+                             f"under an if that excepts the auto-n_ubatch trial (a negated read, with no ||, of a "
+                             f"flag {trial_fn['name'] if trial_fn else 'the trial'} sets true and the nothrow form "
+                             f"never assigns)")
+        elif sr and sr["open"] < p < sr["close"] and all(t < p for t in throws):
             at_end += 1
             if not _trial_excepted(s, sr, trial_flags, p):
                 fails.append(f"context wiring: sched_reserve's end commit at line {s.line(p)} is not under an if "
@@ -1659,22 +1734,27 @@ def clause_context_wiring(texts: dict) -> list:
         else:
             f = s.enclosing(p)
             fails.append(f"context wiring: {f['name'] if f else 'namespace scope'} calls the commit entry at line "
-                         f"{s.line(p)}, outside sched_reserve's success end and try_candidate's point after its "
-                         f"host-fallback check")
+                         f"{s.line(p)}, outside sched_reserve's success end, sched_reserve_nothrow's success arm and "
+                         f"try_candidate's point after its host-fallback check")
     if not at_end:
         fails.append("context wiring: sched_reserve does not call the commit entry at its end, on its success path")
     if not at_trial:
         fails.append("context wiring: try_candidate does not call the commit entry after its host-fallback check")
+    if not at_nothrow:
+        fails.append("context wiring: sched_reserve_nothrow does not call the commit entry in its success arm, before "
+                     "its return true")
     return fails
 
 
 def clause_trial_ops(texts: dict) -> list:
-    """§M75, r9 n-6, r10 m-5: try_candidate OPENs before its reserve, KEEPs beside the commit and RETURNs on both loss
-    paths; sched_reserve RETURNs on its transaction's throw path, MARKs before the measure, RETURN_TO_MARKs before
-    the pipeline-parallel retry, and KEEPs on its success path except under the auto-n_ubatch trial: like the end
-    commit, that KEEP sits under an if whose condition, with no ||, reads negated a flag the trial sets true and
-    sched_reserve never assigns, because inside try_candidate it would run before the host-fallback check and keep
-    a losing candidate's growth."""
+    """§M75, r9 n-6, r10 m-5: try_candidate OPENs before its reserve, KEEPs beside the commit and RETURNs on every
+    loss path (the reserve's throw, the host fallback and the hold spill); sched_reserve RETURNs on its transaction's
+    throw path, MARKs before the measure, RETURN_TO_MARKs before the pipeline-parallel retry, and KEEPs on its success
+    path except under the auto-n_ubatch trial: like the end commit, that KEEP sits under an if whose condition, with
+    no ||, reads negated a flag the trial sets true and sched_reserve never assigns, because inside try_candidate it
+    would run before the host-fallback check and keep a losing candidate's growth. A throw in a try block whose
+    catch (...) arm RETURNs in its own block and rethrows is on that RETURN's path. sched_reserve_nothrow KEEPs beside
+    its success commit under the same exception, and RETURNs on every way out but OK, after its catch arms."""
     lc = texts.get(LC, "")
     if not lc:
         return ["trial ops: src/llama-context.cpp is missing"]
@@ -1683,15 +1763,18 @@ def clause_trial_ops(texts: dict) -> list:
     if not trial:
         return ["trial ops: llama_context does not resolve ggml_backend_sycl_host_scratch_trial"]
     code = s.bare
-    at = {}
-    for m in re.finditer(r"\b" + re.escape(trial) + r"\s*\([^;]*?\b\w*?(RETURN_TO_MARK|OPEN|KEEP|RETURN|MARK)\b", code):
-        at.setdefault(m.group(1), []).append(m.start())
+    at = _trial_steps(s)
     fails = [f"trial ops: llama_context never calls the trial entry with {op}"
              for op in ("OPEN", "KEEP", "RETURN", "MARK", "RETURN_TO_MARK") if op not in at]
     every = sorted(p for ps in at.values() for p in ps)
+    commit = _proc_pointer(s.code, "ggml_backend_sycl_commit_host_holders")
 
     def ops(op, lo, hi):
         return [p for p in at.get(op, []) if lo < p < hi]
+
+    def beside(k, c):
+        a, b = min(k, c), max(k, c)
+        return not re.search(r"\breturn\b", code[a:b]) and not any(a < q < b for q in every if q != k)
 
     cand = _lambda_span(code, "try_candidate")
     if not cand:
@@ -1703,7 +1786,8 @@ def clause_trial_ops(texts: dict) -> list:
         if not opens or (r and lo + r.start() < opens[0]):
             fails.append("trial ops: try_candidate does not OPEN before its reserve")
         for label, text in (("reserve-failure", "compute buffers did not fit"),
-                            ("host-fallback", "compute buffer fell back to host")):
+                            ("host-fallback", "compute buffer fell back to host"),
+                            ("hold-spill", "hold spill left no headroom")):
             m = re.search(r"\breturn\s+\"" + text + r"\"\s*;", s.code[lo:hi])
             if not m:
                 fails.append(f"trial ops: try_candidate has no {label} return")
@@ -1711,15 +1795,10 @@ def clause_trial_ops(texts: dict) -> list:
             ret = lo + m.start()
             returns = ops("RETURN", _block_open(code, ret), ret)
             if not returns or re.search(r"\breturn\b", code[returns[-1]:ret]):
-                fails.append(f"trial ops: try_candidate does not RETURN on both loss paths: none before its {label} "
+                fails.append(f"trial ops: try_candidate does not RETURN on every loss path: none before its {label} "
                              f"return")
-        commit = _proc_pointer(s.code, "ggml_backend_sycl_commit_host_holders")
         commits = _pointer_calls(s, commit, lo, hi) if commit else []
         keeps = ops("KEEP", lo, hi)
-
-        def beside(k, c):
-            a, b = min(k, c), max(k, c)
-            return not re.search(r"\breturn\b", code[a:b]) and not any(a < q < b for q in every if q != k)
         if not keeps or not all(any(beside(k, c) for c in commits) for k in keeps):
             fails.append("trial ops: try_candidate does not KEEP beside the commit, with no exit or trial step "
                          "between them (§M75)")
@@ -1732,7 +1811,10 @@ def clause_trial_ops(texts: dict) -> list:
         if not (tx and throws):
             fails.append("trial ops: sched_reserve does not RETURN on its transaction's throw path: it has no "
                          "transaction call or no throw (r10 m-5)")
+        rethrowing = _rethrowing_tries(code, sr, at.get("RETURN", []))
         for t_at in throws if tx else []:
+            if any(a < t_at < b for a, b in rethrowing):
+                continue
             chain = set()  # the blocks inside sched_reserve that enclose this throw
             b = _block_open(code, t_at)
             while b > sr["open"]:
@@ -1741,7 +1823,8 @@ def clause_trial_ops(texts: dict) -> list:
             if not [r for r in ops("RETURN", sr["open"] + tx.start(), t_at) if _block_open(code, r) in chain]:
                 name = re.match(r"throw\s+([\w:]+)", code[t_at:])
                 fails.append(f"trial ops: sched_reserve does not RETURN on its transaction's throw path before its "
-                             f"'throw {name.group(1) if name else ''}', in a block enclosing that throw (r10 m-5)")
+                             f"{repr('throw ' + name.group(1)) if name else 'rethrow'}, in a block enclosing that "
+                             f"throw (r10 m-5)")
         success_keeps = ops("KEEP", throws[-1], sr["close"]) if throws else []
         if not success_keeps:
             fails.append("trial ops: sched_reserve does not KEEP on its success path, after its throws (r10 m-5)")
@@ -1753,6 +1836,31 @@ def clause_trial_ops(texts: dict) -> list:
                              f"{trial_fn['name'] if trial_fn else 'the trial'} sets true and sched_reserve never "
                              f"assigns): inside try_candidate it would keep a losing candidate's growth before the "
                              f"host-fallback check (r10 m-5, §M75)")
+    _, nt = _fn(texts, LC, "llama_context::sched_reserve_nothrow")
+    if not nt:
+        fails.append("trial ops: no llama_context::sched_reserve_nothrow")
+    else:
+        arm = _ok_arm(code, nt)
+        commits = _pointer_calls(s, commit, *arm) if arm and commit else []
+        keeps = ops("KEEP", *arm) if arm else []
+        if not keeps or not all(any(beside(k, c) for c in commits) for k in keeps):
+            fails.append("trial ops: sched_reserve_nothrow does not KEEP beside its success commit, before its return "
+                         "true, with no exit or trial step between them (§M75)")
+        nt_fn, nt_flags = _trial_flags(s, nt)
+        for k in keeps:
+            if not _trial_excepted(s, nt, nt_flags, k):
+                fails.append(f"trial ops: sched_reserve_nothrow's success KEEP at line {s.line(k)} is not under an if "
+                             f"that excepts the auto-n_ubatch trial (a negated read, with no ||, of a flag "
+                             f"{nt_fn['name'] if nt_fn else 'the trial'} sets true and the nothrow form never "
+                             f"assigns) (§M75)")
+        tr = re.search(r"\btry\s*\{", code[nt["open"]:nt["close"]])
+        arms = _catch_arms(code, match_close(code, nt["open"] + tr.end() - 1)) if tr else []
+        fin = [nt["open"] + m.start() for m in re.finditer(r"\breturn\s+false\s*;", code[nt["open"]:nt["close"]])]
+        rets = [r for r in ops("RETURN", arms[-1][2], fin[-1]) if _block_open(code, r) == nt["open"]] \
+            if arms and fin else []
+        if not rets or re.search(r"\breturn\b", code[rets[-1]:fin[-1]]):
+            fails.append("trial ops: sched_reserve_nothrow does not RETURN on every way out but OK: no RETURN in its "
+                         "body after its catch arms and before its return false (§M75)")
     path = _sched_path(texts)
     im = path["reserve"] if path else None
     lo2 = path["reserve_lo"] if path else 0
@@ -1779,7 +1887,9 @@ def clause_notify_position(texts: dict) -> list:
     """§7 C4, r3 A.2 and A.5: llama_context calls the notify before the allocation it covers, once with
     model.devices[0]'s backend and not in a loop over backends. In output_reserve the call sits between the old
     buffer's free and ggml_backend_buft_alloc_buffer; on sched_reserve's path it follows the measure's last size-only
-    graph_reserve and precedes the first allocating one."""
+    graph_reserve and precedes the first allocating one. Each commit is followed by the re-notify with the allocated
+    size (§4.4 "The same fact for the notify's measure"): a notify after the commit call in the block that holds the
+    commit's statement, with no exit and no trial step between them, so the KEEP comes after it."""
     lc = texts.get(LC, "")
     if not lc:
         return ["notify position: src/llama-context.cpp is missing"]
@@ -1797,9 +1907,26 @@ def clause_notify_position(texts: dict) -> list:
     alloc = re.search(r"\bggml_backend_buft_alloc_buffer\s*\(", span)
     size_only = [key(p) for p, so in _reserves(s, me["open"], me["close"]) if so]
     allocating = [key(p) for p, so in _reserves(s, path["reserve_lo"], im["close"]) if not so]
+    commit = _proc_pointer(s.code, "ggml_backend_sycl_commit_host_holders")
+    commits = _pointer_calls(s, commit) if commit else []
+    steps = sorted(q for ps in _trial_steps(s).values() for q in ps)
+
+    def renotifies(c, p):
+        f = s.enclosing(c)
+        if not f or not c < p < f["close"]:
+            return False
+        blk = _statement_block(s.bare, f["open"], c)
+        return blk < p < match_close(s.bare, blk) and not re.search(r"\breturn\b", s.bare[c:p]) and \
+            not any(c < q < p for q in steps)
     fails = []
     in_out = in_path = 0
-    for p in _pointer_calls(s, ptr):
+    notifies = _pointer_calls(s, ptr)
+    for c in commits:
+        if not any(renotifies(c, p) for p in notifies):
+            f = s.enclosing(c)
+            fails.append(f"notify position: the commit at {f['name'] if f else 'namespace scope'}:{s.line(c)} has no "
+                         f"re-notify after it in its block (§4.4 \"The same fact for the notify's measure\")")
+    for p in notifies:
         f = s.enclosing(p)
         lo = f["open"] if f else 0
         where = f"{f['name'] if f else 'namespace scope'}:{s.line(p)}"
@@ -1818,9 +1945,9 @@ def clause_notify_position(texts: dict) -> list:
             if not (size_only and allocating and size_only[-1] < key(p) < allocating[0]):
                 fails.append(f"notify position: {where} calls the notify on sched_reserve's path outside the span "
                              f"from the measure's last size-only graph_reserve to the first allocating one (r3 A.2)")
-        else:
-            fails.append(f"notify position: {where} calls the notify outside output_reserve and sched_reserve's "
-                         f"path")
+        elif not any(renotifies(c, p) for c in commits):
+            fails.append(f"notify position: {where} calls the notify outside output_reserve, sched_reserve's path "
+                         f"and a commit's re-notify")
     if not in_out:
         fails.append("notify position: output_reserve does not call the notify")
     if not in_path:
@@ -1966,18 +2093,12 @@ CLAUSES = [
     ("dlopen-header", REQUIRED, clause_dlopen_header, None, None),
     ("open-touches-no-set", REQUIRED, clause_open_touches_no_set, None, None),
     ("owner-end-wired", REQUIRED, clause_owner_end_wired, None, None),
-    ("slot-growth-plan-only", EXPECTED_RED, clause_slot_growth_plan_only, "Task 7",
-     "slot_replace is called by ['host_staging_slots::admit'"),
-    ("pools-from-plan", EXPECTED_RED, clause_pools_from_plan, "Task 7",
-     "the pools' init is sized from 'd.dims = host_pool_scan("),
-    ("context-wiring", EXPECTED_RED, clause_context_wiring, "Task 7",
-     "llama_context does not resolve ggml_backend_sycl_begin_host_holders"),
-    ("trial-ops", EXPECTED_RED, clause_trial_ops, "Task 7",
-     "llama_context does not resolve ggml_backend_sycl_host_scratch_trial"),
-    ("notify-position", EXPECTED_RED, clause_notify_position, "Task 7",
-     "llama_context does not resolve ggml_backend_sycl_notify_host_buffer_sizes"),
-    ("dlopen-context", EXPECTED_RED, clause_dlopen_context, "Task 7",
-     "llama_context does not resolve ggml_backend_sycl_notify_host_buffer_sizes"),
+    ("slot-growth-plan-only", REQUIRED, clause_slot_growth_plan_only, None, None),
+    ("pools-from-plan", REQUIRED, clause_pools_from_plan, None, None),
+    ("context-wiring", REQUIRED, clause_context_wiring, None, None),
+    ("trial-ops", REQUIRED, clause_trial_ops, None, None),
+    ("notify-position", REQUIRED, clause_notify_position, None, None),
+    ("dlopen-context", REQUIRED, clause_dlopen_context, None, None),
     ("scratch-fold", EXPECTED_RED, clause_scratch_fold, "Task 7", "beyond the four host terms (§M62 (A))"),
     ("runtime-term", EXPECTED_RED, clause_runtime_term, "Task 7",
      "names ['pp_pipeline_scratch_bytes', 'pp_moe_onednn_scratch_bytes']"),
@@ -2021,71 +2142,141 @@ _HOOKS_AT = "        ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_
 _OWNER_END = ("    if (owner_end) {\n"
               "        (void) ggml_sycl::unified_cache_host_scratch_owner_end(owner_end_device, freed_owner_id);\n"
               "    }\n")
-_TRIAL = "hooks.host_scratch_trial(GGML_SYCL_HOST_SCRATCH_TRIAL_"
-_TRIAL_OPEN = "        " + _TRIAL + "OPEN);\n"
-_PP_MEASURE = ("        auto * gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get(), "
-               "model.hparams.no_alloc,\n")
+_ARENA_RESERVED = ("        GGML_ABORT(\"[SYCL-PLAN] compute arena reserve smaller than scheduler requirement\");\n"
+                   "    }\n")
+_HDR_ARG = " " * 65  # the column of the notify's parameters in ggml-sycl.h
 
 
 def _hook(name: str) -> str:
+    """llama_context's resolve of one host SCRATCH entry, by proc name."""
     return (f"    hooks.{name} = reinterpret_cast<decltype(hooks.{name})>(\n"
             f"        ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_{name}\"));\n")
 
 
-_WIRING_PROCS = ("notify_host_buffer_sizes", "begin_host_holders", "plan_host_holders", "commit_host_holders")
-_WIRING_HOOKS = "".join(_hook(n) for n in _WIRING_PROCS)
-_SCHED_SITES = [
-    "                                             state.cparams.pipeline_parallel, state.cparams.op_offload));\n"
-    "#ifdef GGML_USE_SYCL\n    llama_context_sycl_attach_sched_plan(state.sched.get(), backends);\n",
-    "                                                         max_nodes, false, state.cparams.op_offload));\n"
-    "#ifdef GGML_USE_SYCL\n                llama_context_sycl_attach_sched_plan(state.sched.get(), backends);\n",
-    "                                             false, state.cparams.op_offload));\n"
-    "#ifdef GGML_USE_SYCL\n    llama_context_sycl_attach_sched_plan(state.sched.get(), backends);\n",
-]
-_RETRY_BEGIN = "                hooks.begin_host_holders(state.sched.get());\n"
-_BEGIN = "    hooks.begin_host_holders(state.sched.get());\n"
-_SCHED_NEW_0 = ("    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), "
-                "backend_ptrs.size(), max_nodes,\n")
-_ARENA_RESERVED = ("        GGML_ABORT(\"[SYCL-PLAN] compute arena reserve smaller than scheduler requirement\");\n"
-                   "    }\n")
-_MEASURED = ("            return { sched_reserve_status::FAILED, format(\"failed to measure graph %zu of %zu\", gi, "
-             "graphs.size()) };\n        }\n")
-_SR_FAIL = ("    const sched_reserve_result result = sched_reserve_transaction();\n"
-            "    if (result.status != sched_reserve_status::OK) {\n")
-_SR_FIT_REFUSAL = "        if (result.fit_refusal) {\n            throw llama_auto_ubatch_fit_refusal(result.reason);\n"
-_SR_TAIL_OPEN = "        throw std::runtime_error(result.reason);\n    }\n"
-_SR_TAIL_CLOSE = "}\n\nbool llama_context::sched_reserve_nothrow() {\n"
+# The tree's own text at each site a llama_context mutant edits: each old text must occur exactly once.
+_STEP = "sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_"
+_OPEN = "        " + _STEP + "OPEN, c);\n"
+_FLAG = "        sycl_ubatch_trial_active = true;\n"
+_RESERVED_OK = "        sched_matches_last_good = true;\n"
+# Each loss returns its growth first; the line before that RETURN anchors it, so a mutant drops the RETURN alone.
+_LOSS_FIT_AT = ("            LLAMA_LOG_INFO(\"[SYCL-PLAN] auto n_ubatch candidate %u: compute buffer reserve failed: "
+                "%s\\n\", c, e.what());\n")
+_LOSS_HOST_AT = "            if (fallback_fn(sb.dev_index) > 0) {\n"
+_LOSS_SPILL_AT = "                    c, rung_largest_ub);\n"
+_LOSS_FIT = _LOSS_FIT_AT + "            " + _STEP + "RETURN, c);\n"
+_LOSS_HOST = _LOSS_HOST_AT + "                " + _STEP + "RETURN, c);\n"
+_LOSS_SPILL = _LOSS_SPILL_AT + "                " + _STEP + "RETURN, c);\n"
+_CAND_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
+                "            if (sycl_host_hooks.commit_host_holders) {\n"
+                "                sycl_host_hooks.commit_host_holders(sb.backend);\n"
+                "            }\n"
+                "        }\n")
+_RENOTIFY = ("        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && "
+             "!model.hparams.no_alloc) {\n"
+             "            sycl_host_compute_bytes =\n"
+             "                llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, "
+             "backend_buft);\n"
+             "            llama_context_sycl_notify_checked(\n"
+             "                sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, sycl_host_compute_bytes, "
+             "sycl_host_output_bytes),\n"
+             "                sycl_host_compute_bytes, sycl_host_output_bytes);\n"
+             "        }\n")
+_CAND_KEEP = "        " + _STEP + "KEEP, c);\n"
+_SR_CATCH = "        " + _STEP + "RETURN, cparams.n_ubatch);\n        throw;\n"
+_SR_TRY = ("    try {\n"
+           "        const sched_reserve_result result = sched_reserve_transaction();\n"
+           "        if (result.status != sched_reserve_status::OK) {\n")
+_SR_FIT_REFUSAL = ("            if (result.fit_refusal) {\n"
+                   "                throw llama_auto_ubatch_fit_refusal(result.reason);\n")
 _SR_COMMIT = ("    if (!sycl_ubatch_trial_active) {\n"
               "        for (auto & backend : backends) {\n"
-              "            hooks.commit_host_holders(backend.get());\n"
-              "        }\n"
-              "    }\n")
-_SPILL_OK = "        hold_spill_validated_ub = hold_spill_fn ? c : 0;\n"
-_CANDIDATE = "    auto try_candidate = [&](uint32_t c) -> const char * {\n"
-_TRIAL_FLAG = "    sycl_ubatch_trial_active = true;\n"
-_SR_KEEP = "    if (!sycl_ubatch_trial_active) {\n        " + _TRIAL + "KEEP);\n    }\n"
+              "            if (sycl_host_hooks.commit_host_holders && llama_context_backend_is_sycl(backend.get())) {\n"
+              "                sycl_host_hooks.commit_host_holders(backend.get());\n"
+              "            }\n"
+              "        }\n")
+_SR_KEEP = "        " + _STEP + "KEEP, cparams.n_ubatch);\n"
+_SR_CLOSE = "}\n\nbool llama_context::sched_reserve_nothrow() {\n"
+_SR_END = "    }\n" + _SR_CLOSE
+_NT_COMMIT = ("                for (auto & backend : backends) {\n"
+              "                    if (sycl_host_hooks.commit_host_holders && "
+              "llama_context_backend_is_sycl(backend.get())) {\n"
+              "                        sycl_host_hooks.commit_host_holders(backend.get());\n"
+              "                    }\n"
+              "                }\n")
+_NT_GUARD = "            if (!sycl_ubatch_trial_active) {\n"
+_NT_KEEP_END = ("                " + _STEP + "KEEP, cparams.n_ubatch);\n"
+                "            }\n"
+                "            return true;\n")
+_NT_RETURN = "    " + _STEP + "RETURN, cparams.n_ubatch);\n    sched_need_reserve = true;\n"
+_MARK = "        " + _STEP + "MARK, state.cparams.n_ubatch);\n"
+_RTM = ("                " + _STEP + "RETURN_TO_MARK,\n"
+        "                                                   state.cparams.n_ubatch);\n")
+_PP_SPLITS = "        n_splits_pp        = ggml_backend_sched_get_n_splits(state.sched.get());\n"
+_RETRY_RESERVE = "                gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get());\n"
+_RETRY_BEGIN = ("                if (sycl_host_hooks.begin_host_holders) {\n"
+                "                    sycl_host_hooks.begin_host_holders(state.sched.get());\n"
+                "                }\n")
+_BEGIN = ("    if (sycl_host_hooks.begin_host_holders) {\n"
+          "        sycl_host_hooks.begin_host_holders(state.sched.get());\n"
+          "    }\n")
+_BEGIN_0_NOTE = "    // scheduler's compute buffers, and the walks of this reserve fill the pending plans afresh.\n"
+_SCHED_NEW_0 = ("    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), "
+                "backend_ptrs.size(), max_nodes,\n"
+                "                                             state.cparams.pipeline_parallel, "
+                "state.cparams.op_offload));\n")
+_MEASURE_CALL = "    sycl_host_measure();\n\n"
+_MEASURE_NOTIFY = ("        if (!measure_only) {  // a measure-only context resolves no hooks and prints nothing a "
+                   "vehicle arm scores\n"
+                   "            llama_context_sycl_notify_checked(\n"
+                   "                sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, sycl_host_compute_bytes, "
+                   "sycl_host_output_bytes),\n"
+                   "                sycl_host_compute_bytes, sycl_host_output_bytes);\n"
+                   "        }\n"
+                   "    };\n")
+_IMPL_DEV0 = ("    ggml_backend_t sycl_dev0 =\n"
+              "        model.devices.empty() ? nullptr : llama_context_sycl_backend_of(backends, "
+              "model.devices[0].dev);\n"
+              "    bool   sycl_host_measured = false;\n")
+_OUT_BLOCK = ("        if (sycl_host_hooks.notify_host_buffer_sizes && llama_context_dev_is_sycl(output_dev) &&\n"
+              "            buft == output_dev_host_buft) {\n"
+              "            ggml_backend_t sycl_dev0 = llama_context_sycl_backend_of(backends, "
+              "model.devices[0].dev);\n"
+              "            if (sycl_dev0) {\n"
+              "                sycl_host_output_bytes = new_size;\n"
+              "                const bool grown       = sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, "
+              "sycl_host_compute_bytes,\n"
+              "                                                                                  "
+              "sycl_host_output_bytes);\n"
+              "                llama_context_sycl_notify_checked(grown, sycl_host_compute_bytes, "
+              "sycl_host_output_bytes);\n"
+              "            }\n"
+              "        }\n")
+_OUT_CALL = ("                const bool grown       = sycl_host_hooks.notify_host_buffer_sizes(sycl_dev0, "
+             "sycl_host_compute_bytes,\n"
+             "                                                                                  "
+             "sycl_host_output_bytes);\n")
+_OUT_ALLOC = "        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));\n"
+_LCH_NOTIFY = "    decltype(&ggml_backend_sycl_notify_host_buffer_sizes) notify_host_buffer_sizes = nullptr;\n"
+_LCH_PLAN = "    decltype(&ggml_backend_sycl_plan_host_holders)        plan_host_holders        = nullptr;\n"
+_UNPLANNED_SLOT = ("        // No host holder plan is committed for this device, so nothing sized its slots: each has "
+                   "capacity 0 and\n")
+_UNPLANNED_POOLS = ("        if (!warnings.unplanned.exchange(true)) {\n"
+                    "            GGML_LOG_WARN(\"[HOST-ARENA] DEVICE pools dev=%d unplanned; not initialized\\n\", "
+                    "device);\n"
+                    "        }\n"
+                    "        return d;\n")
+
+
+def _outdent(text: str) -> str:
+    """`text` one level, 4 columns, to the left."""
+    return "".join(line[4:] if line.startswith("    ") else line for line in text.splitlines(True))
+
+
 # Guards that do not except the trial: a flag sched_reserve resets itself, a disjunction, another object's member.
 _GUARD = "if (!sycl_ubatch_trial_active) {"
 _GUARD_RESET = "if (!sched_need_reserve) {"
 _GUARD_OR = "if (true || !sycl_ubatch_trial_active) {"
 _GUARD_MEMBER = "if (cparams.pipeline_parallel == false) {"
-_TRIAL_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
-                 "            hooks.commit_host_holders(sb.backend);\n"
-                 "        }\n")
-_RESERVED_OK = "        sched_matches_last_good = true;\n"
-_PP_SPLITS = "        n_splits_pp        = ggml_backend_sched_get_n_splits(state.sched.get());\n"
-_RETRY_RESERVE = "                gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get());\n"
-_DEV0_BACKEND = "llama_context_sycl_backend_of(backends, model.devices[0])"
-_OUT_ALLOC = "        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));\n"
-_OUT_NOTIFY = "        hooks.notify_host_buffer_sizes(" + _DEV0_BACKEND + ", 0, new_size);\n"
-_MEASURED_OK = "            return measured;\n        }\n"
-_SCHED_DEV0 = "        ggml_backend_t sycl_dev0 = " + _DEV0_BACKEND + ";\n"
-_SCHED_NOTIFY = _SCHED_DEV0 + "        hooks.notify_host_buffer_sizes(sycl_dev0, storage.plan.host_compute_bytes, 0);\n"
-_HAS_PLAN_MEMBER = ("    decltype(&ggml_backend_sycl_has_active_placement_plan)        has_active_plan = "
-                    "nullptr;\n")
-_HDR_ARG = " " * 65  # the column of the notify's parameters in ggml-sycl.h
-_NOTIFY_MEMBER = "    bool (*notify_host_buffer_sizes)(ggml_backend_t, size_t, size_t) = nullptr;\n"
-_PLAN_MEMBER = "    bool (*plan_host_holders)(ggml_backend_sched_t, struct ggml_cgraph *) = nullptr;\n"
 _WITHDRAW_CHECKED = ("            if (!host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx)) {\n"
                      "                GGML_LOG_WARN(\n"
                      "                    \"[HOST-ARENA] SCRATCH return skipped dev=%d chunk=%zu: not a chunk of the "
@@ -2107,58 +2298,6 @@ _TENANT_OWNER = ("        req.intent.owner = { ggml_sycl::alloc_owner_kind::EXEC
                  "ggml_sycl_context_execution_id(ctx) };\n")
 
 FIXTURES = {
-    "slot-growth-plan-only": [
-        (PLAN, "        if (bytes > slot.cap && !slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), "
-               "alloc)) {\n"
-               "            return nullptr;  // the caller declines; the old slot, if any, stays usable\n"
-               "        }\n",
-               "        if (bytes > slot.cap) {\n"
-               "            return nullptr;  // no committed plan: the caller declines\n"
-               "        }\n"),
-    ],
-    "pools-from-plan": [
-        (PLAN, "        d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);\n"
-               "        d.init = d.dims.D > 0 && d.dims.K > 0 && d.dims.N > 0;\n"
-               "        return d;\n",
-               "        d.init = false;\n"
-               "        return d;\n"),
-    ],
-    "context-wiring": [
-        (LC, _HOOKS_AT, _HOOKS_AT + _WIRING_HOOKS),
-        (LC, _SCHED_SITES[0], _SCHED_SITES[0] + _BEGIN),
-        (LC, _SCHED_SITES[1], _SCHED_SITES[1] + _RETRY_BEGIN),
-        (LC, _SCHED_SITES[2], _SCHED_SITES[2] + _BEGIN),
-        (LC, _MEASURED, _MEASURED + "        hooks.plan_host_holders(state.sched.get(), gf);\n"),
-        (LC, _SR_TAIL_OPEN + _SR_TAIL_CLOSE, _SR_TAIL_OPEN + _SR_COMMIT + _SR_TAIL_CLOSE),
-        (LC, _SPILL_OK, _SPILL_OK + _TRIAL_COMMIT),
-        (LC, _CANDIDATE, _TRIAL_FLAG + _CANDIDATE),
-    ],
-    "trial-ops": [
-        (LC, _HOOKS_AT, _HOOKS_AT + _hook("host_scratch_trial") + _hook("commit_host_holders")),
-        (LC, "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n",
-         _TRIAL_OPEN + "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"),
-        (LC, "            return \"compute buffers did not fit\";\n",
-         "            " + _TRIAL + "RETURN);\n            return \"compute buffers did not fit\";\n"),
-        (LC, "                return \"compute buffer fell back to host\";\n",
-         "                " + _TRIAL + "RETURN);\n                return \"compute buffer fell back to host\";\n"),
-        (LC, _SPILL_OK, _SPILL_OK + _TRIAL_COMMIT + "        " + _TRIAL + "KEEP);\n"),
-        (LC, _SR_FAIL, _SR_FAIL + "        " + _TRIAL + "RETURN);\n"),
-        (LC, _SR_TAIL_OPEN + _SR_TAIL_CLOSE, _SR_TAIL_OPEN + _SR_KEEP + _SR_TAIL_CLOSE),
-        (LC, _CANDIDATE, _TRIAL_FLAG + _CANDIDATE),
-        (LC, _PP_MEASURE, "        " + _TRIAL + "MARK);\n" + _PP_MEASURE),
-        (LC, "                state.cparams.pipeline_parallel = false;\n                state.sched.reset(",
-         "                " + _TRIAL + "RETURN_TO_MARK);\n"
-         "                state.cparams.pipeline_parallel = false;\n                state.sched.reset("),
-    ],
-    "notify-position": [
-        (LC, _HOOKS_AT, _HOOKS_AT + _hook("notify_host_buffer_sizes")),
-        (LC, _OUT_ALLOC, _OUT_NOTIFY + _OUT_ALLOC),
-        (LC, _MEASURED_OK, _MEASURED_OK + _SCHED_NOTIFY),
-    ],
-    "dlopen-context": [
-        (LC, _HOOKS_AT, _HOOKS_AT + _hook("notify_host_buffer_sizes") + _hook("plan_host_holders")),
-        (LC, _HAS_PLAN_MEMBER, _HAS_PLAN_MEMBER + _NOTIFY_MEMBER + _PLAN_MEMBER),
-    ],
     "scratch-fold": [(UC, _FOLD, "    for (size_t bytes : " + _FOLD_FOUR + ") {\n")],
     "runtime-term": [
         (UCH, "    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + "
@@ -2232,7 +2371,9 @@ MUTANTS = [
                    "        }\n", _IDLE)],
      "the IDLE path hands out a per-call buffer without the slot's admission"),
     ("slot-refusal-silent", "slot-refusal",
-     [(PLAN, "exceeds the planned %zu B on device %d; declining host", "over its slot on device %d; declining host")],
+     [(PLAN, "\n        \"[ATTN-HOST] staging request %zu B for kind %s exceeds the planned %zu B on device %d; "
+             "declining",
+       "\n        \"[ATTN-HOST] staging request %zu B for kind %s over its slot on device %d; declining")],
      "the planned refusal no longer WARNs by name and counts"),
     ("plan-stages-with-dispatch-off", "staging-plan",
      [(PLAN, "    if (!w.env->host_dispatch_on) {\n        return;\n    }\n", "")],
@@ -2346,8 +2487,13 @@ MUTANTS = [
                  "    (void) bytes;\n"
                  "}\n")],
      "defines or calls unified_cache_grow_host_scratch_zone"),
-    # Planted on the EXPECTED-RED clauses' fixtures.
     ("growth-planned-branch", "slot-growth-plan-only", [_PLANNED_GROW], "slot_replace is called by"),
+    ("growth-unplanned-grows", "slot-growth-plan-only",
+     [(PLAN, _UNPLANNED_SLOT,
+       "        if (bytes > slot.cap && !slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {\n"
+       "            return nullptr;\n"
+       "        }\n" + _UNPLANNED_SLOT)],
+     "slot_replace is called by ['host_staging_slots::admit'"),
     ("growth-idle-allocates", "slot-growth-plan-only",
      [(GS, _IDLE, _IDLE + "        ggml_sycl::host_staging_block grown{};\n"
                           "        (void) ggml_sycl_attn_host_staging_block_alloc(nullptr, device, (int) kind, bytes, "
@@ -2356,27 +2502,27 @@ MUTANTS = [
     ("pools-own-scan-planned", "pools-from-plan",
      [(PLAN, "    d.dims = state.pools;\n", "    d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);\n")],
      "the pools' init is sized from"),
+    ("pools-unplanned-scan", "pools-from-plan",
+     [(PLAN, _UNPLANNED_POOLS, "        d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);\n"
+                               "        return d;\n")],
+     "the pools' init is sized from 'd.dims = host_pool_scan("),
     ("wiring-retry-unbegun", "context-wiring", [(LC, _RETRY_BEGIN, "")],
      "creates a scheduler and reserves before the begin entry"),
     ("wiring-begin-before-creation", "context-wiring",
-     [(LC, _SCHED_NEW_0 + _SCHED_SITES[0] + _BEGIN,
-       _BEGIN + _SCHED_NEW_0 + _SCHED_SITES[0])],
+     [(LC, _SCHED_NEW_0, _BEGIN + _SCHED_NEW_0), (LC, _BEGIN_0_NOTE + _BEGIN, _BEGIN_0_NOTE)],
      "sched_reserve_impl creates a scheduler and reserves before the begin entry"),
     ("wiring-plan-after-full-reserve", "context-wiring",
-     [(LC, "graph_mctx, true, sizes.data());", "graph_mctx, false, sizes.data());")],
+     [(LC, "n_outputs_pp, mctx.get(), true, sizes.data()))", "n_outputs_pp, mctx.get(), false, sizes.data()))")],
      "calls the plan entry not right after a split_only graph_reserve"),
     ("wiring-commit-unresolved", "context-wiring", [(LC, _hook("commit_host_holders"), "")],
      "does not resolve ggml_backend_sycl_commit_host_holders"),
     ("wiring-commit-before-alloc", "context-wiring",
-     [(LC, _SR_TAIL_OPEN + _SR_COMMIT, _SR_TAIL_OPEN),
-      (LC, _PP_MEASURE, _SR_COMMIT + _PP_MEASURE)],
+     [(LC, _MEASURE_CALL, _MEASURE_CALL + "    sycl_host_hooks.commit_host_holders(sycl_dev0);\n")],
      "llama_context::sched_reserve_impl calls the commit entry"),
     ("wiring-end-commit-unguarded", "context-wiring",
-     [(LC, _SR_COMMIT, "    for (auto & backend : backends) {\n"
-                       "        hooks.commit_host_holders(backend.get());\n"
-                       "    }\n")],
+     [(LC, _SR_COMMIT, _outdent(_SR_COMMIT.split("\n", 1)[1]) + "    if (!sycl_ubatch_trial_active) {\n")],
      "is not under an if that excepts the auto-n_ubatch trial"),
-    ("wiring-end-commit-flag-unset", "context-wiring", [(LC, _TRIAL_FLAG + _CANDIDATE, _CANDIDATE)],
+    ("wiring-end-commit-flag-unset", "context-wiring", [(LC, _FLAG, "")],
      "is not under an if that excepts the auto-n_ubatch trial"),
     ("wiring-end-commit-reset-flag", "context-wiring", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_RESET))],
      "is not under an if that excepts the auto-n_ubatch trial"),
@@ -2385,73 +2531,95 @@ MUTANTS = [
     ("wiring-end-commit-member", "context-wiring", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_MEMBER))],
      "is not under an if that excepts the auto-n_ubatch trial"),
     ("wiring-trial-commit-before-fallback", "context-wiring",
-     [(LC, _SPILL_OK + _TRIAL_COMMIT, _SPILL_OK),
-      (LC, _RESERVED_OK, _RESERVED_OK + _TRIAL_COMMIT)],
+     [(LC, _CAND_COMMIT + _RENOTIFY + _CAND_KEEP, _RENOTIFY + _CAND_KEEP),
+      (LC, _RESERVED_OK, _RESERVED_OK + _CAND_COMMIT)],
      "try_candidate does not call the commit entry after its host-fallback check"),
-    ("trial-open-missing", "trial-ops", [(LC, _TRIAL_OPEN, "")], "try_candidate does not OPEN before its reserve"),
+    ("wiring-nothrow-commit-missing", "context-wiring", [(LC, _NT_COMMIT, "")],
+     "sched_reserve_nothrow does not call the commit entry in its success arm"),
+    ("wiring-nothrow-commit-unguarded", "context-wiring",
+     [(LC, _NT_GUARD + _NT_COMMIT, _outdent(_NT_COMMIT) + _NT_GUARD)],
+     "sched_reserve_nothrow's success commit at line"),
+    ("trial-open-missing", "trial-ops", [(LC, _OPEN, "")], "try_candidate does not OPEN before its reserve"),
     ("trial-open-after-reserve", "trial-ops",
-     [(LC, _TRIAL_OPEN, ""), (LC, _RESERVED_OK, _RESERVED_OK + _TRIAL_OPEN)],
+     [(LC, _OPEN, ""), (LC, _RESERVED_OK, _RESERVED_OK + _OPEN)],
      "try_candidate does not OPEN before its reserve"),
-    ("trial-one-return", "trial-ops", [(LC, "                " + _TRIAL + "RETURN);\n", "")],
-     "try_candidate does not RETURN on both loss paths: none before its host-fallback return"),
-    ("trial-catch-unreturned", "trial-ops",
-     [(LC, "            " + _TRIAL + "RETURN);\n            return \"compute buffers did not fit\";\n",
-       "            return \"compute buffers did not fit\";\n")],
-     "try_candidate does not RETURN on both loss paths: none before its reserve-failure return"),
+    ("trial-one-return", "trial-ops", [(LC, _LOSS_HOST, _LOSS_HOST_AT)],
+     "try_candidate does not RETURN on every loss path: none before its host-fallback return"),
+    ("trial-catch-unreturned", "trial-ops", [(LC, _LOSS_FIT, _LOSS_FIT_AT)],
+     "try_candidate does not RETURN on every loss path: none before its reserve-failure return"),
+    ("trial-hold-spill-unreturned", "trial-ops", [(LC, _LOSS_SPILL, _LOSS_SPILL_AT)],
+     "try_candidate does not RETURN on every loss path: none before its hold-spill return"),
     ("trial-keep-before-fallback", "trial-ops",
-     [(LC, _TRIAL_COMMIT + "        " + _TRIAL + "KEEP);\n", _TRIAL_COMMIT),
-      (LC, _RESERVED_OK, _RESERVED_OK + "        " + _TRIAL + "KEEP);\n")],
+     [(LC, _RENOTIFY + _CAND_KEEP, _RENOTIFY), (LC, _RESERVED_OK, _RESERVED_OK + _CAND_KEEP)],
      "try_candidate does not KEEP beside the commit"),
     ("trial-sched-return-on-success", "trial-ops",
-     [(LC, _SR_FAIL + "        " + _TRIAL + "RETURN);\n", _SR_FAIL),
-      (LC, _SR_TAIL_OPEN + _SR_KEEP, _SR_TAIL_OPEN + _SR_KEEP + "    " + _TRIAL + "RETURN);\n")],
+     [(LC, _SR_CATCH, "        throw;\n"),
+      (LC, _SR_KEEP + _SR_END, _SR_KEEP + "    }\n" + _outdent(_SR_CATCH.split("\n")[0] + "\n") + _SR_CLOSE)],
      "sched_reserve does not RETURN on its transaction's throw path"),
     ("trial-sched-return-one-branch", "trial-ops",
-     [(LC, _SR_FAIL + "        " + _TRIAL + "RETURN);\n", _SR_FAIL),
-      (LC, _SR_FIT_REFUSAL, "        if (result.fit_refusal) {\n            " + _TRIAL + "RETURN);\n"
-                            "            throw llama_auto_ubatch_fit_refusal(result.reason);\n")],
+     [(LC, _SR_CATCH, "        throw;\n"),
+      (LC, _SR_FIT_REFUSAL, _SR_FIT_REFUSAL.replace("{\n", "{\n        " + _SR_CATCH.split("\n")[0] + "\n"))],
      "sched_reserve does not RETURN on its transaction's throw path before its 'throw std::runtime_error'"),
+    ("trial-sched-catch-unreturned", "trial-ops", [(LC, _SR_CATCH, "        throw;\n")],
+     "sched_reserve does not RETURN on its transaction's throw path before its 'throw llama_auto_ubatch_fit_refusal'"),
+    ("trial-sched-catch-swallows", "trial-ops",
+     [(LC, _SR_CATCH, "        " + _STEP + "RETURN, cparams.n_ubatch);\n")],
+     "sched_reserve does not RETURN on its transaction's throw path before its 'throw llama_auto_ubatch_fit_refusal'"),
     ("trial-sched-keep-before-transaction", "trial-ops",
-     [(LC, _SR_TAIL_OPEN + _SR_KEEP, _SR_TAIL_OPEN), (LC, _SR_FAIL, _SR_KEEP + _SR_FAIL)],
+     [(LC, _SR_KEEP + _SR_END, _SR_END),
+      (LC, _SR_TRY, "    if (!sycl_ubatch_trial_active) {\n" + _SR_KEEP + "    }\n" + _SR_TRY)],
      "sched_reserve does not KEEP on its success path"),
-    ("trial-sched-keep-unguarded", "trial-ops", [(LC, _SR_KEEP, "    " + _TRIAL + "KEEP);\n")],
+    ("trial-sched-keep-unguarded", "trial-ops",
+     [(LC, _SR_KEEP + _SR_END, "    }\n" + _outdent(_SR_KEEP) + _SR_CLOSE)],
      "is not under an if that excepts the auto-n_ubatch trial"),
-    ("trial-sched-keep-flag-unset", "trial-ops", [(LC, _TRIAL_FLAG + _CANDIDATE, _CANDIDATE)],
+    ("trial-sched-keep-flag-unset", "trial-ops", [(LC, _FLAG, "")],
      "is not under an if that excepts the auto-n_ubatch trial"),
-    ("trial-sched-keep-reset-flag", "trial-ops", [(LC, _SR_KEEP, _SR_KEEP.replace(_GUARD, _GUARD_RESET))],
+    ("trial-sched-keep-reset-flag", "trial-ops", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_RESET))],
      "is not under an if that excepts the auto-n_ubatch trial"),
-    ("trial-sched-keep-disjunction", "trial-ops", [(LC, _SR_KEEP, _SR_KEEP.replace(_GUARD, _GUARD_OR))],
+    ("trial-sched-keep-disjunction", "trial-ops", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_OR))],
      "is not under an if that excepts the auto-n_ubatch trial"),
-    ("trial-sched-keep-member", "trial-ops", [(LC, _SR_KEEP, _SR_KEEP.replace(_GUARD, _GUARD_MEMBER))],
+    ("trial-sched-keep-member", "trial-ops", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_MEMBER))],
      "is not under an if that excepts the auto-n_ubatch trial"),
+    ("trial-nothrow-keep-unguarded", "trial-ops",
+     [(LC, _NT_KEEP_END,
+       "            }\n" + _outdent(_NT_KEEP_END.split("\n")[0] + "\n") + "            return true;\n")],
+     "sched_reserve_nothrow's success KEEP at line"),
+    ("trial-nothrow-unreturned", "trial-ops", [(LC, _NT_RETURN, "    sched_need_reserve = true;\n")],
+     "sched_reserve_nothrow does not RETURN on every way out but OK"),
     ("trial-mark-after-measure", "trial-ops",
-     [(LC, "        " + _TRIAL + "MARK);\n", ""), (LC, _PP_SPLITS, _PP_SPLITS + "        " + _TRIAL + "MARK);\n")],
+     [(LC, _MARK, ""), (LC, _PP_SPLITS, _PP_SPLITS + _MARK)],
      "a RETURN_TO_MARK is not preceded by its MARK before the reserve"),
     ("trial-rtm-after-retry-scheduler", "trial-ops",
-     [(LC, "                " + _TRIAL + "RETURN_TO_MARK);\n", ""),
-      (LC, _RETRY_RESERVE, "                " + _TRIAL + "RETURN_TO_MARK);\n" + _RETRY_RESERVE)],
+     [(LC, _RTM, ""), (LC, _RETRY_RESERVE, _RTM + _RETRY_RESERVE)],
      "does not RETURN_TO_MARK between the failed reserve and the pipeline-parallel retry's scheduler"),
-    ("trial-mark-missing", "trial-ops", [(LC, "        " + _TRIAL + "MARK);\n", "")],
-     "a RETURN_TO_MARK is not preceded by its MARK"),
-    ("notify-output-after-alloc", "notify-position", [(LC, _OUT_NOTIFY + _OUT_ALLOC, _OUT_ALLOC + _OUT_NOTIFY)],
+    ("trial-mark-missing", "trial-ops", [(LC, _MARK, "")], "a RETURN_TO_MARK is not preceded by its MARK"),
+    ("notify-output-after-alloc", "notify-position", [(LC, _OUT_BLOCK + _OUT_ALLOC, _OUT_ALLOC + _OUT_BLOCK)],
      "calls the notify outside the span between the old buffer's free and ggml_backend_buft_alloc_buffer"),
     ("notify-sched-after-alloc", "notify-position",
-     [(LC, _MEASURED_OK + _SCHED_NOTIFY, _MEASURED_OK), (LC, _PP_SPLITS, _PP_SPLITS + _SCHED_NOTIFY)],
+     [(LC, _MEASURE_NOTIFY, "    };\n"), (LC, _PP_SPLITS, _PP_SPLITS + _MEASURE_NOTIFY[:-len("    };\n")])],
      "calls the notify on sched_reserve's path outside the span"),
     ("notify-backend-loop", "notify-position",
-     [(LC, _OUT_NOTIFY, "        for (auto & backend : backends) {\n"
-                        "            hooks.notify_host_buffer_sizes(backend.get(), 0, new_size);\n"
-                        "        }\n")],
+     [(LC, _OUT_CALL, "                bool grown = true;\n"
+                      "                for (auto & backend : backends) {\n"
+                      "                    grown = sycl_host_hooks.notify_host_buffer_sizes(backend.get(), 0,\n"
+                      "                                                                     new_size) && grown;\n"
+                      "                }\n")],
      "calls the notify in a loop, not once with one backend"),
     ("notify-other-backend", "notify-position",
-     [(LC, _SCHED_DEV0, "        ggml_backend_t sycl_dev0 = backends.back().get();\n")],
+     [(LC, _IMPL_DEV0,
+       "    ggml_backend_t sycl_dev0 = backends.back().get();\n    bool   sycl_host_measured = false;\n")],
      "does not pass model.devices[0]'s backend"),
+    ("notify-renotify-after-keep", "notify-position",
+     [(LC, _RENOTIFY + _SR_KEEP + _SR_END, _SR_KEEP + "    }\n" + _outdent(_RENOTIFY) + _SR_CLOSE)],
+     "calls the notify outside output_reserve, sched_reserve's path and a commit's re-notify"),
+    ("notify-renotify-dropped", "notify-position", [(LC, _RENOTIFY + _CAND_KEEP, _CAND_KEEP)],
+     "has no re-notify after it in its block"),
     ("dlopen-context-notify-struct", "dlopen-context",
-     [(LC, _NOTIFY_MEMBER,
+     [(LCH, _LCH_NOTIFY,
        "    bool (*notify_host_buffer_sizes)(ggml_backend_t, const llama_host_sizes *) = nullptr;\n")],
      "llama_context's notify pointer type takes"),
     ("dlopen-context-plan-llama", "dlopen-context",
-     [(LC, _PLAN_MEMBER, "    bool (*plan_host_holders)(ggml_backend_sched_t, llama_context *) = nullptr;\n")],
+     [(LCH, _LCH_PLAN, "    bool (*plan_host_holders)(ggml_backend_sched_t, llama_context *) = nullptr;\n")],
      "llama_context's plan entry pointer type is"),
     ("owner-end-after-delete", "owner-end-wired",
      [(GS, _OWNER_END + "    delete sycl_ctx;\n", "    delete sycl_ctx;\n" + _OWNER_END)],
@@ -2460,6 +2628,7 @@ MUTANTS = [
      [(UC, "            return host_scratch_trial_open(owner, n_ubatch);\n",
        "            return host_scratch_return_chunks(host_scratch_trial_chunks(owner), owner);\n")],
      "touches the marked set in its OPEN step"),
+    # Planted on the EXPECTED-RED clauses' fixtures.
     ("fold-device-term", "scratch-fold",
      [(UC, _FOLD_FOUR, _FOLD_FOUR.replace(" }", ", plan.pp_moe_onednn_scratch_bytes }"))],
      "reads ['pp_moe_onednn_scratch_bytes'] beyond the four host terms"),
@@ -2473,15 +2642,7 @@ MUTANTS = [
 # A target-gone control removes what an EXPECTED-RED clause inspects. The clause must then fail with a distinct
 # reason and never with its recorded one, so a tree that deletes the target does not score as still waiting for its
 # landing task. A clause whose red state is its target's absence itself goes in NO_GONE instead.
-_GONE_LC = ([(LC, None, None)], "src/llama-context.cpp is missing")
 GONE = {
-    "slot-growth-plan-only": ([(PLAN, None, None)], "slot_replace is called by []"),
-    "pools-from-plan": ([(PLAN, "host_pool_init_decision host_pools_init_from_plan(",
-                          "host_pool_init_decision host_pools_init_moved(")], "host_pools_init_from_plan is gone"),
-    "context-wiring": _GONE_LC,
-    "trial-ops": _GONE_LC,
-    "notify-position": _GONE_LC,
-    "dlopen-context": _GONE_LC,
     "scratch-fold": ([(UC, "    plan.host_zone_scratch_bytes = std::max<size_t>(k_min_zone_bytes, host_scratch_total);",
                        "    plan.host_zone_scratch_bytes = host_scratch_total;")],
                      "the host SCRATCH zone sum is not found"),

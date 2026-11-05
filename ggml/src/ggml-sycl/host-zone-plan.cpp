@@ -934,29 +934,26 @@ void * host_staging_slots::admit(int                            device,
         return nullptr;
     }
     host_staging_block & slot = slots_[device][kind];
+    (void) alloc;  // a slot grows only in apply, under the committed plan; only the positive controls allocate here
     if (!planned(device)) {
-#if defined(HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES)
-        // Positive control: an unplanned device refuses as a planned one does, so the pre-notify fallback is gone.
-        if (bytes > slot.cap) {
-            if (counters) {
-                counters->refusal(device);
-            }
+#if defined(HOST_ZONE_PLAN_MUTANT_UNPLANNED_GROWS)
+        // Positive control: the transitional fallback restored, which grows an unplanned device's slot at dispatch.
+        if (bytes > slot.cap && !slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {
             return nullptr;
         }
         return slot.ptr;
 #endif
-        // The pre-notify fallback: until llama_context commits a host holder plan, the slot grows at dispatch as it
-        // did before the plan existed.
-        if (!fallback_warned_[device].exchange(true)) {
-            GGML_LOG_WARN(
-                "[ATTN-HOST] staging dev=%d unplanned; slots grow at dispatch (the pre-notify fallback: no host holder "
-                "plan is committed for this device)\n",
-                device);
+        // No host holder plan is committed for this device, so nothing sized its slots: each has capacity 0 and
+        // refuses by name and counts, as a planned slot's over-plan request does (§4.4 "At dispatch no slot grows"),
+        // whatever a dropped plan left in it until the device is re-applied.
+        GGML_LOG_WARN(
+            "[ATTN-HOST] staging request %zu B for kind %s exceeds the planned %zu B on device %d; declining host "
+            "dispatch\n",
+            bytes, host_staging_kind_name(kind), (size_t) 0, device);
+        if (counters) {
+            counters->refusal(device);
         }
-        if (bytes > slot.cap && !slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {
-            return nullptr;  // the caller declines; the old slot, if any, stays usable
-        }
-        return slot.ptr;
+        return nullptr;
     }
     if (bytes <= slot.cap) {
         return slot.ptr;
@@ -1084,14 +1081,18 @@ host_pool_init_decision host_pools_init_from_plan(int                           
                                                   host_pool_init_warnings &        warnings) {
     host_pool_init_decision d;
     if (!state.planned) {
-        if (!warnings.unplanned.exchange(true)) {
-            GGML_LOG_WARN(
-                "[HOST-ARENA] DEVICE pools dev=%d unplanned; initialized from this graph's own scan (the pre-notify "
-                "fallback: no host holder plan is committed for this device)\n",
-                device);
-        }
+#if defined(HOST_ZONE_PLAN_MUTANT_UNPLANNED_POOLS_SCAN)
+        // Positive control: the transitional fallback restored, which sizes an unplanned device's pools from this
+        // graph's own storage scan.
         d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);
         d.init = d.dims.D > 0 && d.dims.K > 0 && d.dims.N > 0;
+        return d;
+#endif
+        // No host holder plan is committed for this device, so nothing sized the pools: they are not initialized
+        // (§4.4 "And the pools are sized from the plan"). The line prints once per device.
+        if (!warnings.unplanned.exchange(true)) {
+            GGML_LOG_WARN("[HOST-ARENA] DEVICE pools dev=%d unplanned; not initialized\n", device);
+        }
         return d;
     }
 #if defined(HOST_ZONE_PLAN_MUTANT_POOLS_OWN_SCAN)

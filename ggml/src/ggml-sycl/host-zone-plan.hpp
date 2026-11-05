@@ -380,15 +380,15 @@ class host_staging_slots {
     bool   apply(int device, const host_holder_device_state & state, const host_staging_allocator & alloc);
     // Dispatch admission. At or below the slot's capacity: the slot. Above it, or a slot never planned on a planned
     // device: nullptr, with `[ATTN-HOST] staging request %zu B for kind %s exceeds the planned %zu B on device %d;
-    // declining host dispatch` at WARN, counted as a refusal. On a device no plan has been committed for, the slot
-    // grows at dispatch as before the notify path existed, with a once-per-device WARN naming that fallback.
+    // declining host dispatch` at WARN, counted as a refusal. A device no plan has been committed for has capacity 0
+    // in every slot, so each of its requests is refused the same way, naming `the planned 0 B`.
     void * admit(int                            device,
                  int                            kind,
                  size_t                         bytes,
                  const host_staging_allocator & alloc,
                  attn_host_dispatch_counters *  counters);
-    // Releases the slots of every device with no committed plan: the pre-notify fallback's slots, which grow again at
-    // their next dispatch. A planned device's slots stay at its plan; they go when its last plan is dropped and the
+    // Releases the slots of every device with no committed plan, which no dispatch can use: an unplanned device
+    // refuses every request. A planned device's slots stay at its plan; they go when its last plan is dropped and the
     // device is re-applied (a backend's free of a load's temporary backend, or of a context with no plan, frees here).
     void   release_unplanned(const host_staging_allocator & alloc);
     // Releases every slot (module teardown).
@@ -403,7 +403,6 @@ class host_staging_slots {
   private:
     const host_holder_plans & plans_;
     host_staging_block        slots_[host_zone_max_devices][HOST_STAGING_KIND_COUNT]{};
-    std::atomic<bool>         fallback_warned_[host_zone_max_devices]{};
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -439,9 +438,8 @@ struct host_pool_init_decision {
 // graph only checks them, over the nodes the plan folds: a MUL_MAT_ID whose src0 `host_experts` says has an expert on
 // the host for `device` (an unknown placement is not counted, as the walk does not fold it). A graph needing more
 // prints `[HOST-ARENA] DEVICE holder pinned_buffer_pool dev=%d graph needs D=%d K=%lld N=%lld, exceeds its planned
-// D=%d K=%lld N=%lld` once at WARN. With no committed plan, the pre-notify fallback: the pools take the graph's storage
-// scan (host_pool_has_storage), with a once-per-device WARN `[HOST-ARENA] DEVICE pools dev=%d unplanned; ...` naming
-// that fallback.
+// D=%d K=%lld N=%lld` once at WARN. With no committed plan the pools are not initialized, and
+// `[HOST-ARENA] DEVICE pools dev=%d unplanned; not initialized` prints once per device.
 host_pool_init_decision host_pools_init_from_plan(int                              device,
                                                   const host_holder_device_state & state,
                                                   const ggml_cgraph *              graph,
