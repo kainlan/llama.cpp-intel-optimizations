@@ -19,6 +19,7 @@
 #include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
 #include "lazy-io-pool.hpp"
+#include "lazy-table.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
@@ -33579,7 +33580,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         t.table_bytes       = info.table_bytes;
         t.consumer_device   = lazy_consumer_device(plan, info.consumer_layer);
         t.cache_floor_slots = 2ull * placement_load_n_ubatch(kv_info.n_ubatch) * info.rows_per_token;
-        const size_t body   = host_cpu_mapped_size(info.table_bytes);
+        // The HOST term is the body the materialization allocates, the O_DIRECT window over the table (§3.3).
+        const size_t body =
+            host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
         const size_t with   = host_ledger_sat_add(used, body);
         const size_t span   = lazy_block_ring_span(info.row_size);
         if (body != 0 && with <= fit_room && with <= p3_room) {

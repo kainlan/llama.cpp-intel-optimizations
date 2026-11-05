@@ -1687,7 +1687,7 @@ lazy_table
 
 | allocation | scope | tier / role | size | CPU-executed consumer (§5.3's CPU form) |
 |---|---|---|---|---|
-| HOST body | model | `HOST_CPU` / `WEIGHT` | `host_cpu_mapped_size(table_bytes)` (Qwen 50.66 GiB) | the same |
+| HOST body | model | `HOST_CPU` / `WEIGHT` | `host_cpu_mapped_size(lazy_table_host_body_request_bytes(file_offset, table_bytes))`, the `O_DIRECT` window over the table (below) (Qwen 50.66 GiB) | the same |
 | row cache slab | model | `HOST_CPU` / new `alloc_role::LAZY_ROW_CACHE` | `slots x row_size`, in chunks of 256 MiB so that it can yield (§6.4) | the same (STORAGE) |
 | row cache index | model | `HOST_CPU` / `LAZY_ROW_CACHE` | `slots x 13.3 B` (§6.3): 7.8% of the slab on 170 B rows, 12.1% on 110 B, 15.9% on 84 B | the same (STORAGE) |
 | landing slab | context (class C), per table | `HOST_CPU` / new `alloc_role::LAZY_STAGING` | `depth x n_ubatch x rows_per_token x row_size`: Qwen 2 x 512 x 16 x 170 B = 2.66 MiB; DeepSeek Q2_K 2 x 512 x 24 x 84 B = **1.97 MiB per table** | STORAGE: **one** slot, `n_ubatch x rows_per_token x row_size` (Qwen 1.33 MiB; DeepSeek 0.98 MiB per table); HOST: none |
@@ -1702,6 +1702,24 @@ shows the mapped figure), is the requested size of one allocation. The plan
 counts, and the ledger charges, `host_cpu_mapped_size` of it, allocation by
 allocation, so the landing slab, the ids captures, the ring and the row-cache
 chunks round the same way as the HOST body (r53 M-2).
+
+**The HOST body is the `O_DIRECT` window over the table**, not the table alone.
+D1's eager read needs its file offset, its length and its destination aligned to
+`LAZY_IO_BLOCK_BYTES`, and a real table's offset is not (Qwen's PLE table sits at
+offset 192, DeepSeek's `blk.14.engram_embd` at 4032). So the body requests the
+window from the start of the block that holds the table's first byte to the end of
+the block that holds its last, and the table starts at
+`body + file_offset % LAZY_IO_BLOCK_BYTES`. A table that ends its file has a window
+that runs past the end (Qwen's by 832 B); the read ends once it holds the table's last
+byte, so the short read at the end of the file is not a failure. One function in
+`lazy-table.hpp`, `lazy_table_host_body_request_bytes(file_offset, table_bytes)`
+(`round_up(file_offset % LAZY_IO_BLOCK_BYTES + table_bytes,
+LAZY_IO_BLOCK_BYTES)`), is the request the materialization makes and, through
+`host_cpu_mapped_size`, the HOST term the planner charges: one rule for plan and
+reality, which the activation check (§10) compares. The window can map one huge
+page more than the table alone, when the head pushes the table's end past a 2 MiB
+boundary. Refusing a correct table for its geometry, and a bounce buffer (P4),
+were both rejected.
 
 - **Class C, charged at the context transaction** (*lead rulings §T9, §T10* I-1,
   r5 m-13). Every row whose scope is "context" scales with that context's own

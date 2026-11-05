@@ -27,6 +27,7 @@
 
 #include "../host-cpu-mapping.hpp"
 #include "../lazy-io-pool.hpp"
+#include "../lazy-table.hpp"
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
@@ -98,6 +99,12 @@ size_t mapped(size_t bytes) {
     return host_cpu_mapped_size(bytes);
 }
 
+// A HOST table's resident bytes: the mapping of its body, the O_DIRECT window over the table (§3.3). The fixtures'
+// tables sit at offset 0, where the window is the table rounded to a block, so this equals mapped(table_bytes).
+size_t host_body(const placement_lazy_table_info & t) {
+    return mapped(lazy_table_host_body_request_bytes(t.file_offset, t.table_bytes));
+}
+
 // The cache floor's slots (§4.3 step 4: one double-buffered ubatch working set) and a lower bound on its bytes: the
 // slab's raw bytes, before any chunk rounding or index.
 size_t floor_slots(const placement_lazy_table_info & t, const placement_kv_info & kv) {
@@ -163,7 +170,7 @@ const char * residency_name(lazy_residency r) {
     return r == lazy_residency::HOST ? "HOST" : "STORAGE";
 }
 
-// A STORAGE table's checks: its cache holds at least the floor, and less than the whole table's mapping.
+// A STORAGE table's checks: its cache holds at least the floor, and less than the table's HOST body.
 void expect_storage(arm_result &                      r,
                     const placement_plan &            plan,
                     const placement_lazy_table_info & info,
@@ -179,9 +186,9 @@ void expect_storage(arm_result &                      r,
     expect(r, t->host_resident_bytes >= floor_raw_bytes(info, kv),
            at + info.name + " holds " + num(t->host_resident_bytes) + " resident bytes, below its floor's " +
                num(floor_raw_bytes(info, kv)) + " slab bytes");
-    expect(r, t->host_resident_bytes < mapped(info.table_bytes),
-           at + info.name + " holds " + num(t->host_resident_bytes) + " bytes, not less than the table's mapping " +
-               num(mapped(info.table_bytes)));
+    expect(r, t->host_resident_bytes < host_body(info),
+           at + info.name + " holds " + num(t->host_resident_bytes) + " bytes, not less than the table's HOST body " +
+               num(host_body(info)));
     expect(r, t->cache_floor_slots == floor_slots(info, kv),
            at + info.name + " floor is " + num(t->cache_floor_slots) + " slots, want " + num(floor_slots(info, kv)));
     expect(r, t->cache_slots >= t->cache_floor_slots,
@@ -199,9 +206,9 @@ void expect_host(arm_result &                      r,
     }
     expect(r, t->residency == lazy_residency::HOST,
            at + info.name + " is " + residency_name(t->residency) + ", want HOST");
-    expect(r, t->host_resident_bytes == mapped(info.table_bytes),
-           at + info.name + " holds " + num(t->host_resident_bytes) + " resident bytes, want its mapping " +
-               num(mapped(info.table_bytes)));
+    expect(r, t->host_resident_bytes == host_body(info),
+           at + info.name + " holds " + num(t->host_resident_bytes) + " resident bytes, want its HOST body " +
+               num(host_body(info)));
     expect(r, t->cache_slots == 0, at + info.name + " is HOST with a cache of " + num(t->cache_slots) + " slots");
 }
 
@@ -254,7 +261,7 @@ arm_result arm_a_tables_stay_out_of_the_zone_maxima() {
     if (!step2_of(r, ds_shape, pin.pin(), step2)) {
         return r;
     }
-    const size_t            reading = step2 + mapped(tables[0].table_bytes) + k_p3_margin - 1 * GiB;
+    const size_t            reading = step2 + host_body(tables[0]) + k_p3_margin - 1 * GiB;
     const placement_kv_info kv      = kv_with(tables, reading);
     const placement_plan    without = plan_for(ds_shape, kv_with({}, reading), pin.pin());
     const placement_plan    with    = plan_for(ds_shape, kv, pin.pin());
@@ -303,8 +310,8 @@ arm_result deepseek_both_storage(bool delegate) {
     if (!step2_of(r, ds_shape, pin.pin(), step2, delegate)) {
         return r;
     }
-    const size_t threshold_one  = step2 + mapped(tables[0].table_bytes) + k_p3_margin;
-    const size_t threshold_both = step2 + mapped(tables[0].table_bytes) + mapped(tables[1].table_bytes) + k_p3_margin;
+    const size_t threshold_one  = step2 + host_body(tables[0]) + k_p3_margin;
+    const size_t threshold_both = step2 + host_body(tables[0]) + host_body(tables[1]) + k_p3_margin;
     const size_t reading        = threshold_one - 1 * GiB;
     std::printf("  deepseek both-STORAGE: step2=%zu threshold_one=%zu threshold_both=%zu reading=%zu\n", step2,
                 threshold_one, threshold_both, reading);
@@ -374,8 +381,8 @@ arm_result arm_c_deepseek_one_host() {
     if (!step2_of(r, ds_shape, pin.pin(), step2)) {
         return r;
     }
-    const size_t threshold_one  = step2 + mapped(tables[0].table_bytes) + k_p3_margin;
-    const size_t threshold_both = step2 + mapped(tables[0].table_bytes) + mapped(tables[1].table_bytes) + k_p3_margin;
+    const size_t threshold_one  = step2 + host_body(tables[0]) + k_p3_margin;
+    const size_t threshold_both = step2 + host_body(tables[0]) + host_body(tables[1]) + k_p3_margin;
     const size_t reading        = threshold_one + 1 * GiB;
     std::printf("  deepseek one-HOST: step2=%zu threshold_one=%zu threshold_both=%zu reading=%zu\n", step2,
                 threshold_one, threshold_both, reading);
@@ -407,7 +414,7 @@ arm_result arm_d_qwen_flip() {
     if (!step2_of(r, qwen38_shape, pin.pin(), step2)) {
         return r;
     }
-    const size_t threshold = step2 + mapped(tables[0].table_bytes) + k_p3_margin;
+    const size_t threshold = step2 + host_body(tables[0]) + k_p3_margin;
     std::printf("  qwen flip: step2=%zu threshold=%zu\n", step2, threshold);
 
     const placement_kv_info below_kv = kv_with(tables, threshold - 1 * GiB);
@@ -439,7 +446,7 @@ arm_result arm_e_null_pin_refuses() {
     if (!step2_of(r, ds_shape, nullptr, step2)) {
         return r;
     }
-    const size_t         reading = step2 + mapped(tables[0].table_bytes) + k_p3_margin - 1 * GiB;
+    const size_t         reading = step2 + host_body(tables[0]) + k_p3_margin - 1 * GiB;
     const placement_plan plan    = plan_for(ds_shape, kv_with(tables, reading), nullptr);
     expect(r, plan.lazy_refusal == "lazy-table-ring-unpinned",
            "the plan's refusal is '" + plan.lazy_refusal + "', want lazy-table-ring-unpinned");
@@ -504,7 +511,7 @@ arm_result arm_g_the_fit_decides() {
         return r;
     }
     const size_t            reading  = step2 + 512 * GiB;
-    const size_t            budget   = step2 + mapped(tables[0].table_bytes);
+    const size_t            budget   = step2 + host_body(tables[0]);
     const placement_kv_info kv       = kv_with(tables, reading);
     // host_reserve = max(2 GiB, 1% of the budget), as the decision sets it aside (§4.3 step 3).
     const size_t            fit_room = budget - step2 - std::max<size_t>(2 * GiB, budget / 100);
@@ -601,7 +608,7 @@ arm_result arm_i_an_unnamed_micro_batch_floors_at_the_default() {
     if (!step2_of(r, ds_shape, pin.pin(), step2)) {
         return r;
     }
-    const size_t      reading       = step2 + mapped(tables[0].table_bytes) + k_p3_margin - 1 * GiB;
+    const size_t      reading       = step2 + host_body(tables[0]) + k_p3_margin - 1 * GiB;
     placement_kv_info named         = kv_with(tables, reading);
     named.n_ubatch                  = PLACEMENT_LOAD_N_UBATCH_DEFAULT;
     placement_kv_info unnamed       = kv_with(tables, reading);
