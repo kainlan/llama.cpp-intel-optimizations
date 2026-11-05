@@ -569,7 +569,10 @@ arm_result arm_source_short_refuses() {
     return r;
 }
 
-// (7) A descriptor that is not a table refuses before anything is opened or allocated. Engagement: none needed.
+// (7) A descriptor that is not a table refuses before anything is opened or allocated: a wrong row size, table bytes
+// that are not row_size * n_rows, the other residency, a HOST window no size_t holds, and a consumer that is neither -1
+// nor a SYCL device. Engagement: none needed; the last two name a file that does not exist, so a refusal after the
+// open would read lazy-table-open-failed.
 arm_result arm_invalid_desc_refuses() {
     arm_result      r;
     lazy_table_desc d = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0);
@@ -583,6 +586,31 @@ arm_result arm_invalid_desc_refuses() {
     d = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0);
     expect(r, lazy_table_create_host(d).status == lazy_table_status::INVALID_DESC,
            "the HOST constructor built a table the plan made STORAGE");
+
+    // Arm (1)'s saturated window: 2^62 - 1009 F32 rows of 4 B at offset 4032 end 4 B short of 2^64, so offset + size
+    // fits, but the window rounds past 2^64.
+    d             = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0);
+    d.file_path   = "/nonexistent/path/that/is/never/opened";
+    d.type        = GGML_TYPE_F32;
+    d.ne0         = 1;
+    d.n_rows      = (int64_t{ 1 } << 62) - 1009;
+    d.row_size    = ggml_row_size(GGML_TYPE_F32, 1);
+    d.table_bytes = d.row_size * static_cast<size_t>(d.n_rows);
+    expect(r,
+           d.file_offset <= UINT64_MAX - d.table_bytes &&
+               lazy_table_host_body_request_bytes(d.file_offset, d.table_bytes) == SIZE_MAX,
+           "the saturated case is not a window past size_t over an offset + size that fits");
+    const lazy_table_result window = lazy_table_create_host(d);
+    expect(r, window.status == lazy_table_status::INVALID_DESC,
+           std::string("a window no size_t holds gave ") + ggml_sycl::lazy_table_status_name(window.status) +
+               ", want lazy-table-invalid-desc");
+
+    d                             = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, -7);
+    d.file_path                   = "/nonexistent/path/that/is/never/opened";
+    const lazy_table_result other = lazy_table_create_host(d);
+    expect(r, other.status == lazy_table_status::INVALID_DESC,
+           std::string("consumer_device=-7 gave ") + ggml_sycl::lazy_table_status_name(other.status) +
+               ", want lazy-table-invalid-desc");
     return r;
 }
 

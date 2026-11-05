@@ -82,8 +82,15 @@ std::string desc_invalid(const lazy_table_desc & desc, lazy_residency residency)
         return "offset=" + std::to_string(desc.file_offset) + " + size=" + std::to_string(desc.table_bytes) +
                " overflows";
     }
-    if (desc.consumer_device >= GGML_SYCL_MAX_DEVICES) {
-        return "consumer_device=" + std::to_string(desc.consumer_device) + " is no SYCL device";
+    // A HOST body is the O_DIRECT window over the table (§3.3), so a window no size_t holds is a geometry fact, refused
+    // here and never handed to the allocator.
+    if (residency == lazy_residency::HOST &&
+        lazy_table_host_body_request_bytes(desc.file_offset, desc.table_bytes) == SIZE_MAX) {
+        return "the O_DIRECT window over offset=" + std::to_string(desc.file_offset) +
+               " size=" + std::to_string(desc.table_bytes) + " does not fit a size_t";
+    }
+    if (desc.consumer_device < -1 || desc.consumer_device >= GGML_SYCL_MAX_DEVICES) {
+        return "consumer_device=" + std::to_string(desc.consumer_device) + " is neither -1, the CPU, nor a SYCL device";
     }
     return {};
 }
@@ -219,6 +226,9 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
     if (!invalid.empty()) {
         return refuse(desc, lazy_table_status::INVALID_DESC, invalid);
     }
+    // A HOST body's request, a window desc_invalid has found fits a size_t; a STORAGE table allocates no body.
+    const size_t request =
+        residency == lazy_residency::HOST ? lazy_table_host_body_request_bytes(desc.file_offset, desc.table_bytes) : 0;
 
     int       open_err = 0;
     const int fd       = open_direct(desc.file_path, &open_err);
@@ -245,13 +255,12 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
 
     if (residency == lazy_residency::HOST) {
         const size_t      head       = static_cast<size_t>(desc.file_offset % LAZY_IO_BLOCK_BYTES);
-        const size_t      request    = lazy_table_host_body_request_bytes(desc.file_offset, desc.table_bytes);
-        allocation_result body_alloc = request == SIZE_MAX ? allocation_result{} : allocate_host_record(desc, request);
+        allocation_result body_alloc = allocate_host_record(desc, request);
         if (!body_alloc) {
-            const size_t mapped = request == SIZE_MAX ? 0 : host_cpu_mapped_size(request);
             return refuse(desc, lazy_table_status::BODY_REFUSED,
-                          "request=" + std::to_string(request) + " B (mapped " + std::to_string(mapped) +
-                              " B) HOST_CPU on device " + std::to_string(record_device(desc)) +
+                          "request=" + std::to_string(request) + " B (mapped " +
+                              std::to_string(host_cpu_mapped_size(request)) + " B) HOST_CPU on device " +
+                              std::to_string(record_device(desc)) +
                               ": allocation_error=" + std::to_string((int) body_alloc.error));
         }
         table->records_.push_back(mem_handle::from_owned_alloc(std::move(body_alloc.owner), GGML_LAYOUT_AOS));
@@ -333,9 +342,8 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
     GGML_LOG_INFO(
         "[LAZY-TABLE] %s residency=%s table=%zu B body=%zu B charged=%zu B planned=%zu B locked=%s consumer_layer=%d "
         "device=%s file=%u off=%llu\n",
-        desc.name.c_str(), residency_name(residency), desc.table_bytes,
-        residency == lazy_residency::HOST ? lazy_table_host_body_request_bytes(desc.file_offset, desc.table_bytes) : 0,
-        charged, desc.host_resident_bytes, residency == lazy_residency::HOST ? "yes" : "none", desc.consumer_layer,
+        desc.name.c_str(), residency_name(residency), desc.table_bytes, request, charged, desc.host_resident_bytes,
+        residency == lazy_residency::HOST ? "yes" : "none", desc.consumer_layer,
         device_text(desc.consumer_device).c_str(), desc.file_index, (unsigned long long) desc.file_offset);
 
     lazy_table_result result;
