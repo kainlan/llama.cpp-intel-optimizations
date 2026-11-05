@@ -11,6 +11,13 @@ sizing, the chunk-release reachability and withdrawal of §M75, the notify's dev
 operations, the owner's end, and the host SCRATCH fold and runtime term. The segmented forward, the host bufts' one
 intent builder and the KV clauses have their own gates (test-sycl-seg-forward-return-source,
 test-sycl-host-zone-config-source-contract, test-sycl-host-zone-boundary-owner-source and the test-sycl-kv-* gates).
+Three clauses of the bullet are pinned by behaviour, not by this source read:
+  - the notify's zone is the host buft's device, and it tests ggml_backend_is_sycl before it reads
+    backend->context: test-sycl-host-scratch-demand (test_device_is_the_host_bufts with its device-0 and
+    ctx->device mutants, and test_non_sycl_refused);
+  - the SCRATCH graph-boundary check counts only GRAPH records: test-sycl-host-zone-select;
+  - ggml_backend_sycl_free runs the BACKEND check after `delete sycl_ctx;` (§M57 (b)): the O4 row of
+    test-sycl-host-zone-boundary-owner-source, with its check-before-delete mutant.
 
 Each clause is REQUIRED (green on this tree) or EXPECTED-RED with the task that turns it green. An expected-red
 clause is scored: it must fail on this tree with its recorded reason (an ExpectedRed warning, never a skip), it
