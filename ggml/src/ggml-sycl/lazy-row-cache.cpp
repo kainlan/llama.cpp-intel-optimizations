@@ -281,11 +281,13 @@ void lazy_row_cache::place_locked(shard & sh, size_t slot, int64_t row, const vo
 lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config,
                                            lazy_row_cache_memory_source & source) {
     lazy_row_cache_build result;
+    // The refusal is the caller's to name, in its one WARN line (a [HOST-PLAN-BUG] for a shortfall); result.reason
+    // carries every figure there, so the cache's own line is INFO.
     const auto           refuse = [&](lazy_row_cache_status status, const std::string & reason) {
         result.status = status;
         result.reason = reason;
-        GGML_LOG_WARN("[LAZY-ROW-CACHE] %s refused: %s: %s\n", config.name.c_str(), lazy_row_cache_status_name(status),
-                                reason.c_str());
+        GGML_LOG_INFO("[LAZY-ROW-CACHE] %s refused: %s: %s\n", config.name.c_str(), lazy_row_cache_status_name(status),
+                      reason.c_str());
         return std::move(result);
     };
 
