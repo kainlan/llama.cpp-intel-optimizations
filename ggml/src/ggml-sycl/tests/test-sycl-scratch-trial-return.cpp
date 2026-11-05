@@ -28,8 +28,8 @@
 //   live-refusal        the owner's begin over a live allocation refuses the chunk by name and keeps it.
 //   window              the cache-path window: a publish after RETURN grows a new chunk, and the returned chunk is
 //                       still released by the winner's begin.
-//   empty-return        a reserve's own transaction RETURNs an empty chunk: released at once, the footprint leaving with
-//                       the memory.
+//   empty-return        a reserve's own transaction RETURNs an empty chunk: released at once, the footprint leaving
+//                       with the memory.
 //   throw-kept          the same throw with a stand-in live: another context's begin leaves the chunk silently.
 //   retry-return, retry-keep, trial-retry-return, trial-retry-keep
 //                       RETURN_TO_MARK's truncation, both endings, outside and inside a trial.
