@@ -292,7 +292,31 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
         table->records_.push_back(mem_handle::from_owned_alloc(std::move(extra.owner), GGML_LAYOUT_AOS));
     }
 
+    // The activation check (th32 §10): the ledger's charge for the table's own records, the block ring excluded (it is
+    // the pool's), against the plan's host_resident_bytes. Plan != reality is a defect, never tolerated. A STORAGE
+    // table's plan figure is its row cache, whose chunks would be its records; until the cache is built that figure is
+    // refused by name, which is a missing part and not a plan bug.
+    if (residency == lazy_residency::STORAGE && desc.host_resident_bytes != 0) {
+        return refuse(desc, lazy_table_status::ROW_CACHE_UNBUILT,
+                      "planned host_resident_bytes=" + std::to_string(desc.host_resident_bytes) +
+                          " B is the row cache (§6.3), which this build does not construct; records charge " +
+                          std::to_string(table->charged_bytes()) + " B");
+    }
     const size_t charged = table->charged_bytes();
+    if (charged != desc.host_resident_bytes) {
+        const std::string reason = "charged_bytes=" + std::to_string(charged) + " B over " +
+                                   std::to_string(table->records_.size()) +
+                                   " record(s), the block ring excluded, planned host_resident_bytes=" +
+                                   std::to_string(desc.host_resident_bytes) + " B";
+        GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s activation check: %s\n", desc.name.c_str(), reason.c_str());
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("lazy table %s failed its activation check under GGML_SYCL_STRICT_LEASES=1", desc.name.c_str());
+        }
+        lazy_table_result result;
+        result.status = lazy_table_status::ACTIVATION_MISMATCH;
+        result.reason = reason;
+        return result;
+    }
 
     GGML_LOG_INFO(
         "[LAZY-TABLE] %s residency=%s table=%zu B body=%zu B charged=%zu B planned=%zu B locked=%s consumer_layer=%d "
