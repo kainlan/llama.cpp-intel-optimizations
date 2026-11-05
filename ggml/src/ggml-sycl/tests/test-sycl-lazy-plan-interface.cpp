@@ -254,6 +254,47 @@ arm_result arm_b_the_slot_reaches_the_planner() {
     return arr;
 }
 
+// (c) A refused plan refuses the load at the stage (th32 §4.3 step 4): with no pin on the slot, a ~1 TiB table can be
+// neither HOST (it exceeds the budget at any reading) nor STORAGE, so the plan refuses as lazy-table-ring-unpinned, and
+// the early stage returns PLAN_REJECTED with exactly one "[HOST-PLAN] load refused:" WARN naming the reason, and its
+// rollback leaves no candidate for the transaction.
+// Engagement: the planner's [HOST-PLAN] lazy line carries refusal=lazy-table-ring-unpinned, so the stage was shown a
+// refused plan.
+// Mutants: the stage's refusal check dropped (the early stage returns OK and the load goes on with a plan that holds no
+// table); the WARN printed once per device or at both checks (the count is not 1).
+arm_result arm_c_the_stage_refuses_a_refused_plan() {
+    arm_result                arr;
+    loader_inventory          inv;
+    ggml_sycl_lazy_table_info table = lazy_table("blk.14.engram_embd.weight", static_cast<int64_t>((1024 * GiB) / 34));
+    inv.inv.lazy_tables             = &table;
+    inv.inv.lazy_table_count        = 1;
+
+    const ggml_sycl_placement_envelope envelope{ inv.inv.n_ctx, inv.inv.n_ubatch, 1, -1 };
+
+    ggml_sycl_load_txn txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(arr, "the load transaction did not begin");
+        return arr;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result rc   = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
+    const lazy_reading               left = read_candidate(txn);
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+
+    if (lines_with("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").empty()) {
+        void_arm(arr, "no plan line carries refusal=lazy-table-ring-unpinned, so the stage saw no refused plan");
+        return arr;
+    }
+    expect(arr, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+           "the early stage returned " + num(rc) + ", want PLAN_REJECTED (" + num(GGML_SYCL_LIFECYCLE_PLAN_REJECTED) +
+               ")");
+    const size_t warned = lines_with("[HOST-PLAN] load refused: lazy-table-ring-unpinned ").size();
+    expect(arr, warned == 1,
+           "the stage logged " + num(warned) + " load-refused lines naming lazy-table-ring-unpinned, want 1");
+    expect(arr, !left.ok, "a candidate is still staged for the refused load");
+    return arr;
+}
+
 const char * outcome_name(outcome o) {
     return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
 }
@@ -303,8 +344,9 @@ int main(int argc, char ** argv) {
     };
 
     const named_arm arms[] = {
-        { "(a) a table through the stage, the publish and the unload", arm_a_through_the_stage            },
-        { "(b) the thread's plan slot reaches the planner",            arm_b_the_slot_reaches_the_planner },
+        { "(a) a table through the stage, the publish and the unload", arm_a_through_the_stage                },
+        { "(b) the thread's plan slot reaches the planner",            arm_b_the_slot_reaches_the_planner     },
+        { "(c) a refused plan refuses the load at the stage",          arm_c_the_stage_refuses_a_refused_plan },
     };
     int passed = 0, failed = 0, voided = 0;
     for (const named_arm & arm : arms) {

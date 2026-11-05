@@ -7985,8 +7985,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         TIMEOUT 300)
 
     # The lazy tables' backend interface (th32 §11 T3): a table enters through the inventory, rides the early and the
-    # late stage into the published plan and leaves with the model, all read through the model token; and a direct
-    # entry with a pin on the thread's plan slot plans a table STORAGE that only a pinned plan can hold. --devices 1
+    # late stage into the published plan and leaves with the model, all read through the model token; a direct entry
+    # with a pin on the thread's plan slot plans a table STORAGE that only a pinned plan can hold; and a plan that
+    # refuses its table refuses the load at the stage, with one WARN. --devices 1
     # runs on the B70 alone, where the planner caller takes its single-device path; --devices 2 runs on both cards,
     # where it takes the multi-device path, and exits 77 below two GPUs. The stage builds every device's cache, so both
     # carry the OOM-family labels and run alone. Lead-run.
