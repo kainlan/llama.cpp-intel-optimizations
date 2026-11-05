@@ -33792,8 +33792,11 @@ static size_t lazy_table_yieldable_bytes(const placement_lazy_table & table, siz
 
 std::string placement_lazy_table_fields(const placement_lazy_table & table, const placement_lazy_table_info * info) {
     const std::string device = table.consumer_device >= 0 ? std::to_string(table.consumer_device) : "CPU";
+    // locked= is the resident records' tier property (th32 §3.1, §10): both residencies hold locked HOST_CPU memory,
+    // so it is yes whenever the table holds resident bytes and none only at 0.
+    const char *      locked = table.host_resident_bytes != 0 ? "yes" : "none";
     std::string       fields = "table=" + std::to_string(table.table_bytes) +
-                         " resident=" + std::to_string(table.host_resident_bytes) +
+                         " resident=" + std::to_string(table.host_resident_bytes) + " locked=" + locked +
                          " cache_slots=" + std::to_string(table.cache_slots) +
                          " floor_slots=" + std::to_string(table.cache_floor_slots) + " consumer_device=" + device;
     if (info != nullptr) {
@@ -33977,9 +33980,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
 
     // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan. They print
-    // every field the plan holds today, a table's through placement_lazy_table_fields and the refusal through
-    // placement_lazy_refusal_text, the formatters the dry run prints with; locked, output_slot, landing and cold_set
-    // wait for the rows that add them.
+    // every field the plan holds today, a table's through placement_lazy_table_fields (locked= among them) and the
+    // refusal through placement_lazy_refusal_text, the formatters the dry run prints with; output_slot, landing and
+    // cold_set wait for the rows that add them.
     const size_t planned       = plan.host_planned_bytes;
     const size_t leftover      = host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
     size_t       lazy_resident = 0;
