@@ -2009,7 +2009,8 @@ static address_range_index g_runtime_alloc_index;
 //   g_runtime_span_irregular_rows   rows the index cannot answer a key-in-span question for: the key is not the base the
 //                                   row is indexed at (no extent, or handle.ptr != key). Always 0 in practice; while it is
 //                                   not, runtime_registry_span_live_locked() scans, so it keeps the old answer.
-//   g_runtime_host_zone_graph_rows[z]  the rows of g_runtime_host_zone_rows[z] whose lifetime is GRAPH: the only rows the
+//   g_runtime_host_zone_graph_rows[z]
+//                                   the rows of g_runtime_host_zone_rows[z] whose lifetime is GRAPH: the only rows the
 //                                   SCRATCH/STAGING graph-boundary check counts (§4.4 "Lifetimes"). A CONTEXT compute
 //                                   buffer, a DEVICE holder, a MODEL row or an UNOWNED holder is live there by design.
 static size_t g_runtime_host_zone_rows[static_cast<size_t>(host_zone_id::COUNT)];

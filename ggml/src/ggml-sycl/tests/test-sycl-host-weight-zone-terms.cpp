@@ -26,11 +26,12 @@
 // One tenant of the zone is not a term: unplanned loader residency, the model loader's SYCL_Host buffer, which holds
 // every weight the loader reads (role WEIGHT, lifetime MODEL, category HOST_COMPUTE, from the buffer type the loader
 // adds to a SYCL device's list when weights are evictable; the buffer type asks role WEIGHT only under the model-load
-// flag, and a SYCL_Host buffer made after the load, the context's compute and output buffers, routes to SCRATCH). Planning it would plan a duplicate copy of the weights, the defect the
-// mapped host tier (SYCL_Mapped) removes. Which buffer the loader binds is the plan's fact, not the build's: on a load
-// whose plan maps files the loader binds SYCL_Mapped for every FILE_MAPPED weight, whose bytes are the file's pages
-// outside every host zone, so the class reads zero; on a load whose plan does not (-lm none, or a build without the
-// tier) every weight keeps SYCL_Host and the class is the whole model. Arm 2 measures the second, arm 3 the first.
+// flag, and a SYCL_Host buffer made after the load, the context's compute and output buffers, routes to SCRATCH).
+// Planning it would plan a duplicate copy of the weights, the defect the mapped host tier (SYCL_Mapped) removes. Which
+// buffer the loader binds is the plan's fact, not the build's: on a load whose plan maps files the loader binds
+// SYCL_Mapped for every FILE_MAPPED weight, whose bytes are the file's pages outside every host zone, so the class
+// reads zero; on a load whose plan does not (-lm none, or a build without the tier) every weight keeps SYCL_Host and
+// the class is the whole model. Arm 2 measures the second, arm 3 the first.
 //
 // Arm 1 (no model, no device: the real planner over a synthetic Q2_K-shaped inventory, under a mocked device table)
 // asserts, for both planner builders, that the WEIGHT size is exactly the sum of those terms and is not the 1.2x
@@ -46,16 +47,16 @@
 // WEIGHT-zone allocation through the request shapes the materialization paths use, then the loader's buffer through the
 // loader's own buffer type under the model-load flag. That plan is arm 1's, built with the fact false, so the loader's
 // buffer is the one a load that does not map files takes, and the arm measures it on every build; the buffer must be
-// allocated and its bytes must land in WEIGHT. A buffer of the same type made outside the load must land in SCRATCH
-// and take no WEIGHT byte. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 removes it: the loader then adds no SYCL_Host buffer type, so
+// allocated and its bytes must land in WEIGHT. A buffer of the same type made outside the load must land in SCRATCH and
+// take no WEIGHT byte. Only GGML_SYCL_WEIGHTS_EVICTABLE=0 removes it: the loader then adds no SYCL_Host buffer type, so
 // there is no loader buffer to measure, and the binary exits 77 naming that leg rather than passing. Each allocation is
 // classed by the call that made it, and its owner metadata must agree with that class. Metadata separates host_weights
 // from the HOST_COMPUTE tenants; the reserve and unplanned loader residency come from one buffer type with one request
 // shape, so between those two the call alone attributes the bytes; the reserve is now an UNOWNED request and the
-// loader's buffer a MODEL one, so their lifetimes separate them as well. Every byte the zone gains belongs to a named term or
-// to unplanned loader residency, which is reported on its own line; any other byte fails. The terms stay within their
-// bytes and the zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b and 3a
-// have passed.
+// loader's buffer a MODEL one, so their lifetimes separate them as well. Every byte the zone gains belongs to a named
+// term or to unplanned loader residency, which is reported on its own line; any other byte fails. The terms stay within
+// their bytes and the zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b
+// and 3a have passed.
 //
 // Arm 1b (no device) re-backs one host expert FILE_MAPPED and another CPU_OWNED on the single-device plan and asserts
 // that neither one's bytes reach host_weights, blocks or tlsf_bound, while host_weights still equals the plan's

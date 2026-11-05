@@ -51,34 +51,27 @@ struct route_row {
 };
 
 void test_routing_rows() {
-    // One row per rule of §4.4's routing, in rule order, plus the two buft intents the design names.
+    // One row per rule of §4.4's routing, in rule order, plus the two buft intents the design names. R, C, L and Z are
+    // alloc_role, runtime_category, alloc_lifetime and host_zone_id.
+    using R                = alloc_role;
+    using C                = runtime_category;
+    using L                = alloc_lifetime;
+    using Z                = host_zone_id;
     const route_row rows[] = {
-        { "role KV",                               alloc_role::KV,             runtime_category::HOST_COMPUTE, alloc_lifetime::CONTEXT, false, false,
-         host_zone_id::KV                                                                                                                                                   },
-        { "device-KV spill to host",               alloc_role::OTHER,          runtime_category::KV_CACHE,     alloc_lifetime::GRAPH,   false, true,
-         host_zone_id::KV                                                                                                                                                   },
-        { "role WEIGHT",                           alloc_role::WEIGHT,         runtime_category::OTHER,        alloc_lifetime::MODEL,   false, false,
-         host_zone_id::WEIGHT                                                                                                                                               },
-        { "role EXPERT_STAGING with HOST_COMPUTE", alloc_role::EXPERT_STAGING, runtime_category::HOST_COMPUTE,
-         alloc_lifetime::GRAPH,                                                                                                         false, false, host_zone_id::SCRATCH },
-        { "lifetime UNOWNED",                      alloc_role::COMPUTE,        runtime_category::HOST_COMPUTE, alloc_lifetime::UNOWNED, false,
-         false,                                                                                                                                       host_zone_id::WEIGHT  },
-        { "declared persistent owner",             alloc_role::STAGING,        runtime_category::OTHER,        alloc_lifetime::CONTEXT, true,
-         false,                                                                                                                                       host_zone_id::WEIGHT  },
-        { "category HOST_COMPUTE",                 alloc_role::COMPUTE,        runtime_category::HOST_COMPUTE, alloc_lifetime::CONTEXT, false,
-         false,                                                                                                                                       host_zone_id::SCRATCH },
-        { "category EXPERT_CACHE",                 alloc_role::COMPUTE,        runtime_category::EXPERT_CACHE, alloc_lifetime::MODEL,   false,
-         false,                                                                                                                                       host_zone_id::SCRATCH },
-        { "role STAGING, category STAGING",        alloc_role::STAGING,        runtime_category::STAGING,      alloc_lifetime::GRAPH,
-         false,                                                                                                                                false, host_zone_id::STAGING },
-        { "role COMPUTE, category OTHER",          alloc_role::COMPUTE,        runtime_category::OTHER,        alloc_lifetime::GRAPH,   false,
-         false,                                                                                                                                       host_zone_id::STAGING },
+        { "role KV",                        R::KV,             C::HOST_COMPUTE, L::CONTEXT, false, false, Z::KV      },
+        { "device-KV spill to host",        R::OTHER,          C::KV_CACHE,     L::GRAPH,   false, true,  Z::KV      },
+        { "role WEIGHT",                    R::WEIGHT,         C::OTHER,        L::MODEL,   false, false, Z::WEIGHT  },
+        { "role EXPERT_STAGING",            R::EXPERT_STAGING, C::HOST_COMPUTE, L::GRAPH,   false, false, Z::SCRATCH },
+        { "lifetime UNOWNED",               R::COMPUTE,        C::HOST_COMPUTE, L::UNOWNED, false, false, Z::WEIGHT  },
+        { "declared persistent owner",      R::STAGING,        C::OTHER,        L::CONTEXT, true,  false, Z::WEIGHT  },
+        { "category HOST_COMPUTE",          R::COMPUTE,        C::HOST_COMPUTE, L::CONTEXT, false, false, Z::SCRATCH },
+        { "category EXPERT_CACHE",          R::COMPUTE,        C::EXPERT_CACHE, L::MODEL,   false, false, Z::SCRATCH },
+        { "role STAGING, category STAGING", R::STAGING,        C::STAGING,      L::GRAPH,   false, false, Z::STAGING },
+        { "role COMPUTE, category OTHER",   R::COMPUTE,        C::OTHER,        L::GRAPH,   false, false, Z::STAGING },
         // The SYCL_KV_Host buft's intent: role KV, HOST_COMPUTE, CONTEXT.
-        { "SYCL_KV_Host intent",                   alloc_role::KV,             runtime_category::HOST_COMPUTE, alloc_lifetime::CONTEXT, false, false,
-         host_zone_id::KV                                                                                                                                                   },
+        { "SYCL_KV_Host intent",            R::KV,             C::HOST_COMPUTE, L::CONTEXT, false, false, Z::KV      },
         // The post-load SYCL_Host buft's intent: role COMPUTE (WEIGHT only under in_model_load), HOST_COMPUTE, CONTEXT.
-        { "post-load SYCL_Host intent",            alloc_role::COMPUTE,        runtime_category::HOST_COMPUTE, alloc_lifetime::CONTEXT,
-         false,                                                                                                                                false, host_zone_id::SCRATCH },
+        { "post-load SYCL_Host intent",     R::COMPUTE,        C::HOST_COMPUTE, L::CONTEXT, false, false, Z::SCRATCH },
     };
     for (const route_row & r : rows) {
         const host_zone_id got = select_zone(r.role, r.category, r.lifetime, r.persistent, r.spill);
@@ -105,11 +98,14 @@ void test_no_category_selects_weight() {
 }
 
 void test_graph_boundary() {
+    using Z                                 = host_zone_id;
+    using L                                 = alloc_lifetime;
+    using K                                 = alloc_owner_kind;
     const host_zone_record_view by_design[] = {
-        { host_zone_id::SCRATCH, alloc_lifetime::CONTEXT, { alloc_owner_kind::BUFFER, 1 }, "sycl_host_buffer",        64 },
-        { host_zone_id::SCRATCH, alloc_lifetime::MODEL,   { alloc_owner_kind::MODEL, 2 },  "moe_hybrid_decode_table", 64 },
-        { host_zone_id::SCRATCH, alloc_lifetime::DEVICE,  { alloc_owner_kind::DEVICE, 0 }, "pinned_buffer_pool",      64 },
-        { host_zone_id::STAGING, alloc_lifetime::UNOWNED, {},                              "tp_staging",              64 },
+        { Z::SCRATCH, L::CONTEXT, { K::BUFFER, 1 }, "sycl_host_buffer",        64 },
+        { Z::SCRATCH, L::MODEL,   { K::MODEL, 2 },  "moe_hybrid_decode_table", 64 },
+        { Z::SCRATCH, L::DEVICE,  { K::DEVICE, 0 }, "pinned_buffer_pool",      64 },
+        { Z::STAGING, L::UNOWNED, {},               "tp_staging",              64 },
     };
     HZP_CHECK(host_zone_graph_boundary_live(by_design, 4, host_zone_id::SCRATCH) == 0,
               "a CONTEXT, MODEL or DEVICE record trips the SCRATCH graph-boundary check (%zu counted)",
@@ -322,40 +318,38 @@ void test_model_boundary_at_slot_release() {
         r.err.c_str());
 }
 
-// The strict cases: each aborts in its own process, scored on rc 134 plus the leaked-record text.
-void test_strict_aborts() {
-    struct strict_case {
-        const char *    name;
-        alloc_lifetime  lt;
-        alloc_owner_ref owner;
-        host_zone_id    zone;
-        const char *    cohort;
-        const char *    text;
-    };
+// One strict case: the leak aborts in its own process, scored on rc 134 plus the leaked-record text.
+void check_strict_abort(const char *    name,
+                        alloc_lifetime  lt,
+                        alloc_owner_ref owner,
+                        host_zone_id    zone,
+                        const char *    cohort,
+                        const char *    text) {
+    const child_result r = run_in_child([&]() {
+        fake_registry reg;
+        reg.add(zone, lt, owner, cohort, 4096);
+        if (lt != alloc_lifetime::DEVICE || host_zone_device_check_due(0)) {
+            reg.check(lt, owner, /*strict=*/true);
+        }
+    });
+    HZP_CHECK(r.rc == 134 && r.err.find(text) != std::string::npos &&
+                  r.err.find("GGML_SYCL_STRICT_LEASES=1") != std::string::npos,
+              "strict %s leak: rc %d, expected 134 with the leaked-record text; child stderr:\n%s", name, r.rc,
+              r.err.c_str());
+}
 
-    const strict_case cases[] = {
-        { "buffer-owned CONTEXT",       alloc_lifetime::CONTEXT, buffer_7,  host_zone_id::SCRATCH, "sycl_host_buffer",
-         "[HOST-ZONE] leaked CONTEXT record: sycl_host_buffer 4096 owner=buffer/7"                                                                                                                               },
-        { "backend-member CONTEXT",     alloc_lifetime::CONTEXT, backend_9, host_zone_id::STAGING,
-         "context_readback_staging",                                                                                          "[HOST-ZONE] leaked CONTEXT record: context_readback_staging 4096 owner=backend/9" },
-        { "MODEL",                      alloc_lifetime::MODEL,   model_3,   host_zone_id::SCRATCH, "moe_hybrid_decode_table",
-         "[HOST-ZONE] leaked MODEL record: moe_hybrid_decode_table 4096 owner=model/3"                                                                                                                           },
-        { "DEVICE at the last backend", alloc_lifetime::DEVICE,  device_0,  host_zone_id::SCRATCH, "pinned_buffer_pool",
-         "[HOST-ZONE] leaked DEVICE record: pinned_buffer_pool 4096 owner=device/0"                                                                                                                              },
-    };
-    for (const strict_case & c : cases) {
-        const child_result r = run_in_child([&]() {
-            fake_registry reg;
-            reg.add(c.zone, c.lt, c.owner, c.cohort, 4096);
-            if (c.lt != alloc_lifetime::DEVICE || host_zone_device_check_due(0)) {
-                reg.check(c.lt, c.owner, /*strict=*/true);
-            }
-        });
-        HZP_CHECK(r.rc == 134 && r.err.find(c.text) != std::string::npos &&
-                      r.err.find("GGML_SYCL_STRICT_LEASES=1") != std::string::npos,
-                  "strict %s leak: rc %d, expected 134 with the leaked-record text; child stderr:\n%s", c.name, r.rc,
-                  r.err.c_str());
-    }
+// The strict cases, one per lifetime the owner check covers.
+void test_strict_aborts() {
+    check_strict_abort("buffer-owned CONTEXT", alloc_lifetime::CONTEXT, buffer_7, host_zone_id::SCRATCH,
+                       "sycl_host_buffer", "[HOST-ZONE] leaked CONTEXT record: sycl_host_buffer 4096 owner=buffer/7");
+    check_strict_abort("backend-member CONTEXT", alloc_lifetime::CONTEXT, backend_9, host_zone_id::STAGING,
+                       "context_readback_staging",
+                       "[HOST-ZONE] leaked CONTEXT record: context_readback_staging 4096 owner=backend/9");
+    check_strict_abort("MODEL", alloc_lifetime::MODEL, model_3, host_zone_id::SCRATCH, "moe_hybrid_decode_table",
+                       "[HOST-ZONE] leaked MODEL record: moe_hybrid_decode_table 4096 owner=model/3");
+    check_strict_abort("DEVICE at the last backend", alloc_lifetime::DEVICE, device_0, host_zone_id::SCRATCH,
+                       "pinned_buffer_pool",
+                       "[HOST-ZONE] leaked DEVICE record: pinned_buffer_pool 4096 owner=device/0");
 }
 
 }  // namespace
