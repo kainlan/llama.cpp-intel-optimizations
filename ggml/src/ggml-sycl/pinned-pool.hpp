@@ -322,6 +322,20 @@ class pinned_chunk_pool {
         test_free_point_hook_ = hook;
         test_free_point_ctx_  = ctx;
     }
+
+    // The SCRATCH return's device REDs compute every expected figure from the pool's own chunk rule (§7 C4 "computed
+    // as a sum of chunk_footprint_for terms"): the usable and backing bytes of one new chunk able to hold `min_size`.
+    size_t test_chunk_usable_for(size_t min_size) const { return chunk_footprint_for(min_size).usable; }
+
+    size_t test_chunk_backing_for(size_t min_size) const { return chunk_footprint_for(min_size).backing; }
+
+    // The registry metadata of a live base chunk's backing, for the registry hold (§M88 (1)). False for a tombstone or
+    // an index past the end.
+    bool test_chunk_metadata(size_t chunk_idx, alloc_metadata * out) const;
+
+    // Clears a withdrawn chunk's flag and gives its bytes back to the zone: the KEEP_WALKS_SET fault's own step, so
+    // the fault can be planted in the cache, which reaches the flag only through the pool.
+    void test_unwithdraw_zone_chunk(host_zone_id zone, size_t chunk_idx);
 #endif
 
   private:
@@ -449,6 +463,10 @@ class pinned_chunk_pool::released_chunk {
     pinned_chunk_pool * pool_ = nullptr;
     chunk               removed_{};
     size_t              backing_ = 0;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The MOVED_FROM_RELEASES fault's pool (scratch-test-mutant.hpp): set only on a carrier moved from under it.
+    pinned_chunk_pool * test_moved_from_ = nullptr;
+#endif
 };
 
 }  // namespace ggml_sycl

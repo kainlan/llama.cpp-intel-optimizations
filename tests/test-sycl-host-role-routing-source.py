@@ -43,7 +43,7 @@ import pytest
 # sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended
 # here; appended rather than prepended, a file in tests/ never shadows a standard module.
 sys.path.append(str(Path(__file__).resolve().parent))
-from sycl_gate import match_close, views  # noqa: E402
+from sycl_gate import match_close, resolve_mutants, views  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,70 +68,11 @@ class ExpectedRed(UserWarning):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Text views. The source is read with its compile-time positive controls resolved (every `#if defined(..._MUTANT_...)`
-# block evaluated with no mutant macro defined, as the production build compiles it), then with comments blanked
+# Text views. The source is read with its planted-fault blocks resolved by sycl_gate.resolve_mutants (every `#if` over a
+# MUTANT macro evaluated with no mutant macro defined, as the production build compiles it), then with comments blanked
 # (`code`) and with string and character literals blanked too (`bare`), by sycl_gate's views. Every view keeps the raw
 # text's offsets.
 # ---------------------------------------------------------------------------------------------------------------
-
-_DIRECTIVE_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
-
-
-def _mutant_condition(kw: str, rest: str) -> bool:
-    """A directive's value with every mutant macro undefined. Only a condition over mutant macros is evaluated."""
-    rest = re.sub(r"//.*$", "", rest).strip()
-    if kw == "ifdef":
-        return False
-    if kw == "ifndef":
-        return True
-    expr = re.sub(r"\bdefined\s*\(\s*\w*MUTANT\w*\s*\)", " False ", rest)
-    expr = re.sub(r"\bdefined\s+\w*MUTANT\w*", " False ", expr)
-    expr = expr.replace("||", " or ").replace("&&", " and ")
-    expr = re.sub(r"!(?!=)", " not ", expr)
-    assert re.fullmatch(r"[\s()notandrFalse]*", expr), f"mutant directive not understood: #{kw} {rest}"
-    return bool(eval(expr, {"__builtins__": {}}, {}))  # noqa: S307 -- the text is checked to be boolean literals
-
-
-def resolve_mutants(raw: str) -> str:
-    """`raw` with each mutant block resolved; dropped lines become empty, so line numbers and offsets per line hold."""
-    out = []
-    stack = []
-
-    def active(entries) -> bool:
-        return all(e["taking"] for e in entries if e["mutant"])
-
-    for line in raw.split("\n"):
-        m = _DIRECTIVE_RE.match(line)
-        if m:
-            kw, rest = m.group(1), m.group(2)
-            if kw in ("if", "ifdef", "ifndef"):
-                if "MUTANT" in rest:
-                    val = _mutant_condition(kw, rest)
-                    stack.append({"mutant": True, "taking": val, "taken": val})
-                    out.append("")
-                else:
-                    out.append(line if active(stack) else "")
-                    stack.append({"mutant": False})
-                continue
-            top = stack[-1] if stack else {"mutant": False}
-            if kw == "elif" and top["mutant"]:
-                val = (not top["taken"]) and _mutant_condition("if", rest)
-                top["taking"], top["taken"] = val, top["taken"] or val
-                out.append("")
-                continue
-            if kw == "else" and top["mutant"]:
-                top["taking"], top["taken"] = not top["taken"], True
-                out.append("")
-                continue
-            if kw == "endif":
-                stack.pop()
-                out.append("" if top["mutant"] else (line if active(stack) else ""))
-                continue
-            out.append(line if active(stack[:-1]) else "")
-            continue
-        out.append(line if active(stack) else "")
-    return "\n".join(out)
-
 
 _KEYWORDS = r"(?:if|for|while|switch|catch|return|else|do|sizeof|case|new|delete|throw|static_assert|alignof|decltype)"
 # A definition head: a line whose text before its first `(` holds none of `;{}()#=`, ending in the (qualified) name.
@@ -247,13 +188,15 @@ def source_for(rel: str, raw: str) -> Source:
 
 
 def tree_texts() -> dict:
+    """Each file's text with its planted-fault blocks resolved (sycl_gate.resolve_mutants), so a planted control edits
+    production code alone: a fault block may repeat a production statement it varies."""
     texts = {}
     for p in sorted((ROOT / SYCL_DIR).glob("*")):
         if p.is_file() and p.suffix in (".cpp", ".hpp"):
-            texts[f"{SYCL_DIR}/{p.name}"] = p.read_text(errors="replace")
+            texts[f"{SYCL_DIR}/{p.name}"] = resolve_mutants(p.read_text(errors="replace"))
     for p in sorted((ROOT / SRC_DIR).rglob("*")):
         if p.is_file() and p.suffix in (".cpp", ".h"):
-            texts[p.relative_to(ROOT).as_posix()] = p.read_text(errors="replace")
+            texts[p.relative_to(ROOT).as_posix()] = resolve_mutants(p.read_text(errors="replace"))
     for rel in (HEADER, LC, LCH, DOC):
         p = ROOT / rel
         texts[rel] = p.read_text(errors="replace") if p.exists() else ""

@@ -5566,6 +5566,10 @@ class unified_cache {
     // Test accessors: the set's entries, and those for one chunk.
     size_t marked_entries() const;
     size_t marked_entries(size_t chunk_idx) const;
+
+    // The cache's pinned pool, for the SCRATCH return's device REDs (§7 C4: "the fixture is the fixture cache's pinned
+    // pool"); null when the cache has none.
+    pinned_chunk_pool * host_arena_for_testing() const { return host_arena_.get(); }
 #endif
 
     // === The SCRATCH transaction (docs/design/sycl-mmap-host-tier.md §4.4, §M75) ===

@@ -28,6 +28,7 @@
 #include "onednn-woq.hpp"
 #include "planned-load-terms.hpp"
 #include "range-index.hpp"
+#include "scratch-test-mutant.hpp"
 #include "sycl-timeline.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
@@ -21464,6 +21465,13 @@ mem_handle alloc_handle::as_mem_handle() const {
 allocation_registered_state unified_allocation_registered_exact(const alloc_metadata & metadata) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     const auto                  row = g_runtime_alloc_registry.find(metadata.ptr);
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (row != g_runtime_alloc_registry.end() &&
+        scratch_test_mutant_on(scratch_test_mutant::REGISTERED_EXACT_PTR_ONLY)) {
+        return row->second.state == runtime_alloc_state::RELEASING ? ALLOCATION_REGISTERED_RELEASING :
+                                                                     ALLOCATION_REGISTERED_LIVE;
+    }
+#endif
     // A reused address answers GONE: the row there is another allocation unless its whole release key matches.
     if (row == g_runtime_alloc_registry.end() || !(row->second.handle.key() == metadata.key())) {
         return ALLOCATION_REGISTERED_GONE;
@@ -26037,6 +26045,11 @@ void unified_cache::host_zone_free(host_zone_id zone, void * ptr) {
     }
     const zone_audit_timer audit_timer(zone_audit_host_timing(zone), true);
     const size_t           orphaned_chunk = host_arena_->zone_free(zone, ptr);
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::ORPHAN_FREE_IGNORED)) {
+        return;
+    }
+#endif
     // The free that empties an orphaned chunk releases it, after the pool's lock has dropped (§4.4).
     if (orphaned_chunk != pinned_chunk_pool::NO_CHUNK) {
         (void) release_marked_chunk(orphaned_chunk);
@@ -26118,6 +26131,16 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
             candidates.clear();
         }
         for (const marked_chunk_entry & candidate : candidates) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::CONFIGURE_DIRECT_RELEASE)) {
+                pinned_chunk_pool::released_chunk carrier;
+                if (host_arena_->release_zone_chunk(host_zone_id::SCRATCH, candidate.chunk_idx, carrier) ==
+                    PINNED_CHUNK_RELEASE_DONE) {
+                    released.emplace_back(std::move(carrier));
+                }
+                continue;
+            }
+#endif
             (void) release_marked_chunk_locked(candidate.chunk_idx, released, false);
         }
     }
@@ -26130,6 +26153,14 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
 
     // The refusal changes nothing: the zones, every flag, the marked set and the reserved figures stay one state.
     if (!host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes)) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (ggml_sycl_strict_enabled() && scratch_test_mutant_on(scratch_test_mutant::STRICT_ABORT_DROPPED)) {
+            return false;
+        }
+        if (!ggml_sycl_strict_enabled() && scratch_test_mutant_on(scratch_test_mutant::ABORT_NON_STRICT)) {
+            GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (planted fault)");
+        }
+#endif
         if (ggml_sycl_strict_enabled()) {
             GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT)");
         }
@@ -26187,6 +26218,29 @@ size_t unified_cache::host_scratch_return_chunks(const std::vector<size_t> & chu
         // Withdrawal, filing and the release of an already-empty chunk share this one scope, so an empty chunk is
         // never visible in the set between its filing and its release (§4.4).
         for (const size_t chunk_idx : chunk_idxs) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_WITHDRAW) ||
+                scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_FILE) ||
+                scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_IMMEDIATE) ||
+                scratch_test_mutant_on(scratch_test_mutant::RETURN_RELEASES_LIVE)) {
+                if (!scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_WITHDRAW)) {
+                    (void) host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx);
+                }
+                if (!scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_FILE)) {
+                    marked_set_.push_back({ chunk_idx, owner });
+                }
+                const bool live = host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx).used != 0;
+                if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_IMMEDIATE) ||
+                    (live && !scratch_test_mutant_on(scratch_test_mutant::RETURN_RELEASES_LIVE))) {
+                    continue;
+                }
+                const pinned_chunk_release status = release_marked_chunk_locked(chunk_idx, released, false);
+                if (status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) {
+                    refusals.push_back({ chunk_idx, status });
+                }
+                continue;
+            }
+#endif
             if (!host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx)) {
                 GGML_LOG_WARN(
                     "[HOST-ARENA] SCRATCH return skipped dev=%d chunk=%zu: not a chunk of the SCRATCH zone alone\n",
@@ -26297,6 +26351,15 @@ size_t unified_cache::host_scratch_owner_end(uint64_t owner) {
         // A chunk still in use is marked orphaned under the pool's same hold, so a free cannot slip between the check
         // and the flag: the emptying free or the last lease's drop releases it.
         for (const marked_chunk_entry & candidate : candidates) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_NO_EMPTY) &&
+                host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, candidate.chunk_idx).used == 0) {
+                continue;
+            }
+            if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_FIRST_ONLY) && !released.empty()) {
+                break;
+            }
+#endif
             (void) release_marked_chunk_locked(candidate.chunk_idx, released, true);
         }
     }
@@ -26336,6 +26399,12 @@ pinned_chunk_release unified_cache::release_marked_chunk_locked(size_t chunk_idx
     const pinned_chunk_release        status =
         host_arena_->release_zone_chunk(host_zone_id::SCRATCH, chunk_idx, carrier, orphan_if_live);
     if (status == PINNED_CHUNK_RELEASE_DONE) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (scratch_test_mutant_on(scratch_test_mutant::RELEASE_NO_ERASE)) {
+            out.emplace_back(std::move(carrier));
+            return status;
+        }
+#endif
         marked_set_.erase(
             std::remove_if(marked_set_.begin(), marked_set_.end(),
                            [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }),
@@ -26349,6 +26418,11 @@ pinned_chunk_release unified_cache::release_marked_chunk_locked(size_t          
                                                                 pinned_chunk_pool::released_chunk & out) {
     const pinned_chunk_release status = host_arena_->release_zone_chunk(host_zone_id::SCRATCH, chunk_idx, out, false);
     if (status == PINNED_CHUNK_RELEASE_DONE) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (scratch_test_mutant_on(scratch_test_mutant::RELEASE_NO_ERASE)) {
+            return status;
+        }
+#endif
         marked_set_.erase(
             std::remove_if(marked_set_.begin(), marked_set_.end(),
                            [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }),
@@ -30520,6 +30594,11 @@ void unified_cache::host_release_chunk_lease(uint64_t handle) noexcept {
     // The drop of an orphaned, empty SCRATCH chunk's last lease releases it, after the pool's lock has dropped (§4.4
     // "the lease-drop trigger"), through the public form, which allocates nothing.
     const size_t orphaned_chunk = host_arena_->release_chunk_lease(handle);
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::LEASE_DROP_NO_INDEX)) {
+        return;
+    }
+#endif
     if (orphaned_chunk != pinned_chunk_pool::NO_CHUNK) {
         (void) release_marked_chunk(orphaned_chunk);
     }

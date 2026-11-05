@@ -39,7 +39,7 @@ import pytest
 # sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended
 # here; appended rather than prepended, a file in tests/ never shadows a standard module.
 sys.path.append(str(Path(__file__).resolve().parent))
-from sycl_gate import match_close, views  # noqa: E402
+from sycl_gate import match_close, resolve_mutants, views  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -229,10 +229,12 @@ def source_for(rel: str, raw: str) -> Source:
 
 
 def tree_texts() -> dict:
+    """Each file's text with its planted-fault blocks resolved as the production build compiles them
+    (sycl_gate.resolve_mutants), so a control edits, and a clause scores, production code alone."""
     texts = {}
     for rel in (POOL, CACHE, CANON):
         p = ROOT / rel
-        texts[rel] = p.read_text(errors="replace") if p.exists() else ""
+        texts[rel] = resolve_mutants(p.read_text(errors="replace")) if p.exists() else ""
     return texts
 
 
@@ -246,7 +248,7 @@ def committed_census_files(texts: dict) -> dict:
         rel = f"{SYCL_DIR}/{p.name}"
         raw = texts.get(rel)
         if raw is None:
-            raw = p.read_text(errors="replace")
+            raw = resolve_mutants(p.read_text(errors="replace"))
         if "pinned_pool_committed" in raw:
             out[rel] = raw
     for rel, raw in texts.items():

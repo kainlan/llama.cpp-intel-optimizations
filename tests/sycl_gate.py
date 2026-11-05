@@ -29,8 +29,9 @@ Second, the text helpers for source-contract pins, at the end of the module:
 ROOT (the repo root), strip_comments (source text with comments blanked, line
 breaks kept), norm (comment-stripped, whitespace-canonical text), read (a repo
 file's text, or empty when it is missing), body (the brace-balanced body of a
-definition), ordered (needles in order) and mutate (a normalised text with one
-replacement, for positive controls).
+definition), ordered (needles in order), mutate (a normalised text with one
+replacement, for positive controls) and resolve_mutants (source text with every
+`#if` over a MUTANT macro resolved as the production build compiles it).
 """
 import contextlib
 import linecache
@@ -310,3 +311,65 @@ def mutate(text: str, old: str, new: str) -> str:
     n = norm(text)
     assert old in n, f"mutant precondition: {old!r} is not in the text"
     return n.replace(old, new, 1)
+
+
+# A planted fault lives in a block whose `#if` names a MUTANT macro (a CMake variant's -D, or the macro a private-
+# fixture header defines for its runtime seams). The production build compiles none of those blocks, so a gate that
+# scores production code reads the text with them resolved.
+_DIRECTIVE_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+
+
+def _mutant_condition(kw: str, rest: str) -> bool:
+    """A directive's value with every mutant macro undefined. Only a condition over mutant macros is evaluated."""
+    rest = re.sub(r"//.*$", "", rest).strip()
+    if kw == "ifdef":
+        return False
+    if kw == "ifndef":
+        return True
+    expr = re.sub(r"\bdefined\s*\(\s*\w*MUTANT\w*\s*\)", " False ", rest)
+    expr = re.sub(r"\bdefined\s+\w*MUTANT\w*", " False ", expr)
+    expr = expr.replace("||", " or ").replace("&&", " and ")
+    expr = re.sub(r"!(?!=)", " not ", expr)
+    assert re.fullmatch(r"[\s()notandrFalse]*", expr), f"mutant directive not understood: #{kw} {rest}"
+    return bool(eval(expr, {"__builtins__": {}}, {}))  # noqa: S307 -- the text is checked to be boolean literals
+
+
+def resolve_mutants(raw: str) -> str:
+    """`raw` with each mutant block resolved; dropped lines become empty, so line numbers and offsets per line hold."""
+    out = []
+    stack = []
+
+    def active(entries) -> bool:
+        return all(e["taking"] for e in entries if e["mutant"])
+
+    for line in raw.split("\n"):
+        m = _DIRECTIVE_RE.match(line)
+        if m:
+            kw, rest = m.group(1), m.group(2)
+            if kw in ("if", "ifdef", "ifndef"):
+                if "MUTANT" in rest:
+                    val = _mutant_condition(kw, rest)
+                    stack.append({"mutant": True, "taking": val, "taken": val})
+                    out.append("")
+                else:
+                    out.append(line if active(stack) else "")
+                    stack.append({"mutant": False})
+                continue
+            top = stack[-1] if stack else {"mutant": False}
+            if kw == "elif" and top["mutant"]:
+                val = (not top["taken"]) and _mutant_condition("if", rest)
+                top["taking"], top["taken"] = val, top["taken"] or val
+                out.append("")
+                continue
+            if kw == "else" and top["mutant"]:
+                top["taking"], top["taken"] = not top["taken"], True
+                out.append("")
+                continue
+            if kw == "endif":
+                stack.pop()
+                out.append("" if top["mutant"] else (line if active(stack) else ""))
+                continue
+            out.append(line if active(stack[:-1]) else "")
+            continue
+        out.append(line if active(stack) else "")
+    return "\n".join(out)
