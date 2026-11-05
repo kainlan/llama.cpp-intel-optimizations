@@ -402,7 +402,7 @@ if args.self_test:
         ("planner site ungated", "backend: every planner-on-host site in the impl is gated on the parameter",
          with_(be=mutate(sources["be"], "if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {", "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"))),
         ("KV-host predicate takes a flag", "backend: the placement predicates take no flag (they stay pure)",
-         with_(be=mutate(sources["be"], "static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {\n    if (!t) {", "static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {\n    if (!t || placement_declines) {"))),
+         with_(be=mutate(sources["be"], "return ggml_sycl::host_tensor_in_buft_named(t, ggml_backend_sycl_kv_host_buffer_type_name);", "return !placement_declines && ggml_sycl::host_tensor_in_buft_named(t, ggml_backend_sycl_kv_host_buffer_type_name);"))),
         ("thread-local capability state returns", "backend: no thread-local capability state",
          with_(be=sources["be"] + "\nstatic thread_local bool g_sycl_capability_flag = false;\n")),
         ("proc not registered", "backend: the query is registered as a reg proc",
