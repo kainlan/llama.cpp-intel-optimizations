@@ -20,7 +20,7 @@ struct sycl_plan_dry_run_args {
     uint64_t             mem_available_bytes = 0;      // the sample's MemAvailable in place of the live reading
     uint32_t             n_device_budgets    = 0;      // device_budget_bytes[0..n) are read; 0 keeps a device's own
     uint64_t             device_budget_bytes[SYCL_PLAN_DRY_RUN_ARGS_MAX_DEVICES] = {};
-    int32_t              n_ctx         = 0;            // -c as given: 0 (the default) names the model's
+    int32_t              n_ctx         = 0;            // -c as given: 0 (the default) names the model's default context
     bool                 lazy_mode_set = false;        // -lzm given
     enum llama_lazy_mode lazy_mode     = LLAMA_LAZY_MODE_AUTO;
     bool                 help          = false;
