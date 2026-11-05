@@ -57,7 +57,7 @@ constexpr uint64_t k_p3_margin = 29 * GiB;
 // The budget the planner is handed: far above every plan here, so the fit never decides.
 constexpr uint64_t k_budget    = 4096 * GiB;
 // One yieldable chunk with its index share and huge-page rounding stays under this, for every row size here.
-constexpr uint64_t k_chunk_cap = 320 * MiB;
+constexpr uint64_t k_chunk_cap = LAZY_ROW_CACHE_CHUNK_BYTES + 64 * MiB;
 
 // DeepSeek-V4.1-Flash's quant type at a size a test can hold, with 16 layers so both engram consumers (blocks 1 and
 // 14) are layers of the model.
@@ -112,11 +112,10 @@ size_t floor_raw_bytes(const placement_lazy_table_info & t, const placement_kv_i
     return floor_slots(t, kv) * t.row_size;
 }
 
-// An upper bound on a floor's mapped bytes, for the arms' preconditions only: the slab and a generous index
-// (4 x ceil(4s/3) + 8s bytes), each rounded to its mapping.
+// An upper bound on a floor's mapped bytes, for the arms' preconditions only: the slab and its index, each rounded to
+// its mapping as one allocation.
 size_t floor_upper_bytes(const placement_lazy_table_info & t, const placement_kv_info & kv) {
-    const size_t s = floor_slots(t, kv);
-    return mapped(floor_raw_bytes(t, kv)) + mapped(4 * ((4 * s + 2) / 3) + 8 * s);
+    return mapped(floor_raw_bytes(t, kv)) + mapped(lazy_row_cache_index_raw_bytes(floor_slots(t, kv)));
 }
 
 // The plan for `shape` and `kv` against the --devices count: every device gets a 1 MiB VRAM budget, so the weights are
@@ -331,7 +330,7 @@ arm_result deepseek_both_storage(bool delegate) {
     const placement_lazy_table * a = find_table(plan, tables[0].name);
     const placement_lazy_table * b = find_table(plan, tables[1].name);
     if (a != nullptr && b != nullptr) {
-        const size_t slots_per_chunk = (256 * MiB) / tables[0].row_size;
+        const size_t slots_per_chunk = LAZY_ROW_CACHE_CHUNK_BYTES / tables[0].row_size;
         const size_t gap =
             a->cache_slots > b->cache_slots ? a->cache_slots - b->cache_slots : b->cache_slots - a->cache_slots;
         expect(r, gap <= slots_per_chunk,

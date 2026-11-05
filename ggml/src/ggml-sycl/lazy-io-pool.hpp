@@ -25,10 +25,25 @@ namespace ggml_sycl {
 // table, and the ring the IO engine allocates holds exactly that, so both read this constant and nothing else.
 constexpr size_t LAZY_BLOCK_RING_QD = 64;
 
-// One row's read span (§5.2): the 4 KiB-aligned O_DIRECT window that holds a row of `row_size` bytes starting anywhere
-// in a 4 KiB block, ceil((4095 + row_size) / 4 KiB) x 4 KiB. A row of at most 4097 bytes spans 8 KiB.
+// The O_DIRECT block (§5.2): a read span starts and ends on one.
+constexpr size_t LAZY_IO_BLOCK_BYTES = 4096;
+
+// One row's read span (§5.2): the block-aligned O_DIRECT window that holds a row of `row_size` bytes starting anywhere
+// in a block, ceil((LAZY_IO_BLOCK_BYTES - 1 + row_size) / LAZY_IO_BLOCK_BYTES) blocks. A row of at most 4097 bytes
+// spans two blocks.
 constexpr size_t lazy_block_ring_span(size_t row_size) {
-    return (row_size + 4095 + 4095) / 4096 * 4096;
+    return (row_size + 2 * (LAZY_IO_BLOCK_BYTES - 1)) / LAZY_IO_BLOCK_BYTES * LAZY_IO_BLOCK_BYTES;
+}
+
+// A STORAGE row cache's slab grows in chunks of this many bytes (§3.3, §6.3). The planner charges a cache's slab as its
+// whole chunks and one remainder, and the row cache the T4 row (design §11) adds allocates the same chunks, so its
+// activation check compares like with like.
+constexpr size_t LAZY_ROW_CACHE_CHUNK_BYTES = 256ull << 20;
+
+// A STORAGE row cache's index row at `slots` slots, before its mapping (§3.3, §6.3): 4 B slot ids at load factor 0.75
+// plus one 8 B key word per slot.
+constexpr size_t lazy_row_cache_index_raw_bytes(size_t slots) {
+    return 4 * ((4 * slots + 2) / 3) + 8 * slots;
 }
 
 struct lazy_io_pool;

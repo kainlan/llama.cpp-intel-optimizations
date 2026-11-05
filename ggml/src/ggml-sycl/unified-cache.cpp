@@ -33313,21 +33313,21 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
     return false;
 }
 
-// A STORAGE row cache's index row at `slots` slots (th32 §3.3, §6.3): 4 B slot ids at load factor 0.75 plus one 8 B
-// key word per slot, counted at host_cpu_mapped_size as the ledger charges it; 0 for no slots.
+// A STORAGE row cache's index row at `slots` slots (th32 §3.3, §6.3), lazy_row_cache_index_raw_bytes counted at
+// host_cpu_mapped_size as the ledger charges it; 0 for no slots.
 static size_t lazy_row_cache_index_bytes(size_t slots) {
-    const size_t index = 4 * ((4 * slots + 2) / 3) + 8 * slots;
+    const size_t index = lazy_row_cache_index_raw_bytes(slots);
     return index != 0 ? host_cpu_mapped_size(index) : 0;
 }
 
-// A STORAGE row cache's resident bytes at `slots` slots (th32 §3.3, §6.3): the slab of slots x row_size in 256 MiB
-// chunks and the index row, each allocation counted at host_cpu_mapped_size, as the ledger charges it.
+// A STORAGE row cache's resident bytes at `slots` slots (th32 §3.3, §6.3): the slab of slots x row_size in
+// LAZY_ROW_CACHE_CHUNK_BYTES chunks and the index row, each allocation counted at host_cpu_mapped_size, as the ledger
+// charges it.
 static size_t lazy_row_cache_resident_bytes(size_t slots, size_t row_size) {
-    constexpr size_t chunk = 256ull << 20;
-    const size_t     slab  = slots * row_size;
-    size_t           bytes = (slab / chunk) * host_cpu_mapped_size(chunk);
-    if (slab % chunk != 0) {
-        bytes += host_cpu_mapped_size(slab % chunk);
+    const size_t slab  = slots * row_size;
+    size_t       bytes = (slab / LAZY_ROW_CACHE_CHUNK_BYTES) * host_cpu_mapped_size(LAZY_ROW_CACHE_CHUNK_BYTES);
+    if (slab % LAZY_ROW_CACHE_CHUNK_BYTES != 0) {
+        bytes += host_cpu_mapped_size(slab % LAZY_ROW_CACHE_CHUNK_BYTES);
     }
     return bytes + lazy_row_cache_index_bytes(slots);
 }
@@ -33378,6 +33378,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     constexpr size_t p3_runtime = 5ull << 30;             // P3's runtime allowance above expected_host
     constexpr size_t p3_margin  = p3_floor + p3_runtime;  // expected_host + 29 GiB <= MemAvailable_pre
     constexpr size_t envelope   = 0;                      // step 3's context envelope: no planned term exists yet
+
+    constexpr size_t reserve_floor = 2ull << 30;          // step 3: host_reserve's floor
+    constexpr size_t reserve_pct   = 1;                   // step 3: host_reserve's share of the budget, in percent
     plan.lazy_tables.clear();
     plan.lazy_refusal.clear();
     plan.lazy_refusal_detail.clear();
@@ -33392,7 +33395,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
 
     const size_t   step2      = plan.host_zone_terms.total();
     const size_t   budget     = plan.host_budget;
-    const size_t   reserve    = std::max<size_t>(2ull << 30, budget / 100);
+    const size_t   reserve    = std::max<size_t>(reserve_floor, budget / 100 * reserve_pct);
     const size_t   mem_pre    = kv_info.host_mem_available_pre;
     const size_t   fit_room   = host_ledger_sat_sub(budget, host_ledger_sat_add(step2, reserve + envelope));
     const size_t   p3_room    = host_ledger_sat_sub(mem_pre, host_ledger_sat_add(step2, p3_margin));
