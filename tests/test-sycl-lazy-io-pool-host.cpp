@@ -282,7 +282,8 @@ void hold_reap(void * ctx) {
 // list swap; with c0 read after the hook reports, the scope's take must snapshot c0 + 1 reaps run and no parked node,
 // and the scope must leave no parked node and c0 + 2 reaps run. take_if(false) takes nothing and still reaps twice.
 // Mutants: the entry reap dropped or run after the take (the take snapshots c0, or the parked node); the closing reap
-// dropped (the scope's pool survives parked); take_if gated wrong (a lease without a candidate, none with one).
+// dropped (the scope's pool survives parked); take_if gated wrong (a lease without a candidate, none with one). The two
+// dropped reaps are registered controls: LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP and LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP.
 arm_result arm_wrapper_reaps() {
     arm_result r;
     reap_hold  hold;

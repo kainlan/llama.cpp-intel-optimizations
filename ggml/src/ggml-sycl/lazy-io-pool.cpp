@@ -202,12 +202,19 @@ void lazy_io_pool_mark_shut_down() noexcept {
     g_lazy_shut_down.store(true, std::memory_order_release);
 }
 
+// LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP and LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP each drop one of the wrapper's two reaps.
+// Only test-sycl-lazy-io-pool-host's mutant targets define them; each passes only when the host test prints that
+// reap's FAIL text.
 lazy_coverage_scope::reap_guard::reap_guard() noexcept {
+#if !defined(LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP)
     ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+#endif
 }
 
 lazy_coverage_scope::reap_guard::~reap_guard() {
+#if !defined(LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP)
     ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+#endif
 }
 
 bool lazy_coverage_scope::take_if(bool has_lazy_candidate) {

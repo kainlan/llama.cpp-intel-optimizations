@@ -283,18 +283,55 @@ if (BUILD_TESTING)
     # coverage wrapper, the helper guard and shut-down. lazy-io-pool.cpp includes no SYCL header, so this target links
     # it alone with ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
     # re-execute the binary through fork and /proc/self/exe, so it is Linux-only.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp, and the FAIL line the
+    # test prints when it does. Each builds its own executable, test-sycl-lazy-io-pool-host-mutant-<macro suffix>, and a
+    # ctest of that name which passes only when that line appears.
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        add_executable(test-sycl-lazy-io-pool-host
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-pool-host.cpp
-            lazy-io-pool.cpp)
-        target_include_directories(test-sycl-lazy-io-pool-host PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
-        target_compile_definitions(test-sycl-lazy-io-pool-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
-        target_link_libraries(test-sycl-lazy-io-pool-host PRIVATE ggml-base Threads::Threads)
-        set_target_properties(test-sycl-lazy-io-pool-host PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-        add_test(NAME test-sycl-lazy-io-pool-host COMMAND test-sycl-lazy-io-pool-host)
-        set_tests_properties(test-sycl-lazy-io-pool-host PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+        set(_lazy_io_pool_host_mutants
+            LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP
+                "FAIL the wrapper reaps before its take and after its drop: the take snapshot [0-9]+ reaps run, want [0-9]+: the entry reap did not run before the take"
+            LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP
+                "FAIL the wrapper reaps before its take and after its drop: after the scope: 0 live pools, 0 leases, 1 parked, want its pool reaped by its closing reap")
+        set(_lazy_io_pool_host_variants test-sycl-lazy-io-pool-host "" "")
+        list(LENGTH _lazy_io_pool_host_mutants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            math(EXPR _j "${_i} + 1")
+            list(GET _lazy_io_pool_host_mutants ${_i} _macro)
+            list(GET _lazy_io_pool_host_mutants ${_j} _regex)
+            string(REGEX REPLACE "^LAZY_IO_POOL_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            list(APPEND _lazy_io_pool_host_variants test-sycl-lazy-io-pool-host-mutant-${_suffix} "${_macro}" "${_regex}")
+        endforeach()
+        list(LENGTH _lazy_io_pool_host_variants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 3)
+            math(EXPR _j "${_i} + 1")
+            math(EXPR _k "${_i} + 2")
+            list(GET _lazy_io_pool_host_variants ${_i} _name)
+            list(GET _lazy_io_pool_host_variants ${_j} _macro)
+            list(GET _lazy_io_pool_host_variants ${_k} _regex)
+            add_executable(${_name}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-pool-host.cpp
+                lazy-io-pool.cpp)
+            target_include_directories(${_name} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+            target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+            target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+            set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+            add_test(NAME ${_name} COMMAND ${_name})
+            if (_macro STREQUAL "")
+                set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+            else()
+                target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+                set_tests_properties(${_name} PROPERTIES
+                    LABELS "sycl;host;mutant"
+                    TIMEOUT 120
+                    PASS_REGULAR_EXPRESSION "${_regex}")
+            endif()
+        endforeach()
     endif()
 
     # The tier on a build without it (llama.cpp-th32 T1a): host-cpu-mapping.cpp and the test are compiled with _WIN32
