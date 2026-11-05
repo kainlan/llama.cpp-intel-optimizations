@@ -7,10 +7,12 @@ from the tree and fails on any difference from SITE_TABLE, then cross-checks §4
 difference listed row by row in DOC_DRIFT. The other clauses pin the rest of the bullet: select_zone's rules, the
 owners and the UNOWNED and UNSIZED ratchets, the DEVICE holders' lifetime, release and check, the attention staging's
 refusal and plan-only growth, the plan walk's predicates and devices, the pools' one dimension rule and plan-only
-sizing, the chunk-release reachability and withdrawal of §M75, the notify's device, llama_context's wiring and trial
-operations, the owner's end, and the host SCRATCH fold and runtime term. The segmented forward, the host bufts' one
-intent builder and the KV clauses have their own gates (test-sycl-seg-forward-return-source,
-test-sycl-host-zone-config-source-contract, test-sycl-host-zone-boundary-owner-source and the test-sycl-kv-* gates).
+sizing, the chunk-release reachability and withdrawal of §M75, the notify's device and position, that nothing in
+src/ calls the compute-buffer notify, the notify's and plan entry's dlopen shape, llama_context's wiring (begin, plan
+and commit positions) and trial operations, the owner's end, and the host SCRATCH fold and runtime term. The
+segmented forward, the host bufts' one intent builder and the KV clauses have their own gates
+(test-sycl-seg-forward-return-source, test-sycl-host-zone-config-source-contract,
+test-sycl-host-zone-boundary-owner-source and the test-sycl-kv-* gates).
 Three clauses of the bullet are pinned by behaviour, not by this source read:
   - the notify's zone is the host buft's device, and it tests ggml_backend_is_sycl before it reads
     backend->context: test-sycl-host-scratch-demand (test_device_is_the_host_bufts with its device-0 and
@@ -47,6 +49,9 @@ PLAN = SYCL_DIR + "/host-zone-plan.cpp"
 HEADER = "ggml/include/ggml-sycl.h"
 LC = "src/llama-context.cpp"
 LCH = "src/llama-context.h"
+SRC_DIR = "src"
+NOTIFY = "ggml_backend_sycl_notify_host_buffer_sizes"
+PLAN_ENTRY = "ggml_backend_sycl_plan_host_holders"
 DOC = "docs/design/sycl-mmap-host-tier.md"
 
 
@@ -277,6 +282,9 @@ def tree_texts() -> dict:
     for p in sorted((ROOT / SYCL_DIR).glob("*")):
         if p.is_file() and p.suffix in (".cpp", ".hpp"):
             texts[f"{SYCL_DIR}/{p.name}"] = p.read_text(errors="replace")
+    for p in sorted((ROOT / SRC_DIR).rglob("*")):
+        if p.is_file() and p.suffix in (".cpp", ".h"):
+            texts[p.relative_to(ROOT).as_posix()] = p.read_text(errors="replace")
     for rel in (HEADER, LC, LCH, DOC):
         p = ROOT / rel
         texts[rel] = p.read_text(errors="replace") if p.exists() else ""
@@ -1465,6 +1473,66 @@ def clause_grow_host_scratch_gone(texts: dict) -> list:
     return fails
 
 
+def clause_notify_compute_unused(texts: dict) -> list:
+    """§7 C4: nothing in src/ calls ggml_backend_sycl_notify_compute_buffer_sizes, by name or through a proc address
+    looked up by its name (its VRAM half is not 5efe's)."""
+    fails = []
+    for rel in sorted(texts):
+        if rel.startswith(SRC_DIR + "/") and "ggml_backend_sycl_notify_compute_buffer_sizes" in texts[rel]:
+            s = _src(texts, rel)
+            for m in re.finditer(r"\bggml_backend_sycl_notify_compute_buffer_sizes\b", s.code):
+                fails.append(f"notify compute: {rel}:{s.line(m.start())} names "
+                             f"ggml_backend_sycl_notify_compute_buffer_sizes")
+    return fails
+
+
+_SCALAR_RE = r"(?:const\s+)?(?:size_t|int|int32_t|int64_t|uint32_t|uint64_t|bool|float|double)(?:\s+\w+)?"
+
+
+def _fn_type(text: str, m):
+    """(return type, [parameters]) of a declaration whose return type is `m`'s group 1 and whose parameter list
+    opens at the end of `m`, whitespace collapsed."""
+    return (re.sub(r"\s+", " ", m.group(1)).strip(),
+            [re.sub(r"\s+", " ", text[a:b]).strip() for a, b in call_args(text, m.end() - 1)])
+
+
+def _notify_shape(what: str, ret: str, params: list) -> list:
+    """The notify's dlopen shape: an opaque backend handle plus scalars, returning bool (r3 m5)."""
+    fails = []
+    if ret != "bool":
+        fails.append(f"dlopen shape: {what} returns {ret!r}, not bool")
+    if not params or not re.fullmatch(r"ggml_backend_t(?:\s+\w+)?", params[0]) or \
+            not all(re.fullmatch(_SCALAR_RE, q) for q in params[1:]):
+        fails.append(f"dlopen shape: {what} takes {params}, not an opaque backend handle and scalars")
+    return fails
+
+
+def _plan_shape(what: str, ret: str, params: list) -> list:
+    """The plan entry's dlopen shape: a ggml_backend_sched_t and a struct ggml_cgraph *, and no llama type (r3 m5)."""
+    if len(params) == 2 and re.fullmatch(r"ggml_backend_sched_t(?:\s+\w+)?", params[0]) and \
+            re.fullmatch(r"(?:struct\s+)?ggml_cgraph\s*\*\s*\w*", params[1]) and "llama" not in ret:
+        return []
+    return [f"dlopen shape: {what} is {ret} ({', '.join(params)}), not a ggml_backend_sched_t and a ggml_cgraph * "
+            f"with no llama type"]
+
+
+_DLOPEN_ENTRIES = ((NOTIFY, "notify", _notify_shape), (PLAN_ENTRY, "plan entry", _plan_shape))
+
+
+def clause_dlopen_header(texts: dict) -> list:
+    """§7 C4 dlopen shape (r3 m5), the header half: ggml-sycl.h declares the notify with an opaque backend handle
+    plus scalars, returning bool, and the plan entry with ggml-base handles only."""
+    fails = []
+    b = _src(texts, HEADER).bare
+    for name, label, shape in _DLOPEN_ENTRIES:
+        m = re.search(r"\bGGML_BACKEND_API\s+([\w\s*]+?)\s*\b" + name + r"\s*\(", b)
+        if not m:
+            fails.append(f"dlopen shape: ggml-sycl.h does not declare {name}")
+            continue
+        fails += shape(f"ggml-sycl.h's {label}", *_fn_type(b, m))
+    return fails
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # EXPECTED-RED clauses: each names the task that turns it green.
 # ---------------------------------------------------------------------------------------------------------------
@@ -1500,9 +1568,102 @@ def _proc_pointer(text: str, proc: str):
     return m.group(1).split(".")[-1].split(">")[-1] if m else None
 
 
+def _pointer_calls(s: Source, ptr: str, lo: int = 0, hi: int = -1) -> list:
+    """Positions of the calls through the function pointer member `ptr` between lo and hi."""
+    hi = len(s.bare) if hi < 0 else hi
+    return [lo + m.start() for m in re.finditer(r"\b" + re.escape(ptr) + r"\s*\(", s.bare[lo:hi])]
+
+
+def _lambda_span(bare: str, name: str):
+    """(open, close) of the body of the lambda assigned to `name`, or None."""
+    m = re.search(r"\b" + name + r"\s*=\s*\[[^\]]*\]\s*\([^)]*\)[^{]*\{", bare)
+    return (m.end() - 1, match_close(bare, m.end() - 1)) if m else None
+
+
+def _block_open(bare: str, pos: int) -> int:
+    """The offset of the `{` opening the innermost block that holds `pos`."""
+    depth = 0
+    for i in range(pos - 1, -1, -1):
+        if bare[i] == "}":
+            depth += 1
+        elif bare[i] == "{":
+            if depth == 0:
+                return i
+            depth -= 1
+    return 0
+
+
+def _in_loop(bare: str, lo: int, pos: int) -> bool:
+    """Whether `pos` lies in the body of a for or while loop whose head starts between lo and pos."""
+    for m in re.finditer(r"\b(?:for|while)\s*\(", bare[lo:pos]):
+        rp = match_close(bare, lo + m.end() - 1)
+        k = rp + 1
+        while k < len(bare) and bare[k].isspace():
+            k += 1
+        end = match_close(bare, k) if k < len(bare) and bare[k] == "{" else bare.find(";", k)
+        if rp < pos <= end:
+            return True
+    return False
+
+
+_DEV0_RE = r"\bmodel\s*\.\s*devices\s*\[\s*0\s*\]"
+
+
+def _from_dev0(bare: str, lo: int, pos: int, arg: str) -> bool:
+    """Whether a call argument is model.devices[0]'s backend: it names model.devices[0], or it is a local whose last
+    assignment between lo and the call does."""
+    if re.search(_DEV0_RE, arg):
+        return True
+    if not re.fullmatch(r"\w+", arg):
+        return False
+    sets = list(re.finditer(r"\b" + arg + r"\s*=(?!=)([^;]*);", bare[lo:pos]))
+    return bool(sets) and bool(re.search(_DEV0_RE, sets[-1].group(1)))
+
+
+def _reserves(s: Source, lo: int, hi: int) -> list:
+    """(position, split_only) of each graph_reserve call between lo and hi. A call is split-only when its sixth
+    argument is the literal true; a graph_reserve_shift call measures the K-shift graph, so it is split-only too."""
+    out = []
+    for m in re.finditer(r"\bgraph_reserve(_shift)?\s*\(", s.bare[lo:hi]):
+        args = [s.bare[a:b].strip() for a, b in call_args(s.bare, lo + m.end() - 1)]
+        out.append((lo + m.start(), bool(m.group(1)) or (len(args) > 5 and args[5] == "true")))
+    return out
+
+
+def _sched_path(texts: dict):
+    """The order sched_reserve's transaction runs llama-context.cpp in, as a key per offset: the transaction before
+    its MEASURE call (0), the measure (1), the transaction between MEASURE and ALLOC (2), the ALLOC reserve after its
+    MEASURE dispatch (3), and the transaction from ALLOC on (4). An offset off the path keys to None. Returns
+    {key, measure, reserve, reserve_lo}, or None when a function or a call is missing."""
+    s, tr = _fn(texts, LC, "llama_context::sched_reserve_transaction")
+    _, me = _fn(texts, LC, "llama_context::sched_measure_impl")
+    _, im = _fn(texts, LC, "llama_context::sched_reserve_impl")
+    if not (tr and me and im):
+        return None
+    body = s.bare[tr["open"]:tr["close"]]
+    mc = re.search(r"\bsched_reserve_impl\s*\(\s*sched_reserve_mode::MEASURE\b", body)
+    ac = re.search(r"\bsched_reserve_impl\s*\(\s*sched_reserve_mode::ALLOC\b", body)
+    if not (mc and ac):
+        return None
+    m_at, a_at = tr["open"] + mc.start(), tr["open"] + ac.start()
+    d = re.search(r"\breturn\s+sched_measure_impl\s*\([^;]*;\s*\}", s.bare[im["open"]:im["close"]])
+    im_lo = im["open"] + d.end() if d else im["open"]
+
+    def key(p):
+        if me["open"] < p < me["close"]:
+            return (1, p)
+        if im_lo < p < im["close"]:
+            return (3, p)
+        if tr["open"] < p < tr["close"]:
+            return (0, p) if p < m_at else (2, p) if p < a_at else (4, p)
+        return None
+    return {"key": key, "measure": me, "reserve": im, "reserve_lo": im_lo}
+
+
 def clause_context_wiring(texts: dict) -> list:
     """r6 I-1, r7 I-1, r7 m-1: llama_context resolves the notify, begin, plan and commit entries; each begin follows
-    a scheduler creation before any graph_reserve, and each plan call follows a split_only graph_reserve."""
+    a scheduler creation before any graph_reserve, each plan call follows a split_only graph_reserve, and the commit
+    calls run at the end of sched_reserve on its success, or in try_candidate after its host-fallback check."""
     lc = texts.get(LC, "")
     if not lc:
         return ["context wiring: src/llama-context.cpp is missing"]
@@ -1527,39 +1688,203 @@ def clause_context_wiring(texts: dict) -> list:
             if not prev or not re.search(r"\btrue\b", body[prev[-1].start():body.find(";", prev[-1].start())]):
                 fails.append(f"context wiring: {f['name']} calls the plan entry not right after a split_only "
                              f"graph_reserve")
+    _, sr = _fn(texts, LC, "llama_context::sched_reserve")
+    throws = [sr["open"] + m.start() for m in re.finditer(r"\bthrow\b", s.bare[sr["open"]:sr["close"]])] if sr else []
+    cand = _lambda_span(s.bare, "try_candidate")
+    fallback = re.search(r"\breturn\s+\"compute buffer fell back to host\"\s*;", s.code[cand[0]:cand[1]]) \
+        if cand else None
+    at_end = at_trial = 0
+    for p in _pointer_calls(s, ptr["commit_host_holders"]):
+        if sr and sr["open"] < p < sr["close"] and all(t < p for t in throws):
+            at_end += 1
+        elif cand and fallback and cand[0] + fallback.end() < p < cand[1]:
+            at_trial += 1
+        else:
+            f = s.enclosing(p)
+            fails.append(f"context wiring: {f['name'] if f else 'namespace scope'} calls the commit entry at line "
+                         f"{s.line(p)}, outside sched_reserve's success end and try_candidate's point after its "
+                         f"host-fallback check")
+    if not at_end:
+        fails.append("context wiring: sched_reserve does not call the commit entry at its end, on its success path")
+    if not at_trial:
+        fails.append("context wiring: try_candidate does not call the commit entry after its host-fallback check")
     return fails
 
 
 def clause_trial_ops(texts: dict) -> list:
-    """§M75, r9 n-6: try_candidate OPENs before its reserve, KEEPs beside the commit and RETURNs on both loss paths;
-    sched_reserve MARKs before the measure and RETURN_TO_MARKs before the pipeline-parallel retry."""
+    """§M75, r9 n-6, r10 m-5: try_candidate OPENs before its reserve, KEEPs beside the commit and RETURNs on both loss
+    paths; sched_reserve RETURNs on its transaction's throw path and KEEPs on its success path, MARKs before the
+    measure and RETURN_TO_MARKs before the pipeline-parallel retry."""
     lc = texts.get(LC, "")
-    trial = _proc_pointer(source_for(LC, lc).code, "ggml_backend_sycl_host_scratch_trial") if lc else None
+    s = source_for(LC, lc) if lc else None
+    trial = _proc_pointer(s.code, "ggml_backend_sycl_host_scratch_trial") if s else None
     if not trial:
         return ["trial ops: llama_context does not resolve ggml_backend_sycl_host_scratch_trial"]
-    code = source_for(LC, lc).bare
-    ops = re.findall(r"\b" + re.escape(trial) + r"\s*\([^;]*?\b\w*?(RETURN_TO_MARK|OPEN|KEEP|RETURN|MARK)\b", code)
-    fails = []
-    for op in ("OPEN", "KEEP", "RETURN", "MARK", "RETURN_TO_MARK"):
-        if op not in ops:
-            fails.append(f"trial ops: llama_context never calls the trial entry with {op}")
-    cand = re.search(r"\btry_candidate\s*=\s*\[[^\]]*\]\s*\([^)]*\)[^{]*\{", code)
-    if cand:
-        body = code[cand.end() - 1:match_close(code, cand.end() - 1)]
-        o = re.search(r"\b" + re.escape(trial) + r"\s*\([^;]*OPEN\b", body)
-        r = re.search(r"\bsched_reserve\w*\s*\(", body)
-        if not o or (r and r.start() < o.start()):
-            fails.append("trial ops: try_candidate does not OPEN before its reserve")
-        if len(re.findall(r"\b" + re.escape(trial) + r"\s*\([^;]*(?<![A-Z])RETURN\b", body)) < 2:
-            fails.append("trial ops: try_candidate does not RETURN on both loss paths")
-    else:
+    code = s.bare
+    at = {}
+    for m in re.finditer(r"\b" + re.escape(trial) + r"\s*\([^;]*?\b\w*?(RETURN_TO_MARK|OPEN|KEEP|RETURN|MARK)\b", code):
+        at.setdefault(m.group(1), []).append(m.start())
+    fails = [f"trial ops: llama_context never calls the trial entry with {op}"
+             for op in ("OPEN", "KEEP", "RETURN", "MARK", "RETURN_TO_MARK") if op not in at]
+    every = sorted(p for ps in at.values() for p in ps)
+
+    def ops(op, lo, hi):
+        return [p for p in at.get(op, []) if lo < p < hi]
+
+    cand = _lambda_span(code, "try_candidate")
+    if not cand:
         fails.append("trial ops: no try_candidate in llama_context")
-    s = source_for(LC, lc)
-    for m in re.finditer(r"\b" + re.escape(trial) + r"\s*\([^;]*RETURN_TO_MARK\b", code):
-        f = s.enclosing(m.start())
+    else:
+        lo, hi = cand
+        r = re.search(r"\bsched_reserve\w*\s*\(", code[lo:hi])
+        opens = ops("OPEN", lo, hi)
+        if not opens or (r and lo + r.start() < opens[0]):
+            fails.append("trial ops: try_candidate does not OPEN before its reserve")
+        for label, text in (("reserve-failure", "compute buffers did not fit"),
+                            ("host-fallback", "compute buffer fell back to host")):
+            m = re.search(r"\breturn\s+\"" + text + r"\"\s*;", s.code[lo:hi])
+            if not m:
+                fails.append(f"trial ops: try_candidate has no {label} return")
+                continue
+            ret = lo + m.start()
+            returns = ops("RETURN", _block_open(code, ret), ret)
+            if not returns or re.search(r"\breturn\b", code[returns[-1]:ret]):
+                fails.append(f"trial ops: try_candidate does not RETURN on both loss paths: none before its {label} "
+                             f"return")
+        commit = _proc_pointer(s.code, "ggml_backend_sycl_commit_host_holders")
+        commits = _pointer_calls(s, commit, lo, hi) if commit else []
+        keeps = ops("KEEP", lo, hi)
+
+        def beside(k, c):
+            a, b = min(k, c), max(k, c)
+            return not re.search(r"\breturn\b", code[a:b]) and not any(a < q < b for q in every if q != k)
+        if not keeps or not all(any(beside(k, c) for c in commits) for k in keeps):
+            fails.append("trial ops: try_candidate does not KEEP beside the commit, with no exit or trial step "
+                         "between them (§M75)")
+    _, sr = _fn(texts, LC, "llama_context::sched_reserve")
+    if not sr:
+        fails.append("trial ops: no llama_context::sched_reserve")
+    else:
+        tx = re.search(r"\bsched_reserve_transaction\s*\(", code[sr["open"]:sr["close"]])
+        throws = [sr["open"] + m.start() for m in re.finditer(r"\bthrow\b", code[sr["open"]:sr["close"]])]
+        if not (tx and throws and ops("RETURN", sr["open"] + tx.start(), throws[0])):
+            fails.append("trial ops: sched_reserve does not RETURN on its transaction's throw path, before it throws "
+                         "(r10 m-5)")
+        if not (throws and ops("KEEP", throws[-1], sr["close"])):
+            fails.append("trial ops: sched_reserve does not KEEP on its success path, after its throws (r10 m-5)")
+    path = _sched_path(texts)
+    im = path["reserve"] if path else None
+    lo2 = path["reserve_lo"] if path else 0
+    retry = re.search(r"\bpipeline_parallel\s*=\s*false\s*;[^;]*?\bggml_backend_sched_new\s*\(",
+                      code[lo2:im["close"]]) if im else None
+    failed = [p for p, _ in _reserves(s, lo2, lo2 + retry.start())] if retry else []
+    if not failed:
+        fails.append("trial ops: sched_reserve_impl has no reserve followed by a pipeline-parallel retry")
+    elif "RETURN_TO_MARK" in at:
+        key, f_at, retry_new = path["key"], failed[-1], lo2 + retry.end() - 1
+        if not ops("RETURN_TO_MARK", f_at, retry_new):
+            fails.append("trial ops: sched_reserve does not RETURN_TO_MARK between the failed reserve and the "
+                         "pipeline-parallel retry's scheduler (r9 n-6)")
+        allocating = [key(p) for p, so in _reserves(s, lo2, im["close"]) if not so]
+        marked = [q for q in at.get("MARK", []) if key(q) and key(q) < key(f_at)
+                  and not any(key(q) < a < key(f_at) for a in allocating)]
+        if not marked:
+            fails.append("trial ops: a RETURN_TO_MARK is not preceded by its MARK before the reserve the "
+                         "pipeline-parallel retry repeats (r9 n-6)")
+    return fails
+
+
+def clause_notify_position(texts: dict) -> list:
+    """§7 C4, r3 A.2 and A.5: llama_context calls the notify before the allocation it covers, once with
+    model.devices[0]'s backend and not in a loop over backends. In output_reserve the call sits between the old
+    buffer's free and ggml_backend_buft_alloc_buffer; on sched_reserve's path it follows the measure's last size-only
+    graph_reserve and precedes the first allocating one."""
+    lc = texts.get(LC, "")
+    s = source_for(LC, lc) if lc else None
+    ptr = _proc_pointer(s.code, NOTIFY) if s else None
+    if not ptr:
+        return [f"notify position: llama_context does not resolve {NOTIFY}"]
+    _, out = _fn(texts, LC, "llama_context::output_reserve")
+    path = _sched_path(texts)
+    if not out or not path:
+        return ["notify position: output_reserve or sched_reserve's transaction is missing"]
+    key, me, im = path["key"], path["measure"], path["reserve"]
+    span = s.bare[out["open"]:out["close"]]
+    frees = [out["open"] + m.end() for m in re.finditer(r"\bbuf_output\s*=\s*nullptr\s*;", span)]
+    alloc = re.search(r"\bggml_backend_buft_alloc_buffer\s*\(", span)
+    size_only = [key(p) for p, so in _reserves(s, me["open"], me["close"]) if so]
+    allocating = [key(p) for p, so in _reserves(s, path["reserve_lo"], im["close"]) if not so]
+    fails = []
+    in_out = in_path = 0
+    for p in _pointer_calls(s, ptr):
+        f = s.enclosing(p)
         lo = f["open"] if f else 0
-        if not re.search(r"\b" + re.escape(trial) + r"\s*\([^;]*(?<![A-Z])(?<!TO_)MARK\b", code[lo:m.start()]):
-            fails.append("trial ops: a RETURN_TO_MARK is not preceded by its MARK")
+        where = f"{f['name'] if f else 'namespace scope'}:{s.line(p)}"
+        args = [s.bare[a:b].strip() for a, b in call_args(s.bare, s.bare.index("(", p))]
+        if _in_loop(s.bare, lo, p):
+            fails.append(f"notify position: {where} calls the notify in a loop, not once with one backend (r3 A.5)")
+        if not args or not _from_dev0(s.bare, lo, p, args[0]):
+            fails.append(f"notify position: {where} does not pass model.devices[0]'s backend (r3 A.5)")
+        if out["open"] < p < out["close"]:
+            in_out += 1
+            if not (frees and alloc and frees[-1] < p < out["open"] + alloc.start()):
+                fails.append(f"notify position: {where} calls the notify outside the span between the old buffer's "
+                             f"free and ggml_backend_buft_alloc_buffer (r3 A.2)")
+        elif key(p):
+            in_path += 1
+            if not (size_only and allocating and size_only[-1] < key(p) < allocating[0]):
+                fails.append(f"notify position: {where} calls the notify on sched_reserve's path outside the span "
+                             f"from the measure's last size-only graph_reserve to the first allocating one (r3 A.2)")
+        else:
+            fails.append(f"notify position: {where} calls the notify outside output_reserve and sched_reserve's "
+                         f"path")
+    if not in_out:
+        fails.append("notify position: output_reserve does not call the notify")
+    if not in_path:
+        fails.append("notify position: sched_reserve's path does not call the notify")
+    return fails
+
+
+def _pointer_type(texts: dict, member: str):
+    """How llama_context declares the function pointer `member`: ("decltype", function) for decltype(&function), or
+    (return type, [parameters]) for a function pointer type written out, directly or through a using or typedef
+    alias. None when no declaration is found."""
+    for rel in (LC, LCH):
+        if not texts.get(rel):
+            continue
+        b = _src(texts, rel).bare
+        m = re.search(r"\bdecltype\s*\(\s*&\s*(\w+)\s*\)\s+" + member + r"\b", b)
+        if m:
+            return "decltype", m.group(1)
+        m = re.search(r"([\w:]+(?:\s*\*)?)\s*\(\s*\*\s*" + member + r"\s*\)\s*\(", b)
+        if m:
+            return _fn_type(b, m)
+        for a in re.finditer(r"\b(\w+)\s+" + member + r"\s*(?:=|;|\{)", b):
+            alias = (re.search(r"\busing\s+" + a.group(1) + r"\s*=\s*([\w:]+(?:\s*\*)?)\s*\(\s*\*\s*\)\s*\(", b)
+                     or re.search(r"\btypedef\s+([\w:]+(?:\s*\*)?)\s*\(\s*\*\s*" + a.group(1) + r"\s*\)\s*\(", b))
+            if alias:
+                return _fn_type(b, alias)
+    return None
+
+
+def clause_dlopen_context(texts: dict) -> list:
+    """§7 C4 dlopen shape (r3 m5), the llama_context half: the function pointer types llama_context resolves the
+    notify and the plan entry into have the header's shape; a decltype of the header's function inherits it."""
+    lc = texts.get(LC, "")
+    fails = []
+    for name, label, shape in _DLOPEN_ENTRIES:
+        ptr = _proc_pointer(source_for(LC, lc).code, name) if lc else None
+        if not ptr:
+            fails.append(f"dlopen shape: llama_context does not resolve {name}")
+            continue
+        declared = _pointer_type(texts, ptr)
+        if declared is None:
+            fails.append(f"dlopen shape: llama_context declares no type for its {ptr} pointer")
+        elif declared[0] == "decltype":
+            if declared[1] != name:
+                fails.append(f"dlopen shape: llama_context's {ptr} pointer is decltype(&{declared[1]}), not {name}'s")
+        else:
+            fails += shape(f"llama_context's {label} pointer type", *declared)
     return fails
 
 
@@ -1649,6 +1974,8 @@ CLAUSES = [
     ("withdrawal", REQUIRED, clause_withdrawal, None, None),
     ("notify-device", REQUIRED, clause_notify_device, None, None),
     ("grow-host-scratch-gone", REQUIRED, clause_grow_host_scratch_gone, None, None),
+    ("notify-compute-unused", REQUIRED, clause_notify_compute_unused, None, None),
+    ("dlopen-header", REQUIRED, clause_dlopen_header, None, None),
     ("slot-growth-plan-only", EXPECTED_RED, clause_slot_growth_plan_only, "Task 7",
      "slot_replace is called by ['host_staging_slots::admit'"),
     ("pools-from-plan", EXPECTED_RED, clause_pools_from_plan, "Task 7",
@@ -1657,6 +1984,10 @@ CLAUSES = [
      "llama_context does not resolve ggml_backend_sycl_begin_host_holders"),
     ("trial-ops", EXPECTED_RED, clause_trial_ops, "Task 7",
      "llama_context does not resolve ggml_backend_sycl_host_scratch_trial"),
+    ("notify-position", EXPECTED_RED, clause_notify_position, "Task 7",
+     "llama_context does not resolve ggml_backend_sycl_notify_host_buffer_sizes"),
+    ("dlopen-context", EXPECTED_RED, clause_dlopen_context, "Task 7",
+     "llama_context does not resolve ggml_backend_sycl_notify_host_buffer_sizes"),
     ("owner-end-wired", EXPECTED_RED, clause_owner_end_wired, "Task 7",
      "ggml_backend_sycl_free does not call the owner's end"),
     ("open-touches-no-set", EXPECTED_RED, clause_open_touches_no_set, "Task 7",
@@ -1732,6 +2063,33 @@ _ARENA_RESERVED = ("        GGML_ABORT(\"[SYCL-PLAN] compute arena reserve small
                    "    }\n")
 _MEASURED = ("            return { sched_reserve_status::FAILED, format(\"failed to measure graph %zu of %zu\", gi, "
              "graphs.size()) };\n        }\n")
+_SR_FAIL = ("    const sched_reserve_result result = sched_reserve_transaction();\n"
+            "    if (result.status != sched_reserve_status::OK) {\n")
+_SR_TAIL_OPEN = "        throw std::runtime_error(result.reason);\n    }\n"
+_SR_TAIL_CLOSE = "}\n\nbool llama_context::sched_reserve_nothrow() {\n"
+_SR_COMMIT = ("    if (!sycl_ubatch_trial_active) {\n"
+              "        for (auto & backend : backends) {\n"
+              "            hooks.commit_host_holders(backend.get());\n"
+              "        }\n"
+              "    }\n")
+_SPILL_OK = "        hold_spill_validated_ub = hold_spill_fn ? c : 0;\n"
+_TRIAL_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
+                 "            hooks.commit_host_holders(sb.backend);\n"
+                 "        }\n")
+_RESERVED_OK = "        sched_matches_last_good = true;\n"
+_PP_SPLITS = "        n_splits_pp        = ggml_backend_sched_get_n_splits(state.sched.get());\n"
+_RETRY_RESERVE = "                gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get());\n"
+_DEV0_BACKEND = "llama_context_sycl_backend_of(backends, model.devices[0])"
+_OUT_ALLOC = "        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));\n"
+_OUT_NOTIFY = "        hooks.notify_host_buffer_sizes(" + _DEV0_BACKEND + ", 0, new_size);\n"
+_MEASURED_OK = "            return measured;\n        }\n"
+_SCHED_DEV0 = "        ggml_backend_t sycl_dev0 = " + _DEV0_BACKEND + ";\n"
+_SCHED_NOTIFY = _SCHED_DEV0 + "        hooks.notify_host_buffer_sizes(sycl_dev0, storage.plan.host_compute_bytes, 0);\n"
+_HAS_PLAN_MEMBER = ("    decltype(&ggml_backend_sycl_has_active_placement_plan)        has_active_plan = "
+                    "nullptr;\n")
+_HDR_ARG = " " * 65  # the column of the notify's parameters in ggml-sycl.h
+_NOTIFY_MEMBER = "    bool (*notify_host_buffer_sizes)(ggml_backend_t, size_t, size_t) = nullptr;\n"
+_PLAN_MEMBER = "    bool (*plan_host_holders)(ggml_backend_sched_t, struct ggml_cgraph *) = nullptr;\n"
 _OPEN_TRIAL = (UC, None, "\nsize_t unified_cache::host_scratch_trial(host_scratch_trial_op op, uint64_t owner) {\n"
                          "    switch (op) {\n"
                          "        case host_scratch_trial_op::OPEN:\n"
@@ -1784,21 +2142,33 @@ FIXTURES = {
         (LC, _SCHED_SITES[1], _SCHED_SITES[1] + _RETRY_BEGIN),
         (LC, _SCHED_SITES[2], _SCHED_SITES[2] + _BEGIN),
         (LC, _MEASURED, _MEASURED + "        hooks.plan_host_holders(state.sched.get(), gf);\n"),
+        (LC, _SR_TAIL_OPEN + _SR_TAIL_CLOSE, _SR_TAIL_OPEN + _SR_COMMIT + _SR_TAIL_CLOSE),
+        (LC, _SPILL_OK, _SPILL_OK + _TRIAL_COMMIT),
     ],
     "trial-ops": [
-        (LC, _HOOKS_AT, _HOOKS_AT + _hook("host_scratch_trial")),
+        (LC, _HOOKS_AT, _HOOKS_AT + _hook("host_scratch_trial") + _hook("commit_host_holders")),
         (LC, "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n",
          _TRIAL_OPEN + "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"),
         (LC, "            return \"compute buffers did not fit\";\n",
          "            " + _TRIAL + "RETURN);\n            return \"compute buffers did not fit\";\n"),
         (LC, "                return \"compute buffer fell back to host\";\n",
          "                " + _TRIAL + "RETURN);\n                return \"compute buffer fell back to host\";\n"),
-        (LC, "        hold_spill_validated_ub = hold_spill_fn ? c : 0;\n",
-         "        hold_spill_validated_ub = hold_spill_fn ? c : 0;\n        " + _TRIAL + "KEEP);\n"),
+        (LC, _SPILL_OK, _SPILL_OK + _TRIAL_COMMIT + "        " + _TRIAL + "KEEP);\n"),
+        (LC, _SR_FAIL, _SR_FAIL + "        " + _TRIAL + "RETURN);\n"),
+        (LC, _SR_TAIL_OPEN + _SR_TAIL_CLOSE, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n" + _SR_TAIL_CLOSE),
         (LC, _PP_MEASURE, "        " + _TRIAL + "MARK);\n" + _PP_MEASURE),
         (LC, "                state.cparams.pipeline_parallel = false;\n                state.sched.reset(",
          "                " + _TRIAL + "RETURN_TO_MARK);\n"
          "                state.cparams.pipeline_parallel = false;\n                state.sched.reset("),
+    ],
+    "notify-position": [
+        (LC, _HOOKS_AT, _HOOKS_AT + _hook("notify_host_buffer_sizes")),
+        (LC, _OUT_ALLOC, _OUT_NOTIFY + _OUT_ALLOC),
+        (LC, _MEASURED_OK, _MEASURED_OK + _SCHED_NOTIFY),
+    ],
+    "dlopen-context": [
+        (LC, _HOOKS_AT, _HOOKS_AT + _hook("notify_host_buffer_sizes") + _hook("plan_host_holders")),
+        (LC, _HAS_PLAN_MEMBER, _HAS_PLAN_MEMBER + _NOTIFY_MEMBER + _PLAN_MEMBER),
     ],
     "owner-end-wired": [
         (GS, "    delete sycl_ctx;\n    // The backend-member check",
@@ -1964,6 +2334,28 @@ MUTANTS = [
     ("grow-host-scratch-called", "grow-host-scratch-gone",
      [(GS, _ARENA_RESERVED, _ARENA_RESERVED + "    ggml_sycl::unified_cache_grow_host_scratch_zone(total_bytes);\n")],
      "ggml/src/ggml-sycl/ggml-sycl.cpp defines or calls unified_cache_grow_host_scratch_zone"),
+    ("notify-compute-called", "notify-compute-unused",
+     [("src/llama-model.cpp", None, "\nstatic void routing_gate_planted(ggml_backend_t b, const size_t * s) {\n"
+                                    "    ggml_backend_sycl_notify_compute_buffer_sizes(b, s, 1);\n"
+                                    "}\n")],
+     "notify compute: src/llama-model.cpp:"),
+    ("notify-compute-by-proc", "notify-compute-unused",
+     [(LC, _HOOKS_AT, _HOOKS_AT + _hook("notify_compute_buffer_sizes"))],
+     "notify compute: src/llama-context.cpp:"),
+    ("dlopen-notify-struct", "dlopen-header",
+     [(HEADER, "(ggml_backend_t backend,\n" + _HDR_ARG + "size_t         host_compute_bytes,\n"
+               + _HDR_ARG + "size_t         host_output_bytes);\n",
+       "(ggml_backend_t backend,\n" + _HDR_ARG + "const struct ggml_sycl_host_sizes * sizes);\n")],
+     "ggml-sycl.h's notify takes"),
+    ("dlopen-notify-void", "dlopen-header",
+     [(HEADER, "GGML_BACKEND_API bool ggml_backend_sycl_notify_host_buffer_sizes(",
+       "GGML_BACKEND_API void ggml_backend_sycl_notify_host_buffer_sizes(")],
+     "ggml-sycl.h's notify returns 'void', not bool"),
+    ("dlopen-plan-llama", "dlopen-header",
+     [(HEADER, "(ggml_backend_sched_t sched, struct ggml_cgraph * graph);",
+       "(ggml_backend_sched_t sched, struct ggml_cgraph * graph,\n"
+       "                                                         struct llama_context * lctx);")],
+     "ggml-sycl.h's plan entry is"),
     ("grow-host-scratch-defined", "grow-host-scratch-gone",
      [(UC, None, "\nvoid unified_cache_grow_host_scratch_zone(int device, size_t bytes) {\n"
                  "    (void) device;\n"
@@ -1991,11 +2383,66 @@ MUTANTS = [
      "calls the plan entry not right after a split_only graph_reserve"),
     ("wiring-commit-unresolved", "context-wiring", [(LC, _hook("commit_host_holders"), "")],
      "does not resolve ggml_backend_sycl_commit_host_holders"),
+    ("wiring-commit-before-alloc", "context-wiring",
+     [(LC, _SR_TAIL_OPEN + _SR_COMMIT, _SR_TAIL_OPEN),
+      (LC, _PP_MEASURE, _SR_COMMIT + _PP_MEASURE)],
+     "llama_context::sched_reserve_impl calls the commit entry"),
+    ("wiring-trial-commit-before-fallback", "context-wiring",
+     [(LC, _SPILL_OK + _TRIAL_COMMIT, _SPILL_OK),
+      (LC, _RESERVED_OK, _RESERVED_OK + _TRIAL_COMMIT)],
+     "try_candidate does not call the commit entry after its host-fallback check"),
     ("trial-open-missing", "trial-ops", [(LC, _TRIAL_OPEN, "")], "try_candidate does not OPEN before its reserve"),
+    ("trial-open-after-reserve", "trial-ops",
+     [(LC, _TRIAL_OPEN, ""), (LC, _RESERVED_OK, _RESERVED_OK + _TRIAL_OPEN)],
+     "try_candidate does not OPEN before its reserve"),
     ("trial-one-return", "trial-ops", [(LC, "                " + _TRIAL + "RETURN);\n", "")],
-     "try_candidate does not RETURN on both loss paths"),
+     "try_candidate does not RETURN on both loss paths: none before its host-fallback return"),
+    ("trial-catch-unreturned", "trial-ops",
+     [(LC, "            " + _TRIAL + "RETURN);\n            return \"compute buffers did not fit\";\n",
+       "            return \"compute buffers did not fit\";\n")],
+     "try_candidate does not RETURN on both loss paths: none before its reserve-failure return"),
+    ("trial-keep-before-fallback", "trial-ops",
+     [(LC, _TRIAL_COMMIT + "        " + _TRIAL + "KEEP);\n", _TRIAL_COMMIT),
+      (LC, _RESERVED_OK, _RESERVED_OK + "        " + _TRIAL + "KEEP);\n")],
+     "try_candidate does not KEEP beside the commit"),
+    ("trial-sched-return-on-success", "trial-ops",
+     [(LC, _SR_FAIL + "        " + _TRIAL + "RETURN);\n", _SR_FAIL),
+      (LC, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n",
+       _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n    " + _TRIAL + "RETURN);\n")],
+     "sched_reserve does not RETURN on its transaction's throw path"),
+    ("trial-sched-keep-before-transaction", "trial-ops",
+     [(LC, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n", _SR_TAIL_OPEN),
+      (LC, _SR_FAIL, "    " + _TRIAL + "KEEP);\n" + _SR_FAIL)],
+     "sched_reserve does not KEEP on its success path"),
+    ("trial-mark-after-measure", "trial-ops",
+     [(LC, "        " + _TRIAL + "MARK);\n", ""), (LC, _PP_SPLITS, _PP_SPLITS + "        " + _TRIAL + "MARK);\n")],
+     "a RETURN_TO_MARK is not preceded by its MARK before the reserve"),
+    ("trial-rtm-after-retry-scheduler", "trial-ops",
+     [(LC, "                " + _TRIAL + "RETURN_TO_MARK);\n", ""),
+      (LC, _RETRY_RESERVE, "                " + _TRIAL + "RETURN_TO_MARK);\n" + _RETRY_RESERVE)],
+     "does not RETURN_TO_MARK between the failed reserve and the pipeline-parallel retry's scheduler"),
     ("trial-mark-missing", "trial-ops", [(LC, "        " + _TRIAL + "MARK);\n", "")],
      "a RETURN_TO_MARK is not preceded by its MARK"),
+    ("notify-output-after-alloc", "notify-position", [(LC, _OUT_NOTIFY + _OUT_ALLOC, _OUT_ALLOC + _OUT_NOTIFY)],
+     "calls the notify outside the span between the old buffer's free and ggml_backend_buft_alloc_buffer"),
+    ("notify-sched-after-alloc", "notify-position",
+     [(LC, _MEASURED_OK + _SCHED_NOTIFY, _MEASURED_OK), (LC, _PP_SPLITS, _PP_SPLITS + _SCHED_NOTIFY)],
+     "calls the notify on sched_reserve's path outside the span"),
+    ("notify-backend-loop", "notify-position",
+     [(LC, _OUT_NOTIFY, "        for (auto & backend : backends) {\n"
+                        "            hooks.notify_host_buffer_sizes(backend.get(), 0, new_size);\n"
+                        "        }\n")],
+     "calls the notify in a loop, not once with one backend"),
+    ("notify-other-backend", "notify-position",
+     [(LC, _SCHED_DEV0, "        ggml_backend_t sycl_dev0 = backends.back().get();\n")],
+     "does not pass model.devices[0]'s backend"),
+    ("dlopen-context-notify-struct", "dlopen-context",
+     [(LC, _NOTIFY_MEMBER,
+       "    bool (*notify_host_buffer_sizes)(ggml_backend_t, const llama_host_sizes *) = nullptr;\n")],
+     "llama_context's notify pointer type takes"),
+    ("dlopen-context-plan-llama", "dlopen-context",
+     [(LC, _PLAN_MEMBER, "    bool (*plan_host_holders)(ggml_backend_sched_t, llama_context *) = nullptr;\n")],
+     "llama_context's plan entry pointer type is"),
     ("owner-end-after-delete", "owner-end-wired",
      [(GS, _OWNER_END + "    delete sycl_ctx;\n", "    delete sycl_ctx;\n" + _OWNER_END)],
      "calls the owner's end after delete sycl_ctx"),
