@@ -1955,12 +1955,17 @@ created") describes a path that does not run.
       and no longer for a trial candidate.
     - **The transaction.** A fourth proc-table entry, `bool
       ggml_backend_sycl_host_scratch_trial(ggml_backend_t backend, int
-      op)`, with `op` one of `OPEN`, `KEEP` and `RETURN` (plain `int`
-      constants, since no enum crosses the dlopen boundary), called on the
-      backend the notify is made through. `try_candidate` calls `OPEN`
-      right before its `sched_reserve` (`lc:1607`). While it is open, every
-      chunk that zone 3 grows for that context is recorded in the
-      transaction, by the notify's ensure and by the miss path alike. On a
+      op, uint32_t n_ubatch)`, with `op` one of `OPEN`, `KEEP` and `RETURN`
+      (plain `int` constants, since no enum crosses the dlopen boundary)
+      and `n_ubatch` the context's, which the witness below prints, called
+      on the backend the notify is made through. `try_candidate` calls
+      `OPEN` right before its `sched_reserve` (`lc:1607`). An open
+      transaction records the thread that opened it, and a chunk that zone
+      3 grows, by the notify's ensure or by the miss path alike, is
+      recorded in the device's open transaction of the growing thread
+      (canonical contract §5: the reserving thread is the allocating
+      thread); a grow that no open transaction of its thread matches is
+      ordinary capacity. On a
       win, `try_candidate` calls `KEEP` together with the commit, after the
       host-fallback check; the chunks become ordinary SCRATCH capacity. On
       each loss path, the allocating reserve's throw (`lc:1609-1619`) and
